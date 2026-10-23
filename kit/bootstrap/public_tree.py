@@ -7,6 +7,8 @@ PLATFORM_FILES = frozenset(
     (
         ".github/workflows/public-policy.yml",
         ".github/workflows/linux-confinement.yml",
+        ".github/workflows/windows-attestation-permission-probe.yml",
+        ".github/workflows/macos-capability.yml",
         "ci/policy.json",
         "kit/bootstrap/action.yml",
         "kit/bootstrap/check_candidate.py",
@@ -16,6 +18,12 @@ PLATFORM_FILES = frozenset(
         "kit/bootstrap/test_public_tree.py",
         "kit/confinement/macos_harness.py",
         "kit/confinement/test_macos_harness.py",
+        "kit/confinement/macos_capability.py",
+        "kit/confinement/macos_capability.swift",
+        "kit/confinement/macos_capability.entitlements.plist",
+        "kit/confinement/macos_capability_child.entitlements.plist",
+        "kit/confinement/macos_capability_info.plist",
+        "kit/confinement/test_macos_capability.py",
         "kit/confinement/linux_harness.py",
         "kit/confinement/test_linux_harness.py",
     )
@@ -29,6 +37,11 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
+ACTION_VERSION_COMMENT_PATTERN = re.compile(
+    r"^\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}\s+"
+    + re.escape(chr(35))
+    + r"\s+v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$"
+)
 PRIVATE_PATH_PATTERN = re.compile(chr(47) + r"(?:Users|home|private)/[A-Za-z0-9._-]+")
 WINDOWS_PRIVATE_PATH_PATTERN = re.compile(
     r"[A-Za-z]:[\\/]" + r"(?:Users|Documents and Settings)[\\/]" + r"[A-Za-z0-9._ -]+",
@@ -62,7 +75,10 @@ class PublicTreeError(ValueError):
 
 def inspect_text(text, pool):
     lowered = text.lower()
-    if chr(35) in text:
+    if any(
+        chr(35) in line and not ACTION_VERSION_COMMENT_PATTERN.fullmatch(line)
+        for line in text.splitlines()
+    ):
         raise PublicTreeError("comment-present")
     if PLAN_ID_PATTERN.search(text):
         raise PublicTreeError("plan-id-present")
@@ -121,6 +137,8 @@ def scan_tree(root, pool):
         for filename in files:
             item = current_path / filename
             relative = item.relative_to(root).as_posix()
+            if relative == ".git" and item.is_file() and not item.is_symlink():
+                continue
             if relative.startswith(".git/"):
                 continue
             if item.is_symlink() or not item.is_file():

@@ -29,6 +29,12 @@ def main():
             if len(linux_payload) > 262144:
                 raise PolicyError("linux-workflow-too-large")
             validate_workflow_text(linux_payload.decode("utf-8"), pool, "linux-confinement")
+            macos_workflow_path = root / ".github/workflows/macos-capability.yml"
+            with macos_workflow_path.open("rb") as source:
+                macos_payload = source.read(262145)
+            if len(macos_payload) > 262144:
+                raise PolicyError("macos-workflow-too-large")
+            validate_workflow_text(macos_payload.decode("utf-8"), pool, "macos-capability")
         scan_tree(root, pool)
         print("candidate-policy=accepted control-sha=" + actual_sha)
     except (OSError, UnicodeDecodeError, ValueError, PolicyError, PublicTreeError):

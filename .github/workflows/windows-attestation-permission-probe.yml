@@ -1,0 +1,851 @@
+name: windows-attestation-permission-probe
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  require-reviewed-main:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require manual dispatch from main
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EVENT_NAME -ne 'workflow_dispatch' -or $env:EVENT_REF -ne 'refs/heads/main') {
+            Write-Output 'probe=refused reason=trigger'
+            exit 1
+          }
+          Write-Output 'probe=ref-check status=passed'
+
+  common-intersection-ubuntu:
+    name: common-intersection-ubuntu-24.04
+    needs: require-reviewed-main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+    outputs:
+      result: ${{ steps.classify.outputs.result }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PROBE_PROFILE: common-intersection
+      PROBE_RUNNER: ubuntu-24.04
+      PROBE_PREDICATE_TYPE: https://example.invalid/attestation-permission-probe/v1
+      PROBE_SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/windows-attestation-permission-probe.yml
+    steps:
+      - name: Create passive synthetic subject
+        id: subject
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $subjectDirectory = Join-Path $env:RUNNER_TEMP 'attestation-permission-probe'
+          [System.IO.Directory]::CreateDirectory($subjectDirectory) | Out-Null
+          $subjectPath = Join-Path $subjectDirectory 'probe.bin'
+          $subjectBytes = [System.Text.Encoding]::ASCII.GetBytes("synthetic permission probe subject v1`n")
+          [System.IO.File]::WriteAllBytes($subjectPath, $subjectBytes)
+
+      - name: Attest synthetic subject
+        id: attest
+        if: steps.subject.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+          predicate-type: https://example.invalid/attestation-permission-probe/v1
+          predicate: '{"probe":"source-free-permission-probe-v1"}'
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+
+      - name: Verify exact subject and signature
+        id: verify
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        env:
+          PROBE_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          PROBE_REPOSITORY: ${{ github.repository }}
+          PROBE_SUBJECT: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failureReason = 'verification'
+          try {
+            if ($env:PROBE_PROFILE -notin @('common-intersection', 'github-guide', 'actions-readme')) { throw 'invalid' }
+            if ($env:PROBE_RUNNER -notin @('ubuntu-24.04', 'windows-2025')) { throw 'invalid' }
+            if ($env:PROBE_REPOSITORY -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'invalid' }
+            if ($env:PROBE_SIGNER_WORKFLOW -ne "$($env:PROBE_REPOSITORY)/.github/workflows/windows-attestation-permission-probe.yml") { throw 'invalid' }
+            if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:PROBE_BUNDLE)) { throw 'invalid' }
+            $imageOs = $env:ImageOS
+            $imageVersion = $env:ImageVersion
+            if ($imageOs -notmatch '^[A-Za-z0-9._-]{1,64}$' -or $imageVersion -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw 'invalid' }
+
+            $failureReason = 'subject'
+            $subjectInfo = Get-Item -LiteralPath $env:PROBE_SUBJECT
+            if ($subjectInfo.Length -gt 256) { throw 'invalid' }
+            $subjectDigest = (Get-FileHash -LiteralPath $env:PROBE_SUBJECT -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($subjectDigest -ne 'cf46dd9088c858970cef86ae444af8cf0dec8d4fdcbc36af595220011689a0c8') { throw 'invalid' }
+
+            $failureReason = 'bundle'
+            $bundleInfo = Get-Item -LiteralPath $env:PROBE_BUNDLE
+            if ($bundleInfo.Length -le 0 -or $bundleInfo.Length -gt 1048576) { throw 'invalid' }
+            if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'invalid' }
+
+            $failureReason = 'verifier'
+            $ghVersionOutput = & gh version 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+            $ghVersionLine = $ghVersionOutput | Select-Object -First 1
+            if ($ghVersionLine -notmatch '^gh version ([0-9]+\.[0-9]+\.[0-9]+)(\s|$)') { throw 'invalid' }
+            $ghVersion = $Matches[1]
+
+            $failureReason = 'signature-verification'
+            & gh attestation verify $env:PROBE_SUBJECT `
+              --bundle $env:PROBE_BUNDLE `
+              --repo $env:PROBE_REPOSITORY `
+              --signer-workflow $env:PROBE_SIGNER_WORKFLOW `
+              --predicate-type $env:PROBE_PREDICATE_TYPE `
+              --cert-oidc-issuer https://token.actions.githubusercontent.com `
+              --deny-self-hosted-runners
+            if ($LASTEXITCODE -ne 0) { throw 'unverified' }
+          } catch {
+            $verificationResult = if ($failureReason -eq 'signature-verification') { 'unverified' } else { 'error' }
+            "result=$verificationResult" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+            Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$verificationResult reason=$failureReason"
+            exit 1
+          }
+          "result=verified" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=verified image=$imageOs image_version=$imageVersion verifier=gh-$ghVersion subject=sha256:$subjectDigest"
+
+      - name: Classify probe outcome
+        id: classify
+        if: always()
+        env:
+          SUBJECT_OUTCOME: ${{ steps.subject.outcome }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
+        run: |
+          $result = 'error'
+          if ($env:SUBJECT_OUTCOME -eq 'success') {
+            if ($env:ATTEST_OUTCOME -eq 'failure') {
+              $result = 'unverified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'verified' -and $env:VERIFY_OUTCOME -eq 'success') {
+              $result = 'verified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'unverified') {
+              $result = 'unverified'
+            }
+          }
+          "result=$result" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=outcome profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$result"
+
+  common-intersection-windows:
+    name: common-intersection-windows-2025
+    needs: require-reviewed-main
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+    outputs:
+      result: ${{ steps.classify.outputs.result }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PROBE_PROFILE: common-intersection
+      PROBE_RUNNER: windows-2025
+      PROBE_PREDICATE_TYPE: https://example.invalid/attestation-permission-probe/v1
+      PROBE_SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/windows-attestation-permission-probe.yml
+    steps:
+      - name: Create passive synthetic subject
+        id: subject
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $subjectDirectory = Join-Path $env:RUNNER_TEMP 'attestation-permission-probe'
+          [System.IO.Directory]::CreateDirectory($subjectDirectory) | Out-Null
+          $subjectPath = Join-Path $subjectDirectory 'probe.bin'
+          $subjectBytes = [System.Text.Encoding]::ASCII.GetBytes("synthetic permission probe subject v1`n")
+          [System.IO.File]::WriteAllBytes($subjectPath, $subjectBytes)
+
+      - name: Attest synthetic subject
+        id: attest
+        if: steps.subject.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+          predicate-type: https://example.invalid/attestation-permission-probe/v1
+          predicate: '{"probe":"source-free-permission-probe-v1"}'
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+
+      - name: Verify exact subject and signature
+        id: verify
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        env:
+          PROBE_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          PROBE_REPOSITORY: ${{ github.repository }}
+          PROBE_SUBJECT: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failureReason = 'verification'
+          try {
+            if ($env:PROBE_PROFILE -notin @('common-intersection', 'github-guide', 'actions-readme')) { throw 'invalid' }
+            if ($env:PROBE_RUNNER -notin @('ubuntu-24.04', 'windows-2025')) { throw 'invalid' }
+            if ($env:PROBE_REPOSITORY -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'invalid' }
+            if ($env:PROBE_SIGNER_WORKFLOW -ne "$($env:PROBE_REPOSITORY)/.github/workflows/windows-attestation-permission-probe.yml") { throw 'invalid' }
+            if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:PROBE_BUNDLE)) { throw 'invalid' }
+            $imageOs = $env:ImageOS
+            $imageVersion = $env:ImageVersion
+            if ($imageOs -notmatch '^[A-Za-z0-9._-]{1,64}$' -or $imageVersion -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw 'invalid' }
+
+            $failureReason = 'subject'
+            $subjectInfo = Get-Item -LiteralPath $env:PROBE_SUBJECT
+            if ($subjectInfo.Length -gt 256) { throw 'invalid' }
+            $subjectDigest = (Get-FileHash -LiteralPath $env:PROBE_SUBJECT -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($subjectDigest -ne 'cf46dd9088c858970cef86ae444af8cf0dec8d4fdcbc36af595220011689a0c8') { throw 'invalid' }
+
+            $failureReason = 'bundle'
+            $bundleInfo = Get-Item -LiteralPath $env:PROBE_BUNDLE
+            if ($bundleInfo.Length -le 0 -or $bundleInfo.Length -gt 1048576) { throw 'invalid' }
+            if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'invalid' }
+
+            $failureReason = 'verifier'
+            $ghVersionOutput = & gh version 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+            $ghVersionLine = $ghVersionOutput | Select-Object -First 1
+            if ($ghVersionLine -notmatch '^gh version ([0-9]+\.[0-9]+\.[0-9]+)(\s|$)') { throw 'invalid' }
+            $ghVersion = $Matches[1]
+
+            $failureReason = 'signature-verification'
+            & gh attestation verify $env:PROBE_SUBJECT `
+              --bundle $env:PROBE_BUNDLE `
+              --repo $env:PROBE_REPOSITORY `
+              --signer-workflow $env:PROBE_SIGNER_WORKFLOW `
+              --predicate-type $env:PROBE_PREDICATE_TYPE `
+              --cert-oidc-issuer https://token.actions.githubusercontent.com `
+              --deny-self-hosted-runners
+            if ($LASTEXITCODE -ne 0) { throw 'unverified' }
+          } catch {
+            $verificationResult = if ($failureReason -eq 'signature-verification') { 'unverified' } else { 'error' }
+            "result=$verificationResult" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+            Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$verificationResult reason=$failureReason"
+            exit 1
+          }
+          "result=verified" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=verified image=$imageOs image_version=$imageVersion verifier=gh-$ghVersion subject=sha256:$subjectDigest"
+
+      - name: Classify probe outcome
+        id: classify
+        if: always()
+        env:
+          SUBJECT_OUTCOME: ${{ steps.subject.outcome }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
+        run: |
+          $result = 'error'
+          if ($env:SUBJECT_OUTCOME -eq 'success') {
+            if ($env:ATTEST_OUTCOME -eq 'failure') {
+              $result = 'unverified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'verified' -and $env:VERIFY_OUTCOME -eq 'success') {
+              $result = 'verified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'unverified') {
+              $result = 'unverified'
+            }
+          }
+          "result=$result" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=outcome profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$result"
+
+  github-guide-ubuntu:
+    name: github-guide-ubuntu-24.04
+    needs: require-reviewed-main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    outputs:
+      result: ${{ steps.classify.outputs.result }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PROBE_PROFILE: github-guide
+      PROBE_RUNNER: ubuntu-24.04
+      PROBE_PREDICATE_TYPE: https://example.invalid/attestation-permission-probe/v1
+      PROBE_SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/windows-attestation-permission-probe.yml
+    steps:
+      - name: Create passive synthetic subject
+        id: subject
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $subjectDirectory = Join-Path $env:RUNNER_TEMP 'attestation-permission-probe'
+          [System.IO.Directory]::CreateDirectory($subjectDirectory) | Out-Null
+          $subjectPath = Join-Path $subjectDirectory 'probe.bin'
+          $subjectBytes = [System.Text.Encoding]::ASCII.GetBytes("synthetic permission probe subject v1`n")
+          [System.IO.File]::WriteAllBytes($subjectPath, $subjectBytes)
+
+      - name: Attest synthetic subject
+        id: attest
+        if: steps.subject.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+          predicate-type: https://example.invalid/attestation-permission-probe/v1
+          predicate: '{"probe":"source-free-permission-probe-v1"}'
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+
+      - name: Verify exact subject and signature
+        id: verify
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        env:
+          PROBE_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          PROBE_REPOSITORY: ${{ github.repository }}
+          PROBE_SUBJECT: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failureReason = 'verification'
+          try {
+            if ($env:PROBE_PROFILE -notin @('common-intersection', 'github-guide', 'actions-readme')) { throw 'invalid' }
+            if ($env:PROBE_RUNNER -notin @('ubuntu-24.04', 'windows-2025')) { throw 'invalid' }
+            if ($env:PROBE_REPOSITORY -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'invalid' }
+            if ($env:PROBE_SIGNER_WORKFLOW -ne "$($env:PROBE_REPOSITORY)/.github/workflows/windows-attestation-permission-probe.yml") { throw 'invalid' }
+            if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:PROBE_BUNDLE)) { throw 'invalid' }
+            $imageOs = $env:ImageOS
+            $imageVersion = $env:ImageVersion
+            if ($imageOs -notmatch '^[A-Za-z0-9._-]{1,64}$' -or $imageVersion -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw 'invalid' }
+
+            $failureReason = 'subject'
+            $subjectInfo = Get-Item -LiteralPath $env:PROBE_SUBJECT
+            if ($subjectInfo.Length -gt 256) { throw 'invalid' }
+            $subjectDigest = (Get-FileHash -LiteralPath $env:PROBE_SUBJECT -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($subjectDigest -ne 'cf46dd9088c858970cef86ae444af8cf0dec8d4fdcbc36af595220011689a0c8') { throw 'invalid' }
+
+            $failureReason = 'bundle'
+            $bundleInfo = Get-Item -LiteralPath $env:PROBE_BUNDLE
+            if ($bundleInfo.Length -le 0 -or $bundleInfo.Length -gt 1048576) { throw 'invalid' }
+            if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'invalid' }
+
+            $failureReason = 'verifier'
+            $ghVersionOutput = & gh version 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+            $ghVersionLine = $ghVersionOutput | Select-Object -First 1
+            if ($ghVersionLine -notmatch '^gh version ([0-9]+\.[0-9]+\.[0-9]+)(\s|$)') { throw 'invalid' }
+            $ghVersion = $Matches[1]
+
+            $failureReason = 'signature-verification'
+            & gh attestation verify $env:PROBE_SUBJECT `
+              --bundle $env:PROBE_BUNDLE `
+              --repo $env:PROBE_REPOSITORY `
+              --signer-workflow $env:PROBE_SIGNER_WORKFLOW `
+              --predicate-type $env:PROBE_PREDICATE_TYPE `
+              --cert-oidc-issuer https://token.actions.githubusercontent.com `
+              --deny-self-hosted-runners
+            if ($LASTEXITCODE -ne 0) { throw 'unverified' }
+          } catch {
+            $verificationResult = if ($failureReason -eq 'signature-verification') { 'unverified' } else { 'error' }
+            "result=$verificationResult" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+            Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$verificationResult reason=$failureReason"
+            exit 1
+          }
+          "result=verified" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=verified image=$imageOs image_version=$imageVersion verifier=gh-$ghVersion subject=sha256:$subjectDigest"
+
+      - name: Classify probe outcome
+        id: classify
+        if: always()
+        env:
+          SUBJECT_OUTCOME: ${{ steps.subject.outcome }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
+        run: |
+          $result = 'error'
+          if ($env:SUBJECT_OUTCOME -eq 'success') {
+            if ($env:ATTEST_OUTCOME -eq 'failure') {
+              $result = 'unverified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'verified' -and $env:VERIFY_OUTCOME -eq 'success') {
+              $result = 'verified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'unverified') {
+              $result = 'unverified'
+            }
+          }
+          "result=$result" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=outcome profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$result"
+
+  github-guide-windows:
+    name: github-guide-windows-2025
+    needs: require-reviewed-main
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    outputs:
+      result: ${{ steps.classify.outputs.result }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PROBE_PROFILE: github-guide
+      PROBE_RUNNER: windows-2025
+      PROBE_PREDICATE_TYPE: https://example.invalid/attestation-permission-probe/v1
+      PROBE_SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/windows-attestation-permission-probe.yml
+    steps:
+      - name: Create passive synthetic subject
+        id: subject
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $subjectDirectory = Join-Path $env:RUNNER_TEMP 'attestation-permission-probe'
+          [System.IO.Directory]::CreateDirectory($subjectDirectory) | Out-Null
+          $subjectPath = Join-Path $subjectDirectory 'probe.bin'
+          $subjectBytes = [System.Text.Encoding]::ASCII.GetBytes("synthetic permission probe subject v1`n")
+          [System.IO.File]::WriteAllBytes($subjectPath, $subjectBytes)
+
+      - name: Attest synthetic subject
+        id: attest
+        if: steps.subject.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+          predicate-type: https://example.invalid/attestation-permission-probe/v1
+          predicate: '{"probe":"source-free-permission-probe-v1"}'
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+
+      - name: Verify exact subject and signature
+        id: verify
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        env:
+          PROBE_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          PROBE_REPOSITORY: ${{ github.repository }}
+          PROBE_SUBJECT: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failureReason = 'verification'
+          try {
+            if ($env:PROBE_PROFILE -notin @('common-intersection', 'github-guide', 'actions-readme')) { throw 'invalid' }
+            if ($env:PROBE_RUNNER -notin @('ubuntu-24.04', 'windows-2025')) { throw 'invalid' }
+            if ($env:PROBE_REPOSITORY -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'invalid' }
+            if ($env:PROBE_SIGNER_WORKFLOW -ne "$($env:PROBE_REPOSITORY)/.github/workflows/windows-attestation-permission-probe.yml") { throw 'invalid' }
+            if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:PROBE_BUNDLE)) { throw 'invalid' }
+            $imageOs = $env:ImageOS
+            $imageVersion = $env:ImageVersion
+            if ($imageOs -notmatch '^[A-Za-z0-9._-]{1,64}$' -or $imageVersion -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw 'invalid' }
+
+            $failureReason = 'subject'
+            $subjectInfo = Get-Item -LiteralPath $env:PROBE_SUBJECT
+            if ($subjectInfo.Length -gt 256) { throw 'invalid' }
+            $subjectDigest = (Get-FileHash -LiteralPath $env:PROBE_SUBJECT -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($subjectDigest -ne 'cf46dd9088c858970cef86ae444af8cf0dec8d4fdcbc36af595220011689a0c8') { throw 'invalid' }
+
+            $failureReason = 'bundle'
+            $bundleInfo = Get-Item -LiteralPath $env:PROBE_BUNDLE
+            if ($bundleInfo.Length -le 0 -or $bundleInfo.Length -gt 1048576) { throw 'invalid' }
+            if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'invalid' }
+
+            $failureReason = 'verifier'
+            $ghVersionOutput = & gh version 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+            $ghVersionLine = $ghVersionOutput | Select-Object -First 1
+            if ($ghVersionLine -notmatch '^gh version ([0-9]+\.[0-9]+\.[0-9]+)(\s|$)') { throw 'invalid' }
+            $ghVersion = $Matches[1]
+
+            $failureReason = 'signature-verification'
+            & gh attestation verify $env:PROBE_SUBJECT `
+              --bundle $env:PROBE_BUNDLE `
+              --repo $env:PROBE_REPOSITORY `
+              --signer-workflow $env:PROBE_SIGNER_WORKFLOW `
+              --predicate-type $env:PROBE_PREDICATE_TYPE `
+              --cert-oidc-issuer https://token.actions.githubusercontent.com `
+              --deny-self-hosted-runners
+            if ($LASTEXITCODE -ne 0) { throw 'unverified' }
+          } catch {
+            $verificationResult = if ($failureReason -eq 'signature-verification') { 'unverified' } else { 'error' }
+            "result=$verificationResult" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+            Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$verificationResult reason=$failureReason"
+            exit 1
+          }
+          "result=verified" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=verified image=$imageOs image_version=$imageVersion verifier=gh-$ghVersion subject=sha256:$subjectDigest"
+
+      - name: Classify probe outcome
+        id: classify
+        if: always()
+        env:
+          SUBJECT_OUTCOME: ${{ steps.subject.outcome }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
+        run: |
+          $result = 'error'
+          if ($env:SUBJECT_OUTCOME -eq 'success') {
+            if ($env:ATTEST_OUTCOME -eq 'failure') {
+              $result = 'unverified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'verified' -and $env:VERIFY_OUTCOME -eq 'success') {
+              $result = 'verified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'unverified') {
+              $result = 'unverified'
+            }
+          }
+          "result=$result" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=outcome profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$result"
+
+  actions-readme-ubuntu:
+    name: actions-readme-ubuntu-24.04
+    needs: require-reviewed-main
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      result: ${{ steps.classify.outputs.result }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PROBE_PROFILE: actions-readme
+      PROBE_RUNNER: ubuntu-24.04
+      PROBE_PREDICATE_TYPE: https://example.invalid/attestation-permission-probe/v1
+      PROBE_SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/windows-attestation-permission-probe.yml
+    steps:
+      - name: Create passive synthetic subject
+        id: subject
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $subjectDirectory = Join-Path $env:RUNNER_TEMP 'attestation-permission-probe'
+          [System.IO.Directory]::CreateDirectory($subjectDirectory) | Out-Null
+          $subjectPath = Join-Path $subjectDirectory 'probe.bin'
+          $subjectBytes = [System.Text.Encoding]::ASCII.GetBytes("synthetic permission probe subject v1`n")
+          [System.IO.File]::WriteAllBytes($subjectPath, $subjectBytes)
+
+      - name: Attest synthetic subject
+        id: attest
+        if: steps.subject.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+          predicate-type: https://example.invalid/attestation-permission-probe/v1
+          predicate: '{"probe":"source-free-permission-probe-v1"}'
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+
+      - name: Verify exact subject and signature
+        id: verify
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        env:
+          PROBE_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          PROBE_REPOSITORY: ${{ github.repository }}
+          PROBE_SUBJECT: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failureReason = 'verification'
+          try {
+            if ($env:PROBE_PROFILE -notin @('common-intersection', 'github-guide', 'actions-readme')) { throw 'invalid' }
+            if ($env:PROBE_RUNNER -notin @('ubuntu-24.04', 'windows-2025')) { throw 'invalid' }
+            if ($env:PROBE_REPOSITORY -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'invalid' }
+            if ($env:PROBE_SIGNER_WORKFLOW -ne "$($env:PROBE_REPOSITORY)/.github/workflows/windows-attestation-permission-probe.yml") { throw 'invalid' }
+            if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:PROBE_BUNDLE)) { throw 'invalid' }
+            $imageOs = $env:ImageOS
+            $imageVersion = $env:ImageVersion
+            if ($imageOs -notmatch '^[A-Za-z0-9._-]{1,64}$' -or $imageVersion -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw 'invalid' }
+
+            $failureReason = 'subject'
+            $subjectInfo = Get-Item -LiteralPath $env:PROBE_SUBJECT
+            if ($subjectInfo.Length -gt 256) { throw 'invalid' }
+            $subjectDigest = (Get-FileHash -LiteralPath $env:PROBE_SUBJECT -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($subjectDigest -ne 'cf46dd9088c858970cef86ae444af8cf0dec8d4fdcbc36af595220011689a0c8') { throw 'invalid' }
+
+            $failureReason = 'bundle'
+            $bundleInfo = Get-Item -LiteralPath $env:PROBE_BUNDLE
+            if ($bundleInfo.Length -le 0 -or $bundleInfo.Length -gt 1048576) { throw 'invalid' }
+            if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'invalid' }
+
+            $failureReason = 'verifier'
+            $ghVersionOutput = & gh version 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+            $ghVersionLine = $ghVersionOutput | Select-Object -First 1
+            if ($ghVersionLine -notmatch '^gh version ([0-9]+\.[0-9]+\.[0-9]+)(\s|$)') { throw 'invalid' }
+            $ghVersion = $Matches[1]
+
+            $failureReason = 'signature-verification'
+            & gh attestation verify $env:PROBE_SUBJECT `
+              --bundle $env:PROBE_BUNDLE `
+              --repo $env:PROBE_REPOSITORY `
+              --signer-workflow $env:PROBE_SIGNER_WORKFLOW `
+              --predicate-type $env:PROBE_PREDICATE_TYPE `
+              --cert-oidc-issuer https://token.actions.githubusercontent.com `
+              --deny-self-hosted-runners
+            if ($LASTEXITCODE -ne 0) { throw 'unverified' }
+          } catch {
+            $verificationResult = if ($failureReason -eq 'signature-verification') { 'unverified' } else { 'error' }
+            "result=$verificationResult" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+            Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$verificationResult reason=$failureReason"
+            exit 1
+          }
+          "result=verified" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=verified image=$imageOs image_version=$imageVersion verifier=gh-$ghVersion subject=sha256:$subjectDigest"
+
+      - name: Classify probe outcome
+        id: classify
+        if: always()
+        env:
+          SUBJECT_OUTCOME: ${{ steps.subject.outcome }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
+        run: |
+          $result = 'error'
+          if ($env:SUBJECT_OUTCOME -eq 'success') {
+            if ($env:ATTEST_OUTCOME -eq 'failure') {
+              $result = 'unverified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'verified' -and $env:VERIFY_OUTCOME -eq 'success') {
+              $result = 'verified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'unverified') {
+              $result = 'unverified'
+            }
+          }
+          "result=$result" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=outcome profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$result"
+
+  actions-readme-windows:
+    name: actions-readme-windows-2025
+    needs: require-reviewed-main
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    outputs:
+      result: ${{ steps.classify.outputs.result }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PROBE_PROFILE: actions-readme
+      PROBE_RUNNER: windows-2025
+      PROBE_PREDICATE_TYPE: https://example.invalid/attestation-permission-probe/v1
+      PROBE_SIGNER_WORKFLOW: ${{ github.repository }}/.github/workflows/windows-attestation-permission-probe.yml
+    steps:
+      - name: Create passive synthetic subject
+        id: subject
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $subjectDirectory = Join-Path $env:RUNNER_TEMP 'attestation-permission-probe'
+          [System.IO.Directory]::CreateDirectory($subjectDirectory) | Out-Null
+          $subjectPath = Join-Path $subjectDirectory 'probe.bin'
+          $subjectBytes = [System.Text.Encoding]::ASCII.GetBytes("synthetic permission probe subject v1`n")
+          [System.IO.File]::WriteAllBytes($subjectPath, $subjectBytes)
+
+      - name: Attest synthetic subject
+        id: attest
+        if: steps.subject.outcome == 'success'
+        continue-on-error: true
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+          predicate-type: https://example.invalid/attestation-permission-probe/v1
+          predicate: '{"probe":"source-free-permission-probe-v1"}'
+          push-to-registry: false
+          create-storage-record: false
+          show-summary: false
+
+      - name: Verify exact subject and signature
+        id: verify
+        if: steps.attest.outcome == 'success'
+        continue-on-error: true
+        env:
+          PROBE_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          PROBE_REPOSITORY: ${{ github.repository }}
+          PROBE_SUBJECT: ${{ runner.temp }}/attestation-permission-probe/probe.bin
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failureReason = 'verification'
+          try {
+            if ($env:PROBE_PROFILE -notin @('common-intersection', 'github-guide', 'actions-readme')) { throw 'invalid' }
+            if ($env:PROBE_RUNNER -notin @('ubuntu-24.04', 'windows-2025')) { throw 'invalid' }
+            if ($env:PROBE_REPOSITORY -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'invalid' }
+            if ($env:PROBE_SIGNER_WORKFLOW -ne "$($env:PROBE_REPOSITORY)/.github/workflows/windows-attestation-permission-probe.yml") { throw 'invalid' }
+            if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP) -or [string]::IsNullOrWhiteSpace($env:PROBE_BUNDLE)) { throw 'invalid' }
+            $imageOs = $env:ImageOS
+            $imageVersion = $env:ImageVersion
+            if ($imageOs -notmatch '^[A-Za-z0-9._-]{1,64}$' -or $imageVersion -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw 'invalid' }
+
+            $failureReason = 'subject'
+            $subjectInfo = Get-Item -LiteralPath $env:PROBE_SUBJECT
+            if ($subjectInfo.Length -gt 256) { throw 'invalid' }
+            $subjectDigest = (Get-FileHash -LiteralPath $env:PROBE_SUBJECT -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($subjectDigest -ne 'cf46dd9088c858970cef86ae444af8cf0dec8d4fdcbc36af595220011689a0c8') { throw 'invalid' }
+
+            $failureReason = 'bundle'
+            $bundleInfo = Get-Item -LiteralPath $env:PROBE_BUNDLE
+            if ($bundleInfo.Length -le 0 -or $bundleInfo.Length -gt 1048576) { throw 'invalid' }
+            if ($null -eq (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'invalid' }
+
+            $failureReason = 'verifier'
+            $ghVersionOutput = & gh version 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'invalid' }
+            $ghVersionLine = $ghVersionOutput | Select-Object -First 1
+            if ($ghVersionLine -notmatch '^gh version ([0-9]+\.[0-9]+\.[0-9]+)(\s|$)') { throw 'invalid' }
+            $ghVersion = $Matches[1]
+
+            $failureReason = 'signature-verification'
+            & gh attestation verify $env:PROBE_SUBJECT `
+              --bundle $env:PROBE_BUNDLE `
+              --repo $env:PROBE_REPOSITORY `
+              --signer-workflow $env:PROBE_SIGNER_WORKFLOW `
+              --predicate-type $env:PROBE_PREDICATE_TYPE `
+              --cert-oidc-issuer https://token.actions.githubusercontent.com `
+              --deny-self-hosted-runners
+            if ($LASTEXITCODE -ne 0) { throw 'unverified' }
+          } catch {
+            $verificationResult = if ($failureReason -eq 'signature-verification') { 'unverified' } else { 'error' }
+            "result=$verificationResult" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+            Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$verificationResult reason=$failureReason"
+            exit 1
+          }
+          "result=verified" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=verification-result profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=verified image=$imageOs image_version=$imageVersion verifier=gh-$ghVersion subject=sha256:$subjectDigest"
+
+      - name: Classify probe outcome
+        id: classify
+        if: always()
+        env:
+          SUBJECT_OUTCOME: ${{ steps.subject.outcome }}
+          ATTEST_OUTCOME: ${{ steps.attest.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          VERIFY_RESULT: ${{ steps.verify.outputs.result }}
+        run: |
+          $result = 'error'
+          if ($env:SUBJECT_OUTCOME -eq 'success') {
+            if ($env:ATTEST_OUTCOME -eq 'failure') {
+              $result = 'unverified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'verified' -and $env:VERIFY_OUTCOME -eq 'success') {
+              $result = 'verified'
+            } elseif ($env:ATTEST_OUTCOME -eq 'success' -and $env:VERIFY_RESULT -eq 'unverified') {
+              $result = 'unverified'
+            }
+          }
+          "result=$result" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "probe=outcome profile=$env:PROBE_PROFILE runner=$env:PROBE_RUNNER result=$result"
+
+  compare-probe-results:
+    name: compare-profile-results
+    if: always()
+    needs:
+      - require-reviewed-main
+      - common-intersection-ubuntu
+      - common-intersection-windows
+      - github-guide-ubuntu
+      - github-guide-windows
+      - actions-readme-ubuntu
+      - actions-readme-windows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      MAIN_GUARD: ${{ needs.require-reviewed-main.result }}
+      COMMON_UBUNTU_JOB_RESULT: ${{ needs.common-intersection-ubuntu.result }}
+      COMMON_WINDOWS_JOB_RESULT: ${{ needs.common-intersection-windows.result }}
+      GUIDE_UBUNTU_JOB_RESULT: ${{ needs.github-guide-ubuntu.result }}
+      GUIDE_WINDOWS_JOB_RESULT: ${{ needs.github-guide-windows.result }}
+      README_UBUNTU_JOB_RESULT: ${{ needs.actions-readme-ubuntu.result }}
+      README_WINDOWS_JOB_RESULT: ${{ needs.actions-readme-windows.result }}
+      COMMON_UBUNTU: ${{ needs.common-intersection-ubuntu.outputs.result }}
+      COMMON_WINDOWS: ${{ needs.common-intersection-windows.outputs.result }}
+      GUIDE_UBUNTU: ${{ needs.github-guide-ubuntu.outputs.result }}
+      GUIDE_WINDOWS: ${{ needs.github-guide-windows.outputs.result }}
+      README_UBUNTU: ${{ needs.actions-readme-ubuntu.outputs.result }}
+      README_WINDOWS: ${{ needs.actions-readme-windows.outputs.result }}
+    steps:
+      - name: Refuse comparison after workflow cancellation
+        if: cancelled()
+        run: |
+          Write-Output 'probe=profile-comparison result=blocked reason=workflow-cancelled'
+          exit 1
+      - name: Compare only classified arm results
+        if: ${{ success() && !cancelled() }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:MAIN_GUARD -ne 'success') {
+            Write-Output 'probe=profile-comparison result=blocked reason=main-guard'
+            exit 1
+          }
+          $jobResults = [ordered]@{
+            common_intersection_ubuntu = $env:COMMON_UBUNTU_JOB_RESULT
+            common_intersection_windows = $env:COMMON_WINDOWS_JOB_RESULT
+            github_guide_ubuntu = $env:GUIDE_UBUNTU_JOB_RESULT
+            github_guide_windows = $env:GUIDE_WINDOWS_JOB_RESULT
+            actions_readme_ubuntu = $env:README_UBUNTU_JOB_RESULT
+            actions_readme_windows = $env:README_WINDOWS_JOB_RESULT
+          }
+          foreach ($entry in $jobResults.GetEnumerator()) {
+            if ($entry.Value -ne 'success') {
+              Write-Output 'probe=profile-comparison result=blocked reason=arm-job-not-success'
+              exit 1
+            }
+          }
+          $results = [ordered]@{
+            common_intersection_ubuntu = $env:COMMON_UBUNTU
+            common_intersection_windows = $env:COMMON_WINDOWS
+            github_guide_ubuntu = $env:GUIDE_UBUNTU
+            github_guide_windows = $env:GUIDE_WINDOWS
+            actions_readme_ubuntu = $env:README_UBUNTU
+            actions_readme_windows = $env:README_WINDOWS
+          }
+          foreach ($entry in $results.GetEnumerator()) {
+            if ($entry.Value -notin @('verified', 'unverified', 'error')) {
+              Write-Output 'probe=profile-comparison result=blocked reason=missing-or-invalid-arm-result'
+              exit 1
+            }
+          }
+          Write-Output "probe=profile-comparison common_intersection=$($results.common_intersection_ubuntu)/$($results.common_intersection_windows) github_guide=$($results.github_guide_ubuntu)/$($results.github_guide_windows) actions_readme=$($results.actions_readme_ubuntu)/$($results.actions_readme_windows)"
+          if ($results.Values -contains 'unverified' -or $results.Values -contains 'error') {
+            Write-Output 'probe=profile-selection result=blocked reason=failed-or-ambiguous-arm'
+            exit 1
+          }
+          if ($results.common_intersection_ubuntu -eq 'verified' -and $results.common_intersection_windows -eq 'verified') {
+            Write-Output 'probe=profile-selection result=selected profile=common-intersection'
+            exit 0
+          }
+          if ($results.github_guide_ubuntu -eq 'verified' -and $results.github_guide_windows -eq 'verified') {
+            Write-Output 'probe=profile-selection result=selected profile=github-guide'
+            exit 0
+          }
+          if ($results.actions_readme_ubuntu -eq 'verified' -and $results.actions_readme_windows -eq 'verified') {
+            Write-Output 'probe=profile-selection result=selected profile=actions-readme'
+            exit 0
+          }
+          Write-Output 'probe=profile-selection result=blocked reason=no-shared-verified-profile'
+          exit 1
