@@ -35,6 +35,16 @@ CHILD_UID = 65534
 CHILD_GID = 65534
 MAX_CAPTURE = 8192
 MAX_PROBE_SECONDS = 10
+INNER_REFUSAL_REASONS = (
+    20, 21, 22, 23, 24, 25, 26, 27, 45, 46, 47, 48, 51, 52, 53,
+    57, 58, 59, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+    79, 80, 81, 98,
+)
+INNER_REFUSAL_LINES = {
+    ("inner=refused reason=" + str(reason) + "\n").encode("ascii"): reason
+    for reason in INNER_REFUSAL_REASONS
+}
+MAX_INNER_REFUSAL_BYTES = len(b"inner=refused reason=98\n")
 UNSHARE_ARGUMENTS = ("--mount", "--pid", "--fork", "--ipc", "--net", "--propagation", "private", "--kill-child=KILL")
 PR_SET_NO_NEW_PRIVS = 38
 PR_CAPBSET_DROP = 24
@@ -790,8 +800,16 @@ def _run_probe(kind, services, nonce, rootfs, control_sha):
     except (OSError, subprocess.TimeoutExpired):
         raise ProofFailure(54)
     expected = ("inner=accepted probe=" + kind + "\n").encode()
-    if result.returncode != 0 or result.stdout != expected or result.stderr:
-        raise ProofFailure(55)
+    if result.returncode != 0:
+        if result.returncode == 1 and result.stderr == b"" and len(result.stdout) <= MAX_INNER_REFUSAL_BYTES:
+            inner_reason = INNER_REFUSAL_LINES.get(result.stdout)
+            if inner_reason is not None:
+                raise ProofFailure(inner_reason)
+        raise ProofFailure(82)
+    if result.stdout != expected:
+        raise ProofFailure(83)
+    if result.stderr:
+        raise ProofFailure(84)
     _positive_control(kind, services, "check-" + nonce + "-" + kind)
     with services.condition:
         if any(child_canary in event or ("q-child-" + nonce).encode().hex() in event for event in services.events):

@@ -47,6 +47,68 @@ class HarnessPolicyTests(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], MAX_PROBE_SECONDS + 5)
         self.assertTrue(run.call_args.kwargs["close_fds"])
 
+    def test_inner_probe_failures_have_fixed_numeric_reasons(self):
+        services = SimpleNamespace(
+            tcp_port=1,
+            udp_port=2,
+            http_port=3,
+            ipc_path="/tmp/socket",
+            file_path="/tmp/file",
+            condition=threading.Condition(),
+            events=[],
+        )
+        expected = b"inner=accepted probe=tcp\n"
+        cases = (
+            ("child-nonzero", SimpleNamespace(returncode=1, stdout=expected, stderr=b""), 82),
+            ("stdout-mismatch", SimpleNamespace(returncode=0, stdout=b"opaque output", stderr=b""), 83),
+            ("stderr-present", SimpleNamespace(returncode=0, stdout=expected, stderr=b"opaque output"), 84),
+            ("nonzero-precedes-output", SimpleNamespace(returncode=1, stdout=b"opaque output", stderr=b"opaque output"), 82),
+        )
+        for label, result, reason in cases:
+            with self.subTest(case=label), \
+                 patch("linux_harness._positive_control") as control, \
+                 patch("linux_harness.shutil.which", return_value="/usr/bin/unshare"), \
+                 patch("linux_harness.os.stat", return_value=SimpleNamespace(st_ino=1)), \
+                 patch("linux_harness.subprocess.run", return_value=result):
+                with self.assertRaises(ProofFailure) as raised:
+                    _run_probe("tcp", services, "a" * 24, "/tmp/root", "b" * 40)
+                self.assertEqual(raised.exception.reason, reason)
+                self.assertEqual(outcome(False, raised.exception.reason), "linux-confinement=refused reason=" + str(reason))
+                control.assert_called_once()
+
+    def test_only_exact_known_inner_refusals_cross_the_capture_boundary(self):
+        services = SimpleNamespace(
+            tcp_port=1,
+            udp_port=2,
+            http_port=3,
+            ipc_path="/tmp/socket",
+            file_path="/tmp/file",
+            condition=threading.Condition(),
+            events=[],
+        )
+        cases = (
+            ("known-boundary", 1, b"inner=refused reason=53\n", b"", 53),
+            ("known-generic", 1, b"inner=refused reason=98\n", b"", 98),
+            ("unknown-reason", 1, b"inner=refused reason=54\n", b"", 82),
+            ("arbitrary-number", 1, b"inner=refused reason=99\n", b"", 82),
+            ("leading-zero", 1, b"inner=refused reason=053\n", b"", 82),
+            ("extra-line", 1, b"inner=refused reason=53\nextra\n", b"", 82),
+            ("stderr", 1, b"inner=refused reason=53\n", b"opaque output", 82),
+            ("wrong-exit", 2, b"inner=refused reason=53\n", b"", 82),
+            ("oversized", 1, b"inner=refused reason=53\n" + b"x" * 8192, b"", 82),
+        )
+        for label, returncode, stdout, stderr, reason in cases:
+            with self.subTest(case=label), \
+                 patch("linux_harness._positive_control") as control, \
+                 patch("linux_harness.shutil.which", return_value="/usr/bin/unshare"), \
+                 patch("linux_harness.os.stat", return_value=SimpleNamespace(st_ino=1)), \
+                 patch("linux_harness.subprocess.run", return_value=SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)):
+                with self.assertRaises(ProofFailure) as raised:
+                    _run_probe("tcp", services, "a" * 24, "/tmp/root", "b" * 40)
+                self.assertEqual(raised.exception.reason, reason)
+                self.assertEqual(outcome(False, raised.exception.reason), "linux-confinement=refused reason=" + str(reason))
+                control.assert_called_once()
+
     def test_embedded_synthetic_program_is_standalone_valid_python(self):
         tree = ast.parse(CHILD_SOURCE)
         functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
