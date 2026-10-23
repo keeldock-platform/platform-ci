@@ -20,6 +20,8 @@ APP_IDENTIFIER = "org.example.sandboxcapability"
 CHILD_IDENTIFIER = APP_IDENTIFIER + ".CapabilityChild"
 MAX_CAPTURE_BYTES = 65536
 MAX_PROBE_SECONDS = 45
+MAX_RUNNER_ANCESTORS = 16
+MAX_PROCESS_PATH_BYTES = 4096
 LSOF_NON_DESCRIPTOR_ENTRIES = frozenset(("cwd", "rtd", "txt", "mem", "ltx"))
 PROC_PIDLISTFDS = 1
 PROC_PIDFDPIPEINFO = 6
@@ -185,17 +187,105 @@ def _runner_paths(workspace):
     workspace = Path(workspace).resolve()
     if len(workspace.parents) < 3:
         raise ProbeFailure("runner_control_unavailable", check="workspace_layout")
-    runner_home = workspace.parents[2]
-    runners = runner_home / "runners"
+    diagnostics = _runner_diagnostics(workspace)
+    work_temp = workspace.parents[1] / "_temp"
+    return (Path(runner_temp), work_temp, diagnostics)
+
+
+def _parent_pid_and_uid(pid):
     try:
-        installations = [item for item in runners.iterdir() if item.is_dir() and not item.is_symlink()]
-        diagnostics = [item / "_diag" for item in installations if (item / "_diag").is_dir()]
+        result = _run(["/bin/ps", "-p", str(pid), "-o", "ppid=,uid="], timeout=5)
+    except ProbeFailure:
+        raise ProbeFailure("runner_control_unavailable", check="diagnostics_access")
+    fields = result.stdout.decode("ascii", "ignore").split()
+    if result.returncode != 0 or len(result.stdout) > 128 or len(fields) != 2 or not all(field.isdecimal() for field in fields):
+        raise ProbeFailure("runner_control_unavailable", check="diagnostics_access")
+    return int(fields[0]), int(fields[1])
+
+
+def _process_executable(pid):
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        library.proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+        library.proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(MAX_PROCESS_PATH_BYTES)
+        size = library.proc_pidpath(pid, buffer, len(buffer))
+        if size <= 0 or size >= len(buffer):
+            raise ProbeFailure("runner_control_unavailable", check="diagnostics_access")
+        raw = buffer.raw[:size].split(b"\0", 1)[0].decode("utf-8")
+        if not raw or not Path(raw).is_absolute():
+            raise ProbeFailure("runner_control_unavailable", check="diagnostics_access")
+        return Path(raw)
+    except (OSError, AttributeError, UnicodeDecodeError, ValueError):
+        raise ProbeFailure("runner_control_unavailable", check="diagnostics_access")
+
+
+def _runner_diagnostics(workspace):
+    try:
+        runner_uid = workspace.stat().st_uid
     except OSError:
         raise ProbeFailure("runner_control_unavailable", check="diagnostics_access")
-    if len(diagnostics) != 1:
-        raise ProbeFailure("runner_control_unavailable", check="diagnostics_layout")
-    work_temp = workspace.parents[1] / "_temp"
-    return (Path(runner_temp), work_temp, diagnostics[0])
+    runner_home = workspace.parents[2]
+    pid = os.getppid()
+    seen = set()
+    for _ in range(MAX_RUNNER_ANCESTORS):
+        if pid <= 1 or pid in seen:
+            break
+        seen.add(pid)
+        parent, uid = _parent_pid_and_uid(pid)
+        executable = _process_executable(pid)
+        if executable.name == "Runner.Worker":
+            if uid != runner_uid or executable.parent.name != "bin":
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_layout")
+            root = executable.parent.parent
+            try:
+                relative = root.relative_to(runner_home)
+                allowed_root = relative.parts == ("actions-runner", "cached") or (
+                    len(relative.parts) == 2
+                    and relative.parts[0] == "runners"
+                    and re.fullmatch(r"2\.[0-9]+\.[0-9]+", relative.parts[1]) is not None
+                )
+                if not allowed_root or ".." in executable.parts:
+                    raise ValueError("runner installation outside owner home")
+                path = runner_home
+                home_info = path.lstat()
+                if not stat.S_ISDIR(home_info.st_mode) or home_info.st_uid != runner_uid:
+                    raise ValueError("untrusted runner home")
+                for component in relative.parts + ("bin", "Runner.Worker"):
+                    path = path / component
+                    info = path.lstat()
+                    required = stat.S_ISREG if path == executable else stat.S_ISDIR
+                    if not required(info.st_mode) or info.st_uid != runner_uid:
+                        raise ValueError("untrusted runner installation")
+                if _parent_pid_and_uid(pid) != (parent, uid) or _process_executable(pid) != executable:
+                    raise ValueError("runner process changed")
+            except (OSError, ValueError):
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_layout")
+            return root / "_diag"
+        pid = parent
+    raise ProbeFailure("runner_control_unavailable", check="diagnostics_access")
+
+
+def _open_control_nofollow(path, directory):
+    path = Path(path)
+    if not path.is_absolute() or len(path.parts) < 2:
+        raise OSError("control path is not absolute")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory_flag is None or not hasattr(os, "fchmod"):
+        raise OSError("no-follow file controls unavailable")
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    current = os.open(path.anchor, flags | directory_flag)
+    try:
+        for index, component in enumerate(path.parts[1:]):
+            last = index == len(path.parts) - 2
+            following = os.open(component, flags | (directory_flag if directory or not last else 0), dir_fd=current)
+            os.close(current)
+            current = following
+        return current
+    except Exception:
+        os.close(current)
+        raise
 
 
 def _protect_runner_controls(workspace):
@@ -208,15 +298,29 @@ def _protect_runner_controls(workspace):
     directories = set(_runner_paths(workspace))
     for path in directories:
         try:
-            info = path.lstat()
-            if not stat.S_ISDIR(info.st_mode) or info.st_uid != runner_uid:
+            named = path.lstat()
+            if not stat.S_ISDIR(named.st_mode) or named.st_uid != runner_uid:
                 raise ProbeFailure("runner_control_unavailable", check="directory_type_owner")
-            os.chmod(path, stat.S_IMODE(info.st_mode) & 0o700)
-            checked = path.stat()
-            if stat.S_IMODE(checked.st_mode) & 0o077:
+        except OSError:
+            raise ProbeFailure("runner_control_unavailable", check="directory_permissions")
+        try:
+            descriptor = _open_control_nofollow(path, True)
+        except OSError:
+            raise ProbeFailure("runner_control_unavailable", check="directory_permissions")
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_uid != runner_uid
+                    or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+                raise ProbeFailure("runner_control_unavailable", check="directory_type_owner")
+            os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o700)
+            checked = os.fstat(descriptor)
+            named = path.lstat()
+            if (checked.st_dev, checked.st_ino) != (named.st_dev, named.st_ino) or stat.S_IMODE(checked.st_mode) & 0o077:
                 raise ProbeFailure("runner_control_unavailable", check="directory_permissions")
         except OSError:
             raise ProbeFailure("runner_control_unavailable", check="directory_permissions")
+        finally:
+            os.close(descriptor)
     control_files = ("GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STEP_SUMMARY")
     for key in control_files:
         value = os.environ.get(key)
@@ -224,15 +328,29 @@ def _protect_runner_controls(workspace):
             raise ProbeFailure("runner_control_unavailable", check="file_reference")
         path = Path(value)
         try:
-            info = path.lstat()
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != runner_uid:
+            named = path.lstat()
+            if not stat.S_ISREG(named.st_mode) or named.st_uid != runner_uid:
                 raise ProbeFailure("runner_control_unavailable", check="file_type_owner")
-            os.chmod(path, stat.S_IMODE(info.st_mode) & 0o600)
-            checked = path.stat()
-            if stat.S_IMODE(checked.st_mode) & 0o077:
+        except OSError:
+            raise ProbeFailure("runner_control_unavailable", check="file_permissions")
+        try:
+            descriptor = _open_control_nofollow(path, False)
+        except OSError:
+            raise ProbeFailure("runner_control_unavailable", check="file_permissions")
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != runner_uid
+                    or (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino)):
+                raise ProbeFailure("runner_control_unavailable", check="file_type_owner")
+            os.fchmod(descriptor, stat.S_IMODE(info.st_mode) & 0o600)
+            checked = os.fstat(descriptor)
+            named = path.lstat()
+            if (checked.st_dev, checked.st_ino) != (named.st_dev, named.st_ino) or stat.S_IMODE(checked.st_mode) & 0o077:
                 raise ProbeFailure("runner_control_unavailable", check="file_permissions")
         except OSError:
             raise ProbeFailure("runner_control_unavailable", check="file_permissions")
+        finally:
+            os.close(descriptor)
     return runner_uid, tuple(sorted(directories)), tuple(Path(os.environ[key]) for key in control_files)
 
 

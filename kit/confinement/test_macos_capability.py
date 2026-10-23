@@ -1,3 +1,4 @@
+import ctypes
 import io
 import os
 import shutil
@@ -115,53 +116,195 @@ class FixedOutcomeTests(unittest.TestCase):
 
 
 class RunnerControlDiagnosticTests(unittest.TestCase):
+    def test_parent_link_requires_only_two_bounded_numeric_fields(self):
+        accepted = subprocess.CompletedProcess([], 0, b"1 501\n", b"")
+        with patch.object(macos_capability, "_run", return_value=accepted):
+            self.assertEqual(macos_capability._parent_pid_and_uid(100), (1, 501))
+        for payload in (b"1 501 forged-command\n", b"1 -1\n", b"1\n", b"1 " + b"9" * 130):
+            with self.subTest(payload_length=len(payload)):
+                result = subprocess.CompletedProcess([], 0, payload, b"")
+                with patch.object(macos_capability, "_run", return_value=result):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._parent_pid_and_uid(100)
+                self.assertEqual(raised.exception.check, "diagnostics_access")
+
+    def test_executable_path_is_read_from_kernel_api_and_must_be_absolute(self):
+        absolute = str(Path.cwd() / "synthetic" / "bin" / "Runner.Worker").encode("utf-8")
+
+        class ProcPidPath:
+            def __init__(self, payload):
+                self.payload = payload
+
+            def __call__(self, pid, buffer, length):
+                self_pid = 100
+                if pid != self_pid:
+                    return 0
+                ctypes.memmove(buffer, self.payload, len(self.payload))
+                return len(self.payload)
+
+        for payload, accepted in ((absolute, True), (b"relative/Runner.Worker", False)):
+            with self.subTest(accepted=accepted):
+                library = type("Libproc", (), {"proc_pidpath": ProcPidPath(payload)})()
+                with patch.object(macos_capability.ctypes, "CDLL", return_value=library):
+                    if accepted:
+                        self.assertEqual(macos_capability._process_executable(100), Path(absolute.decode("utf-8")))
+                    else:
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            macos_capability._process_executable(100)
+                        self.assertEqual(raised.exception.check, "diagnostics_access")
+
+    def test_missing_no_follow_support_refuses_instead_of_opening_path(self):
+        with patch.object(macos_capability.os, "O_NOFOLLOW", None, create=True):
+            with patch.object(macos_capability.os, "open") as opened:
+                with self.assertRaises(OSError):
+                    macos_capability._open_control_nofollow(Path.cwd(), True)
+        opened.assert_not_called()
+
+    def runner_layout(self, directory):
+        runner_home = Path(directory).resolve() / "runner"
+        workspace = runner_home / "work" / "platform-ci" / "platform-ci"
+        workspace.mkdir(parents=True)
+        runner_temp = runner_home / "work" / "_temp"
+        runner_temp.mkdir()
+        installation = runner_home / "actions-runner" / "cached"
+        executable = installation / "bin" / "Runner.Worker"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("synthetic runner executable")
+        diagnostics = installation / "_diag"
+        diagnostics.mkdir()
+        return runner_home, workspace, runner_temp, executable, diagnostics
+
+    def runner_ancestor(self, pid, runner_uid):
+        if pid == 200:
+            return 100, 0
+        if pid == 100:
+            return 1, runner_uid
+        raise AssertionError("unexpected ancestor")
+
+    def runner_executable(self, pid, executable):
+        if pid == 200:
+            return Path("/usr/bin/sudo")
+        if pid == 100:
+            return executable
+        raise AssertionError("unexpected ancestor")
+
     def test_zero_workspace_owner_refuses_before_any_permission_change(self):
         owner = type("WorkspaceOwner", (), {"st_uid": 0})()
         with patch.object(macos_capability.os, "stat", return_value=owner):
-            with patch.object(macos_capability.os, "chmod") as chmod:
+            with patch.object(macos_capability.os, "fchmod", create=True) as chmod:
                 with self.assertRaises(macos_capability.ProbeFailure) as raised:
                     macos_capability._protect_runner_controls("synthetic-workspace")
         self.assertEqual(raised.exception.reason, "runner_control_unavailable")
         self.assertEqual(raised.exception.check, "workspace_owner")
         chmod.assert_not_called()
 
-    def test_runner_path_layout_refuses_missing_diagnostics_without_exposing_paths(self):
+    def test_runner_diagnostics_comes_from_exact_worker_ancestor_not_decoy_directory(self):
         with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
-            runner_home = Path(directory).resolve() / "runner"
-            workspace = runner_home / "work" / "platform-ci" / "platform-ci"
-            workspace.mkdir(parents=True)
-            runner_temp = runner_home / "work" / "_temp"
-            runner_temp.mkdir()
+            runner_home, workspace, runner_temp, executable, diagnostics = self.runner_layout(directory)
+            decoy = runner_home / "runners" / "2.338.0" / "_diag"
+            decoy.mkdir(parents=True)
+            decoy_before = decoy.stat()
+            uid = os.stat(workspace).st_uid
             with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
-                with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                    macos_capability._runner_paths(workspace)
-            self.assertEqual(raised.exception.reason, "runner_control_unavailable")
-            self.assertEqual(raised.exception.check, "diagnostics_access")
-            self.assertNotIn(str(directory), str(raised.exception))
+                with patch.object(macos_capability.os, "getppid", return_value=200):
+                    with patch.object(macos_capability, "_parent_pid_and_uid", side_effect=lambda pid: self.runner_ancestor(pid, uid)):
+                        with patch.object(macos_capability, "_process_executable", side_effect=lambda pid: self.runner_executable(pid, executable)):
+                            self.assertEqual(
+                                macos_capability._runner_paths(workspace),
+                                (runner_temp, runner_temp, diagnostics),
+                            )
+            decoy_after = decoy.stat()
+            self.assertEqual((decoy_after.st_dev, decoy_after.st_ino), (decoy_before.st_dev, decoy_before.st_ino))
+            self.assertEqual(decoy_after.st_mode & 0o777, decoy_before.st_mode & 0o777)
 
-            diagnostics = runner_home / "runners" / "current" / "_diag"
-            diagnostics.mkdir(parents=True)
-            with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
-                self.assertEqual(
-                    macos_capability._runner_paths(workspace),
-                    (runner_temp, runner_temp, diagnostics),
-                )
-            second = runner_home / "runners" / "old" / "_diag"
-            second.mkdir(parents=True)
-            with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
-                with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                    macos_capability._runner_paths(workspace)
-            self.assertEqual(raised.exception.check, "diagnostics_layout")
+    def test_versioned_runner_family_requires_exact_worker_process(self):
+        with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
+            runner_home, workspace, runner_temp, executable, diagnostics = self.runner_layout(directory)
+            versioned = runner_home / "runners" / "2.338.0" / "bin" / "Runner.Worker"
+            versioned.parent.mkdir(parents=True)
+            versioned.write_text("synthetic versioned runner")
+            versioned_diag = versioned.parent.parent / "_diag"
+            versioned_diag.mkdir()
+            uid = os.stat(workspace).st_uid
+            with patch.object(macos_capability.os, "getppid", return_value=100):
+                with patch.object(macos_capability, "_parent_pid_and_uid", return_value=(1, uid)):
+                    with patch.object(macos_capability, "_process_executable", return_value=versioned):
+                        self.assertEqual(macos_capability._runner_diagnostics(workspace), versioned_diag)
+            self.assertNotEqual(versioned_diag, diagnostics)
+
+    def test_replaced_directory_inode_refuses_before_chmod(self):
+        with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
+            runner_home, workspace, runner_temp, executable, diagnostics = self.runner_layout(directory)
+            if os.name == "nt":
+                with patch.object(macos_capability.os, "fchmod", create=True) as chmod:
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._protect_runner_controls(workspace)
+                self.assertEqual(raised.exception.check, "workspace_owner")
+                chmod.assert_not_called()
+            else:
+                decoy = runner_home / "decoy"
+                decoy.mkdir()
+                decoy_fd = os.open(decoy, os.O_RDONLY)
+                try:
+                    with patch.object(macos_capability, "_runner_paths", return_value=(diagnostics,)):
+                        with patch.object(macos_capability, "_open_control_nofollow", side_effect=lambda path, directory: os.dup(decoy_fd)):
+                            with patch.object(macos_capability.os, "fchmod", create=True) as chmod:
+                                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                    macos_capability._protect_runner_controls(workspace)
+                    self.assertEqual(raised.exception.check, "directory_type_owner")
+                    chmod.assert_not_called()
+                finally:
+                    os.close(decoy_fd)
+
+    def test_untrusted_or_missing_worker_ancestor_refuses_before_chmod(self):
+        with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
+            runner_home, workspace, runner_temp, executable, diagnostics = self.runner_layout(directory)
+            uid = os.stat(workspace).st_uid
+            unsafe = runner_home / "work" / "decoy" / "bin" / "Runner.Worker"
+            unsafe.parent.mkdir(parents=True)
+            unsafe.write_text("synthetic decoy")
+            candidates = (unsafe, executable.parent.parent.parent / "missing" / "bin" / "Runner.Worker")
+            for candidate in candidates:
+                with self.subTest(candidate=candidate.name):
+                    with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
+                        with patch.object(macos_capability.os, "getppid", return_value=100):
+                            with patch.object(macos_capability, "_parent_pid_and_uid", return_value=(1, uid)):
+                                with patch.object(macos_capability, "_process_executable", return_value=candidate):
+                                    with patch.object(macos_capability.os, "fchmod", create=True) as chmod:
+                                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                            if os.name == "nt":
+                                                macos_capability._runner_diagnostics(workspace)
+                                            else:
+                                                macos_capability._protect_runner_controls(workspace)
+                    self.assertEqual(raised.exception.reason, "runner_control_unavailable")
+                    self.assertEqual(raised.exception.check, "diagnostics_layout")
+                    chmod.assert_not_called()
+
+            if os.name == "nt":
+                with patch.object(macos_capability.os, "getppid", return_value=100):
+                    with patch.object(macos_capability, "_parent_pid_and_uid", return_value=(1, uid)):
+                        with patch.object(macos_capability, "_process_executable", return_value=Path("synthetic-python")):
+                            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                macos_capability._runner_diagnostics(workspace)
+                self.assertEqual(raised.exception.check, "diagnostics_access")
+            else:
+                executable.unlink()
+                executable.parent.rmdir()
+                executable.parent.symlink_to(runner_home / "work" / "decoy" / "bin", target_is_directory=True)
+                with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
+                    with patch.object(macos_capability.os, "getppid", return_value=100):
+                        with patch.object(macos_capability, "_parent_pid_and_uid", return_value=(1, uid)):
+                            with patch.object(macos_capability, "_process_executable", return_value=executable):
+                                with patch.object(macos_capability.os, "fchmod", create=True) as chmod:
+                                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                        macos_capability._protect_runner_controls(workspace)
+                self.assertEqual(raised.exception.check, "diagnostics_layout")
+                chmod.assert_not_called()
 
     def test_runner_control_files_are_protected_and_missing_file_refuses(self):
         with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
-            runner_home = Path(directory).resolve() / "runner"
-            workspace = runner_home / "work" / "platform-ci" / "platform-ci"
-            workspace.mkdir(parents=True)
-            runner_temp = runner_home / "work" / "_temp"
-            runner_temp.mkdir()
-            diagnostics = runner_home / "runners" / "current" / "_diag"
-            diagnostics.mkdir(parents=True)
+            runner_home, workspace, runner_temp, executable, diagnostics = self.runner_layout(directory)
+            uid = os.stat(workspace).st_uid
             files = {key: runner_temp / key.lower() for key in (
                 "GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STEP_SUMMARY"
             )}
@@ -170,33 +313,46 @@ class RunnerControlDiagnosticTests(unittest.TestCase):
                 path.chmod(0o666)
             environment = {key: str(path) for key, path in files.items()}
             environment["RUNNER_TEMP"] = str(runner_temp)
-            if os.name == "nt":
-                self.assertEqual(os.stat(workspace).st_uid, 0)
-                with patch.dict(os.environ, environment):
-                    with patch.object(macos_capability.os, "chmod") as chmod:
-                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                            macos_capability._protect_runner_controls(workspace)
-                self.assertEqual(raised.exception.reason, "runner_control_unavailable")
-                self.assertEqual(raised.exception.check, "workspace_owner")
-                chmod.assert_not_called()
-            else:
-                with patch.dict(os.environ, environment):
-                    runner_uid, directories, protected_files = macos_capability._protect_runner_controls(workspace)
-                self.assertEqual(runner_uid, os.stat(workspace).st_uid)
-                self.assertEqual(set(directories), {runner_temp, diagnostics})
-                self.assertEqual(set(protected_files), set(files.values()))
-                self.assertTrue(all(path.stat().st_mode & 0o077 == 0 for path in directories + protected_files))
-                files["GITHUB_STEP_SUMMARY"].unlink()
-                with patch.dict(os.environ, environment):
-                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                        macos_capability._protect_runner_controls(workspace)
-                self.assertEqual(raised.exception.reason, "runner_control_unavailable")
-                self.assertEqual(raised.exception.check, "file_permissions")
-                files["GITHUB_STEP_SUMMARY"].symlink_to(files["GITHUB_ENV"])
-                with patch.dict(os.environ, environment):
-                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                        macos_capability._protect_runner_controls(workspace)
-                self.assertEqual(raised.exception.check, "file_type_owner")
+            with patch.object(macos_capability.os, "getppid", return_value=100):
+                with patch.object(macos_capability, "_parent_pid_and_uid", return_value=(1, uid)):
+                    with patch.object(macos_capability, "_process_executable", return_value=executable):
+                        if os.name == "nt":
+                            self.assertEqual(uid, 0)
+                            with patch.dict(os.environ, environment):
+                                with patch.object(macos_capability.os, "fchmod", create=True) as chmod:
+                                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                        macos_capability._protect_runner_controls(workspace)
+                            self.assertEqual(raised.exception.reason, "runner_control_unavailable")
+                            self.assertEqual(raised.exception.check, "workspace_owner")
+                            chmod.assert_not_called()
+                        else:
+                            with patch.dict(os.environ, environment):
+                                runner_uid, directories, protected_files = macos_capability._protect_runner_controls(workspace)
+                            self.assertEqual(runner_uid, uid)
+                            self.assertEqual(set(directories), {runner_temp, diagnostics})
+                            self.assertEqual(set(protected_files), set(files.values()))
+                            self.assertTrue(all(path.stat().st_mode & 0o077 == 0 for path in directories + protected_files))
+                            files["GITHUB_STEP_SUMMARY"].unlink()
+                            with patch.dict(os.environ, environment):
+                                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                    macos_capability._protect_runner_controls(workspace)
+                            self.assertEqual(raised.exception.reason, "runner_control_unavailable")
+                            self.assertEqual(raised.exception.check, "file_permissions")
+                            files["GITHUB_STEP_SUMMARY"].symlink_to(files["GITHUB_ENV"])
+                            with patch.dict(os.environ, environment):
+                                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                    macos_capability._protect_runner_controls(workspace)
+                            self.assertEqual(raised.exception.check, "file_type_owner")
+                            files["GITHUB_STEP_SUMMARY"].unlink()
+                            files["GITHUB_STEP_SUMMARY"].write_text("")
+                            alias = runner_temp / "alias"
+                            alias.symlink_to(runner_temp, target_is_directory=True)
+                            through_alias = dict(environment)
+                            through_alias["GITHUB_STEP_SUMMARY"] = str(alias / files["GITHUB_STEP_SUMMARY"].name)
+                            with patch.dict(os.environ, through_alias):
+                                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                    macos_capability._protect_runner_controls(workspace)
+                            self.assertEqual(raised.exception.check, "file_permissions")
 
 
 class DescriptorReadbackTests(unittest.TestCase):
