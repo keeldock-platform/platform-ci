@@ -22,6 +22,13 @@ def main():
             raise PolicyError("workflow-too-large")
         workflow_text = workflow_payload.decode("utf-8")
         validate_workflow_text(workflow_text, pool)
+        if pool == "platform":
+            linux_workflow_path = root / ".github/workflows/linux-confinement.yml"
+            with linux_workflow_path.open("rb") as source:
+                linux_payload = source.read(262145)
+            if len(linux_payload) > 262144:
+                raise PolicyError("linux-workflow-too-large")
+            validate_workflow_text(linux_payload.decode("utf-8"), pool, "linux-confinement")
         scan_tree(root, pool)
         print("candidate-policy=accepted control-sha=" + actual_sha)
     except (OSError, UnicodeDecodeError, ValueError, PolicyError, PublicTreeError):
