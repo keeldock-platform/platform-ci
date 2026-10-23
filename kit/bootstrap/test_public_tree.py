@@ -1,17 +1,285 @@
+import os
+import shutil
+import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
+import re
 
 from public_tree import PublicTreeError, inspect_text, scan_tree
 
 
 ROOT = Path(__file__).resolve().parents[2]
+PROBE_WORKFLOW = ROOT / ".github/workflows/windows-attestation-permission-probe.yml"
+PROBE_ACTION_SHA = "1e69f48acb82d1966a394da916b4c1698aa569d6"
+PROBE_SUBJECT_SHA = "cf46dd9088c858970cef86ae444af8cf0dec8d4fdcbc36af595220011689a0c8"
+PINNED_ACTION_LOG_SOURCE_CONTRACT = {
+    "sha": PROBE_ACTION_SHA,
+    "main_source_excerpt": (
+        "logAttestation(subjects, att, sigstoreInstance)\n"
+        "if (inputs.showSummary) {\n"
+        "await logSummary(att)\n"
+        "} catch (err) {\n"
+        "core.setFailed(err instanceof Error ? err : `${err}`)"
+    ),
+}
 
 
 class PublicTreeTests(unittest.TestCase):
     def test_platform_candidate_has_only_the_allowlisted_tree(self):
         result = scan_tree(ROOT, "platform")
         self.assertIn("kit/bootstrap/policy.py", result)
+        self.assertIn(".github/workflows/windows-attestation-permission-probe.yml", result)
+
+    def test_pinned_action_version_comment_is_the_only_permitted_comment(self):
+        version_pin = "uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " v4.2.2"
+        inspect_text(version_pin, "platform")
+        for fixture in (
+            "uses: actions/attest@main " + chr(35) + " v4.2.2",
+            "uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " latest",
+            "purpose " + chr(35) + " comment",
+        ):
+            with self.subTest(comment_class="unapproved"):
+                with self.assertRaisesRegex(PublicTreeError, "comment-present"):
+                    inspect_text(fixture, "platform")
+
+    def test_permission_probe_is_manual_source_free_and_uses_only_reviewed_profiles(self):
+        workflow = PROBE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(
+            workflow.startswith(
+                "name: windows-attestation-permission-probe\n"
+                "on:\n  workflow_dispatch:\npermissions: {}\njobs:\n"
+            )
+        )
+        for forbidden_trigger in (
+            "inputs:",
+            "workflow_call:",
+            "pull_request:",
+            "pull_request_target:",
+            "push:\n",
+        ):
+            with self.subTest(forbidden_trigger=forbidden_trigger):
+                self.assertNotIn(forbidden_trigger, workflow)
+        self.assertIn("EVENT_NAME: ${{ github.event_name }}", workflow)
+        self.assertIn("EVENT_REF: ${{ github.ref }}", workflow)
+        self.assertIn("$env:EVENT_REF -ne 'refs/heads/main'", workflow)
+        self.assertIn("synthetic permission probe subject v1`n", workflow)
+        self.assertIn(PROBE_SUBJECT_SHA, workflow)
+
+        lines = workflow.splitlines()
+        jobs_index = lines.index("jobs:")
+        job_starts = [
+            index
+            for index in range(jobs_index + 1, len(lines))
+            if re.fullmatch(r"  [a-z0-9-]+:", lines[index])
+        ]
+        jobs = {}
+        for position, start in enumerate(job_starts):
+            end = (
+                job_starts[position + 1]
+                if position + 1 < len(job_starts)
+                else len(lines)
+            )
+            jobs[lines[start].strip()[:-1]] = lines[start + 1 : end]
+        expected_jobs = {
+            "require-reviewed-main",
+            "compare-probe-results",
+            "common-intersection-ubuntu",
+            "common-intersection-windows",
+            "github-guide-ubuntu",
+            "github-guide-windows",
+            "actions-readme-ubuntu",
+            "actions-readme-windows",
+        }
+        self.assertEqual(set(jobs), expected_jobs)
+        self.assertIn("    permissions: {}", jobs["require-reviewed-main"])
+        self.assertIn("    permissions: {}", jobs["compare-probe-results"])
+        self.assertIn("    if: always()", jobs["compare-probe-results"])
+
+        profiles = {
+            "common-intersection": ["id-token: write", "attestations: write"],
+            "github-guide": ["id-token: write", "contents: read", "attestations: write"],
+            "actions-readme": [
+                "id-token: write",
+                "attestations: write",
+                "artifact-metadata: write",
+            ],
+        }
+        runner_labels = {"ubuntu": "ubuntu-24.04", "windows": "windows-2025"}
+        for profile, permission_values in profiles.items():
+            for runner_key, runner_label in runner_labels.items():
+                job_name = f"{profile}-{runner_key}"
+                block = jobs[job_name]
+                self.assertIn("    needs: require-reviewed-main", block)
+                self.assertIn(f"    runs-on: {runner_label}", block)
+                permission_index = block.index("    permissions:")
+                actual_permissions = []
+                for line in block[permission_index + 1 :]:
+                    if not line.startswith("      "):
+                        break
+                    actual_permissions.append(line.strip())
+                self.assertEqual(actual_permissions, permission_values)
+                self.assertIn("      result: ${{ steps.classify.outputs.result }}", block)
+                self.assertIn("        if: always()", block)
+                self.assertIn("          $result = 'error'", block)
+                self.assertIn("              $result = 'unverified'", block)
+                self.assertIn("              $result = 'verified'", block)
+                action_start = block.index("      - name: Attest synthetic subject")
+                verify_start = block.index("      - name: Verify exact subject and signature")
+                action_step = block[action_start:verify_start]
+                self.assertIn(
+                    "        uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " v4.2.2",
+                    action_step,
+                )
+                self.assertNotIn("        run:", action_step)
+                self.assertNotIn("        shell:", action_step)
+
+        action_line = "uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " v4.2.2"
+        self.assertEqual(workflow.count(action_line), 6)
+        for expected in (
+            "subject-path: ${{ runner.temp }}/attestation-permission-probe/probe.bin",
+            "predicate-type: https://example.invalid/attestation-permission-probe/v1",
+            "predicate: '{\"probe\":\"source-free-permission-probe-v1\"}'",
+            "show-summary: false",
+            "push-to-registry: false",
+            "create-storage-record: false",
+            "--deny-self-hosted-runners",
+            "probe=profile-selection result=blocked reason=failed-or-ambiguous-arm",
+        ):
+            with self.subTest(expected=expected):
+                minimum_count = 6 if expected != "probe=profile-selection result=blocked reason=failed-or-ambiguous-arm" else 1
+                self.assertGreaterEqual(workflow.count(expected), minimum_count)
+        self.assertEqual(workflow.count("gh attestation verify"), 6)
+        self.assertEqual(workflow.count("continue-on-error: true"), 18)
+        self.assertEqual(workflow.count("if: steps.attest.outcome == 'success'"), 6)
+        self.assertEqual(workflow.count("VERIFY_RESULT: ${{ steps.verify.outputs.result }}"), 6)
+        self.assertNotIn("*> $verificationPath", workflow)
+        self.assertNotIn("tee ", workflow)
+
+        gate = jobs["compare-probe-results"]
+        self.assertIn(
+            "if ($results.Values -contains 'unverified' -or $results.Values -contains 'error')",
+            "\n".join(gate),
+        )
+        gate_text = "\n".join(gate)
+        self.assertIn("- name: Refuse comparison after workflow cancellation", gate_text)
+        self.assertIn("        if: cancelled()", gate_text)
+        self.assertIn("if: ${{ success() && !cancelled() }}", gate_text)
+        self.assertIn(
+            "probe=profile-comparison result=blocked reason=workflow-cancelled",
+            gate_text,
+        )
+        cancellation_step = gate_text.split(
+            "- name: Compare only classified arm results", maxsplit=1
+        )[0]
+        self.assertIn("          exit 1", cancellation_step)
+        conclusion_check = gate_text.index("if ($entry.Value -ne 'success')")
+        output_map = gate_text.index("$results = [ordered]@{")
+        self.assertLess(conclusion_check, output_map)
+        for arm in (
+            "common-intersection-ubuntu",
+            "common-intersection-windows",
+            "github-guide-ubuntu",
+            "github-guide-windows",
+            "actions-readme-ubuntu",
+            "actions-readme-windows",
+        ):
+            with self.subTest(arm=arm):
+                self.assertIn(f"needs.{arm}.result", gate_text)
+        for arm, result_variable in (
+            ("common_intersection_ubuntu", "COMMON_UBUNTU_JOB_RESULT"),
+            ("common_intersection_windows", "COMMON_WINDOWS_JOB_RESULT"),
+            ("github_guide_ubuntu", "GUIDE_UBUNTU_JOB_RESULT"),
+            ("github_guide_windows", "GUIDE_WINDOWS_JOB_RESULT"),
+            ("actions_readme_ubuntu", "README_UBUNTU_JOB_RESULT"),
+            ("actions_readme_windows", "README_WINDOWS_JOB_RESULT"),
+        ):
+            with self.subTest(job_result=arm):
+                self.assertIn(f"{arm} = $env:{result_variable}", gate_text)
+        for job_name in expected_jobs - {"require-reviewed-main", "compare-probe-results"}:
+            self.assertIn(f"      - {job_name}", gate)
+
+        for forbidden in (
+            "secrets.",
+            "workflow_dispatch.inputs",
+            "actions/checkout",
+            "upload-artifact",
+            "download-artifact",
+            "cache:",
+            "contents: write",
+            "actions: write",
+            "packages: write",
+            "push-to-registry: true",
+            "create-storage-record: true",
+        ):
+            with self.subTest(forbidden_class=forbidden):
+                self.assertNotIn(forbidden, workflow)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell is required to execute the workflow gate")
+    def test_final_gate_rejects_verified_output_when_arm_job_did_not_succeed(self):
+        workflow = PROBE_WORKFLOW.read_text(encoding="utf-8")
+        step_marker = "      - name: Compare only classified arm results\n"
+        step_start = workflow.index(step_marker)
+        run_marker = "        run: |\n"
+        script_start = workflow.index(run_marker, step_start) + len(run_marker)
+        script = textwrap.dedent(workflow[script_start:])
+        arm_names = (
+            "COMMON_UBUNTU",
+            "COMMON_WINDOWS",
+            "GUIDE_UBUNTU",
+            "GUIDE_WINDOWS",
+            "README_UBUNTU",
+            "README_WINDOWS",
+        )
+
+        def run_gate(job_result_overrides=None):
+            env = {
+                "PATH": os.environ["PATH"],
+                "MAIN_GUARD": "success",
+            }
+            for arm in arm_names:
+                env[f"{arm}_JOB_RESULT"] = "success"
+                env[arm] = "verified"
+            for arm, result in (job_result_overrides or {}).items():
+                env[f"{arm}_JOB_RESULT"] = result
+            return subprocess.run(
+                [shutil.which("pwsh"), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        for conclusion in ("cancelled", "failure", "skipped", ""):
+            with self.subTest(conclusion=conclusion or "missing"):
+                arm = "GUIDE_WINDOWS"
+                result = run_gate({arm: conclusion})
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(
+                    "probe=profile-comparison result=blocked reason=arm-job-not-success",
+                    result.stdout,
+                )
+
+        success = run_gate()
+        self.assertEqual(success.returncode, 0, success.stdout + success.stderr)
+        self.assertIn(
+            "probe=profile-selection result=selected profile=common-intersection",
+            success.stdout,
+        )
+
+    def test_pinned_action_public_log_contract_is_not_hidden_by_summary_setting(self):
+        workflow = PROBE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(PINNED_ACTION_LOG_SOURCE_CONTRACT["sha"], PROBE_ACTION_SHA)
+        source_excerpt = PINNED_ACTION_LOG_SOURCE_CONTRACT["main_source_excerpt"]
+        self.assertLess(
+            source_excerpt.index("logAttestation(subjects, att, sigstoreInstance)"),
+            source_excerpt.index("if (inputs.showSummary)"),
+        )
+        self.assertIn("core.setFailed(err instanceof Error ? err : `${err}`)", source_excerpt)
+        self.assertEqual(workflow.count("uses: actions/attest@" + PROBE_ACTION_SHA), 6)
+        self.assertEqual(workflow.count("show-summary: false"), 6)
+        self.assertNotIn("fixed public output", workflow.lower())
 
     def test_consumer_shape_accepts_only_workflow_and_policy_data(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -22,6 +290,7 @@ class PublicTreeTests(unittest.TestCase):
             policy = root / "ci/policy.json"
             policy.parent.mkdir()
             policy.write_text('{"pool":"connect","schema_version":1}\n', encoding="utf-8")
+            (root / ".git").write_text("gitdir: worktrees/example\n", encoding="utf-8")
             self.assertEqual(scan_tree(root, "connect"), (".github/workflows/public-policy.yml", "ci/policy.json"))
             (root / "README.md").write_text("text", encoding="utf-8")
             with self.assertRaisesRegex(PublicTreeError, "tree-shape"):
