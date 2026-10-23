@@ -169,6 +169,119 @@ jobs:
 """
 
 
+LINUX_CONFINEMENT_WORKFLOW_TEMPLATE = """name: linux-confinement
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  linux-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Fetch public candidate
+        run: |
+          set -euo pipefail
+          if [[ ! "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SERVER_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
+            exit 1
+          fi
+          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
+            if [[ ! "$CI_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]; then
+              exit 1
+            fi
+            requested_ref="$CI_REF"
+          else
+            if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
+              exit 1
+            fi
+            requested_ref="$CI_REF"
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$requested_ref" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Run unprivileged source-free checks
+        run: |
+          set -euo pipefail
+          python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_public_tree.py
+          python3 -B kit/confinement/test_linux_harness.py
+          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+  linux-confinement:
+    needs: linux-policy
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Check reviewed control tree
+        run: |
+          set -euo pipefail
+          python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_public_tree.py
+          python3 -B kit/confinement/test_linux_harness.py
+          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+      - name: Run Linux synthetic confinement proof
+        run: |
+          set -euo pipefail
+          sudo -n -- env PYTHONDONTWRITEBYTECODE=1 python3 -B kit/confinement/linux_harness.py --control-sha "$CI_SHA"
+"""
+
+
 CONSUMER_ACTION_PREFIX = "keeldock-platform/platform-ci/kit/bootstrap@"
 
 
@@ -207,10 +320,16 @@ def consumer_workflow_template(pool, pin):
     )
 
 
-def validate_workflow_text(text, pool):
+def validate_workflow_text(text, pool, workflow_kind="public-policy"):
     if type(text) is not str or type(pool) is not str or pool not in PUBLIC_POOLS:
         raise PolicyError("workflow-input")
-    if pool == "platform":
+    if workflow_kind == "linux-confinement":
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        expected = LINUX_CONFINEMENT_WORKFLOW_TEMPLATE
+    elif workflow_kind != "public-policy":
+        raise PolicyError("workflow-kind")
+    elif pool == "platform":
         expected = PLATFORM_WORKFLOW_TEMPLATE
     else:
         pattern = re.compile(

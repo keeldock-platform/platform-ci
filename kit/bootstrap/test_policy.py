@@ -19,6 +19,7 @@ from policy import (
 
 GOOD_SHA = "a" * 40
 PLATFORM_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/public-policy.yml"
+LINUX_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/linux-confinement.yml"
 PLATFORM_ACTION = Path(__file__).resolve().parent / "action.yml"
 
 
@@ -84,6 +85,47 @@ class WorkflowPolicyTests(unittest.TestCase):
 
     def test_actual_platform_workflow_matches_closed_supported_shape(self):
         self.assertTrue(validate_workflow_text(self._platform_workflow(), "platform"))
+
+    def test_actual_linux_workflow_matches_closed_supported_shape(self):
+        workflow = LINUX_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(workflow, "platform", "linux-confinement"))
+        static_lane, privileged_lane = workflow.split("  linux-confinement:\n", 1)
+        self.assertNotIn("sudo ", static_lane)
+        self.assertIn("needs: linux-policy", privileged_lane)
+        self.assertIn("github.event_name == 'workflow_dispatch'", privileged_lane)
+        self.assertIn("github.ref == 'refs/heads/main'", privileged_lane)
+        self.assertNotIn("inputs:", workflow)
+        self.assertIn('"$CI_REF" != "refs/heads/main"', privileged_lane)
+        self.assertIn('"$CI_REPOSITORY" != "keeldock-platform/platform-ci"', privileged_lane)
+        self.assertIn("CI_SHA: ${{ github.sha }}", privileged_lane)
+        self.assertIn('if [[ "$actual_sha" != "$CI_SHA" ]]', privileged_lane)
+        self.assertIn('git fetch --quiet --no-tags --depth=1 origin "$CI_REF"', privileged_lane)
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "linux-confinement")
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "platform")
+
+    def test_linux_workflow_rejects_skips_masking_extra_execution_and_weak_permissions(self):
+        base = LINUX_WORKFLOW.read_text(encoding="utf-8")
+        mutations = (
+            base.replace("      - name: Run Linux synthetic confinement proof\n", "      - name: Extra execution\n        run: echo extra\n      - name: Run Linux synthetic confinement proof\n"),
+            base.replace("      - name: Run Linux synthetic confinement proof\n        run: |", "      - name: Run Linux synthetic confinement proof\n        if: ${{ false }}\n        run: |"),
+            base.replace("      - name: Run Linux synthetic confinement proof\n", "      - name: Run Linux synthetic confinement proof\n        continue-on-error: true\n"),
+            base.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n"),
+            base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
+            base.replace("    timeout-minutes: 15\n", "    timeout-minutes: 0\n"),
+            base.replace("  pull_request:\n", "  pull_request:\n    branches: []\n"),
+            base + "  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",
+            base.replace("    needs: linux-policy\n", ""),
+            base.replace("github.ref == 'refs/heads/main'", "always()"),
+            base.replace('"$CI_REF" != "refs/heads/main"', '"$CI_REF" != "refs/heads/feature"'),
+            base.replace('"$CI_REPOSITORY" != "keeldock-platform/platform-ci"', '"$CI_REPOSITORY" != "fork/platform-ci"'),
+            base.replace("      - name: Run unprivileged source-free checks\n", "      - name: Run unprivileged source-free checks\n        run: sudo true\n"),
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation_index=index):
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "linux-confinement")
 
     def test_actual_workflow_rejects_skips_masking_extra_execution_and_filters(self):
         base = self._platform_workflow()
