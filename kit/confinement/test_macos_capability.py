@@ -117,6 +117,36 @@ class FixedOutcomeTests(unittest.TestCase):
 
 
 class RunnerControlDiagnosticTests(unittest.TestCase):
+    def test_unknown_worker_roots_have_only_fixed_refusal_categories(self):
+        with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
+            runner_home, workspace, _, _, _ = self.runner_layout(directory)
+            uid = os.stat(workspace).st_uid
+            roots = (
+                ("diagnostics_root_outside_home", runner_home.parent / "elsewhere"),
+                ("diagnostics_root_parent_component", runner_home / "actions-runner" / "cached" / ".." / "cached"),
+                ("diagnostics_root_actions_runner", runner_home / "actions-runner"),
+                ("diagnostics_root_cached_versioned", runner_home / "actions-runner" / "cached" / "2.338.0"),
+                ("diagnostics_root_extracted_versioned", runner_home / "actions-runner" / "extracted" / "2.338.0"),
+                ("diagnostics_root_other", runner_home / "actions-runner" / "cached" / "2.338.0-extra"),
+            )
+            for expected, root in roots:
+                with self.subTest(check=expected):
+                    executable = root / "bin" / "Runner.Worker"
+                    with patch.object(macos_capability.os, "getppid", return_value=100):
+                        with patch.object(macos_capability, "_parent_pid_and_uid", return_value=(1, uid)):
+                            with patch.object(macos_capability, "_process_executable", return_value=executable):
+                                with patch.object(macos_capability.os, "fchmod", create=True) as chmod:
+                                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                        macos_capability._runner_diagnostics(workspace)
+                    chmod.assert_not_called()
+                    self.assertEqual(raised.exception.reason, "runner_control_unavailable")
+                    self.assertEqual(raised.exception.check, expected)
+                    self.assertEqual(
+                        macos_capability.safe_output(False, raised.exception.reason, raised.exception.check),
+                        "macos-capability=refused reason=runner_control_unavailable check=" + expected + "\n"
+                        "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                    )
+
     def test_runner_layout_subreasons_are_fixed_and_do_not_expose_evidence(self):
         with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
             runner_home, workspace, _, executable, _ = self.runner_layout(directory)
@@ -147,7 +177,7 @@ class RunnerControlDiagnosticTests(unittest.TestCase):
             cases = (
                 ("diagnostics_worker_uid", executable, uid + 1, False, None),
                 ("diagnostics_worker_bin", executable.parent.parent / "other" / "Runner.Worker", None, False, None),
-                ("diagnostics_root_family", runner_home / "work" / "decoy" / "bin" / "Runner.Worker", None, False, None),
+                ("diagnostics_root_other", runner_home / "work" / "decoy" / "bin" / "Runner.Worker", None, False, None),
                 ("diagnostics_home_owner", executable, None, False, runner_home),
                 ("diagnostics_component_owner", executable, None, False, executable),
                 ("diagnostics_process_changed", executable, None, True, None),
@@ -318,7 +348,7 @@ class RunnerControlDiagnosticTests(unittest.TestCase):
                     with self.subTest(candidate=candidate.parent.parent.name):
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
                             discover(candidate)
-                        self.assertEqual(raised.exception.check, "diagnostics_root_family")
+                        self.assertEqual(raised.exception.check, "diagnostics_root_other")
 
                 with self.assertRaises(macos_capability.ProbeFailure) as raised:
                     discover(worker, process_uid=uid + 1)
@@ -404,7 +434,7 @@ class RunnerControlDiagnosticTests(unittest.TestCase):
                                             else:
                                                 macos_capability._protect_runner_controls(workspace)
                     self.assertEqual(raised.exception.reason, "runner_control_unavailable")
-                    self.assertEqual(raised.exception.check, "diagnostics_root_family")
+                    self.assertEqual(raised.exception.check, "diagnostics_root_other")
                     chmod.assert_not_called()
 
             if os.name == "nt":
