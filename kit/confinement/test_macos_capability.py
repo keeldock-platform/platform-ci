@@ -2,6 +2,7 @@ import ctypes
 import io
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -282,6 +283,81 @@ class RunnerControlDiagnosticTests(unittest.TestCase):
                     with patch.object(macos_capability, "_process_executable", return_value=versioned):
                         self.assertEqual(macos_capability._runner_diagnostics(workspace), versioned_diag)
             self.assertNotEqual(versioned_diag, diagnostics)
+
+    def test_extracted_runner_family_requires_exact_worker_and_trusted_components(self):
+        with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
+            runner_home, workspace, runner_temp, cached_worker, cached_diag = self.runner_layout(directory)
+            extracted = runner_home / "actions-runner" / "extracted"
+            worker = extracted / "bin" / "Runner.Worker"
+            worker.parent.mkdir(parents=True)
+            worker.write_text("synthetic extracted worker")
+            diagnostics = extracted / "_diag"
+            diagnostics.mkdir()
+            uid = os.stat(workspace).st_uid
+
+            def discover(candidate, *, process_uid=None, executable_readback=None):
+                owner = uid if process_uid is None else process_uid
+                readback = candidate if executable_readback is None else executable_readback
+                with patch.object(macos_capability.os, "getppid", return_value=100):
+                    with patch.object(macos_capability, "_parent_pid_and_uid", return_value=(1, owner)):
+                        with patch.object(macos_capability, "_process_executable", side_effect=[candidate, readback]):
+                            with patch.object(macos_capability.os, "fchmod", create=True) as chmod:
+                                try:
+                                    return macos_capability._runner_paths(workspace)
+                                finally:
+                                    chmod.assert_not_called()
+
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
+                self.assertEqual(discover(worker), (runner_temp, runner_temp, diagnostics))
+                self.assertNotEqual(diagnostics, cached_diag)
+
+                for candidate in (
+                    runner_home / "actions-runner" / "extracted-evil" / "bin" / "Runner.Worker",
+                    runner_home / "work" / "decoy" / "bin" / "Runner.Worker",
+                ):
+                    with self.subTest(candidate=candidate.parent.parent.name):
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            discover(candidate)
+                        self.assertEqual(raised.exception.check, "diagnostics_root_family")
+
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    discover(worker, process_uid=uid + 1)
+                self.assertEqual(raised.exception.check, "diagnostics_worker_uid")
+
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    discover(worker, executable_readback=cached_worker)
+                self.assertEqual(raised.exception.check, "diagnostics_process_changed")
+
+                original_lstat = Path.lstat
+
+                def wrong_owner(path):
+                    info = original_lstat(path)
+                    if path == extracted:
+                        return type("WrongOwner", (), {"st_mode": info.st_mode, "st_uid": uid + 1})()
+                    return info
+
+                with patch.object(Path, "lstat", autospec=True, side_effect=wrong_owner):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        discover(worker)
+                self.assertEqual(raised.exception.check, "diagnostics_component_owner")
+
+                if os.name == "nt":
+                    def symlinked_bin(path):
+                        info = original_lstat(path)
+                        if path == worker.parent:
+                            return type("SymlinkInfo", (), {"st_mode": stat.S_IFLNK | 0o777, "st_uid": uid})()
+                        return info
+
+                    with patch.object(Path, "lstat", autospec=True, side_effect=symlinked_bin):
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            discover(worker)
+                else:
+                    worker.unlink()
+                    worker.parent.rmdir()
+                    worker.parent.symlink_to(cached_worker.parent, target_is_directory=True)
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        discover(worker)
+                self.assertEqual(raised.exception.check, "diagnostics_component_owner")
 
     def test_replaced_directory_inode_refuses_before_chmod(self):
         with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
