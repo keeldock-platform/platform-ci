@@ -6,6 +6,7 @@ from pathlib import Path
 PLATFORM_FILES = frozenset(
     (
         ".github/workflows/public-policy.yml",
+        ".github/workflows/linux-confinement.yml",
         "ci/policy.json",
         "kit/bootstrap/action.yml",
         "kit/bootstrap/check_candidate.py",
@@ -15,6 +16,8 @@ PLATFORM_FILES = frozenset(
         "kit/bootstrap/test_public_tree.py",
         "kit/confinement/macos_harness.py",
         "kit/confinement/test_macos_harness.py",
+        "kit/confinement/linux_harness.py",
+        "kit/confinement/test_linux_harness.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
