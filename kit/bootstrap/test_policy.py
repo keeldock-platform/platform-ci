@@ -20,6 +20,7 @@ from policy import (
 GOOD_SHA = "a" * 40
 PLATFORM_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/public-policy.yml"
 LINUX_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/linux-confinement.yml"
+MACOS_CAPABILITY_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-capability.yml"
 PLATFORM_ACTION = Path(__file__).resolve().parent / "action.yml"
 
 
@@ -126,6 +127,42 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(mutation_index=index):
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(changed, "platform", "linux-confinement")
+
+    def test_actual_macos_capability_workflow_matches_closed_manual_shape(self):
+        workflow = MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(workflow, "platform", "macos-capability"))
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("runs-on: macos-15", workflow)
+        self.assertIn("permissions: {}", workflow)
+        self.assertIn('CI_SHA="$CI_SHA"', workflow)
+        self.assertIn('RUNNER_WORKSPACE="$RUNNER_WORKSPACE"', workflow)
+        self.assertIn("Validate source-free control tree", workflow)
+        self.assertIn('check_candidate.py --root "$RUNNER_WORKSPACE" --pool platform --sha "$CI_SHA"', workflow)
+        self.assertNotIn("inputs:", workflow)
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "macos-capability")
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "platform")
+
+    def test_macos_capability_workflow_rejects_trigger_runner_and_execution_changes(self):
+        base = MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8")
+        mutations = (
+            base.replace("  workflow_dispatch:\n", "  push:\n"),
+            base.replace("github.event_name == 'workflow_dispatch'", "github.event_name == 'push'"),
+            base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
+            base.replace("    runs-on: macos-15\n", "    runs-on: macos-latest\n"),
+            base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
+            base.replace("      - name: Validate source-free control tree\n", ""),
+            base.replace("      - name: Run source-free capability experiment\n", "      - name: Extra execution\n        run: echo extra\n      - name: Run source-free capability experiment\n"),
+            base.replace("            CI_SHA=\"$CI_SHA\" \\\n", ""),
+            base.replace("RUNNER_WORKSPACE=\"$RUNNER_WORKSPACE\"", "RUNNER_WORKSPACE=/unreviewed"),
+            base + "  extra:\n    runs-on: macos-15\n    steps: []\n",
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation_index=index):
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "macos-capability")
 
     def test_actual_workflow_rejects_skips_masking_extra_execution_and_filters(self):
         base = self._platform_workflow()

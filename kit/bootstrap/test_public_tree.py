@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 import re
 
-from public_tree import PublicTreeError, inspect_text, scan_tree
+from public_tree import PLATFORM_FILES, PublicTreeError, inspect_text, scan_tree
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,8 +29,26 @@ PINNED_ACTION_LOG_SOURCE_CONTRACT = {
 class PublicTreeTests(unittest.TestCase):
     def test_platform_candidate_has_only_the_allowlisted_tree(self):
         result = scan_tree(ROOT, "platform")
+        self.assertEqual(set(result), set(PLATFORM_FILES))
         self.assertIn("kit/bootstrap/policy.py", result)
         self.assertIn(".github/workflows/windows-attestation-permission-probe.yml", result)
+        self.assertIn(".github/workflows/macos-capability.yml", result)
+        self.assertIn("kit/confinement/macos_harness.py", result)
+        self.assertIn("kit/confinement/macos_capability.py", result)
+        self.assertIn("kit/confinement/macos_capability.swift", result)
+        self.assertIn("kit/confinement/test_macos_capability.py", result)
+
+    def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in PLATFORM_FILES:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("safe\n", encoding="utf-8")
+            scan_tree(root, "platform")
+            (root / "kit/confinement/unreviewed.py").write_text("safe\n", encoding="utf-8")
+            with self.assertRaisesRegex(PublicTreeError, "tree-shape"):
+                scan_tree(root, "platform")
 
     def test_pinned_action_version_comment_is_the_only_permitted_comment(self):
         version_pin = "uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " v4.2.2"

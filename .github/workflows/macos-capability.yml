@@ -1,0 +1,67 @@
+name: macos-capability
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  macos-capability:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      RUNNER_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Validate source-free control tree
+        run: |
+          set -euo pipefail
+          python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_public_tree.py
+          python3 -B kit/confinement/test_linux_harness.py
+          python3 -B kit/confinement/test_macos_harness.py
+          python3 -B kit/confinement/test_macos_capability.py
+          python3 -B kit/bootstrap/check_candidate.py --root "$RUNNER_WORKSPACE" --pool platform --sha "$CI_SHA"
+      - name: Run source-free capability experiment
+        run: |
+          set -euo pipefail
+          sudo -n -- env \
+            CI_EVENT_NAME="$CI_EVENT_NAME" \
+            CI_REF="$CI_REF" \
+            CI_REPOSITORY="$CI_REPOSITORY" \
+            CI_SERVER_URL="$CI_SERVER_URL" \
+            CI_SHA="$CI_SHA" \
+            GITHUB_ENV="$GITHUB_ENV" \
+            GITHUB_OUTPUT="$GITHUB_OUTPUT" \
+            GITHUB_PATH="$GITHUB_PATH" \
+            GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            RUNNER_WORKSPACE="$RUNNER_WORKSPACE" \
+            /usr/bin/python3 -B kit/confinement/macos_capability.py --control-sha "$CI_SHA"
