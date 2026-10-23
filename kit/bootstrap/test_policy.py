@@ -136,9 +136,12 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("runs-on: macos-15", workflow)
         self.assertIn("permissions: {}", workflow)
         self.assertIn('CI_SHA="$CI_SHA"', workflow)
-        self.assertIn('RUNNER_WORKSPACE="$RUNNER_WORKSPACE"', workflow)
+        self.assertIn("CI_WORKSPACE: ${{ github.workspace }}", workflow)
+        self.assertIn('CI_WORKSPACE="$CI_WORKSPACE"', workflow)
+        self.assertNotIn("RUNNER_WORKSPACE: ${{ github.workspace }}", workflow)
+        self.assertNotIn('RUNNER_WORKSPACE="$RUNNER_WORKSPACE"', workflow)
         self.assertIn("Validate source-free control tree", workflow)
-        self.assertIn('check_candidate.py --root "$RUNNER_WORKSPACE" --pool platform --sha "$CI_SHA"', workflow)
+        self.assertIn('check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"', workflow)
         self.assertNotIn("inputs:", workflow)
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow, "connect", "macos-capability")
@@ -153,10 +156,12 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
             base.replace("    runs-on: macos-15\n", "    runs-on: macos-latest\n"),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
+            base.replace("      CI_WORKSPACE: ${{ github.workspace }}\n", "      RUNNER_WORKSPACE: ${{ github.workspace }}\n"),
+            base.replace('check_candidate.py --root "$CI_WORKSPACE"', 'check_candidate.py --root "$RUNNER_WORKSPACE"'),
+            base.replace('            CI_WORKSPACE="$CI_WORKSPACE" \\\n', '            CI_WORKSPACE=/unreviewed \\\n'),
             base.replace("      - name: Validate source-free control tree\n", ""),
             base.replace("      - name: Run source-free capability experiment\n", "      - name: Extra execution\n        run: echo extra\n      - name: Run source-free capability experiment\n"),
             base.replace("            CI_SHA=\"$CI_SHA\" \\\n", ""),
-            base.replace("RUNNER_WORKSPACE=\"$RUNNER_WORKSPACE\"", "RUNNER_WORKSPACE=/unreviewed"),
             base + "  extra:\n    runs-on: macos-15\n    steps: []\n",
         )
         for index, changed in enumerate(mutations):

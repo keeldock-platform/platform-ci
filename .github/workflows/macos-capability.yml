@@ -16,7 +16,7 @@ jobs:
       CI_SHA: ${{ github.sha }}
       CI_SERVER_URL: ${{ github.server_url }}
       CI_EVENT_NAME: ${{ github.event_name }}
-      RUNNER_WORKSPACE: ${{ github.workspace }}
+      CI_WORKSPACE: ${{ github.workspace }}
     steps:
       - name: Fetch reviewed main control
         run: |
@@ -47,7 +47,7 @@ jobs:
           python3 -B kit/confinement/test_linux_harness.py
           python3 -B kit/confinement/test_macos_harness.py
           python3 -B kit/confinement/test_macos_capability.py
-          python3 -B kit/bootstrap/check_candidate.py --root "$RUNNER_WORKSPACE" --pool platform --sha "$CI_SHA"
+          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
       - name: Run source-free capability experiment
         run: |
           set -euo pipefail
@@ -63,5 +63,5 @@ jobs:
             GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
             PYTHONDONTWRITEBYTECODE=1 \
             RUNNER_TEMP="$RUNNER_TEMP" \
-            RUNNER_WORKSPACE="$RUNNER_WORKSPACE" \
+            CI_WORKSPACE="$CI_WORKSPACE" \
             /usr/bin/python3 -B kit/confinement/macos_capability.py --control-sha "$CI_SHA"

@@ -1,12 +1,14 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 import re
 
+import check_candidate
 from public_tree import PLATFORM_FILES, PublicTreeError, inspect_text, scan_tree
 
 
@@ -27,6 +29,96 @@ PINNED_ACTION_LOG_SOURCE_CONTRACT = {
 
 
 class PublicTreeTests(unittest.TestCase):
+    def test_parent_runner_workspace_is_not_a_valid_checkout_root(self):
+        with tempfile.TemporaryDirectory(prefix="platform-workspace-root-") as temporary:
+            runner_parent = Path(temporary) / "runner-workspace"
+            checkout_root = runner_parent / "platform-ci"
+            checkout_root.mkdir(parents=True)
+            for name in PLATFORM_FILES:
+                source = ROOT / name
+                destination = checkout_root / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+
+            subprocess.run(
+                ["git", "init", "--quiet", "--template=/dev/null", str(checkout_root)],
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            for key, value in (
+                ("user.name", "Platform fixture"),
+                ("user.email", "platform-fixture@example.invalid"),
+                ("commit.gpgsign", "false"),
+                ("core.hooksPath", "/dev/null"),
+            ):
+                subprocess.run(
+                    ["git", "config", key, value],
+                    cwd=str(checkout_root),
+                    check=True,
+                    capture_output=True,
+                    timeout=10,
+                )
+            subprocess.run(
+                ["git", "add", "--force", "--all"],
+                cwd=str(checkout_root),
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            subprocess.run(
+                ["git", "commit", "--quiet", "--no-gpg-sign", "-m", "source-free workspace fixture"],
+                cwd=str(checkout_root),
+                check=True,
+                capture_output=True,
+                timeout=10,
+            )
+            sha = subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=str(checkout_root),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout.strip()
+
+            with self.assertRaises(check_candidate.PolicyError) as refused:
+                check_candidate.verify_git_head(runner_parent, sha)
+            self.assertEqual(refused.exception.code, "control-head-unavailable")
+
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "RUNNER_WORKSPACE": str(runner_parent),
+                    "CI_WORKSPACE": str(checkout_root),
+                }
+            )
+            checker = [sys.executable, "-B", str(ROOT / "kit/bootstrap/check_candidate.py")]
+            arguments = ["--pool", "platform", "--sha", sha]
+            old_root = subprocess.run(
+                checker + ["--root", environment["RUNNER_WORKSPACE"]] + arguments,
+                cwd=str(checkout_root),
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(old_root.returncode, 1)
+            self.assertEqual(old_root.stdout, "candidate-policy=refused\n")
+            self.assertEqual(old_root.stderr, "")
+
+            checkout = subprocess.run(
+                checker + ["--root", environment["CI_WORKSPACE"]] + arguments,
+                cwd=str(checkout_root),
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(checkout.returncode, 0)
+            self.assertEqual(checkout.stdout, "candidate-policy=accepted control-sha=" + sha + "\n")
+            self.assertEqual(checkout.stderr, "")
+
     def test_platform_candidate_has_only_the_allowlisted_tree(self):
         result = scan_tree(ROOT, "platform")
         self.assertEqual(set(result), set(PLATFORM_FILES))

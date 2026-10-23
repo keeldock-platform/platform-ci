@@ -58,6 +58,23 @@ class FixedOutcomeTests(unittest.TestCase):
             "macos-confinement=refused reason=incomplete_channel_evidence\n",
         )
 
+    def test_native_probe_uses_checkout_workspace_not_reserved_runner_parent(self):
+        runner_parent = "/runner/work/platform-ci"
+        checkout_root = runner_parent + "/platform-ci"
+        with patch.dict(
+            os.environ,
+            {"CI_WORKSPACE": checkout_root, "RUNNER_WORKSPACE": runner_parent},
+        ):
+            with patch.object(
+                macos_capability,
+                "_check_context",
+                side_effect=macos_capability.ProbeFailure("control_identity_invalid"),
+            ) as check_context:
+                with self.assertRaisesRegex(macos_capability.ProbeFailure, "control_identity_invalid"):
+                    macos_capability.run_native_probe(CONTROL_SHA)
+
+        check_context.assert_called_once_with(CONTROL_SHA, checkout_root)
+
 
 class DescriptorReadbackTests(unittest.TestCase):
     def read_snapshot(self, payload, pids=(101, 102)):
@@ -304,7 +321,7 @@ class ProbeTeardownTests(unittest.TestCase):
                 return path
 
             failure = macos_capability.ProbeFailure("sandbox_behavior_unavailable", cleanup_complete=False)
-            with patch.dict(os.environ, {"RUNNER_WORKSPACE": root}):
+            with patch.dict(os.environ, {"CI_WORKSPACE": root}):
                 with patch.object(macos_capability, "_check_context", return_value=Path(root)):
                     with patch.object(macos_capability, "_disable_developer_mode"):
                         with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
