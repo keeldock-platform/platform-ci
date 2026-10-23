@@ -39,13 +39,29 @@ REASONS = frozenset(
         "probe_timeout",
     )
 )
+RUNNER_CONTROL_CHECKS = frozenset(
+    (
+        "temp_reference",
+        "workspace_layout",
+        "diagnostics_access",
+        "diagnostics_layout",
+        "workspace_owner",
+        "directory_type_owner",
+        "directory_permissions",
+        "file_reference",
+        "file_type_owner",
+        "file_permissions",
+        "probe_access",
+    )
+)
 
 
 class ProbeFailure(Exception):
-    def __init__(self, reason, cleanup_complete=True):
+    def __init__(self, reason, cleanup_complete=True, check=None):
         super().__init__(reason if reason in REASONS else "native_preflight_unavailable")
         self.reason = reason if reason in REASONS else "native_preflight_unavailable"
         self.cleanup_complete = cleanup_complete
+        self.check = check if self.reason == "runner_control_unavailable" and check in RUNNER_CONTROL_CHECKS else None
 
 
 class _ProcFdInfo(ctypes.Structure):
@@ -106,12 +122,14 @@ def valid_sha(value):
     return type(value) is str and CONTROL_SHA.fullmatch(value) is not None
 
 
-def safe_output(observed, reason="native_preflight_unavailable"):
+def safe_output(observed, reason="native_preflight_unavailable", check=None):
     capability = "macos-capability=observed" if observed else "macos-capability=refused"
     if not observed:
         if reason not in REASONS:
             reason = "native_preflight_unavailable"
         capability += " reason=" + reason
+        if reason == "runner_control_unavailable" and check in RUNNER_CONTROL_CHECKS:
+            capability += " check=" + check
     return capability + "\nmacos-confinement=refused reason=incomplete_channel_evidence\n"
 
 
@@ -163,19 +181,19 @@ def _check_context(control_sha, workspace):
 def _runner_paths(workspace):
     runner_temp = os.environ.get("RUNNER_TEMP")
     if not runner_temp:
-        raise ProbeFailure("runner_control_unavailable")
+        raise ProbeFailure("runner_control_unavailable", check="temp_reference")
     workspace = Path(workspace).resolve()
     if len(workspace.parents) < 3:
-        raise ProbeFailure("runner_control_unavailable")
+        raise ProbeFailure("runner_control_unavailable", check="workspace_layout")
     runner_home = workspace.parents[2]
     runners = runner_home / "runners"
     try:
         installations = [item for item in runners.iterdir() if item.is_dir() and not item.is_symlink()]
         diagnostics = [item / "_diag" for item in installations if (item / "_diag").is_dir()]
     except OSError:
-        raise ProbeFailure("runner_control_unavailable")
+        raise ProbeFailure("runner_control_unavailable", check="diagnostics_access")
     if len(diagnostics) != 1:
-        raise ProbeFailure("runner_control_unavailable")
+        raise ProbeFailure("runner_control_unavailable", check="diagnostics_layout")
     work_temp = workspace.parents[1] / "_temp"
     return (Path(runner_temp), work_temp, diagnostics[0])
 
@@ -184,37 +202,37 @@ def _protect_runner_controls(workspace):
     try:
         runner_uid = os.stat(workspace).st_uid
     except OSError:
-        raise ProbeFailure("runner_control_unavailable")
+        raise ProbeFailure("runner_control_unavailable", check="workspace_owner")
     if runner_uid == 0:
-        raise ProbeFailure("runner_control_unavailable")
+        raise ProbeFailure("runner_control_unavailable", check="workspace_owner")
     directories = set(_runner_paths(workspace))
     for path in directories:
         try:
             info = path.lstat()
             if not stat.S_ISDIR(info.st_mode) or info.st_uid != runner_uid:
-                raise ProbeFailure("runner_control_unavailable")
+                raise ProbeFailure("runner_control_unavailable", check="directory_type_owner")
             os.chmod(path, stat.S_IMODE(info.st_mode) & 0o700)
             checked = path.stat()
             if stat.S_IMODE(checked.st_mode) & 0o077:
-                raise ProbeFailure("runner_control_unavailable")
+                raise ProbeFailure("runner_control_unavailable", check="directory_permissions")
         except OSError:
-            raise ProbeFailure("runner_control_unavailable")
+            raise ProbeFailure("runner_control_unavailable", check="directory_permissions")
     control_files = ("GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STEP_SUMMARY")
     for key in control_files:
         value = os.environ.get(key)
         if not value:
-            raise ProbeFailure("runner_control_unavailable")
+            raise ProbeFailure("runner_control_unavailable", check="file_reference")
         path = Path(value)
         try:
             info = path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_uid != runner_uid:
-                raise ProbeFailure("runner_control_unavailable")
+                raise ProbeFailure("runner_control_unavailable", check="file_type_owner")
             os.chmod(path, stat.S_IMODE(info.st_mode) & 0o600)
             checked = path.stat()
             if stat.S_IMODE(checked.st_mode) & 0o077:
-                raise ProbeFailure("runner_control_unavailable")
+                raise ProbeFailure("runner_control_unavailable", check="file_permissions")
         except OSError:
-            raise ProbeFailure("runner_control_unavailable")
+            raise ProbeFailure("runner_control_unavailable", check="file_permissions")
     return runner_uid, tuple(sorted(directories)), tuple(Path(os.environ[key]) for key in control_files)
 
 
@@ -295,7 +313,7 @@ def _verify_runner_controls_are_private(paths, uid):
     for path in paths:
         result = _run(["/usr/bin/sudo", "-n", "-u", USERNAME, "--", "/usr/bin/python3", "-c", script, str(path)], env=env, timeout=5)
         if result.returncode != 0:
-            raise ProbeFailure("runner_control_unavailable")
+            raise ProbeFailure("runner_control_unavailable", check="probe_access")
     if uid == 0:
         raise ProbeFailure("probe_identity_unavailable")
 
@@ -784,8 +802,7 @@ def main(argv=None):
     try:
         run_native_probe(arguments.control_sha)
     except ProbeFailure as error:
-        print("macos-capability=refused reason=" + error.reason)
-        print("macos-confinement=refused reason=incomplete_channel_evidence")
+        print(safe_output(False, error.reason, error.check), end="")
         return 1
     except BaseException:
         print("macos-capability=refused reason=native_preflight_unavailable")

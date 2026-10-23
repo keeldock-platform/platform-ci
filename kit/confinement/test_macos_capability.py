@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +75,108 @@ class FixedOutcomeTests(unittest.TestCase):
                     macos_capability.run_native_probe(CONTROL_SHA)
 
         check_context.assert_called_once_with(CONTROL_SHA, checkout_root)
+
+    def test_runner_control_refusal_emits_only_allowlisted_check(self):
+        refusal = macos_capability.ProbeFailure("runner_control_unavailable", check="diagnostics_layout")
+        self.assertEqual(
+            macos_capability.safe_output(False, refusal.reason, refusal.check),
+            "macos-capability=refused reason=runner_control_unavailable check=diagnostics_layout\n"
+            "macos-confinement=refused reason=incomplete_channel_evidence\n",
+        )
+        for unsafe in (
+            chr(47) + "private" + chr(47) + "tmp" + chr(47) + "secret",
+            "diagnostics_layout\nsecret=raw",
+            "file_permissions path=/tmp",
+        ):
+            with self.subTest(unsafe=unsafe):
+                refusal = macos_capability.ProbeFailure("runner_control_unavailable", check=unsafe)
+                self.assertIsNone(refusal.check)
+                self.assertEqual(
+                    macos_capability.safe_output(False, refusal.reason, refusal.check),
+                    "macos-capability=refused reason=runner_control_unavailable\n"
+                    "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                )
+
+    def test_main_preserves_refusal_and_emits_bounded_check(self):
+        output = io.StringIO()
+        with patch.object(
+            macos_capability,
+            "run_native_probe",
+            side_effect=macos_capability.ProbeFailure("runner_control_unavailable", check="file_type_owner"),
+        ):
+            with redirect_stdout(output):
+                status = macos_capability.main(["--control-sha", CONTROL_SHA])
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output.getvalue(),
+            "macos-capability=refused reason=runner_control_unavailable check=file_type_owner\n"
+            "macos-confinement=refused reason=incomplete_channel_evidence\n",
+        )
+
+
+class RunnerControlDiagnosticTests(unittest.TestCase):
+    def test_runner_path_layout_refuses_missing_diagnostics_without_exposing_paths(self):
+        with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
+            runner_home = Path(directory).resolve() / "runner"
+            workspace = runner_home / "work" / "platform-ci" / "platform-ci"
+            workspace.mkdir(parents=True)
+            runner_temp = runner_home / "work" / "_temp"
+            runner_temp.mkdir()
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    macos_capability._runner_paths(workspace)
+            self.assertEqual(raised.exception.reason, "runner_control_unavailable")
+            self.assertEqual(raised.exception.check, "diagnostics_access")
+            self.assertNotIn(str(directory), str(raised.exception))
+
+            diagnostics = runner_home / "runners" / "current" / "_diag"
+            diagnostics.mkdir(parents=True)
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
+                self.assertEqual(
+                    macos_capability._runner_paths(workspace),
+                    (runner_temp, runner_temp, diagnostics),
+                )
+            second = runner_home / "runners" / "old" / "_diag"
+            second.mkdir(parents=True)
+            with patch.dict(os.environ, {"RUNNER_TEMP": str(runner_temp)}):
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    macos_capability._runner_paths(workspace)
+            self.assertEqual(raised.exception.check, "diagnostics_layout")
+
+    def test_runner_control_files_are_protected_and_missing_file_refuses(self):
+        with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
+            runner_home = Path(directory).resolve() / "runner"
+            workspace = runner_home / "work" / "platform-ci" / "platform-ci"
+            workspace.mkdir(parents=True)
+            runner_temp = runner_home / "work" / "_temp"
+            runner_temp.mkdir()
+            diagnostics = runner_home / "runners" / "current" / "_diag"
+            diagnostics.mkdir(parents=True)
+            files = {key: runner_temp / key.lower() for key in (
+                "GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH", "GITHUB_STEP_SUMMARY"
+            )}
+            for path in files.values():
+                path.write_text("")
+                path.chmod(0o666)
+            environment = {key: str(path) for key, path in files.items()}
+            environment["RUNNER_TEMP"] = str(runner_temp)
+            with patch.dict(os.environ, environment):
+                runner_uid, directories, protected_files = macos_capability._protect_runner_controls(workspace)
+            self.assertEqual(runner_uid, os.stat(workspace).st_uid)
+            self.assertEqual(set(directories), {runner_temp, diagnostics})
+            self.assertEqual(set(protected_files), set(files.values()))
+            self.assertTrue(all(path.stat().st_mode & 0o077 == 0 for path in directories + protected_files))
+            files["GITHUB_STEP_SUMMARY"].unlink()
+            with patch.dict(os.environ, environment):
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    macos_capability._protect_runner_controls(workspace)
+            self.assertEqual(raised.exception.reason, "runner_control_unavailable")
+            self.assertEqual(raised.exception.check, "file_permissions")
+            files["GITHUB_STEP_SUMMARY"].symlink_to(files["GITHUB_ENV"])
+            with patch.dict(os.environ, environment):
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    macos_capability._protect_runner_controls(workspace)
+            self.assertEqual(raised.exception.check, "file_type_owner")
 
 
 class DescriptorReadbackTests(unittest.TestCase):
