@@ -6,7 +6,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -53,6 +53,112 @@ class FixedOutcomeTests(unittest.TestCase):
         self.assertEqual(
             macos_capability.safe_output(False, "descriptor_readback_unavailable"),
             "macos-capability=refused reason=descriptor_readback_unavailable\n"
+            "macos-confinement=refused reason=incomplete_channel_evidence\n",
+        )
+
+    def test_native_preflight_checks_are_fixed_and_never_echo_error_data(self):
+        for check in macos_capability.NATIVE_PREFLIGHT_CHECKS:
+            with self.subTest(check=check):
+                refusal = macos_capability.ProbeFailure("native_preflight_unavailable", check=check)
+                self.assertEqual(
+                    macos_capability.safe_output(False, refusal.reason, refusal.check),
+                    "macos-capability=refused reason=native_preflight_unavailable check=" + check + "\n"
+                    "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                )
+        for unsafe in (chr(47) + "private/tmp/secret", "context\nsecret=raw", "probe_identity path=/tmp"):
+            with self.subTest(unsafe=unsafe):
+                refusal = macos_capability.ProbeFailure("native_preflight_unavailable", check=unsafe)
+                self.assertIsNone(refusal.check)
+                self.assertEqual(
+                    macos_capability.safe_output(False, refusal.reason, refusal.check),
+                    "macos-capability=refused reason=native_preflight_unavailable\n"
+                    "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                )
+
+    def test_each_native_preflight_phase_labels_only_generic_failures(self):
+        phases = (
+            ("context", "_check_context"),
+            ("developer_mode", "_disable_developer_mode"),
+            ("runner_controls", "_protect_runner_controls"),
+            ("probe_identity", "_create_probe_identity"),
+        )
+        defaults = {
+            "_check_context": Path("/tmp/synthetic-control"),
+            "_disable_developer_mode": None,
+            "_protect_runner_controls": (501, (), ()),
+            "_create_probe_identity": (502, Path("/tmp/synthetic-home"), Path("/tmp/synthetic-home/home")),
+        }
+        for check, failing in phases:
+            for failure in (macos_capability.ProbeFailure("native_preflight_unavailable"), RuntimeError("private path /tmp/secret")):
+                with self.subTest(check=check, failure=type(failure).__name__):
+                    output = io.StringIO()
+                    with ExitStack() as stack:
+                        stack.enter_context(patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}))
+                        for name, result in defaults.items():
+                            stack.enter_context(patch.object(
+                                macos_capability, name,
+                                side_effect=failure if name == failing else None,
+                                return_value=result,
+                            ))
+                        with redirect_stdout(output):
+                            status = macos_capability.main(["--control-sha", CONTROL_SHA])
+                    self.assertEqual(status, 1)
+                    self.assertEqual(
+                        output.getvalue(),
+                        "macos-capability=refused reason=native_preflight_unavailable check=" + check + "\n"
+                        "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                    )
+
+    def test_subprocess_launch_failure_stays_in_its_fixed_preflight_phase(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}):
+            with patch.object(macos_capability, "_check_context", return_value=Path("/tmp/synthetic-control")):
+                with patch.object(macos_capability.subprocess, "run", side_effect=OSError("private path /tmp/secret")):
+                    with redirect_stdout(output):
+                        status = macos_capability.main(["--control-sha", CONTROL_SHA])
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output.getvalue(),
+            "macos-capability=refused reason=native_preflight_unavailable check=developer_mode\n"
+            "macos-confinement=refused reason=incomplete_channel_evidence\n",
+        )
+
+    def test_post_identity_generic_failure_still_cleans_up_and_only_prints_phase(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}):
+            with patch.object(macos_capability, "_check_context", return_value=Path("/tmp/synthetic-control")):
+                with patch.object(macos_capability, "_disable_developer_mode"):
+                    with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
+                        with patch.object(macos_capability, "_create_probe_identity", return_value=(502, Path("/tmp/synthetic-home"), Path("/tmp/synthetic-home/home"))):
+                            with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=RuntimeError("private path /tmp/secret")):
+                                with patch.object(macos_capability, "_run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as command:
+                                    with patch.object(macos_capability.shutil, "rmtree") as remove:
+                                        with redirect_stdout(output):
+                                            status = macos_capability.main(["--control-sha", CONTROL_SHA])
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output.getvalue(),
+            "macos-capability=refused reason=native_preflight_unavailable check=capability_probe\n"
+            "macos-confinement=refused reason=incomplete_channel_evidence\n",
+        )
+        command.assert_called_once_with(["/usr/bin/dscl", ".", "-delete", chr(47) + "Users/" + macos_capability.USERNAME], timeout=10)
+        remove.assert_called_once_with(Path("/tmp/synthetic-home"), ignore_errors=True)
+
+    def test_preflight_phase_does_not_change_existing_specific_refusal(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}):
+            with patch.object(macos_capability, "_check_context", return_value=Path("/tmp/synthetic-control")):
+                with patch.object(macos_capability, "_disable_developer_mode"):
+                    with patch.object(
+                        macos_capability, "_protect_runner_controls",
+                        side_effect=macos_capability.ProbeFailure("runner_control_unavailable", check="directory_type_owner"),
+                    ):
+                        with redirect_stdout(output):
+                            status = macos_capability.main(["--control-sha", CONTROL_SHA])
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output.getvalue(),
+            "macos-capability=refused reason=runner_control_unavailable check=directory_type_owner\n"
             "macos-confinement=refused reason=incomplete_channel_evidence\n",
         )
         self.assertEqual(

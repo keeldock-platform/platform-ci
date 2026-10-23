@@ -1,5 +1,6 @@
 import argparse
 import ctypes
+from contextlib import contextmanager
 import os
 from pathlib import Path
 import plistlib
@@ -68,6 +69,9 @@ RUNNER_CONTROL_CHECKS = frozenset(
         "probe_access",
     )
 )
+NATIVE_PREFLIGHT_CHECKS = frozenset(
+    ("context", "developer_mode", "runner_controls", "probe_identity", "capability_probe")
+)
 
 
 class ProbeFailure(Exception):
@@ -75,7 +79,12 @@ class ProbeFailure(Exception):
         super().__init__(reason if reason in REASONS else "native_preflight_unavailable")
         self.reason = reason if reason in REASONS else "native_preflight_unavailable"
         self.cleanup_complete = cleanup_complete
-        self.check = check if self.reason == "runner_control_unavailable" and check in RUNNER_CONTROL_CHECKS else None
+        if self.reason == "runner_control_unavailable" and check in RUNNER_CONTROL_CHECKS:
+            self.check = check
+        elif self.reason == "native_preflight_unavailable" and check in NATIVE_PREFLIGHT_CHECKS:
+            self.check = check
+        else:
+            self.check = None
 
 
 class _ProcFdInfo(ctypes.Structure):
@@ -142,9 +151,23 @@ def safe_output(observed, reason="native_preflight_unavailable", check=None):
         if reason not in REASONS:
             reason = "native_preflight_unavailable"
         capability += " reason=" + reason
-        if reason == "runner_control_unavailable" and check in RUNNER_CONTROL_CHECKS:
+        if (reason == "runner_control_unavailable" and check in RUNNER_CONTROL_CHECKS) or (
+            reason == "native_preflight_unavailable" and check in NATIVE_PREFLIGHT_CHECKS
+        ):
             capability += " check=" + check
     return capability + "\nmacos-confinement=refused reason=incomplete_channel_evidence\n"
+
+
+@contextmanager
+def _preflight_phase(check):
+    try:
+        yield
+    except ProbeFailure as error:
+        if error.reason == "native_preflight_unavailable":
+            raise ProbeFailure(error.reason, cleanup_complete=error.cleanup_complete, check=check) from None
+        raise
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check=check) from None
 
 
 def _run(argv, *, cwd=None, env=None, timeout=30):
@@ -908,49 +931,54 @@ def run_native_probe(control_sha):
     workspace = os.environ.get("CI_WORKSPACE")
     if not workspace:
         raise ProbeFailure("runner_control_unavailable")
-    root = _check_context(control_sha, workspace)
-    _disable_developer_mode()
-    runner_uid, protected_directories, protected_files = _protect_runner_controls(root)
-    probe_uid, home_parent, home = _create_probe_identity(root)
+    with _preflight_phase("context"):
+        root = _check_context(control_sha, workspace)
+    with _preflight_phase("developer_mode"):
+        _disable_developer_mode()
+    with _preflight_phase("runner_controls"):
+        runner_uid, protected_directories, protected_files = _protect_runner_controls(root)
+    with _preflight_phase("probe_identity"):
+        probe_uid, home_parent, home = _create_probe_identity(root)
     scratch = None
     outside = None
     cleanup_safe = True
-    try:
-        scratch = Path(tempfile.mkdtemp(prefix="sandbox-capability-", dir="/tmp"))
-        outside = Path(tempfile.mkdtemp(prefix="sandbox-capability-write-", dir="/tmp"))
-        os.chmod(scratch, 0o755)
-        os.chmod(outside, 0o1777)
-        _verify_runner_controls_are_private(protected_directories + protected_files, probe_uid)
-        marker = root / "kit/confinement/macos_capability.swift"
-        if not marker.is_file() or not (marker.stat().st_mode & stat.S_IROTH):
-            raise ProbeFailure("sandbox_behavior_unavailable")
-        user_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
-        positive_read = "import sys; open(sys.argv[1], 'rb').close()"
-        _run_as_probe_user(["/usr/bin/python3", "-c", positive_read, str(marker)], probe_uid, env=user_env, timeout=10)
-        positive_write = "import sys; open(sys.argv[1], 'wb').close()"
-        positive_file = outside / "positive-control"
-        _run_as_probe_user(["/usr/bin/python3", "-c", positive_write, str(positive_file)], probe_uid, env=user_env, timeout=10)
-        executable = _build_signed_probe(root, scratch)
-        _observe_probe(executable, marker, outside, probe_uid, home)
-    except ProbeFailure as error:
-        if not error.cleanup_complete:
-            cleanup_safe = False
-        raise
-    finally:
-        if cleanup_safe:
-            cleanup_failure = False
-            try:
-                delete_user = _run(["/usr/bin/dscl", ".", "-delete", "/Users/" + USERNAME], timeout=10)
-                cleanup_failure = delete_user.returncode != 0
-            except Exception:
-                cleanup_failure = True
-            shutil.rmtree(home_parent, ignore_errors=True)
-            if scratch is not None:
-                shutil.rmtree(scratch, ignore_errors=True)
-            if outside is not None:
-                shutil.rmtree(outside, ignore_errors=True)
-            if cleanup_failure:
-                raise ProbeFailure("probe_identity_unavailable")
+    with _preflight_phase("capability_probe"):
+        try:
+            scratch = Path(tempfile.mkdtemp(prefix="sandbox-capability-", dir="/tmp"))
+            outside = Path(tempfile.mkdtemp(prefix="sandbox-capability-write-", dir="/tmp"))
+            os.chmod(scratch, 0o755)
+            os.chmod(outside, 0o1777)
+            _verify_runner_controls_are_private(protected_directories + protected_files, probe_uid)
+            marker = root / "kit/confinement/macos_capability.swift"
+            if not marker.is_file() or not (marker.stat().st_mode & stat.S_IROTH):
+                raise ProbeFailure("sandbox_behavior_unavailable")
+            user_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
+            positive_read = "import sys; open(sys.argv[1], 'rb').close()"
+            _run_as_probe_user(["/usr/bin/python3", "-c", positive_read, str(marker)], probe_uid, env=user_env, timeout=10)
+            positive_write = "import sys; open(sys.argv[1], 'wb').close()"
+            positive_file = outside / "positive-control"
+            _run_as_probe_user(["/usr/bin/python3", "-c", positive_write, str(positive_file)], probe_uid, env=user_env, timeout=10)
+            executable = _build_signed_probe(root, scratch)
+            _observe_probe(executable, marker, outside, probe_uid, home)
+        except ProbeFailure as error:
+            if not error.cleanup_complete:
+                cleanup_safe = False
+            raise
+        finally:
+            if cleanup_safe:
+                cleanup_failure = False
+                try:
+                    delete_user = _run(["/usr/bin/dscl", ".", "-delete", "/Users/" + USERNAME], timeout=10)
+                    cleanup_failure = delete_user.returncode != 0
+                except Exception:
+                    cleanup_failure = True
+                shutil.rmtree(home_parent, ignore_errors=True)
+                if scratch is not None:
+                    shutil.rmtree(scratch, ignore_errors=True)
+                if outside is not None:
+                    shutil.rmtree(outside, ignore_errors=True)
+                if cleanup_failure:
+                    raise ProbeFailure("probe_identity_unavailable")
 
 
 def main(argv=None):
