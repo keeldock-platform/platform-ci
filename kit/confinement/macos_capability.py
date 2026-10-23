@@ -47,6 +47,12 @@ RUNNER_CONTROL_CHECKS = frozenset(
         "workspace_layout",
         "diagnostics_access",
         "diagnostics_layout",
+        "diagnostics_worker_uid",
+        "diagnostics_worker_bin",
+        "diagnostics_root_family",
+        "diagnostics_home_owner",
+        "diagnostics_component_owner",
+        "diagnostics_process_changed",
         "workspace_owner",
         "directory_type_owner",
         "directory_permissions",
@@ -235,32 +241,40 @@ def _runner_diagnostics(workspace):
         parent, uid = _parent_pid_and_uid(pid)
         executable = _process_executable(pid)
         if executable.name == "Runner.Worker":
-            if uid != runner_uid or executable.parent.name != "bin":
-                raise ProbeFailure("runner_control_unavailable", check="diagnostics_layout")
+            if uid != runner_uid:
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_worker_uid")
+            if executable.parent.name != "bin":
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_worker_bin")
             root = executable.parent.parent
             try:
                 relative = root.relative_to(runner_home)
-                allowed_root = relative.parts == ("actions-runner", "cached") or (
-                    len(relative.parts) == 2
-                    and relative.parts[0] == "runners"
-                    and re.fullmatch(r"2\.[0-9]+\.[0-9]+", relative.parts[1]) is not None
-                )
-                if not allowed_root or ".." in executable.parts:
-                    raise ValueError("runner installation outside owner home")
-                path = runner_home
+            except ValueError:
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_root_family")
+            allowed_root = relative.parts == ("actions-runner", "cached") or (
+                len(relative.parts) == 2
+                and relative.parts[0] == "runners"
+                and re.fullmatch(r"2\.[0-9]+\.[0-9]+", relative.parts[1]) is not None
+            )
+            if not allowed_root or ".." in executable.parts:
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_root_family")
+            path = runner_home
+            try:
                 home_info = path.lstat()
-                if not stat.S_ISDIR(home_info.st_mode) or home_info.st_uid != runner_uid:
-                    raise ValueError("untrusted runner home")
-                for component in relative.parts + ("bin", "Runner.Worker"):
-                    path = path / component
+            except OSError:
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_home_owner")
+            if not stat.S_ISDIR(home_info.st_mode) or home_info.st_uid != runner_uid:
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_home_owner")
+            for component in relative.parts + ("bin", "Runner.Worker"):
+                path = path / component
+                try:
                     info = path.lstat()
-                    required = stat.S_ISREG if path == executable else stat.S_ISDIR
-                    if not required(info.st_mode) or info.st_uid != runner_uid:
-                        raise ValueError("untrusted runner installation")
-                if _parent_pid_and_uid(pid) != (parent, uid) or _process_executable(pid) != executable:
-                    raise ValueError("runner process changed")
-            except (OSError, ValueError):
-                raise ProbeFailure("runner_control_unavailable", check="diagnostics_layout")
+                except OSError:
+                    raise ProbeFailure("runner_control_unavailable", check="diagnostics_component_owner")
+                required = stat.S_ISREG if path == executable else stat.S_ISDIR
+                if not required(info.st_mode) or info.st_uid != runner_uid:
+                    raise ProbeFailure("runner_control_unavailable", check="diagnostics_component_owner")
+            if _parent_pid_and_uid(pid) != (parent, uid) or _process_executable(pid) != executable:
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_process_changed")
             return root / "_diag"
         pid = parent
     raise ProbeFailure("runner_control_unavailable", check="diagnostics_access")

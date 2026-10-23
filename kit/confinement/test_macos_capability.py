@@ -116,6 +116,57 @@ class FixedOutcomeTests(unittest.TestCase):
 
 
 class RunnerControlDiagnosticTests(unittest.TestCase):
+    def test_runner_layout_subreasons_are_fixed_and_do_not_expose_evidence(self):
+        with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
+            runner_home, workspace, _, executable, _ = self.runner_layout(directory)
+            uid = os.stat(workspace).st_uid
+
+            def refusal(candidate, *, process_uid=None, changed=False, untrusted=None):
+                parent = (1, uid if process_uid is None else process_uid)
+                if changed:
+                    parents = [(1, uid), (2, uid)]
+                else:
+                    parents = None
+                original_lstat = Path.lstat
+
+                def checked_lstat(path):
+                    info = original_lstat(path)
+                    if path == untrusted:
+                        return type("UntrustedInfo", (), {"st_mode": info.st_mode, "st_uid": uid + 1})()
+                    return info
+
+                with patch.object(macos_capability.os, "getppid", return_value=100):
+                    with patch.object(macos_capability, "_parent_pid_and_uid", side_effect=parents, return_value=parent):
+                        with patch.object(macos_capability, "_process_executable", return_value=candidate):
+                            with patch.object(Path, "lstat", autospec=True, side_effect=checked_lstat):
+                                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                    macos_capability._runner_diagnostics(workspace)
+                return raised.exception
+
+            cases = (
+                ("diagnostics_worker_uid", executable, uid + 1, False, None),
+                ("diagnostics_worker_bin", executable.parent.parent / "other" / "Runner.Worker", None, False, None),
+                ("diagnostics_root_family", runner_home / "work" / "decoy" / "bin" / "Runner.Worker", None, False, None),
+                ("diagnostics_home_owner", executable, None, False, runner_home),
+                ("diagnostics_component_owner", executable, None, False, executable),
+                ("diagnostics_process_changed", executable, None, True, None),
+            )
+            for expected, candidate, process_uid, changed, untrusted in cases:
+                with self.subTest(check=expected):
+                    failure = refusal(candidate, process_uid=process_uid, changed=changed, untrusted=untrusted)
+                    self.assertEqual(failure.reason, "runner_control_unavailable")
+                    self.assertEqual(failure.check, expected)
+                    self.assertEqual(
+                        macos_capability.safe_output(False, failure.reason, failure.check),
+                        "macos-capability=refused reason=runner_control_unavailable check=" + expected + "\n"
+                        "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                    )
+
+            unsafe = macos_capability.ProbeFailure(
+                "runner_control_unavailable", check="diagnostics_root_family path=" + str(executable)
+            )
+            self.assertIsNone(unsafe.check)
+
     def test_parent_link_requires_only_two_bounded_numeric_fields(self):
         accepted = subprocess.CompletedProcess([], 0, b"1 501\n", b"")
         with patch.object(macos_capability, "_run", return_value=accepted):
@@ -277,7 +328,7 @@ class RunnerControlDiagnosticTests(unittest.TestCase):
                                             else:
                                                 macos_capability._protect_runner_controls(workspace)
                     self.assertEqual(raised.exception.reason, "runner_control_unavailable")
-                    self.assertEqual(raised.exception.check, "diagnostics_layout")
+                    self.assertEqual(raised.exception.check, "diagnostics_root_family")
                     chmod.assert_not_called()
 
             if os.name == "nt":
@@ -298,7 +349,7 @@ class RunnerControlDiagnosticTests(unittest.TestCase):
                                 with patch.object(macos_capability.os, "fchmod", create=True) as chmod:
                                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                                         macos_capability._protect_runner_controls(workspace)
-                self.assertEqual(raised.exception.check, "diagnostics_layout")
+                self.assertEqual(raised.exception.check, "diagnostics_component_owner")
                 chmod.assert_not_called()
 
     def test_runner_control_files_are_protected_and_missing_file_refuses(self):
