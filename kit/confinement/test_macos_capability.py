@@ -115,6 +115,16 @@ class FixedOutcomeTests(unittest.TestCase):
 
 
 class RunnerControlDiagnosticTests(unittest.TestCase):
+    def test_zero_workspace_owner_refuses_before_any_permission_change(self):
+        owner = type("WorkspaceOwner", (), {"st_uid": 0})()
+        with patch.object(macos_capability.os, "stat", return_value=owner):
+            with patch.object(macos_capability.os, "chmod") as chmod:
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    macos_capability._protect_runner_controls("synthetic-workspace")
+        self.assertEqual(raised.exception.reason, "runner_control_unavailable")
+        self.assertEqual(raised.exception.check, "workspace_owner")
+        chmod.assert_not_called()
+
     def test_runner_path_layout_refuses_missing_diagnostics_without_exposing_paths(self):
         with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
             runner_home = Path(directory).resolve() / "runner"
@@ -160,23 +170,33 @@ class RunnerControlDiagnosticTests(unittest.TestCase):
                 path.chmod(0o666)
             environment = {key: str(path) for key, path in files.items()}
             environment["RUNNER_TEMP"] = str(runner_temp)
-            with patch.dict(os.environ, environment):
-                runner_uid, directories, protected_files = macos_capability._protect_runner_controls(workspace)
-            self.assertEqual(runner_uid, os.stat(workspace).st_uid)
-            self.assertEqual(set(directories), {runner_temp, diagnostics})
-            self.assertEqual(set(protected_files), set(files.values()))
-            self.assertTrue(all(path.stat().st_mode & 0o077 == 0 for path in directories + protected_files))
-            files["GITHUB_STEP_SUMMARY"].unlink()
-            with patch.dict(os.environ, environment):
-                with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                    macos_capability._protect_runner_controls(workspace)
-            self.assertEqual(raised.exception.reason, "runner_control_unavailable")
-            self.assertEqual(raised.exception.check, "file_permissions")
-            files["GITHUB_STEP_SUMMARY"].symlink_to(files["GITHUB_ENV"])
-            with patch.dict(os.environ, environment):
-                with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                    macos_capability._protect_runner_controls(workspace)
-            self.assertEqual(raised.exception.check, "file_type_owner")
+            if os.name == "nt":
+                self.assertEqual(os.stat(workspace).st_uid, 0)
+                with patch.dict(os.environ, environment):
+                    with patch.object(macos_capability.os, "chmod") as chmod:
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            macos_capability._protect_runner_controls(workspace)
+                self.assertEqual(raised.exception.reason, "runner_control_unavailable")
+                self.assertEqual(raised.exception.check, "workspace_owner")
+                chmod.assert_not_called()
+            else:
+                with patch.dict(os.environ, environment):
+                    runner_uid, directories, protected_files = macos_capability._protect_runner_controls(workspace)
+                self.assertEqual(runner_uid, os.stat(workspace).st_uid)
+                self.assertEqual(set(directories), {runner_temp, diagnostics})
+                self.assertEqual(set(protected_files), set(files.values()))
+                self.assertTrue(all(path.stat().st_mode & 0o077 == 0 for path in directories + protected_files))
+                files["GITHUB_STEP_SUMMARY"].unlink()
+                with patch.dict(os.environ, environment):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._protect_runner_controls(workspace)
+                self.assertEqual(raised.exception.reason, "runner_control_unavailable")
+                self.assertEqual(raised.exception.check, "file_permissions")
+                files["GITHUB_STEP_SUMMARY"].symlink_to(files["GITHUB_ENV"])
+                with patch.dict(os.environ, environment):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._protect_runner_controls(workspace)
+                self.assertEqual(raised.exception.check, "file_type_owner")
 
 
 class DescriptorReadbackTests(unittest.TestCase):
