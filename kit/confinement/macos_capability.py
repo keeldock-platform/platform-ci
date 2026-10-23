@@ -50,6 +50,12 @@ RUNNER_CONTROL_CHECKS = frozenset(
         "diagnostics_worker_uid",
         "diagnostics_worker_bin",
         "diagnostics_root_family",
+        "diagnostics_root_outside_home",
+        "diagnostics_root_parent_component",
+        "diagnostics_root_actions_runner",
+        "diagnostics_root_cached_versioned",
+        "diagnostics_root_extracted_versioned",
+        "diagnostics_root_other",
         "diagnostics_home_owner",
         "diagnostics_component_owner",
         "diagnostics_process_changed",
@@ -249,14 +255,30 @@ def _runner_diagnostics(workspace):
             try:
                 relative = root.relative_to(runner_home)
             except ValueError:
-                raise ProbeFailure("runner_control_unavailable", check="diagnostics_root_family")
+                raise ProbeFailure("runner_control_unavailable", check="diagnostics_root_outside_home")
             allowed_root = relative.parts in (("actions-runner", "cached"), ("actions-runner", "extracted")) or (
                 len(relative.parts) == 2
                 and relative.parts[0] == "runners"
                 and re.fullmatch(r"2\.[0-9]+\.[0-9]+", relative.parts[1]) is not None
             )
             if not allowed_root or ".." in executable.parts:
-                raise ProbeFailure("runner_control_unavailable", check="diagnostics_root_family")
+                if ".." in executable.parts:
+                    check = "diagnostics_root_parent_component"
+                elif relative.parts == ("actions-runner",):
+                    check = "diagnostics_root_actions_runner"
+                elif (
+                    len(relative.parts) == 3
+                    and relative.parts[:2] in (("actions-runner", "cached"), ("actions-runner", "extracted"))
+                    and re.fullmatch(r"2\.[0-9]+\.[0-9]+", relative.parts[2]) is not None
+                ):
+                    check = (
+                        "diagnostics_root_cached_versioned"
+                        if relative.parts[1] == "cached"
+                        else "diagnostics_root_extracted_versioned"
+                    )
+                else:
+                    check = "diagnostics_root_other"
+                raise ProbeFailure("runner_control_unavailable", check=check)
             path = runner_home
             try:
                 home_info = path.lstat()
