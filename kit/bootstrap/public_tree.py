@@ -13,6 +13,8 @@ PLATFORM_FILES = frozenset(
         "kit/bootstrap/public_tree.py",
         "kit/bootstrap/test_policy.py",
         "kit/bootstrap/test_public_tree.py",
+        "kit/confinement/macos_harness.py",
+        "kit/confinement/test_macos_harness.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))

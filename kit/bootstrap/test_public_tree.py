@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from public_tree import PublicTreeError, inspect_text, scan_tree
+from public_tree import PLATFORM_FILES, PublicTreeError, inspect_text, scan_tree
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -11,7 +11,24 @@ ROOT = Path(__file__).resolve().parents[2]
 class PublicTreeTests(unittest.TestCase):
     def test_platform_candidate_has_only_the_allowlisted_tree(self):
         result = scan_tree(ROOT, "platform")
+        self.assertEqual(set(result), set(PLATFORM_FILES))
         self.assertIn("kit/bootstrap/policy.py", result)
+        self.assertIn("kit/confinement/macos_harness.py", result)
+        self.assertIn("kit/confinement/test_macos_harness.py", result)
+
+    def test_platform_confinement_files_are_allowed_but_extra_files_fail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in PLATFORM_FILES:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("safe\n", encoding="utf-8")
+            result = scan_tree(root, "platform")
+            self.assertIn("kit/confinement/macos_harness.py", result)
+            self.assertIn("kit/confinement/test_macos_harness.py", result)
+            (root / "kit/confinement/unreviewed.py").write_text("safe\n", encoding="utf-8")
+            with self.assertRaisesRegex(PublicTreeError, "tree-shape"):
+                scan_tree(root, "platform")
 
     def test_consumer_shape_accepts_only_workflow_and_policy_data(self):
         with tempfile.TemporaryDirectory() as temporary:
