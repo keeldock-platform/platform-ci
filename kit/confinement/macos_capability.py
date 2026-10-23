@@ -250,7 +250,7 @@ def _runner_diagnostics(workspace):
                 relative = root.relative_to(runner_home)
             except ValueError:
                 raise ProbeFailure("runner_control_unavailable", check="diagnostics_root_family")
-            allowed_root = relative.parts == ("actions-runner", "cached") or (
+            allowed_root = relative.parts in (("actions-runner", "cached"), ("actions-runner", "extracted")) or (
                 len(relative.parts) == 2
                 and relative.parts[0] == "runners"
                 and re.fullmatch(r"2\.[0-9]+\.[0-9]+", relative.parts[1]) is not None
