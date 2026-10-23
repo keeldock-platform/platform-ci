@@ -729,7 +729,7 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
 
 
 def run_native_probe(control_sha):
-    workspace = os.environ.get("RUNNER_WORKSPACE")
+    workspace = os.environ.get("CI_WORKSPACE")
     if not workspace:
         raise ProbeFailure("runner_control_unavailable")
     root = _check_context(control_sha, workspace)
