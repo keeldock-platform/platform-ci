@@ -3,16 +3,58 @@ import errno
 import io
 import signal
 import socket
+import struct
 import threading
 import unittest
 from types import SimpleNamespace
 import urllib.error
 from unittest.mock import patch
 
-from linux_harness import CHILD_SOURCE, MAX_PROBE_SECONDS, PROBES, UNSHARE_ARGUMENTS, ProofFailure, _drop_child, _enter_rootfs_and_launch, _expected_denial, _inside, _run_probe, _supervise_child_process, advance_supervision, outcome, valid_sha
+from linux_harness import CHILD_SOURCE, MAX_PROBE_SECONDS, PROBES, UNSHARE_ARGUMENTS, ProofFailure, _drop_child, _enter_rootfs_and_launch, _expected_denial, _inside, _run_probe, _supervise_child_process, _verify_netns, advance_supervision, outcome, valid_sha
 
 
 class HarnessPolicyTests(unittest.TestCase):
+    def test_route_diagnostics_refuse_every_nonempty_table_without_printing_rows(self):
+        zero = "0" * 32
+        null_route = f"{zero} 00 {zero} 00 {zero} ffffffff 00000001 00000000 00200200 lo\n"
+        other_route = f"{zero} 00 {zero} 00 {zero} 00000001 00000001 00000000 00000001 lo\n"
+        header = "Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n"
+
+        class DatagramSocket:
+            def fileno(self):
+                return 9
+
+            def close(self):
+                pass
+
+        cases = (
+            ("empty", header, "", None),
+            ("ipv4", header + "lo 00000000 00000000 0001\n", "", 85),
+            ("ipv6-null", header, null_route, 86),
+            ("two-ipv6-nulls", header, null_route * 2, 86),
+            ("ipv6-other", header, other_route, 87),
+            ("ipv6-mixed", header, null_route + other_route, 87),
+            ("ipv4-precedes-ipv6", header + "lo 00000000 00000000 0001\n", null_route, 85),
+            ("malformed-ipv6", header, "unexpected-row\n", 87),
+            ("oversized", header, "x" * 65537, 81),
+        )
+        for label, ipv4, ipv6, reason in cases:
+            def route_file(path, mode, encoding=None):
+                return io.StringIO(ipv4 if path == "/proc/net/route" else ipv6)
+
+            with self.subTest(case=label), \
+                 patch("linux_harness.socket.if_nameindex", return_value=((1, "lo"),)), \
+                 patch("linux_harness.socket.socket", return_value=DatagramSocket()), \
+                 patch("linux_harness.fcntl.ioctl", return_value=struct.pack("16sH22x", b"lo", 0)), \
+                 patch("linux_harness.open", create=True, side_effect=route_file):
+                if reason is None:
+                    self.assertIsNone(_verify_netns())
+                else:
+                    with self.assertRaises(ProofFailure) as raised:
+                        _verify_netns()
+                    self.assertEqual(raised.exception.reason, reason)
+                    self.assertEqual(outcome(False, reason), f"linux-confinement=refused reason={reason}")
+
     def test_public_probe_set_is_fixed_and_linux_only(self):
         self.assertEqual(
             PROBES,
@@ -88,7 +130,11 @@ class HarnessPolicyTests(unittest.TestCase):
         )
         cases = (
             ("known-boundary", 1, b"inner=refused reason=53\n", b"", 53),
+            ("ipv4-route", 1, b"inner=refused reason=85\n", b"", 85),
+            ("ipv6-null-route", 1, b"inner=refused reason=86\n", b"", 86),
+            ("ipv6-other-route", 1, b"inner=refused reason=87\n", b"", 87),
             ("known-generic", 1, b"inner=refused reason=98\n", b"", 98),
+            ("retired-route-reason", 1, b"inner=refused reason=59\n", b"", 82),
             ("unknown-reason", 1, b"inner=refused reason=54\n", b"", 82),
             ("arbitrary-number", 1, b"inner=refused reason=99\n", b"", 82),
             ("leading-zero", 1, b"inner=refused reason=053\n", b"", 82),

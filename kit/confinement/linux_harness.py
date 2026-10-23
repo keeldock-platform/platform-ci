@@ -37,8 +37,8 @@ MAX_CAPTURE = 8192
 MAX_PROBE_SECONDS = 10
 INNER_REFUSAL_REASONS = (
     20, 21, 22, 23, 24, 25, 26, 27, 45, 46, 47, 48, 51, 52, 53,
-    57, 58, 59, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
-    79, 80, 81, 98,
+    57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
+    79, 80, 81, 85, 86, 87, 98,
 )
 INNER_REFUSAL_LINES = {
     ("inner=refused reason=" + str(reason) + "\n").encode("ascii"): reason
@@ -633,8 +633,29 @@ def _verify_netns():
         raise ProofFailure(81)
     routes = tuple(line for line in route_data.splitlines()[1:] if line.strip())
     routes6 = tuple(line for line in route_data6.splitlines() if line.strip())
-    if routes or routes6:
-        raise ProofFailure(59)
+    if routes:
+        raise ProofFailure(85)
+    if routes6:
+        if all(_is_kernel_unreachable_ipv6_route(line) for line in routes6):
+            raise ProofFailure(86)
+        raise ProofFailure(87)
+
+
+def _is_kernel_unreachable_ipv6_route(line):
+    fields = line.split()
+    if len(fields) != 10:
+        return False
+    destination, destination_bits, source, source_bits, gateway, metric, references, uses, flags, device = fields
+    zero = "0" * 32
+    return (
+        destination == source == gateway == zero
+        and destination_bits == source_bits == "00"
+        and metric == "ffffffff"
+        and re.fullmatch(r"[0-9a-f]{8}", references) is not None
+        and re.fullmatch(r"[0-9a-f]{8}", uses) is not None
+        and flags == "00200200"
+        and device == "lo"
+    )
 
 
 def _write_capture(rootfs, name):
