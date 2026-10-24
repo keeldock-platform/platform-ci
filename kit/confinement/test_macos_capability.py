@@ -316,13 +316,15 @@ class ProbeUidCensusTests(unittest.TestCase):
         self.assertEqual(raised.exception.check, "probe_process_census")
         self.assertFalse(raised.exception.cleanup_complete)
 
-    def test_control_survivor_snapshot_classifies_only_fixed_process_relationships(self):
+    def test_control_uid_snapshot_classifies_count_and_group_from_one_process_table(self):
         cases = (
-            (b"1 1 S 0 0 0\n20 10 R 502 502 502\n", "probe_process_survivor_controls_same_group"),
-            (b"1 1 S 0 0 0\n20 11 R 502 0 0\n", "probe_process_survivor_controls_other_group"),
-            (b"1 1 S 0 0 0\n20 2 Z 0 502 0\n", "probe_process_survivor_controls_zombie"),
-            (b"1 1 S 0 0 0\n", "probe_process_survivor_controls_unattributed"),
-            (b"1 1 S 0 0 0\n20 2 R 0 502 0\n21 3 R 502 0 0\n", "probe_process_survivor_controls_unattributed"),
+            (b"1 1 S 0 0 0\n", (False, None)),
+            (b"1 1 S 0 0 0\n20 10 R 502 502 502\n", (True, "probe_process_survivor_controls_same_group")),
+            (b"1 1 S 0 0 0\n20 11 R 502 0 0\n", (True, "probe_process_survivor_controls_other_group")),
+            (b"1 1 S 0 0 0\n20 2 Z 0 502 0\n", (True, "probe_process_survivor_controls_zombie")),
+            (b"1 1 S 0 0 0\n20 0 Z 0 502 0\n", (True, "probe_process_survivor_controls_zombie")),
+            (b"1 1 S 0 0 0\n20 2 R 0 502 0\n21 3 R 502 0 0\n", (True, "probe_process_survivor_controls_unattributed")),
+            (b"1 1 S 0 0 0\n20 0 R 502 502 502\n", (True, "probe_process_survivor_controls_unattributed")),
         )
         for output, expected in cases:
             with self.subTest(expected=expected):
@@ -331,7 +333,9 @@ class ProbeUidCensusTests(unittest.TestCase):
                     "_run",
                     return_value=subprocess.CompletedProcess([], 0, output, b""),
                 ) as command:
-                    self.assertEqual(macos_capability._probe_control_survivor_check(502, 10), expected)
+                    self.assertEqual(
+                        macos_capability._probe_uid_process_snapshot(502, launched_pgid=10), expected
+                    )
                 command.assert_called_once_with(
                     ["/bin/ps", "-A", "-o", "pid=,pgid=,state=,ruid=,uid=,svuid="],
                     env={"LANG": "C", "LC_ALL": "C"},
@@ -339,7 +343,7 @@ class ProbeUidCensusTests(unittest.TestCase):
                     timeout_check="probe_process_census",
                 )
 
-    def test_control_survivor_snapshot_refuses_malformed_or_ambiguous_rows(self):
+    def test_control_uid_snapshot_refuses_malformed_or_ambiguous_rows(self):
         invalid_outputs = (
             b"",
             b"1 1 S 0 0 0",
@@ -356,7 +360,21 @@ class ProbeUidCensusTests(unittest.TestCase):
                     return_value=subprocess.CompletedProcess([], 0, output, b""),
                 ):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                        macos_capability._probe_control_survivor_check(502, 10)
+                        macos_capability._probe_uid_process_snapshot(502, launched_pgid=10)
+                self.assertEqual(raised.exception.check, "probe_process_census")
+                self.assertFalse(raised.exception.cleanup_complete)
+
+    def test_control_uid_snapshot_preserves_strict_command_failures(self):
+        outputs = (
+            subprocess.CompletedProcess([], 1, b"1 1 S 0 0 0\n", b""),
+            subprocess.CompletedProcess([], 0, b"1 1 S 0 0 0\n", b"warning\n"),
+            subprocess.CompletedProcess([], 0, b"1 1 S 0 0 0\n" + b"0" * (macos_capability.MAX_CAPTURE_BYTES + 1), b""),
+        )
+        for result in outputs:
+            with self.subTest(returncode=result.returncode, stderr=bool(result.stderr)):
+                with patch.object(macos_capability, "_run", return_value=result):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._probe_uid_process_snapshot(502, launched_pgid=10)
                 self.assertEqual(raised.exception.check, "probe_process_census")
                 self.assertFalse(raised.exception.cleanup_complete)
 
@@ -607,11 +625,11 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
             return_value=subprocess.CompletedProcess([], 0, output, b""),
         ):
             self.assertEqual(
-                macos_capability._probe_control_survivor_check(502, 12352),
-                "probe_process_survivor_controls_same_group",
+                macos_capability._probe_uid_process_snapshot(502, launched_pgid=12352),
+                (True, "probe_process_survivor_controls_same_group"),
             )
 
-    def test_control_access_probe_uses_launched_group_survivor_diagnostic(self):
+    def test_control_access_probe_uses_one_authoritative_group_census(self):
         process = type(
             "CompletedProcess",
             (),
@@ -621,22 +639,25 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
         process.poll = lambda: process.returncode
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True) as census:
+                with patch.object(
+                    macos_capability,
+                    "_probe_uid_process_snapshot",
+                    return_value=(True, "probe_process_survivor_controls_other_group"),
+                ) as census:
                     with patch.object(
                         macos_capability,
-                        "_probe_control_survivor_check",
-                        return_value="probe_process_survivor_controls_other_group",
-                    ) as diagnostic:
+                        "_probe_uid_processes_present",
+                    ) as ordinary_census:
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
                             macos_capability._run_as_probe_user(
                                 ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
                             )
         self.assertEqual(raised.exception.check, "probe_process_survivor_controls_other_group")
         self.assertFalse(raised.exception.cleanup_complete)
-        census.assert_called_once_with(502)
-        diagnostic.assert_called_once_with(502, 12352)
+        census.assert_called_once_with(502, launched_pgid=12352)
+        ordinary_census.assert_not_called()
 
-    def test_positive_census_remains_refused_when_second_snapshot_has_no_match(self):
+    def test_control_access_probe_accepts_only_a_clean_zero_match_snapshot(self):
         process = type(
             "CompletedProcess",
             (),
@@ -646,16 +667,38 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
         process.poll = lambda: process.returncode
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True):
-                    with patch.object(macos_capability, "_probe_control_survivor_check", return_value=None):
-                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                            macos_capability._run_as_probe_user(
-                                ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
-                            )
+                with patch.object(
+                    macos_capability,
+                    "_probe_uid_process_snapshot",
+                    return_value=(False, None),
+                ) as census:
+                    with patch.object(macos_capability, "_probe_uid_processes_present") as ordinary_census:
+                        result = macos_capability._run_as_probe_user(
+                            ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
+                        )
+        self.assertEqual(result.stdout, b"")
+        census.assert_called_once_with(502, launched_pgid=12352)
+        ordinary_census.assert_not_called()
+
+    def test_positive_control_snapshot_without_fixed_category_fails_closed(self):
+        process = type(
+            "CompletedProcess",
+            (),
+            {"pid": 12352, "stdout": io.BytesIO(b""), "stderr": io.BytesIO(b""), "returncode": 0},
+        )()
+        process.wait = lambda timeout: process.returncode
+        process.poll = lambda: process.returncode
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                with patch.object(macos_capability, "_probe_uid_process_snapshot", return_value=(True, None)):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(
+                            ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
+                        )
         self.assertEqual(raised.exception.check, "probe_process_survivor_controls_unattributed")
         self.assertFalse(raised.exception.cleanup_complete)
 
-    def test_malformed_second_snapshot_preserves_census_refusal(self):
+    def test_malformed_control_snapshot_preserves_census_refusal(self):
         process = type(
             "CompletedProcess",
             (),
@@ -665,19 +708,62 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
         process.poll = lambda: process.returncode
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True):
+                with patch.object(
+                    macos_capability,
+                    "_probe_uid_process_snapshot",
+                    side_effect=macos_capability.ProbeFailure(
+                        "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
+                    ),
+                ):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(
+                            ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
+                        )
+        self.assertEqual(raised.exception.check, "probe_process_census")
+        self.assertFalse(raised.exception.cleanup_complete)
+
+    def test_control_snapshot_does_not_override_tree_or_capture_cleanup_failures(self):
+        process = type(
+            "CompletedProcess",
+            (),
+            {"pid": 12352, "stdout": io.BytesIO(b""), "stderr": io.BytesIO(b""), "returncode": 0},
+        )()
+        process.wait = lambda timeout: process.returncode
+        process.poll = lambda: process.returncode
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=False):
+                with patch.object(
+                    macos_capability,
+                    "_probe_uid_process_snapshot",
+                    return_value=(True, "probe_process_survivor_controls_same_group"),
+                ):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(
+                            ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
+                        )
+        self.assertEqual(raised.exception.check, "probe_process_group_cleanup")
+        self.assertFalse(raised.exception.cleanup_complete)
+
+        process = type(
+            "CompletedProcess",
+            (),
+            {"pid": 12353, "stdout": io.BytesIO(b""), "stderr": io.BytesIO(b""), "returncode": 0},
+        )()
+        process.wait = lambda timeout: process.returncode
+        process.poll = lambda: process.returncode
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                with patch.object(macos_capability._Capture, "join", return_value=False):
                     with patch.object(
                         macos_capability,
-                        "_probe_control_survivor_check",
-                        side_effect=macos_capability.ProbeFailure(
-                            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
-                        ),
+                        "_probe_uid_process_snapshot",
+                        return_value=(True, "probe_process_survivor_controls_same_group"),
                     ):
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
                             macos_capability._run_as_probe_user(
                                 ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
                             )
-        self.assertEqual(raised.exception.check, "probe_process_census")
+        self.assertEqual(raised.exception.check, "probe_process_capture_cleanup")
         self.assertFalse(raised.exception.cleanup_complete)
 
     def test_runner_control_access_requests_control_survivor_correlation(self):

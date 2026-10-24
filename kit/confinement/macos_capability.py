@@ -568,13 +568,14 @@ def runner_uid_for_workspace(workspace):
         raise ProbeFailure("runner_control_unavailable")
 
 
-def _probe_uid_processes_present(uid):
-    """Take a strict best-effort snapshot; this cannot rule out privileged or later processes."""
-    if uid <= 0:
+def _probe_uid_process_snapshot(uid, launched_pgid=None):
+    if uid <= 0 or (launched_pgid is not None and launched_pgid <= 0):
         raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+    control_diagnostics = launched_pgid is not None
+    fields = "pid=,pgid=,state=,ruid=,uid=,svuid=" if control_diagnostics else "pid=,ruid=,uid=,svuid="
     try:
         result = _run(
-            ["/bin/ps", "-A", "-o", "pid=,ruid=,uid=,svuid="],
+            ["/bin/ps", "-A", "-o", fields],
             env={"LANG": "C", "LC_ALL": "C"},
             timeout=5,
             timeout_check="probe_process_census",
@@ -595,74 +596,54 @@ def _probe_uid_processes_present(uid):
     if not lines:
         raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
     seen_pids = set()
-    present = False
+    matches = 0
+    matched_pgid = None
+    matched_state = None
     for line in lines:
-        fields = line.split()
-        if len(fields) != 4 or not all(field.isdecimal() for field in fields):
-            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
-        pid, real_uid, effective_uid, saved_uid = (int(field) for field in fields)
+        row = line.split()
+        if control_diagnostics:
+            if len(row) != 6 or not all(field.isdecimal() for field in row[:2] + row[3:]):
+                raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+            pid, pgid = (int(field) for field in row[:2])
+            state = row[2]
+            if (
+                not state
+                or state[0] not in "IRSTUZ"
+                or any(character not in "+<>AELNsSVWX" for character in state[1:])
+            ):
+                raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+            real_uid, effective_uid, saved_uid = (int(field) for field in row[3:])
+        else:
+            if len(row) != 4 or not all(field.isdecimal() for field in row):
+                raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+            pid, real_uid, effective_uid, saved_uid = (int(field) for field in row)
+            pgid = None
+            state = None
         if pid in seen_pids:
             raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
         seen_pids.add(pid)
         if uid in (real_uid, effective_uid, saved_uid):
-            present = True
-    return present
+            matches += 1
+            if matches == 1:
+                matched_pgid = pgid
+                matched_state = state
+    if not control_diagnostics:
+        return matches > 0, None
+    if matches == 0:
+        return False, None
+    if matches > 1:
+        return True, "probe_process_survivor_controls_unattributed"
+    if matched_state[0] == "Z":
+        return True, "probe_process_survivor_controls_zombie"
+    if matched_pgid <= 0:
+        return True, "probe_process_survivor_controls_unattributed"
+    if matched_pgid == launched_pgid:
+        return True, "probe_process_survivor_controls_same_group"
+    return True, "probe_process_survivor_controls_other_group"
 
 
-def _probe_control_survivor_check(uid, launched_pgid):
-    if uid <= 0 or launched_pgid <= 0:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
-    try:
-        result = _run(
-            ["/bin/ps", "-A", "-o", "pid=,pgid=,state=,ruid=,uid=,svuid="],
-            env={"LANG": "C", "LC_ALL": "C"},
-            timeout=5,
-            timeout_check="probe_process_census",
-        )
-    except BaseException:
-        raise ProbeFailure(
-            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
-        ) from None
-    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_CAPTURE_BYTES:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
-    try:
-        output = result.stdout.decode("ascii")
-    except UnicodeDecodeError:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census") from None
-    if not output.endswith("\n"):
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
-    lines = output.splitlines()
-    if not lines:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
-    seen_pids = set()
-    matches = []
-    for line in lines:
-        fields = line.split()
-        if len(fields) != 6 or not all(field.isdecimal() for field in fields[:2] + fields[3:]):
-            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
-        pid, pgid = (int(field) for field in fields[:2])
-        state = fields[2]
-        if (
-            pid in seen_pids
-            or not state
-            or state[0] not in "IRSTUZ"
-            or any(character not in "+<>AELNsSVWX" for character in state[1:])
-        ):
-            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
-        seen_pids.add(pid)
-        real_uid, effective_uid, saved_uid = (int(field) for field in fields[3:])
-        if uid in (real_uid, effective_uid, saved_uid):
-            matches.append((pgid, state))
-    if not matches:
-        return "probe_process_survivor_controls_unattributed"
-    if len(matches) != 1:
-        return "probe_process_survivor_controls_unattributed"
-    pgid, state = matches[0]
-    if state[0] == "Z":
-        return "probe_process_survivor_controls_zombie"
-    if pgid == launched_pgid:
-        return "probe_process_survivor_controls_same_group"
-    return "probe_process_survivor_controls_other_group"
+def _probe_uid_processes_present(uid):
+    return _probe_uid_process_snapshot(uid)[0]
 
 
 def _remove_probe_tree(path):
@@ -745,13 +726,11 @@ def _run_as_probe_user(
         escaped_process = True
         control_survivor_check = None
         try:
-            escaped_process = _probe_uid_processes_present(uid)
+            if control_survivor_diagnostics:
+                escaped_process, control_survivor_check = _probe_uid_process_snapshot(uid, launched_pgid=process.pid)
+            else:
+                escaped_process = _probe_uid_processes_present(uid)
             census_known = True
-            if control_survivor_diagnostics and escaped_process:
-                try:
-                    control_survivor_check = _probe_control_survivor_check(uid, process.pid)
-                except BaseException:
-                    control_survivor_check = "probe_process_census"
         except BaseException:
             pass
         if not tree_stopped:
