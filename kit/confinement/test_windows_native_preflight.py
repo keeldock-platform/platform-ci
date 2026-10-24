@@ -237,10 +237,119 @@ if (-not $rejected) {{ exit 6 }}
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.source)
-        self.assertIn("ReadKeyDword(\"Export Policy\", NCryptSilentFlag) != 0", self.source)
+        self.assertIn('uint exportPolicy = ReadKeyDword("Export Policy", NCryptSilentFlag);', self.source)
+        self.assertIn("if (exportPolicy != 0)", self.source)
         self.assertIn("OwnerSecurityInformation | NCryptSilentFlag", self.source)
         self.assertIn("Native.EqualSid(ownerSid, currentUserSid)", self.source)
         self.assertNotIn("BCRYPT_ECCPRIVATE_BLOB", self.source)
+
+    def test_cng_export_failures_use_fixed_subphases_and_exact_status_mapping(self):
+        verify = self.source[
+            self.source.index("internal void VerifyKeyExportDenial()"):
+            self.source.index("internal bool Cleanup()")
+        ]
+        self.assertIn('cngExportCheck = "cng_export_policy_read";', verify)
+        self.assertLess(
+            verify.index('cngExportCheck = "cng_export_policy_read";'),
+            verify.index('ReadKeyDword("Export Policy", NCryptSilentFlag)'),
+        )
+        self.assertLess(
+            verify.index('if (exportPolicy != 0)'),
+            verify.index('cngExportCheck = "cng_export_policy_nonzero";'),
+        )
+        self.assertLess(
+            verify.index('cngExportCheck = "cng_export_other";'),
+            verify.index('Native.NCryptExportKey(key, IntPtr.Zero, "ECCPRIVATEBLOB"'),
+        )
+        self.assertIn("cngExportCheck = ClassifyExportStatus(status);", verify)
+        self.assertIn("if (status != NtePermissionDenied)", verify)
+        self.assertIn(
+            'else if (check == "cng_export")\n                {\n                    check = state.CngExportCheck;',
+            self.source,
+        )
+        self.assertIn('private string cngExportCheck = "cng_export_policy_read";', self.source)
+        self.assertIn("internal string CngExportCheck", self.source)
+        self.assertNotIn("ToString(", verify)
+        self.assertNotIn("Console.", verify)
+        self.assertNotIn("exception.Message", verify)
+        classifier = self.source[
+            self.source.index("internal static string ClassifyExportStatus"):
+            self.source.index("internal static string BuildChildEnvironmentBlock")
+        ]
+        self.assertNotIn("ToString(", classifier)
+        self.assertNotIn("Console.", classifier)
+        self.assertEqual(
+            re.findall(r'return "(cng_export_[a-z_]+)";', classifier),
+            [
+                "cng_export_size_query_succeeded",
+                "cng_export_permission_denied",
+                "cng_export_bad_flags",
+                "cng_export_bad_key_state",
+                "cng_export_bad_type",
+                "cng_export_invalid_handle",
+                "cng_export_invalid_parameter",
+                "cng_export_other",
+            ],
+        )
+
+        labels = (
+            "cng_export_policy_read",
+            "cng_export_policy_nonzero",
+            "cng_export_size_query_succeeded",
+            "cng_export_permission_denied",
+            "cng_export_bad_flags",
+            "cng_export_bad_key_state",
+            "cng_export_bad_type",
+            "cng_export_invalid_handle",
+            "cng_export_invalid_parameter",
+            "cng_export_other",
+        )
+        for label in labels:
+            with self.subTest(label=label):
+                self.assertIn(label, self.wrapper)
+
+        powershell = shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable for export status mapping fixtures")
+        encoded_source_path = base64.b64encode(str(HARNESS).encode("utf-8")).decode("ascii")
+        cases = (
+            (0, "cng_export_size_query_succeeded"),
+            (-2146893808, "cng_export_permission_denied"),
+            (-2146893815, "cng_export_bad_flags"),
+            (-2146893813, "cng_export_bad_key_state"),
+            (-2146893814, "cng_export_bad_type"),
+            (-2146893786, "cng_export_invalid_handle"),
+            (-2146893785, "cng_export_invalid_parameter"),
+            (-1, "cng_export_other"),
+        )
+        case_text = ",\n".join(
+            "    [pscustomobject]@{ Status = %d; Label = '%s' }" % case
+            for case in cases
+        )
+        command = f"""
+$sourcePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_source_path}'))
+Add-Type -Path $sourcePath -ErrorAction Stop
+$type = [KeelDock.Platform.WindowsNativePreflight.Probe]
+$flags = [System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Static
+$method = $type.GetMethod('ClassifyExportStatus', $flags)
+if ($null -eq $method) {{ exit 2 }}
+$cases = @(
+{case_text}
+)
+foreach ($case in $cases) {{
+    $actual = [string]$method.Invoke($null, [object[]]@([int]$case.Status))
+    if (-not [string]::Equals($actual, [string]$case.Label, [System.StringComparison]::Ordinal)) {{ exit 3 }}
+}}
+"""
+        completed = subprocess.run(
+            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            check=False,
+            capture_output=True,
+            text=False,
+            timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(completed.stdout, b"")
 
     def test_cng_key_owner_is_set_from_token_user_before_finalize_and_readback(self):
         run = self.source[self.source.index("public static string Run()"):self.source.index("private static string Refusal(")]
@@ -686,7 +795,16 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             "cng_acl_dacl_tighten_reopen",
             "cng_acl_dacl_tighten_readback",
             "cng_acl_dacl_tighten_compare",
-            "cng_export",
+            "cng_export_policy_read",
+            "cng_export_policy_nonzero",
+            "cng_export_size_query_succeeded",
+            "cng_export_permission_denied",
+            "cng_export_bad_flags",
+            "cng_export_bad_key_state",
+            "cng_export_bad_type",
+            "cng_export_invalid_handle",
+            "cng_export_invalid_parameter",
+            "cng_export_other",
             "cleanup",
             "runtime",
         )
@@ -872,6 +990,10 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
         fixed_lines = (
             "windows-native-preflight=refused check=lpac_profile reason=native_preflight_unavailable cleanup=verified",
             "windows-native-preflight=refused check=child_environment reason=native_preflight_unavailable cleanup=verified",
+            "windows-native-preflight=refused check=cng_export_policy_read reason=native_preflight_unavailable cleanup=verified",
+            "windows-native-preflight=refused check=cng_export_policy_nonzero reason=native_preflight_unavailable cleanup=verified",
+            "windows-native-preflight=refused check=cng_export_size_query_succeeded reason=native_preflight_unavailable cleanup=verified",
+            "windows-native-preflight=refused check=cng_export_bad_type reason=native_preflight_unavailable cleanup=verified",
         )
         generic_fallback = "windows-native-preflight=refused check=runtime reason=native_preflight_unavailable cleanup=incomplete"
         for fixed_line in fixed_lines:
@@ -899,6 +1021,25 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
                     self.assertEqual(completed.returncode, 1)
                     self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
                     self.assertEqual(completed.stderr, b"")
+
+        raw_status_line = "windows-native-preflight=refused check=cng_export_status_80090010 reason=native_preflight_unavailable cleanup=verified"
+        encoded = base64.b64encode(raw_status_line.encode("utf-8")).decode("ascii")
+        command = (
+            "$result = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
+            + encoded
+            + "'))\n"
+            + parser
+        )
+        completed = subprocess.run(
+            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            check=False,
+            capture_output=True,
+            text=False,
+            timeout=10,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertEqual(completed.stdout, generic_fallback.encode("utf-8") + os.linesep.encode("ascii"))
+        self.assertEqual(completed.stderr, b"")
 
     def test_powershell_token_subphase_refusals_are_exact_and_fail_closed(self):
         powershell = shutil.which("pwsh")
