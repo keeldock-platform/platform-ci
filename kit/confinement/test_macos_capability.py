@@ -249,9 +249,9 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                             output = b"502\n"
                         return subprocess.CompletedProcess(argv, 0, output, b"")
                     with ExitStack() as stack:
-                        stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0))
+                        stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
                         stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", return_value=str(parent)))
-                        stack.enter_context(patch.object(macos_capability.os, "chown"))
+                        stack.enter_context(patch.object(macos_capability.os, "chown", create=True))
                         stack.enter_context(patch.object(macos_capability.os, "chmod"))
                         stack.enter_context(patch.object(macos_capability, "runner_uid_for_workspace", return_value=501))
                         stack.enter_context(patch.object(macos_capability, "_run", side_effect=command))
@@ -273,7 +273,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
 
     def test_identity_home_error_is_sanitised_before_account_creation(self):
         results = (subprocess.CompletedProcess([], 1, b"", b""), subprocess.CompletedProcess([], 0, b"account 501\n", b""))
-        with patch.object(macos_capability.os, "geteuid", return_value=0):
+        with patch.object(macos_capability.os, "geteuid", return_value=0, create=True):
             with patch.object(macos_capability, "_run", side_effect=results) as command:
                 with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=OSError("sensitive filesystem detail")):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
@@ -301,12 +301,13 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                     results.append(subprocess.CompletedProcess([], 0, b"account 501\n", b""))
                     results.extend([subprocess.CompletedProcess([], 0, b"", b"")] * 8)
                     with ExitStack() as stack:
-                        stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0))
+                        stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
                         stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", return_value=str(parent)))
                         for name in ("chown", "chmod"):
                             stack.enter_context(patch.object(
                                 macos_capability.os, name,
                                 side_effect=OSError("sensitive filesystem detail") if name == operation else None,
+                                create=(name == "chown"),
                             ))
                         command = stack.enter_context(patch.object(macos_capability, "_run", side_effect=results))
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
