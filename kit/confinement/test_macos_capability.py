@@ -1,10 +1,13 @@
+import builtins
 import ctypes
 import io
 import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
@@ -383,7 +386,7 @@ class ProbeUidCensusTests(unittest.TestCase):
 class ProbeIdentityDiagnosticTests(unittest.TestCase):
     def _identity_runner(
         self, directory, *, listing=b"runner 501\n", groups=b"staff\n", uid=b"502\n",
-        delete_status=0, fail_attribute=False,
+        delete_status=0, fail_attribute=False, events=None, census_results=(False, False),
     ):
         parent = Path(directory) / "probe-home"
         parent.mkdir()
@@ -394,6 +397,8 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
             if argv[0] == "/usr/bin/dscl" and "-list" in argv:
                 return subprocess.CompletedProcess(argv, 0, listing, b"")
             if argv[0] == "/usr/bin/dscl" and "-delete" in argv:
+                if events is not None:
+                    events.append(("delete", parent.exists()))
                 return subprocess.CompletedProcess(argv, delete_status, b"", b"")
             if fail_attribute and argv[0] == "/usr/bin/dscl" and argv[2:4] == ["-create", "/Users/" + macos_capability.USERNAME] and len(argv) > 4:
                 raise macos_capability.ProbeFailure("native_preflight_unavailable")
@@ -410,6 +415,17 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
             stack.enter_context(patch.object(macos_capability.os, "chmod"))
             stack.enter_context(patch.object(macos_capability, "runner_uid_for_workspace", return_value=501))
             stack.enter_context(patch.object(macos_capability, "_run", side_effect=command))
+            stack.enter_context(
+                patch.object(macos_capability, "_probe_uid_processes_present", side_effect=census_results)
+            )
+            if events is not None:
+                real_remove = macos_capability._remove_probe_tree
+
+                def remove_and_record(path):
+                    events.append(("remove", Path(path).exists()))
+                    return real_remove(path)
+
+                stack.enter_context(patch.object(macos_capability, "_remove_probe_tree", side_effect=remove_and_record))
             result = macos_capability._create_probe_identity(Path(directory))
         return result, calls, parent
 
@@ -462,6 +478,25 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                                 macos_capability._create_probe_identity(Path(directory))
                 self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
                 self.assertEqual(raised.exception.check, "probe_identity_inventory")
+
+    def test_selected_uid_is_censused_before_home_or_account_creation(self):
+        with tempfile.TemporaryDirectory(prefix="macos-identity-census-") as directory:
+            with patch.object(macos_capability.os, "geteuid", return_value=0, create=True):
+                with patch.object(
+                    macos_capability,
+                    "_run",
+                    return_value=subprocess.CompletedProcess([], 0, b"runner 501\n", b""),
+                ) as command:
+                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True) as census:
+                        with patch.object(macos_capability.tempfile, "mkdtemp") as make_home:
+                            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                with macos_capability._preflight_phase("probe_identity"):
+                                    macos_capability._create_probe_identity(Path(directory))
+            self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
+            self.assertEqual(raised.exception.check, "probe_identity_census")
+            census.assert_called_once_with(502)
+            command.assert_called_once_with(["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"], timeout=10)
+            make_home.assert_not_called()
 
     def test_identity_inventory_accepts_ascii_negative_uids_and_preserves_positive_collision_scan(self):
         with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
@@ -528,6 +563,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                 stack.enter_context(patch.object(macos_capability.os, "chown", create=True))
                 stack.enter_context(patch.object(macos_capability.os, "chmod"))
                 stack.enter_context(patch.object(macos_capability, "runner_uid_for_workspace", return_value=501))
+                stack.enter_context(patch.object(macos_capability, "_probe_uid_processes_present", return_value=False))
                 stack.enter_context(patch.object(macos_capability, "_run", side_effect=command))
                 with self.assertRaises(macos_capability.ProbeFailure) as raised:
                     with macos_capability._preflight_phase("probe_identity"):
@@ -537,12 +573,30 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
             self.assertEqual(calls[-1], ["/usr/bin/dscl", ".", "-create", "/Users/" + macos_capability.USERNAME])
             self.assertTrue(parent.exists())
 
-    def test_identity_cleanup_failure_preserves_home_and_refuses(self):
+    def test_identity_cleanup_removes_home_then_refuses_when_account_delete_fails(self):
         with tempfile.TemporaryDirectory(prefix="macos-identity-cleanup-") as directory:
+            events = []
             with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                self._identity_runner(directory, groups=b"staff admin\n", delete_status=1)
+                self._identity_runner(directory, groups=b"staff admin\n", delete_status=1, events=events)
             self.assertFalse(raised.exception.cleanup_complete)
             self.assertEqual(raised.exception.check, "probe_identity_cleanup")
+            self.assertFalse((Path(directory) / "probe-home").exists())
+            self.assertEqual(events, [("remove", True), ("delete", False)])
+
+    def test_setup_error_keeps_account_and_home_when_uid_census_is_uncertain(self):
+        with tempfile.TemporaryDirectory(prefix="macos-identity-cleanup-census-") as directory:
+            events = []
+            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                self._identity_runner(
+                    directory,
+                    fail_attribute=True,
+                    events=events,
+                    census_results=(False, macos_capability.ProbeFailure("native_preflight_unavailable")),
+                )
+            self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
+            self.assertEqual(raised.exception.check, "probe_identity_cleanup")
+            self.assertFalse(raised.exception.cleanup_complete)
+            self.assertEqual(events, [])
             self.assertTrue((Path(directory) / "probe-home").exists())
 
     def test_identity_failure_refuses_when_home_removal_errors_or_leaves_path(self):
@@ -550,6 +604,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
             with self.subTest(remove_behavior=remove_behavior), tempfile.TemporaryDirectory(
                 prefix="macos-identity-home-cleanup-"
             ) as directory:
+                events = []
                 parent = Path(directory) / "probe-home"
                 if remove_behavior is None:
                     remove = lambda path: None
@@ -557,19 +612,201 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                     remove = unittest.mock.Mock(side_effect=remove_behavior)
                 with patch.object(macos_capability.shutil, "rmtree", side_effect=remove):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                        self._identity_runner(directory, groups=b"staff admin\n")
+                        self._identity_runner(directory, groups=b"staff admin\n", events=events)
                 self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
                 self.assertEqual(raised.exception.check, "probe_identity_cleanup")
                 self.assertFalse(raised.exception.cleanup_complete)
                 self.assertTrue(parent.is_dir())
+                self.assertEqual(events, [("remove", True)])
                 shutil.rmtree(parent)
 
     def test_failure_after_account_creation_removes_only_the_created_account(self):
         with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+            events = []
             with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                self._identity_runner(directory, fail_attribute=True)
+                self._identity_runner(directory, fail_attribute=True, events=events)
             self.assertEqual(raised.exception.check, "probe_identity_attributes")
             self.assertFalse((Path(directory) / "probe-home").exists())
+            self.assertEqual(events, [("remove", True), ("delete", False)])
+
+
+class ProbeIdentityBootstrapTests(unittest.TestCase):
+    def run_bootstrap(
+        self,
+        *,
+        identifiers=None,
+        groups=(20,),
+        ps_values=(502, 502, 502, 20, 20, 20),
+        ps_output=None,
+        ps_status=0,
+        ps_stderr=b"",
+        short_marker_write=False,
+        source=None,
+    ):
+        class StopBootstrap(BaseException):
+            pass
+
+        identity_values = {"getuid": 502, "geteuid": 502, "getgid": 20, "getegid": 20}
+        identity_values.update(identifiers or {})
+        if ps_output is None:
+            ps_output = " ".join(str(value) for value in ps_values).encode("ascii") + b"\n"
+        events = {"writes": [], "exec": [], "exit": [], "ps": []}
+
+        class GroupReader:
+            def __init__(self, values):
+                self.values = tuple(values)
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, count, buffer):
+                if count == 0:
+                    return len(self.values)
+                if count < len(self.values):
+                    return -1
+                for index, value in enumerate(self.values):
+                    buffer[index] = value
+                return len(self.values)
+
+        group_reader = GroupReader(groups)
+        fake_os = types.SimpleNamespace(
+            **{name: (lambda value=value: value) for name, value in identity_values.items()}
+        )
+        fake_os.getpid = lambda: 999
+
+        def write(fd, data):
+            data = bytes(data)
+            events["writes"].append((fd, data))
+            if short_marker_write and data == macos_capability.PROBE_IDENTITY_VERIFIED:
+                return len(data) - 1
+            return len(data)
+
+        def execv(path, argv):
+            events["exec"].append((path, list(argv)))
+
+        def exit_process(code):
+            events["exit"].append(code)
+            raise StopBootstrap()
+
+        fake_os.write = write
+        fake_os.execv = execv
+        fake_os._exit = exit_process
+        ps_run = types.SimpleNamespace(
+            returncode=ps_status,
+            stdout=ps_output,
+            stderr=ps_stderr,
+        )
+        fake_subprocess = types.SimpleNamespace(
+            DEVNULL=object(),
+            PIPE=object(),
+            run=lambda argv, **kwargs: (events["ps"].append((argv, kwargs)) or ps_run),
+        )
+        fake_ctypes = types.SimpleNamespace(
+            CDLL=lambda name, use_errno: types.SimpleNamespace(getgroups=group_reader),
+            c_int=ctypes.c_int,
+            POINTER=ctypes.POINTER,
+            c_uint32=ctypes.c_uint32,
+        )
+        fake_sys = types.SimpleNamespace(argv=["-c", "502", "20", "/usr/bin/true"])
+        modules = {
+            "ctypes": fake_ctypes,
+            "os": fake_os,
+            "subprocess": fake_subprocess,
+            "sys": fake_sys,
+        }
+        python_builtins = vars(builtins).copy()
+        python_builtins["__import__"] = lambda name, *args, **kwargs: modules[name]
+        try:
+            exec(source or macos_capability.PROBE_IDENTITY_BOOTSTRAP, {"__builtins__": python_builtins})
+        except StopBootstrap:
+            pass
+        return events
+
+    def assert_refused_without_exec(self, **kwargs):
+        events = self.run_bootstrap(**kwargs)
+        self.assertEqual(events["exec"], [])
+        self.assertTrue(events["exit"])
+        self.assertTrue(all(code == 125 for code in events["exit"]))
+        return events
+
+    def test_bootstrap_checks_kernel_credentials_then_execs_target(self):
+        events = self.run_bootstrap()
+        self.assertEqual(events["writes"], [(2, macos_capability.PROBE_IDENTITY_VERIFIED)])
+        self.assertEqual(events["exec"], [("/usr/bin/true", ["/usr/bin/true"])])
+        self.assertEqual(events["exit"], [])
+        argv, kwargs = events["ps"][0]
+        self.assertEqual(
+            argv,
+            ["/bin/ps", "-p", "999", "-o", "ruid=,uid=,svuid=,rgid=,gid=,svgid="],
+        )
+        self.assertEqual(kwargs["timeout"], 3)
+        self.assertTrue(kwargs["close_fds"])
+
+    def test_bootstrap_refuses_all_credential_group_and_process_readback_mismatches(self):
+        identifier_cases = []
+        for name in ("getuid", "geteuid", "getgid", "getegid"):
+            identifier_cases.append(("identifier-" + name, {name: 0}))
+        for index in range(6):
+            ps_values = [502, 502, 502, 20, 20, 20]
+            ps_values[index] = 0
+            identifier_cases.append(("ps-field-" + str(index), {"ps_values": tuple(ps_values)}))
+        group_cases = (
+            ("empty-groups", ()),
+            ("wrong-group", (0,)),
+            ("extra-group", (20, 80)),
+            ("duplicate-group", (20, 20)),
+            ("too-many-groups", tuple(range(17))),
+        )
+        ps_cases = (
+            ("empty-ps", {"ps_output": b""}),
+            ("extra-ps-field", {"ps_output": b"502 502 502 20 20 20 1\n"}),
+            ("oversized-ps", {"ps_output": b"x" * 129}),
+            ("failed-ps", {"ps_status": 1}),
+            ("ps-stderr", {"ps_stderr": b"error\n"}),
+        )
+        for name, changes in identifier_cases:
+            with self.subTest(case=name):
+                identifiers = {"getuid": 502, "geteuid": 502, "getgid": 20, "getegid": 20}
+                if name.startswith("identifier-"):
+                    identifiers.update(changes)
+                    self.assert_refused_without_exec(identifiers=identifiers)
+                else:
+                    self.assert_refused_without_exec(**changes)
+        for name, values in group_cases:
+            with self.subTest(case=name):
+                self.assert_refused_without_exec(groups=values)
+        for name, changes in ps_cases:
+            with self.subTest(case=name):
+                self.assert_refused_without_exec(**changes)
+        with self.subTest(case="short-marker-write"):
+            self.assert_refused_without_exec(short_marker_write=True)
+
+    def test_effective_uid_readback_is_a_required_security_check(self):
+        mutated = macos_capability.PROBE_IDENTITY_BOOTSTRAP.replace(
+            "or os.geteuid() != uid", "or False"
+        )
+        events = self.run_bootstrap(
+            identifiers={"getuid": 502, "geteuid": 0, "getgid": 20, "getegid": 20},
+            source=mutated,
+        )
+        self.assertEqual(events["exec"], [("/usr/bin/true", ["/usr/bin/true"])])
+
+    def test_identity_marker_parser_rejects_missing_or_malformed_records(self):
+        self.assertEqual(
+            macos_capability._strip_probe_identity_record(
+                macos_capability.PROBE_IDENTITY_VERIFIED + b"target stderr"
+            ),
+            b"target stderr",
+        )
+        for record in (
+            b"",
+            b"unexpected" + macos_capability.PROBE_IDENTITY_VERIFIED,
+            macos_capability.PROBE_IDENTITY_VERIFIED.rstrip(b"\n"),
+            macos_capability.PROBE_IDENTITY_REFUSED,
+        ):
+            with self.subTest(record=record):
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    macos_capability._strip_probe_identity_record(record)
+                self.assertEqual(raised.exception.check, "probe_process_identity")
 
     def test_probe_user_timeout_is_bounded_and_group_cleanup_is_checked(self):
         class StubProcess:
@@ -594,6 +831,9 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
         self.assertFalse(raised.exception.cleanup_complete)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertEqual(popen.call_args.kwargs["close_fds"], True)
+        self.assertEqual(popen.call_args.kwargs["user"], 502)
+        self.assertEqual(popen.call_args.kwargs["group"], macos_capability.PROBE_PRIMARY_GID)
+        self.assertEqual(popen.call_args.kwargs["extra_groups"], ())
         cleanup.assert_called_once_with(process)
 
     def test_probe_user_census_detects_detached_child_after_group_cleanup(self):
@@ -634,7 +874,12 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
         process = type(
             "CompletedProcess",
             (),
-            {"pid": 12352, "stdout": io.BytesIO(b""), "stderr": io.BytesIO(b""), "returncode": 0},
+            {
+                "pid": 12352,
+                "stdout": io.BytesIO(b""),
+                "stderr": io.BytesIO(macos_capability.PROBE_IDENTITY_VERIFIED),
+                "returncode": 0,
+            },
         )()
         process.wait = lambda timeout: process.returncode
         process.poll = lambda: process.returncode
@@ -662,7 +907,12 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
         process = type(
             "CompletedProcess",
             (),
-            {"pid": 12352, "stdout": io.BytesIO(b""), "stderr": io.BytesIO(b""), "returncode": 0},
+            {
+                "pid": 12352,
+                "stdout": io.BytesIO(b""),
+                "stderr": io.BytesIO(macos_capability.PROBE_IDENTITY_VERIFIED),
+                "returncode": 0,
+            },
         )()
         process.wait = lambda timeout: process.returncode
         process.poll = lambda: process.returncode
@@ -851,7 +1101,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
         class StubProcess:
             pid = 12347
             stdout = io.BytesIO(b"safe output\n")
-            stderr = io.BytesIO(b"")
+            stderr = io.BytesIO(macos_capability.PROBE_IDENTITY_VERIFIED)
             returncode = 0
 
             def wait(self, timeout):
@@ -861,12 +1111,60 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                 return self.returncode
 
         process = StubProcess()
-        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process) as popen:
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
                 with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False) as census:
                     result = macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
         self.assertEqual(result.stdout, b"safe output\n")
+        self.assertEqual(result.stderr, b"")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:5], ["/usr/bin/python3", "-I", "-S", "-B", "-c"])
+        self.assertEqual(command[5], macos_capability.PROBE_IDENTITY_BOOTSTRAP)
+        self.assertEqual(command[6:], ["502", "20", "/usr/bin/true"])
+        self.assertNotIn("/usr/bin/sudo", command)
+        self.assertEqual(popen.call_args.kwargs["user"], 502)
+        self.assertEqual(popen.call_args.kwargs["group"], macos_capability.PROBE_PRIMARY_GID)
+        self.assertEqual(popen.call_args.kwargs["extra_groups"], ())
         census.assert_called_once_with(502)
+
+    def test_probe_user_identity_mismatch_or_missing_marker_refuses(self):
+        class StubProcess:
+            pid = 12354
+            stdout = io.BytesIO(b"")
+            returncode = 125
+
+            def __init__(self, marker):
+                self.stderr = io.BytesIO(marker)
+
+            def wait(self, timeout):
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        for marker in (macos_capability.PROBE_IDENTITY_REFUSED, b""):
+            with self.subTest(marker=marker):
+                process = StubProcess(marker)
+                with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+                    with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
+                self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
+                self.assertEqual(raised.exception.check, "probe_process_identity")
+
+    def test_probe_user_old_python_or_missing_keyword_support_fails_without_sudo_fallback(self):
+        process = type("StubProcess", (), {"pid": 12355})()
+        for version, launch_error in (((3, 8, 0), None), ((3, 14, 0), TypeError("unsupported keyword"))):
+            with self.subTest(version=version):
+                with patch.object(macos_capability, "sys") as runtime:
+                    runtime.version_info = version
+                    with patch.object(macos_capability.subprocess, "Popen", side_effect=launch_error) as popen:
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            macos_capability._run_as_probe_user(["/usr/bin/true"], 502)
+                self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
+                self.assertEqual(raised.exception.check, "probe_process_launch")
+                self.assertEqual(popen.call_count, int(version >= (3, 9, 0)))
 
     def test_probe_user_wait_error_is_incomplete_even_with_clean_snapshot(self):
         class StubProcess:
@@ -1519,6 +1817,66 @@ class DescriptorReadbackTests(unittest.TestCase):
 
 
 class ProbeTeardownTests(unittest.TestCase):
+    def test_bootstrap_and_later_mismatched_root_rows_cannot_supply_probe_roles(self):
+        class StubProcess:
+            pid = 12340
+            stdout = io.BytesIO(b"")
+            stderr = io.BytesIO(macos_capability.PROBE_IDENTITY_VERIFIED)
+            returncode = None
+
+            def __init__(self):
+                self.poll_calls = 0
+
+            def poll(self):
+                self.poll_calls += 1
+                return None if self.poll_calls < 4 else 0
+
+            def wait(self, timeout):
+                self.returncode = 0
+                return 0
+
+        process = StubProcess()
+        uid = 502
+        bootstrap_rows = {
+            process.pid: (1, uid, "/usr/bin/python3"),
+            12341: (process.pid, uid, "/bin/ps"),
+        }
+        signed_probe_rows = {
+            process.pid: (1, uid, chr(47) + "private/tmp/CapabilityProbe"),
+            12342: (process.pid, uid, "CapabilityChild"),
+            12343: (process.pid, uid, "/bin/sh"),
+            12344: (process.pid, uid, "/bin/sleep"),
+            12345: (process.pid, uid, "capability-child"),
+            12346: (process.pid, uid, "capability-child"),
+            12347: (process.pid, uid, "/usr/bin/clang"),
+        }
+        later_mismatch_rows = dict(signed_probe_rows)
+        later_mismatch_rows[process.pid] = (1, uid, "/usr/bin/python3")
+        later_mismatch_rows[12348] = (process.pid, uid, "/usr/bin/python3")
+
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(
+                macos_capability,
+                "_process_table",
+                side_effect=(bootstrap_rows, signed_probe_rows, later_mismatch_rows),
+            ) as table:
+                with patch.object(macos_capability, "_descriptor_snapshot", return_value={}) as descriptors:
+                    with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                            with patch.object(macos_capability.time, "sleep"):
+                                with self.assertRaisesRegex(
+                                    macos_capability.ProbeFailure,
+                                    "descriptor_readback_unavailable",
+                                ):
+                                    macos_capability._observe_probe(
+                                        "/tmp/CapabilityProbe", "/tmp/marker", "/tmp/outside", uid, "/tmp/home"
+                                    )
+
+        self.assertEqual(table.call_count, 3)
+        descriptors.assert_called_once()
+        sampled_pids = descriptors.call_args.args[0]
+        self.assertEqual(set(sampled_pids), set(signed_probe_rows))
+
     def test_observe_census_detects_detached_child_after_group_cleanup(self):
         process = type(
             "CompletedProcess",
@@ -1527,14 +1885,21 @@ class ProbeTeardownTests(unittest.TestCase):
         )()
         process.poll = lambda: process.returncode
         process.wait = lambda timeout: process.returncode
-        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process) as popen:
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
                 with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True) as census:
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                        macos_capability._observe_probe("unused", "unused", "unused", 502, "unused")
+                        macos_capability._observe_probe("/tmp/unused", "unused", "unused", 502, "unused")
         self.assertEqual(raised.exception.check, "probe_process_survivor_probe_tree")
         self.assertFalse(raised.exception.cleanup_complete)
         census.assert_called_once_with(502)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:5], ["/usr/bin/python3", "-I", "-S", "-B", "-c"])
+        self.assertNotIn("/usr/bin/sudo", command)
+        self.assertEqual(popen.call_args.kwargs["user"], 502)
+        self.assertEqual(popen.call_args.kwargs["group"], macos_capability.PROBE_PRIMARY_GID)
+        self.assertEqual(popen.call_args.kwargs["extra_groups"], ())
+        self.assertEqual(popen.call_args.kwargs["cwd"], "/tmp")
 
     def test_observe_timeout_is_never_cleanup_complete(self):
         process = type(
@@ -1553,7 +1918,7 @@ class ProbeTeardownTests(unittest.TestCase):
                 with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
                     with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                            macos_capability._observe_probe("unused", "unused", "unused", 502, "unused")
+                            macos_capability._observe_probe("/tmp/unused", "unused", "unused", 502, "unused")
         self.assertEqual(raised.exception.reason, "probe_timeout")
         self.assertFalse(raised.exception.cleanup_complete)
 
@@ -1574,7 +1939,7 @@ class ProbeTeardownTests(unittest.TestCase):
                 with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
                     with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                            macos_capability._observe_probe("unused", "unused", "unused", 502, "unused")
+                            macos_capability._observe_probe("/tmp/unused", "unused", "unused", 502, "unused")
         self.assertEqual(raised.exception.check, "probe_process_observation")
         self.assertFalse(raised.exception.cleanup_complete)
 
@@ -1606,8 +1971,8 @@ class ProbeTeardownTests(unittest.TestCase):
                                 "descriptor_readback_unavailable",
                             ):
                                 macos_capability._observe_probe(
-                                    "unused",
-                                    "unused",
+                                    "/tmp/unused",
+                                    "/tmp/unused",
                                     "unused",
                                     501,
                                     "unused",
@@ -1669,7 +2034,7 @@ class ProbeTeardownTests(unittest.TestCase):
                                 "descriptor_readback_unavailable",
                             ):
                                 macos_capability._observe_probe(
-                                    "unused",
+                                    "/tmp/unused",
                                     "unused",
                                     "unused",
                                     501,
@@ -1709,8 +2074,8 @@ class ProbeTeardownTests(unittest.TestCase):
                                         "native_preflight_unavailable",
                                     ) as raised:
                                         macos_capability._observe_probe(
-                                            "unused",
-                                            "unused",
+                                            "/tmp/unused",
+                                            "/tmp/unused",
                                             "unused",
                                             501,
                                             "unused",
@@ -1910,10 +2275,61 @@ class ProbeTeardownTests(unittest.TestCase):
             self.assertTrue(home_parent.is_dir())
             self.assertTrue(home.is_dir())
             self.assertTrue(all(not path.exists() for path in scratch_paths))
-            command.assert_called_once_with(
-                ["/usr/bin/dscl", ".", "-delete", "/Users/" + macos_capability.USERNAME], timeout=10
-            )
+            command.assert_not_called()
             real_rmtree(home_parent)
+
+    def test_final_cleanup_removes_every_tree_before_deleting_identity(self):
+        with tempfile.TemporaryDirectory(prefix="macos-final-cleanup-order-") as directory:
+            root = Path(directory) / "workspace"
+            marker = root / "kit" / "confinement" / "macos_capability.swift"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("// public synthetic probe\n", encoding="utf-8")
+            marker.chmod(0o644)
+            home_parent = Path(directory) / "home-parent"
+            home_parent.mkdir()
+            (home_parent / "home").mkdir()
+            scratch_paths = []
+            events = []
+
+            def make_scratch(prefix, dir):
+                path = Path(directory) / prefix
+                path.mkdir()
+                scratch_paths.append(path)
+                return str(path)
+
+            def command(argv, **kwargs):
+                events.append(("dscl-delete", all(not path.exists() for path in [home_parent, *scratch_paths])))
+                return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+            with patch.dict(os.environ, {"CI_WORKSPACE": str(root)}):
+                with patch.object(macos_capability, "_check_context", return_value=root):
+                    with patch.object(macos_capability, "_disable_developer_mode"):
+                        with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
+                            with patch.object(
+                                macos_capability,
+                                "_create_probe_identity",
+                                return_value=(502, home_parent, home_parent / "home"),
+                            ):
+                                with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=make_scratch):
+                                    with patch.object(macos_capability, "_verify_runner_controls_are_private"):
+                                        with patch.object(
+                                            macos_capability,
+                                            "_run_as_probe_user",
+                                            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+                                        ):
+                                            with patch.object(macos_capability, "_build_signed_probe", return_value="unused"):
+                                                with patch.object(macos_capability, "_observe_probe"):
+                                                    with patch.object(
+                                                        macos_capability,
+                                                        "_probe_uid_processes_present",
+                                                        return_value=False,
+                                                    ) as census:
+                                                        with patch.object(macos_capability, "_run", side_effect=command) as run:
+                                                            macos_capability.run_native_probe("a" * 40)
+
+            self.assertEqual(events, [("dscl-delete", True)])
+            self.assertEqual(run.call_args.args[0], ["/usr/bin/dscl", ".", "-delete", "/Users/" + macos_capability.USERNAME])
+            census.assert_called_once_with(502)
 
 
 if __name__ == "__main__":
