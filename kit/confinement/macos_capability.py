@@ -80,6 +80,9 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_identity_readback", "probe_identity_cleanup", "probe_process_timeout", "probe_process_cleanup",
         "probe_process_group_cleanup", "probe_process_capture_cleanup", "probe_process_census",
         "probe_process_survivor", "probe_process_observation",
+        "probe_process_survivor_controls", "probe_process_survivor_positive_read",
+        "probe_process_survivor_positive_write", "probe_process_survivor_probe_tree",
+        "probe_process_survivor_final_census",
     )
 )
 PROBE_IDENTITY_CHECKS = frozenset(
@@ -631,6 +634,7 @@ def _run_as_probe_user(
     timeout=10,
     failure_reason="probe_identity_unavailable",
     failure_check=None,
+    survivor_check="probe_process_survivor",
 ):
     if uid <= 0:
         raise ProbeFailure("probe_identity_unavailable")
@@ -690,7 +694,11 @@ def _run_as_probe_user(
         elif not census_known:
             cleanup_check = "probe_process_census"
         elif escaped_process:
-            cleanup_check = "probe_process_survivor"
+            cleanup_check = (
+                survivor_check
+                if isinstance(survivor_check, str) and survivor_check in NATIVE_PREFLIGHT_CHECKS
+                else "probe_process_survivor"
+            )
         else:
             cleanup_check = None
         if cleanup_check is not None:
@@ -717,6 +725,7 @@ def _verify_runner_controls_are_private(paths, uid):
         _run_as_probe_user(
             ["/usr/bin/python3", "-c", script, str(path)], uid, env=env, timeout=5,
             failure_reason="runner_control_unavailable", failure_check="probe_access",
+            survivor_check="probe_process_survivor_controls",
         )
     if uid == 0:
         raise ProbeFailure("probe_identity_unavailable")
@@ -1165,7 +1174,7 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
         elif not census_known:
             cleanup_check = "probe_process_census"
         elif escaped_process:
-            cleanup_check = "probe_process_survivor"
+            cleanup_check = "probe_process_survivor_probe_tree"
         else:
             cleanup_check = None
         if cleanup_check is not None:
@@ -1210,12 +1219,14 @@ def run_native_probe(control_sha):
             _run_as_probe_user(
                 ["/usr/bin/python3", "-c", positive_read, str(marker)], probe_uid, env=user_env, timeout=10,
                 failure_reason="sandbox_behavior_unavailable",
+                survivor_check="probe_process_survivor_positive_read",
             )
             positive_write = "import sys; open(sys.argv[1], 'wb').close()"
             positive_file = outside / "positive-control"
             _run_as_probe_user(
                 ["/usr/bin/python3", "-c", positive_write, str(positive_file)], probe_uid, env=user_env, timeout=10,
                 failure_reason="sandbox_behavior_unavailable",
+                survivor_check="probe_process_survivor_positive_write",
             )
             executable = _build_signed_probe(root, scratch)
             _observe_probe(executable, marker, outside, probe_uid, home)
@@ -1227,7 +1238,8 @@ def run_native_probe(control_sha):
             if cleanup_safe:
                 if _probe_uid_processes_present(probe_uid):
                     raise ProbeFailure(
-                        "native_preflight_unavailable", cleanup_complete=False, check="probe_process_survivor"
+                        "native_preflight_unavailable", cleanup_complete=False,
+                        check="probe_process_survivor_final_census",
                     )
                 try:
                     delete_user = _run(["/usr/bin/dscl", ".", "-delete", "/Users/" + USERNAME], timeout=10)
