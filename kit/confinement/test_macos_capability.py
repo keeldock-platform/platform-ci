@@ -323,7 +323,8 @@ class ProbeUidCensusTests(unittest.TestCase):
             (b"1 1 S 0 0 0\n20 11 R 502 0 0\n", (True, "probe_process_survivor_controls_other_group")),
             (b"1 1 S 0 0 0\n20 2 Z 0 502 0\n", (True, "probe_process_survivor_controls_zombie")),
             (b"1 1 S 0 0 0\n20 0 Z 0 502 0\n", (True, "probe_process_survivor_controls_zombie")),
-            (b"1 1 S 0 0 0\n20 2 R 0 502 0\n21 3 R 502 0 0\n", (True, "probe_process_survivor_controls_unattributed")),
+            (b"1 1 S 0 0 0\n20 2 R 0 502 0\n21 3 R 502 0 0\n", (True, "probe_process_survivor_controls_multiple")),
+            (b"1 1 S 0 0 0\n20 0 R 0 502 0\n21 3 R 502 0 0\n", (True, "probe_process_survivor_controls_multiple")),
             (b"1 1 S 0 0 0\n20 0 R 502 502 502\n", (True, "probe_process_survivor_controls_unattributed")),
         )
         for output, expected in cases:
@@ -642,7 +643,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                 with patch.object(
                     macos_capability,
                     "_probe_uid_process_snapshot",
-                    return_value=(True, "probe_process_survivor_controls_other_group"),
+                    return_value=(True, "probe_process_survivor_controls_multiple"),
                 ) as census:
                     with patch.object(
                         macos_capability,
@@ -652,7 +653,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                             macos_capability._run_as_probe_user(
                                 ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
                             )
-        self.assertEqual(raised.exception.check, "probe_process_survivor_controls_other_group")
+        self.assertEqual(raised.exception.check, "probe_process_survivor_controls_multiple")
         self.assertFalse(raised.exception.cleanup_complete)
         census.assert_called_once_with(502, launched_pgid=12352)
         ordinary_census.assert_not_called()
