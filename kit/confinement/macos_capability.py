@@ -74,7 +74,7 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "context", "developer_mode", "runner_controls", "probe_identity", "capability_probe",
         "probe_identity_lookup", "probe_identity_inventory", "probe_identity_home",
         "probe_identity_create", "probe_identity_attributes", "probe_identity_permissions",
-        "probe_identity_readback", "probe_identity_privilege",
+        "probe_identity_readback", "probe_identity_privilege", "probe_identity_privilege_timeout",
     )
 )
 
@@ -175,7 +175,7 @@ def _preflight_phase(check):
         raise ProbeFailure("native_preflight_unavailable", check=check) from None
 
 
-def _run(argv, *, cwd=None, env=None, timeout=30):
+def _run(argv, *, cwd=None, env=None, timeout=30, timeout_check=None):
     try:
         return subprocess.run(
             [str(part) for part in argv],
@@ -187,6 +187,8 @@ def _run(argv, *, cwd=None, env=None, timeout=30):
             timeout=timeout,
             close_fds=True,
         )
+    except subprocess.TimeoutExpired:
+        raise ProbeFailure("native_preflight_unavailable", check=timeout_check) from None
     except (OSError, subprocess.SubprocessError):
         raise ProbeFailure("native_preflight_unavailable")
 
@@ -476,7 +478,10 @@ def _create_probe_identity(workspace):
             "raise SystemExit(0 if result.returncode != 0 else 1)"
         )
         with _preflight_phase("probe_identity_privilege"):
-            _run_as_probe_user(["/usr/bin/python3", "-c", privilege_check], uid, env=user_env, timeout=5)
+            _run_as_probe_user(
+                ["/usr/bin/python3", "-c", privilege_check], uid, env=user_env, timeout=5,
+                timeout_check="probe_identity_privilege_timeout",
+            )
     except BaseException:
         try:
             _run(["/usr/bin/dscl", ".", "-delete", account], timeout=10)
@@ -494,8 +499,11 @@ def runner_uid_for_workspace(workspace):
         raise ProbeFailure("runner_control_unavailable")
 
 
-def _run_as_probe_user(argv, uid, env=None, timeout=10):
-    result = _run(["/usr/bin/sudo", "-n", "-u", USERNAME, "--"] + list(argv), env=env, timeout=timeout)
+def _run_as_probe_user(argv, uid, env=None, timeout=10, timeout_check=None):
+    result = _run(
+        ["/usr/bin/sudo", "-n", "-u", USERNAME, "--"] + list(argv),
+        env=env, timeout=timeout, timeout_check=timeout_check,
+    )
     _require_success(result, "probe_identity_unavailable")
     if uid <= 0:
         raise ProbeFailure("probe_identity_unavailable")
