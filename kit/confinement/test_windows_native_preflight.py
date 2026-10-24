@@ -220,6 +220,8 @@ if (-not $rejected) {{ exit 6 }}
             '"Security Descr Support"',
             '"Security Descr"',
             "NCryptSilentFlag = 0x00000040",
+            "Native.InitializeSecurityDescriptor",
+            "Native.SetSecurityDescriptorOwner",
             "Native.GetSecurityDescriptorOwner",
             "Native.GetSecurityDescriptorDacl",
             'Native.NCryptExportKey(key, IntPtr.Zero, "ECCPRIVATEBLOB"',
@@ -233,13 +235,90 @@ if (-not $rejected) {{ exit 6 }}
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.source)
         self.assertIn("ReadKeyDword(\"Export Policy\", NCryptSilentFlag) != 0", self.source)
+        self.assertIn("OwnerSecurityInformation | NCryptSilentFlag", self.source)
         self.assertIn("Native.EqualSid(ownerSid, currentUserSid)", self.source)
         self.assertNotIn("BCRYPT_ECCPRIVATE_BLOB", self.source)
 
-    def test_cng_acl_failures_use_fixed_ordered_subphases(self):
+    def test_cng_key_owner_is_set_from_token_user_before_finalize_and_readback(self):
+        run = self.source[self.source.index("public static string Run()"):self.source.index("private static string Refusal(")]
+        calls = (
+            "state.CreateKey();",
+            "state.SetKeyOwnerToCurrentUser();",
+            "state.FinalizeKey();",
+            "state.VerifyKeyAcl();",
+        )
+        positions = [run.index(call) for call in calls]
+        self.assertEqual(positions, sorted(positions))
+
+        set_owner = self.source[
+            self.source.index("internal void SetKeyOwnerToCurrentUser()"):
+            self.source.index("internal void FinalizeKey()")
+        ]
         stages = (
             ("cng_acl_support_read", 'ReadProviderDword("Security Descr Support")'),
             ("cng_acl_token_open", "Native.OpenProcessToken(Native.GetCurrentProcess()"),
+            ("cng_acl_user_read", "QueryTokenInformation(currentToken, TokenUser"),
+            ("cng_acl_user_check", "if (userLength < (uint)IntPtr.Size)"),
+            ("cng_acl_owner_set", '"Security Descr",'),
+        )
+        previous = -1
+        for label, operation in stages:
+            marker = f'cngAclCheck = "{label}";'
+            self.assertIn(marker, set_owner)
+            self.assertIn(label, self.wrapper)
+            phase_position = set_owner.index(marker)
+            operation_position = set_owner.index(operation)
+            self.assertGreater(phase_position, previous)
+            self.assertLess(phase_position, operation_position)
+            previous = phase_position
+        self.assertIn("Native.InitializeSecurityDescriptor(descriptor, SecurityDescriptorRevision)", set_owner)
+        self.assertIn("Native.IsValidSecurityDescriptor(descriptor)", set_owner)
+        self.assertIn("OwnerSecurityInformation | NCryptSilentFlag", set_owner)
+        self.assertNotIn("DaclSecurityInformation", set_owner)
+        self.assertIn("keyOwned = true;", self.source[:self.source.index("internal void SetKeyOwnerToCurrentUser()")])
+        verify = self.source[
+            self.source.index("internal void VerifyKeyAcl()"):
+            self.source.index("internal void VerifyKeyExportDenial()")
+        ]
+        self.assertIn("Native.EqualSid(ownerSid, currentUserSid)", verify)
+        self.assertIn('cngAclCheck = "cng_acl_dacl_read";', verify)
+        self.assertIn("ReadSecurityDescriptor(key, DaclSecurityInformation | NCryptSilentFlag)", verify)
+
+    def test_security_descriptor_absolute_abi_matches_native_pointer_layout(self):
+        powershell = shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable for native structure layout fixtures")
+        encoded_source_path = base64.b64encode(str(HARNESS).encode("utf-8")).decode("ascii")
+        command = f"""
+$sourcePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_source_path}'))
+Add-Type -Path $sourcePath -ErrorAction Stop
+$flags = [System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Public
+$native = [KeelDock.Platform.WindowsNativePreflight.Probe].GetNestedType('Native', $flags)
+if ($null -eq $native) {{ exit 2 }}
+$descriptor = $native.GetNestedType('SecurityDescriptor', $flags)
+if ($null -eq $descriptor) {{ exit 3 }}
+$pointerSize = [IntPtr]::Size
+$expectedOwnerOffset = [int]([Math]::Ceiling(4.0 / $pointerSize) * $pointerSize)
+$expectedSize = $expectedOwnerOffset + 4 * $pointerSize
+$instance = [System.Activator]::CreateInstance($descriptor)
+if ([System.Runtime.InteropServices.Marshal]::SizeOf($instance) -ne $expectedSize) {{ exit 4 }}
+if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, 'Owner') -ne $expectedOwnerOffset) {{ exit 5 }}
+if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, 'Group') -ne ($expectedOwnerOffset + $pointerSize)) {{ exit 6 }}
+if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, 'Sacl') -ne ($expectedOwnerOffset + 2 * $pointerSize)) {{ exit 7 }}
+if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, 'Dacl') -ne ($expectedOwnerOffset + 3 * $pointerSize)) {{ exit 8 }}
+"""
+        completed = subprocess.run(
+            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            check=False,
+            capture_output=True,
+            text=False,
+            timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(completed.stdout, b"")
+
+    def test_cng_acl_failures_use_fixed_ordered_subphases(self):
+        stages = (
             ("cng_acl_user_read", "QueryTokenInformation(currentToken, TokenUser"),
             ("cng_acl_user_check", "if (userLength < (uint)IntPtr.Size)"),
             ("cng_acl_system_sid", 'Native.ConvertStringSidToSidW("S-1-5-18"'),
@@ -385,6 +464,7 @@ if (-not $rejected) {{ exit 6 }}
             "cng_acl_token_open",
             "cng_acl_user_read",
             "cng_acl_user_check",
+            "cng_acl_owner_set",
             "cng_acl_system_sid",
             "cng_acl_owner_read",
             "cng_acl_owner_check",
@@ -679,6 +759,7 @@ if (-not $rejected) {{ exit 6 }}
             "cng_acl_token_open",
             "cng_acl_user_read",
             "cng_acl_user_check",
+            "cng_acl_owner_set",
             "cng_acl_system_sid",
             "cng_acl_owner_read",
             "cng_acl_owner_check",

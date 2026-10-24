@@ -38,6 +38,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
         private const uint OwnerSecurityInformation = 0x00000001;
         private const uint DaclSecurityInformation = 0x00000004;
         private const uint NCryptSilentFlag = 0x00000040;
+        private const uint SecurityDescriptorRevision = 1;
         private const int NtePermissionDenied = unchecked((int)0x80090010);
         private const int NteBadKeyset = unchecked((int)0x80090016);
         private const int HresultAlreadyExists = unchecked((int)0x800700b7);
@@ -62,6 +63,10 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 state.VerifyJob();
                 check = "cng_key";
                 state.CreateKey();
+                check = "cng_acl";
+                state.SetKeyOwnerToCurrentUser();
+                check = "cng_key";
+                state.FinalizeKey();
                 check = "cng_acl";
                 state.VerifyKeyAcl();
                 check = "cng_export";
@@ -542,7 +547,72 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     Marshal.FreeHGlobal(exportPolicy);
                 }
-                status = Native.NCryptFinalizeKey(key, NCryptSilentFlag);
+            }
+
+            internal void SetKeyOwnerToCurrentUser()
+            {
+                cngAclCheck = "cng_acl_support_read";
+                if (ReadProviderDword("Security Descr Support") != 1)
+                {
+                    throw new InvalidOperationException();
+                }
+                cngAclCheck = "cng_acl_token_open";
+                if (!Native.OpenProcessToken(Native.GetCurrentProcess(), TokenQuery, out currentToken) || currentToken == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException();
+                }
+                IntPtr userInformation = IntPtr.Zero;
+                IntPtr descriptor = IntPtr.Zero;
+                try
+                {
+                    cngAclCheck = "cng_acl_user_read";
+                    userInformation = QueryTokenInformation(currentToken, TokenUser, out uint userLength);
+                    cngAclCheck = "cng_acl_user_check";
+                    if (userLength < (uint)IntPtr.Size)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    IntPtr currentUserSid = Marshal.ReadIntPtr(userInformation);
+                    if (currentUserSid == IntPtr.Zero || !Native.IsValidSid(currentUserSid))
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_owner_set";
+                    int descriptorSize = Marshal.SizeOf(typeof(Native.SecurityDescriptor));
+                    descriptor = Marshal.AllocHGlobal(descriptorSize);
+                    if (!Native.InitializeSecurityDescriptor(descriptor, SecurityDescriptorRevision) ||
+                        !Native.SetSecurityDescriptorOwner(descriptor, currentUserSid, false) ||
+                        !Native.IsValidSecurityDescriptor(descriptor))
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    int status = Native.NCryptSetProperty(
+                        key,
+                        "Security Descr",
+                        descriptor,
+                        checked((uint)descriptorSize),
+                        OwnerSecurityInformation | NCryptSilentFlag);
+                    if (status != 0)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                }
+                finally
+                {
+                    if (descriptor != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(descriptor);
+                    }
+                    if (userInformation != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(userInformation);
+                    }
+                }
+            }
+
+            internal void FinalizeKey()
+            {
+                int status = Native.NCryptFinalizeKey(key, NCryptSilentFlag);
                 if (status != 0)
                 {
                     throw new InvalidOperationException();
@@ -555,11 +625,6 @@ namespace KeelDock.Platform.WindowsNativePreflight
 
             internal void VerifyKeyAcl()
             {
-                cngAclCheck = "cng_acl_support_read";
-                if (ReadProviderDword("Security Descr Support") != 1)
-                {
-                    throw new InvalidOperationException();
-                }
                 IntPtr currentUserSid = IntPtr.Zero;
                 IntPtr systemSid = IntPtr.Zero;
                 IntPtr ownerDescriptor = IntPtr.Zero;
@@ -567,11 +632,6 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 IntPtr userInformation = IntPtr.Zero;
                 try
                 {
-                    cngAclCheck = "cng_acl_token_open";
-                    if (!Native.OpenProcessToken(Native.GetCurrentProcess(), TokenQuery, out currentToken) || currentToken == IntPtr.Zero)
-                    {
-                        throw new InvalidOperationException();
-                    }
                     cngAclCheck = "cng_acl_user_read";
                     userInformation = QueryTokenInformation(currentToken, TokenUser, out uint userLength);
                     cngAclCheck = "cng_acl_user_check";
@@ -1244,6 +1304,18 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 internal uint AclBytesFree;
             }
 
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct SecurityDescriptor
+            {
+                internal byte Revision;
+                internal byte Sbz1;
+                internal ushort Control;
+                internal IntPtr Owner;
+                internal IntPtr Group;
+                internal IntPtr Sacl;
+                internal IntPtr Dacl;
+            }
+
             [DllImport("userenv.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
             internal static extern int CreateAppContainerProfile(string appContainerName, string displayName, string description, IntPtr capabilities, uint capabilityCount, out IntPtr appContainerSid);
 
@@ -1363,6 +1435,14 @@ namespace KeelDock.Platform.WindowsNativePreflight
             [DllImport("advapi32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool IsValidSecurityDescriptor(IntPtr securityDescriptor);
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool InitializeSecurityDescriptor(IntPtr securityDescriptor, uint revision);
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool SetSecurityDescriptorOwner(IntPtr securityDescriptor, IntPtr owner, [MarshalAs(UnmanagedType.Bool)] bool ownerDefaulted);
 
             [DllImport("kernel32.dll", SetLastError = true)]
             internal static extern IntPtr LocalFree(IntPtr memory);
