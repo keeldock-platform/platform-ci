@@ -123,10 +123,12 @@ class WindowsNativePreflightTests(unittest.TestCase):
         create_call = self.source.index("bool created = Native.CreateProcessW(")
         process_capture = self.source.index("process = processInformation.Process;", create_call)
         thread_capture = self.source.index("thread = processInformation.Thread;", create_call)
-        failure_check = self.source.index("if (!created || !processCreated || thread == IntPtr.Zero)", create_call)
+        failure_check = self.source.index("if (!created)", create_call)
+        handle_check = self.source.index("if (!processCreated || thread == IntPtr.Zero)", create_call)
         self.assertLess(create_call, process_capture)
         self.assertLess(process_capture, thread_capture)
         self.assertLess(thread_capture, failure_check)
+        self.assertLess(failure_check, handle_check)
         self.assertIn("Native.ProcessInformation processInformation = new Native.ProcessInformation();", self.source)
         self.assertIn("ref startup, ref processInformation);", self.source)
         self.assertIn("ref ProcessInformation processInformation", self.source)
@@ -150,7 +152,7 @@ class WindowsNativePreflightTests(unittest.TestCase):
         self.assertRegex(
             self.wrapper,
             re.compile(
-                r"\^windows-native-preflight=refused check=\(lpac_profile\|job_setup\|child_attribute_list\|child_security_capabilities\|child_lpac_policy\|child_system_executable\|child_process_create\|child_job_assignment\|child_job_readback\|token_readback\|job_readback\|cng_key\|cng_acl\|cng_export\|cleanup\|runtime\)"
+                r"\^windows-native-preflight=refused check=\(lpac_profile\|job_setup\|child_attribute_list\|child_security_capabilities\|child_lpac_policy\|child_system_executable\|child_process_create\|child_process_create_access_denied\|child_process_create_invalid_parameter\|child_process_create_other\|child_job_assignment\|child_job_readback\|token_readback\|job_readback\|cng_key\|cng_acl\|cng_export\|cleanup\|runtime\)"
             ),
         )
         self.assertIn("if ($phase -eq 'native') { $cleanup = 'incomplete' }", self.wrapper)
@@ -190,6 +192,61 @@ class WindowsNativePreflightTests(unittest.TestCase):
         ]
         self.assertNotIn("GetLastWin32Error", refusal)
         self.assertNotIn("Exception", refusal)
+
+    def test_createprocess_failure_is_reduced_to_fixed_error_categories(self):
+        create_child = self.source[
+            self.source.index("internal void CreateSuspendedChild()"):
+            self.source.index("internal void VerifyToken()")
+        ]
+        create_call = create_child.index("bool created = Native.CreateProcessW(")
+        error_capture = create_child.index(
+            "int createProcessError = created ? 0 : Marshal.GetLastWin32Error();",
+            create_call,
+        )
+        process_capture = create_child.index("process = processInformation.Process;", create_call)
+        thread_capture = create_child.index("thread = processInformation.Thread;", create_call)
+        failure_classification = create_child.index(
+            "childLaunchCheck = Probe.ChildProcessFailureCheck(createProcessError);",
+            create_call,
+        )
+        failure_branch = create_child.index("if (!created)", create_call)
+        self.assertLess(create_call, error_capture)
+        self.assertLess(error_capture, process_capture)
+        self.assertLess(process_capture, thread_capture)
+        self.assertLess(thread_capture, failure_branch)
+        self.assertLess(failure_branch, failure_classification)
+        self.assertIn("private const int ErrorAccessDenied = 5;", self.source)
+        self.assertIn("private const int ErrorInvalidParameter = 87;", self.source)
+        classifier = self.source[
+            self.source.index("private static string ChildProcessFailureCheck(int error)"):
+            self.source.index("private sealed class State")
+        ]
+        self.assertIn(
+            'if (error == ErrorAccessDenied)\n            {\n                return "child_process_create_access_denied";',
+            classifier,
+        )
+        self.assertIn(
+            'if (error == ErrorInvalidParameter)\n            {\n                return "child_process_create_invalid_parameter";',
+            classifier,
+        )
+        self.assertIn('return "child_process_create_other";', classifier)
+        for category in (
+            "child_process_create_access_denied",
+            "child_process_create_invalid_parameter",
+            "child_process_create_other",
+        ):
+            with self.subTest(category=category):
+                self.assertIn(f'return "{category}";', self.source)
+                self.assertIn(category, self.wrapper)
+        self.assertRegex(
+            self.source,
+            re.compile(
+                r'\[DllImport\("kernel32\.dll", CharSet = CharSet\.Unicode, SetLastError = true\)\]\s+'
+                r'\[return: MarshalAs\(UnmanagedType\.Bool\)\]\s+'
+                r'internal static extern bool CreateProcessW\('
+            ),
+        )
+        self.assertNotIn("createProcessError +", self.source)
 
 
 if __name__ == "__main__":
