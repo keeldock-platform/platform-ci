@@ -17,6 +17,7 @@ import time
 
 CONTROL_SHA = re.compile(r"[a-f0-9]{40}\Z")
 USERNAME = "ci-sandbox-probe"
+PROBE_PRIMARY_GID = 20
 APP_IDENTIFIER = "org.example.sandboxcapability"
 CHILD_IDENTIFIER = APP_IDENTIFIER + ".CapabilityChild"
 MAX_CAPTURE_BYTES = 65536
@@ -32,6 +33,65 @@ PROC_PIDFDPIPEINFO = 6
 PROX_FDTYPE_PIPE = 6
 FREAD = 1
 FWRITE = 2
+PROBE_IDENTITY_VERIFIED = b"probe-identity=verified\n"
+PROBE_IDENTITY_REFUSED = b"probe-identity=refused\n"
+PROBE_IDENTITY_BOOTSTRAP = '''\
+import ctypes
+import os
+import subprocess
+import sys
+
+try:
+    uid = int(sys.argv[1])
+    gid = int(sys.argv[2])
+    target = sys.argv[3:]
+    if (uid <= 0 or not target or not target[0].startswith("/")
+            or os.getuid() != uid or os.geteuid() != uid
+            or os.getgid() != gid or os.getegid() != gid):
+        raise ValueError
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    getgroups = libc.getgroups
+    getgroups.argtypes = (ctypes.c_int, ctypes.POINTER(ctypes.c_uint32))
+    getgroups.restype = ctypes.c_int
+    group_count = getgroups(0, None)
+    if group_count < 0 or group_count > 16:
+        raise ValueError
+    group_buffer = (ctypes.c_uint32 * max(1, group_count))()
+    readback_count = getgroups(group_count, group_buffer) if group_count else getgroups(0, None)
+    if readback_count != group_count or tuple(group_buffer[:readback_count]) != (gid,):
+        raise ValueError
+
+    identities = subprocess.run(
+        ["/bin/ps", "-p", str(os.getpid()), "-o", "ruid=,uid=,svuid=,rgid=,gid=,svgid="],
+        env={"LANG": "C", "LC_ALL": "C"},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=3,
+        check=False,
+        close_fds=True,
+    )
+    if (identities.returncode != 0 or identities.stderr
+            or len(identities.stdout) > 128 or len(identities.stderr) > 128):
+        raise ValueError
+    identity_fields = identities.stdout.decode("ascii").split()
+    if (len(identity_fields) != 6 or not all(field.isdecimal() for field in identity_fields)
+            or tuple(int(field) for field in identity_fields) != (uid, uid, uid, gid, gid, gid)):
+        raise ValueError
+except BaseException:
+    try:
+        os.write(2, b"probe-identity=refused\\n")
+    finally:
+        os._exit(125)
+
+try:
+    if os.write(2, b"probe-identity=verified\\n") != len(b"probe-identity=verified\\n"):
+        os._exit(125)
+    os.execv(target[0], target)
+except BaseException:
+    os._exit(125)
+'''
 REASONS = frozenset(
     (
         "control_identity_invalid",
@@ -79,6 +139,7 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_identity_create", "probe_identity_attributes", "probe_identity_permissions",
         "probe_identity_readback", "probe_identity_cleanup", "probe_process_timeout", "probe_process_cleanup",
         "probe_process_group_cleanup", "probe_process_capture_cleanup", "probe_process_census",
+        "probe_process_launch", "probe_process_identity",
         "probe_process_survivor", "probe_process_observation",
         "probe_process_survivor_controls", "probe_process_survivor_positive_read",
         "probe_process_survivor_positive_write", "probe_process_survivor_probe_tree",
@@ -94,7 +155,7 @@ PROBE_IDENTITY_CHECKS = frozenset(
     (
         "probe_identity", "probe_identity_inventory", "probe_identity_home", "probe_identity_create",
         "probe_identity_attributes", "probe_identity_permissions", "probe_identity_readback",
-        "probe_identity_cleanup",
+        "probe_identity_census", "probe_identity_cleanup", "probe_process_identity",
     )
 )
 
@@ -499,6 +560,9 @@ def _create_probe_identity(workspace):
         uid = max(raw_ids or [500]) + 1
         if uid <= 0 or uid >= 60000 or uid in ids:
             raise ProbeFailure("probe_identity_unavailable")
+    with _preflight_phase("probe_identity_census"):
+        if _probe_uid_processes_present(uid):
+            raise ProbeFailure("probe_identity_unavailable", check="probe_identity_census")
     with _preflight_phase("probe_identity_home"):
         home_parent = Path(tempfile.mkdtemp(prefix="sandbox-capability-home-", dir="/tmp"))
     home = home_parent / "home"
@@ -515,7 +579,7 @@ def _create_probe_identity(workspace):
         with _preflight_phase("probe_identity_attributes"):
             for key, value in (
                 ("UniqueID", str(uid)),
-                ("PrimaryGroupID", "20"),
+                ("PrimaryGroupID", str(PROBE_PRIMARY_GID)),
                 ("NFSHomeDirectory", str(home)),
                 ("UserShell", "/usr/bin/false"),
                 ("RealName", "Capability Probe"),
@@ -549,6 +613,22 @@ def _create_probe_identity(workspace):
         cleanup_failed = False
         if created:
             try:
+                if _probe_uid_processes_present(uid):
+                    raise ProbeFailure(
+                        "native_preflight_unavailable",
+                        cleanup_complete=False,
+                        check="probe_identity_cleanup",
+                    )
+            except BaseException:
+                raise ProbeFailure(
+                    "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
+                ) from None
+        try:
+            _remove_probe_tree(home_parent)
+        except ProbeFailure:
+            cleanup_failed = True
+        if not cleanup_failed and created:
+            try:
                 delete_result = _run(["/usr/bin/dscl", ".", "-delete", account], timeout=10)
                 cleanup_failed = delete_result.returncode != 0 or bool(delete_result.stderr)
             except Exception:
@@ -557,7 +637,6 @@ def _create_probe_identity(workspace):
             raise ProbeFailure(
                 "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
             ) from None
-        _remove_probe_tree(home_parent)
         raise
     return uid, home_parent, home
 
@@ -669,6 +748,59 @@ def _remove_probe_tree(path):
     raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup")
 
 
+def _probe_user_command(argv, uid):
+    if uid <= 0 or not argv or not str(argv[0]).startswith("/"):
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_launch")
+    if sys.version_info < (3, 9):
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_launch")
+    return [
+        "/usr/bin/python3",
+        "-I",
+        "-S",
+        "-B",
+        "-c",
+        PROBE_IDENTITY_BOOTSTRAP,
+        str(uid),
+        str(PROBE_PRIMARY_GID),
+        *[str(part) for part in argv],
+    ]
+
+
+def _spawn_probe_user(argv, uid, *, env, cwd=None, failure_reason, failure_check=None):
+    command = _probe_user_command(argv, uid)
+    launch_env = env if env is not None else {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": "/tmp",
+        "LANG": "C",
+    }
+    try:
+        return subprocess.Popen(
+            command,
+            cwd=str(cwd) if cwd is not None else None,
+            env=launch_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+            user=uid,
+            group=PROBE_PRIMARY_GID,
+            extra_groups=(),
+        )
+    except TypeError:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_launch") from None
+    except (OSError, subprocess.SubprocessError):
+        raise ProbeFailure(failure_reason, check=failure_check) from None
+
+
+def _strip_probe_identity_record(stderr):
+    if stderr.startswith(PROBE_IDENTITY_VERIFIED):
+        return stderr[len(PROBE_IDENTITY_VERIFIED):]
+    if stderr.startswith(PROBE_IDENTITY_REFUSED):
+        raise ProbeFailure("probe_identity_unavailable", check="probe_process_identity")
+    raise ProbeFailure("probe_identity_unavailable", check="probe_process_identity")
+
+
 def _run_as_probe_user(
     argv,
     uid,
@@ -681,19 +813,14 @@ def _run_as_probe_user(
 ):
     if uid <= 0:
         raise ProbeFailure("probe_identity_unavailable")
-    command = ["/usr/bin/sudo", "-n", "-u", USERNAME, "--"] + [str(part) for part in argv]
-    try:
-        process = subprocess.Popen(
-            command,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            start_new_session=True,
-        )
-    except (OSError, subprocess.SubprocessError):
-        raise ProbeFailure(failure_reason, check=failure_check) from None
+    command = [str(part) for part in argv]
+    process = _spawn_probe_user(
+        command,
+        uid,
+        env=env,
+        failure_reason=failure_reason,
+        failure_check=failure_check,
+    )
     stdout_capture = _Capture(process.stdout)
     stderr_capture = _Capture(process.stderr)
     captures = (stdout_capture, stderr_capture)
@@ -768,9 +895,12 @@ def _run_as_probe_user(
                     pass
     if timed_out or wait_uncertain:
         raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_timeout")
-    if stdout_capture.overflow or stderr_capture.overflow or process.returncode != 0:
+    if stdout_capture.overflow or stderr_capture.overflow:
         raise ProbeFailure(failure_reason, check=failure_check)
-    return subprocess.CompletedProcess(command, process.returncode, bytes(stdout_capture.data), bytes(stderr_capture.data))
+    stderr = _strip_probe_identity_record(bytes(stderr_capture.data))
+    if process.returncode != 0:
+        raise ProbeFailure(failure_reason, check=failure_check)
+    return subprocess.CompletedProcess(command, process.returncode, bytes(stdout_capture.data), stderr)
 
 
 def _verify_runner_controls_are_private(paths, uid):
@@ -1129,34 +1259,19 @@ def _terminate_probe_tree(process):
 def _observe_probe(executable, marker, writable_directory, uid, home):
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
     argv = [
-        "/usr/bin/sudo",
-        "-n",
-        "-u",
-        USERNAME,
-        "--",
-        "/usr/bin/env",
-        "HOME=" + str(home),
-        "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
-        "LANG=C",
         str(executable),
         "--marker",
         str(marker),
         "--writable-directory",
         str(writable_directory),
     ]
-    try:
-        process = subprocess.Popen(
-            argv,
-            cwd="/tmp",
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            close_fds=True,
-            start_new_session=True,
-        )
-    except OSError:
-        raise ProbeFailure("sandbox_behavior_unavailable")
+    process = _spawn_probe_user(
+        argv,
+        uid,
+        env=env,
+        cwd="/tmp",
+        failure_reason="sandbox_behavior_unavailable",
+    )
     captures = []
     try:
         out_capture = _Capture(process.stdout)
@@ -1166,10 +1281,21 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
         err_capture.start()
         deadline = time.monotonic() + MAX_PROBE_SECONDS
         observed_roles = set()
+        expected_executable = Path(executable).name
         while time.monotonic() < deadline and process.poll() is None:
             rows = _process_table()
-            pids = [pid for pid in _descendants(process.pid, rows) if rows[pid][1] == uid]
-            if process.pid in rows and rows[process.pid][1] == uid:
+            root = rows.get(process.pid)
+            root_is_probe = (
+                root is not None
+                and root[1] == uid
+                and Path(root[2]).name == expected_executable
+            )
+            pids = (
+                [pid for pid in _descendants(process.pid, rows) if rows[pid][1] == uid]
+                if root_is_probe
+                else []
+            )
+            if root_is_probe:
                 pids.insert(0, process.pid)
             if pids:
                 try:
@@ -1193,10 +1319,6 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
             process.wait(timeout=max(1, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             raise ProbeFailure("probe_timeout", cleanup_complete=False)
-        if process.returncode != 0:
-            raise ProbeFailure("sandbox_behavior_unavailable")
-        if not _roles_complete(observed_roles):
-            raise ProbeFailure("descriptor_readback_unavailable")
         if out_capture.overflow or err_capture.overflow:
             raise ProbeFailure("sandbox_behavior_unavailable")
     except ProbeFailure:
@@ -1243,6 +1365,13 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
                     stream.close()
                 except (OSError, ValueError):
                     pass
+    if out_capture.overflow or err_capture.overflow:
+        raise ProbeFailure("sandbox_behavior_unavailable")
+    _strip_probe_identity_record(bytes(err_capture.data))
+    if process.returncode != 0:
+        raise ProbeFailure("sandbox_behavior_unavailable")
+    if not _roles_complete(observed_roles):
+        raise ProbeFailure("descriptor_readback_unavailable")
 
 
 def run_native_probe(control_sha):
@@ -1297,6 +1426,16 @@ def run_native_probe(control_sha):
                         "native_preflight_unavailable", cleanup_complete=False,
                         check="probe_process_survivor_final_census",
                     )
+                cleanup_failed = False
+                for path in (home_parent, scratch, outside):
+                    try:
+                        _remove_probe_tree(path)
+                    except ProbeFailure:
+                        cleanup_failed = True
+                if cleanup_failed:
+                    raise ProbeFailure(
+                        "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
+                    )
                 try:
                     delete_user = _run(["/usr/bin/dscl", ".", "-delete", "/Users/" + USERNAME], timeout=10)
                 except ProbeFailure as error:
@@ -1312,16 +1451,6 @@ def run_native_probe(control_sha):
                         "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
                     ) from None
                 if delete_user.returncode != 0 or delete_user.stderr:
-                    raise ProbeFailure(
-                        "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
-                    )
-                cleanup_failed = False
-                for path in (home_parent, scratch, outside):
-                    try:
-                        _remove_probe_tree(path)
-                    except ProbeFailure:
-                        cleanup_failed = True
-                if cleanup_failed:
                     raise ProbeFailure(
                         "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
                     )
