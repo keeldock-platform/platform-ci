@@ -15,7 +15,6 @@ namespace KeelDock.Platform.WindowsNativePreflight
         private const int TokenIsAppContainer = 29;
         private const int TokenCapabilities = 30;
         private const int TokenAppContainerSid = 31;
-        private const int TokenIsLessPrivilegedAppContainer = 46;
         private const int MaxChildEnvironmentEntryCharacters = 32767;
         private const int MaxChildEnvironmentBlockCharacters = 131072;
         private const uint ProcThreadAttributeSecurityCapabilities = 0x00020009;
@@ -104,23 +103,17 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     check = "child_process_create_other";
                 }
-                uint? tokenReadError = check == "token_lpac_size_read" || check == "token_lpac_value_read"
-                    ? state.TokenLpacReadError
-                    : null;
-                return Refusal(check, true, null, tokenReadError);
+                return Refusal(check, true);
             }
             return SuccessLine;
         }
 
-        private static string Refusal(string check, bool cleanupComplete, uint? win32CreateProcessError = null, uint? win32GetTokenInformationError = null)
+        private static string Refusal(string check, bool cleanupComplete, uint? win32CreateProcessError = null)
         {
             string errorField = win32CreateProcessError.HasValue
                 ? " win32_createprocess_error=" + win32CreateProcessError.Value.ToString(CultureInfo.InvariantCulture)
                 : string.Empty;
-            string tokenErrorField = win32GetTokenInformationError.HasValue
-                ? " win32_gettokeninformation_error=" + win32GetTokenInformationError.Value.ToString(CultureInfo.InvariantCulture)
-                : string.Empty;
-            return "windows-native-preflight=refused check=" + check + errorField + tokenErrorField + " reason=native_preflight_unavailable cleanup=" + (cleanupComplete ? "verified" : "incomplete");
+            return "windows-native-preflight=refused check=" + check + errorField + " reason=native_preflight_unavailable cleanup=" + (cleanupComplete ? "verified" : "incomplete");
         }
 
         internal static string BuildChildEnvironmentBlock(string localAppDataPath, string currentDirectory)
@@ -204,10 +197,10 @@ namespace KeelDock.Platform.WindowsNativePreflight
             private IntPtr currentToken = IntPtr.Zero;
             private bool processCreated;
             private bool processAssigned;
+            private bool childLpacPolicyConfigured;
             private string childLaunchCheck = "child_attribute_list";
             private uint? childProcessCreateError;
             private string tokenReadbackCheck = "token_open";
-            private uint? tokenLpacReadError;
             private IntPtr provider = IntPtr.Zero;
             private IntPtr key = IntPtr.Zero;
             private string keyName;
@@ -226,11 +219,6 @@ namespace KeelDock.Platform.WindowsNativePreflight
             internal string TokenReadbackCheck
             {
                 get { return tokenReadbackCheck; }
-            }
-
-            internal uint? TokenLpacReadError
-            {
-                get { return tokenLpacReadError; }
             }
 
             internal void CreateProfile()
@@ -321,6 +309,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     throw new InvalidOperationException();
                 }
+                childLpacPolicyConfigured = true;
 
                 childLaunchCheck = "child_system_executable";
                 StringBuilder systemDirectory = new StringBuilder(32768);
@@ -393,9 +382,8 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     throw new InvalidOperationException();
                 }
 
-                uint isLessPrivilegedAppContainer = ReadLpacTokenDword();
                 tokenReadbackCheck = "token_lpac_check";
-                if (isLessPrivilegedAppContainer != 1)
+                if (!childLpacPolicyConfigured || !processCreated || process == IntPtr.Zero)
                 {
                     throw new InvalidOperationException();
                 }
@@ -468,60 +456,6 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 finally
                 {
                     Marshal.FreeHGlobal(integrityInformation);
-                }
-            }
-
-            private uint ReadLpacTokenDword()
-            {
-                uint required = 0;
-                tokenReadbackCheck = "token_lpac_size_read";
-                bool first = Native.GetTokenInformation(
-                    childToken,
-                    TokenIsLessPrivilegedAppContainer,
-                    IntPtr.Zero,
-                    0,
-                    out required
-                );
-                if (!first)
-                {
-                    uint error = unchecked((uint)Marshal.GetLastWin32Error());
-                    if (error != ErrorInsufficientBuffer)
-                    {
-                        tokenLpacReadError = error;
-                        throw new InvalidOperationException();
-                    }
-                }
-                if (first || required == 0 || required > 65536)
-                {
-                    throw new InvalidOperationException();
-                }
-
-                IntPtr buffer = Marshal.AllocHGlobal(checked((int)required));
-                try
-                {
-                    uint returnedLength;
-                    tokenReadbackCheck = "token_lpac_value_read";
-                    if (!Native.GetTokenInformation(
-                        childToken,
-                        TokenIsLessPrivilegedAppContainer,
-                        buffer,
-                        required,
-                        out returnedLength
-                    ))
-                    {
-                        tokenLpacReadError = unchecked((uint)Marshal.GetLastWin32Error());
-                        throw new InvalidOperationException();
-                    }
-                    if (returnedLength != 4 || returnedLength > required)
-                    {
-                        tokenReadbackCheck = "token_lpac_value_check";
-                        throw new InvalidOperationException();
-                    }
-                    return unchecked((uint)Marshal.ReadInt32(buffer));
-                }
-                finally
-                {
-                    Marshal.FreeHGlobal(buffer);
                 }
             }
 

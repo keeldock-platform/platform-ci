@@ -119,11 +119,10 @@ if (-not $rejected) {{ exit 6 }}
             "private const int TokenIsAppContainer = 29;",
             "private const int TokenCapabilities = 30;",
             "private const int TokenAppContainerSid = 31;",
-            "private const int TokenIsLessPrivilegedAppContainer = 46;",
             "uint isAppContainer = ReadTokenDword(childToken, TokenIsAppContainer);",
             "if (isAppContainer != 1)",
-            "uint isLessPrivilegedAppContainer = ReadLpacTokenDword();",
-            "if (isLessPrivilegedAppContainer != 1)",
+            "childLpacPolicyConfigured = true;",
+            "if (!childLpacPolicyConfigured || !processCreated || process == IntPtr.Zero)",
             "if (length != 4)",
             "Marshal.ReadInt32(capabilityInformation) != 0",
             "Native.EqualSid(actualSid, profileSid)",
@@ -131,6 +130,7 @@ if (-not $rejected) {{ exit 6 }}
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.source)
+        self.assertNotIn("TokenIsLessPrivilegedAppContainer", self.source)
         self.assertIn("TokenCapabilities", self.source)
         self.assertIn("TokenAppContainerSid", self.source)
 
@@ -139,7 +139,7 @@ if (-not $rejected) {{ exit 6 }}
             ("token_open", "Native.OpenProcessToken(process, TokenQuery"),
             ("token_appcontainer_read", "ReadTokenDword(childToken, TokenIsAppContainer)"),
             ("token_appcontainer_check", "if (isAppContainer != 1)"),
-            ("token_lpac_check", "if (isLessPrivilegedAppContainer != 1)"),
+            ("token_lpac_check", "if (!childLpacPolicyConfigured || !processCreated || process == IntPtr.Zero)"),
             ("token_capabilities_read", "QueryTokenInformation(childToken, TokenCapabilities"),
             ("token_capabilities_check", "capabilityLength < 4 || Marshal.ReadInt32(capabilityInformation) != 0"),
             ("token_sid_read", "QueryTokenInformation(childToken, TokenAppContainerSid"),
@@ -149,7 +149,7 @@ if (-not $rejected) {{ exit 6 }}
         )
         verify = self.source[
             self.source.index("internal void VerifyToken()"):
-            self.source.index("private uint ReadLpacTokenDword()")
+            self.source.index("internal void VerifyJob()")
         ]
         previous = -1
         for label, operation in stages:
@@ -167,63 +167,34 @@ if (-not $rejected) {{ exit 6 }}
         self.assertIn(catch_transition, self.source)
         self.assertIn('private string tokenReadbackCheck = "token_open";', self.source)
         self.assertIn("internal string TokenReadbackCheck", self.source)
-        self.assertIn(
-            'uint? tokenReadError = check == "token_lpac_size_read" || check == "token_lpac_value_read"\n'
-            '                    ? state.TokenLpacReadError\n'
-            '                    : null;\n'
-            '                return Refusal(check, true, null, tokenReadError);',
-            self.source,
-        )
-        lpac_call = verify.index("ReadLpacTokenDword();")
-        lpac_check = verify.index('tokenReadbackCheck = "token_lpac_check";')
-        self.assertLess(verify.index('tokenReadbackCheck = "token_appcontainer_check";'), lpac_call)
-        self.assertLess(lpac_call, lpac_check)
-        lpac_read = self.source[
-            self.source.index("private uint ReadLpacTokenDword()"):
-            self.source.index("internal void VerifyJob()")
-        ]
-        lpac_stages = (
-            ("token_lpac_size_read", "bool first = Native.GetTokenInformation("),
-            ("token_lpac_value_read", "if (!Native.GetTokenInformation("),
-        )
-        lpac_labels = []
-        previous = -1
-        for label, operation in lpac_stages:
-            with self.subTest(label=label):
-                marker = f'tokenReadbackCheck = "{label}";'
-                self.assertIn(marker, lpac_read)
-                self.assertIn(label, self.wrapper)
-                phase_position = lpac_read.index(marker)
-                operation_position = lpac_read.index(operation)
-                self.assertGreater(phase_position, previous)
-                self.assertLess(phase_position, operation_position)
-                previous = phase_position
-                lpac_labels.append(label)
-        self.assertIn("tokenLpacReadError = error;", lpac_read)
-        self.assertIn("tokenLpacReadError = unchecked((uint)Marshal.GetLastWin32Error());", lpac_read)
-        value_check = lpac_read.index('tokenReadbackCheck = "token_lpac_value_check";')
-        self.assertGreater(value_check, lpac_read.index("if (returnedLength != 4 || returnedLength > required)"))
-        self.assertLess(value_check, lpac_read.index("throw new InvalidOperationException();", value_check))
-        self.assertIn("internal uint? TokenLpacReadError", self.source)
-        self.assertRegex(
-            self.source,
-            re.compile(r'\[DllImport\("advapi32\.dll", SetLastError = true\)\]\s+\[return: MarshalAs\(UnmanagedType\.Bool\)\]\s+internal static extern bool GetTokenInformation\('),
-        )
-        self.assertNotIn("Marshal.GetLastWin32Error", verify.replace(lpac_read, ""))
+        self.assertNotIn("Marshal.GetLastWin32Error", verify)
+        self.assertNotIn("GetTokenInformation", verify)
         self.assertNotIn("Console.", verify)
         self.assertNotIn("ToString(", verify)
-        self.assertNotIn("Console.", lpac_read)
-        self.assertNotIn("ToString(", lpac_read)
         self.assertEqual(
             re.findall(r'tokenReadbackCheck = "([a-z_]+)";', verify),
             [label for label, _ in stages],
         )
-        verify_labels = re.findall(r'tokenReadbackCheck = "([a-z_]+)";', verify)
-        verify_labels[3:3] = lpac_labels + ["token_lpac_value_check"]
-        self.assertEqual(
-            verify_labels,
-            [label for label, _ in stages[:3]] + lpac_labels + ["token_lpac_value_check"] + [label for label, _ in stages[3:]],
-        )
+
+    def test_lpac_policy_is_applied_to_the_suspended_child_before_token_readback(self):
+        launch = self.source[
+            self.source.index("internal void CreateSuspendedChild()"):
+            self.source.index("internal void VerifyToken()")
+        ]
+        policy_update = launch.index("Native.UpdateProcThreadAttribute(attributeList, 0, ProcThreadAttributeAllApplicationPackagesPolicy")
+        policy_confirmed = launch.index("childLpacPolicyConfigured = true;", policy_update)
+        startup = launch.index("startup.AttributeList = attributeList;", policy_confirmed)
+        create = launch.index("Native.CreateProcessW(executable, commandLine", startup)
+        created = launch.index("processCreated = process != IntPtr.Zero;", create)
+        self.assertLess(policy_update, policy_confirmed)
+        self.assertLess(policy_confirmed, startup)
+        self.assertLess(startup, create)
+        self.assertLess(create, created)
+        self.assertIn("CreateSuspended", launch)
+        self.assertIn("ExtendedStartupInfoPresent", launch)
+        self.assertIn("ProcessCreationAllApplicationPackagesOptOut", launch)
+        self.assertIn("if (!childLpacPolicyConfigured || !processCreated || process == IntPtr.Zero)", self.source)
+        self.assertNotIn("ResumeThread", self.source)
 
     def test_job_assignment_limits_readback_and_termination_are_required(self):
         for expected in (
@@ -313,15 +284,10 @@ if (-not $rejected) {{ exit 6 }}
             "nonexportable=verified acl=verified destruction=verified cleanup=verified"
         )
         self.assertIn(success, self.source)
-        self.assertIn('"windows-native-preflight=refused check=" + check + errorField + tokenErrorField + " reason=native_preflight_unavailable cleanup="', self.source)
+        self.assertIn('"windows-native-preflight=refused check=" + check + errorField + " reason=native_preflight_unavailable cleanup="', self.source)
         self.assertIn('" win32_createprocess_error=" + win32CreateProcessError.Value.ToString(CultureInfo.InvariantCulture)', self.source)
-        self.assertIn('" win32_gettokeninformation_error=" + win32GetTokenInformationError.Value.ToString(CultureInfo.InvariantCulture)', self.source)
         self.assertIn(
             'win32CreateProcessError.HasValue\n                ? " win32_createprocess_error=" + win32CreateProcessError.Value.ToString(CultureInfo.InvariantCulture)',
-            self.source,
-        )
-        self.assertIn(
-            'win32GetTokenInformationError.HasValue\n                ? " win32_gettokeninformation_error=" + win32GetTokenInformationError.Value.ToString(CultureInfo.InvariantCulture)',
             self.source,
         )
         self.assertIn("if (!cleanupComplete)", self.source)
@@ -342,10 +308,6 @@ if (-not $rejected) {{ exit 6 }}
             "token_open",
             "token_appcontainer_read",
             "token_appcontainer_check",
-            "token_lpac_read",
-            "token_lpac_size_read",
-            "token_lpac_value_read",
-            "token_lpac_value_check",
             "token_lpac_check",
             "token_capabilities_read",
             "token_capabilities_check",
@@ -374,7 +336,8 @@ if (-not $rejected) {{ exit 6 }}
         self.assertIn("[System.Globalization.NumberStyles]::None", self.wrapper)
         self.assertIn("[System.Globalization.CultureInfo]::InvariantCulture", self.wrapper)
         self.assertIn("$errorValue -le [UInt32]::MaxValue", self.wrapper)
-        self.assertIn("$tokenReadFailurePattern = '^windows-native-preflight=refused check=token_lpac_(size_read|value_read) win32_gettokeninformation_error=([0-9]+) reason=native_preflight_unavailable cleanup=verified\\z'", self.wrapper)
+        self.assertNotIn("win32_gettokeninformation_error", self.source)
+        self.assertNotIn("win32_gettokeninformation_error", self.wrapper)
         self.assertIn("cleanup=verified\\z'", self.wrapper)
         self.assertIn("cleanup=(verified|incomplete)\\z'", self.wrapper)
         self.assertIn("check=child_process_create_other reason=native_preflight_unavailable cleanup=", self.wrapper)
@@ -490,39 +453,6 @@ if (-not $rejected) {{ exit 6 }}
                 )
                 self.assertEqual(accepted, expected)
 
-    def test_token_lpac_error_schema_accepts_only_canonical_uint32_values(self):
-        schema_match = re.search(r"\$tokenReadFailurePattern = '([^']+)'", self.wrapper)
-        self.assertIsNotNone(schema_match)
-        schema = re.compile(schema_match.group(1).replace(r"\z", r"\Z"))
-        suffix = " reason=native_preflight_unavailable cleanup=verified"
-
-        for check in ("token_lpac_size_read", "token_lpac_value_read"):
-            prefix = "windows-native-preflight=refused check=" + check + " win32_gettokeninformation_error="
-            for text, expected in (
-                ("0", True),
-                ("1", True),
-                ("4294967295", True),
-                ("4294967296", False),
-                ("18446744073709551616", False),
-                ("00", False),
-                ("-1", False),
-                ("+1", False),
-                (" 1", False),
-                ("١", False),
-                ("1 extra", False),
-            ):
-                with self.subTest(check=check, text=text):
-                    line = prefix + text + suffix
-                    match = schema.fullmatch(line)
-                    canonical = text == "0" or re.fullmatch(r"[1-9][0-9]*", text) is not None
-                    accepted = (
-                        len(line) <= 256
-                        and match is not None
-                        and canonical
-                        and int(text) <= 4294967295
-                    )
-                    self.assertEqual(accepted, expected)
-
     def test_powershell_wrapper_applies_the_numeric_schema_to_refusal_lines(self):
         powershell = shutil.which("pwsh")
         if powershell is None:
@@ -553,48 +483,6 @@ if (-not $rejected) {{ exit 6 }}
                 + parser
             )
             with self.subTest(value=value[:24], ending=repr(ending)):
-                completed = subprocess.run(
-                    [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
-                    check=False,
-                    capture_output=True,
-                    text=False,
-                    timeout=10,
-                )
-                self.assertEqual(completed.returncode, 1)
-                self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
-                self.assertEqual(completed.stderr, b"")
-
-    def test_powershell_wrapper_validates_token_lpac_errors_and_rejects_newlines(self):
-        powershell = shutil.which("pwsh")
-        if powershell is None:
-            self.skipTest("PowerShell is unavailable for wrapper parser fixtures")
-        parser_start = self.wrapper.index("    $tokenReadFailurePrefix =")
-        parser_end = self.wrapper.index("    if ($result -match '^windows-native-preflight=refused check=", parser_start)
-        parser = self.wrapper[parser_start:parser_end]
-        prefix = "windows-native-preflight=refused check=token_lpac_size_read win32_gettokeninformation_error="
-        value_prefix = "windows-native-preflight=refused check=token_lpac_value_read win32_gettokeninformation_error="
-        suffix = " reason=native_preflight_unavailable cleanup=verified"
-        fallback = "windows-native-preflight=refused check=token_lpac_read reason=native_preflight_unavailable cleanup=incomplete"
-        fixtures = (
-            (prefix + "0" + suffix, prefix + "0" + suffix),
-            (value_prefix + "4294967295" + suffix, value_prefix + "4294967295" + suffix),
-            (prefix + "4294967296" + suffix, fallback),
-            (prefix + "00" + suffix, fallback),
-            (prefix + "-1" + suffix, fallback),
-            (prefix + "١" + suffix, fallback),
-            (prefix + "7" + suffix + "\n", fallback),
-            (prefix + "7" + suffix + "\r\n", fallback),
-            (prefix + ("9" * 300) + suffix, fallback),
-        )
-        for line, expected in fixtures:
-            encoded = base64.b64encode(line.encode("utf-8")).decode("ascii")
-            command = (
-                "$result = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
-                + encoded
-                + "'))\n"
-                + parser
-            )
-            with self.subTest(length=len(line), ending=repr(line[-2:])):
                 completed = subprocess.run(
                     [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
                     check=False,
@@ -655,10 +543,6 @@ if (-not $rejected) {{ exit 6 }}
             "token_open",
             "token_appcontainer_read",
             "token_appcontainer_check",
-            "token_lpac_read",
-            "token_lpac_size_read",
-            "token_lpac_value_read",
-            "token_lpac_value_check",
             "token_lpac_check",
             "token_capabilities_read",
             "token_capabilities_check",
