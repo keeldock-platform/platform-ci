@@ -219,6 +219,7 @@ if (-not $rejected) {{ exit 6 }}
             '"Length"',
             '"Security Descr Support"',
             '"Security Descr"',
+            "NCryptPersistFlag = 0x80000000",
             "NCryptSilentFlag = 0x00000040",
             "Native.InitializeSecurityDescriptor",
             "Native.SetSecurityDescriptorOwner",
@@ -227,8 +228,8 @@ if (-not $rejected) {{ exit 6 }}
             "Native.SetSecurityDescriptorDacl",
             "Native.GetSecurityDescriptorOwner",
             "Native.GetSecurityDescriptorDacl",
-            'Native.NCryptExportKey(key, IntPtr.Zero, "ECCPRIVATEBLOB"',
-            "status != NtePermissionDenied",
+            'Native.NCryptSetProperty(\n                        key,\n                        "Export Policy",\n                        exportPolicy,\n                        4,\n                        NCryptPersistFlag | NCryptSilentFlag)',
+            'ReadCngDword(verificationKey, "Export Policy", NCryptSilentFlag)',
             "Native.NCryptDeleteKey(key, NCryptSilentFlag)",
             "Native.NCryptOpenKey(provider, out reopened, keyName, 0, NCryptSilentFlag)",
             "status == NteBadKeyset",
@@ -237,108 +238,112 @@ if (-not $rejected) {{ exit 6 }}
         ):
             with self.subTest(expected=expected):
                 self.assertIn(expected, self.source)
-        self.assertIn('uint exportPolicy = ReadKeyDword("Export Policy", NCryptSilentFlag);', self.source)
-        self.assertIn("if (exportPolicy != 0)", self.source)
+        self.assertIn("RequireExportPolicySet(status);", self.source)
+        self.assertIn("RequireZeroExportPolicy(exportPolicy);", self.source)
+        self.assertIn("ValidateDwordRead(status, returned, buffer)", self.source)
+        self.assertNotIn("NCryptExportKey", self.source)
+        self.assertNotIn("ECCPRIVATEBLOB", self.source)
+        self.assertNotIn("nonexportable=verified", self.source)
         self.assertIn("OwnerSecurityInformation | NCryptSilentFlag", self.source)
         self.assertIn("Native.EqualSid(ownerSid, currentUserSid)", self.source)
-        self.assertNotIn("BCRYPT_ECCPRIVATE_BLOB", self.source)
 
-    def test_cng_export_failures_use_fixed_subphases_and_exact_status_mapping(self):
+    def test_export_policy_is_persisted_before_finalize_and_read_back_from_reopened_key(self):
+        run = self.source[
+            self.source.index("public static string Run()"):self.source.index("private static string Refusal(")
+        ]
+        calls = (
+            "state.CreateKey();",
+            "state.SetKeyExportPolicy();",
+            "state.SetKeyOwnerToCurrentUser();",
+            "state.FinalizeKey();",
+            "state.TightenKeyDacl();",
+            "state.VerifyKeyAcl();",
+            "state.VerifyPersistedKeyExportPolicy();",
+        )
+        positions = [run.index(call) for call in calls]
+        self.assertEqual(positions, sorted(positions))
+
+        setter = self.source[
+            self.source.index("internal void SetKeyExportPolicy()"):
+            self.source.index("internal void SetKeyOwnerToCurrentUser()")
+        ]
+        self.assertLess(setter.index('cngExportCheck = "cng_export_policy_set";'), setter.index("NCryptSetProperty("))
+        self.assertLess(setter.index("Marshal.WriteInt32(exportPolicy, 0)"), setter.index("NCryptSetProperty("))
+        self.assertIn("NCryptPersistFlag | NCryptSilentFlag", setter)
+        self.assertIn("RequireExportPolicySet(status);", setter)
+        self.assertNotIn("ReadKeyDword(\"Export Policy\"", self.source)
+
         verify = self.source[
-            self.source.index("internal void VerifyKeyExportDenial()"):
+            self.source.index("internal void VerifyPersistedKeyExportPolicy()"):
             self.source.index("internal bool Cleanup()")
         ]
-        self.assertIn('cngExportCheck = "cng_export_policy_read";', verify)
         self.assertLess(
             verify.index('cngExportCheck = "cng_export_policy_read";'),
-            verify.index('ReadKeyDword("Export Policy", NCryptSilentFlag)'),
+            verify.index('ReadCngDword(verificationKey, "Export Policy", NCryptSilentFlag)'),
         )
-        self.assertLess(
-            verify.index('if (exportPolicy != 0)'),
-            verify.index('cngExportCheck = "cng_export_policy_nonzero";'),
-        )
-        self.assertLess(
-            verify.index('cngExportCheck = "cng_export_other";'),
-            verify.index('Native.NCryptExportKey(key, IntPtr.Zero, "ECCPRIVATEBLOB"'),
-        )
-        self.assertIn("cngExportCheck = ClassifyExportStatus(status);", verify)
-        self.assertIn("if (status != NtePermissionDenied)", verify)
-        self.assertIn(
-            'else if (check == "cng_export")\n                {\n                    check = state.CngExportCheck;',
-            self.source,
-        )
-        self.assertIn('private string cngExportCheck = "cng_export_policy_read";', self.source)
-        self.assertIn("internal string CngExportCheck", self.source)
-        self.assertNotIn("ToString(", verify)
-        self.assertNotIn("Console.", verify)
-        self.assertNotIn("exception.Message", verify)
-        classifier = self.source[
-            self.source.index("internal static string ClassifyExportStatus"):
-            self.source.index("internal static string BuildChildEnvironmentBlock")
-        ]
-        self.assertNotIn("ToString(", classifier)
-        self.assertNotIn("Console.", classifier)
-        self.assertEqual(
-            re.findall(r'return "(cng_export_[a-z_]+)";', classifier),
-            [
-                "cng_export_size_query_succeeded",
-                "cng_export_permission_denied",
-                "cng_export_bad_flags",
-                "cng_export_bad_key_state",
-                "cng_export_bad_type",
-                "cng_export_invalid_handle",
-                "cng_export_invalid_parameter",
-                "cng_export_other",
-            ],
-        )
+        self.assertLess(verify.index('cngExportCheck = "cng_export_policy_nonzero";'), verify.index("RequireZeroExportPolicy(exportPolicy);"))
+        self.assertIn('else if (check == "cng_export")\n                {\n                    check = state.CngExportCheck;', self.source)
+        self.assertIn('private string cngExportCheck = "cng_export_policy_set";', self.source)
+        self.assertNotIn("NCryptExportKey", self.source)
+        self.assertNotIn("ClassifyExportStatus", self.source)
+        self.assertNotIn("ECCPRIVATEBLOB", self.source)
 
-        labels = (
-            "cng_export_policy_read",
-            "cng_export_policy_nonzero",
-            "cng_export_size_query_succeeded",
-            "cng_export_permission_denied",
-            "cng_export_bad_flags",
-            "cng_export_bad_key_state",
-            "cng_export_bad_type",
-            "cng_export_invalid_handle",
-            "cng_export_invalid_parameter",
-            "cng_export_other",
-        )
-        for label in labels:
-            with self.subTest(label=label):
-                self.assertIn(label, self.wrapper)
+    def test_export_policy_and_exact_dword_helpers_fail_closed(self):
+        self.assertIn("internal static void RequireExportPolicySet(int status)", self.source)
+        self.assertIn("if (status != 0)\n            {\n                throw new InvalidOperationException();", self.source)
+        self.assertIn("internal static void RequireZeroExportPolicy(uint exportPolicy)", self.source)
+        self.assertIn("if (exportPolicy != 0)", self.source)
+        self.assertIn("internal static uint ValidateDwordRead(int status, uint returned, IntPtr buffer)", self.source)
+        self.assertIn("status != 0 || returned != 4 || buffer == IntPtr.Zero", self.source)
 
         powershell = shutil.which("pwsh")
         if powershell is None:
-            self.skipTest("PowerShell is unavailable for export status mapping fixtures")
+            self.skipTest("PowerShell is unavailable for native policy helper fixtures")
         encoded_source_path = base64.b64encode(str(HARNESS).encode("utf-8")).decode("ascii")
-        cases = (
-            (0, "cng_export_size_query_succeeded"),
-            (-2146893808, "cng_export_permission_denied"),
-            (-2146893815, "cng_export_bad_flags"),
-            (-2146893813, "cng_export_bad_key_state"),
-            (-2146893814, "cng_export_bad_type"),
-            (-2146893786, "cng_export_invalid_handle"),
-            (-2146893785, "cng_export_invalid_parameter"),
-            (-1, "cng_export_other"),
-        )
-        case_text = ",\n".join(
-            "    [pscustomobject]@{ Status = %d; Label = '%s' }" % case
-            for case in cases
-        )
         command = f"""
 $sourcePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_source_path}'))
 Add-Type -Path $sourcePath -ErrorAction Stop
 $type = [KeelDock.Platform.WindowsNativePreflight.Probe]
 $flags = [System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Static
-$method = $type.GetMethod('ClassifyExportStatus', $flags)
-if ($null -eq $method) {{ exit 2 }}
-$cases = @(
-{case_text}
-)
-foreach ($case in $cases) {{
-    $actual = [string]$method.Invoke($null, [object[]]@([int]$case.Status))
-    if (-not [string]::Equals($actual, [string]$case.Label, [System.StringComparison]::Ordinal)) {{ exit 3 }}
+$setMethod = $type.GetMethod('RequireExportPolicySet', $flags)
+$zeroMethod = $type.GetMethod('RequireZeroExportPolicy', $flags)
+$readMethod = $type.GetMethod('ValidateDwordRead', $flags)
+if ($null -eq $setMethod -or $null -eq $zeroMethod -or $null -eq $readMethod) {{ exit 2 }}
+$setMethod.Invoke($null, [object[]]@([int]0)) | Out-Null
+foreach ($status in @([int]1, [int]-1, [int]-2146893785)) {{
+    $rejected = $false
+    try {{ $setMethod.Invoke($null, [object[]]@($status)) | Out-Null }} catch {{ $rejected = $true }}
+    if (-not $rejected) {{ exit 3 }}
+}}
+$zeroMethod.Invoke($null, [object[]]@([uint32]0)) | Out-Null
+foreach ($policy in @([uint32]1, [uint32]8, [uint32]4294967295)) {{
+    $rejected = $false
+    try {{ $zeroMethod.Invoke($null, [object[]]@($policy)) | Out-Null }} catch {{ $rejected = $true }}
+    if (-not $rejected) {{ exit 4 }}
+}}
+$buffer = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(4)
+try {{
+    [System.Runtime.InteropServices.Marshal]::WriteInt32($buffer, [int]0)
+    $value = [uint32]$readMethod.Invoke($null, [object[]]@([int]0, [uint32]4, $buffer))
+    if ($value -ne [uint32]0) {{ exit 5 }}
+    [System.Runtime.InteropServices.Marshal]::WriteInt32($buffer, [int]-2147483648)
+    $value = [uint32]$readMethod.Invoke($null, [object[]]@([int]0, [uint32]4, $buffer))
+    if ($value -ne [uint32]2147483648) {{ exit 6 }}
+    $badReads = @(
+        [object[]]@([int]1, [uint32]4, $buffer),
+        [object[]]@([int]0, [uint32]0, [IntPtr]::Zero),
+        [object[]]@([int]0, [uint32]3, [IntPtr]::Zero),
+        [object[]]@([int]0, [uint32]5, [IntPtr]::Zero),
+        [object[]]@([int]0, [uint32]4294967295, [IntPtr]::Zero),
+        [object[]]@([int]0, [uint32]4, [IntPtr]::Zero)
+    )
+    foreach ($args in $badReads) {{
+        $rejected = $false
+        try {{ $readMethod.Invoke($null, $args) | Out-Null }} catch {{ $rejected = $true }}
+        if (-not $rejected) {{ exit 7 }}
+    }}
+}} finally {{
+    [System.Runtime.InteropServices.Marshal]::FreeHGlobal($buffer)
 }}
 """
         completed = subprocess.run(
@@ -391,7 +396,7 @@ foreach ($case in $cases) {{
         self.assertIn("keyOwned = true;", self.source[:self.source.index("internal void SetKeyOwnerToCurrentUser()")])
         verify = self.source[
             self.source.index("internal void VerifyKeyAcl()"):
-            self.source.index("internal void VerifyKeyExportDenial()")
+            self.source.index("internal void VerifyPersistedKeyExportPolicy()")
         ]
         self.assertIn("Native.EqualSid(ownerSid, currentUserSid)", verify)
         self.assertIn('cngAclCheck = "cng_acl_dacl_read";', verify)
@@ -403,7 +408,7 @@ foreach ($case in $cases) {{
             "state.FinalizeKey();",
             "state.TightenKeyDacl();",
             "state.VerifyKeyAcl();",
-            "state.VerifyKeyExportDenial();",
+            "state.VerifyPersistedKeyExportPolicy();",
         )
         positions = [run.index(call) for call in calls]
         self.assertEqual(positions, sorted(positions))
@@ -598,7 +603,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
         )
         verify = self.source[
             self.source.index("internal void VerifyKeyAcl()"):
-            self.source.index("internal void VerifyKeyExportDenial()")
+            self.source.index("internal void VerifyPersistedKeyExportPolicy()")
         ]
         previous = -1
         for label, operation in stages:
@@ -625,7 +630,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
     def test_owner_rights_allow_ace_is_distinguished_but_still_refused(self):
         verify = self.source[
             self.source.index("internal void VerifyKeyAcl()"):
-            self.source.index("internal void VerifyKeyExportDenial()")
+            self.source.index("internal void VerifyPersistedKeyExportPolicy()")
         ]
         self.assertIn("private const int MaxSidSize = 68;", self.source)
         self.assertIn("private const int WinCreatorOwnerRightsSid = 71;", self.source)
@@ -711,7 +716,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
         success = (
             "windows-native-preflight=observed appcontainer=lpac token=verified capabilities=empty "
             "integrity=low job=assigned limits=verified termination=verified cng=p256-user "
-            "nonexportable=verified acl=verified destruction=verified cleanup=verified"
+            "export_policy=zero_persisted acl=verified destruction=verified cleanup=verified"
         )
         self.assertIn(success, self.source)
         self.assertIn('"windows-native-preflight=refused check=" + check + errorField + " reason=native_preflight_unavailable cleanup="', self.source)
@@ -795,16 +800,9 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             "cng_acl_dacl_tighten_reopen",
             "cng_acl_dacl_tighten_readback",
             "cng_acl_dacl_tighten_compare",
+            "cng_export_policy_set",
             "cng_export_policy_read",
             "cng_export_policy_nonzero",
-            "cng_export_size_query_succeeded",
-            "cng_export_permission_denied",
-            "cng_export_bad_flags",
-            "cng_export_bad_key_state",
-            "cng_export_bad_type",
-            "cng_export_invalid_handle",
-            "cng_export_invalid_parameter",
-            "cng_export_other",
             "cleanup",
             "runtime",
         )
@@ -990,10 +988,9 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
         fixed_lines = (
             "windows-native-preflight=refused check=lpac_profile reason=native_preflight_unavailable cleanup=verified",
             "windows-native-preflight=refused check=child_environment reason=native_preflight_unavailable cleanup=verified",
+            "windows-native-preflight=refused check=cng_export_policy_set reason=native_preflight_unavailable cleanup=verified",
             "windows-native-preflight=refused check=cng_export_policy_read reason=native_preflight_unavailable cleanup=verified",
             "windows-native-preflight=refused check=cng_export_policy_nonzero reason=native_preflight_unavailable cleanup=verified",
-            "windows-native-preflight=refused check=cng_export_size_query_succeeded reason=native_preflight_unavailable cleanup=verified",
-            "windows-native-preflight=refused check=cng_export_bad_type reason=native_preflight_unavailable cleanup=verified",
         )
         generic_fallback = "windows-native-preflight=refused check=runtime reason=native_preflight_unavailable cleanup=incomplete"
         for fixed_line in fixed_lines:
@@ -1022,7 +1019,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
                     self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
                     self.assertEqual(completed.stderr, b"")
 
-        raw_status_line = "windows-native-preflight=refused check=cng_export_status_80090010 reason=native_preflight_unavailable cleanup=verified"
+        raw_status_line = "windows-native-preflight=refused check=cng_export_policy_extra reason=native_preflight_unavailable cleanup=verified"
         encoded = base64.b64encode(raw_status_line.encode("utf-8")).decode("ascii")
         command = (
             "$result = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"

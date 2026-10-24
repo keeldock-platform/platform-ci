@@ -46,18 +46,13 @@ namespace KeelDock.Platform.WindowsNativePreflight
         private const int WinCreatorOwnerRightsSid = 71;
         private const uint OwnerSecurityInformation = 0x00000001;
         private const uint DaclSecurityInformation = 0x00000004;
+        private const uint NCryptPersistFlag = 0x80000000;
         private const uint NCryptSilentFlag = 0x00000040;
         private const uint SecurityDescriptorRevision = 1;
-        private const int NtePermissionDenied = unchecked((int)0x80090010);
-        private const int NteBadFlags = unchecked((int)0x80090009);
-        private const int NteBadType = unchecked((int)0x8009000a);
-        private const int NteBadKeyState = unchecked((int)0x8009000b);
-        private const int NteInvalidHandle = unchecked((int)0x80090026);
-        private const int NteInvalidParameter = unchecked((int)0x80090027);
         private const int NteBadKeyset = unchecked((int)0x80090016);
         private const int HresultAlreadyExists = unchecked((int)0x800700b7);
 
-        private const string SuccessLine = "windows-native-preflight=observed appcontainer=lpac token=verified capabilities=empty integrity=low job=assigned limits=verified termination=verified cng=p256-user nonexportable=verified acl=verified destruction=verified cleanup=verified";
+        private const string SuccessLine = "windows-native-preflight=observed appcontainer=lpac token=verified capabilities=empty integrity=low job=assigned limits=verified termination=verified cng=p256-user export_policy=zero_persisted acl=verified destruction=verified cleanup=verified";
 
         public static string Run()
         {
@@ -77,6 +72,8 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 state.VerifyJob();
                 check = "cng_key";
                 state.CreateKey();
+                check = "cng_export";
+                state.SetKeyExportPolicy();
                 check = "cng_acl";
                 state.SetKeyOwnerToCurrentUser();
                 check = "cng_key";
@@ -86,7 +83,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 check = "cng_acl";
                 state.VerifyKeyAcl();
                 check = "cng_export";
-                state.VerifyKeyExportDenial();
+                state.VerifyPersistedKeyExportPolicy();
                 completed = true;
             }
             catch
@@ -146,39 +143,6 @@ namespace KeelDock.Platform.WindowsNativePreflight
             return "windows-native-preflight=refused check=" + check + errorField + " reason=native_preflight_unavailable cleanup=" + (cleanupComplete ? "verified" : "incomplete");
         }
 
-        internal static string ClassifyExportStatus(int status)
-        {
-            if (status == 0)
-            {
-                return "cng_export_size_query_succeeded";
-            }
-            if (status == NtePermissionDenied)
-            {
-                return "cng_export_permission_denied";
-            }
-            if (status == NteBadFlags)
-            {
-                return "cng_export_bad_flags";
-            }
-            if (status == NteBadKeyState)
-            {
-                return "cng_export_bad_key_state";
-            }
-            if (status == NteBadType)
-            {
-                return "cng_export_bad_type";
-            }
-            if (status == NteInvalidHandle)
-            {
-                return "cng_export_invalid_handle";
-            }
-            if (status == NteInvalidParameter)
-            {
-                return "cng_export_invalid_parameter";
-            }
-            return "cng_export_other";
-        }
-
         internal static string BuildChildEnvironmentBlock(string localAppDataPath, string currentDirectory)
         {
             ValidateWindowsDirectory(localAppDataPath, MaxChildEnvironmentEntryCharacters - "LOCALAPPDATA=".Length);
@@ -206,6 +170,31 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 throw new InvalidOperationException();
             }
             return block;
+        }
+
+        internal static void RequireExportPolicySet(int status)
+        {
+            if (status != 0)
+            {
+                throw new InvalidOperationException();
+            }
+        }
+
+        internal static void RequireZeroExportPolicy(uint exportPolicy)
+        {
+            if (exportPolicy != 0)
+            {
+                throw new InvalidOperationException();
+            }
+        }
+
+        internal static uint ValidateDwordRead(int status, uint returned, IntPtr buffer)
+        {
+            if (status != 0 || returned != 4 || buffer == IntPtr.Zero)
+            {
+                throw new InvalidOperationException();
+            }
+            return unchecked((uint)Marshal.ReadInt32(buffer));
         }
 
         private static void ValidateWindowsDirectory(string path, int maximumCharacters)
@@ -265,7 +254,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
             private uint? childProcessCreateError;
             private string tokenReadbackCheck = "token_open";
             private string cngAclCheck = "cng_acl_support_read";
-            private string cngExportCheck = "cng_export_policy_read";
+            private string cngExportCheck = "cng_export_policy_set";
             private IntPtr provider = IntPtr.Zero;
             private IntPtr key = IntPtr.Zero;
             private IntPtr verificationKey = IntPtr.Zero;
@@ -593,15 +582,22 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     throw new InvalidOperationException();
                 }
+            }
+
+            internal void SetKeyExportPolicy()
+            {
+                cngExportCheck = "cng_export_policy_set";
                 IntPtr exportPolicy = Marshal.AllocHGlobal(4);
                 try
                 {
                     Marshal.WriteInt32(exportPolicy, 0);
-                    status = Native.NCryptSetProperty(key, "Export Policy", exportPolicy, 4, NCryptSilentFlag);
-                    if (status != 0)
-                    {
-                        throw new InvalidOperationException();
-                    }
+                    int status = Native.NCryptSetProperty(
+                        key,
+                        "Export Policy",
+                        exportPolicy,
+                        4,
+                        NCryptPersistFlag | NCryptSilentFlag);
+                    RequireExportPolicySet(status);
                 }
                 finally
                 {
@@ -677,7 +673,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     throw new InvalidOperationException();
                 }
-                if (ReadKeyDword("Export Policy", NCryptSilentFlag) != 0 || ReadKeyDword("Key Type", NCryptSilentFlag) != 0 || ReadKeyDword("Length", NCryptSilentFlag) != 256)
+                if (ReadKeyDword("Key Type", NCryptSilentFlag) != 0 || ReadKeyDword("Length", NCryptSilentFlag) != 256)
                 {
                     throw new InvalidOperationException();
                 }
@@ -1169,23 +1165,15 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 }
             }
 
-            internal void VerifyKeyExportDenial()
+            internal void VerifyPersistedKeyExportPolicy()
             {
                 cngExportCheck = "cng_export_policy_read";
-                uint exportPolicy = ReadKeyDword("Export Policy", NCryptSilentFlag);
+                uint exportPolicy = ReadCngDword(verificationKey, "Export Policy", NCryptSilentFlag);
                 if (exportPolicy != 0)
                 {
                     cngExportCheck = "cng_export_policy_nonzero";
-                    throw new InvalidOperationException();
                 }
-                uint requiredBytes;
-                cngExportCheck = "cng_export_other";
-                int status = Native.NCryptExportKey(key, IntPtr.Zero, "ECCPRIVATEBLOB", IntPtr.Zero, IntPtr.Zero, 0, out requiredBytes, NCryptSilentFlag);
-                cngExportCheck = ClassifyExportStatus(status);
-                if (status != NtePermissionDenied)
-                {
-                    throw new InvalidOperationException();
-                }
+                RequireZeroExportPolicy(exportPolicy);
             }
 
             internal bool Cleanup()
@@ -1415,11 +1403,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     uint returned;
                     int status = Native.NCryptGetProperty(handle, property, buffer, 4, out returned, flags | NCryptSilentFlag);
-                    if (status != 0 || returned != 4)
-                    {
-                        throw new InvalidOperationException();
-                    }
-                    return unchecked((uint)Marshal.ReadInt32(buffer));
+                    return ValidateDwordRead(status, returned, buffer);
                 }
                 finally
                 {
@@ -1875,9 +1859,6 @@ namespace KeelDock.Platform.WindowsNativePreflight
 
             [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
             internal static extern int NCryptFinalizeKey(IntPtr key, uint flags);
-
-            [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
-            internal static extern int NCryptExportKey(IntPtr key, IntPtr exportKey, string blobType, IntPtr parameters, IntPtr output, uint outputLength, out uint resultLength, uint flags);
 
             [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
             internal static extern int NCryptDeleteKey(IntPtr key, uint flags);
