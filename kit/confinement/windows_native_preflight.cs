@@ -34,7 +34,14 @@ namespace KeelDock.Platform.WindowsNativePreflight
         private const uint WaitObject0 = 0;
         private const uint AccessAllowedAceType = 0;
         private const uint AccessDeniedAceType = 1;
+        private const byte InheritedAceFlag = 0x10;
+        private const byte InheritOnlyAceFlag = 0x08;
+        private const byte UnsupportedDaclAceFlags = 0xe0;
         private const uint AclSizeInformation = 2;
+        private const uint AclRevision = 2;
+        private const uint AclRevisionDs = 4;
+        private const uint AclHeaderSize = 8;
+        private const uint MaxAclBytes = 65535;
         private const int MaxSidSize = 68;
         private const int WinCreatorOwnerRightsSid = 71;
         private const uint OwnerSecurityInformation = 0x00000001;
@@ -69,6 +76,8 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 state.SetKeyOwnerToCurrentUser();
                 check = "cng_key";
                 state.FinalizeKey();
+                check = "cng_acl";
+                state.TightenKeyDacl();
                 check = "cng_acl";
                 state.VerifyKeyAcl();
                 check = "cng_export";
@@ -216,6 +225,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
             private string cngAclCheck = "cng_acl_support_read";
             private IntPtr provider = IntPtr.Zero;
             private IntPtr key = IntPtr.Zero;
+            private IntPtr verificationKey = IntPtr.Zero;
             private string keyName;
             private bool keyOwned;
 
@@ -625,6 +635,316 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 }
             }
 
+            internal void TightenKeyDacl()
+            {
+                IntPtr userInformation = IntPtr.Zero;
+                IntPtr systemSid = IntPtr.Zero;
+                IntPtr ownerRightsSid = IntPtr.Zero;
+                IntPtr sourceDescriptor = IntPtr.Zero;
+                IntPtr targetDacl = IntPtr.Zero;
+                IntPtr setDescriptor = IntPtr.Zero;
+                IntPtr readbackDescriptor = IntPtr.Zero;
+                try
+                {
+                    cngAclCheck = "cng_acl_dacl_tighten_user_read";
+                    userInformation = QueryTokenInformation(currentToken, TokenUser, out uint userLength);
+                    cngAclCheck = "cng_acl_dacl_tighten_user_check";
+                    if (userLength < (uint)IntPtr.Size)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    IntPtr currentUserSid = Marshal.ReadIntPtr(userInformation);
+                    if (currentUserSid == IntPtr.Zero || !Native.IsValidSid(currentUserSid))
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_dacl_tighten_system_sid";
+                    if (!Native.ConvertStringSidToSidW("S-1-5-18", out systemSid) || systemSid == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_dacl_tighten_owner_rights";
+                    ownerRightsSid = Marshal.AllocHGlobal(MaxSidSize);
+                    uint ownerRightsSidLength = MaxSidSize;
+                    if (ownerRightsSid == IntPtr.Zero ||
+                        !Native.CreateWellKnownSid(WinCreatorOwnerRightsSid, IntPtr.Zero, ownerRightsSid, ref ownerRightsSidLength) ||
+                        ownerRightsSidLength == 0 || ownerRightsSidLength > MaxSidSize ||
+                        !Native.IsValidSid(ownerRightsSid) ||
+                        Native.GetLengthSid(ownerRightsSid) != ownerRightsSidLength)
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    cngAclCheck = "cng_acl_dacl_tighten_source_read";
+                    sourceDescriptor = ReadSecurityDescriptor(key, DaclSecurityInformation | NCryptSilentFlag);
+                    cngAclCheck = "cng_acl_dacl_tighten_source_check";
+                    bool daclPresent;
+                    bool daclDefaulted;
+                    IntPtr sourceDacl;
+                    if (!Native.GetSecurityDescriptorDacl(sourceDescriptor, out daclPresent, out sourceDacl, out daclDefaulted) ||
+                        !daclPresent || sourceDacl == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    Native.AclSizeInformation sourceInformation = new Native.AclSizeInformation();
+                    cngAclCheck = "cng_acl_dacl_tighten_source_count";
+                    if (!Native.GetAclInformation(sourceDacl, ref sourceInformation, (uint)Marshal.SizeOf(typeof(Native.AclSizeInformation)), AclSizeInformation) ||
+                        sourceInformation.AceCount == 0 || sourceInformation.AceCount > 64 ||
+                        sourceInformation.AclBytesInUse < AclHeaderSize || sourceInformation.AclBytesInUse > MaxAclBytes)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    byte aclRevision = Marshal.ReadByte(sourceDacl);
+                    ushort sourceAclSize = unchecked((ushort)Marshal.ReadInt16(sourceDacl, 2));
+                    if ((aclRevision != AclRevision && aclRevision != AclRevisionDs) ||
+                        sourceAclSize < sourceInformation.AclBytesInUse ||
+                        sourceAclSize - sourceInformation.AclBytesInUse != sourceInformation.AclBytesFree)
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    cngAclCheck = "cng_acl_dacl_tighten_build";
+                    byte[] expectedAceBytes = new byte[checked((int)(sourceInformation.AclBytesInUse - AclHeaderSize))];
+                    uint[] expectedAceSizes = new uint[sourceInformation.AceCount];
+                    targetDacl = Marshal.AllocHGlobal(checked((int)sourceInformation.AclBytesInUse));
+                    if (targetDacl == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_dacl_tighten_build";
+                    if (!Native.InitializeAcl(targetDacl, sourceInformation.AclBytesInUse, aclRevision))
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    uint sourceBytesRead = AclHeaderSize;
+                    uint expectedBytesWritten = 0;
+                    uint expectedAceCount = 0;
+                    bool currentUserAllowed = false;
+                    for (uint index = 0; index < sourceInformation.AceCount; index++)
+                    {
+                        IntPtr ace;
+                        cngAclCheck = "cng_acl_dacl_tighten_source_ace";
+                        if (!Native.GetAce(sourceDacl, index, out ace) || ace == IntPtr.Zero)
+                        {
+                            throw new InvalidOperationException();
+                        }
+                        byte type = Marshal.ReadByte(ace, 0);
+                        byte aceFlags = Marshal.ReadByte(ace, 1);
+                        uint aceSize = unchecked((ushort)Marshal.ReadInt16(ace, 2));
+                        cngAclCheck = "cng_acl_dacl_tighten_source_shape";
+                        if ((type != AccessAllowedAceType && type != AccessDeniedAceType) ||
+                            !IsSupportedDaclAceFlags(aceFlags) || aceSize < 16 || (aceSize & 3) != 0 ||
+                            aceSize > sourceInformation.AclBytesInUse - sourceBytesRead)
+                        {
+                            throw new InvalidOperationException();
+                        }
+                        cngAclCheck = "cng_acl_dacl_tighten_inherited";
+                        if (IsInheritedDaclAce(aceFlags))
+                        {
+                            throw new InvalidOperationException();
+                        }
+                        IntPtr aceSid = IntPtr.Add(ace, 8);
+                        cngAclCheck = "cng_acl_dacl_tighten_source_sid";
+                        if (!Native.IsValidSid(aceSid))
+                        {
+                            throw new InvalidOperationException();
+                        }
+                        uint sidLength = Native.GetLengthSid(aceSid);
+                        if (sidLength == 0 || aceSize < 8 + sidLength)
+                        {
+                            throw new InvalidOperationException();
+                        }
+
+                        bool isUser = false;
+                        bool isSystem = false;
+                        bool isOwnerRights = false;
+                        if (type == AccessAllowedAceType)
+                        {
+                            isUser = Native.EqualSid(aceSid, currentUserSid);
+                            isSystem = Native.EqualSid(aceSid, systemSid);
+                            if (!isUser && !isSystem)
+                            {
+                                cngAclCheck = "cng_acl_dacl_tighten_owner_rights";
+                                isOwnerRights = Native.EqualSid(aceSid, ownerRightsSid);
+                            }
+                        }
+                        bool retainAce = ShouldRetainDaclAce(type, isUser, isSystem, isOwnerRights);
+                        if (type == AccessAllowedAceType && isUser && (aceFlags & InheritOnlyAceFlag) == 0)
+                        {
+                            currentUserAllowed = true;
+                        }
+
+                        if (retainAce)
+                        {
+                            cngAclCheck = "cng_acl_dacl_tighten_build";
+                            if (expectedAceCount >= (uint)expectedAceSizes.Length ||
+                                aceSize > (uint)expectedAceBytes.Length - expectedBytesWritten ||
+                                !Native.AddAce(targetDacl, aclRevision, uint.MaxValue, ace, aceSize))
+                            {
+                                throw new InvalidOperationException();
+                            }
+                            Marshal.Copy(ace, expectedAceBytes, checked((int)expectedBytesWritten), checked((int)aceSize));
+                            expectedAceSizes[expectedAceCount] = aceSize;
+                            expectedBytesWritten += aceSize;
+                            expectedAceCount++;
+                        }
+                        sourceBytesRead += aceSize;
+                    }
+                    cngAclCheck = "cng_acl_dacl_tighten_source_count";
+                    if (sourceBytesRead != sourceInformation.AclBytesInUse)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_dacl_tighten_user_allow";
+                    if (!currentUserAllowed || expectedAceCount == 0)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_dacl_tighten_build";
+                    Array.Resize(ref expectedAceBytes, checked((int)expectedBytesWritten));
+
+                    Native.AclSizeInformation targetInformation = new Native.AclSizeInformation();
+                    cngAclCheck = "cng_acl_dacl_tighten_build";
+                    if (!Native.GetAclInformation(targetDacl, ref targetInformation, (uint)Marshal.SizeOf(typeof(Native.AclSizeInformation)), AclSizeInformation) ||
+                        targetInformation.AceCount != expectedAceCount || targetInformation.AclBytesInUse != AclHeaderSize + expectedBytesWritten)
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    cngAclCheck = "cng_acl_dacl_tighten_descriptor";
+                    int descriptorSize = Marshal.SizeOf(typeof(Native.SecurityDescriptor));
+                    setDescriptor = Marshal.AllocHGlobal(descriptorSize);
+                    if (setDescriptor == IntPtr.Zero ||
+                        !Native.InitializeSecurityDescriptor(setDescriptor, SecurityDescriptorRevision) ||
+                        !Native.SetSecurityDescriptorDacl(setDescriptor, true, targetDacl, false) ||
+                        !Native.IsValidSecurityDescriptor(setDescriptor))
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_dacl_tighten_apply";
+                    int status = Native.NCryptSetProperty(
+                        key,
+                        "Security Descr",
+                        setDescriptor,
+                        checked((uint)descriptorSize),
+                        DaclSecurityInformation | NCryptSilentFlag);
+                    if (status != 0)
+                    {
+                        throw new InvalidOperationException();
+                    }
+
+                    cngAclCheck = "cng_acl_dacl_tighten_reopen";
+                    int openStatus = Native.NCryptOpenKey(provider, out verificationKey, keyName, 0, NCryptSilentFlag);
+                    if (openStatus != 0 || verificationKey == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_dacl_tighten_readback";
+                    readbackDescriptor = ReadSecurityDescriptor(verificationKey, DaclSecurityInformation | NCryptSilentFlag);
+                    bool readbackDaclPresent;
+                    bool readbackDaclDefaulted;
+                    IntPtr readbackDacl;
+                    if (!Native.GetSecurityDescriptorDacl(readbackDescriptor, out readbackDaclPresent, out readbackDacl, out readbackDaclDefaulted) ||
+                        !readbackDaclPresent || readbackDacl == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    Native.AclSizeInformation readbackInformation = new Native.AclSizeInformation();
+                    cngAclCheck = "cng_acl_dacl_tighten_compare";
+                    if (!Native.GetAclInformation(readbackDacl, ref readbackInformation, (uint)Marshal.SizeOf(typeof(Native.AclSizeInformation)), AclSizeInformation))
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    ushort readbackAclSize = unchecked((ushort)Marshal.ReadInt16(readbackDacl, 2));
+                    if (Marshal.ReadByte(readbackDacl) != aclRevision ||
+                        readbackAclSize < readbackInformation.AclBytesInUse ||
+                        readbackAclSize - readbackInformation.AclBytesInUse != readbackInformation.AclBytesFree ||
+                        readbackInformation.AceCount != expectedAceCount ||
+                        readbackInformation.AclBytesInUse != AclHeaderSize + expectedBytesWritten)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    uint expectedOffset = 0;
+                    for (uint index = 0; index < expectedAceCount; index++)
+                    {
+                        IntPtr ace;
+                        if (!Native.GetAce(readbackDacl, index, out ace) || ace == IntPtr.Zero ||
+                            unchecked((ushort)Marshal.ReadInt16(ace, 2)) != expectedAceSizes[index])
+                        {
+                            throw new InvalidOperationException();
+                        }
+                        for (uint byteIndex = 0; byteIndex < expectedAceSizes[index]; byteIndex++)
+                        {
+                            if (Marshal.ReadByte(ace, checked((int)byteIndex)) != expectedAceBytes[checked((int)(expectedOffset + byteIndex))])
+                            {
+                                throw new InvalidOperationException();
+                            }
+                        }
+                        expectedOffset += expectedAceSizes[index];
+                    }
+                    if (expectedOffset != expectedBytesWritten)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                }
+                finally
+                {
+                    if (sourceDescriptor != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(sourceDescriptor);
+                    }
+                    if (targetDacl != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(targetDacl);
+                    }
+                    if (setDescriptor != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(setDescriptor);
+                    }
+                    if (readbackDescriptor != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(readbackDescriptor);
+                    }
+                    if (userInformation != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(userInformation);
+                    }
+                    if (systemSid != IntPtr.Zero)
+                    {
+                        Native.LocalFree(systemSid);
+                    }
+                    if (ownerRightsSid != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(ownerRightsSid);
+                    }
+                }
+            }
+
+            internal static bool ShouldRetainDaclAce(byte type, bool isUser, bool isSystem, bool isOwnerRights)
+            {
+                if (type == AccessDeniedAceType)
+                {
+                    return true;
+                }
+                if (type != AccessAllowedAceType || isOwnerRights)
+                {
+                    throw new InvalidOperationException();
+                }
+                return isUser || isSystem;
+            }
+
+            internal static bool IsInheritedDaclAce(byte flags)
+            {
+                return (flags & InheritedAceFlag) != 0;
+            }
+
+            internal static bool IsSupportedDaclAceFlags(byte flags)
+            {
+                return (flags & UnsupportedDaclAceFlags) == 0;
+            }
+
             internal void VerifyKeyAcl()
             {
                 IntPtr currentUserSid = IntPtr.Zero;
@@ -664,7 +984,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                         throw new InvalidOperationException();
                     }
                     cngAclCheck = "cng_acl_owner_read";
-                    ownerDescriptor = ReadSecurityDescriptor(key, OwnerSecurityInformation | NCryptSilentFlag);
+                    ownerDescriptor = ReadSecurityDescriptor(verificationKey, OwnerSecurityInformation | NCryptSilentFlag);
                     cngAclCheck = "cng_acl_owner_extract";
                     IntPtr ownerSid = IntPtr.Zero;
                     bool ownerDefaulted;
@@ -710,7 +1030,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                         }
                     }
                     cngAclCheck = "cng_acl_dacl_read";
-                    daclDescriptor = ReadSecurityDescriptor(key, DaclSecurityInformation | NCryptSilentFlag);
+                    daclDescriptor = ReadSecurityDescriptor(verificationKey, DaclSecurityInformation | NCryptSilentFlag);
                     cngAclCheck = "cng_acl_dacl_check";
                     bool daclPresent;
                     bool daclDefaulted;
@@ -892,6 +1212,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 }
                 complete = SafeCloseHandle(ref process, complete);
                 complete = SafeCloseHandle(ref thread, complete);
+                complete = SafeFreeCngObject(ref verificationKey, complete);
 
                 if (keyOwned && provider != IntPtr.Zero && keyName != null)
                 {
@@ -1452,6 +1773,18 @@ namespace KeelDock.Platform.WindowsNativePreflight
             [DllImport("advapi32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool GetAclInformation(IntPtr acl, ref AclSizeInformation information, uint informationLength, uint informationClass);
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool InitializeAcl(IntPtr acl, uint aclLength, uint aclRevision);
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool AddAce(IntPtr acl, uint aceRevision, uint startingAceIndex, IntPtr aceList, uint aceListLength);
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool SetSecurityDescriptorDacl(IntPtr securityDescriptor, [MarshalAs(UnmanagedType.Bool)] bool daclPresent, IntPtr dacl, [MarshalAs(UnmanagedType.Bool)] bool daclDefaulted);
 
             [DllImport("advapi32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
