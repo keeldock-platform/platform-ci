@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import subprocess
@@ -23,7 +24,33 @@ PLATFORM_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/pub
 LINUX_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/linux-confinement.yml"
 MACOS_CAPABILITY_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-capability.yml"
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-native-preflight.yml"
+PROBE_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_capability.py"
 PLATFORM_ACTION = Path(__file__).resolve().parent / "action.yml"
+
+
+def probe_child_flags(path):
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    functions = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_probe_user_command"
+    ]
+    if len(functions) != 1:
+        raise AssertionError("expected exactly one _probe_user_command, found %d" % len(functions))
+    returns = [
+        node.value for node in ast.walk(functions[0])
+        if isinstance(node, ast.Return) and isinstance(node.value, ast.List)
+    ]
+    if len(returns) != 1:
+        raise AssertionError("expected exactly one argv list return, found %d" % len(returns))
+    elements = returns[0].elts
+    flags = []
+    for element in elements[1:]:
+        if not (isinstance(element, ast.Constant) and isinstance(element.value, str)):
+            raise AssertionError("argv flag section ended before -c")
+        if element.value == "-c":
+            return flags
+        flags.append(element.value)
+    raise AssertionError("no -c in argv list")
 
 
 def result(**changes):
@@ -176,7 +203,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             "/Library/Developer/CommandLineTools/Library/Frameworks/"
             "Python3.framework/Versions/3.9/bin/python3.9"
         )
-        launch = " -B kit/confinement/macos_capability.py --control-sha \"$CI_SHA\""
+        launch = " -I -S -B kit/confinement/macos_capability.py --control-sha \"$CI_SHA\""
         for text in (MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8"), MACOS_CAPABILITY_WORKFLOW_TEMPLATE):
             with self.subTest(source=text[:20]):
                 self.assertEqual(text.count(clt + launch), 1)
@@ -199,7 +226,28 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         for replacement in ("/usr/bin/python3", clt.replace("Versions/3.9", "Versions/Current")):
             with self.subTest(replacement=replacement):
-                changed = workflow.replace(clt + " -B kit/confinement", replacement + " -B kit/confinement")
+                changed = workflow.replace(clt + " -I -S -B kit/confinement", replacement + " -I -S -B kit/confinement")
+                self.assertNotEqual(changed, workflow)
+                with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
+                    validate_workflow_text(changed, "platform", "macos-capability")
+
+    def test_macos_capability_privileged_launch_flags_match_probe_child_flags(self):
+        child_flags = probe_child_flags(PROBE_SOURCE)
+        self.assertEqual(child_flags, ["-I", "-S", "-B"])
+        for text in (MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8"), MACOS_CAPABILITY_WORKFLOW_TEMPLATE):
+            with self.subTest(source=text[:20]):
+                lines = [line.strip() for line in text.splitlines() if "confinement/macos_capability.py" in line]
+                self.assertEqual(len(lines), 1)
+                tokens = lines[0].split()
+                script = tokens.index("kit/confinement/macos_capability.py")
+                self.assertTrue(tokens[0].endswith("/bin/python3.9"))
+                self.assertEqual(tokens[1:script], child_flags)
+
+    def test_macos_capability_workflow_dropping_isolation_flags_is_rejected(self):
+        workflow = MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8")
+        for flags in ("-S -B", "-I -B", "-B", "-I -S", "-S -I -B"):
+            with self.subTest(flags=flags):
+                changed = workflow.replace("python3.9 -I -S -B kit/confinement", "python3.9 " + flags + " kit/confinement")
                 self.assertNotEqual(changed, workflow)
                 with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
                     validate_workflow_text(changed, "platform", "macos-capability")
