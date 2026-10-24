@@ -37,6 +37,40 @@ FREAD = 1
 FWRITE = 2
 PROBE_IDENTITY_VERIFIED = b"probe-identity=verified\n"
 PROBE_IDENTITY_REFUSED = b"probe-identity=refused\n"
+SANDBOX_STAGES = (
+    "marker_access",
+    "positive_read_spawn", "positive_read_overflow", "positive_read_exit",
+    "positive_write_spawn", "positive_write_overflow", "positive_write_exit",
+    "probe_spawn",
+    "probe_stdout_overflow_before_wait", "probe_stderr_overflow_before_wait",
+    "probe_stdout_overflow_after_wait", "probe_stderr_overflow_after_wait",
+    "probe_stdout_overflow_final", "probe_stderr_overflow_final",
+    "probe_exit",
+)
+SANDBOX_FAILURES = (
+    "invalid_input", "identity_invalid", "sandbox_missing", "child_sandbox_missing", "child_failed",
+    "storage_unavailable", "outside_write_allowed",
+    "python_error", "exec_failed",
+    "signal_exit", "other_exit",
+)
+SANDBOX_EXIT_STAGES = ("positive_read_exit", "positive_write_exit", "probe_exit")
+SANDBOX_STAGE_SET = frozenset(SANDBOX_STAGES)
+SANDBOX_FAILURE_SET = frozenset(SANDBOX_FAILURES)
+SANDBOX_EXIT_STAGE_SET = frozenset(SANDBOX_EXIT_STAGES)
+PROBE_EXIT_FAILURES = {
+    20: "invalid_input",
+    21: "identity_invalid",
+    22: "sandbox_missing",
+    23: "child_failed",
+    24: "storage_unavailable",
+    25: "outside_write_allowed",
+    26: "child_sandbox_missing",
+    125: "exec_failed",
+}
+CONTROL_EXIT_FAILURES = {
+    1: "python_error",
+    125: "exec_failed",
+}
 SURVIVOR_CLASS_ORDER = (
     "python",
     "ps",
@@ -224,7 +258,10 @@ PROBE_IDENTITY_CHECKS = frozenset(
 
 
 class ProbeFailure(Exception):
-    def __init__(self, reason, cleanup_complete=True, check=None, survivor_classes=None):
+    def __init__(
+        self, reason, cleanup_complete=True, check=None, survivor_classes=None,
+        sandbox_stage=None, sandbox_failure=None,
+    ):
         super().__init__(reason if reason in REASONS else "native_preflight_unavailable")
         self.reason = reason if reason in REASONS else "native_preflight_unavailable"
         self.cleanup_complete = cleanup_complete
@@ -242,6 +279,23 @@ class ProbeFailure(Exception):
             )
         else:
             self.survivor_classes = ()
+        if (
+            self.reason == "sandbox_behavior_unavailable"
+            and type(sandbox_stage) is str
+            and sandbox_stage in SANDBOX_STAGE_SET
+        ):
+            self.sandbox_stage = sandbox_stage
+            if (
+                sandbox_stage in SANDBOX_EXIT_STAGE_SET
+                and type(sandbox_failure) is str
+                and sandbox_failure in SANDBOX_FAILURE_SET
+            ):
+                self.sandbox_failure = sandbox_failure
+            else:
+                self.sandbox_failure = None
+        else:
+            self.sandbox_stage = None
+            self.sandbox_failure = None
 
 
 class _ProcFdInfo(ctypes.Structure):
@@ -302,7 +356,10 @@ def valid_sha(value):
     return type(value) is str and CONTROL_SHA.fullmatch(value) is not None
 
 
-def safe_output(observed, reason="native_preflight_unavailable", check=None, survivor_classes=None):
+def safe_output(
+    observed, reason="native_preflight_unavailable", check=None, survivor_classes=None,
+    sandbox_stage=None, sandbox_failure=None,
+):
     capability = "macos-capability=observed" if observed else "macos-capability=refused"
     if not observed:
         if reason not in REASONS:
@@ -322,6 +379,18 @@ def safe_output(observed, reason="native_preflight_unavailable", check=None, sur
             )
             if categories:
                 capability += " survivor_classes=" + ",".join(categories)
+        if (
+            reason == "sandbox_behavior_unavailable"
+            and type(sandbox_stage) is str
+            and sandbox_stage in SANDBOX_STAGE_SET
+        ):
+            capability += " sandbox_stage=" + sandbox_stage
+            if (
+                sandbox_stage in SANDBOX_EXIT_STAGE_SET
+                and type(sandbox_failure) is str
+                and sandbox_failure in SANDBOX_FAILURE_SET
+            ):
+                capability += " sandbox_failure=" + sandbox_failure
     return capability + "\nmacos-confinement=refused reason=incomplete_channel_evidence\n"
 
 
@@ -1154,7 +1223,9 @@ def _probe_user_command(argv, uid, python_executable):
     ]
 
 
-def _spawn_probe_user(argv, uid, *, env, python_executable, cwd=None, failure_reason, failure_check=None):
+def _spawn_probe_user(
+    argv, uid, *, env, python_executable, cwd=None, failure_reason, failure_check=None, failure_stage=None,
+):
     command = _probe_user_command(argv, uid, python_executable)
     launch_env = env if env is not None else {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
@@ -1178,7 +1249,17 @@ def _spawn_probe_user(argv, uid, *, env, python_executable, cwd=None, failure_re
     except TypeError:
         raise ProbeFailure("native_preflight_unavailable", check="probe_process_launch") from None
     except (OSError, subprocess.SubprocessError):
-        raise ProbeFailure(failure_reason, check=failure_check) from None
+        raise ProbeFailure(failure_reason, check=failure_check, sandbox_stage=failure_stage) from None
+
+
+def _classify_exit(returncode, codes):
+    if type(returncode) is not int:
+        return "other_exit"
+    if returncode < 0:
+        return "signal_exit"
+    if returncode in codes:
+        return codes[returncode]
+    return "other_exit"
 
 
 def _strip_probe_identity_record(stderr):
@@ -1197,6 +1278,9 @@ def _run_as_probe_user(
     timeout=10,
     failure_reason="probe_identity_unavailable",
     failure_check=None,
+    failure_stage_spawn=None,
+    failure_stage_overflow=None,
+    failure_stage_exit=None,
     survivor_check="probe_process_survivor",
     control_survivor_diagnostics=False,
     python_executable,
@@ -1211,6 +1295,7 @@ def _run_as_probe_user(
         python_executable=python_executable,
         failure_reason=failure_reason,
         failure_check=failure_check,
+        failure_stage=failure_stage_spawn,
     )
     stdout_capture = _Capture(process.stdout)
     stderr_capture = _Capture(process.stderr)
@@ -1306,10 +1391,15 @@ def _run_as_probe_user(
     if timed_out or wait_uncertain:
         raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_timeout")
     if stdout_capture.overflow or stderr_capture.overflow:
-        raise ProbeFailure(failure_reason, check=failure_check)
+        raise ProbeFailure(failure_reason, check=failure_check, sandbox_stage=failure_stage_overflow)
     stderr = _strip_probe_identity_record(bytes(stderr_capture.data))
     if process.returncode != 0:
-        raise ProbeFailure(failure_reason, check=failure_check)
+        raise ProbeFailure(
+            failure_reason,
+            check=failure_check,
+            sandbox_stage=failure_stage_exit,
+            sandbox_failure=_classify_exit(process.returncode, CONTROL_EXIT_FAILURES),
+        )
     return subprocess.CompletedProcess(command, process.returncode, bytes(stdout_capture.data), stderr)
 
 
@@ -1702,6 +1792,7 @@ def _observe_probe(
         python_executable=python_executable,
         cwd="/tmp",
         failure_reason="sandbox_behavior_unavailable",
+        failure_stage="probe_spawn",
     )
     captures = []
     try:
@@ -1745,13 +1836,25 @@ def _observe_probe(
                 break
             time.sleep(0.08)
         if out_capture.overflow or err_capture.overflow:
-            raise ProbeFailure("sandbox_behavior_unavailable")
+            raise ProbeFailure(
+                "sandbox_behavior_unavailable",
+                sandbox_stage=(
+                    "probe_stdout_overflow_before_wait" if out_capture.overflow
+                    else "probe_stderr_overflow_before_wait"
+                ),
+            )
         try:
             process.wait(timeout=max(1, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             raise ProbeFailure("probe_timeout", cleanup_complete=False)
         if out_capture.overflow or err_capture.overflow:
-            raise ProbeFailure("sandbox_behavior_unavailable")
+            raise ProbeFailure(
+                "sandbox_behavior_unavailable",
+                sandbox_stage=(
+                    "probe_stdout_overflow_after_wait" if out_capture.overflow
+                    else "probe_stderr_overflow_after_wait"
+                ),
+            )
     except ProbeFailure:
         raise
     except BaseException:
@@ -1804,10 +1907,20 @@ def _observe_probe(
                 except (OSError, ValueError):
                     pass
     if out_capture.overflow or err_capture.overflow:
-        raise ProbeFailure("sandbox_behavior_unavailable")
+        raise ProbeFailure(
+            "sandbox_behavior_unavailable",
+            sandbox_stage=(
+                "probe_stdout_overflow_final" if out_capture.overflow
+                else "probe_stderr_overflow_final"
+            ),
+        )
     _strip_probe_identity_record(bytes(err_capture.data))
     if process.returncode != 0:
-        raise ProbeFailure("sandbox_behavior_unavailable")
+        raise ProbeFailure(
+            "sandbox_behavior_unavailable",
+            sandbox_stage="probe_exit",
+            sandbox_failure=_classify_exit(process.returncode, PROBE_EXIT_FAILURES),
+        )
     if not _roles_complete(observed_roles):
         raise ProbeFailure("descriptor_readback_unavailable")
 
@@ -1840,12 +1953,15 @@ def run_native_probe(control_sha):
             )
             marker = root / "kit/confinement/macos_capability.swift"
             if not marker.is_file() or not (marker.stat().st_mode & stat.S_IROTH):
-                raise ProbeFailure("sandbox_behavior_unavailable")
+                raise ProbeFailure("sandbox_behavior_unavailable", sandbox_stage="marker_access")
             user_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
             positive_read = "import sys; open(sys.argv[1], 'rb').close()"
             _run_as_probe_user(
                 [toolchain["python"], "-c", positive_read, str(marker)], probe_uid, env=user_env, timeout=10,
                 failure_reason="sandbox_behavior_unavailable",
+                failure_stage_spawn="positive_read_spawn",
+                failure_stage_overflow="positive_read_overflow",
+                failure_stage_exit="positive_read_exit",
                 survivor_check="probe_process_survivor_positive_read",
                 python_executable=toolchain["python"],
             )
@@ -1854,6 +1970,9 @@ def run_native_probe(control_sha):
             _run_as_probe_user(
                 [toolchain["python"], "-c", positive_write, str(positive_file)], probe_uid, env=user_env, timeout=10,
                 failure_reason="sandbox_behavior_unavailable",
+                failure_stage_spawn="positive_write_spawn",
+                failure_stage_overflow="positive_write_overflow",
+                failure_stage_exit="positive_write_exit",
                 survivor_check="probe_process_survivor_positive_write",
                 python_executable=toolchain["python"],
             )
@@ -1924,7 +2043,10 @@ def main(argv=None):
         run_native_probe(arguments.control_sha)
     except ProbeFailure as error:
         print(
-            safe_output(False, error.reason, error.check, survivor_classes=error.survivor_classes),
+            safe_output(
+                False, error.reason, error.check, survivor_classes=error.survivor_classes,
+                sandbox_stage=error.sandbox_stage, sandbox_failure=error.sandbox_failure,
+            ),
             end="",
         )
         return 1

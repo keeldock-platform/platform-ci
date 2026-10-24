@@ -2789,5 +2789,438 @@ class ProbeTeardownTests(unittest.TestCase):
             )
 
 
+class SandboxStageDiagnosticTests(unittest.TestCase):
+    PREFIX = "macos-capability=refused reason=sandbox_behavior_unavailable"
+    SUFFIX = "\nmacos-confinement=refused reason=incomplete_channel_evidence\n"
+
+    def line(self, text):
+        return self.PREFIX + text + self.SUFFIX
+
+    def test_sandbox_enums_are_fixed(self):
+        self.assertEqual(
+            macos_capability.SANDBOX_STAGES,
+            (
+                "marker_access",
+                "positive_read_spawn", "positive_read_overflow", "positive_read_exit",
+                "positive_write_spawn", "positive_write_overflow", "positive_write_exit",
+                "probe_spawn",
+                "probe_stdout_overflow_before_wait", "probe_stderr_overflow_before_wait",
+                "probe_stdout_overflow_after_wait", "probe_stderr_overflow_after_wait",
+                "probe_stdout_overflow_final", "probe_stderr_overflow_final",
+                "probe_exit",
+            ),
+        )
+        self.assertEqual(
+            macos_capability.SANDBOX_FAILURES,
+            (
+                "invalid_input", "identity_invalid", "sandbox_missing", "child_sandbox_missing", "child_failed",
+                "storage_unavailable", "outside_write_allowed",
+                "python_error", "exec_failed",
+                "signal_exit", "other_exit",
+            ),
+        )
+        self.assertEqual(
+            macos_capability.SANDBOX_EXIT_STAGES, ("positive_read_exit", "positive_write_exit", "probe_exit")
+        )
+        self.assertEqual(
+            macos_capability.PROBE_EXIT_FAILURES,
+            {
+                20: "invalid_input", 21: "identity_invalid", 22: "sandbox_missing",
+                23: "child_failed", 24: "storage_unavailable", 25: "outside_write_allowed",
+                26: "child_sandbox_missing", 125: "exec_failed",
+            },
+        )
+        self.assertEqual(
+            macos_capability.CONTROL_EXIT_FAILURES, {1: "python_error", 125: "exec_failed"}
+        )
+        for ordered, derived in (
+            (macos_capability.SANDBOX_STAGES, macos_capability.SANDBOX_STAGE_SET),
+            (macos_capability.SANDBOX_FAILURES, macos_capability.SANDBOX_FAILURE_SET),
+            (macos_capability.SANDBOX_EXIT_STAGES, macos_capability.SANDBOX_EXIT_STAGE_SET),
+        ):
+            self.assertIs(type(ordered), tuple)
+            self.assertIs(type(derived), frozenset)
+            self.assertEqual(len(ordered), len(derived))
+            self.assertEqual(derived, frozenset(ordered))
+        self.assertEqual(
+            macos_capability.SANDBOX_EXIT_STAGE_SET | frozenset(), frozenset(macos_capability.SANDBOX_EXIT_STAGES)
+        )
+        for value in (*macos_capability.SANDBOX_STAGES, *macos_capability.SANDBOX_FAILURES):
+            self.assertRegex(value, r"^[a-z_]+$")
+
+    def test_every_declared_value_is_emitted_and_no_undeclared_value_is(self):
+        import ast
+
+        tree = ast.parse(Path(macos_capability.__file__).read_text(encoding="utf-8"))
+        stage_keywords = {
+            "sandbox_stage", "failure_stage", "failure_stage_spawn",
+            "failure_stage_overflow", "failure_stage_exit",
+        }
+
+        def literals(node):
+            if isinstance(node, ast.Constant):
+                return {node.value}
+            if isinstance(node, ast.IfExp):
+                return literals(node.body) | literals(node.orelse)
+            if isinstance(node, ast.Name) and node.id in stage_keywords:
+                return set()
+            if isinstance(node, ast.Attribute) and node.attr == "sandbox_stage":
+                return set()
+            self.fail("unresolvable stage argument at line " + str(node.lineno))
+
+        emitted_stages = set()
+        sandbox_raises = 0
+        sandbox_reason_calls = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            keywords = {k.arg: k.value for k in node.keywords}
+            is_probe_failure = isinstance(node.func, ast.Name) and node.func.id == "ProbeFailure"
+            if is_probe_failure and node.args and isinstance(node.args[0], ast.Constant) and (
+                node.args[0].value == "sandbox_behavior_unavailable"
+            ):
+                sandbox_raises += 1
+                self.assertIn("sandbox_stage", keywords)
+            if isinstance(keywords.get("failure_reason"), ast.Constant) and (
+                keywords["failure_reason"].value == "sandbox_behavior_unavailable"
+            ):
+                sandbox_reason_calls += 1
+                self.assertTrue(stage_keywords & set(keywords))
+            for name, value in keywords.items():
+                if name in stage_keywords:
+                    emitted_stages |= literals(value)
+        self.assertEqual(sandbox_raises, 5)
+        self.assertEqual(sandbox_reason_calls, 3)
+        emitted_stages.discard(None)
+        self.assertEqual(emitted_stages, macos_capability.SANDBOX_STAGE_SET)
+
+        emitted_failures = set()
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and getattr(node.targets[0], "id", None) in ("PROBE_EXIT_FAILURES", "CONTROL_EXIT_FAILURES")
+            ):
+                emitted_failures |= {value.value for value in node.value.values}
+        classify = next(
+            f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == "_classify_exit"
+        )
+        for node in ast.walk(classify):
+            if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant):
+                emitted_failures.add(node.value.value)
+        self.assertEqual(emitted_failures, macos_capability.SANDBOX_FAILURE_SET)
+
+    def test_classify_exit_maps_known_codes_signals_and_everything_else(self):
+        classify = macos_capability._classify_exit
+        for code, expected in macos_capability.PROBE_EXIT_FAILURES.items():
+            self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), expected)
+        for code, expected in macos_capability.CONTROL_EXIT_FAILURES.items():
+            self.assertEqual(classify(code, macos_capability.CONTROL_EXIT_FAILURES), expected)
+        for code in (1, 2, 19, 27, 31, 126, 255):
+            self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), "other_exit")
+        for code in (2, 20, 126):
+            self.assertEqual(classify(code, macos_capability.CONTROL_EXIT_FAILURES), "other_exit")
+        for code in (-1, -9, -15):
+            self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), "signal_exit")
+        for code in (None, "23", 23.0, True):
+            self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), "other_exit")
+
+    def test_safe_output_emits_only_declared_sandbox_values_for_the_sandbox_reason(self):
+        reason = "sandbox_behavior_unavailable"
+        for stage in macos_capability.SANDBOX_STAGES:
+            self.assertEqual(
+                macos_capability.safe_output(False, reason, sandbox_stage=stage),
+                self.line(" sandbox_stage=" + stage),
+            )
+            self.assertEqual(
+                macos_capability.safe_output(False, reason, sandbox_failure="other_exit"),
+                self.line(""),
+            )
+            for failure in macos_capability.SANDBOX_FAILURES:
+                expected = " sandbox_stage=" + stage
+                if stage in macos_capability.SANDBOX_EXIT_STAGES:
+                    expected += " sandbox_failure=" + failure
+                self.assertEqual(
+                    macos_capability.safe_output(False, reason, sandbox_stage=stage, sandbox_failure=failure),
+                    self.line(expected),
+                )
+                refusal = macos_capability.ProbeFailure(
+                    reason, sandbox_stage=stage, sandbox_failure=failure
+                )
+                self.assertEqual(refusal.sandbox_stage, stage)
+                self.assertEqual(
+                    refusal.sandbox_failure,
+                    failure if stage in macos_capability.SANDBOX_EXIT_STAGES else None,
+                )
+
+    def test_hostile_sandbox_values_are_dropped_everywhere(self):
+        class StrSubclass(str):
+            pass
+
+        reason = "sandbox_behavior_unavailable"
+        hostile = (
+            "other", "", "probe_exit\nmacos-confinement=observed", "probe_exit::x", "probe_exit extra=1",
+            "probe_exit ", "PROBE_EXIT", "/tmp/secret", 23, None, b"probe_exit", ["probe_exit"],
+            ("probe_exit",), StrSubclass("probe_exit"), True,
+        )
+        for value in hostile:
+            with self.subTest(stage=value):
+                self.assertEqual(
+                    macos_capability.safe_output(False, reason, sandbox_stage=value), self.line("")
+                )
+                refusal = macos_capability.ProbeFailure(reason, sandbox_stage=value, sandbox_failure="other_exit")
+                self.assertIsNone(refusal.sandbox_stage)
+                self.assertIsNone(refusal.sandbox_failure)
+            with self.subTest(failure=value):
+                self.assertEqual(
+                    macos_capability.safe_output(
+                        False, reason, sandbox_stage="probe_exit", sandbox_failure=value
+                    ),
+                    self.line(" sandbox_stage=probe_exit"),
+                )
+                refusal = macos_capability.ProbeFailure(
+                    reason, sandbox_stage="probe_exit", sandbox_failure=value
+                )
+                self.assertEqual(refusal.sandbox_stage, "probe_exit")
+                self.assertIsNone(refusal.sandbox_failure)
+
+    def test_sandbox_values_on_other_reasons_are_dropped_and_other_output_is_unchanged(self):
+        for reason in sorted(macos_capability.REASONS - {"sandbox_behavior_unavailable"}) + ["unknown_reason"]:
+            plain = macos_capability.safe_output(False, reason)
+            self.assertEqual(
+                macos_capability.safe_output(
+                    False, reason, sandbox_stage="probe_exit", sandbox_failure="child_failed"
+                ),
+                plain,
+            )
+            refusal = macos_capability.ProbeFailure(
+                reason, sandbox_stage="probe_exit", sandbox_failure="child_failed"
+            )
+            self.assertIsNone(refusal.sandbox_stage)
+            self.assertIsNone(refusal.sandbox_failure)
+            self.assertNotIn("sandbox_stage", plain)
+        self.assertEqual(
+            macos_capability.safe_output(False, "probe_timeout"),
+            "macos-capability=refused reason=probe_timeout\n" + self.SUFFIX[1:],
+        )
+        self.assertEqual(
+            macos_capability.safe_output(
+                False, "native_preflight_unavailable", "probe_process_launch"
+            ),
+            "macos-capability=refused reason=native_preflight_unavailable check=probe_process_launch"
+            + self.SUFFIX,
+        )
+        self.assertEqual(
+            macos_capability.safe_output(False, "sandbox_behavior_unavailable"), self.line("")
+        )
+        self.assertEqual(
+            macos_capability.safe_output(True, "sandbox_behavior_unavailable", sandbox_stage="probe_exit"),
+            "macos-capability=observed" + self.SUFFIX,
+        )
+
+    def drive(self, *, marker="readable", popen_script=(), captures=None, terminate=None):
+        stub_toolchain = TEST_TOOLCHAIN
+        state = {"popen": 0, "captures": 0, "phase": "before"}
+
+        class Process:
+            pid = 12400
+            returncode = None
+
+            def __init__(self, returncode, stdout, stderr):
+                self.stdout = io.BytesIO(stdout)
+                self.stderr = io.BytesIO(stderr)
+                self.final = returncode
+
+            def poll(self):
+                return self.final
+
+            def wait(self, timeout=None):
+                state["phase"] = "after"
+                self.returncode = self.final
+                return self.final
+
+        def popen(*args, **kwargs):
+            step = popen_script[state["popen"]] if state["popen"] < len(popen_script) else ("ok",)
+            state["popen"] += 1
+            state["phase"] = "before"
+            if step[0] == "oserror":
+                raise OSError("private detail /tmp/secret")
+            if step[0] == "exit":
+                return Process(step[1], b"", macos_capability.PROBE_IDENTITY_VERIFIED)
+            if step[0] == "refused":
+                return Process(step[1], b"", macos_capability.PROBE_IDENTITY_REFUSED)
+            if step[0] == "overflow":
+                return Process(0, b"x" * (macos_capability.MAX_CAPTURE_BYTES + 1), macos_capability.PROBE_IDENTITY_VERIFIED)
+            return Process(0, b"", macos_capability.PROBE_IDENTITY_VERIFIED)
+
+        real_capture = macos_capability._Capture
+
+        class FakeCapture:
+            def __init__(self, stream):
+                self.index = state["captures"]
+                state["captures"] += 1
+                self.real = real_capture(stream) if self.index < 4 or captures is None else None
+                if self.real is None:
+                    self.data = bytearray(macos_capability.PROBE_IDENTITY_VERIFIED)
+
+            def __getattr__(self, name):
+                if self.real is not None:
+                    return getattr(self.real, name)
+                raise AttributeError(name)
+
+            @property
+            def overflow(self):
+                if self.real is not None:
+                    return self.real.overflow
+                stream = "stdout" if self.index % 2 == 0 else "stderr"
+                return state["phase"] in captures.get(stream, ())
+
+            def start(self):
+                if self.real is not None:
+                    self.real.start()
+
+            def join(self):
+                return True if self.real is None else self.real.join()
+
+        def fake_terminate(process):
+            if state["phase"] == "after":
+                state["phase"] = "final"
+            return True
+
+        with tempfile.TemporaryDirectory(prefix="macos-sandbox-stage-") as directory:
+            root = Path(directory) / "workspace"
+            marker_path = root / "kit" / "confinement" / "macos_capability.swift"
+            marker_path.parent.mkdir(parents=True)
+            if marker != "missing":
+                marker_path.write_text("synthetic\n", encoding="utf-8")
+            marker_mode = stat.S_IFREG | (0o600 if marker == "private" else 0o644)
+            host_path_type = type(root)
+            real_stat = host_path_type.stat
+
+            def injected_stat(path, *args, **kwargs):
+                if path == marker_path:
+                    return types.SimpleNamespace(st_mode=marker_mode)
+                return real_stat(path, *args, **kwargs)
+
+            home_parent = Path(directory) / "home-parent"
+            home = home_parent / "home"
+            home.mkdir(parents=True)
+            counter = []
+
+            def make_scratch(prefix, dir):
+                path = Path(directory) / (prefix + str(len(counter)))
+                path.mkdir()
+                counter.append(path)
+                return str(path)
+
+            dscl = subprocess.CompletedProcess([], 0, b"", b"")
+            output = io.StringIO()
+            with ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, {"CI_WORKSPACE": str(root)}))
+                for name, value in (
+                    ("_check_context", root),
+                    ("_resolve_trusted_toolchain", stub_toolchain),
+                    ("_disable_developer_mode", None),
+                    ("_protect_runner_controls", (501, (), ())),
+                    ("_create_probe_identity", (502, home_parent, home)),
+                    ("_verify_runner_controls_are_private", None),
+                    ("_build_signed_probe", "/tmp/CapabilityProbe"),
+                    ("_process_table", {}),
+                    ("_probe_uid_processes_present", (False, ())),
+                    ("_remove_probe_tree", None),
+                    ("_run", dscl),
+                ):
+                    stack.enter_context(patch.object(macos_capability, name, return_value=value))
+                if marker != "missing":
+                    stack.enter_context(patch.object(host_path_type, "stat", injected_stat))
+                stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", side_effect=make_scratch))
+                stack.enter_context(patch.object(macos_capability.subprocess, "Popen", side_effect=popen))
+                stack.enter_context(patch.object(macos_capability, "_Capture", FakeCapture))
+                stack.enter_context(
+                    patch.object(macos_capability, "_terminate_probe_tree", side_effect=terminate or fake_terminate)
+                )
+                stack.enter_context(patch.object(macos_capability.time, "sleep"))
+                stack.enter_context(redirect_stdout(output))
+                status = macos_capability.main(["--control-sha", CONTROL_SHA])
+        return status, output.getvalue()
+
+    def assert_refusal(self, result, suffix):
+        status, text = result
+        self.assertEqual(status, 1)
+        self.assertEqual(text, self.line(suffix))
+
+    def test_marker_site(self):
+        self.assert_refusal(self.drive(marker="missing"), " sandbox_stage=marker_access")
+        self.assert_refusal(self.drive(marker="private"), " sandbox_stage=marker_access")
+
+    def test_positive_control_sites(self):
+        self.assert_refusal(self.drive(popen_script=(("oserror",),)), " sandbox_stage=positive_read_spawn")
+        self.assert_refusal(self.drive(popen_script=(("overflow",),)), " sandbox_stage=positive_read_overflow")
+        self.assert_refusal(
+            self.drive(popen_script=(("exit", 1),)),
+            " sandbox_stage=positive_read_exit sandbox_failure=python_error",
+        )
+        self.assert_refusal(
+            self.drive(popen_script=(("exit", 125),)),
+            " sandbox_stage=positive_read_exit sandbox_failure=exec_failed",
+        )
+        self.assert_refusal(
+            self.drive(popen_script=(("exit", -9),)),
+            " sandbox_stage=positive_read_exit sandbox_failure=signal_exit",
+        )
+        self.assert_refusal(
+            self.drive(popen_script=(("exit", 7),)),
+            " sandbox_stage=positive_read_exit sandbox_failure=other_exit",
+        )
+        self.assert_refusal(
+            self.drive(popen_script=(("ok",), ("oserror",))), " sandbox_stage=positive_write_spawn"
+        )
+        self.assert_refusal(
+            self.drive(popen_script=(("ok",), ("overflow",))), " sandbox_stage=positive_write_overflow"
+        )
+        self.assert_refusal(
+            self.drive(popen_script=(("ok",), ("exit", 1))),
+            " sandbox_stage=positive_write_exit sandbox_failure=python_error",
+        )
+
+    def test_probe_spawn_site(self):
+        self.assert_refusal(
+            self.drive(popen_script=(("ok",), ("ok",), ("oserror",))), " sandbox_stage=probe_spawn"
+        )
+
+    def test_probe_overflow_sites_name_phase_and_stream(self):
+        for phase, label in (("before", "before_wait"), ("after", "after_wait"), ("final", "final")):
+            for stream in ("stdout", "stderr"):
+                with self.subTest(phase=phase, stream=stream):
+                    self.assert_refusal(
+                        self.drive(captures={stream: (phase,)}),
+                        " sandbox_stage=probe_" + stream + "_overflow_" + label,
+                    )
+        self.assert_refusal(
+            self.drive(captures={"stdout": ("before",), "stderr": ("before",)}),
+            " sandbox_stage=probe_stdout_overflow_before_wait",
+        )
+
+    def test_probe_identity_refusal_wins_over_exit_status(self):
+        status, text = self.drive(popen_script=(("ok",), ("ok",), ("refused", 125)))
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            text,
+            "macos-capability=refused reason=probe_identity_unavailable check=probe_process_identity"
+            + self.SUFFIX,
+        )
+        self.assertNotIn("sandbox_stage", text)
+
+    def test_probe_exit_site_maps_each_known_code_signal_and_other(self):
+        expected = dict(macos_capability.PROBE_EXIT_FAILURES)
+        expected.update({26: "child_sandbox_missing", 27: "other_exit", 1: "other_exit", 125: "exec_failed", -9: "signal_exit", -6: "signal_exit"})
+        for code, failure in expected.items():
+            with self.subTest(code=code):
+                self.assert_refusal(
+                    self.drive(popen_script=(("ok",), ("ok",), ("exit", code)), captures={}),
+                    " sandbox_stage=probe_exit sandbox_failure=" + failure,
+                )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
