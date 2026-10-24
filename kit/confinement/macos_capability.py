@@ -78,6 +78,8 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_identity_inventory", "probe_identity_home",
         "probe_identity_create", "probe_identity_attributes", "probe_identity_permissions",
         "probe_identity_readback", "probe_identity_cleanup", "probe_process_timeout", "probe_process_cleanup",
+        "probe_process_group_cleanup", "probe_process_capture_cleanup", "probe_process_census",
+        "probe_process_survivor", "probe_process_observation",
     )
 )
 PROBE_IDENTITY_CHECKS = frozenset(
@@ -562,38 +564,38 @@ def runner_uid_for_workspace(workspace):
 def _probe_uid_processes_present(uid):
     """Take a strict best-effort snapshot; this cannot rule out privileged or later processes."""
     if uid <= 0:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
     try:
         result = _run(
             ["/bin/ps", "-A", "-o", "pid=,ruid=,uid=,svuid="],
             env={"LANG": "C", "LC_ALL": "C"},
             timeout=5,
-            timeout_check="probe_process_cleanup",
+            timeout_check="probe_process_census",
         )
     except BaseException:
         raise ProbeFailure(
-            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup"
+            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
         ) from None
     if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_CAPTURE_BYTES:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
     try:
         output = result.stdout.decode("ascii")
     except UnicodeDecodeError:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup") from None
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census") from None
     if not output.endswith("\n"):
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
     lines = output.splitlines()
     if not lines:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
     seen_pids = set()
     present = False
     for line in lines:
         fields = line.split()
         if len(fields) != 4 or not all(field.isdecimal() for field in fields):
-            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
         pid, real_uid, effective_uid, saved_uid = (int(field) for field in fields)
         if pid in seen_pids:
-            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
         seen_pids.add(pid)
         if uid in (real_uid, effective_uid, saved_uid):
             present = True
@@ -681,9 +683,19 @@ def _run_as_probe_user(
             census_known = True
         except BaseException:
             pass
-        if not tree_stopped or not captures_joined or not census_known or escaped_process:
+        if not tree_stopped:
+            cleanup_check = "probe_process_group_cleanup"
+        elif not captures_joined:
+            cleanup_check = "probe_process_capture_cleanup"
+        elif not census_known:
+            cleanup_check = "probe_process_census"
+        elif escaped_process:
+            cleanup_check = "probe_process_survivor"
+        else:
+            cleanup_check = None
+        if cleanup_check is not None:
             raise ProbeFailure(
-                "native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup"
+                "native_preflight_unavailable", cleanup_complete=False, check=cleanup_check
             )
         for stream in (process.stdout, process.stderr):
             if stream is not None and not stream.closed:
@@ -1125,7 +1137,7 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
     except ProbeFailure:
         raise
     except BaseException:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup") from None
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_observation") from None
     finally:
         try:
             tree_stopped = _terminate_probe_tree(process)
@@ -1146,9 +1158,19 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
             census_known = True
         except BaseException:
             pass
-        if not tree_stopped or not captures_joined or not census_known or escaped_process:
+        if not tree_stopped:
+            cleanup_check = "probe_process_group_cleanup"
+        elif not captures_joined:
+            cleanup_check = "probe_process_capture_cleanup"
+        elif not census_known:
+            cleanup_check = "probe_process_census"
+        elif escaped_process:
+            cleanup_check = "probe_process_survivor"
+        else:
+            cleanup_check = None
+        if cleanup_check is not None:
             raise ProbeFailure(
-                "native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup"
+                "native_preflight_unavailable", cleanup_complete=False, check=cleanup_check
             )
         for stream in (process.stdout, process.stderr):
             if stream is not None and not stream.closed:
@@ -1205,7 +1227,7 @@ def run_native_probe(control_sha):
             if cleanup_safe:
                 if _probe_uid_processes_present(probe_uid):
                     raise ProbeFailure(
-                        "native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup"
+                        "native_preflight_unavailable", cleanup_complete=False, check="probe_process_survivor"
                     )
                 try:
                     delete_user = _run(["/usr/bin/dscl", ".", "-delete", "/Users/" + USERNAME], timeout=10)

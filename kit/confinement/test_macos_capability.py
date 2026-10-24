@@ -285,7 +285,7 @@ class ProbeUidCensusTests(unittest.TestCase):
             ["/bin/ps", "-A", "-o", "pid=,ruid=,uid=,svuid="],
             env={"LANG": "C", "LC_ALL": "C"},
             timeout=5,
-            timeout_check="probe_process_cleanup",
+            timeout_check="probe_process_census",
         )
 
     def test_census_accepts_clean_snapshot_but_only_as_a_snapshot(self):
@@ -308,12 +308,12 @@ class ProbeUidCensusTests(unittest.TestCase):
                 with patch.object(macos_capability, "_run", return_value=result):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._probe_uid_processes_present(502)
-                self.assertEqual(raised.exception.check, "probe_process_cleanup")
+                self.assertEqual(raised.exception.check, "probe_process_census")
                 self.assertFalse(raised.exception.cleanup_complete)
         with patch.object(macos_capability, "_run", side_effect=macos_capability.ProbeFailure("native_preflight_unavailable", cleanup_complete=False)):
             with self.assertRaises(macos_capability.ProbeFailure) as raised:
                 macos_capability._probe_uid_processes_present(502)
-        self.assertEqual(raised.exception.check, "probe_process_cleanup")
+        self.assertEqual(raised.exception.check, "probe_process_census")
         self.assertFalse(raised.exception.cleanup_complete)
 
 
@@ -552,7 +552,29 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                 with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
-        self.assertEqual(raised.exception.check, "probe_process_cleanup")
+        self.assertEqual(raised.exception.check, "probe_process_survivor")
+        self.assertFalse(raised.exception.cleanup_complete)
+
+    def test_probe_user_group_cleanup_failure_has_fixed_subphase(self):
+        class StubProcess:
+            pid = 12349
+            stdout = io.BytesIO(b"")
+            stderr = io.BytesIO(b"")
+            returncode = 0
+
+            def wait(self, timeout):
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+        process = StubProcess()
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=False):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
+        self.assertEqual(raised.exception.check, "probe_process_group_cleanup")
         self.assertFalse(raised.exception.cleanup_complete)
 
     def test_probe_user_normal_completion_requires_clean_census(self):
@@ -1240,7 +1262,7 @@ class ProbeTeardownTests(unittest.TestCase):
                 with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True) as census:
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._observe_probe("unused", "unused", "unused", 502, "unused")
-        self.assertEqual(raised.exception.check, "probe_process_cleanup")
+        self.assertEqual(raised.exception.check, "probe_process_survivor")
         self.assertFalse(raised.exception.cleanup_complete)
         census.assert_called_once_with(502)
 
@@ -1283,7 +1305,7 @@ class ProbeTeardownTests(unittest.TestCase):
                     with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
                             macos_capability._observe_probe("unused", "unused", "unused", 502, "unused")
-        self.assertEqual(raised.exception.check, "probe_process_cleanup")
+        self.assertEqual(raised.exception.check, "probe_process_observation")
         self.assertFalse(raised.exception.cleanup_complete)
 
     def test_process_table_error_terminates_and_reaps_injected_probe_group(self):
@@ -1408,7 +1430,7 @@ class ProbeTeardownTests(unittest.TestCase):
                 "_process_table",
                 side_effect=macos_capability.ProbeFailure("descriptor_readback_unavailable"),
             ):
-                with patch.object(macos_capability, "_terminate_probe_tree", return_value=False):
+                with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
                         with patch.object(macos_capability._Capture, "start"):
                             with patch.object(macos_capability._Capture, "join", return_value=False):
                                 with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
@@ -1424,6 +1446,7 @@ class ProbeTeardownTests(unittest.TestCase):
                                             "unused",
                                         )
         self.assertFalse(raised.exception.cleanup_complete)
+        self.assertEqual(raised.exception.check, "probe_process_capture_cleanup")
         self.assertEqual(stdout.close_calls, 0)
         self.assertEqual(stderr.close_calls, 0)
 
@@ -1548,7 +1571,7 @@ class ProbeTeardownTests(unittest.TestCase):
                                                         with patch.object(macos_capability, "_run") as command:
                                                             with self.assertRaises(macos_capability.ProbeFailure) as raised:
                                                                 macos_capability.run_native_probe("a" * 40)
-            self.assertEqual(raised.exception.check, "probe_process_cleanup")
+            self.assertEqual(raised.exception.check, "probe_process_survivor")
             self.assertFalse(raised.exception.cleanup_complete)
             census.assert_called_once_with(502)
             command.assert_not_called()
