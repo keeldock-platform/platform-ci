@@ -70,7 +70,12 @@ RUNNER_CONTROL_CHECKS = frozenset(
     )
 )
 NATIVE_PREFLIGHT_CHECKS = frozenset(
-    ("context", "developer_mode", "runner_controls", "probe_identity", "capability_probe")
+    (
+        "context", "developer_mode", "runner_controls", "probe_identity", "capability_probe",
+        "probe_identity_lookup", "probe_identity_inventory", "probe_identity_home",
+        "probe_identity_create", "probe_identity_attributes", "probe_identity_permissions",
+        "probe_identity_readback", "probe_identity_privilege",
+    )
 )
 
 
@@ -164,7 +169,7 @@ def _preflight_phase(check):
         yield
     except ProbeFailure as error:
         if error.reason == "native_preflight_unavailable":
-            raise ProbeFailure(error.reason, cleanup_complete=error.cleanup_complete, check=check) from None
+            raise ProbeFailure(error.reason, cleanup_complete=error.cleanup_complete, check=error.check or check) from None
         raise
     except BaseException:
         raise ProbeFailure("native_preflight_unavailable", check=check) from None
@@ -421,48 +426,57 @@ def _create_probe_identity(workspace):
     if os.geteuid() != 0:
         raise ProbeFailure("probe_identity_unavailable")
     account = "/Users/" + USERNAME
-    existing = _run(["/usr/bin/dscl", ".", "-read", account], timeout=10)
+    with _preflight_phase("probe_identity_lookup"):
+        existing = _run(["/usr/bin/dscl", ".", "-read", account], timeout=10)
     if existing.returncode == 0:
         raise ProbeFailure("probe_identity_unavailable")
-    listed = _require_success(_run(["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"], timeout=10), "probe_identity_unavailable")
-    ids = []
-    for line in listed.stdout.decode("utf-8", "ignore").splitlines():
-        fields = line.split()
-        if len(fields) == 2 and fields[1].isdigit():
-            ids.append(int(fields[1]))
-    uid = max(ids or [500]) + 1
-    if uid >= 60000:
-        raise ProbeFailure("probe_identity_unavailable")
-    home_parent = Path(tempfile.mkdtemp(prefix="sandbox-capability-home-", dir="/tmp"))
+    with _preflight_phase("probe_identity_inventory"):
+        listed = _require_success(_run(["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"], timeout=10), "probe_identity_unavailable")
+        ids = []
+        for line in listed.stdout.decode("utf-8", "ignore").splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[1].isdigit():
+                ids.append(int(fields[1]))
+        uid = max(ids or [500]) + 1
+        if uid >= 60000:
+            raise ProbeFailure("probe_identity_unavailable")
+    with _preflight_phase("probe_identity_home"):
+        home_parent = Path(tempfile.mkdtemp(prefix="sandbox-capability-home-", dir="/tmp"))
     home = home_parent / "home"
     try:
-        home.mkdir(mode=0o700)
-        _require_success(_run(["/usr/bin/dscl", ".", "-create", account], timeout=10), "probe_identity_unavailable")
-        for key, value in (
-            ("UniqueID", str(uid)),
-            ("PrimaryGroupID", "20"),
-            ("NFSHomeDirectory", str(home)),
-            ("UserShell", "/usr/bin/false"),
-            ("RealName", "Capability Probe"),
-            ("IsHidden", "1"),
-        ):
-            _require_success(_run(["/usr/bin/dscl", ".", "-create", account, key, value], timeout=10), "probe_identity_unavailable")
-        os.chown(home_parent, uid, 20)
-        os.chown(home, uid, 20)
-        os.chmod(home_parent, 0o700)
-        os.chmod(home, 0o700)
-        group_result = _require_success(_run(["/usr/bin/id", "-Gn", USERNAME], timeout=5), "probe_identity_unavailable")
-        groups = group_result.stdout.decode("ascii", "ignore").split()
-        uid_result = _require_success(_run(["/usr/bin/id", "-u", USERNAME], timeout=5), "probe_identity_unavailable")
-        if "admin" in groups or uid_result.stdout.decode("ascii", "ignore").strip() != str(uid) or uid == runner_uid_for_workspace(workspace):
-            raise ProbeFailure("probe_identity_unavailable")
+        with _preflight_phase("probe_identity_home"):
+            home.mkdir(mode=0o700)
+        with _preflight_phase("probe_identity_create"):
+            _require_success(_run(["/usr/bin/dscl", ".", "-create", account], timeout=10), "probe_identity_unavailable")
+        with _preflight_phase("probe_identity_attributes"):
+            for key, value in (
+                ("UniqueID", str(uid)),
+                ("PrimaryGroupID", "20"),
+                ("NFSHomeDirectory", str(home)),
+                ("UserShell", "/usr/bin/false"),
+                ("RealName", "Capability Probe"),
+                ("IsHidden", "1"),
+            ):
+                _require_success(_run(["/usr/bin/dscl", ".", "-create", account, key, value], timeout=10), "probe_identity_unavailable")
+        with _preflight_phase("probe_identity_permissions"):
+            os.chown(home_parent, uid, 20)
+            os.chown(home, uid, 20)
+            os.chmod(home_parent, 0o700)
+            os.chmod(home, 0o700)
+        with _preflight_phase("probe_identity_readback"):
+            group_result = _require_success(_run(["/usr/bin/id", "-Gn", USERNAME], timeout=5), "probe_identity_unavailable")
+            groups = group_result.stdout.decode("ascii", "ignore").split()
+            uid_result = _require_success(_run(["/usr/bin/id", "-u", USERNAME], timeout=5), "probe_identity_unavailable")
+            if "admin" in groups or uid_result.stdout.decode("ascii", "ignore").strip() != str(uid) or uid == runner_uid_for_workspace(workspace):
+                raise ProbeFailure("probe_identity_unavailable")
         user_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
         privilege_check = (
             "import subprocess; result = subprocess.run(['/usr/bin/sudo', '-n', '-l'], "
             "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
             "raise SystemExit(0 if result.returncode != 0 else 1)"
         )
-        _run_as_probe_user(["/usr/bin/python3", "-c", privilege_check], uid, env=user_env, timeout=5)
+        with _preflight_phase("probe_identity_privilege"):
+            _run_as_probe_user(["/usr/bin/python3", "-c", privilege_check], uid, env=user_env, timeout=5)
     except BaseException:
         try:
             _run(["/usr/bin/dscl", ".", "-delete", account], timeout=10)

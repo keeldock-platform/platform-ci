@@ -222,6 +222,102 @@ class FixedOutcomeTests(unittest.TestCase):
         )
 
 
+class ProbeIdentityDiagnosticTests(unittest.TestCase):
+    def test_identity_command_failures_report_fixed_subphase_and_keep_cleanup(self):
+        checks = (
+            "probe_identity_lookup", "probe_identity_inventory", "probe_identity_create",
+            *("probe_identity_attributes",) * 6,
+            "probe_identity_readback", "probe_identity_readback", "probe_identity_privilege",
+        )
+        for failure_index, check in enumerate(checks):
+            with self.subTest(check=check, command=failure_index):
+                with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+                    parent = Path(directory) / "probe-home"
+                    parent.mkdir()
+                    calls = []
+                    def command(argv, **kwargs):
+                        index = len(calls)
+                        calls.append(argv)
+                        if index == failure_index:
+                            raise macos_capability.ProbeFailure("native_preflight_unavailable")
+                        if argv[2:4] == ["-read", "/Users/" + macos_capability.USERNAME]:
+                            return subprocess.CompletedProcess(argv, 1, b"", b"")
+                        output = b"account 501\n" if "-list" in argv else b""
+                        if "-Gn" in argv:
+                            output = b"staff\n"
+                        if "-u" in argv and argv[0] == "/usr/bin/id":
+                            output = b"502\n"
+                        return subprocess.CompletedProcess(argv, 0, output, b"")
+                    with ExitStack() as stack:
+                        stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0))
+                        stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", return_value=str(parent)))
+                        stack.enter_context(patch.object(macos_capability.os, "chown"))
+                        stack.enter_context(patch.object(macos_capability.os, "chmod"))
+                        stack.enter_context(patch.object(macos_capability, "runner_uid_for_workspace", return_value=501))
+                        stack.enter_context(patch.object(macos_capability, "_run", side_effect=command))
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            with macos_capability._preflight_phase("probe_identity"):
+                                macos_capability._create_probe_identity(Path(directory))
+                    self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
+                    self.assertEqual(raised.exception.check, check)
+                    self.assertEqual(
+                        macos_capability.safe_output(False, raised.exception.reason, raised.exception.check),
+                        "macos-capability=refused reason=native_preflight_unavailable check=" + check + "\n"
+                        "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                    )
+                    if failure_index >= 2:
+                        self.assertEqual(calls[-1], ["/usr/bin/dscl", ".", "-delete", "/Users/" + macos_capability.USERNAME])
+                        self.assertFalse(parent.exists())
+                    else:
+                        self.assertTrue(parent.exists())
+
+    def test_identity_home_error_is_sanitised_before_account_creation(self):
+        results = (subprocess.CompletedProcess([], 1, b"", b""), subprocess.CompletedProcess([], 0, b"account 501\n", b""))
+        with patch.object(macos_capability.os, "geteuid", return_value=0):
+            with patch.object(macos_capability, "_run", side_effect=results) as command:
+                with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=OSError("sensitive filesystem detail")):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        with macos_capability._preflight_phase("probe_identity"):
+                            macos_capability._create_probe_identity(Path("/tmp/synthetic-workspace"))
+        self.assertEqual(command.call_count, 2)
+        self.assertEqual(raised.exception.check, "probe_identity_home")
+        self.assertNotIn("sensitive", str(raised.exception))
+
+    def test_nested_identity_phase_preserves_cleanup_flag(self):
+        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+            with macos_capability._preflight_phase("probe_identity"):
+                with macos_capability._preflight_phase("probe_identity_privilege"):
+                    raise macos_capability.ProbeFailure("native_preflight_unavailable", cleanup_complete=False)
+        self.assertEqual(raised.exception.check, "probe_identity_privilege")
+        self.assertFalse(raised.exception.cleanup_complete)
+
+    def test_identity_permission_error_keeps_account_and_home_cleanup(self):
+        for operation in ("chown", "chmod"):
+            with self.subTest(operation=operation):
+                with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+                    parent = Path(directory) / "probe-home"
+                    parent.mkdir()
+                    results = [subprocess.CompletedProcess([], 1, b"", b"")]
+                    results.append(subprocess.CompletedProcess([], 0, b"account 501\n", b""))
+                    results.extend([subprocess.CompletedProcess([], 0, b"", b"")] * 8)
+                    with ExitStack() as stack:
+                        stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0))
+                        stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", return_value=str(parent)))
+                        for name in ("chown", "chmod"):
+                            stack.enter_context(patch.object(
+                                macos_capability.os, name,
+                                side_effect=OSError("sensitive filesystem detail") if name == operation else None,
+                            ))
+                        command = stack.enter_context(patch.object(macos_capability, "_run", side_effect=results))
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            with macos_capability._preflight_phase("probe_identity"):
+                                macos_capability._create_probe_identity(Path(directory))
+                    self.assertEqual(raised.exception.check, "probe_identity_permissions")
+                    self.assertNotIn("sensitive", str(raised.exception))
+                    command.assert_called_with(["/usr/bin/dscl", ".", "-delete", "/Users/" + macos_capability.USERNAME], timeout=10)
+                    self.assertFalse(parent.exists())
+
+
 class RunnerControlDiagnosticTests(unittest.TestCase):
     def test_unknown_worker_roots_have_only_fixed_refusal_categories(self):
         with tempfile.TemporaryDirectory(prefix="macos-runner-control-") as directory:
