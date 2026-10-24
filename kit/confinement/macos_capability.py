@@ -86,6 +86,7 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_process_survivor_controls_same_group",
         "probe_process_survivor_controls_other_group",
         "probe_process_survivor_controls_zombie",
+        "probe_process_survivor_controls_multiple",
         "probe_process_survivor_controls_unattributed",
     )
 )
@@ -632,7 +633,7 @@ def _probe_uid_process_snapshot(uid, launched_pgid=None):
     if matches == 0:
         return False, None
     if matches > 1:
-        return True, "probe_process_survivor_controls_unattributed"
+        return True, "probe_process_survivor_controls_multiple"
     if matched_state[0] == "Z":
         return True, "probe_process_survivor_controls_zombie"
     if matched_pgid <= 0:
