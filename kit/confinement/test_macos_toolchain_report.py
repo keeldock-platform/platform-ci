@@ -651,17 +651,31 @@ class MainTests(unittest.TestCase):
                 self.assertTrue(safe.isascii() and safe.isprintable())
 
 
+def clt_fixture(directory):
+    root = Path(directory) / "CommandLineTools"
+    (root / "usr" / "bin").mkdir(parents=True)
+    (root / "usr" / "bin" / "clang").write_text("x")
+    (root / "SDKs" / "MacOSX.sdk").mkdir(parents=True)
+    for version in ("3.9", "3.13"):
+        binary = root / "Library" / "Frameworks" / "Python3.framework" / "Versions" / version / "bin"
+        binary.mkdir(parents=True)
+        (binary / ("python" + version)).write_text("x")
+    return root
+
+
 class DiagnosticTests(unittest.TestCase):
     def run_diagnostics(self, sys_executable, queries, trusted=None):
         lines = []
         fake_sys = mock.patch.object(sys, "executable", sys_executable)
-        fake_queries = mock.patch.object(report, "run_query", side_effect=queries)
-        with fake_sys, fake_queries:
-            if trusted is None:
-                report.unconditional_diagnostics(lines.append)
-            else:
-                with mock.patch.object(macos_capability, "_trusted_path_metadata", side_effect=trusted):
-                    report.unconditional_diagnostics(lines.append)
+        fake_queries = mock.patch.object(report, "run_query", side_effect=list(queries) + [None] * 2)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(fake_sys)
+            stack.enter_context(fake_queries)
+            stack.enter_context(mock.patch.object(report, "CLT_ROOT", "/nonexistent-fixture-clt"))
+            stack.enter_context(mock.patch.object(report, "USR_BIN_PYTHON3", "/nonexistent-fixture-usr/python3"))
+            if trusted is not None:
+                stack.enter_context(mock.patch.object(macos_capability, "_trusted_path_metadata", side_effect=trusted))
+            report.unconditional_diagnostics(lines.append)
         return lines
 
     def ok(self, text):
@@ -700,7 +714,7 @@ class DiagnosticTests(unittest.TestCase):
         self.assertTrue(lines[-1].startswith(report.DIAGNOSTIC_BANNER))
         for label in ("python_realpath", "xcode_select_directory", "clang_path", "sdk_path"):
             self.assertTrue(any(line.startswith("diag target " + label) for line in lines), label)
-        self.assertEqual(sum(line.endswith("=REFUSE") for line in lines), 4)
+        self.assertEqual(sum(line.endswith("=REFUSE") for line in lines), 5)
         self.assertTrue(any("(directory=True)=REFUSE" in line for line in lines))
         self.assertTrue(any("(directory=False)=REFUSE" in line for line in lines))
         self.assertTrue(any("matches PYTHON_XCODE_LAYOUT=False" in line for line in lines))
@@ -761,6 +775,161 @@ class DiagnosticTests(unittest.TestCase):
             with mock.patch.object(report, "unconditional_diagnostics", side_effect=calls.append):
                 report.build_report([].append)
         self.assertEqual(len(calls), 1)
+
+
+class CltDiagnosticTests(unittest.TestCase):
+    ENV = {"PATH": "/usr/bin"}
+
+    def ok(self, text):
+        return types.SimpleNamespace(returncode=0, stdout=text.encode() + b"\n", stderr=b"")
+
+    def run_clt(self, root, queries, python3="/nonexistent-fixture-usr/python3", trusted=None):
+        lines = []
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(report, "CLT_ROOT", str(root)))
+            stack.enter_context(mock.patch.object(report, "USR_BIN_PYTHON3", python3))
+            stack.enter_context(mock.patch.object(report, "run_query", side_effect=queries))
+            if trusted is not None:
+                stack.enter_context(mock.patch.object(macos_capability, "_trusted_path_metadata", side_effect=trusted))
+            report.clt_diagnostics(lines.append, self.ENV)
+        return lines
+
+    def test_absent_clt_prints_cleanly_and_never_raises(self):
+        lines = self.run_clt("/nonexistent-fixture-clt", [None, None])
+        self.assertIn("diag clt root='/nonexistent-fixture-clt' exists=False", lines)
+        self.assertIn("diag clt python3 candidates=0", lines)
+        self.assertTrue(any("clt_clang" in line and line.endswith(" absent") for line in lines))
+        self.assertTrue(any("clt_sdk" in line and line.endswith(" absent") for line in lines))
+        self.assertEqual(sum(line == "  query did not run" for line in lines), 2)
+        self.assertFalse(any("diagnostic_error" in line for line in lines))
+
+    def test_present_clt_walks_each_target_and_every_python_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = clt_fixture(directory)
+            lines = self.run_clt(root, [None, None])
+        self.assertIn("diag clt python3 candidates=2", lines)
+        for label in ("clt_root", "clt_clang", "clt_sdk", "clt_python_0", "clt_python_1"):
+            self.assertTrue(any(line.startswith("diag target " + label + " ") for line in lines), label)
+        self.assertTrue(any("exists=True" in line for line in lines))
+        self.assertTrue(any("Versions/3.13/bin/python3.13" in line for line in lines))
+        self.assertTrue(any("Versions/3.9/bin/python3.9" in line for line in lines))
+        self.assertEqual(sum("real _trusted_path_metadata(directory=True)=" in line for line in lines), 2)
+        self.assertEqual(sum("real _trusted_path_metadata(directory=False)=" in line for line in lines), 3)
+
+    def test_real_trust_check_result_is_printed_per_target(self):
+        refuse = macos_capability.ProbeFailure("fixture")
+
+        def refusing(path, directory=False):
+            raise refuse
+
+        with tempfile.TemporaryDirectory() as directory:
+            lines = self.run_clt(clt_fixture(directory), [None, None], trusted=refusing)
+        self.assertEqual(sum(line.endswith("=REFUSE") for line in lines), 5)
+
+    def test_python_layout_match_is_reported_for_each_candidate(self):
+        good = report.CLT_ROOT + "/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
+        bad = report.CLT_ROOT + "/Library/Frameworks/Python3.framework/Versions/Current/bin/python3.9"
+        with mock.patch.object(report, "discover_clt_pythons", return_value=[good, bad]):
+            lines = self.run_clt(report.CLT_ROOT, [None, None])
+        matches = [line for line in lines if "matches PYTHON_CLT_LAYOUT=" in line]
+        self.assertEqual(matches, ["  matches PYTHON_CLT_LAYOUT=True", "  matches PYTHON_CLT_LAYOUT=False"])
+
+    def test_discovery_enumerates_versions_present_not_a_fixed_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = clt_fixture(directory)
+            found = report.discover_clt_pythons(str(root))
+        self.assertEqual([Path(item).name for item in found], ["python3.13", "python3.9"])
+        self.assertEqual(report.discover_clt_pythons("/nonexistent-fixture-clt"), [])
+
+    def test_queries_use_clt_developer_dir_and_report_read_tool_path(self):
+        seen = []
+        replies = [self.ok("/Fixture/clang"), types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom\n")]
+
+        def fake(argv, env, emit):
+            seen.append((argv, env))
+            return replies[len(seen) - 1]
+
+        lines = []
+        with mock.patch.object(report, "CLT_ROOT", "/nonexistent-fixture-clt"):
+            with mock.patch.object(report, "USR_BIN_PYTHON3", "/nonexistent-fixture-usr/python3"):
+                with mock.patch.object(report, "run_query", side_effect=fake):
+                    report.clt_diagnostics(lines.append, self.ENV)
+        self.assertEqual(seen[0][0], ["/usr/bin/xcrun", "--find", "clang"])
+        self.assertEqual(seen[1][0], ["/usr/bin/xcrun", "--show-sdk-path"])
+        for _, env in seen:
+            self.assertEqual(env["DEVELOPER_DIR"], "/nonexistent-fixture-clt")
+            self.assertEqual(env["PATH"], "/usr/bin")
+        self.assertNotIn("DEVELOPER_DIR", self.ENV)
+        self.assertIn("  _read_tool_path would accept value='/Fixture/clang'", lines)
+        self.assertIn("  _read_tool_path would REFUSE", lines)
+        self.assertIn("  returncode=1", lines)
+        self.assertIn("  stderr=b'boom\\n'", lines)
+
+    def test_usr_bin_python3_lstat_chain_shows_a_symlink_and_its_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            real = Path(directory) / "real"
+            real.write_text("x")
+            link = Path(directory) / "python3"
+            link.symlink_to(real)
+            lines = self.run_clt("/nonexistent-fixture-clt", [None, None], python3=str(link))
+        self.assertIn("diag lstat chain " + ascii(str(link)), lines)
+        leaf = [line for line in lines if line.startswith("  " + ascii(str(link)) + " type=symlink ")]
+        self.assertEqual(len(leaf), 1)
+        self.assertIn("target=" + ascii(str(real)), leaf[0])
+
+    def test_each_substep_failure_is_contained_and_later_steps_still_run(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = clt_fixture(directory)
+            with mock.patch.object(report, "discover_clt_pythons", side_effect=RuntimeError("fixture")):
+                with mock.patch.object(report, "diagnostic_clt_query", side_effect=RuntimeError("fixture")):
+                    lines = self.run_clt(root, [None, None])
+        self.assertEqual(sum(line == "  diagnostic_error=RuntimeError" for line in lines), 3)
+        self.assertTrue(any(line.startswith("diag lstat chain") for line in lines))
+        self.assertTrue(any(line.startswith("diag target clt_sdk ") for line in lines))
+
+    def test_unconditional_diagnostics_contains_a_clt_block_failure(self):
+        with mock.patch.object(report, "clt_diagnostics", side_effect=RuntimeError("fixture")):
+            with mock.patch.object(report, "run_query", return_value=None):
+                lines = []
+                report.unconditional_diagnostics(lines.append)
+        self.assertIn("diagnostic_error=RuntimeError", lines)
+        self.assertEqual(lines[-1], report.DIAGNOSTIC_BANNER + " end")
+
+    def test_clt_block_runs_inside_the_banners_and_is_ascii_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = clt_fixture(directory)
+            hostile = Path(directory) / "p\ny::x"
+            with mock.patch.object(report, "run_query", return_value=None):
+                with mock.patch.object(report, "CLT_ROOT", str(root)):
+                    with mock.patch.object(report, "USR_BIN_PYTHON3", str(hostile)):
+                        lines = []
+                        report.unconditional_diagnostics(lines.append)
+        index = [i for i, line in enumerate(lines) if line.startswith("diag clt root=")]
+        self.assertEqual(len(index), 1)
+        self.assertTrue(lines[0].startswith(report.DIAGNOSTIC_BANNER))
+        self.assertTrue(lines[-1].startswith(report.DIAGNOSTIC_BANNER))
+        for line in lines:
+            self.assertTrue(line.isascii() and line.isprintable(), line)
+
+    def test_clt_diagnostics_never_change_stages_verdict_or_drift(self):
+        outputs = []
+        for diagnostics in (lambda emit: None, lambda emit: report.clt_diagnostics(emit, self.ENV)):
+            with synthetic_host(python_ok=False):
+                with mock.patch.object(report, "unconditional_diagnostics", side_effect=diagnostics):
+                    with mock.patch.object(report, "CLT_ROOT", "/nonexistent-fixture-clt"):
+                        with mock.patch.object(report, "run_query", return_value=None):
+                            output = io.StringIO()
+                            with contextlib.redirect_stdout(output):
+                                self.assertEqual(report.main(), 0)
+            outputs.append(
+                [
+                    line
+                    for line in output.getvalue().splitlines()
+                    if line.startswith(("stages ", "verdict:", "drift_detected="))
+                ]
+            )
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(len(outputs[0]), 3)
 
 
 class PreviewTests(unittest.TestCase):

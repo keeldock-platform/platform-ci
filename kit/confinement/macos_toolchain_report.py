@@ -1,3 +1,4 @@
+import glob
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -509,6 +510,11 @@ def collect_stages(emit, stages, resolved):
 
 
 DIAGNOSTIC_BANNER = "unconditional-diagnostic-walks"
+CLT_ROOT = "/Library/Developer/CommandLineTools"
+CLT_CLANG_RELATIVE = "usr/bin/clang"
+CLT_SDK_RELATIVE = "SDKs/MacOSX.sdk"
+CLT_PYTHON_GLOB_RELATIVE = "Library/Frameworks/Python3.framework/Versions/*/bin/python3.*"
+USR_BIN_PYTHON3 = "/usr/bin/python3"
 
 
 def file_type_text(metadata):
@@ -587,6 +593,82 @@ def diagnostic_query_value(query):
     return value or None
 
 
+def discover_clt_pythons(root):
+    pattern = os.path.join(glob.escape(root), CLT_PYTHON_GLOB_RELATIVE)
+    return sorted(glob.glob(pattern))
+
+
+def diagnostic_clt_query(label, argv, env, emit):
+    emit("diag clt query " + label + " DEVELOPER_DIR=" + ascii(env["DEVELOPER_DIR"]))
+    query = run_query(argv, env, emit)
+    if query is None:
+        emit("  query did not run")
+        return
+    emit("  returncode=" + str(query.returncode))
+    emit("  stdout=" + preview(query.stdout))
+    emit("  stderr=" + preview(query.stderr))
+    try:
+        value = macos_capability._read_tool_path(query)
+        emit("  _read_tool_path would accept value=" + ascii(value))
+    except macos_capability.ProbeFailure:
+        emit("  _read_tool_path would REFUSE")
+
+
+def clt_diagnostics(emit, query_env):
+    root = CLT_ROOT
+    try:
+        emit("diag clt root=" + ascii(root) + " exists=" + str(os.path.lexists(root)))
+    except BaseException as error:
+        emit("  diagnostic_error=" + type(error).__name__)
+    try:
+        diagnostic_target("clt_root", root, True, emit)
+    except BaseException as error:
+        emit("  diagnostic_error=" + type(error).__name__)
+    fixed = (
+        ("clt_clang", os.path.join(root, CLT_CLANG_RELATIVE), False),
+        ("clt_sdk", os.path.join(root, CLT_SDK_RELATIVE), True),
+    )
+    for label, path, directory in fixed:
+        try:
+            if os.path.lexists(path):
+                diagnostic_target(label, path, directory, emit)
+            else:
+                emit("diag target " + label + " path=" + ascii(path) + " absent")
+        except BaseException as error:
+            emit("  diagnostic_error=" + type(error).__name__)
+    try:
+        pythons = discover_clt_pythons(root)
+        emit("diag clt python3 candidates=" + str(len(pythons)))
+        for index, python in enumerate(pythons):
+            try:
+                diagnostic_target("clt_python_" + str(index), python, False, emit)
+                text = Path(python).as_posix()
+                emit("  matches PYTHON_CLT_LAYOUT=" + str(bool(macos_capability.PYTHON_CLT_LAYOUT.fullmatch(text))))
+            except BaseException as error:
+                emit("  diagnostic_error=" + type(error).__name__)
+    except BaseException as error:
+        emit("  diagnostic_error=" + type(error).__name__)
+    try:
+        env = dict(query_env)
+        env["DEVELOPER_DIR"] = root
+    except BaseException as error:
+        emit("  diagnostic_error=" + type(error).__name__)
+        return
+    queries = (
+        ("find_clang", ["/usr/bin/xcrun", "--find", "clang"]),
+        ("show_sdk_path", ["/usr/bin/xcrun", "--show-sdk-path"]),
+    )
+    for label, argv in queries:
+        try:
+            diagnostic_clt_query(label, argv, env, emit)
+        except BaseException as error:
+            emit("  diagnostic_error=" + type(error).__name__)
+    try:
+        diagnostic_lstat_chain(USR_BIN_PYTHON3, emit)
+    except BaseException as error:
+        emit("  diagnostic_error=" + type(error).__name__)
+
+
 def unconditional_diagnostics(emit):
     emit(DIAGNOSTIC_BANNER + " begin (diagnostic only; changes no verdict)")
     try:
@@ -626,6 +708,10 @@ def unconditional_diagnostics(emit):
                 emit("diag sdk path unavailable")
             else:
                 diagnostic_target("sdk_path", sdk, True, emit)
+    except BaseException as error:
+        emit("diagnostic_error=" + type(error).__name__)
+    try:
+        clt_diagnostics(emit, query_env)
     except BaseException as error:
         emit("diagnostic_error=" + type(error).__name__)
     emit(DIAGNOSTIC_BANNER + " end")
