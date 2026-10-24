@@ -75,6 +75,44 @@ class FixedOutcomeTests(unittest.TestCase):
                     "macos-confinement=refused reason=incomplete_channel_evidence\n",
                 )
 
+    def test_identity_subphase_checks_are_fixed_and_never_echo_error_data(self):
+        for check in macos_capability.PROBE_IDENTITY_CHECKS:
+            with self.subTest(check=check):
+                refusal = macos_capability.ProbeFailure("probe_identity_unavailable", check=check)
+                self.assertEqual(
+                    macos_capability.safe_output(False, refusal.reason, refusal.check),
+                    "macos-capability=refused reason=probe_identity_unavailable check=" + check + "\n"
+                    "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                )
+        for unsafe in ("private account name", "probe_identity_readback path=/tmp/secret", "probe_identity_inventory\nsecret"):
+            with self.subTest(unsafe=unsafe):
+                refusal = macos_capability.ProbeFailure("probe_identity_unavailable", check=unsafe)
+                self.assertIsNone(refusal.check)
+                self.assertEqual(
+                    macos_capability.safe_output(False, refusal.reason, refusal.check),
+                    "macos-capability=refused reason=probe_identity_unavailable\n"
+                    "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                )
+
+    def test_main_preserves_fixed_identity_subphase_diagnostic(self):
+        output = io.StringIO()
+        failure = macos_capability.ProbeFailure(
+            "probe_identity_unavailable", check="probe_identity_readback"
+        )
+        with patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}):
+            with patch.object(macos_capability, "_check_context", return_value=Path("/tmp/synthetic-control")):
+                with patch.object(macos_capability, "_disable_developer_mode"):
+                    with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
+                        with patch.object(macos_capability, "_create_probe_identity", side_effect=failure):
+                            with redirect_stdout(output):
+                                status = macos_capability.main(["--control-sha", CONTROL_SHA])
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output.getvalue(),
+            "macos-capability=refused reason=probe_identity_unavailable check=probe_identity_readback\n"
+            "macos-confinement=refused reason=incomplete_channel_evidence\n",
+        )
+
     def test_each_native_preflight_phase_labels_only_generic_failures(self):
         phases = (
             ("context", "_check_context"),
@@ -325,6 +363,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                 with self.assertRaises(macos_capability.ProbeFailure) as raised:
                     self._identity_runner(directory, groups=groups)
                 self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
+                self.assertEqual(raised.exception.check, "probe_identity_readback")
                 self.assertFalse((Path(directory) / "probe-home").exists())
 
     def test_malformed_group_and_uid_readback_refuse(self):
@@ -334,6 +373,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                 with self.assertRaises(macos_capability.ProbeFailure) as raised:
                     self._identity_runner(directory, groups=groups, uid=uid)
                 self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
+                self.assertEqual(raised.exception.check, "probe_identity_readback")
                 self.assertFalse((Path(directory) / "probe-home").exists())
 
     def test_identity_inventory_refuses_existing_fixed_name_or_malformed_records(self):
@@ -348,6 +388,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                             with macos_capability._preflight_phase("probe_identity"):
                                 macos_capability._create_probe_identity(Path(directory))
                 self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
+                self.assertEqual(raised.exception.check, "probe_identity_inventory")
 
     def test_ambiguous_create_timeout_preserves_home_and_never_deletes_account(self):
         with tempfile.TemporaryDirectory(prefix="macos-identity-timeout-") as directory:

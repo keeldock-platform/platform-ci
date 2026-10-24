@@ -77,6 +77,13 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_identity_readback", "probe_identity_cleanup", "probe_process_timeout", "probe_process_cleanup",
     )
 )
+PROBE_IDENTITY_CHECKS = frozenset(
+    (
+        "probe_identity", "probe_identity_inventory", "probe_identity_home", "probe_identity_create",
+        "probe_identity_attributes", "probe_identity_permissions", "probe_identity_readback",
+        "probe_identity_cleanup",
+    )
+)
 
 
 class ProbeFailure(Exception):
@@ -87,6 +94,8 @@ class ProbeFailure(Exception):
         if self.reason == "runner_control_unavailable" and check in RUNNER_CONTROL_CHECKS:
             self.check = check
         elif self.reason == "native_preflight_unavailable" and check in NATIVE_PREFLIGHT_CHECKS:
+            self.check = check
+        elif self.reason == "probe_identity_unavailable" and check in PROBE_IDENTITY_CHECKS:
             self.check = check
         else:
             self.check = None
@@ -158,7 +167,7 @@ def safe_output(observed, reason="native_preflight_unavailable", check=None):
         capability += " reason=" + reason
         if (reason == "runner_control_unavailable" and check in RUNNER_CONTROL_CHECKS) or (
             reason == "native_preflight_unavailable" and check in NATIVE_PREFLIGHT_CHECKS
-        ):
+        ) or (reason == "probe_identity_unavailable" and check in PROBE_IDENTITY_CHECKS):
             capability += " check=" + check
     return capability + "\nmacos-confinement=refused reason=incomplete_channel_evidence\n"
 
@@ -170,6 +179,13 @@ def _preflight_phase(check):
     except ProbeFailure as error:
         if error.reason == "native_preflight_unavailable":
             raise ProbeFailure(error.reason, cleanup_complete=error.cleanup_complete, check=error.check or check) from None
+        if error.reason == "probe_identity_unavailable":
+            identity_check = error.check if error.check in PROBE_IDENTITY_CHECKS else check
+            raise ProbeFailure(
+                error.reason,
+                cleanup_complete=error.cleanup_complete,
+                check=identity_check,
+            ) from None
         raise
     except BaseException:
         raise ProbeFailure("native_preflight_unavailable", check=check) from None
