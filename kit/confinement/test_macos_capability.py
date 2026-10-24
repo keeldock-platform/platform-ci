@@ -223,6 +223,80 @@ class FixedOutcomeTests(unittest.TestCase):
 
 
 class ProbeIdentityDiagnosticTests(unittest.TestCase):
+    def test_privilege_timeout_is_distinguished_from_launch_and_unknown_failures(self):
+        failures = (
+            (OSError("private launch detail"), "probe_identity_privilege"),
+            (subprocess.SubprocessError("private subprocess detail"), "probe_identity_privilege"),
+            (
+                subprocess.TimeoutExpired(
+                    "stub-timeout",
+                    5,
+                    output=b"private stdout",
+                    stderr=b"private stderr",
+                ),
+                "probe_identity_privilege_timeout",
+            ),
+        )
+        for failure, check in failures:
+            with self.subTest(check=check, failure=type(failure).__name__):
+                with patch.object(macos_capability.subprocess, "run", side_effect=failure):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        with macos_capability._preflight_phase("probe_identity_privilege"):
+                            macos_capability._run_as_probe_user(
+                                ["/usr/bin/python3", "-c", "pass"],
+                                502,
+                                env={"PATH": "/usr/bin:/bin"},
+                                timeout=5,
+                                timeout_check="probe_identity_privilege_timeout",
+                            )
+                self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
+                self.assertEqual(raised.exception.check, check)
+                output = macos_capability.safe_output(False, raised.exception.reason, raised.exception.check)
+                self.assertEqual(
+                    output,
+                    "macos-capability=refused reason=native_preflight_unavailable check=" + check + "\n"
+                    "macos-confinement=refused reason=incomplete_channel_evidence\n",
+                )
+                self.assertNotIn("private", output)
+
+    def test_probe_identity_privilege_call_selects_timeout_diagnostic(self):
+        with tempfile.TemporaryDirectory(prefix="macos-identity-timeout-test-") as directory:
+            parent = Path(directory) / "probe-home"
+            parent.mkdir()
+            calls = []
+
+            def command(argv, **kwargs):
+                calls.append((argv, kwargs))
+                if argv[0] == "/usr/bin/sudo":
+                    raise macos_capability.ProbeFailure(
+                        "native_preflight_unavailable", check=kwargs.get("timeout_check")
+                    )
+                if argv[2:4] == ["-read", "/Users/" + macos_capability.USERNAME]:
+                    return subprocess.CompletedProcess(argv, 1, b"", b"")
+                output = b"account 501\n" if "-list" in argv else b""
+                if "-Gn" in argv:
+                    output = b"staff\n"
+                if "-u" in argv and argv[0] == "/usr/bin/id":
+                    output = b"502\n"
+                return subprocess.CompletedProcess(argv, 0, output, b"")
+
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
+                stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", return_value=str(parent)))
+                stack.enter_context(patch.object(macos_capability.os, "chown", create=True))
+                stack.enter_context(patch.object(macos_capability.os, "chmod"))
+                stack.enter_context(patch.object(macos_capability, "runner_uid_for_workspace", return_value=501))
+                stack.enter_context(patch.object(macos_capability, "_run", side_effect=command))
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    with macos_capability._preflight_phase("probe_identity"):
+                        macos_capability._create_probe_identity(Path(directory))
+
+            self.assertEqual(raised.exception.check, "probe_identity_privilege_timeout")
+            privilege_call = next(call for call in calls if call[0][0] == "/usr/bin/sudo")
+            self.assertEqual(privilege_call[1]["timeout"], 5)
+            self.assertEqual(privilege_call[1]["timeout_check"], "probe_identity_privilege_timeout")
+            self.assertFalse(parent.exists())
+
     def test_identity_command_failures_report_fixed_subphase_and_keep_cleanup(self):
         checks = (
             "probe_identity_lookup", "probe_identity_inventory", "probe_identity_create",
