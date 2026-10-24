@@ -123,6 +123,17 @@ class FixedOutcomeTests(unittest.TestCase):
             "macos-confinement=refused reason=incomplete_channel_evidence\n",
         )
 
+    def test_subprocess_timeout_marks_cleanup_unproven(self):
+        with patch.object(
+            macos_capability.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired("stub-command", 1),
+        ):
+            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                macos_capability._run(["/usr/bin/true"], timeout=1)
+        self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
+        self.assertFalse(raised.exception.cleanup_complete)
+
     def test_post_identity_generic_failure_still_cleans_up_and_only_prints_phase(self):
         output = io.StringIO()
         with patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}):
@@ -130,11 +141,12 @@ class FixedOutcomeTests(unittest.TestCase):
                 with patch.object(macos_capability, "_disable_developer_mode"):
                     with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
                         with patch.object(macos_capability, "_create_probe_identity", return_value=(502, Path("/tmp/synthetic-home"), Path("/tmp/synthetic-home/home"))):
-                            with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=RuntimeError("private path /tmp/secret")):
-                                with patch.object(macos_capability, "_run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as command:
-                                    with patch.object(macos_capability.shutil, "rmtree") as remove:
-                                        with redirect_stdout(output):
-                                            status = macos_capability.main(["--control-sha", CONTROL_SHA])
+                            with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                                with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=RuntimeError("private path /tmp/secret")):
+                                    with patch.object(macos_capability, "_run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as command:
+                                        with patch.object(macos_capability.shutil, "rmtree") as remove:
+                                            with redirect_stdout(output):
+                                                status = macos_capability.main(["--control-sha", CONTROL_SHA])
         self.assertEqual(status, 1)
         self.assertEqual(
             output.getvalue(),
@@ -142,7 +154,7 @@ class FixedOutcomeTests(unittest.TestCase):
             "macos-confinement=refused reason=incomplete_channel_evidence\n",
         )
         command.assert_called_once_with(["/usr/bin/dscl", ".", "-delete", chr(47) + "Users/" + macos_capability.USERNAME], timeout=10)
-        remove.assert_called_once_with(Path("/tmp/synthetic-home"), ignore_errors=True)
+        remove.assert_called_once_with(Path("/tmp/synthetic-home"))
 
     def test_preflight_phase_does_not_change_existing_specific_refusal(self):
         output = io.StringIO()
@@ -222,63 +234,132 @@ class FixedOutcomeTests(unittest.TestCase):
         )
 
 
-class ProbeIdentityDiagnosticTests(unittest.TestCase):
-    def test_privilege_timeout_is_distinguished_from_launch_and_unknown_failures(self):
-        failures = (
-            (OSError("private launch detail"), "probe_identity_privilege"),
-            (subprocess.SubprocessError("private subprocess detail"), "probe_identity_privilege"),
-            (
-                subprocess.TimeoutExpired(
-                    "stub-timeout",
-                    5,
-                    output=b"private stdout",
-                    stderr=b"private stderr",
-                ),
-                "probe_identity_privilege_timeout",
-            ),
+class ProbeUidCensusTests(unittest.TestCase):
+    def test_census_checks_real_effective_and_saved_uid_fields(self):
+        rows = b"10 0 0 0\n11 502 0 0\n12 0 502 0\n13 0 0 502\n"
+        with patch.object(
+            macos_capability,
+            "_run",
+            return_value=subprocess.CompletedProcess([], 0, rows, b""),
+        ) as command:
+            self.assertTrue(macos_capability._probe_uid_processes_present(502))
+        command.assert_called_once_with(
+            ["/bin/ps", "-A", "-o", "pid=,ruid=,uid=,svuid="],
+            env={"LANG": "C", "LC_ALL": "C"},
+            timeout=5,
+            timeout_check="probe_process_cleanup",
         )
-        for failure, check in failures:
-            with self.subTest(check=check, failure=type(failure).__name__):
-                with patch.object(macos_capability.subprocess, "run", side_effect=failure):
-                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                        with macos_capability._preflight_phase("probe_identity_privilege"):
-                            macos_capability._run_as_probe_user(
-                                ["/usr/bin/python3", "-c", "pass"],
-                                502,
-                                env={"PATH": "/usr/bin:/bin"},
-                                timeout=5,
-                                timeout_check="probe_identity_privilege_timeout",
-                            )
-                self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
-                self.assertEqual(raised.exception.check, check)
-                output = macos_capability.safe_output(False, raised.exception.reason, raised.exception.check)
-                self.assertEqual(
-                    output,
-                    "macos-capability=refused reason=native_preflight_unavailable check=" + check + "\n"
-                    "macos-confinement=refused reason=incomplete_channel_evidence\n",
-                )
-                self.assertNotIn("private", output)
 
-    def test_probe_identity_privilege_call_selects_timeout_diagnostic(self):
-        with tempfile.TemporaryDirectory(prefix="macos-identity-timeout-test-") as directory:
+    def test_census_accepts_clean_snapshot_but_only_as_a_snapshot(self):
+        with patch.object(
+            macos_capability,
+            "_run",
+            return_value=subprocess.CompletedProcess([], 0, b"1 0 0 0\n2 501 501 501\n", b""),
+        ):
+            self.assertFalse(macos_capability._probe_uid_processes_present(502))
+
+    def test_census_malformed_or_failed_readback_is_incomplete(self):
+        invalid_outputs = (b"", b"1 0 0 0", b"1 0 0 unknown\n", b"1 0 0 0\n1 1 1 1\n1 1 1 1\n")
+        results = [subprocess.CompletedProcess([], 0, output, b"") for output in invalid_outputs]
+        results.extend((
+            subprocess.CompletedProcess([], 1, b"1 0 0 0\n", b""),
+            subprocess.CompletedProcess([], 0, b"1 0 0 0\n", b"warning\n"),
+        ))
+        for result in results:
+            with self.subTest(result=result):
+                with patch.object(macos_capability, "_run", return_value=result):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._probe_uid_processes_present(502)
+                self.assertEqual(raised.exception.check, "probe_process_cleanup")
+                self.assertFalse(raised.exception.cleanup_complete)
+        with patch.object(macos_capability, "_run", side_effect=macos_capability.ProbeFailure("native_preflight_unavailable", cleanup_complete=False)):
+            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                macos_capability._probe_uid_processes_present(502)
+        self.assertEqual(raised.exception.check, "probe_process_cleanup")
+        self.assertFalse(raised.exception.cleanup_complete)
+
+
+class ProbeIdentityDiagnosticTests(unittest.TestCase):
+    def _identity_runner(self, directory, *, groups=b"staff\n", uid=b"502\n", delete_status=0, fail_attribute=False):
+        parent = Path(directory) / "probe-home"
+        parent.mkdir()
+        calls = []
+
+        def command(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if argv[0] == "/usr/bin/dscl" and "-list" in argv:
+                return subprocess.CompletedProcess(argv, 0, b"runner 501\n", b"")
+            if argv[0] == "/usr/bin/dscl" and "-delete" in argv:
+                return subprocess.CompletedProcess(argv, delete_status, b"", b"")
+            if fail_attribute and argv[0] == "/usr/bin/dscl" and argv[2:4] == ["-create", "/Users/" + macos_capability.USERNAME] and len(argv) > 4:
+                raise macos_capability.ProbeFailure("native_preflight_unavailable")
+            if argv[0] == "/usr/bin/id" and "-Gn" in argv:
+                return subprocess.CompletedProcess(argv, 0, groups, b"")
+            if argv[0] == "/usr/bin/id" and "-u" in argv:
+                return subprocess.CompletedProcess(argv, 0, uid, b"")
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
+            stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", return_value=str(parent)))
+            stack.enter_context(patch.object(macos_capability.os, "chown", create=True))
+            stack.enter_context(patch.object(macos_capability.os, "chmod"))
+            stack.enter_context(patch.object(macos_capability, "runner_uid_for_workspace", return_value=501))
+            stack.enter_context(patch.object(macos_capability, "_run", side_effect=command))
+            result = macos_capability._create_probe_identity(Path(directory))
+        return result, calls, parent
+
+    def test_identity_readback_proves_distinct_non_admin_account_without_claiming_sudo_absence(self):
+        with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+            (uid, parent, home), calls, _ = self._identity_runner(directory)
+            self.assertEqual(uid, 502)
+            self.assertEqual(home, parent / "home")
+            self.assertIn(["/usr/bin/id", "-Gn", macos_capability.USERNAME], [call[0] for call in calls])
+            self.assertIn(["/usr/bin/id", "-u", macos_capability.USERNAME], [call[0] for call in calls])
+            self.assertFalse(any(call[0][0] == "/usr/bin/sudo" for call in calls))
+            shutil.rmtree(parent, ignore_errors=True)
+
+    def test_admin_and_developer_group_membership_refuse_and_clean_created_identity(self):
+        for groups in (b"staff admin\n", b"staff _developer\n"):
+            with self.subTest(groups=groups), tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    self._identity_runner(directory, groups=groups)
+                self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
+                self.assertFalse((Path(directory) / "probe-home").exists())
+
+    def test_malformed_group_and_uid_readback_refuse(self):
+        cases = ((b"staff\nextra\n", b"502\n"), (b"staff\n", b"502\n502\n"), (b"staff\n", b"503\n"))
+        for groups, uid in cases:
+            with self.subTest(groups=groups, uid=uid), tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    self._identity_runner(directory, groups=groups, uid=uid)
+                self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
+                self.assertFalse((Path(directory) / "probe-home").exists())
+
+    def test_identity_inventory_refuses_existing_fixed_name_or_malformed_records(self):
+        for listing in (b"ci-sandbox-probe 502\n", b"broken record\n"):
+            with self.subTest(listing=listing), tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+                def command(argv, **kwargs):
+                    return subprocess.CompletedProcess(argv, 0, listing, b"")
+
+                with patch.object(macos_capability.os, "geteuid", return_value=0, create=True):
+                    with patch.object(macos_capability, "_run", side_effect=command):
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            with macos_capability._preflight_phase("probe_identity"):
+                                macos_capability._create_probe_identity(Path(directory))
+                self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
+
+    def test_ambiguous_create_timeout_preserves_home_and_never_deletes_account(self):
+        with tempfile.TemporaryDirectory(prefix="macos-identity-timeout-") as directory:
             parent = Path(directory) / "probe-home"
             parent.mkdir()
             calls = []
 
             def command(argv, **kwargs):
-                calls.append((argv, kwargs))
-                if argv[0] == "/usr/bin/sudo":
-                    raise macos_capability.ProbeFailure(
-                        "native_preflight_unavailable", check=kwargs.get("timeout_check")
-                    )
-                if argv[2:4] == ["-read", "/Users/" + macos_capability.USERNAME]:
-                    return subprocess.CompletedProcess(argv, 1, b"", b"")
-                output = b"account 501\n" if "-list" in argv else b""
-                if "-Gn" in argv:
-                    output = b"staff\n"
-                if "-u" in argv and argv[0] == "/usr/bin/id":
-                    output = b"502\n"
-                return subprocess.CompletedProcess(argv, 0, output, b"")
+                calls.append(argv)
+                if "-list" in argv:
+                    return subprocess.CompletedProcess(argv, 0, b"runner 501\n", b"")
+                raise macos_capability.ProbeFailure("native_preflight_unavailable", cleanup_complete=False)
 
             with ExitStack() as stack:
                 stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
@@ -290,107 +371,173 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                 with self.assertRaises(macos_capability.ProbeFailure) as raised:
                     with macos_capability._preflight_phase("probe_identity"):
                         macos_capability._create_probe_identity(Path(directory))
+            self.assertFalse(raised.exception.cleanup_complete)
+            self.assertEqual(raised.exception.check, "probe_identity_create")
+            self.assertEqual(calls[-1], ["/usr/bin/dscl", ".", "-create", "/Users/" + macos_capability.USERNAME])
+            self.assertTrue(parent.exists())
 
-            self.assertEqual(raised.exception.check, "probe_identity_privilege_timeout")
-            privilege_call = next(call for call in calls if call[0][0] == "/usr/bin/sudo")
-            self.assertEqual(privilege_call[1]["timeout"], 5)
-            self.assertEqual(privilege_call[1]["timeout_check"], "probe_identity_privilege_timeout")
-            self.assertFalse(parent.exists())
+    def test_identity_cleanup_failure_preserves_home_and_refuses(self):
+        with tempfile.TemporaryDirectory(prefix="macos-identity-cleanup-") as directory:
+            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                self._identity_runner(directory, groups=b"staff admin\n", delete_status=1)
+            self.assertFalse(raised.exception.cleanup_complete)
+            self.assertEqual(raised.exception.check, "probe_identity_cleanup")
+            self.assertTrue((Path(directory) / "probe-home").exists())
 
-    def test_identity_command_failures_report_fixed_subphase_and_keep_cleanup(self):
-        checks = (
-            "probe_identity_lookup", "probe_identity_inventory", "probe_identity_create",
-            *("probe_identity_attributes",) * 6,
-            "probe_identity_readback", "probe_identity_readback", "probe_identity_privilege",
-        )
-        for failure_index, check in enumerate(checks):
-            with self.subTest(check=check, command=failure_index):
-                with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
-                    parent = Path(directory) / "probe-home"
-                    parent.mkdir()
-                    calls = []
-                    def command(argv, **kwargs):
-                        index = len(calls)
-                        calls.append(argv)
-                        if index == failure_index:
-                            raise macos_capability.ProbeFailure("native_preflight_unavailable")
-                        if argv[2:4] == ["-read", "/Users/" + macos_capability.USERNAME]:
-                            return subprocess.CompletedProcess(argv, 1, b"", b"")
-                        output = b"account 501\n" if "-list" in argv else b""
-                        if "-Gn" in argv:
-                            output = b"staff\n"
-                        if "-u" in argv and argv[0] == "/usr/bin/id":
-                            output = b"502\n"
-                        return subprocess.CompletedProcess(argv, 0, output, b"")
-                    with ExitStack() as stack:
-                        stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
-                        stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", return_value=str(parent)))
-                        stack.enter_context(patch.object(macos_capability.os, "chown", create=True))
-                        stack.enter_context(patch.object(macos_capability.os, "chmod"))
-                        stack.enter_context(patch.object(macos_capability, "runner_uid_for_workspace", return_value=501))
-                        stack.enter_context(patch.object(macos_capability, "_run", side_effect=command))
-                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                            with macos_capability._preflight_phase("probe_identity"):
-                                macos_capability._create_probe_identity(Path(directory))
-                    self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
-                    self.assertEqual(raised.exception.check, check)
-                    self.assertEqual(
-                        macos_capability.safe_output(False, raised.exception.reason, raised.exception.check),
-                        "macos-capability=refused reason=native_preflight_unavailable check=" + check + "\n"
-                        "macos-confinement=refused reason=incomplete_channel_evidence\n",
-                    )
-                    if failure_index >= 2:
-                        self.assertEqual(calls[-1], ["/usr/bin/dscl", ".", "-delete", "/Users/" + macos_capability.USERNAME])
-                        self.assertFalse(parent.exists())
-                    else:
-                        self.assertTrue(parent.exists())
-
-    def test_identity_home_error_is_sanitised_before_account_creation(self):
-        results = (subprocess.CompletedProcess([], 1, b"", b""), subprocess.CompletedProcess([], 0, b"account 501\n", b""))
-        with patch.object(macos_capability.os, "geteuid", return_value=0, create=True):
-            with patch.object(macos_capability, "_run", side_effect=results) as command:
-                with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=OSError("sensitive filesystem detail")):
+    def test_identity_failure_refuses_when_home_removal_errors_or_leaves_path(self):
+        for remove_behavior in (PermissionError("home-delete-error"), None):
+            with self.subTest(remove_behavior=remove_behavior), tempfile.TemporaryDirectory(
+                prefix="macos-identity-home-cleanup-"
+            ) as directory:
+                parent = Path(directory) / "probe-home"
+                if remove_behavior is None:
+                    remove = lambda path: None
+                else:
+                    remove = unittest.mock.Mock(side_effect=remove_behavior)
+                with patch.object(macos_capability.shutil, "rmtree", side_effect=remove):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                        with macos_capability._preflight_phase("probe_identity"):
-                            macos_capability._create_probe_identity(Path("/tmp/synthetic-workspace"))
-        self.assertEqual(command.call_count, 2)
-        self.assertEqual(raised.exception.check, "probe_identity_home")
-        self.assertNotIn("sensitive", str(raised.exception))
+                        self._identity_runner(directory, groups=b"staff admin\n")
+                self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
+                self.assertEqual(raised.exception.check, "probe_identity_cleanup")
+                self.assertFalse(raised.exception.cleanup_complete)
+                self.assertTrue(parent.is_dir())
+                shutil.rmtree(parent)
 
-    def test_nested_identity_phase_preserves_cleanup_flag(self):
-        with self.assertRaises(macos_capability.ProbeFailure) as raised:
-            with macos_capability._preflight_phase("probe_identity"):
-                with macos_capability._preflight_phase("probe_identity_privilege"):
-                    raise macos_capability.ProbeFailure("native_preflight_unavailable", cleanup_complete=False)
-        self.assertEqual(raised.exception.check, "probe_identity_privilege")
+    def test_failure_after_account_creation_removes_only_the_created_account(self):
+        with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                self._identity_runner(directory, fail_attribute=True)
+            self.assertEqual(raised.exception.check, "probe_identity_attributes")
+            self.assertFalse((Path(directory) / "probe-home").exists())
+
+    def test_probe_user_timeout_is_bounded_and_group_cleanup_is_checked(self):
+        class StubProcess:
+            pid = 12345
+            stdout = io.BytesIO(b"")
+            stderr = io.BytesIO(b"")
+            returncode = None
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired("stub-probe", timeout)
+
+            def poll(self):
+                return self.returncode
+
+        process = StubProcess()
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process) as popen:
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=True) as cleanup:
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
+        self.assertEqual(raised.exception.check, "probe_process_timeout")
+        self.assertFalse(raised.exception.cleanup_complete)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(popen.call_args.kwargs["close_fds"], True)
+        cleanup.assert_called_once_with(process)
+
+    def test_probe_user_census_detects_detached_child_after_group_cleanup(self):
+        class StubProcess:
+            pid = 12346
+            stdout = io.BytesIO(b"")
+            stderr = io.BytesIO(b"")
+            returncode = 0
+
+            def wait(self, timeout):
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+        process = StubProcess()
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
+        self.assertEqual(raised.exception.check, "probe_process_cleanup")
         self.assertFalse(raised.exception.cleanup_complete)
 
-    def test_identity_permission_error_keeps_account_and_home_cleanup(self):
-        for operation in ("chown", "chmod"):
-            with self.subTest(operation=operation):
-                with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
-                    parent = Path(directory) / "probe-home"
-                    parent.mkdir()
-                    results = [subprocess.CompletedProcess([], 1, b"", b"")]
-                    results.append(subprocess.CompletedProcess([], 0, b"account 501\n", b""))
-                    results.extend([subprocess.CompletedProcess([], 0, b"", b"")] * 8)
-                    with ExitStack() as stack:
-                        stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
-                        stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", return_value=str(parent)))
-                        for name in ("chown", "chmod"):
-                            stack.enter_context(patch.object(
-                                macos_capability.os, name,
-                                side_effect=OSError("sensitive filesystem detail") if name == operation else None,
-                                create=(name == "chown"),
-                            ))
-                        command = stack.enter_context(patch.object(macos_capability, "_run", side_effect=results))
-                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                            with macos_capability._preflight_phase("probe_identity"):
-                                macos_capability._create_probe_identity(Path(directory))
-                    self.assertEqual(raised.exception.check, "probe_identity_permissions")
-                    self.assertNotIn("sensitive", str(raised.exception))
-                    command.assert_called_with(["/usr/bin/dscl", ".", "-delete", "/Users/" + macos_capability.USERNAME], timeout=10)
-                    self.assertFalse(parent.exists())
+    def test_probe_user_normal_completion_requires_clean_census(self):
+        class StubProcess:
+            pid = 12347
+            stdout = io.BytesIO(b"safe output\n")
+            stderr = io.BytesIO(b"")
+            returncode = 0
+
+            def wait(self, timeout):
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+        process = StubProcess()
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False) as census:
+                    result = macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
+        self.assertEqual(result.stdout, b"safe output\n")
+        census.assert_called_once_with(502)
+
+    def test_probe_user_wait_error_is_incomplete_even_with_clean_snapshot(self):
+        class StubProcess:
+            pid = 12348
+            stdout = io.BytesIO(b"")
+            stderr = io.BytesIO(b"")
+            returncode = None
+
+            def wait(self, timeout):
+                raise OSError("private wait detail")
+
+            def poll(self):
+                return self.returncode
+
+        process = StubProcess()
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
+        self.assertEqual(raised.exception.check, "probe_process_timeout")
+        self.assertFalse(raised.exception.cleanup_complete)
+
+
+class DeveloperModeReadbackTests(unittest.TestCase):
+    def test_disable_uses_c_locale_and_requires_exact_disabled_status(self):
+        success = subprocess.CompletedProcess([], 0, b"", b"")
+        status = subprocess.CompletedProcess([], 0, b"Developer mode is currently disabled.\n", b"")
+        with patch.object(macos_capability, "_run", side_effect=(success, status)) as command:
+            macos_capability._disable_developer_mode()
+        self.assertEqual(command.call_args_list[0].args[0], ["/usr/sbin/DevToolsSecurity", "-disable"])
+        self.assertEqual(command.call_args_list[1].args[0], ["/usr/sbin/DevToolsSecurity", "-status"])
+        for call in command.call_args_list:
+            self.assertEqual(call.kwargs["env"], {"LANG": "C", "LC_ALL": "C"})
+            self.assertEqual(call.kwargs["timeout"], 10)
+
+    def test_enabled_extra_or_ambiguous_status_refuses(self):
+        cases = (
+            (b"Developer mode is currently enabled.\n", b""),
+            (b"prefix Developer mode is currently disabled.\n", b""),
+            (b"Developer mode is currently disabled.\nextra\n", b""),
+            (b"Developer mode is currently disabled.\n", b"warning\n"),
+            (b"Developer mode is currently disabled.", b""),
+        )
+        for stdout, stderr in cases:
+            with self.subTest(stdout=stdout, stderr=stderr):
+                status = subprocess.CompletedProcess([], 0, stdout, stderr)
+                with patch.object(macos_capability, "_run", side_effect=(subprocess.CompletedProcess([], 0, b"", b""), status)):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._disable_developer_mode()
+                self.assertEqual(raised.exception.reason, "developer_mode_unavailable")
+
+    def test_disable_or_status_command_failure_refuses(self):
+        for results in (
+            (subprocess.CompletedProcess([], 1, b"", b""),),
+            (subprocess.CompletedProcess([], 0, b"", b""), subprocess.CompletedProcess([], 1, b"", b"")),
+        ):
+            with self.subTest(results=results):
+                with patch.object(macos_capability, "_run", side_effect=results):
+                    with self.assertRaises(macos_capability.ProbeFailure):
+                        macos_capability._disable_developer_mode()
 
 
 class RunnerControlDiagnosticTests(unittest.TestCase):
@@ -982,6 +1129,65 @@ class DescriptorReadbackTests(unittest.TestCase):
 
 
 class ProbeTeardownTests(unittest.TestCase):
+    def test_observe_census_detects_detached_child_after_group_cleanup(self):
+        process = type(
+            "CompletedProcess",
+            (),
+            {"pid": 12344, "stdout": io.BytesIO(), "stderr": io.BytesIO(), "returncode": 0},
+        )()
+        process.poll = lambda: process.returncode
+        process.wait = lambda timeout: process.returncode
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True) as census:
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._observe_probe("unused", "unused", "unused", 502, "unused")
+        self.assertEqual(raised.exception.check, "probe_process_cleanup")
+        self.assertFalse(raised.exception.cleanup_complete)
+        census.assert_called_once_with(502)
+
+    def test_observe_timeout_is_never_cleanup_complete(self):
+        process = type(
+            "TimedOutProcess",
+            (),
+            {"pid": 12343, "stdout": io.BytesIO(), "stderr": io.BytesIO(), "returncode": None},
+        )()
+        process.poll = lambda: None
+
+        def wait(timeout):
+            raise subprocess.TimeoutExpired("stub-probe", timeout)
+
+        process.wait = wait
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "MAX_PROBE_SECONDS", 0):
+                with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            macos_capability._observe_probe("unused", "unused", "unused", 502, "unused")
+        self.assertEqual(raised.exception.reason, "probe_timeout")
+        self.assertFalse(raised.exception.cleanup_complete)
+
+    def test_observe_wait_error_is_never_cleanup_complete(self):
+        process = type(
+            "WaitErrorProcess",
+            (),
+            {"pid": 12342, "stdout": io.BytesIO(), "stderr": io.BytesIO(), "returncode": None},
+        )()
+        process.poll = lambda: None
+
+        def wait(timeout):
+            raise OSError("private wait detail")
+
+        process.wait = wait
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "MAX_PROBE_SECONDS", 0):
+                with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            macos_capability._observe_probe("unused", "unused", "unused", 502, "unused")
+        self.assertEqual(raised.exception.check, "probe_process_cleanup")
+        self.assertFalse(raised.exception.cleanup_complete)
+
     def test_process_table_error_terminates_and_reaps_injected_probe_group(self):
         process = type(
             "StubProcess",
@@ -1004,17 +1210,18 @@ class ProbeTeardownTests(unittest.TestCase):
                 side_effect=macos_capability.ProbeFailure("descriptor_readback_unavailable"),
             ):
                 with patch.object(macos_capability, "_terminate_probe_tree", side_effect=terminate_group) as teardown:
-                    with self.assertRaisesRegex(
-                        macos_capability.ProbeFailure,
-                        "descriptor_readback_unavailable",
-                    ):
-                        macos_capability._observe_probe(
-                            "unused",
-                            "unused",
-                            "unused",
-                            501,
-                            "unused",
-                        )
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                            with self.assertRaisesRegex(
+                                macos_capability.ProbeFailure,
+                                "descriptor_readback_unavailable",
+                            ):
+                                macos_capability._observe_probe(
+                                    "unused",
+                                    "unused",
+                                    "unused",
+                                    501,
+                                    "unused",
+                                )
         self.assertIsNotNone(process.poll(), "probe root process was not reaped")
         self.assertFalse(group, "probe process group was not terminated")
         teardown.assert_called_once_with(process)
@@ -1066,17 +1273,18 @@ class ProbeTeardownTests(unittest.TestCase):
                 side_effect=macos_capability.ProbeFailure("descriptor_readback_unavailable"),
             ):
                 with patch.object(macos_capability, "_terminate_probe_tree", return_value=True) as teardown:
-                    with self.assertRaisesRegex(
-                        macos_capability.ProbeFailure,
-                        "descriptor_readback_unavailable",
-                    ):
-                        macos_capability._observe_probe(
-                            "unused",
-                            "unused",
-                            "unused",
-                            501,
-                            "unused",
-                        )
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                            with self.assertRaisesRegex(
+                                macos_capability.ProbeFailure,
+                                "descriptor_readback_unavailable",
+                            ):
+                                macos_capability._observe_probe(
+                                    "unused",
+                                    "unused",
+                                    "unused",
+                                    501,
+                                    "unused",
+                                )
         teardown.assert_called_once_with(process)
 
     def test_unproven_teardown_does_not_close_stream_under_live_capture(self):
@@ -1103,19 +1311,20 @@ class ProbeTeardownTests(unittest.TestCase):
                 side_effect=macos_capability.ProbeFailure("descriptor_readback_unavailable"),
             ):
                 with patch.object(macos_capability, "_terminate_probe_tree", return_value=False):
-                    with patch.object(macos_capability._Capture, "start"):
-                        with patch.object(macos_capability._Capture, "join", return_value=False):
-                            with self.assertRaisesRegex(
-                                macos_capability.ProbeFailure,
-                                "sandbox_behavior_unavailable",
-                            ) as raised:
-                                macos_capability._observe_probe(
-                                    "unused",
-                                    "unused",
-                                    "unused",
-                                    501,
-                                    "unused",
-                                )
+                        with patch.object(macos_capability._Capture, "start"):
+                            with patch.object(macos_capability._Capture, "join", return_value=False):
+                                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                                    with self.assertRaisesRegex(
+                                        macos_capability.ProbeFailure,
+                                        "native_preflight_unavailable",
+                                    ) as raised:
+                                        macos_capability._observe_probe(
+                                            "unused",
+                                            "unused",
+                                            "unused",
+                                            501,
+                                            "unused",
+                                        )
         self.assertFalse(raised.exception.cleanup_complete)
         self.assertEqual(stdout.close_calls, 0)
         self.assertEqual(stderr.close_calls, 0)
@@ -1163,6 +1372,157 @@ class ProbeTeardownTests(unittest.TestCase):
             shutil.rmtree(home_parent, ignore_errors=True)
             for path in scratch_paths:
                 shutil.rmtree(path, ignore_errors=True)
+
+    def test_probe_process_cleanup_ambiguity_refuses_before_probe_build(self):
+        with tempfile.TemporaryDirectory(prefix="macos-probe-command-cleanup-") as directory:
+            root = Path(directory) / "workspace"
+            marker = root / "kit" / "confinement" / "macos_capability.swift"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("// public synthetic probe\n", encoding="utf-8")
+            home_parent = Path(directory) / "home-parent"
+            home = home_parent / "home"
+            home_parent.mkdir()
+            home.mkdir()
+            scratch_paths = []
+
+            def make_scratch(prefix, dir):
+                path = Path(directory) / (prefix + str(len(scratch_paths)))
+                path.mkdir()
+                scratch_paths.append(path)
+                return str(path)
+
+            failure = macos_capability.ProbeFailure(
+                "native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup"
+            )
+            with patch.dict(os.environ, {"CI_WORKSPACE": str(root)}):
+                with patch.object(macos_capability, "_check_context", return_value=root):
+                    with patch.object(macos_capability, "_disable_developer_mode"):
+                        with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
+                            with patch.object(macos_capability, "_create_probe_identity", return_value=(502, home_parent, home)):
+                                with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=make_scratch):
+                                    with patch.object(macos_capability, "_verify_runner_controls_are_private"):
+                                        with patch.object(macos_capability, "_run_as_probe_user", side_effect=failure):
+                                            with patch.object(macos_capability, "_build_signed_probe") as build:
+                                                with patch.object(macos_capability, "_observe_probe") as observe:
+                                                    with patch.object(macos_capability, "_run") as command:
+                                                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                                            macos_capability.run_native_probe("a" * 40)
+            self.assertEqual(raised.exception.check, "probe_process_cleanup")
+            self.assertFalse(raised.exception.cleanup_complete)
+            build.assert_not_called()
+            observe.assert_not_called()
+            command.assert_not_called()
+            self.assertTrue(home_parent.is_dir())
+            self.assertTrue(all(path.is_dir() for path in scratch_paths))
+            shutil.rmtree(home_parent, ignore_errors=True)
+            for path in scratch_paths:
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_account_deletion_is_refused_when_uid_census_finds_escaped_child(self):
+        with tempfile.TemporaryDirectory(prefix="macos-account-census-") as directory:
+            root = Path(directory) / "workspace"
+            marker = root / "kit" / "confinement" / "macos_capability.swift"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("// public synthetic probe\n", encoding="utf-8")
+            home_parent = Path(directory) / "home-parent"
+            home = home_parent / "home"
+            home_parent.mkdir()
+            home.mkdir()
+            scratch_paths = []
+
+            def make_scratch(prefix, dir):
+                path = Path(directory) / (prefix + str(len(scratch_paths)))
+                path.mkdir()
+                scratch_paths.append(path)
+                return str(path)
+
+            with patch.dict(os.environ, {"CI_WORKSPACE": str(root)}):
+                with patch.object(macos_capability, "_check_context", return_value=root):
+                    with patch.object(macos_capability, "_disable_developer_mode"):
+                        with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
+                            with patch.object(macos_capability, "_create_probe_identity", return_value=(502, home_parent, home)):
+                                with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=make_scratch):
+                                    with patch.object(macos_capability, "_verify_runner_controls_are_private"):
+                                        with patch.object(macos_capability, "_run_as_probe_user", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+                                            with patch.object(macos_capability, "_build_signed_probe", return_value="unused"):
+                                                with patch.object(macos_capability, "_observe_probe"):
+                                                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True) as census:
+                                                        with patch.object(macos_capability, "_run") as command:
+                                                            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                                                macos_capability.run_native_probe("a" * 40)
+            self.assertEqual(raised.exception.check, "probe_process_cleanup")
+            self.assertFalse(raised.exception.cleanup_complete)
+            census.assert_called_once_with(502)
+            command.assert_not_called()
+            self.assertTrue(home_parent.is_dir())
+            self.assertTrue(all(path.is_dir() for path in scratch_paths))
+            shutil.rmtree(home_parent, ignore_errors=True)
+            for path in scratch_paths:
+                shutil.rmtree(path, ignore_errors=True)
+
+    def test_final_cleanup_refuses_when_home_removal_errors_and_checks_remaining_paths(self):
+        with tempfile.TemporaryDirectory(prefix="macos-final-home-cleanup-") as directory:
+            root = Path(directory) / "workspace"
+            marker = root / "kit" / "confinement" / "macos_capability.swift"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("// public synthetic probe\n", encoding="utf-8")
+            marker.chmod(0o644)
+            home_parent = Path(directory) / "home-parent"
+            home = home_parent / "home"
+            home_parent.mkdir()
+            home.mkdir()
+            scratch_paths = []
+
+            def make_scratch(prefix, dir):
+                path = Path(directory) / (prefix + str(len(scratch_paths)))
+                path.mkdir()
+                scratch_paths.append(path)
+                return str(path)
+
+            real_rmtree = shutil.rmtree
+
+            def fail_home_remove(path):
+                if Path(path) == home_parent:
+                    raise PermissionError("home-delete-error")
+                real_rmtree(path)
+
+            with patch.dict(os.environ, {"CI_WORKSPACE": str(root)}):
+                with patch.object(macos_capability, "_check_context", return_value=root):
+                    with patch.object(macos_capability, "_disable_developer_mode"):
+                        with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
+                            with patch.object(macos_capability, "_create_probe_identity", return_value=(502, home_parent, home)):
+                                with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=make_scratch):
+                                    with patch.object(macos_capability, "_verify_runner_controls_are_private"):
+                                        with patch.object(
+                                            macos_capability,
+                                            "_run_as_probe_user",
+                                            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+                                        ):
+                                            with patch.object(macos_capability, "_build_signed_probe", return_value="unused"):
+                                                with patch.object(macos_capability, "_observe_probe"):
+                                                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                                                        with patch.object(
+                                                            macos_capability,
+                                                            "_run",
+                                                            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+                                                        ) as command:
+                                                            with patch.object(
+                                                                macos_capability.shutil,
+                                                                "rmtree",
+                                                                side_effect=fail_home_remove,
+                                                            ):
+                                                                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                                                    macos_capability.run_native_probe("a" * 40)
+            self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
+            self.assertEqual(raised.exception.check, "probe_identity_cleanup")
+            self.assertFalse(raised.exception.cleanup_complete)
+            self.assertTrue(home_parent.is_dir())
+            self.assertTrue(home.is_dir())
+            self.assertTrue(all(not path.exists() for path in scratch_paths))
+            command.assert_called_once_with(
+                ["/usr/bin/dscl", ".", "-delete", "/Users/" + macos_capability.USERNAME], timeout=10
+            )
+            real_rmtree(home_parent)
 
 
 if __name__ == "__main__":

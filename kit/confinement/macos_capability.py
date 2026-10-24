@@ -72,9 +72,9 @@ RUNNER_CONTROL_CHECKS = frozenset(
 NATIVE_PREFLIGHT_CHECKS = frozenset(
     (
         "context", "developer_mode", "runner_controls", "probe_identity", "capability_probe",
-        "probe_identity_lookup", "probe_identity_inventory", "probe_identity_home",
+        "probe_identity_inventory", "probe_identity_home",
         "probe_identity_create", "probe_identity_attributes", "probe_identity_permissions",
-        "probe_identity_readback", "probe_identity_privilege", "probe_identity_privilege_timeout",
+        "probe_identity_readback", "probe_identity_cleanup", "probe_process_timeout", "probe_process_cleanup",
     )
 )
 
@@ -188,7 +188,7 @@ def _run(argv, *, cwd=None, env=None, timeout=30, timeout_check=None):
             close_fds=True,
         )
     except subprocess.TimeoutExpired:
-        raise ProbeFailure("native_preflight_unavailable", check=timeout_check) from None
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check=timeout_check) from None
     except (OSError, subprocess.SubprocessError):
         raise ProbeFailure("native_preflight_unavailable")
 
@@ -428,19 +428,29 @@ def _create_probe_identity(workspace):
     if os.geteuid() != 0:
         raise ProbeFailure("probe_identity_unavailable")
     account = "/Users/" + USERNAME
-    with _preflight_phase("probe_identity_lookup"):
-        existing = _run(["/usr/bin/dscl", ".", "-read", account], timeout=10)
-    if existing.returncode == 0:
-        raise ProbeFailure("probe_identity_unavailable")
+    created = False
     with _preflight_phase("probe_identity_inventory"):
         listed = _require_success(_run(["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"], timeout=10), "probe_identity_unavailable")
         ids = []
-        for line in listed.stdout.decode("utf-8", "ignore").splitlines():
+        records = set()
+        try:
+            lines = listed.stdout.decode("ascii").splitlines()
+        except UnicodeDecodeError:
+            raise ProbeFailure("probe_identity_unavailable") from None
+        if listed.stderr:
+            raise ProbeFailure("probe_identity_unavailable")
+        for line in lines:
             fields = line.split()
-            if len(fields) == 2 and fields[1].isdigit():
-                ids.append(int(fields[1]))
+            if len(fields) != 2 or not fields[1].isdecimal() or not re.fullmatch(r"[A-Za-z0-9._-]+", fields[0]):
+                raise ProbeFailure("probe_identity_unavailable")
+            if fields[0] in records:
+                raise ProbeFailure("probe_identity_unavailable")
+            records.add(fields[0])
+            ids.append(int(fields[1]))
+        if USERNAME in records:
+            raise ProbeFailure("probe_identity_unavailable")
         uid = max(ids or [500]) + 1
-        if uid >= 60000:
+        if uid <= 0 or uid >= 60000:
             raise ProbeFailure("probe_identity_unavailable")
     with _preflight_phase("probe_identity_home"):
         home_parent = Path(tempfile.mkdtemp(prefix="sandbox-capability-home-", dir="/tmp"))
@@ -449,7 +459,12 @@ def _create_probe_identity(workspace):
         with _preflight_phase("probe_identity_home"):
             home.mkdir(mode=0o700)
         with _preflight_phase("probe_identity_create"):
-            _require_success(_run(["/usr/bin/dscl", ".", "-create", account], timeout=10), "probe_identity_unavailable")
+            create_result = _run(["/usr/bin/dscl", ".", "-create", account], timeout=10)
+            if create_result.returncode != 0 or create_result.stderr:
+                raise ProbeFailure(
+                    "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_create"
+                )
+            created = True
         with _preflight_phase("probe_identity_attributes"):
             for key, value in (
                 ("UniqueID", str(uid)),
@@ -467,27 +482,35 @@ def _create_probe_identity(workspace):
             os.chmod(home, 0o700)
         with _preflight_phase("probe_identity_readback"):
             group_result = _require_success(_run(["/usr/bin/id", "-Gn", USERNAME], timeout=5), "probe_identity_unavailable")
-            groups = group_result.stdout.decode("ascii", "ignore").split()
             uid_result = _require_success(_run(["/usr/bin/id", "-u", USERNAME], timeout=5), "probe_identity_unavailable")
-            if "admin" in groups or uid_result.stdout.decode("ascii", "ignore").strip() != str(uid) or uid == runner_uid_for_workspace(workspace):
+            try:
+                group_text = group_result.stdout.decode("ascii")
+                uid_text = uid_result.stdout.decode("ascii")
+            except UnicodeDecodeError:
+                raise ProbeFailure("probe_identity_unavailable") from None
+            if group_result.stderr or uid_result.stderr:
                 raise ProbeFailure("probe_identity_unavailable")
-        user_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
-        privilege_check = (
-            "import subprocess; result = subprocess.run(['/usr/bin/sudo', '-n', '-l'], "
-            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
-            "raise SystemExit(0 if result.returncode != 0 else 1)"
-        )
-        with _preflight_phase("probe_identity_privilege"):
-            _run_as_probe_user(
-                ["/usr/bin/python3", "-c", privilege_check], uid, env=user_env, timeout=5,
-                timeout_check="probe_identity_privilege_timeout",
-            )
-    except BaseException:
-        try:
-            _run(["/usr/bin/dscl", ".", "-delete", account], timeout=10)
-        except Exception:
-            pass
-        shutil.rmtree(home_parent, ignore_errors=True)
+            if re.fullmatch(r"[A-Za-z0-9._-]+(?:[ \t]+[A-Za-z0-9._-]+)*\n", group_text) is None:
+                raise ProbeFailure("probe_identity_unavailable")
+            groups = group_text[:-1].split()
+            if ("admin" in groups or "_developer" in groups or uid <= 0
+                    or uid_text != str(uid) + "\n" or uid == runner_uid_for_workspace(workspace)):
+                raise ProbeFailure("probe_identity_unavailable")
+    except BaseException as error:
+        if isinstance(error, ProbeFailure) and not error.cleanup_complete:
+            raise
+        cleanup_failed = False
+        if created:
+            try:
+                delete_result = _run(["/usr/bin/dscl", ".", "-delete", account], timeout=10)
+                cleanup_failed = delete_result.returncode != 0 or bool(delete_result.stderr)
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed:
+            raise ProbeFailure(
+                "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
+            ) from None
+        _remove_probe_tree(home_parent)
         raise
     return uid, home_parent, home
 
@@ -499,33 +522,162 @@ def runner_uid_for_workspace(workspace):
         raise ProbeFailure("runner_control_unavailable")
 
 
-def _run_as_probe_user(argv, uid, env=None, timeout=10, timeout_check=None):
-    result = _run(
-        ["/usr/bin/sudo", "-n", "-u", USERNAME, "--"] + list(argv),
-        env=env, timeout=timeout, timeout_check=timeout_check,
-    )
-    _require_success(result, "probe_identity_unavailable")
+def _probe_uid_processes_present(uid):
+    """Take a strict best-effort snapshot; this cannot rule out privileged or later processes."""
+    if uid <= 0:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+    try:
+        result = _run(
+            ["/bin/ps", "-A", "-o", "pid=,ruid=,uid=,svuid="],
+            env={"LANG": "C", "LC_ALL": "C"},
+            timeout=5,
+            timeout_check="probe_process_cleanup",
+        )
+    except BaseException:
+        raise ProbeFailure(
+            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup"
+        ) from None
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_CAPTURE_BYTES:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+    try:
+        output = result.stdout.decode("ascii")
+    except UnicodeDecodeError:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup") from None
+    if not output.endswith("\n"):
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+    lines = output.splitlines()
+    if not lines:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+    seen_pids = set()
+    present = False
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 4 or not all(field.isdecimal() for field in fields):
+            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+        pid, real_uid, effective_uid, saved_uid = (int(field) for field in fields)
+        if pid in seen_pids:
+            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup")
+        seen_pids.add(pid)
+        if uid in (real_uid, effective_uid, saved_uid):
+            present = True
+    return present
+
+
+def _remove_probe_tree(path):
+    if path is None:
+        return
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except BaseException:
+        raise ProbeFailure(
+            "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
+        ) from None
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return
+    except BaseException:
+        raise ProbeFailure(
+            "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
+        ) from None
+    raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup")
+
+
+def _run_as_probe_user(
+    argv,
+    uid,
+    env=None,
+    timeout=10,
+    failure_reason="probe_identity_unavailable",
+    failure_check=None,
+):
     if uid <= 0:
         raise ProbeFailure("probe_identity_unavailable")
-    return result
+    command = ["/usr/bin/sudo", "-n", "-u", USERNAME, "--"] + [str(part) for part in argv]
+    try:
+        process = subprocess.Popen(
+            command,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise ProbeFailure(failure_reason, check=failure_check) from None
+    stdout_capture = _Capture(process.stdout)
+    stderr_capture = _Capture(process.stderr)
+    captures = (stdout_capture, stderr_capture)
+    timed_out = False
+    wait_uncertain = False
+    try:
+        for capture in captures:
+            capture.start()
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+        except BaseException:
+            wait_uncertain = True
+    except BaseException:
+        wait_uncertain = True
+    finally:
+        try:
+            tree_stopped = _terminate_probe_tree(process)
+        except BaseException:
+            tree_stopped = False
+        captures_joined = True
+        for capture in captures:
+            try:
+                joined = capture.join()
+            except BaseException:
+                joined = False
+            if not joined:
+                captures_joined = False
+        census_known = False
+        escaped_process = True
+        try:
+            escaped_process = _probe_uid_processes_present(uid)
+            census_known = True
+        except BaseException:
+            pass
+        if not tree_stopped or not captures_joined or not census_known or escaped_process:
+            raise ProbeFailure(
+                "native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup"
+            )
+        for stream in (process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+    if timed_out or wait_uncertain:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_timeout")
+    if stdout_capture.overflow or stderr_capture.overflow or process.returncode != 0:
+        raise ProbeFailure(failure_reason, check=failure_check)
+    return subprocess.CompletedProcess(command, process.returncode, bytes(stdout_capture.data), bytes(stderr_capture.data))
 
 
 def _verify_runner_controls_are_private(paths, uid):
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/tmp"}
     script = "import os,sys; raise SystemExit(1 if os.access(sys.argv[1], os.R_OK) else 0)"
     for path in paths:
-        result = _run(["/usr/bin/sudo", "-n", "-u", USERNAME, "--", "/usr/bin/python3", "-c", script, str(path)], env=env, timeout=5)
-        if result.returncode != 0:
-            raise ProbeFailure("runner_control_unavailable", check="probe_access")
+        _run_as_probe_user(
+            ["/usr/bin/python3", "-c", script, str(path)], uid, env=env, timeout=5,
+            failure_reason="runner_control_unavailable", failure_check="probe_access",
+        )
     if uid == 0:
         raise ProbeFailure("probe_identity_unavailable")
 
 
 def _disable_developer_mode():
-    _require_success(_run(["/usr/sbin/DevToolsSecurity", "-disable"], timeout=10), "developer_mode_unavailable")
-    result = _require_success(_run(["/usr/sbin/DevToolsSecurity", "-status"], timeout=10), "developer_mode_unavailable")
-    status = (result.stdout + result.stderr).decode("ascii", "ignore").lower()
-    if "disabled" not in status or "enabled" in status:
+    env = {"LANG": "C", "LC_ALL": "C"}
+    _require_success(_run(["/usr/sbin/DevToolsSecurity", "-disable"], env=env, timeout=10), "developer_mode_unavailable")
+    result = _require_success(_run(["/usr/sbin/DevToolsSecurity", "-status"], env=env, timeout=10), "developer_mode_unavailable")
+    if result.stdout != b"Developer mode is currently disabled.\n" or result.stderr:
         raise ProbeFailure("developer_mode_unavailable")
 
 
@@ -926,21 +1078,41 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
         try:
             process.wait(timeout=max(1, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            raise ProbeFailure("probe_timeout")
+            raise ProbeFailure("probe_timeout", cleanup_complete=False)
         if process.returncode != 0:
             raise ProbeFailure("sandbox_behavior_unavailable")
         if not _roles_complete(observed_roles):
             raise ProbeFailure("descriptor_readback_unavailable")
         if out_capture.overflow or err_capture.overflow:
             raise ProbeFailure("sandbox_behavior_unavailable")
+    except ProbeFailure:
+        raise
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup") from None
     finally:
-        tree_stopped = _terminate_probe_tree(process)
+        try:
+            tree_stopped = _terminate_probe_tree(process)
+        except BaseException:
+            tree_stopped = False
         captures_joined = True
         for capture in captures:
-            if not capture.join():
+            try:
+                joined = capture.join()
+            except BaseException:
+                joined = False
+            if not joined:
                 captures_joined = False
-        if not tree_stopped or not captures_joined:
-            raise ProbeFailure("sandbox_behavior_unavailable", cleanup_complete=False)
+        census_known = False
+        escaped_process = True
+        try:
+            escaped_process = _probe_uid_processes_present(uid)
+            census_known = True
+        except BaseException:
+            pass
+        if not tree_stopped or not captures_joined or not census_known or escaped_process:
+            raise ProbeFailure(
+                "native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup"
+            )
         for stream in (process.stdout, process.stderr):
             if stream is not None and not stream.closed:
                 try:
@@ -976,10 +1148,16 @@ def run_native_probe(control_sha):
                 raise ProbeFailure("sandbox_behavior_unavailable")
             user_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
             positive_read = "import sys; open(sys.argv[1], 'rb').close()"
-            _run_as_probe_user(["/usr/bin/python3", "-c", positive_read, str(marker)], probe_uid, env=user_env, timeout=10)
+            _run_as_probe_user(
+                ["/usr/bin/python3", "-c", positive_read, str(marker)], probe_uid, env=user_env, timeout=10,
+                failure_reason="sandbox_behavior_unavailable",
+            )
             positive_write = "import sys; open(sys.argv[1], 'wb').close()"
             positive_file = outside / "positive-control"
-            _run_as_probe_user(["/usr/bin/python3", "-c", positive_write, str(positive_file)], probe_uid, env=user_env, timeout=10)
+            _run_as_probe_user(
+                ["/usr/bin/python3", "-c", positive_write, str(positive_file)], probe_uid, env=user_env, timeout=10,
+                failure_reason="sandbox_behavior_unavailable",
+            )
             executable = _build_signed_probe(root, scratch)
             _observe_probe(executable, marker, outside, probe_uid, home)
         except ProbeFailure as error:
@@ -988,19 +1166,38 @@ def run_native_probe(control_sha):
             raise
         finally:
             if cleanup_safe:
-                cleanup_failure = False
+                if _probe_uid_processes_present(probe_uid):
+                    raise ProbeFailure(
+                        "native_preflight_unavailable", cleanup_complete=False, check="probe_process_cleanup"
+                    )
                 try:
                     delete_user = _run(["/usr/bin/dscl", ".", "-delete", "/Users/" + USERNAME], timeout=10)
-                    cleanup_failure = delete_user.returncode != 0
-                except Exception:
-                    cleanup_failure = True
-                shutil.rmtree(home_parent, ignore_errors=True)
-                if scratch is not None:
-                    shutil.rmtree(scratch, ignore_errors=True)
-                if outside is not None:
-                    shutil.rmtree(outside, ignore_errors=True)
-                if cleanup_failure:
-                    raise ProbeFailure("probe_identity_unavailable")
+                except ProbeFailure as error:
+                    if error.reason == "native_preflight_unavailable":
+                        raise ProbeFailure(
+                            error.reason,
+                            cleanup_complete=False,
+                            check=error.check or "probe_identity_cleanup",
+                        ) from None
+                    raise
+                except BaseException:
+                    raise ProbeFailure(
+                        "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
+                    ) from None
+                if delete_user.returncode != 0 or delete_user.stderr:
+                    raise ProbeFailure(
+                        "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
+                    )
+                cleanup_failed = False
+                for path in (home_parent, scratch, outside):
+                    try:
+                        _remove_probe_tree(path)
+                    except ProbeFailure:
+                        cleanup_failed = True
+                if cleanup_failed:
+                    raise ProbeFailure(
+                        "native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup"
+                    )
 
 
 def main(argv=None):
