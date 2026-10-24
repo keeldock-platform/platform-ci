@@ -67,6 +67,10 @@ namespace KeelDock.Platform.WindowsNativePreflight
             }
             catch
             {
+                if (check == "child_launch")
+                {
+                    check = state.ChildLaunchCheck;
+                }
                 completed = false;
             }
 
@@ -115,10 +119,16 @@ namespace KeelDock.Platform.WindowsNativePreflight
             private IntPtr currentToken = IntPtr.Zero;
             private bool processCreated;
             private bool processAssigned;
+            private string childLaunchCheck = "child_attribute_list";
             private IntPtr provider = IntPtr.Zero;
             private IntPtr key = IntPtr.Zero;
             private string keyName;
             private bool keyOwned;
+
+            internal string ChildLaunchCheck
+            {
+                get { return childLaunchCheck; }
+            }
 
             internal void CreateProfile()
             {
@@ -172,6 +182,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
 
             internal void CreateSuspendedChild()
             {
+                childLaunchCheck = "child_attribute_list";
                 IntPtr requiredSize = IntPtr.Zero;
                 bool firstCall = Native.InitializeProcThreadAttributeList(IntPtr.Zero, 2, IntPtr.Zero, ref requiredSize);
                 if (firstCall || Marshal.GetLastWin32Error() != ErrorInsufficientBuffer || requiredSize.ToInt64() <= 0 || requiredSize.ToInt64() > 65536)
@@ -186,6 +197,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 attributeList = attributeListBuffer;
                 attributeListInitialized = true;
 
+                childLaunchCheck = "child_security_capabilities";
                 Native.SecurityCapabilities capabilities = new Native.SecurityCapabilities();
                 capabilities.AppContainerSid = profileSid;
                 capabilities.Capabilities = IntPtr.Zero;
@@ -199,6 +211,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     throw new InvalidOperationException();
                 }
 
+                childLaunchCheck = "child_lpac_policy";
                 appPackagesPolicyBuffer = Marshal.AllocHGlobal(4);
                 Marshal.WriteInt32(appPackagesPolicyBuffer, unchecked((int)ProcessCreationAllApplicationPackagesOptOut));
                 if (!Native.UpdateProcThreadAttribute(attributeList, 0, ProcThreadAttributeAllApplicationPackagesPolicy, appPackagesPolicyBuffer, new UIntPtr(4), IntPtr.Zero, IntPtr.Zero))
@@ -206,6 +219,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     throw new InvalidOperationException();
                 }
 
+                childLaunchCheck = "child_system_executable";
                 StringBuilder systemDirectory = new StringBuilder(32768);
                 uint systemDirectoryLength = Native.GetSystemDirectoryW(systemDirectory, (uint)systemDirectory.Capacity);
                 if (systemDirectoryLength == 0 || systemDirectoryLength >= systemDirectory.Capacity)
@@ -224,6 +238,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 StringBuilder commandLine = new StringBuilder("\"" + executable + "\" /d /c exit 0");
                 Native.ProcessInformation processInformation = new Native.ProcessInformation();
                 uint flags = ExtendedStartupInfoPresent | CreateSuspended | CreateUnicodeEnvironment | CreateNoWindow;
+                childLaunchCheck = "child_process_create";
                 bool created = Native.CreateProcessW(executable, commandLine, IntPtr.Zero, IntPtr.Zero, false, flags, environmentBlock, systemDirectory.ToString(), ref startup, ref processInformation);
                 process = processInformation.Process;
                 thread = processInformation.Thread;
@@ -232,11 +247,13 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     throw new InvalidOperationException();
                 }
+                childLaunchCheck = "child_job_assignment";
                 if (!Native.AssignProcessToJobObject(job, process))
                 {
                     throw new InvalidOperationException();
                 }
                 processAssigned = true;
+                childLaunchCheck = "child_job_readback";
                 bool inJob;
                 if (!Native.IsProcessInJob(process, job, out inJob) || !inJob)
                 {

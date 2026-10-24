@@ -150,11 +150,46 @@ class WindowsNativePreflightTests(unittest.TestCase):
         self.assertRegex(
             self.wrapper,
             re.compile(
-                r"\^windows-native-preflight=refused check=\(lpac_profile\|job_setup\|child_launch\|token_readback\|job_readback\|cng_key\|cng_acl\|cng_export\|cleanup\|runtime\)"
+                r"\^windows-native-preflight=refused check=\(lpac_profile\|job_setup\|child_attribute_list\|child_security_capabilities\|child_lpac_policy\|child_system_executable\|child_process_create\|child_job_assignment\|child_job_readback\|token_readback\|job_readback\|cng_key\|cng_acl\|cng_export\|cleanup\|runtime\)"
             ),
         )
         self.assertIn("if ($phase -eq 'native') { $cleanup = 'incomplete' }", self.wrapper)
         self.assertNotIn("$_.Exception", self.wrapper)
+
+    def test_child_launch_failures_use_fixed_allowlisted_subphases(self):
+        stages = (
+            ("child_attribute_list", "Native.InitializeProcThreadAttributeList"),
+            ("child_security_capabilities", "Native.UpdateProcThreadAttribute(attributeList, 0, ProcThreadAttributeSecurityCapabilities"),
+            ("child_lpac_policy", "Native.UpdateProcThreadAttribute(attributeList, 0, ProcThreadAttributeAllApplicationPackagesPolicy"),
+            ("child_system_executable", "Native.GetSystemDirectoryW"),
+            ("child_process_create", "Native.CreateProcessW(executable, commandLine"),
+            ("child_job_assignment", "Native.AssignProcessToJobObject(job, process)"),
+            ("child_job_readback", "Native.IsProcessInJob(process, job, out inJob)"),
+        )
+        create_child = self.source[
+            self.source.index("internal void CreateSuspendedChild()"):
+            self.source.index("internal void VerifyToken()")
+        ]
+        previous = -1
+        for label, operation in stages:
+            with self.subTest(label=label):
+                marker = f'childLaunchCheck = "{label}";'
+                self.assertIn(marker, create_child)
+                self.assertIn(label, self.wrapper)
+                stage_position = create_child.index(marker)
+                operation_position = create_child.index(operation)
+                self.assertGreater(stage_position, previous)
+                self.assertLess(stage_position, operation_position)
+                previous = stage_position
+        self.assertIn('if (check == "child_launch")', self.source)
+        self.assertIn("check = state.ChildLaunchCheck;", self.source)
+        self.assertNotIn("Exception.Message", self.source)
+        refusal = self.source[
+            self.source.index("private static string Refusal("):
+            self.source.index("private sealed class State")
+        ]
+        self.assertNotIn("GetLastWin32Error", refusal)
+        self.assertNotIn("Exception", refusal)
 
 
 if __name__ == "__main__":
