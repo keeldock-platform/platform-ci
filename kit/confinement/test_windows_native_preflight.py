@@ -222,6 +222,9 @@ if (-not $rejected) {{ exit 6 }}
             "NCryptSilentFlag = 0x00000040",
             "Native.InitializeSecurityDescriptor",
             "Native.SetSecurityDescriptorOwner",
+            "Native.InitializeAcl",
+            "Native.AddAce",
+            "Native.SetSecurityDescriptorDacl",
             "Native.GetSecurityDescriptorOwner",
             "Native.GetSecurityDescriptorDacl",
             'Native.NCryptExportKey(key, IntPtr.Zero, "ECCPRIVATEBLOB"',
@@ -245,6 +248,7 @@ if (-not $rejected) {{ exit 6 }}
             "state.CreateKey();",
             "state.SetKeyOwnerToCurrentUser();",
             "state.FinalizeKey();",
+            "state.TightenKeyDacl();",
             "state.VerifyKeyAcl();",
         )
         positions = [run.index(call) for call in calls]
@@ -282,7 +286,149 @@ if (-not $rejected) {{ exit 6 }}
         ]
         self.assertIn("Native.EqualSid(ownerSid, currentUserSid)", verify)
         self.assertIn('cngAclCheck = "cng_acl_dacl_read";', verify)
-        self.assertIn("ReadSecurityDescriptor(key, DaclSecurityInformation | NCryptSilentFlag)", verify)
+        self.assertIn("ReadSecurityDescriptor(verificationKey, DaclSecurityInformation | NCryptSilentFlag)", verify)
+
+    def test_disposable_key_dacl_is_filtered_and_verified_after_finalize(self):
+        run = self.source[self.source.index("public static string Run()"):self.source.index("private static string Refusal(")]
+        calls = (
+            "state.FinalizeKey();",
+            "state.TightenKeyDacl();",
+            "state.VerifyKeyAcl();",
+            "state.VerifyKeyExportDenial();",
+        )
+        positions = [run.index(call) for call in calls]
+        self.assertEqual(positions, sorted(positions))
+        tighten = self.source[
+            self.source.index("internal void TightenKeyDacl()"):
+            self.source.index("internal void VerifyKeyAcl()")
+        ]
+        stages = (
+            ("cng_acl_dacl_tighten_user_read", "QueryTokenInformation(currentToken, TokenUser"),
+            ("cng_acl_dacl_tighten_user_check", "if (userLength < (uint)IntPtr.Size)"),
+            ("cng_acl_dacl_tighten_system_sid", 'Native.ConvertStringSidToSidW("S-1-5-18"'),
+            ("cng_acl_dacl_tighten_owner_rights", "Native.CreateWellKnownSid(WinCreatorOwnerRightsSid"),
+            ("cng_acl_dacl_tighten_source_read", "ReadSecurityDescriptor(key, DaclSecurityInformation"),
+            ("cng_acl_dacl_tighten_source_check", "Native.GetSecurityDescriptorDacl(sourceDescriptor"),
+            ("cng_acl_dacl_tighten_source_count", "Native.GetAclInformation(sourceDacl"),
+            ("cng_acl_dacl_tighten_build", "Native.InitializeAcl(targetDacl"),
+            ("cng_acl_dacl_tighten_source_ace", "Native.GetAce(sourceDacl, index"),
+            ("cng_acl_dacl_tighten_source_shape", "if ((type != AccessAllowedAceType"),
+            ("cng_acl_dacl_tighten_inherited", "if (IsInheritedDaclAce(aceFlags))"),
+            ("cng_acl_dacl_tighten_source_sid", "if (!Native.IsValidSid(aceSid))"),
+            ("cng_acl_dacl_tighten_user_allow", "if (!currentUserAllowed || expectedAceCount == 0)"),
+            ("cng_acl_dacl_tighten_descriptor", "Native.SetSecurityDescriptorDacl(setDescriptor, true, targetDacl, false)"),
+            ("cng_acl_dacl_tighten_apply", "Native.NCryptSetProperty("),
+            ("cng_acl_dacl_tighten_reopen", "Native.NCryptOpenKey(provider, out verificationKey, keyName"),
+            ("cng_acl_dacl_tighten_readback", "readbackDescriptor = ReadSecurityDescriptor(verificationKey, DaclSecurityInformation"),
+            ("cng_acl_dacl_tighten_compare", "Native.GetAclInformation(readbackDacl"),
+        )
+        previous = -1
+        for label, operation in stages:
+            with self.subTest(label=label):
+                marker = f'cngAclCheck = "{label}";'
+                self.assertIn(marker, tighten)
+                self.assertIn(label, self.wrapper)
+                phase_position = tighten.index(marker)
+                operation_position = tighten.index(operation)
+                self.assertGreater(phase_position, previous)
+                self.assertLess(phase_position, operation_position)
+                previous = phase_position
+
+        self.assertIn("private const byte InheritedAceFlag = 0x10;", self.source)
+        self.assertIn("private const byte InheritOnlyAceFlag = 0x08;", self.source)
+        self.assertIn("private const byte UnsupportedDaclAceFlags = 0xe0;", self.source)
+        self.assertIn("if ((type != AccessAllowedAceType && type != AccessDeniedAceType)", tighten)
+        self.assertIn("!IsSupportedDaclAceFlags(aceFlags)", tighten)
+        self.assertIn("sourceAclSize - sourceInformation.AclBytesInUse != sourceInformation.AclBytesFree", tighten)
+        self.assertIn("readbackAclSize - readbackInformation.AclBytesInUse != readbackInformation.AclBytesFree", tighten)
+        self.assertIn("aceSize < 16 || (aceSize & 3)", tighten)
+        self.assertIn("bool retainAce = ShouldRetainDaclAce(type, isUser, isSystem, isOwnerRights);", tighten)
+        self.assertIn("isUser = Native.EqualSid(aceSid, currentUserSid);", tighten)
+        self.assertIn("isSystem = Native.EqualSid(aceSid, systemSid);", tighten)
+        self.assertIn("isOwnerRights = Native.EqualSid(aceSid, ownerRightsSid);", tighten)
+        self.assertIn("type == AccessAllowedAceType && isUser && (aceFlags & InheritOnlyAceFlag) == 0", tighten)
+        policy = self.source[
+            self.source.index("internal static bool ShouldRetainDaclAce("):
+            self.source.index("internal void VerifyKeyAcl()")
+        ]
+        self.assertIn("if (type == AccessDeniedAceType)", policy)
+        self.assertIn("if (type != AccessAllowedAceType || isOwnerRights)", policy)
+        self.assertIn("return isUser || isSystem;", policy)
+        self.assertIn("Native.AddAce(targetDacl, aclRevision, uint.MaxValue, ace, aceSize)", tighten)
+        self.assertIn("Marshal.Copy(ace, expectedAceBytes", tighten)
+        self.assertIn("DaclSecurityInformation | NCryptSilentFlag", tighten)
+        self.assertIn("Marshal.ReadByte(ace, checked((int)byteIndex)) != expectedAceBytes", tighten)
+        self.assertNotIn("ToString(", tighten)
+        self.assertNotIn("Console.", tighten)
+        self.assertNotIn("Environment.GetEnvironmentVariable", tighten)
+
+        loop_start = tighten.index("for (uint index = 0; index < sourceInformation.AceCount; index++)")
+        owner_rights_check = tighten.index("Native.EqualSid(aceSid, ownerRightsSid)", loop_start)
+        retain_policy_check = tighten.index("ShouldRetainDaclAce(type, isUser, isSystem, isOwnerRights)", loop_start)
+        loop_end = tighten.index("sourceBytesRead += aceSize;", loop_start)
+        apply_call = tighten.index("Native.NCryptSetProperty(")
+        self.assertLess(loop_start, owner_rights_check)
+        self.assertLess(owner_rights_check, apply_call)
+        self.assertLess(retain_policy_check, loop_end)
+        self.assertNotIn("break;", tighten[loop_start:loop_end])
+        self.assertNotIn("continue;", tighten[loop_start:loop_end])
+        self.assertNotIn("return;", tighten[loop_start:loop_end])
+        self.assertLess(tighten.index("bool retainAce = ShouldRetainDaclAce("), apply_call)
+        self.assertLess(loop_end, apply_call)
+        self.assertIn("if (IsInheritedDaclAce(aceFlags))", tighten)
+        self.assertLess(tighten.index("if (IsInheritedDaclAce(aceFlags))"), apply_call)
+        self.assertIn("finally", tighten)
+        self.assertIn("Marshal.FreeHGlobal(targetDacl);", tighten)
+        self.assertIn("internal static bool IsInheritedDaclAce(byte flags)", self.source)
+        self.assertIn("internal static bool IsSupportedDaclAceFlags(byte flags)", self.source)
+        self.assertIn("ReadSecurityDescriptor(verificationKey, OwnerSecurityInformation", self.source)
+        self.assertIn("ReadSecurityDescriptor(verificationKey, DaclSecurityInformation", self.source)
+        self.assertLess(
+            self.source.index("complete = SafeFreeCngObject(ref verificationKey, complete);"),
+            self.source.index("int deleteStatus = Native.NCryptDeleteKey(key, NCryptSilentFlag)"),
+        )
+        self.assertIn("if (!cleanupComplete)", self.source)
+
+    def test_dacl_policy_drops_other_allow_then_refuses_later_owner_rights(self):
+        powershell = shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable for managed DACL policy fixtures")
+        encoded_source_path = base64.b64encode(str(HARNESS).encode("utf-8")).decode("ascii")
+        command = f"""
+$sourcePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_source_path}'))
+Add-Type -Path $sourcePath -ErrorAction Stop
+$typeFlags = [System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Public
+$state = [KeelDock.Platform.WindowsNativePreflight.Probe].GetNestedType('State', $typeFlags)
+if ($null -eq $state) {{ exit 2 }}
+$methodFlags = [System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Static
+$method = $state.GetMethod('ShouldRetainDaclAce', $methodFlags)
+if ($null -eq $method) {{ exit 2 }}
+$firstAceRetained = [bool]$method.Invoke($null, [object[]]@([byte]0, $false, $false, $false))
+if ($firstAceRetained) {{ exit 3 }}
+try {{ [void]$method.Invoke($null, [object[]]@([byte]0, $false, $false, $true)); exit 4 }} catch {{ }}
+$deniedAceRetained = [bool]$method.Invoke($null, [object[]]@([byte]1, $false, $false, $false))
+if (-not $deniedAceRetained) {{ exit 5 }}
+$userAceRetained = [bool]$method.Invoke($null, [object[]]@([byte]0, $true, $false, $false))
+if (-not $userAceRetained) {{ exit 6 }}
+$inheritedMethod = $state.GetMethod('IsInheritedDaclAce', $methodFlags)
+if ($null -eq $inheritedMethod) {{ exit 7 }}
+if (-not [bool]$inheritedMethod.Invoke($null, [object[]]@([byte]16))) {{ exit 8 }}
+if ([bool]$inheritedMethod.Invoke($null, [object[]]@([byte]1))) {{ exit 9 }}
+try {{ [void]$method.Invoke($null, [object[]]@([byte]2, $false, $false, $false)); exit 10 }} catch {{ }}
+$flagsMethod = $state.GetMethod('IsSupportedDaclAceFlags', $methodFlags)
+if ($null -eq $flagsMethod) {{ exit 11 }}
+if (-not [bool]$flagsMethod.Invoke($null, [object[]]@([byte]15))) {{ exit 12 }}
+if ([bool]$flagsMethod.Invoke($null, [object[]]@([byte]32))) {{ exit 13 }}
+"""
+        completed = subprocess.run(
+            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            check=False,
+            capture_output=True,
+            text=False,
+            timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(completed.stdout, b"")
 
     def test_security_descriptor_absolute_abi_matches_native_pointer_layout(self):
         powershell = shutil.which("pwsh")
@@ -323,7 +469,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             ("cng_acl_user_check", "if (userLength < (uint)IntPtr.Size)"),
             ("cng_acl_system_sid", 'Native.ConvertStringSidToSidW("S-1-5-18"'),
             ("cng_acl_owner_rights_sid", "Native.CreateWellKnownSid(WinCreatorOwnerRightsSid"),
-            ("cng_acl_owner_read", "ReadSecurityDescriptor(key, OwnerSecurityInformation"),
+            ("cng_acl_owner_read", "ReadSecurityDescriptor(verificationKey, OwnerSecurityInformation"),
             ("cng_acl_owner_extract", "Native.GetSecurityDescriptorOwner(ownerDescriptor"),
             ("cng_acl_owner_absent", "if (ownerSid == IntPtr.Zero)"),
             ("cng_acl_owner_validate", "if (!Native.IsValidSid(ownerSid))"),
@@ -331,7 +477,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             ("cng_acl_owner_default_read", "QueryTokenInformation(currentToken, TokenOwner"),
             ("cng_acl_owner_default_validate", "if (ownerLength < (uint)IntPtr.Size)"),
             ("cng_acl_owner_default_compare", "bool ownerMatchesTokenDefault = Native.EqualSid(ownerSid, tokenOwnerSid)"),
-            ("cng_acl_dacl_read", "ReadSecurityDescriptor(key, DaclSecurityInformation"),
+            ("cng_acl_dacl_read", "ReadSecurityDescriptor(verificationKey, DaclSecurityInformation"),
             ("cng_acl_dacl_check", "Native.GetSecurityDescriptorDacl(daclDescriptor"),
             ("cng_acl_count_read", "Native.GetAclInformation(dacl"),
             ("cng_acl_ace_read", "Native.GetAce(dacl, index"),
@@ -522,6 +668,24 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             "cng_acl_ace_owner_rights_allow",
             "cng_acl_ace_other_allow",
             "cng_acl_user_allow_check",
+            "cng_acl_dacl_tighten_user_read",
+            "cng_acl_dacl_tighten_user_check",
+            "cng_acl_dacl_tighten_system_sid",
+            "cng_acl_dacl_tighten_owner_rights",
+            "cng_acl_dacl_tighten_source_read",
+            "cng_acl_dacl_tighten_source_check",
+            "cng_acl_dacl_tighten_source_count",
+            "cng_acl_dacl_tighten_build",
+            "cng_acl_dacl_tighten_source_ace",
+            "cng_acl_dacl_tighten_source_shape",
+            "cng_acl_dacl_tighten_inherited",
+            "cng_acl_dacl_tighten_source_sid",
+            "cng_acl_dacl_tighten_user_allow",
+            "cng_acl_dacl_tighten_descriptor",
+            "cng_acl_dacl_tighten_apply",
+            "cng_acl_dacl_tighten_reopen",
+            "cng_acl_dacl_tighten_readback",
+            "cng_acl_dacl_tighten_compare",
             "cng_export",
             "cleanup",
             "runtime",
@@ -821,6 +985,24 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             "cng_acl_ace_owner_rights_allow",
             "cng_acl_ace_other_allow",
             "cng_acl_user_allow_check",
+            "cng_acl_dacl_tighten_user_read",
+            "cng_acl_dacl_tighten_user_check",
+            "cng_acl_dacl_tighten_system_sid",
+            "cng_acl_dacl_tighten_owner_rights",
+            "cng_acl_dacl_tighten_source_read",
+            "cng_acl_dacl_tighten_source_check",
+            "cng_acl_dacl_tighten_source_count",
+            "cng_acl_dacl_tighten_build",
+            "cng_acl_dacl_tighten_source_ace",
+            "cng_acl_dacl_tighten_source_shape",
+            "cng_acl_dacl_tighten_inherited",
+            "cng_acl_dacl_tighten_source_sid",
+            "cng_acl_dacl_tighten_user_allow",
+            "cng_acl_dacl_tighten_descriptor",
+            "cng_acl_dacl_tighten_apply",
+            "cng_acl_dacl_tighten_reopen",
+            "cng_acl_dacl_tighten_readback",
+            "cng_acl_dacl_tighten_compare",
         )
         fallback = "windows-native-preflight=refused check=runtime reason=native_preflight_unavailable cleanup=incomplete"
         lines = [
