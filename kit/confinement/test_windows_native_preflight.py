@@ -44,6 +44,75 @@ class WindowsNativePreflightTests(unittest.TestCase):
             ),
         )
 
+    def test_child_environment_block_is_profile_scoped_sorted_and_bounded(self):
+        for required in (
+            '"LOCALAPPDATA=" + localAppDataPath',
+            '"TEMP=" + tempPath',
+            '"TMP=" + tempPath',
+            '"KD_NATIVE_PREFLIGHT=1"',
+            '"=" + char.ToUpperInvariant(currentDirectory[0]) + ":=" + currentDirectory',
+            'Array.Sort(entries, StringComparer.OrdinalIgnoreCase)',
+            'string.Join("\\0", entries) + "\\0\\0"',
+            "MaxChildEnvironmentEntryCharacters",
+            "MaxChildEnvironmentBlockCharacters",
+            "GetAppContainerFolderPath",
+            "ConvertSidToStringSidW",
+            "Marshal.FreeCoTaskMem(memory)",
+            "Native.LocalFree(memory)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.source)
+        for forbidden in (
+            "Environment.GetEnvironmentVariable",
+            "GetEnvironmentStrings",
+            "CreateEnvironmentBlock",
+            "$env:",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.source)
+
+        powershell = shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable for environment-block fixtures")
+        encoded_source_path = base64.b64encode(str(HARNESS).encode("utf-8")).decode("ascii")
+        command = f"""
+$sourcePath = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{encoded_source_path}'))
+Add-Type -Path $sourcePath -ErrorAction Stop
+$flags = [System.Reflection.BindingFlags]::NonPublic -bor [System.Reflection.BindingFlags]::Static
+$method = [KeelDock.Platform.WindowsNativePreflight.Probe].GetMethod('BuildChildEnvironmentBlock', $flags)
+if ($null -eq $method) {{ exit 2 }}
+$local = 'C:\\Users\\Fixture\\AppData\\Local\\Packages\\KDN123\\AC'
+$current = 'C:\\Windows\\System32'
+$block = [string]$method.Invoke($null, [object[]]@($local, $current))
+$expectedEntries = [string[]]@(
+    '=C:=C:\\Windows\\System32',
+    'KD_NATIVE_PREFLIGHT=1',
+    'LOCALAPPDATA=C:\\Users\\Fixture\\AppData\\Local\\Packages\\KDN123\\AC',
+    'TEMP=C:\\Users\\Fixture\\AppData\\Local\\Packages\\KDN123\\AC\\Temp',
+    'TMP=C:\\Users\\Fixture\\AppData\\Local\\Packages\\KDN123\\AC\\Temp'
+)
+$expected = [string]::Join([char]0, $expectedEntries) + [char]0 + [char]0
+if (-not [string]::Equals($block, $expected, [System.StringComparison]::Ordinal)) {{ exit 3 }}
+if ($block.Length -gt 131072 -or $block[$block.Length - 1] -ne [char]0 -or $block[$block.Length - 2] -ne [char]0) {{ exit 4 }}
+$newlinePath = [string]::Concat('C:\\Users\\Fixture', [char]10, '\\AC')
+$rejected = $false
+try {{ [void]$method.Invoke($null, [object[]]@($newlinePath, $current)) }} catch {{ $rejected = $true }}
+if (-not $rejected) {{ exit 5 }}
+$longPath = 'C:\\' + ('x' * 32760)
+$rejected = $false
+try {{ [void]$method.Invoke($null, [object[]]@($longPath, $current)) }} catch {{ $rejected = $true }}
+if (-not $rejected) {{ exit 6 }}
+"""
+        completed = subprocess.run(
+            [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+            check=False,
+            capture_output=True,
+            text=False,
+            timeout=20,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8", errors="replace"))
+        self.assertEqual(completed.stdout, b"")
+
     def test_actual_token_properties_are_read_before_acceptance(self):
         for expected in (
             "private const int TokenIntegrityLevel = 25;",
@@ -168,6 +237,7 @@ class WindowsNativePreflightTests(unittest.TestCase):
             "child_security_capabilities",
             "child_lpac_policy",
             "child_system_executable",
+            "child_environment",
             "child_process_create_other",
             "child_job_assignment",
             "child_job_readback",
@@ -209,6 +279,7 @@ class WindowsNativePreflightTests(unittest.TestCase):
             ("child_security_capabilities", "Native.UpdateProcThreadAttribute(attributeList, 0, ProcThreadAttributeSecurityCapabilities"),
             ("child_lpac_policy", "Native.UpdateProcThreadAttribute(attributeList, 0, ProcThreadAttributeAllApplicationPackagesPolicy"),
             ("child_system_executable", "Native.GetSystemDirectoryW"),
+            ("child_environment", "BuildChildEnvironmentBlock("),
             ("child_process_create", "Native.CreateProcessW(executable, commandLine"),
             ("child_job_assignment", "Native.AssignProcessToJobObject(job, process)"),
             ("child_job_readback", "Native.IsProcessInJob(process, job, out inJob)"),
@@ -233,7 +304,7 @@ class WindowsNativePreflightTests(unittest.TestCase):
         self.assertNotIn("Exception.Message", self.source)
         refusal = self.source[
             self.source.index("private static string Refusal("):
-            self.source.index("private sealed class State")
+            self.source.index("internal static string BuildChildEnvironmentBlock(")
         ]
         self.assertNotIn("GetLastWin32Error", refusal)
         self.assertNotIn("Exception", refusal)
@@ -355,32 +426,36 @@ class WindowsNativePreflightTests(unittest.TestCase):
         parser_start = self.wrapper.index("    if ($result -match '^windows-native-preflight=refused check=(")
         parser_end = self.wrapper.index("} catch {", parser_start)
         parser = self.wrapper[parser_start:parser_end]
-        fixed_line = "windows-native-preflight=refused check=lpac_profile reason=native_preflight_unavailable cleanup=verified"
+        fixed_lines = (
+            "windows-native-preflight=refused check=lpac_profile reason=native_preflight_unavailable cleanup=verified",
+            "windows-native-preflight=refused check=child_environment reason=native_preflight_unavailable cleanup=verified",
+        )
         generic_fallback = "windows-native-preflight=refused check=runtime reason=native_preflight_unavailable cleanup=incomplete"
-        for ending, expected in (
-            ("", fixed_line),
-            ("\n", generic_fallback),
-            ("\r\n", generic_fallback),
-        ):
-            line = fixed_line + ending
-            encoded = base64.b64encode(line.encode("utf-8")).decode("ascii")
-            command = (
-                "$result = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
-                + encoded
-                + "'))\n"
-                + parser
-            )
-            with self.subTest(ending=repr(ending)):
-                completed = subprocess.run(
-                    [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
-                    check=False,
-                    capture_output=True,
-                    text=False,
-                    timeout=10,
+        for fixed_line in fixed_lines:
+            for ending, expected in (
+                ("", fixed_line),
+                ("\n", generic_fallback),
+                ("\r\n", generic_fallback),
+            ):
+                line = fixed_line + ending
+                encoded = base64.b64encode(line.encode("utf-8")).decode("ascii")
+                command = (
+                    "$result = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
+                    + encoded
+                    + "'))\n"
+                    + parser
                 )
-                self.assertEqual(completed.returncode, 1)
-                self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
-                self.assertEqual(completed.stderr, b"")
+                with self.subTest(check=fixed_line.split("check=")[1].split()[0], ending=repr(ending)):
+                    completed = subprocess.run(
+                        [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                        check=False,
+                        capture_output=True,
+                        text=False,
+                        timeout=10,
+                    )
+                    self.assertEqual(completed.returncode, 1)
+                    self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
+                    self.assertEqual(completed.stderr, b"")
 
 
 if __name__ == "__main__":
