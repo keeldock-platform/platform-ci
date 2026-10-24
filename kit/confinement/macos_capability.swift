@@ -8,6 +8,7 @@ enum ProbeStatus {
     static let childFailed: Int32 = 23
     static let storageUnavailable: Int32 = 24
     static let outsideWriteAllowed: Int32 = 25
+    static let childSandboxMissing: Int32 = 26
 }
 
 func option(_ name: String) -> String? {
@@ -48,6 +49,25 @@ func startProcess(_ executable: String, _ arguments: [String]) throws -> Process
     return process
 }
 
+func parentStatus(for child: Process) -> Int32 {
+    if child.terminationStatus == 0 {
+        return 0
+    }
+    guard child.terminationReason == .exit else {
+        return ProbeStatus.childFailed
+    }
+    switch child.terminationStatus {
+    case ProbeStatus.invalidInput,
+         ProbeStatus.identityInvalid,
+         ProbeStatus.storageUnavailable,
+         ProbeStatus.outsideWriteAllowed,
+         ProbeStatus.childSandboxMissing:
+        return child.terminationStatus
+    default:
+        return ProbeStatus.childFailed
+    }
+}
+
 func runParent(
     _ marker: String,
     _ writableDirectory: String,
@@ -78,7 +98,7 @@ func runParent(
             "--sdk-root", sdkRoot,
         ])
         child.waitUntilExit()
-        exit(child.terminationStatus == 0 ? 0 : ProbeStatus.childFailed)
+        exit(parentStatus(for: child))
     } catch {
         exit(ProbeStatus.childFailed)
     }
@@ -92,8 +112,11 @@ func runChild(
     _ linkerExecutable: String,
     _ sdkRoot: String
 ) -> Never {
-    guard getuid() > 0, getuid() == geteuid(), readIsDenied(marker) else {
-        exit(ProbeStatus.sandboxMissing)
+    guard getuid() > 0, getuid() == geteuid() else {
+        exit(ProbeStatus.identityInvalid)
+    }
+    guard readIsDenied(marker) else {
+        exit(ProbeStatus.childSandboxMissing)
     }
     guard isAbsolutePath(pythonExecutable),
           isAbsolutePath(compilerExecutable),

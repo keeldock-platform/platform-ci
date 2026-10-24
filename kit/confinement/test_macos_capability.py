@@ -2,6 +2,7 @@ import builtins
 import ctypes
 import io
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -342,6 +343,278 @@ class FixedOutcomeTests(unittest.TestCase):
                     macos_capability.run_native_probe(CONTROL_SHA)
 
         check_context.assert_called_once_with(CONTROL_SHA, checkout_root)
+
+
+class ProbeParentStatusTests(unittest.TestCase):
+    EXPECTED_PARENT_STATUSES = frozenset((0, 20, 21, 22, 23, 24, 25, 26))
+    PASSED_THROUGH = frozenset((20, 21, 24, 25, 26))
+    FALLBACK = 23
+    STATUS_TABLE = {
+        "invalidInput": 20,
+        "identityInvalid": 21,
+        "sandboxMissing": 22,
+        "childFailed": 23,
+        "storageUnavailable": 24,
+        "outsideWriteAllowed": 25,
+        "childSandboxMissing": 26,
+    }
+    PARENT_DIRECT_EXITS = (
+        "ProbeStatus.childFailed",
+        "ProbeStatus.childFailed",
+        "ProbeStatus.identityInvalid",
+        "ProbeStatus.sandboxMissing",
+        "parentStatus(for:child)",
+    )
+    CHILD_STATUS_NAMES = frozenset(
+        ("invalidInput", "identityInvalid", "storageUnavailable", "childFailed", "outsideWriteAllowed", "childSandboxMissing")
+    )
+
+    @staticmethod
+    def masked_source():
+        path = Path(macos_capability.__file__).resolve().with_name("macos_capability.swift")
+        text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        hash_mark = chr(35)
+        out = []
+        stack = []
+        index = 0
+        length = len(text)
+
+        def blank(count):
+            for offset in range(count):
+                out.append("\n" if text[index + offset] == "\n" else " ")
+
+        while index < length:
+            context = stack[-1] if stack else None
+            if context is None or context[0] == "code":
+                if text.startswith("//", index):
+                    end = text.find("\n", index)
+                    end = length if end < 0 else end
+                    blank(end - index)
+                    index = end
+                    continue
+                if text.startswith("/*", index):
+                    end = text.find("*/", index + 2)
+                    end = length if end < 0 else end + 2
+                    blank(end - index)
+                    index = end
+                    continue
+                cursor = index
+                while cursor < length and text[cursor] == hash_mark:
+                    cursor += 1
+                if text.startswith('"""', cursor):
+                    quote = '"""'
+                elif text.startswith('"', cursor):
+                    quote = '"'
+                else:
+                    quote = None
+                if quote is not None:
+                    width = cursor - index + len(quote)
+                    blank(width)
+                    stack.append(["string", hash_mark * (cursor - index), quote])
+                    index += width
+                    continue
+                if context is not None:
+                    if text[index] == "(":
+                        context[1] += 1
+                    elif text[index] == ")":
+                        context[1] -= 1
+                        if context[1] == 0:
+                            stack.pop()
+                            blank(1)
+                            index += 1
+                            continue
+                out.append(text[index])
+                index += 1
+                continue
+            escape = "\\" + context[1]
+            if text.startswith(escape + "(", index):
+                blank(len(escape) + 1)
+                index += len(escape) + 1
+                stack.append(["code", 1])
+                continue
+            if text.startswith(escape, index):
+                width = min(len(escape) + 1, length - index)
+                blank(width)
+                index += width
+                continue
+            if text.startswith(context[2] + context[1], index):
+                width = len(context[2]) + len(context[1])
+                blank(width)
+                index += width
+                stack.pop()
+                continue
+            blank(1)
+            index += 1
+        return "".join(out)
+
+    @staticmethod
+    def balanced(text, opening, left, right):
+        depth = 0
+        for index in range(opening, len(text)):
+            if text[index] == left:
+                depth += 1
+            elif text[index] == right:
+                depth -= 1
+                if depth == 0:
+                    return index
+        raise AssertionError("unbalanced source")
+
+    def function_body(self, source, signature):
+        start = source.index(signature)
+        close = self.balanced(source, source.index("(", start), "(", ")")
+        opening = source.index("{", close)
+        return source[opening + 1 : self.balanced(source, opening, "{", "}")]
+
+    def exit_arguments(self, body, enum_cases=0):
+        self.assertEqual(len(re.findall(r"\bexit\b(?!\s*\()", body)), enum_cases)
+        self.assertIsNone(re.search(r"\b(?:_exit|abort|fatalError|quick_exit|precondition)\b", body))
+        result = []
+        for match in re.finditer(r"\bexit\s*\(", body):
+            opening = match.end() - 1
+            close = self.balanced(body, opening, "(", ")")
+            result.append(re.sub(r"\s+", "", body[opening + 1 : close]))
+        return result
+
+    def statuses(self, source):
+        declaration = source[source.index("enum ProbeStatus") :].split("}", 1)[0]
+        table = {name: int(value) for name, value in re.findall(r"static\s+let\s+(\w+)\s*:\s*Int32\s*=\s*([0-9]+)", declaration)}
+        self.assertEqual(table, self.STATUS_TABLE)
+        return table
+
+    def passed_through_names(self, body):
+        cases = re.findall(
+            r"\bcase\s+((?:ProbeStatus\.\w+\s*,\s*)*ProbeStatus\.\w+)\s*:\s*return\s+child\.terminationStatus\b", body
+        )
+        self.assertEqual(len(cases), 1)
+        return re.findall(r"ProbeStatus\.(\w+)", cases[0])
+
+    def test_parent_passes_through_exactly_the_sandbox_statuses(self):
+        source = self.masked_source()
+        table = self.statuses(source)
+        body = self.function_body(source, "func parentStatus(")
+        names = self.passed_through_names(body)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertEqual(frozenset(table[name] for name in names), self.PASSED_THROUGH)
+        self.assertEqual(len(re.findall(r"\breturn\s+child\.terminationStatus\b", body)), 1)
+
+    def test_every_other_child_outcome_falls_back_to_child_failed(self):
+        source = self.masked_source()
+        table = self.statuses(source)
+        self.assertEqual(table["childFailed"], self.FALLBACK)
+        body = self.function_body(source, "func parentStatus(")
+        self.assertEqual(
+            sorted(re.findall(r"\breturn\s+([\w.]+)", body)),
+            ["0", "ProbeStatus.childFailed", "ProbeStatus.childFailed", "child.terminationStatus"],
+        )
+        self.assertRegex(
+            body,
+            r"guard\s+child\.terminationReason\s*==\s*\.exit\s+else\s*\{\s*return\s+ProbeStatus\.childFailed\s*\}",
+        )
+        self.assertRegex(body, r"default\s*:\s*return\s+ProbeStatus\.childFailed\s*\}\s*$")
+        self.assertRegex(body, r"^\s*if\s+child\.terminationStatus\s*==\s*0\s*\{\s*return\s+0\s*\}")
+        self.assertEqual(self.exit_arguments(body, enum_cases=1), [])
+
+    def test_parent_exits_only_through_the_child_status_helper_or_fixed_failures(self):
+        source = self.masked_source()
+        parent = self.function_body(source, "func runParent(")
+        self.assertNotIn("terminationStatus", parent)
+        self.assertEqual(sorted(self.exit_arguments(parent)), sorted(self.PARENT_DIRECT_EXITS))
+        self.assertRegex(
+            parent,
+            r"child\.waitUntilExit\(\)\s*exit\(\s*parentStatus\(\s*for\s*:\s*child\s*\)\s*\)",
+        )
+
+    def test_child_exits_only_with_fixed_statuses_or_success(self):
+        source = self.masked_source()
+        table = self.statuses(source)
+        arguments = self.exit_arguments(self.function_body(source, "func runChild("))
+        names = set()
+        for argument in arguments:
+            if argument == "0":
+                continue
+            match = re.fullmatch(r"ProbeStatus\.(\w+)", argument)
+            self.assertIsNotNone(match, argument)
+            self.assertIn(match.group(1), table)
+            names.add(match.group(1))
+        self.assertEqual(arguments.count("0"), 1)
+        self.assertEqual(names, self.CHILD_STATUS_NAMES)
+
+    def test_child_sandbox_failure_is_distinct_from_parent_sandbox_failure(self):
+        source = self.masked_source()
+        child = self.function_body(source, "func runChild(")
+        parent = self.function_body(source, "func runParent(")
+        self.assertRegex(
+            child,
+            r"guard\s+getuid\(\)\s*>\s*0\s*,\s*getuid\(\)\s*==\s*geteuid\(\)\s+else\s*\{\s*exit\(\s*ProbeStatus\.identityInvalid\s*\)\s*\}"
+            r"\s*guard\s+readIsDenied\(\s*marker\s*\)\s+else\s*\{\s*exit\(\s*ProbeStatus\.childSandboxMissing\s*\)\s*\}",
+        )
+        self.assertRegex(
+            parent,
+            r"guard\s+readIsDenied\(\s*marker\s*\)\s+else\s*\{\s*exit\(\s*ProbeStatus\.sandboxMissing\s*\)\s*\}",
+        )
+
+    FUNCTION_NAMES = frozenset(
+        ("option", "isAbsolutePath", "isExecutableFile", "readIsDenied", "startProcess", "parentStatus", "runParent", "runChild")
+    )
+
+    def strip_declarations(self, source):
+        while True:
+            match = re.search(r"\b(?:func|enum)\s+\w+", source)
+            if match is None:
+                return source
+            opening = source.index("{", match.end())
+            close = self.balanced(source, opening, "{", "}")
+            source = source[: match.start()] + source[close + 1 :]
+
+    def test_no_declaration_or_top_level_code_can_exit_or_replace_the_process(self):
+        source = self.masked_source()
+        self.assertEqual(frozenset(re.findall(r"\bfunc\s+(\w+)", source)), self.FUNCTION_NAMES)
+        self.assertEqual(len(re.findall(r"\bfunc\s+", source)), len(self.FUNCTION_NAMES))
+        self.assertIsNone(re.search(r"\b(?:class|struct|extension|protocol|typealias|macro)\b", source))
+        self.assertIsNone(re.search(r"\b(?:let|var)\s+(?:exit|_exit|abort|fatalError)\b", source))
+        self.assertNotIn("_silgen_name", source)
+        self.assertNotIn("_cdecl", source)
+        top_level = self.strip_declarations(source)
+        self.assertEqual(self.exit_arguments(top_level), ["ProbeStatus.invalidInput"])
+        self.assertEqual(len(re.findall(r"\brunChild\s*\(", top_level)), 1)
+        self.assertEqual(len(re.findall(r"\brunParent\s*\(", top_level)), 1)
+        for name in self.FUNCTION_NAMES - {"parentStatus", "runParent", "runChild"}:
+            self.assertEqual(self.exit_arguments(self.function_body(source, "func " + name + "(")), [])
+
+    def test_only_process_launches_are_the_pinned_child_and_descendants(self):
+        source = self.masked_source()
+        self.assertIsNone(
+            re.search(
+                r"\b(?:execl\w*|execv\w*|posix_spawn\w*|system|popen|fork|vfork|NSTask|dlopen|dlsym)\b|\.launch\s*\(|\blaunchPath\b",
+                source,
+            )
+        )
+        self.assertEqual(len(re.findall(r"\bProcess\s*\(", source)), 1)
+        self.assertEqual(len(re.findall(r"\.run\s*\(", source)), 1)
+        self.assertEqual(len(re.findall(r"\bstartProcess\s*\(", self.function_body(source, "func runParent("))), 1)
+        self.assertEqual(len(re.findall(r"\bstartProcess\s*\(", self.function_body(source, "func runChild("))), 5)
+        self.assertEqual(len(re.findall(r"\bstartProcess\s*\(", self.function_body(source, "func parentStatus("))), 0)
+
+    def test_marker_read_denial_is_only_access_or_permission_errors(self):
+        source = self.masked_source()
+        body = re.sub(r"\s+", "", self.function_body(source, "func readIsDenied("))
+        self.assertEqual(
+            body,
+            "letdescriptor=open(path,O_RDONLY)ifdescriptor>=0{close(descriptor)returnfalse}returnerrno==EACCES||errno==EPERM",
+        )
+
+    def test_every_parent_status_is_in_the_expected_exit_table(self):
+        source = self.masked_source()
+        table = self.statuses(source)
+        parent = self.function_body(source, "func runParent(")
+        helper = self.function_body(source, "func parentStatus(")
+        reachable = {0, table["childFailed"]}
+        reachable.update(table[name] for name in self.passed_through_names(helper))
+        for argument in self.exit_arguments(parent):
+            match = re.fullmatch(r"ProbeStatus\.(\w+)", argument)
+            if match:
+                reachable.add(table[match.group(1)])
+        self.assertEqual(reachable, self.EXPECTED_PARENT_STATUSES)
 
 
 class CommandLineToolsInterpreterTests(unittest.TestCase):
