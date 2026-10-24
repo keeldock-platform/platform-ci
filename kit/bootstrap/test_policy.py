@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from policy import (
+    MACOS_CAPABILITY_WORKFLOW_TEMPLATE,
     PolicyError,
     encode_public_result,
     validate_control_sha,
@@ -168,6 +169,39 @@ class WorkflowPolicyTests(unittest.TestCase):
         for index, changed in enumerate(mutations):
             with self.subTest(mutation_index=index):
                 with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "macos-capability")
+
+    def test_macos_capability_privileged_step_uses_pinned_command_line_tools_interpreter(self):
+        clt = (
+            "/Library/Developer/CommandLineTools/Library/Frameworks/"
+            "Python3.framework/Versions/3.9/bin/python3.9"
+        )
+        launch = " -B kit/confinement/macos_capability.py --control-sha \"$CI_SHA\""
+        for text in (MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8"), MACOS_CAPABILITY_WORKFLOW_TEMPLATE):
+            with self.subTest(source=text[:20]):
+                self.assertEqual(text.count(clt + launch), 1)
+                self.assertEqual(text.count("confinement/macos_capability.py"), 1)
+                self.assertNotIn("/usr/bin/python3 -B kit/confinement/macos_capability.py", text)
+                self.assertNotIn("Versions/Current", text)
+                privileged = [line for line in text.splitlines() if "confinement/macos_capability.py" in line]
+                self.assertEqual([line.strip() for line in privileged], [clt + launch])
+
+    def test_macos_capability_workflow_file_equals_pinned_template(self):
+        workflow = MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(workflow, MACOS_CAPABILITY_WORKFLOW_TEMPLATE)
+        self.assertTrue(validate_workflow_text(workflow, "platform", "macos-capability"))
+
+    def test_macos_capability_workflow_reverting_to_shim_interpreter_is_rejected(self):
+        workflow = MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8")
+        clt = (
+            "/Library/Developer/CommandLineTools/Library/Frameworks/"
+            "Python3.framework/Versions/3.9/bin/python3.9"
+        )
+        for replacement in ("/usr/bin/python3", clt.replace("Versions/3.9", "Versions/Current")):
+            with self.subTest(replacement=replacement):
+                changed = workflow.replace(clt + " -B kit/confinement", replacement + " -B kit/confinement")
+                self.assertNotEqual(changed, workflow)
+                with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
                     validate_workflow_text(changed, "platform", "macos-capability")
 
     def test_actual_windows_native_preflight_matches_closed_manual_main_shape(self):
