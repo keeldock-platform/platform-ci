@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -9,6 +10,7 @@ PLATFORM_FILES = frozenset(
         ".github/workflows/linux-confinement.yml",
         ".github/workflows/windows-attestation-permission-probe.yml",
         ".github/workflows/macos-capability.yml",
+        ".github/workflows/windows-native-preflight.yml",
         "ci/policy.json",
         "kit/bootstrap/action.yml",
         "kit/bootstrap/check_candidate.py",
@@ -26,6 +28,9 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/test_macos_capability.py",
         "kit/confinement/linux_harness.py",
         "kit/confinement/test_linux_harness.py",
+        "kit/confinement/windows_native_preflight.cs",
+        "kit/confinement/windows_native_preflight.ps1",
+        "kit/confinement/test_windows_native_preflight.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
@@ -36,6 +41,12 @@ ALLOWED_FILES = {
     "data": CONSUMER_FILES,
 }
 MAX_FILE_BYTES = 262144
+PINNED_FILE_SHA256 = {
+    ".github/workflows/windows-native-preflight.yml": "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb",
+    "kit/confinement/windows_native_preflight.cs": "54511789a631744b997575d56980a8075fa98077a01f48fb5dc526b2afaeb40a",
+    "kit/confinement/windows_native_preflight.ps1": "407ccb577a307ce6dc99e982fd529240eb0bc7149d0738223b2e0797a559fa67",
+    "kit/confinement/test_windows_native_preflight.py": "3cbe14320361d7ea716aacbe33c3f21632729f0d17ebccddde8540213e0367e6",
+}
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(
     r"^\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}\s+"
@@ -160,5 +171,8 @@ def scan_tree(root, pool):
             text = payload.decode("utf-8")
         except UnicodeDecodeError:
             raise PublicTreeError("file-not-utf8")
+        expected_hash = PINNED_FILE_SHA256.get(relative)
+        if expected_hash is not None and hashlib.sha256(payload).hexdigest() != expected_hash:
+            raise PublicTreeError("file-hash-mismatch")
         inspect_text(text, pool)
     return tuple(sorted(actual_files))
