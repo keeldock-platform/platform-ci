@@ -322,6 +322,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             ("cng_acl_user_read", "QueryTokenInformation(currentToken, TokenUser"),
             ("cng_acl_user_check", "if (userLength < (uint)IntPtr.Size)"),
             ("cng_acl_system_sid", 'Native.ConvertStringSidToSidW("S-1-5-18"'),
+            ("cng_acl_owner_rights_sid", "Native.CreateWellKnownSid(WinCreatorOwnerRightsSid"),
             ("cng_acl_owner_read", "ReadSecurityDescriptor(key, OwnerSecurityInformation"),
             ("cng_acl_owner_extract", "Native.GetSecurityDescriptorOwner(ownerDescriptor"),
             ("cng_acl_owner_absent", "if (ownerSid == IntPtr.Zero)"),
@@ -337,6 +338,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             ("cng_acl_ace_shape", "if ((type != AccessAllowedAceType"),
             ("cng_acl_ace_sid", "Native.IsValidSid(aceSid)"),
             ("cng_acl_ace_policy", "bool isUser = Native.EqualSid(aceSid"),
+            ("cng_acl_ace_owner_rights_check", "bool isOwnerRights = Native.EqualSid(aceSid, ownerRightsSid)"),
             ("cng_acl_user_allow_check", "if (!currentUserAllowed)"),
         )
         verify = self.source[
@@ -358,10 +360,41 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
         self.assertIn("internal string CngAclCheck", self.source)
         assigned_labels = re.findall(r'cngAclCheck\s*=\s*"([a-z0-9_]+)";', verify)
         self.assertEqual(set(assigned_labels), {label for label, _ in stages})
-        self.assertEqual(len(re.findall(r"cngAclCheck\s*=", verify)), len(assigned_labels) + 1)
+        self.assertEqual(len(re.findall(r"cngAclCheck\s*=", verify)), len(assigned_labels) + 2)
         self.assertIn(
             'cngAclCheck = ownerMatchesTokenDefault ? "cng_acl_owner_matches_token_default" : "cng_acl_owner_matches_other";',
             verify,
+        )
+        self.assertIn('cngAclCheck = isOwnerRights ? "cng_acl_ace_owner_rights_allow" : "cng_acl_ace_other_allow";', verify)
+
+    def test_owner_rights_allow_ace_is_distinguished_but_still_refused(self):
+        verify = self.source[
+            self.source.index("internal void VerifyKeyAcl()"):
+            self.source.index("internal void VerifyKeyExportDenial()")
+        ]
+        self.assertIn("private const int MaxSidSize = 68;", self.source)
+        self.assertIn("private const int WinCreatorOwnerRightsSid = 71;", self.source)
+        self.assertIn(
+            "Native.CreateWellKnownSid(WinCreatorOwnerRightsSid, IntPtr.Zero, ownerRightsSid, ref ownerRightsSidLength)",
+            verify,
+        )
+        self.assertIn("ownerRightsSidLength > MaxSidSize", verify)
+        self.assertIn("Native.GetLengthSid(ownerRightsSid) != ownerRightsSidLength", verify)
+        branch = verify[verify.index("if (!isUser && !isSystem)"):]
+        classification = 'cngAclCheck = isOwnerRights ? "cng_acl_ace_owner_rights_allow" : "cng_acl_ace_other_allow";'
+        self.assertLess(branch.index(classification), branch.index("throw new InvalidOperationException();"))
+        self.assertLess(branch.index("throw new InvalidOperationException();"), branch.index("if (isUser)"))
+        self.assertNotIn("currentUserAllowed = true", branch[:branch.index("throw new InvalidOperationException();")])
+        self.assertIn("Marshal.FreeHGlobal(ownerRightsSid);", verify)
+        self.assertNotIn("ConvertSidToStringSidW", verify)
+        self.assertNotIn("ToString(", verify)
+        self.assertRegex(
+            self.source,
+            re.compile(
+                r'\[DllImport\("advapi32\.dll", SetLastError = true\)\]\s+'
+                r'\[return: MarshalAs\(UnmanagedType\.Bool\)\]\s+'
+                r'internal static extern bool CreateWellKnownSid\(int wellKnownSidType, IntPtr domainSid, IntPtr sid, ref uint sidSize\);'
+            ),
         )
         owner_mismatch = verify[
             verify.index("if (!Native.EqualSid(ownerSid, currentUserSid))"):
@@ -466,6 +499,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             "cng_acl_user_check",
             "cng_acl_owner_set",
             "cng_acl_system_sid",
+            "cng_acl_owner_rights_sid",
             "cng_acl_owner_read",
             "cng_acl_owner_check",
             "cng_acl_owner_extract",
@@ -484,6 +518,9 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             "cng_acl_ace_shape",
             "cng_acl_ace_sid",
             "cng_acl_ace_policy",
+            "cng_acl_ace_owner_rights_check",
+            "cng_acl_ace_owner_rights_allow",
+            "cng_acl_ace_other_allow",
             "cng_acl_user_allow_check",
             "cng_export",
             "cleanup",
@@ -760,6 +797,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             "cng_acl_user_read",
             "cng_acl_user_check",
             "cng_acl_owner_set",
+            "cng_acl_owner_rights_sid",
             "cng_acl_system_sid",
             "cng_acl_owner_read",
             "cng_acl_owner_check",
@@ -779,6 +817,9 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             "cng_acl_ace_shape",
             "cng_acl_ace_sid",
             "cng_acl_ace_policy",
+            "cng_acl_ace_owner_rights_check",
+            "cng_acl_ace_owner_rights_allow",
+            "cng_acl_ace_other_allow",
             "cng_acl_user_allow_check",
         )
         fallback = "windows-native-preflight=refused check=runtime reason=native_preflight_unavailable cleanup=incomplete"

@@ -35,6 +35,8 @@ namespace KeelDock.Platform.WindowsNativePreflight
         private const uint AccessAllowedAceType = 0;
         private const uint AccessDeniedAceType = 1;
         private const uint AclSizeInformation = 2;
+        private const int MaxSidSize = 68;
+        private const int WinCreatorOwnerRightsSid = 71;
         private const uint OwnerSecurityInformation = 0x00000001;
         private const uint DaclSecurityInformation = 0x00000004;
         private const uint NCryptSilentFlag = 0x00000040;
@@ -627,6 +629,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
             {
                 IntPtr currentUserSid = IntPtr.Zero;
                 IntPtr systemSid = IntPtr.Zero;
+                IntPtr ownerRightsSid = IntPtr.Zero;
                 IntPtr ownerDescriptor = IntPtr.Zero;
                 IntPtr daclDescriptor = IntPtr.Zero;
                 IntPtr userInformation = IntPtr.Zero;
@@ -646,6 +649,17 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     }
                     cngAclCheck = "cng_acl_system_sid";
                     if (!Native.ConvertStringSidToSidW("S-1-5-18", out systemSid) || systemSid == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_owner_rights_sid";
+                    ownerRightsSid = Marshal.AllocHGlobal(MaxSidSize);
+                    uint ownerRightsSidLength = MaxSidSize;
+                    if (ownerRightsSid == IntPtr.Zero ||
+                        !Native.CreateWellKnownSid(WinCreatorOwnerRightsSid, IntPtr.Zero, ownerRightsSid, ref ownerRightsSidLength) ||
+                        ownerRightsSidLength == 0 || ownerRightsSidLength > MaxSidSize ||
+                        !Native.IsValidSid(ownerRightsSid) ||
+                        Native.GetLengthSid(ownerRightsSid) != ownerRightsSidLength)
                     {
                         throw new InvalidOperationException();
                     }
@@ -745,6 +759,9 @@ namespace KeelDock.Platform.WindowsNativePreflight
                             bool isSystem = Native.EqualSid(aceSid, systemSid);
                             if (!isUser && !isSystem)
                             {
+                                cngAclCheck = "cng_acl_ace_owner_rights_check";
+                                bool isOwnerRights = Native.EqualSid(aceSid, ownerRightsSid);
+                                cngAclCheck = isOwnerRights ? "cng_acl_ace_owner_rights_allow" : "cng_acl_ace_other_allow";
                                 throw new InvalidOperationException();
                             }
                             if (isUser)
@@ -776,6 +793,10 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     if (systemSid != IntPtr.Zero)
                     {
                         Native.LocalFree(systemSid);
+                    }
+                    if (ownerRightsSid != IntPtr.Zero)
+                    {
+                        Marshal.FreeHGlobal(ownerRightsSid);
                     }
                 }
             }
@@ -1344,6 +1365,10 @@ namespace KeelDock.Platform.WindowsNativePreflight
             [DllImport("advapi32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool EqualSid(IntPtr sid1, IntPtr sid2);
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool CreateWellKnownSid(int wellKnownSidType, IntPtr domainSid, IntPtr sid, ref uint sidSize);
 
             [DllImport("advapi32.dll", SetLastError = true)]
             internal static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
