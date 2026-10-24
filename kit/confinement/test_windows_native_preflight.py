@@ -1,4 +1,8 @@
+import base64
+import os
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -123,7 +127,10 @@ class WindowsNativePreflightTests(unittest.TestCase):
         create_call = self.source.index("bool created = Native.CreateProcessW(")
         process_capture = self.source.index("process = processInformation.Process;", create_call)
         thread_capture = self.source.index("thread = processInformation.Thread;", create_call)
-        failure_check = self.source.index("if (!created)", create_call)
+        failure_check = self.source.index(
+            "if (!created)\n                {\n                    childProcessCreateError = createProcessError;",
+            create_call,
+        )
         handle_check = self.source.index("if (!processCreated || thread == IntPtr.Zero)", create_call)
         self.assertLess(create_call, process_capture)
         self.assertLess(process_capture, thread_capture)
@@ -137,23 +144,61 @@ class WindowsNativePreflightTests(unittest.TestCase):
         self.assertIn("SafeCloseHandle(ref process, complete)", self.source[cleanup:])
         self.assertIn("SafeCloseHandle(ref thread, complete)", self.source[cleanup:])
 
-    def test_only_fixed_status_lines_are_emitted_and_cleanup_failures_refuse(self):
+    def test_refusal_output_is_bounded_and_cleanup_failures_refuse(self):
         success = (
             "windows-native-preflight=observed appcontainer=lpac token=verified capabilities=empty "
             "integrity=low job=assigned limits=verified termination=verified cng=p256-user "
             "nonexportable=verified acl=verified destruction=verified cleanup=verified"
         )
         self.assertIn(success, self.source)
-        self.assertIn('"windows-native-preflight=refused check=" + check + " reason=native_preflight_unavailable cleanup="', self.source)
+        self.assertIn('"windows-native-preflight=refused check=" + check + errorField + " reason=native_preflight_unavailable cleanup="', self.source)
+        self.assertIn('" win32_createprocess_error=" + win32CreateProcessError.Value.ToString(CultureInfo.InvariantCulture)', self.source)
+        self.assertIn(
+            'win32CreateProcessError.HasValue\n                ? " win32_createprocess_error=" + win32CreateProcessError.Value.ToString(CultureInfo.InvariantCulture)',
+            self.source,
+        )
         self.assertIn("if (!cleanupComplete)", self.source)
         self.assertIn("catch\n            {\n                cleanupComplete = false;", self.source)
         self.assertNotIn("exception.Message", self.source)
         self.assertNotIn("Exception.ToString", self.source)
+        allowed_checks = (
+            "lpac_profile",
+            "job_setup",
+            "child_attribute_list",
+            "child_security_capabilities",
+            "child_lpac_policy",
+            "child_system_executable",
+            "child_process_create_other",
+            "child_job_assignment",
+            "child_job_readback",
+            "token_readback",
+            "job_readback",
+            "cng_key",
+            "cng_acl",
+            "cng_export",
+            "cleanup",
+            "runtime",
+        )
         self.assertRegex(
             self.wrapper,
             re.compile(
-                r"\^windows-native-preflight=refused check=\(lpac_profile\|job_setup\|child_attribute_list\|child_security_capabilities\|child_lpac_policy\|child_system_executable\|child_process_create\|child_process_create_access_denied\|child_process_create_invalid_parameter\|child_process_create_other\|child_job_assignment\|child_job_readback\|token_readback\|job_readback\|cng_key\|cng_acl\|cng_export\|cleanup\|runtime\)"
+                r"\^windows-native-preflight=refused check=\("
+                + r"\|".join(allowed_checks)
+                + r"\)"
             ),
+        )
+        self.assertIn("$createProcessFailurePrefix = 'windows-native-preflight=refused check=child_process_create win32_createprocess_error='", self.wrapper)
+        self.assertIn("$result.Length -le 256", self.wrapper)
+        self.assertIn("[UInt64]::TryParse(", self.wrapper)
+        self.assertIn("[System.Globalization.NumberStyles]::None", self.wrapper)
+        self.assertIn("[System.Globalization.CultureInfo]::InvariantCulture", self.wrapper)
+        self.assertIn("$errorValue -le [UInt32]::MaxValue", self.wrapper)
+        self.assertIn("cleanup=verified\\z'", self.wrapper)
+        self.assertIn("cleanup=(verified|incomplete)\\z'", self.wrapper)
+        self.assertIn("check=child_process_create_other reason=native_preflight_unavailable cleanup=", self.wrapper)
+        self.assertLess(
+            self.wrapper.index("$errorValue -le [UInt32]::MaxValue"),
+            self.wrapper.index("Write-Output $result", self.wrapper.index("$createProcessFailurePrefix")),
         )
         self.assertIn("if ($phase -eq 'native') { $cleanup = 'incomplete' }", self.wrapper)
         self.assertNotIn("$_.Exception", self.wrapper)
@@ -193,51 +238,30 @@ class WindowsNativePreflightTests(unittest.TestCase):
         self.assertNotIn("GetLastWin32Error", refusal)
         self.assertNotIn("Exception", refusal)
 
-    def test_createprocess_failure_is_reduced_to_fixed_error_categories(self):
+    def test_createprocess_failure_captures_only_the_unsigned_win32_error(self):
         create_child = self.source[
             self.source.index("internal void CreateSuspendedChild()"):
             self.source.index("internal void VerifyToken()")
         ]
         create_call = create_child.index("bool created = Native.CreateProcessW(")
-        error_capture = create_child.index(
-            "int createProcessError = created ? 0 : Marshal.GetLastWin32Error();",
-            create_call,
-        )
+        error_capture = create_child.index("createProcessError = unchecked((uint)Marshal.GetLastWin32Error());", create_call)
         process_capture = create_child.index("process = processInformation.Process;", create_call)
         thread_capture = create_child.index("thread = processInformation.Thread;", create_call)
-        failure_classification = create_child.index(
-            "childLaunchCheck = Probe.ChildProcessFailureCheck(createProcessError);",
-            create_call,
+        failure_branch = create_child.index(
+            "if (!created)\n                {\n                    childProcessCreateError = createProcessError;",
+            process_capture,
         )
-        failure_branch = create_child.index("if (!created)", create_call)
         self.assertLess(create_call, error_capture)
         self.assertLess(error_capture, process_capture)
         self.assertLess(process_capture, thread_capture)
         self.assertLess(thread_capture, failure_branch)
-        self.assertLess(failure_branch, failure_classification)
-        self.assertIn("private const int ErrorAccessDenied = 5;", self.source)
-        self.assertIn("private const int ErrorInvalidParameter = 87;", self.source)
-        classifier = self.source[
-            self.source.index("private static string ChildProcessFailureCheck(int error)"):
-            self.source.index("private sealed class State")
-        ]
-        self.assertIn(
-            'if (error == ErrorAccessDenied)\n            {\n                return "child_process_create_access_denied";',
-            classifier,
-        )
-        self.assertIn(
-            'if (error == ErrorInvalidParameter)\n            {\n                return "child_process_create_invalid_parameter";',
-            classifier,
-        )
-        self.assertIn('return "child_process_create_other";', classifier)
-        for category in (
-            "child_process_create_access_denied",
-            "child_process_create_invalid_parameter",
-            "child_process_create_other",
-        ):
-            with self.subTest(category=category):
-                self.assertIn(f'return "{category}";', self.source)
-                self.assertIn(category, self.wrapper)
+        self.assertIn("uint? createProcessError = null;", create_child)
+        self.assertIn("childProcessCreateError = createProcessError;", create_child)
+        self.assertIn("private uint? childProcessCreateError;", self.source)
+        self.assertIn("internal uint? ChildProcessCreateError", self.source)
+        self.assertIn('check = "child_process_create_other";', self.source)
+        self.assertNotIn("ChildProcessFailureCheck", self.source)
+        self.assertNotIn("FormatMessage", self.source)
         self.assertRegex(
             self.source,
             re.compile(
@@ -247,6 +271,116 @@ class WindowsNativePreflightTests(unittest.TestCase):
             ),
         )
         self.assertNotIn("createProcessError +", self.source)
+
+    def test_createprocess_output_schema_accepts_only_canonical_uint32_values(self):
+        schema_match = re.search(
+            r"\$createProcessFailurePattern = '([^']+)'",
+            self.wrapper,
+        )
+        self.assertIsNotNone(schema_match)
+        schema = re.compile(schema_match.group(1).replace(r"\z", r"\Z"))
+        prefix = "windows-native-preflight=refused check=child_process_create win32_createprocess_error="
+        suffix = " reason=native_preflight_unavailable cleanup=verified"
+
+        for text, expected in (
+            ("0", True),
+            ("1", True),
+            ("4294967295", True),
+            ("4294967296", False),
+            ("18446744073709551616", False),
+            ("00", False),
+            ("-1", False),
+            ("+1", False),
+            (" 1", False),
+            ("١", False),
+            ("1 extra", False),
+        ):
+            with self.subTest(text=text):
+                line = prefix + text + suffix
+                match = schema.fullmatch(line)
+                canonical = text == "0" or re.fullmatch(r"[1-9][0-9]*", text) is not None
+                accepted = (
+                    len(line) <= 256
+                    and match is not None
+                    and canonical
+                    and int(text) <= 4294967295
+                )
+                self.assertEqual(accepted, expected)
+
+    def test_powershell_wrapper_applies_the_numeric_schema_to_refusal_lines(self):
+        powershell = shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable for wrapper parser fixtures")
+        parser_start = self.wrapper.index("    $createProcessFailurePrefix =")
+        parser_end = self.wrapper.index("    if ($result -match '^windows-native-preflight=refused check=", parser_start)
+        parser = self.wrapper[parser_start:parser_end]
+        prefix = "windows-native-preflight=refused check=child_process_create win32_createprocess_error="
+        suffix = " reason=native_preflight_unavailable cleanup=verified"
+        fallback_incomplete = "windows-native-preflight=refused check=child_process_create_other reason=native_preflight_unavailable cleanup=incomplete"
+        for value, ending, expected in (
+            ("0", "", prefix + "0" + suffix),
+            ("4294967295", "", prefix + "4294967295" + suffix),
+            ("4294967296", "", "windows-native-preflight=refused check=child_process_create_other reason=native_preflight_unavailable cleanup=verified"),
+            ("00", "", "windows-native-preflight=refused check=child_process_create_other reason=native_preflight_unavailable cleanup=verified"),
+            ("-1", "", fallback_incomplete),
+            ("١", "", fallback_incomplete),
+            ("9" * 300, "", fallback_incomplete),
+            ("7", "\n", fallback_incomplete),
+            ("7", "\r\n", fallback_incomplete),
+        ):
+            line = prefix + value + suffix + ending
+            encoded = base64.b64encode(line.encode("utf-8")).decode("ascii")
+            command = (
+                "$result = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
+                + encoded
+                + "'))\n"
+                + parser
+            )
+            with self.subTest(value=value[:24], ending=repr(ending)):
+                completed = subprocess.run(
+                    [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                    check=False,
+                    capture_output=True,
+                    text=False,
+                    timeout=10,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
+                self.assertEqual(completed.stderr, b"")
+
+    def test_powershell_fixed_refusal_allowlist_rejects_trailing_newlines(self):
+        powershell = shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable for wrapper parser fixtures")
+        parser_start = self.wrapper.index("    if ($result -match '^windows-native-preflight=refused check=(")
+        parser_end = self.wrapper.index("} catch {", parser_start)
+        parser = self.wrapper[parser_start:parser_end]
+        fixed_line = "windows-native-preflight=refused check=lpac_profile reason=native_preflight_unavailable cleanup=verified"
+        generic_fallback = "windows-native-preflight=refused check=runtime reason=native_preflight_unavailable cleanup=incomplete"
+        for ending, expected in (
+            ("", fixed_line),
+            ("\n", generic_fallback),
+            ("\r\n", generic_fallback),
+        ):
+            line = fixed_line + ending
+            encoded = base64.b64encode(line.encode("utf-8")).decode("ascii")
+            command = (
+                "$result = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
+                + encoded
+                + "'))\n"
+                + parser
+            )
+            with self.subTest(ending=repr(ending)):
+                completed = subprocess.run(
+                    [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                    check=False,
+                    capture_output=True,
+                    text=False,
+                    timeout=10,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
+                self.assertEqual(completed.stderr, b"")
 
 
 if __name__ == "__main__":
