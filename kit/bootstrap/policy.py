@@ -348,7 +348,7 @@ jobs:
             PYTHONDONTWRITEBYTECODE=1 \\
             RUNNER_TEMP="$RUNNER_TEMP" \\
             CI_WORKSPACE="$CI_WORKSPACE" \\
-            /usr/bin/python3 -B kit/confinement/macos_capability.py --control-sha "$CI_SHA"
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -B kit/confinement/macos_capability.py --control-sha "$CI_SHA"
 """
 
 

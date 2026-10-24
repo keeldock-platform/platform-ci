@@ -344,6 +344,28 @@ class FixedOutcomeTests(unittest.TestCase):
         check_context.assert_called_once_with(CONTROL_SHA, checkout_root)
 
 
+class CommandLineToolsInterpreterTests(unittest.TestCase):
+    CLT_PYTHON = (
+        "/Library/Developer/CommandLineTools/Library/Frameworks/"
+        "Python3.framework/Versions/3.9/bin/python3.9"
+    )
+
+    def test_pinned_command_line_tools_interpreter_matches_layout_and_maps_to_developer_directory(self):
+        self.assertIsNotNone(macos_capability.PYTHON_CLT_LAYOUT.fullmatch(self.CLT_PYTHON))
+        self.assertEqual(
+            macos_capability._python_developer_directory(Path(self.CLT_PYTHON)),
+            Path("/Library/Developer/CommandLineTools"),
+        )
+
+    def test_current_alias_and_shim_do_not_match_command_line_tools_layout(self):
+        alias = self.CLT_PYTHON.replace("Versions/3.9", "Versions/Current")
+        self.assertIsNone(macos_capability.PYTHON_CLT_LAYOUT.fullmatch(alias))
+        with self.assertRaises(macos_capability.ProbeFailure):
+            macos_capability._python_developer_directory(Path(alias))
+        with self.assertRaises(macos_capability.ProbeFailure):
+            macos_capability._python_developer_directory(Path("/usr/bin/python3"))
+
+
 class TrustedToolchainTests(unittest.TestCase):
     def test_toolchain_binds_current_python_and_resolves_clang_sdk_and_linker_from_its_install(self):
         values = {
