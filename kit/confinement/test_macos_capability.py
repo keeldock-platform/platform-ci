@@ -318,7 +318,10 @@ class ProbeUidCensusTests(unittest.TestCase):
 
 
 class ProbeIdentityDiagnosticTests(unittest.TestCase):
-    def _identity_runner(self, directory, *, groups=b"staff\n", uid=b"502\n", delete_status=0, fail_attribute=False):
+    def _identity_runner(
+        self, directory, *, listing=b"runner 501\n", groups=b"staff\n", uid=b"502\n",
+        delete_status=0, fail_attribute=False,
+    ):
         parent = Path(directory) / "probe-home"
         parent.mkdir()
         calls = []
@@ -326,7 +329,7 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
         def command(argv, **kwargs):
             calls.append((argv, kwargs))
             if argv[0] == "/usr/bin/dscl" and "-list" in argv:
-                return subprocess.CompletedProcess(argv, 0, b"runner 501\n", b"")
+                return subprocess.CompletedProcess(argv, 0, listing, b"")
             if argv[0] == "/usr/bin/dscl" and "-delete" in argv:
                 return subprocess.CompletedProcess(argv, delete_status, b"", b"")
             if fail_attribute and argv[0] == "/usr/bin/dscl" and argv[2:4] == ["-create", "/Users/" + macos_capability.USERNAME] and len(argv) > 4:
@@ -377,7 +380,14 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                 self.assertFalse((Path(directory) / "probe-home").exists())
 
     def test_identity_inventory_refuses_existing_fixed_name_or_malformed_records(self):
-        for listing in (b"ci-sandbox-probe 502\n", b"broken record\n"):
+        for listing in (
+            b"ci-sandbox-probe 502\n",
+            b"broken record\n",
+            b"negative -\n",
+            b"positive +2\n",
+            b"double-sign --2\n",
+            b"non-ascii \xc2\xb2\n",
+        ):
             with self.subTest(listing=listing), tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
                 def command(argv, **kwargs):
                     return subprocess.CompletedProcess(argv, 0, listing, b"")
@@ -389,6 +399,53 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
                                 macos_capability._create_probe_identity(Path(directory))
                 self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
                 self.assertEqual(raised.exception.check, "probe_identity_inventory")
+
+    def test_identity_inventory_accepts_ascii_negative_uids_and_preserves_positive_collision_scan(self):
+        with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+            listing = b"legacy -2\nrunner 501\noccupied 502\n"
+            (uid, parent, home), calls, _ = self._identity_runner(
+                directory, listing=listing, uid=b"503\n"
+            )
+            self.assertEqual(uid, 503)
+            self.assertEqual(home, parent / "home")
+            self.assertIn(
+                ["/usr/bin/dscl", ".", "-create", "/Users/" + macos_capability.USERNAME, "UniqueID", "503"],
+                [call[0] for call in calls],
+            )
+            shutil.rmtree(parent, ignore_errors=True)
+
+    def test_signed_uid_normalization_is_bounded_to_darwin_uid_width(self):
+        self.assertEqual(
+            macos_capability._parse_darwin_uid("-2"),
+            (-2, 4294967294),
+        )
+        self.assertEqual(
+            macos_capability._parse_darwin_uid("4294967295"),
+            (4294967295, 4294967295),
+        )
+        self.assertEqual(
+            macos_capability._parse_darwin_uid("-2147483648"),
+            (-2147483648, 2147483648),
+        )
+        self.assertIsNone(macos_capability._parse_darwin_uid("-4294966794"))
+        self.assertIsNone(macos_capability._parse_darwin_uid("4294967296"))
+
+    def test_out_of_range_signed_alias_refuses_before_account_creation(self):
+        listing = b"runner 501\noverflow -4294966794\n"
+        calls = []
+        with tempfile.TemporaryDirectory(prefix="macos-identity-test-") as directory:
+            def command(argv, **kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 0, listing, b"")
+
+            with patch.object(macos_capability.os, "geteuid", return_value=0, create=True):
+                with patch.object(macos_capability, "_run", side_effect=command):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        with macos_capability._preflight_phase("probe_identity"):
+                            macos_capability._create_probe_identity(Path(directory))
+        self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
+        self.assertEqual(raised.exception.check, "probe_identity_inventory")
+        self.assertEqual(calls, [["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"]])
 
     def test_ambiguous_create_timeout_preserves_home_and_never_deletes_account(self):
         with tempfile.TemporaryDirectory(prefix="macos-identity-timeout-") as directory:

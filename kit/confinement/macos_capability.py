@@ -23,6 +23,9 @@ MAX_CAPTURE_BYTES = 65536
 MAX_PROBE_SECONDS = 45
 MAX_RUNNER_ANCESTORS = 16
 MAX_PROCESS_PATH_BYTES = 4096
+DARWIN_UID_MODULUS = 1 << 32
+DARWIN_UID_MAX = DARWIN_UID_MODULUS - 1
+DARWIN_SIGNED_UID_MIN = -(1 << 31)
 LSOF_NON_DESCRIPTOR_ENTRIES = frozenset(("cwd", "rtd", "txt", "mem", "ltx"))
 PROC_PIDLISTFDS = 1
 PROC_PIDFDPIPEINFO = 6
@@ -440,6 +443,18 @@ def _protect_runner_controls(workspace):
     return runner_uid, tuple(sorted(directories)), tuple(Path(os.environ[key]) for key in control_files)
 
 
+def _parse_darwin_uid(value):
+    if re.fullmatch(r"-?[0-9]+", value) is None:
+        return None
+    try:
+        parsed = int(value, 10)
+    except ValueError:
+        return None
+    if parsed < DARWIN_SIGNED_UID_MIN or parsed > DARWIN_UID_MAX:
+        return None
+    return parsed, parsed % DARWIN_UID_MODULUS
+
+
 def _create_probe_identity(workspace):
     if os.geteuid() != 0:
         raise ProbeFailure("probe_identity_unavailable")
@@ -447,7 +462,8 @@ def _create_probe_identity(workspace):
     created = False
     with _preflight_phase("probe_identity_inventory"):
         listed = _require_success(_run(["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"], timeout=10), "probe_identity_unavailable")
-        ids = []
+        ids = set()
+        raw_ids = []
         records = set()
         try:
             lines = listed.stdout.decode("ascii").splitlines()
@@ -457,16 +473,21 @@ def _create_probe_identity(workspace):
             raise ProbeFailure("probe_identity_unavailable")
         for line in lines:
             fields = line.split()
-            if len(fields) != 2 or not fields[1].isdecimal() or not re.fullmatch(r"[A-Za-z0-9._-]+", fields[0]):
+            if len(fields) != 2 or re.fullmatch(r"[A-Za-z0-9._-]+", fields[0]) is None:
                 raise ProbeFailure("probe_identity_unavailable")
+            uid_record = _parse_darwin_uid(fields[1])
+            if uid_record is None:
+                raise ProbeFailure("probe_identity_unavailable")
+            raw_uid, normalized_uid = uid_record
             if fields[0] in records:
                 raise ProbeFailure("probe_identity_unavailable")
             records.add(fields[0])
-            ids.append(int(fields[1]))
+            raw_ids.append(raw_uid)
+            ids.add(normalized_uid)
         if USERNAME in records:
             raise ProbeFailure("probe_identity_unavailable")
-        uid = max(ids or [500]) + 1
-        if uid <= 0 or uid >= 60000:
+        uid = max(raw_ids or [500]) + 1
+        if uid <= 0 or uid >= 60000 or uid in ids:
             raise ProbeFailure("probe_identity_unavailable")
     with _preflight_phase("probe_identity_home"):
         home_parent = Path(tempfile.mkdtemp(prefix="sandbox-capability-home-", dir="/tmp"))
