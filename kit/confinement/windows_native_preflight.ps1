@@ -21,7 +21,33 @@ try {
         Write-Output $result
         exit 0
     }
-    if ($result -match '^windows-native-preflight=refused check=(lpac_profile|job_setup|child_attribute_list|child_security_capabilities|child_lpac_policy|child_system_executable|child_process_create|child_process_create_access_denied|child_process_create_invalid_parameter|child_process_create_other|child_job_assignment|child_job_readback|token_readback|job_readback|cng_key|cng_acl|cng_export|cleanup|runtime) reason=native_preflight_unavailable cleanup=(verified|incomplete)$') {
+    $createProcessFailurePrefix = 'windows-native-preflight=refused check=child_process_create win32_createprocess_error='
+    if ($result.StartsWith($createProcessFailurePrefix, [StringComparison]::Ordinal)) {
+        $cleanup = 'incomplete'
+        if ($result.Length -le 256) {
+            $createProcessFailurePattern = '^windows-native-preflight=refused check=child_process_create win32_createprocess_error=([0-9]+) reason=native_preflight_unavailable cleanup=verified\z'
+            $match = [regex]::Match($result, $createProcessFailurePattern)
+            if ($match.Success) {
+                $cleanup = 'verified'
+                $errorText = $match.Groups[1].Value
+                $canonical = $errorText -eq '0' -or $errorText -match '^[1-9][0-9]*$'
+                [UInt64]$errorValue = 0
+                $parsed = $canonical -and [UInt64]::TryParse(
+                    $errorText,
+                    [System.Globalization.NumberStyles]::None,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$errorValue
+                )
+                if ($parsed -and $errorValue -le [UInt32]::MaxValue) {
+                    Write-Output $result
+                    exit 1
+                }
+            }
+        }
+        Write-Output ('windows-native-preflight=refused check=child_process_create_other reason=native_preflight_unavailable cleanup=' + $cleanup)
+        exit 1
+    }
+    if ($result -match '^windows-native-preflight=refused check=(lpac_profile|job_setup|child_attribute_list|child_security_capabilities|child_lpac_policy|child_system_executable|child_process_create_other|child_job_assignment|child_job_readback|token_readback|job_readback|cng_key|cng_acl|cng_export|cleanup|runtime) reason=native_preflight_unavailable cleanup=(verified|incomplete)\z') {
         Write-Output $result
         exit 1
     }
