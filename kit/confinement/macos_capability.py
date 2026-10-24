@@ -2,7 +2,7 @@ import argparse
 import ctypes
 from contextlib import contextmanager
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import shutil
@@ -71,7 +71,8 @@ DEVELOPER_SHIM_PATHS = frozenset(
     )
 )
 APPLE_SYSTEM_PATH_ROOTS = tuple(
-    Path(path) for path in ("/System/Library", "/usr/libexec", "/usr/sbin", "/sbin", "/bin", "/usr/bin")
+    PurePosixPath(path)
+    for path in ("/System/Library", "/usr/libexec", "/usr/sbin", "/sbin", "/bin", "/usr/bin")
 )
 PROCESS_TABLE_PATHS = frozenset(("/bin/ps", "/usr/bin/ps"))
 KNOWN_APPLE_HELPER_PATHS = {
@@ -735,13 +736,14 @@ def _survivor_path_class(path, python_executable):
     if path is None:
         return "unknown"
     try:
-        candidate = Path(path)
+        raw_path = path.as_posix() if hasattr(path, "as_posix") else str(path)
+        candidate = PurePosixPath(raw_path)
         if not candidate.is_absolute():
             return "unknown"
         value = candidate.as_posix()
     except BaseException:
         return "unknown"
-    if value == python_executable:
+    if value == PurePosixPath(python_executable).as_posix():
         return "python"
     if value in PROCESS_TABLE_PATHS:
         return "ps"
@@ -992,8 +994,11 @@ def _resolve_trusted_path(raw, *, directory=False, reject_python_shim=False):
     try:
         if len(os.fsencode(raw)) > MAX_TOOL_PATH_BYTES:
             raise ValueError
+        semantic_path = PurePosixPath(raw)
         supplied = Path(raw)
-        if not supplied.is_absolute() or (reject_python_shim and supplied.as_posix() == "/usr/bin/python3"):
+        if not semantic_path.is_absolute() or (
+            reject_python_shim and semantic_path.as_posix() == "/usr/bin/python3"
+        ):
             raise ValueError
         link_metadata = supplied.lstat()
         if link_metadata.st_uid != 0:
@@ -1006,8 +1011,9 @@ def _resolve_trusted_path(raw, *, directory=False, reject_python_shim=False):
 
 def _python_developer_directory(path):
     text = path.as_posix()
+    semantic_path = PurePosixPath(text)
     if PYTHON_XCODE_LAYOUT.fullmatch(text):
-        return Path(*path.parts[:5])
+        return Path(PurePosixPath(*semantic_path.parts[:5]).as_posix())
     if PYTHON_CLT_LAYOUT.fullmatch(text):
         return Path("/Library/Developer/CommandLineTools")
     raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
@@ -1034,10 +1040,12 @@ def _read_tool_path(result):
 def _resolve_toolchain_file(raw, developer_directory, *, kind):
     path = _resolve_trusted_path(raw, directory=kind == "sdk")
     try:
-        relative = path.relative_to(developer_directory).parts
+        relative = PurePosixPath(path.as_posix()).relative_to(
+            PurePosixPath(developer_directory.as_posix())
+        ).parts
     except ValueError:
         raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain") from None
-    is_xcode = developer_directory.name == "Developer"
+    is_xcode = PurePosixPath(developer_directory.as_posix()).name == "Developer"
     if kind == "clang":
         expected = (
             ("Toolchains", "XcodeDefault.xctoolchain", "usr", "bin", "clang")
@@ -1086,7 +1094,7 @@ def _resolve_trusted_toolchain():
     env = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": "/var/empty",
-        "DEVELOPER_DIR": str(developer_directory),
+        "DEVELOPER_DIR": developer_directory.as_posix(),
         "LANG": "C",
         "LC_ALL": "C",
     }
@@ -1113,11 +1121,11 @@ def _resolve_trusted_toolchain():
     )
     linker = _resolve_toolchain_file(_read_tool_path(linker_query), developer_directory, kind="linker")
     return {
-        "python": str(python),
-        "clang": str(clang),
-        "sdk": str(sdk),
-        "linker": str(linker),
-        "developer_directory": str(developer_directory),
+        "python": python.as_posix(),
+        "clang": clang.as_posix(),
+        "sdk": sdk.as_posix(),
+        "linker": linker.as_posix(),
+        "developer_directory": developer_directory.as_posix(),
     }
 
 

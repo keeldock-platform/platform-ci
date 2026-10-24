@@ -10,7 +10,7 @@ import tempfile
 import types
 import unittest
 from contextlib import ExitStack, redirect_stdout
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 import macos_capability
@@ -347,11 +347,11 @@ class FixedOutcomeTests(unittest.TestCase):
 class TrustedToolchainTests(unittest.TestCase):
     def test_toolchain_binds_current_python_and_resolves_clang_sdk_and_linker_from_its_install(self):
         values = {
-            TEST_TOOLCHAIN["python"]: Path(TEST_TOOLCHAIN["python"]),
-            "/usr/bin/xcrun": Path("/usr/bin/xcrun"),
-            TEST_TOOLCHAIN["clang"]: Path(TEST_TOOLCHAIN["clang"]),
-            TEST_TOOLCHAIN["sdk"]: Path(TEST_TOOLCHAIN["sdk"]),
-            TEST_TOOLCHAIN["linker"]: Path(TEST_TOOLCHAIN["linker"]),
+            TEST_TOOLCHAIN["python"]: PurePosixPath(TEST_TOOLCHAIN["python"]),
+            "/usr/bin/xcrun": PurePosixPath("/usr/bin/xcrun"),
+            TEST_TOOLCHAIN["clang"]: PurePosixPath(TEST_TOOLCHAIN["clang"]),
+            TEST_TOOLCHAIN["sdk"]: PurePosixPath(TEST_TOOLCHAIN["sdk"]),
+            TEST_TOOLCHAIN["linker"]: PurePosixPath(TEST_TOOLCHAIN["linker"]),
         }
         output = (
             subprocess.CompletedProcess([], 0, (TEST_TOOLCHAIN["clang"] + "\n").encode(), b""),
@@ -361,7 +361,7 @@ class TrustedToolchainTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch.object(macos_capability.sys, "platform", "darwin"))
             stack.enter_context(patch.object(macos_capability.sys, "executable", TEST_TOOLCHAIN["python"]))
-            stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0))
+            stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
             stack.enter_context(
                 patch.object(
                     macos_capability,
@@ -412,11 +412,11 @@ class TrustedToolchainTests(unittest.TestCase):
     def test_unreviewed_python_layout_fails_before_tool_queries(self):
         with patch.object(macos_capability.sys, "platform", "darwin"):
             with patch.object(macos_capability.sys, "executable", "/opt/unreviewed/python3"):
-                with patch.object(macos_capability.os, "geteuid", return_value=0):
+                with patch.object(macos_capability.os, "geteuid", return_value=0, create=True):
                     with patch.object(
                         macos_capability,
                         "_resolve_trusted_path",
-                        return_value=Path("/opt/unreviewed/python3"),
+                        return_value=PurePosixPath("/opt/unreviewed/python3"),
                     ):
                         with patch.object(macos_capability, "_run") as run:
                             with self.assertRaises(macos_capability.ProbeFailure) as raised:
@@ -426,23 +426,26 @@ class TrustedToolchainTests(unittest.TestCase):
 
     def test_trusted_path_checks_each_ancestor_and_allows_only_non_probe_group_writes(self):
         expected = Path(TEST_TOOLCHAIN["python"])
+        host_path_type = type(expected)
+        expected_text = expected.as_posix()
 
         def metadata(path, *, unsafe=None):
-            if unsafe == "probe_group" and path == Path("/Applications"):
+            path_text = path.as_posix()
+            if unsafe == "probe_group" and path_text == "/Applications":
                 return types.SimpleNamespace(st_uid=0, st_gid=20, st_mode=stat.S_IFDIR | 0o775)
-            if unsafe == "world" and path == Path("/"):
+            if unsafe == "world" and path_text == "/":
                 return types.SimpleNamespace(st_uid=0, st_gid=80, st_mode=stat.S_IFDIR | 0o777)
-            if unsafe == "owner" and path == Path("/Applications"):
+            if unsafe == "owner" and path_text == "/Applications":
                 return types.SimpleNamespace(st_uid=501, st_gid=80, st_mode=stat.S_IFDIR | 0o755)
-            if unsafe == "setuid" and path == expected:
+            if unsafe == "setuid" and path_text == expected_text:
                 return types.SimpleNamespace(st_uid=0, st_gid=80, st_mode=stat.S_IFREG | 0o755 | stat.S_ISUID)
-            if path == expected:
+            if path_text == expected_text:
                 return types.SimpleNamespace(st_uid=0, st_gid=80, st_mode=stat.S_IFREG | 0o755)
             return types.SimpleNamespace(st_uid=0, st_gid=80, st_mode=stat.S_IFDIR | 0o775)
 
-        with patch.object(Path, "lstat", return_value=types.SimpleNamespace(st_uid=0)):
-            with patch.object(Path, "resolve", return_value=expected):
-                with patch.object(Path, "stat", autospec=True, side_effect=lambda self: metadata(self)):
+        with patch.object(host_path_type, "lstat", return_value=types.SimpleNamespace(st_uid=0)):
+            with patch.object(host_path_type, "resolve", return_value=expected):
+                with patch.object(host_path_type, "stat", autospec=True, side_effect=lambda self: metadata(self)):
                     self.assertEqual(
                         macos_capability._resolve_trusted_path(TEST_TOOLCHAIN["python"], reject_python_shim=True),
                         expected,
@@ -450,7 +453,7 @@ class TrustedToolchainTests(unittest.TestCase):
                 for unsafe in ("probe_group", "world", "owner", "setuid"):
                     with self.subTest(unsafe=unsafe):
                         with patch.object(
-                            Path,
+                            host_path_type,
                             "stat",
                             autospec=True,
                             side_effect=lambda self, unsafe=unsafe: metadata(self, unsafe=unsafe),
@@ -627,7 +630,7 @@ class ProbeUidCensusTests(unittest.TestCase):
             with patch.object(
                 macos_capability,
                 "_process_executable",
-                return_value=Path(TEST_TOOLCHAIN["python"]),
+                return_value=PurePosixPath(TEST_TOOLCHAIN["python"]),
             ):
                 result = macos_capability._probe_uid_process_snapshot(
                     502,
@@ -650,7 +653,7 @@ class ProbeUidCensusTests(unittest.TestCase):
             with patch.object(
                 macos_capability,
                 "_process_executable",
-                side_effect=(Path(TEST_TOOLCHAIN["python"]), Path("/bin/ps")),
+                side_effect=(PurePosixPath(TEST_TOOLCHAIN["python"]), PurePosixPath("/bin/ps")),
             ) as process_path:
                 result = macos_capability._probe_uid_process_snapshot(
                     502,
@@ -680,7 +683,7 @@ class ProbeUidCensusTests(unittest.TestCase):
             with patch.object(
                 macos_capability,
                 "_process_executable",
-                side_effect=(Path(TEST_TOOLCHAIN["python"]), Path("/bin/ps")),
+                side_effect=(PurePosixPath(TEST_TOOLCHAIN["python"]), PurePosixPath("/bin/ps")),
             ):
                 result = macos_capability._probe_uid_process_snapshot(
                     502,
@@ -695,26 +698,26 @@ class ProbeUidCensusTests(unittest.TestCase):
 
     def test_survivor_path_classes_use_exact_namespaces_and_never_process_text(self):
         cases = (
-            (Path(TEST_TOOLCHAIN["python"]), "python"),
-            (Path("/bin/ps"), "ps"),
-            (Path("/usr/bin/clang"), "developer_shim"),
-            (Path("/usr/libexec/cfprefsd"), "helper_preferences"),
-            (Path("/usr/libexec/distnoted"), "helper_notifications"),
-            (Path("/usr/libexec/lsd"), "helper_launch_services"),
+            (PurePosixPath(TEST_TOOLCHAIN["python"]), "python"),
+            (PurePosixPath("/bin/ps"), "ps"),
+            (PurePosixPath("/usr/bin/clang"), "developer_shim"),
+            (PurePosixPath("/usr/libexec/cfprefsd"), "helper_preferences"),
+            (PurePosixPath("/usr/libexec/distnoted"), "helper_notifications"),
+            (PurePosixPath("/usr/libexec/lsd"), "helper_launch_services"),
             (
-                Path("/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsd"),
+                PurePosixPath("/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsd"),
                 "helper_launch_services",
             ),
-            (Path("/usr/libexec/secd"), "helper_security"),
-            (Path("/usr/libexec/trustd"), "helper_trust"),
-            (Path("/usr/libexec/containermanagerd"), "helper_containers"),
+            (PurePosixPath("/usr/libexec/secd"), "helper_security"),
+            (PurePosixPath("/usr/libexec/trustd"), "helper_trust"),
+            (PurePosixPath("/usr/libexec/containermanagerd"), "helper_containers"),
             (
-                Path("/System/Library/PrivateFrameworks/ContainerManager.framework/Support/containermanagerd"),
+                PurePosixPath("/System/Library/PrivateFrameworks/ContainerManager.framework/Support/containermanagerd"),
                 "helper_containers",
             ),
-            (Path("/usr/libexec/example-agent"), "apple_system_path"),
-            (Path("/opt/example-agent"), "other"),
-            (Path("/tmp/cfprefsd-copy"), "other"),
+            (PurePosixPath("/usr/libexec/example-agent"), "apple_system_path"),
+            (PurePosixPath("/opt/example-agent"), "other"),
+            (PurePosixPath("/tmp/cfprefsd-copy"), "other"),
             (None, "unknown"),
         )
         for path, expected in cases:
@@ -723,13 +726,22 @@ class ProbeUidCensusTests(unittest.TestCase):
                     macos_capability._survivor_path_class(path, TEST_TOOLCHAIN["python"]), expected
                 )
 
+    def test_macos_path_classification_uses_posix_semantics_on_every_host(self):
+        path = PurePosixPath("/usr/libexec/distnoted")
+        self.assertTrue(path.is_absolute())
+        self.assertEqual(
+            macos_capability._survivor_path_class(path, TEST_TOOLCHAIN["python"]),
+            "helper_notifications",
+        )
+        self.assertTrue(all(isinstance(root, PurePosixPath) for root in macos_capability.APPLE_SYSTEM_PATH_ROOTS))
+
     def test_survivor_path_readback_is_bounded_and_marks_unread_rows_as_additional(self):
         pids = tuple(range(100, 117))
         readback = "".join(f"{pid} 502 0 0\n" for pid in pids[:macos_capability.MAX_SURVIVOR_PATH_READBACKS])
         with patch.object(
             macos_capability,
             "_process_executable",
-            return_value=Path("/bin/ps"),
+            return_value=PurePosixPath("/bin/ps"),
         ) as process_path:
             with patch.object(
                 macos_capability,
