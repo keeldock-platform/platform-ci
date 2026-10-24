@@ -508,6 +508,129 @@ def collect_stages(emit, stages, resolved):
         stages.append(("linker_file", SKIPPED, "needs_linker_output"))
 
 
+DIAGNOSTIC_BANNER = "unconditional-diagnostic-walks"
+
+
+def file_type_text(metadata):
+    mode = metadata.st_mode
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "other"
+
+
+def diagnostic_trust_line(path, directory, emit):
+    try:
+        macos_capability._trusted_path_metadata(Path(path), directory=directory)
+        outcome = "accept"
+    except macos_capability.ProbeFailure:
+        outcome = "REFUSE"
+    except BaseException as error:
+        outcome = "error:" + type(error).__name__
+    emit("  real _trusted_path_metadata(directory=" + str(directory) + ")=" + outcome)
+
+
+def diagnostic_target(label, path, directory, emit):
+    emit("diag target " + label + " path=" + ascii(str(path)))
+    try:
+        print_walk(Path(path), directory, emit)
+        diagnostic_trust_line(path, directory, emit)
+    except BaseException as error:
+        emit("  diagnostic_error=" + type(error).__name__)
+
+
+def diagnostic_lstat_chain(raw, emit):
+    emit("diag lstat chain " + ascii(str(raw)))
+    try:
+        components = ancestor_components(raw)
+    except BaseException as error:
+        emit("  diagnostic_error=" + type(error).__name__)
+        return
+    for component in components:
+        try:
+            metadata = component.lstat()
+        except OSError as error:
+            emit("  " + ascii(str(component)) + " lstat_error=" + type(error).__name__)
+            continue
+        line = (
+            "  "
+            + ascii(str(component))
+            + " type="
+            + file_type_text(metadata)
+            + " uid="
+            + str(metadata.st_uid)
+            + " gid="
+            + str(metadata.st_gid)
+            + " mode="
+            + mode_text(metadata)
+        )
+        if stat.S_ISLNK(metadata.st_mode):
+            try:
+                line += " target=" + ascii(os.readlink(str(component)))
+            except OSError as error:
+                line += " readlink_error=" + type(error).__name__
+        emit(line)
+
+
+def diagnostic_query_value(query):
+    if query is None or query.returncode != 0 or query.stderr:
+        return None
+    if not query.stdout.endswith(b"\n") or query.stdout.count(b"\n") != 1:
+        return None
+    try:
+        value = query.stdout[:-1].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return value or None
+
+
+def unconditional_diagnostics(emit):
+    emit(DIAGNOSTIC_BANNER + " begin (diagnostic only; changes no verdict)")
+    try:
+        target = os.path.realpath(sys.executable)
+        diagnostic_target("python_realpath", target, False, emit)
+        diagnostic_lstat_chain(sys.executable, emit)
+        text = Path(target).as_posix()
+        emit("diag python realpath matches PYTHON_XCODE_LAYOUT=" + str(bool(macos_capability.PYTHON_XCODE_LAYOUT.fullmatch(text))))
+        emit("diag python realpath matches PYTHON_CLT_LAYOUT=" + str(bool(macos_capability.PYTHON_CLT_LAYOUT.fullmatch(text))))
+    except BaseException as error:
+        emit("diagnostic_error=" + type(error).__name__)
+    query_env = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": "/var/empty",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    try:
+        selected = diagnostic_query_value(run_query(["/usr/bin/xcode-select", "-p"], query_env, emit))
+        if selected is None:
+            emit("diag xcode-select directory unavailable")
+        else:
+            diagnostic_target("xcode_select_directory", selected, True, emit)
+            env = dict(query_env)
+            env["DEVELOPER_DIR"] = selected
+            clang = diagnostic_query_value(
+                run_query(["/usr/bin/xcrun", "--sdk", "macosx", "--find", "clang"], env, emit)
+            )
+            sdk = diagnostic_query_value(
+                run_query(["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"], env, emit)
+            )
+            if clang is None:
+                emit("diag clang path unavailable")
+            else:
+                diagnostic_target("clang_path", clang, False, emit)
+            if sdk is None:
+                emit("diag sdk path unavailable")
+            else:
+                diagnostic_target("sdk_path", sdk, True, emit)
+    except BaseException as error:
+        emit("diagnostic_error=" + type(error).__name__)
+    emit(DIAGNOSTIC_BANNER + " end")
+
+
 def build_report(emit):
     stages = []
     resolved = {}
@@ -517,6 +640,10 @@ def build_report(emit):
         emit("report_error=" + type(error).__name__)
         stages.append(("report_error", REFUSE, type(error).__name__))
     stages.append(cross_check(stages, resolved, emit))
+    try:
+        unconditional_diagnostics(emit)
+    except BaseException as error:
+        emit("diagnostic_error=" + type(error).__name__)
     return stages
 
 

@@ -46,6 +46,7 @@ def synthetic_host(euid=502, python_ok=True, developer=DEVELOPER, outcome=("refu
         stack.enter_context(mock.patch.object(report, "toolchain_file_stage", side_effect=fake_file_stage))
         stack.enter_context(mock.patch.object(report, "developer_directory_for", return_value=developer))
         stack.enter_context(mock.patch.object(report, "print_walk"))
+        stack.enter_context(mock.patch.object(report, "unconditional_diagnostics"))
         stack.enter_context(mock.patch.object(macos_capability, "_trusted_path_metadata", side_effect=lambda p, directory=False: p))
         stack.enter_context(mock.patch.object(report, "real_resolver_outcome", return_value=outcome))
         yield
@@ -648,6 +649,118 @@ class MainTests(unittest.TestCase):
                 safe = report.safe_line(line)
                 self.assertTrue(safe.startswith("unsafe_line_suppressed="))
                 self.assertTrue(safe.isascii() and safe.isprintable())
+
+
+class DiagnosticTests(unittest.TestCase):
+    def run_diagnostics(self, sys_executable, queries, trusted=None):
+        lines = []
+        fake_sys = mock.patch.object(sys, "executable", sys_executable)
+        fake_queries = mock.patch.object(report, "run_query", side_effect=queries)
+        with fake_sys, fake_queries:
+            if trusted is None:
+                report.unconditional_diagnostics(lines.append)
+            else:
+                with mock.patch.object(macos_capability, "_trusted_path_metadata", side_effect=trusted):
+                    report.unconditional_diagnostics(lines.append)
+        return lines
+
+    def ok(self, text):
+        return types.SimpleNamespace(returncode=0, stdout=text.encode() + b"\n", stderr=b"")
+
+    def test_lstat_chain_shows_symlinks_as_symlinks_with_owner_and_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            real = Path(directory) / "real"
+            real.write_text("x")
+            link = Path(directory) / "link"
+            link.symlink_to(real)
+            lines = []
+            report.diagnostic_lstat_chain(str(link), lines.append)
+        leaf = [line for line in lines if "/link' type=symlink " in line]
+        self.assertEqual(len(leaf), 1)
+        self.assertIn("uid=" + str(os.lstat(__file__).st_uid), leaf[0])
+        self.assertIn("mode=0", leaf[0])
+        self.assertIn("/120000", leaf[0])
+        self.assertIn("target=", leaf[0])
+        self.assertTrue(any(" type=directory " in line for line in lines))
+
+    def test_lstat_chain_reports_missing_component_without_raising(self):
+        lines = []
+        report.diagnostic_lstat_chain("/nonexistent-fixture/a/b", lines.append)
+        self.assertTrue(any("lstat_error=FileNotFoundError" in line for line in lines))
+
+    def test_diagnostics_run_all_targets_and_banner_even_when_python_would_refuse(self):
+        queries = [self.ok("/Fixture/dev"), self.ok("/Fixture/dev/clang"), self.ok("/Fixture/dev/sdk")]
+        refuse = macos_capability.ProbeFailure("fixture")
+
+        def refusing(path, directory=False):
+            raise refuse
+
+        lines = self.run_diagnostics("/Fixture/bin/python3", queries, trusted=refusing)
+        self.assertTrue(lines[0].startswith(report.DIAGNOSTIC_BANNER))
+        self.assertTrue(lines[-1].startswith(report.DIAGNOSTIC_BANNER))
+        for label in ("python_realpath", "xcode_select_directory", "clang_path", "sdk_path"):
+            self.assertTrue(any(line.startswith("diag target " + label) for line in lines), label)
+        self.assertEqual(sum(line.endswith("=REFUSE") for line in lines), 4)
+        self.assertTrue(any("(directory=True)=REFUSE" in line for line in lines))
+        self.assertTrue(any("(directory=False)=REFUSE" in line for line in lines))
+        self.assertTrue(any("matches PYTHON_XCODE_LAYOUT=False" in line for line in lines))
+        self.assertTrue(any("matches PYTHON_CLT_LAYOUT=False" in line for line in lines))
+        self.assertTrue(any(line.startswith("diag lstat chain") for line in lines))
+
+    def test_unavailable_queries_are_printed_not_raised(self):
+        lines = self.run_diagnostics("/Fixture/bin/python3", [None])
+        self.assertIn("diag xcode-select directory unavailable", lines)
+        self.assertEqual(lines[-1], report.DIAGNOSTIC_BANNER + " end")
+        lines = self.run_diagnostics("/Fixture/bin/python3", [self.ok("/Fixture/dev"), None, None])
+        self.assertIn("diag clang path unavailable", lines)
+        self.assertIn("diag sdk path unavailable", lines)
+
+    def test_layout_match_is_reported_for_a_matching_target(self):
+        target = "/Applications/Xcode_1.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
+        with mock.patch.object(os.path, "realpath", return_value=target):
+            lines = self.run_diagnostics("/Fixture/bin/python3", [None])
+        matches = [line for line in lines if "matches PYTHON_" in line]
+        self.assertEqual(len(matches), 2)
+        self.assertTrue(any("XCODE_LAYOUT=True" in line for line in matches))
+
+    def test_unexpected_errors_in_a_target_are_contained(self):
+        queries = [self.ok("/Fixture/dev"), None, None]
+        with mock.patch.object(report, "print_walk", side_effect=RuntimeError("fixture")):
+            lines = self.run_diagnostics("/Fixture/bin/python3", queries)
+        self.assertIn("  diagnostic_error=RuntimeError", lines)
+        self.assertEqual(lines[-1], report.DIAGNOSTIC_BANNER + " end")
+
+    def test_hostile_path_cannot_forge_a_diagnostic_line(self):
+        queries = [self.ok("/Fixture/d\x1bev"), None, None]
+        lines = self.run_diagnostics("/Fixture/p\ny::x", queries)
+        for line in lines:
+            self.assertTrue(line.isascii() and line.isprintable(), line)
+
+    def test_diagnostics_never_change_stages_verdict_or_drift(self):
+        outputs = []
+        for diagnostics in (lambda emit: None, lambda emit: emit("diag fixture line")):
+            with synthetic_host(python_ok=False):
+                with mock.patch.object(report, "unconditional_diagnostics", side_effect=diagnostics):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        self.assertEqual(report.main(), 0)
+            outputs.append([line for line in output.getvalue().splitlines() if not line.startswith("diag ")])
+        self.assertEqual(outputs[0], outputs[1])
+
+    def test_a_failing_diagnostic_never_breaks_build_report_or_main(self):
+        with synthetic_host(python_ok=False):
+            with mock.patch.object(report, "unconditional_diagnostics", side_effect=RuntimeError("fixture")):
+                lines = []
+                stages = report.build_report(lines.append)
+        self.assertIn("diagnostic_error=RuntimeError", lines)
+        self.assertEqual(report.first_refusal(stages)[0], "python_path")
+
+    def test_build_report_runs_diagnostics_after_a_refused_python_path(self):
+        calls = []
+        with synthetic_host(python_ok=False):
+            with mock.patch.object(report, "unconditional_diagnostics", side_effect=calls.append):
+                report.build_report([].append)
+        self.assertEqual(len(calls), 1)
 
 
 class PreviewTests(unittest.TestCase):
