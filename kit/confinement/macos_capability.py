@@ -83,6 +83,10 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_process_survivor_controls", "probe_process_survivor_positive_read",
         "probe_process_survivor_positive_write", "probe_process_survivor_probe_tree",
         "probe_process_survivor_final_census",
+        "probe_process_survivor_controls_same_group",
+        "probe_process_survivor_controls_other_group",
+        "probe_process_survivor_controls_zombie",
+        "probe_process_survivor_controls_unattributed",
     )
 )
 PROBE_IDENTITY_CHECKS = frozenset(
@@ -605,6 +609,62 @@ def _probe_uid_processes_present(uid):
     return present
 
 
+def _probe_control_survivor_check(uid, launched_pgid):
+    if uid <= 0 or launched_pgid <= 0:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+    try:
+        result = _run(
+            ["/bin/ps", "-A", "-o", "pid=,pgid=,state=,ruid=,uid=,svuid="],
+            env={"LANG": "C", "LC_ALL": "C"},
+            timeout=5,
+            timeout_check="probe_process_census",
+        )
+    except BaseException:
+        raise ProbeFailure(
+            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
+        ) from None
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_CAPTURE_BYTES:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+    try:
+        output = result.stdout.decode("ascii")
+    except UnicodeDecodeError:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census") from None
+    if not output.endswith("\n"):
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+    lines = output.splitlines()
+    if not lines:
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+    seen_pids = set()
+    matches = []
+    for line in lines:
+        fields = line.split()
+        if len(fields) != 6 or not all(field.isdecimal() for field in fields[:2] + fields[3:]):
+            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+        pid, pgid = (int(field) for field in fields[:2])
+        state = fields[2]
+        if (
+            pid in seen_pids
+            or not state
+            or state[0] not in "IRSTUZ"
+            or any(character not in "+<>AELNsSVWX" for character in state[1:])
+        ):
+            raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+        seen_pids.add(pid)
+        real_uid, effective_uid, saved_uid = (int(field) for field in fields[3:])
+        if uid in (real_uid, effective_uid, saved_uid):
+            matches.append((pgid, state))
+    if not matches:
+        return "probe_process_survivor_controls_unattributed"
+    if len(matches) != 1:
+        return "probe_process_survivor_controls_unattributed"
+    pgid, state = matches[0]
+    if state[0] == "Z":
+        return "probe_process_survivor_controls_zombie"
+    if pgid == launched_pgid:
+        return "probe_process_survivor_controls_same_group"
+    return "probe_process_survivor_controls_other_group"
+
+
 def _remove_probe_tree(path):
     if path is None:
         return
@@ -635,6 +695,7 @@ def _run_as_probe_user(
     failure_reason="probe_identity_unavailable",
     failure_check=None,
     survivor_check="probe_process_survivor",
+    control_survivor_diagnostics=False,
 ):
     if uid <= 0:
         raise ProbeFailure("probe_identity_unavailable")
@@ -682,9 +743,15 @@ def _run_as_probe_user(
                 captures_joined = False
         census_known = False
         escaped_process = True
+        control_survivor_check = None
         try:
             escaped_process = _probe_uid_processes_present(uid)
             census_known = True
+            if control_survivor_diagnostics and escaped_process:
+                try:
+                    control_survivor_check = _probe_control_survivor_check(uid, process.pid)
+                except BaseException:
+                    control_survivor_check = "probe_process_census"
         except BaseException:
             pass
         if not tree_stopped:
@@ -694,11 +761,19 @@ def _run_as_probe_user(
         elif not census_known:
             cleanup_check = "probe_process_census"
         elif escaped_process:
-            cleanup_check = (
-                survivor_check
-                if isinstance(survivor_check, str) and survivor_check in NATIVE_PREFLIGHT_CHECKS
-                else "probe_process_survivor"
-            )
+            if control_survivor_diagnostics:
+                cleanup_check = (
+                    control_survivor_check
+                    if isinstance(control_survivor_check, str)
+                    and control_survivor_check in NATIVE_PREFLIGHT_CHECKS
+                    else "probe_process_survivor_controls_unattributed"
+                )
+            else:
+                cleanup_check = (
+                    survivor_check
+                    if isinstance(survivor_check, str) and survivor_check in NATIVE_PREFLIGHT_CHECKS
+                    else "probe_process_survivor"
+                )
         else:
             cleanup_check = None
         if cleanup_check is not None:
@@ -726,6 +801,7 @@ def _verify_runner_controls_are_private(paths, uid):
             ["/usr/bin/python3", "-c", script, str(path)], uid, env=env, timeout=5,
             failure_reason="runner_control_unavailable", failure_check="probe_access",
             survivor_check="probe_process_survivor_controls",
+            control_survivor_diagnostics=True,
         )
     if uid == 0:
         raise ProbeFailure("probe_identity_unavailable")
