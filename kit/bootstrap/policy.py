@@ -166,6 +166,11 @@ jobs:
         uses: ./kit/bootstrap
         with:
           pool: platform
+      - name: Report macOS toolchain layout
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: |
+          /usr/bin/python3 -B kit/confinement/macos_toolchain_report.py || true
 """
 
 
