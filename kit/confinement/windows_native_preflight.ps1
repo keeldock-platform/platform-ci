@@ -47,7 +47,32 @@ try {
         Write-Output ('windows-native-preflight=refused check=child_process_create_other reason=native_preflight_unavailable cleanup=' + $cleanup)
         exit 1
     }
-    if ($result -match '^windows-native-preflight=refused check=(lpac_profile|job_setup|child_attribute_list|child_security_capabilities|child_lpac_policy|child_system_executable|child_environment|child_process_create_other|child_job_assignment|child_job_readback|token_open|token_appcontainer_read|token_appcontainer_check|token_lpac_read|token_lpac_check|token_capabilities_read|token_capabilities_check|token_sid_read|token_sid_check|token_integrity_read|token_integrity_check|job_readback|cng_key|cng_acl|cng_export|cleanup|runtime) reason=native_preflight_unavailable cleanup=(verified|incomplete)\z') {
+    $tokenReadFailurePrefix = 'windows-native-preflight=refused check=token_lpac_size_read win32_gettokeninformation_error='
+    $tokenValueFailurePrefix = 'windows-native-preflight=refused check=token_lpac_value_read win32_gettokeninformation_error='
+    if ($result.StartsWith($tokenReadFailurePrefix, [StringComparison]::Ordinal) -or $result.StartsWith($tokenValueFailurePrefix, [StringComparison]::Ordinal)) {
+        if ($result.Length -le 256) {
+            $tokenReadFailurePattern = '^windows-native-preflight=refused check=token_lpac_(size_read|value_read) win32_gettokeninformation_error=([0-9]+) reason=native_preflight_unavailable cleanup=verified\z'
+            $match = [regex]::Match($result, $tokenReadFailurePattern)
+            if ($match.Success) {
+                $errorText = $match.Groups[2].Value
+                $canonical = $errorText -eq '0' -or $errorText -match '^[1-9][0-9]*$'
+                [UInt64]$errorValue = 0
+                $parsed = $canonical -and [UInt64]::TryParse(
+                    $errorText,
+                    [System.Globalization.NumberStyles]::None,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$errorValue
+                )
+                if ($parsed -and $errorValue -le [UInt32]::MaxValue) {
+                    Write-Output $result
+                    exit 1
+                }
+            }
+        }
+        Write-Output 'windows-native-preflight=refused check=token_lpac_read reason=native_preflight_unavailable cleanup=incomplete'
+        exit 1
+    }
+    if ($result -match '^windows-native-preflight=refused check=(lpac_profile|job_setup|child_attribute_list|child_security_capabilities|child_lpac_policy|child_system_executable|child_environment|child_process_create_other|child_job_assignment|child_job_readback|token_open|token_appcontainer_read|token_appcontainer_check|token_lpac_read|token_lpac_size_read|token_lpac_value_read|token_lpac_value_check|token_lpac_check|token_capabilities_read|token_capabilities_check|token_sid_read|token_sid_check|token_integrity_read|token_integrity_check|job_readback|cng_key|cng_acl|cng_export|cleanup|runtime) reason=native_preflight_unavailable cleanup=(verified|incomplete)\z') {
         Write-Output $result
         exit 1
     }
