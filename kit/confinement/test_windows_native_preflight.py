@@ -244,7 +244,13 @@ if (-not $rejected) {{ exit 6 }}
             ("cng_acl_user_check", "if (userLength < (uint)IntPtr.Size)"),
             ("cng_acl_system_sid", 'Native.ConvertStringSidToSidW("S-1-5-18"'),
             ("cng_acl_owner_read", "ReadSecurityDescriptor(key, OwnerSecurityInformation"),
-            ("cng_acl_owner_check", "Native.GetSecurityDescriptorOwner(ownerDescriptor"),
+            ("cng_acl_owner_extract", "Native.GetSecurityDescriptorOwner(ownerDescriptor"),
+            ("cng_acl_owner_absent", "if (ownerSid == IntPtr.Zero)"),
+            ("cng_acl_owner_validate", "if (!Native.IsValidSid(ownerSid))"),
+            ("cng_acl_owner_user_match", "if (!Native.EqualSid(ownerSid, currentUserSid))"),
+            ("cng_acl_owner_default_read", "QueryTokenInformation(currentToken, TokenOwner"),
+            ("cng_acl_owner_default_validate", "if (ownerLength < (uint)IntPtr.Size)"),
+            ("cng_acl_owner_default_compare", "bool ownerMatchesTokenDefault = Native.EqualSid(ownerSid, tokenOwnerSid)"),
             ("cng_acl_dacl_read", "ReadSecurityDescriptor(key, DaclSecurityInformation"),
             ("cng_acl_dacl_check", "Native.GetSecurityDescriptorDacl(daclDescriptor"),
             ("cng_acl_count_read", "Native.GetAclInformation(dacl"),
@@ -273,7 +279,19 @@ if (-not $rejected) {{ exit 6 }}
         self.assertIn("internal string CngAclCheck", self.source)
         assigned_labels = re.findall(r'cngAclCheck\s*=\s*"([a-z0-9_]+)";', verify)
         self.assertEqual(set(assigned_labels), {label for label, _ in stages})
-        self.assertEqual(len(re.findall(r"cngAclCheck\s*=", verify)), len(assigned_labels))
+        self.assertEqual(len(re.findall(r"cngAclCheck\s*=", verify)), len(assigned_labels) + 1)
+        self.assertIn(
+            'cngAclCheck = ownerMatchesTokenDefault ? "cng_acl_owner_matches_token_default" : "cng_acl_owner_matches_other";',
+            verify,
+        )
+        owner_mismatch = verify[
+            verify.index("if (!Native.EqualSid(ownerSid, currentUserSid))"):
+            verify.index('cngAclCheck = "cng_acl_dacl_read";')
+        ]
+        self.assertIn("QueryTokenInformation(currentToken, TokenOwner", owner_mismatch)
+        self.assertIn("throw new InvalidOperationException();", owner_mismatch)
+        self.assertIn("cng_acl_owner_matches_token_default", self.wrapper)
+        self.assertIn("cng_acl_owner_matches_other", self.wrapper)
         self.assertIn(
             'else if (check == "cng_acl")\n                {\n                    check = state.CngAclCheck;',
             self.source,
@@ -370,6 +388,15 @@ if (-not $rejected) {{ exit 6 }}
             "cng_acl_system_sid",
             "cng_acl_owner_read",
             "cng_acl_owner_check",
+            "cng_acl_owner_extract",
+            "cng_acl_owner_absent",
+            "cng_acl_owner_validate",
+            "cng_acl_owner_user_match",
+            "cng_acl_owner_default_read",
+            "cng_acl_owner_default_validate",
+            "cng_acl_owner_default_compare",
+            "cng_acl_owner_matches_token_default",
+            "cng_acl_owner_matches_other",
             "cng_acl_dacl_read",
             "cng_acl_dacl_check",
             "cng_acl_count_read",
@@ -655,6 +682,15 @@ if (-not $rejected) {{ exit 6 }}
             "cng_acl_system_sid",
             "cng_acl_owner_read",
             "cng_acl_owner_check",
+            "cng_acl_owner_extract",
+            "cng_acl_owner_absent",
+            "cng_acl_owner_validate",
+            "cng_acl_owner_user_match",
+            "cng_acl_owner_default_read",
+            "cng_acl_owner_default_validate",
+            "cng_acl_owner_default_compare",
+            "cng_acl_owner_matches_token_default",
+            "cng_acl_owner_matches_other",
             "cng_acl_dacl_read",
             "cng_acl_dacl_check",
             "cng_acl_count_read",
