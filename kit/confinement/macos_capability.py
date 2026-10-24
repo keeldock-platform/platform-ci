@@ -48,7 +48,7 @@ SANDBOX_STAGES = (
     "probe_exit",
 )
 SANDBOX_FAILURES = (
-    "invalid_input", "identity_invalid", "sandbox_missing", "child_failed",
+    "invalid_input", "identity_invalid", "sandbox_missing", "child_sandbox_missing", "child_failed",
     "storage_unavailable", "outside_write_allowed",
     "python_error", "exec_failed",
     "signal_exit", "other_exit",
@@ -64,6 +64,7 @@ PROBE_EXIT_FAILURES = {
     23: "child_failed",
     24: "storage_unavailable",
     25: "outside_write_allowed",
+    26: "child_sandbox_missing",
     125: "exec_failed",
 }
 CONTROL_EXIT_FAILURES = {

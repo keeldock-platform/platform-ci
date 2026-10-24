@@ -2813,7 +2813,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
         self.assertEqual(
             macos_capability.SANDBOX_FAILURES,
             (
-                "invalid_input", "identity_invalid", "sandbox_missing", "child_failed",
+                "invalid_input", "identity_invalid", "sandbox_missing", "child_sandbox_missing", "child_failed",
                 "storage_unavailable", "outside_write_allowed",
                 "python_error", "exec_failed",
                 "signal_exit", "other_exit",
@@ -2827,7 +2827,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
             {
                 20: "invalid_input", 21: "identity_invalid", 22: "sandbox_missing",
                 23: "child_failed", 24: "storage_unavailable", 25: "outside_write_allowed",
-                125: "exec_failed",
+                26: "child_sandbox_missing", 125: "exec_failed",
             },
         )
         self.assertEqual(
@@ -2916,7 +2916,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
             self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), expected)
         for code, expected in macos_capability.CONTROL_EXIT_FAILURES.items():
             self.assertEqual(classify(code, macos_capability.CONTROL_EXIT_FAILURES), expected)
-        for code in (1, 2, 19, 26, 31, 126, 255):
+        for code in (1, 2, 19, 27, 31, 126, 255):
             self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), "other_exit")
         for code in (2, 20, 126):
             self.assertEqual(classify(code, macos_capability.CONTROL_EXIT_FAILURES), "other_exit")
@@ -3213,7 +3213,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
 
     def test_probe_exit_site_maps_each_known_code_signal_and_other(self):
         expected = dict(macos_capability.PROBE_EXIT_FAILURES)
-        expected.update({26: "other_exit", 1: "other_exit", 125: "exec_failed", -9: "signal_exit", -6: "signal_exit"})
+        expected.update({26: "child_sandbox_missing", 27: "other_exit", 1: "other_exit", 125: "exec_failed", -9: "signal_exit", -6: "signal_exit"})
         for code, failure in expected.items():
             with self.subTest(code=code):
                 self.assert_refusal(
