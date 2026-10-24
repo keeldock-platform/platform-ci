@@ -10,7 +10,9 @@ import macos_capability
 
 
 TOOL_OUTPUT_PREVIEW_BYTES = 512
+CHILD_OUTPUT_PREVIEW_BYTES = 2048
 QUERY_TIMEOUT_SECONDS = 10
+CHILD_TIMEOUT_SECONDS = 60
 SDK_NAME_PATTERN = r"MacOSX[0-9]*(?:\.[0-9]+)*\.sdk"
 PASS = "pass"
 REFUSE = "REFUSE"
@@ -196,9 +198,9 @@ def verdict_line(stages):
     return "verdict: first refusal=" + name + " detail=" + str(detail)
 
 
-def preview(data):
-    shown = data[:TOOL_OUTPUT_PREVIEW_BYTES]
-    suffix = "" if len(data) <= TOOL_OUTPUT_PREVIEW_BYTES else "...(+" + str(len(data) - len(shown)) + " bytes)"
+def preview(data, limit=TOOL_OUTPUT_PREVIEW_BYTES):
+    shown = data[:limit]
+    suffix = "" if len(data) <= limit else "...(+" + str(len(data) - len(shown)) + " bytes)"
     return ascii(shown) + suffix
 
 
@@ -329,6 +331,14 @@ def tool_output_stage(name, query, emit):
 def run_query(argv, env, emit):
     try:
         return macos_capability._run(argv, env=env, timeout=QUERY_TIMEOUT_SECONDS)
+    except macos_capability.ProbeFailure:
+        emit("  could not run " + ascii(str(argv[0])))
+        return None
+
+
+def run_child(argv, env, emit):
+    try:
+        return macos_capability._run(argv, env=env, timeout=CHILD_TIMEOUT_SECONDS)
     except macos_capability.ProbeFailure:
         emit("  could not run " + ascii(str(argv[0])))
         return None
@@ -598,20 +608,97 @@ def discover_clt_pythons(root):
     return sorted(glob.glob(pattern))
 
 
+CLT_INTERPRETER_PROGRAM = "\n".join(
+    (
+        "import os, sys",
+        "sys.path.insert(0, sys.argv[1])",
+        "print('clt-interpreter-executable=' + ascii(sys.executable))",
+        "try:",
+        "    import macos_capability",
+        "    real_geteuid = os.geteuid",
+        "    os.geteuid = lambda: 0",
+        "    try:",
+        "        resolved = macos_capability._resolve_trusted_toolchain()",
+        "    finally:",
+        "        os.geteuid = real_geteuid",
+        "    print('clt-interpreter-result=accept ' + ' '.join(",
+        "        key + '=' + ascii(resolved[key])",
+        "        for key in ('python', 'clang', 'sdk', 'linker', 'developer_directory')))",
+        "except BaseException as error:",
+        "    if type(error).__name__ == 'ProbeFailure':",
+        "        print('clt-interpreter-result=refuse')",
+        "    else:",
+        "        print('clt-interpreter-result=error:' + type(error).__name__)",
+    )
+)
+
+
 def diagnostic_clt_query(label, argv, env, emit):
     emit("diag clt query " + label + " DEVELOPER_DIR=" + ascii(env["DEVELOPER_DIR"]))
     query = run_query(argv, env, emit)
     if query is None:
         emit("  query did not run")
-        return
+        return None
     emit("  returncode=" + str(query.returncode))
     emit("  stdout=" + preview(query.stdout))
     emit("  stderr=" + preview(query.stderr))
     try:
         value = macos_capability._read_tool_path(query)
         emit("  _read_tool_path would accept value=" + ascii(value))
+        return value
     except macos_capability.ProbeFailure:
         emit("  _read_tool_path would REFUSE")
+        return None
+
+
+def clt_linker_probe(clang, sdk, root, env, emit):
+    emit("diag clt linker clang=" + ascii(str(clang)) + " sdk=" + ascii(str(sdk)) + " DEVELOPER_DIR=" + ascii(root))
+    query = run_query([clang, "-isysroot", sdk, "-print-prog-name=ld"], env, emit)
+    if query is None:
+        emit("  diag clt linker query did not run")
+        return
+    emit("  diag clt linker returncode=" + str(query.returncode))
+    emit("  diag clt linker stdout=" + preview(query.stdout))
+    emit("  diag clt linker stderr=" + preview(query.stderr))
+    try:
+        value = macos_capability._read_tool_path(query)
+        emit("  diag clt linker _read_tool_path would accept value=" + ascii(value))
+    except macos_capability.ProbeFailure:
+        emit("  diag clt linker _read_tool_path would REFUSE")
+        return
+    if value.startswith("/"):
+        try:
+            diagnostic_target("clt_linker", value, False, emit)
+        except BaseException as error:
+            emit("  diagnostic_error=" + type(error).__name__)
+    else:
+        emit("  diag clt linker value is not an absolute path; ancestor walk skipped")
+    try:
+        accepted = macos_capability._resolve_toolchain_file(value, Path(root), kind="linker")
+        emit("  diag clt linker real _resolve_toolchain_file(kind=linker)=accept " + ascii(str(accepted)))
+    except macos_capability.ProbeFailure:
+        emit("  diag clt linker real _resolve_toolchain_file(kind=linker)=REFUSE")
+    except BaseException as error:
+        emit("  diag clt linker real _resolve_toolchain_file(kind=linker)=error:" + type(error).__name__)
+
+
+def clt_interpreter_probe(pythons, query_env, emit):
+    chosen = [
+        python for python in pythons if macos_capability.PYTHON_CLT_LAYOUT.fullmatch(Path(python).as_posix())
+    ]
+    if not chosen:
+        emit("diag clt interpreter skipped: no discovered python fits PYTHON_CLT_LAYOUT")
+        return
+    capability_directory = os.path.dirname(os.path.abspath(macos_capability.__file__))
+    for python in chosen:
+        emit("diag clt interpreter python=" + ascii(str(python)) + " capability_dir=" + ascii(capability_directory))
+        child = run_child([python, "-B", "-I", "-c", CLT_INTERPRETER_PROGRAM, capability_directory], dict(query_env), emit)
+        if child is None:
+            emit("  diag clt interpreter child did not run")
+            continue
+        emit("  diag clt interpreter returncode=" + str(child.returncode))
+        emit("  diag clt interpreter stdout=" + preview(child.stdout, CHILD_OUTPUT_PREVIEW_BYTES))
+        emit("  diag clt interpreter stderr=" + preview(child.stderr))
 
 
 def clt_diagnostics(emit, query_env):
@@ -636,6 +723,7 @@ def clt_diagnostics(emit, query_env):
                 emit("diag target " + label + " path=" + ascii(path) + " absent")
         except BaseException as error:
             emit("  diagnostic_error=" + type(error).__name__)
+    pythons = []
     try:
         pythons = discover_clt_pythons(root)
         emit("diag clt python3 candidates=" + str(len(pythons)))
@@ -658,13 +746,27 @@ def clt_diagnostics(emit, query_env):
         ("find_clang", ["/usr/bin/xcrun", "--find", "clang"]),
         ("show_sdk_path", ["/usr/bin/xcrun", "--show-sdk-path"]),
     )
+    values = {}
     for label, argv in queries:
         try:
-            diagnostic_clt_query(label, argv, env, emit)
+            values[label] = diagnostic_clt_query(label, argv, env, emit)
         except BaseException as error:
             emit("  diagnostic_error=" + type(error).__name__)
     try:
         diagnostic_lstat_chain(USR_BIN_PYTHON3, emit)
+    except BaseException as error:
+        emit("  diagnostic_error=" + type(error).__name__)
+    try:
+        clang = values.get("find_clang")
+        sdk = values.get("show_sdk_path")
+        if clang is None or sdk is None:
+            emit("diag clt linker skipped: clang or sdk path not accepted")
+        else:
+            clt_linker_probe(clang, sdk, root, env, emit)
+    except BaseException as error:
+        emit("  diagnostic_error=" + type(error).__name__)
+    try:
+        clt_interpreter_probe(pythons, query_env, emit)
     except BaseException as error:
         emit("  diagnostic_error=" + type(error).__name__)
 

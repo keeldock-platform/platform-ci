@@ -789,6 +789,7 @@ class CltDiagnosticTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(report, "CLT_ROOT", str(root)))
             stack.enter_context(mock.patch.object(report, "USR_BIN_PYTHON3", python3))
             stack.enter_context(mock.patch.object(report, "run_query", side_effect=queries))
+            stack.enter_context(mock.patch.object(report, "run_child", return_value=None))
             if trusted is not None:
                 stack.enter_context(mock.patch.object(macos_capability, "_trusted_path_metadata", side_effect=trusted))
             report.clt_diagnostics(lines.append, self.ENV)
@@ -927,6 +928,279 @@ class CltDiagnosticTests(unittest.TestCase):
                     for line in output.getvalue().splitlines()
                     if line.startswith(("stages ", "verdict:", "drift_detected="))
                 ]
+            )
+        self.assertEqual(outputs[0], outputs[1])
+        self.assertEqual(len(outputs[0]), 3)
+
+
+class StubProbeFailure(Exception):
+    pass
+
+
+StubProbeFailure.__name__ = "ProbeFailure"
+CLT_GOOD_PYTHON = "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
+CLT_ALIAS_PYTHON = "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/Current/bin/python3.9"
+CLT_ROOT_TEXT = "/Library/Developer/CommandLineTools"
+
+
+class CltLinkerProbeTests(unittest.TestCase):
+    ENV = {"PATH": "/usr/bin", "DEVELOPER_DIR": CLT_ROOT_TEXT}
+
+    def reply(self, stdout=b"/Library/Developer/CommandLineTools/usr/bin/ld\n", stderr=b"", returncode=0):
+        return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def probe(self, query, resolver=None, trusted=None):
+        lines = []
+        calls = []
+        resolver = resolver or (lambda raw, directory, kind: Path(raw))
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(report, "run_query", side_effect=lambda *a: calls.append(a) or query))
+            stack.enter_context(mock.patch.object(report, "print_walk"))
+            stack.enter_context(mock.patch.object(macos_capability, "_resolve_toolchain_file", side_effect=resolver))
+            stack.enter_context(
+                mock.patch.object(macos_capability, "_trusted_path_metadata", side_effect=trusted or (lambda p, directory=False: p))
+            )
+            report.clt_linker_probe("/c/clang", "/c/sdk", CLT_ROOT_TEXT, self.ENV, lines.append)
+        return lines, calls
+
+    def test_command_and_environment_are_the_resolvers_own(self):
+        _, calls = self.probe(self.reply())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], ["/c/clang", "-isysroot", "/c/sdk", "-print-prog-name=ld"])
+        self.assertEqual(calls[0][1]["DEVELOPER_DIR"], CLT_ROOT_TEXT)
+
+    def test_everything_is_printed_for_an_acceptable_linker(self):
+        lines, _ = self.probe(self.reply())
+        self.assertIn("  diag clt linker returncode=0", lines)
+        self.assertTrue(any(line.startswith("  diag clt linker stdout=b'/Library") for line in lines))
+        self.assertIn("  diag clt linker stderr=b''", lines)
+        self.assertTrue(any("_read_tool_path would accept" in line for line in lines))
+        self.assertIn("diag target clt_linker path='/Library/Developer/CommandLineTools/usr/bin/ld'", lines)
+        self.assertIn("  real _trusted_path_metadata(directory=False)=accept", lines)
+        self.assertTrue(any("_resolve_toolchain_file(kind=linker)=accept" in line for line in lines))
+
+    def test_resolver_is_called_with_the_clt_root_and_linker_kind(self):
+        seen = []
+
+        def resolver(raw, directory, kind):
+            seen.append((raw, directory, kind))
+            return Path(raw)
+
+        self.probe(self.reply(), resolver=resolver)
+        self.assertEqual(seen, [("/Library/Developer/CommandLineTools/usr/bin/ld", Path(CLT_ROOT_TEXT), "linker")])
+
+    def test_bare_name_skips_the_walk_and_reports_the_real_refusal(self):
+        def resolver(raw, directory, kind):
+            raise macos_capability.ProbeFailure("fixture")
+
+        lines, _ = self.probe(self.reply(stdout=b"ld\n"), resolver=resolver)
+        self.assertTrue(any("not an absolute path" in line for line in lines))
+        self.assertFalse(any(line.startswith("diag target clt_linker") for line in lines))
+        self.assertTrue(any("_resolve_toolchain_file(kind=linker)=REFUSE" in line for line in lines))
+
+    def test_outside_root_path_is_refused_by_the_real_resolver_verdict(self):
+        def resolver(raw, directory, kind):
+            raise macos_capability.ProbeFailure("fixture")
+
+        lines, _ = self.probe(self.reply(stdout=b"/Applications/x/ld\n"), resolver=resolver)
+        self.assertTrue(any("(kind=linker)=REFUSE" in line for line in lines))
+        self.assertIn("diag target clt_linker path='/Applications/x/ld'", lines)
+
+    def test_unreadable_output_is_printed_and_no_resolver_call_is_made(self):
+        resolver = mock.Mock()
+        lines, _ = self.probe(self.reply(returncode=1, stdout=b"", stderr=b"boom\n"), resolver=resolver)
+        self.assertIn("  diag clt linker returncode=1", lines)
+        self.assertIn("  diag clt linker _read_tool_path would REFUSE", lines)
+        resolver.assert_not_called()
+
+    def test_query_that_did_not_run_and_unexpected_errors_are_contained(self):
+        lines, _ = self.probe(None)
+        self.assertIn("  diag clt linker query did not run", lines)
+
+        def boom(raw, directory, kind):
+            raise RuntimeError("fixture")
+
+        lines, _ = self.probe(self.reply(), resolver=boom)
+        self.assertTrue(any(line.endswith("(kind=linker)=error:RuntimeError") for line in lines))
+
+    def test_hostile_linker_output_is_escaped(self):
+        lines, _ = self.probe(self.reply(stdout=b"::set-output x=y\n\x1b[2J/ld\n", stderr=b"::err\n"))
+        for line in lines:
+            self.assertTrue(line.isascii() and line.isprintable(), line)
+            self.assertFalse(line.startswith("::"))
+
+    def test_linker_probe_runs_only_with_both_accepted_clt_paths(self):
+        for queries in ([None, None], [self.ok_value("/c/clang"), None], [None, self.ok_value("/c/sdk")]):
+            with mock.patch.object(report, "clt_linker_probe") as probe:
+                self.run_clt(queries)
+            probe.assert_not_called()
+
+    def test_linker_probe_receives_the_discovered_paths_and_root(self):
+        with mock.patch.object(report, "clt_linker_probe") as probe:
+            self.run_clt([self.ok_value("/c/clang"), self.ok_value("/c/sdk")])
+        args = probe.call_args[0]
+        self.assertEqual(args[:3], ("/c/clang", "/c/sdk", "/nonexistent-fixture-clt"))
+        self.assertEqual(args[3]["DEVELOPER_DIR"], "/nonexistent-fixture-clt")
+
+    def test_linker_probe_failure_is_contained_inside_clt_diagnostics(self):
+        with mock.patch.object(report, "clt_linker_probe", side_effect=RuntimeError("fixture")):
+            lines = self.run_clt([self.ok_value("/c/clang"), self.ok_value("/c/sdk")])
+        self.assertIn("  diagnostic_error=RuntimeError", lines)
+        self.assertTrue(any(line.startswith("diag clt interpreter") for line in lines))
+
+    def ok_value(self, text):
+        return types.SimpleNamespace(returncode=0, stdout=text.encode() + b"\n", stderr=b"")
+
+    def run_clt(self, queries):
+        lines = []
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(report, "CLT_ROOT", "/nonexistent-fixture-clt"))
+            stack.enter_context(mock.patch.object(report, "USR_BIN_PYTHON3", "/nonexistent-fixture-usr/python3"))
+            stack.enter_context(mock.patch.object(report, "run_query", side_effect=queries))
+            stack.enter_context(mock.patch.object(report, "run_child", return_value=None))
+            report.clt_diagnostics(lines.append, {"PATH": "/usr/bin"})
+        return lines
+
+
+class CltInterpreterProbeTests(unittest.TestCase):
+    ENV = {"PATH": "/usr/bin", "HOME": "/var/empty"}
+
+    def child(self, stdout=b"", stderr=b"", returncode=0):
+        return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def probe(self, pythons, reply):
+        lines = []
+        with mock.patch.object(report, "run_child", return_value=reply) as spawn:
+            report.clt_interpreter_probe(pythons, self.ENV, lines.append)
+        return lines, spawn
+
+    def test_only_the_layout_matching_python_is_launched_never_the_alias(self):
+        lines, spawn = self.probe([CLT_ALIAS_PYTHON, CLT_GOOD_PYTHON, "/elsewhere/python3.9"], self.child())
+        self.assertEqual(spawn.call_count, 1)
+        argv, env, _ = spawn.call_args[0]
+        self.assertEqual(argv[0], CLT_GOOD_PYTHON)
+        self.assertEqual(argv[1:4], ["-B", "-I", "-c"])
+        self.assertEqual(argv[4], report.CLT_INTERPRETER_PROGRAM)
+        self.assertEqual(argv[5], os.path.dirname(os.path.abspath(macos_capability.__file__)))
+        self.assertEqual(env, self.ENV)
+        self.assertIsNot(env, self.ENV)
+
+    def test_no_matching_python_means_no_spawn_and_a_printed_reason(self):
+        lines, spawn = self.probe([CLT_ALIAS_PYTHON], self.child())
+        spawn.assert_not_called()
+        self.assertTrue(any(line.startswith("diag clt interpreter skipped") for line in lines))
+        lines, spawn = self.probe([], self.child())
+        spawn.assert_not_called()
+
+    def test_returncode_stdout_and_stderr_are_printed(self):
+        lines, _ = self.probe([CLT_GOOD_PYTHON], self.child(b"clt-interpreter-result=refuse\n", b"warn\n", 3))
+        self.assertIn("  diag clt interpreter returncode=3", lines)
+        self.assertIn("  diag clt interpreter stdout=b'clt-interpreter-result=refuse\\n'", lines)
+        self.assertIn("  diag clt interpreter stderr=b'warn\\n'", lines)
+
+    def test_long_child_output_is_kept_past_the_default_preview(self):
+        value = b"clt-interpreter-result=accept " + b"x" * 900 + b"\n"
+        lines, _ = self.probe([CLT_GOOD_PYTHON], self.child(value))
+        shown = [line for line in lines if "interpreter stdout=" in line][0]
+        self.assertIn("x" * 900, shown)
+        huge, _ = self.probe([CLT_GOOD_PYTHON], self.child(b"y" * 5000))
+        self.assertIn("(+", [line for line in huge if "interpreter stdout=" in line][0])
+
+    def test_hostile_child_output_cannot_forge_a_log_line(self):
+        hostile = b"\n::error::forged\r\n\x1b[2J\xff\x00clt-interpreter-result=accept\n"
+        lines, _ = self.probe([CLT_GOOD_PYTHON], self.child(hostile, b"::stderr\n"))
+        for line in lines:
+            self.assertTrue(line.isascii() and line.isprintable(), line)
+            self.assertFalse(line.startswith("::"))
+
+    def test_failed_spawn_is_printed_and_contained(self):
+        lines, _ = self.probe([CLT_GOOD_PYTHON], None)
+        self.assertIn("  diag clt interpreter child did not run", lines)
+
+    def test_run_child_turns_timeout_and_oserror_into_a_printed_miss(self):
+        for failure in (macos_capability.ProbeFailure("fixture"),):
+            with mock.patch.object(macos_capability, "_run", side_effect=failure) as run:
+                lines = []
+                self.assertIsNone(report.run_child(["/x/python3.9"], {}, lines.append))
+            self.assertEqual(run.call_args[1]["timeout"], report.CHILD_TIMEOUT_SECONDS)
+            self.assertEqual(lines, ["  could not run '/x/python3.9'"])
+
+    def test_unexpected_probe_failure_is_contained_inside_clt_diagnostics(self):
+        with mock.patch.object(report, "clt_interpreter_probe", side_effect=RuntimeError("fixture")):
+            with mock.patch.object(report, "CLT_ROOT", "/nonexistent-fixture-clt"):
+                with mock.patch.object(report, "run_query", return_value=None):
+                    lines = []
+                    report.clt_diagnostics(lines.append, {"PATH": "/usr/bin"})
+        self.assertIn("  diagnostic_error=RuntimeError", lines)
+
+    def run_program(self, resolver):
+        stub = types.ModuleType("macos_capability")
+        stub.ProbeFailure = StubProbeFailure
+        stub._resolve_trusted_toolchain = resolver
+        output = io.StringIO()
+        real = os.geteuid
+        with mock.patch.dict(sys.modules, {"macos_capability": stub}):
+            with mock.patch.object(sys, "argv", ["-c", "/fixture-capability-dir"]):
+                with mock.patch.object(sys, "path", list(sys.path)):
+                    with contextlib.redirect_stdout(output):
+                        exec(compile(report.CLT_INTERPRETER_PROGRAM, "<child>", "exec"), {"__name__": "__main__"})
+                    inserted = sys.path[0]
+        self.assertIs(os.geteuid, real)
+        return output.getvalue().splitlines(), inserted
+
+    def test_program_accepts_with_geteuid_stubbed_only_during_the_call(self):
+        seen = []
+
+        def resolver():
+            seen.append(os.geteuid())
+            return {
+                "python": "/p",
+                "clang": "/c",
+                "sdk": "/s",
+                "linker": "/l",
+                "developer_directory": "/d",
+            }
+
+        lines, inserted = self.run_program(resolver)
+        self.assertEqual(seen, [0])
+        self.assertEqual(inserted, "/fixture-capability-dir")
+        self.assertEqual(
+            lines[-1],
+            "clt-interpreter-result=accept python='/p' clang='/c' sdk='/s' linker='/l' developer_directory='/d'",
+        )
+
+    def test_program_reports_refuse_and_error_and_restores_geteuid_each_time(self):
+        def refuse():
+            raise StubProbeFailure("fixture")
+
+        def broken():
+            raise KeyError("fixture")
+
+        self.assertEqual(self.run_program(refuse)[0][-1], "clt-interpreter-result=refuse")
+        self.assertEqual(self.run_program(broken)[0][-1], "clt-interpreter-result=error:KeyError")
+
+    def test_program_is_read_only_and_uses_no_privileged_calls(self):
+        for word in ("chmod", "chown", "sudo", "open(", "setuid", "os.system", "subprocess"):
+            self.assertNotIn(word, report.CLT_INTERPRETER_PROGRAM)
+
+    def test_interpreter_and_linker_blocks_never_change_stages_verdict_or_drift(self):
+        outputs = []
+
+        def probes(emit):
+            report.clt_linker_probe("/c/clang", "/c/sdk", CLT_ROOT_TEXT, {"DEVELOPER_DIR": CLT_ROOT_TEXT}, emit)
+            report.clt_interpreter_probe([CLT_GOOD_PYTHON], self.ENV, emit)
+
+        reply = types.SimpleNamespace(returncode=0, stdout=b"clt-interpreter-result=accept\n", stderr=b"")
+        for diagnostics in (lambda emit: None, probes):
+            with synthetic_host(python_ok=False):
+                with mock.patch.object(report, "unconditional_diagnostics", side_effect=diagnostics):
+                    with mock.patch.object(report, "run_query", return_value=reply):
+                        with mock.patch.object(report, "run_child", return_value=reply):
+                            output = io.StringIO()
+                            with contextlib.redirect_stdout(output):
+                                self.assertEqual(report.main(), 0)
+            outputs.append(
+                [l for l in output.getvalue().splitlines() if l.startswith(("stages ", "verdict:", "drift_detected="))]
             )
         self.assertEqual(outputs[0], outputs[1])
         self.assertEqual(len(outputs[0]), 3)
