@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 
 import check_candidate
-from public_tree import PLATFORM_FILES, PublicTreeError, inspect_text, scan_tree
+from public_tree import PINNED_FILE_SHA256, PLATFORM_FILES, PublicTreeError, inspect_text, scan_tree
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -125,10 +125,14 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("kit/bootstrap/policy.py", result)
         self.assertIn(".github/workflows/windows-attestation-permission-probe.yml", result)
         self.assertIn(".github/workflows/macos-capability.yml", result)
+        self.assertIn(".github/workflows/windows-native-preflight.yml", result)
         self.assertIn("kit/confinement/macos_harness.py", result)
         self.assertIn("kit/confinement/macos_capability.py", result)
         self.assertIn("kit/confinement/macos_capability.swift", result)
         self.assertIn("kit/confinement/test_macos_capability.py", result)
+        self.assertIn("kit/confinement/windows_native_preflight.cs", result)
+        self.assertIn("kit/confinement/windows_native_preflight.ps1", result)
+        self.assertIn("kit/confinement/test_windows_native_preflight.py", result)
 
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -136,10 +140,34 @@ class PublicTreeTests(unittest.TestCase):
             for name in PLATFORM_FILES:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("safe\n", encoding="utf-8")
+                if name in PINNED_FILE_SHA256:
+                    shutil.copyfile(ROOT / name, path)
+                else:
+                    path.write_text("safe\n", encoding="utf-8")
             scan_tree(root, "platform")
             (root / "kit/confinement/unreviewed.py").write_text("safe\n", encoding="utf-8")
             with self.assertRaisesRegex(PublicTreeError, "tree-shape"):
+                scan_tree(root, "platform")
+
+    def test_windows_native_preflight_controls_have_public_tree_hash_pins(self):
+        expected = {
+            ".github/workflows/windows-native-preflight.yml",
+            "kit/confinement/windows_native_preflight.cs",
+            "kit/confinement/windows_native_preflight.ps1",
+            "kit/confinement/test_windows_native_preflight.py",
+        }
+        self.assertEqual(set(PINNED_FILE_SHA256), expected)
+        self.assertTrue(expected.issubset(PLATFORM_FILES))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in PLATFORM_FILES:
+                destination = root / name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, destination)
+            scan_tree(root, "platform")
+            edited = root / "kit/confinement/windows_native_preflight.cs"
+            edited.write_text(edited.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+            with self.assertRaisesRegex(PublicTreeError, "file-hash-mismatch"):
                 scan_tree(root, "platform")
 
     def test_pinned_action_version_comment_is_the_only_permitted_comment(self):

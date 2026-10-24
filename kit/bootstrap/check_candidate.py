@@ -35,6 +35,12 @@ def main():
             if len(macos_payload) > 262144:
                 raise PolicyError("macos-workflow-too-large")
             validate_workflow_text(macos_payload.decode("utf-8"), pool, "macos-capability")
+            windows_workflow_path = root / ".github/workflows/windows-native-preflight.yml"
+            with windows_workflow_path.open("rb") as source:
+                windows_payload = source.read(262145)
+            if len(windows_payload) > 262144:
+                raise PolicyError("windows-workflow-too-large")
+            validate_workflow_text(windows_payload.decode("utf-8"), pool, "windows-native-preflight")
         scan_tree(root, pool)
         print("candidate-policy=accepted control-sha=" + actual_sha)
     except (OSError, UnicodeDecodeError, ValueError, PolicyError, PublicTreeError):

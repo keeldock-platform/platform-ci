@@ -21,6 +21,7 @@ GOOD_SHA = "a" * 40
 PLATFORM_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/public-policy.yml"
 LINUX_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/linux-confinement.yml"
 MACOS_CAPABILITY_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-capability.yml"
+WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-native-preflight.yml"
 PLATFORM_ACTION = Path(__file__).resolve().parent / "action.yml"
 
 
@@ -168,6 +169,56 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.subTest(mutation_index=index):
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(changed, "platform", "macos-capability")
+
+    def test_actual_windows_native_preflight_matches_closed_manual_main_shape(self):
+        workflow = WINDOWS_NATIVE_PREFLIGHT_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(workflow, "platform", "windows-native-preflight"))
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("runs-on: windows-2025", workflow)
+        self.assertIn("permissions: {}", workflow)
+        self.assertIn("CI_WORKSPACE: ${{ github.workspace }}", workflow)
+        self.assertIn("git fetch --quiet --no-tags --depth=1 origin $env:CI_REF", workflow)
+        self.assertIn("$actualSha.Trim() -ne $env:CI_SHA", workflow)
+        self.assertIn("test_windows_native_preflight.py", workflow)
+        self.assertIn("windows_native_preflight.ps1", workflow)
+        for forbidden in (
+            "inputs:",
+            "secrets.",
+            "uses:",
+            "upload-artifact",
+            "download-artifact",
+            "attest",
+            "cache:",
+            "outputs:",
+            "contents: read",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "windows-native-preflight")
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "platform")
+
+    def test_windows_native_preflight_rejects_trigger_runner_and_execution_changes(self):
+        base = WINDOWS_NATIVE_PREFLIGHT_WORKFLOW.read_text(encoding="utf-8")
+        mutations = (
+            base.replace("  workflow_dispatch:\n", "  push:\n"),
+            base.replace("github.event_name == 'workflow_dispatch'", "github.event_name == 'push'"),
+            base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
+            base.replace("    runs-on: windows-2025\n", "    runs-on: windows-latest\n"),
+            base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
+            base.replace("      - name: Run source-free native diagnostic\n", ""),
+            base.replace("python -B kit/confinement/test_windows_native_preflight.py\n", ""),
+            base.replace("      - name: Validate source-free control tree\n", "      - name: Validate source-free control tree\n        continue-on-error: true\n"),
+            base.replace("git fetch --quiet --no-tags --depth=1 origin $env:CI_REF", "git fetch --quiet origin main"),
+            base.replace("$actualSha.Trim() -ne $env:CI_SHA", "$false"),
+            base + "  extra:\n    runs-on: windows-2025\n    steps: []\n",
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation_index=index):
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "windows-native-preflight")
 
     def test_actual_workflow_rejects_skips_masking_extra_execution_and_filters(self):
         base = self._platform_workflow()
