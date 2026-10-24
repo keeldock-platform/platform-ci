@@ -2,7 +2,7 @@ import argparse
 import ctypes
 from contextlib import contextmanager
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import shutil
@@ -24,6 +24,8 @@ MAX_CAPTURE_BYTES = 65536
 MAX_PROBE_SECONDS = 45
 MAX_RUNNER_ANCESTORS = 16
 MAX_PROCESS_PATH_BYTES = 4096
+MAX_TOOL_PATH_BYTES = 4096
+MAX_SURVIVOR_PATH_READBACKS = 16
 DARWIN_UID_MODULUS = 1 << 32
 DARWIN_UID_MAX = DARWIN_UID_MODULUS - 1
 DARWIN_SIGNED_UID_MIN = -(1 << 31)
@@ -35,6 +37,56 @@ FREAD = 1
 FWRITE = 2
 PROBE_IDENTITY_VERIFIED = b"probe-identity=verified\n"
 PROBE_IDENTITY_REFUSED = b"probe-identity=refused\n"
+SURVIVOR_CLASS_ORDER = (
+    "python",
+    "ps",
+    "developer_shim",
+    "helper_preferences",
+    "helper_notifications",
+    "helper_launch_services",
+    "helper_security",
+    "helper_trust",
+    "helper_containers",
+    "apple_system_path",
+    "other",
+    "unknown",
+    "additional",
+)
+SURVIVOR_CLASSES = frozenset(SURVIVOR_CLASS_ORDER)
+PYTHON_XCODE_LAYOUT = re.compile(
+    r"/Applications/[^/]+\.app/Contents/Developer/Library/Frameworks/"
+    r"Python3\.framework/Versions/[0-9]+(?:\.[0-9]+)*/bin/python3\.[0-9]+\Z"
+)
+PYTHON_CLT_LAYOUT = re.compile(
+    r"/Library/Developer/CommandLineTools/Library/Frameworks/"
+    r"Python3\.framework/Versions/[0-9]+(?:\.[0-9]+)*/bin/python3\.[0-9]+\Z"
+)
+DEVELOPER_SHIM_PATHS = frozenset(
+    (
+        "/usr/bin/python3",
+        "/usr/bin/clang",
+        "/usr/bin/swiftc",
+        "/usr/bin/xcrun",
+        "/usr/bin/xcodebuild",
+    )
+)
+APPLE_SYSTEM_PATH_ROOTS = tuple(
+    PurePosixPath(path)
+    for path in ("/System/Library", "/usr/libexec", "/usr/sbin", "/sbin", "/bin", "/usr/bin")
+)
+PROCESS_TABLE_PATHS = frozenset(("/bin/ps", "/usr/bin/ps"))
+KNOWN_APPLE_HELPER_PATHS = {
+    "/usr/sbin/cfprefsd": "helper_preferences",
+    "/usr/libexec/cfprefsd": "helper_preferences",
+    "/usr/sbin/distnoted": "helper_notifications",
+    "/usr/libexec/distnoted": "helper_notifications",
+    "/usr/libexec/lsd": "helper_launch_services",
+    "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsd": "helper_launch_services",
+    "/usr/libexec/secd": "helper_security",
+    "/usr/libexec/trustd": "helper_trust",
+    "/usr/libexec/containermanagerd": "helper_containers",
+    "/System/Library/PrivateFrameworks/ContainerManager.framework/Support/containermanagerd": "helper_containers",
+}
 PROBE_IDENTITY_BOOTSTRAP = '''\
 import ctypes
 import os
@@ -140,6 +192,7 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_identity_readback", "probe_identity_cleanup", "probe_process_timeout", "probe_process_cleanup",
         "probe_process_group_cleanup", "probe_process_capture_cleanup", "probe_process_census",
         "probe_process_launch", "probe_process_identity",
+        "probe_process_toolchain",
         "probe_process_survivor", "probe_process_observation",
         "probe_process_survivor_controls", "probe_process_survivor_positive_read",
         "probe_process_survivor_positive_write", "probe_process_survivor_probe_tree",
@@ -149,6 +202,16 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_process_survivor_controls_zombie",
         "probe_process_survivor_controls_multiple",
         "probe_process_survivor_controls_unattributed",
+    )
+)
+SURVIVOR_CHECKS = frozenset(
+    (
+        "probe_process_survivor", "probe_process_survivor_controls",
+        "probe_process_survivor_controls_same_group", "probe_process_survivor_controls_other_group",
+        "probe_process_survivor_controls_zombie", "probe_process_survivor_controls_multiple",
+        "probe_process_survivor_controls_unattributed", "probe_process_survivor_positive_read",
+        "probe_process_survivor_positive_write", "probe_process_survivor_probe_tree",
+        "probe_process_survivor_final_census",
     )
 )
 PROBE_IDENTITY_CHECKS = frozenset(
@@ -161,7 +224,7 @@ PROBE_IDENTITY_CHECKS = frozenset(
 
 
 class ProbeFailure(Exception):
-    def __init__(self, reason, cleanup_complete=True, check=None):
+    def __init__(self, reason, cleanup_complete=True, check=None, survivor_classes=None):
         super().__init__(reason if reason in REASONS else "native_preflight_unavailable")
         self.reason = reason if reason in REASONS else "native_preflight_unavailable"
         self.cleanup_complete = cleanup_complete
@@ -173,6 +236,12 @@ class ProbeFailure(Exception):
             self.check = check
         else:
             self.check = None
+        if isinstance(survivor_classes, (tuple, list, set, frozenset)):
+            self.survivor_classes = tuple(
+                category for category in SURVIVOR_CLASS_ORDER if category in survivor_classes
+            )
+        else:
+            self.survivor_classes = ()
 
 
 class _ProcFdInfo(ctypes.Structure):
@@ -233,7 +302,7 @@ def valid_sha(value):
     return type(value) is str and CONTROL_SHA.fullmatch(value) is not None
 
 
-def safe_output(observed, reason="native_preflight_unavailable", check=None):
+def safe_output(observed, reason="native_preflight_unavailable", check=None, survivor_classes=None):
     capability = "macos-capability=observed" if observed else "macos-capability=refused"
     if not observed:
         if reason not in REASONS:
@@ -243,6 +312,16 @@ def safe_output(observed, reason="native_preflight_unavailable", check=None):
             reason == "native_preflight_unavailable" and check in NATIVE_PREFLIGHT_CHECKS
         ) or (reason == "probe_identity_unavailable" and check in PROBE_IDENTITY_CHECKS):
             capability += " check=" + check
+        if (
+            reason == "native_preflight_unavailable"
+            and check in SURVIVOR_CHECKS
+            and isinstance(survivor_classes, (tuple, list, set, frozenset))
+        ):
+            categories = tuple(
+                category for category in SURVIVOR_CLASS_ORDER if category in survivor_classes
+            )
+            if categories:
+                capability += " survivor_classes=" + ",".join(categories)
     return capability + "\nmacos-confinement=refused reason=incomplete_channel_evidence\n"
 
 
@@ -252,7 +331,12 @@ def _preflight_phase(check):
         yield
     except ProbeFailure as error:
         if error.reason == "native_preflight_unavailable":
-            raise ProbeFailure(error.reason, cleanup_complete=error.cleanup_complete, check=error.check or check) from None
+            raise ProbeFailure(
+                error.reason,
+                cleanup_complete=error.cleanup_complete,
+                check=error.check or check,
+                survivor_classes=error.survivor_classes,
+            ) from None
         if error.reason == "probe_identity_unavailable":
             identity_check = error.check if error.check in PROBE_IDENTITY_CHECKS else check
             raise ProbeFailure(
@@ -648,7 +732,72 @@ def runner_uid_for_workspace(workspace):
         raise ProbeFailure("runner_control_unavailable")
 
 
-def _probe_uid_process_snapshot(uid, launched_pgid=None):
+def _survivor_path_class(path, python_executable):
+    if path is None:
+        return "unknown"
+    try:
+        raw_path = path.as_posix() if hasattr(path, "as_posix") else str(path)
+        candidate = PurePosixPath(raw_path)
+        if not candidate.is_absolute():
+            return "unknown"
+        value = candidate.as_posix()
+    except BaseException:
+        return "unknown"
+    if value == PurePosixPath(python_executable).as_posix():
+        return "python"
+    if value in PROCESS_TABLE_PATHS:
+        return "ps"
+    if value in DEVELOPER_SHIM_PATHS:
+        return "developer_shim"
+    if value in KNOWN_APPLE_HELPER_PATHS:
+        return KNOWN_APPLE_HELPER_PATHS[value]
+    if any(candidate == root or root in candidate.parents for root in APPLE_SYSTEM_PATH_ROOTS):
+        return "apple_system_path"
+    return "other"
+
+
+def _survivor_process_classes(pids, uid, python_executable, additional):
+    categories = set()
+    for pid in pids[:MAX_SURVIVOR_PATH_READBACKS]:
+        try:
+            path = _process_executable(pid)
+        except BaseException:
+            path = None
+        categories.add(_survivor_path_class(path, python_executable))
+    if additional:
+        categories.add("additional")
+    try:
+        selected = ",".join(str(pid) for pid in pids[:MAX_SURVIVOR_PATH_READBACKS])
+        result = _run(
+            ["/bin/ps", "-p", selected, "-o", "pid=,ruid=,uid=,svuid="],
+            env={"LANG": "C", "LC_ALL": "C"},
+            timeout=5,
+            timeout_check="probe_process_census",
+        )
+        if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_CAPTURE_BYTES:
+            raise ValueError
+        output = result.stdout.decode("ascii")
+        if output and not output.endswith("\n"):
+            raise ValueError
+        current = {}
+        for line in output.splitlines():
+            fields = line.split()
+            if len(fields) != 4 or not all(field.isdecimal() for field in fields):
+                raise ValueError
+            pid, *identities = (int(field) for field in fields)
+            if pid in current or uid not in identities:
+                raise ValueError
+            current[pid] = True
+        if set(current) != set(pids[:MAX_SURVIVOR_PATH_READBACKS]):
+            raise ValueError
+    except BaseException:
+        categories = {"unknown"}
+        if additional:
+            categories.add("additional")
+    return tuple(category for category in SURVIVOR_CLASS_ORDER if category in categories)
+
+
+def _probe_uid_process_snapshot(uid, launched_pgid=None, *, include_survivor_classes=False, python_executable=None):
     if uid <= 0 or (launched_pgid is not None and launched_pgid <= 0):
         raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
     control_diagnostics = launched_pgid is not None
@@ -679,10 +828,13 @@ def _probe_uid_process_snapshot(uid, launched_pgid=None):
     matches = 0
     matched_pgid = None
     matched_state = None
+    matched_pids = []
     for line in lines:
         row = line.split()
         if control_diagnostics:
             if len(row) != 6 or not all(field.isdecimal() for field in row[:2] + row[3:]):
+                raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+            if any(len(field) > 10 for field in row[:2] + row[3:]):
                 raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
             pid, pgid = (int(field) for field in row[:2])
             state = row[2]
@@ -696,6 +848,8 @@ def _probe_uid_process_snapshot(uid, launched_pgid=None):
         else:
             if len(row) != 4 or not all(field.isdecimal() for field in row):
                 raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+            if any(len(field) > 10 for field in row):
+                raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
             pid, real_uid, effective_uid, saved_uid = (int(field) for field in row)
             pgid = None
             state = None
@@ -704,26 +858,85 @@ def _probe_uid_process_snapshot(uid, launched_pgid=None):
         seen_pids.add(pid)
         if uid in (real_uid, effective_uid, saved_uid):
             matches += 1
+            if len(matched_pids) < MAX_SURVIVOR_PATH_READBACKS + 1:
+                matched_pids.append(pid)
             if matches == 1:
                 matched_pgid = pgid
                 matched_state = state
+    survivor_classes = ()
+    if include_survivor_classes and matches > 0:
+        survivor_classes = _survivor_process_classes(
+            matched_pids,
+            uid,
+            python_executable,
+            additional=matches > MAX_SURVIVOR_PATH_READBACKS,
+        )
     if not control_diagnostics:
-        return matches > 0, None
+        result = (matches > 0, None)
+        return result + (survivor_classes,) if include_survivor_classes else result
     if matches == 0:
-        return False, None
+        result = (False, None)
+        return result + (survivor_classes,) if include_survivor_classes else result
     if matches > 1:
-        return True, "probe_process_survivor_controls_multiple"
+        result = (True, "probe_process_survivor_controls_multiple")
+        return result + (survivor_classes,) if include_survivor_classes else result
     if matched_state[0] == "Z":
-        return True, "probe_process_survivor_controls_zombie"
+        result = (True, "probe_process_survivor_controls_zombie")
+        return result + (survivor_classes,) if include_survivor_classes else result
     if matched_pgid <= 0:
-        return True, "probe_process_survivor_controls_unattributed"
+        result = (True, "probe_process_survivor_controls_unattributed")
+        return result + (survivor_classes,) if include_survivor_classes else result
     if matched_pgid == launched_pgid:
-        return True, "probe_process_survivor_controls_same_group"
-    return True, "probe_process_survivor_controls_other_group"
+        result = (True, "probe_process_survivor_controls_same_group")
+    else:
+        result = (True, "probe_process_survivor_controls_other_group")
+    return result + (survivor_classes,) if include_survivor_classes else result
 
 
-def _probe_uid_processes_present(uid):
-    return _probe_uid_process_snapshot(uid)[0]
+def _probe_uid_processes_present(uid, *, include_survivor_classes=False, python_executable=None):
+    snapshot = _probe_uid_process_snapshot(
+        uid,
+        include_survivor_classes=include_survivor_classes,
+        python_executable=python_executable,
+    )
+    if include_survivor_classes:
+        return snapshot[0], snapshot[2]
+    return snapshot[0]
+
+
+def _presence_result(value):
+    valid = (
+        type(value) is tuple
+        and len(value) == 2
+        and type(value[0]) is bool
+        and type(value[1]) is tuple
+        and len(value[1]) <= len(SURVIVOR_CLASS_ORDER)
+        and all(type(category) is str and category in SURVIVOR_CLASSES for category in value[1])
+        and len(set(value[1])) == len(value[1])
+        and tuple(category for category in SURVIVOR_CLASS_ORDER if category in value[1]) == value[1]
+        and (value[0] or not value[1])
+    )
+    if not valid:
+        raise ProbeFailure(
+            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
+        )
+    return value
+
+
+def _snapshot_presence_result(value):
+    if type(value) is not tuple or len(value) != 3:
+        raise ProbeFailure(
+            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
+        )
+    present, check, classes = value
+    present, classes = _presence_result((present, classes))
+    if (present and (type(check) is not str or check not in SURVIVOR_CHECKS)) or (
+        not present and check is not None
+    ):
+        raise ProbeFailure(
+            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
+        )
+    return present, check, classes
 
 
 def _remove_probe_tree(path):
@@ -748,13 +961,188 @@ def _remove_probe_tree(path):
     raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_identity_cleanup")
 
 
-def _probe_user_command(argv, uid):
-    if uid <= 0 or not argv or not str(argv[0]).startswith("/"):
+def _trusted_path_metadata(path, *, directory=False):
+    try:
+        components = list(reversed(path.parents)) + [path]
+        metadata = None
+        for component in components:
+            metadata = component.stat()
+            mode = metadata.st_mode
+            if (
+                metadata.st_uid != 0
+                or mode & stat.S_IWOTH
+                or (mode & stat.S_IWGRP and metadata.st_gid == PROBE_PRIMARY_GID)
+            ):
+                raise ValueError
+        if directory:
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ValueError
+        elif (
+            not stat.S_ISREG(metadata.st_mode)
+            or not metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
+        ):
+            raise ValueError
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain") from None
+    return path
+
+
+def _resolve_trusted_path(raw, *, directory=False, reject_python_shim=False):
+    if not isinstance(raw, str) or not raw or "\0" in raw:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+    try:
+        if len(os.fsencode(raw)) > MAX_TOOL_PATH_BYTES:
+            raise ValueError
+        semantic_path = PurePosixPath(raw)
+        supplied = Path(raw)
+        if not semantic_path.is_absolute() or (
+            reject_python_shim and semantic_path.as_posix() == "/usr/bin/python3"
+        ):
+            raise ValueError
+        link_metadata = supplied.lstat()
+        if link_metadata.st_uid != 0:
+            raise ValueError
+        resolved = supplied.resolve(strict=True)
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain") from None
+    return _trusted_path_metadata(resolved, directory=directory)
+
+
+def _python_developer_directory(path):
+    text = path.as_posix()
+    semantic_path = PurePosixPath(text)
+    if PYTHON_XCODE_LAYOUT.fullmatch(text):
+        return Path(PurePosixPath(*semantic_path.parts[:5]).as_posix())
+    if PYTHON_CLT_LAYOUT.fullmatch(text):
+        return Path("/Library/Developer/CommandLineTools")
+    raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+
+
+def _read_tool_path(result):
+    if (
+        result.returncode != 0
+        or result.stderr
+        or not result.stdout.endswith(b"\n")
+        or result.stdout.count(b"\n") != 1
+        or len(result.stdout) > MAX_TOOL_PATH_BYTES
+    ):
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+    try:
+        value = result.stdout[:-1].decode("ascii")
+    except UnicodeDecodeError:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain") from None
+    if not value or value != value.strip():
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+    return value
+
+
+def _resolve_toolchain_file(raw, developer_directory, *, kind):
+    path = _resolve_trusted_path(raw, directory=kind == "sdk")
+    try:
+        relative = PurePosixPath(path.as_posix()).relative_to(
+            PurePosixPath(developer_directory.as_posix())
+        ).parts
+    except ValueError:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain") from None
+    is_xcode = PurePosixPath(developer_directory.as_posix()).name == "Developer"
+    if kind == "clang":
+        expected = (
+            ("Toolchains", "XcodeDefault.xctoolchain", "usr", "bin", "clang")
+            if is_xcode
+            else ("usr", "bin", "clang")
+        )
+        valid = relative == expected
+    elif kind == "linker":
+        expected = (
+            ("Toolchains", "XcodeDefault.xctoolchain", "usr", "bin", "ld")
+            if is_xcode
+            else ("usr", "bin", "ld")
+        )
+        valid = relative == expected
+    elif kind == "sdk":
+        sdk_name = relative[-1] if relative else ""
+        if is_xcode:
+            valid = (
+                len(relative) == 5
+                and relative[:4] == ("Platforms", "MacOSX.platform", "Developer", "SDKs")
+                and re.fullmatch(r"MacOSX[0-9]*(?:\.[0-9]+)*\.sdk", sdk_name) is not None
+            )
+        else:
+            valid = (
+                len(relative) == 2
+                and relative[0] == "SDKs"
+                and re.fullmatch(r"MacOSX[0-9]*(?:\.[0-9]+)*\.sdk", sdk_name) is not None
+            )
+    else:
+        valid = False
+    if not valid:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+    return path
+
+
+def _resolve_trusted_toolchain():
+    if sys.platform != "darwin" or os.geteuid() != 0:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+    if sys.version_info < (3, 9):
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+    python = _resolve_trusted_path(sys.executable, reject_python_shim=True)
+    if not (PYTHON_XCODE_LAYOUT.fullmatch(python.as_posix()) or PYTHON_CLT_LAYOUT.fullmatch(python.as_posix())):
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+    developer_directory = _python_developer_directory(python)
+    _trusted_path_metadata(developer_directory, directory=True)
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": "/var/empty",
+        "DEVELOPER_DIR": developer_directory.as_posix(),
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    xcrun = _resolve_trusted_path("/usr/bin/xcrun")
+    clang_query = _run(
+        [str(xcrun), "--sdk", "macosx", "--find", "clang"],
+        env=env,
+        timeout=10,
+        timeout_check="probe_process_toolchain",
+    )
+    sdk_query = _run(
+        [str(xcrun), "--sdk", "macosx", "--show-sdk-path"],
+        env=env,
+        timeout=10,
+        timeout_check="probe_process_toolchain",
+    )
+    clang = _resolve_toolchain_file(_read_tool_path(clang_query), developer_directory, kind="clang")
+    sdk = _resolve_toolchain_file(_read_tool_path(sdk_query), developer_directory, kind="sdk")
+    linker_query = _run(
+        [str(clang), "-isysroot", str(sdk), "-print-prog-name=ld"],
+        env=env,
+        timeout=10,
+        timeout_check="probe_process_toolchain",
+    )
+    linker = _resolve_toolchain_file(_read_tool_path(linker_query), developer_directory, kind="linker")
+    return {
+        "python": python.as_posix(),
+        "clang": clang.as_posix(),
+        "sdk": sdk.as_posix(),
+        "linker": linker.as_posix(),
+        "developer_directory": developer_directory.as_posix(),
+    }
+
+
+def _probe_user_command(argv, uid, python_executable):
+    if (
+        uid <= 0
+        or not argv
+        or not str(argv[0]).startswith("/")
+        or not isinstance(python_executable, str)
+        or not python_executable.startswith("/")
+        or len(os.fsencode(python_executable)) > MAX_TOOL_PATH_BYTES
+    ):
         raise ProbeFailure("native_preflight_unavailable", check="probe_process_launch")
     if sys.version_info < (3, 9):
         raise ProbeFailure("native_preflight_unavailable", check="probe_process_launch")
     return [
-        "/usr/bin/python3",
+        str(python_executable),
         "-I",
         "-S",
         "-B",
@@ -766,8 +1154,8 @@ def _probe_user_command(argv, uid):
     ]
 
 
-def _spawn_probe_user(argv, uid, *, env, cwd=None, failure_reason, failure_check=None):
-    command = _probe_user_command(argv, uid)
+def _spawn_probe_user(argv, uid, *, env, python_executable, cwd=None, failure_reason, failure_check=None):
+    command = _probe_user_command(argv, uid, python_executable)
     launch_env = env if env is not None else {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": "/tmp",
@@ -804,12 +1192,14 @@ def _strip_probe_identity_record(stderr):
 def _run_as_probe_user(
     argv,
     uid,
+    *,
     env=None,
     timeout=10,
     failure_reason="probe_identity_unavailable",
     failure_check=None,
     survivor_check="probe_process_survivor",
     control_survivor_diagnostics=False,
+    python_executable,
 ):
     if uid <= 0:
         raise ProbeFailure("probe_identity_unavailable")
@@ -818,6 +1208,7 @@ def _run_as_probe_user(
         command,
         uid,
         env=env,
+        python_executable=python_executable,
         failure_reason=failure_reason,
         failure_check=failure_check,
     )
@@ -853,11 +1244,27 @@ def _run_as_probe_user(
         census_known = False
         escaped_process = True
         control_survivor_check = None
+        control_survivor_classes = ()
         try:
             if control_survivor_diagnostics:
-                escaped_process, control_survivor_check = _probe_uid_process_snapshot(uid, launched_pgid=process.pid)
+                snapshot = _probe_uid_process_snapshot(
+                    uid,
+                    launched_pgid=process.pid,
+                    include_survivor_classes=True,
+                    python_executable=python_executable,
+                )
+                (
+                    escaped_process,
+                    control_survivor_check,
+                    control_survivor_classes,
+                ) = _snapshot_presence_result(snapshot)
             else:
-                escaped_process = _probe_uid_processes_present(uid)
+                presence = _probe_uid_processes_present(
+                    uid,
+                    include_survivor_classes=True,
+                    python_executable=python_executable,
+                )
+                escaped_process, control_survivor_classes = _presence_result(presence)
             census_known = True
         except BaseException:
             pass
@@ -885,7 +1292,10 @@ def _run_as_probe_user(
             cleanup_check = None
         if cleanup_check is not None:
             raise ProbeFailure(
-                "native_preflight_unavailable", cleanup_complete=False, check=cleanup_check
+                "native_preflight_unavailable",
+                cleanup_complete=False,
+                check=cleanup_check,
+                survivor_classes=control_survivor_classes,
             )
         for stream in (process.stdout, process.stderr):
             if stream is not None and not stream.closed:
@@ -903,15 +1313,16 @@ def _run_as_probe_user(
     return subprocess.CompletedProcess(command, process.returncode, bytes(stdout_capture.data), stderr)
 
 
-def _verify_runner_controls_are_private(paths, uid):
+def _verify_runner_controls_are_private(paths, uid, python_executable):
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/tmp"}
     script = "import os,sys; raise SystemExit(1 if os.access(sys.argv[1], os.R_OK) else 0)"
     for path in paths:
         _run_as_probe_user(
-            ["/usr/bin/python3", "-c", script, str(path)], uid, env=env, timeout=5,
+            [python_executable, "-c", script, str(path)], uid, env=env, timeout=5,
             failure_reason="runner_control_unavailable", failure_check="probe_access",
             survivor_check="probe_process_survivor_controls",
             control_survivor_diagnostics=True,
+            python_executable=python_executable,
         )
     if uid == 0:
         raise ProbeFailure("probe_identity_unavailable")
@@ -1256,7 +1667,18 @@ def _terminate_probe_tree(process):
     return process.poll() is not None
 
 
-def _observe_probe(executable, marker, writable_directory, uid, home):
+def _observe_probe(
+    executable,
+    marker,
+    writable_directory,
+    uid,
+    home,
+    *,
+    python_executable,
+    compiler_executable,
+    linker_executable,
+    sdk_root,
+):
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
     argv = [
         str(executable),
@@ -1264,11 +1686,20 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
         str(marker),
         "--writable-directory",
         str(writable_directory),
+        "--python-executable",
+        str(python_executable),
+        "--compiler-executable",
+        str(compiler_executable),
+        "--linker-executable",
+        str(linker_executable),
+        "--sdk-root",
+        str(sdk_root),
     ]
     process = _spawn_probe_user(
         argv,
         uid,
         env=env,
+        python_executable=python_executable,
         cwd="/tmp",
         failure_reason="sandbox_behavior_unavailable",
     )
@@ -1340,8 +1771,14 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
                 captures_joined = False
         census_known = False
         escaped_process = True
+        survivor_classes = ()
         try:
-            escaped_process = _probe_uid_processes_present(uid)
+            presence = _probe_uid_processes_present(
+                uid,
+                include_survivor_classes=True,
+                python_executable=python_executable,
+            )
+            escaped_process, survivor_classes = _presence_result(presence)
             census_known = True
         except BaseException:
             pass
@@ -1357,7 +1794,8 @@ def _observe_probe(executable, marker, writable_directory, uid, home):
             cleanup_check = None
         if cleanup_check is not None:
             raise ProbeFailure(
-                "native_preflight_unavailable", cleanup_complete=False, check=cleanup_check
+                "native_preflight_unavailable", cleanup_complete=False, check=cleanup_check,
+                survivor_classes=survivor_classes,
             )
         for stream in (process.stdout, process.stderr):
             if stream is not None and not stream.closed:
@@ -1380,6 +1818,8 @@ def run_native_probe(control_sha):
         raise ProbeFailure("runner_control_unavailable")
     with _preflight_phase("context"):
         root = _check_context(control_sha, workspace)
+    with _preflight_phase("probe_process_toolchain"):
+        toolchain = _resolve_trusted_toolchain()
     with _preflight_phase("developer_mode"):
         _disable_developer_mode()
     with _preflight_phase("runner_controls"):
@@ -1395,36 +1835,56 @@ def run_native_probe(control_sha):
             outside = Path(tempfile.mkdtemp(prefix="sandbox-capability-write-", dir="/tmp"))
             os.chmod(scratch, 0o755)
             os.chmod(outside, 0o1777)
-            _verify_runner_controls_are_private(protected_directories + protected_files, probe_uid)
+            _verify_runner_controls_are_private(
+                protected_directories + protected_files, probe_uid, python_executable=toolchain["python"]
+            )
             marker = root / "kit/confinement/macos_capability.swift"
             if not marker.is_file() or not (marker.stat().st_mode & stat.S_IROTH):
                 raise ProbeFailure("sandbox_behavior_unavailable")
             user_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
             positive_read = "import sys; open(sys.argv[1], 'rb').close()"
             _run_as_probe_user(
-                ["/usr/bin/python3", "-c", positive_read, str(marker)], probe_uid, env=user_env, timeout=10,
+                [toolchain["python"], "-c", positive_read, str(marker)], probe_uid, env=user_env, timeout=10,
                 failure_reason="sandbox_behavior_unavailable",
                 survivor_check="probe_process_survivor_positive_read",
+                python_executable=toolchain["python"],
             )
             positive_write = "import sys; open(sys.argv[1], 'wb').close()"
             positive_file = outside / "positive-control"
             _run_as_probe_user(
-                ["/usr/bin/python3", "-c", positive_write, str(positive_file)], probe_uid, env=user_env, timeout=10,
+                [toolchain["python"], "-c", positive_write, str(positive_file)], probe_uid, env=user_env, timeout=10,
                 failure_reason="sandbox_behavior_unavailable",
                 survivor_check="probe_process_survivor_positive_write",
+                python_executable=toolchain["python"],
             )
             executable = _build_signed_probe(root, scratch)
-            _observe_probe(executable, marker, outside, probe_uid, home)
+            _observe_probe(
+                executable,
+                marker,
+                outside,
+                probe_uid,
+                home,
+                python_executable=toolchain["python"],
+                compiler_executable=toolchain["clang"],
+                linker_executable=toolchain["linker"],
+                sdk_root=toolchain["sdk"],
+            )
         except ProbeFailure as error:
             if not error.cleanup_complete:
                 cleanup_safe = False
             raise
         finally:
             if cleanup_safe:
-                if _probe_uid_processes_present(probe_uid):
+                presence = _probe_uid_processes_present(
+                    probe_uid,
+                    include_survivor_classes=True,
+                    python_executable=toolchain["python"],
+                )
+                has_survivors, survivor_classes = _presence_result(presence)
+                if has_survivors:
                     raise ProbeFailure(
                         "native_preflight_unavailable", cleanup_complete=False,
-                        check="probe_process_survivor_final_census",
+                        check="probe_process_survivor_final_census", survivor_classes=survivor_classes,
                     )
                 cleanup_failed = False
                 for path in (home_parent, scratch, outside):
@@ -1463,7 +1923,10 @@ def main(argv=None):
     try:
         run_native_probe(arguments.control_sha)
     except ProbeFailure as error:
-        print(safe_output(False, error.reason, error.check), end="")
+        print(
+            safe_output(False, error.reason, error.check, survivor_classes=error.survivor_classes),
+            end="",
+        )
         return 1
     except BaseException:
         print("macos-capability=refused reason=native_preflight_unavailable")

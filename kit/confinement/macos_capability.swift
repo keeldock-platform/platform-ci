@@ -18,6 +18,17 @@ func option(_ name: String) -> String? {
     return CommandLine.arguments[index + 1]
 }
 
+func isAbsolutePath(_ path: String) -> Bool {
+    !path.isEmpty && path.hasPrefix("/") && !path.contains("\0")
+}
+
+func isExecutableFile(_ path: String) -> Bool {
+    var isDirectory = ObjCBool(false)
+    return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+        && !isDirectory.boolValue
+        && FileManager.default.isExecutableFile(atPath: path)
+}
+
 func readIsDenied(_ path: String) -> Bool {
     let descriptor = open(path, O_RDONLY)
     if descriptor >= 0 {
@@ -37,7 +48,14 @@ func startProcess(_ executable: String, _ arguments: [String]) throws -> Process
     return process
 }
 
-func runParent(_ marker: String, _ writableDirectory: String) -> Never {
+func runParent(
+    _ marker: String,
+    _ writableDirectory: String,
+    _ pythonExecutable: String,
+    _ compilerExecutable: String,
+    _ linkerExecutable: String,
+    _ sdkRoot: String
+) -> Never {
     guard getuid() > 0, getuid() == geteuid() else {
         exit(ProbeStatus.identityInvalid)
     }
@@ -50,7 +68,15 @@ func runParent(_ marker: String, _ writableDirectory: String) -> Never {
     }
     let helper = executable.deletingLastPathComponent().appendingPathComponent("CapabilityChild")
     do {
-        let child = try startProcess(helper.path, ["--child", "--marker", marker, "--writable-directory", writableDirectory])
+        let child = try startProcess(helper.path, [
+            "--child",
+            "--marker", marker,
+            "--writable-directory", writableDirectory,
+            "--python-executable", pythonExecutable,
+            "--compiler-executable", compilerExecutable,
+            "--linker-executable", linkerExecutable,
+            "--sdk-root", sdkRoot,
+        ])
         child.waitUntilExit()
         exit(child.terminationStatus == 0 ? 0 : ProbeStatus.childFailed)
     } catch {
@@ -58,9 +84,22 @@ func runParent(_ marker: String, _ writableDirectory: String) -> Never {
     }
 }
 
-func runChild(_ marker: String, _ writableDirectory: String) -> Never {
+func runChild(
+    _ marker: String,
+    _ writableDirectory: String,
+    _ pythonExecutable: String,
+    _ compilerExecutable: String,
+    _ linkerExecutable: String,
+    _ sdkRoot: String
+) -> Never {
     guard getuid() > 0, getuid() == geteuid(), readIsDenied(marker) else {
         exit(ProbeStatus.sandboxMissing)
+    }
+    guard isAbsolutePath(pythonExecutable),
+          isAbsolutePath(compilerExecutable),
+          isAbsolutePath(linkerExecutable),
+          isAbsolutePath(sdkRoot) else {
+        exit(ProbeStatus.invalidInput)
     }
     close(STDIN_FILENO)
     guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
@@ -80,9 +119,13 @@ func runChild(_ marker: String, _ writableDirectory: String) -> Never {
     setenv("PYTHONDONTWRITEBYTECODE", "1", 1)
     setenv("LANG", "C", 1)
 
-    guard FileManager.default.isExecutableFile(atPath: "/bin/sh"),
-          FileManager.default.isExecutableFile(atPath: "/usr/bin/python3"),
-          FileManager.default.isExecutableFile(atPath: "/usr/bin/clang") else {
+    var sdkIsDirectory = ObjCBool(false)
+    guard isExecutableFile("/bin/sh"),
+          isExecutableFile(pythonExecutable),
+          isExecutableFile(compilerExecutable),
+          isExecutableFile(linkerExecutable),
+          FileManager.default.fileExists(atPath: sdkRoot, isDirectory: &sdkIsDirectory),
+          sdkIsDirectory.boolValue else {
         exit(ProbeStatus.childFailed)
     }
 
@@ -91,7 +134,7 @@ func runChild(_ marker: String, _ writableDirectory: String) -> Never {
     let python: Process
     do {
         shell = try startProcess("/bin/sh", ["-c", shellCommand, "sh", marker])
-        python = try startProcess("/usr/bin/python3", [
+        python = try startProcess(pythonExecutable, [
             "-c",
             "import subprocess,sys,time\ntry:\n open(sys.argv[1], 'rb').close()\n raise SystemExit(32)\nexcept OSError:\n pass\np = subprocess.Popen(['/bin/sleep', '4'])\ntime.sleep(4)\nraise SystemExit(p.wait())",
             marker,
@@ -136,12 +179,24 @@ func runChild(_ marker: String, _ writableDirectory: String) -> Never {
     }
 
     do {
-        let outsideCompiler = try startProcess("/usr/bin/clang", ["-x", "c", "-o", blockedOutput, source.path])
+        let outsideCompiler = try startProcess(compilerExecutable, [
+            "-x", "c",
+            "-isysroot", sdkRoot,
+            "-fuse-ld=\(linkerExecutable)",
+            "-o", blockedOutput,
+            source.path,
+        ])
         outsideCompiler.waitUntilExit()
         if outsideCompiler.terminationStatus == 0 {
             exit(ProbeStatus.outsideWriteAllowed)
         }
-        let builtCompiler = try startProcess("/usr/bin/clang", ["-x", "c", "-o", builtOutput, source.path])
+        let builtCompiler = try startProcess(compilerExecutable, [
+            "-x", "c",
+            "-isysroot", sdkRoot,
+            "-fuse-ld=\(linkerExecutable)",
+            "-o", builtOutput,
+            source.path,
+        ])
         builtCompiler.waitUntilExit()
         guard builtCompiler.terminationStatus == 0 else {
             exit(ProbeStatus.childFailed)
@@ -162,12 +217,20 @@ func runChild(_ marker: String, _ writableDirectory: String) -> Never {
 }
 
 guard let marker = option("--marker"),
-      let writableDirectory = option("--writable-directory") else {
+      let writableDirectory = option("--writable-directory"),
+      let pythonExecutable = option("--python-executable"),
+      let compilerExecutable = option("--compiler-executable"),
+      let linkerExecutable = option("--linker-executable"),
+      let sdkRoot = option("--sdk-root"),
+      isAbsolutePath(pythonExecutable),
+      isAbsolutePath(compilerExecutable),
+      isAbsolutePath(linkerExecutable),
+      isAbsolutePath(sdkRoot) else {
     exit(ProbeStatus.invalidInput)
 }
 
 if CommandLine.arguments.contains("--child") {
-    runChild(marker, writableDirectory)
+    runChild(marker, writableDirectory, pythonExecutable, compilerExecutable, linkerExecutable, sdkRoot)
 } else {
-    runParent(marker, writableDirectory)
+    runParent(marker, writableDirectory, pythonExecutable, compilerExecutable, linkerExecutable, sdkRoot)
 }

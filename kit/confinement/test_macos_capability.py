@@ -10,13 +10,20 @@ import tempfile
 import types
 import unittest
 from contextlib import ExitStack, redirect_stdout
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 import macos_capability
 
 
 CONTROL_SHA = "a" * 40
+TEST_TOOLCHAIN = {
+    "python": "/Applications/ToolchainFixture.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9",
+    "clang": "/Applications/ToolchainFixture.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+    "linker": "/Applications/ToolchainFixture.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld",
+    "sdk": "/Applications/ToolchainFixture.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+    "developer_directory": "/Applications/ToolchainFixture.app/Contents/Developer",
+}
 
 
 def descriptor_output(pids=(101, 102)):
@@ -40,6 +47,64 @@ def native_snapshot(pids=(101, 102)):
 
 
 class FixedOutcomeTests(unittest.TestCase):
+    def test_malformed_presence_results_refuse_as_census_errors(self):
+        malformed = (
+            None,
+            0,
+            "",
+            (),
+            (None, ()),
+            (True, []),
+            (True, ("unknown-private",)),
+            (True, ("python", "python")),
+            (False, ("python",)),
+            (True, ("ps", "python")),
+        )
+        for value in malformed:
+            with self.subTest(value=repr(value)):
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    macos_capability._presence_result(value)
+                self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
+                self.assertEqual(raised.exception.check, "probe_process_census")
+                self.assertFalse(raised.exception.cleanup_complete)
+
+        malformed_snapshots = (
+            None,
+            (None, None, ()),
+            (True, None, ()),
+            (False, "probe_process_survivor_controls_multiple", ()),
+            (True, "unreviewed", ()),
+        )
+        for value in malformed_snapshots:
+            with self.subTest(snapshot=repr(value)):
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    macos_capability._snapshot_presence_result(value)
+                self.assertEqual(raised.exception.check, "probe_process_census")
+                self.assertFalse(raised.exception.cleanup_complete)
+
+    def test_malformed_final_census_prevents_any_account_or_path_cleanup(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}):
+            with patch.object(macos_capability, "_check_context", return_value=Path("/tmp/synthetic-control")):
+                with patch.object(macos_capability, "_resolve_trusted_toolchain", return_value=TEST_TOOLCHAIN):
+                    with patch.object(macos_capability, "_disable_developer_mode"):
+                        with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
+                            with patch.object(macos_capability, "_create_probe_identity", return_value=(502, Path("/tmp/synthetic-home"), Path("/tmp/synthetic-home/home"))):
+                                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=None):
+                                    with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=RuntimeError("private path")):
+                                        with patch.object(macos_capability, "_run") as command:
+                                            with patch.object(macos_capability.shutil, "rmtree") as remove:
+                                                with redirect_stdout(output):
+                                                    status = macos_capability.main(["--control-sha", CONTROL_SHA])
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output.getvalue(),
+            "macos-capability=refused reason=native_preflight_unavailable check=probe_process_census\n"
+            "macos-confinement=refused reason=incomplete_channel_evidence\n",
+        )
+        command.assert_not_called()
+        remove.assert_not_called()
+
     def test_control_sha_is_full_lowercase_hex_only(self):
         self.assertTrue(macos_capability.valid_sha(CONTROL_SHA))
         for value in (CONTROL_SHA[:12], CONTROL_SHA.upper(), "g" * 40, CONTROL_SHA + "0", None):
@@ -78,6 +143,42 @@ class FixedOutcomeTests(unittest.TestCase):
                     "macos-confinement=refused reason=incomplete_channel_evidence\n",
                 )
 
+    def test_survivor_classes_are_fixed_bounded_and_limited_to_survivor_refusals(self):
+        classes = ("other", "python", "ps", "unknown", "python", "unreviewed /tmp/private")
+        refusal = macos_capability.ProbeFailure(
+            "native_preflight_unavailable",
+            check="probe_process_survivor_controls_multiple",
+            survivor_classes=classes,
+        )
+        self.assertEqual(
+            macos_capability.safe_output(
+                False, refusal.reason, refusal.check, survivor_classes=refusal.survivor_classes
+            ),
+            "macos-capability=refused reason=native_preflight_unavailable "
+            "check=probe_process_survivor_controls_multiple survivor_classes=python,ps,other,unknown\n"
+            "macos-confinement=refused reason=incomplete_channel_evidence\n",
+        )
+        self.assertNotIn("private", macos_capability.safe_output(
+            False,
+            refusal.reason,
+            "probe_process_survivor_controls_same_group",
+            survivor_classes=classes,
+        ))
+        later_refusal = macos_capability.ProbeFailure(
+            "native_preflight_unavailable",
+            check="probe_process_survivor_positive_read",
+            survivor_classes=("helper_preferences", "unknown"),
+        )
+        self.assertIn(
+            "check=probe_process_survivor_positive_read survivor_classes=helper_preferences,unknown",
+            macos_capability.safe_output(
+                False,
+                later_refusal.reason,
+                later_refusal.check,
+                survivor_classes=later_refusal.survivor_classes,
+            ),
+        )
+
     def test_identity_subphase_checks_are_fixed_and_never_echo_error_data(self):
         for check in macos_capability.PROBE_IDENTITY_CHECKS:
             with self.subTest(check=check):
@@ -104,11 +205,12 @@ class FixedOutcomeTests(unittest.TestCase):
         )
         with patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}):
             with patch.object(macos_capability, "_check_context", return_value=Path("/tmp/synthetic-control")):
-                with patch.object(macos_capability, "_disable_developer_mode"):
-                    with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
-                        with patch.object(macos_capability, "_create_probe_identity", side_effect=failure):
-                            with redirect_stdout(output):
-                                status = macos_capability.main(["--control-sha", CONTROL_SHA])
+                with patch.object(macos_capability, "_resolve_trusted_toolchain", return_value=TEST_TOOLCHAIN):
+                    with patch.object(macos_capability, "_disable_developer_mode"):
+                        with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
+                            with patch.object(macos_capability, "_create_probe_identity", side_effect=failure):
+                                with redirect_stdout(output):
+                                    status = macos_capability.main(["--control-sha", CONTROL_SHA])
         self.assertEqual(status, 1)
         self.assertEqual(
             output.getvalue(),
@@ -119,12 +221,14 @@ class FixedOutcomeTests(unittest.TestCase):
     def test_each_native_preflight_phase_labels_only_generic_failures(self):
         phases = (
             ("context", "_check_context"),
+            ("probe_process_toolchain", "_resolve_trusted_toolchain"),
             ("developer_mode", "_disable_developer_mode"),
             ("runner_controls", "_protect_runner_controls"),
             ("probe_identity", "_create_probe_identity"),
         )
         defaults = {
             "_check_context": Path("/tmp/synthetic-control"),
+            "_resolve_trusted_toolchain": TEST_TOOLCHAIN,
             "_disable_developer_mode": None,
             "_protect_runner_controls": (501, (), ()),
             "_create_probe_identity": (502, Path("/tmp/synthetic-home"), Path("/tmp/synthetic-home/home")),
@@ -160,7 +264,7 @@ class FixedOutcomeTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertEqual(
             output.getvalue(),
-            "macos-capability=refused reason=native_preflight_unavailable check=developer_mode\n"
+            "macos-capability=refused reason=native_preflight_unavailable check=probe_process_toolchain\n"
             "macos-confinement=refused reason=incomplete_channel_evidence\n",
         )
 
@@ -179,15 +283,16 @@ class FixedOutcomeTests(unittest.TestCase):
         output = io.StringIO()
         with patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}):
             with patch.object(macos_capability, "_check_context", return_value=Path("/tmp/synthetic-control")):
-                with patch.object(macos_capability, "_disable_developer_mode"):
-                    with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
-                        with patch.object(macos_capability, "_create_probe_identity", return_value=(502, Path("/tmp/synthetic-home"), Path("/tmp/synthetic-home/home"))):
-                            with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
-                                with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=RuntimeError("private path /tmp/secret")):
-                                    with patch.object(macos_capability, "_run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as command:
-                                        with patch.object(macos_capability.shutil, "rmtree") as remove:
-                                            with redirect_stdout(output):
-                                                status = macos_capability.main(["--control-sha", CONTROL_SHA])
+                with patch.object(macos_capability, "_resolve_trusted_toolchain", return_value=TEST_TOOLCHAIN):
+                    with patch.object(macos_capability, "_disable_developer_mode"):
+                        with patch.object(macos_capability, "_protect_runner_controls", return_value=(501, (), ())):
+                            with patch.object(macos_capability, "_create_probe_identity", return_value=(502, Path("/tmp/synthetic-home"), Path("/tmp/synthetic-home/home"))):
+                                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
+                                    with patch.object(macos_capability.tempfile, "mkdtemp", side_effect=RuntimeError("private path /tmp/secret")):
+                                        with patch.object(macos_capability, "_run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as command:
+                                            with patch.object(macos_capability.shutil, "rmtree") as remove:
+                                                with redirect_stdout(output):
+                                                    status = macos_capability.main(["--control-sha", CONTROL_SHA])
         self.assertEqual(status, 1)
         self.assertEqual(
             output.getvalue(),
@@ -201,13 +306,14 @@ class FixedOutcomeTests(unittest.TestCase):
         output = io.StringIO()
         with patch.dict(os.environ, {"CI_WORKSPACE": "/tmp/synthetic-control"}):
             with patch.object(macos_capability, "_check_context", return_value=Path("/tmp/synthetic-control")):
-                with patch.object(macos_capability, "_disable_developer_mode"):
-                    with patch.object(
-                        macos_capability, "_protect_runner_controls",
-                        side_effect=macos_capability.ProbeFailure("runner_control_unavailable", check="directory_type_owner"),
-                    ):
-                        with redirect_stdout(output):
-                            status = macos_capability.main(["--control-sha", CONTROL_SHA])
+                with patch.object(macos_capability, "_resolve_trusted_toolchain", return_value=TEST_TOOLCHAIN):
+                    with patch.object(macos_capability, "_disable_developer_mode"):
+                        with patch.object(
+                            macos_capability, "_protect_runner_controls",
+                            side_effect=macos_capability.ProbeFailure("runner_control_unavailable", check="directory_type_owner"),
+                        ):
+                            with redirect_stdout(output):
+                                status = macos_capability.main(["--control-sha", CONTROL_SHA])
         self.assertEqual(status, 1)
         self.assertEqual(
             output.getvalue(),
@@ -236,6 +342,134 @@ class FixedOutcomeTests(unittest.TestCase):
                     macos_capability.run_native_probe(CONTROL_SHA)
 
         check_context.assert_called_once_with(CONTROL_SHA, checkout_root)
+
+
+class TrustedToolchainTests(unittest.TestCase):
+    def test_toolchain_binds_current_python_and_resolves_clang_sdk_and_linker_from_its_install(self):
+        values = {
+            TEST_TOOLCHAIN["python"]: PurePosixPath(TEST_TOOLCHAIN["python"]),
+            "/usr/bin/xcrun": PurePosixPath("/usr/bin/xcrun"),
+            TEST_TOOLCHAIN["clang"]: PurePosixPath(TEST_TOOLCHAIN["clang"]),
+            TEST_TOOLCHAIN["sdk"]: PurePosixPath(TEST_TOOLCHAIN["sdk"]),
+            TEST_TOOLCHAIN["linker"]: PurePosixPath(TEST_TOOLCHAIN["linker"]),
+        }
+        output = (
+            subprocess.CompletedProcess([], 0, (TEST_TOOLCHAIN["clang"] + "\n").encode(), b""),
+            subprocess.CompletedProcess([], 0, (TEST_TOOLCHAIN["sdk"] + "\n").encode(), b""),
+            subprocess.CompletedProcess([], 0, (TEST_TOOLCHAIN["linker"] + "\n").encode(), b""),
+        )
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(macos_capability.sys, "platform", "darwin"))
+            stack.enter_context(patch.object(macos_capability.sys, "executable", TEST_TOOLCHAIN["python"]))
+            stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
+            stack.enter_context(
+                patch.object(
+                    macos_capability,
+                    "_resolve_trusted_path",
+                    side_effect=lambda raw, **kwargs: values[raw],
+                )
+            )
+            stack.enter_context(
+                patch.object(macos_capability, "_trusted_path_metadata", side_effect=lambda path, **kwargs: path)
+            )
+            run = stack.enter_context(patch.object(macos_capability, "_run", side_effect=output))
+            stack.enter_context(
+                patch.dict(
+                    os.environ,
+                    {
+                        "DEVELOPER_DIR": "/tmp/untrusted-developer-dir",
+                        "TOOLCHAINS": "untrusted-toolchain",
+                        "SDKROOT": "/tmp/untrusted-sdk",
+                    },
+                )
+            )
+            tools = macos_capability._resolve_trusted_toolchain()
+        self.assertEqual(tools, TEST_TOOLCHAIN)
+        self.assertEqual(run.call_count, 3)
+        env = {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": "/var/empty",
+            "DEVELOPER_DIR": TEST_TOOLCHAIN["developer_directory"],
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            ["/usr/bin/xcrun", "--sdk", "macosx", "--find", "clang"],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-path"],
+        )
+        self.assertEqual(
+            run.call_args_list[2].args[0],
+            [TEST_TOOLCHAIN["clang"], "-isysroot", TEST_TOOLCHAIN["sdk"], "-print-prog-name=ld"],
+        )
+        for call in run.call_args_list:
+            self.assertEqual(call.kwargs["env"], env)
+            self.assertEqual(call.kwargs["timeout"], 10)
+
+    def test_unreviewed_python_layout_fails_before_tool_queries(self):
+        with patch.object(macos_capability.sys, "platform", "darwin"):
+            with patch.object(macos_capability.sys, "executable", "/opt/unreviewed/python3"):
+                with patch.object(macos_capability.os, "geteuid", return_value=0, create=True):
+                    with patch.object(
+                        macos_capability,
+                        "_resolve_trusted_path",
+                        return_value=PurePosixPath("/opt/unreviewed/python3"),
+                    ):
+                        with patch.object(macos_capability, "_run") as run:
+                            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                macos_capability._resolve_trusted_toolchain()
+        self.assertEqual(raised.exception.check, "probe_process_toolchain")
+        run.assert_not_called()
+
+    def test_trusted_path_checks_each_ancestor_and_allows_only_non_probe_group_writes(self):
+        expected = Path(TEST_TOOLCHAIN["python"])
+        host_path_type = type(expected)
+        expected_text = expected.as_posix()
+
+        def metadata(path, *, unsafe=None):
+            path_text = path.as_posix()
+            if unsafe == "probe_group" and path_text == "/Applications":
+                return types.SimpleNamespace(st_uid=0, st_gid=20, st_mode=stat.S_IFDIR | 0o775)
+            if unsafe == "world" and path_text == "/":
+                return types.SimpleNamespace(st_uid=0, st_gid=80, st_mode=stat.S_IFDIR | 0o777)
+            if unsafe == "owner" and path_text == "/Applications":
+                return types.SimpleNamespace(st_uid=501, st_gid=80, st_mode=stat.S_IFDIR | 0o755)
+            if unsafe == "setuid" and path_text == expected_text:
+                return types.SimpleNamespace(st_uid=0, st_gid=80, st_mode=stat.S_IFREG | 0o755 | stat.S_ISUID)
+            if path_text == expected_text:
+                return types.SimpleNamespace(st_uid=0, st_gid=80, st_mode=stat.S_IFREG | 0o755)
+            return types.SimpleNamespace(st_uid=0, st_gid=80, st_mode=stat.S_IFDIR | 0o775)
+
+        with patch.object(host_path_type, "lstat", return_value=types.SimpleNamespace(st_uid=0)):
+            with patch.object(host_path_type, "resolve", return_value=expected):
+                with patch.object(host_path_type, "stat", autospec=True, side_effect=lambda self: metadata(self)):
+                    self.assertEqual(
+                        macos_capability._resolve_trusted_path(TEST_TOOLCHAIN["python"], reject_python_shim=True),
+                        expected,
+                    )
+                for unsafe in ("probe_group", "world", "owner", "setuid"):
+                    with self.subTest(unsafe=unsafe):
+                        with patch.object(
+                            host_path_type,
+                            "stat",
+                            autospec=True,
+                            side_effect=lambda self, unsafe=unsafe: metadata(self, unsafe=unsafe),
+                        ):
+                            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                macos_capability._resolve_trusted_path(
+                                    TEST_TOOLCHAIN["python"], reject_python_shim=True
+                                )
+                        self.assertEqual(raised.exception.check, "probe_process_toolchain")
+
+    def test_operating_system_python_shim_is_refused_even_if_it_resolves(self):
+        with patch.object(Path, "lstat", return_value=types.SimpleNamespace(st_uid=0)) as lstat:
+            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                macos_capability._resolve_trusted_path("/usr/bin/python3", reject_python_shim=True)
+        self.assertEqual(raised.exception.check, "probe_process_toolchain")
+        lstat.assert_not_called()
 
     def test_runner_control_refusal_emits_only_allowlisted_check(self):
         refusal = macos_capability.ProbeFailure("runner_control_unavailable", check="diagnostics_layout")
@@ -381,6 +615,146 @@ class ProbeUidCensusTests(unittest.TestCase):
                         macos_capability._probe_uid_process_snapshot(502, launched_pgid=10)
                 self.assertEqual(raised.exception.check, "probe_process_census")
                 self.assertFalse(raised.exception.cleanup_complete)
+
+    def test_noncontrol_survivor_snapshot_can_attach_bounded_classes(self):
+        initial = b"20 502 0 0\n"
+        recheck = b"20 502 0 0\n"
+        with patch.object(
+            macos_capability,
+            "_run",
+            side_effect=(
+                subprocess.CompletedProcess([], 0, initial, b""),
+                subprocess.CompletedProcess([], 0, recheck, b""),
+            ),
+        ):
+            with patch.object(
+                macos_capability,
+                "_process_executable",
+                return_value=PurePosixPath(TEST_TOOLCHAIN["python"]),
+            ):
+                result = macos_capability._probe_uid_process_snapshot(
+                    502,
+                    include_survivor_classes=True,
+                    python_executable=TEST_TOOLCHAIN["python"],
+                )
+        self.assertEqual(result, (True, None, ("python",)))
+
+    def test_survivor_diagnostic_uses_kernel_paths_and_revalidates_the_uid_rows(self):
+        initial = b"1 1 S 0 0 0\n20 2 R 0 502 0\n21 3 R 502 0 0\n"
+        readback = b"20 0 502 0\n21 502 0 0\n"
+        with patch.object(
+            macos_capability,
+            "_run",
+            side_effect=(
+                subprocess.CompletedProcess([], 0, initial, b""),
+                subprocess.CompletedProcess([], 0, readback, b""),
+            ),
+        ) as command:
+            with patch.object(
+                macos_capability,
+                "_process_executable",
+                side_effect=(PurePosixPath(TEST_TOOLCHAIN["python"]), PurePosixPath("/bin/ps")),
+            ) as process_path:
+                result = macos_capability._probe_uid_process_snapshot(
+                    502,
+                    launched_pgid=10,
+                    include_survivor_classes=True,
+                    python_executable=TEST_TOOLCHAIN["python"],
+                )
+        self.assertEqual(
+            result,
+            (True, "probe_process_survivor_controls_multiple", ("python", "ps")),
+        )
+        self.assertEqual(process_path.call_args_list[0].args, (20,))
+        self.assertEqual(process_path.call_args_list[1].args, (21,))
+        self.assertEqual(command.call_args_list[1].args[0], ["/bin/ps", "-p", "20,21", "-o", "pid=,ruid=,uid=,svuid="])
+
+    def test_ambiguous_survivor_readback_adds_unknown_without_clearing_refusal(self):
+        initial = b"1 1 S 0 0 0\n20 2 R 0 502 0\n21 3 R 502 0 0\n"
+        changed = b"20 0 502 0\n"
+        with patch.object(
+            macos_capability,
+            "_run",
+            side_effect=(
+                subprocess.CompletedProcess([], 0, initial, b""),
+                subprocess.CompletedProcess([], 0, changed, b""),
+            ),
+        ):
+            with patch.object(
+                macos_capability,
+                "_process_executable",
+                side_effect=(PurePosixPath(TEST_TOOLCHAIN["python"]), PurePosixPath("/bin/ps")),
+            ):
+                result = macos_capability._probe_uid_process_snapshot(
+                    502,
+                    launched_pgid=10,
+                    include_survivor_classes=True,
+                    python_executable=TEST_TOOLCHAIN["python"],
+                )
+        self.assertEqual(
+            result,
+            (True, "probe_process_survivor_controls_multiple", ("unknown",)),
+        )
+
+    def test_survivor_path_classes_use_exact_namespaces_and_never_process_text(self):
+        cases = (
+            (PurePosixPath(TEST_TOOLCHAIN["python"]), "python"),
+            (PurePosixPath("/bin/ps"), "ps"),
+            (PurePosixPath("/usr/bin/clang"), "developer_shim"),
+            (PurePosixPath("/usr/libexec/cfprefsd"), "helper_preferences"),
+            (PurePosixPath("/usr/libexec/distnoted"), "helper_notifications"),
+            (PurePosixPath("/usr/libexec/lsd"), "helper_launch_services"),
+            (
+                PurePosixPath("/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsd"),
+                "helper_launch_services",
+            ),
+            (PurePosixPath("/usr/libexec/secd"), "helper_security"),
+            (PurePosixPath("/usr/libexec/trustd"), "helper_trust"),
+            (PurePosixPath("/usr/libexec/containermanagerd"), "helper_containers"),
+            (
+                PurePosixPath("/System/Library/PrivateFrameworks/ContainerManager.framework/Support/containermanagerd"),
+                "helper_containers",
+            ),
+            (PurePosixPath("/usr/libexec/example-agent"), "apple_system_path"),
+            (PurePosixPath("/opt/example-agent"), "other"),
+            (PurePosixPath("/tmp/cfprefsd-copy"), "other"),
+            (None, "unknown"),
+        )
+        for path, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    macos_capability._survivor_path_class(path, TEST_TOOLCHAIN["python"]), expected
+                )
+
+    def test_macos_path_classification_uses_posix_semantics_on_every_host(self):
+        path = PurePosixPath("/usr/libexec/distnoted")
+        self.assertTrue(path.is_absolute())
+        self.assertEqual(
+            macos_capability._survivor_path_class(path, TEST_TOOLCHAIN["python"]),
+            "helper_notifications",
+        )
+        self.assertTrue(all(isinstance(root, PurePosixPath) for root in macos_capability.APPLE_SYSTEM_PATH_ROOTS))
+
+    def test_survivor_path_readback_is_bounded_and_marks_unread_rows_as_additional(self):
+        pids = tuple(range(100, 117))
+        readback = "".join(f"{pid} 502 0 0\n" for pid in pids[:macos_capability.MAX_SURVIVOR_PATH_READBACKS])
+        with patch.object(
+            macos_capability,
+            "_process_executable",
+            return_value=PurePosixPath("/bin/ps"),
+        ) as process_path:
+            with patch.object(
+                macos_capability,
+                "_run",
+                return_value=subprocess.CompletedProcess([], 0, readback.encode("ascii"), b""),
+            ) as command:
+                categories = macos_capability._survivor_process_classes(
+                    pids, 502, TEST_TOOLCHAIN["python"], additional=True
+                )
+        self.assertEqual(categories, ("ps", "additional"))
+        self.assertEqual(process_path.call_count, macos_capability.MAX_SURVIVOR_PATH_READBACKS)
+        selected = ",".join(str(pid) for pid in pids[:macos_capability.MAX_SURVIVOR_PATH_READBACKS])
+        self.assertEqual(command.call_args.args[0][2], selected)
 
 
 class ProbeIdentityDiagnosticTests(unittest.TestCase):
@@ -631,6 +1005,19 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
 
 
 class ProbeIdentityBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        original = macos_capability._run_as_probe_user
+
+        def launch_with_test_binding(*args, **kwargs):
+            kwargs.setdefault("python_executable", TEST_TOOLCHAIN["python"])
+            return original(*args, **kwargs)
+
+        self.launch_patcher = patch.object(
+            macos_capability, "_run_as_probe_user", side_effect=launch_with_test_binding
+        )
+        self.launch_patcher.start()
+        self.addCleanup(self.launch_patcher.stop)
+
     def run_bootstrap(
         self,
         *,
@@ -824,7 +1211,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
         process = StubProcess()
         with patch.object(macos_capability.subprocess, "Popen", return_value=process) as popen:
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True) as cleanup:
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
         self.assertEqual(raised.exception.check, "probe_process_timeout")
@@ -852,7 +1239,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
         process = StubProcess()
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(True, ())):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
         self.assertEqual(raised.exception.check, "probe_process_survivor")
@@ -888,7 +1275,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
                 with patch.object(
                     macos_capability,
                     "_probe_uid_process_snapshot",
-                    return_value=(True, "probe_process_survivor_controls_multiple"),
+                    return_value=(True, "probe_process_survivor_controls_multiple", ()),
                 ) as census:
                     with patch.object(
                         macos_capability,
@@ -900,7 +1287,12 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
                             )
         self.assertEqual(raised.exception.check, "probe_process_survivor_controls_multiple")
         self.assertFalse(raised.exception.cleanup_complete)
-        census.assert_called_once_with(502, launched_pgid=12352)
+        census.assert_called_once_with(
+            502,
+            launched_pgid=12352,
+            include_survivor_classes=True,
+            python_executable=TEST_TOOLCHAIN["python"],
+        )
         ordinary_census.assert_not_called()
 
     def test_control_access_probe_accepts_only_a_clean_zero_match_snapshot(self):
@@ -921,14 +1313,19 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
                 with patch.object(
                     macos_capability,
                     "_probe_uid_process_snapshot",
-                    return_value=(False, None),
+                    return_value=(False, None, ()),
                 ) as census:
                     with patch.object(macos_capability, "_probe_uid_processes_present") as ordinary_census:
                         result = macos_capability._run_as_probe_user(
                             ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
                         )
         self.assertEqual(result.stdout, b"")
-        census.assert_called_once_with(502, launched_pgid=12352)
+        census.assert_called_once_with(
+            502,
+            launched_pgid=12352,
+            include_survivor_classes=True,
+            python_executable=TEST_TOOLCHAIN["python"],
+        )
         ordinary_census.assert_not_called()
 
     def test_positive_control_snapshot_without_fixed_category_fails_closed(self):
@@ -941,7 +1338,11 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
         process.poll = lambda: process.returncode
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_process_snapshot", return_value=(True, None)):
+                with patch.object(
+                    macos_capability,
+                    "_probe_uid_process_snapshot",
+                    return_value=(True, "probe_process_survivor_controls_unattributed", ()),
+                ):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._run_as_probe_user(
                             ["/usr/bin/true"], 502, timeout=3, control_survivor_diagnostics=True
@@ -986,7 +1387,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
                 with patch.object(
                     macos_capability,
                     "_probe_uid_process_snapshot",
-                    return_value=(True, "probe_process_survivor_controls_same_group"),
+                    return_value=(True, "probe_process_survivor_controls_same_group", ()),
                 ):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._run_as_probe_user(
@@ -1008,7 +1409,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
                     with patch.object(
                         macos_capability,
                         "_probe_uid_process_snapshot",
-                        return_value=(True, "probe_process_survivor_controls_same_group"),
+                        return_value=(True, "probe_process_survivor_controls_same_group", ()),
                     ):
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
                             macos_capability._run_as_probe_user(
@@ -1019,8 +1420,12 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
 
     def test_runner_control_access_requests_control_survivor_correlation(self):
         with patch.object(macos_capability, "_run_as_probe_user") as command:
-            macos_capability._verify_runner_controls_are_private(["/protected"], 502)
+            macos_capability._verify_runner_controls_are_private(
+                ["/protected"], 502, TEST_TOOLCHAIN["python"]
+            )
         self.assertTrue(command.call_args.kwargs["control_survivor_diagnostics"])
+        self.assertEqual(command.call_args.args[0][0], TEST_TOOLCHAIN["python"])
+        self.assertEqual(command.call_args.kwargs["python_executable"], TEST_TOOLCHAIN["python"])
 
     def test_probe_user_survivor_diagnostic_is_fixed_to_caller_phase(self):
         class StubProcess:
@@ -1038,7 +1443,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
         process = StubProcess()
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(True, ())):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._run_as_probe_user(
                             ["/usr/bin/true"], 502, timeout=3,
@@ -1066,7 +1471,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
                 process = StubProcess()
                 with patch.object(macos_capability.subprocess, "Popen", return_value=process):
                     with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(True, ())):
                             with self.assertRaises(macos_capability.ProbeFailure) as raised:
                                 macos_capability._run_as_probe_user(
                                     ["/usr/bin/true"], 502, timeout=3,
@@ -1091,7 +1496,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
         process = StubProcess()
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=False):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
         self.assertEqual(raised.exception.check, "probe_process_group_cleanup")
@@ -1113,19 +1518,23 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
         process = StubProcess()
         with patch.object(macos_capability.subprocess, "Popen", return_value=process) as popen:
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False) as census:
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())) as census:
                     result = macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
         self.assertEqual(result.stdout, b"safe output\n")
         self.assertEqual(result.stderr, b"")
         command = popen.call_args.args[0]
-        self.assertEqual(command[:5], ["/usr/bin/python3", "-I", "-S", "-B", "-c"])
+        self.assertEqual(
+            command[:5], [TEST_TOOLCHAIN["python"], "-I", "-S", "-B", "-c"]
+        )
         self.assertEqual(command[5], macos_capability.PROBE_IDENTITY_BOOTSTRAP)
         self.assertEqual(command[6:], ["502", "20", "/usr/bin/true"])
         self.assertNotIn("/usr/bin/sudo", command)
         self.assertEqual(popen.call_args.kwargs["user"], 502)
         self.assertEqual(popen.call_args.kwargs["group"], macos_capability.PROBE_PRIMARY_GID)
         self.assertEqual(popen.call_args.kwargs["extra_groups"], ())
-        census.assert_called_once_with(502)
+        census.assert_called_once_with(
+            502, include_survivor_classes=True, python_executable=TEST_TOOLCHAIN["python"]
+        )
 
     def test_probe_user_identity_mismatch_or_missing_marker_refuses(self):
         class StubProcess:
@@ -1147,7 +1556,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
                 process = StubProcess(marker)
                 with patch.object(macos_capability.subprocess, "Popen", return_value=process):
                     with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                             with self.assertRaises(macos_capability.ProbeFailure) as raised:
                                 macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
                 self.assertEqual(raised.exception.reason, "probe_identity_unavailable")
@@ -1159,9 +1568,13 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
             with self.subTest(version=version):
                 with patch.object(macos_capability, "sys") as runtime:
                     runtime.version_info = version
+                    runtime.platform = "linux"
+                    runtime.executable = str(Path(sys.executable).resolve(strict=True))
                     with patch.object(macos_capability.subprocess, "Popen", side_effect=launch_error) as popen:
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                            macos_capability._run_as_probe_user(["/usr/bin/true"], 502)
+                            macos_capability._run_as_probe_user(
+                                ["/usr/bin/true"], 502, python_executable=TEST_TOOLCHAIN["python"]
+                            )
                 self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
                 self.assertEqual(raised.exception.check, "probe_process_launch")
                 self.assertEqual(popen.call_count, int(version >= (3, 9, 0)))
@@ -1182,7 +1595,7 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
         process = StubProcess()
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
         self.assertEqual(raised.exception.check, "probe_process_timeout")
@@ -1817,6 +2230,22 @@ class DescriptorReadbackTests(unittest.TestCase):
 
 
 class ProbeTeardownTests(unittest.TestCase):
+    def setUp(self):
+        self.toolchain_patcher = patch.object(
+            macos_capability, "_resolve_trusted_toolchain", return_value=TEST_TOOLCHAIN
+        )
+        self.toolchain_patcher.start()
+        self.addCleanup(self.toolchain_patcher.stop)
+
+    def observe_probe(self, *args):
+        return macos_capability._observe_probe(
+            *args,
+            python_executable=TEST_TOOLCHAIN["python"],
+            compiler_executable=TEST_TOOLCHAIN["clang"],
+            linker_executable=TEST_TOOLCHAIN["linker"],
+            sdk_root=TEST_TOOLCHAIN["sdk"],
+        )
+
     def test_bootstrap_and_later_mismatched_root_rows_cannot_supply_probe_roles(self):
         class StubProcess:
             pid = 12340
@@ -1862,13 +2291,13 @@ class ProbeTeardownTests(unittest.TestCase):
             ) as table:
                 with patch.object(macos_capability, "_descriptor_snapshot", return_value={}) as descriptors:
                     with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                             with patch.object(macos_capability.time, "sleep"):
                                 with self.assertRaisesRegex(
                                     macos_capability.ProbeFailure,
                                     "descriptor_readback_unavailable",
                                 ):
-                                    macos_capability._observe_probe(
+                                    self.observe_probe(
                                         "/tmp/CapabilityProbe", "/tmp/marker", "/tmp/outside", uid, "/tmp/home"
                                     )
 
@@ -1887,14 +2316,16 @@ class ProbeTeardownTests(unittest.TestCase):
         process.wait = lambda timeout: process.returncode
         with patch.object(macos_capability.subprocess, "Popen", return_value=process) as popen:
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True) as census:
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(True, ())) as census:
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                        macos_capability._observe_probe("/tmp/unused", "unused", "unused", 502, "unused")
+                        self.observe_probe("/tmp/unused", "unused", "unused", 502, "unused")
         self.assertEqual(raised.exception.check, "probe_process_survivor_probe_tree")
         self.assertFalse(raised.exception.cleanup_complete)
-        census.assert_called_once_with(502)
+        census.assert_called_once_with(
+            502, include_survivor_classes=True, python_executable=TEST_TOOLCHAIN["python"]
+        )
         command = popen.call_args.args[0]
-        self.assertEqual(command[:5], ["/usr/bin/python3", "-I", "-S", "-B", "-c"])
+        self.assertEqual(command[:5], [TEST_TOOLCHAIN["python"], "-I", "-S", "-B", "-c"])
         self.assertNotIn("/usr/bin/sudo", command)
         self.assertEqual(popen.call_args.kwargs["user"], 502)
         self.assertEqual(popen.call_args.kwargs["group"], macos_capability.PROBE_PRIMARY_GID)
@@ -1916,9 +2347,9 @@ class ProbeTeardownTests(unittest.TestCase):
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "MAX_PROBE_SECONDS", 0):
                 with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                            macos_capability._observe_probe("/tmp/unused", "unused", "unused", 502, "unused")
+                            self.observe_probe("/tmp/unused", "unused", "unused", 502, "unused")
         self.assertEqual(raised.exception.reason, "probe_timeout")
         self.assertFalse(raised.exception.cleanup_complete)
 
@@ -1937,9 +2368,9 @@ class ProbeTeardownTests(unittest.TestCase):
         with patch.object(macos_capability.subprocess, "Popen", return_value=process):
             with patch.object(macos_capability, "MAX_PROBE_SECONDS", 0):
                 with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                         with self.assertRaises(macos_capability.ProbeFailure) as raised:
-                            macos_capability._observe_probe("/tmp/unused", "unused", "unused", 502, "unused")
+                            self.observe_probe("/tmp/unused", "unused", "unused", 502, "unused")
         self.assertEqual(raised.exception.check, "probe_process_observation")
         self.assertFalse(raised.exception.cleanup_complete)
 
@@ -1965,12 +2396,12 @@ class ProbeTeardownTests(unittest.TestCase):
                 side_effect=macos_capability.ProbeFailure("descriptor_readback_unavailable"),
             ):
                 with patch.object(macos_capability, "_terminate_probe_tree", side_effect=terminate_group) as teardown:
-                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                             with self.assertRaisesRegex(
                                 macos_capability.ProbeFailure,
                                 "descriptor_readback_unavailable",
                             ):
-                                macos_capability._observe_probe(
+                                self.observe_probe(
                                     "/tmp/unused",
                                     "/tmp/unused",
                                     "unused",
@@ -2028,12 +2459,12 @@ class ProbeTeardownTests(unittest.TestCase):
                 side_effect=macos_capability.ProbeFailure("descriptor_readback_unavailable"),
             ):
                 with patch.object(macos_capability, "_terminate_probe_tree", return_value=True) as teardown:
-                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                             with self.assertRaisesRegex(
                                 macos_capability.ProbeFailure,
                                 "descriptor_readback_unavailable",
                             ):
-                                macos_capability._observe_probe(
+                                self.observe_probe(
                                     "/tmp/unused",
                                     "unused",
                                     "unused",
@@ -2068,12 +2499,12 @@ class ProbeTeardownTests(unittest.TestCase):
                 with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
                         with patch.object(macos_capability._Capture, "start"):
                             with patch.object(macos_capability._Capture, "join", return_value=False):
-                                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                                     with self.assertRaisesRegex(
                                         macos_capability.ProbeFailure,
                                         "native_preflight_unavailable",
                                     ) as raised:
-                                        macos_capability._observe_probe(
+                                        self.observe_probe(
                                             "/tmp/unused",
                                             "/tmp/unused",
                                             "unused",
@@ -2202,13 +2633,15 @@ class ProbeTeardownTests(unittest.TestCase):
                                         with patch.object(macos_capability, "_run_as_probe_user", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
                                             with patch.object(macos_capability, "_build_signed_probe", return_value="unused"):
                                                 with patch.object(macos_capability, "_observe_probe"):
-                                                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True) as census:
+                                                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(True, ())) as census:
                                                         with patch.object(macos_capability, "_run") as command:
                                                             with self.assertRaises(macos_capability.ProbeFailure) as raised:
                                                                 macos_capability.run_native_probe("a" * 40)
             self.assertEqual(raised.exception.check, "probe_process_survivor_final_census")
             self.assertFalse(raised.exception.cleanup_complete)
-            census.assert_called_once_with(502)
+            census.assert_called_once_with(
+                502, include_survivor_classes=True, python_executable=TEST_TOOLCHAIN["python"]
+            )
             command.assert_not_called()
             self.assertTrue(home_parent.is_dir())
             self.assertTrue(all(path.is_dir() for path in scratch_paths))
@@ -2256,7 +2689,7 @@ class ProbeTeardownTests(unittest.TestCase):
                                         ):
                                             with patch.object(macos_capability, "_build_signed_probe", return_value="unused"):
                                                 with patch.object(macos_capability, "_observe_probe"):
-                                                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=False):
+                                                    with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
                                                         with patch.object(
                                                             macos_capability,
                                                             "_run",
@@ -2322,14 +2755,16 @@ class ProbeTeardownTests(unittest.TestCase):
                                                     with patch.object(
                                                         macos_capability,
                                                         "_probe_uid_processes_present",
-                                                        return_value=False,
+                                                        return_value=(False, ()),
                                                     ) as census:
                                                         with patch.object(macos_capability, "_run", side_effect=command) as run:
                                                             macos_capability.run_native_probe("a" * 40)
 
             self.assertEqual(events, [("dscl-delete", True)])
             self.assertEqual(run.call_args.args[0], ["/usr/bin/dscl", ".", "-delete", "/Users/" + macos_capability.USERNAME])
-            census.assert_called_once_with(502)
+            census.assert_called_once_with(
+                502, include_survivor_classes=True, python_executable=TEST_TOOLCHAIN["python"]
+            )
 
 
 if __name__ == "__main__":
