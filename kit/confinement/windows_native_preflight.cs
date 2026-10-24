@@ -77,6 +77,10 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     check = state.TokenReadbackCheck;
                 }
+                else if (check == "cng_acl")
+                {
+                    check = state.CngAclCheck;
+                }
                 completed = false;
             }
 
@@ -201,6 +205,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
             private string childLaunchCheck = "child_attribute_list";
             private uint? childProcessCreateError;
             private string tokenReadbackCheck = "token_open";
+            private string cngAclCheck = "cng_acl_support_read";
             private IntPtr provider = IntPtr.Zero;
             private IntPtr key = IntPtr.Zero;
             private string keyName;
@@ -219,6 +224,11 @@ namespace KeelDock.Platform.WindowsNativePreflight
             internal string TokenReadbackCheck
             {
                 get { return tokenReadbackCheck; }
+            }
+
+            internal string CngAclCheck
+            {
+                get { return cngAclCheck; }
             }
 
             internal void CreateProfile()
@@ -544,6 +554,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
 
             internal void VerifyKeyAcl()
             {
+                cngAclCheck = "cng_acl_support_read";
                 if (ReadProviderDword("Security Descr Support") != 1)
                 {
                     throw new InvalidOperationException();
@@ -555,11 +566,14 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 IntPtr userInformation = IntPtr.Zero;
                 try
                 {
+                    cngAclCheck = "cng_acl_token_open";
                     if (!Native.OpenProcessToken(Native.GetCurrentProcess(), TokenQuery, out currentToken) || currentToken == IntPtr.Zero)
                     {
                         throw new InvalidOperationException();
                     }
+                    cngAclCheck = "cng_acl_user_read";
                     userInformation = QueryTokenInformation(currentToken, TokenUser, out uint userLength);
+                    cngAclCheck = "cng_acl_user_check";
                     if (userLength < (uint)IntPtr.Size)
                     {
                         throw new InvalidOperationException();
@@ -569,18 +583,23 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     {
                         throw new InvalidOperationException();
                     }
+                    cngAclCheck = "cng_acl_system_sid";
                     if (!Native.ConvertStringSidToSidW("S-1-5-18", out systemSid) || systemSid == IntPtr.Zero)
                     {
                         throw new InvalidOperationException();
                     }
-                ownerDescriptor = ReadSecurityDescriptor(key, OwnerSecurityInformation | NCryptSilentFlag);
+                    cngAclCheck = "cng_acl_owner_read";
+                    ownerDescriptor = ReadSecurityDescriptor(key, OwnerSecurityInformation | NCryptSilentFlag);
+                    cngAclCheck = "cng_acl_owner_check";
                     IntPtr ownerSid;
                     bool ownerDefaulted;
                     if (!Native.GetSecurityDescriptorOwner(ownerDescriptor, out ownerSid, out ownerDefaulted) || ownerSid == IntPtr.Zero || !Native.EqualSid(ownerSid, currentUserSid))
                     {
                         throw new InvalidOperationException();
                     }
+                    cngAclCheck = "cng_acl_dacl_read";
                     daclDescriptor = ReadSecurityDescriptor(key, DaclSecurityInformation | NCryptSilentFlag);
+                    cngAclCheck = "cng_acl_dacl_check";
                     bool daclPresent;
                     bool daclDefaulted;
                     IntPtr dacl;
@@ -589,6 +608,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                         throw new InvalidOperationException();
                     }
                     Native.AclSizeInformation aclInformation = new Native.AclSizeInformation();
+                    cngAclCheck = "cng_acl_count_read";
                     if (!Native.GetAclInformation(dacl, ref aclInformation, (uint)Marshal.SizeOf(typeof(Native.AclSizeInformation)), AclSizeInformation) || aclInformation.AceCount == 0 || aclInformation.AceCount > 64)
                     {
                         throw new InvalidOperationException();
@@ -597,17 +617,20 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     for (uint index = 0; index < aclInformation.AceCount; index++)
                     {
                         IntPtr ace;
+                        cngAclCheck = "cng_acl_ace_read";
                         if (!Native.GetAce(dacl, index, out ace) || ace == IntPtr.Zero)
                         {
                             throw new InvalidOperationException();
                         }
                         byte type = Marshal.ReadByte(ace, 0);
                         ushort aceSize = unchecked((ushort)Marshal.ReadInt16(ace, 2));
+                        cngAclCheck = "cng_acl_ace_shape";
                         if ((type != AccessAllowedAceType && type != AccessDeniedAceType) || aceSize < 16)
                         {
                             throw new InvalidOperationException();
                         }
                         IntPtr aceSid = IntPtr.Add(ace, 8);
+                        cngAclCheck = "cng_acl_ace_sid";
                         if (!Native.IsValidSid(aceSid))
                         {
                             throw new InvalidOperationException();
@@ -619,6 +642,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                         }
                         if (type == AccessAllowedAceType)
                         {
+                            cngAclCheck = "cng_acl_ace_policy";
                             bool isUser = Native.EqualSid(aceSid, currentUserSid);
                             bool isSystem = Native.EqualSid(aceSid, systemSid);
                             if (!isUser && !isSystem)
@@ -631,6 +655,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
                             }
                         }
                     }
+                    cngAclCheck = "cng_acl_user_allow_check";
                     if (!currentUserAllowed)
                     {
                         throw new InvalidOperationException();

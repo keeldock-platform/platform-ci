@@ -236,6 +236,51 @@ if (-not $rejected) {{ exit 6 }}
         self.assertIn("Native.EqualSid(ownerSid, currentUserSid)", self.source)
         self.assertNotIn("BCRYPT_ECCPRIVATE_BLOB", self.source)
 
+    def test_cng_acl_failures_use_fixed_ordered_subphases(self):
+        stages = (
+            ("cng_acl_support_read", 'ReadProviderDword("Security Descr Support")'),
+            ("cng_acl_token_open", "Native.OpenProcessToken(Native.GetCurrentProcess()"),
+            ("cng_acl_user_read", "QueryTokenInformation(currentToken, TokenUser"),
+            ("cng_acl_user_check", "if (userLength < (uint)IntPtr.Size)"),
+            ("cng_acl_system_sid", 'Native.ConvertStringSidToSidW("S-1-5-18"'),
+            ("cng_acl_owner_read", "ReadSecurityDescriptor(key, OwnerSecurityInformation"),
+            ("cng_acl_owner_check", "Native.GetSecurityDescriptorOwner(ownerDescriptor"),
+            ("cng_acl_dacl_read", "ReadSecurityDescriptor(key, DaclSecurityInformation"),
+            ("cng_acl_dacl_check", "Native.GetSecurityDescriptorDacl(daclDescriptor"),
+            ("cng_acl_count_read", "Native.GetAclInformation(dacl"),
+            ("cng_acl_ace_read", "Native.GetAce(dacl, index"),
+            ("cng_acl_ace_shape", "if ((type != AccessAllowedAceType"),
+            ("cng_acl_ace_sid", "Native.IsValidSid(aceSid)"),
+            ("cng_acl_ace_policy", "bool isUser = Native.EqualSid(aceSid"),
+            ("cng_acl_user_allow_check", "if (!currentUserAllowed)"),
+        )
+        verify = self.source[
+            self.source.index("internal void VerifyKeyAcl()"):
+            self.source.index("internal void VerifyKeyExportDenial()")
+        ]
+        previous = -1
+        for label, operation in stages:
+            with self.subTest(label=label):
+                marker = f'cngAclCheck = "{label}";'
+                self.assertIn(marker, verify)
+                self.assertIn(label, self.wrapper)
+                phase_position = verify.index(marker)
+                operation_position = verify.index(operation)
+                self.assertGreater(phase_position, previous)
+                self.assertLess(phase_position, operation_position)
+                previous = phase_position
+        self.assertIn('private string cngAclCheck = "cng_acl_support_read";', self.source)
+        self.assertIn("internal string CngAclCheck", self.source)
+        assigned_labels = re.findall(r'cngAclCheck\s*=\s*"([a-z0-9_]+)";', verify)
+        self.assertEqual(set(assigned_labels), {label for label, _ in stages})
+        self.assertEqual(len(re.findall(r"cngAclCheck\s*=", verify)), len(assigned_labels))
+        self.assertIn(
+            'else if (check == "cng_acl")\n                {\n                    check = state.CngAclCheck;',
+            self.source,
+        )
+        self.assertNotIn("Console.", verify)
+        self.assertNotIn("ToString(", verify)
+
     def test_cng_collision_never_grants_ownership_or_deletes_existing_key(self):
         create_key = self.source.index("status = Native.NCryptCreatePersistedKey")
         failure_check = self.source.index("if (status != 0)", create_key)
@@ -318,6 +363,21 @@ if (-not $rejected) {{ exit 6 }}
             "job_readback",
             "cng_key",
             "cng_acl",
+            "cng_acl_support_read",
+            "cng_acl_token_open",
+            "cng_acl_user_read",
+            "cng_acl_user_check",
+            "cng_acl_system_sid",
+            "cng_acl_owner_read",
+            "cng_acl_owner_check",
+            "cng_acl_dacl_read",
+            "cng_acl_dacl_check",
+            "cng_acl_count_read",
+            "cng_acl_ace_read",
+            "cng_acl_ace_shape",
+            "cng_acl_ace_sid",
+            "cng_acl_ace_policy",
+            "cng_acl_user_allow_check",
             "cng_export",
             "cleanup",
             "runtime",
@@ -550,6 +610,59 @@ if (-not $rejected) {{ exit 6 }}
             "token_sid_check",
             "token_integrity_read",
             "token_integrity_check",
+        )
+        fallback = "windows-native-preflight=refused check=runtime reason=native_preflight_unavailable cleanup=incomplete"
+        lines = [
+            "windows-native-preflight=refused check="
+            + check
+            + " reason=native_preflight_unavailable cleanup=verified"
+            for check in checks
+        ]
+        fixtures = [(line, line) for line in lines]
+        fixtures.extend((lines[-1] + ending, fallback) for ending in ("\n", "\r\n"))
+        for line, expected in fixtures:
+            encoded = base64.b64encode(line.encode("utf-8")).decode("ascii")
+            command = (
+                "$result = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
+                + encoded
+                + "'))\n"
+                + parser
+            )
+            with self.subTest(check=line.split("check=")[1].split()[0], length=len(line)):
+                completed = subprocess.run(
+                    [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                    check=False,
+                    capture_output=True,
+                    text=False,
+                    timeout=10,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
+                self.assertEqual(completed.stderr, b"")
+
+    def test_powershell_cng_acl_subphase_refusals_are_exact_and_fail_closed(self):
+        powershell = shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable for wrapper parser fixtures")
+        parser_start = self.wrapper.index("    if ($result -match '^windows-native-preflight=refused check=(")
+        parser_end = self.wrapper.index("} catch {", parser_start)
+        parser = self.wrapper[parser_start:parser_end]
+        checks = (
+            "cng_acl_support_read",
+            "cng_acl_token_open",
+            "cng_acl_user_read",
+            "cng_acl_user_check",
+            "cng_acl_system_sid",
+            "cng_acl_owner_read",
+            "cng_acl_owner_check",
+            "cng_acl_dacl_read",
+            "cng_acl_dacl_check",
+            "cng_acl_count_read",
+            "cng_acl_ace_read",
+            "cng_acl_ace_shape",
+            "cng_acl_ace_sid",
+            "cng_acl_ace_policy",
+            "cng_acl_user_allow_check",
         )
         fallback = "windows-native-preflight=refused check=runtime reason=native_preflight_unavailable cleanup=incomplete"
         lines = [
