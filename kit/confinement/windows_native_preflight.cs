@@ -11,6 +11,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
         private const int ErrorInsufficientBuffer = 122;
         private const uint TokenQuery = 0x0008;
         private const int TokenUser = 1;
+        private const int TokenOwner = 4;
         private const int TokenIntegrityLevel = 25;
         private const int TokenIsAppContainer = 29;
         private const int TokenCapabilities = 30;
@@ -590,12 +591,49 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     }
                     cngAclCheck = "cng_acl_owner_read";
                     ownerDescriptor = ReadSecurityDescriptor(key, OwnerSecurityInformation | NCryptSilentFlag);
-                    cngAclCheck = "cng_acl_owner_check";
-                    IntPtr ownerSid;
+                    cngAclCheck = "cng_acl_owner_extract";
+                    IntPtr ownerSid = IntPtr.Zero;
                     bool ownerDefaulted;
-                    if (!Native.GetSecurityDescriptorOwner(ownerDescriptor, out ownerSid, out ownerDefaulted) || ownerSid == IntPtr.Zero || !Native.EqualSid(ownerSid, currentUserSid))
+                    if (!Native.GetSecurityDescriptorOwner(ownerDescriptor, out ownerSid, out ownerDefaulted))
                     {
                         throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_owner_absent";
+                    if (ownerSid == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_owner_validate";
+                    if (!Native.IsValidSid(ownerSid))
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    cngAclCheck = "cng_acl_owner_user_match";
+                    if (!Native.EqualSid(ownerSid, currentUserSid))
+                    {
+                        cngAclCheck = "cng_acl_owner_default_read";
+                        IntPtr ownerInformation = QueryTokenInformation(currentToken, TokenOwner, out uint ownerLength);
+                        try
+                        {
+                            cngAclCheck = "cng_acl_owner_default_validate";
+                            if (ownerLength < (uint)IntPtr.Size)
+                            {
+                                throw new InvalidOperationException();
+                            }
+                            IntPtr tokenOwnerSid = Marshal.ReadIntPtr(ownerInformation);
+                            if (tokenOwnerSid == IntPtr.Zero || !Native.IsValidSid(tokenOwnerSid))
+                            {
+                                throw new InvalidOperationException();
+                            }
+                            cngAclCheck = "cng_acl_owner_default_compare";
+                            bool ownerMatchesTokenDefault = Native.EqualSid(ownerSid, tokenOwnerSid);
+                            cngAclCheck = ownerMatchesTokenDefault ? "cng_acl_owner_matches_token_default" : "cng_acl_owner_matches_other";
+                            throw new InvalidOperationException();
+                        }
+                        finally
+                        {
+                            Marshal.FreeHGlobal(ownerInformation);
+                        }
                     }
                     cngAclCheck = "cng_acl_dacl_read";
                     daclDescriptor = ReadSecurityDescriptor(key, DaclSecurityInformation | NCryptSilentFlag);

@@ -43,9 +43,9 @@ ALLOWED_FILES = {
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
     ".github/workflows/windows-native-preflight.yml": "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb",
-    "kit/confinement/windows_native_preflight.cs": "3b54ebd7b3f3710ea5e6c7151b480b684ada5a2861a6d54a764e5ca2148b2797",
-    "kit/confinement/windows_native_preflight.ps1": "7510342c49ce3687f26dc0048ab8b765c25d501a620b071f4f6b5a4b892e928f",
-    "kit/confinement/test_windows_native_preflight.py": "1f76c7cab713bd3738cd76beb92435660c6149702e758427e0b3221f3a8e9d9e",
+    "kit/confinement/windows_native_preflight.cs": "a42828689d0577b0301f5e56b1ddac7bd32454a0c6e6326794255a758553ad35",
+    "kit/confinement/windows_native_preflight.ps1": "b2448a86ab09d1d77b98a00caeb071fa58449f22043031c0aa8e5a710c7f11f1",
+    "kit/confinement/test_windows_native_preflight.py": "4f164ddfb3cde2e5cec382efe8c452b67e5d6ca65c7472845662d43eaa861f93",
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(
