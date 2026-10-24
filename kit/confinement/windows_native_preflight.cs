@@ -16,6 +16,8 @@ namespace KeelDock.Platform.WindowsNativePreflight
         private const int TokenCapabilities = 30;
         private const int TokenAppContainerSid = 31;
         private const int TokenIsLessPrivilegedAppContainer = 46;
+        private const int MaxChildEnvironmentEntryCharacters = 32767;
+        private const int MaxChildEnvironmentBlockCharacters = 131072;
         private const uint ProcThreadAttributeSecurityCapabilities = 0x00020009;
         private const uint ProcThreadAttributeAllApplicationPackagesPolicy = 0x0002000f;
         private const uint ProcessCreationAllApplicationPackagesOptOut = 0x00000001;
@@ -111,6 +113,65 @@ namespace KeelDock.Platform.WindowsNativePreflight
             return "windows-native-preflight=refused check=" + check + errorField + " reason=native_preflight_unavailable cleanup=" + (cleanupComplete ? "verified" : "incomplete");
         }
 
+        internal static string BuildChildEnvironmentBlock(string localAppDataPath, string currentDirectory)
+        {
+            ValidateWindowsDirectory(localAppDataPath, MaxChildEnvironmentEntryCharacters - "LOCALAPPDATA=".Length);
+            ValidateWindowsDirectory(currentDirectory, MaxChildEnvironmentEntryCharacters - "=C:=".Length);
+            string tempPath = AppendWindowsPath(localAppDataPath, "Temp");
+            string[] entries = new string[]
+            {
+                "=" + char.ToUpperInvariant(currentDirectory[0]) + ":=" + currentDirectory,
+                "KD_NATIVE_PREFLIGHT=1",
+                "LOCALAPPDATA=" + localAppDataPath,
+                "TEMP=" + tempPath,
+                "TMP=" + tempPath
+            };
+            Array.Sort(entries, StringComparer.OrdinalIgnoreCase);
+            for (int index = 0; index < entries.Length; ++index)
+            {
+                if (entries[index].Length > MaxChildEnvironmentEntryCharacters)
+                {
+                    throw new InvalidOperationException();
+                }
+            }
+            string block = string.Join("\0", entries) + "\0\0";
+            if (block.Length > MaxChildEnvironmentBlockCharacters)
+            {
+                throw new InvalidOperationException();
+            }
+            return block;
+        }
+
+        private static void ValidateWindowsDirectory(string path, int maximumCharacters)
+        {
+            if (string.IsNullOrEmpty(path) || path.Length < 3 || path.Length > maximumCharacters
+                || !IsAsciiDriveLetter(path[0]) || path[1] != ':' || path[2] != '\\')
+            {
+                throw new InvalidOperationException();
+            }
+            for (int index = 0; index < path.Length; ++index)
+            {
+                char value = path[index];
+                if (char.IsControl(value) || value == '"' || value == '<' || value == '>'
+                    || value == '|' || value == '?' || value == '*' || (index != 1 && value == ':'))
+                {
+                    throw new InvalidOperationException();
+                }
+            }
+        }
+
+        private static bool IsAsciiDriveLetter(char value)
+        {
+            return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
+        }
+
+        private static string AppendWindowsPath(string directory, string child)
+        {
+            return directory.EndsWith("\\", StringComparison.Ordinal)
+                ? directory + child
+                : directory + "\\" + child;
+        }
+
         private sealed class State
         {
             private string profileName;
@@ -124,6 +185,8 @@ namespace KeelDock.Platform.WindowsNativePreflight
             private IntPtr securityCapabilitiesBuffer = IntPtr.Zero;
             private IntPtr appPackagesPolicyBuffer = IntPtr.Zero;
             private IntPtr environmentBlock = IntPtr.Zero;
+            private IntPtr appContainerSidString = IntPtr.Zero;
+            private IntPtr appContainerLocalAppDataPath = IntPtr.Zero;
             private IntPtr job = IntPtr.Zero;
             private IntPtr process = IntPtr.Zero;
             private IntPtr thread = IntPtr.Zero;
@@ -249,7 +312,10 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     throw new InvalidOperationException();
                 }
-                environmentBlock = Marshal.StringToHGlobalUni("KD_NATIVE_PREFLIGHT=1\0\0");
+                childLaunchCheck = "child_environment";
+                string localAppDataPath = GetAppContainerLocalAppDataPath();
+                string childEnvironmentBlock = BuildChildEnvironmentBlock(localAppDataPath, systemDirectory.ToString());
+                environmentBlock = Marshal.StringToHGlobalUni(childEnvironmentBlock);
                 Native.StartupInfoEx startup = new Native.StartupInfoEx();
                 startup.StartupInfo.cb = (uint)Marshal.SizeOf(typeof(Native.StartupInfoEx));
                 startup.AttributeList = attributeList;
@@ -636,6 +702,8 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 complete = FreeMemory(ref securityCapabilitiesBuffer, complete);
                 complete = FreeMemory(ref appPackagesPolicyBuffer, complete);
                 complete = FreeMemory(ref environmentBlock, complete);
+                complete = FreeCoTaskMemory(ref appContainerLocalAppDataPath, complete);
+                complete = SafeLocalFree(ref appContainerSidString, complete);
                 complete = FreeMemory(ref attributeListBuffer, complete);
                 attributeList = IntPtr.Zero;
 
@@ -906,6 +974,68 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 return complete;
             }
 
+            private static bool FreeCoTaskMemory(ref IntPtr memory, bool complete)
+            {
+                if (memory != IntPtr.Zero)
+                {
+                    try
+                    {
+                        Marshal.FreeCoTaskMem(memory);
+                    }
+                    catch
+                    {
+                        complete = false;
+                    }
+                    memory = IntPtr.Zero;
+                }
+                return complete;
+            }
+
+            private static bool SafeLocalFree(ref IntPtr memory, bool complete)
+            {
+                if (memory != IntPtr.Zero)
+                {
+                    try
+                    {
+                        if (Native.LocalFree(memory) != IntPtr.Zero)
+                        {
+                            complete = false;
+                        }
+                    }
+                    catch
+                    {
+                        complete = false;
+                    }
+                    memory = IntPtr.Zero;
+                }
+                return complete;
+            }
+
+            private string GetAppContainerLocalAppDataPath()
+            {
+                if (!Native.ConvertSidToStringSidW(profileSid, out appContainerSidString) || appContainerSidString == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException();
+                }
+                int sidLength = Native.lstrlenW(appContainerSidString);
+                if (sidLength < 1 || sidLength > 184)
+                {
+                    throw new InvalidOperationException();
+                }
+                string sidText = Marshal.PtrToStringUni(appContainerSidString, sidLength);
+                if (string.IsNullOrEmpty(sidText) || Native.GetAppContainerFolderPath(sidText, out appContainerLocalAppDataPath) != 0
+                    || appContainerLocalAppDataPath == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException();
+                }
+                int pathLength = Native.lstrlenW(appContainerLocalAppDataPath);
+                if (pathLength < 1 || pathLength > MaxChildEnvironmentEntryCharacters - "LOCALAPPDATA=".Length)
+                {
+                    throw new InvalidOperationException();
+                }
+                return Marshal.PtrToStringUni(appContainerLocalAppDataPath, pathLength);
+            }
+
             private static bool FreeCngObject(ref IntPtr handle, bool complete)
             {
                 if (handle != IntPtr.Zero)
@@ -1033,6 +1163,9 @@ namespace KeelDock.Platform.WindowsNativePreflight
             [DllImport("userenv.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
             internal static extern int DeleteAppContainerProfile(string appContainerName);
 
+            [DllImport("userenv.dll", CharSet = CharSet.Unicode, ExactSpelling = true, PreserveSig = true)]
+            internal static extern int GetAppContainerFolderPath(string appContainerSid, out IntPtr path);
+
             [DllImport("advapi32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
@@ -1044,6 +1177,10 @@ namespace KeelDock.Platform.WindowsNativePreflight
             [DllImport("advapi32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool IsValidSid(IntPtr sid);
+
+            [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool ConvertSidToStringSidW(IntPtr sid, out IntPtr stringSid);
 
             [DllImport("advapi32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
@@ -1142,6 +1279,9 @@ namespace KeelDock.Platform.WindowsNativePreflight
 
             [DllImport("kernel32.dll", SetLastError = true)]
             internal static extern IntPtr LocalFree(IntPtr memory);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+            internal static extern int lstrlenW(IntPtr stringPointer);
 
             [DllImport("ncrypt.dll", CharSet = CharSet.Unicode)]
             internal static extern int NCryptOpenStorageProvider(out IntPtr provider, string providerName, uint flags);
