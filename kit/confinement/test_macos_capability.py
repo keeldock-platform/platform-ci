@@ -555,6 +555,59 @@ class ProbeIdentityDiagnosticTests(unittest.TestCase):
         self.assertEqual(raised.exception.check, "probe_process_survivor")
         self.assertFalse(raised.exception.cleanup_complete)
 
+    def test_probe_user_survivor_diagnostic_is_fixed_to_caller_phase(self):
+        class StubProcess:
+            pid = 12350
+            stdout = io.BytesIO(b"")
+            stderr = io.BytesIO(b"")
+            returncode = 0
+
+            def wait(self, timeout):
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+        process = StubProcess()
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(
+                            ["/usr/bin/true"], 502, timeout=3,
+                            survivor_check="probe_process_survivor_positive_read",
+                        )
+        self.assertEqual(raised.exception.check, "probe_process_survivor_positive_read")
+        self.assertFalse(raised.exception.cleanup_complete)
+
+    def test_probe_user_invalid_survivor_diagnostic_still_refuses(self):
+        class StubProcess:
+            def __init__(self):
+                self.pid = 12351
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+                self.returncode = 0
+
+            def wait(self, timeout):
+                return 0
+
+            def poll(self):
+                return self.returncode
+
+        for survivor_check in (None, "private/path", []):
+            with self.subTest(survivor_check_type=type(survivor_check).__name__):
+                process = StubProcess()
+                with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+                    with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True):
+                            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                macos_capability._run_as_probe_user(
+                                    ["/usr/bin/true"], 502, timeout=3,
+                                    survivor_check=survivor_check,
+                                )
+                self.assertEqual(raised.exception.check, "probe_process_survivor")
+                self.assertFalse(raised.exception.cleanup_complete)
+
     def test_probe_user_group_cleanup_failure_has_fixed_subphase(self):
         class StubProcess:
             pid = 12349
@@ -1262,7 +1315,7 @@ class ProbeTeardownTests(unittest.TestCase):
                 with patch.object(macos_capability, "_probe_uid_processes_present", return_value=True) as census:
                     with self.assertRaises(macos_capability.ProbeFailure) as raised:
                         macos_capability._observe_probe("unused", "unused", "unused", 502, "unused")
-        self.assertEqual(raised.exception.check, "probe_process_survivor")
+        self.assertEqual(raised.exception.check, "probe_process_survivor_probe_tree")
         self.assertFalse(raised.exception.cleanup_complete)
         census.assert_called_once_with(502)
 
@@ -1571,7 +1624,7 @@ class ProbeTeardownTests(unittest.TestCase):
                                                         with patch.object(macos_capability, "_run") as command:
                                                             with self.assertRaises(macos_capability.ProbeFailure) as raised:
                                                                 macos_capability.run_native_probe("a" * 40)
-            self.assertEqual(raised.exception.check, "probe_process_survivor")
+            self.assertEqual(raised.exception.check, "probe_process_survivor_final_census")
             self.assertFalse(raised.exception.cleanup_complete)
             census.assert_called_once_with(502)
             command.assert_not_called()
