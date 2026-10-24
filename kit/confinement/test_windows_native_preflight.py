@@ -120,8 +120,10 @@ if (-not $rejected) {{ exit 6 }}
             "private const int TokenCapabilities = 30;",
             "private const int TokenAppContainerSid = 31;",
             "private const int TokenIsLessPrivilegedAppContainer = 46;",
-            "ReadTokenDword(childToken, TokenIsAppContainer) != 1",
-            "ReadTokenDword(childToken, TokenIsLessPrivilegedAppContainer) != 1",
+            "uint isAppContainer = ReadTokenDword(childToken, TokenIsAppContainer);",
+            "if (isAppContainer != 1)",
+            "uint isLessPrivilegedAppContainer = ReadTokenDword(childToken, TokenIsLessPrivilegedAppContainer);",
+            "if (isLessPrivilegedAppContainer != 1)",
             "if (length != 4)",
             "Marshal.ReadInt32(capabilityInformation) != 0",
             "Native.EqualSid(actualSid, profileSid)",
@@ -131,6 +133,50 @@ if (-not $rejected) {{ exit 6 }}
                 self.assertIn(expected, self.source)
         self.assertIn("TokenCapabilities", self.source)
         self.assertIn("TokenAppContainerSid", self.source)
+
+    def test_token_readback_failures_use_fixed_ordered_subphases(self):
+        stages = (
+            ("token_open", "Native.OpenProcessToken(process, TokenQuery"),
+            ("token_appcontainer_read", "ReadTokenDword(childToken, TokenIsAppContainer)"),
+            ("token_appcontainer_check", "if (isAppContainer != 1)"),
+            ("token_lpac_read", "ReadTokenDword(childToken, TokenIsLessPrivilegedAppContainer)"),
+            ("token_lpac_check", "if (isLessPrivilegedAppContainer != 1)"),
+            ("token_capabilities_read", "QueryTokenInformation(childToken, TokenCapabilities"),
+            ("token_capabilities_check", "capabilityLength < 4 || Marshal.ReadInt32(capabilityInformation) != 0"),
+            ("token_sid_read", "QueryTokenInformation(childToken, TokenAppContainerSid"),
+            ("token_sid_check", "appContainerLength < (uint)IntPtr.Size"),
+            ("token_integrity_read", "QueryTokenInformation(childToken, TokenIntegrityLevel"),
+            ("token_integrity_check", "integrityLength < (uint)IntPtr.Size"),
+        )
+        verify = self.source[
+            self.source.index("internal void VerifyToken()"):
+            self.source.index("internal void VerifyJob()")
+        ]
+        previous = -1
+        labels = []
+        for label, operation in stages:
+            with self.subTest(label=label):
+                marker = f'tokenReadbackCheck = "{label}";'
+                self.assertIn(marker, verify)
+                self.assertIn(label, self.wrapper)
+                phase_position = verify.index(marker)
+                operation_position = verify.index(operation)
+                self.assertGreater(phase_position, previous)
+                self.assertLess(phase_position, operation_position)
+                previous = phase_position
+                labels.append(label)
+
+        catch_transition = 'else if (check == "token_readback")\n                {\n                    check = state.TokenReadbackCheck;'
+        self.assertIn(catch_transition, self.source)
+        self.assertIn('private string tokenReadbackCheck = "token_open";', self.source)
+        self.assertIn("internal string TokenReadbackCheck", self.source)
+        self.assertNotIn("Marshal.GetLastWin32Error", verify)
+        self.assertNotIn("Console.", verify)
+        self.assertNotIn("ToString(", verify)
+        self.assertEqual(
+            re.findall(r'tokenReadbackCheck = "([a-z_]+)";', verify),
+            labels,
+        )
 
     def test_job_assignment_limits_readback_and_termination_are_required(self):
         for expected in (
@@ -241,7 +287,17 @@ if (-not $rejected) {{ exit 6 }}
             "child_process_create_other",
             "child_job_assignment",
             "child_job_readback",
-            "token_readback",
+            "token_open",
+            "token_appcontainer_read",
+            "token_appcontainer_check",
+            "token_lpac_read",
+            "token_lpac_check",
+            "token_capabilities_read",
+            "token_capabilities_check",
+            "token_sid_read",
+            "token_sid_check",
+            "token_integrity_read",
+            "token_integrity_check",
             "job_readback",
             "cng_key",
             "cng_acl",
@@ -456,6 +512,55 @@ if (-not $rejected) {{ exit 6 }}
                     self.assertEqual(completed.returncode, 1)
                     self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
                     self.assertEqual(completed.stderr, b"")
+
+    def test_powershell_token_subphase_refusals_are_exact_and_fail_closed(self):
+        powershell = shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell is unavailable for wrapper parser fixtures")
+        parser_start = self.wrapper.index("    if ($result -match '^windows-native-preflight=refused check=(")
+        parser_end = self.wrapper.index("} catch {", parser_start)
+        parser = self.wrapper[parser_start:parser_end]
+        checks = (
+            "token_open",
+            "token_appcontainer_read",
+            "token_appcontainer_check",
+            "token_lpac_read",
+            "token_lpac_check",
+            "token_capabilities_read",
+            "token_capabilities_check",
+            "token_sid_read",
+            "token_sid_check",
+            "token_integrity_read",
+            "token_integrity_check",
+        )
+        fallback = "windows-native-preflight=refused check=runtime reason=native_preflight_unavailable cleanup=incomplete"
+        lines = [
+            "windows-native-preflight=refused check="
+            + check
+            + " reason=native_preflight_unavailable cleanup=verified"
+            for check in checks
+        ]
+        fixtures = [(line, line) for line in lines]
+        fixtures.extend((lines[-1] + ending, fallback) for ending in ("\n", "\r\n"))
+        for line, expected in fixtures:
+            encoded = base64.b64encode(line.encode("utf-8")).decode("ascii")
+            command = (
+                "$result = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('"
+                + encoded
+                + "'))\n"
+                + parser
+            )
+            with self.subTest(check=line.split("check=")[1].split()[0], length=len(line)):
+                completed = subprocess.run(
+                    [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                    check=False,
+                    capture_output=True,
+                    text=False,
+                    timeout=10,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual(completed.stdout, expected.encode("utf-8") + os.linesep.encode("ascii"))
+                self.assertEqual(completed.stderr, b"")
 
 
 if __name__ == "__main__":
