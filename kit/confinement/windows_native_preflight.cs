@@ -74,6 +74,10 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 {
                     check = state.ChildLaunchCheck;
                 }
+                else if (check == "token_readback")
+                {
+                    check = state.TokenReadbackCheck;
+                }
                 completed = false;
             }
 
@@ -196,6 +200,7 @@ namespace KeelDock.Platform.WindowsNativePreflight
             private bool processAssigned;
             private string childLaunchCheck = "child_attribute_list";
             private uint? childProcessCreateError;
+            private string tokenReadbackCheck = "token_open";
             private IntPtr provider = IntPtr.Zero;
             private IntPtr key = IntPtr.Zero;
             private string keyName;
@@ -209,6 +214,11 @@ namespace KeelDock.Platform.WindowsNativePreflight
             internal uint? ChildProcessCreateError
             {
                 get { return childProcessCreateError; }
+            }
+
+            internal string TokenReadbackCheck
+            {
+                get { return tokenReadbackCheck; }
             }
 
             internal void CreateProfile()
@@ -357,22 +367,33 @@ namespace KeelDock.Platform.WindowsNativePreflight
 
             internal void VerifyToken()
             {
+                tokenReadbackCheck = "token_open";
                 if (!Native.OpenProcessToken(process, TokenQuery, out childToken) || childToken == IntPtr.Zero)
                 {
                     throw new InvalidOperationException();
                 }
-                if (ReadTokenDword(childToken, TokenIsAppContainer) != 1)
-                {
-                    throw new InvalidOperationException();
-                }
-                if (ReadTokenDword(childToken, TokenIsLessPrivilegedAppContainer) != 1)
+
+                tokenReadbackCheck = "token_appcontainer_read";
+                uint isAppContainer = ReadTokenDword(childToken, TokenIsAppContainer);
+                tokenReadbackCheck = "token_appcontainer_check";
+                if (isAppContainer != 1)
                 {
                     throw new InvalidOperationException();
                 }
 
+                tokenReadbackCheck = "token_lpac_read";
+                uint isLessPrivilegedAppContainer = ReadTokenDword(childToken, TokenIsLessPrivilegedAppContainer);
+                tokenReadbackCheck = "token_lpac_check";
+                if (isLessPrivilegedAppContainer != 1)
+                {
+                    throw new InvalidOperationException();
+                }
+
+                tokenReadbackCheck = "token_capabilities_read";
                 IntPtr capabilityInformation = QueryTokenInformation(childToken, TokenCapabilities, out uint capabilityLength);
                 try
                 {
+                    tokenReadbackCheck = "token_capabilities_check";
                     if (capabilityLength < 4 || Marshal.ReadInt32(capabilityInformation) != 0)
                     {
                         throw new InvalidOperationException();
@@ -383,9 +404,11 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     Marshal.FreeHGlobal(capabilityInformation);
                 }
 
+                tokenReadbackCheck = "token_sid_read";
                 IntPtr appContainerInformation = QueryTokenInformation(childToken, TokenAppContainerSid, out uint appContainerLength);
                 try
                 {
+                    tokenReadbackCheck = "token_sid_check";
                     if (appContainerLength < (uint)IntPtr.Size)
                     {
                         throw new InvalidOperationException();
@@ -401,9 +424,11 @@ namespace KeelDock.Platform.WindowsNativePreflight
                     Marshal.FreeHGlobal(appContainerInformation);
                 }
 
+                tokenReadbackCheck = "token_integrity_read";
                 IntPtr integrityInformation = QueryTokenInformation(childToken, TokenIntegrityLevel, out uint integrityLength);
                 try
                 {
+                    tokenReadbackCheck = "token_integrity_check";
                     if (integrityLength < (uint)IntPtr.Size)
                     {
                         throw new InvalidOperationException();
