@@ -3093,7 +3093,15 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
             marker_path.parent.mkdir(parents=True)
             if marker != "missing":
                 marker_path.write_text("synthetic\n", encoding="utf-8")
-                marker_path.chmod(0o644 if marker == "readable" else 0o600)
+            marker_mode = stat.S_IFREG | (0o600 if marker == "private" else 0o644)
+            host_path_type = type(root)
+            real_stat = host_path_type.stat
+
+            def injected_stat(path, *args, **kwargs):
+                if path == marker_path:
+                    return types.SimpleNamespace(st_mode=marker_mode)
+                return real_stat(path, *args, **kwargs)
+
             home_parent = Path(directory) / "home-parent"
             home = home_parent / "home"
             home.mkdir(parents=True)
@@ -3123,6 +3131,8 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
                     ("_run", dscl),
                 ):
                     stack.enter_context(patch.object(macos_capability, name, return_value=value))
+                if marker != "missing":
+                    stack.enter_context(patch.object(host_path_type, "stat", injected_stat))
                 stack.enter_context(patch.object(macos_capability.tempfile, "mkdtemp", side_effect=make_scratch))
                 stack.enter_context(patch.object(macos_capability.subprocess, "Popen", side_effect=popen))
                 stack.enter_context(patch.object(macos_capability, "_Capture", FakeCapture))
