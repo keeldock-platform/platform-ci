@@ -21,7 +21,7 @@ try {
         Write-Output $result
         exit 0
     }
-    if ($result -match '^windows-native-preflight=refused check=(lpac_profile|job_setup|child_attribute_list|child_security_capabilities|child_lpac_policy|child_system_executable|child_process_create|child_job_assignment|child_job_readback|token_readback|job_readback|cng_key|cng_acl|cng_export|cleanup|runtime) reason=native_preflight_unavailable cleanup=(verified|incomplete)$') {
+    if ($result -match '^windows-native-preflight=refused check=(lpac_profile|job_setup|child_attribute_list|child_security_capabilities|child_lpac_policy|child_system_executable|child_process_create|child_process_create_access_denied|child_process_create_invalid_parameter|child_process_create_other|child_job_assignment|child_job_readback|token_readback|job_readback|cng_key|cng_acl|cng_export|cleanup|runtime) reason=native_preflight_unavailable cleanup=(verified|incomplete)$') {
         Write-Output $result
         exit 1
     }

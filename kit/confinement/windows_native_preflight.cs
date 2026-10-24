@@ -8,6 +8,8 @@ namespace KeelDock.Platform.WindowsNativePreflight
     public static class Probe
     {
         private const int ErrorInsufficientBuffer = 122;
+        private const int ErrorAccessDenied = 5;
+        private const int ErrorInvalidParameter = 87;
         private const uint TokenQuery = 0x0008;
         private const int TokenUser = 1;
         private const int TokenIntegrityLevel = 25;
@@ -97,6 +99,19 @@ namespace KeelDock.Platform.WindowsNativePreflight
         private static string Refusal(string check, bool cleanupComplete)
         {
             return "windows-native-preflight=refused check=" + check + " reason=native_preflight_unavailable cleanup=" + (cleanupComplete ? "verified" : "incomplete");
+        }
+
+        private static string ChildProcessFailureCheck(int error)
+        {
+            if (error == ErrorAccessDenied)
+            {
+                return "child_process_create_access_denied";
+            }
+            if (error == ErrorInvalidParameter)
+            {
+                return "child_process_create_invalid_parameter";
+            }
+            return "child_process_create_other";
         }
 
         private sealed class State
@@ -240,10 +255,16 @@ namespace KeelDock.Platform.WindowsNativePreflight
                 uint flags = ExtendedStartupInfoPresent | CreateSuspended | CreateUnicodeEnvironment | CreateNoWindow;
                 childLaunchCheck = "child_process_create";
                 bool created = Native.CreateProcessW(executable, commandLine, IntPtr.Zero, IntPtr.Zero, false, flags, environmentBlock, systemDirectory.ToString(), ref startup, ref processInformation);
+                int createProcessError = created ? 0 : Marshal.GetLastWin32Error();
                 process = processInformation.Process;
                 thread = processInformation.Thread;
                 processCreated = process != IntPtr.Zero;
-                if (!created || !processCreated || thread == IntPtr.Zero)
+                if (!created)
+                {
+                    childLaunchCheck = Probe.ChildProcessFailureCheck(createProcessError);
+                    throw new InvalidOperationException();
+                }
+                if (!processCreated || thread == IntPtr.Zero)
                 {
                     throw new InvalidOperationException();
                 }
