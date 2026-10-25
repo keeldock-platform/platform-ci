@@ -18,6 +18,8 @@ PLATFORM_FILES = frozenset(
         "kit/bootstrap/public_tree.py",
         "kit/bootstrap/test_policy.py",
         "kit/bootstrap/test_public_tree.py",
+        "kit/confinement/macos_boundary_guard.py",
+        "kit/confinement/test_macos_boundary_guard.py",
         "kit/confinement/macos_public_audit.py",
         "kit/confinement/test_macos_public_audit.py",
         "kit/confinement/macos_harness.py",
