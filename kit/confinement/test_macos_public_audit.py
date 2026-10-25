@@ -302,7 +302,7 @@ class ApiIdentityTests(unittest.TestCase):
                         "actions-results/run/log.txt?sig=opaque"
                     )
                     raise urllib.error.HTTPError(
-                        request.full_url, 302, "Found", headers, None
+                        request.full_url, 302, "Found", headers, io.BytesIO(b"")
                     )
                 body = b"macos-native=complete\n"
                 return FakeResponse(body, {
@@ -538,7 +538,7 @@ class AuditRunTests(unittest.TestCase):
         class DeniedOpener:
             def open(self, request, timeout):
                 raise urllib.error.HTTPError(
-                    request.full_url, 403, "forbidden-token-value", email.message.Message(), None
+                    request.full_url, 403, "forbidden-token-value", email.message.Message(), io.BytesIO(b"")
                 )
 
         api = audit.GitHubAPI.__new__(audit.GitHubAPI)
@@ -555,7 +555,9 @@ class AuditRunTests(unittest.TestCase):
             def open(self, request, timeout):
                 headers = email.message.Message()
                 headers["Location"] = "https://attacker.invalid/log?token=untrusted-value"
-                raise urllib.error.HTTPError(request.full_url, 302, "Found", headers, None)
+                raise urllib.error.HTTPError(
+                    request.full_url, 302, "Found", headers, io.BytesIO(b"")
+                )
 
         api = audit.GitHubAPI.__new__(audit.GitHubAPI)
         api._token = "t" * 32

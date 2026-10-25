@@ -161,7 +161,7 @@ class PFGuardTests(unittest.TestCase):
             mock.patch.object(boundary, "_read_pf_config", return_value=PF_CONFIG),
             mock.patch.object(boundary, "_validate_directory_metadata"),
             mock.patch.object(boundary, "_validate_file_metadata"),
-            mock.patch.object(boundary.os, "geteuid", return_value=0),
+            mock.patch.object(boundary.os, "geteuid", return_value=0, create=True),
             mock.patch.object(boundary, "_run_command", side_effect=self.pf),
             mock.patch.object(boundary, "_write_rules_file", side_effect=self._write_rules),
         )
