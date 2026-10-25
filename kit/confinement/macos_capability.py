@@ -3,7 +3,6 @@ import ctypes
 from contextlib import contextmanager
 import os
 from pathlib import Path, PurePosixPath
-import plistlib
 import re
 import shutil
 import signal
@@ -25,6 +24,12 @@ MAX_PROBE_SECONDS = 45
 MAX_RUNNER_ANCESTORS = 16
 MAX_PROCESS_PATH_BYTES = 4096
 MAX_TOOL_PATH_BYTES = 4096
+SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec"
+SEATBELT_PROFILE_NAME = "capability.sb"
+SEATBELT_WRITABLE_DEVICES = ("/dev/null", "/dev/dtracehelper")
+SEATBELT_MACH_LOOKUP_NAMES = ()
+SEATBELT_MACH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}\Z")
+MAX_SEATBELT_PATHS = 64
 MAX_SURVIVOR_PATH_READBACKS = 16
 DARWIN_UID_MODULUS = 1 << 32
 DARWIN_UID_MAX = DARWIN_UID_MODULUS - 1
@@ -49,14 +54,25 @@ SANDBOX_STAGES = (
 )
 SANDBOX_FAILURES = (
     "invalid_input", "identity_invalid", "sandbox_missing", "child_sandbox_missing", "child_failed",
-    "storage_unavailable", "outside_write_allowed",
+    "storage_unavailable", "outside_write_allowed", "network_allowed", "child_network_allowed",
+    "ipc_allowed", "child_ipc_allowed", "profile_rejected",
     "python_error", "exec_failed",
-    "signal_exit", "other_exit",
+    "signal_kill", "signal_trap", "signal_abort", "signal_segv", "signal_bus", "signal_ill", "signal_term",
+    "signal_other", "other_exit",
 )
 SANDBOX_EXIT_STAGES = ("positive_read_exit", "positive_write_exit", "probe_exit")
 SANDBOX_STAGE_SET = frozenset(SANDBOX_STAGES)
 SANDBOX_FAILURE_SET = frozenset(SANDBOX_FAILURES)
 SANDBOX_EXIT_STAGE_SET = frozenset(SANDBOX_EXIT_STAGES)
+SIGNAL_EXIT_FAILURES = {
+    9: "signal_kill",
+    5: "signal_trap",
+    6: "signal_abort",
+    11: "signal_segv",
+    10: "signal_bus",
+    4: "signal_ill",
+    15: "signal_term",
+}
 PROBE_EXIT_FAILURES = {
     20: "invalid_input",
     21: "identity_invalid",
@@ -65,6 +81,11 @@ PROBE_EXIT_FAILURES = {
     24: "storage_unavailable",
     25: "outside_write_allowed",
     26: "child_sandbox_missing",
+    27: "network_allowed",
+    28: "child_network_allowed",
+    29: "ipc_allowed",
+    30: "child_ipc_allowed",
+    65: "profile_rejected",
     125: "exec_failed",
 }
 CONTROL_EXIT_FAILURES = {
@@ -226,7 +247,8 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_identity_readback", "probe_identity_cleanup", "probe_process_timeout", "probe_process_cleanup",
         "probe_process_group_cleanup", "probe_process_capture_cleanup", "probe_process_census",
         "probe_process_launch", "probe_process_identity",
-        "probe_process_toolchain",
+        "probe_process_toolchain", "probe_process_seatbelt", "probe_process_profile",
+        "probe_process_storage",
         "probe_process_survivor", "probe_process_observation",
         "probe_process_survivor_controls", "probe_process_survivor_positive_read",
         "probe_process_survivor_positive_write", "probe_process_survivor_probe_tree",
@@ -1256,7 +1278,7 @@ def _classify_exit(returncode, codes):
     if type(returncode) is not int:
         return "other_exit"
     if returncode < 0:
-        return "signal_exit"
+        return SIGNAL_EXIT_FAILURES.get(-returncode, "signal_other")
     if returncode in codes:
         return codes[returncode]
     return "other_exit"
@@ -1426,7 +1448,7 @@ def _disable_developer_mode():
         raise ProbeFailure("developer_mode_unavailable")
 
 
-def _codesign_info(path, identifier, expected_entitlements):
+def _codesign_info(path, identifier):
     result = _require_success(
         _run(["/usr/bin/codesign", "-d", "--verbose=4", "--entitlements", ":-", str(path)], timeout=10),
         "sandbox_signing_unavailable",
@@ -1434,67 +1456,175 @@ def _codesign_info(path, identifier, expected_entitlements):
     details = (result.stdout + b"\n" + result.stderr).decode("utf-8", "ignore")
     if "Identifier=" + identifier not in details or "Signature=adhoc" not in details:
         raise ProbeFailure("sandbox_signing_unavailable")
-    start = details.find("<?xml")
-    if start < 0:
-        raise ProbeFailure("sandbox_signing_unavailable")
-    end = details.find("</plist>", start)
-    if end < 0:
-        raise ProbeFailure("sandbox_signing_unavailable")
-    try:
-        entitlements = plistlib.loads(details[start : end + len("</plist>")].encode("utf-8"))
-    except (plistlib.InvalidFileException, ValueError, TypeError):
-        raise ProbeFailure("sandbox_signing_unavailable")
-    if entitlements != expected_entitlements:
-        raise ProbeFailure("sandbox_signing_unavailable")
-    if "com.apple.security.network.client" in entitlements or "com.apple.security.network.server" in entitlements:
+    if "<?xml" in details or "com.apple.security" in details:
         raise ProbeFailure("sandbox_signing_unavailable")
 
 
 def _build_signed_probe(root, scratch):
     source = root / "kit/confinement/macos_capability.swift"
-    main_entitlements = root / "kit/confinement/macos_capability.entitlements.plist"
-    child_entitlements = root / "kit/confinement/macos_capability_child.entitlements.plist"
-    info = root / "kit/confinement/macos_capability_info.plist"
-    app = scratch / "CapabilityProbe.app"
-    contents = app / "Contents"
-    binaries = contents / "MacOS"
-    binaries.mkdir(parents=True)
-    shutil.copy2(info, contents / "Info.plist")
-    executable = binaries / "CapabilityProbe"
-    child = binaries / "CapabilityChild"
-    compiled = scratch / "CapabilityProbe.unbundled"
-    build = _require_success(
-        _run(["/usr/bin/swiftc", "-O", "-o", compiled, source], cwd=root, timeout=120),
+    executable = scratch / "CapabilityProbe"
+    child = scratch / "CapabilityChild"
+    _require_success(
+        _run(["/usr/bin/swiftc", "-O", "-o", executable, source], cwd=root, timeout=120),
         "sandbox_signing_unavailable",
     )
-    del build
-    shutil.copy2(compiled, executable)
-    shutil.copy2(compiled, child)
+    shutil.copy2(executable, child)
     os.chmod(executable, 0o755)
     os.chmod(child, 0o755)
-    _require_success(
-        _run(
-            ["/usr/bin/codesign", "--force", "--sign", "-", "--identifier", CHILD_IDENTIFIER, "--entitlements", child_entitlements, child],
-            timeout=20,
-        ),
-        "sandbox_signing_unavailable",
-    )
-    _require_success(
-        _run(
-            ["/usr/bin/codesign", "--force", "--sign", "-", "--identifier", APP_IDENTIFIER, "--entitlements", main_entitlements, app],
-            timeout=20,
-        ),
-        "sandbox_signing_unavailable",
-    )
-    for path in (app, child):
-        _require_success(_run(["/usr/bin/codesign", "--verify", "--strict", "--verbose=0", path], timeout=15), "sandbox_signing_unavailable")
-    _codesign_info(app, APP_IDENTIFIER, {"com.apple.security.app-sandbox": True})
-    _codesign_info(
-        child,
-        CHILD_IDENTIFIER,
-        {"com.apple.security.app-sandbox": True, "com.apple.security.inherit": True},
-    )
+    signed = ((executable, APP_IDENTIFIER), (child, CHILD_IDENTIFIER))
+    for path, identifier in signed:
+        _require_success(
+            _run(["/usr/bin/codesign", "--force", "--sign", "-", "--identifier", identifier, path], timeout=20),
+            "sandbox_signing_unavailable",
+        )
+    for path, identifier in signed:
+        _require_success(
+            _run(["/usr/bin/codesign", "--verify", "--strict", "--verbose=0", path], timeout=15),
+            "sandbox_signing_unavailable",
+        )
+        _codesign_info(path, identifier)
     return executable
+
+
+def _resolve_sandbox_exec():
+    try:
+        path = _resolve_trusted_path(SANDBOX_EXEC_PATH)
+        if path.as_posix() != SANDBOX_EXEC_PATH:
+            raise ValueError
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_seatbelt") from None
+    return SANDBOX_EXEC_PATH
+
+
+def _prepare_storage_directory(path, uid):
+    try:
+        os.chown(path, uid, PROBE_PRIMARY_GID)
+        os.chmod(path, 0o700)
+        info = os.lstat(path)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != uid
+            or info.st_gid != PROBE_PRIMARY_GID
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise ValueError
+        return _canonical_path(path), _storage_identity(info)
+    except BaseException:
+        raise ProbeFailure("probe_identity_unavailable", check="probe_identity_permissions") from None
+
+
+def _storage_identity(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode)
+
+
+def _verify_storage_directory(path, expected, uid):
+    try:
+        canonical, identity = expected
+        if _canonical_path(path) != canonical:
+            raise ValueError
+        info = os.lstat(canonical)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or _storage_identity(info) != identity
+            or info.st_uid != uid
+            or info.st_gid != PROBE_PRIMARY_GID
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise ValueError
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_storage") from None
+
+
+def _canonical_path(path):
+    return os.path.realpath(str(path))
+
+
+def _seatbelt_literal(path):
+    if type(path) is not str or not path:
+        raise ValueError
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in path):
+        raise ValueError
+    if len(path.encode("utf-8")) > MAX_TOOL_PATH_BYTES:
+        raise ValueError
+    semantic_path = PurePosixPath(path)
+    if (
+        not semantic_path.is_absolute()
+        or len(semantic_path.parts) < 2
+        or semantic_path.as_posix() != path
+        or ".." in semantic_path.parts
+    ):
+        raise ValueError
+    return '"' + path.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _seatbelt_profile_text(marker, storage_directory, protected_directories, protected_files):
+    try:
+        if (
+            not isinstance(protected_directories, (tuple, list))
+            or not isinstance(protected_files, (tuple, list))
+            or len(protected_directories) + len(protected_files) > MAX_SEATBELT_PATHS
+        ):
+            raise ValueError
+        marker_literal = _seatbelt_literal(marker)
+        storage_literal = _seatbelt_literal(storage_directory)
+        directory_literals = sorted({_seatbelt_literal(path) for path in protected_directories})
+        file_literals = sorted({_seatbelt_literal(path) for path in protected_files})
+        mach_names = tuple(SEATBELT_MACH_LOOKUP_NAMES)
+        if not all(type(name) is str and SEATBELT_MACH_NAME.fullmatch(name) for name in mach_names):
+            raise ValueError
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_profile") from None
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        "(deny network*)",
+        "(deny lsopen)",
+        "(deny mach-lookup)",
+    ]
+    if mach_names:
+        lines.append(
+            "(allow mach-lookup" + "".join(' (global-name "' + name + '")' for name in mach_names) + ")"
+        )
+    lines.append("(deny file-read* (literal " + marker_literal + "))")
+    lines.extend("(deny file-read* (subpath " + literal + "))" for literal in directory_literals)
+    lines.extend("(deny file-read* (literal " + literal + "))" for literal in file_literals)
+    lines.append('(deny file-write* (subpath "/"))')
+    lines.append(
+        "(allow file-write* (subpath "
+        + storage_literal
+        + ")"
+        + "".join(' (literal "' + device + '")' for device in SEATBELT_WRITABLE_DEVICES)
+        + ")"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _write_seatbelt_profile(scratch, marker, storage_directory, protected_directories, protected_files):
+    try:
+        text = _seatbelt_profile_text(
+            _canonical_path(marker),
+            _canonical_path(storage_directory),
+            tuple(_canonical_path(path) for path in protected_directories),
+            tuple(_canonical_path(path) for path in protected_files),
+        )
+        payload = text.encode("utf-8")
+        path = Path(scratch) / SEATBELT_PROFILE_NAME
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(path, flags, 0o644)
+        try:
+            if os.write(descriptor, payload) != len(payload):
+                raise OSError("short profile write")
+        finally:
+            os.close(descriptor)
+        os.chmod(path, 0o644)
+    except ProbeFailure:
+        raise
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_profile") from None
+    return path
 
 
 def _process_table():
@@ -1764,18 +1894,27 @@ def _observe_probe(
     uid,
     home,
     *,
+    sandbox_exec,
+    profile,
+    storage_directory,
     python_executable,
     compiler_executable,
     linker_executable,
     sdk_root,
+    storage_identity,
 ):
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
     argv = [
+        str(sandbox_exec),
+        "-f",
+        str(profile),
         str(executable),
         "--marker",
         str(marker),
         "--writable-directory",
         str(writable_directory),
+        "--storage-directory",
+        str(storage_directory),
         "--python-executable",
         str(python_executable),
         "--compiler-executable",
@@ -1785,6 +1924,7 @@ def _observe_probe(
         "--sdk-root",
         str(sdk_root),
     ]
+    _verify_storage_directory(storage_directory, storage_identity, uid)
     process = _spawn_probe_user(
         argv,
         uid,
@@ -1933,6 +2073,8 @@ def run_native_probe(control_sha):
         root = _check_context(control_sha, workspace)
     with _preflight_phase("probe_process_toolchain"):
         toolchain = _resolve_trusted_toolchain()
+    with _preflight_phase("probe_process_seatbelt"):
+        sandbox_exec = _resolve_sandbox_exec()
     with _preflight_phase("developer_mode"):
         _disable_developer_mode()
     with _preflight_phase("runner_controls"):
@@ -1941,13 +2083,16 @@ def run_native_probe(control_sha):
         probe_uid, home_parent, home = _create_probe_identity(root)
     scratch = None
     outside = None
+    storage = None
     cleanup_safe = True
     with _preflight_phase("capability_probe"):
         try:
             scratch = Path(tempfile.mkdtemp(prefix="sandbox-capability-", dir="/tmp"))
             outside = Path(tempfile.mkdtemp(prefix="sandbox-capability-write-", dir="/tmp"))
+            storage = Path(tempfile.mkdtemp(prefix="sandbox-capability-storage-", dir="/tmp"))
             os.chmod(scratch, 0o755)
             os.chmod(outside, 0o1777)
+            storage_identity = _prepare_storage_directory(storage, probe_uid)
             _verify_runner_controls_are_private(
                 protected_directories + protected_files, probe_uid, python_executable=toolchain["python"]
             )
@@ -1976,6 +2121,9 @@ def run_native_probe(control_sha):
                 survivor_check="probe_process_survivor_positive_write",
                 python_executable=toolchain["python"],
             )
+            profile = _write_seatbelt_profile(
+                scratch, marker, storage, protected_directories, protected_files
+            )
             executable = _build_signed_probe(root, scratch)
             _observe_probe(
                 executable,
@@ -1983,10 +2131,14 @@ def run_native_probe(control_sha):
                 outside,
                 probe_uid,
                 home,
+                sandbox_exec=sandbox_exec,
+                profile=profile,
+                storage_directory=storage,
                 python_executable=toolchain["python"],
                 compiler_executable=toolchain["clang"],
                 linker_executable=toolchain["linker"],
                 sdk_root=toolchain["sdk"],
+                storage_identity=storage_identity,
             )
         except ProbeFailure as error:
             if not error.cleanup_complete:
@@ -2006,7 +2158,7 @@ def run_native_probe(control_sha):
                         check="probe_process_survivor_final_census", survivor_classes=survivor_classes,
                     )
                 cleanup_failed = False
-                for path in (home_parent, scratch, outside):
+                for path in (home_parent, scratch, outside, storage):
                     try:
                         _remove_probe_tree(path)
                     except ProbeFailure:
