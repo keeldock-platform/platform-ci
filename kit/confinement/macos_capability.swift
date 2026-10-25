@@ -142,6 +142,40 @@ func startProcess(_ executable: String, _ arguments: [String]) throws -> Process
     return process
 }
 
+func startSuspended(_ executable: String, _ arguments: [String]) -> pid_t? {
+    var attributes: posix_spawnattr_t? = nil
+    var actions: posix_spawn_file_actions_t? = nil
+    guard posix_spawnattr_init(&attributes) == 0 else {
+        return nil
+    }
+    defer { posix_spawnattr_destroy(&attributes) }
+    guard posix_spawn_file_actions_init(&actions) == 0 else {
+        return nil
+    }
+    defer { posix_spawn_file_actions_destroy(&actions) }
+    let flags = Int16(POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT)
+    guard posix_spawnattr_setflags(&attributes, flags) == 0,
+          posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDWR, 0) == 0,
+          posix_spawn_file_actions_addinherit_np(&actions, STDOUT_FILENO) == 0,
+          posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO) == 0 else {
+        return nil
+    }
+    var argv: [UnsafeMutablePointer<CChar>?] = []
+    defer { for item in argv { free(item) } }
+    for item in [executable] + arguments {
+        guard let copy = strdup(item) else {
+            return nil
+        }
+        argv.append(copy)
+    }
+    argv.append(nil)
+    var pid: pid_t = 0
+    guard posix_spawn(&pid, executable, &actions, &attributes, argv, environ) == 0 else {
+        return nil
+    }
+    return pid
+}
+
 func parentStatus(for child: Process) -> Int32 {
     if child.terminationStatus == 0 {
         return 0
@@ -268,10 +302,24 @@ func runChild(
         shell = try startProcess("/bin/sh", ["-c", shellCommand, "sh", marker])
         python = try startProcess(pythonExecutable, [
             "-c",
-            "import subprocess,sys,time\ntry:\n open(sys.argv[1], 'rb').close()\n raise SystemExit(32)\nexcept OSError:\n pass\np = subprocess.Popen(['/bin/sleep', '4'])\ntime.sleep(4)\nraise SystemExit(p.wait())",
+            "import os,sys,time\ntry:\n open(sys.argv[1], 'rb').close()\n raise SystemExit(32)\nexcept OSError:\n pass\np = os.posix_spawn('/bin/sleep', ['/bin/sleep', '4'], os.environ)\ntime.sleep(4)\nraise SystemExit(0 if os.waitpid(p, 0)[1] == 0 else 1)",
             marker,
         ])
     } catch {
+        exit(ProbeStatus.childFailed)
+    }
+
+    let holdSource = workDirectory.appendingPathComponent("hold.c")
+    guard FileManager.default.createFile(atPath: holdSource.path, contents: Data()) else {
+        exit(ProbeStatus.storageUnavailable)
+    }
+    let holdDeadline = Date().addingTimeInterval(3)
+    guard let holdCompiler = startSuspended(compilerExecutable, [
+        "-x", "c",
+        "-isysroot", sdkRoot,
+        "-fsyntax-only",
+        holdSource.path,
+    ]) else {
         exit(ProbeStatus.childFailed)
     }
 
@@ -331,6 +379,17 @@ func runChild(
         ])
         builtCompiler.waitUntilExit()
         guard builtCompiler.terminationStatus == 0 else {
+            exit(ProbeStatus.childFailed)
+        }
+        let holdRemaining = holdDeadline.timeIntervalSinceNow
+        if holdRemaining > 0 {
+            Thread.sleep(forTimeInterval: holdRemaining)
+        }
+        guard kill(holdCompiler, SIGCONT) == 0 else {
+            exit(ProbeStatus.childFailed)
+        }
+        var holdStatus: Int32 = 0
+        guard waitpid(holdCompiler, &holdStatus, 0) == holdCompiler, holdStatus == 0 else {
             exit(ProbeStatus.childFailed)
         }
         let builtChild = try startProcess(builtOutput, [marker])

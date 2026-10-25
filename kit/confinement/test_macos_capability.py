@@ -27,26 +27,6 @@ TEST_TOOLCHAIN = {
 }
 
 
-def descriptor_output(pids=(101, 102)):
-    lines = []
-    for pid in pids:
-        lines.extend(("p" + str(pid), "fcwd", "tDIR", "n/tmp", "ftxt", "tREG", "n/usr/bin/python3"))
-        lines.extend(("f1", "tPIPE", "n->0xa41e4580bb63aaf3"))
-        lines.extend(("f2", "tPIPE", "n->0x2c6caff2d92a6b2b"))
-    return "\n".join(lines) + "\n"
-
-
-def native_snapshot(pids=(101, 102)):
-    result = {}
-    for index, pid in enumerate(pids):
-        base = 0x1000 + index * 0x100
-        result[pid] = {
-            1: {"mode": "w", "type": "PIPE", "name": "->0x%x" % base},
-            2: {"mode": "w", "type": "PIPE", "name": "->0x%x" % (base + 1)},
-        }
-    return result
-
-
 class FixedOutcomeTests(unittest.TestCase):
     def setUp(self):
         sandbox_patcher = patch.object(
@@ -574,7 +554,7 @@ class ProbeParentStatusTests(unittest.TestCase):
     FUNCTION_NAMES = frozenset(
         (
             "option", "isAbsolutePath", "isExecutableFile", "readIsDenied", "connectIsDenied", "inetConnectIsDenied",
-            "unixConnectIsDenied", "networkIsDenied", "ipcIsDenied", "startProcess", "parentStatus", "runParent", "runChild",
+            "unixConnectIsDenied", "networkIsDenied", "ipcIsDenied", "startProcess", "startSuspended", "parentStatus", "runParent", "runChild",
         )
     )
 
@@ -607,7 +587,7 @@ class ProbeParentStatusTests(unittest.TestCase):
         source = self.masked_source()
         self.assertIsNone(
             re.search(
-                r"\b(?:execl\w*|execv\w*|posix_spawn\w*|system|popen|fork|vfork|NSTask|dlopen)\b|\.launch\s*\(|\blaunchPath\b",
+                r"\b(?:execl\w*|execv\w*|posix_spawnp|system|popen|fork|vfork|NSTask|dlopen)\b|\.launch\s*\(|\blaunchPath\b",
                 source,
             )
         )
@@ -616,7 +596,49 @@ class ProbeParentStatusTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"\.run\s*\(", source)), 1)
         self.assertEqual(len(re.findall(r"\bstartProcess\s*\(", self.function_body(source, "func runParent("))), 1)
         self.assertEqual(len(re.findall(r"\bstartProcess\s*\(", self.function_body(source, "func runChild("))), 5)
+        self.assertEqual(len(re.findall(r"\bposix_spawn\s*\(", source)), 1)
+        self.assertEqual(len(re.findall(r"\bposix_spawn\s*\(", self.function_body(source, "func startSuspended("))), 1)
+        self.assertEqual(len(re.findall(r"\bstartSuspended\s*\(", self.function_body(source, "func runChild("))), 1)
+        self.assertEqual(len(re.findall(r"\bstartSuspended\s*\(", self.function_body(source, "func runParent("))), 0)
         self.assertEqual(len(re.findall(r"\bstartProcess\s*\(", self.function_body(source, "func parentStatus("))), 0)
+
+    def test_a_compiler_is_held_suspended_until_after_the_real_compiles(self):
+        raw = Path(macos_capability.__file__).resolve().with_name("macos_capability.swift").read_text(encoding="utf-8")
+        masked = self.masked_source()
+        child = self.function_body(masked, "func runChild(")
+        helper = self.function_body(masked, "func startSuspended(")
+        for forbidden in ("mkfifo", "FIFO", "fifo", "O_RDWR | O_CLOEXEC", "F_DUPFD"):
+            self.assertNotIn(forbidden, raw)
+        flags = "let flags = Int16(POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_CLOEXEC_DEFAULT)"
+        self.assertEqual(raw.count(flags), 1)
+        self.assertEqual(len(re.findall(r"\bposix_spawnattr_setflags\s*\(&attributes, flags\)", helper)), 1)
+        self.assertEqual(raw.count('posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDWR, 0) == 0'), 1)
+        self.assertEqual(len(re.findall(r"posix_spawn_file_actions_addinherit_np\(&actions, STD(?:OUT|ERR)_FILENO\)", helper)), 2)
+        self.assertNotIn("SIGCONT", helper)
+        self.assertIn("guard let copy = strdup(item) else {\n            return nil", raw)
+        self.assertEqual(len(re.findall(r"\bkill\s*\(", raw)), 1)
+        self.assertEqual(len(re.findall(r"\bSIGCONT\b", raw)), 1)
+        self.assertIn("guard kill(holdCompiler, SIGCONT) == 0 else {\n            exit(ProbeStatus.childFailed)", raw)
+        self.assertIn("guard waitpid(holdCompiler, &holdStatus, 0) == holdCompiler, holdStatus == 0 else {\n            exit(ProbeStatus.childFailed)", raw)
+        self.assertEqual(raw.count("holdDeadline = Date().addingTimeInterval(3)"), 1)
+        self.assertEqual(raw.count("Thread.sleep(forTimeInterval: holdRemaining)"), 1)
+        order = (
+            "startSuspended(compilerExecutable",
+            "outsideCompiler = try startProcess(",
+            "builtCompiler.waitUntilExit()",
+            "Thread.sleep(forTimeInterval: holdRemaining)",
+            "kill(holdCompiler, SIGCONT)",
+            "waitpid(holdCompiler, &holdStatus, 0)",
+            "builtChild = try startProcess(",
+        )
+        positions = [child.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('"-fsyntax-only",\n        holdSource.path,', raw)
+
+    def test_the_sibling_interpreter_spawns_without_extra_descriptors(self):
+        raw = Path(macos_capability.__file__).resolve().with_name("macos_capability.swift").read_text(encoding="utf-8")
+        self.assertIn("os.posix_spawn('/bin/sleep', ['/bin/sleep', '4'], os.environ)", raw)
+        self.assertNotIn("subprocess", raw)
 
     def test_marker_read_denial_is_only_access_or_permission_errors(self):
         source = self.masked_source()
@@ -2830,92 +2852,6 @@ class RunnerControlDiagnosticTests(unittest.TestCase):
                             self.assertEqual(raised.exception.check, "file_permissions")
 
 
-class DescriptorReadbackTests(unittest.TestCase):
-    def read_snapshot(self, payload, pids=(101, 102)):
-        result = subprocess.CompletedProcess([], 0, payload.encode("utf-8"), b"")
-        native = native_snapshot(pids)
-        with patch.object(macos_capability, "_run", return_value=result):
-            with patch.object(macos_capability, "_native_descriptor_snapshot", side_effect=lambda pid: native[pid]):
-                return macos_capability._descriptor_snapshot(list(pids))
-
-    def test_realistic_lsof_pipe_output_without_access_mode_uses_native_readback(self):
-        result = self.read_snapshot(descriptor_output())
-        self.assertEqual(set(result), {101, 102})
-        self.assertEqual(set(result[101]), {1, 2})
-        self.assertEqual(result[101][1]["mode"], "w")
-        self.assertEqual(result[101][2]["mode"], "w")
-        self.assertNotEqual(result[101][1]["name"], result[101][2]["name"])
-
-    def test_lsof_is_requested_for_types_and_names_without_access_mode(self):
-        payload = descriptor_output((101,))
-        result = subprocess.CompletedProcess([], 0, payload.encode("utf-8"), b"")
-        native = native_snapshot((101,))
-        with patch.object(macos_capability, "_run", return_value=result) as run:
-            with patch.object(macos_capability, "_native_descriptor_snapshot", side_effect=lambda pid: native[pid]):
-                snapshot = macos_capability._descriptor_snapshot([101])
-        run.assert_called_once_with(
-            ["/usr/sbin/lsof", "-nP", "-Fpfnt", "-p", "101"],
-            timeout=10,
-        )
-        self.assertEqual(snapshot[101][1]["mode"], "w")
-        self.assertEqual(snapshot[101][2]["mode"], "w")
-
-    def test_lsof_readback_refuses_missing_extra_non_pipe_or_shared_descriptors(self):
-        base = descriptor_output((101,))
-        mutations = (
-            base.replace("f1\ntPIPE", "f0\ntPIPE"),
-            base + "f3\ntPIPE\nn->0xfeed\n",
-            base.replace("f1\ntPIPE", "f1\ntREG"),
-            base.replace("n->0x2c6caff2d92a6b2b", "n->0xa41e4580bb63aaf3"),
-            base.replace("f2\ntPIPE\nn->0x2c6caff2d92a6b2b\n", ""),
-            base.replace("fcwd", "fother"),
-            descriptor_output((101,)),
-        )
-        pids = ((101,), (101,), (101,), (101,), (101,), (101,), (101, 102))
-        for index, (payload, expected_pids) in enumerate(zip(mutations, pids)):
-            with self.subTest(mutation_index=index):
-                with self.assertRaisesRegex(macos_capability.ProbeFailure, "descriptor_readback_unavailable"):
-                    self.read_snapshot(payload, expected_pids)
-
-    def test_native_readback_refuses_unallowed_descriptors_modes_types_and_shared_pipes(self):
-        payload = descriptor_output((101,))
-        mutations = (
-            {1: {"mode": "w", "type": "PIPE", "name": "->1"}},
-            {1: {"mode": "w", "type": "PIPE", "name": "->1"}, 2: {"mode": "w", "type": "PIPE", "name": "->2"}, 3: {"mode": "w", "type": "PIPE", "name": "->3"}},
-            {0: {"mode": "rw", "type": "CHR", "name": "/dev/null"}, 1: {"mode": "w", "type": "PIPE", "name": "->1"}, 2: {"mode": "w", "type": "PIPE", "name": "->2"}},
-            {1: {"mode": "r", "type": "PIPE", "name": "->1"}, 2: {"mode": "w", "type": "PIPE", "name": "->2"}},
-            {1: {"mode": "w", "type": "PIPE", "name": "->1"}, 2: {"mode": "u", "type": "PIPE", "name": "->2"}},
-            {1: {"mode": "w", "type": "PIPE", "name": "->1"}, 2: {"mode": "w", "type": "PIPE", "name": "->1"}},
-        )
-        for index, native in enumerate(mutations):
-            result = subprocess.CompletedProcess([], 0, payload.encode("utf-8"), b"")
-            with self.subTest(mutation_index=index):
-                with patch.object(macos_capability, "_run", return_value=result):
-                    with patch.object(macos_capability, "_native_descriptor_snapshot", return_value=native):
-                        with self.assertRaisesRegex(macos_capability.ProbeFailure, "descriptor_readback_unavailable"):
-                            macos_capability._descriptor_snapshot([101])
-
-    def test_probe_requires_observed_forked_grandchild_and_all_process_roles(self):
-        roles = {
-            "capabilityprobe",
-            "capabilitychild",
-            "sh",
-            "sleep",
-            "capability-child",
-            "forked-grandchild",
-            "python3",
-            "clang",
-        }
-        self.assertTrue(macos_capability._roles_complete(roles))
-        roles.remove("forked-grandchild")
-        self.assertFalse(macos_capability._roles_complete(roles))
-        observed = macos_capability._observe_roles(
-            {"capabilityprobe", "capabilitychild", "capability-child", "clang"},
-            {"capabilityprobe": 1, "capabilitychild": 1, "capability-child": 2, "clang": 1},
-        )
-        self.assertIn("forked-grandchild", observed)
-
-
 class ProbeTeardownTests(unittest.TestCase):
     def setUp(self):
         self.toolchain_patcher = patch.object(
@@ -3005,6 +2941,96 @@ class ProbeTeardownTests(unittest.TestCase):
         descriptors.assert_called_once()
         sampled_pids = descriptors.call_args.args[0]
         self.assertEqual(set(sampled_pids), set(signed_probe_rows))
+
+    def run_observer(self, polls, snapshot, python_name="/x/Python.app/Contents/MacOS/Python", trusted=True):
+        uid = 502
+
+        class StubProcess:
+            pid = 12340
+            stdout = io.BytesIO(b"")
+            stderr = io.BytesIO(macos_capability.PROBE_IDENTITY_VERIFIED)
+            returncode = None
+            calls = 0
+
+            def poll(self):
+                self.calls += 1
+                return None if self.calls <= polls else 0
+
+            def wait(self, timeout):
+                self.returncode = 0
+                return 0
+
+        process = StubProcess()
+        rows = {process.pid: (1, uid, chr(47) + "private/tmp/CapabilityProbe")}
+        for pid, name in enumerate(
+            ("CapabilityChild", "/bin/sh", "/bin/sleep", "capability-child", "capability-child", "/usr/bin/clang", python_name),
+            start=12342,
+        ):
+            rows[pid] = (process.pid, uid, name)
+        with patch.object(macos_capability, "_terminate_probe_tree", return_value=True) as teardown:
+            with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+                with patch.object(macos_capability, "_process_table", return_value=rows):
+                    with patch.object(macos_capability, "_descriptor_snapshot", side_effect=snapshot), patch.object(
+                        macos_capability, "_image_is_trusted", return_value=trusted
+                    ):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
+                            with patch.object(macos_capability.time, "sleep"):
+                                self.observe_probe("/tmp/CapabilityProbe", "/tmp/marker", "/tmp/outside", uid, "/tmp/home")
+        return teardown
+
+    def test_every_role_observed_on_verified_pids_completes_the_observation(self):
+        calls = []
+
+        def snapshot(pids, policy=None, agreed=None):
+            calls.append(policy)
+            return {pid: {} for pid in pids}
+
+        self.run_observer(7, snapshot)
+        self.assertEqual(len(calls), 7)
+        policy = calls[0]
+        canonical = macos_capability._canonical_path
+        self.assertEqual(policy.images, frozenset((canonical(TEST_TOOLCHAIN["clang"]), canonical(TEST_TOOLCHAIN["linker"]))))
+        self.assertEqual(policy.storage, canonical("/tmp/storage"))
+        self.assertIn(canonical(TEST_TOOLCHAIN["sdk"]), policy.read_roots)
+
+    def test_a_clang_named_process_with_an_untrusted_image_earns_no_clang_role(self):
+        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+            self.run_observer(4, lambda pids, policy=None, agreed=None: {pid: {} for pid in pids}, trusted=False)
+        self.assertEqual(raised.exception.missing_roles, ("clang",))
+
+    def test_unverified_pids_supply_no_roles_and_the_refusal_names_the_missing_ones(self):
+        def snapshot(pids, policy=None, agreed=None):
+            return {pid: {} for pid in pids if pid not in {12343, 12347}}
+
+        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+            self.run_observer(3, snapshot)
+        refusal = raised.exception
+        self.assertEqual((refusal.reason, refusal.missing_roles, refusal.snapshot_rejections),
+                         ("descriptor_readback_unavailable", ("sh", "clang"), "some"))
+
+    def test_a_failed_snapshot_counts_as_a_rejection_and_supplies_no_roles(self):
+        def snapshot(pids, policy=None, agreed=None):
+            raise macos_capability.ProbeFailure("descriptor_readback_unavailable")
+
+        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+            self.run_observer(12, snapshot)
+        self.assertEqual(raised.exception.missing_roles, macos_capability.PROBE_ROLE_ORDER)
+        self.assertEqual(raised.exception.snapshot_rejections, "many")
+
+    def test_a_channel_verdict_refuses_at_once_even_after_every_role_was_seen(self):
+        calls = []
+
+        def snapshot(pids, policy=None, agreed=None):
+            calls.append(1)
+            if len(calls) > 3:
+                raise macos_capability.ProbeFailure("descriptor_channel_unexpected")
+            return {pid: {} for pid in pids}
+
+        with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                self.run_observer(12, snapshot)
+        self.assertEqual((raised.exception.reason, raised.exception.cleanup_complete), ("descriptor_channel_unexpected", True))
+        self.assertEqual(len(calls), 4)
 
     def test_observe_census_detects_detached_child_after_group_cleanup(self):
         process = type(

@@ -36,7 +36,9 @@ DARWIN_UID_MAX = DARWIN_UID_MODULUS - 1
 DARWIN_SIGNED_UID_MIN = -(1 << 31)
 LSOF_NON_DESCRIPTOR_ENTRIES = frozenset(("cwd", "rtd", "txt", "mem", "ltx"))
 PROC_PIDLISTFDS = 1
+PROC_PIDFDVNODEPATHINFO = 2
 PROC_PIDFDPIPEINFO = 6
+PROX_FDTYPE_VNODE = 1
 PROX_FDTYPE_PIPE = 6
 FREAD = 1
 FWRITE = 2
@@ -64,6 +66,35 @@ SANDBOX_EXIT_STAGES = ("positive_read_exit", "positive_write_exit", "probe_exit"
 SANDBOX_STAGE_SET = frozenset(SANDBOX_STAGES)
 SANDBOX_FAILURE_SET = frozenset(SANDBOX_FAILURES)
 SANDBOX_EXIT_STAGE_SET = frozenset(SANDBOX_EXIT_STAGES)
+PROBE_ROLE_ORDER = (
+    "capabilityprobe",
+    "capabilitychild",
+    "sh",
+    "sleep",
+    "capability-child",
+    "forked-grandchild",
+    "python3",
+    "clang",
+)
+PROBE_ROLE_SET = frozenset(PROBE_ROLE_ORDER)
+SNAPSHOT_REJECTION_BUCKETS = ("none", "some", "many")
+SNAPSHOT_REJECTION_SET = frozenset(SNAPSHOT_REJECTION_BUCKETS)
+SNAPSHOT_REJECTIONS_MANY = 10
+PROBE_STDIN_DEVICE = "/dev/null"
+CLANG_ROLE_EVIDENCE = "spawn-time descriptors of the suspended hold process"
+
+
+def _closed_missing_roles(roles):
+    if not isinstance(roles, (tuple, list, set, frozenset)):
+        return ()
+    present = {role for role in roles if type(role) is str and role in PROBE_ROLE_SET}
+    return tuple(role for role in PROBE_ROLE_ORDER if role in present)
+
+
+def _closed_rejection_bucket(bucket):
+    if type(bucket) is str and bucket in SNAPSHOT_REJECTION_SET:
+        return bucket
+    return None
 SIGNAL_EXIT_FAILURES = {
     9: "signal_kill",
     5: "signal_trap",
@@ -209,6 +240,7 @@ REASONS = frozenset(
         "sandbox_signing_unavailable",
         "sandbox_behavior_unavailable",
         "descriptor_readback_unavailable",
+        "descriptor_channel_unexpected",
         "probe_timeout",
     )
 )
@@ -282,7 +314,7 @@ PROBE_IDENTITY_CHECKS = frozenset(
 class ProbeFailure(Exception):
     def __init__(
         self, reason, cleanup_complete=True, check=None, survivor_classes=None,
-        sandbox_stage=None, sandbox_failure=None,
+        sandbox_stage=None, sandbox_failure=None, missing_roles=None, snapshot_rejections=None,
     ):
         super().__init__(reason if reason in REASONS else "native_preflight_unavailable")
         self.reason = reason if reason in REASONS else "native_preflight_unavailable"
@@ -318,6 +350,12 @@ class ProbeFailure(Exception):
         else:
             self.sandbox_stage = None
             self.sandbox_failure = None
+        if self.reason == "descriptor_readback_unavailable":
+            self.missing_roles = _closed_missing_roles(missing_roles)
+            self.snapshot_rejections = _closed_rejection_bucket(snapshot_rejections)
+        else:
+            self.missing_roles = ()
+            self.snapshot_rejections = None
 
 
 class _ProcFdInfo(ctypes.Structure):
@@ -374,13 +412,30 @@ class _PipeFdInfo(ctypes.Structure):
     _fields_ = (("pfi", _ProcFileInfo), ("pipeinfo", _PipeInfo))
 
 
+class _VnodeInfo(ctypes.Structure):
+    _fields_ = (
+        ("stat", _VInfoStat),
+        ("type", ctypes.c_int32),
+        ("pad", ctypes.c_int32),
+        ("fsid", ctypes.c_int32 * 2),
+    )
+
+
+class _VnodePathInfo(ctypes.Structure):
+    _fields_ = (("vnode", _VnodeInfo), ("path", ctypes.c_char * 1024))
+
+
+class _VnodeFdInfoWithPath(ctypes.Structure):
+    _fields_ = (("pfi", _ProcFileInfo), ("pvip", _VnodePathInfo))
+
+
 def valid_sha(value):
     return type(value) is str and CONTROL_SHA.fullmatch(value) is not None
 
 
 def safe_output(
     observed, reason="native_preflight_unavailable", check=None, survivor_classes=None,
-    sandbox_stage=None, sandbox_failure=None,
+    sandbox_stage=None, sandbox_failure=None, missing_roles=None, snapshot_rejections=None,
 ):
     capability = "macos-capability=observed" if observed else "macos-capability=refused"
     if not observed:
@@ -413,6 +468,13 @@ def safe_output(
                 and sandbox_failure in SANDBOX_FAILURE_SET
             ):
                 capability += " sandbox_failure=" + sandbox_failure
+        if reason == "descriptor_readback_unavailable":
+            roles = _closed_missing_roles(missing_roles)
+            if roles:
+                capability += " missing_roles=" + ",".join(roles)
+            bucket = _closed_rejection_bucket(snapshot_rejections)
+            if bucket is not None:
+                capability += " snapshot_rejections=" + bucket
     return capability + "\nmacos-confinement=refused reason=incomplete_channel_evidence\n"
 
 
@@ -1658,58 +1720,214 @@ def _load_libproc():
         library.proc_pidinfo.restype = ctypes.c_int
         library.proc_pidfdinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
         library.proc_pidfdinfo.restype = ctypes.c_int
+        library.proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+        library.proc_pidpath.restype = ctypes.c_int
         return library
     except (OSError, AttributeError):
         raise ProbeFailure("descriptor_readback_unavailable")
 
 
-def _native_descriptor_snapshot(pid):
+def _unexpected_channel():
+    return ProbeFailure("descriptor_channel_unexpected")
+
+
+class _ToolchainPolicy:
+    def __init__(self, images, storage, read_roots):
+        self.images = frozenset(images)
+        self.storage = storage
+        self.read_roots = tuple(read_roots)
+
+
+def _within(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _toolchain_policy(compiler, linker, sdk_root, storage_directory):
+    roots = [_canonical_path(sdk_root), _canonical_path(storage_directory)]
+    for tool in (compiler, linker):
+        parents = Path(_canonical_path(tool)).parents
+        if len(parents) > 3:
+            roots.append(parents[2].as_posix())
+    return _ToolchainPolicy(
+        (_canonical_path(compiler), _canonical_path(linker)),
+        _canonical_path(storage_directory),
+        sorted(set(roots)),
+    )
+
+
+def _pid_image(library, pid):
+    buffer = ctypes.create_string_buffer(4096)
+    returned = library.proc_pidpath(pid, buffer, len(buffer))
+    if returned <= 0 or returned >= len(buffer):
+        return None
+    try:
+        return buffer.raw[:returned].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _image_is_trusted(pid, policy):
+    if policy is None:
+        return False
+    image = _pid_image(_load_libproc(), pid)
+    return image is not None and image in policy.images
+
+
+_NULL_DEVICE_RDEV = []
+
+
+def _null_device_rdev():
+    if not _NULL_DEVICE_RDEV:
+        try:
+            info = os.stat(PROBE_STDIN_DEVICE)
+        except OSError:
+            raise ProbeFailure("descriptor_readback_unavailable") from None
+        if not stat.S_ISCHR(info.st_mode):
+            raise ProbeFailure("descriptor_readback_unavailable")
+        _NULL_DEVICE_RDEV.append(info.st_rdev)
+    return _NULL_DEVICE_RDEV[0]
+
+
+def _native_vnode(library, pid, fd):
+    buffer = ctypes.create_string_buffer(ctypes.sizeof(_VnodeFdInfoWithPath))
+    returned = library.proc_pidfdinfo(pid, fd, PROC_PIDFDVNODEPATHINFO, buffer, len(buffer))
+    if returned != ctypes.sizeof(_VnodeFdInfoWithPath):
+        return None
+    info = _VnodeFdInfoWithPath.from_buffer_copy(buffer.raw)
+    if info.pfi.type != PROX_FDTYPE_VNODE:
+        return None
+    return info.pvip.vnode.stat.mode, info.pvip.vnode.stat.rdev, info.pvip.path, info.pfi.openflags
+
+
+def _extra_descriptor_allowed(node, policy):
+    mode, _rdev, raw_path, flags = node
+    try:
+        path = raw_path.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+        return False
+    if not path.startswith("/") or ".." in path.split("/"):
+        return False
+    if _within(path, policy.storage):
+        return True
+    if flags & FWRITE:
+        return False
+    return any(_within(path, root) for root in policy.read_roots)
+
+
+def _native_descriptor_snapshot(pid, policy=None):
+    """Return (descriptors, granted) for pid, None when the process is gone or unreadable,
+    and raise descriptor_channel_unexpected for any readable but non-conforming process.
+    The toolchain allowance is granted by the executable image path alone, never by name."""
     library = _load_libproc()
     buffer = ctypes.create_string_buffer(8192)
     returned = library.proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buffer, len(buffer))
-    if returned <= 0 or returned >= len(buffer) or returned % ctypes.sizeof(_ProcFdInfo):
+    if returned <= 0:
+        return None
+    if returned >= len(buffer):
+        raise _unexpected_channel()
+    if returned % ctypes.sizeof(_ProcFdInfo):
         raise ProbeFailure("descriptor_readback_unavailable")
     descriptors = {}
     for offset in range(0, returned, ctypes.sizeof(_ProcFdInfo)):
         item = _ProcFdInfo.from_buffer_copy(buffer.raw[offset : offset + ctypes.sizeof(_ProcFdInfo)])
         if item.fd < 0 or item.fd in descriptors:
-            raise ProbeFailure("descriptor_readback_unavailable")
+            raise _unexpected_channel()
         descriptors[item.fd] = item.type
-    if set(descriptors) != {1, 2}:
-        raise ProbeFailure("descriptor_readback_unavailable")
-    if descriptors != {1: PROX_FDTYPE_PIPE, 2: PROX_FDTYPE_PIPE}:
-        raise ProbeFailure("descriptor_readback_unavailable")
+    if not descriptors:
+        return None
+    extras = sorted(set(descriptors) - {0, 1, 2})
+    for fd, kind in descriptors.items():
+        if kind != (PROX_FDTYPE_PIPE if fd in (1, 2) else PROX_FDTYPE_VNODE):
+            raise _unexpected_channel()
+    if not {1, 2}.issubset(descriptors):
+        raise _unexpected_channel()
+    granted = False
+    if extras:
+        if policy is None:
+            raise _unexpected_channel()
+        image = _pid_image(library, pid)
+        if image is None:
+            return None
+        if image not in policy.images:
+            raise _unexpected_channel()
+        granted = True
 
+    unreadable = False
     observations = {}
+    if 0 in descriptors:
+        node = _native_vnode(library, pid, 0)
+        if node is None:
+            unreadable = True
+        else:
+            mode, rdev, path, _flags = node
+            if (
+                path != PROBE_STDIN_DEVICE.encode("ascii")
+                or not stat.S_ISCHR(mode)
+                or rdev != _null_device_rdev()
+            ):
+                raise _unexpected_channel()
+            observations[0] = {"mode": "?", "type": "VNODE", "name": PROBE_STDIN_DEVICE}
     pipe_handles = set()
     for fd in (1, 2):
         pipe_buffer = ctypes.create_string_buffer(ctypes.sizeof(_PipeFdInfo))
         returned = library.proc_pidfdinfo(pid, fd, PROC_PIDFDPIPEINFO, pipe_buffer, len(pipe_buffer))
         if returned != ctypes.sizeof(_PipeFdInfo):
-            raise ProbeFailure("descriptor_readback_unavailable")
+            unreadable = True
+            continue
         pipe = _PipeFdInfo.from_buffer_copy(pipe_buffer.raw)
         if pipe.pfi.type != PROX_FDTYPE_PIPE or pipe.pfi.openflags & (FREAD | FWRITE) != FWRITE:
-            raise ProbeFailure("descriptor_readback_unavailable")
+            raise _unexpected_channel()
         handles = (pipe.pipeinfo.handle, pipe.pipeinfo.peerhandle)
         if not all(handles) or handles[0] == handles[1] or pipe_handles.intersection(handles):
-            raise ProbeFailure("descriptor_readback_unavailable")
+            raise _unexpected_channel()
         pipe_handles.update(handles)
         observations[fd] = {
             "mode": "w",
             "type": "PIPE",
             "name": "->0x" + format(handles[0], "x"),
         }
-    return observations
+    for fd in extras:
+        node = _native_vnode(library, pid, fd)
+        if node is None:
+            unreadable = True
+        elif not _extra_descriptor_allowed(node, policy):
+            raise _unexpected_channel()
+    if unreadable:
+        return None
+    return observations, granted
 
 
-def _descriptor_snapshot(pids):
+def _check_lsof_descriptors(entries, granted):
+    for fd, entry in entries.items():
+        if fd == 0:
+            allowed = entry["type"] == "CHR" and entry["name"] == PROBE_STDIN_DEVICE
+        elif fd in (1, 2):
+            allowed = entry["type"] == "PIPE" and entry["name"].startswith("->")
+        else:
+            allowed = granted and entry["type"] in ("REG", "DIR")
+        if not allowed:
+            raise _unexpected_channel()
+    if not {1, 2}.issubset(entries) or entries[1]["name"] == entries[2]["name"]:
+        raise _unexpected_channel()
+
+
+def _descriptor_snapshot(pids, policy=None, agreed=None):
     if not pids or len(set(pids)) != len(pids):
         raise ProbeFailure("descriptor_readback_unavailable")
-    joined = ",".join(str(pid) for pid in pids)
-    result = _run(["/usr/sbin/lsof", "-nP", "-Fpfnt", "-p", joined], timeout=10)
-    if result.returncode not in (0, 1):
-        raise ProbeFailure("descriptor_readback_unavailable")
+    if agreed is None:
+        agreed = set()
+    agreed.intersection_update(pids)
+    unconfirmed = [pid for pid in pids if pid not in agreed]
     lsof = {}
+    if unconfirmed:
+        joined = ",".join(str(pid) for pid in unconfirmed)
+        result = _run(["/usr/sbin/lsof", "-nP", "-Fpfnt", "-p", joined], timeout=10)
+        if result.returncode not in (0, 1):
+            raise ProbeFailure("descriptor_readback_unavailable")
+    else:
+        result = subprocess.CompletedProcess([], 0, b"", b"")
     current_pid = None
     current_fd = None
     current_special_entry = False
@@ -1750,24 +1968,27 @@ def _descriptor_snapshot(pids):
             entry["name"] = line[1:]
         else:
             raise ProbeFailure("descriptor_readback_unavailable")
-    if set(lsof) != set(pids):
-        raise ProbeFailure("descriptor_readback_unavailable")
     observations = {}
     for pid in pids:
-        native = _native_descriptor_snapshot(pid)
-        if set(lsof[pid]) != set(native):
-            raise ProbeFailure("descriptor_readback_unavailable")
-        if any(lsof[pid][fd]["type"] != "PIPE" or not lsof[pid][fd]["name"].startswith("->") for fd in (1, 2)):
-            raise ProbeFailure("descriptor_readback_unavailable")
-        if lsof[pid][1]["name"] == lsof[pid][2]["name"]:
-            raise ProbeFailure("descriptor_readback_unavailable")
+        result_pair = _native_descriptor_snapshot(pid, policy)
+        if result_pair is None:
+            agreed.discard(pid)
+            continue
+        native, granted = result_pair
+        if pid in agreed:
+            observations[pid] = native
+            continue
+        entries = lsof.get(pid)
+        if not entries:
+            continue
+        _check_lsof_descriptors(entries, granted)
+        if {fd for fd in entries if fd < 3} != set(native):
+            continue
         if native[1]["name"] == native[2]["name"]:
-            raise ProbeFailure("descriptor_readback_unavailable")
-        for fd in (1, 2):
-            if native[fd]["type"] != lsof[pid][fd]["type"]:
-                raise ProbeFailure("descriptor_readback_unavailable")
-            if native[fd]["mode"] != "w":
-                raise ProbeFailure("descriptor_readback_unavailable")
+            raise _unexpected_channel()
+        if any(native[fd]["type"] != entries[fd]["type"] or native[fd]["mode"] != "w" for fd in (1, 2)):
+            continue
+        agreed.add(pid)
         observations[pid] = native
     return observations
 
@@ -1779,7 +2000,7 @@ def _role_names(rows, pids):
 def _observe_roles(names, counts):
     roles = set()
     roles.update(name for name in names if name in {"capabilityprobe", "capabilitychild", "sh", "sleep", "capability-child"})
-    if any(name.startswith("python3") for name in names):
+    if any(name.startswith("python3") or name == "python" for name in names):
         roles.add("python3")
     if any(name.startswith("clang") for name in names):
         roles.add("clang")
@@ -1789,16 +2010,17 @@ def _observe_roles(names, counts):
 
 
 def _roles_complete(roles):
-    return {
-        "capabilityprobe",
-        "capabilitychild",
-        "sh",
-        "sleep",
-        "capability-child",
-        "forked-grandchild",
-        "python3",
-        "clang",
-    }.issubset(roles)
+    return PROBE_ROLE_SET.issubset(roles)
+
+
+def _missing_roles(roles):
+    return tuple(role for role in PROBE_ROLE_ORDER if role not in roles)
+
+
+def _rejection_bucket(count):
+    if count <= 0:
+        return "none"
+    return "many" if count >= SNAPSHOT_REJECTIONS_MANY else "some"
 
 
 class _Capture:
@@ -1943,6 +2165,9 @@ def _observe_probe(
         err_capture.start()
         deadline = time.monotonic() + MAX_PROBE_SECONDS
         observed_roles = set()
+        rejected_polls = 0
+        agreed = set()
+        policy = _toolchain_policy(compiler_executable, linker_executable, sdk_root, storage_directory)
         expected_executable = Path(executable).name
         while time.monotonic() < deadline and process.poll() is None:
             rows = _process_table()
@@ -1961,18 +2186,22 @@ def _observe_probe(
                 pids.insert(0, process.pid)
             if pids:
                 try:
-                    _descriptor_snapshot(pids)
-                    counts = {}
-                    for pid in pids:
+                    verified = _descriptor_snapshot(pids, policy, agreed)
+                except ProbeFailure as error:
+                    if error.reason == "descriptor_channel_unexpected":
+                        raise
+                    verified = {}
+                if len(verified) != len(pids):
+                    rejected_polls += 1
+                counts = {}
+                for pid in pids:
+                    if pid in verified:
                         name = Path(rows[pid][2]).name.lower()
+                        if name.startswith("clang") and not _image_is_trusted(pid, policy):
+                            continue
                         counts[name] = counts.get(name, 0) + 1
-                    names = set(counts)
-                    observed_roles.update(_observe_roles(names, counts))
-                except ProbeFailure:
-                    pass
+                observed_roles.update(_observe_roles(set(counts), counts))
             if out_capture.overflow or err_capture.overflow:
-                break
-            if _roles_complete(observed_roles):
                 break
             time.sleep(0.08)
         if out_capture.overflow or err_capture.overflow:
@@ -2062,7 +2291,11 @@ def _observe_probe(
             sandbox_failure=_classify_exit(process.returncode, PROBE_EXIT_FAILURES),
         )
     if not _roles_complete(observed_roles):
-        raise ProbeFailure("descriptor_readback_unavailable")
+        raise ProbeFailure(
+            "descriptor_readback_unavailable",
+            missing_roles=_missing_roles(observed_roles),
+            snapshot_rejections=_rejection_bucket(rejected_polls),
+        )
 
 
 def run_native_probe(control_sha):
@@ -2198,6 +2431,7 @@ def main(argv=None):
             safe_output(
                 False, error.reason, error.check, survivor_classes=error.survivor_classes,
                 sandbox_stage=error.sandbox_stage, sandbox_failure=error.sandbox_failure,
+                missing_roles=error.missing_roles, snapshot_rejections=error.snapshot_rejections,
             ),
             end="",
         )

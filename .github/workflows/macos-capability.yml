@@ -47,6 +47,7 @@ jobs:
           python3 -B kit/confinement/test_linux_harness.py
           python3 -B kit/confinement/test_macos_harness.py
           python3 -B kit/confinement/test_macos_capability.py
+          python3 -B kit/confinement/test_macos_descriptors.py
           python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
       - name: Run source-free capability experiment
         run: |
