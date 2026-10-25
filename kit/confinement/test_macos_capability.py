@@ -3619,10 +3619,10 @@ class SeatbeltProfileTests(unittest.TestCase):
 
     def test_writer_canonicalizes_every_path_and_writes_a_world_readable_profile(self):
         mapping = {
-            "/tmp/marker": "/real/marker",
-            "/tmp/storage": "/real/storage",
-            "/tmp/dir": "/real/dir",
-            "/tmp/file": "/real/file",
+            str(Path("/tmp/marker")): "/real/marker",
+            str(Path("/tmp/storage")): "/real/storage",
+            str(Path("/tmp/dir")): "/real/dir",
+            str(Path("/tmp/file")): "/real/file",
         }
         with tempfile.TemporaryDirectory(prefix="macos-profile-writer-") as directory:
             with patch.object(macos_capability, "_canonical_path", side_effect=lambda path: mapping[str(path)]):
