@@ -979,6 +979,8 @@ class DenyDefaultPolicyTests(unittest.TestCase):
             output = result.stdout.decode("ascii", "strict")
         except UnicodeDecodeError:
             self.fail("isolated help was not plain text")
+        self.assertNotIn("\r", output.replace("\r\n", ""))
+        output = output.replace("\r\n", "\n")
         program = Path(deny.__file__).name
         group = "optional arguments" if sys.version_info < (3, 10) else "options"
         expected = re.fullmatch(
