@@ -27,6 +27,62 @@ TEST_TOOLCHAIN = {
 }
 
 
+class ContextGitTrustTests(unittest.TestCase):
+    def test_root_git_lookup_scopes_safe_directory_to_the_canonical_checkout(self):
+        root = Path(macos_capability.__file__).resolve().parents[2]
+        environment = {
+            "CI_EVENT_NAME": "workflow_dispatch",
+            "CI_REF": "refs/heads/main",
+            "CI_REPOSITORY": "keeldock-platform/platform-ci",
+            "CI_SERVER_URL": "https://github.com",
+            "CI_SHA": CONTROL_SHA,
+        }
+        expected_argv = [
+            "/usr/bin/git",
+            "-c",
+            "safe.directory=",
+            "-c",
+            "safe.directory=" + str(root),
+            "rev-parse",
+            "--verify",
+            "HEAD",
+        ]
+        result = subprocess.CompletedProcess(expected_argv, 0, (CONTROL_SHA + "\n").encode("ascii"), b"")
+        with ExitStack() as stack:
+            stack.enter_context(patch.dict(os.environ, environment, clear=True))
+            stack.enter_context(patch.object(macos_capability.sys, "platform", "darwin"))
+            stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
+            stack.enter_context(patch.object(macos_capability.Path, "cwd", return_value=root))
+            lookup = stack.enter_context(patch.object(macos_capability, "_run", return_value=result))
+            self.assertNotIn("SUDO_UID", os.environ)
+            self.assertEqual(macos_capability._check_context(CONTROL_SHA, str(root)), root)
+        lookup.assert_called_once_with(expected_argv, cwd=root, timeout=5)
+
+    def test_invalid_context_refuses_before_git_lookup_without_sudo_uid(self):
+        root = Path(macos_capability.__file__).resolve().parents[2]
+        expected_environment = {
+            "CI_EVENT_NAME": "workflow_dispatch",
+            "CI_REF": "refs/heads/main",
+            "CI_REPOSITORY": "keeldock-platform/platform-ci",
+            "CI_SERVER_URL": "https://github.com",
+            "CI_SHA": CONTROL_SHA,
+        }
+        for key, invalid in (("CI_REF", "refs/heads/feature"), ("CI_SHA", "b" * 40)):
+            with self.subTest(key=key):
+                environment = dict(expected_environment)
+                environment[key] = invalid
+                with ExitStack() as stack:
+                    stack.enter_context(patch.dict(os.environ, environment, clear=True))
+                    stack.enter_context(patch.object(macos_capability.sys, "platform", "darwin"))
+                    stack.enter_context(patch.object(macos_capability.os, "geteuid", return_value=0, create=True))
+                    stack.enter_context(patch.object(macos_capability.Path, "cwd", return_value=root))
+                    lookup = stack.enter_context(patch.object(macos_capability, "_run"))
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._check_context(CONTROL_SHA, str(root))
+                self.assertEqual(raised.exception.reason, "control_identity_invalid")
+                lookup.assert_not_called()
+
+
 class FixedOutcomeTests(unittest.TestCase):
     def setUp(self):
         sandbox_patcher = patch.object(
