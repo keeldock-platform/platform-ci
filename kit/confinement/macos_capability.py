@@ -51,12 +51,22 @@ SANDBOX_FAILURES = (
     "invalid_input", "identity_invalid", "sandbox_missing", "child_sandbox_missing", "child_failed",
     "storage_unavailable", "outside_write_allowed",
     "python_error", "exec_failed",
-    "signal_exit", "other_exit",
+    "signal_kill", "signal_trap", "signal_abort", "signal_segv", "signal_bus", "signal_ill", "signal_term",
+    "signal_other", "other_exit",
 )
 SANDBOX_EXIT_STAGES = ("positive_read_exit", "positive_write_exit", "probe_exit")
 SANDBOX_STAGE_SET = frozenset(SANDBOX_STAGES)
 SANDBOX_FAILURE_SET = frozenset(SANDBOX_FAILURES)
 SANDBOX_EXIT_STAGE_SET = frozenset(SANDBOX_EXIT_STAGES)
+SIGNAL_EXIT_FAILURES = {
+    9: "signal_kill",
+    5: "signal_trap",
+    6: "signal_abort",
+    11: "signal_segv",
+    10: "signal_bus",
+    4: "signal_ill",
+    15: "signal_term",
+}
 PROBE_EXIT_FAILURES = {
     20: "invalid_input",
     21: "identity_invalid",
@@ -1256,7 +1266,7 @@ def _classify_exit(returncode, codes):
     if type(returncode) is not int:
         return "other_exit"
     if returncode < 0:
-        return "signal_exit"
+        return SIGNAL_EXIT_FAILURES.get(-returncode, "signal_other")
     if returncode in codes:
         return codes[returncode]
     return "other_exit"

@@ -3089,8 +3089,16 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
                 "invalid_input", "identity_invalid", "sandbox_missing", "child_sandbox_missing", "child_failed",
                 "storage_unavailable", "outside_write_allowed",
                 "python_error", "exec_failed",
-                "signal_exit", "other_exit",
+                "signal_kill", "signal_trap", "signal_abort", "signal_segv", "signal_bus", "signal_ill",
+                "signal_term", "signal_other", "other_exit",
             ),
+        )
+        self.assertEqual(
+            macos_capability.SIGNAL_EXIT_FAILURES,
+            {
+                9: "signal_kill", 5: "signal_trap", 6: "signal_abort", 11: "signal_segv",
+                10: "signal_bus", 4: "signal_ill", 15: "signal_term",
+            },
         )
         self.assertEqual(
             macos_capability.SANDBOX_EXIT_STAGES, ("positive_read_exit", "positive_write_exit", "probe_exit")
@@ -3172,15 +3180,30 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
             if (
                 isinstance(node, ast.Assign)
                 and len(node.targets) == 1
-                and getattr(node.targets[0], "id", None) in ("PROBE_EXIT_FAILURES", "CONTROL_EXIT_FAILURES")
+                and getattr(node.targets[0], "id", None)
+                in ("PROBE_EXIT_FAILURES", "CONTROL_EXIT_FAILURES", "SIGNAL_EXIT_FAILURES")
             ):
                 emitted_failures |= {value.value for value in node.value.values}
         classify = next(
             f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == "_classify_exit"
         )
         for node in ast.walk(classify):
-            if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant):
+            if (
+                isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Constant)
+                and type(node.value.value) is str
+            ):
                 emitted_failures.add(node.value.value)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "SIGNAL_EXIT_FAILURES"
+            ):
+                self.assertEqual(len(node.args), 2)
+                self.assertIsInstance(node.args[1], ast.Constant)
+                emitted_failures.add(node.args[1].value)
         self.assertEqual(emitted_failures, macos_capability.SANDBOX_FAILURE_SET)
 
     def test_classify_exit_maps_known_codes_signals_and_everything_else(self):
@@ -3193,10 +3216,42 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
             self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), "other_exit")
         for code in (2, 20, 126):
             self.assertEqual(classify(code, macos_capability.CONTROL_EXIT_FAILURES), "other_exit")
-        for code in (-1, -9, -15):
-            self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), "signal_exit")
+        named = {-9: "signal_kill", -5: "signal_trap", -6: "signal_abort", -11: "signal_segv",
+                 -10: "signal_bus", -4: "signal_ill", -15: "signal_term"}
+        for table in (macos_capability.PROBE_EXIT_FAILURES, macos_capability.CONTROL_EXIT_FAILURES):
+            for code, expected in named.items():
+                self.assertEqual(classify(code, table), expected)
+            for code in (-1, -2, -3, -7, -8, -30, -64, -255):
+                self.assertEqual(classify(code, table), "signal_other")
+        for code in (-5.0, -9.0, "-9", None, False):
+            self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), "other_exit")
+        self.assertEqual(classify(0, macos_capability.PROBE_EXIT_FAILURES), "other_exit")
         for code in (None, "23", 23.0, True):
             self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), "other_exit")
+
+    def test_signal_exit_failures_and_classify_exit_alone_use_integer_literals_and_no_signal_module(self):
+        import ast
+        source = Path(macos_capability.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        tables = [
+            node for node in tree.body
+            if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "SIGNAL_EXIT_FAILURES"
+        ]
+        self.assertEqual(len(tables), 1)
+        self.assertIsInstance(tables[0].value, ast.Dict)
+        for key, value in zip(tables[0].value.keys, tables[0].value.values):
+            self.assertIsInstance(key, ast.Constant)
+            self.assertIs(type(key.value), int)
+            self.assertIsInstance(value, ast.Constant)
+        classify = next(
+            f for f in ast.walk(tree) if isinstance(f, ast.FunctionDef) and f.name == "_classify_exit"
+        )
+        for scope in (tables[0], classify):
+            for node in ast.walk(scope):
+                if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+                    self.assertNotEqual(node.value.id, "signal")
+                if isinstance(node, ast.Name):
+                    self.assertNotEqual(node.id, "signal")
 
     def test_safe_output_emits_only_declared_sandbox_values_for_the_sandbox_reason(self):
         reason = "sandbox_behavior_unavailable"
@@ -3439,7 +3494,19 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
         )
         self.assert_refusal(
             self.drive(popen_script=(("exit", -9),)),
-            " sandbox_stage=positive_read_exit sandbox_failure=signal_exit",
+            " sandbox_stage=positive_read_exit sandbox_failure=signal_kill",
+        )
+        self.assert_refusal(
+            self.drive(popen_script=(("exit", -5),)),
+            " sandbox_stage=positive_read_exit sandbox_failure=signal_trap",
+        )
+        self.assert_refusal(
+            self.drive(popen_script=(("ok",), ("exit", -11))),
+            " sandbox_stage=positive_write_exit sandbox_failure=signal_segv",
+        )
+        self.assert_refusal(
+            self.drive(popen_script=(("exit", -64),)),
+            " sandbox_stage=positive_read_exit sandbox_failure=signal_other",
         )
         self.assert_refusal(
             self.drive(popen_script=(("exit", 7),)),
@@ -3486,7 +3553,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
 
     def test_probe_exit_site_maps_each_known_code_signal_and_other(self):
         expected = dict(macos_capability.PROBE_EXIT_FAILURES)
-        expected.update({26: "child_sandbox_missing", 27: "other_exit", 1: "other_exit", 125: "exec_failed", -9: "signal_exit", -6: "signal_exit"})
+        expected.update({26: "child_sandbox_missing", 27: "other_exit", 1: "other_exit", 125: "exec_failed", -9: "signal_kill", -5: "signal_trap", -6: "signal_abort", -11: "signal_segv", -10: "signal_bus", -4: "signal_ill", -15: "signal_term", -7: "signal_other", -64: "signal_other"})
         for code, failure in expected.items():
             with self.subTest(code=code):
                 self.assert_refusal(
