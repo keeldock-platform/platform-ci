@@ -660,7 +660,7 @@ def _copy_canary_scanner(directory):
 
 
 def _prepare_resolver_fixture(canary):
-    parent = Path("/private/etc")
+    parent = Path("/private") / "etc"
     resolver_directory = parent / "resolver"
     created_directory = False
     target = None
