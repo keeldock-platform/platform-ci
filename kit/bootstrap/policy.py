@@ -287,7 +287,55 @@ on:
   workflow_dispatch:
 permissions: {}
 jobs:
+  macos-public-snapshot:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      actions: read
+    outputs:
+      cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Snapshot cache inventory
+        id: snapshot
+        run: python3 -B kit/confinement/macos_public_audit.py snapshot
   macos-capability:
+    needs: macos-public-snapshot
+    permissions: {}
+    outputs:
+      receipt: ${{ steps.proof.outputs.receipt }}
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: macos-15
     timeout-minutes: 20
@@ -329,19 +377,26 @@ jobs:
           python3 -B kit/bootstrap/test_policy.py
           python3 -B kit/bootstrap/test_public_tree.py
           python3 -B kit/confinement/test_linux_harness.py
-          python3 -B kit/confinement/test_macos_harness.py
-          python3 -B kit/confinement/test_macos_capability.py
-          python3 -B kit/confinement/test_macos_descriptors.py
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
           python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
       - name: Run source-free capability experiment
+        id: proof
         run: |
           set -euo pipefail
-          sudo -n -- env \\
+          sudo -n -- env -i \\
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \\
+            LANG=C \\
+            LC_ALL=C \\
             CI_EVENT_NAME="$CI_EVENT_NAME" \\
             CI_REF="$CI_REF" \\
             CI_REPOSITORY="$CI_REPOSITORY" \\
             CI_SERVER_URL="$CI_SERVER_URL" \\
             CI_SHA="$CI_SHA" \\
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \\
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \\
+            ImageOS="$ImageOS" \\
+            ImageVersion="$ImageVersion" \\
+            RUNNER_HOME="$HOME" \\
             GITHUB_ENV="$GITHUB_ENV" \\
             GITHUB_OUTPUT="$GITHUB_OUTPUT" \\
             GITHUB_PATH="$GITHUB_PATH" \\
@@ -349,7 +404,52 @@ jobs:
             PYTHONDONTWRITEBYTECODE=1 \\
             RUNNER_TEMP="$RUNNER_TEMP" \\
             CI_WORKSPACE="$CI_WORKSPACE" \\
-            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_capability.py --control-sha "$CI_SHA"
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_deny_default.py --control-sha "$CI_SHA"
+  macos-public-surface-audit:
+    if: ${{ always() }}
+    needs: [macos-public-snapshot, macos-capability]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      actions: read
+      checks: read
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      GITHUB_TOKEN: ${{ github.token }}
+      MACOS_CACHE_SNAPSHOT: ${{ needs.macos-public-snapshot.outputs.cache_snapshot }}
+      MACOS_NATIVE_RECEIPT_B64URL: ${{ needs.macos-capability.outputs.receipt }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Audit public surfaces
+        run: python3 -B kit/confinement/macos_harness.py --control-sha "$CI_SHA"
 """
 
 
