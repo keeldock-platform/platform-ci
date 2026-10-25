@@ -11,7 +11,25 @@ enum ProbeStatus {
     static let childSandboxMissing: Int32 = 26
     static let networkAllowed: Int32 = 27
     static let childNetworkAllowed: Int32 = 28
+    static let ipcAllowed: Int32 = 29
+    static let childIpcAllowed: Int32 = 30
 }
+
+let bootstrapNotPrivileged: kern_return_t = 1100
+let deniedMachServices = [
+    "com.apple.nsurlsessiond",
+    "com.apple.trustd",
+    "com.apple.trustd.agent",
+    "com.apple.dnssd.service",
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.lsd.open",
+    "com.apple.lsd.mapdb",
+    "com.apple.lsd.modifydb",
+    "com.apple.system.notification_center",
+    "com.apple.distributed_notifications@Uv3",
+    "com.apple.SystemConfiguration.configd",
+]
+typealias BootstrapLookUp = @convention(c) (mach_port_t, UnsafePointer<CChar>, UnsafeMutablePointer<mach_port_t>) -> kern_return_t
 
 func option(_ name: String) -> String? {
     guard let index = CommandLine.arguments.firstIndex(of: name),
@@ -90,6 +108,30 @@ func networkIsDenied() -> Bool {
     inetConnectIsDenied(SOCK_DGRAM) && inetConnectIsDenied(SOCK_STREAM) && unixConnectIsDenied()
 }
 
+func ipcIsDenied() -> Bool {
+    guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "bootstrap_look_up") else {
+        return false
+    }
+    let lookUp = unsafeBitCast(symbol, to: BootstrapLookUp.self)
+    var bootstrap = mach_port_t(0)
+    guard task_get_special_port(mach_task_self_, TASK_BOOTSTRAP_PORT, &bootstrap) == KERN_SUCCESS,
+          bootstrap != mach_port_t(0) else {
+        return false
+    }
+    for service in deniedMachServices {
+        var port = mach_port_t(0)
+        let result = lookUp(bootstrap, service, &port)
+        if result == KERN_SUCCESS {
+            mach_port_deallocate(mach_task_self_, port)
+            return false
+        }
+        if result != bootstrapNotPrivileged {
+            return false
+        }
+    }
+    return true
+}
+
 func startProcess(_ executable: String, _ arguments: [String]) throws -> Process {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
@@ -113,7 +155,8 @@ func parentStatus(for child: Process) -> Int32 {
          ProbeStatus.storageUnavailable,
          ProbeStatus.outsideWriteAllowed,
          ProbeStatus.childSandboxMissing,
-         ProbeStatus.childNetworkAllowed:
+         ProbeStatus.childNetworkAllowed,
+         ProbeStatus.childIpcAllowed:
         return child.terminationStatus
     default:
         return ProbeStatus.childFailed
@@ -138,6 +181,9 @@ func runParent(
     }
     guard networkIsDenied() else {
         exit(ProbeStatus.networkAllowed)
+    }
+    guard ipcIsDenied() else {
+        exit(ProbeStatus.ipcAllowed)
     }
     guard let executable = Bundle.main.executableURL else {
         exit(ProbeStatus.childFailed)
@@ -178,6 +224,9 @@ func runChild(
     }
     guard networkIsDenied() else {
         exit(ProbeStatus.childNetworkAllowed)
+    }
+    guard ipcIsDenied() else {
+        exit(ProbeStatus.childIpcAllowed)
     }
     guard isAbsolutePath(storageDirectory),
           isAbsolutePath(pythonExecutable),

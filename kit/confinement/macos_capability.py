@@ -27,6 +27,8 @@ MAX_TOOL_PATH_BYTES = 4096
 SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec"
 SEATBELT_PROFILE_NAME = "capability.sb"
 SEATBELT_WRITABLE_DEVICES = ("/dev/null", "/dev/dtracehelper")
+SEATBELT_MACH_LOOKUP_NAMES = ()
+SEATBELT_MACH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}\Z")
 MAX_SEATBELT_PATHS = 64
 MAX_SURVIVOR_PATH_READBACKS = 16
 DARWIN_UID_MODULUS = 1 << 32
@@ -53,6 +55,7 @@ SANDBOX_STAGES = (
 SANDBOX_FAILURES = (
     "invalid_input", "identity_invalid", "sandbox_missing", "child_sandbox_missing", "child_failed",
     "storage_unavailable", "outside_write_allowed", "network_allowed", "child_network_allowed",
+    "ipc_allowed", "child_ipc_allowed", "profile_rejected",
     "python_error", "exec_failed",
     "signal_kill", "signal_trap", "signal_abort", "signal_segv", "signal_bus", "signal_ill", "signal_term",
     "signal_other", "other_exit",
@@ -80,6 +83,9 @@ PROBE_EXIT_FAILURES = {
     26: "child_sandbox_missing",
     27: "network_allowed",
     28: "child_network_allowed",
+    29: "ipc_allowed",
+    30: "child_ipc_allowed",
+    65: "profile_rejected",
     125: "exec_failed",
 }
 CONTROL_EXIT_FAILURES = {
@@ -242,6 +248,7 @@ NATIVE_PREFLIGHT_CHECKS = frozenset(
         "probe_process_group_cleanup", "probe_process_capture_cleanup", "probe_process_census",
         "probe_process_launch", "probe_process_identity",
         "probe_process_toolchain", "probe_process_seatbelt", "probe_process_profile",
+        "probe_process_storage",
         "probe_process_survivor", "probe_process_observation",
         "probe_process_survivor_controls", "probe_process_survivor_positive_read",
         "probe_process_survivor_positive_write", "probe_process_survivor_probe_tree",
@@ -1501,8 +1508,31 @@ def _prepare_storage_directory(path, uid):
             or stat.S_IMODE(info.st_mode) != 0o700
         ):
             raise ValueError
+        return _canonical_path(path), _storage_identity(info)
     except BaseException:
         raise ProbeFailure("probe_identity_unavailable", check="probe_identity_permissions") from None
+
+
+def _storage_identity(info):
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_gid, info.st_mode)
+
+
+def _verify_storage_directory(path, expected, uid):
+    try:
+        canonical, identity = expected
+        if _canonical_path(path) != canonical:
+            raise ValueError
+        info = os.lstat(canonical)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or _storage_identity(info) != identity
+            or info.st_uid != uid
+            or info.st_gid != PROBE_PRIMARY_GID
+            or stat.S_IMODE(info.st_mode) != 0o700
+        ):
+            raise ValueError
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_storage") from None
 
 
 def _canonical_path(path):
@@ -1539,14 +1569,23 @@ def _seatbelt_profile_text(marker, storage_directory, protected_directories, pro
         storage_literal = _seatbelt_literal(storage_directory)
         directory_literals = sorted({_seatbelt_literal(path) for path in protected_directories})
         file_literals = sorted({_seatbelt_literal(path) for path in protected_files})
+        mach_names = tuple(SEATBELT_MACH_LOOKUP_NAMES)
+        if not all(type(name) is str and SEATBELT_MACH_NAME.fullmatch(name) for name in mach_names):
+            raise ValueError
     except BaseException:
         raise ProbeFailure("native_preflight_unavailable", check="probe_process_profile") from None
     lines = [
         "(version 1)",
         "(allow default)",
         "(deny network*)",
-        "(deny file-read* (literal " + marker_literal + "))",
+        "(deny lsopen)",
+        "(deny mach-lookup)",
     ]
+    if mach_names:
+        lines.append(
+            "(allow mach-lookup" + "".join(' (global-name "' + name + '")' for name in mach_names) + ")"
+        )
+    lines.append("(deny file-read* (literal " + marker_literal + "))")
     lines.extend("(deny file-read* (subpath " + literal + "))" for literal in directory_literals)
     lines.extend("(deny file-read* (literal " + literal + "))" for literal in file_literals)
     lines.append('(deny file-write* (subpath "/"))')
@@ -1862,6 +1901,7 @@ def _observe_probe(
     compiler_executable,
     linker_executable,
     sdk_root,
+    storage_identity,
 ):
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "LANG": "C"}
     argv = [
@@ -1884,6 +1924,7 @@ def _observe_probe(
         "--sdk-root",
         str(sdk_root),
     ]
+    _verify_storage_directory(storage_directory, storage_identity, uid)
     process = _spawn_probe_user(
         argv,
         uid,
@@ -2051,7 +2092,7 @@ def run_native_probe(control_sha):
             storage = Path(tempfile.mkdtemp(prefix="sandbox-capability-storage-", dir="/tmp"))
             os.chmod(scratch, 0o755)
             os.chmod(outside, 0o1777)
-            _prepare_storage_directory(storage, probe_uid)
+            storage_identity = _prepare_storage_directory(storage, probe_uid)
             _verify_runner_controls_are_private(
                 protected_directories + protected_files, probe_uid, python_executable=toolchain["python"]
             )
@@ -2097,6 +2138,7 @@ def run_native_probe(control_sha):
                 compiler_executable=toolchain["clang"],
                 linker_executable=toolchain["linker"],
                 sdk_root=toolchain["sdk"],
+                storage_identity=storage_identity,
             )
         except ProbeFailure as error:
             if not error.cleanup_complete:

@@ -355,8 +355,8 @@ class FixedOutcomeTests(unittest.TestCase):
 
 
 class ProbeParentStatusTests(unittest.TestCase):
-    EXPECTED_PARENT_STATUSES = frozenset((0, 20, 21, 22, 23, 24, 25, 26, 27, 28))
-    PASSED_THROUGH = frozenset((20, 21, 24, 25, 26, 28))
+    EXPECTED_PARENT_STATUSES = frozenset((0, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30))
+    PASSED_THROUGH = frozenset((20, 21, 24, 25, 26, 28, 30))
     FALLBACK = 23
     STATUS_TABLE = {
         "invalidInput": 20,
@@ -368,6 +368,8 @@ class ProbeParentStatusTests(unittest.TestCase):
         "childSandboxMissing": 26,
         "networkAllowed": 27,
         "childNetworkAllowed": 28,
+        "ipcAllowed": 29,
+        "childIpcAllowed": 30,
     }
     PARENT_DIRECT_EXITS = (
         "ProbeStatus.childFailed",
@@ -375,12 +377,13 @@ class ProbeParentStatusTests(unittest.TestCase):
         "ProbeStatus.identityInvalid",
         "ProbeStatus.sandboxMissing",
         "ProbeStatus.networkAllowed",
+        "ProbeStatus.ipcAllowed",
         "parentStatus(for:child)",
     )
     CHILD_STATUS_NAMES = frozenset(
         (
             "invalidInput", "identityInvalid", "storageUnavailable", "childFailed", "outsideWriteAllowed",
-            "childSandboxMissing", "childNetworkAllowed",
+            "childSandboxMissing", "childNetworkAllowed", "childIpcAllowed",
         )
     )
 
@@ -571,7 +574,7 @@ class ProbeParentStatusTests(unittest.TestCase):
     FUNCTION_NAMES = frozenset(
         (
             "option", "isAbsolutePath", "isExecutableFile", "readIsDenied", "connectIsDenied", "inetConnectIsDenied",
-            "unixConnectIsDenied", "networkIsDenied", "startProcess", "parentStatus", "runParent", "runChild",
+            "unixConnectIsDenied", "networkIsDenied", "ipcIsDenied", "startProcess", "parentStatus", "runParent", "runChild",
         )
     )
 
@@ -588,7 +591,8 @@ class ProbeParentStatusTests(unittest.TestCase):
         source = self.masked_source()
         self.assertEqual(frozenset(re.findall(r"\bfunc\s+(\w+)", source)), self.FUNCTION_NAMES)
         self.assertEqual(len(re.findall(r"\bfunc\s+", source)), len(self.FUNCTION_NAMES))
-        self.assertIsNone(re.search(r"\b(?:class|struct|extension|protocol|typealias|macro)\b", source))
+        self.assertIsNone(re.search(r"\b(?:class|struct|extension|protocol|macro)\b", source))
+        self.assertEqual(re.findall(r"\btypealias\s+(\w+)", source), ["BootstrapLookUp"])
         self.assertIsNone(re.search(r"\b(?:let|var)\s+(?:exit|_exit|abort|fatalError)\b", source))
         self.assertNotIn("_silgen_name", source)
         self.assertNotIn("_cdecl", source)
@@ -603,10 +607,11 @@ class ProbeParentStatusTests(unittest.TestCase):
         source = self.masked_source()
         self.assertIsNone(
             re.search(
-                r"\b(?:execl\w*|execv\w*|posix_spawn\w*|system|popen|fork|vfork|NSTask|dlopen|dlsym)\b|\.launch\s*\(|\blaunchPath\b",
+                r"\b(?:execl\w*|execv\w*|posix_spawn\w*|system|popen|fork|vfork|NSTask|dlopen)\b|\.launch\s*\(|\blaunchPath\b",
                 source,
             )
         )
+        self.assertEqual(re.findall(r"\bdlsym\b", source), ["dlsym"])
         self.assertEqual(len(re.findall(r"\bProcess\s*\(", source)), 1)
         self.assertEqual(len(re.findall(r"\.run\s*\(", source)), 1)
         self.assertEqual(len(re.findall(r"\bstartProcess\s*\(", self.function_body(source, "func runParent("))), 1)
@@ -672,7 +677,8 @@ class StorageDirectoryArgumentTests(unittest.TestCase):
     def test_swift_source_has_no_bundle_or_container_dependence_beyond_the_sibling_helper(self):
         raw = self.raw()
         self.assertNotIn("Containers", raw)
-        self.assertNotIn("com.apple", raw)
+        services = raw[raw.index("let deniedMachServices = ["):].split("]", 1)[0]
+        self.assertEqual(raw.replace(services, "").count("com.apple"), 0)
         self.assertEqual(raw.count("Bundle.main"), 1)
         self.assertIn('appendingPathComponent("CapabilityChild")', raw)
 
@@ -680,7 +686,8 @@ class StorageDirectoryArgumentTests(unittest.TestCase):
 class StorageOwnershipTests(unittest.TestCase):
     def info(self, mode=stat.S_IFDIR | 0o700, uid=502, gid=None):
         return types.SimpleNamespace(
-            st_mode=mode, st_uid=uid, st_gid=macos_capability.PROBE_PRIMARY_GID if gid is None else gid
+            st_dev=7, st_ino=11, st_mode=mode, st_uid=uid,
+            st_gid=macos_capability.PROBE_PRIMARY_GID if gid is None else gid,
         )
 
     def prepare(self, info=None, chown_error=None):
@@ -692,6 +699,7 @@ class StorageOwnershipTests(unittest.TestCase):
                 raise chown_error
 
         with ExitStack() as stack:
+            stack.enter_context(patch.object(macos_capability, "_canonical_path", return_value="/var/ci/storage"))
             stack.enter_context(patch.object(macos_capability.os, "chown", side_effect=chown, create=True))
             stack.enter_context(
                 patch.object(macos_capability.os, "chmod", side_effect=lambda path, mode: events.append(("chmod", mode)))
@@ -724,6 +732,94 @@ class StorageOwnershipTests(unittest.TestCase):
                 ("lstat",),
             ],
         )
+
+    def test_preparation_returns_the_canonical_path_and_the_inode_identity(self):
+        with patch.object(macos_capability, "_canonical_path", return_value="/var/ci/real-storage"):
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(macos_capability.os, "chown", create=True))
+                stack.enter_context(patch.object(macos_capability.os, "chmod"))
+                stack.enter_context(patch.object(macos_capability.os, "lstat", return_value=self.info()))
+                result = macos_capability._prepare_storage_directory("/var/ci/storage", 502)
+        self.assertEqual(
+            result,
+            (
+                "/var/ci/real-storage",
+                (7, 11, 502, macos_capability.PROBE_PRIMARY_GID, stat.S_IFDIR | 0o700),
+            ),
+        )
+
+    def verify(self, info=None, canonical="/var/ci/real-storage", lstat_error=None):
+        expected = (
+            "/var/ci/real-storage",
+            (7, 11, 502, macos_capability.PROBE_PRIMARY_GID, stat.S_IFDIR | 0o700),
+        )
+        paths = []
+
+        def lstat(path):
+            paths.append(path)
+            if lstat_error is not None:
+                raise lstat_error
+            return info or self.info()
+
+        with patch.object(macos_capability, "_canonical_path", return_value=canonical):
+            with patch.object(macos_capability.os, "lstat", side_effect=lstat):
+                macos_capability._verify_storage_directory("/var/ci/storage", expected, 502)
+        return paths
+
+    def test_launch_time_recheck_accepts_only_the_prepared_directory_and_lstats_the_canonical_path(self):
+        self.assertEqual(self.verify(), ["/var/ci/real-storage"])
+
+    def test_launch_time_recheck_refuses_any_change_with_a_named_check(self):
+        changed = types.SimpleNamespace
+        base = dict(st_dev=7, st_ino=11, st_mode=stat.S_IFDIR | 0o700, st_uid=502, st_gid=macos_capability.PROBE_PRIMARY_GID)
+        cases = {
+            "inode": changed(**{**base, "st_ino": 12}),
+            "device": changed(**{**base, "st_dev": 8}),
+            "owner": changed(**{**base, "st_uid": 0}),
+            "group": changed(**{**base, "st_gid": 80}),
+            "mode": changed(**{**base, "st_mode": stat.S_IFDIR | 0o755}),
+            "symlink": changed(**{**base, "st_mode": stat.S_IFLNK | 0o700}),
+        }
+        for name, info in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    self.verify(info=info)
+                self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
+                self.assertEqual(raised.exception.check, "probe_process_storage")
+                self.assertTrue(raised.exception.cleanup_complete)
+        with self.subTest(name="path_moved"):
+            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                self.verify(canonical="/var/ci/elsewhere")
+            self.assertEqual(raised.exception.check, "probe_process_storage")
+        with self.subTest(name="lstat_error"):
+            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                self.verify(lstat_error=FileNotFoundError("private detail"))
+            self.assertEqual(raised.exception.check, "probe_process_storage")
+            self.assertNotIn("private", str(raised.exception))
+        self.assertIn("probe_process_storage", macos_capability.NATIVE_PREFLIGHT_CHECKS)
+
+    def test_recheck_runs_before_the_probe_is_spawned_and_refusal_never_spawns(self):
+        source = Path(macos_capability.__file__).read_text(encoding="utf-8")
+        body = source[source.index("def _observe_probe("):source.index("def run_native_probe(")]
+        self.assertLess(
+            body.index("_verify_storage_directory(storage_directory, storage_identity, uid)"),
+            body.index("_spawn_probe_user("),
+        )
+        with patch.object(
+            macos_capability, "_verify_storage_directory",
+            side_effect=macos_capability.ProbeFailure("native_preflight_unavailable", check="probe_process_storage"),
+        ):
+            with patch.object(macos_capability, "_spawn_probe_user") as spawn:
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    macos_capability._observe_probe(
+                        "/var/ci/CapabilityProbe", "/var/ci/marker", "/var/ci/outside", 502, "/var/ci/home",
+                        sandbox_exec="/usr/bin/sandbox-exec", profile="/var/ci/p.sb",
+                        storage_directory="/var/ci/storage", python_executable=TEST_TOOLCHAIN["python"],
+                        compiler_executable=TEST_TOOLCHAIN["clang"], linker_executable=TEST_TOOLCHAIN["linker"],
+                        sdk_root=TEST_TOOLCHAIN["sdk"], storage_identity="x",
+                    )
+        self.assertEqual(raised.exception.check, "probe_process_storage")
+        spawn.assert_not_called()
 
     def test_wrong_owner_group_mode_or_type_is_refused(self):
         for name, info in (
@@ -826,6 +922,91 @@ class NetworkProbeSourceTests(unittest.TestCase):
         )
         self.assertIn("childNetworkAllowed", names)
         self.assertNotIn("networkAllowed", names)
+
+
+class IpcProbeSourceTests(unittest.TestCase):
+    SERVICES = (
+        "com.apple.nsurlsessiond",
+        "com.apple.trustd",
+        "com.apple.trustd.agent",
+        "com.apple.dnssd.service",
+        "com.apple.coreservices.launchservicesd",
+        "com.apple.lsd.open",
+        "com.apple.lsd.mapdb",
+        "com.apple.lsd.modifydb",
+        "com.apple.system.notification_center",
+        "com.apple.distributed_notifications@Uv3",
+        "com.apple.SystemConfiguration.configd",
+    )
+
+    def source(self):
+        return ProbeParentStatusTests.masked_source()
+
+    def raw(self):
+        path = Path(macos_capability.__file__).resolve().with_name("macos_capability.swift")
+        return path.read_text(encoding="utf-8")
+
+    def test_parent_and_child_check_ipc_denial_right_after_the_network_check(self):
+        source = self.source()
+        helper = ProbeParentStatusTests()
+        parent = helper.function_body(source, "func runParent(")
+        child = helper.function_body(source, "func runChild(")
+        self.assertRegex(
+            parent,
+            r"guard\s+networkIsDenied\(\)\s+else\s*\{\s*exit\(\s*ProbeStatus\.networkAllowed\s*\)\s*\}"
+            r"\s*guard\s+ipcIsDenied\(\)\s+else\s*\{\s*exit\(\s*ProbeStatus\.ipcAllowed\s*\)\s*\}",
+        )
+        self.assertRegex(
+            child,
+            r"guard\s+networkIsDenied\(\)\s+else\s*\{\s*exit\(\s*ProbeStatus\.childNetworkAllowed\s*\)\s*\}"
+            r"\s*guard\s+ipcIsDenied\(\)\s+else\s*\{\s*exit\(\s*ProbeStatus\.childIpcAllowed\s*\)\s*\}",
+        )
+        self.assertEqual(len(re.findall(r"\bipcIsDenied\s*\(", source)), 3)
+
+    def test_ipc_statuses_are_distinct_codes_and_only_the_child_one_is_passed_through(self):
+        source = self.source()
+        helper = ProbeParentStatusTests()
+        table = helper.statuses(source)
+        self.assertEqual((table["ipcAllowed"], table["childIpcAllowed"]), (29, 30))
+        names = helper.passed_through_names(helper.function_body(source, "func parentStatus("))
+        self.assertIn("childIpcAllowed", names)
+        self.assertNotIn("ipcAllowed", names)
+
+    def test_the_denied_service_list_is_pinned_and_never_derived_from_input(self):
+        raw = self.raw()
+        declaration = raw[raw.index("let deniedMachServices = ["):].split("]", 1)[0]
+        self.assertEqual(tuple(re.findall(r'"([^"]+)"', declaration)), self.SERVICES)
+        for name in ("CommandLine", "getenv", "option("):
+            self.assertNotIn(name, declaration)
+        self.assertIn("let bootstrapNotPrivileged: kern_return_t = 1100", raw)
+
+    def test_a_lookup_counts_as_denied_only_for_the_sandbox_refusal_code(self):
+        helper = ProbeParentStatusTests()
+        self.assertEqual(self.raw().count('dlsym(UnsafeMutableRawPointer(bitPattern: -2), "bootstrap_look_up")'), 1)
+        body = re.sub(r"\s+", "", helper.function_body(self.source(), "func ipcIsDenied("))
+        self.assertEqual(
+            body,
+            'guardletsymbol=dlsym(UnsafeMutableRawPointer(bitPattern:-2),)else{returnfalse}'
+            "letlookUp=unsafeBitCast(symbol,to:BootstrapLookUp.self)"
+            "varbootstrap=mach_port_t(0)"
+            "guardtask_get_special_port(mach_task_self_,TASK_BOOTSTRAP_PORT,&bootstrap)==KERN_SUCCESS,"
+            "bootstrap!=mach_port_t(0)else{returnfalse}"
+            "forserviceindeniedMachServices{"
+            "varport=mach_port_t(0)"
+            "letresult=lookUp(bootstrap,service,&port)"
+            "ifresult==KERN_SUCCESS{mach_port_deallocate(mach_task_self_,port)returnfalse}"
+            "ifresult!=bootstrapNotPrivileged{returnfalse}}"
+            "returntrue",
+        )
+
+    def test_ipc_check_never_opens_launch_services_or_any_connection(self):
+        raw = self.raw()
+        for forbidden in (
+            "LSOpen", "NSWorkspace", "xpc_", "NSXPC", "bootstrap_register", "launch_msg", "launchctl",
+            "mach_msg", "CFMessagePort", "NSConnection", "DistributedNotification", "URLSession", "open(\"/usr",
+        ):
+            self.assertNotIn(forbidden, raw)
+        self.assertEqual(len(re.findall(r"\bdlsym\b", self.source())), 1)
 
 
 class CommandLineToolsInterpreterTests(unittest.TestCase):
@@ -2746,6 +2927,7 @@ class ProbeTeardownTests(unittest.TestCase):
             ("_resolve_sandbox_exec", macos_capability.SANDBOX_EXEC_PATH),
             ("_write_seatbelt_profile", Path("/tmp/capability.sb")),
             ("_prepare_storage_directory", None),
+            ("_verify_storage_directory", None),
         ):
             patcher = patch.object(macos_capability, name, return_value=value)
             patcher.start()
@@ -2761,6 +2943,7 @@ class ProbeTeardownTests(unittest.TestCase):
             compiler_executable=TEST_TOOLCHAIN["clang"],
             linker_executable=TEST_TOOLCHAIN["linker"],
             sdk_root=TEST_TOOLCHAIN["sdk"],
+            storage_identity=("/tmp/storage", (1, 2, 502, macos_capability.PROBE_PRIMARY_GID, stat.S_IFDIR | 0o700)),
         )
 
     def test_bootstrap_and_later_mismatched_root_rows_cannot_supply_probe_roles(self):
@@ -3313,6 +3496,8 @@ class SeatbeltProfileTests(unittest.TestCase):
             "(version 1)\n"
             "(allow default)\n"
             "(deny network*)\n"
+            "(deny lsopen)\n"
+            "(deny mach-lookup)\n"
             '(deny file-read* (literal "/var/ci/work/marker"))\n'
             '(deny file-read* (subpath "/var/ci/runner/_diag"))\n'
             '(deny file-read* (subpath "/var/ci/work/_temp"))\n'
@@ -3327,14 +3512,14 @@ class SeatbeltProfileTests(unittest.TestCase):
             directories=["/var/ci/b", "/var/ci/a", "/var/ci/b"], files=("/var/ci/f", "/var/ci/f")
         )
         self.assertEqual(
-            text.splitlines()[4:-2],
+            text.splitlines()[6:-2],
             [
                 '(deny file-read* (subpath "/var/ci/a"))',
                 '(deny file-read* (subpath "/var/ci/b"))',
                 '(deny file-read* (literal "/var/ci/f"))',
             ],
         )
-        self.assertEqual(len(self.build(directories=(), files=()).splitlines()), 6)
+        self.assertEqual(len(self.build(directories=(), files=()).splitlines()), 8)
 
     def test_network_is_denied_before_any_allow_and_writes_are_denied_before_the_storage_allow(self):
         lines = self.build().splitlines()
@@ -3345,11 +3530,46 @@ class SeatbeltProfileTests(unittest.TestCase):
         self.assertTrue(lines[-1].startswith("(allow file-write* (subpath "))
         self.assertNotIn("allow network", self.build())
 
+    def test_profile_denies_launch_services_and_all_mach_lookups_before_any_allow(self):
+        lines = self.build().splitlines()
+        self.assertEqual(lines.count("(deny lsopen)"), 1)
+        self.assertEqual(lines.count("(deny mach-lookup)"), 1)
+        self.assertEqual(lines[:5], ["(version 1)", "(allow default)", "(deny network*)", "(deny lsopen)", "(deny mach-lookup)"])
+        self.assertFalse(any(line.startswith("(allow mach-lookup") for line in lines))
+        self.assertNotIn("(allow lsopen", self.build())
+        self.assertNotIn("(allow mach*", self.build())
+
+    def test_mach_lookup_allow_list_is_exactly_the_empirically_required_constant_names(self):
+        self.assertEqual(macos_capability.SEATBELT_MACH_LOOKUP_NAMES, ())
+        banned = (
+            "nsurlsessiond", "trustd", "dnssd", "mDNSResponder", "launchservices", "lsd", "coreservices",
+            "launchd", "xpc.launchd", "distributed_notifications", "system.notification_center", "configd",
+        )
+        for name in macos_capability.SEATBELT_MACH_LOOKUP_NAMES:
+            for fragment in banned:
+                self.assertNotIn(fragment.lower(), name.lower())
+
+    def test_allowed_mach_names_are_emitted_after_the_deny_as_global_names_only(self):
+        with patch.object(macos_capability, "SEATBELT_MACH_LOOKUP_NAMES", ("com.example.one", "com.example.two")):
+            lines = self.build().splitlines()
+        self.assertEqual(
+            lines[4:6],
+            ["(deny mach-lookup)", '(allow mach-lookup (global-name "com.example.one") (global-name "com.example.two"))'],
+        )
+        self.assertEqual(len(lines), 13)
+        self.assertEqual(len(self.build(directories=(), files=()).splitlines()), 8)
+
+    def test_hostile_mach_names_are_refused(self):
+        for name in ('a"b', "a b", "a\n(allow default)", "", "-x", "a)(allow mach*", 7, None):
+            with self.subTest(name=name):
+                with patch.object(macos_capability, "SEATBELT_MACH_LOOKUP_NAMES", (name,)):
+                    self.assert_refused()
+
     def test_quote_and_backslash_are_escaped_and_cannot_inject_profile_text(self):
         hostile = '/var/ci/ev"))(allow file-write* (subpath "/x'
         text = self.build(storage=hostile, files=(), directories=())
         lines = text.splitlines()
-        self.assertEqual(len(lines), 6)
+        self.assertEqual(len(lines), 8)
         self.assertEqual(
             lines[-1],
             '(allow file-write* (subpath "/var/ci/ev\\"))(allow file-write* (subpath \\"/x")'
@@ -3358,15 +3578,15 @@ class SeatbeltProfileTests(unittest.TestCase):
         slash = "/var/ci/a\\b"
         self.assertIn('(deny file-read* (literal "/var/ci/a\\\\b"))', self.build(files=(slash,)))
         marker_text = self.build(marker=hostile, files=(), directories=())
-        self.assertEqual(len(marker_text.splitlines()), 6)
+        self.assertEqual(len(marker_text.splitlines()), 8)
         self.assertEqual(
-            marker_text.splitlines()[3],
+            marker_text.splitlines()[5],
             '(deny file-read* (literal "/var/ci/ev\\"))(allow file-write* (subpath \\"/x"))',
         )
         for directory in (True, False):
             hostile_rule = self.build(
                 directories=(hostile,) if directory else (), files=() if directory else (hostile,)
-            ).splitlines()[4]
+            ).splitlines()[6]
             self.assertTrue(hostile_rule.endswith('\\"/x"))'))
             self.assertEqual(hostile_rule.count("(deny"), 1)
 
@@ -3546,7 +3766,8 @@ class SeatbeltLaunchTests(unittest.TestCase):
 
         with patch.object(macos_capability.subprocess, "Popen", return_value=StubProcess()) as popen:
             with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
-                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())), \
+                        patch.object(macos_capability, "_verify_storage_directory") as verify:
                     with self.assertRaisesRegex(macos_capability.ProbeFailure, "descriptor_readback_unavailable"):
                         macos_capability._observe_probe(
                             "/var/ci/scratch/CapabilityProbe",
@@ -3561,7 +3782,9 @@ class SeatbeltLaunchTests(unittest.TestCase):
                             compiler_executable=TEST_TOOLCHAIN["clang"],
                             linker_executable=TEST_TOOLCHAIN["linker"],
                             sdk_root=TEST_TOOLCHAIN["sdk"],
+                            storage_identity="identity-token",
                         )
+        verify.assert_called_once_with("/var/ci/storage", "identity-token", 502)
         command = popen.call_args.args[0]
         self.assertEqual(command[:5], [TEST_TOOLCHAIN["python"], "-I", "-S", "-B", "-c"])
         self.assertEqual(
@@ -3752,6 +3975,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
             (
                 "invalid_input", "identity_invalid", "sandbox_missing", "child_sandbox_missing", "child_failed",
                 "storage_unavailable", "outside_write_allowed", "network_allowed", "child_network_allowed",
+                "ipc_allowed", "child_ipc_allowed", "profile_rejected",
                 "python_error", "exec_failed",
                 "signal_kill", "signal_trap", "signal_abort", "signal_segv", "signal_bus", "signal_ill",
                 "signal_term", "signal_other", "other_exit",
@@ -3773,6 +3997,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
                 20: "invalid_input", 21: "identity_invalid", 22: "sandbox_missing",
                 23: "child_failed", 24: "storage_unavailable", 25: "outside_write_allowed",
                 26: "child_sandbox_missing", 27: "network_allowed", 28: "child_network_allowed",
+                29: "ipc_allowed", 30: "child_ipc_allowed", 65: "profile_rejected",
                 125: "exec_failed",
             },
         )
@@ -3877,7 +4102,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
             self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), expected)
         for code, expected in macos_capability.CONTROL_EXIT_FAILURES.items():
             self.assertEqual(classify(code, macos_capability.CONTROL_EXIT_FAILURES), expected)
-        for code in (1, 2, 19, 29, 31, 126, 255):
+        for code in (1, 2, 19, 31, 64, 66, 126, 255):
             self.assertEqual(classify(code, macos_capability.PROBE_EXIT_FAILURES), "other_exit")
         for code in (2, 20, 126):
             self.assertEqual(classify(code, macos_capability.CONTROL_EXIT_FAILURES), "other_exit")
@@ -4116,6 +4341,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
                     ("_resolve_sandbox_exec", macos_capability.SANDBOX_EXEC_PATH),
                     ("_write_seatbelt_profile", Path("/tmp/capability.sb")),
                     ("_prepare_storage_directory", None),
+                    ("_verify_storage_directory", None),
                     ("_disable_developer_mode", None),
                     ("_protect_runner_controls", (501, (), ())),
                     ("_create_probe_identity", (502, home_parent, home)),
@@ -4221,7 +4447,7 @@ class SandboxStageDiagnosticTests(unittest.TestCase):
 
     def test_probe_exit_site_maps_each_known_code_signal_and_other(self):
         expected = dict(macos_capability.PROBE_EXIT_FAILURES)
-        expected.update({26: "child_sandbox_missing", 27: "network_allowed", 28: "child_network_allowed", 29: "other_exit", 1: "other_exit", 125: "exec_failed", -9: "signal_kill", -5: "signal_trap", -6: "signal_abort", -11: "signal_segv", -10: "signal_bus", -4: "signal_ill", -15: "signal_term", -7: "signal_other", -64: "signal_other"})
+        expected.update({26: "child_sandbox_missing", 27: "network_allowed", 28: "child_network_allowed", 29: "ipc_allowed", 30: "child_ipc_allowed", 31: "other_exit", 64: "other_exit", 66: "other_exit", 1: "other_exit", 125: "exec_failed", -9: "signal_kill", -5: "signal_trap", -6: "signal_abort", -11: "signal_segv", -10: "signal_bus", -4: "signal_ill", -15: "signal_term", -7: "signal_other", -64: "signal_other"})
         for code, failure in expected.items():
             with self.subTest(code=code):
                 self.assert_refusal(
