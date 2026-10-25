@@ -15,6 +15,10 @@ import macos_public_audit
 CONTROL_SHA = "a" * 40
 
 
+class _ReasonString(str):
+    pass
+
+
 def receipt(**changes):
     value = {
         "schema_version": 2,
@@ -205,6 +209,17 @@ class CurrentRunAcceptanceTests(unittest.TestCase):
 
 
 class PublicAuditBindingTests(unittest.TestCase):
+    def _cli_environment(self):
+        return {
+            "CI_SHA": CONTROL_SHA,
+            "GITHUB_RUN_ID": "123",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "MACOS_NATIVE_RECEIPT_B64URL": encode_receipt(receipt()),
+        }
+
+    def test_audit_reason_allowlist_matches_the_auditor_contract(self):
+        self.assertEqual(macos_harness.PUBLIC_AUDIT_REASONS, macos_public_audit.REASONS)
+
     def test_current_run_binds_receipt_to_live_run_identity(self):
         native_receipt = receipt()
         env = {
@@ -242,6 +257,79 @@ class PublicAuditBindingTests(unittest.TestCase):
             with patch.object(macos_public_audit, "run", return_value=2):
                 with self.assertRaisesRegex(macos_harness.Refusal, "public_audit_incomplete"):
                     macos_harness._verify_current_run(CONTROL_SHA)
+
+    def test_known_audit_failures_keep_only_their_closed_reason(self):
+        for audit_reason in (
+            "log_unavailable",
+            "api_status",
+            "pagination_incomplete",
+            "native_job_failed",
+        ):
+            output = io.StringIO()
+            failure = macos_public_audit.AuditRefusal(audit_reason)
+            with self.subTest(audit_reason=audit_reason):
+                with patch.dict("os.environ", self._cli_environment(), clear=True):
+                    with patch.object(macos_public_audit, "run", side_effect=failure):
+                        with contextlib.redirect_stdout(output):
+                            result = macos_harness.main(["--control-sha", CONTROL_SHA])
+                self.assertEqual(result, 2)
+                self.assertEqual(
+                    output.getvalue(),
+                    "macos-confinement=refused reason=public_audit_incomplete "
+                    "audit_reason=" + audit_reason + "\n",
+                )
+
+    def test_unknown_or_mutated_audit_reasons_collapse_to_internal_error(self):
+        for bad_reason in (
+            "unrecognized diagnostic",
+            ["api_status"],
+            _ReasonString("api_status"),
+        ):
+            output = io.StringIO()
+            failure = macos_public_audit.AuditRefusal("api_status")
+            failure.reason = bad_reason
+            with self.subTest(reason_type=type(bad_reason).__name__):
+                with patch.dict("os.environ", self._cli_environment(), clear=True):
+                    with patch.object(macos_public_audit, "run", side_effect=failure):
+                        with contextlib.redirect_stdout(output):
+                            result = macos_harness.main(["--control-sha", CONTROL_SHA])
+                self.assertEqual(result, 2)
+                self.assertEqual(
+                    output.getvalue(),
+                    "macos-confinement=refused reason=public_audit_incomplete "
+                    "audit_reason=internal_error\n",
+                )
+
+    def test_refusal_formatter_revalidates_reason_fields(self):
+        refusal = macos_harness.Refusal("public_audit_incomplete", "api_status")
+        refusal.audit_reason = ["untrusted"]
+        self.assertEqual(
+            macos_harness.format_refusal(refusal),
+            "macos-confinement=refused reason=public_audit_incomplete "
+            "audit_reason=internal_error",
+        )
+
+        refusal.reason = _ReasonString("public_audit_incomplete")
+        self.assertEqual(
+            macos_harness.format_refusal(refusal),
+            "macos-confinement=refused reason=no_supported_boundary",
+        )
+
+    def test_unexpected_audit_exception_is_not_emitted(self):
+        output = io.StringIO()
+        with patch.dict("os.environ", self._cli_environment(), clear=True):
+            with patch.object(
+                macos_public_audit, "run", side_effect=RuntimeError("secret diagnostic")
+            ):
+                with contextlib.redirect_stdout(output):
+                    result = macos_harness.main(["--control-sha", CONTROL_SHA])
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            output.getvalue(),
+            "macos-confinement=refused reason=public_audit_incomplete "
+            "audit_reason=internal_error\n",
+        )
+        self.assertNotIn("secret diagnostic", output.getvalue())
 
     def test_command_line_acceptance_uses_one_live_audit(self):
         env = {

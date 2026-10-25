@@ -34,14 +34,49 @@ REFUSALS = frozenset((
     "public_audit_incomplete",
     "runner_vm_is_not_process_boundary",
 ))
+PUBLIC_AUDIT_REASONS = frozenset((
+    "invalid_input",
+    "api_unavailable",
+    "api_status",
+    "api_schema",
+    "run_identity_mismatch",
+    "pagination_incomplete",
+    "inventory_changed",
+    "artifact_found",
+    "log_unavailable",
+    "log_too_large",
+    "log_format_unknown",
+    "canary_exposed",
+    "workflow_command_exposed",
+    "receipt_invalid",
+    "native_job_failed",
+    "output_unavailable",
+    "internal_error",
+))
+
+
+def _safe_refusal_reason(reason):
+    if type(reason) is str and reason in REFUSALS:
+        return reason
+    return "no_supported_boundary"
+
+
+def _safe_public_audit_reason(reason):
+    if type(reason) is str and reason in PUBLIC_AUDIT_REASONS:
+        return reason
+    return "internal_error"
 
 
 class Refusal(Exception):
-    def __init__(self, reason):
-        if reason not in REFUSALS:
-            reason = "no_supported_boundary"
+    def __init__(self, reason, audit_reason=None):
+        reason = _safe_refusal_reason(reason)
         super().__init__(reason)
         self.reason = reason
+        self.audit_reason = (
+            _safe_public_audit_reason(audit_reason)
+            if reason == "public_audit_incomplete"
+            else None
+        )
 
 
 def valid_sha(value):
@@ -49,9 +84,29 @@ def valid_sha(value):
 
 
 def refuse(reason):
-    if reason not in REFUSALS:
-        reason = "no_supported_boundary"
+    reason = _safe_refusal_reason(reason)
     return "macos-confinement=refused reason=" + reason
+
+
+def format_refusal(error):
+    if type(error) is not Refusal:
+        return refuse("no_supported_boundary")
+    reason = _safe_refusal_reason(error.reason)
+    line = refuse(reason)
+    if reason == "public_audit_incomplete":
+        audit_reason = _safe_public_audit_reason(error.audit_reason)
+        line += " audit_reason=" + audit_reason
+    return line
+
+
+def _public_audit_reason(audit_module, error):
+    try:
+        refusal_type = audit_module.AuditRefusal
+        if type(refusal_type) is not type or type(error) is not refusal_type:
+            return "internal_error"
+        return _safe_public_audit_reason(error.reason)
+    except BaseException:
+        return "internal_error"
 
 
 def _record_from_receipt(receipt):
@@ -128,6 +183,7 @@ def _verify_current_run(control_sha):
     env = os.environ
     if env.get("CI_SHA") != control_sha:
         raise Refusal("invalid_control_identity")
+    macos_public_audit = None
     try:
         import macos_public_audit
 
@@ -142,8 +198,9 @@ def _verify_current_run(control_sha):
         )
     except Refusal:
         raise
-    except BaseException:
-        raise Refusal("public_audit_incomplete") from None
+    except BaseException as error:
+        audit_reason = _public_audit_reason(macos_public_audit, error)
+        raise Refusal("public_audit_incomplete", audit_reason) from None
     return receipt
 
 
@@ -171,7 +228,7 @@ def main(argv=None):
     try:
         result = run_native_probe(arguments.control_sha)
     except Refusal as error:
-        print(refuse(error.reason))
+        print(format_refusal(error))
         return 2
     print(result)
     return 0

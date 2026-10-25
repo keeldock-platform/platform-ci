@@ -542,7 +542,20 @@ def _check_context(control_sha, workspace):
     root = Path(__file__).resolve().parents[2]
     if root != Path(workspace).resolve() or Path.cwd().resolve() != root:
         raise ProbeFailure("control_identity_invalid")
-    result = _run(["/usr/bin/git", "rev-parse", "--verify", "HEAD"], cwd=root, timeout=5)
+    result = _run(
+        [
+            "/usr/bin/git",
+            "-c",
+            "safe.directory=",
+            "-c",
+            "safe.directory=" + str(root),
+            "rev-parse",
+            "--verify",
+            "HEAD",
+        ],
+        cwd=root,
+        timeout=5,
+    )
     _require_success(result, "control_identity_invalid")
     if result.stdout.decode("ascii", "ignore").strip() != control_sha:
         raise ProbeFailure("control_identity_invalid")
