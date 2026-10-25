@@ -75,7 +75,5 @@ runs:
         fi
         "$python_bin" -B "$CI_ACTION_PATH/test_policy.py"
         "$python_bin" -B "$CI_ACTION_PATH/test_public_tree.py"
-        "$python_bin" -B "$CI_ACTION_PATH/../confinement/test_macos_harness.py"
-        "$python_bin" -B "$CI_ACTION_PATH/../confinement/test_macos_capability.py"
-        "$python_bin" -B "$CI_ACTION_PATH/../confinement/test_macos_descriptors.py"
+        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_macos*.py"
         "$python_bin" -B "$CI_ACTION_PATH/check_candidate.py" --root "$CI_WORKSPACE" --pool "$CI_POOL" --sha "$CI_SHA"

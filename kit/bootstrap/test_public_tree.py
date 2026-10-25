@@ -126,6 +126,8 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn(".github/workflows/windows-attestation-permission-probe.yml", result)
         self.assertIn(".github/workflows/macos-capability.yml", result)
         self.assertIn(".github/workflows/windows-native-preflight.yml", result)
+        self.assertIn("kit/confinement/macos_public_audit.py", result)
+        self.assertIn("kit/confinement/test_macos_public_audit.py", result)
         self.assertIn("kit/confinement/macos_harness.py", result)
         self.assertIn("kit/confinement/macos_capability.py", result)
         self.assertIn("kit/confinement/macos_capability.swift", result)
