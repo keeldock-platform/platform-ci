@@ -9,6 +9,8 @@ enum ProbeStatus {
     static let storageUnavailable: Int32 = 24
     static let outsideWriteAllowed: Int32 = 25
     static let childSandboxMissing: Int32 = 26
+    static let networkAllowed: Int32 = 27
+    static let childNetworkAllowed: Int32 = 28
 }
 
 func option(_ name: String) -> String? {
@@ -39,6 +41,55 @@ func readIsDenied(_ path: String) -> Bool {
     return errno == EACCES || errno == EPERM
 }
 
+func connectIsDenied(_ family: Int32, _ type: Int32, _ address: UnsafePointer<sockaddr>, _ length: socklen_t) -> Bool {
+    let descriptor = socket(family, type, 0)
+    if descriptor < 0 {
+        return errno == EPERM
+    }
+    defer { close(descriptor) }
+    if connect(descriptor, address, length) == 0 {
+        return false
+    }
+    return errno == EPERM
+}
+
+func inetConnectIsDenied(_ type: Int32) -> Bool {
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = UInt16(49152).bigEndian
+    address.sin_addr.s_addr = UInt32(0x7f000001).bigEndian
+    return withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { generic in
+            connectIsDenied(AF_INET, type, generic, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+}
+
+func unixConnectIsDenied() -> Bool {
+    var address = sockaddr_un()
+    address.sun_family = sa_family_t(AF_UNIX)
+    let socketPath = Array("/var/run/mDNSResponder".utf8CString)
+    guard socketPath.count <= MemoryLayout.size(ofValue: address.sun_path) else {
+        return false
+    }
+    withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+        for (index, byte) in socketPath.enumerated() {
+            buffer[index] = UInt8(bitPattern: byte)
+        }
+    }
+    address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+    return withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { generic in
+            connectIsDenied(AF_UNIX, SOCK_STREAM, generic, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+}
+
+func networkIsDenied() -> Bool {
+    inetConnectIsDenied(SOCK_DGRAM) && inetConnectIsDenied(SOCK_STREAM) && unixConnectIsDenied()
+}
+
 func startProcess(_ executable: String, _ arguments: [String]) throws -> Process {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
@@ -61,7 +112,8 @@ func parentStatus(for child: Process) -> Int32 {
          ProbeStatus.identityInvalid,
          ProbeStatus.storageUnavailable,
          ProbeStatus.outsideWriteAllowed,
-         ProbeStatus.childSandboxMissing:
+         ProbeStatus.childSandboxMissing,
+         ProbeStatus.childNetworkAllowed:
         return child.terminationStatus
     default:
         return ProbeStatus.childFailed
@@ -71,6 +123,7 @@ func parentStatus(for child: Process) -> Int32 {
 func runParent(
     _ marker: String,
     _ writableDirectory: String,
+    _ storageDirectory: String,
     _ pythonExecutable: String,
     _ compilerExecutable: String,
     _ linkerExecutable: String,
@@ -83,6 +136,9 @@ func runParent(
     guard readIsDenied(marker) else {
         exit(ProbeStatus.sandboxMissing)
     }
+    guard networkIsDenied() else {
+        exit(ProbeStatus.networkAllowed)
+    }
     guard let executable = Bundle.main.executableURL else {
         exit(ProbeStatus.childFailed)
     }
@@ -92,6 +148,7 @@ func runParent(
             "--child",
             "--marker", marker,
             "--writable-directory", writableDirectory,
+            "--storage-directory", storageDirectory,
             "--python-executable", pythonExecutable,
             "--compiler-executable", compilerExecutable,
             "--linker-executable", linkerExecutable,
@@ -107,6 +164,7 @@ func runParent(
 func runChild(
     _ marker: String,
     _ writableDirectory: String,
+    _ storageDirectory: String,
     _ pythonExecutable: String,
     _ compilerExecutable: String,
     _ linkerExecutable: String,
@@ -118,16 +176,18 @@ func runChild(
     guard readIsDenied(marker) else {
         exit(ProbeStatus.childSandboxMissing)
     }
-    guard isAbsolutePath(pythonExecutable),
+    guard networkIsDenied() else {
+        exit(ProbeStatus.childNetworkAllowed)
+    }
+    guard isAbsolutePath(storageDirectory),
+          isAbsolutePath(pythonExecutable),
           isAbsolutePath(compilerExecutable),
           isAbsolutePath(linkerExecutable),
           isAbsolutePath(sdkRoot) else {
         exit(ProbeStatus.invalidInput)
     }
     close(STDIN_FILENO)
-    guard let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-        exit(ProbeStatus.storageUnavailable)
-    }
+    let support = URL(fileURLWithPath: storageDirectory, isDirectory: true)
     let workDirectory = support.appendingPathComponent("capability", isDirectory: true)
     let temporaryDirectory = workDirectory.appendingPathComponent("tmp", isDirectory: true)
     do {
@@ -135,7 +195,7 @@ func runChild(
     } catch {
         exit(ProbeStatus.storageUnavailable)
     }
-    setenv("HOME", NSHomeDirectory(), 1)
+    setenv("HOME", workDirectory.path, 1)
     setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin", 1)
     setenv("TMPDIR", temporaryDirectory.path, 1)
     setenv("PYTHONNOUSERSITE", "1", 1)
@@ -196,7 +256,7 @@ func runChild(
         cSource += "int generated_\(index)(void) { return \(index); }\n"
     }
     do {
-        try cSource.write(to: source, atomically: true, encoding: .utf8)
+        try cSource.write(to: source, atomically: false, encoding: .utf8)
     } catch {
         exit(ProbeStatus.storageUnavailable)
     }
@@ -241,6 +301,7 @@ func runChild(
 
 guard let marker = option("--marker"),
       let writableDirectory = option("--writable-directory"),
+      let storageDirectory = option("--storage-directory"),
       let pythonExecutable = option("--python-executable"),
       let compilerExecutable = option("--compiler-executable"),
       let linkerExecutable = option("--linker-executable"),
@@ -253,7 +314,7 @@ guard let marker = option("--marker"),
 }
 
 if CommandLine.arguments.contains("--child") {
-    runChild(marker, writableDirectory, pythonExecutable, compilerExecutable, linkerExecutable, sdkRoot)
+    runChild(marker, writableDirectory, storageDirectory, pythonExecutable, compilerExecutable, linkerExecutable, sdkRoot)
 } else {
-    runParent(marker, writableDirectory, pythonExecutable, compilerExecutable, linkerExecutable, sdkRoot)
+    runParent(marker, writableDirectory, storageDirectory, pythonExecutable, compilerExecutable, linkerExecutable, sdkRoot)
 }
