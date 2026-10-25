@@ -37,6 +37,7 @@ DARWIN_SIGNED_UID_MIN = -(1 << 31)
 LSOF_NON_DESCRIPTOR_ENTRIES = frozenset(("cwd", "rtd", "txt", "mem", "ltx"))
 PROC_PIDLISTFDS = 1
 PROC_PIDFDPIPEINFO = 6
+PROX_FDTYPE_VNODE = 1
 PROX_FDTYPE_PIPE = 6
 FREAD = 1
 FWRITE = 2
@@ -64,6 +65,34 @@ SANDBOX_EXIT_STAGES = ("positive_read_exit", "positive_write_exit", "probe_exit"
 SANDBOX_STAGE_SET = frozenset(SANDBOX_STAGES)
 SANDBOX_FAILURE_SET = frozenset(SANDBOX_FAILURES)
 SANDBOX_EXIT_STAGE_SET = frozenset(SANDBOX_EXIT_STAGES)
+PROBE_ROLE_ORDER = (
+    "capabilityprobe",
+    "capabilitychild",
+    "sh",
+    "sleep",
+    "capability-child",
+    "forked-grandchild",
+    "python3",
+    "clang",
+)
+PROBE_ROLE_SET = frozenset(PROBE_ROLE_ORDER)
+SNAPSHOT_REJECTION_BUCKETS = ("none", "some", "many")
+SNAPSHOT_REJECTION_SET = frozenset(SNAPSHOT_REJECTION_BUCKETS)
+SNAPSHOT_REJECTIONS_MANY = 10
+PROBE_STDIN_DEVICE = "/dev/null"
+
+
+def _closed_missing_roles(roles):
+    if not isinstance(roles, (tuple, list, set, frozenset)):
+        return ()
+    present = {role for role in roles if type(role) is str and role in PROBE_ROLE_SET}
+    return tuple(role for role in PROBE_ROLE_ORDER if role in present)
+
+
+def _closed_rejection_bucket(bucket):
+    if type(bucket) is str and bucket in SNAPSHOT_REJECTION_SET:
+        return bucket
+    return None
 SIGNAL_EXIT_FAILURES = {
     9: "signal_kill",
     5: "signal_trap",
@@ -282,7 +311,7 @@ PROBE_IDENTITY_CHECKS = frozenset(
 class ProbeFailure(Exception):
     def __init__(
         self, reason, cleanup_complete=True, check=None, survivor_classes=None,
-        sandbox_stage=None, sandbox_failure=None,
+        sandbox_stage=None, sandbox_failure=None, missing_roles=None, snapshot_rejections=None,
     ):
         super().__init__(reason if reason in REASONS else "native_preflight_unavailable")
         self.reason = reason if reason in REASONS else "native_preflight_unavailable"
@@ -318,6 +347,12 @@ class ProbeFailure(Exception):
         else:
             self.sandbox_stage = None
             self.sandbox_failure = None
+        if self.reason == "descriptor_readback_unavailable":
+            self.missing_roles = _closed_missing_roles(missing_roles)
+            self.snapshot_rejections = _closed_rejection_bucket(snapshot_rejections)
+        else:
+            self.missing_roles = ()
+            self.snapshot_rejections = None
 
 
 class _ProcFdInfo(ctypes.Structure):
@@ -380,7 +415,7 @@ def valid_sha(value):
 
 def safe_output(
     observed, reason="native_preflight_unavailable", check=None, survivor_classes=None,
-    sandbox_stage=None, sandbox_failure=None,
+    sandbox_stage=None, sandbox_failure=None, missing_roles=None, snapshot_rejections=None,
 ):
     capability = "macos-capability=observed" if observed else "macos-capability=refused"
     if not observed:
@@ -413,6 +448,13 @@ def safe_output(
                 and sandbox_failure in SANDBOX_FAILURE_SET
             ):
                 capability += " sandbox_failure=" + sandbox_failure
+        if reason == "descriptor_readback_unavailable":
+            roles = _closed_missing_roles(missing_roles)
+            if roles:
+                capability += " missing_roles=" + ",".join(roles)
+            bucket = _closed_rejection_bucket(snapshot_rejections)
+            if bucket is not None:
+                capability += " snapshot_rejections=" + bucket
     return capability + "\nmacos-confinement=refused reason=incomplete_channel_evidence\n"
 
 
@@ -1675,12 +1717,16 @@ def _native_descriptor_snapshot(pid):
         if item.fd < 0 or item.fd in descriptors:
             raise ProbeFailure("descriptor_readback_unavailable")
         descriptors[item.fd] = item.type
-    if set(descriptors) != {1, 2}:
+    if set(descriptors) not in ({1, 2}, {0, 1, 2}):
         raise ProbeFailure("descriptor_readback_unavailable")
-    if descriptors != {1: PROX_FDTYPE_PIPE, 2: PROX_FDTYPE_PIPE}:
+    if descriptors.get(0, PROX_FDTYPE_VNODE) != PROX_FDTYPE_VNODE:
+        raise ProbeFailure("descriptor_readback_unavailable")
+    if any(descriptors[fd] != PROX_FDTYPE_PIPE for fd in (1, 2)):
         raise ProbeFailure("descriptor_readback_unavailable")
 
     observations = {}
+    if 0 in descriptors:
+        observations[0] = {"mode": "?", "type": "VNODE", "name": PROBE_STDIN_DEVICE}
     pipe_handles = set()
     for fd in (1, 2):
         pipe_buffer = ctypes.create_string_buffer(ctypes.sizeof(_PipeFdInfo))
@@ -1750,25 +1796,36 @@ def _descriptor_snapshot(pids):
             entry["name"] = line[1:]
         else:
             raise ProbeFailure("descriptor_readback_unavailable")
-    if set(lsof) != set(pids):
-        raise ProbeFailure("descriptor_readback_unavailable")
     observations = {}
     for pid in pids:
-        native = _native_descriptor_snapshot(pid)
-        if set(lsof[pid]) != set(native):
-            raise ProbeFailure("descriptor_readback_unavailable")
-        if any(lsof[pid][fd]["type"] != "PIPE" or not lsof[pid][fd]["name"].startswith("->") for fd in (1, 2)):
-            raise ProbeFailure("descriptor_readback_unavailable")
-        if lsof[pid][1]["name"] == lsof[pid][2]["name"]:
-            raise ProbeFailure("descriptor_readback_unavailable")
-        if native[1]["name"] == native[2]["name"]:
-            raise ProbeFailure("descriptor_readback_unavailable")
-        for fd in (1, 2):
-            if native[fd]["type"] != lsof[pid][fd]["type"]:
+        if pid not in lsof:
+            continue
+        try:
+            native = _native_descriptor_snapshot(pid)
+            if set(lsof[pid]) != set(native):
                 raise ProbeFailure("descriptor_readback_unavailable")
-            if native[fd]["mode"] != "w":
+            if 0 in native and (
+                lsof[pid][0]["type"] != "CHR"
+                or lsof[pid][0]["name"] != PROBE_STDIN_DEVICE
+                or native[0]["type"] != "VNODE"
+            ):
                 raise ProbeFailure("descriptor_readback_unavailable")
+            if any(lsof[pid][fd]["type"] != "PIPE" or not lsof[pid][fd]["name"].startswith("->") for fd in (1, 2)):
+                raise ProbeFailure("descriptor_readback_unavailable")
+            if lsof[pid][1]["name"] == lsof[pid][2]["name"]:
+                raise ProbeFailure("descriptor_readback_unavailable")
+            if native[1]["name"] == native[2]["name"]:
+                raise ProbeFailure("descriptor_readback_unavailable")
+            for fd in (1, 2):
+                if native[fd]["type"] != lsof[pid][fd]["type"]:
+                    raise ProbeFailure("descriptor_readback_unavailable")
+                if native[fd]["mode"] != "w":
+                    raise ProbeFailure("descriptor_readback_unavailable")
+        except ProbeFailure:
+            continue
         observations[pid] = native
+    if not observations:
+        raise ProbeFailure("descriptor_readback_unavailable")
     return observations
 
 
@@ -1779,7 +1836,7 @@ def _role_names(rows, pids):
 def _observe_roles(names, counts):
     roles = set()
     roles.update(name for name in names if name in {"capabilityprobe", "capabilitychild", "sh", "sleep", "capability-child"})
-    if any(name.startswith("python3") for name in names):
+    if any(name.startswith("python3") or name == "python" for name in names):
         roles.add("python3")
     if any(name.startswith("clang") for name in names):
         roles.add("clang")
@@ -1789,16 +1846,17 @@ def _observe_roles(names, counts):
 
 
 def _roles_complete(roles):
-    return {
-        "capabilityprobe",
-        "capabilitychild",
-        "sh",
-        "sleep",
-        "capability-child",
-        "forked-grandchild",
-        "python3",
-        "clang",
-    }.issubset(roles)
+    return PROBE_ROLE_SET.issubset(roles)
+
+
+def _missing_roles(roles):
+    return tuple(role for role in PROBE_ROLE_ORDER if role not in roles)
+
+
+def _rejection_bucket(count):
+    if count <= 0:
+        return "none"
+    return "many" if count >= SNAPSHOT_REJECTIONS_MANY else "some"
 
 
 class _Capture:
@@ -1943,6 +2001,7 @@ def _observe_probe(
         err_capture.start()
         deadline = time.monotonic() + MAX_PROBE_SECONDS
         observed_roles = set()
+        rejected_polls = 0
         expected_executable = Path(executable).name
         while time.monotonic() < deadline and process.poll() is None:
             rows = _process_table()
@@ -1961,15 +2020,17 @@ def _observe_probe(
                 pids.insert(0, process.pid)
             if pids:
                 try:
-                    _descriptor_snapshot(pids)
-                    counts = {}
-                    for pid in pids:
+                    verified = _descriptor_snapshot(pids)
+                except ProbeFailure:
+                    verified = {}
+                if len(verified) != len(pids):
+                    rejected_polls += 1
+                counts = {}
+                for pid in pids:
+                    if pid in verified:
                         name = Path(rows[pid][2]).name.lower()
                         counts[name] = counts.get(name, 0) + 1
-                    names = set(counts)
-                    observed_roles.update(_observe_roles(names, counts))
-                except ProbeFailure:
-                    pass
+                observed_roles.update(_observe_roles(set(counts), counts))
             if out_capture.overflow or err_capture.overflow:
                 break
             if _roles_complete(observed_roles):
@@ -2062,7 +2123,11 @@ def _observe_probe(
             sandbox_failure=_classify_exit(process.returncode, PROBE_EXIT_FAILURES),
         )
     if not _roles_complete(observed_roles):
-        raise ProbeFailure("descriptor_readback_unavailable")
+        raise ProbeFailure(
+            "descriptor_readback_unavailable",
+            missing_roles=_missing_roles(observed_roles),
+            snapshot_rejections=_rejection_bucket(rejected_polls),
+        )
 
 
 def run_native_probe(control_sha):
@@ -2198,6 +2263,7 @@ def main(argv=None):
             safe_output(
                 False, error.reason, error.check, survivor_classes=error.survivor_classes,
                 sandbox_stage=error.sandbox_stage, sandbox_failure=error.sandbox_failure,
+                missing_roles=error.missing_roles, snapshot_rejections=error.snapshot_rejections,
             ),
             end="",
         )

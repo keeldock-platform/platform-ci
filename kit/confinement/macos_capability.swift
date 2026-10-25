@@ -275,6 +275,33 @@ func runChild(
         exit(ProbeStatus.childFailed)
     }
 
+    let holdPath = workDirectory.appendingPathComponent("compiler-hold").path
+    unlink(holdPath)
+    guard mkfifo(holdPath, 0o600) == 0 else {
+        exit(ProbeStatus.storageUnavailable)
+    }
+    let openedHold = open(holdPath, O_RDWR)
+    guard openedHold >= 0 else {
+        exit(ProbeStatus.storageUnavailable)
+    }
+    let holdDescriptor = fcntl(openedHold, F_DUPFD_CLOEXEC, 10)
+    close(openedHold)
+    guard holdDescriptor >= 10 else {
+        exit(ProbeStatus.storageUnavailable)
+    }
+    let holdDeadline = Date().addingTimeInterval(3)
+    let holdCompiler: Process
+    do {
+        holdCompiler = try startProcess(compilerExecutable, [
+            "-x", "c",
+            "-isysroot", sdkRoot,
+            "-fsyntax-only",
+            holdPath,
+        ])
+    } catch {
+        exit(ProbeStatus.childFailed)
+    }
+
     let source = workDirectory.appendingPathComponent("descendant.c")
     let blockedOutput = URL(fileURLWithPath: writableDirectory).appendingPathComponent("outside-build").path
     let builtOutput = workDirectory.appendingPathComponent("capability-child").path
@@ -331,6 +358,15 @@ func runChild(
         ])
         builtCompiler.waitUntilExit()
         guard builtCompiler.terminationStatus == 0 else {
+            exit(ProbeStatus.childFailed)
+        }
+        let holdRemaining = holdDeadline.timeIntervalSinceNow
+        if holdRemaining > 0 {
+            Thread.sleep(forTimeInterval: holdRemaining)
+        }
+        close(holdDescriptor)
+        holdCompiler.waitUntilExit()
+        guard holdCompiler.terminationStatus == 0 else {
             exit(ProbeStatus.childFailed)
         }
         let builtChild = try startProcess(builtOutput, [marker])
