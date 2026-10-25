@@ -507,7 +507,10 @@ class DenyDefaultPolicyTests(unittest.TestCase):
             payload, error_output = proof_output(evidence, canary)
             self.assert_proof_refusal(payload, error_output, canary)
         with self.subTest(kind="canary_missing_from_stdout"):
-            self.assert_proof_refusal(b"\n".join(stdout.splitlines()[:-1]), stderr, canary)
+            no_canary_stdout = stdout.replace(canary, b"KD-REDACTED-CANARY")
+            self.assertNotIn(canary, no_canary_stdout)
+            self.assertIn(proof_line, no_canary_stdout)
+            self.assert_proof_refusal(no_canary_stdout, stderr, canary)
         with self.subTest(kind="canary_missing_from_stderr"):
             self.assert_proof_refusal(stdout, b"", canary)
         with self.subTest(kind="workflow_marker_missing"):
@@ -1131,9 +1134,87 @@ class DenyDefaultPolicyTests(unittest.TestCase):
             if isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id == "passed" for target in node.targets)
         )
-        self.assertIsInstance(pass_assignment, ast.Call)
-        self.assertIsInstance(pass_assignment.func, ast.Name)
-        self.assertEqual(pass_assignment.func.id, "all")
+        self.assertIsInstance(pass_assignment, ast.BoolOp)
+        self.assertIsInstance(pass_assignment.op, ast.And)
+
+        def conjunction_terms(expression):
+            if isinstance(expression, ast.BoolOp) and isinstance(expression.op, ast.And):
+                terms = []
+                for value in expression.values:
+                    terms.extend(conjunction_terms(value))
+                return terms
+            return [expression]
+
+        terms = conjunction_terms(pass_assignment)
+        channel_gate = next(
+            node for node in terms
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "all"
+        )
+        self.assertEqual(len(channel_gate.args), 1)
+        channel_iterator = channel_gate.args[0]
+        self.assertIsInstance(channel_iterator, ast.GeneratorExp)
+        self.assertEqual(len(channel_iterator.generators), 1)
+        channel_generator = channel_iterator.generators[0]
+        self.assertIsInstance(channel_generator.iter, ast.Name)
+        self.assertEqual(channel_generator.iter.id, "expected")
+        self.assertIsInstance(channel_iterator.elt, ast.Compare)
+        self.assertIsInstance(channel_iterator.elt.ops[0], ast.Is)
+        self.assertIsInstance(channel_iterator.elt.comparators[0], ast.Constant)
+        self.assertIs(channel_iterator.elt.comparators[0].value, True)
+        channel_observation = channel_iterator.elt.left
+        self.assertIsInstance(channel_observation, ast.Call)
+        self.assertIsInstance(channel_observation.func, ast.Attribute)
+        self.assertEqual(channel_observation.func.attr, "get")
+        self.assertIsInstance(channel_observation.func.value, ast.Name)
+        self.assertEqual(channel_observation.func.value.id, "result")
+        self.assertEqual(channel_observation.args[0].id, "channel")
+        self.assertEqual(channel_generator.target.id, "channel")
+        self.assertEqual(
+            expected_fields - channel_fields,
+            {
+                "actions_environment",
+                "dns_resolver",
+                "outside_write",
+                "positive_read",
+                "positive_write",
+                "staging_write",
+            },
+        )
+
+        file_scan_gate = next(
+            node for node in terms
+            if isinstance(node, ast.Compare)
+            and isinstance(node.left, ast.Call)
+            and isinstance(node.left.func, ast.Attribute)
+            and node.left.func.attr == "get"
+            and node.left.args
+            and isinstance(node.left.args[0], ast.Constant)
+            and node.left.args[0].value == "readable_file_canary"
+        )
+        self.assertIsInstance(file_scan_gate.ops[0], ast.Eq)
+        self.assertEqual(file_scan_gate.comparators[0].value, "absent")
+
+        log_gate = assignments["raw_log_channels"]
+        self.assertIsInstance(log_gate, ast.BoolOp)
+        self.assertIsInstance(log_gate.op, ast.And)
+        log_observations = set()
+        for value in log_gate.values:
+            self.assertIsInstance(value, ast.Compare)
+            self.assertIsInstance(value.ops[0], ast.Is)
+            self.assertIsInstance(value.comparators[0], ast.Constant)
+            self.assertIs(value.comparators[0].value, True)
+            self.assertIsInstance(value.left, ast.Call)
+            self.assertIsInstance(value.left.func, ast.Attribute)
+            self.assertEqual(value.left.func.attr, "get")
+            log_observations.add(value.left.args[0].value)
+        self.assertEqual(log_observations, {"syslog", "logger_attempted", "os_log_attempted"})
+
+        native_pass_assignment = assignments["native_pass"]
+        self.assertIsInstance(native_pass_assignment, ast.Name)
+        self.assertEqual(native_pass_assignment.id, "passed")
+        self.assertFalse(isinstance(pass_assignment, ast.Constant) and pass_assignment.value is True)
 
 
 if __name__ == "__main__":
