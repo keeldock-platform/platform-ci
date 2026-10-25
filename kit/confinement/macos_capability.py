@@ -81,8 +81,7 @@ SNAPSHOT_REJECTION_BUCKETS = ("none", "some", "many")
 SNAPSHOT_REJECTION_SET = frozenset(SNAPSHOT_REJECTION_BUCKETS)
 SNAPSHOT_REJECTIONS_MANY = 10
 PROBE_STDIN_DEVICE = "/dev/null"
-TOOLCHAIN_ROLE_PREFIXES = ("clang",)
-TOOLCHAIN_ROLE_NAMES = frozenset(("ld",))
+CLANG_ROLE_EVIDENCE = "spawn-time descriptors of the suspended hold process"
 
 
 def _closed_missing_roles(roles):
@@ -1721,6 +1720,8 @@ def _load_libproc():
         library.proc_pidinfo.restype = ctypes.c_int
         library.proc_pidfdinfo.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int)
         library.proc_pidfdinfo.restype = ctypes.c_int
+        library.proc_pidpath.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+        library.proc_pidpath.restype = ctypes.c_int
         return library
     except (OSError, AttributeError):
         raise ProbeFailure("descriptor_readback_unavailable")
@@ -1730,8 +1731,46 @@ def _unexpected_channel():
     return ProbeFailure("descriptor_channel_unexpected")
 
 
-def _is_toolchain_name(name):
-    return name in TOOLCHAIN_ROLE_NAMES or name.startswith(TOOLCHAIN_ROLE_PREFIXES)
+class _ToolchainPolicy:
+    def __init__(self, images, storage, read_roots):
+        self.images = frozenset(images)
+        self.storage = storage
+        self.read_roots = tuple(read_roots)
+
+
+def _within(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _toolchain_policy(compiler, linker, sdk_root, storage_directory):
+    roots = [_canonical_path(sdk_root), _canonical_path(storage_directory)]
+    for tool in (compiler, linker):
+        parents = Path(_canonical_path(tool)).parents
+        if len(parents) > 3:
+            roots.append(parents[2].as_posix())
+    return _ToolchainPolicy(
+        (_canonical_path(compiler), _canonical_path(linker)),
+        _canonical_path(storage_directory),
+        sorted(set(roots)),
+    )
+
+
+def _pid_image(library, pid):
+    buffer = ctypes.create_string_buffer(4096)
+    returned = library.proc_pidpath(pid, buffer, len(buffer))
+    if returned <= 0 or returned >= len(buffer):
+        return None
+    try:
+        return buffer.raw[:returned].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _image_is_trusted(pid, policy):
+    if policy is None:
+        return False
+    image = _pid_image(_load_libproc(), pid)
+    return image is not None and image in policy.images
 
 
 _NULL_DEVICE_RDEV = []
@@ -1757,12 +1796,30 @@ def _native_vnode(library, pid, fd):
     info = _VnodeFdInfoWithPath.from_buffer_copy(buffer.raw)
     if info.pfi.type != PROX_FDTYPE_VNODE:
         return None
-    return info.pvip.vnode.stat.mode, info.pvip.vnode.stat.rdev, info.pvip.path
+    return info.pvip.vnode.stat.mode, info.pvip.vnode.stat.rdev, info.pvip.path, info.pfi.openflags
 
 
-def _native_descriptor_snapshot(pid, toolchain=False):
-    """Return the verified descriptors of pid, None when the process is gone or unreadable,
-    and raise descriptor_channel_unexpected for any readable but non-conforming process."""
+def _extra_descriptor_allowed(node, policy):
+    mode, _rdev, raw_path, flags = node
+    try:
+        path = raw_path.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+        return False
+    if not path.startswith("/") or ".." in path.split("/"):
+        return False
+    if _within(path, policy.storage):
+        return True
+    if flags & FWRITE:
+        return False
+    return any(_within(path, root) for root in policy.read_roots)
+
+
+def _native_descriptor_snapshot(pid, policy=None):
+    """Return (descriptors, granted) for pid, None when the process is gone or unreadable,
+    and raise descriptor_channel_unexpected for any readable but non-conforming process.
+    The toolchain allowance is granted by the executable image path alone, never by name."""
     library = _load_libproc()
     buffer = ctypes.create_string_buffer(8192)
     returned = library.proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buffer, len(buffer))
@@ -1780,35 +1837,45 @@ def _native_descriptor_snapshot(pid, toolchain=False):
         descriptors[item.fd] = item.type
     if not descriptors:
         return None
+    extras = sorted(set(descriptors) - {0, 1, 2})
     for fd, kind in descriptors.items():
-        if fd in (1, 2):
-            allowed = kind == PROX_FDTYPE_PIPE
-        else:
-            allowed = kind == PROX_FDTYPE_VNODE and (fd == 0 or toolchain)
-        if not allowed:
+        if kind != (PROX_FDTYPE_PIPE if fd in (1, 2) else PROX_FDTYPE_VNODE):
             raise _unexpected_channel()
     if not {1, 2}.issubset(descriptors):
         raise _unexpected_channel()
+    granted = False
+    if extras:
+        if policy is None:
+            raise _unexpected_channel()
+        image = _pid_image(library, pid)
+        if image is None:
+            return None
+        if image not in policy.images:
+            raise _unexpected_channel()
+        granted = True
 
+    unreadable = False
     observations = {}
     if 0 in descriptors:
         node = _native_vnode(library, pid, 0)
         if node is None:
-            return None
-        mode, rdev, path = node
-        if (
-            path != PROBE_STDIN_DEVICE.encode("ascii")
-            or not stat.S_ISCHR(mode)
-            or rdev != _null_device_rdev()
-        ):
-            raise _unexpected_channel()
-        observations[0] = {"mode": "?", "type": "VNODE", "name": PROBE_STDIN_DEVICE}
+            unreadable = True
+        else:
+            mode, rdev, path, _flags = node
+            if (
+                path != PROBE_STDIN_DEVICE.encode("ascii")
+                or not stat.S_ISCHR(mode)
+                or rdev != _null_device_rdev()
+            ):
+                raise _unexpected_channel()
+            observations[0] = {"mode": "?", "type": "VNODE", "name": PROBE_STDIN_DEVICE}
     pipe_handles = set()
     for fd in (1, 2):
         pipe_buffer = ctypes.create_string_buffer(ctypes.sizeof(_PipeFdInfo))
         returned = library.proc_pidfdinfo(pid, fd, PROC_PIDFDPIPEINFO, pipe_buffer, len(pipe_buffer))
         if returned != ctypes.sizeof(_PipeFdInfo):
-            return None
+            unreadable = True
+            continue
         pipe = _PipeFdInfo.from_buffer_copy(pipe_buffer.raw)
         if pipe.pfi.type != PROX_FDTYPE_PIPE or pipe.pfi.openflags & (FREAD | FWRITE) != FWRITE:
             raise _unexpected_channel()
@@ -1821,30 +1888,32 @@ def _native_descriptor_snapshot(pid, toolchain=False):
             "type": "PIPE",
             "name": "->0x" + format(handles[0], "x"),
         }
-    for fd in sorted(set(descriptors) - {0, 1, 2}):
+    for fd in extras:
         node = _native_vnode(library, pid, fd)
         if node is None:
-            continue
-        if not (stat.S_ISREG(node[0]) or stat.S_ISDIR(node[0])):
+            unreadable = True
+        elif not _extra_descriptor_allowed(node, policy):
             raise _unexpected_channel()
-    return observations
+    if unreadable:
+        return None
+    return observations, granted
 
 
-def _check_lsof_descriptors(entries, toolchain):
+def _check_lsof_descriptors(entries, granted):
     for fd, entry in entries.items():
         if fd == 0:
             allowed = entry["type"] == "CHR" and entry["name"] == PROBE_STDIN_DEVICE
         elif fd in (1, 2):
             allowed = entry["type"] == "PIPE" and entry["name"].startswith("->")
         else:
-            allowed = toolchain and entry["type"] in ("REG", "DIR")
+            allowed = granted and entry["type"] in ("REG", "DIR")
         if not allowed:
             raise _unexpected_channel()
     if not {1, 2}.issubset(entries) or entries[1]["name"] == entries[2]["name"]:
         raise _unexpected_channel()
 
 
-def _descriptor_snapshot(pids, toolchain=frozenset(), agreed=None):
+def _descriptor_snapshot(pids, policy=None, agreed=None):
     if not pids or len(set(pids)) != len(pids):
         raise ProbeFailure("descriptor_readback_unavailable")
     if agreed is None:
@@ -1901,17 +1970,18 @@ def _descriptor_snapshot(pids, toolchain=frozenset(), agreed=None):
             raise ProbeFailure("descriptor_readback_unavailable")
     observations = {}
     for pid in pids:
-        native = _native_descriptor_snapshot(pid, pid in toolchain)
-        if native is None:
+        result_pair = _native_descriptor_snapshot(pid, policy)
+        if result_pair is None:
             agreed.discard(pid)
             continue
+        native, granted = result_pair
         if pid in agreed:
             observations[pid] = native
             continue
         entries = lsof.get(pid)
         if not entries:
             continue
-        _check_lsof_descriptors(entries, pid in toolchain)
+        _check_lsof_descriptors(entries, granted)
         if {fd for fd in entries if fd < 3} != set(native):
             continue
         if native[1]["name"] == native[2]["name"]:
@@ -2097,6 +2167,7 @@ def _observe_probe(
         observed_roles = set()
         rejected_polls = 0
         agreed = set()
+        policy = _toolchain_policy(compiler_executable, linker_executable, sdk_root, storage_directory)
         expected_executable = Path(executable).name
         while time.monotonic() < deadline and process.poll() is None:
             rows = _process_table()
@@ -2114,9 +2185,8 @@ def _observe_probe(
             if root_is_probe:
                 pids.insert(0, process.pid)
             if pids:
-                toolchain = {pid for pid in pids if _is_toolchain_name(Path(rows[pid][2]).name.lower())}
                 try:
-                    verified = _descriptor_snapshot(pids, toolchain, agreed)
+                    verified = _descriptor_snapshot(pids, policy, agreed)
                 except ProbeFailure as error:
                     if error.reason == "descriptor_channel_unexpected":
                         raise
@@ -2127,6 +2197,8 @@ def _observe_probe(
                 for pid in pids:
                     if pid in verified:
                         name = Path(rows[pid][2]).name.lower()
+                        if name.startswith("clang") and not _image_is_trusted(pid, policy):
+                            continue
                         counts[name] = counts.get(name, 0) + 1
                 observed_roles.update(_observe_roles(set(counts), counts))
             if out_capture.overflow or err_capture.overflow:

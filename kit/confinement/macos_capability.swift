@@ -160,9 +160,15 @@ func startSuspended(_ executable: String, _ arguments: [String]) -> pid_t? {
           posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO) == 0 else {
         return nil
     }
-    var argv: [UnsafeMutablePointer<CChar>?] = ([executable] + arguments).map { strdup($0) }
-    argv.append(nil)
+    var argv: [UnsafeMutablePointer<CChar>?] = []
     defer { for item in argv { free(item) } }
+    for item in [executable] + arguments {
+        guard let copy = strdup(item) else {
+            return nil
+        }
+        argv.append(copy)
+    }
+    argv.append(nil)
     var pid: pid_t = 0
     guard posix_spawn(&pid, executable, &actions, &attributes, argv, environ) == 0 else {
         return nil

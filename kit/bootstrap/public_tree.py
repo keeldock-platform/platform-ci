@@ -23,6 +23,7 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/macos_capability.py",
         "kit/confinement/macos_capability.swift",
         "kit/confinement/test_macos_capability.py",
+        "kit/confinement/test_macos_descriptors.py",
         "kit/confinement/linux_harness.py",
         "kit/confinement/test_linux_harness.py",
         "kit/confinement/windows_native_preflight.cs",

@@ -130,6 +130,7 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("kit/confinement/macos_capability.py", result)
         self.assertIn("kit/confinement/macos_capability.swift", result)
         self.assertIn("kit/confinement/test_macos_capability.py", result)
+        self.assertIn("kit/confinement/test_macos_descriptors.py", result)
         self.assertIn("kit/confinement/windows_native_preflight.cs", result)
         self.assertIn("kit/confinement/windows_native_preflight.ps1", result)
         self.assertIn("kit/confinement/test_windows_native_preflight.py", result)
