@@ -203,14 +203,14 @@ class WorkflowPolicyTests(unittest.TestCase):
             "/Library/Developer/CommandLineTools/Library/Frameworks/"
             "Python3.framework/Versions/3.9/bin/python3.9"
         )
-        launch = " -I -S -B kit/confinement/macos_capability.py --control-sha \"$CI_SHA\""
+        launch = " -I -S -B kit/confinement/macos_deny_default.py --control-sha \"$CI_SHA\""
         for text in (MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8"), MACOS_CAPABILITY_WORKFLOW_TEMPLATE):
             with self.subTest(source=text[:20]):
                 self.assertEqual(text.count(clt + launch), 1)
-                self.assertEqual(text.count("confinement/macos_capability.py"), 1)
-                self.assertNotIn("/usr/bin/python3 -B kit/confinement/macos_capability.py", text)
+                self.assertEqual(text.count("confinement/macos_deny_default.py"), 1)
+                self.assertNotIn("/usr/bin/python3 -B kit/confinement/macos_deny_default.py", text)
                 self.assertNotIn("Versions/Current", text)
-                privileged = [line for line in text.splitlines() if "confinement/macos_capability.py" in line]
+                privileged = [line for line in text.splitlines() if "confinement/macos_deny_default.py" in line]
                 self.assertEqual([line.strip() for line in privileged], [clt + launch])
 
     def test_macos_capability_workflow_file_equals_pinned_template(self):
@@ -236,10 +236,10 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(child_flags, ["-I", "-S", "-B"])
         for text in (MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8"), MACOS_CAPABILITY_WORKFLOW_TEMPLATE):
             with self.subTest(source=text[:20]):
-                lines = [line.strip() for line in text.splitlines() if "confinement/macos_capability.py" in line]
+                lines = [line.strip() for line in text.splitlines() if "confinement/macos_deny_default.py" in line]
                 self.assertEqual(len(lines), 1)
                 tokens = lines[0].split()
-                script = tokens.index("kit/confinement/macos_capability.py")
+                script = tokens.index("kit/confinement/macos_deny_default.py")
                 self.assertTrue(tokens[0].endswith("/bin/python3.9"))
                 self.assertEqual(tokens[1:script], child_flags)
 
@@ -250,6 +250,41 @@ class WorkflowPolicyTests(unittest.TestCase):
                 changed = workflow.replace("python3.9 -I -S -B kit/confinement", "python3.9 " + flags + " kit/confinement")
                 self.assertNotEqual(changed, workflow)
                 with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
+                    validate_workflow_text(changed, "platform", "macos-capability")
+
+    def test_macos_audit_dependencies_tokens_and_final_gate_are_pinned(self):
+        base = MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8")
+        required = (
+            "    needs: macos-public-snapshot\n",
+            "    needs: [macos-public-snapshot, macos-capability]\n",
+            "    if: ${{ always() }}\n",
+            "      receipt: ${{ steps.proof.outputs.receipt }}\n",
+            "      MACOS_CACHE_SNAPSHOT: ${{ needs.macos-public-snapshot.outputs.cache_snapshot }}\n",
+            "      MACOS_NATIVE_RECEIPT_B64URL: ${{ needs.macos-capability.outputs.receipt }}\n",
+            '          sudo -n -- env -i ',
+            '            RUNNER_HOME="$HOME" ',
+            '        run: python3 -B kit/confinement/macos_harness.py --control-sha "$CI_SHA"',
+        )
+        for value in required:
+            with self.subTest(fragment=value):
+                self.assertIn(value, base)
+                changed = base.replace(value, "", 1)
+                self.assertNotEqual(changed, base)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "macos-capability")
+        mutations = (
+            base.replace("      checks: read\n", "      checks: write\n"),
+            base.replace("      actions: read\n", "      actions: write\n"),
+            base.replace("    permissions: {}\n", "    permissions:\n      actions: read\n", 1),
+            base.replace('        id: proof\n', '        id: untrusted\n'),
+            base.replace("    needs: macos-public-snapshot\n", "    needs: []\n"),
+            base.replace("      GITHUB_TOKEN: ${{ github.token }}\n", ""),
+            base.replace("macos_deny_default.py --control-sha", "macos_capability.py --control-sha"),
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(changed, base)
+                with self.assertRaises(PolicyError):
                     validate_workflow_text(changed, "platform", "macos-capability")
 
     def test_actual_windows_native_preflight_matches_closed_manual_main_shape(self):
