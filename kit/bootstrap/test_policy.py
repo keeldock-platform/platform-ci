@@ -13,6 +13,8 @@ from policy import (
     MACOS_CACHE_PROOF_ACTION_SHA,
     MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE,
     MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256,
+    MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256,
+    MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256,
     MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE,
     MACOS_SOURCE_READER_ACTION_SHA,
     MACOS_SOURCE_READER_WORKFLOW_SHA256,
@@ -34,6 +36,8 @@ MACOS_REVIEWED_BUILD_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/w
 MACOS_CACHE_PROOF_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-cache-proof.yml"
 MACOS_SOURCE_READER_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-source-reader-preflight.yml"
 MACOS_RULES_SOURCE_READER_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rules-reader-preflight.yml"
+MACOS_RULES_BOOTSTRAP_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rules-bootstrap.yml"
+MACOS_CORE_BOOTSTRAP_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-core-bootstrap.yml"
 MACOS_CACHE_CLIENT_ACTION = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/action.yml"
 MACOS_CACHE_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/index.js"
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-native-preflight.yml"
@@ -433,6 +437,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("uses: ./kit/confinement/macos_cache_client", workflow)
         self.assertIn("mode: read\n", workflow)
         self.assertIn("mode: write\n", workflow)
+        self.assertIn("SAVE_OUTCOME: ${{ steps.denied-save.outcome }}", workflow)
         client_metadata = MACOS_CACHE_CLIENT_ACTION.read_text(encoding="utf-8")
         self.assertIn("description:", client_metadata)
         self.assertIn("using: node24", client_metadata)
@@ -606,7 +611,8 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertIn("kit/confinement/macos_source_reader.py", workflow)
                 self.assertIn('summary_prefix="macos-summary-"', workflow)
                 self.assertIn(
-                    'summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT"',
+                    'summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA '
+                    'run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT"',
                     workflow,
                 )
                 self.assertIn("expected_json='{\"meta''data\":\"verified\",\"reason\":\"ok\",'", workflow)
@@ -652,6 +658,112 @@ class WorkflowPolicyTests(unittest.TestCase):
                         1,
                     ),
                     workflow.replace("repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}", "repositories: "),
+                ):
+                    with self.assertRaises(PolicyError):
+                        validate_workflow_text(changed, "platform", workflow_kind)
+
+    def test_bootstrap_workflows_are_fixed_manual_main_only_and_publicly_audited(self):
+        cases = (
+            (
+                MACOS_RULES_BOOTSTRAP_WORKFLOW,
+                "macos-rules-bootstrap",
+                MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256,
+                "rules-source-read",
+                "macos-rules-bootstrap-settings",
+                "macos-rules-bootstrap",
+                "macos-rules-bootstrap-audit",
+            ),
+            (
+                MACOS_CORE_BOOTSTRAP_WORKFLOW,
+                "macos-core-bootstrap",
+                MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256,
+                "source-read",
+                "macos-public-snapshot",
+                "macos-core-bootstrap",
+                "macos-core-bootstrap-audit",
+            ),
+        )
+        for path, workflow_kind, digest, environment, settings_job, producer_job, audit_job in cases:
+            with self.subTest(workflow=workflow_kind):
+                workflow = path.read_text(encoding="utf-8")
+                self.assertEqual(hashlib.sha256(workflow.encode("utf-8")).hexdigest(), digest)
+                self.assertTrue(validate_workflow_text(workflow, "platform", workflow_kind))
+                self.assertTrue(workflow.startswith(
+                    "name: " + workflow_kind + "\non:\n  workflow_dispatch:\n"
+                ))
+                self.assertIn("cache-mode: none\npermissions: {}", workflow)
+                self.assertIn("github.ref == 'refs/heads/main'", workflow)
+                self.assertIn("environment: " + environment, workflow)
+                self.assertEqual(workflow.count("environment:"), 1)
+                self.assertIn("  " + settings_job + ":\n", workflow)
+                self.assertIn("  " + producer_job + ":\n", workflow)
+                self.assertIn("  " + audit_job + ":\n", workflow)
+                self.assertIn("if: ${{ always() && github.event_name == 'workflow_dispatch'", workflow)
+                self.assertIn("actions: read\n      checks: read", workflow)
+                self.assertIn("uses: actions/create-github-app-token@" + MACOS_SOURCE_READER_ACTION_SHA, workflow)
+                self.assertIn("permission-contents: read", workflow)
+                self.assertNotIn("actions/checkout", workflow)
+                self.assertNotIn("upload-artifact", workflow)
+                self.assertNotIn("download-artifact", workflow)
+                self.assertNotIn("workflow_call:", workflow)
+                self.assertNotIn("pull_request:", workflow)
+                self.assertNotIn("pull_request_target:", workflow)
+                self.assertNotRegex(workflow, r"(?m)^\s*GITHUB_STEP_SUMMARY:")
+                settings_section = workflow.split("  " + settings_job + ":\n", 1)[1].split(
+                    "  " + producer_job + ":\n", 1
+                )[0]
+                audit_section = workflow.split("  " + audit_job + ":\n", 1)[1]
+                self.assertNotIn("SOURCE_READER_PRIVATE_KEY", settings_section)
+                self.assertNotIn("SOURCE_READER_APP_PRIVATE_KEY", settings_section)
+                self.assertNotIn("SOURCE_READER_PRIVATE_KEY", audit_section)
+                self.assertNotIn("SOURCE_READER_APP_PRIVATE_KEY", audit_section)
+                if workflow_kind == "macos-rules-bootstrap":
+                    self.assertIn("RULES_ID_DEFINITIONS", workflow)
+                    self.assertIn("SOURCE_CANDIDATE_REF", workflow)
+                    self.assertIn("Validate source-reader scope configuration", workflow)
+                    self.assertIn("SOURCE_REPOSITORY_ID\" != \"1428198872\"", workflow)
+                    self.assertIn("macos-rules-source-binding=", workflow)
+                    self.assertIn("Revoke token if bootstrap did not confirm", workflow)
+                    self.assertIn("run --token-stdin", workflow)
+                    self.assertIn("--phase revoke --token-stdin", workflow)
+                    self.assertNotIn('SOURCE_READER_TOKEN="$SOURCE_READER_TOKEN"', workflow)
+                    self.assertIn("marker_prefix='macos-rules-bootstrap='", workflow)
+                    self.assertNotIn("macos-rules-bootstrap=passed", workflow)
+                    self.assertNotIn("macos-rules-bootstrap=refused", workflow)
+                    self.assertNotIn('{"metadata":', workflow)
+                    self.assertIn("Write trusted summary visibility control", workflow)
+                else:
+                    self.assertIn("core-bootstrap-settings", workflow)
+                    self.assertIn("core-bootstrap-snapshot", workflow)
+                    self.assertIn("Core preflight", workflow)
+                    self.assertIn("Validate reader settings", workflow)
+                    self.assertIn('"$SOURCE_REPOSITORY_ID" != "1430959909"', workflow)
+                    self.assertIn(
+                        "SOURCE_TOKEN_INSTALLATION_ID: ${{ steps.source-token.outputs.installation-id }}",
+                        workflow,
+                    )
+                    self.assertIn(
+                        '"$SOURCE_TOKEN_INSTALLATION_ID" != "$SOURCE_READER_INSTALLATION_ID"',
+                        workflow,
+                    )
+                    self.assertNotIn('SOURCE_READER_TOKEN="$SOURCE_READER_TOKEN"', workflow)
+                    self.assertIn("macos-core-source-binding=", workflow)
+                    self.assertIn("Validate core bootstrap", workflow)
+                    self.assertIn("--token-stdin", workflow)
+                    self.assertIn("--phase revoke --token-stdin", workflow)
+                    self.assertIn("token-revocation=(not-read|confirmed|unconfirmed)", workflow)
+                    self.assertIn("marker_prefix='macos-core-bootstrap='", workflow)
+                    self.assertIn("binding_prefix='macos-core-source-binding='", workflow)
+                    self.assertNotIn("macos-core-bootstrap=verified", workflow)
+                    self.assertNotIn("macos-core-bootstrap=refused", workflow)
+                    self.assertNotIn("macos-core-source-binding=verified", workflow)
+                    self.assertNotIn('{"metadata":', workflow)
+                for changed in (
+                    workflow.replace("cache-mode: none", "cache-mode: write", 1),
+                    workflow.replace(environment, "invalid-environment", 1),
+                    workflow.replace(MACOS_SOURCE_READER_ACTION_SHA, "0" * 40),
+                    workflow.replace("actions: read\n      checks: read", "actions: write\n      checks: read"),
+                    workflow.replace("always() && github.event_name", "success() && github.event_name", 1),
                 ):
                     with self.assertRaises(PolicyError):
                         validate_workflow_text(changed, "platform", workflow_kind)

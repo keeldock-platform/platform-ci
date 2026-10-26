@@ -20,7 +20,6 @@ SAFE_TOKEN_PATTERN = re.compile(r"[!-~]{1,4096}\Z")
 TOKEN_PATTERN = SAFE_TOKEN_PATTERN
 FULL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
 METADATA_PATH_PATTERN = re.compile(r"/repos/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
-ROLE_PERMISSION_KEYS = frozenset(("pull", "push", "admin", "maintain", "triage"))
 REASONS = frozenset((
     "token_unavailable", "arguments_invalid", "token_invalid", "configuration_invalid",
     "repository_list_unavailable", "repository_schema_invalid", "repository_count_invalid",
@@ -118,23 +117,9 @@ def _unique_object(pairs):
     return value
 
 
-def _permissions_are_read_only(value):
+def _repository_permissions_metadata_shape_is_valid(value):
     permissions = value.get("permissions")
-    if permissions is None:
-        return True
-    if type(permissions) is not dict or not permissions:
-        return False
-    if set(permissions).issubset(ROLE_PERMISSION_KEYS):
-        if permissions.get("pull") is not True:
-            return False
-        return all(
-            type(permissions[key]) is bool and permissions[key] is False
-            for key in ("push", "admin", "maintain", "triage")
-            if key in permissions
-        )
-    if set(permissions) == {"contents", "metadata"}:
-        return permissions.get("contents") == "read" and permissions.get("metadata") == "read"
-    return False
+    return permissions is None or type(permissions) is dict
 
 
 def _repository_entry_diagnostic(body, expected_repository_id):
@@ -153,7 +138,7 @@ def _repository_entry_diagnostic(body, expected_repository_id):
         return None, "repository_id_invalid"
     if repository.get("private") is not True:
         return None, "repository_private_invalid"
-    if not _permissions_are_read_only(repository):
+    if not _repository_permissions_metadata_shape_is_valid(repository):
         return None, "repository_permissions_invalid"
     full_name = repository.get("full_name")
     if type(full_name) is not str or FULL_NAME_PATTERN.fullmatch(full_name) is None:

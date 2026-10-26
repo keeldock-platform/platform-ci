@@ -167,8 +167,17 @@ class PublicTreeTests(unittest.TestCase):
             with self.assertRaisesRegex(PublicTreeError, "tree-shape"):
                 scan_tree(root, "platform")
 
-    def test_reviewed_windows_and_source_reader_controls_have_public_tree_hash_pins(self):
+    def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
+            'kit/confinement/macos_rules_bootstrap.py',
+            'kit/confinement/test_macos_rules_bootstrap.py',
+            'kit/confinement/macos_core_bootstrap.py',
+            'kit/confinement/test_macos_core_bootstrap.py',
+            '.github/workflows/macos-rules-bootstrap.yml',
+            '.github/workflows/macos-core-bootstrap.yml',
+            'kit/confinement/macos_private_validation.py',
+            'kit/confinement/test_macos_private_validation.py',
+            'ci/revoked-signer-fingerprints',
             ".github/workflows/windows-native-preflight.yml",
             "kit/confinement/windows_native_preflight.cs",
             "kit/confinement/windows_native_preflight.ps1",

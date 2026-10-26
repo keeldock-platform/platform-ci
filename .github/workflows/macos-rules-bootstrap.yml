@@ -1,0 +1,493 @@
+name: macos-rules-bootstrap
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full reviewed source commit SHA.
+        required: true
+        type: string
+      base_sha:
+        description: Full admitted base commit SHA.
+        required: true
+        type: string
+      base_branch:
+        description: Admitted permanent branch for the source base.
+        required: true
+        type: choice
+        options:
+          - main
+          - develop
+          - uat
+cache-mode: none
+permissions: {}
+jobs:
+  macos-rules-bootstrap-settings:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 15
+    permissions:
+      actions: read
+    outputs:
+      cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_BASE_SHA: ${{ inputs.base_sha }}
+      REQUESTED_BASE_BRANCH: ${{ inputs.base_branch }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Validate source-free control tree
+        run: |
+          set -euo pipefail
+          python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_public_tree.py
+          python3 -B -m unittest discover -s kit/confinement -p "test_macos*.py"
+          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+      - name: Validate requested source identity
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ || ! "$REQUESTED_BASE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          case "$REQUESTED_BASE_BRANCH" in
+            main|develop|uat) ;;
+            *) exit 1 ;;
+          esac
+      - name: Verify exact protected environment settings
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py rules-bootstrap-settings
+      - name: Snapshot public surfaces
+        id: snapshot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py rules-bootstrap-snapshot
+  macos-rules-bootstrap:
+    needs: macos-rules-bootstrap-settings
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    environment: rules-source-read
+    runs-on: macos-15
+    cache-mode: none
+    timeout-minutes: 45
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      reviewed_diff_sha256: ${{ steps.bootstrap-preflight.outputs.reviewed_diff_sha256 }}
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_BASE_SHA: ${{ inputs.base_sha }}
+      REQUESTED_BASE_BRANCH: ${{ inputs.base_branch }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Validate source-free control tree
+        run: |
+          set -euo pipefail
+          python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_public_tree.py
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
+          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+      - name: Seal exact control signer inventory
+        run: |
+          set -euo pipefail
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          sudo -n -- /usr/sbin/chown root:wheel "$CI_WORKSPACE/ci" "$CI_WORKSPACE/ci/revoked-signer-fingerprints" 2>/dev/null
+          if [[ "$(/usr/bin/stat -f '%u' "$CI_WORKSPACE/ci" 2>/dev/null)" != "0" || "$(/usr/bin/stat -f '%u' "$CI_WORKSPACE/ci/revoked-signer-fingerprints" 2>/dev/null)" != "0" ]]; then
+            exit 1
+          fi
+          inventory_prefix="macos-rules-control-inventory-"
+          printf '%ssealed schema=1 control-sha=%s run-id=%s run-attempt=%s owner=0\n' "$inventory_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+      - name: Prepare pinned public dash before token mint
+        run: |
+          set -euo pipefail
+          if [[ -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]; then
+            exit 1
+          fi
+          sudo -n -- env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME=/var/root LANG=C LC_ALL=C \
+            CI_REPOSITORY="$CI_REPOSITORY" CI_REF="$CI_REF" CI_SHA="$CI_SHA" \
+            CI_SERVER_URL="$CI_SERVER_URL" CI_EVENT_NAME="$CI_EVENT_NAME" CI_WORKSPACE="$CI_WORKSPACE" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+            -I -S -B kit/confinement/macos_rules_bootstrap.py prepare-dash
+      - name: Preflight protected bootstrap and review binding
+        id: bootstrap-preflight
+        env:
+          RULES_BOOTSTRAP_ALLOWED_SHA: ${{ vars.RULES_BOOTSTRAP_ALLOWED_SHA }}
+          RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA: ${{ vars.RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA }}
+          RULES_ID_DEFINITIONS: ${{ secrets.RULES_ID_DEFINITIONS }}
+          RULES_ID_DEFINITIONS_SHA256: ${{ vars.RULES_ID_DEFINITIONS_SHA256 }}
+          SOURCE_REVIEWED_SHA: ${{ vars.SOURCE_REVIEWED_SHA }}
+          SOURCE_REVIEWED_BASE: ${{ vars.SOURCE_REVIEWED_BASE }}
+          SOURCE_REVIEWED_BASE_BRANCH: ${{ vars.SOURCE_REVIEWED_BASE_BRANCH }}
+          SOURCE_REVIEWED_DIFF_SHA256: ${{ vars.SOURCE_REVIEWED_DIFF_SHA256 }}
+          SOURCE_CANDIDATE_REF: ${{ secrets.SOURCE_CANDIDATE_REF }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]; then
+            exit 1
+          fi
+          if [[ ! "$SOURCE_REVIEWED_DIFF_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+            exit 1
+          fi
+          sudo -n -- env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME=/var/root LANG=C LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
+            CI_REPOSITORY="$CI_REPOSITORY" CI_REF="$CI_REF" CI_SHA="$CI_SHA" \
+            CI_SERVER_URL="$CI_SERVER_URL" CI_EVENT_NAME="$CI_EVENT_NAME" CI_WORKSPACE="$CI_WORKSPACE" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            ImageOS="$ImageOS" ImageVersion="$ImageVersion" \
+            REQUESTED_SOURCE_SHA="$REQUESTED_SOURCE_SHA" REQUESTED_BASE_SHA="$REQUESTED_BASE_SHA" \
+            REQUESTED_BASE_BRANCH="$REQUESTED_BASE_BRANCH" \
+            RULES_BOOTSTRAP_ALLOWED_SHA="$RULES_BOOTSTRAP_ALLOWED_SHA" \
+            RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA="$RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA" \
+            RULES_ID_DEFINITIONS="$RULES_ID_DEFINITIONS" \
+            RULES_ID_DEFINITIONS_SHA256="$RULES_ID_DEFINITIONS_SHA256" \
+            SOURCE_REVIEWED_SHA="$SOURCE_REVIEWED_SHA" SOURCE_REVIEWED_BASE="$SOURCE_REVIEWED_BASE" \
+            SOURCE_REVIEWED_BASE_BRANCH="$SOURCE_REVIEWED_BASE_BRANCH" \
+            SOURCE_REVIEWED_DIFF_SHA256="$SOURCE_REVIEWED_DIFF_SHA256" \
+            SOURCE_CANDIDATE_REF="$SOURCE_CANDIDATE_REF" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+            -I -S -B kit/confinement/macos_rules_bootstrap.py preflight \
+            --source-sha "$REQUESTED_SOURCE_SHA" --base-sha "$REQUESTED_BASE_SHA" \
+            --base-branch "$REQUESTED_BASE_BRANCH" --concern rules-bootstrap
+          printf 'reviewed_diff_sha256=%s\n' "$SOURCE_REVIEWED_DIFF_SHA256" >> "$GITHUB_OUTPUT"
+      - name: Validate source-reader scope configuration
+        env:
+          SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
+          SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_READER_CLIENT_ID" =~ ^[A-Za-z0-9._-]{1,100}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$SOURCE_READER_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$SOURCE_REPOSITORY_ID" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          if [[ "$SOURCE_REPOSITORY_ID" != "1428198872" ]]; then
+            exit 1
+          fi
+          if [[ ! "$SOURCE_REPOSITORY_OWNER" =~ ^[A-Za-z0-9_.-]{1,100}$ || ! "$SOURCE_REPOSITORY_NAME" =~ ^[A-Za-z0-9_.-]{1,100}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          source_binding_prefix="macos-rules-source-binding="
+          printf '%sverified schema=1 control-sha=%s run-id=%s run-attempt=%s repository-id=%s\n' "$source_binding_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_REPOSITORY_ID"
+      - name: Mint scoped source-reader token
+        id: source-reader-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.SOURCE_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+          owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+          permission-contents: read
+      - name: Verify selected installation identity
+        env:
+          EXPECTED_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          ACTUAL_INSTALLATION_ID: ${{ steps.source-reader-token.outputs.installation-id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ || "$ACTUAL_INSTALLATION_ID" != "$EXPECTED_INSTALLATION_ID" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          reader_prefix="macos-source-reader-"
+          printf '%sinstallation=verified schema=1 control-sha=%s run-id=%s run-attempt=%s installation-id=%s\n' "$reader_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$ACTUAL_INSTALLATION_ID"
+      - name: Run fixed rules bootstrap
+        id: rules-bootstrap
+        env:
+          SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
+          SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+          RULES_BOOTSTRAP_ALLOWED_SHA: ${{ vars.RULES_BOOTSTRAP_ALLOWED_SHA }}
+          RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA: ${{ vars.RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA }}
+          RULES_ID_DEFINITIONS: ${{ secrets.RULES_ID_DEFINITIONS }}
+          RULES_ID_DEFINITIONS_SHA256: ${{ vars.RULES_ID_DEFINITIONS_SHA256 }}
+          SOURCE_REVIEWED_SHA: ${{ vars.SOURCE_REVIEWED_SHA }}
+          SOURCE_REVIEWED_BASE: ${{ vars.SOURCE_REVIEWED_BASE }}
+          SOURCE_REVIEWED_BASE_BRANCH: ${{ vars.SOURCE_REVIEWED_BASE_BRANCH }}
+          SOURCE_REVIEWED_DIFF_SHA256: ${{ vars.SOURCE_REVIEWED_DIFF_SHA256 }}
+          SOURCE_CANDIDATE_REF: ${{ secrets.SOURCE_CANDIDATE_REF }}
+        run: |
+          set -euo pipefail
+          marker_prefix='macos-rules-bootstrap='
+          success_state='passed'
+          refusal_state='refused'
+          cleanup_prefix='{'
+          cleanup_record="${cleanup_prefix}\"metadata\":\"verified\",\"reason\":\"ok\",\"repository_scope\":\"verified\",\"revocation\":\"confirmed\",\"schema_version\":1,\"status\":\"passed\"}"
+          write_token_state() {
+            printf 'token_revocation=%s\n' "$1" >> "$GITHUB_OUTPUT"
+          }
+          run_revoke_cli() {
+            local result
+            local result_status
+            set +e
+            result="$(printf '%s' "$SOURCE_READER_TOKEN" | sudo -n -- env -i \
+              PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+              LANG=C \
+              LC_ALL=C \
+              SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
+              PYTHONDONTWRITEBYTECODE=1 \
+              /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+              -I -S -B kit/confinement/macos_core_bootstrap.py --phase revoke --token-stdin 2>/dev/null)"
+            result_status=$?
+            set -e
+            if [[ "$result_status" -ne 0 || "$result" != "$cleanup_record" ]]; then
+              return 1
+            fi
+            printf '%s\n' "$result"
+            return 0
+          }
+          refuse_after_fallback() {
+            local state="$1"
+            printf '%s%s schema=1 reason=source_lease_unavailable stage=source_lease control-sha=%s run-id=%s run-attempt=%s token-revocation=%s\n' \
+              "$marker_prefix" "$refusal_state" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$state"
+            exit 1
+          }
+          set +e
+          bootstrap_output="$(printf '%s' "$SOURCE_READER_TOKEN" | sudo -n -- env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME=/var/root LANG=C LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
+            CI_REPOSITORY="$CI_REPOSITORY" CI_REF="$CI_REF" CI_SHA="$CI_SHA" \
+            CI_SERVER_URL="$CI_SERVER_URL" CI_EVENT_NAME="$CI_EVENT_NAME" CI_WORKSPACE="$CI_WORKSPACE" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            GITHUB_ENV="$GITHUB_ENV" GITHUB_OUTPUT="$GITHUB_OUTPUT" GITHUB_PATH="$GITHUB_PATH" \
+            GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" CI_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            RUNNER_TEMP="$RUNNER_TEMP" RUNNER_HOME="$HOME" \
+            ImageOS="${ImageOS:-}" ImageVersion="${ImageVersion:-}" \
+            REQUESTED_SOURCE_SHA="$REQUESTED_SOURCE_SHA" REQUESTED_BASE_SHA="$REQUESTED_BASE_SHA" \
+            REQUESTED_BASE_BRANCH="$REQUESTED_BASE_BRANCH" \
+            SOURCE_READER_INSTALLATION_ID="$SOURCE_READER_INSTALLATION_ID" \
+            SOURCE_READER_CLIENT_ID="$SOURCE_READER_CLIENT_ID" \
+            SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
+            SOURCE_REPOSITORY_OWNER="$SOURCE_REPOSITORY_OWNER" SOURCE_REPOSITORY_NAME="$SOURCE_REPOSITORY_NAME" \
+            RULES_BOOTSTRAP_ALLOWED_SHA="$RULES_BOOTSTRAP_ALLOWED_SHA" \
+            RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA="$RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA" \
+            RULES_ID_DEFINITIONS="$RULES_ID_DEFINITIONS" RULES_ID_DEFINITIONS_SHA256="$RULES_ID_DEFINITIONS_SHA256" \
+            SOURCE_REVIEWED_SHA="$SOURCE_REVIEWED_SHA" SOURCE_REVIEWED_BASE="$SOURCE_REVIEWED_BASE" \
+            SOURCE_REVIEWED_BASE_BRANCH="$SOURCE_REVIEWED_BASE_BRANCH" \
+            SOURCE_REVIEWED_DIFF_SHA256="$SOURCE_REVIEWED_DIFF_SHA256" \
+            SOURCE_CANDIDATE_REF="$SOURCE_CANDIDATE_REF" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+            -I -S -B kit/confinement/macos_rules_bootstrap.py run --token-stdin \
+            --source-sha "$REQUESTED_SOURCE_SHA" --base-sha "$REQUESTED_BASE_SHA" \
+            --base-branch "$REQUESTED_BASE_BRANCH" --concern rules-bootstrap 2>/dev/null)"
+          bootstrap_status=$?
+          set -e
+          success_re="^${marker_prefix}${success_state} schema=1 control-sha=[a-f0-9]{40} run-id=[1-9][0-9]{0,18} run-attempt=[1-9][0-9]{0,18} source-sha=[a-f0-9]{40} base-sha=[a-f0-9]{40} base-branch=(main|develop|uat) candidate-class=(permanent-tip|signed-descendant) suites=rules\.hooks,rules\.sync,rules\.static,rules\.public,plan-ids token-revocation=confirmed-before-execution lease-cleanup=complete process-cleanup=complete identity-cleanup=complete summary-guard=append-sibling-create-readback-restore source-tree=uid-read-only dash-version=0\.5\.13\.5 dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0 dash-binary-sha256=[a-f0-9]{64} reviewed-diff-sha256=[a-f0-9]{64} same-job-memory=not-verified$"
+          refusal_re="^${marker_prefix}${refusal_state} schema=1 reason=(invalid_input|control_identity_invalid|bootstrap_gate_refused|developer_mode_unavailable|plan_snapshot_refused|dash_bottle_unavailable|dash_bottle_invalid|dash_identity_invalid|context_unavailable|toolchain_unavailable|runner_controls_unavailable|probe_identity_unavailable|storage_unavailable|source_lease_unavailable|source_identity_invalid|source_tree_invalid|summary_guard_failed|suite_failed|plan_ids_failed|cleanup_incomplete|internal_error) stage=(arguments|context|bootstrap_gate|developer_mode|plan_snapshot|dash_download|dash_archive|dash_verify|toolchain|runner_controls|identity|storage|source_lease|source_identity|source_tree|summary_guard|rules\.hooks|rules\.sync|rules\.static|rules\.public|plan-ids|cleanup) control-sha=([a-f0-9]{40}|unknown) run-id=([1-9][0-9]{0,18}|unknown) run-attempt=([1-9][0-9]{0,18}|unknown) token-revocation=(not-read|confirmed|unconfirmed)$"
+          if [[ "$bootstrap_output" =~ $success_re ]]; then
+            if [[ "$bootstrap_output" == *" control-sha=$CI_SHA "* \
+              && "$bootstrap_output" == *" run-id=$GITHUB_RUN_ID "* \
+              && "$bootstrap_output" == *" run-attempt=$GITHUB_RUN_ATTEMPT "* \
+              && "$bootstrap_output" == *" source-sha=$REQUESTED_SOURCE_SHA "* \
+              && "$bootstrap_output" == *" base-sha=$REQUESTED_BASE_SHA "* \
+              && "$bootstrap_output" == *" base-branch=$REQUESTED_BASE_BRANCH "* \
+              && "$bootstrap_output" == *" reviewed-diff-sha256=$SOURCE_REVIEWED_DIFF_SHA256"* ]]; then
+              write_token_state confirmed
+              if [[ "$bootstrap_status" -eq 0 ]]; then
+                printf '%s\n' "$bootstrap_output"
+                exit 0
+              fi
+              exit 1
+            fi
+          elif [[ "$bootstrap_output" =~ $refusal_re ]]; then
+            if [[ "$bootstrap_output" == *" control-sha=$CI_SHA "* \
+              && "$bootstrap_output" == *" run-id=$GITHUB_RUN_ID "* \
+              && "$bootstrap_output" == *" run-attempt=$GITHUB_RUN_ATTEMPT "* ]]; then
+              case "$bootstrap_output" in
+                *" token-revocation=not-read") token_state=not-read ;;
+                *" token-revocation=confirmed") token_state=confirmed ;;
+                *" token-revocation=unconfirmed") token_state=unconfirmed ;;
+                *) token_state=invalid ;;
+              esac
+              printf '%s\n' "$bootstrap_output"
+              if [[ "$token_state" != "not-read" ]]; then
+                write_token_state "$token_state"
+                exit 1
+              fi
+            fi
+          fi
+          if run_revoke_cli; then
+            write_token_state confirmed
+            refuse_after_fallback confirmed
+          fi
+          write_token_state unconfirmed
+          refuse_after_fallback unconfirmed
+      - name: Revoke token if bootstrap did not confirm
+        if: ${{ always() && steps.source-reader-token.outcome == 'success' && steps.rules-bootstrap.outputs.token_revocation != 'confirmed' && steps.rules-bootstrap.outputs.token_revocation != 'unconfirmed' }}
+        env:
+          SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+        run: |
+          set -euo pipefail
+          cleanup_prefix='{'
+          cleanup_record="${cleanup_prefix}\"metadata\":\"verified\",\"reason\":\"ok\",\"repository_scope\":\"verified\",\"revocation\":\"confirmed\",\"schema_version\":1,\"status\":\"passed\"}"
+          set +e
+          result="$(printf '%s' "$SOURCE_READER_TOKEN" | sudo -n -- env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+            -I -S -B kit/confinement/macos_core_bootstrap.py --phase revoke --token-stdin 2>/dev/null)"
+          result_status=$?
+          set -e
+          if [[ "$result_status" -eq 0 && "$result" == "$cleanup_record" ]]; then
+            printf '%s\n' "$result"
+            exit 0
+          fi
+          exit 1
+      - name: Clean prepared dash
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          sudo -n -- env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME=/var/root LANG=C LC_ALL=C \
+            CI_REPOSITORY="$CI_REPOSITORY" CI_REF="$CI_REF" CI_SHA="$CI_SHA" \
+            CI_SERVER_URL="$CI_SERVER_URL" CI_EVENT_NAME="$CI_EVENT_NAME" CI_WORKSPACE="$CI_WORKSPACE" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            ImageOS="${ImageOS:-}" ImageVersion="${ImageVersion:-}" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+            -I -S -B kit/confinement/macos_rules_bootstrap.py cleanup-dash
+      - name: Write trusted summary visibility control
+        if: ${{ success() && steps.rules-bootstrap.outcome == 'success' }}
+        env:
+          SOURCE_REVIEWED_DIFF_SHA256: ${{ vars.SOURCE_REVIEWED_DIFF_SHA256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ || ! "$REQUESTED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ || ! "$REQUESTED_BASE_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ || ! "$SOURCE_REVIEWED_DIFF_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+            exit 1
+          fi
+          if [[ -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            exit 1
+          fi
+          summary_prefix="macos-rules-summary-"
+          summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT source-sha=$REQUESTED_SOURCE_SHA base-sha=$REQUESTED_BASE_SHA reviewed-diff-sha256=$SOURCE_REVIEWED_DIFF_SHA256"
+          printf '%s\n' "$summary_line" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$summary_line"
+  macos-rules-bootstrap-audit:
+    needs: [macos-rules-bootstrap-settings, macos-rules-bootstrap]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      checks: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_BASE_SHA: ${{ inputs.base_sha }}
+      REQUESTED_BASE_BRANCH: ${{ inputs.base_branch }}
+      REVIEWED_DIFF_SHA256: ${{ needs.macos-rules-bootstrap.outputs.reviewed_diff_sha256 }}
+      MACOS_CACHE_SNAPSHOT: ${{ needs.macos-rules-bootstrap-settings.outputs.cache_snapshot }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Audit rules bootstrap and public surfaces
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py rules-bootstrap-audit

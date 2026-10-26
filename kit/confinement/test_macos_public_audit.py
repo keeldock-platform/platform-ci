@@ -768,6 +768,49 @@ def source_reader_settings_fixture(kind):
     }
 
 
+def bootstrap_dispatch_run(kind, run_id=RUN_ID, sha=CONTROL_SHA, status="in_progress"):
+    configuration = audit.SOURCE_READER_CONFIGURATIONS[kind]
+    return {
+        "id": int(run_id),
+        "run_attempt": int(RUN_ATTEMPT),
+        "head_sha": sha,
+        "workflow_id": 987654321,
+        "path": configuration["workflow_path"],
+        "event": "workflow_dispatch",
+        "head_branch": "main",
+        "status": status,
+        "repository": {"full_name": audit.REPOSITORY},
+    }
+
+
+def bootstrap_dispatch_settings_fixture(kind, runs=None, total_count=None, link=None):
+    run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+    current_run = bootstrap_dispatch_run(kind)
+    workflow_runs_path = (
+        "/repos/keeldock-platform/platform-ci/actions/workflows/987654321/runs"
+    )
+    collection_path = (
+        workflow_runs_path
+        + "?branch=main&event=workflow_dispatch&per_page=100&page=1"
+    )
+    if runs is None:
+        runs = [dict(current_run)]
+    response = {"total_count": len(runs) if total_count is None else total_count,
+                "workflow_runs": runs}
+    headers = {} if link is None else {"Link": link}
+    pages = source_reader_settings_fixture(kind)
+    pages[run_path] = (current_run, {})
+    pages[collection_path] = (response, headers)
+    env = {
+        "GITHUB_REPOSITORY": audit.REPOSITORY,
+        "GITHUB_RUN_ID": RUN_ID,
+        "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
+        "CI_SHA": CONTROL_SHA,
+        "GITHUB_TOKEN": "t" * 32,
+    }
+    return pages, env, workflow_runs_path
+
+
 def source_reader_audit_fixture(kind):
     configuration = audit.SOURCE_READER_CONFIGURATIONS[kind]
     run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
@@ -889,9 +932,236 @@ def source_reader_audit_fixture(kind):
     return pages, env, logs
 
 
+def bootstrap_audit_fixture(kind):
+    configuration = audit.SOURCE_READER_CONFIGURATIONS[kind]
+    run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+    jobs_path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+    )
+    artifact_path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        + "/artifacts?per_page=100&page=1"
+    )
+    cache_path = "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+    source_sha = "b" * 40
+    base_sha = "c" * 40
+    reviewed_diff = "d" * 64
+    if kind == "rules-bootstrap":
+        snapshot_name = audit.RULES_BOOTSTRAP_SETTINGS_JOB_NAME
+        producer_name = audit.RULES_BOOTSTRAP_PRODUCER_JOB_NAME
+        audit_name = audit.RULES_BOOTSTRAP_AUDIT_JOB_NAME
+        snapshot_id, snapshot_check = 802, 902
+        producer_id, producer_check = 803, 903
+        audit_id, audit_check = 804, 904
+        snapshot_steps = (
+            "Fetch reviewed main control", "Validate source-free control tree",
+            "Validate requested source identity", "Verify exact protected environment settings",
+            "Snapshot public surfaces",
+        )
+        producer_steps = (
+            "Fetch reviewed main control", "Validate source-free control tree",
+            "Seal exact control signer inventory", "Prepare pinned public dash before token mint",
+            "Preflight protected bootstrap and review binding",
+            "Validate source-reader scope configuration", "Mint scoped source-reader token",
+            "Verify selected installation identity", "Run fixed rules bootstrap",
+            "Revoke token if bootstrap did not confirm", "Clean prepared dash",
+            "Write trusted summary visibility control",
+        )
+        preflight = (
+            "macos-rules-bootstrap=preflight-passed schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " source-sha=" + source_sha + " base-sha=" + base_sha
+            + " base-branch=develop dash-version=0.5.13.5"
+            + " dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0"
+            + " dash-binary-sha256=" + "e" * 64 + " reviewed-diff-sha256=" + reviewed_diff
+        ).encode("ascii")
+        success = (
+            "macos-rules-bootstrap=passed schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " source-sha=" + source_sha + " base-sha=" + base_sha
+            + " base-branch=develop candidate-class=signed-descendant"
+            + " suites=rules.hooks,rules.sync,rules.static,rules.public,plan-ids"
+            + " token-revocation=confirmed-before-execution lease-cleanup=complete"
+            + " process-cleanup=complete identity-cleanup=complete"
+            + " summary-guard=append-sibling-create-readback-restore source-tree=uid-read-only"
+            + " dash-version=0.5.13.5"
+            + " dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0"
+            + " dash-binary-sha256=" + "e" * 64 + " reviewed-diff-sha256=" + reviewed_diff
+            + " same-job-memory=not-verified"
+        ).encode("ascii")
+        summary = (
+            "macos-rules-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " source-sha=" + source_sha + " base-sha=" + base_sha
+            + " reviewed-diff-sha256=" + reviewed_diff
+        ).encode("ascii")
+        source_binding = (
+            "macos-rules-source-binding=verified schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " repository-id=" + audit.BOOTSTRAP_SOURCE_REPOSITORY_IDS["rules-bootstrap"]
+        ).encode("ascii")
+        producer_log = preflight + b"\n" + source_binding + b"\n" + success + b"\n" + summary + b"\n"
+        env = {
+            "REQUESTED_SOURCE_SHA": source_sha,
+            "REQUESTED_BASE_SHA": base_sha,
+            "REQUESTED_BASE_BRANCH": "develop",
+            "REVIEWED_DIFF_SHA256": reviewed_diff,
+        }
+        skipped_step = "Revoke token if bootstrap did not confirm"
+    elif kind == "core-bootstrap":
+        snapshot_name = audit.CORE_BOOTSTRAP_SNAPSHOT_JOB_NAME
+        producer_name = audit.CORE_BOOTSTRAP_PRODUCER_JOB_NAME
+        audit_name = audit.CORE_BOOTSTRAP_AUDIT_JOB_NAME
+        snapshot_id, snapshot_check = 812, 912
+        producer_id, producer_check = 813, 913
+        audit_id, audit_check = 814, 914
+        source_sha = "b" * 40
+        snapshot_steps = ("Fetch control", "Audit source-read settings", "Snapshot cache")
+        producer_steps = (
+            "Fetch control", "Test control", "Run reviewed smoke", "Protect inventory",
+            "Core preflight", "Validate reader settings", "Mint reader token",
+            "Validate core bootstrap",
+        )
+        smoke = (
+            "macos-build=synthetic-smoke-passed schema=1 source=none control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " image-os=macos-15 image-version=20261026.0337.1 macos-version=15.7.9"
+            + " architecture=arm64 xcode=not-used xcode-build=not-used"
+            + " compiler-origin=command-line-tools clang=16.0.0 sdk=15.0"
+            + " developer-mode=disabled privilege=separate-nonadmin sudo=denied"
+            + " compile=passed link=passed load-test=passed capture=passed"
+            + " summary-standin=write-denied real-summary=write-denied"
+            + " cleanup=complete seatbelt=not-run pf=not-run"
+        ).encode("ascii")
+        preflight = (
+            "macos-core-bootstrap=preflight-passed schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " source-sha=" + source_sha + " runner-summary=append-denied"
+            + " summary-sibling=create-denied summary-standin=write-denied cleanup=complete"
+        ).encode("ascii")
+        source_binding = (
+            "macos-core-source-binding=verified schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " repository-id=" + audit.BOOTSTRAP_SOURCE_REPOSITORY_IDS["core-bootstrap"]
+        ).encode("ascii")
+        success = (
+            "macos-core-bootstrap=verified schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " image-os=macos-15 image-version=20261026.0337.1"
+            + " source-repository-id=1430959909 source-sha=" + source_sha
+            + " base-branch=main base-sha=" + source_sha + " concern=core-bootstrap"
+            + " source-signature=verified token-revocation=confirmed-before-execution"
+            + " rules-lock=present rules-lock-signature=declared-verified"
+            + " lock-format=3 manifest=matched signers-hash=well-formed fragment-hash=well-formed"
+            + " source-execution=not-run app-build=not-run worker-access=not-applicable cleanup=complete"
+            + " summary-control=append-denied summary-sibling=create-denied"
+            + " summary-standin=write-denied summary-sentinel=written"
+        ).encode("ascii")
+        binding_command_echo = b'source_binding_prefix="macos-core-source-binding="'
+        bootstrap_command_echo = (
+            b"marker_prefix='macos-core-bootstrap='\n"
+            b"success_state='verified'\nrefusal_state='refused'\n"
+        )
+        producer_log = (
+            smoke + b"\n" + preflight + b"\n" + bootstrap_command_echo + b"\n"
+            + binding_command_echo + b"\n"
+            + source_binding + b"\n" + success + b"\n"
+        )
+        env = {"SOURCE_SHA": source_sha}
+        skipped_step = None
+    else:
+        raise AssertionError("unknown bootstrap fixture kind")
+
+    settings_marker = (
+        "macos-source-environment=verified schema=1 kind=" + kind
+        + " name=" + configuration["environment_name"]
+        + " environment-id=" + str(configuration["environment_id"])
+        + " policy-id=" + str(configuration["branch_policy_id"])
+        + " custom-branch-policies=true protected-branches=false branch=main branch-type=branch"
+        + " control-sha=" + CONTROL_SHA + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+    ).encode("ascii")
+    snapshot_marker = (
+        "macos-" + kind + "-snapshot=ready schema=1 control-sha=" + CONTROL_SHA
+        + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+    ).encode("ascii")
+    dispatch_marker = audit._bootstrap_dispatch_marker(kind, CONTROL_SHA, RUN_ID, RUN_ATTEMPT)
+    snapshot_log = dispatch_marker + b"\n" + settings_marker + b"\n" + snapshot_marker + b"\n"
+    run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+    pages = {
+        run_path: ({
+            "id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT), "head_sha": CONTROL_SHA,
+            "event": "workflow_dispatch", "head_branch": "main",
+            "path": configuration["workflow_path"],
+            "repository": {"full_name": audit.REPOSITORY},
+        }, {}),
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        + "/artifacts?per_page=100&page=1": ({"total_count": 0, "artifacts": []}, {}),
+        "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1": (
+            {"total_count": 0, "actions_caches": []}, {}
+        ),
+    }
+    pages.update(source_reader_settings_fixture(kind))
+    jobs = []
+    logs = {}
+    job_specs = (
+        (snapshot_name, snapshot_id, snapshot_check, "completed", "success", snapshot_steps),
+        (producer_name, producer_id, producer_check, "completed", "success", producer_steps),
+        (audit_name, audit_id, audit_check, "in_progress", "success", ()),
+    )
+    for name, job_id, check_id, status, conclusion, step_names in job_specs:
+        check_url = "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id)
+        record = {
+            "id": job_id, "run_id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT),
+            "head_sha": CONTROL_SHA, "name": name, "status": status,
+            "conclusion": conclusion, "check_run_url": check_url,
+        }
+        jobs.append(record)
+        if status == "completed":
+            step_records = []
+            post_names = (
+                ("Post Mint scoped source-reader token",)
+                if name == producer_name and kind == "rules-bootstrap"
+                else ("Post Mint reader token",)
+                if name == producer_name and kind == "core-bootstrap"
+                else ()
+            )
+            actual_step_names = ("Set up job", *step_names, *post_names, "Complete job")
+            for index, step_name in enumerate(actual_step_names, 1):
+                step_conclusion = "skipped" if step_name == skipped_step else "success"
+                step_records.append({
+                    "number": index, "name": step_name, "status": "completed",
+                    "conclusion": step_conclusion,
+                })
+            detail = dict(record, steps=step_records)
+            pages["/repos/keeldock-platform/platform-ci/actions/jobs/" + str(job_id)] = (detail, {})
+            check_path = "/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id)
+            pages[check_path] = ({
+                "id": check_id, "head_sha": CONTROL_SHA, "status": "completed",
+                "conclusion": "success",
+                "output": {"title": name, "summary": "bootstrap fixture", "annotations_count": 0},
+            }, {})
+            pages[check_path + "/annotations?per_page=100&page=1"] = ([], {})
+            logs[job_id] = snapshot_log if name == snapshot_name else producer_log
+    jobs_path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+    )
+    pages[jobs_path] = ({"total_count": len(jobs), "jobs": jobs}, {})
+    env.update({
+        "GITHUB_REPOSITORY": audit.REPOSITORY,
+        "GITHUB_RUN_ID": RUN_ID,
+        "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
+        "CI_SHA": CONTROL_SHA,
+        "GITHUB_TOKEN": "t" * 32,
+        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_digest([]),
+    })
+    return pages, env, logs
+
+
 class SourceReaderSettingsTests(unittest.TestCase):
     def test_settings_require_exact_environment_and_one_main_branch_policy(self):
-        for kind in ("core", "rules"):
+        for kind in ("core", "rules", "core-bootstrap", "rules-bootstrap"):
             with self.subTest(kind=kind):
                 pages = source_reader_settings_fixture(kind)
                 api = FakeAPI(pages)
@@ -905,6 +1175,7 @@ class SourceReaderSettingsTests(unittest.TestCase):
     def test_settings_refuse_missing_or_ambiguous_branch_policy_metadata(self):
         for kind, mutate in (
             ("rules", lambda env, policies: policies["branch_policies"][0].pop("type")),
+            ("rules-bootstrap", lambda env, policies: policies["branch_policies"][0].pop("type")),
             ("rules", lambda env, policies: policies["branch_policies"][0].update(type="tag")),
             ("rules", lambda env, policies: policies["branch_policies"][0].update(name="release/*")),
             ("rules", lambda env, policies: policies.update(
@@ -935,6 +1206,149 @@ class SourceReaderSettingsTests(unittest.TestCase):
                     audit._verify_source_reader_environment(
                         FakeAPI(pages), kind, CONTROL_SHA, RUN_ID, RUN_ATTEMPT
                     )
+
+
+class BootstrapDispatchGuardTests(unittest.TestCase):
+    def _run_settings(self, kind, pages, env):
+        output = io.StringIO()
+        api = FakeAPI(pages)
+        with contextlib.redirect_stdout(output):
+            result = audit.run(kind + "-settings", env, api)
+        return result, output.getvalue(), api
+
+    def test_settings_guard_allows_current_and_completed_runs(self):
+        kind = "core-bootstrap"
+        current = bootstrap_dispatch_run(kind)
+        completed = bootstrap_dispatch_run(
+            kind, run_id="765432101", sha="f" * 40, status="completed"
+        )
+        pages, env, collection_path = bootstrap_dispatch_settings_fixture(
+            kind, [current, completed]
+        )
+        result, output, api = self._run_settings(kind, pages, env)
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "macos-bootstrap-dispatch=single-active-verified schema=1 kind=core-bootstrap",
+            output,
+        )
+        self.assertEqual(api.calls[0], "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID)
+        self.assertEqual(api.calls[1], collection_path + "?branch=main&event=workflow_dispatch&per_page=100&page=1")
+        self.assertTrue(api.calls[2].endswith("/environments/source-read"))
+
+    def test_settings_guard_refuses_other_active_main_dispatch_even_at_an_older_sha(self):
+        kind = "rules-bootstrap"
+        current = bootstrap_dispatch_run(kind)
+        for status in ("queued", "in_progress", "waiting", "pending", "requested"):
+            with self.subTest(status=status):
+                other = bootstrap_dispatch_run(
+                    kind, run_id="765432101", sha="f" * 40, status=status
+                )
+                pages, env, _ = bootstrap_dispatch_settings_fixture(kind, [current, other])
+                api = FakeAPI(pages)
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.run(kind + "-settings", env, api)
+                self.assertEqual(caught.exception.reason, "run_identity_mismatch")
+                self.assertEqual(len(api.calls), 2)
+                self.assertFalse(any("/environments/" in path for path in api.calls))
+
+    def test_settings_guard_requires_exact_current_run_identity(self):
+        for field, value in (
+            ("head_sha", "f" * 40),
+            ("run_attempt", 3),
+            ("path", ".github/workflows/other.yml"),
+            ("head_branch", "develop"),
+            ("event", "push"),
+            ("workflow_id", 123456),
+            ("repository", {"full_name": "other/repository"}),
+        ):
+            with self.subTest(field=field):
+                kind = "core-bootstrap"
+                current = bootstrap_dispatch_run(kind)
+                listed_current = dict(current)
+                listed_current[field] = value
+                pages, env, _ = bootstrap_dispatch_settings_fixture(kind, [listed_current])
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.run(kind + "-settings", env, FakeAPI(pages))
+                expected = "api_schema" if field in {
+                    "path", "head_branch", "event", "workflow_id", "repository"
+                } else "run_identity_mismatch"
+                self.assertEqual(caught.exception.reason, expected)
+
+    def test_settings_guard_refuses_unknown_status_and_missing_current_run(self):
+        kind = "core-bootstrap"
+        current = bootstrap_dispatch_run(kind)
+        unknown = dict(current, status="suspended")
+        pages, env, _ = bootstrap_dispatch_settings_fixture(kind, [unknown])
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run(kind + "-settings", env, FakeAPI(pages))
+        self.assertEqual(caught.exception.reason, "api_schema")
+
+        pages, env, _ = bootstrap_dispatch_settings_fixture(kind, [])
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run(kind + "-settings", env, FakeAPI(pages))
+        self.assertEqual(caught.exception.reason, "run_identity_mismatch")
+
+        pages, env, _ = bootstrap_dispatch_settings_fixture(kind, [current, dict(current)])
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run(kind + "-settings", env, FakeAPI(pages))
+        self.assertEqual(caught.exception.reason, "api_schema")
+
+    def test_settings_guard_requires_complete_pagination_for_all_runs(self):
+        kind = "rules-bootstrap"
+        first_page = [bootstrap_dispatch_run(kind)] + [
+            bootstrap_dispatch_run(
+                kind, run_id=str(700000000 + index), sha="f" * 40, status="completed"
+            )
+            for index in range(99)
+        ]
+        pages, env, list_path = bootstrap_dispatch_settings_fixture(
+            kind, first_page, total_count=101
+        )
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run(kind + "-settings", env, FakeAPI(pages))
+        self.assertEqual(caught.exception.reason, "pagination_incomplete")
+
+        second_path = list_path + "?branch=main&event=workflow_dispatch&per_page=100&page=2"
+        first_url = "https://api.github.com" + list_path + "?branch=main&event=workflow_dispatch&per_page=100&page=1"
+        second_url = "https://api.github.com" + second_path
+        pages[list_path + "?branch=main&event=workflow_dispatch&per_page=100&page=1"] = (
+            {"total_count": 101, "workflow_runs": first_page},
+            {"Link": "<" + second_url + ">; rel=\"next\", <" + second_url + ">; rel=\"last\""},
+        )
+        pages[second_path] = (
+            {"total_count": 101, "workflow_runs": [bootstrap_dispatch_run(
+                kind, run_id="700000999", sha="f" * 40, status="completed"
+            )]},
+            {"Link": "<" + first_url + ">; rel=\"first\", <" + first_url + ">; rel=\"prev\", <" + second_url + ">; rel=\"last\""},
+        )
+        result, _, api = self._run_settings(kind, pages, env)
+        self.assertEqual(result, 0)
+        self.assertIn(second_path, api.calls)
+
+    def test_bootstrap_snapshot_audit_requires_one_run_bound_dispatch_guard_marker(self):
+        for kind, snapshot_job_id in (
+            ("rules-bootstrap", 802),
+            ("core-bootstrap", 812),
+        ):
+            with self.subTest(kind=kind):
+                _, _, logs = bootstrap_audit_fixture(kind)
+                raw = logs[snapshot_job_id]
+                audit._inspect_bootstrap_settings_snapshot(
+                    raw, kind, CONTROL_SHA, RUN_ID, RUN_ATTEMPT
+                )
+                marker = audit._bootstrap_dispatch_marker(
+                    kind, CONTROL_SHA, RUN_ID, RUN_ATTEMPT
+                )
+                for changed in (
+                    raw.replace(marker + b"\n", b"", 1),
+                    raw + marker + b"\n",
+                    raw.replace(CONTROL_SHA.encode("ascii"), b"f" * 40, 1),
+                ):
+                    with self.assertRaises(audit.AuditRefusal) as caught:
+                        audit._inspect_bootstrap_settings_snapshot(
+                            changed, kind, CONTROL_SHA, RUN_ID, RUN_ATTEMPT
+                        )
+                    self.assertEqual(caught.exception.reason, "receipt_invalid")
 
 
 class SourceReaderAuditTests(unittest.TestCase):
@@ -1034,6 +1448,152 @@ class SourceReaderAuditTests(unittest.TestCase):
         pages[env_path][0]["deployment_branch_policy"]["custom_branch_policies"] = False
         with self.assertRaises(audit.AuditRefusal):
             audit.run("source-reader-audit-core", env, FakeMultiAuditAPI(pages, logs))
+
+
+class BootstrapAuditTests(unittest.TestCase):
+    def test_rules_and_core_bootstrap_require_settings_snapshot_and_producer_evidence(self):
+        for kind, expected_output, expected_logs in (
+            (
+                "rules-bootstrap",
+                "macos-rules-bootstrap-audit=verified schema=1",
+                [802, 803],
+            ),
+            (
+                "core-bootstrap",
+                "macos-core-bootstrap-audit=verified schema=1",
+                [812, 813],
+            ),
+        ):
+            with self.subTest(kind=kind):
+                pages, env, logs = bootstrap_audit_fixture(kind)
+                api = FakeMultiAuditAPI(pages, logs)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    result = audit.run(kind + "-audit", env, api)
+                self.assertEqual(result, 0)
+                self.assertTrue(output.getvalue().startswith(expected_output))
+                self.assertIn("summary-ui=required source-admission=not-authorized", output.getvalue())
+                self.assertEqual(api.log_calls, expected_logs)
+                self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
+                self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
+                self.assertTrue(any(path.endswith("/deployment-branch-policies?per_page=100&page=1") for path in api.calls))
+
+    def test_rules_audit_refuses_missing_or_mismatched_run_bindings_and_fallback(self):
+        mutations = (
+            lambda pages, env, logs: logs.__setitem__(803, logs[803].replace(
+                b"reviewed-diff-sha256=" + b"d" * 64,
+                b"reviewed-diff-sha256=" + b"f" * 64,
+                1,
+            )),
+            lambda pages, env, logs: logs.__setitem__(803, logs[803].replace(
+                b"macos-rules-summary-control=trusted-write", b"macos-rules-summary-control=missing", 1
+            )),
+            lambda pages, env, logs: logs.__setitem__(803, logs[803].replace(
+                b"dash-binary-sha256=" + b"e" * 64,
+                b"dash-binary-sha256=" + b"f" * 64,
+                1,
+            )),
+            lambda pages, env, logs: env.__setitem__("REQUESTED_SOURCE_SHA", "f" * 40),
+            lambda pages, env, logs: logs.__setitem__(803, logs[803].replace(
+                b"repository-id=" + audit.BOOTSTRAP_SOURCE_REPOSITORY_IDS["rules-bootstrap"].encode("ascii"),
+                b"repository-id=999999", 1,
+            )),
+            lambda pages, env, logs: next(
+                step for step in pages[
+                    "/repos/keeldock-platform/platform-ci/actions/jobs/803"
+                ][0]["steps"] if step["name"] == "Revoke token if bootstrap did not confirm"
+            ).update(conclusion="success"),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                pages, env, logs = bootstrap_audit_fixture("rules-bootstrap")
+                mutate(pages, env, logs)
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.run(
+                        "rules-bootstrap-audit", env, FakeMultiAuditAPI(pages, logs)
+                    )
+
+    def test_core_audit_refuses_missing_summary_marker_wrong_sha_and_failed_step(self):
+        mutations = (
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"macos-core-bootstrap=verified", b"macos-core-bootstrap=refused", 1
+            )),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813] + b"macos-core-bootstrap=refused schema=1\n"),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"source-repository-id=1430959909", b"source-repository-id=999999", 1
+            )),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"summary-sentinel=written", b"summary-sentinel=not-written", 1
+            )),
+            lambda pages, env, logs: env.__setitem__("SOURCE_SHA", "f" * 40),
+            lambda pages, env, logs: pages[
+                "/repos/keeldock-platform/platform-ci/actions/jobs/813"
+            ][0]["steps"][8].update(conclusion="failure"),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"macos-core-source-binding=verified", b"macos-core-source-binding=missing", 1
+            )),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"repository-id=1430959909", b"repository-id=999999", 1
+            )),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                pages, env, logs = bootstrap_audit_fixture("core-bootstrap")
+                mutate(pages, env, logs)
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.run(
+                        "core-bootstrap-audit", env, FakeMultiAuditAPI(pages, logs)
+                    )
+
+    def test_bootstrap_audit_refuses_wrong_job_topology_artifacts_and_changed_caches(self):
+        pages, env, logs = bootstrap_audit_fixture("core-bootstrap")
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        pages[jobs_path][0]["jobs"].append(dict(pages[jobs_path][0]["jobs"][0], id=999, name="extra"))
+        pages[jobs_path][0]["total_count"] += 1
+        with self.assertRaises(audit.AuditRefusal):
+            audit.run("core-bootstrap-audit", env, FakeMultiAuditAPI(pages, logs))
+
+        pages, env, logs = bootstrap_audit_fixture("rules-bootstrap")
+        artifact_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/artifacts?per_page=100&page=1"
+        )
+        pages[artifact_path] = ({"total_count": 1, "artifacts": [{
+            "id": 99, "name": "unexpected", "size_in_bytes": 1, "expired": False,
+        }]}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rules-bootstrap-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "artifact_found")
+
+        pages, env, logs = bootstrap_audit_fixture("core-bootstrap")
+        cache_path = "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        pages[cache_path] = ({"total_count": 1, "actions_caches": [{
+            "id": 101, "ref": "refs/heads/main", "key": "unexpected-public-cache",
+            "version": "v1", "last_accessed_at": None,
+            "created_at": "2026-10-26T00:00:00Z", "size_in_bytes": 1,
+        }]}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("core-bootstrap-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "inventory_changed")
+
+    def test_bootstrap_audit_requires_only_the_exact_github_implicit_job_steps(self):
+        mutations = (
+            lambda steps: steps.pop(0),
+            lambda steps: steps[-1].update(name="Unexpected final step"),
+            lambda steps: next(
+                step for step in steps if step["name"] == "Post Mint reader token"
+            ).update(name="Unexpected post step"),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                pages, env, logs = bootstrap_audit_fixture("core-bootstrap")
+                steps = pages["/repos/keeldock-platform/platform-ci/actions/jobs/813"][0]["steps"]
+                mutate(steps)
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.run("core-bootstrap-audit", env, FakeMultiAuditAPI(pages, logs))
 
 
 class CacheProofAuditTests(unittest.TestCase):

@@ -27,6 +27,10 @@ CACHE_PROOF_ACTION_SHA = "3edfce9056124e459a23f683a21433670d47daca"
 CACHE_PROOF_SEED_KEY_PREFIX = "macos-public-cache-seed-v1-"
 CACHE_PROOF_NONE_WRITE_KEY_PREFIX = "macos-public-cache-none-write-v1-"
 SOURCE_READER_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
+BOOTSTRAP_SOURCE_REPOSITORY_IDS = {
+    "rules-bootstrap": "1428198872",
+    "core-bootstrap": "1430959909",
+}
 SOURCE_READER_CONFIGURATIONS = {
     "core": {
         "workflow_path": ".github/workflows/macos-source-reader-preflight.yml",
@@ -40,6 +44,18 @@ SOURCE_READER_CONFIGURATIONS = {
         "environment_id": 25357465381,
         "branch_policy_id": 64411429,
     },
+    "rules-bootstrap": {
+        "workflow_path": ".github/workflows/macos-rules-bootstrap.yml",
+        "environment_name": "rules-source-read",
+        "environment_id": 25357465381,
+        "branch_policy_id": 64411429,
+    },
+    "core-bootstrap": {
+        "workflow_path": ".github/workflows/macos-core-bootstrap.yml",
+        "environment_name": "source-read",
+        "environment_id": 25337167708,
+        "branch_policy_id": 64386356,
+    },
 }
 SOURCE_READER_PHASES = {
     "source-reader-settings-core": ("settings", "core"),
@@ -48,10 +64,22 @@ SOURCE_READER_PHASES = {
     "source-reader-settings-rules": ("settings", "rules"),
     "source-reader-snapshot-rules": ("snapshot", "rules"),
     "source-reader-audit-rules": ("audit", "rules"),
+    "rules-bootstrap-settings": ("settings", "rules-bootstrap"),
+    "rules-bootstrap-snapshot": ("snapshot", "rules-bootstrap"),
+    "rules-bootstrap-audit": ("bootstrap-audit", "rules-bootstrap"),
+    "core-bootstrap-settings": ("settings", "core-bootstrap"),
+    "core-bootstrap-snapshot": ("snapshot", "core-bootstrap"),
+    "core-bootstrap-audit": ("bootstrap-audit", "core-bootstrap"),
 }
 SOURCE_READER_SETTINGS_JOB_NAME = "macos-source-reader-settings"
 SOURCE_READER_TOKEN_JOB_NAME = "macos-source-reader-token"
 SOURCE_READER_AUDIT_JOB_NAME = "macos-source-reader-audit"
+RULES_BOOTSTRAP_SETTINGS_JOB_NAME = "macos-rules-bootstrap-settings"
+RULES_BOOTSTRAP_PRODUCER_JOB_NAME = "macos-rules-bootstrap"
+RULES_BOOTSTRAP_AUDIT_JOB_NAME = "macos-rules-bootstrap-audit"
+CORE_BOOTSTRAP_SNAPSHOT_JOB_NAME = "macos-public-snapshot"
+CORE_BOOTSTRAP_PRODUCER_JOB_NAME = "macos-core-bootstrap"
+CORE_BOOTSTRAP_AUDIT_JOB_NAME = "macos-core-bootstrap-audit"
 SOURCE_READER_SUCCESS_RECORD = (
     b'{"metadata":"verified","reason":"ok","repository_scope":"verified",'
     b'"revocation":"confirmed","schema_version":1,"status":"passed"}'
@@ -91,7 +119,12 @@ MAX_CACHE_ITEMS = 10000
 MAX_ARTIFACT_ITEMS = 1000
 MAX_ANNOTATIONS = 10000
 MAX_PAGES = 100
+MAX_WORKFLOW_RUNS = PAGE_SIZE * MAX_PAGES
 MAX_RECEIPT_BYTES = 16 * 1024
+ACTIVE_WORKFLOW_RUN_STATUSES = frozenset(
+    ("queued", "in_progress", "waiting", "pending", "requested")
+)
+KNOWN_WORKFLOW_RUN_STATUSES = ACTIVE_WORKFLOW_RUN_STATUSES | {"completed"}
 CONTROL_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./-]{20,512}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
@@ -126,6 +159,71 @@ REVIEWED_SUMMARY_CONTROL_MARKER_RE = re.compile(
     rb"(?:\.[0-9]+)?Z )?macos-summary-control=trusted-write schema=1 "
     rb"control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) "
     rb"run-attempt=([1-9][0-9]{0,18})(?=\r?(?:\n|$))"
+)
+RULES_BOOTSTRAP_PREFLIGHT_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-rules-bootstrap=preflight-passed schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"source-sha=([a-f0-9]{40}) base-sha=([a-f0-9]{40}) base-branch=(main|develop|uat) "
+    rb"dash-version=0\.5\.13\.5 dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0 "
+    rb"dash-binary-sha256=([a-f0-9]{64}) reviewed-diff-sha256=([a-f0-9]{64})"
+    rb"(?=\r?(?:\n|$))"
+)
+RULES_BOOTSTRAP_SUCCESS_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-rules-bootstrap=passed schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"source-sha=([a-f0-9]{40}) base-sha=([a-f0-9]{40}) base-branch=(main|develop|uat) "
+    rb"candidate-class=(permanent-tip|signed-descendant) "
+    rb"suites=rules\.hooks,rules\.sync,rules\.static,rules\.public,plan-ids "
+    rb"token-revocation=confirmed-before-execution lease-cleanup=complete "
+    rb"process-cleanup=complete identity-cleanup=complete "
+    rb"summary-guard=append-sibling-create-readback-restore source-tree=uid-read-only "
+    rb"dash-version=0\.5\.13\.5 dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0 "
+    rb"dash-binary-sha256=([a-f0-9]{64}) reviewed-diff-sha256=([a-f0-9]{64}) "
+    rb"same-job-memory=not-verified(?=\r?(?:\n|$))"
+)
+RULES_BOOTSTRAP_SUMMARY_CONTROL_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-rules-summary-control=trusted-write schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"source-sha=([a-f0-9]{40}) base-sha=([a-f0-9]{40}) reviewed-diff-sha256=([a-f0-9]{64})"
+    rb"(?=\r?(?:\n|$))"
+)
+RULES_BOOTSTRAP_SOURCE_BINDING_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-rules-source-binding=verified schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"repository-id=([1-9][0-9]{0,18})(?=\r?(?:\n|$))"
+)
+CORE_BOOTSTRAP_PREFLIGHT_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-core-bootstrap=preflight-passed schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"source-sha=([a-f0-9]{40}) runner-summary=append-denied "
+    rb"summary-sibling=create-denied summary-standin=write-denied cleanup=complete"
+    rb"(?=\r?(?:\n|$))"
+)
+CORE_BOOTSTRAP_SUCCESS_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-core-bootstrap=verified schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"image-os=(macos-?[0-9]{1,2}(?:-(?:arm64|x64|intel))?) "
+    rb"image-version=([0-9]+(?:\.[0-9]+){1,3}) "
+    rb"source-repository-id=([1-9][0-9]{0,18}) source-sha=([a-f0-9]{40}) "
+    rb"base-branch=main base-sha=([a-f0-9]{40}) concern=core-bootstrap "
+    rb"source-signature=verified token-revocation=confirmed-before-execution "
+    rb"rules-lock=present rules-lock-signature=declared-verified "
+    rb"lock-format=3 manifest=matched signers-hash=well-formed fragment-hash=well-formed "
+    rb"source-execution=not-run app-build=not-run worker-access=not-applicable cleanup=complete "
+    rb"summary-control=append-denied summary-sibling=create-denied "
+    rb"summary-standin=write-denied summary-sentinel=written(?=\r?(?:\n|$))"
+)
+CORE_BOOTSTRAP_SOURCE_BINDING_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-core-source-binding=verified schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"repository-id=([1-9][0-9]{0,18})(?=\r?(?:\n|$))"
 )
 CANARY_DOMAIN = b"keeldock" + b"-macos-ci-canary-v1\0"
 CANARY_PREFIX = b"KD-MACOS-CI-CANARY-v1:"
@@ -596,7 +694,7 @@ def _validate_log_location(value):
         _fail("log_unavailable")
 
 
-def _page_link_map(header_value, path, page, expected_last_page=None):
+def _page_link_map(header_value, path, page, expected_last_page=None, fixed_query=None):
     if header_value is None or header_value == "":
         if expected_last_page is not None and expected_last_page > page:
             _fail("pagination_incomplete")
@@ -620,17 +718,25 @@ def _page_link_map(header_value, path, page, expected_last_page=None):
             port = parsed.port
         except Exception:
             _fail("pagination_incomplete")
+        expected_query_keys = {"page", "per_page"}
+        if fixed_query is not None:
+            expected_query_keys.update(fixed_query)
         if (parsed.scheme != "https" or parsed.hostname != API_HOST or parsed.netloc != API_HOST
                 or port is not None
                 or parsed.username is not None or parsed.password is not None or parsed.path != path
-                or parsed.fragment or set(query) != {"page", "per_page"}
+                or parsed.fragment or set(query) != expected_query_keys
                 or len(query["page"]) != 1 or len(query["per_page"]) != 1
                 or query["per_page"][0] != str(PAGE_SIZE)
-                or not query["page"][0].isdecimal()
-                or parsed.query not in (
+                or not query["page"][0].isdecimal()):
+            _fail("pagination_incomplete")
+        if fixed_query is None and parsed.query not in (
                     "per_page=" + str(PAGE_SIZE) + "&page=" + query["page"][0],
                     "page=" + query["page"][0] + "&per_page=" + str(PAGE_SIZE),
-                )):
+                ):
+            _fail("pagination_incomplete")
+        if fixed_query is not None and any(
+                len(query.get(key, ())) != 1 or query[key][0] != value
+                for key, value in fixed_query.items()):
             _fail("pagination_incomplete")
         target_page = int(query["page"][0])
         if relation == "first" and target_page != 1:
@@ -660,12 +766,15 @@ def _page_link_map(header_value, path, page, expected_last_page=None):
     return result
 
 
-def _query_path(path, page):
-    return path + "?per_page=" + str(PAGE_SIZE) + "&page=" + str(page)
+def _query_path(path, page, fixed_query=None):
+    if fixed_query is None:
+        return path + "?per_page=" + str(PAGE_SIZE) + "&page=" + str(page)
+    query = urllib.parse.urlencode(fixed_query)
+    return path + "?" + query + "&per_page=" + str(PAGE_SIZE) + "&page=" + str(page)
 
 
-def _read_counted_collection(api, path, key, maximum, item_validator):
-    first, headers = api.json(_query_path(path, 1))
+def _read_counted_collection(api, path, key, maximum, item_validator, fixed_query=None):
+    first, headers = api.json(_query_path(path, 1, fixed_query))
     if type(first) is not dict or type(first.get("total_count")) is not int or first["total_count"] < 0:
         _fail("api_schema")
     total = first["total_count"]
@@ -677,17 +786,17 @@ def _read_counted_collection(api, path, key, maximum, item_validator):
         _fail("pagination_incomplete")
     if len(items) != min(PAGE_SIZE, total):
         _fail("pagination_incomplete")
-    _page_link_map(headers.get("Link"), path, 1, pages)
+    _page_link_map(headers.get("Link"), path, 1, pages, fixed_query)
     collected = list(items)
     for page in range(2, pages + 1):
-        body, page_headers = api.json(_query_path(path, page))
+        body, page_headers = api.json(_query_path(path, page, fixed_query))
         if (type(body) is not dict or type(body.get("total_count")) is not int
                 or body["total_count"] != total or type(body.get(key)) is not list):
             _fail("pagination_incomplete")
         expected_count = min(PAGE_SIZE, total - (page - 1) * PAGE_SIZE)
         if len(body[key]) != expected_count:
             _fail("pagination_incomplete")
-        _page_link_map(page_headers.get("Link"), path, page, pages)
+        _page_link_map(page_headers.get("Link"), path, page, pages, fixed_query)
         collected.extend(body[key])
     if len(collected) != total:
         _fail("pagination_incomplete")
@@ -1001,6 +1110,75 @@ def _verify_source_reader_environment(api, kind, control_sha, run_id, run_attemp
     ).encode("ascii")
 
 
+def _validate_bootstrap_workflow_run(item, workflow_id, workflow_path):
+    repository = item.get("repository") if type(item) is dict else None
+    if (type(item) is not dict
+            or not _exact_int(item.get("run_attempt"), 1)
+            or not _valid_sha(item.get("head_sha"))
+            or not _exact_int(item.get("workflow_id"), 1)
+            or item.get("workflow_id") != workflow_id
+            or item.get("path") != workflow_path
+            or item.get("event") != "workflow_dispatch"
+            or item.get("head_branch") != "main"
+            or type(item.get("status")) is not str
+            or item.get("status") not in KNOWN_WORKFLOW_RUN_STATUSES
+            or type(repository) is not dict
+            or repository.get("full_name") != REPOSITORY):
+        _fail("api_schema")
+
+
+def _verify_bootstrap_dispatch_guard(api, kind, current_run, control_sha, run_id, run_attempt):
+    configuration = _source_reader_configuration(kind)
+    workflow_id = current_run.get("workflow_id") if type(current_run) is dict else None
+    if (not _exact_int(workflow_id, 1)
+            or type(current_run.get("status")) is not str
+            or current_run.get("status") not in KNOWN_WORKFLOW_RUN_STATUSES):
+        _fail("api_schema")
+    workflow_path = configuration["workflow_path"]
+    path = (
+        "/repos/keeldock-platform/platform-ci/actions/workflows/"
+        + str(workflow_id) + "/runs"
+    )
+    fixed_query = {"branch": "main", "event": "workflow_dispatch"}
+
+    def validate_record(item):
+        _validate_bootstrap_workflow_run(item, workflow_id, workflow_path)
+
+    runs = _read_counted_collection(
+        api, path, "workflow_runs", MAX_WORKFLOW_RUNS, validate_record,
+        fixed_query=fixed_query,
+    )
+    current_matches = []
+    for item in runs:
+        if item["id"] == int(run_id):
+            current_matches.append(item)
+        elif item["status"] in ACTIVE_WORKFLOW_RUN_STATUSES:
+            _fail("run_identity_mismatch")
+    if len(current_matches) != 1:
+        _fail("run_identity_mismatch")
+    listed_current = current_matches[0]
+    identity_fields = (
+        "id", "run_attempt", "head_sha", "workflow_id", "path", "event", "head_branch"
+    )
+    if (any(listed_current.get(field) != current_run.get(field) for field in identity_fields)
+            or listed_current["run_attempt"] != int(run_attempt)
+            or listed_current["head_sha"] != control_sha
+            or listed_current["path"] != workflow_path
+            or listed_current["event"] != "workflow_dispatch"
+            or listed_current["head_branch"] != "main"
+            or listed_current["repository"].get("full_name") != REPOSITORY):
+        _fail("run_identity_mismatch")
+    return _bootstrap_dispatch_marker(kind, control_sha, run_id, run_attempt)
+
+
+def _bootstrap_dispatch_marker(kind, control_sha, run_id, run_attempt):
+    return (
+        "macos-bootstrap-dispatch=single-active-verified schema=1 kind=" + kind
+        + " control-sha=" + control_sha + " run-id=" + run_id
+        + " run-attempt=" + run_attempt
+    ).encode("ascii")
+
+
 def _source_reader_step_names(job, expected_names):
     steps = job.get("steps")
     actual = [step.get("name") for step in steps] if type(steps) is list else []
@@ -1148,6 +1326,270 @@ def _source_reader_audit(api, kind, control_sha, run_id, run_attempt, env):
     return 0
 
 
+def _bootstrap_job_steps(detail, expected_names, skipped_names=(), post_names=()):
+    steps = detail.get("steps")
+    if type(steps) is not list or any(type(step) is not dict for step in steps):
+        _fail("api_schema")
+    expected_api_names = ["Set up job", *expected_names, *post_names, "Complete job"]
+    if [step.get("name") for step in steps] != expected_api_names:
+        _fail("api_schema")
+    skipped_names = set(skipped_names)
+    if (not skipped_names.issubset(set(expected_names))
+            or skipped_names.intersection(post_names)):
+        _fail("api_schema")
+    success = True
+    for step in steps:
+        if type(step) is not dict:
+            _fail("api_schema")
+        if step["name"] in skipped_names:
+            if step.get("status") != "completed" or step.get("conclusion") != "skipped":
+                success = False
+        elif step.get("status") != "completed" or step.get("conclusion") != "success":
+            success = False
+    return success
+
+
+def _bootstrap_jobs(api, kind, run_id, run_attempt, control_sha):
+    path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + run_id
+        + "/attempts/" + run_attempt + "/jobs"
+    )
+    jobs = _read_counted_collection(api, path, "jobs", 10000, _validate_job_record)
+    if kind == "rules-bootstrap":
+        expected_names = {
+            RULES_BOOTSTRAP_SETTINGS_JOB_NAME,
+            RULES_BOOTSTRAP_PRODUCER_JOB_NAME,
+            RULES_BOOTSTRAP_AUDIT_JOB_NAME,
+        }
+        snapshot_name = RULES_BOOTSTRAP_SETTINGS_JOB_NAME
+        producer_name = RULES_BOOTSTRAP_PRODUCER_JOB_NAME
+        audit_name = RULES_BOOTSTRAP_AUDIT_JOB_NAME
+        snapshot_steps = (
+            "Fetch reviewed main control",
+            "Validate source-free control tree",
+            "Validate requested source identity",
+            "Verify exact protected environment settings",
+            "Snapshot public surfaces",
+        )
+        producer_steps = (
+            "Fetch reviewed main control",
+            "Validate source-free control tree",
+            "Seal exact control signer inventory",
+            "Prepare pinned public dash before token mint",
+            "Preflight protected bootstrap and review binding",
+            "Validate source-reader scope configuration",
+            "Mint scoped source-reader token",
+            "Verify selected installation identity",
+            "Run fixed rules bootstrap",
+            "Revoke token if bootstrap did not confirm",
+            "Clean prepared dash",
+            "Write trusted summary visibility control",
+        )
+        allowed_skips = ("Revoke token if bootstrap did not confirm",)
+        snapshot_post_steps = ()
+        producer_post_steps = ("Post Mint scoped source-reader token",)
+    elif kind == "core-bootstrap":
+        expected_names = {
+            CORE_BOOTSTRAP_SNAPSHOT_JOB_NAME,
+            CORE_BOOTSTRAP_PRODUCER_JOB_NAME,
+            CORE_BOOTSTRAP_AUDIT_JOB_NAME,
+        }
+        snapshot_name = CORE_BOOTSTRAP_SNAPSHOT_JOB_NAME
+        producer_name = CORE_BOOTSTRAP_PRODUCER_JOB_NAME
+        audit_name = CORE_BOOTSTRAP_AUDIT_JOB_NAME
+        snapshot_steps = (
+            "Fetch control",
+            "Audit source-read settings",
+            "Snapshot cache",
+        )
+        producer_steps = (
+            "Fetch control",
+            "Test control",
+            "Run reviewed smoke",
+            "Protect inventory",
+            "Core preflight",
+            "Validate reader settings",
+            "Mint reader token",
+            "Validate core bootstrap",
+        )
+        allowed_skips = ()
+        snapshot_post_steps = ()
+        producer_post_steps = ("Post Mint reader token",)
+    else:
+        _fail("invalid_input")
+    if len(jobs) != len(expected_names) or {job.get("name") for job in jobs} != expected_names:
+        _fail("api_schema")
+    by_name = {job["name"]: job for job in jobs}
+    audit_job = by_name[audit_name]
+    if (audit_job.get("run_id") != int(run_id)
+            or audit_job.get("run_attempt") != int(run_attempt)
+            or audit_job.get("head_sha") != control_sha
+            or audit_job.get("status") != "in_progress"):
+        _fail("run_identity_mismatch")
+    details = {}
+    for name, expected_steps, post_steps in (
+        (snapshot_name, snapshot_steps, snapshot_post_steps),
+        (producer_name, producer_steps, producer_post_steps),
+    ):
+        detail = _job_detail(api, by_name[name], run_id, run_attempt, control_sha, name)
+        skipped = allowed_skips if name == producer_name else ()
+        details[name] = (
+            detail[0], detail[1],
+            _bootstrap_job_steps(detail[0], expected_steps, skipped, post_steps),
+        )
+    return details
+
+
+def _one_bootstrap_marker(raw, marker, pattern):
+    matches = list(pattern.finditer(raw)) if type(raw) is bytes else []
+    if len(matches) != 1 or raw.count(marker) != 1:
+        _fail("receipt_invalid")
+    return matches[0].groups()
+
+
+def _inspect_bootstrap_settings_snapshot(raw, kind, control_sha, run_id, run_attempt):
+    configuration = _source_reader_configuration(kind)
+    expected_settings = (
+        "macos-source-environment=verified schema=1 kind=" + kind
+        + " name=" + configuration["environment_name"]
+        + " environment-id=" + str(configuration["environment_id"])
+        + " policy-id=" + str(configuration["branch_policy_id"])
+        + " custom-branch-policies=true protected-branches=false branch=main branch-type=branch"
+        + " control-sha=" + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+    ).encode("ascii")
+    prefix = "macos-" + kind + "-snapshot=ready schema=1 control-sha="
+    expected_snapshot = (
+        prefix + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+    ).encode("ascii")
+    _require_source_reader_log_line(
+        raw, _bootstrap_dispatch_marker(kind, control_sha, run_id, run_attempt),
+        b"macos-bootstrap-dispatch=",
+    )
+    _require_source_reader_log_line(raw, expected_settings, b"macos-source-environment=")
+    _require_source_reader_log_line(raw, expected_snapshot, prefix.encode("ascii"))
+
+
+def _inspect_rules_bootstrap_markers(raw, control_sha, run_id, run_attempt, env):
+    source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+    base_sha = env.get("REQUESTED_BASE_SHA", "")
+    base_branch = env.get("REQUESTED_BASE_BRANCH", "")
+    reviewed_diff = env.get("REVIEWED_DIFF_SHA256", "")
+    if (not _valid_sha(source_sha) or not _valid_sha(base_sha)
+            or base_branch not in {"main", "develop", "uat"}
+            or HEX_DIGEST_RE.fullmatch(reviewed_diff) is None):
+        _fail("invalid_input")
+    preflight = _one_bootstrap_marker(
+        raw, b"macos-rules-bootstrap=preflight-passed", RULES_BOOTSTRAP_PREFLIGHT_MARKER_RE
+    )
+    success = _one_bootstrap_marker(
+        raw, b"macos-rules-bootstrap=passed", RULES_BOOTSTRAP_SUCCESS_MARKER_RE
+    )
+    summary = _one_bootstrap_marker(
+        raw, b"macos-rules-summary-control=trusted-write", RULES_BOOTSTRAP_SUMMARY_CONTROL_MARKER_RE
+    )
+    source_binding = _one_bootstrap_marker(
+        raw, b"macos-rules-source-binding=verified", RULES_BOOTSTRAP_SOURCE_BINDING_MARKER_RE
+    )
+    expected = (control_sha.encode("ascii"), run_id.encode("ascii"), run_attempt.encode("ascii"))
+    if (preflight[:3] != expected or success[:3] != expected or summary[:3] != expected
+            or source_binding[:3] != expected):
+        _fail("receipt_invalid")
+    requested = (source_sha.encode("ascii"), base_sha.encode("ascii"), base_branch.encode("ascii"))
+    if (preflight[3:6] != requested or success[3:6] != requested
+            or summary[3:5] != requested[:2]):
+        _fail("receipt_invalid")
+    if (preflight[7] != reviewed_diff.encode("ascii") or success[5] != requested[2]
+            or preflight[6] != success[7]):
+        _fail("receipt_invalid")
+    if success[8] != reviewed_diff.encode("ascii") or summary[5] != reviewed_diff.encode("ascii"):
+        _fail("receipt_invalid")
+    if source_binding[3] != BOOTSTRAP_SOURCE_REPOSITORY_IDS["rules-bootstrap"].encode("ascii"):
+        _fail("receipt_invalid")
+
+
+def _inspect_core_bootstrap_markers(raw, control_sha, run_id, run_attempt, env):
+    source_sha = env.get("SOURCE_SHA", "")
+    if not _valid_sha(source_sha):
+        _fail("invalid_input")
+    if type(raw) is not bytes or raw.count(b"macos-core-bootstrap=refused"):
+        _fail("receipt_invalid")
+    preflight = _one_bootstrap_marker(
+        raw, b"macos-core-bootstrap=preflight-passed", CORE_BOOTSTRAP_PREFLIGHT_MARKER_RE
+    )
+    success = _one_bootstrap_marker(
+        raw, b"macos-core-bootstrap=verified", CORE_BOOTSTRAP_SUCCESS_MARKER_RE
+    )
+    source_binding = _one_bootstrap_marker(
+        raw, b"macos-core-source-binding=verified", CORE_BOOTSTRAP_SOURCE_BINDING_MARKER_RE
+    )
+    expected = (control_sha.encode("ascii"), run_id.encode("ascii"), run_attempt.encode("ascii"))
+    if preflight[:3] != expected or success[:3] != expected or source_binding[:3] != expected:
+        _fail("receipt_invalid")
+    source = source_sha.encode("ascii")
+    if preflight[3] != source or success[6] != source or success[7] != source:
+        _fail("receipt_invalid")
+    if success[5] != BOOTSTRAP_SOURCE_REPOSITORY_IDS["core-bootstrap"].encode("ascii"):
+        _fail("receipt_invalid")
+    if source_binding[3] != BOOTSTRAP_SOURCE_REPOSITORY_IDS["core-bootstrap"].encode("ascii"):
+        _fail("receipt_invalid")
+    _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt)
+
+
+def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):
+    configuration = _source_reader_configuration(kind)
+    _validate_run(api, run_id, run_attempt, control_sha, configuration["workflow_path"])
+    details = _bootstrap_jobs(api, kind, run_id, run_attempt, control_sha)
+    if kind == "rules-bootstrap":
+        snapshot_name = RULES_BOOTSTRAP_SETTINGS_JOB_NAME
+        producer_name = RULES_BOOTSTRAP_PRODUCER_JOB_NAME
+        audit_name = RULES_BOOTSTRAP_AUDIT_JOB_NAME
+    else:
+        snapshot_name = CORE_BOOTSTRAP_SNAPSHOT_JOB_NAME
+        producer_name = CORE_BOOTSTRAP_PRODUCER_JOB_NAME
+        audit_name = CORE_BOOTSTRAP_AUDIT_JOB_NAME
+    snapshot_job, snapshot_check_id, snapshot_steps_success = details[snapshot_name]
+    producer_job, producer_check_id, producer_steps_success = details[producer_name]
+    snapshot_log = api.log_text(snapshot_job["id"])
+    producer_log = api.log_text(producer_job["id"])
+    inspect_reviewed_public_bytes(snapshot_log, control_sha)
+    inspect_reviewed_public_bytes(producer_log, control_sha)
+    _scan_annotations(api, snapshot_job, snapshot_check_id, control_sha, reviewed=True)
+    _scan_annotations(api, producer_job, producer_check_id, control_sha, reviewed=True)
+    _fetch_artifacts(api, run_id)
+    cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+    baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
+    if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
+        _fail("inventory_changed")
+    settings_marker = _verify_source_reader_environment(
+        api, kind, control_sha, run_id, run_attempt
+    )
+    expected_settings = (
+        "macos-source-environment=verified schema=1 kind=" + kind
+        + " name=" + configuration["environment_name"]
+        + " environment-id=" + str(configuration["environment_id"])
+        + " policy-id=" + str(configuration["branch_policy_id"])
+        + " custom-branch-policies=true protected-branches=false branch=main branch-type=branch"
+        + " control-sha=" + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+    ).encode("ascii")
+    if settings_marker != expected_settings:
+        _fail("api_schema")
+    _inspect_bootstrap_settings_snapshot(snapshot_log, kind, control_sha, run_id, run_attempt)
+    if kind == "rules-bootstrap":
+        _inspect_rules_bootstrap_markers(producer_log, control_sha, run_id, run_attempt, env)
+    else:
+        _inspect_core_bootstrap_markers(producer_log, control_sha, run_id, run_attempt, env)
+    if (snapshot_job.get("conclusion") != "success" or not snapshot_steps_success
+            or producer_job.get("conclusion") != "success" or not producer_steps_success):
+        _fail("native_job_failed")
+    print(
+        "macos-" + kind + "-audit=verified schema=1 control-sha=" + control_sha
+        + " run-id=" + run_id + " run-attempt=" + run_attempt
+        + " public-surfaces=logs,checks,annotations,artifacts,caches summary-ui=required"
+        + " source-admission=not-authorized"
+    )
+    return 0
+
+
 def _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt):
     matches = list(REVIEWED_SMOKE_MARKER_RE.finditer(raw))
     if len(matches) != 1 or raw.count(b"macos-build=") != 1:
@@ -1225,26 +1667,42 @@ def _fetch_caches(api, control_sha, reviewed=False):
 
 
 def _snapshot(phase, api, control_sha, run_id, run_attempt, env):
+    bootstrap_kind = {
+        "rules-bootstrap-snapshot": "rules-bootstrap",
+        "core-bootstrap-snapshot": "core-bootstrap",
+    }.get(phase)
     workflow_path = (
         CACHE_PROOF_WORKFLOW_PATH if phase == "cache-proof-snapshot"
         else REVIEWED_WORKFLOW_PATH if phase == "reviewed-snapshot"
-        else WORKFLOW_PATH
+        else _source_reader_configuration(bootstrap_kind)["workflow_path"]
+        if bootstrap_kind is not None else WORKFLOW_PATH
     )
     _validate_run(api, run_id, run_attempt, control_sha, workflow_path)
     caches = _fetch_cache_entries(
         api,
         control_sha,
-        reviewed=phase in {"reviewed-snapshot", "cache-proof-snapshot"},
+        reviewed=phase in {
+            "reviewed-snapshot", "cache-proof-snapshot",
+            "rules-bootstrap-snapshot", "core-bootstrap-snapshot",
+        },
     )
     if phase == "cache-proof-snapshot":
         seed_key, write_key = _cache_proof_keys(run_id, run_attempt)
         if any(item.get("key") in {seed_key, write_key} for item in caches):
             _fail("inventory_changed")
     digest = cache_inventory_digest(caches)
-    if phase in {"snapshot", "reviewed-snapshot", "cache-proof-snapshot"}:
+    if phase in {
+        "snapshot", "reviewed-snapshot", "cache-proof-snapshot",
+        "rules-bootstrap-snapshot", "core-bootstrap-snapshot",
+    }:
         _write_output("cache_snapshot", digest, env)
         if phase == "cache-proof-snapshot":
             print("macos-cache-proof=snapshot-ready")
+        elif bootstrap_kind is not None:
+            print(
+                "macos-" + bootstrap_kind + "-snapshot=ready schema=1 control-sha="
+                + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+            )
         else:
             print("macos-public-surface-audit=snapshot-ready")
         return 0
@@ -1303,8 +1761,18 @@ def run(phase, environ=None, api=None):
         configuration = _source_reader_configuration(kind)
         if operation == "audit":
             return _source_reader_audit(api, kind, control_sha, run_id, run_attempt, env)
-        _validate_run(api, run_id, run_attempt, control_sha, configuration["workflow_path"])
+        if operation == "bootstrap-audit":
+            return _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env)
+        current_run = _validate_run(
+            api, run_id, run_attempt, control_sha, configuration["workflow_path"]
+        )
         if operation == "settings":
+            if kind in {"rules-bootstrap", "core-bootstrap"}:
+                print(
+                    _verify_bootstrap_dispatch_guard(
+                        api, kind, current_run, control_sha, run_id, run_attempt
+                    ).decode("ascii")
+                )
             print(
                 _verify_source_reader_environment(
                     api, kind, control_sha, run_id, run_attempt
@@ -1314,8 +1782,12 @@ def run(phase, environ=None, api=None):
         if operation == "snapshot":
             digest = _fetch_caches(api, control_sha, reviewed=True)
             _write_output("cache_snapshot", digest, env)
+            snapshot_name = (
+                "macos-source-reader-snapshot" if kind in {"core", "rules"}
+                else "macos-" + kind + "-snapshot"
+            )
             print(
-                "macos-source-reader-snapshot=ready schema=1 control-sha=" + control_sha
+                snapshot_name + "=ready schema=1 control-sha=" + control_sha
                 + " run-id=" + run_id + " run-attempt=" + run_attempt
             )
             return 0
