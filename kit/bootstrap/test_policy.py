@@ -779,8 +779,17 @@ class WorkflowPolicyTests(unittest.TestCase):
                         "observer_parse",
                         "observer_record",
                         "observer_missing",
+                        "cleanup_lease",
+                        "cleanup_storage",
+                        "cleanup_worker",
+                        "cleanup_summary",
+                        "cleanup_dash",
+                        "cleanup_unknown",
+                        "cleanup",
                     ):
                         self.assertIn(stage, refusal_pattern)
+                    for stage in ("cleanup_cache", "cleanup_private", "cleanup_unknown_extra"):
+                        self.assertNotIn(stage, refusal_pattern)
                     self.assertNotIn("arguments_invalid", refusal_pattern)
                     self.assertIn("RULES_ID_DEFINITIONS", workflow)
                     self.assertIn("SOURCE_CANDIDATE_REF", workflow)
