@@ -33,8 +33,8 @@ def success_record(**changes):
         "image_version": "20260907.0337.1",
         "macos_version": "15.7.9",
         "architecture": "arm64",
-        "xcode_version": "26.1",
-        "xcode_build": "17B55",
+        "xcode_version": "not-used",
+        "xcode_build": "not-used",
         "compiler_origin": "command-line-tools",
         "clang_version": "17.0.0",
         "sdk_version": "15.5",
@@ -79,46 +79,36 @@ class RunBindingTests(unittest.TestCase):
 
 
 class ToolchainProvenanceTests(unittest.TestCase):
-    def test_selected_xcode_query_does_not_inherit_command_line_tools_override(self):
-        selected_path = "/Applications/Xcode_26.1.app/Contents/Developer"
-        selected_alias = "/Applications/Xcode.app/Contents/Developer"
-        result = subprocess.CompletedProcess(("xcode-select",), 0, (selected_alias + "\n").encode(), b"")
-        def resolve_trusted_path(path, directory=False):
-            if path == selected_alias:
-                return Path(selected_path)
-            return Path(path)
-        with patch.object(
-            reviewed_build.capability,
-            "_resolve_trusted_path",
-            side_effect=resolve_trusted_path,
-        ):
-            with patch.object(reviewed_build, "_run_command", return_value=result) as run:
-                resolved = reviewed_build._selected_xcode_directory()
-        self.assertEqual(resolved, Path(selected_path))
-        environment = run.call_args.kwargs["env"]
-        self.assertNotIn("DEVELOPER_DIR", environment)
-        self.assertEqual(run.call_args.args[0][-1], "--print-path")
-
-    def test_selected_xcode_query_refuses_the_command_line_tools_directory(self):
-        result = subprocess.CompletedProcess(
-            ("xcode-select",), 0, b"/Library/Developer/CommandLineTools\n", b"",
-        )
-        with patch.object(
-            reviewed_build.capability,
-            "_resolve_trusted_path",
-            side_effect=lambda path, directory=False: Path(path),
-        ):
-            with patch.object(reviewed_build, "_run_command", return_value=result):
-                with self.assertRaises(reviewed_build.Refusal) as raised:
-                    reviewed_build._selected_xcode_directory()
-        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
-        self.assertEqual(raised.exception.stage, "xcode_select_path")
-
-    def test_host_versions_bind_xcodebuild_to_selected_xcode_and_keep_compiler_origin(self):
-        selected_xcode = Path("/Applications/Xcode_26.1.app/Contents/Developer")
+    def test_command_line_tools_origin_records_versions_without_querying_xcode(self):
         toolchain = {
             "developer_directory": "/Library/Developer/CommandLineTools",
             "clang": "/Library/Developer/CommandLineTools/usr/bin/clang",
+        }
+        results = (
+            subprocess.CompletedProcess(("sw_vers",), 0, b"15.7.9\n", b""),
+            subprocess.CompletedProcess(("clang",), 0, b"Apple clang version 17.0.0 (clang-1700.0.13.3)\n", b""),
+            subprocess.CompletedProcess(("xcrun",), 0, b"15.5\n", b""),
+        )
+        with patch.object(reviewed_build.platform, "system", return_value="Darwin"):
+            with patch.object(reviewed_build.platform, "machine", return_value="arm64"):
+                with patch.object(reviewed_build, "_run_command", side_effect=results) as run:
+                    identity = reviewed_build._host_identity(binding_environment(), toolchain)
+        calls = run.call_args_list
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[1].args[0][0], toolchain["clang"])
+        self.assertEqual(calls[1].kwargs["env"]["DEVELOPER_DIR"], toolchain["developer_directory"])
+        self.assertEqual(calls[2].kwargs["env"]["DEVELOPER_DIR"], toolchain["developer_directory"])
+        self.assertEqual(identity["compiler_origin"], "command-line-tools")
+        self.assertEqual(identity["xcode_version"], "not-used")
+        self.assertEqual(identity["xcode_build"], "not-used")
+        self.assertEqual(identity["clang_version"], "17.0.0")
+        self.assertEqual(identity["sdk_version"], "15.5")
+
+    def test_xcode_origin_queries_metadata_from_verified_toolchain_directory(self):
+        developer_directory = "/Applications/Xcode_26.1.app/Contents/Developer"
+        toolchain = {
+            "developer_directory": developer_directory,
+            "clang": developer_directory + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
         }
         results = (
             subprocess.CompletedProcess(("sw_vers",), 0, b"15.7.9\n", b""),
@@ -128,64 +118,22 @@ class ToolchainProvenanceTests(unittest.TestCase):
         )
         with patch.object(reviewed_build.platform, "system", return_value="Darwin"):
             with patch.object(reviewed_build.platform, "machine", return_value="arm64"):
-                with patch.object(reviewed_build, "_selected_xcode_directory", return_value=selected_xcode):
-                    with patch.object(reviewed_build, "_run_command", side_effect=results) as run:
-                        identity = reviewed_build._host_identity(binding_environment(), toolchain)
+                with patch.object(reviewed_build, "_run_command", side_effect=results) as run:
+                    identity = reviewed_build._host_identity(binding_environment(), toolchain)
         calls = run.call_args_list
-        self.assertEqual(calls[1].kwargs["env"]["DEVELOPER_DIR"], selected_xcode.as_posix())
-        self.assertEqual(calls[2].kwargs["env"]["DEVELOPER_DIR"], toolchain["developer_directory"])
-        self.assertEqual(calls[3].kwargs["env"]["DEVELOPER_DIR"], toolchain["developer_directory"])
-        self.assertEqual(identity["compiler_origin"], "command-line-tools")
+        self.assertEqual(calls[1].args[0][0], "/usr/bin/xcodebuild")
+        self.assertEqual(calls[1].kwargs["env"]["DEVELOPER_DIR"], developer_directory)
+        self.assertEqual(calls[2].kwargs["env"]["DEVELOPER_DIR"], developer_directory)
+        self.assertEqual(identity["compiler_origin"], "xcode")
+        self.assertEqual(identity["xcode_version"], "26.1")
+        self.assertEqual(identity["xcode_build"], "17B55")
+
+    def test_compiler_origin_rejects_unverified_layout(self):
         self.assertEqual(reviewed_build._compiler_origin({
-            "developer_directory": selected_xcode.as_posix(),
-        }), "xcode")
+            "developer_directory": "/Library/Developer/CommandLineTools",
+        }), "command-line-tools")
         with self.assertRaisesRegex(reviewed_build.Refusal, "toolchain_unavailable"):
             reviewed_build._compiler_origin({"developer_directory": "/tmp/other"})
-        different_xcode = {
-            "developer_directory": "/Applications/Xcode_26.0.app/Contents/Developer",
-            "clang": "/Applications/Xcode_26.0.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
-        }
-        with patch.object(reviewed_build.platform, "system", return_value="Darwin"):
-            with patch.object(reviewed_build.platform, "machine", return_value="arm64"):
-                with patch.object(reviewed_build, "_selected_xcode_directory", return_value=selected_xcode):
-                    with self.assertRaisesRegex(reviewed_build.Refusal, "toolchain_unavailable"):
-                        reviewed_build._host_identity(binding_environment(), different_xcode)
-
-    def test_selector_resolution_and_query_failures_have_distinct_fixed_stages(self):
-        with patch.object(
-            reviewed_build.capability,
-            "_resolve_trusted_path",
-            side_effect=reviewed_build.capability.ProbeFailure("native_preflight_unavailable"),
-        ):
-            with self.assertRaises(reviewed_build.Refusal) as raised:
-                reviewed_build._selected_xcode_directory()
-        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
-        self.assertEqual(raised.exception.stage, "xcode_select_path")
-
-        selector = Path("/usr/bin/xcode-select")
-        malformed_query = subprocess.CompletedProcess(("xcode-select",), 0, b"bad\npath\n", b"")
-        with patch.object(
-            reviewed_build.capability,
-            "_resolve_trusted_path",
-            return_value=selector,
-        ):
-            with patch.object(reviewed_build, "_run_command", return_value=malformed_query):
-                with self.assertRaises(reviewed_build.Refusal) as raised:
-                    reviewed_build._selected_xcode_directory()
-        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
-        self.assertEqual(raised.exception.stage, "xcode_select_query")
-
-        failed_query = subprocess.CompletedProcess(("xcode-select",), 1, b"", b"private diagnostic")
-        with patch.object(
-            reviewed_build.capability,
-            "_resolve_trusted_path",
-            return_value=selector,
-        ):
-            with patch.object(reviewed_build, "_run_command", return_value=failed_query):
-                with self.assertRaises(reviewed_build.Refusal) as raised:
-                    reviewed_build._selected_xcode_directory()
-        self.assertEqual(raised.exception.stage, "xcode_select_query")
-        self.assertNotIn("private diagnostic", str(raised.exception))
 
 
 class ToolchainStageTests(unittest.TestCase):
@@ -210,42 +158,44 @@ class ToolchainStageTests(unittest.TestCase):
         self.assertEqual(raised.exception.stage, "toolchain_resolve")
 
     def test_host_version_queries_report_only_their_fixed_stage(self):
-        selected_xcode = Path("/Applications/Xcode_26.1.app/Contents/Developer")
-        toolchain = {
+        clt_toolchain = {
             "developer_directory": "/Library/Developer/CommandLineTools",
             "clang": "/Library/Developer/CommandLineTools/usr/bin/clang",
         }
+        xcode_directory = "/Applications/Xcode_26.1.app/Contents/Developer"
+        xcode_toolchain = {
+            "developer_directory": xcode_directory,
+            "clang": xcode_directory + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+        }
         valid_sw_vers = subprocess.CompletedProcess(("sw_vers",), 0, b"15.7.9\n", b"")
-        valid_xcode = subprocess.CompletedProcess(
-            ("xcodebuild",), 0, b"Xcode 26.1\nBuild version 17B55\n", b"",
-        )
         valid_clang = subprocess.CompletedProcess(
             ("clang",), 0, b"Apple clang version 17.0.0 (clang-1700.0.13.3)\n", b"",
         )
         cases = (
             (
+                xcode_toolchain,
                 (valid_sw_vers, subprocess.CompletedProcess(("xcodebuild",), 1, b"", b"private diagnostic")),
                 "xcode_version",
             ),
             (
-                (valid_sw_vers, valid_xcode,
-                 subprocess.CompletedProcess(("clang",), 1, b"", b"private diagnostic")),
+                clt_toolchain,
+                (valid_sw_vers, subprocess.CompletedProcess(("clang",), 1, b"", b"private diagnostic")),
                 "clang_version",
             ),
             (
-                (valid_sw_vers, valid_xcode, valid_clang,
+                clt_toolchain,
+                (valid_sw_vers, valid_clang,
                  subprocess.CompletedProcess(("xcrun",), 1, b"", b"private diagnostic")),
                 "sdk_version",
             ),
         )
-        for results, expected_stage in cases:
+        for toolchain, results, expected_stage in cases:
             with self.subTest(stage=expected_stage):
                 with patch.object(reviewed_build.platform, "system", return_value="Darwin"):
                     with patch.object(reviewed_build.platform, "machine", return_value="arm64"):
-                        with patch.object(reviewed_build, "_selected_xcode_directory", return_value=selected_xcode):
-                            with patch.object(reviewed_build, "_run_command", side_effect=results):
-                                with self.assertRaises(reviewed_build.Refusal) as raised:
-                                    reviewed_build._host_identity(binding_environment(), toolchain)
+                        with patch.object(reviewed_build, "_run_command", side_effect=results):
+                            with self.assertRaises(reviewed_build.Refusal) as raised:
+                                reviewed_build._host_identity(binding_environment(), toolchain)
                 self.assertEqual(raised.exception.reason, "toolchain_unavailable")
                 self.assertEqual(raised.exception.stage, expected_stage)
 
@@ -370,7 +320,7 @@ class FixedRecordTests(unittest.TestCase):
         expected = (
             "macos-build=synthetic-smoke-passed schema=1 source=none control-sha=" + CONTROL_SHA
             + " run-id=123456789 run-attempt=1 image-os=macos15 image-version=20260907.0337.1"
-            + " macos-version=15.7.9 architecture=arm64 xcode=26.1 xcode-build=17B55"
+            + " macos-version=15.7.9 architecture=arm64 xcode=not-used xcode-build=not-used"
             + " compiler-origin=command-line-tools clang=17.0.0 sdk=15.5"
             + " developer-mode=disabled privilege=separate-nonadmin"
             + " sudo=denied compile=passed link=passed load-test=passed capture=passed"
@@ -388,10 +338,24 @@ class FixedRecordTests(unittest.TestCase):
             success_record(pf="enforced"),
             success_record(source="private"),
             success_record(capture="unknown"),
+            success_record(xcode_version="26.1", xcode_build="17B55"),
+            success_record(compiler_origin="xcode"),
         ):
             with self.subTest(fields=tuple(record)):
                 with self.assertRaisesRegex(reviewed_build.Refusal, "internal_error"):
                     reviewed_build._format_success(record)
+
+    def test_xcode_origin_records_the_numeric_version_pair(self):
+        record = success_record(
+            compiler_origin="xcode",
+            xcode_version="26.1",
+            xcode_build="17B55",
+        )
+        line = reviewed_build._format_success(record)
+        self.assertIn(
+            "xcode=26.1 xcode-build=17B55 compiler-origin=xcode",
+            line,
+        )
 
     def test_refusal_formatter_collapses_unrecognized_values(self):
         refusal = reviewed_build.Refusal("internal_error", "preflight")

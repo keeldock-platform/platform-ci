@@ -73,8 +73,7 @@ REASONS = frozenset((
 STAGES = frozenset((
     "context", "toolchain", "developer_mode", "identity", "privilege", "storage",
     "compile", "link", "load_test", "capture", "cleanup", "preflight",
-    "toolchain_module", "toolchain_resolve", "xcode_select_path", "xcode_select_query",
-    "xcode_version", "clang_version", "sdk_version",
+    "toolchain_module", "toolchain_resolve", "xcode_version", "clang_version", "sdk_version",
 ))
 SUMMARY_STANDIN = b"synthetic-summary-standin-v1\n"
 SUMMARY_MARKER = b"KD-RB:summary-standin=write-denied\n"
@@ -290,36 +289,6 @@ def _compiler_origin(toolchain):
     raise Refusal("toolchain_unavailable", "toolchain_resolve")
 
 
-def _selected_xcode_directory():
-    base_env = {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-        "HOME": "/var/empty",
-        "LANG": "C",
-        "LC_ALL": "C",
-    }
-    try:
-        selector = capability._resolve_trusted_path("/usr/bin/xcode-select")
-    except capability.ProbeFailure:
-        raise Refusal("toolchain_unavailable", "xcode_select_path") from None
-    result = _run_command(
-        (selector, "--print-path"), env=base_env, timeout=5,
-        failure_stage="xcode_select_query",
-    )
-    if result.returncode != 0 or result.stderr:
-        raise Refusal("toolchain_unavailable", "xcode_select_query")
-    try:
-        raw_path = capability._read_tool_path(result)
-    except capability.ProbeFailure:
-        raise Refusal("toolchain_unavailable", "xcode_select_query") from None
-    try:
-        selected = capability._resolve_trusted_path(raw_path, directory=True)
-    except capability.ProbeFailure:
-        raise Refusal("toolchain_unavailable", "xcode_select_path") from None
-    if not _is_xcode_developer_directory(selected):
-        raise Refusal("toolchain_unavailable", "xcode_select_path")
-    return selected
-
-
 def _host_identity(binding, toolchain):
     if platform.system() != "Darwin" or platform.machine() not in ARCHITECTURES:
         raise Refusal("runner_identity_unavailable", "toolchain")
@@ -330,31 +299,31 @@ def _host_identity(binding, toolchain):
         "LANG": "C",
         "LC_ALL": "C",
     }
-    selected_xcode = _selected_xcode_directory()
-    if compiler_origin == "xcode" and toolchain["developer_directory"] != selected_xcode.as_posix():
-        raise Refusal("toolchain_unavailable", "xcode_select_path")
-    xcode_env = {**base_env, "DEVELOPER_DIR": selected_xcode.as_posix()}
     compiler_env = {**base_env, "DEVELOPER_DIR": toolchain["developer_directory"]}
     product_result = _run_command(("/usr/bin/sw_vers", "-productVersion"), env=base_env, timeout=5)
     if product_result.returncode != 0 or product_result.stderr:
         raise Refusal("runner_identity_unavailable", "toolchain")
     product_version = _single_ascii_line(product_result.stdout, PRODUCT_VERSION)
-    xcode_result = _run_command(
-        ("/usr/bin/xcodebuild", "-version"), env=xcode_env, timeout=10,
-        max_output=MAX_VERSION_OUTPUT, failure_stage="xcode_version",
-    )
-    if xcode_result.returncode != 0 or xcode_result.stderr:
-        raise Refusal("toolchain_unavailable", "xcode_version")
-    try:
-        xcode_lines = xcode_result.stdout.decode("ascii", "strict").splitlines()
-    except UnicodeDecodeError:
-        raise Refusal("toolchain_unavailable", "xcode_version") from None
-    if len(xcode_lines) != 2 or not xcode_lines[0].startswith("Xcode ") or not xcode_lines[1].startswith("Build version "):
-        raise Refusal("toolchain_unavailable", "xcode_version")
-    xcode_version = xcode_lines[0][len("Xcode "):]
-    xcode_build = xcode_lines[1][len("Build version "):]
-    if not _valid_run_value(TOOL_VERSION, xcode_version) or re.fullmatch(r"[A-Za-z0-9.]+", xcode_build) is None:
-        raise Refusal("toolchain_unavailable", "xcode_version")
+    if compiler_origin == "xcode":
+        xcode_result = _run_command(
+            ("/usr/bin/xcodebuild", "-version"), env=compiler_env, timeout=10,
+            max_output=MAX_VERSION_OUTPUT, failure_stage="xcode_version",
+        )
+        if xcode_result.returncode != 0 or xcode_result.stderr:
+            raise Refusal("toolchain_unavailable", "xcode_version")
+        try:
+            xcode_lines = xcode_result.stdout.decode("ascii", "strict").splitlines()
+        except UnicodeDecodeError:
+            raise Refusal("toolchain_unavailable", "xcode_version") from None
+        if len(xcode_lines) != 2 or not xcode_lines[0].startswith("Xcode ") or not xcode_lines[1].startswith("Build version "):
+            raise Refusal("toolchain_unavailable", "xcode_version")
+        xcode_version = xcode_lines[0][len("Xcode "):]
+        xcode_build = xcode_lines[1][len("Build version "):]
+        if not _valid_run_value(TOOL_VERSION, xcode_version) or re.fullmatch(r"[A-Za-z0-9.]+", xcode_build) is None:
+            raise Refusal("toolchain_unavailable", "xcode_version")
+    else:
+        xcode_version = "not-used"
+        xcode_build = "not-used"
     clang_result = _run_command(
         (toolchain["clang"], "--version"), env=compiler_env, timeout=10,
         max_output=MAX_VERSION_OUTPUT, failure_stage="clang_version",
@@ -728,11 +697,18 @@ def _format_success(record):
     if type(record["compiler_origin"]) is not str or record["compiler_origin"] not in {"command-line-tools", "xcode"}:
         raise Refusal("internal_error", "preflight")
     for key, pattern in (("image_os", IMAGE_OS), ("image_version", IMAGE_VERSION), ("macos_version", PRODUCT_VERSION),
-                         ("architecture", re.compile(r"(?:arm64|x86_64)\Z")), ("xcode_version", TOOL_VERSION),
-                         ("xcode_build", re.compile(r"[A-Za-z0-9.]+\Z")), ("clang_version", TOOL_VERSION),
-                         ("sdk_version", TOOL_VERSION)):
+                         ("architecture", re.compile(r"(?:arm64|x86_64)\Z")),
+                         ("clang_version", TOOL_VERSION), ("sdk_version", TOOL_VERSION)):
         if not _valid_run_value(pattern, record[key]):
             raise Refusal("internal_error", "preflight")
+    if record["compiler_origin"] == "command-line-tools":
+        if record["xcode_version"] != "not-used" or record["xcode_build"] != "not-used":
+            raise Refusal("internal_error", "preflight")
+    elif (
+        not _valid_run_value(TOOL_VERSION, record["xcode_version"])
+        or not _valid_run_value(re.compile(r"[A-Za-z0-9.]+\Z"), record["xcode_build"])
+    ):
+        raise Refusal("internal_error", "preflight")
     fixed_values = {
         "developer_mode": "disabled", "privilege": "separate_nonadmin", "sudo": "denied",
         "compile": "passed", "link": "passed", "load_test": "passed", "capture": "passed",
