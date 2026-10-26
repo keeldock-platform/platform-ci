@@ -56,6 +56,24 @@ IMAGE_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){1,3}\Z")
 PRODUCT_VERSION = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?\Z")
 TOOL_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}\Z")
 ARCHITECTURES = frozenset(("arm64", "x86_64"))
+TOOL_PHASES = ("baseline", "python", "git", "ssh", "summary", "cleanup", "unknown")
+SURVIVOR_CLASS_ORDER = (
+    "python",
+    "ps",
+    "developer_shim",
+    "helper_preferences",
+    "helper_notifications",
+    "helper_launch_services",
+    "helper_security",
+    "helper_trust",
+    "helper_containers",
+    "apple_system_path",
+    "other",
+    "unknown",
+    "additional",
+)
+SURVIVOR_CLASSES = frozenset(SURVIVOR_CLASS_ORDER)
+SURVIVOR_CLASS_STATES = frozenset(("unavailable", "unclassified", "none"))
 REASONS = frozenset((
     "invalid_control_identity",
     "context_unavailable",
@@ -92,6 +110,138 @@ MAX_VERSION_OUTPUT = 4096
 MAX_NATIVE_STEP_SECONDS = 90
 
 SOURCE = "int kd_synthetic_value(void) { return 42; }\n"
+WORKER_TOOL_MARKER = b"KD-RB:worker-tool=passed\n"
+WORKER_TOOL_CONTENT = b"source-free-worker-tool-fixture-v1\n"
+WORKER_TOOL_PAYLOAD = b"source-free-worker-signature-v1\n"
+
+WORKER_TOOL_SCRIPT = '''\
+import os
+import re
+import subprocess
+import sys
+
+try:
+    operation, root = sys.argv[1:]
+    if operation not in ("python", "git-init", "git-add", "git-commit", "ssh-keygen", "ssh-sign", "ssh-verify"):
+        raise SystemExit(41)
+    root = os.path.realpath(root)
+    repository = os.path.join(root, "repository")
+    template_path = os.path.join(root, "template")
+    private_key = os.path.join(root, "fixture-key")
+    public_key = private_key + ".pub"
+    payload_path = os.path.join(root, "payload")
+    signature_path = payload_path + ".sig"
+    identity = "fixture@example.invalid"
+    environment = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": os.environ["HOME"],
+        "TMPDIR": os.environ["TMPDIR"],
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "safe.directory",
+        "GIT_CONFIG_VALUE_0": repository,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    command = None
+    input_data = None
+    expected_stdout = None
+    if operation == "python":
+        command = (
+            "/usr/bin/env", "python3", "-I", "-S", "-B", "-c",
+            "import os; os.write(1, b'KD-RB:worker-python=passed\\\\n')",
+        )
+        expected_stdout = b"KD-RB:worker-python=passed\\n"
+    elif operation == "git-init":
+        command = ("git", "init", "--quiet", "-b", "main", "--template=" + template_path, repository)
+    elif operation == "git-add":
+        command = ("git", "-C", repository, "add", "--", "fixture.txt")
+    elif operation == "git-commit":
+        command = (
+            "git", "-C", repository,
+            "-c", "user.name=Source Free Worker",
+            "-c", "user.email=fixture@example.invalid",
+            "-c", "commit.gpgsign=false",
+            "commit", "--quiet", "-m", "synthetic fixture",
+        )
+    elif operation == "ssh-keygen":
+        command = (
+            "ssh-keygen", "-q", "-t", "ed25519", "-N", "",
+            "-C", identity, "-f", private_key,
+        )
+    elif operation == "ssh-sign":
+        command = ("ssh-keygen", "-q", "-Y", "sign", "-f", private_key, "-n", "git", payload_path)
+    elif operation == "ssh-verify":
+        with open(public_key, "rb") as stream:
+            public_data = stream.read(4097)
+        if (len(public_data) > 4096 or not public_data.endswith(b"\\n")
+                or public_data.count(b"\\n") != 1):
+            raise SystemExit(42)
+        fields = public_data[:-1].split(b" ")
+        if (len(fields) != 3 or fields[0] != b"ssh-ed25519"
+                or fields[2] != identity.encode("ascii")
+                or re.fullmatch(rb"[A-Za-z0-9+/]+={0,2}", fields[1]) is None):
+            raise SystemExit(43)
+        allowed_path = os.path.join(root, "allowed-signers")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise SystemExit(44)
+        descriptor = os.open(allowed_path, flags | nofollow, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            payload = identity.encode("ascii") + b" " + fields[0] + b" " + fields[1] + b"\\n"
+            if os.write(descriptor, payload) != len(payload):
+                raise SystemExit(45)
+        finally:
+            os.close(descriptor)
+        with open(payload_path, "rb") as stream:
+            input_data = stream.read(4097)
+        if input_data != b"source-free-worker-signature-v1\\n":
+            raise SystemExit(46)
+        command = (
+            "ssh-keygen", "-q", "-Y", "verify", "-f", allowed_path,
+            "-I", identity, "-n", "git", "-s", signature_path,
+        )
+    arguments = {
+        "env": environment,
+        "timeout": 15,
+        "close_fds": True,
+        "check": False,
+    }
+    if expected_stdout is None:
+        arguments["stdout"] = subprocess.DEVNULL
+        arguments["stderr"] = subprocess.DEVNULL
+    else:
+        arguments["stdout"] = subprocess.PIPE
+        arguments["stderr"] = subprocess.PIPE
+    if input_data is None:
+        arguments["stdin"] = subprocess.DEVNULL
+    else:
+        arguments["input"] = input_data
+    result = subprocess.run(command, **arguments)
+    if result.returncode != 0:
+        raise SystemExit(47)
+    if expected_stdout is None:
+        if result.stdout is not None or result.stderr is not None:
+            raise SystemExit(47)
+    elif (
+        type(result.stdout) is not bytes
+        or type(result.stderr) is not bytes
+        or len(result.stdout) > 8192
+        or len(result.stderr) > 8192
+        or result.stdout != expected_stdout
+        or result.stderr
+    ):
+        raise SystemExit(47)
+except BaseException:
+    raise SystemExit(48)
+
+os.write(1, b"KD-RB:worker-tool=passed\\n")
+'''
 
 PRIVILEGE_SCRIPT = '''\
 import os
@@ -256,9 +406,11 @@ else:
 
 
 class Refusal(Exception):
-    def __init__(self, reason, stage):
+    def __init__(self, reason, stage, *, tool_phase="unknown", survivor_classes="unavailable"):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "preflight"
+        self.tool_phase = tool_phase
+        self.survivor_classes = survivor_classes
         super().__init__(self.reason)
 
 
@@ -674,18 +826,32 @@ def _close_runner_summary(guard):
         raise Refusal("cleanup_incomplete", "cleanup")
 
 
+def _summary_refusal(reason, stage, guard, uid, python_executable):
+    if guard.get("child_termination_confirmed") is True:
+        _, survivor_classes = _read_survivor_classes(uid, python_executable)
+    else:
+        survivor_classes = "unavailable"
+    return Refusal(
+        reason, stage,
+        tool_phase="summary",
+        survivor_classes=survivor_classes,
+    )
+
+
 def _run_real_summary_probe(guard, uid, *, env, python_executable, binding):
     parent_probe_name = guard["name"] + ".kd-rb-" + binding["run_id"] + "-" + binding["run_attempt"]
     if len(os.fsencode(parent_probe_name)) > 255:
-        raise Refusal("summary_file_unavailable", "summary_file")
+        raise _summary_refusal("summary_file_unavailable", "summary_file", guard, uid, python_executable)
     try:
         os.stat(parent_probe_name, dir_fd=guard["parent_descriptor"], follow_symlinks=False)
     except FileNotFoundError:
         pass
     except BaseException:
-        raise Refusal("summary_file_unavailable", "summary_file") from None
+        raise _summary_refusal(
+            "summary_file_unavailable", "summary_file", guard, uid, python_executable,
+        ) from None
     else:
-        raise Refusal("summary_file_unavailable", "summary_file")
+        raise _summary_refusal("summary_file_unavailable", "summary_file", guard, uid, python_executable)
     guard["parent_probe_name"] = parent_probe_name
     guard["child_termination_confirmed"] = False
     result = None
@@ -707,11 +873,16 @@ def _run_real_summary_probe(guard, uid, *, env, python_executable, binding):
         guard["child_termination_confirmed"] = True
     except capability.ProbeFailure as error:
         if not error.cleanup_complete:
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+            _, survivor_classes = _read_survivor_classes(uid, python_executable)
+            raise Refusal(
+                "cleanup_incomplete", "cleanup",
+                tool_phase="summary",
+                survivor_classes=survivor_classes,
+            ) from None
         guard["child_termination_confirmed"] = True
         child_failure = error
     except BaseException:
-        raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise _summary_refusal("cleanup_incomplete", "cleanup", guard, uid, python_executable) from None
     observed = None
     observed_changed = False
     observation_failed = False
@@ -735,7 +906,7 @@ def _run_real_summary_probe(guard, uid, *, env, python_executable, binding):
     except Refusal:
         cleanup_failed = True
     if cleanup_failed:
-        raise Refusal("cleanup_incomplete", "cleanup")
+        raise _summary_refusal("cleanup_incomplete", "cleanup", guard, uid, python_executable)
     child_reported_write = (
         type(result) is subprocess.CompletedProcess
         and result.returncode == 0
@@ -743,11 +914,11 @@ def _run_real_summary_probe(guard, uid, *, env, python_executable, binding):
         and result.stderr == b""
     )
     if observed_changed or parent_write_allowed or child_reported_write:
-        raise Refusal("summary_file_write_allowed", "summary_file")
+        raise _summary_refusal("summary_file_write_allowed", "summary_file", guard, uid, python_executable)
     if child_failure is not None or observation_failed:
-        raise Refusal("summary_file_unavailable", "summary_file")
+        raise _summary_refusal("summary_file_unavailable", "summary_file", guard, uid, python_executable)
     if not _check_capture(result, REAL_SUMMARY_MARKER, b""):
-        raise Refusal("summary_file_unavailable", "summary_file")
+        raise _summary_refusal("summary_file_unavailable", "summary_file", guard, uid, python_executable)
 
 
 def _create_synthetic_source(storage, uid):
@@ -794,7 +965,146 @@ def _check_capture(result, expected_stdout, expected_stderr):
     )
 
 
-def _run_probe_step(argv, uid, *, env, python_executable, stage, expected_stdout, expected_stderr=b""):
+def _normalized_survivor_classes(value):
+    if type(value) is str and value in SURVIVOR_CLASS_STATES:
+        return value
+    if (
+        type(value) is tuple
+        and 0 < len(value) <= len(SURVIVOR_CLASS_ORDER)
+        and all(type(item) is str and item in SURVIVOR_CLASSES for item in value)
+        and len(set(value)) == len(value)
+        and tuple(item for item in SURVIVOR_CLASS_ORDER if item in value) == value
+    ):
+        return value
+    return "unavailable"
+
+
+def _survivor_classes_from_presence(presence):
+    try:
+        present, classes = capability._presence_result(presence)
+    except BaseException:
+        return None, "unavailable"
+    if not present:
+        return False, "none"
+    if not classes:
+        return True, "unclassified"
+    if _normalized_survivor_classes(classes) == classes:
+        return True, classes
+    return None, "unavailable"
+
+
+def _read_survivor_classes(uid, python_executable):
+    try:
+        presence = capability._probe_uid_processes_present(
+            uid, include_survivor_classes=True, python_executable=python_executable,
+        )
+    except BaseException:
+        return None, "unavailable"
+    return _survivor_classes_from_presence(presence)
+
+
+def _worker_census(uid, python_executable, tool_phase):
+    present, classes = _read_survivor_classes(uid, python_executable)
+    if present is not False:
+        raise Refusal(
+            "cleanup_incomplete", "cleanup",
+            tool_phase=tool_phase,
+            survivor_classes=classes,
+        )
+
+
+def _write_worker_tool_file(path, uid, payload):
+    descriptor = None
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise Refusal("synthetic_build_failed", "storage", tool_phase="python")
+    try:
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600,
+        )
+        os.fchown(descriptor, uid, capability.PROBE_PRIMARY_GID)
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, payload)
+        os.close(descriptor)
+        descriptor = None
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != uid
+            or info.st_gid != capability.PROBE_PRIMARY_GID
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+            or path.read_bytes() != payload
+        ):
+            raise OSError
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+        raise Refusal("synthetic_build_failed", "storage", tool_phase="python") from None
+
+
+def _create_worker_tool_fixture(storage, uid):
+    root = storage / "worker-tools"
+    repository = root / "repository"
+    template = root / "template"
+    try:
+        os.mkdir(root, 0o700)
+        os.chown(root, uid, capability.PROBE_PRIMARY_GID)
+        os.chmod(root, 0o700)
+        os.mkdir(repository, 0o700)
+        os.chown(repository, uid, capability.PROBE_PRIMARY_GID)
+        os.chmod(repository, 0o700)
+        os.mkdir(template, 0o700)
+        os.chown(template, uid, capability.PROBE_PRIMARY_GID)
+        os.chmod(template, 0o700)
+        for directory in (root, repository, template):
+            info = directory.lstat()
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != uid
+                or info.st_gid != capability.PROBE_PRIMARY_GID
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
+                raise OSError
+        _write_worker_tool_file(repository / "fixture.txt", uid, WORKER_TOOL_CONTENT)
+        _write_worker_tool_file(root / "payload", uid, WORKER_TOOL_PAYLOAD)
+    except Refusal:
+        raise
+    except BaseException:
+        raise Refusal("synthetic_build_failed", "storage", tool_phase="python") from None
+    return root
+
+
+def _run_worker_tool_fixture(root, uid, env, toolchain):
+    operations = (
+        ("python", "python"),
+        ("git-init", "git"),
+        ("git-add", "git"),
+        ("git-commit", "git"),
+        ("ssh-keygen", "ssh"),
+        ("ssh-sign", "ssh"),
+        ("ssh-verify", "ssh"),
+    )
+    for operation, phase in operations:
+        _run_probe_step(
+            _probe_argv(toolchain["python"], WORKER_TOOL_SCRIPT, operation, root),
+            uid,
+            env=env,
+            python_executable=toolchain["python"],
+            stage="storage",
+            expected_stdout=WORKER_TOOL_MARKER,
+            tool_phase=phase,
+        )
+        _worker_census(uid, toolchain["python"], phase)
+
+
+def _run_probe_step(
+    argv, uid, *, env, python_executable, stage, expected_stdout,
+    expected_stderr=b"", tool_phase="unknown",
+):
     try:
         result = capability._run_as_probe_user(
             argv,
@@ -805,12 +1115,26 @@ def _run_probe_step(argv, uid, *, env, python_executable, stage, expected_stdout
             python_executable=python_executable,
         )
     except capability.ProbeFailure as error:
+        _, diagnostic_classes = _read_survivor_classes(uid, python_executable)
         if not error.cleanup_complete:
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+            raise Refusal(
+                "cleanup_incomplete", "cleanup",
+                tool_phase=tool_phase,
+                survivor_classes=diagnostic_classes,
+            ) from None
         reason = "privilege_check_failed" if stage == "privilege" else "synthetic_build_failed"
-        raise Refusal(reason, stage) from None
+        raise Refusal(
+            reason, stage,
+            tool_phase=tool_phase,
+            survivor_classes=diagnostic_classes,
+        ) from None
     if not _check_capture(result, expected_stdout, expected_stderr):
-        raise Refusal("capture_invalid", "capture")
+        _, diagnostic_classes = _read_survivor_classes(uid, python_executable)
+        raise Refusal(
+            "capture_invalid", "capture",
+            tool_phase=tool_phase,
+            survivor_classes=diagnostic_classes,
+        )
 
 
 def _probe_argv(python_executable, script, *arguments):
@@ -835,29 +1159,45 @@ def _assert_standin_unchanged(path):
 
 
 def _remove_identity(uid, *, toolchain):
+    survivor_classes = "unavailable"
     try:
         presence = capability._probe_uid_processes_present(
             uid,
             include_survivor_classes=True,
             python_executable=toolchain["python"],
         )
-        present, _ = capability._presence_result(presence)
+        present, survivor_classes = _survivor_classes_from_presence(presence)
+        if present is None:
+            raise Refusal(
+                "cleanup_incomplete", "cleanup",
+                tool_phase="cleanup", survivor_classes="unavailable",
+            )
         if present:
-            raise Refusal("cleanup_incomplete", "cleanup")
+            raise Refusal(
+                "cleanup_incomplete", "cleanup",
+                tool_phase="cleanup", survivor_classes=survivor_classes,
+            )
         result = capability._run(
             ("/usr/bin/dscl", ".", "-delete", "/Users/" + capability.USERNAME),
             timeout=10,
             timeout_check="probe_identity_cleanup",
         )
         if result.returncode != 0 or result.stderr:
-            raise Refusal("cleanup_incomplete", "cleanup")
+            raise Refusal(
+                "cleanup_incomplete", "cleanup",
+                tool_phase="cleanup", survivor_classes=survivor_classes,
+            )
     except Refusal:
         raise
     except BaseException:
-        raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise Refusal(
+            "cleanup_incomplete", "cleanup",
+            tool_phase="cleanup", survivor_classes="unavailable",
+        ) from None
 
 
 def _cleanup(paths, uid, toolchain):
+    survivor_classes = "unavailable"
     if uid is not None:
         try:
             presence = capability._probe_uid_processes_present(
@@ -865,17 +1205,31 @@ def _cleanup(paths, uid, toolchain):
                 include_survivor_classes=True,
                 python_executable=toolchain["python"],
             )
-            present, _ = capability._presence_result(presence)
+            present, survivor_classes = _survivor_classes_from_presence(presence)
+            if present is None:
+                raise Refusal(
+                    "cleanup_incomplete", "cleanup",
+                    tool_phase="cleanup", survivor_classes="unavailable",
+                )
         except BaseException:
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+            raise Refusal(
+                "cleanup_incomplete", "cleanup",
+                tool_phase="cleanup", survivor_classes="unavailable",
+            ) from None
         if present:
-            raise Refusal("cleanup_incomplete", "cleanup")
+            raise Refusal(
+                "cleanup_incomplete", "cleanup",
+                tool_phase="cleanup", survivor_classes=survivor_classes,
+            )
     for path in paths:
         if path is not None:
             try:
                 capability._remove_probe_tree(path)
             except BaseException:
-                raise Refusal("cleanup_incomplete", "cleanup") from None
+                raise Refusal(
+                    "cleanup_incomplete", "cleanup",
+                    tool_phase="cleanup", survivor_classes=survivor_classes,
+                ) from None
     if uid is not None:
         _remove_identity(uid, toolchain=toolchain)
 
@@ -897,6 +1251,25 @@ def _safe_context(control_sha):
     return binding, root
 
 
+def _diagnostic_for_refusal(error):
+    if type(error) is not Refusal or type(error.tool_phase) is not str or error.tool_phase not in TOOL_PHASES:
+        return None
+    if error.tool_phase == "unknown":
+        return None
+    return error.tool_phase, _normalized_survivor_classes(error.survivor_classes)
+
+
+def _preserve_first_diagnostic(error, diagnostic):
+    selected = diagnostic if diagnostic is not None else _diagnostic_for_refusal(error)
+    if selected is None:
+        return error
+    return Refusal(
+        error.reason, error.stage,
+        tool_phase=selected[0],
+        survivor_classes=selected[1],
+    )
+
+
 def _run_synthetic_smoke(control_sha):
     if capability is None:
         raise Refusal("toolchain_unavailable", "toolchain_module")
@@ -909,6 +1282,7 @@ def _run_synthetic_smoke(control_sha):
     build_storage = None
     summary_guard = None
     failure = None
+    first_diagnostic = None
     record = None
     stage = "toolchain"
     try:
@@ -937,6 +1311,20 @@ def _run_synthetic_smoke(control_sha):
             expected_stdout=PRIVILEGE_MARKER,
         )
         stage = "storage"
+        tool_fixture_root = _create_worker_tool_fixture(build_storage, identity_uid)
+        _worker_census(identity_uid, toolchain["python"], "baseline")
+        stage = "summary_file"
+        _run_real_summary_probe(
+            summary_guard,
+            identity_uid,
+            env=child_env,
+            python_executable=toolchain["python"],
+            binding=binding,
+        )
+        _worker_census(identity_uid, toolchain["python"], "baseline")
+        stage = "storage"
+        _run_worker_tool_fixture(tool_fixture_root, identity_uid, child_env, toolchain)
+        _worker_census(identity_uid, toolchain["python"], "cleanup")
         source = _create_synthetic_source(build_storage, identity_uid)
         object_path = build_storage / "smoke.o"
         library_path = build_storage / "smoke.dylib"
@@ -1003,6 +1391,7 @@ def _run_synthetic_smoke(control_sha):
         }
     except Refusal as error:
         failure = error
+        first_diagnostic = _diagnostic_for_refusal(error)
     except capability.ProbeFailure as error:
         if not error.cleanup_complete:
             failure = Refusal("cleanup_incomplete", "cleanup")
@@ -1023,11 +1412,25 @@ def _run_synthetic_smoke(control_sha):
                 _cleanup((build_storage, control_scratch, home_parent), identity_uid, toolchain)
                 cleanup_succeeded = True
             except Refusal as error:
-                failure = error
+                failure = _preserve_first_diagnostic(error, first_diagnostic)
+                if first_diagnostic is None:
+                    first_diagnostic = _diagnostic_for_refusal(failure)
             except BaseException:
-                failure = Refusal("cleanup_incomplete", "cleanup")
+                error = Refusal(
+                    "cleanup_incomplete", "cleanup",
+                    tool_phase="cleanup", survivor_classes="unavailable",
+                )
+                failure = _preserve_first_diagnostic(error, first_diagnostic)
+                if first_diagnostic is None:
+                    first_diagnostic = _diagnostic_for_refusal(failure)
         elif any(path is not None for path in (build_storage, control_scratch, home_parent)):
-            failure = Refusal("cleanup_incomplete", "cleanup")
+            error = Refusal(
+                "cleanup_incomplete", "cleanup",
+                tool_phase="cleanup", survivor_classes="unavailable",
+            )
+            failure = _preserve_first_diagnostic(error, first_diagnostic)
+            if first_diagnostic is None:
+                first_diagnostic = _diagnostic_for_refusal(failure)
         if summary_guard is not None:
             if cleanup_succeeded:
                 summary_guard["child_termination_confirmed"] = True
@@ -1038,15 +1441,39 @@ def _run_synthetic_smoke(control_sha):
                     if parent_probe_name is not None:
                         parent_write_allowed = _remove_summary_parent_probe(summary_guard, parent_probe_name)
                         if parent_write_allowed:
-                            failure = Refusal("summary_file_write_allowed", "summary_file")
+                            error = _summary_refusal(
+                                "summary_file_write_allowed", "summary_file", summary_guard,
+                                identity_uid, toolchain["python"],
+                            )
+                            failure = _preserve_first_diagnostic(error, first_diagnostic)
+                            if first_diagnostic is None:
+                                first_diagnostic = _diagnostic_for_refusal(failure)
                 except Refusal as error:
-                    failure = error
+                    diagnostic_error = _summary_refusal(
+                        error.reason, error.stage, summary_guard,
+                        identity_uid, toolchain["python"],
+                    )
+                    failure = _preserve_first_diagnostic(diagnostic_error, first_diagnostic)
+                    if first_diagnostic is None:
+                        first_diagnostic = _diagnostic_for_refusal(failure)
             else:
-                failure = Refusal("cleanup_incomplete", "cleanup")
+                error = _summary_refusal(
+                    "cleanup_incomplete", "cleanup", summary_guard,
+                    identity_uid, toolchain["python"],
+                )
+                failure = _preserve_first_diagnostic(error, first_diagnostic)
+                if first_diagnostic is None:
+                    first_diagnostic = _diagnostic_for_refusal(failure)
             try:
                 _close_runner_summary(summary_guard)
             except Refusal as error:
-                failure = error
+                diagnostic_error = _summary_refusal(
+                    error.reason, error.stage, summary_guard,
+                    identity_uid, toolchain["python"],
+                )
+                failure = _preserve_first_diagnostic(diagnostic_error, first_diagnostic)
+                if first_diagnostic is None:
+                    first_diagnostic = _diagnostic_for_refusal(failure)
     if failure is not None:
         raise failure
     if record is None:
@@ -1135,15 +1562,27 @@ def _safe_binding_fields(control_sha, environ):
     return sha, run_id, run_attempt
 
 
+def _format_tool_phase(value):
+    return value if type(value) is str and value in TOOL_PHASES else "unknown"
+
+
+def _format_survivor_classes(value):
+    normalized = _normalized_survivor_classes(value)
+    return ",".join(normalized) if type(normalized) is tuple else normalized
+
+
 def _format_refusal(error, control_sha, environ):
     if type(error) is not Refusal:
         error = Refusal("internal_error", "preflight")
     reason = error.reason if type(error.reason) is str and error.reason in REASONS else "internal_error"
     stage = error.stage if type(error.stage) is str and error.stage in STAGES else "preflight"
+    tool_phase = _format_tool_phase(error.tool_phase)
+    survivor_classes = _format_survivor_classes(error.survivor_classes)
     sha, run_id, run_attempt = _safe_binding_fields(control_sha, environ)
     return (
         "macos-build=refused schema=1 reason=" + reason + " stage=" + stage
         + " control-sha=" + sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+        + " tool-phase=" + tool_phase + " survivor-classes=" + survivor_classes
     )
 
 
