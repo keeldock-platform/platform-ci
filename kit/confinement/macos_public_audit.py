@@ -16,6 +16,15 @@ REVIEWED_WORKFLOW_PATH = ".github/workflows/macos-reviewed-build.yml"
 REVIEWED_SNAPSHOT_JOB_NAME = "macos-public-snapshot"
 REVIEWED_SMOKE_JOB_NAME = "macos-reviewed-smoke"
 REVIEWED_AUDIT_JOB_NAME = "macos-public-surface-audit"
+CACHE_PROOF_WORKFLOW_PATH = ".github/workflows/macos-cache-proof.yml"
+CACHE_PROOF_SNAPSHOT_JOB_NAME = "macos-cache-public-snapshot"
+CACHE_PROOF_SEED_JOB_NAME = "macos-cache-seed"
+CACHE_PROOF_POSITIVE_JOB_NAME = "macos-cache-positive"
+CACHE_PROOF_NONE_JOB_NAME = "macos-cache-none-probe"
+CACHE_PROOF_AUDIT_JOB_NAME = "macos-cache-public-audit"
+CACHE_PROOF_CLEANUP_JOB_NAME = "macos-cache-cleanup"
+CACHE_PROOF_SEED_KEY_PREFIX = "macos-public-cache-seed-v1-"
+CACHE_PROOF_NONE_WRITE_KEY_PREFIX = "macos-public-cache-none-write-v1-"
 API_ORIGIN = "https://api.github.com"
 API_HOST = "api.github.com"
 API_VERSION = "2022-11-28"
@@ -202,6 +211,48 @@ def inspect_reviewed_public_bytes(raw, control_sha):
     for needle in _reviewed_canary_variants(control_sha):
         if needle and needle in raw:
             _fail("canary_exposed")
+
+
+def inspect_cache_probe_public_bytes(raw, control_sha, write_key):
+    if type(raw) is not bytes:
+        _fail("log_format_unknown")
+    read_warnings = 0
+    write_warnings = 0
+    sanitized = []
+    prefix = b"::warning::"
+    read_prefix = prefix + b"Failed to restore: cache read denied:"
+    write_prefix = (
+        prefix + b"Unable to reserve cache with key " + write_key.encode("ascii")
+        + b". More details: cache write denied:"
+    )
+    for line in raw.splitlines(keepends=True):
+        content = line.rstrip(b"\r\n")
+        ending = line[len(content):]
+        if content.startswith(read_prefix):
+            message = content[len(prefix):]
+            suffix = content[len(read_prefix):]
+            if (len(suffix) > 1024 or b"::" in suffix
+                    or any(byte < 32 or byte > 126 for byte in suffix)):
+                _fail("workflow_command_exposed")
+            inspect_reviewed_public_bytes(message, control_sha)
+            read_warnings += 1
+            sanitized.append(b"[cache-service-warning]" + message + ending)
+        elif content.startswith(write_prefix):
+            message = content[len(prefix):]
+            suffix = content[len(write_prefix):]
+            if (len(suffix) > 1024 or b"::" in suffix
+                    or any(byte < 32 or byte > 126 for byte in suffix)):
+                _fail("workflow_command_exposed")
+            inspect_reviewed_public_bytes(message, control_sha)
+            write_warnings += 1
+            sanitized.append(b"[cache-service-warning]" + message + ending)
+        elif content.startswith(prefix):
+            _fail("workflow_command_exposed")
+        else:
+            sanitized.append(line)
+    if (read_warnings or write_warnings) and (read_warnings != 1 or write_warnings != 1):
+        _fail("workflow_command_exposed")
+    inspect_reviewed_public_bytes(b"".join(sanitized), control_sha)
 
 
 def cache_inventory_digest(entries):
@@ -392,6 +443,43 @@ class GitHubAPI:
         except Exception:
             _fail("log_format_unknown")
         return data
+
+    def delete_cache(self, cache_id):
+        if not _exact_int(cache_id, 1):
+            _fail("invalid_input")
+        path = "/repos/keeldock-platform/platform-ci/actions/caches/" + str(cache_id)
+        request = urllib.request.Request(
+            API_ORIGIN + path,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": "Bearer " + self._token,
+                "X-GitHub-Api-Version": API_VERSION,
+                "User-Agent": "macos-cache-proof-cleanup",
+                "Accept-Encoding": "identity",
+            },
+            method="DELETE",
+        )
+        try:
+            response = self._opener.open(request, timeout=30)
+        except urllib.error.HTTPError as error:
+            error.close()
+            _fail("api_status")
+        except Exception:
+            _fail("api_unavailable")
+        try:
+            if response.status != 204:
+                _fail("api_status")
+            if response.read(1):
+                _fail("api_schema")
+        except AuditRefusal:
+            raise
+        except Exception:
+            _fail("api_unavailable")
+        finally:
+            try:
+                response.close()
+            except Exception:
+                pass
 
 
 def _validate_api_url(value, expected_path):
@@ -686,6 +774,88 @@ def _reviewed_jobs(api, run_id, run_attempt, control_sha):
     )
 
 
+def _cache_proof_keys(run_id, run_attempt):
+    if not _positive_decimal(run_id) or not _positive_decimal(run_attempt):
+        _fail("invalid_input")
+    suffix = run_id + "-" + run_attempt
+    return (
+        CACHE_PROOF_SEED_KEY_PREFIX + suffix,
+        CACHE_PROOF_NONE_WRITE_KEY_PREFIX + suffix,
+    )
+
+
+def _cache_proof_step_names(job, expected_names):
+    steps = job.get("steps")
+    actual = [step.get("name") for step in steps] if type(steps) is list else []
+    if len(actual) != len(set(actual)) or any(name not in actual for name in expected_names):
+        _fail("api_schema")
+
+
+def _cache_proof_jobs(api, run_id, run_attempt, control_sha):
+    path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + run_id
+        + "/attempts/" + run_attempt + "/jobs"
+    )
+    jobs = _read_counted_collection(api, path, "jobs", 10000, _validate_job_record)
+    required_names = {
+        CACHE_PROOF_SNAPSHOT_JOB_NAME,
+        CACHE_PROOF_SEED_JOB_NAME,
+        CACHE_PROOF_POSITIVE_JOB_NAME,
+        CACHE_PROOF_NONE_JOB_NAME,
+        CACHE_PROOF_AUDIT_JOB_NAME,
+    }
+    actual_names = {job.get("name") for job in jobs}
+    if (not required_names.issubset(actual_names)
+            or actual_names - required_names not in (set(), {CACHE_PROOF_CLEANUP_JOB_NAME})
+            or len(jobs) != len(actual_names)):
+        _fail("api_schema")
+    by_name = {job["name"]: job for job in jobs}
+    audit_job = by_name[CACHE_PROOF_AUDIT_JOB_NAME]
+    if (audit_job.get("run_id") != int(run_id)
+            or audit_job.get("run_attempt") != int(run_attempt)
+            or audit_job.get("head_sha") != control_sha
+            or audit_job.get("status") != "in_progress"):
+        _fail("run_identity_mismatch")
+    if CACHE_PROOF_CLEANUP_JOB_NAME in by_name:
+        cleanup_job = by_name[CACHE_PROOF_CLEANUP_JOB_NAME]
+        if (cleanup_job.get("run_id") != int(run_id)
+                or cleanup_job.get("run_attempt") != int(run_attempt)
+                or cleanup_job.get("head_sha") != control_sha
+                or cleanup_job.get("status") != "queued"):
+            _fail("run_identity_mismatch")
+    expected_steps = {
+        CACHE_PROOF_SNAPSHOT_JOB_NAME: (
+            "Fetch reviewed main control",
+            "Snapshot cache inventory",
+        ),
+        CACHE_PROOF_SEED_JOB_NAME: (
+            "Fetch reviewed main control",
+            "Prepare public cache fixture",
+            "Save public cache fixture",
+            "Confirm seed step completed",
+        ),
+        CACHE_PROOF_POSITIVE_JOB_NAME: (
+            "Fetch reviewed main control",
+            "Restore the known public cache fixture",
+            "Verify exact fixture bytes after a cache hit",
+        ),
+        CACHE_PROOF_NONE_JOB_NAME: (
+            "Fetch reviewed main control",
+            "Require fixture is absent before the denied read",
+            "Request the known fixture with the none-scoped token",
+            "Verify the none-scoped read did not restore bytes",
+            "Prepare a distinct public write probe",
+            "Request a cache save with the none-scoped token",
+            "Confirm save request completed",
+        ),
+    }
+    details = {}
+    for name, step_names in expected_steps.items():
+        details[name] = _job_detail(api, by_name[name], run_id, run_attempt, control_sha, name)
+        _cache_proof_step_names(details[name][0], step_names)
+    return details
+
+
 def _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt):
     matches = list(REVIEWED_SMOKE_MARKER_RE.finditer(raw))
     if len(matches) != 1 or raw.count(b"macos-build=") != 1:
@@ -733,7 +903,7 @@ def _fetch_artifacts(api, run_id):
         _fail("artifact_found")
 
 
-def _fetch_caches(api, control_sha, reviewed=False):
+def _fetch_cache_entries(api, control_sha, reviewed=False):
     path = "/repos/keeldock-platform/platform-ci/actions/caches"
     caches = _read_counted_collection(api, path, "actions_caches", MAX_CACHE_ITEMS, _validate_cache)
     for item in caches:
@@ -743,16 +913,37 @@ def _fetch_caches(api, control_sha, reviewed=False):
             _fail("api_schema")
         inspect = inspect_reviewed_public_bytes if reviewed else inspect_public_bytes
         inspect(raw, control_sha)
-    return cache_inventory_digest(caches)
+    cache_inventory_digest(caches)
+    return caches
+
+
+def _fetch_caches(api, control_sha, reviewed=False):
+    return cache_inventory_digest(_fetch_cache_entries(api, control_sha, reviewed))
 
 
 def _snapshot(phase, api, control_sha, run_id, run_attempt, env):
-    workflow_path = REVIEWED_WORKFLOW_PATH if phase == "reviewed-snapshot" else WORKFLOW_PATH
+    workflow_path = (
+        CACHE_PROOF_WORKFLOW_PATH if phase == "cache-proof-snapshot"
+        else REVIEWED_WORKFLOW_PATH if phase == "reviewed-snapshot"
+        else WORKFLOW_PATH
+    )
     _validate_run(api, run_id, run_attempt, control_sha, workflow_path)
-    digest = _fetch_caches(api, control_sha, reviewed=phase == "reviewed-snapshot")
-    if phase in {"snapshot", "reviewed-snapshot"}:
+    caches = _fetch_cache_entries(
+        api,
+        control_sha,
+        reviewed=phase in {"reviewed-snapshot", "cache-proof-snapshot"},
+    )
+    if phase == "cache-proof-snapshot":
+        seed_key, write_key = _cache_proof_keys(run_id, run_attempt)
+        if any(item.get("key") in {seed_key, write_key} for item in caches):
+            _fail("inventory_changed")
+    digest = cache_inventory_digest(caches)
+    if phase in {"snapshot", "reviewed-snapshot", "cache-proof-snapshot"}:
         _write_output("cache_snapshot", digest, env)
-        print("macos-public-surface-audit=snapshot-ready")
+        if phase == "cache-proof-snapshot":
+            print("macos-cache-proof=snapshot-ready")
+        else:
+            print("macos-public-surface-audit=snapshot-ready")
         return 0
     baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
     if HEX_DIGEST_RE.fullmatch(baseline) is None or digest != baseline:
@@ -783,7 +974,10 @@ def _write_output(key, value, env):
 
 def run(phase, environ=None, api=None):
     env = os.environ if environ is None else environ
-    if phase not in {"snapshot", "audit", "reviewed-snapshot", "reviewed-audit"}:
+    if phase not in {
+        "snapshot", "audit", "reviewed-snapshot", "reviewed-audit",
+        "cache-proof-snapshot", "cache-proof-audit", "cache-proof-cleanup",
+    }:
         _fail("invalid_input")
     repository = env.get("GITHUB_REPOSITORY", "")
     run_id = env.get("GITHUB_RUN_ID", "")
@@ -797,8 +991,103 @@ def run(phase, environ=None, api=None):
         api = GitHubAPI(token)
     elif type(token) is not str or TOKEN_RE.fullmatch(token) is None:
         _fail("invalid_input")
-    if phase in {"snapshot", "reviewed-snapshot"}:
+    if phase in {"snapshot", "reviewed-snapshot", "cache-proof-snapshot"}:
         return _snapshot(phase, api, control_sha, run_id, run_attempt, env)
+
+    if phase == "cache-proof-audit":
+        _validate_run(api, run_id, run_attempt, control_sha, CACHE_PROOF_WORKFLOW_PATH)
+        details = _cache_proof_jobs(api, run_id, run_attempt, control_sha)
+        seed_key, write_key = _cache_proof_keys(run_id, run_attempt)
+        log_by_name = {}
+        for name in (
+            CACHE_PROOF_SNAPSHOT_JOB_NAME,
+            CACHE_PROOF_SEED_JOB_NAME,
+            CACHE_PROOF_POSITIVE_JOB_NAME,
+            CACHE_PROOF_NONE_JOB_NAME,
+        ):
+            job, check_id, steps_success = details[name]
+            if job.get("conclusion") != "success" or not steps_success:
+                _fail("native_job_failed")
+            log_bytes = api.log_text(job["id"])
+            if name == CACHE_PROOF_NONE_JOB_NAME:
+                inspect_cache_probe_public_bytes(log_bytes, control_sha, write_key)
+            else:
+                inspect_reviewed_public_bytes(log_bytes, control_sha)
+            _scan_annotations(api, job, check_id, control_sha, reviewed=True)
+            log_by_name[name] = log_bytes
+        _fetch_artifacts(api, run_id)
+        caches = _fetch_cache_entries(api, control_sha, reviewed=True)
+        seed_entries = [item for item in caches if item["key"] == seed_key]
+        write_entries = [item for item in caches if item["key"] == write_key]
+        if (len(seed_entries) != 1 or write_entries
+                or seed_entries[0]["ref"] != "refs/heads/main"
+                or not seed_entries[0]["version"]
+                or seed_entries[0]["size_in_bytes"] <= 0):
+            _fail("inventory_changed")
+        baseline_entries = [item for item in caches if item["key"] not in {seed_key, write_key}]
+        baseline_digest = env.get("MACOS_CACHE_SNAPSHOT", "")
+        if (HEX_DIGEST_RE.fullmatch(baseline_digest) is None
+                or cache_inventory_digest(baseline_entries) != baseline_digest):
+            _fail("inventory_changed")
+        expected_seed_line = (
+            "macos-cache-seed=step-complete schema=1 run-id=" + run_id
+            + " run-attempt=" + run_attempt
+        ).encode("ascii")
+        expected_positive_line = (
+            "macos-cache-positive=restored schema=1 run-id=" + run_id
+            + " run-attempt=" + run_attempt
+        ).encode("ascii")
+        expected_none_read_line = (
+            "macos-cache-none-read=local-absent schema=1 run-id=" + run_id
+            + " run-attempt=" + run_attempt
+        ).encode("ascii")
+        expected_none_save_line = (
+            "macos-cache-none-save=request-finished schema=1 run-id=" + run_id
+            + " run-attempt=" + run_attempt
+        ).encode("ascii")
+        snapshot_log = log_by_name[CACHE_PROOF_SNAPSHOT_JOB_NAME]
+        seed_log = log_by_name[CACHE_PROOF_SEED_JOB_NAME]
+        positive_log = log_by_name[CACHE_PROOF_POSITIVE_JOB_NAME]
+        none_log = log_by_name[CACHE_PROOF_NONE_JOB_NAME]
+        if b"macos-cache-proof=snapshot-ready" not in snapshot_log:
+            _fail("receipt_invalid")
+        if (seed_log.count(expected_seed_line) != 1
+                or b"Cache saved with key: " + seed_key.encode("ascii") not in seed_log):
+            _fail("receipt_invalid")
+        if (positive_log.count(expected_positive_line) != 1
+                or b"Cache restored from key: " + seed_key.encode("ascii") not in positive_log):
+            _fail("receipt_invalid")
+        if (none_log.count(expected_none_read_line) != 1
+                or none_log.count(expected_none_save_line) != 1
+                or b"cache read denied:" not in none_log
+                or b"Cache not found for input keys: " + seed_key.encode("ascii") not in none_log
+                or b"cache write denied:" not in none_log
+                or write_key.encode("ascii") not in none_log
+                or b"Cache restored from key: " + seed_key.encode("ascii") in none_log
+                or b"Cache saved with key: " + write_key.encode("ascii") in none_log):
+            _fail("receipt_invalid")
+        print("macos-cache-proof=seeded-positive-and-none-denials-audited")
+        return 0
+
+    if phase == "cache-proof-cleanup":
+        _validate_run(api, run_id, run_attempt, control_sha, CACHE_PROOF_WORKFLOW_PATH)
+        seed_key, write_key = _cache_proof_keys(run_id, run_attempt)
+        fixture_keys = {seed_key, write_key}
+        caches = _fetch_cache_entries(api, control_sha, reviewed=True)
+        for item in caches:
+            if item["key"] in fixture_keys:
+                if item["ref"] != "refs/heads/main":
+                    _fail("inventory_changed")
+        for item in caches:
+            if item["key"] in fixture_keys and item["ref"] == "refs/heads/main":
+                if not hasattr(api, "delete_cache"):
+                    _fail("api_unavailable")
+                api.delete_cache(item["id"])
+        remaining = _fetch_cache_entries(api, control_sha, reviewed=True)
+        if any(item["key"] in fixture_keys for item in remaining):
+            _fail("inventory_changed")
+        print("macos-cache-cleanup=complete schema=1 run-id=" + run_id + " run-attempt=" + run_attempt)
+        return 0
 
     if phase == "reviewed-audit":
         _validate_run(api, run_id, run_attempt, control_sha, REVIEWED_WORKFLOW_PATH)
@@ -840,7 +1129,10 @@ def run(phase, environ=None, api=None):
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 1 or args[0] not in {"snapshot", "audit", "reviewed-snapshot", "reviewed-audit"}:
+    if len(args) != 1 or args[0] not in {
+        "snapshot", "audit", "reviewed-snapshot", "reviewed-audit",
+        "cache-proof-snapshot", "cache-proof-audit", "cache-proof-cleanup",
+    }:
         print("macos-public-surface-audit=refused reason=invalid_input")
         return 2
     try:

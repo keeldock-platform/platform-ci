@@ -11,6 +11,7 @@ PLATFORM_FILES = frozenset(
         ".github/workflows/windows-attestation-permission-probe.yml",
         ".github/workflows/macos-capability.yml",
         ".github/workflows/macos-reviewed-build.yml",
+        ".github/workflows/macos-cache-proof.yml",
         ".github/workflows/windows-native-preflight.yml",
         "ci/policy.json",
         "kit/bootstrap/action.yml",

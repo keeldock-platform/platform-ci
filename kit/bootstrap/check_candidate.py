@@ -43,6 +43,12 @@ def main():
             validate_workflow_text(
                 reviewed_macos_payload.decode("utf-8"), pool, "macos-reviewed-build"
             )
+            macos_cache_workflow_path = root / ".github/workflows/macos-cache-proof.yml"
+            with macos_cache_workflow_path.open("rb") as source:
+                macos_cache_payload = source.read(262145)
+            if len(macos_cache_payload) > 262144:
+                raise PolicyError("macos-cache-workflow-too-large")
+            validate_workflow_text(macos_cache_payload.decode("utf-8"), pool, "macos-cache-proof")
             windows_workflow_path = root / ".github/workflows/windows-native-preflight.yml"
             with windows_workflow_path.open("rb") as source:
                 windows_payload = source.read(262145)
