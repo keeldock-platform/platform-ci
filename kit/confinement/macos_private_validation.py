@@ -1,0 +1,1838 @@
+import base64
+from contextlib import contextmanager
+from dataclasses import dataclass
+import datetime
+import hashlib
+import importlib.util
+import os
+import re
+import selectors
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from types import MappingProxyType
+import unicodedata
+from pathlib import Path
+
+
+try:
+    _CONTROL_DIRECTORY = Path(__file__).resolve(strict=True).parent
+except BaseException:
+    _CONTROL_DIRECTORY = None
+
+
+def _load_control_sibling(module_name):
+    if (
+        _CONTROL_DIRECTORY is None
+        or type(module_name) is not str
+        or module_name not in {"macos_capability", "macos_reviewed_build"}
+    ):
+        raise ImportError("control module unavailable")
+    candidate = _CONTROL_DIRECTORY / (module_name + ".py")
+    try:
+        info = candidate.lstat()
+        path = candidate.resolve(strict=True)
+        if path.parent != _CONTROL_DIRECTORY or not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise ImportError("control module unavailable")
+    except BaseException:
+        raise ImportError("control module unavailable") from None
+    loaded = sys.modules.get(module_name)
+    if loaded is not None:
+        loaded_path = getattr(loaded, "__file__", None)
+        if type(loaded_path) is str:
+            try:
+                if Path(loaded_path).resolve(strict=True) == path:
+                    return loaded
+            except OSError:
+                pass
+    spec = importlib.util.spec_from_file_location(module_name, str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError("control module unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise ImportError("control module unavailable") from None
+    return module
+
+
+try:
+    capability = _load_control_sibling("macos_capability")
+    reviewed_build = _load_control_sibling("macos_reviewed_build")
+except BaseException:
+    capability = None
+    reviewed_build = None
+
+
+SCHEMA_VERSION = 1
+SOURCE_SHA_PATTERN = re.compile(r"[a-f0-9]{40}\Z")
+REPOSITORY_ID_PATTERN = re.compile(r"[1-9][0-9]{0,18}\Z")
+RUN_ID_PATTERN = re.compile(r"[1-9][0-9]{0,18}\Z")
+RUN_ATTEMPT_PATTERN = re.compile(r"[1-9][0-9]{0,18}\Z")
+OWNER_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
+REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
+FINGERPRINT_PATTERN = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
+BRANCHES = frozenset(("main", "develop", "uat"))
+CONCERNS = frozenset(("core-bootstrap", "rules-bootstrap"))
+REASONS = frozenset((
+    "invalid_input",
+    "context_unavailable",
+    "configuration_unavailable",
+    "source_reader_unavailable",
+    "repository_scope_invalid",
+    "source_fetch_unavailable",
+    "revocation_unconfirmed",
+    "base_invalid",
+    "signature_invalid",
+    "revocation_policy_invalid",
+    "bootstrap_snapshot_invalid",
+    "bootstrap_not_approved",
+    "cleanup_incomplete",
+    "internal_error",
+))
+STAGES = frozenset((
+    "input", "context", "configuration", "source_scope", "fetch", "revoke",
+    "history", "signature", "revocation", "bootstrap", "cleanup",
+))
+SOURCE_REPOSITORY_ID_ENV = "SOURCE_REPOSITORY_ID"
+SOURCE_REPOSITORY_OWNER_ENV = "SOURCE_REPOSITORY_OWNER"
+SOURCE_REPOSITORY_NAME_ENV = "SOURCE_REPOSITORY_NAME"
+SOURCE_CANDIDATE_REF_ENV = "SOURCE_CANDIDATE_REF"
+RULES_BOOTSTRAP_SOURCE_GATE_ENV = "RULES_BOOTSTRAP_ALLOWED_SHA"
+RULES_BOOTSTRAP_CONTROL_GATE_ENV = "RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA"
+REVOCATION_INVENTORY = "ci/revoked-signer-fingerprints"
+SIGNER_PATH_PARTS = ("docs", "commit-signers")
+RULES_DIRECTORY = chr(46) + "claude"
+RULES_LOCK_PATH = RULES_DIRECTORY + "/shared.lock"
+MAX_SIGNER_BYTES = 65536
+MAX_INVENTORY_BYTES = 16384
+MAX_TREE_BYTES = 1024 * 1024
+MAX_GIT_OUTPUT = 65536
+MAX_COMMITS = 20000
+MAX_TREE_ENTRIES = 20000
+COMMAND_TIMEOUT_SECONDS = 60
+
+
+class Refusal(Exception):
+    def __init__(self, reason, stage):
+        self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
+        self.stage = stage if type(stage) is str and stage in STAGES else "input"
+        super().__init__(self.reason)
+
+
+@dataclass(frozen=True, repr=False)
+class SourceLease:
+    source_path: Path
+    record: object
+
+    def __repr__(self):
+        return "SourceLease"
+
+
+def _full_sha(value):
+    return type(value) is str and SOURCE_SHA_PATTERN.fullmatch(value) is not None
+
+
+def parse_request(arguments):
+    if type(arguments) not in (tuple, list) or len(arguments) != 8:
+        raise Refusal("invalid_input", "input")
+    if type(arguments[0]) is not str or arguments[0] != "--source-sha" or not _full_sha(arguments[1]):
+        raise Refusal("invalid_input", "input")
+    if type(arguments[2]) is not str or arguments[2] != "--base-sha" or not _full_sha(arguments[3]):
+        raise Refusal("invalid_input", "input")
+    if type(arguments[4]) is not str or arguments[4] != "--base-branch" or type(arguments[5]) is not str or arguments[5] not in BRANCHES:
+        raise Refusal("invalid_input", "input")
+    if type(arguments[6]) is not str or arguments[6] != "--concern" or type(arguments[7]) is not str or arguments[7] not in CONCERNS:
+        raise Refusal("invalid_input", "input")
+    return {
+        "source_sha": arguments[1],
+        "base_sha": arguments[3],
+        "base_branch": arguments[5],
+        "concern": arguments[7],
+    }
+
+
+def _safe_context(control_sha, environ):
+    if capability is None or reviewed_build is None:
+        raise Refusal("context_unavailable", "context")
+    try:
+        binding = reviewed_build._binding(control_sha, environ)
+        workspace = environ.get("CI_WORKSPACE", "")
+        root = capability._check_context(control_sha, workspace)
+    except Refusal:
+        raise
+    except capability.ProbeFailure:
+        raise Refusal("context_unavailable", "context") from None
+    except BaseException:
+        raise Refusal("context_unavailable", "context") from None
+    return binding, root
+
+
+def _load_source_reader(root):
+    try:
+        path = (Path(__file__).resolve(strict=True).parent / "macos_source_reader.py").resolve(strict=True)
+        if path.parent != Path(__file__).resolve(strict=True).parent or not path.is_file():
+            raise ValueError
+        spec = importlib.util.spec_from_file_location("macos_source_reader", str(path))
+        if spec is None or spec.loader is None:
+            raise ValueError
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except BaseException:
+        raise Refusal("source_reader_unavailable", "source_scope") from None
+
+
+def _repository_configuration(reader, environ):
+    try:
+        repository_id_text = environ.get(SOURCE_REPOSITORY_ID_ENV, "")
+        owner = environ.get(SOURCE_REPOSITORY_OWNER_ENV, "")
+        repository = environ.get(SOURCE_REPOSITORY_NAME_ENV, "")
+        if (
+            type(repository_id_text) is not str
+            or REPOSITORY_ID_PATTERN.fullmatch(repository_id_text) is None
+            or type(owner) is not str
+            or OWNER_PATTERN.fullmatch(owner) is None
+            or type(repository) is not str
+            or REPOSITORY_PATTERN.fullmatch(repository) is None
+        ):
+            raise ValueError
+        token = environ.get(reader.TOKEN_ENV, "")
+        if type(token) is not str or reader.TOKEN_PATTERN.fullmatch(token) is None:
+            raise ValueError
+        return int(repository_id_text), owner, repository, token
+    except BaseException:
+        raise Refusal("configuration_unavailable", "configuration") from None
+
+
+def _verify_repository_scope(reader, repository_id, owner, repository, token):
+    expected_name = owner + "/" + repository
+    if reader.FULL_NAME_PATTERN.fullmatch(expected_name) is None:
+        raise Refusal("configuration_unavailable", "configuration")
+    try:
+        status, body = reader._exchange("GET", reader.LIST_PATH, token)
+        if status != 200:
+            raise ValueError
+        full_name = reader._repository_entry(body, repository_id)
+        if full_name != expected_name:
+            raise ValueError
+        status, body = reader._exchange("GET", "/repos/" + full_name, token)
+        if status != 200 or not reader._metadata_is_positive(body, repository_id, expected_name):
+            raise ValueError
+    except Refusal:
+        raise
+    except BaseException:
+        raise Refusal("repository_scope_invalid", "source_scope") from None
+
+
+def _resolve_trusted_executable(raw):
+    try:
+        return capability._resolve_trusted_path(raw).as_posix()
+    except BaseException:
+        raise Refusal("configuration_unavailable", "configuration") from None
+
+
+def _base_git_environment(home, authorization=None):
+    values = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": str(home),
+        "TMPDIR": str(home),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "TZ": "UTC",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_GRAFT_FILE": "/dev/null",
+        "GIT_ATTR_NOSYSTEM": "1",
+    }
+    settings = [
+        ("core.hooksPath", "/dev/null"),
+        ("fetch.fsckObjects", "true"),
+        ("transfer.fsckObjects", "true"),
+        ("protocol.version", "2"),
+        ("protocol.https.allow", "always"),
+        ("protocol.file.allow", "never"),
+        ("protocol.ext.allow", "never"),
+        ("credential.helper", ""),
+        ("http.followRedirects", "false"),
+        ("core.autocrlf", "false"),
+        ("core.filemode", "true"),
+        ("core.symlinks", "true"),
+        ("core.attributesFile", "/dev/null"),
+    ]
+    if authorization is not None:
+        settings.append(("http.https://github.com/.extraheader", authorization))
+    values["GIT_CONFIG_COUNT"] = str(len(settings))
+    for index, (key, value) in enumerate(settings):
+        values["GIT_CONFIG_KEY_" + str(index)] = key
+        values["GIT_CONFIG_VALUE_" + str(index)] = value
+    return values
+
+
+def _process_failure(stage):
+    selected = stage if type(stage) is str and stage in STAGES else "fetch"
+    reason = {
+        "signature": "signature_invalid",
+        "history": "base_invalid",
+        "configuration": "revocation_policy_invalid",
+        "revocation": "revocation_policy_invalid",
+        "bootstrap": "bootstrap_snapshot_invalid",
+        "cleanup": "cleanup_incomplete",
+    }.get(selected, "source_fetch_unavailable")
+    return Refusal(reason, selected)
+
+
+def _stop_process(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except BaseException:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+    try:
+        process.wait(timeout=5)
+    except BaseException:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        pass
+    except BaseException:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+    else:
+        raise Refusal("cleanup_incomplete", "cleanup")
+    for stream in (process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            try:
+                stream.close()
+            except OSError:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+
+
+def _run_process(
+    argv,
+    *,
+    cwd,
+    environ,
+    timeout=COMMAND_TIMEOUT_SECONDS,
+    max_output=MAX_GIT_OUTPUT,
+    stage="fetch",
+):
+    try:
+        process = subprocess.Popen(
+            [str(part) for part in argv],
+            cwd=str(cwd),
+            env=environ,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        raise _process_failure(stage) from None
+    selector = None
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    streams = (("stdout", process.stdout), ("stderr", process.stderr))
+    timed_out = False
+    overflow = False
+    failed = False
+    deadline = time.monotonic() + timeout
+    try:
+        selector = selectors.DefaultSelector()
+        for name, stream in streams:
+            if stream is None:
+                raise OSError
+            os.set_blocking(stream.fileno(), False)
+            selector.register(stream, selectors.EVENT_READ, name)
+        while selector.get_map() or process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if not selector.get_map():
+                time.sleep(min(remaining, 0.05))
+                continue
+            events = selector.select(min(remaining, 0.25))
+            for key, unused_mask in events:
+                name = key.data
+                remaining_capacity = max_output + 1 - len(buffers[name])
+                try:
+                    payload = os.read(key.fd, min(8192, remaining_capacity))
+                except BlockingIOError:
+                    continue
+                if not payload:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                    continue
+                buffers[name].extend(payload)
+                if len(buffers[name]) > max_output:
+                    overflow = True
+                    break
+            if overflow:
+                break
+    except BaseException:
+        failed = True
+    finally:
+        if selector is not None:
+            try:
+                selector.close()
+            except BaseException:
+                failed = True
+    if timed_out or overflow or failed:
+        _stop_process(process)
+        if failed:
+            raise Refusal("cleanup_incomplete", "cleanup")
+        raise _process_failure(stage)
+    try:
+        process.wait(timeout=5)
+    except BaseException:
+        _stop_process(process)
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+    return subprocess.CompletedProcess(argv, process.returncode, bytes(buffers["stdout"]), bytes(buffers["stderr"]))
+
+
+def _require_git_success(result, stage):
+    if result.returncode != 0 or result.stderr:
+        reason = {
+            "signature": "signature_invalid",
+            "history": "base_invalid",
+            "configuration": "revocation_policy_invalid",
+            "bootstrap": "bootstrap_snapshot_invalid",
+        }.get(stage, "source_fetch_unavailable")
+        raise Refusal(reason, stage)
+    return result.stdout
+
+
+def _one_line_sha(payload):
+    if type(payload) is not bytes or not payload.endswith(b"\n") or payload.count(b"\n") != 1:
+        return None
+    try:
+        value = payload[:-1].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return value if _full_sha(value) else None
+
+
+def _safe_temp_root(parent=None):
+    path = None
+    try:
+        parent = "/tmp" if parent is None else str(parent)
+        path = Path(tempfile.mkdtemp(prefix="macos-private-validation-", dir=parent))
+        path = path.resolve(strict=True)
+        os.chown(path, 0, 0)
+        os.chmod(path, 0o700)
+        info = path.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o700
+            or info.st_nlink < 2
+        ):
+            raise ValueError
+        return path
+    except BaseException:
+        if path is not None:
+            try:
+                shutil.rmtree(path)
+            except BaseException:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise Refusal("configuration_unavailable", "configuration") from None
+
+
+def _write_private_file(path, payload):
+    descriptor = None
+    try:
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None or type(payload) is not bytes or len(payload) > MAX_SIGNER_BYTES:
+            raise ValueError
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+        os.fchmod(descriptor, 0o600)
+        os.fchown(descriptor, 0, 0)
+        position = 0
+        while position < len(payload):
+            written = os.write(descriptor, payload[position:])
+            if written <= 0:
+                raise OSError
+            position += written
+        os.fsync(descriptor)
+        info = os.fstat(descriptor)
+        path_info = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+            or (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino)
+        ):
+            raise ValueError
+    except BaseException:
+        raise Refusal("configuration_unavailable", "configuration") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+
+
+def _control_inventory(root, control_sha, git_executable, temp_root):
+    descriptor = None
+    try:
+        control_root = Path(root).resolve(strict=True)
+        if not control_root.is_dir():
+            raise ValueError
+        inventory_path = control_root / REVOCATION_INVENTORY
+        parent_info = inventory_path.parent.lstat()
+        info = inventory_path.lstat()
+        if (
+            not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != 0
+            or parent_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_nlink != 1
+            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+            or info.st_size > MAX_INVENTORY_BYTES
+        ):
+            raise ValueError
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        if nofollow is None:
+            raise ValueError
+        descriptor = os.open(inventory_path, os.O_RDONLY | nofollow)
+        opened_info = os.fstat(descriptor)
+        current_info = inventory_path.lstat()
+        if (
+            not stat.S_ISREG(opened_info.st_mode)
+            or opened_info.st_uid != 0
+            or opened_info.st_nlink != 1
+            or (opened_info.st_dev, opened_info.st_ino) != (info.st_dev, info.st_ino)
+            or (current_info.st_dev, current_info.st_ino) != (info.st_dev, info.st_ino)
+            or opened_info.st_size > MAX_INVENTORY_BYTES
+        ):
+            raise ValueError
+        local_buffer = bytearray()
+        while len(local_buffer) <= MAX_INVENTORY_BYTES:
+            chunk = os.read(descriptor, min(4096, MAX_INVENTORY_BYTES + 1 - len(local_buffer)))
+            if not chunk:
+                break
+            local_buffer.extend(chunk)
+        if len(local_buffer) > MAX_INVENTORY_BYTES:
+            raise ValueError
+        local_bytes = bytes(local_buffer)
+        env = _base_git_environment(temp_root)
+        listing = _run_process(
+            _control_git_command(
+                git_executable, control_root, "ls-tree", "-z", control_sha, "--", REVOCATION_INVENTORY,
+            ),
+            cwd=control_root,
+            environ=env,
+            stage="revocation",
+        )
+        output = _require_git_success(listing, "configuration")
+        entry = _parse_single_tree_entry(output, REVOCATION_INVENTORY)
+        if entry is None or entry[0] != "100644" or entry[1] != "blob":
+            raise ValueError
+        blob_result = _run_process(
+            _control_git_command(git_executable, control_root, "cat-file", "blob", entry[2]),
+            cwd=control_root, environ=env,
+            stage="revocation",
+        )
+        blob = _require_git_success(blob_result, "configuration")
+        if len(blob) > MAX_INVENTORY_BYTES or local_bytes != blob:
+            raise ValueError
+        return _parse_fingerprint_inventory(blob)
+    except Refusal:
+        raise
+    except BaseException:
+        raise Refusal("revocation_policy_invalid", "revocation") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+
+
+def _control_git_command(git_executable, control_root, *arguments):
+    try:
+        resolved_root = Path(control_root).resolve(strict=True)
+        if not resolved_root.is_dir() or not resolved_root.is_absolute():
+            raise ValueError
+        if type(git_executable) is not str or not git_executable.startswith("/"):
+            raise ValueError
+        if not arguments or any(type(argument) is not str or not argument for argument in arguments):
+            raise ValueError
+        return (
+            git_executable,
+            "-c",
+            "safe.directory=" + resolved_root.as_posix(),
+            *arguments,
+        )
+    except BaseException:
+        raise Refusal("revocation_policy_invalid", "revocation") from None
+
+
+def _parse_fingerprint_inventory(payload):
+    if type(payload) is not bytes or len(payload) > MAX_INVENTORY_BYTES:
+        raise Refusal("revocation_policy_invalid", "revocation")
+    if payload == b"":
+        return ()
+    if not payload.endswith(b"\n") or b"\r" in payload:
+        raise Refusal("revocation_policy_invalid", "revocation")
+    fingerprints = []
+    for raw_line in payload[:-1].split(b"\n"):
+        try:
+            line = raw_line.decode("ascii")
+        except UnicodeDecodeError:
+            raise Refusal("revocation_policy_invalid", "revocation") from None
+        if FINGERPRINT_PATTERN.fullmatch(line) is None or line in fingerprints:
+            raise Refusal("revocation_policy_invalid", "revocation")
+        fingerprints.append(line)
+    return tuple(fingerprints)
+
+
+def _ssh_string(payload, offset):
+    if type(payload) is not bytes or offset < 0 or offset + 4 > len(payload):
+        raise ValueError
+    size = int.from_bytes(payload[offset:offset + 4], "big")
+    start = offset + 4
+    end = start + size
+    if end > len(payload):
+        raise ValueError
+    return payload[start:end], end
+
+
+def _key_fingerprint(key_type, encoded_key):
+    if key_type != "ssh-ed25519" or type(encoded_key) is not str:
+        raise ValueError
+    blob = base64.b64decode(encoded_key.encode("ascii"), validate=True)
+    algorithm, offset = _ssh_string(blob, 0)
+    public_key, offset = _ssh_string(blob, offset)
+    if algorithm != b"ssh-ed25519" or len(public_key) != 32 or offset != len(blob):
+        raise ValueError
+    digest = base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii").rstrip("=")
+    return "SHA256:" + digest, blob
+
+
+def _signer_timestamp(value):
+    if type(value) is not str:
+        raise ValueError
+    formats = {
+        8: "%Y%m%d",
+        12: "%Y%m%d%H%M",
+        14: "%Y%m%d%H%M%S",
+    }
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value) is not None:
+        parsed = datetime.datetime.strptime(value, "%Y-%m-%d")
+    else:
+        normalized = value[:-1] if value.endswith("Z") else value
+        format_string = formats.get(len(normalized))
+        if format_string is None or re.fullmatch(r"[0-9]+", normalized) is None:
+            raise ValueError
+        parsed = datetime.datetime.strptime(normalized, format_string)
+    return parsed.replace(tzinfo=datetime.timezone.utc)
+
+
+def _signer_options(value):
+    if type(value) is not str:
+        raise ValueError
+    options = value.split(",")
+    if not options or len(options) > 3:
+        raise ValueError
+    parsed = {}
+    for option in options:
+        name, separator, option_value = option.partition("=")
+        if not separator or name in parsed or not option_value:
+            raise ValueError
+        parsed[name] = option_value
+    if parsed.get("namespaces") != "git":
+        raise ValueError
+    if set(parsed) - {"namespaces", "valid-after", "valid-before"}:
+        raise ValueError
+    valid_after = _signer_timestamp(parsed["valid-after"]) if "valid-after" in parsed else None
+    valid_before = _signer_timestamp(parsed["valid-before"]) if "valid-before" in parsed else None
+    if valid_after is not None and valid_before is not None and valid_after > valid_before:
+        raise ValueError
+    return parsed
+
+
+def _signer_inventory(payload, *, current_time=None):
+    if type(payload) is not bytes or not payload or len(payload) > MAX_SIGNER_BYTES:
+        raise Refusal("signature_invalid", "signature")
+    if current_time is None:
+        current_time = datetime.datetime.now(datetime.timezone.utc)
+    if (
+        type(current_time) is not datetime.datetime
+        or current_time.tzinfo is None
+        or current_time.utcoffset() is None
+    ):
+        raise Refusal("signature_invalid", "signature")
+    current_time = current_time.astimezone(datetime.timezone.utc)
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError:
+        raise Refusal("signature_invalid", "signature") from None
+    keys = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(chr(35)):
+            continue
+        try:
+            fields = shlex.split(line, comments=False, posix=True)
+            key_positions = [index for index in (1, 2) if index < len(fields) and fields[index] == "ssh-ed25519"]
+            if len(key_positions) != 1:
+                raise ValueError
+            key_position = key_positions[0]
+            if len(fields) < key_position + 2:
+                raise ValueError
+            principal_field = fields[0]
+            principals = principal_field.split(",")
+            if not principals or any(re.fullmatch(r"[A-Za-z0-9_.+@-]{1,200}", item) is None for item in principals):
+                raise ValueError
+            options = {}
+            if key_position == 2:
+                options = _signer_options(fields[1])
+            elif key_position != 1:
+                raise ValueError
+            if len(fields) != key_position + 2:
+                raise ValueError
+            encoded_key = fields[key_position + 1]
+            fingerprint, blob = _key_fingerprint("ssh-ed25519", encoded_key)
+            key_line = b"ssh-ed25519 " + encoded_key.encode("ascii") + b"\n"
+            previous = keys.get(fingerprint)
+            if previous is not None and previous[:2] != (key_line, blob):
+                raise ValueError
+            active_lines = list(previous[2]) if previous is not None else []
+            valid_after = _signer_timestamp(options["valid-after"]) if "valid-after" in options else None
+            valid_before = _signer_timestamp(options["valid-before"]) if "valid-before" in options else None
+            if (valid_after is None or current_time >= valid_after) and (
+                valid_before is None or current_time <= valid_before
+            ):
+                active_line = (line + "\n").encode("ascii")
+                if active_line not in active_lines:
+                    active_lines.append(active_line)
+            keys[fingerprint] = (key_line, blob, tuple(active_lines))
+        except BaseException:
+            raise Refusal("signature_invalid", "signature") from None
+    if not keys:
+        raise Refusal("signature_invalid", "signature")
+    if not _active_signer_payload(keys):
+        raise Refusal("signature_invalid", "signature")
+    return keys
+
+
+def _active_signer_payload(signers):
+    if type(signers) is not dict:
+        raise Refusal("signature_invalid", "signature")
+    return b"".join(
+        line
+        for value in signers.values()
+        for line in value[2]
+    )
+
+
+def _revocation_payload(fingerprints, signers):
+    if type(fingerprints) is not tuple or type(signers) is not dict:
+        raise Refusal("revocation_policy_invalid", "revocation")
+    unmatched = [fingerprint for fingerprint in fingerprints if fingerprint not in signers]
+    if unmatched:
+        raise Refusal("revocation_policy_invalid", "revocation")
+    return b"".join(signers[fingerprint][0] for fingerprint in fingerprints)
+
+
+def _parse_single_tree_entry(payload, expected_path):
+    if (
+        type(payload) is not bytes
+        or not payload.endswith(b"\x00")
+        or payload.count(b"\x00") != 1
+    ):
+        return None
+    try:
+        metadata, path_bytes = payload[:-1].split(b"\t", 1)
+        fields = metadata.decode("ascii").split()
+        path = path_bytes.decode("utf-8", "strict")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if len(fields) != 3 or path != expected_path or re.fullmatch(r"[a-f0-9]{40}", fields[2]) is None:
+        return None
+    return fields[0], fields[1], fields[2]
+
+
+def _source_entry(repository, git_executable, repo_env, commit, path, *, stage="bootstrap"):
+    result = _run_process(
+        (git_executable, "ls-tree", "-z", commit, "--", path),
+        cwd=repository,
+        environ=repo_env,
+        stage=stage,
+    )
+    if result.returncode != 0 or result.stderr:
+        raise _process_failure(stage)
+    entry = _parse_single_tree_entry(result.stdout, path)
+    if entry is None:
+        raise _process_failure(stage)
+    return entry
+
+
+def _read_source_blob(repository, git_executable, repo_env, object_id, maximum):
+    result = _run_process(
+        (git_executable, "cat-file", "blob", object_id),
+        cwd=repository,
+        environ=repo_env,
+        stage="signature",
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > maximum:
+        raise Refusal("signature_invalid", "signature")
+    return result.stdout
+
+
+def _administrative_tree(repository, git_executable, repo_env, commit):
+    result = _run_process(
+        (git_executable, "ls-tree", "-r", "-z", commit),
+        cwd=repository,
+        environ=repo_env,
+        max_output=MAX_TREE_BYTES,
+        stage="bootstrap",
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_TREE_BYTES:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    root_files = {".gitignore", "AGENTS.md", "CLAUDE.md", "README.md"}
+    rules_lock = RULES_LOCK_PATH
+    signers = "/".join(SIGNER_PATH_PARTS)
+    known_paths = {
+        rules_lock,
+        RULES_DIRECTORY + "/settings.json",
+        signers,
+    }
+    if result.stdout and not result.stdout.endswith(b"\x00"):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    for raw_entry in result.stdout.split(b"\x00"):
+        if not raw_entry:
+            continue
+        try:
+            metadata, path_bytes = raw_entry.split(b"\t", 1)
+            mode, object_type, object_id = metadata.decode("ascii").split()
+            path = path_bytes.decode("utf-8", "strict")
+        except (ValueError, UnicodeDecodeError):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+        if object_type != "blob" or re.fullmatch(r"[a-f0-9]{40}", object_id) is None:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+        valid = (
+            path in root_files and mode == "100644"
+            or path in known_paths and mode == "100644"
+            or path.startswith(RULES_DIRECTORY + "/rules/shared/")
+            and path.endswith(".md") and mode == "100644"
+            or path.startswith(RULES_DIRECTORY + "/hooks/shared/")
+            and path.endswith(".sh") and mode == "100755"
+        )
+        if not valid:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    lock_entry = _source_entry(repository, git_executable, repo_env, commit, rules_lock)
+    signer_entry = _source_entry(
+        repository, git_executable, repo_env, commit, signers, stage="signature",
+    )
+    if lock_entry[:2] != ("100644", "blob") or signer_entry[:2] != ("100644", "blob"):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+
+
+def _safe_rules_tree(repository, git_executable, repo_env, commit):
+    result = _run_process(
+        (git_executable, "ls-tree", "-r", "-z", commit),
+        cwd=repository,
+        environ=repo_env,
+        max_output=MAX_TREE_BYTES,
+        stage="bootstrap",
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_TREE_BYTES:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    if result.stdout and not result.stdout.endswith(b"\x00"):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    folded = set()
+    entries = 0
+    for raw_entry in result.stdout.split(b"\x00"):
+        if not raw_entry:
+            continue
+        entries += 1
+        if entries > MAX_TREE_ENTRIES:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+        try:
+            metadata, path_bytes = raw_entry.split(b"\t", 1)
+            mode, object_type, object_id = metadata.decode("ascii").split()
+            path = path_bytes.decode("utf-8", "strict")
+        except (ValueError, UnicodeDecodeError):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+        components = path.split("/")
+        if (
+            object_type != "blob"
+            or mode not in ("100644", "100755")
+            or re.fullmatch(r"[a-f0-9]{40}", object_id) is None
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in ("", ".", "..") for part in components)
+            or components[0] == ".git"
+            or unicodedata.normalize("NFC", path) != path
+            or re.fullmatch(r"[A-Za-z0-9._/-]+", path) is None
+            or path.casefold() in folded
+        ):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+        folded.add(path.casefold())
+    signer_entry = _source_entry(
+        repository, git_executable, repo_env, commit, "/".join(SIGNER_PATH_PARTS), stage="signature",
+    )
+    if signer_entry[:2] != ("100644", "blob"):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+
+
+LEASE_ACCESS_SCRIPT = '''\
+import errno
+import os
+import sys
+
+uid = int(sys.argv[1])
+root, source, signer = sys.argv[2:]
+if os.getuid() != uid or os.geteuid() != uid:
+    raise SystemExit(20)
+if not os.listdir(source):
+    raise SystemExit(21)
+with open(signer, "rb") as stream:
+    stream.read(1)
+
+def denied(action):
+    try:
+        action()
+    except OSError as error:
+        if error.errno in (errno.EACCES, errno.EPERM):
+            return
+    raise SystemExit(22)
+
+denied(lambda: open(signer, "ab").close())
+denied(lambda: os.mkdir(os.path.join(root, "lease-write-probe"), 0o700))
+os.write(1, b"KD-MPV:lease-acl=verified\\n")
+'''
+
+
+LEASE_ACL_MARKER = b"KD-MPV:lease-acl=verified\n"
+MAX_TEMP_PATHS = 100000
+
+
+def _run_acl_command(chmod_executable, arguments):
+    result = _run_process(
+        (chmod_executable, *arguments),
+        cwd="/",
+        environ={"PATH": "/bin:/usr/bin", "HOME": "/", "LANG": "C", "LC_ALL": "C"},
+        timeout=15,
+        stage="bootstrap",
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_GIT_OUTPUT:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+
+
+def _acl_entries(path, ls_executable):
+    result = _run_process(
+        (ls_executable, "-lde", str(path)),
+        cwd="/",
+        environ={"PATH": "/bin:/usr/bin", "HOME": "/", "LANG": "C", "LC_ALL": "C"},
+        timeout=15,
+        stage="bootstrap",
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_GIT_OUTPUT:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    try:
+        lines = result.stdout.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+    if not lines:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    return lines[1:]
+
+
+def _verify_acl_rule(path, ls_executable, username, rights):
+    entries = _acl_entries(path, ls_executable)
+    if len(entries) != 1:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    prefix = "0: user:" + username + " allow "
+    if not entries[0].startswith(prefix):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    actual = entries[0][len(prefix):].split(",")
+    if len(actual) != len(set(actual)) or set(actual) != set(rights):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+
+
+def _add_storage_search_acl(storage_root):
+    added = False
+    try:
+        chmod = _resolve_trusted_executable("/bin/chmod")
+        ls = _resolve_trusted_executable("/bin/ls")
+        username = capability.USERNAME
+        if _acl_entries(storage_root, ls):
+            raise ValueError
+        _run_acl_command(chmod, ["+a", username + " allow search", str(storage_root)])
+        added = True
+        _verify_acl_rule(storage_root, ls, username, ("search",))
+    except Refusal:
+        if added:
+            try:
+                _remove_storage_search_acl(storage_root)
+            except BaseException:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise
+    except BaseException:
+        if added:
+            try:
+                _remove_storage_search_acl(storage_root)
+            except BaseException:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise Refusal("bootstrap_not_approved", "configuration") from None
+
+
+def _remove_storage_search_acl(storage_root):
+    try:
+        chmod = _resolve_trusted_executable("/bin/chmod")
+        ls = _resolve_trusted_executable("/bin/ls")
+        username = capability.USERNAME
+        entries = _acl_entries(storage_root, ls)
+        if entries:
+            _verify_acl_rule(storage_root, ls, username, ("search",))
+            _run_acl_command(chmod, ["-a", username + " allow search", str(storage_root)])
+            if _acl_entries(storage_root, ls):
+                raise ValueError
+        info = storage_root.lstat()
+        with os.scandir(storage_root) as entries:
+            empty = next(entries, None) is None
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o700
+            or not empty
+        ):
+            raise ValueError
+    except BaseException:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+
+
+def _lease_paths(temporary):
+    directories = [temporary]
+    files = []
+    count = 1
+    try:
+        for current, names, file_names in os.walk(temporary, topdown=True, followlinks=False):
+            current_path = Path(current)
+            for name in names:
+                path = current_path / name
+                info = path.lstat()
+                if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+                    raise ValueError
+                directories.append(path)
+                count += 1
+            for name in file_names:
+                path = current_path / name
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != 0:
+                    raise ValueError
+                files.append((path, bool(info.st_mode & 0o111)))
+                count += 1
+            if count > MAX_TEMP_PATHS:
+                raise ValueError
+    except BaseException:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+    return directories, files
+
+
+def _grant_worker_readonly(temporary, source_path, storage_root, worker_uid):
+    try:
+        username = capability.USERNAME
+        chmod = _resolve_trusted_executable("/bin/chmod")
+        directories, files = _lease_paths(temporary)
+        directory_rule = username + " allow list,search,read,readattr,readextattr,readsecurity"
+        file_rule = username + " allow read,readattr,readextattr,readsecurity"
+        executable_rule = username + " allow read,execute,readattr,readextattr,readsecurity"
+        for start in range(0, len(directories), 64):
+            paths = [str(path) for path in directories[start:start + 64]]
+            _run_acl_command(chmod, ["-N", *paths])
+            _run_acl_command(chmod, ["700", *paths])
+            _run_acl_command(chmod, ["+a", directory_rule, *paths])
+        regular_files = [str(path) for path, executable in files if not executable]
+        executable_files = [str(path) for path, executable in files if executable]
+        for paths, mode, rule in (
+            (regular_files, "600", file_rule),
+            (executable_files, "700", executable_rule),
+        ):
+            for start in range(0, len(paths), 64):
+                selected = paths[start:start + 64]
+                _run_acl_command(chmod, ["-N", *selected])
+                _run_acl_command(chmod, [mode, *selected])
+                _run_acl_command(chmod, ["+a", rule, *selected])
+        for path in directories:
+            info = path.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o700:
+                raise ValueError
+        for path, executable in files:
+            info = path.lstat()
+            expected_mode = 0o700 if executable else 0o600
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != expected_mode:
+                raise ValueError
+        python_executable = capability._resolve_trusted_toolchain()["python"]
+        source_signers = source_path.joinpath(*SIGNER_PATH_PARTS)
+        if not source_signers.is_file() or (temporary / "lease-write-probe").exists():
+            raise ValueError
+        environment = {
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "HOME": "/",
+            "TMPDIR": str(storage_root),
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
+        result = capability._run_as_probe_user(
+            (
+                python_executable, "-I", "-S", "-B", "-c", LEASE_ACCESS_SCRIPT,
+                str(worker_uid), str(temporary), str(source_path), str(source_signers),
+            ),
+            worker_uid,
+            env=environment,
+            timeout=10,
+            failure_reason="native_preflight_unavailable",
+            python_executable=python_executable,
+        )
+        if result.returncode != 0 or result.stdout != LEASE_ACL_MARKER or result.stderr:
+            raise ValueError
+        return python_executable
+    except Refusal:
+        raise
+    except BaseException:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+
+
+def _assert_worker_absent(worker_uid, python_executable):
+    try:
+        presence = capability._probe_uid_processes_present(
+            worker_uid,
+            include_survivor_classes=True,
+            python_executable=python_executable,
+        )
+        present, unused_classes = capability._presence_result(presence)
+        if present:
+            raise ValueError
+    except BaseException:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+
+
+def _checkout_source(repository, git_executable, repo_env, temporary, commit):
+    source_path = temporary / "source"
+    add_result = _run_process(
+        (
+            git_executable, "worktree", "add", "--detach", "--no-checkout",
+            str(source_path), commit,
+        ),
+        cwd=repository,
+        environ=repo_env,
+    )
+    _require_git_success(add_result, "bootstrap")
+    checkout_result = _run_process(
+        (git_executable, "-C", str(source_path), "checkout", "--quiet", "--detach", commit),
+        cwd=source_path,
+        environ=repo_env,
+    )
+    _require_git_success(checkout_result, "bootstrap")
+    try:
+        root = temporary.resolve(strict=True)
+        source = source_path.resolve(strict=True)
+        if source.parent != root:
+            raise ValueError
+        for current, directories, files in os.walk(source, topdown=True, followlinks=False):
+            current_path = Path(current)
+            current_info = current_path.lstat()
+            if (
+                not stat.S_ISDIR(current_info.st_mode)
+                or current_info.st_uid != 0
+                or current_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+            ):
+                raise ValueError
+            for name in directories + files:
+                child = current_path / name
+                info = child.lstat()
+                if (
+                    stat.S_ISLNK(info.st_mode)
+                    or info.st_uid != 0
+                    or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+                ):
+                    raise ValueError
+                if name in files and not stat.S_ISREG(info.st_mode):
+                    raise ValueError
+                if name in directories and not stat.S_ISDIR(info.st_mode):
+                    raise ValueError
+    except BaseException:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+    return source
+
+
+def _commit_list(repository, git_executable, repo_env, base_sha, source_sha):
+    result = _run_process(
+        (git_executable, "rev-list", "--topo-order", "--reverse", base_sha + ".." + source_sha),
+        cwd=repository,
+        environ=repo_env,
+        max_output=MAX_COMMITS * 41,
+        stage="history",
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_COMMITS * 41:
+        raise Refusal("base_invalid", "history")
+    if result.stdout and not result.stdout.endswith(b"\n"):
+        raise Refusal("base_invalid", "history")
+    commits = []
+    for raw_line in result.stdout.splitlines():
+        try:
+            value = raw_line.decode("ascii")
+        except UnicodeDecodeError:
+            raise Refusal("base_invalid", "history") from None
+        if not _full_sha(value) or len(commits) >= MAX_COMMITS:
+            raise Refusal("base_invalid", "history")
+        commits.append(value)
+    return tuple(commits)
+
+
+def _changed_paths(repository, git_executable, repo_env, commit):
+    result = _run_process(
+        (
+            git_executable, "diff-tree", "-m", "--no-commit-id", "--name-only", "-r", "-z", commit,
+        ),
+        cwd=repository,
+        environ=repo_env,
+        max_output=MAX_TREE_BYTES,
+        stage="history",
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_TREE_BYTES:
+        raise Refusal("base_invalid", "history")
+    try:
+        return tuple(value.decode("utf-8", "strict") for value in result.stdout.split(b"\x00") if value)
+    except UnicodeDecodeError:
+        raise Refusal("base_invalid", "history") from None
+
+
+def _verify_commit(repository, git_executable, repo_env, ssh_keygen, allowed_path, revoked_path, commit):
+    result = _run_process(
+        (
+            git_executable,
+            "-c", "gpg.format=ssh",
+            "-c", "gpg.ssh.program=" + ssh_keygen,
+            "-c", "gpg.program=false",
+            "-c", "gpg.x509.program=false",
+            "-c", "gpg.ssh.allowedSignersFile=" + str(allowed_path),
+            "-c", "gpg.ssh.revocationFile=" + str(revoked_path),
+            "-c", "gpg.minTrustLevel=fully",
+            "verify-commit", commit,
+        ),
+        cwd=repository,
+        environ=repo_env,
+        stage="signature",
+    )
+    if result.returncode != 0 or len(result.stdout) > MAX_GIT_OUTPUT or len(result.stderr) > MAX_GIT_OUTPUT:
+        raise Refusal("signature_invalid", "signature")
+
+
+def _revoke_token(reader, environ):
+    try:
+        if environ is os.environ:
+            result = reader.run()
+        else:
+            result = reader.run(environ=environ)
+        if type(environ) is dict:
+            environ.pop(reader.TOKEN_ENV, None)
+        elif environ is os.environ:
+            os.environ.pop(reader.TOKEN_ENV, None)
+        if (
+            type(result) is not dict
+            or set(result) != {
+                "schema_version", "status", "reason", "repository_scope", "metadata", "revocation",
+            }
+            or type(result.get("schema_version")) is not int
+            or result.get("schema_version") != 1
+            or result.get("status") != "passed"
+            or result.get("reason") != "ok"
+            or result.get("repository_scope") != "verified"
+            or result.get("metadata") != "verified"
+            or result.get("revocation") != "confirmed"
+        ):
+            raise Refusal("revocation_unconfirmed", "revoke")
+        return result
+    except Refusal:
+        raise
+    except BaseException:
+        raise Refusal("revocation_unconfirmed", "revoke") from None
+
+
+def _remove_tree(path):
+    try:
+        shutil.rmtree(path)
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            return
+        raise OSError
+    except FileNotFoundError:
+        return
+    except BaseException:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+
+
+def _check_request(request):
+    expected = {"source_sha", "base_sha", "base_branch", "concern"}
+    if (
+        type(request) is not dict
+        or set(request) != expected
+        or not _full_sha(request.get("source_sha"))
+        or not _full_sha(request.get("base_sha"))
+        or type(request.get("base_branch")) is not str
+        or request["base_branch"] not in BRANCHES
+        or type(request.get("concern")) is not str
+        or request["concern"] not in CONCERNS
+    ):
+        raise Refusal("invalid_input", "input")
+    return True
+
+
+def _check_rules_bootstrap_gate(request, environ):
+    if request["concern"] != "rules-bootstrap":
+        return
+    control_sha = environ.get("CI_SHA", "")
+    if (
+        not _full_sha(control_sha)
+        or environ.get(RULES_BOOTSTRAP_SOURCE_GATE_ENV) != request["source_sha"]
+        or environ.get(RULES_BOOTSTRAP_CONTROL_GATE_ENV) != control_sha
+    ):
+        raise Refusal("bootstrap_not_approved", "configuration")
+
+
+def _check_source_ref_binding(request, environ):
+    candidate_ref = environ.get(SOURCE_CANDIDATE_REF_ENV, "")
+    if request["concern"] == "core-bootstrap" and request["source_sha"] != request["base_sha"]:
+        raise Refusal("bootstrap_not_approved", "configuration")
+    if request["source_sha"] == request["base_sha"]:
+        if candidate_ref and candidate_ref != "refs/heads/" + request["base_branch"]:
+            raise Refusal("bootstrap_not_approved", "configuration")
+        return None
+    if request["concern"] != "rules-bootstrap" or type(candidate_ref) is not str:
+        raise Refusal("bootstrap_not_approved", "configuration")
+    if re.fullmatch(r"refs/heads/(?:feat|fix|chore|plan)/[A-Za-z0-9][A-Za-z0-9._/-]{0,126}", candidate_ref) is None:
+        raise Refusal("bootstrap_not_approved", "configuration")
+    path = candidate_ref.removeprefix("refs/heads/")
+    components = path.split("/")
+    if any(
+        not component
+        or component in (".", "..")
+        or component.startswith(".")
+        or component.endswith(".")
+        or component.endswith(".lock")
+        for component in components
+    ) or ".." in path or "@{" in path or path.endswith("/"):
+        raise Refusal("bootstrap_not_approved", "configuration")
+    return candidate_ref
+
+
+def _check_worker_identity(root, worker_uid):
+    if type(worker_uid) is not int or worker_uid <= 0 or worker_uid >= 60000:
+        raise Refusal("bootstrap_not_approved", "configuration")
+    try:
+        runner_uid = os.stat(root).st_uid
+        identity = _run_process(
+            ("/usr/bin/id", "-u", capability.USERNAME),
+            cwd="/",
+            environ={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            timeout=5,
+            stage="configuration",
+        )
+        if (
+            runner_uid == 0
+            or worker_uid == runner_uid
+            or identity.returncode != 0
+            or identity.stderr
+            or identity.stdout != (str(worker_uid) + "\n").encode("ascii")
+        ):
+            raise ValueError
+    except BaseException:
+        raise Refusal("bootstrap_not_approved", "configuration") from None
+
+
+def _validate_storage_root(storage_root):
+    try:
+        if type(storage_root) not in (str, Path) or not str(storage_root).startswith("/"):
+            raise ValueError
+        supplied = Path(storage_root)
+        named = supplied.lstat()
+        resolved = supplied.resolve(strict=True)
+        parent = Path("/tmp").resolve(strict=True)
+        parent_info = parent.lstat()
+        info = resolved.lstat()
+        with os.scandir(resolved) as entries:
+            empty = next(entries, None) is None
+        if (
+            (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)
+            or resolved.parent != parent
+            or not stat.S_ISDIR(parent_info.st_mode)
+            or parent_info.st_uid != 0
+            or not parent_info.st_mode & stat.S_ISVTX
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or stat.S_IMODE(info.st_mode) != 0o700
+            or info.st_nlink < 2
+            or not empty
+        ):
+            raise ValueError
+        return resolved
+    except BaseException:
+        raise Refusal("bootstrap_not_approved", "configuration") from None
+
+
+def _validate_binding(binding):
+    if (
+        type(binding) is not dict
+        or set(binding) != {"control_sha", "run_id", "run_attempt", "image_os", "image_version"}
+        or not _full_sha(binding.get("control_sha"))
+    ):
+        raise Refusal("invalid_input", "input")
+
+
+@contextmanager
+def validated_source(request, binding, root, environ, *, worker_uid=None, storage_root=None):
+    _check_request(request)
+    _check_rules_bootstrap_gate(request, environ)
+    candidate_ref = _check_source_ref_binding(request, environ)
+    _validate_binding(binding)
+    current_binding, current_root = _safe_context(binding["control_sha"], environ)
+    try:
+        supplied_root = Path(root).resolve(strict=True)
+    except BaseException:
+        raise Refusal("context_unavailable", "context") from None
+    if current_binding != binding or current_root != supplied_root:
+        raise Refusal("context_unavailable", "context")
+    if request["concern"] == "rules-bootstrap":
+        _check_worker_identity(current_root, worker_uid)
+        storage_root = _validate_storage_root(storage_root)
+    storage_acl = False
+    temporary = None
+    worker_python = None
+    try:
+        if request["concern"] == "rules-bootstrap":
+            storage_acl = True
+            _add_storage_search_acl(storage_root)
+        record, temporary, source_path = _source_snapshot(
+            request,
+            binding,
+            current_root,
+            environ,
+            candidate_ref=candidate_ref,
+            retain=True,
+            temp_parent=storage_root if request["concern"] == "rules-bootstrap" else None,
+        )
+        worker_access = "not_applicable"
+        if request["concern"] == "rules-bootstrap":
+            worker_python = _grant_worker_readonly(temporary, source_path, storage_root, worker_uid)
+            worker_access = "uid_read_only"
+        record["repository_scope"] = "verified"
+        record["metadata"] = "verified"
+        record["control_sha"] = binding["control_sha"]
+        record["run_id"] = binding["run_id"]
+        record["run_attempt"] = binding["run_attempt"]
+        record["image_os"] = binding["image_os"]
+        record["image_version"] = binding["image_version"]
+        record["token_revocation"] = "confirmed_before_yield"
+        record["signer_authority"] = "bound_base"
+        record["signatures"] = "all_new_commits_verified"
+        record["ancestry"] = "base_ancestor"
+        record["revocation_policy"] = "current_control_fingerprints"
+        record["tree"] = "core_administrative" if request["concern"] == "core-bootstrap" else "rules_regular_files"
+        record["worker_access"] = worker_access
+        record["source_execution"] = "not_run_at_yield"
+        record["cleanup"] = "lease_open"
+        lease = SourceLease(source_path, MappingProxyType(dict(record)))
+    except BaseException:
+        _revoke_on_early_refusal(environ)
+        cleanup_safe = True
+        if request["concern"] == "rules-bootstrap" and temporary is not None:
+            try:
+                census_python = worker_python or capability._resolve_trusted_toolchain()["python"]
+                _assert_worker_absent(worker_uid, census_python)
+            except BaseException:
+                cleanup_safe = False
+        if not cleanup_safe:
+            raise Refusal("cleanup_incomplete", "cleanup") from None
+        if temporary is not None:
+            _remove_tree(temporary)
+        if storage_acl:
+            _remove_storage_search_acl(storage_root)
+        raise
+    try:
+        yield lease
+    finally:
+        cleanup_error = None
+        cleanup_safe = True
+        if request["concern"] == "rules-bootstrap":
+            try:
+                _assert_worker_absent(worker_uid, worker_python)
+            except BaseException:
+                cleanup_error = Refusal("cleanup_incomplete", "cleanup")
+                cleanup_safe = False
+        if cleanup_safe:
+            try:
+                if temporary is not None:
+                    _remove_tree(temporary)
+            except BaseException:
+                cleanup_error = Refusal("cleanup_incomplete", "cleanup")
+            if storage_acl:
+                try:
+                    _remove_storage_search_acl(storage_root)
+                except BaseException:
+                    cleanup_error = Refusal("cleanup_incomplete", "cleanup")
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
+def _source_snapshot(request, binding, root, environ, *, candidate_ref=None, retain=False, temp_parent=None):
+    if candidate_ref != _check_source_ref_binding(request, environ):
+        raise Refusal("bootstrap_not_approved", "configuration")
+    git_executable = _resolve_trusted_executable("/usr/bin/git")
+    ssh_keygen = _resolve_trusted_executable("/usr/bin/ssh-keygen")
+    temporary = _safe_temp_root(temp_parent)
+    repository = temporary / "repository.git"
+    env = None
+    git_environment = None
+    signer_payload = None
+    reader = None
+    token = None
+    authorization = None
+    signer_path = "/".join(SIGNER_PATH_PARTS)
+    revocation_result = None
+    pending_failure = None
+    transferred = False
+    try:
+        fingerprints = _control_inventory(root, binding["control_sha"], git_executable, temporary)
+        reader = _load_source_reader(root)
+        repository_id, owner, repository_name, token = _repository_configuration(reader, environ)
+        _verify_repository_scope(reader, repository_id, owner, repository_name, token)
+        authorization = "AUTHORIZATION: basic " + base64.b64encode(
+            ("x-access-token:" + token).encode("ascii")
+        ).decode("ascii")
+        git_environment = _base_git_environment(temporary, authorization)
+        init_result = _run_process(
+            (git_executable, "init", "--quiet", "--bare", str(repository)),
+            cwd=temporary,
+            environ=_base_git_environment(temporary),
+        )
+        _require_git_success(init_result, "fetch")
+        remote_url = "https://github.com/" + owner + "/" + repository_name + ".git"
+        remote_result = _run_process(
+            (git_executable, "remote", "add", "source", remote_url),
+            cwd=repository,
+            environ=git_environment,
+        )
+        _require_git_success(remote_result, "fetch")
+        branch_ref = "refs/heads/" + request["base_branch"]
+        destination_ref = "refs/remotes/source/" + request["base_branch"]
+        fetch_result = _run_process(
+            (
+                git_executable, "fetch", "--quiet", "--no-tags",
+                "source", branch_ref + ":" + destination_ref,
+            ),
+            cwd=repository,
+            environ=git_environment,
+            timeout=300,
+        )
+        _require_git_success(fetch_result, "fetch")
+        branch_result = _run_process(
+            (git_executable, "rev-parse", "--verify", destination_ref + "^{commit}"),
+            cwd=repository,
+            environ=git_environment,
+        )
+        actual_base = _one_line_sha(_require_git_success(branch_result, "fetch"))
+        if actual_base != request["base_sha"]:
+            raise Refusal("base_invalid", "history")
+        source_ref = destination_ref
+        if candidate_ref is not None:
+            candidate_destination = "refs/remotes/source/candidate"
+            candidate_fetch = _run_process(
+                (
+                    git_executable, "fetch", "--quiet", "--no-tags",
+                    "source", candidate_ref + ":" + candidate_destination,
+                ),
+                cwd=repository,
+                environ=git_environment,
+                timeout=300,
+            )
+            _require_git_success(candidate_fetch, "fetch")
+            source_ref = candidate_destination
+        source_result = _run_process(
+            (git_executable, "rev-parse", "--verify", source_ref + "^{commit}"),
+            cwd=repository,
+            environ=git_environment,
+        )
+        if _one_line_sha(_require_git_success(source_result, "fetch")) != request["source_sha"]:
+            raise Refusal("base_invalid", "history")
+        shallow_result = _run_process(
+            (git_executable, "rev-parse", "--is-shallow-repository"),
+            cwd=repository,
+            environ=git_environment,
+        )
+        if _require_git_success(shallow_result, "fetch") != b"false\n":
+            raise Refusal("base_invalid", "history")
+        signer_entry = _source_entry(
+            repository, git_executable, git_environment, request["base_sha"], signer_path,
+            stage="signature",
+        )
+        if signer_entry[:2] != ("100644", "blob"):
+            raise Refusal("signature_invalid", "signature")
+        signer_payload = _read_source_blob(
+            repository, git_executable, git_environment, signer_entry[2], MAX_SIGNER_BYTES,
+        )
+        remove_remote = _run_process(
+            (git_executable, "remote", "remove", "source"),
+            cwd=repository,
+            environ=git_environment,
+        )
+        _require_git_success(remove_remote, "fetch")
+        git_environment = None
+    except Refusal as error:
+        pending_failure = error
+    except BaseException:
+        pending_failure = Refusal("source_fetch_unavailable", "fetch")
+    finally:
+        if git_environment is not None:
+            git_environment.clear()
+        if reader is not None and token is not None:
+            try:
+                revocation_result = _revoke_token(reader, environ)
+            except Refusal as error:
+                pending_failure = error
+        authorization = None
+        token = None
+    if pending_failure is not None:
+        _remove_tree(temporary)
+        raise pending_failure
+    if revocation_result is None:
+        _remove_tree(temporary)
+        raise Refusal("revocation_unconfirmed", "revoke")
+    try:
+        env = _base_git_environment(temporary)
+        signer_keys = _signer_inventory(signer_payload)
+        revoked_payload = _revocation_payload(fingerprints, signer_keys)
+        base_allowed_path = temporary / "base-allowed-signers"
+        current_allowed_path = temporary / "current-allowed-signers"
+        revoked_path = temporary / "revoked-signers"
+        _write_private_file(base_allowed_path, signer_payload)
+        _write_private_file(current_allowed_path, _active_signer_payload(signer_keys))
+        _write_private_file(revoked_path, revoked_payload)
+        shallow = _run_process(
+            (git_executable, "rev-parse", "--is-shallow-repository"),
+            cwd=repository,
+            environ=env,
+        )
+        if _require_git_success(shallow, "history") != b"false\n":
+            raise Refusal("base_invalid", "history")
+        ancestry = _run_process(
+            (git_executable, "merge-base", "--is-ancestor", request["base_sha"], request["source_sha"]),
+            cwd=repository,
+            environ=env,
+        )
+        if ancestry.returncode != 0 or ancestry.stdout or ancestry.stderr:
+            raise Refusal("base_invalid", "history")
+        commits = _commit_list(
+            repository, git_executable, env, request["base_sha"], request["source_sha"],
+        )
+        if request["source_sha"] == request["base_sha"]:
+            commits_to_verify = (request["base_sha"],)
+        else:
+            commits_to_verify = commits
+            if not commits_to_verify:
+                raise Refusal("base_invalid", "history")
+        for commit in commits_to_verify:
+            if commit != request["base_sha"] and signer_path in _changed_paths(
+                repository, git_executable, env, commit,
+            ):
+                raise Refusal("signature_invalid", "signature")
+            _verify_commit(
+                repository,
+                git_executable,
+                env,
+                ssh_keygen,
+                base_allowed_path if commit == request["base_sha"] else current_allowed_path,
+                revoked_path,
+                commit,
+            )
+        if request["concern"] == "core-bootstrap":
+            _administrative_tree(repository, git_executable, env, request["source_sha"])
+            rules_lock = "present"
+            tree_kind = "core_administrative"
+        else:
+            _safe_rules_tree(repository, git_executable, env, request["source_sha"])
+            rules_lock = "not-applicable"
+            tree_kind = "rules_regular_files"
+        source_path = _checkout_source(
+            repository, git_executable, env, temporary, request["source_sha"],
+        )
+        record = {
+            "repository_id": str(repository_id),
+            "source_sha": request["source_sha"],
+            "base_sha": request["base_sha"],
+            "base_branch": request["base_branch"],
+            "concern": request["concern"],
+            "candidate_class": "permanent-tip" if request["source_sha"] == request["base_sha"] else "signed-descendant",
+            "signature": "verified",
+            "rules_lock": rules_lock,
+            "tree": tree_kind,
+            "source_execution": "not_run",
+            "app_build": "not_run",
+            "cleanup": "lease_open" if retain else "complete",
+        }
+        if retain:
+            transferred = True
+            return record, temporary, source_path
+        return record
+    finally:
+        if not transferred:
+            _remove_tree(temporary)
+
+
+def _format_success(record, binding):
+    required = {
+        "repository_id", "source_sha", "base_sha", "base_branch", "concern",
+        "candidate_class", "signature", "rules_lock", "tree", "source_execution", "app_build", "cleanup",
+        "control_sha", "run_id", "run_attempt", "image_os", "image_version",
+        "repository_scope", "metadata", "token_revocation", "signer_authority",
+        "signatures", "ancestry", "revocation_policy", "worker_access",
+    }
+    if type(record) is not dict or set(record) != required:
+        raise Refusal("internal_error", "input")
+    if (
+        record["control_sha"] != binding["control_sha"]
+        or record["run_id"] != binding["run_id"]
+        or record["run_attempt"] != binding["run_attempt"]
+        or record["image_os"] != binding["image_os"]
+        or record["image_version"] != binding["image_version"]
+        or REPOSITORY_ID_PATTERN.fullmatch(record["repository_id"]) is None
+        or not _full_sha(record["source_sha"])
+        or not _full_sha(record["base_sha"])
+        or record["base_branch"] not in BRANCHES
+        or record["concern"] not in CONCERNS
+        or record["candidate_class"] not in {"permanent-tip", "signed-descendant"}
+        or (record["candidate_class"] == "permanent-tip") != (record["source_sha"] == record["base_sha"])
+        or (record["concern"] == "core-bootstrap" and record["source_sha"] != record["base_sha"])
+    ):
+        raise Refusal("internal_error", "input")
+    fixed = {
+        "signature": "verified",
+        "rules_lock": "present" if record.get("concern") == "core-bootstrap" else "not-applicable",
+        "tree": "core_administrative" if record.get("concern") == "core-bootstrap" else "rules_regular_files",
+        "source_execution": "not_run_at_yield",
+        "repository_scope": "verified",
+        "metadata": "verified",
+        "token_revocation": "confirmed_before_yield",
+        "signer_authority": "bound_base",
+        "signatures": "all_new_commits_verified",
+        "ancestry": "base_ancestor",
+        "revocation_policy": "current_control_fingerprints",
+        "worker_access": "not_applicable" if record.get("concern") == "core-bootstrap" else "uid_read_only",
+        "app_build": "not_run",
+        "cleanup": "complete",
+    }
+    if any(record[key] != value for key, value in fixed.items()):
+        raise Refusal("internal_error", "input")
+    return " ".join((
+        "macos-private-validation=verified",
+        "schema=" + str(SCHEMA_VERSION),
+        "control-sha=" + binding["control_sha"],
+        "run-id=" + binding["run_id"],
+        "run-attempt=" + binding["run_attempt"],
+        "image-os=" + binding["image_os"],
+        "image-version=" + binding["image_version"],
+        "source-repository-id=" + record["repository_id"],
+        "source-sha=" + record["source_sha"],
+        "base-branch=" + record["base_branch"],
+        "base-sha=" + record["base_sha"],
+        "concern=" + record["concern"],
+        "candidate-class=" + record["candidate_class"],
+        "signature=verified",
+        "rules-lock=" + record["rules_lock"],
+        "source-execution=not-run",
+        "app-build=not-run",
+        "cleanup=complete",
+    ))
+
+
+def _safe_identity_fields(control_sha, environ):
+    sha = control_sha if _full_sha(control_sha) else "unknown"
+    run_id = environ.get("GITHUB_RUN_ID", "")
+    attempt = environ.get("GITHUB_RUN_ATTEMPT", "")
+    if RUN_ID_PATTERN.fullmatch(run_id) is None:
+        run_id = "unknown"
+    if RUN_ATTEMPT_PATTERN.fullmatch(attempt) is None:
+        attempt = "unknown"
+    return sha, run_id, attempt
+
+
+def _format_refusal(error, control_sha, environ, request=None):
+    if type(error) is not Refusal:
+        error = Refusal("internal_error", "input")
+    reason = error.reason if error.reason in REASONS else "internal_error"
+    stage = error.stage if error.stage in STAGES else "input"
+    sha, run_id, attempt = _safe_identity_fields(control_sha, environ)
+    source_sha = request["source_sha"] if type(request) is dict and _full_sha(request.get("source_sha")) else "unknown"
+    base_sha = request["base_sha"] if type(request) is dict and _full_sha(request.get("base_sha")) else "unknown"
+    return (
+        "macos-private-validation=refused schema=1 reason=" + reason + " stage=" + stage
+        + " control-sha=" + sha + " run-id=" + run_id + " run-attempt=" + attempt
+        + " source-sha=" + source_sha + " base-sha=" + base_sha
+    )
+
+
+def _revoke_on_early_refusal(environ):
+    token_name = "SOURCE_READER_TOKEN"
+    token = environ.get(token_name, "")
+    if type(token) is not str or not token:
+        return
+    try:
+        root = Path(__file__).resolve(strict=True).parents[2]
+        reader = _load_source_reader(root)
+        _revoke_token(reader, environ)
+    except BaseException:
+        try:
+            environ.pop(token_name, None)
+        except BaseException:
+            pass
+
+
+def main(arguments=None):
+    actual_arguments = sys.argv[1:] if arguments is None else arguments
+    environment = os.environ
+    control_sha = environment.get("CI_SHA", "")
+    request = None
+    try:
+        request = parse_request(actual_arguments)
+        binding, root = _safe_context(control_sha, environment)
+        with validated_source(request, binding, root, environment) as lease:
+            record = dict(lease.record)
+        record["cleanup"] = "complete"
+        line = _format_success(record, binding)
+    except Refusal as error:
+        _revoke_on_early_refusal(environment)
+        line = _format_refusal(error, control_sha, environment, request)
+        sys.stdout.write(line + "\n")
+        return 1
+    except BaseException:
+        _revoke_on_early_refusal(environment)
+        line = _format_refusal(Refusal("internal_error", "input"), control_sha, environment, request)
+        sys.stdout.write(line + "\n")
+        return 1
+    sys.stdout.write(line + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
