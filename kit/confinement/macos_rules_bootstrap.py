@@ -113,8 +113,18 @@ OBSERVER_STAGE_LABELS = frozenset((
 ))
 CLEANUP_STAGES = frozenset((
     "cleanup_lease", "cleanup_storage", "cleanup_worker", "cleanup_summary",
-    "cleanup_dash", "cleanup_unknown",
+    "cleanup_summary_census", "cleanup_summary_present", "cleanup_summary_probe",
+    "cleanup_summary_restore", "cleanup_summary_close", "cleanup_dash", "cleanup_unknown",
 ))
+SUMMARY_SURVIVOR_CLASSES = frozenset((
+    "python", "ps", "developer_shim", "helper_preferences", "helper_notifications",
+    "helper_launch_services", "helper_security", "helper_trust", "helper_containers",
+    "apple_system_path",
+))
+SUMMARY_SURVIVOR_STAGES = frozenset(
+    "cleanup_summary_present_" + category for category in SUMMARY_SURVIVOR_CLASSES
+)
+CLEANUP_STAGES = CLEANUP_STAGES | SUMMARY_SURVIVOR_STAGES
 REASONS = frozenset((
     "invalid_input", "control_identity_invalid", "bootstrap_gate_refused", "developer_mode_unavailable",
     "plan_snapshot_refused", "dash_bottle_unavailable", "dash_bottle_invalid",
@@ -1079,21 +1089,28 @@ def _summary_guard(uid, home, toolchain, reviewed, capability, root, binding, en
 def _finish_summary_guard(guard, reviewed, *, worker_cleanup_confirmed, cleanup_state=None):
     if guard is None:
         return
-    failed = not worker_cleanup_confirmed
+    first_failure = None
+    if not worker_cleanup_confirmed:
+        first_failure = _cleanup_failure("cleanup_summary", cleanup_state)
     if worker_cleanup_confirmed:
         try:
             probe_name = guard.get("parent_probe_name")
             if type(probe_name) is str and probe_name:
                 reviewed._remove_summary_parent_probe(guard, probe_name)
+        except BaseException:
+            first_failure = _cleanup_failure("cleanup_summary_restore", cleanup_state)
+        try:
             reviewed._restore_runner_summary(guard)
         except BaseException:
-            failed = True
+            if first_failure is None:
+                first_failure = _cleanup_failure("cleanup_summary_restore", cleanup_state)
     try:
         reviewed._close_runner_summary(guard)
     except BaseException:
-        failed = True
-    if failed:
-        raise _cleanup_failure("cleanup_summary", cleanup_state) from None
+        if first_failure is None:
+            first_failure = _cleanup_failure("cleanup_summary_close", cleanup_state)
+    if first_failure is not None:
+        raise first_failure from None
 
 
 def _probe_summary_after_commands(guard, uid, home, toolchain, reviewed, capability, binding,
@@ -1103,17 +1120,26 @@ def _probe_summary_after_commands(guard, uid, home, toolchain, reviewed, capabil
         presence = capability._probe_uid_processes_present(
             uid, include_survivor_classes=True, python_executable=toolchain["python"]
         )
-        present, _ = capability._presence_result(presence)
-        if present:
-            raise _cleanup_failure("cleanup_summary", cleanup_state)
+        present, classes = capability._presence_result(presence)
+    except BaseException:
+        raise _cleanup_failure("cleanup_summary_census", cleanup_state) from None
+    if present:
+        stage = "cleanup_summary_present"
+        if (type(classes) is tuple and len(classes) == 1
+                and type(classes[0]) is str and classes[0] in SUMMARY_SURVIVOR_CLASSES):
+            stage += "_" + classes[0]
+        raise _cleanup_failure(stage, cleanup_state)
+    try:
         reviewed._run_real_summary_probe(
             guard, uid, env=env, python_executable=toolchain["python"], binding=binding
         )
-    except Refusal:
+    except Refusal as error:
+        if _is_cleanup_failure(error):
+            raise _cleanup_failure("cleanup_summary_probe", cleanup_state) from None
         raise
     except BaseException as error:
         if getattr(error, "reason", None) == "cleanup_incomplete":
-            raise _cleanup_failure("cleanup_summary", cleanup_state) from None
+            raise _cleanup_failure("cleanup_summary_probe", cleanup_state) from None
         raise Refusal("summary_guard_failed", "summary_guard") from None
 
 
