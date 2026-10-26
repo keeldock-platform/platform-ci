@@ -135,6 +135,8 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("kit/confinement/test_macos_deny_default.py", result)
         self.assertIn("kit/confinement/macos_public_audit.py", result)
         self.assertIn("kit/confinement/test_macos_public_audit.py", result)
+        self.assertIn("kit/confinement/macos_cache_client/action.yml", result)
+        self.assertIn("kit/confinement/macos_cache_client/index.js", result)
         self.assertIn("kit/confinement/macos_reviewed_build.py", result)
         self.assertIn("kit/confinement/test_macos_reviewed_build.py", result)
         self.assertIn("kit/confinement/macos_harness.py", result)

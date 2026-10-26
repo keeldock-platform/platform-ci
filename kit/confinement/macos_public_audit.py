@@ -23,6 +23,7 @@ CACHE_PROOF_POSITIVE_JOB_NAME = "macos-cache-positive"
 CACHE_PROOF_NONE_JOB_NAME = "macos-cache-none-probe"
 CACHE_PROOF_AUDIT_JOB_NAME = "macos-cache-public-audit"
 CACHE_PROOF_CLEANUP_JOB_NAME = "macos-cache-cleanup"
+CACHE_PROOF_ACTION_SHA = "3edfce9056124e459a23f683a21433670d47daca"
 CACHE_PROOF_SEED_KEY_PREFIX = "macos-public-cache-seed-v1-"
 CACHE_PROOF_NONE_WRITE_KEY_PREFIX = "macos-public-cache-none-write-v1-"
 API_ORIGIN = "https://api.github.com"
@@ -41,6 +42,14 @@ CONTROL_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./-]{20,512}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 HEX_DIGEST_RE = re.compile(r"[a-f0-9]{64}\Z")
+CACHE_PROOF_CLIENT_MARKER_RE = re.compile(
+    rb"macos-cache-client=(read|write)-denied schema=1 action-sha="
+    + CACHE_PROOF_ACTION_SHA.encode("ascii")
+    + rb" key=(macos-public-cache-(?:seed-v1|none-write-v1)-[1-9][0-9]{0,18}-[1-9][0-9]{0,18}) "
+    rb"control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) "
+    rb"run-attempt=([1-9][0-9]{0,18}) node=(24\.[0-9]+\.[0-9]+)"
+    rb"(?=\r?(?:\n|$))"
+)
 REVIEWED_SMOKE_MARKER_RE = re.compile(
     rb"macos-build=synthetic-smoke-passed schema=1 source=none "
     rb"control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) "
@@ -236,46 +245,45 @@ def inspect_reviewed_public_bytes(raw, control_sha):
             _fail("canary_exposed")
 
 
-def inspect_cache_probe_public_bytes(raw, control_sha, write_key):
+def inspect_cache_probe_public_bytes(raw, control_sha):
     if type(raw) is not bytes:
         _fail("log_format_unknown")
-    read_warnings = 0
-    write_warnings = 0
-    sanitized = []
-    prefix = b"::warning::"
-    read_prefix = prefix + b"Failed to restore: cache read denied:"
-    write_prefix = (
-        prefix + b"Unable to reserve cache with key " + write_key.encode("ascii")
-        + b". More details: cache write denied:"
-    )
-    for line in raw.splitlines(keepends=True):
-        content = line.rstrip(b"\r\n")
-        ending = line[len(content):]
-        if content.startswith(read_prefix):
-            message = content[len(prefix):]
-            suffix = content[len(read_prefix):]
-            if (len(suffix) > 1024 or b"::" in suffix
-                    or any(byte < 32 or byte > 126 for byte in suffix)):
-                _fail("workflow_command_exposed")
-            inspect_reviewed_public_bytes(message, control_sha)
-            read_warnings += 1
-            sanitized.append(b"[cache-service-warning]" + message + ending)
-        elif content.startswith(write_prefix):
-            message = content[len(prefix):]
-            suffix = content[len(write_prefix):]
-            if (len(suffix) > 1024 or b"::" in suffix
-                    or any(byte < 32 or byte > 126 for byte in suffix)):
-                _fail("workflow_command_exposed")
-            inspect_reviewed_public_bytes(message, control_sha)
-            write_warnings += 1
-            sanitized.append(b"[cache-service-warning]" + message + ending)
-        elif content.startswith(prefix):
-            _fail("workflow_command_exposed")
-        else:
-            sanitized.append(line)
-    if (read_warnings or write_warnings) and (read_warnings != 1 or write_warnings != 1):
+    if b"::" in raw:
         _fail("workflow_command_exposed")
-    inspect_reviewed_public_bytes(b"".join(sanitized), control_sha)
+    for forbidden in (
+        b"Cache restore skipped",
+        b"Cache save skipped",
+        b"cache read denied:",
+        b"cache write denied:",
+        b"Cache not found for input keys:",
+        b"Cache restored from key:",
+        b"Cache saved with key:",
+    ):
+        if forbidden in raw:
+            _fail("workflow_command_exposed")
+    inspect_reviewed_public_bytes(raw, control_sha)
+
+
+def _inspect_cache_client_markers(raw, control_sha, run_id, run_attempt, seed_key, write_key):
+    matches = list(CACHE_PROOF_CLIENT_MARKER_RE.finditer(raw))
+    if len(matches) != 2 or raw.count(b"macos-cache-client=") != 2:
+        _fail("receipt_invalid")
+    expected_keys = {b"read": seed_key.encode("ascii"), b"write": write_key.encode("ascii")}
+    seen = set()
+    for match in matches:
+        mode = match.group(1)
+        key = match.group(2)
+        marker_sha = match.group(3)
+        marker_run_id = match.group(4)
+        marker_attempt = match.group(5)
+        if (mode in seen or key != expected_keys.get(mode)
+                or marker_sha != control_sha.encode("ascii")
+                or marker_run_id != run_id.encode("ascii")
+                or marker_attempt != run_attempt.encode("ascii")):
+            _fail("receipt_invalid")
+        seen.add(mode)
+    if seen != {b"read", b"write"}:
+        _fail("receipt_invalid")
 
 
 def cache_inventory_digest(entries):
@@ -874,11 +882,12 @@ def _cache_proof_jobs(api, run_id, run_attempt, control_sha):
         ),
         CACHE_PROOF_NONE_JOB_NAME: (
             "Fetch reviewed main control",
+            "Fetch the exact pinned public cache client",
             "Require fixture is absent before the denied read",
-            "Request the known fixture with the none-scoped token",
+            "Request the known fixture through the pinned cache client",
             "Verify the none-scoped read did not restore bytes",
             "Prepare a distinct public write probe",
-            "Request a cache save with the none-scoped token",
+            "Request a save through the pinned cache client",
             "Confirm save request completed",
         ),
     }
@@ -1054,7 +1063,7 @@ def run(phase, environ=None, api=None):
                 _fail("native_job_failed")
             log_bytes = api.log_text(job["id"])
             if name == CACHE_PROOF_NONE_JOB_NAME:
-                inspect_cache_probe_public_bytes(log_bytes, control_sha, write_key)
+                inspect_cache_probe_public_bytes(log_bytes, control_sha)
             else:
                 inspect_reviewed_public_bytes(log_bytes, control_sha)
             _scan_annotations(api, job, check_id, control_sha, reviewed=True)
@@ -1089,10 +1098,16 @@ def run(phase, environ=None, api=None):
             "macos-cache-none-save=request-finished schema=1 run-id=" + run_id
             + " run-attempt=" + run_attempt
         ).encode("ascii")
+        expected_client_source_line = (
+            "macos-cache-client-source=verified schema=1 action-sha=" + CACHE_PROOF_ACTION_SHA
+        ).encode("ascii")
         snapshot_log = log_by_name[CACHE_PROOF_SNAPSHOT_JOB_NAME]
         seed_log = log_by_name[CACHE_PROOF_SEED_JOB_NAME]
         positive_log = log_by_name[CACHE_PROOF_POSITIVE_JOB_NAME]
         none_log = log_by_name[CACHE_PROOF_NONE_JOB_NAME]
+        _inspect_cache_client_markers(
+            none_log, control_sha, run_id, run_attempt, seed_key, write_key
+        )
         if b"macos-cache-proof=snapshot-ready" not in snapshot_log:
             _fail("receipt_invalid")
         if (seed_log.count(expected_seed_line) != 1
@@ -1101,12 +1116,9 @@ def run(phase, environ=None, api=None):
         if (positive_log.count(expected_positive_line) != 1
                 or b"Cache restored from key: " + seed_key.encode("ascii") not in positive_log):
             _fail("receipt_invalid")
-        if (none_log.count(expected_none_read_line) != 1
+        if (none_log.count(expected_client_source_line) != 1
+                or none_log.count(expected_none_read_line) != 1
                 or none_log.count(expected_none_save_line) != 1
-                or b"cache read denied:" not in none_log
-                or b"Cache not found for input keys: " + seed_key.encode("ascii") not in none_log
-                or b"cache write denied:" not in none_log
-                or write_key.encode("ascii") not in none_log
                 or b"Cache restored from key: " + seed_key.encode("ascii") in none_log
                 or b"Cache saved with key: " + write_key.encode("ascii") in none_log):
             _fail("receipt_invalid")
