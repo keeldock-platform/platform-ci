@@ -741,6 +741,301 @@ def cache_proof_audit_fixture():
     return pages, env, logs, cache_items
 
 
+def source_reader_settings_fixture(kind):
+    configuration = audit.SOURCE_READER_CONFIGURATIONS[kind]
+    environment_path = (
+        "/repos/keeldock-platform/platform-ci/environments/"
+        + configuration["environment_name"]
+    )
+    policies_path = environment_path + "/deployment-branch-policies?per_page=100&page=1"
+    return {
+        environment_path: ({
+            "id": configuration["environment_id"],
+            "name": configuration["environment_name"],
+            "deployment_branch_policy": {
+                "custom_branch_policies": True,
+                "protected_branches": False,
+            },
+        }, {}),
+        policies_path: ({
+            "total_count": 1,
+            "branch_policies": [{
+                "id": configuration["branch_policy_id"],
+                "name": "main",
+                "type": "branch",
+            }],
+        }, {}),
+    }
+
+
+def source_reader_audit_fixture(kind):
+    configuration = audit.SOURCE_READER_CONFIGURATIONS[kind]
+    run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+    jobs_path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+    )
+    artifact_path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        + "/artifacts?per_page=100&page=1"
+    )
+    cache_path = "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+    settings_check_id = 702
+    token_check_id = 703
+    settings_job_id = 602
+    token_job_id = 603
+    job_specs = (
+        (audit.SOURCE_READER_SETTINGS_JOB_NAME, settings_job_id, settings_check_id, "completed", "success", (
+            "Fetch reviewed main control", "Validate source-free control tree",
+            "Verify exact protected environment settings", "Snapshot public surfaces",
+        )),
+        (audit.SOURCE_READER_TOKEN_JOB_NAME, token_job_id, token_check_id, "completed", "success", (
+            "Fetch reviewed main control", "Validate source-reader scope configuration",
+            "Mint scoped source-reader token", "Verify selected installation identity",
+            "Verify one-repository read scope and revoke token",
+            "Write trusted summary visibility control",
+        )),
+        (audit.SOURCE_READER_AUDIT_JOB_NAME, 604, 704, "in_progress", "success", ()),
+    )
+    pages = {
+        run_path: ({
+            "id": int(RUN_ID),
+            "run_attempt": int(RUN_ATTEMPT),
+            "head_sha": CONTROL_SHA,
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "path": configuration["workflow_path"],
+            "repository": {"full_name": audit.REPOSITORY},
+        }, {}),
+        artifact_path: ({"total_count": 0, "artifacts": []}, {}),
+        cache_path: ({"total_count": 0, "actions_caches": []}, {}),
+    }
+    pages.update(source_reader_settings_fixture(kind))
+    jobs = []
+    logs = {}
+    environment_marker = (
+        "macos-source-environment=verified schema=1 kind=" + kind
+        + " name=" + configuration["environment_name"]
+        + " environment-id=" + str(configuration["environment_id"])
+        + " policy-id=" + str(configuration["branch_policy_id"])
+        + " custom-branch-policies=true protected-branches=false branch=main branch-type=branch"
+        + " control-sha=" + CONTROL_SHA + " run-id=" + RUN_ID
+        + " run-attempt=" + RUN_ATTEMPT + "\n"
+    ).encode("ascii")
+    snapshot_marker = (
+        "macos-source-reader-snapshot=ready schema=1 control-sha=" + CONTROL_SHA
+        + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT + "\n"
+    ).encode("ascii")
+    installation_id = b"7654321"
+    repository_id = b"246813579"
+    settings_log = environment_marker + snapshot_marker
+    token_log = (
+        b"macos-source-reader-installation=verified schema=1 control-sha="
+        + CONTROL_SHA.encode("ascii") + b" run-id=" + RUN_ID.encode("ascii")
+        + b" run-attempt=" + RUN_ATTEMPT.encode("ascii")
+        + b" installation-id=" + installation_id + b"\n"
+        + audit.SOURCE_READER_SUCCESS_RECORD + b"\n"
+        + b"macos-source-reader-scope=verified schema=1 action-sha="
+        + audit.SOURCE_READER_ACTION_SHA.encode("ascii") + b" control-sha="
+        + CONTROL_SHA.encode("ascii") + b" run-id=" + RUN_ID.encode("ascii")
+        + b" run-attempt=" + RUN_ATTEMPT.encode("ascii")
+        + b" installation-id=" + installation_id + b" repository-id=" + repository_id
+        + b" repositories=1 permission=contents-read metadata=verified revocation=confirmed "
+        + b"source-content=not-read\n"
+        + b"macos-summary-control=trusted-write schema=1 control-sha="
+        + CONTROL_SHA.encode("ascii") + b" run-id=" + RUN_ID.encode("ascii")
+        + b" run-attempt=" + RUN_ATTEMPT.encode("ascii") + b"\n"
+    )
+    for name, job_id, check_id, status, conclusion, step_names in job_specs:
+        check_url = "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id)
+        record = {
+            "id": job_id,
+            "run_id": int(RUN_ID),
+            "run_attempt": int(RUN_ATTEMPT),
+            "head_sha": CONTROL_SHA,
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "check_run_url": check_url,
+        }
+        jobs.append(record)
+        if status == "completed":
+            detail = dict(record, steps=[{
+                "number": index,
+                "name": step_name,
+                "status": "completed",
+                "conclusion": "success",
+            } for index, step_name in enumerate(step_names, 1)])
+            pages["/repos/keeldock-platform/platform-ci/actions/jobs/" + str(job_id)] = (detail, {})
+            check_path = "/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id)
+            pages[check_path] = ({
+                "id": check_id,
+                "head_sha": CONTROL_SHA,
+                "status": "completed",
+                "conclusion": "success",
+                "output": {"title": name, "summary": "source reader fixture", "annotations_count": 0},
+            }, {})
+            pages[check_path + "/annotations?per_page=100&page=1"] = ([], {})
+            logs[job_id] = settings_log if name == audit.SOURCE_READER_SETTINGS_JOB_NAME else token_log
+    pages[jobs_path] = ({"total_count": len(jobs), "jobs": jobs}, {})
+    env = {
+        "GITHUB_REPOSITORY": audit.REPOSITORY,
+        "GITHUB_RUN_ID": RUN_ID,
+        "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
+        "CI_SHA": CONTROL_SHA,
+        "GITHUB_TOKEN": "t" * 32,
+        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_digest([]),
+    }
+    return pages, env, logs
+
+
+class SourceReaderSettingsTests(unittest.TestCase):
+    def test_settings_require_exact_environment_and_one_main_branch_policy(self):
+        for kind in ("core", "rules"):
+            with self.subTest(kind=kind):
+                pages = source_reader_settings_fixture(kind)
+                api = FakeAPI(pages)
+                marker = audit._verify_source_reader_environment(
+                    api, kind, CONTROL_SHA, RUN_ID, RUN_ATTEMPT
+                )
+                self.assertIn(b"branch=main branch-type=branch", marker)
+                self.assertIn(b"custom-branch-policies=true protected-branches=false", marker)
+                self.assertEqual(len(api.calls), 2)
+
+    def test_settings_refuse_missing_or_ambiguous_branch_policy_metadata(self):
+        for kind, mutate in (
+            ("rules", lambda env, policies: policies[0]["branch_policies"][0].pop("type")),
+            ("rules", lambda env, policies: policies[0]["branch_policies"][0].update(type="tag")),
+            ("rules", lambda env, policies: policies[0]["branch_policies"][0].update(name="release/*")),
+            ("rules", lambda env, policies: policies[0].update(
+                total_count=2,
+                branch_policies=policies[0]["branch_policies"] + [{
+                    "id": 991122,
+                    "name": "release/*",
+                    "type": "branch",
+                }],
+            )),
+            ("core", lambda env, policies: env.update(
+                deployment_branch_policy={
+                    "custom_branch_policies": False,
+                    "protected_branches": True,
+                }
+            )),
+            ("core", lambda env, policies: env.update(id=1)),
+        ):
+            with self.subTest(kind=kind, mutation=mutate.__code__.co_firstlineno):
+                pages = source_reader_settings_fixture(kind)
+                environment_path = (
+                    "/repos/keeldock-platform/platform-ci/environments/"
+                    + audit.SOURCE_READER_CONFIGURATIONS[kind]["environment_name"]
+                )
+                policy_path = environment_path + "/deployment-branch-policies?per_page=100&page=1"
+                mutate(pages[environment_path][0], pages[policy_path][0])
+                with self.assertRaises(audit.AuditRefusal):
+                    audit._verify_source_reader_environment(
+                        FakeAPI(pages), kind, CONTROL_SHA, RUN_ID, RUN_ATTEMPT
+                    )
+
+
+class SourceReaderAuditTests(unittest.TestCase):
+    def test_audit_requires_scope_revocation_summary_and_all_public_surfaces(self):
+        for kind in ("core", "rules"):
+            with self.subTest(kind=kind):
+                pages, env, logs = source_reader_audit_fixture(kind)
+                api = FakeMultiAuditAPI(pages, logs)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    result = audit.run("source-reader-audit-" + kind, env, api)
+                self.assertEqual(result, 0)
+                self.assertEqual(
+                    output.getvalue(),
+                    "macos-source-reader-audit=verified schema=1 kind=" + kind
+                    + " control-sha=" + CONTROL_SHA + " run-id=" + RUN_ID
+                    + " run-attempt=" + RUN_ATTEMPT
+                    + " scope=one-private-repository-read revocation=confirmed source-content=not-read\n",
+                )
+                self.assertEqual(api.log_calls, [602, 603])
+                self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
+                self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
+                self.assertTrue(any(path.endswith("/deployment-branch-policies?per_page=100&page=1") for path in api.calls))
+
+    def test_audit_refuses_missing_identity_revocation_or_summary_evidence(self):
+        mutations = (
+            lambda logs: logs.__setitem__(603, logs[603].replace(
+                b"revocation=confirmed", b"revocation=unconfirmed", 1
+            )),
+            lambda logs: logs.__setitem__(603, logs[603].replace(
+                audit.SOURCE_READER_SUCCESS_RECORD, b"", 1
+            )),
+            lambda logs: logs.__setitem__(603, logs[603].replace(
+                b"macos-summary-control=trusted-write", b"macos-summary-control=missing", 1
+            )),
+            lambda logs: logs.__setitem__(603, logs[603].replace(
+                b"run-attempt=" + RUN_ATTEMPT.encode("ascii"), b"run-attempt=3", 1
+            )),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                pages, env, logs = source_reader_audit_fixture("rules")
+                mutate(logs)
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.run("source-reader-audit-rules", env, FakeMultiAuditAPI(pages, logs))
+
+    def test_audit_refuses_failed_jobs_artifacts_cache_changes_and_wrong_branch_policy(self):
+        pages, env, logs = source_reader_audit_fixture("core")
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        token_job = next(
+            job for job in pages[jobs_path][0]["jobs"]
+            if job["name"] == audit.SOURCE_READER_TOKEN_JOB_NAME
+        )
+        token_job["conclusion"] = "failure"
+        token_detail_path = "/repos/keeldock-platform/platform-ci/actions/jobs/603"
+        pages[token_detail_path][0]["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/check-runs/703"][0]["conclusion"] = "failure"
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("source-reader-audit-core", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "native_job_failed")
+
+        pages, env, logs = source_reader_audit_fixture("core")
+        artifact_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/artifacts?per_page=100&page=1"
+        )
+        pages[artifact_path] = ({"total_count": 1, "artifacts": [{
+            "id": 909,
+            "name": "unexpected",
+            "size_in_bytes": 1,
+            "expired": False,
+        }]}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("source-reader-audit-core", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "artifact_found")
+
+        pages, env, logs = source_reader_audit_fixture("core")
+        cache_path = "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        pages[cache_path] = ({"total_count": 1, "actions_caches": [{
+            "id": 808,
+            "ref": "refs/heads/main",
+            "key": "unexpected-public-cache-v1",
+            "version": "v1",
+            "last_accessed_at": None,
+            "created_at": "2026-10-26T00:00:00Z",
+            "size_in_bytes": 1,
+        }]}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("source-reader-audit-core", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "inventory_changed")
+
+        pages, env, logs = source_reader_audit_fixture("core")
+        env_path = "/repos/keeldock-platform/platform-ci/environments/source-read"
+        pages[env_path][0]["deployment_branch_policy"]["custom_branch_policies"] = False
+        with self.assertRaises(audit.AuditRefusal):
+            audit.run("source-reader-audit-core", env, FakeMultiAuditAPI(pages, logs))
+
+
 class CacheProofAuditTests(unittest.TestCase):
     def test_cache_probe_log_scanner_only_allows_fixed_client_markers(self):
         allowed = (

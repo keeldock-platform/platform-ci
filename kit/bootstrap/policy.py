@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import subprocess
@@ -10,6 +11,9 @@ MAX_POLICY_BYTES = 2048
 MAX_RESULT_BYTES = 2048
 MAX_COUNT = 100000
 MAX_DURATION_MS = 86400000
+MACOS_SOURCE_READER_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
+MACOS_SOURCE_READER_WORKFLOW_SHA256 = "4395dd58e0cc3ae16fbb84db1353f12f4ce3ef68e8c6f0e0f731206232555da8"
+MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "5a688fc2b5e28a4fc3e4771991f1cc5878f993ac137ef9726c19783cfc82654c"
 
 
 class PolicyError(ValueError):
@@ -1115,6 +1119,17 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         expected = MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE
+    elif workflow_kind in {"macos-source-reader", "macos-rules-source-reader"}:
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        expected_digest = (
+            MACOS_SOURCE_READER_WORKFLOW_SHA256
+            if workflow_kind == "macos-source-reader"
+            else MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256
+        )
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_digest:
+            raise PolicyError("workflow-template-mismatch")
+        return True
     elif workflow_kind == "windows-native-preflight":
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")

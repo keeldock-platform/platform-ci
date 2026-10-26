@@ -49,6 +49,18 @@ def main():
             if len(macos_cache_payload) > 262144:
                 raise PolicyError("macos-cache-workflow-too-large")
             validate_workflow_text(macos_cache_payload.decode("utf-8"), pool, "macos-cache-proof")
+            for path, workflow_kind in (
+                (".github/workflows/macos-source-reader-preflight.yml", "macos-source-reader"),
+                (".github/workflows/macos-rules-reader-preflight.yml", "macos-rules-source-reader"),
+            ):
+                source_reader_path = root / path
+                with source_reader_path.open("rb") as source:
+                    source_reader_payload = source.read(262145)
+                if len(source_reader_payload) > 262144:
+                    raise PolicyError("source-reader-workflow-too-large")
+                validate_workflow_text(
+                    source_reader_payload.decode("utf-8"), pool, workflow_kind
+                )
             windows_workflow_path = root / ".github/workflows/windows-native-preflight.yml"
             with windows_workflow_path.open("rb") as source:
                 windows_payload = source.read(262145)
