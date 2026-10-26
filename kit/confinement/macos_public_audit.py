@@ -12,6 +12,10 @@ import urllib.request
 REPOSITORY = "keeldock-platform/platform-ci"
 WORKFLOW_PATH = ".github/workflows/macos-capability.yml"
 NATIVE_JOB_NAME = "macos-capability"
+REVIEWED_WORKFLOW_PATH = ".github/workflows/macos-reviewed-build.yml"
+REVIEWED_SNAPSHOT_JOB_NAME = "macos-public-snapshot"
+REVIEWED_SMOKE_JOB_NAME = "macos-reviewed-smoke"
+REVIEWED_AUDIT_JOB_NAME = "macos-public-surface-audit"
 API_ORIGIN = "https://api.github.com"
 API_HOST = "api.github.com"
 API_VERSION = "2022-11-28"
@@ -28,8 +32,24 @@ CONTROL_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./-]{20,512}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 HEX_DIGEST_RE = re.compile(r"[a-f0-9]{64}\Z")
+REVIEWED_SMOKE_MARKER_RE = re.compile(
+    rb"macos-build=synthetic-smoke-passed schema=1 source=none "
+    rb"control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) "
+    rb"run-attempt=([1-9][0-9]{0,18}) "
+    rb"image-os=(macos-?[0-9]{1,2}(?:-(?:arm64|x64|intel))?) "
+    rb"image-version=[0-9]+(?:\.[0-9]+){1,3} "
+    rb"macos-version=[0-9]+\.[0-9]+(?:\.[0-9]+)? "
+    rb"architecture=(?:arm64|x86_64) "
+    rb"xcode=[0-9]+(?:\.[0-9]+){0,3} xcode-build=[A-Za-z0-9.]+ "
+    rb"clang=[0-9]+(?:\.[0-9]+){0,3} sdk=[0-9]+(?:\.[0-9]+){0,3} "
+    rb"developer-mode=disabled privilege=separate-nonadmin sudo=denied "
+    rb"compile=passed link=passed load-test=passed capture=passed "
+    rb"summary-standin=write-denied cleanup=complete seatbelt=not-run pf=not-run"
+    rb"(?=\r?(?:\n|$))"
+)
 CANARY_DOMAIN = b"keeldock" + b"-macos-ci-canary-v1\0"
 CANARY_PREFIX = b"KD-MACOS-CI-CANARY-v1:"
+REVIEWED_CANARY_PREFIX = b"KD-RB-CANARY-"
 CANARY_COMMANDS = (
     b"::error file=canary.txt,line=1::",
     b"::warning::",
@@ -68,6 +88,7 @@ REASONS = frozenset(
         "workflow_command_exposed",
         "receipt_invalid",
         "native_job_failed",
+        "smoke_marker_missing",
         "output_unavailable",
         "internal_error",
     )
@@ -135,6 +156,24 @@ def _canary_variants(control_sha):
     }
 
 
+def derive_reviewed_canary(control_sha):
+    if not _valid_sha(control_sha):
+        _fail("invalid_input")
+    return REVIEWED_CANARY_PREFIX + control_sha[:16].encode("ascii")
+
+
+def _reviewed_canary_variants(control_sha):
+    value = derive_reviewed_canary(control_sha)
+    return {
+        value,
+        value.upper(),
+        value.hex().encode("ascii"),
+        base64.b64encode(value),
+        base64.urlsafe_b64encode(value).rstrip(b"="),
+        urllib.parse.quote_from_bytes(value, safe="").encode("ascii"),
+    }
+
+
 def canary_needles(control_sha):
     variants = _canary_variants(control_sha)
     values = set(variants)
@@ -154,6 +193,13 @@ def inspect_public_bytes(raw, control_sha):
             if command + variant in raw:
                 _fail("workflow_command_exposed")
     for needle in _canary_variants(control_sha):
+        if needle and needle in raw:
+            _fail("canary_exposed")
+
+
+def inspect_reviewed_public_bytes(raw, control_sha):
+    inspect_public_bytes(raw, control_sha)
+    for needle in _reviewed_canary_variants(control_sha):
         if needle and needle in raw:
             _fail("canary_exposed")
 
@@ -560,7 +606,7 @@ def _validate_job_steps(job):
     return all_success
 
 
-def _validate_run(api, run_id, run_attempt, control_sha):
+def _validate_run(api, run_id, run_attempt, control_sha, workflow_path=WORKFLOW_PATH):
     run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + run_id
     run, _ = api.json(run_path)
     repository = run.get("repository") if type(run) is dict else None
@@ -568,22 +614,13 @@ def _validate_run(api, run_id, run_attempt, control_sha):
             or run["id"] != int(run_id) or type(run.get("run_attempt")) is not int
             or run["run_attempt"] != int(run_attempt) or run.get("head_sha") != control_sha
             or run.get("event") != "workflow_dispatch" or run.get("head_branch") != "main"
-            or run.get("path") != WORKFLOW_PATH or type(repository) is not dict
+            or run.get("path") != workflow_path or type(repository) is not dict
             or repository.get("full_name") != REPOSITORY):
         _fail("run_identity_mismatch")
     return run
 
 
-def _native_job(api, run_id, run_attempt, control_sha):
-    path = (
-        "/repos/keeldock-platform/platform-ci/actions/runs/" + run_id
-        + "/attempts/" + run_attempt + "/jobs"
-    )
-    jobs = _read_counted_collection(api, path, "jobs", 10000, _validate_job_record)
-    matches = [job for job in jobs if type(job) is dict and job.get("name") == NATIVE_JOB_NAME]
-    if len(matches) != 1:
-        _fail("api_schema")
-    job = matches[0]
+def _job_detail(api, job, run_id, run_attempt, control_sha, job_name):
     if (job.get("run_id") != int(run_id) or job.get("run_attempt") != int(run_attempt)
             or job.get("head_sha") != control_sha
             or job.get("status") != "completed"):
@@ -593,7 +630,8 @@ def _native_job(api, run_id, run_attempt, control_sha):
     _validate_job_record(detail)
     if (detail.get("id") != job["id"] or detail.get("run_id") != int(run_id)
             or detail.get("run_attempt") != int(run_attempt) or detail.get("head_sha") != control_sha
-            or detail.get("name") != NATIVE_JOB_NAME or detail.get("status") != "completed"):
+            or detail.get("name") != job_name or detail.get("status") != "completed"
+            or detail.get("conclusion") != job.get("conclusion")):
         _fail("run_identity_mismatch")
     steps_success = _validate_job_steps(detail)
     try:
@@ -611,7 +649,53 @@ def _native_job(api, run_id, run_attempt, control_sha):
     return detail, int(check_id.group(1)), steps_success
 
 
-def _scan_annotations(api, job, check_id, control_sha):
+def _native_job(api, run_id, run_attempt, control_sha):
+    path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + run_id
+        + "/attempts/" + run_attempt + "/jobs"
+    )
+    jobs = _read_counted_collection(api, path, "jobs", 10000, _validate_job_record)
+    matches = [job for job in jobs if type(job) is dict and job.get("name") == NATIVE_JOB_NAME]
+    if len(matches) != 1:
+        _fail("api_schema")
+    return _job_detail(api, matches[0], run_id, run_attempt, control_sha, NATIVE_JOB_NAME)
+
+
+def _reviewed_jobs(api, run_id, run_attempt, control_sha):
+    path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + run_id
+        + "/attempts/" + run_attempt + "/jobs"
+    )
+    jobs = _read_counted_collection(api, path, "jobs", 10000, _validate_job_record)
+    expected_names = {
+        REVIEWED_SNAPSHOT_JOB_NAME,
+        REVIEWED_SMOKE_JOB_NAME,
+        REVIEWED_AUDIT_JOB_NAME,
+    }
+    if len(jobs) != len(expected_names) or {job.get("name") for job in jobs} != expected_names:
+        _fail("api_schema")
+    audit_job = next(job for job in jobs if job.get("name") == REVIEWED_AUDIT_JOB_NAME)
+    if (audit_job.get("run_id") != int(run_id) or audit_job.get("run_attempt") != int(run_attempt)
+            or audit_job.get("head_sha") != control_sha or audit_job.get("status") != "in_progress"):
+        _fail("run_identity_mismatch")
+    snapshot = next(job for job in jobs if job.get("name") == REVIEWED_SNAPSHOT_JOB_NAME)
+    smoke = next(job for job in jobs if job.get("name") == REVIEWED_SMOKE_JOB_NAME)
+    return (
+        _job_detail(api, snapshot, run_id, run_attempt, control_sha, REVIEWED_SNAPSHOT_JOB_NAME),
+        _job_detail(api, smoke, run_id, run_attempt, control_sha, REVIEWED_SMOKE_JOB_NAME),
+    )
+
+
+def _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt):
+    matches = list(REVIEWED_SMOKE_MARKER_RE.finditer(raw))
+    if len(matches) != 1 or raw.count(b"macos-build=") != 1:
+        _fail("smoke_marker_missing")
+    match = matches[0]
+    if match.group(1) != control_sha.encode("ascii") or match.group(2) != run_id.encode("ascii") or match.group(3) != run_attempt.encode("ascii"):
+        _fail("smoke_marker_missing")
+
+
+def _scan_annotations(api, job, check_id, control_sha, reviewed=False):
     check_path = "/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id)
     check_run, _ = api.json(check_path)
     if (type(check_run) is not dict or not _exact_int(check_run.get("id"), 1)
@@ -628,7 +712,8 @@ def _scan_annotations(api, job, check_id, control_sha):
         output_bytes = json.dumps(output, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
     except Exception:
         _fail("api_schema")
-    inspect_public_bytes(output_bytes, control_sha)
+    inspect = inspect_reviewed_public_bytes if reviewed else inspect_public_bytes
+    inspect(output_bytes, control_sha)
     path = "/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id) + "/annotations"
     items = _read_annotations(api, path)
     if len(items) != output["annotations_count"]:
@@ -638,7 +723,7 @@ def _scan_annotations(api, job, check_id, control_sha):
             raw = json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
         except Exception:
             _fail("api_schema")
-        inspect_public_bytes(raw, control_sha)
+        inspect(raw, control_sha)
 
 
 def _fetch_artifacts(api, run_id):
@@ -648,7 +733,7 @@ def _fetch_artifacts(api, run_id):
         _fail("artifact_found")
 
 
-def _fetch_caches(api, control_sha):
+def _fetch_caches(api, control_sha, reviewed=False):
     path = "/repos/keeldock-platform/platform-ci/actions/caches"
     caches = _read_counted_collection(api, path, "actions_caches", MAX_CACHE_ITEMS, _validate_cache)
     for item in caches:
@@ -656,14 +741,16 @@ def _fetch_caches(api, control_sha):
             raw = json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
         except Exception:
             _fail("api_schema")
-        inspect_public_bytes(raw, control_sha)
+        inspect = inspect_reviewed_public_bytes if reviewed else inspect_public_bytes
+        inspect(raw, control_sha)
     return cache_inventory_digest(caches)
 
 
 def _snapshot(phase, api, control_sha, run_id, run_attempt, env):
-    _validate_run(api, run_id, run_attempt, control_sha)
-    digest = _fetch_caches(api, control_sha)
-    if phase == "snapshot":
+    workflow_path = REVIEWED_WORKFLOW_PATH if phase == "reviewed-snapshot" else WORKFLOW_PATH
+    _validate_run(api, run_id, run_attempt, control_sha, workflow_path)
+    digest = _fetch_caches(api, control_sha, reviewed=phase == "reviewed-snapshot")
+    if phase in {"snapshot", "reviewed-snapshot"}:
         _write_output("cache_snapshot", digest, env)
         print("macos-public-surface-audit=snapshot-ready")
         return 0
@@ -696,7 +783,7 @@ def _write_output(key, value, env):
 
 def run(phase, environ=None, api=None):
     env = os.environ if environ is None else environ
-    if phase not in {"snapshot", "audit"}:
+    if phase not in {"snapshot", "audit", "reviewed-snapshot", "reviewed-audit"}:
         _fail("invalid_input")
     repository = env.get("GITHUB_REPOSITORY", "")
     run_id = env.get("GITHUB_RUN_ID", "")
@@ -710,8 +797,29 @@ def run(phase, environ=None, api=None):
         api = GitHubAPI(token)
     elif type(token) is not str or TOKEN_RE.fullmatch(token) is None:
         _fail("invalid_input")
-    if phase == "snapshot":
+    if phase in {"snapshot", "reviewed-snapshot"}:
         return _snapshot(phase, api, control_sha, run_id, run_attempt, env)
+
+    if phase == "reviewed-audit":
+        _validate_run(api, run_id, run_attempt, control_sha, REVIEWED_WORKFLOW_PATH)
+        snapshot, smoke = _reviewed_jobs(api, run_id, run_attempt, control_sha)
+        snapshot_log = api.log_text(snapshot[0]["id"])
+        inspect_reviewed_public_bytes(snapshot_log, control_sha)
+        smoke_log = api.log_text(smoke[0]["id"])
+        inspect_reviewed_public_bytes(smoke_log, control_sha)
+        _scan_annotations(api, snapshot[0], snapshot[1], control_sha, reviewed=True)
+        _scan_annotations(api, smoke[0], smoke[1], control_sha, reviewed=True)
+        _fetch_artifacts(api, run_id)
+        cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+        baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
+        if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
+            _fail("inventory_changed")
+        if (snapshot[0].get("conclusion") != "success" or not snapshot[2]
+                or smoke[0].get("conclusion") != "success" or not smoke[2]):
+            _fail("native_job_failed")
+        _inspect_reviewed_smoke_marker(smoke_log, control_sha, run_id, run_attempt)
+        print("macos-public-surface-audit=synthetic-smoke-audited")
+        return 0
 
     _validate_run(api, run_id, run_attempt, control_sha)
     job, check_id, steps_success = _native_job(api, run_id, run_attempt, control_sha)
@@ -732,7 +840,7 @@ def run(phase, environ=None, api=None):
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 1 or args[0] not in {"snapshot", "audit"}:
+    if len(args) != 1 or args[0] not in {"snapshot", "audit", "reviewed-snapshot", "reviewed-audit"}:
         print("macos-public-surface-audit=refused reason=invalid_input")
         return 2
     try:

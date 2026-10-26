@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from policy import (
     MACOS_CAPABILITY_WORKFLOW_TEMPLATE,
+    MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE,
     PolicyError,
     encode_public_result,
     validate_control_sha,
@@ -23,6 +24,7 @@ GOOD_SHA = "a" * 40
 PLATFORM_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/public-policy.yml"
 LINUX_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/linux-confinement.yml"
 MACOS_CAPABILITY_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-capability.yml"
+MACOS_REVIEWED_BUILD_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-reviewed-build.yml"
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-native-preflight.yml"
 PROBE_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_capability.py"
 PLATFORM_ACTION = Path(__file__).resolve().parent / "action.yml"
@@ -286,6 +288,90 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertNotEqual(changed, base)
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(changed, "platform", "macos-capability")
+
+    def test_actual_macos_reviewed_build_workflow_has_source_free_smoke_and_independent_audit(self):
+        workflow = MACOS_REVIEWED_BUILD_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(workflow, MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE)
+        self.assertTrue(validate_workflow_text(workflow, "platform", "macos-reviewed-build"))
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("runs-on: macos-15", workflow)
+        self.assertEqual(workflow.count("cache-mode: none"), 4)
+        self.assertIn("permissions: {}", workflow)
+        self.assertIn("needs: [macos-public-snapshot, macos-reviewed-smoke]", workflow)
+        self.assertIn("if: ${{ always() }}", workflow)
+        self.assertIn("actions: read\n      checks: read", workflow)
+        self.assertIn("python3 -B kit/confinement/macos_public_audit.py reviewed-snapshot", workflow)
+        self.assertIn("python3 -B kit/confinement/macos_public_audit.py reviewed-audit", workflow)
+        self.assertIn(
+            "      - name: Snapshot cache inventory\n        id: snapshot\n        env:\n"
+            "          GITHUB_TOKEN: ${{ github.token }}\n",
+            workflow,
+        )
+        self.assertIn(
+            "      - name: Audit public surfaces\n        env:\n"
+            "          GITHUB_TOKEN: ${{ github.token }}\n",
+            workflow,
+        )
+        self.assertIn("test_macos*.py", workflow)
+        self.assertIn("kit/confinement/macos_reviewed_build.py --control-sha \"$CI_SHA\"", workflow)
+        self.assertIn('if [[ -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]', workflow)
+        self.assertIn('ImageOS="$ImageOS"', workflow)
+        self.assertIn('ImageVersion="$ImageVersion"', workflow)
+        smoke = workflow.split("  macos-reviewed-smoke:\n", 1)[1].split(
+            "  macos-public-surface-audit:\n", 1
+        )[0]
+        self.assertNotIn("GITHUB_TOKEN", smoke)
+        snapshot = workflow.split("  macos-public-snapshot:\n", 1)[1].split(
+            "  macos-reviewed-smoke:\n", 1
+        )[0]
+        self.assertNotIn("GITHUB_TOKEN", snapshot.split("      - name: Snapshot cache inventory\n", 1)[0])
+        audit_job = workflow.split("  macos-public-surface-audit:\n", 1)[1]
+        self.assertNotIn("GITHUB_TOKEN", audit_job.split("      - name: Audit public surfaces\n", 1)[0])
+        self.assertNotIn("GITHUB_STEP_SUMMARY", workflow)
+        for forbidden in (
+            "secrets.",
+            "source-read",
+            "environment:",
+            "inputs:",
+            "actions/checkout",
+            "upload-artifact",
+            "download-artifact",
+            "uses:",
+            "continue-on-error:",
+            "MACOS_NATIVE_RECEIPT_B64URL",
+            "macos_deny_default.py",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "macos-reviewed-build")
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "platform")
+
+    def test_macos_reviewed_build_workflow_rejects_cache_source_and_audit_bypasses(self):
+        base = MACOS_REVIEWED_BUILD_WORKFLOW.read_text(encoding="utf-8")
+        mutations = (
+            base.replace("cache-mode: none\n", "cache-mode: read\n", 1),
+            base.replace("    cache-mode: none\n", "", 1),
+            base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
+            base.replace("runs-on: macos-15", "runs-on: macos-latest"),
+            base.replace("needs: [macos-public-snapshot, macos-reviewed-smoke]", "needs: macos-reviewed-smoke"),
+            base.replace("    if: ${{ always() }}\n", "    if: ${{ success() }}\n"),
+            base.replace("      actions: read\n      checks: read\n", "      actions: write\n      checks: write\n"),
+            base.replace("      - name: Run source-free reviewed build smoke\n", ""),
+            base.replace("      - name: Audit public surfaces\n", "      - name: Extra execution\n        run: echo unreviewed\n      - name: Audit public surfaces\n"),
+            base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
+            base.replace("      CI_WORKSPACE: ${{ github.workspace }}\n", "      GITHUB_TOKEN: ${{ github.token }}\n      CI_WORKSPACE: ${{ github.workspace }}\n"),
+            base.replace("GITHUB_RUN_ATTEMPT=\"$GITHUB_RUN_ATTEMPT\" \\\n", ""),
+            base.replace('          if [[ -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]; then\n            exit 1\n          fi\n', ""),
+            base.replace("macos_reviewed_build.py --control-sha", "macos_deny_default.py --control-sha"),
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(changed, base)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "macos-reviewed-build")
 
     def test_actual_windows_native_preflight_matches_closed_manual_main_shape(self):
         workflow = WINDOWS_NATIVE_PREFLIGHT_WORKFLOW.read_text(encoding="utf-8")
