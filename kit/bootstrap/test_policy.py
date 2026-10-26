@@ -759,10 +759,29 @@ class WorkflowPolicyTests(unittest.TestCase):
                         "revocation_policy_invalid",
                         "bootstrap_snapshot_invalid",
                         "bootstrap_not_approved",
+                        "binding_invalid",
+                        "interface_unavailable",
+                        "observer_unavailable",
+                        "capture_invalid",
                         "cleanup_incomplete",
                         "internal_error",
                     ):
                         self.assertIn(reason, refusal_pattern)
+                    for stage in (
+                        "observer_import",
+                        "observer_interface_hardware",
+                        "observer_interface_capture",
+                        "observer_interface_address",
+                        "observer_interface",
+                        "observer_binding",
+                        "observer_start",
+                        "observer_finish",
+                        "observer_parse",
+                        "observer_record",
+                        "observer_missing",
+                    ):
+                        self.assertIn(stage, refusal_pattern)
+                    self.assertNotIn("arguments_invalid", refusal_pattern)
                     self.assertIn("RULES_ID_DEFINITIONS", workflow)
                     self.assertIn("SOURCE_CANDIDATE_REF", workflow)
                     self.assertIn("Validate source-reader scope configuration", workflow)

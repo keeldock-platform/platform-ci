@@ -84,6 +84,33 @@ SOURCE_VALIDATION_REASONS = frozenset((
     "signature_invalid", "revocation_policy_invalid", "bootstrap_snapshot_invalid",
     "bootstrap_not_approved", "cleanup_incomplete", "internal_error",
 ))
+OBSERVER_REASON_STAGE_PAIRS = frozenset((
+    ("binding_invalid", "binding"),
+    ("interface_unavailable", "interface"),
+    ("interface_unavailable", "interface_hardware"),
+    ("interface_unavailable", "interface_capture"),
+    ("interface_unavailable", "interface_address"),
+    ("observer_unavailable", "interface"),
+    ("observer_unavailable", "interface_hardware"),
+    ("observer_unavailable", "interface_capture"),
+    ("observer_unavailable", "interface_address"),
+    ("observer_unavailable", "start"),
+    ("observer_unavailable", "finish"),
+    ("capture_invalid", "start"),
+    ("capture_invalid", "finish"),
+    ("capture_invalid", "parse"),
+    ("internal_error", "finish"),
+))
+OBSERVER_STAGE_LABELS = frozenset((
+    ("binding", "observer_binding"),
+    ("interface", "observer_interface"),
+    ("interface_hardware", "observer_interface_hardware"),
+    ("interface_capture", "observer_interface_capture"),
+    ("interface_address", "observer_interface_address"),
+    ("start", "observer_start"),
+    ("finish", "observer_finish"),
+    ("parse", "observer_parse"),
+))
 REASONS = frozenset((
     "invalid_input", "control_identity_invalid", "bootstrap_gate_refused", "developer_mode_unavailable",
     "plan_snapshot_refused", "dash_bottle_unavailable", "dash_bottle_invalid",
@@ -92,7 +119,7 @@ REASONS = frozenset((
     "source_lease_unavailable", "source_identity_invalid", "source_tree_invalid",
     "summary_guard_failed", "suite_failed", "plan_ids_failed",
     "cleanup_incomplete", "internal_error",
-)) | SOURCE_VALIDATION_REASONS
+)) | SOURCE_VALIDATION_REASONS | frozenset(reason for reason, unused in OBSERVER_REASON_STAGE_PAIRS)
 STAGES = frozenset((
     "arguments", "context", "bootstrap_gate", "developer_mode", "plan_snapshot", "dash_download",
     "dash_archive", "dash_archive_structure", "dash_archive_pax_metadata",
@@ -100,6 +127,9 @@ STAGES = frozenset((
     "dash_archive_formula_missing", "dash_archive_formula_digest_mismatch",
     "dash_verify", "toolchain", "runner_controls", "identity",
     "storage", "source_lease", "source_identity", "source_tree", "summary_guard",
+    "observer_import", "observer_interface_hardware", "observer_interface_capture",
+    "observer_interface_address", "observer_interface", "observer_binding",
+    "observer_start", "observer_finish", "observer_parse", "observer_record", "observer_missing",
     *GATES, "cleanup",
 ))
 
@@ -1187,9 +1217,21 @@ def _probe_worker_privilege(worker_uid, home, storage, toolchain, reviewed):
     return "sudo-denied"
 
 
-def _observer_refusal(error):
-    if getattr(error, "reason", None) == "cleanup_incomplete":
+def _observer_refusal(observer, error):
+    refusal_type = getattr(observer, "ObserverRefusal", None)
+    if not isinstance(refusal_type, type) or type(error) is not refusal_type:
+        return Refusal("runner_controls_unavailable", "runner_controls")
+    reason = getattr(error, "reason", None)
+    stage = getattr(error, "stage", None)
+    if ((type(reason) is str and reason == "cleanup_incomplete")
+            or (type(stage) is str and stage == "cleanup")):
         return Refusal("cleanup_incomplete", "cleanup")
+    if (type(reason) is str and type(stage) is str
+            and (reason, stage) in OBSERVER_REASON_STAGE_PAIRS):
+        wrapper_stage = next(
+            label for observer_stage, label in OBSERVER_STAGE_LABELS if observer_stage == stage
+        )
+        return Refusal(reason, wrapper_stage)
     return Refusal("runner_controls_unavailable", "runner_controls")
 
 
@@ -1201,7 +1243,7 @@ def _validate_network_record(record, binding, source_sha):
         "worker_attribution", "completeness", "network_blocking",
     }
     if type(record) is not dict or set(record) != keys:
-        raise Refusal("runner_controls_unavailable", "runner_controls")
+        raise Refusal("runner_controls_unavailable", "observer_record")
     if (type(record["schema_version"]) is not int or record["schema_version"] != 1
             or record["status"] != "observed" or record["mode"] != "host-level"
             or record["control_sha"] != binding["control_sha"]
@@ -1224,34 +1266,55 @@ def _validate_network_record(record, binding, source_sha):
             or record["worker_attribution"] != "not-claimed"
             or record["completeness"] != "not-claimed"
             or record["network_blocking"] != "not-claimed"):
-        raise Refusal("runner_controls_unavailable", "runner_controls")
+        raise Refusal("runner_controls_unavailable", "observer_record")
     for key in ("dns_name_hashes", "tcp_destination_hashes"):
         values = record[key]
         if (type(values) is not list or len(values) > 16
                 or any(type(value) is not str or SHA256_RE.fullmatch(value) is None for value in values)
                 or values != sorted(set(values))):
-            raise Refusal("runner_controls_unavailable", "runner_controls")
+            raise Refusal("runner_controls_unavailable", "observer_record")
     return record
 
 
 def _start_network_observation(binding, source_sha):
     try:
         observer = _load_control_sibling("macos_network_observer")
-        return observer.start_observation(
+    except BaseException:
+        raise Refusal("runner_controls_unavailable", "observer_import") from None
+    refusal_type = getattr(observer, "ObserverRefusal", None)
+    session_type = getattr(observer, "ObservationSession", None)
+    start = getattr(observer, "start_observation", None)
+    if not isinstance(refusal_type, type) or not isinstance(session_type, type) or not callable(start):
+        raise Refusal("runner_controls_unavailable", "observer_import")
+    try:
+        session = start(
             binding["control_sha"], binding["run_id"], binding["run_attempt"], source_sha,
         )
     except BaseException as error:
-        raise _observer_refusal(error) from None
+        raise _observer_refusal(observer, error) from None
+    if type(session) is not session_type:
+        raise Refusal("runner_controls_unavailable", "observer_import")
+    return observer, session
 
 
-def _finish_network_observation(session, binding, source_sha):
+def _finish_network_observation(observer, session, binding, source_sha):
     try:
         record = session.finish()
+    except BaseException as error:
+        raise _observer_refusal(observer, error) from None
+    try:
         return _validate_network_record(record, binding, source_sha)
     except Refusal:
         raise
-    except BaseException as error:
-        raise _observer_refusal(error) from None
+    except BaseException:
+        raise Refusal("runner_controls_unavailable", "observer_record") from None
+
+
+def _required_network_marker(lifecycle):
+    observed = lifecycle.get("network_observation_marker") if type(lifecycle) is dict else None
+    if type(observed) is not str or not observed.startswith("macos-rules-network=observed "):
+        raise Refusal("runner_controls_unavailable", "observer_missing")
+    return observed
 
 
 def _format_network_observed(record):
@@ -1410,7 +1473,9 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
                 )
                 environment = _worker_environment(source, dash_directory, home, worker_storage)
                 original_cwd = Path.cwd()
-                network_session = _start_network_observation(binding, request["source_sha"])
+                network_observer, network_session = _start_network_observation(
+                    binding, request["source_sha"],
+                )
                 commands_started = False
                 command_failure = None
                 observation_failure = None
@@ -1439,7 +1504,7 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
                         command_failure = Refusal("cleanup_incomplete", "cleanup")
                     try:
                         observation = _finish_network_observation(
-                            network_session, binding, request["source_sha"],
+                            network_observer, network_session, binding, request["source_sha"],
                         )
                         lifecycle["network_observation_marker"] = _format_network_observed(observation)
                     except BaseException as error:
@@ -1761,9 +1826,7 @@ def main(argv=None, environ=None):
         else:
             line = _format_success(result)
         if mode == "run":
-            observed = lifecycle["network_observation_marker"]
-            if type(observed) is not str or not observed.startswith("macos-rules-network=observed "):
-                raise Refusal("runner_controls_unavailable", "runner_controls")
+            observed = _required_network_marker(lifecycle)
             line = observed + "\n" + line
         print(line)
         return 0

@@ -648,6 +648,14 @@ class WorkerPrivilegeTests(unittest.TestCase):
 
 
 class NetworkObservationTests(unittest.TestCase):
+    class ObserverRefusal(Exception):
+        def __init__(self, reason, stage):
+            self.reason = reason
+            self.stage = stage
+
+    class ObservationSession:
+        pass
+
     def test_loader_allowlist_adds_only_the_fixed_network_observer(self):
         self.assertEqual(bootstrap.CONTROL_SIBLINGS, frozenset((
             "macos_reviewed_build", "macos_capability", "macos_boundary_guard",
@@ -658,14 +666,78 @@ class NetworkObservationTests(unittest.TestCase):
 
     def test_observer_uses_the_validated_source_and_run_binding(self):
         binding = binding_value()
-        session = object()
+        session = self.ObservationSession()
         calls = []
         observer = SimpleNamespace(
+            ObserverRefusal=self.ObserverRefusal,
+            ObservationSession=self.ObservationSession,
             start_observation=lambda *args: calls.append(args) or session,
         )
         with patch.object(bootstrap, "_load_control_sibling", return_value=observer):
-            self.assertIs(bootstrap._start_network_observation(binding, SOURCE), session)
+            self.assertEqual(bootstrap._start_network_observation(binding, SOURCE), (observer, session))
         self.assertEqual(calls, [(CONTROL, "123456789", "2", SOURCE)])
+
+    def test_observer_module_contract_failure_has_fixed_import_leaf(self):
+        observer = SimpleNamespace(start_observation=lambda *args: object())
+        with patch.object(bootstrap, "_load_control_sibling", return_value=observer):
+            with self.assertRaises(bootstrap.Refusal) as caught:
+                bootstrap._start_network_observation(binding_value(), SOURCE)
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("runner_controls_unavailable", "observer_import"))
+
+    def test_observer_import_failure_has_a_fixed_leaf_without_exception_text(self):
+        with patch.object(bootstrap, "_load_control_sibling", side_effect=ImportError("raw import detail")):
+            with self.assertRaises(bootstrap.Refusal) as caught:
+                bootstrap._start_network_observation(binding_value(), SOURCE)
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("runner_controls_unavailable", "observer_import"))
+        self.assertNotIn("raw import detail", str(caught.exception))
+
+    def test_trusted_interface_failure_preserves_only_approved_reason_and_leaf(self):
+        def fail_start(*args):
+            raise self.ObserverRefusal("interface_unavailable", "interface_hardware")
+
+        observer = SimpleNamespace(
+            ObserverRefusal=self.ObserverRefusal,
+            ObservationSession=self.ObservationSession,
+            start_observation=fail_start,
+        )
+        with patch.object(bootstrap, "_load_control_sibling", return_value=observer):
+            with self.assertRaises(bootstrap.Refusal) as caught:
+                bootstrap._start_network_observation(binding_value(), SOURCE)
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("interface_unavailable", "observer_interface_hardware"))
+
+    def test_unknown_or_untrusted_observer_exception_stays_generic(self):
+        class UntrustedFailure(Exception):
+            reason = "interface_unavailable"
+            stage = "interface_hardware"
+
+        def fail_start(*args):
+            raise UntrustedFailure("untrusted detail")
+
+        observer = SimpleNamespace(
+            ObserverRefusal=self.ObserverRefusal,
+            ObservationSession=self.ObservationSession,
+            start_observation=fail_start,
+        )
+        with patch.object(bootstrap, "_load_control_sibling", return_value=observer):
+            with self.assertRaises(bootstrap.Refusal) as caught:
+                bootstrap._start_network_observation(binding_value(), SOURCE)
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("runner_controls_unavailable", "runner_controls"))
+        self.assertNotIn("untrusted detail", str(caught.exception))
+
+        def unknown_start(*args):
+            raise self.ObserverRefusal("unsafe detail", "interface_hardware")
+
+        observer.start_observation = unknown_start
+        with patch.object(bootstrap, "_load_control_sibling", return_value=observer):
+            with self.assertRaises(bootstrap.Refusal) as caught:
+                bootstrap._start_network_observation(binding_value(), SOURCE)
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("runner_controls_unavailable", "runner_controls"))
+        self.assertNotIn("unsafe detail", str(caught.exception))
 
     def test_real_observer_record_schema_matches_wrapper_without_host_capture(self):
         observer = bootstrap._load_control_sibling("macos_network_observer")
@@ -722,22 +794,42 @@ class NetworkObservationTests(unittest.TestCase):
         )
         for changes in cases:
             with self.subTest(keys=tuple(changes)):
-                with self.assertRaisesRegex(bootstrap.Refusal, "runner_controls_unavailable"):
+                with self.assertRaises(bootstrap.Refusal) as caught:
                     bootstrap._validate_network_record(
                         network_record_value(**changes), binding_value(), SOURCE
                     )
+                self.assertEqual((caught.exception.reason, caught.exception.stage),
+                                 ("runner_controls_unavailable", "observer_record"))
 
-    def test_observer_cleanup_refusal_stays_a_cleanup_failure(self):
-        class CleanupError(Exception):
-            reason = "cleanup_incomplete"
-            stage = "cleanup"
+    def test_observer_finish_preserves_approved_finish_leaf(self):
+        observer = SimpleNamespace(ObserverRefusal=self.ObserverRefusal)
 
         class Session:
             def finish(self):
-                raise CleanupError("closed observer cleanup refusal")
+                raise NetworkObservationTests.ObserverRefusal("observer_unavailable", "finish")
+
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._finish_network_observation(observer, Session(), binding_value(), SOURCE)
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("observer_unavailable", "observer_finish"))
+
+    def test_observer_cleanup_refusal_stays_a_cleanup_failure(self):
+        observer = SimpleNamespace(ObserverRefusal=self.ObserverRefusal)
+
+        class Session:
+            def finish(self):
+                raise NetworkObservationTests.ObserverRefusal("cleanup_incomplete", "cleanup")
 
         with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete"):
-            bootstrap._finish_network_observation(Session(), binding_value(), SOURCE)
+            bootstrap._finish_network_observation(observer, Session(), binding_value(), SOURCE)
+
+    def test_missing_observer_marker_has_a_fixed_leaf(self):
+        for lifecycle in ({}, {"network_observation_marker": "untrusted marker"}):
+            with self.subTest(lifecycle=tuple(lifecycle)):
+                with self.assertRaises(bootstrap.Refusal) as caught:
+                    bootstrap._required_network_marker(lifecycle)
+                self.assertEqual((caught.exception.reason, caught.exception.stage),
+                                 ("runner_controls_unavailable", "observer_missing"))
 
 
 class SummaryGuardTests(unittest.TestCase):

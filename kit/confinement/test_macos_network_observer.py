@@ -152,6 +152,166 @@ class InterfaceTests(unittest.TestCase):
         self.assertEqual(result, frozenset(("192.0.2.10", "fe80::1", "::1")))
 
 
+class PhysicalInterfaceTests(unittest.TestCase):
+    def test_system_interfaces_uses_fixed_hardware_capture_and_address_commands(self):
+        hardware = b"Hardware Port: Wi-Fi\nDevice: en0\n"
+        capture = b"1.en0 [Up, Running, Wireless, Associated]\n2.lo0 [Up, Running, Loopback]\n"
+        addresses = b"en0: flags=8863<UP,RUNNING>\n inet 192.0.2.10 netmask 0xffffff00\n inet6 fe80::1%en0 prefixlen 64\n"
+        with patch.object(observer, "_run_fixed_command", side_effect=(hardware, capture, addresses)) as command:
+            interfaces = observer._system_interfaces()
+        self.assertEqual(
+            interfaces,
+            ({"name": "en0", "addresses": frozenset(("192.0.2.10", "fe80::1"))},),
+        )
+        self.assertEqual(
+            [call.args for call in command.call_args_list],
+            [
+                ((observer.NETWORKSETUP_PATH, "-listallhardwareports"), "interface_hardware"),
+                ((observer.TCPDUMP_PATH, "-D"), "interface_capture"),
+                ((observer.IFCONFIG_PATH, "en0"), "interface_address"),
+            ],
+        )
+
+    def test_system_interfaces_refuses_without_a_running_hardware_capture(self):
+        hardware = b"Hardware Port: Wi-Fi\nDevice: en0\n"
+        capture = b"1.en0 [Down]\n2.lo0 [Up, Running, Loopback]\n"
+        with patch.object(observer, "_run_fixed_command", side_effect=(hardware, capture)):
+            with self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._system_interfaces()
+        self.assertEqual((caught.exception.reason, caught.exception.stage), ("interface_unavailable", "interface_capture"))
+
+    def test_system_interfaces_refuses_when_hardware_inventory_has_no_physical_device(self):
+        hardware = b"Hardware Port: Wi-Fi\nDevice: bridge0\n"
+        capture = b"1.en0 [Up, Running]\n"
+        with patch.object(observer, "_run_fixed_command", side_effect=(hardware, capture)):
+            with self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._system_interfaces()
+        self.assertEqual((caught.exception.reason, caught.exception.stage), ("interface_unavailable", "interface_hardware"))
+
+    def test_physical_discovery_parser_failures_keep_their_fixed_leaf_stage(self):
+        for parser, stage in (
+            (observer._parse_hardware_devices, "interface_hardware"),
+            (observer._parse_capture_devices, "interface_capture"),
+            (observer._parse_local_addresses, "interface_address"),
+        ):
+            with self.subTest(stage=stage), self.assertRaises(observer.ObserverRefusal) as caught:
+                parser(b"\xff\n", stage)
+            self.assertEqual((caught.exception.reason, caught.exception.stage), ("interface_unavailable", stage))
+
+    def test_address_command_refusal_uses_the_address_stage(self):
+        hardware = b"Hardware Port: Wi-Fi\nDevice: en0\n"
+        capture = b"1.en0 [Up, Running]\n"
+        with patch.object(
+            observer,
+            "_run_fixed_command",
+            side_effect=(hardware, capture, observer.ObserverRefusal("observer_unavailable", "interface_address")),
+        ):
+            with self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._system_interfaces()
+        self.assertEqual((caught.exception.reason, caught.exception.stage), ("observer_unavailable", "interface_address"))
+
+
+class PhysicalSelftestTests(unittest.TestCase):
+    def _binding(self):
+        return observer._validated_binding(CONTROL_SHA, RUN_ID, RUN_ATTEMPT, None)
+
+    def _zero_traffic_record(self, **changes):
+        record = valid_record(
+            interface_count=1,
+            dns_query_count=0,
+            tcp_syn_count=0,
+            dns_name_hashes=[],
+            tcp_destination_hashes=[],
+        )
+        record.update(changes)
+        return record
+
+    def test_physical_capture_uses_system_discovery_and_accepts_zero_traffic(self):
+        class Session:
+            _captures = (object(),)
+
+            def __init__(self, record):
+                self.record = record
+                self.finish_calls = 0
+
+            def finish(self):
+                self.finish_calls += 1
+                return self.record
+
+        hardware = b"Hardware Port: Wi-Fi\nDevice: en0\n"
+        capture = b"1.en0 [Up, Running, Wireless, Associated]\n"
+        addresses = b"en0: flags=8863<UP,RUNNING>\n inet 192.0.2.10 netmask 0xffffff00\n"
+        session = Session(self._zero_traffic_record())
+        with patch.object(observer, "_require_macos_root"), \
+                patch.object(observer, "_run_fixed_command", side_effect=(hardware, capture, addresses)), \
+                patch.object(observer, "_start_session", return_value=session) as start:
+            observer._physical_selftest_capture(self._binding())
+        interface = {"name": "en0", "addresses": frozenset(("192.0.2.10",))}
+        expression = observer._capture_filter(frozenset((53,)), frozenset((53,)))
+        start.assert_called_once_with(
+            self._binding(),
+            (interface,),
+            frozenset((53,)),
+            frozenset((53,)),
+            {"en0": expression},
+        )
+        self.assertEqual(session.finish_calls, 1)
+
+    def test_physical_capture_requires_unlimited_complete_private_cleanup(self):
+        for changes in (
+            {"capture_limited": True},
+            {"cleanup": "incomplete"},
+            {"interface_count": 2},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._validate_physical_selftest_record(
+                    self._zero_traffic_record(**changes), self._binding(), 1,
+                )
+            self.assertEqual((caught.exception.reason, caught.exception.stage), ("capture_invalid", "finish"))
+
+    def test_physical_capture_cleanup_failure_is_preserved(self):
+        class Session:
+            def finish(self):
+                raise observer.ObserverRefusal("cleanup_incomplete", "cleanup")
+
+        interface = {"name": "en0", "addresses": frozenset(("192.0.2.10",))}
+        with patch.object(observer, "_require_macos_root"), \
+                patch.object(observer, "_system_interfaces", return_value=(interface,)), \
+                patch.object(observer, "_start_session", return_value=Session()):
+            with self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._physical_selftest_capture(self._binding())
+        self.assertEqual((caught.exception.reason, caught.exception.stage), ("cleanup_incomplete", "cleanup"))
+
+    def test_physical_failure_stops_before_loopback_without_fallback(self):
+        failure = observer.ObserverRefusal("interface_unavailable", "interface_capture")
+        with patch.object(observer, "_require_macos_root"), \
+                patch.object(observer, "_physical_selftest_capture", side_effect=failure) as physical, \
+                patch.object(observer, "_tcpdump_interfaces") as loopback:
+            with self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._selftest_record(self._binding())
+        physical.assert_called_once_with(self._binding())
+        loopback.assert_not_called()
+        self.assertIs(caught.exception, failure)
+
+    def test_loopback_positive_path_remains_required_after_physical_capture(self):
+        events = []
+
+        def physical(binding):
+            events.append("physical")
+
+        def loopback():
+            events.append("loopback")
+            return {}
+
+        with patch.object(observer, "_require_macos_root"), \
+                patch.object(observer, "_physical_selftest_capture", side_effect=physical), \
+                patch.object(observer, "_tcpdump_interfaces", side_effect=loopback):
+            with self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._selftest_record(self._binding())
+        self.assertEqual(events, ["physical", "loopback"])
+        self.assertEqual((caught.exception.reason, caught.exception.stage), ("interface_unavailable", "interface"))
+
+
 class CaptureParserTests(unittest.TestCase):
     def test_dns_and_outbound_syn_are_counted_and_only_hmacs_are_returned(self):
         query = dns_query(DNS_NAME)
@@ -597,6 +757,17 @@ class OutputContractTests(unittest.TestCase):
                 self.assertEqual(len(output.getvalue().splitlines()), 1)
                 self.assertIn("reason=" + reason, output.getvalue())
                 self.assertNotIn("Traceback", output.getvalue())
+
+    def test_physical_discovery_refusal_line_contains_only_the_closed_leaf_stage(self):
+        line = observer._format_refusal_line(
+            observer.ObserverRefusal("interface_unavailable", "interface_address"),
+            CONTROL_SHA,
+            RUN_ID,
+            RUN_ATTEMPT,
+        )
+        self.assertIn("reason=interface_unavailable stage=interface_address", line)
+        self.assertNotIn(LOCAL_V4, line)
+        self.assertNotIn("Traceback", line)
 
     def test_refusal_diagnostics_are_fixed_and_bind_expected_fixture_hashes(self):
         details = observer._selftest_diagnostics(
