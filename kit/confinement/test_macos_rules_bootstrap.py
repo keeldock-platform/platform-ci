@@ -88,6 +88,31 @@ def review_environment(request=None):
     return environment
 
 
+def extract_verified_fixture(bottle, formula_sha256=None):
+    with patch.object(bootstrap, "DASH_BOTTLE_SHA256", hashlib.sha256(bottle).hexdigest()):
+        if formula_sha256 is None:
+            return bootstrap._extract_dash_member(bottle)
+        with patch.object(bootstrap, "DASH_FORMULA_SHA256", formula_sha256):
+            return bootstrap._extract_dash_member(bottle)
+
+
+def bottle_fixture(entries):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        for name in ("dash-shell", "dash-shell/0.5.13.5", "dash-shell/0.5.13.5/bin",
+                     "dash-shell/0.5.13.5/.brew"):
+            directory = tarfile.TarInfo(name)
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            archive.addfile(directory)
+        for name, payload, mode in entries:
+            member = tarfile.TarInfo(name)
+            member.size = len(payload)
+            member.mode = mode
+            archive.addfile(member, io.BytesIO(payload))
+    return output.getvalue()
+
+
 class RequestAndGateTests(unittest.TestCase):
     def test_request_is_exact_fixed_schema(self):
         parsed = bootstrap._parse_request((
@@ -294,6 +319,7 @@ class RequestAndGateTests(unittest.TestCase):
 class PublicBottleTests(unittest.TestCase):
     def test_bottle_urls_are_fixed_public_reads(self):
         self.assertEqual(bootstrap.DASH_BOTTLE_SHA256, "0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0")
+        self.assertEqual(bootstrap.DASH_FORMULA_SHA256, "7a414fa6d299c0697053cb3f796b94d13682cd43c20e8ba62ce515cb3a1c3d14")
         self.assertTrue(bootstrap.DASH_BOTTLE_URL.startswith("https://ghcr.io/v2/homebrew/core/dash-shell/blobs/"))
         token_url = urllib.parse.urlsplit(bootstrap.DASH_TOKEN_URL)
         self.assertEqual((token_url.scheme, token_url.netloc, token_url.path), ("https", "ghcr.io", "/token"))
@@ -351,8 +377,9 @@ class PublicBottleTests(unittest.TestCase):
         self.assertIsNone(redirected)
 
     def test_invalid_tar_is_closed_refusal(self):
+        bottle = b"not a tarball"
         with self.assertRaises(bootstrap.Refusal) as caught:
-            bootstrap._extract_dash_member(b"not a tarball")
+            extract_verified_fixture(bottle)
         self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
         self.assertEqual(caught.exception.stage, "dash_archive_structure")
 
@@ -385,8 +412,66 @@ class PublicBottleTests(unittest.TestCase):
                     "hdrcharset": "UTF-8",
                 }
                 archive.addfile(member, io.BytesIO(payload))
-        with patch.object(bootstrap, "DASH_FORMULA_SHA256", hashlib.sha256(formula).hexdigest()):
-            self.assertEqual(bootstrap._extract_dash_member(output.getvalue()), binary)
+        self.assertEqual(
+            extract_verified_fixture(output.getvalue(), hashlib.sha256(formula).hexdigest()), binary,
+        )
+
+    def test_archive_content_failures_have_closed_stages_and_public_digest(self):
+        binary = b"public dash fixture bytes\n"
+        formula = b"historical formula fixture\n"
+        cases = (
+            ((bootstrap.DASH_FORMULA_MEMBER, formula, 0o644), "dash_archive_binary_missing"),
+            ((bootstrap.DASH_BINARY_MEMBER, binary, 0o755), "dash_archive_formula_missing"),
+        )
+        for entry, expected_stage in cases:
+            with self.subTest(stage=expected_stage):
+                bottle = bottle_fixture((entry,))
+                with self.assertRaises(bootstrap.Refusal) as caught:
+                    extract_verified_fixture(bottle)
+                self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
+                self.assertEqual(caught.exception.stage, expected_stage)
+                line = bootstrap._format_refusal(
+                    caught.exception,
+                    {"CI_SHA": CONTROL, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"},
+                )
+                self.assertNotIn("embedded-formula-sha256=", line)
+
+        bottle = bottle_fixture((
+            (bootstrap.DASH_BINARY_MEMBER, binary, 0o755),
+            (bootstrap.DASH_FORMULA_MEMBER, formula, 0o644),
+        ))
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            extract_verified_fixture(bottle)
+        self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
+        self.assertEqual(caught.exception.stage, "dash_archive_formula_digest_mismatch")
+        self.assertEqual(caught.exception.embedded_formula_sha256, hashlib.sha256(formula).hexdigest())
+        self.assertEqual(
+            caught.exception.verified_bottle_sha256,
+            hashlib.sha256(bottle).hexdigest(),
+        )
+        with patch.object(bootstrap, "DASH_BOTTLE_SHA256", hashlib.sha256(bottle).hexdigest()):
+            line = bootstrap._format_refusal(
+                caught.exception,
+                {"CI_SHA": CONTROL, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"},
+            )
+        self.assertTrue(line.endswith("embedded-formula-sha256=" + hashlib.sha256(formula).hexdigest()))
+        self.assertNotIn("historical formula fixture", line)
+        self.assertNotIn(bootstrap.DASH_FORMULA_MEMBER, line)
+
+    def test_unpinned_bottle_cannot_emit_formula_digest(self):
+        formula = b"historical formula fixture\n"
+        bottle = bottle_fixture((
+            (bootstrap.DASH_BINARY_MEMBER, b"public dash fixture bytes\n", 0o755),
+            (bootstrap.DASH_FORMULA_MEMBER, formula, 0o644),
+        ))
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._extract_dash_member(bottle)
+        self.assertEqual(caught.exception.stage, "dash_download")
+        line = bootstrap._format_refusal(
+            caught.exception,
+            {"CI_SHA": CONTROL, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"},
+        )
+        self.assertNotIn("embedded-formula-sha256=", line)
 
     def test_pax_path_link_size_and_sparse_overrides_are_closed_refusals(self):
         for key, value in (
@@ -404,7 +489,7 @@ class PublicBottleTests(unittest.TestCase):
                     member.pax_headers = {key: value}
                     archive.addfile(member, io.BytesIO(b"x"))
                 with self.assertRaises(bootstrap.Refusal) as caught:
-                    bootstrap._extract_dash_member(output.getvalue())
+                    extract_verified_fixture(output.getvalue())
                 self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
                 self.assertEqual(caught.exception.stage, "dash_archive_pax_metadata")
 
@@ -416,7 +501,7 @@ class PublicBottleTests(unittest.TestCase):
             link.linkname = "../../etc/passwd"
             archive.addfile(link)
         with self.assertRaises(bootstrap.Refusal) as caught:
-            bootstrap._extract_dash_member(output.getvalue())
+            extract_verified_fixture(output.getvalue())
         self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
         self.assertEqual(caught.exception.stage, "dash_archive_member")
 
@@ -429,7 +514,7 @@ class PublicBottleTests(unittest.TestCase):
             member.size = 1
             archive.addfile(member, io.BytesIO(b"x"))
         with self.assertRaises(bootstrap.Refusal) as caught:
-            bootstrap._extract_dash_member(output.getvalue())
+            extract_verified_fixture(output.getvalue())
         self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
         self.assertEqual(caught.exception.stage, "dash_archive_member")
 

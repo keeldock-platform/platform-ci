@@ -51,7 +51,7 @@ TOKEN_RE = re.compile(r"[!-~]{1,4096}\Z")
 
 DASH_FORMULA = "homebrew/core/dash-shell"
 DASH_VERSION = "0.5.13.5"
-DASH_FORMULA_SHA256 = "0ca80aa6b79a6eab267ebdc733692c55f0e47d3af6eedc15beffab717ad96ad5"
+DASH_FORMULA_SHA256 = "7a414fa6d299c0697053cb3f796b94d13682cd43c20e8ba62ce515cb3a1c3d14"
 DASH_BOTTLE_SHA256 = "0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0"
 DASH_BOTTLE_URL = (
     "https://ghcr.io/v2/homebrew/core/dash-shell/blobs/sha256:" + DASH_BOTTLE_SHA256
@@ -90,7 +90,9 @@ REASONS = frozenset((
 STAGES = frozenset((
     "arguments", "context", "bootstrap_gate", "developer_mode", "plan_snapshot", "dash_download",
     "dash_archive", "dash_archive_structure", "dash_archive_pax_metadata",
-    "dash_archive_member", "dash_archive_content", "dash_verify", "toolchain", "runner_controls", "identity",
+    "dash_archive_member", "dash_archive_content", "dash_archive_binary_missing",
+    "dash_archive_formula_missing", "dash_archive_formula_digest_mismatch",
+    "dash_verify", "toolchain", "runner_controls", "identity",
     "storage", "source_lease", "source_identity", "source_tree", "summary_guard",
     *GATES, "cleanup",
 ))
@@ -189,9 +191,19 @@ os.write(1, b"plan-id-snapshot=read-only\n")
 
 
 class Refusal(Exception):
-    def __init__(self, reason, stage):
+    def __init__(self, reason, stage, *, embedded_formula_sha256=None, verified_bottle_sha256=None):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "context"
+        self.embedded_formula_sha256 = (
+            embedded_formula_sha256
+            if type(embedded_formula_sha256) is str and SHA256_RE.fullmatch(embedded_formula_sha256)
+            else None
+        )
+        self.verified_bottle_sha256 = (
+            verified_bottle_sha256
+            if type(verified_bottle_sha256) is str and SHA256_RE.fullmatch(verified_bottle_sha256)
+            else None
+        )
         super().__init__(self.reason)
 
 
@@ -526,6 +538,9 @@ def _extract_dash_member(bottle):
     try:
         if type(bottle) is not bytes or len(bottle) > MAX_BOTTLE_BYTES:
             raise Refusal("dash_bottle_invalid", "dash_archive_structure")
+        actual_bottle_sha256 = hashlib.sha256(bottle).hexdigest()
+        if actual_bottle_sha256 != DASH_BOTTLE_SHA256:
+            raise Refusal("dash_bottle_invalid", "dash_download")
         try:
             inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
             unpacked = inflater.decompress(bottle, MAX_BOTTLE_TOTAL_BYTES + 1)
@@ -594,8 +609,19 @@ def _extract_dash_member(bottle):
         raise
     except BaseException:
         raise Refusal("dash_bottle_invalid", "dash_archive") from None
-    if (not binary or formula is None or hashlib.sha256(formula).hexdigest() != DASH_FORMULA_SHA256):
+    if binary is None:
+        raise Refusal("dash_bottle_invalid", "dash_archive_binary_missing")
+    if not binary:
         raise Refusal("dash_bottle_invalid", "dash_archive_content")
+    if formula is None:
+        raise Refusal("dash_bottle_invalid", "dash_archive_formula_missing")
+    embedded_formula_sha256 = hashlib.sha256(formula).hexdigest()
+    if embedded_formula_sha256 != DASH_FORMULA_SHA256:
+        raise Refusal(
+            "dash_bottle_invalid", "dash_archive_formula_digest_mismatch",
+            embedded_formula_sha256=embedded_formula_sha256,
+            verified_bottle_sha256=actual_bottle_sha256,
+        )
     return binary
 
 
@@ -1585,11 +1611,18 @@ def _format_refusal(error, environ, lifecycle=None):
             token_revocation = value
         else:
             token_revocation = "unconfirmed"
-    return (
+    line = (
         "macos-rules-bootstrap=refused schema=1 reason=" + reason + " stage=" + stage
         + " control-sha=" + control + " run-id=" + run_id + " run-attempt=" + attempt
         + " token-revocation=" + token_revocation
     )
+    if (type(error) is Refusal and reason == "dash_bottle_invalid"
+            and stage == "dash_archive_formula_digest_mismatch"
+            and error.verified_bottle_sha256 == DASH_BOTTLE_SHA256
+            and type(error.embedded_formula_sha256) is str
+            and SHA256_RE.fullmatch(error.embedded_formula_sha256)):
+        line += " embedded-formula-sha256=" + error.embedded_formula_sha256
+    return line
 
 
 def _validate_cli(argv):
