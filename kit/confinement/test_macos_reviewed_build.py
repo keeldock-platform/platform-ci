@@ -109,8 +109,10 @@ class ToolchainProvenanceTests(unittest.TestCase):
             side_effect=lambda path, directory=False: Path(path),
         ):
             with patch.object(reviewed_build, "_run_command", return_value=result):
-                with self.assertRaisesRegex(reviewed_build.Refusal, "toolchain_unavailable"):
+                with self.assertRaises(reviewed_build.Refusal) as raised:
                     reviewed_build._selected_xcode_directory()
+        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
+        self.assertEqual(raised.exception.stage, "xcode_select_path")
 
     def test_host_versions_bind_xcodebuild_to_selected_xcode_and_keep_compiler_origin(self):
         selected_xcode = Path("/Applications/Xcode_26.1.app/Contents/Developer")
@@ -148,6 +150,117 @@ class ToolchainProvenanceTests(unittest.TestCase):
                 with patch.object(reviewed_build, "_selected_xcode_directory", return_value=selected_xcode):
                     with self.assertRaisesRegex(reviewed_build.Refusal, "toolchain_unavailable"):
                         reviewed_build._host_identity(binding_environment(), different_xcode)
+
+    def test_selector_resolution_and_query_failures_have_distinct_fixed_stages(self):
+        with patch.object(
+            reviewed_build.capability,
+            "_resolve_trusted_path",
+            side_effect=reviewed_build.capability.ProbeFailure("native_preflight_unavailable"),
+        ):
+            with self.assertRaises(reviewed_build.Refusal) as raised:
+                reviewed_build._selected_xcode_directory()
+        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
+        self.assertEqual(raised.exception.stage, "xcode_select_path")
+
+        selector = Path("/usr/bin/xcode-select")
+        malformed_query = subprocess.CompletedProcess(("xcode-select",), 0, b"bad\npath\n", b"")
+        with patch.object(
+            reviewed_build.capability,
+            "_resolve_trusted_path",
+            return_value=selector,
+        ):
+            with patch.object(reviewed_build, "_run_command", return_value=malformed_query):
+                with self.assertRaises(reviewed_build.Refusal) as raised:
+                    reviewed_build._selected_xcode_directory()
+        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
+        self.assertEqual(raised.exception.stage, "xcode_select_query")
+
+        failed_query = subprocess.CompletedProcess(("xcode-select",), 1, b"", b"private diagnostic")
+        with patch.object(
+            reviewed_build.capability,
+            "_resolve_trusted_path",
+            return_value=selector,
+        ):
+            with patch.object(reviewed_build, "_run_command", return_value=failed_query):
+                with self.assertRaises(reviewed_build.Refusal) as raised:
+                    reviewed_build._selected_xcode_directory()
+        self.assertEqual(raised.exception.stage, "xcode_select_query")
+        self.assertNotIn("private diagnostic", str(raised.exception))
+
+
+class ToolchainStageTests(unittest.TestCase):
+    def test_missing_capability_module_has_a_fixed_stage(self):
+        with patch.object(reviewed_build, "capability", None):
+            with self.assertRaises(reviewed_build.Refusal) as raised:
+                reviewed_build._run_synthetic_smoke(CONTROL_SHA)
+        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
+        self.assertEqual(raised.exception.stage, "toolchain_module")
+
+    def test_trusted_toolchain_failure_has_a_fixed_stage(self):
+        failure = reviewed_build.capability.ProbeFailure("native_preflight_unavailable")
+        with patch.object(reviewed_build, "_safe_context", return_value=({}, Path("/tmp/root"))):
+            with patch.object(
+                reviewed_build.capability,
+                "_resolve_trusted_toolchain",
+                side_effect=failure,
+            ):
+                with self.assertRaises(reviewed_build.Refusal) as raised:
+                    reviewed_build._run_synthetic_smoke(CONTROL_SHA)
+        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
+        self.assertEqual(raised.exception.stage, "toolchain_resolve")
+
+    def test_host_version_queries_report_only_their_fixed_stage(self):
+        selected_xcode = Path("/Applications/Xcode_26.1.app/Contents/Developer")
+        toolchain = {
+            "developer_directory": "/Library/Developer/CommandLineTools",
+            "clang": "/Library/Developer/CommandLineTools/usr/bin/clang",
+        }
+        valid_sw_vers = subprocess.CompletedProcess(("sw_vers",), 0, b"15.7.9\n", b"")
+        valid_xcode = subprocess.CompletedProcess(
+            ("xcodebuild",), 0, b"Xcode 26.1\nBuild version 17B55\n", b"",
+        )
+        valid_clang = subprocess.CompletedProcess(
+            ("clang",), 0, b"Apple clang version 17.0.0 (clang-1700.0.13.3)\n", b"",
+        )
+        cases = (
+            (
+                (valid_sw_vers, subprocess.CompletedProcess(("xcodebuild",), 1, b"", b"private diagnostic")),
+                "xcode_version",
+            ),
+            (
+                (valid_sw_vers, valid_xcode,
+                 subprocess.CompletedProcess(("clang",), 1, b"", b"private diagnostic")),
+                "clang_version",
+            ),
+            (
+                (valid_sw_vers, valid_xcode, valid_clang,
+                 subprocess.CompletedProcess(("xcrun",), 1, b"", b"private diagnostic")),
+                "sdk_version",
+            ),
+        )
+        for results, expected_stage in cases:
+            with self.subTest(stage=expected_stage):
+                with patch.object(reviewed_build.platform, "system", return_value="Darwin"):
+                    with patch.object(reviewed_build.platform, "machine", return_value="arm64"):
+                        with patch.object(reviewed_build, "_selected_xcode_directory", return_value=selected_xcode):
+                            with patch.object(reviewed_build, "_run_command", side_effect=results):
+                                with self.assertRaises(reviewed_build.Refusal) as raised:
+                                    reviewed_build._host_identity(binding_environment(), toolchain)
+                self.assertEqual(raised.exception.reason, "toolchain_unavailable")
+                self.assertEqual(raised.exception.stage, expected_stage)
+
+    def test_command_failure_does_not_expose_process_diagnostics(self):
+        with patch.object(subprocess, "run", side_effect=OSError("private diagnostic")):
+            with self.assertRaises(reviewed_build.Refusal) as raised:
+                reviewed_build._run_command(
+                    ("/usr/bin/xcodebuild", "-version"),
+                    env={},
+                    timeout=1,
+                    failure_stage="xcode_version",
+                )
+        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
+        self.assertEqual(raised.exception.stage, "xcode_version")
+        self.assertNotIn("private diagnostic", str(raised.exception))
 
 
 class ChildEnvironmentTests(unittest.TestCase):
