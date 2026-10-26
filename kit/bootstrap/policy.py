@@ -884,6 +884,15 @@ jobs:
           mode: read
           path: ${{ runner.temp }}/macos-public-cache/fixture.txt
           key: macos-public-cache-seed-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Verify the none-scoped read did not restore bytes
+        env:
+          CACHE_HIT: ${{ steps.denied-restore.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ ( -n "$CACHE_HIT" && "$CACHE_HIT" != "false" ) || -e "$RUNNER_TEMP/macos-public-cache/fixture.txt" ]]; then
+            exit 1
+          fi
+          printf 'macos-cache-none-read=local-absent schema=1 run-id=%s run-attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
       - name: Prepare a distinct public write probe
         run: |
           set -euo pipefail
