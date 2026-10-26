@@ -18,6 +18,7 @@ import time
 from types import MappingProxyType
 import unicodedata
 from pathlib import Path
+import weakref
 
 
 try:
@@ -74,6 +75,7 @@ except BaseException:
 SCHEMA_VERSION = 1
 SOURCE_SHA_PATTERN = re.compile(r"[a-f0-9]{40}\Z")
 REPOSITORY_ID_PATTERN = re.compile(r"[1-9][0-9]{0,18}\Z")
+SOURCE_TOKEN_PATTERN = re.compile(r"[!-~]{1,4096}\Z")
 RUN_ID_PATTERN = re.compile(r"[1-9][0-9]{0,18}\Z")
 RUN_ATTEMPT_PATTERN = re.compile(r"[1-9][0-9]{0,18}\Z")
 OWNER_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
@@ -125,6 +127,17 @@ class Refusal(Exception):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "input"
         super().__init__(self.reason)
+
+
+_REVOCATION_PROOF_SEAL = object()
+_REVOCATION_PROOFS = weakref.WeakKeyDictionary()
+
+
+class RevocationState:
+    __slots__ = ("__weakref__",)
+
+    def __repr__(self):
+        return "RevocationState"
 
 
 @dataclass(frozen=True, repr=False)
@@ -1128,13 +1141,17 @@ def _assert_worker_absent(worker_uid, python_executable):
         raise Refusal("cleanup_incomplete", "cleanup") from None
 
 
+def _worktree_add_arguments(git_executable, source_path, commit):
+    return (
+        git_executable, "worktree", "add", "--quiet", "--detach", "--no-checkout",
+        str(source_path), commit,
+    )
+
+
 def _checkout_source(repository, git_executable, repo_env, temporary, commit):
     source_path = temporary / "source"
     add_result = _run_process(
-        (
-            git_executable, "worktree", "add", "--detach", "--no-checkout",
-            str(source_path), commit,
-        ),
+        _worktree_add_arguments(git_executable, source_path, commit),
         cwd=repository,
         environ=repo_env,
     )
@@ -1240,35 +1257,85 @@ def _verify_commit(repository, git_executable, repo_env, ssh_keygen, allowed_pat
         raise Refusal("signature_invalid", "signature")
 
 
-def _revoke_token(reader, environ):
+def _reader_revocation_passed(result):
+    return (
+        type(result) is dict
+        and set(result) == {
+            "schema_version", "status", "reason", "repository_scope", "metadata", "revocation",
+        }
+        and type(result.get("schema_version")) is int
+        and result.get("schema_version") == 1
+        and result.get("status") == "passed"
+        and result.get("reason") == "ok"
+        and result.get("repository_scope") == "verified"
+        and result.get("metadata") == "verified"
+        and result.get("revocation") == "confirmed"
+    )
+
+
+def _restore_token_if_missing(environ, token_name, token):
     try:
-        if environ is os.environ:
-            result = reader.run()
-        else:
-            result = reader.run(environ=environ)
-        if type(environ) is dict:
-            environ.pop(reader.TOKEN_ENV, None)
-        elif environ is os.environ:
-            os.environ.pop(reader.TOKEN_ENV, None)
-        if (
-            type(result) is not dict
-            or set(result) != {
-                "schema_version", "status", "reason", "repository_scope", "metadata", "revocation",
-            }
-            or type(result.get("schema_version")) is not int
-            or result.get("schema_version") != 1
-            or result.get("status") != "passed"
-            or result.get("reason") != "ok"
-            or result.get("repository_scope") != "verified"
-            or result.get("metadata") != "verified"
-            or result.get("revocation") != "confirmed"
-        ):
-            raise Refusal("revocation_unconfirmed", "revoke")
-        return result
-    except Refusal:
-        raise
+        current = environ.get(token_name)
+        if current is None:
+            environ[token_name] = token
+            return True
+        return current == token
     except BaseException:
+        return False
+
+
+def _revoke_token(
+    reader,
+    environ,
+    *,
+    revocation_state=None,
+    retained_token=None,
+    repository_id=None,
+    request=None,
+    binding=None,
+):
+    token_name = reader.TOKEN_ENV
+    token = retained_token
+    if token is None:
+        try:
+            token = environ.get(token_name)
+        except BaseException:
+            token = None
+    if type(token) is not str or SOURCE_TOKEN_PATTERN.fullmatch(token) is None:
+        raise Refusal("revocation_unconfirmed", "revoke")
+    try:
+        current_token = environ.get(token_name)
+    except BaseException:
+        current_token = None
+    if current_token != token:
+        raise Refusal("revocation_unconfirmed", "revoke")
+    if revocation_state is not None and _revocation_proof_values(
+        token, repository_id, request, binding,
+    ) is None:
+        raise Refusal("revocation_unconfirmed", "revoke")
+    try:
+        result = reader.run(environ=environ)
+    except BaseException:
+        _restore_token_if_missing(environ, token_name, token)
         raise Refusal("revocation_unconfirmed", "revoke") from None
+    if not _reader_revocation_passed(result):
+        _restore_token_if_missing(environ, token_name, token)
+        raise Refusal("revocation_unconfirmed", "revoke")
+    if revocation_state is not None:
+        try:
+            _record_revocation_proof(
+                revocation_state, token, repository_id, request, binding,
+            )
+        except Refusal:
+            _restore_token_if_missing(environ, token_name, token)
+            raise
+    try:
+        environ.pop(token_name, None)
+        if token_name in environ:
+            raise OSError
+    except BaseException:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+    return result
 
 
 def _remove_tree(path):
@@ -1402,12 +1469,82 @@ def _validate_binding(binding):
         raise Refusal("invalid_input", "input")
 
 
+def _revocation_proof_values(token, repository_id, request, binding):
+    try:
+        if type(repository_id) is int and repository_id > 0:
+            repository_text = str(repository_id)
+        elif type(repository_id) is str and REPOSITORY_ID_PATTERN.fullmatch(repository_id) is not None:
+            repository_text = repository_id
+        else:
+            return None
+        if type(token) is not str or SOURCE_TOKEN_PATTERN.fullmatch(token) is None:
+            return None
+        _check_request(request)
+        _validate_binding(binding)
+        token_digest = hashlib.sha256(token.encode("ascii", "strict")).digest()
+        return (
+            _REVOCATION_PROOF_SEAL,
+            token_digest,
+            repository_text,
+            binding["control_sha"],
+            request["source_sha"],
+            request["base_sha"],
+            request["base_branch"],
+            request["concern"],
+            binding["run_id"],
+            binding["run_attempt"],
+        )
+    except BaseException:
+        return None
+
+
+def _record_revocation_proof(state, token, repository_id, request, binding):
+    if type(state) is not RevocationState or state in _REVOCATION_PROOFS:
+        raise Refusal("revocation_unconfirmed", "revoke")
+    values = _revocation_proof_values(token, repository_id, request, binding)
+    if values is None:
+        raise Refusal("revocation_unconfirmed", "revoke")
+    try:
+        _REVOCATION_PROOFS[state] = values
+    except BaseException:
+        raise Refusal("revocation_unconfirmed", "revoke") from None
+
+
+def revocation_confirmed(state, retained_token, expected_repository_id, request, binding):
+    if type(state) is not RevocationState:
+        return False
+    expected = _revocation_proof_values(
+        retained_token, expected_repository_id, request, binding,
+    )
+    if expected is None:
+        return False
+    try:
+        recorded = _REVOCATION_PROOFS.get(state)
+    except BaseException:
+        return False
+    return type(recorded) is tuple and recorded == expected
+
+
 @contextmanager
-def validated_source(request, binding, root, environ, *, worker_uid=None, storage_root=None):
+def validated_source(
+    request,
+    binding,
+    root,
+    environ,
+    *,
+    worker_uid=None,
+    storage_root=None,
+    revocation_state=None,
+):
     _check_request(request)
     _check_rules_bootstrap_gate(request, environ)
     candidate_ref = _check_source_ref_binding(request, environ)
     _validate_binding(binding)
+    if revocation_state is not None and (
+        type(revocation_state) is not RevocationState
+        or revocation_state in _REVOCATION_PROOFS
+    ):
+        raise Refusal("invalid_input", "input")
     current_binding, current_root = _safe_context(binding["control_sha"], environ)
     try:
         supplied_root = Path(root).resolve(strict=True)
@@ -1433,6 +1570,7 @@ def validated_source(request, binding, root, environ, *, worker_uid=None, storag
             candidate_ref=candidate_ref,
             retain=True,
             temp_parent=storage_root if request["concern"] == "rules-bootstrap" else None,
+            revocation_state=revocation_state,
         )
         worker_access = "not_applicable"
         if request["concern"] == "rules-bootstrap":
@@ -1456,7 +1594,7 @@ def validated_source(request, binding, root, environ, *, worker_uid=None, storag
         record["cleanup"] = "lease_open"
         lease = SourceLease(source_path, MappingProxyType(dict(record)))
     except BaseException:
-        _revoke_on_early_refusal(environ)
+        _revoke_on_early_refusal(environ, revocation_state, request, binding)
         cleanup_safe = True
         if request["concern"] == "rules-bootstrap" and temporary is not None:
             try:
@@ -1497,7 +1635,17 @@ def validated_source(request, binding, root, environ, *, worker_uid=None, storag
             raise cleanup_error
 
 
-def _source_snapshot(request, binding, root, environ, *, candidate_ref=None, retain=False, temp_parent=None):
+def _source_snapshot(
+    request,
+    binding,
+    root,
+    environ,
+    *,
+    candidate_ref=None,
+    retain=False,
+    temp_parent=None,
+    revocation_state=None,
+):
     if candidate_ref != _check_source_ref_binding(request, environ):
         raise Refusal("bootstrap_not_approved", "configuration")
     git_executable = _resolve_trusted_executable("/usr/bin/git")
@@ -1509,6 +1657,7 @@ def _source_snapshot(request, binding, root, environ, *, candidate_ref=None, ret
     signer_payload = None
     reader = None
     token = None
+    repository_id = None
     authorization = None
     signer_path = "/".join(SIGNER_PATH_PARTS)
     revocation_result = None
@@ -1609,7 +1758,15 @@ def _source_snapshot(request, binding, root, environ, *, candidate_ref=None, ret
             git_environment.clear()
         if reader is not None and token is not None:
             try:
-                revocation_result = _revoke_token(reader, environ)
+                revocation_result = _revoke_token(
+                    reader,
+                    environ,
+                    revocation_state=revocation_state,
+                    retained_token=token,
+                    repository_id=repository_id,
+                    request=request,
+                    binding=binding,
+                )
             except Refusal as error:
                 pending_failure = error
         authorization = None
@@ -1793,20 +1950,31 @@ def _format_refusal(error, control_sha, environ, request=None):
     )
 
 
-def _revoke_on_early_refusal(environ):
+def _revoke_on_early_refusal(environ, revocation_state=None, request=None, binding=None):
     token_name = "SOURCE_READER_TOKEN"
     token = environ.get(token_name, "")
-    if type(token) is not str or not token:
-        return
+    if type(token) is not str or SOURCE_TOKEN_PATTERN.fullmatch(token) is None:
+        return False
+    repository_id = environ.get(SOURCE_REPOSITORY_ID_ENV, "")
+    if revocation_state is not None and revocation_confirmed(
+        revocation_state, token, repository_id, request, binding,
+    ):
+        return True
     try:
         root = Path(__file__).resolve(strict=True).parents[2]
         reader = _load_source_reader(root)
-        _revoke_token(reader, environ)
+        _revoke_token(
+            reader,
+            environ,
+            revocation_state=revocation_state,
+            retained_token=token,
+            repository_id=repository_id,
+            request=request,
+            binding=binding,
+        )
+        return True
     except BaseException:
-        try:
-            environ.pop(token_name, None)
-        except BaseException:
-            pass
+        return False
 
 
 def main(arguments=None):

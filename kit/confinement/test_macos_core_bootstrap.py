@@ -36,6 +36,72 @@ def _lock(file_digest="a" * 64, hook_path=HOOK_PATH, signature="verified"):
     return ((chr(35) + " generated fixture\n") + "\n".join(lines) + "\n").encode("ascii")
 
 
+def _run_runtime_refusal(reason, stage, proof_confirmed):
+    token = "!" * 32
+
+    class RuntimeRefusal(Exception):
+        def __init__(self, value, where):
+            self.reason = value
+            self.stage = where
+
+    class Runtime:
+        Refusal = RuntimeRefusal
+        RevocationState = type("State", (), {})
+
+        @staticmethod
+        def revocation_confirmed(state, retained_token, repository_id, request, binding):
+            return (
+                state.confirmed is True
+                and retained_token == token
+                and repository_id == "123"
+                and request["source_sha"] == "a" * 40
+                and binding["run_id"] == "12"
+            )
+
+        @staticmethod
+        def validated_source(request, binding, root, environ, *, revocation_state=None):
+            revocation_state.confirmed = proof_confirmed
+            environ.pop("SOURCE_READER_TOKEN", None)
+            raise RuntimeRefusal(reason, stage)
+
+    source_reader = type("Reader", (), {
+        "run": staticmethod(lambda environ: {
+            "schema_version": 1,
+            "status": "refused",
+            "reason": "revocation_unconfirmed",
+            "repository_scope": "unverified",
+            "metadata": "unverified",
+            "revocation": "unconfirmed",
+        }),
+    })
+    environment = {
+        "CI_SHA": "b" * 40,
+        subject.CORE_SOURCE_GATE_ENV: "a" * 40,
+        subject.CORE_CONTROL_GATE_ENV: "b" * 40,
+        "SOURCE_REPOSITORY_ID": "123",
+        "GITHUB_RUN_ID": "12",
+        "GITHUB_RUN_ATTEMPT": "1",
+    }
+    binding = {
+        "control_sha": "b" * 40,
+        "run_id": "12",
+        "run_attempt": "1",
+        "image_os": "macos-15",
+        "image_version": "20261026.1",
+    }
+    with patch.object(subject, "_load_control", return_value=(object(), object(), Runtime)), \
+            patch.object(subject, "_safe_context", return_value=(binding, Path("trusted-root"))), \
+            patch.object(subject, "_verify_control_inventory"), \
+            patch.object(subject, "_run_summary_probe", return_value={}), \
+            patch.object(subject, "_load_control_sibling", return_value=source_reader) as reader_loader:
+        line, status = subject.run(
+            ("--phase", "bootstrap", "--source-sha", "a" * 40, "--token-stdin"),
+            environment,
+            token_reader=io.BytesIO(token.encode("ascii")),
+        )
+    return line, status, environment, reader_loader
+
+
 class InputTests(unittest.TestCase):
     def test_cli_shape_is_closed(self):
         self.assertEqual(
@@ -172,9 +238,14 @@ class InputTests(unittest.TestCase):
 
         class Runtime:
             Refusal = RuntimeRefusal
+            RevocationState = type("State", (), {})
 
             @staticmethod
-            def validated_source(request, binding, root, environ):
+            def revocation_confirmed(state, token, repository_id, request, binding):
+                return False
+
+            @staticmethod
+            def validated_source(request, binding, root, environ, *, revocation_state=None):
                 environ.pop("SOURCE_READER_TOKEN", None)
                 raise RuntimeRefusal("revocation_unconfirmed", "revoke")
 
@@ -218,6 +289,29 @@ class InputTests(unittest.TestCase):
         self.assertIn("reason=cleanup_incomplete stage=cleanup", line)
         self.assertIn("token-revocation=unconfirmed", line)
         self.assertEqual(observed_tokens, [token])
+
+    def test_confirmed_revocation_proof_preserves_before_yield_signature_refusal(self):
+        line, status, environment, reader_loader = _run_runtime_refusal(
+            "signature_invalid", "signature", True,
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("macos-core-bootstrap=refused", line)
+        self.assertIn("reason=signature_invalid stage=source_lease", line)
+        self.assertIn("token-revocation=confirmed", line)
+        self.assertNotIn("macos-core-bootstrap=verified", line)
+        self.assertNotIn("SOURCE_READER_TOKEN", environment)
+        reader_loader.assert_not_called()
+
+    def test_cleanup_refusal_keeps_confirmed_token_receipt_without_acceptance(self):
+        line, status, environment, reader_loader = _run_runtime_refusal(
+            "cleanup_incomplete", "cleanup", True,
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("reason=cleanup_incomplete stage=cleanup", line)
+        self.assertIn("token-revocation=confirmed", line)
+        self.assertNotIn("macos-core-bootstrap=verified", line)
+        self.assertNotIn("SOURCE_READER_TOKEN", environment)
+        reader_loader.assert_not_called()
 
     def test_revoke_fallback_requires_the_exact_reader_record(self):
         good = {

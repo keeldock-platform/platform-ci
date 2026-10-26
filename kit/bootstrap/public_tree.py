@@ -67,13 +67,13 @@ ALLOWED_FILES = {
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
     '.github/workflows/macos-rules-bootstrap.yml': '0a7875b43365267da678157d663873d3f868a0c811b05c4d6091d1bf3e9d5366',
-    '.github/workflows/macos-core-bootstrap.yml': '64ec7aef3be400cdfadbda9b6f902c569abb6ea6488101f306f1880c3bc34e00',
+    '.github/workflows/macos-core-bootstrap.yml': '7c110953eca3e99d502fbf32cb2bd176e4aceb92d22074bd4a5060cb1e4e4597',
     'kit/confinement/macos_rules_bootstrap.py': '7dc297bf39d1cca2bde087ea6e806cea8a88684bc3a3829d0688b43bf1b67fc2',
     'kit/confinement/test_macos_rules_bootstrap.py': '6981c44551604fdd995f7bbac7d269f13557dae1e66ba142e428ac0d88edc82d',
-    'kit/confinement/macos_core_bootstrap.py': 'cafe0f16467225b64d6c4957a8488cf886b81c0036a62ec71735d6c439481d6d',
-    'kit/confinement/test_macos_core_bootstrap.py': 'a0cec855c469b6ef3cf9243f8bf9632ebb8f2d61a42cf9f6e0d306681b20ab22',
-    'kit/confinement/macos_private_validation.py': '39edb976b9a785eacbde659904138d577e5e524432556c86fcbcf0aaa266c3a8',
-    'kit/confinement/test_macos_private_validation.py': '554a86f913c732c9da31426c5065dbdb3b8c0a59581c6c7ac07169eb361dbff8',
+    'kit/confinement/macos_core_bootstrap.py': '8f27ed84b98d2c3fcf45d2c12f330f9a324ab00f542058c8e095765989555b00',
+    'kit/confinement/test_macos_core_bootstrap.py': '0d0bee2301702fa0bcfa97956bd788d8dd743a5eeab14e96fc23186916b6e400',
+    'kit/confinement/macos_private_validation.py': 'de9e453ad6c560b02eb3fa7f3d41a171ff088e4eecef8483a79f49d79423d871',
+    'kit/confinement/test_macos_private_validation.py': '9db800f00d633947d9fb321e9b181b7565ababd94c2fbd7440e15fdb5abaab58',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     ".github/workflows/windows-native-preflight.yml": "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb",
     "kit/confinement/windows_native_preflight.cs": "ba0f8859db9d8bcc1e4c8274520bcb67a3292cb311f553127e1f29fe13838543",
