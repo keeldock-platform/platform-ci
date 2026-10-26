@@ -93,12 +93,27 @@ class SourceReaderPreflightTests(unittest.TestCase):
                     result = source_reader.run(environment(**{source_reader.TOKEN_ENV: token}))
                 self.assertEqual(result["status"], "passed")
 
-    def test_repository_list_without_permissions_object_can_still_be_checked(self):
-        response = repository_list(permissions=None)
-        with patch.object(source_reader, "_exchange", side_effect=((200, response), (200, metadata()), (204, b""), (401, b""))):
-            result = source_reader.run(environment())
+    def test_absent_and_null_repository_permission_metadata_are_accepted(self):
+        absent = json.loads(repository_list())
+        del absent["repositories"][0]["permissions"]
+        responses = (
+            (200, json.dumps(absent).encode("utf-8")),
+            (200, metadata()),
+            (204, b""),
+            (401, b""),
+        )
+        with patch.object(source_reader, "_exchange", side_effect=responses):
+            absent_result = source_reader.run(environment())
 
-        self.assertEqual(result["status"], "passed")
+        with patch.object(
+            source_reader,
+            "_exchange",
+            side_effect=((200, repository_list(permissions=None)), (200, metadata()), (204, b""), (401, b"")),
+        ):
+            null_result = source_reader.run(environment())
+
+        self.assertEqual(absent_result["status"], "passed")
+        self.assertEqual(null_result["status"], "passed")
 
     def test_rejects_repository_scope_mismatch_and_still_revokes(self):
         responses = (
@@ -143,10 +158,7 @@ class SourceReaderPreflightTests(unittest.TestCase):
             (extra_repository, "repository_count_invalid"),
             (repository_list(id=REPOSITORY_ID + 1), "repository_id_invalid"),
             (repository_list(private=False), "repository_private_invalid"),
-            (
-                repository_list(permissions={"contents": "write", "metadata": "read"}),
-                "repository_permissions_invalid",
-            ),
+            (repository_list(permissions=[]), "repository_permissions_invalid"),
             (invalid_name, "repository_name_invalid"),
         )
         for body, expected_reason in cases:
@@ -169,21 +181,34 @@ class SourceReaderPreflightTests(unittest.TestCase):
                 self.assertNotIn("opaque-owner/invalid/extra", json.dumps(result))
                 self.assertNotIn("private-detail", json.dumps(result))
 
-    def test_rejects_writable_repository_permission_when_present(self):
-        response = repository_list(permissions={"pull": True, "push": True, "admin": False})
-        with patch.object(source_reader, "_exchange", side_effect=((200, response), (204, b""), (401, b""))):
+    def test_accepts_role_permission_metadata_without_treating_it_as_app_scope(self):
+        response = repository_list(permissions={"pull": True, "push": True, "admin": True})
+        with patch.object(
+            source_reader,
+            "_exchange",
+            side_effect=((200, response), (200, metadata()), (204, b""), (401, b"")),
+        ) as exchange:
             result = source_reader.run(environment())
 
-        self.assertEqual(result["reason"], "repository_permissions_invalid")
-        self.assertEqual(result["revocation"], "confirmed")
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["repository_scope"], "verified")
+        self.assertEqual(result["metadata"], "verified")
+        self.assertEqual([call.args[0] for call in exchange.call_args_list], ["GET", "GET", "DELETE", "GET"])
 
-    def test_rejects_non_read_only_application_permission_map(self):
-        response = repository_list(permissions={"contents": "write", "metadata": "read"})
-        with patch.object(source_reader, "_exchange", side_effect=((200, response), (204, b""), (401, b""))):
-            result = source_reader.run(environment())
+    def test_rejects_nonobject_repository_permission_metadata_and_still_revokes(self):
+        for permissions in ([], "pull", True, 1):
+            with self.subTest(permission_shape=type(permissions).__name__):
+                response = repository_list(permissions=permissions)
+                with patch.object(
+                    source_reader,
+                    "_exchange",
+                    side_effect=((200, response), (204, b""), (401, b"")),
+                ) as exchange:
+                    result = source_reader.run(environment())
 
-        self.assertEqual(result["reason"], "repository_permissions_invalid")
-        self.assertEqual(result["revocation"], "confirmed")
+                self.assertEqual(result["reason"], "repository_permissions_invalid")
+                self.assertEqual(result["revocation"], "confirmed")
+                self.assertEqual([call.args[0] for call in exchange.call_args_list], ["GET", "DELETE", "GET"])
 
     def test_metadata_failure_still_revokes(self):
         responses = (

@@ -322,7 +322,12 @@ jobs:
               && "$bootstrap_output" == *" run-attempt=$GITHUB_RUN_ATTEMPT "* \
               && "$bootstrap_output" == *" source-sha=$SOURCE_SHA "* ]]; then
               receipt_bound=true
-              token_state="${bootstrap_output##* token-revocation=}"
+              case "$bootstrap_output" in
+                *" token-revocation=not-read") token_state=not-read ;;
+                *" token-revocation=confirmed") token_state=confirmed ;;
+                *" token-revocation=unconfirmed") token_state=unconfirmed ;;
+                *) token_state=invalid ;;
+              esac
               printf '%s\n' "$bootstrap_output"
               if [[ "$token_state" != "not-read" ]]; then
                 exit 1

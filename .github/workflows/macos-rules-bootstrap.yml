@@ -366,7 +366,12 @@ jobs:
             if [[ "$bootstrap_output" == *" control-sha=$CI_SHA "* \
               && "$bootstrap_output" == *" run-id=$GITHUB_RUN_ID "* \
               && "$bootstrap_output" == *" run-attempt=$GITHUB_RUN_ATTEMPT "* ]]; then
-              token_state="${bootstrap_output##* token-revocation=}"
+              case "$bootstrap_output" in
+                *" token-revocation=not-read") token_state=not-read ;;
+                *" token-revocation=confirmed") token_state=confirmed ;;
+                *" token-revocation=unconfirmed") token_state=unconfirmed ;;
+                *) token_state=invalid ;;
+              esac
               printf '%s\n' "$bootstrap_output"
               if [[ "$token_state" != "not-read" ]]; then
                 write_token_state "$token_state"
