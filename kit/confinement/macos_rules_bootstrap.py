@@ -1,3 +1,4 @@
+from decimal import Decimal, InvalidOperation
 import hashlib
 import importlib.util
 import io
@@ -65,6 +66,12 @@ MAX_BOTTLE_MEMBERS = 4096
 MAX_BOTTLE_MEMBER_BYTES = 16 * 1024 * 1024
 MAX_BOTTLE_TOTAL_BYTES = 32 * 1024 * 1024
 MAX_DASH_BYTES = 16 * 1024 * 1024
+MAX_PAX_HEADERS = 7
+MAX_PAX_VALUE_BYTES = 32
+PAX_TIMESTAMP_RE = re.compile(r"-?(?:0|[1-9][0-9]{0,11})(?:\.[0-9]{1,9})?\Z")
+PAX_TIMESTAMP_MIN = Decimal("-62135596800")
+PAX_TIMESTAMP_MAX = Decimal("253402300799.999999999")
+PAX_TIMESTAMP_KEYS = frozenset(("mtime", "atime", "ctime", "LIBARCHIVE.creationtime"))
 PREP_ROOT = Path("/") / "private" / "tmp"
 PREP_PREFIX = "macos-ci-dash-"
 RUN_PREFIX = "macos-ci-check-"
@@ -82,7 +89,8 @@ REASONS = frozenset((
 ))
 STAGES = frozenset((
     "arguments", "context", "bootstrap_gate", "developer_mode", "plan_snapshot", "dash_download",
-    "dash_archive", "dash_verify", "toolchain", "runner_controls", "identity",
+    "dash_archive", "dash_archive_structure", "dash_archive_pax_metadata",
+    "dash_archive_member", "dash_archive_content", "dash_verify", "toolchain", "runner_controls", "identity",
     "storage", "source_lease", "source_identity", "source_tree", "summary_guard",
     *GATES, "cleanup",
 ))
@@ -478,6 +486,38 @@ def _safe_tar_name(name):
     return path.as_posix()
 
 
+def _safe_pax_headers(headers):
+    if type(headers) is not dict or len(headers) > MAX_PAX_HEADERS:
+        return False
+    for key, value in headers.items():
+        if (type(key) is not str or type(value) is not str or not key.isascii()
+                or not value.isascii() or len(value) > MAX_PAX_VALUE_BYTES):
+            return False
+        if key in PAX_TIMESTAMP_KEYS:
+            if PAX_TIMESTAMP_RE.fullmatch(value) is None:
+                return False
+            try:
+                timestamp = Decimal(value)
+            except InvalidOperation:
+                return False
+            if not timestamp.is_finite() or not PAX_TIMESTAMP_MIN <= timestamp <= PAX_TIMESTAMP_MAX:
+                return False
+        elif key in ("uid", "gid"):
+            if value != "0":
+                return False
+        elif key == "hdrcharset":
+            if value not in ("BINARY", "UTF-8"):
+                return False
+        else:
+            return False
+    return True
+
+
+def _safe_archive_member_type(member):
+    return (member.type in (tarfile.DIRTYPE, tarfile.REGTYPE, tarfile.AREGTYPE)
+            and member.sparse is None)
+
+
 def _extract_dash_member(bottle):
     binary = None
     formula = None
@@ -485,56 +525,77 @@ def _extract_dash_member(bottle):
     total = 0
     try:
         if type(bottle) is not bytes or len(bottle) > MAX_BOTTLE_BYTES:
-            raise ValueError("oversized compressed archive")
-        inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
-        unpacked = inflater.decompress(bottle, MAX_BOTTLE_TOTAL_BYTES + 1)
-        if (len(unpacked) > MAX_BOTTLE_TOTAL_BYTES or inflater.unconsumed_tail
-                or inflater.unused_data or not inflater.eof):
-            raise ValueError("oversized or malformed gzip")
-        tail = inflater.flush(MAX_BOTTLE_TOTAL_BYTES + 1 - len(unpacked))
-        if len(unpacked) + len(tail) > MAX_BOTTLE_TOTAL_BYTES:
-            raise ValueError("oversized decompressed archive")
-        unpacked += tail
-        with tarfile.open(fileobj=io.BytesIO(unpacked), mode="r:") as archive:
-            count = 0
-            for member in archive:
-                count += 1
-                name = _safe_tar_name(member.name)
-                if (count > MAX_BOTTLE_MEMBERS or name is None or name in seen
-                        or (name not in ("dash-shell", "dash-shell/" + DASH_VERSION)
-                            and not name.startswith("dash-shell/" + DASH_VERSION + "/"))):
-                    raise ValueError("unsafe archive path")
-                seen.add(name)
-                if (member.pax_headers or member.issym() or member.islnk() or member.isdev()
-                        or member.isfifo() or not (member.isdir() or member.isreg())
-                        or member.mode & (stat.S_ISUID | stat.S_ISGID)):
-                    raise ValueError("unsafe archive entry")
-                if member.size < 0 or member.size > MAX_BOTTLE_MEMBER_BYTES:
-                    raise ValueError("oversized archive member")
-                total += member.size
-                if total > MAX_BOTTLE_TOTAL_BYTES or (member.isdir() and member.size != 0):
-                    raise ValueError("oversized archive")
-                if member.isdir() or name not in (DASH_BINARY_MEMBER, DASH_FORMULA_MEMBER):
-                    continue
-                stream = archive.extractfile(member)
-                if stream is None:
-                    raise ValueError("missing archive data")
-                with stream:
-                    data = stream.read(member.size + 1)
-                if len(data) != member.size:
-                    raise ValueError("truncated archive data")
-                if name == DASH_BINARY_MEMBER:
-                    if binary is not None or not member.mode & 0o111 or len(data) > MAX_DASH_BYTES:
-                        raise ValueError("invalid dash binary")
-                    binary = data
-                else:
-                    if formula is not None or len(data) > 65536:
-                        raise ValueError("invalid formula metadata")
-                    formula = data
+            raise Refusal("dash_bottle_invalid", "dash_archive_structure")
+        try:
+            inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            unpacked = inflater.decompress(bottle, MAX_BOTTLE_TOTAL_BYTES + 1)
+            if (len(unpacked) > MAX_BOTTLE_TOTAL_BYTES or inflater.unconsumed_tail
+                    or inflater.unused_data or not inflater.eof):
+                raise Refusal("dash_bottle_invalid", "dash_archive_structure")
+            tail = inflater.flush(MAX_BOTTLE_TOTAL_BYTES + 1 - len(unpacked))
+            if len(unpacked) + len(tail) > MAX_BOTTLE_TOTAL_BYTES:
+                raise Refusal("dash_bottle_invalid", "dash_archive_structure")
+            unpacked += tail
+        except Refusal:
+            raise
+        except BaseException:
+            raise Refusal("dash_bottle_invalid", "dash_archive_structure") from None
+        try:
+            archive = tarfile.open(fileobj=io.BytesIO(unpacked), mode="r:")
+        except BaseException:
+            raise Refusal("dash_bottle_invalid", "dash_archive_structure") from None
+        try:
+            with archive:
+                count = 0
+                for member in archive:
+                    count += 1
+                    if count > MAX_BOTTLE_MEMBERS:
+                        raise Refusal("dash_bottle_invalid", "dash_archive_member")
+                    if not _safe_pax_headers(member.pax_headers):
+                        raise Refusal("dash_bottle_invalid", "dash_archive_pax_metadata")
+                    name = _safe_tar_name(member.name)
+                    if (name is None or name in seen
+                            or (name not in ("dash-shell", "dash-shell/" + DASH_VERSION)
+                                and not name.startswith("dash-shell/" + DASH_VERSION + "/"))):
+                        raise Refusal("dash_bottle_invalid", "dash_archive_member")
+                    seen.add(name)
+                    if (not _safe_archive_member_type(member)
+                            or member.issym() or member.islnk() or member.isdev() or member.isfifo()
+                            or not (member.isdir() or member.isreg())
+                            or member.mode & (stat.S_ISUID | stat.S_ISGID)):
+                        raise Refusal("dash_bottle_invalid", "dash_archive_member")
+                    if member.size < 0 or member.size > MAX_BOTTLE_MEMBER_BYTES:
+                        raise Refusal("dash_bottle_invalid", "dash_archive_member")
+                    total += member.size
+                    if total > MAX_BOTTLE_TOTAL_BYTES or (member.isdir() and member.size != 0):
+                        raise Refusal("dash_bottle_invalid", "dash_archive_member")
+                    if member.isdir() or name not in (DASH_BINARY_MEMBER, DASH_FORMULA_MEMBER):
+                        continue
+                    stream = archive.extractfile(member)
+                    if stream is None:
+                        raise Refusal("dash_bottle_invalid", "dash_archive_structure")
+                    with stream:
+                        data = stream.read(member.size + 1)
+                    if len(data) != member.size:
+                        raise Refusal("dash_bottle_invalid", "dash_archive_structure")
+                    if name == DASH_BINARY_MEMBER:
+                        if binary is not None or not member.mode & 0o111 or len(data) > MAX_DASH_BYTES:
+                            raise Refusal("dash_bottle_invalid", "dash_archive_member")
+                        binary = data
+                    else:
+                        if formula is not None or len(data) > 65536:
+                            raise Refusal("dash_bottle_invalid", "dash_archive_member")
+                        formula = data
+        except Refusal:
+            raise
+        except BaseException:
+            raise Refusal("dash_bottle_invalid", "dash_archive_structure") from None
+    except Refusal:
+        raise
     except BaseException:
         raise Refusal("dash_bottle_invalid", "dash_archive") from None
     if (not binary or formula is None or hashlib.sha256(formula).hexdigest() != DASH_FORMULA_SHA256):
-        raise Refusal("dash_bottle_invalid", "dash_archive")
+        raise Refusal("dash_bottle_invalid", "dash_archive_content")
     return binary
 
 
