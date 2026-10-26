@@ -35,6 +35,14 @@ def main():
             if len(macos_payload) > 262144:
                 raise PolicyError("macos-workflow-too-large")
             validate_workflow_text(macos_payload.decode("utf-8"), pool, "macos-capability")
+            reviewed_macos_workflow_path = root / ".github/workflows/macos-reviewed-build.yml"
+            with reviewed_macos_workflow_path.open("rb") as source:
+                reviewed_macos_payload = source.read(262145)
+            if len(reviewed_macos_payload) > 262144:
+                raise PolicyError("reviewed-macos-workflow-too-large")
+            validate_workflow_text(
+                reviewed_macos_payload.decode("utf-8"), pool, "macos-reviewed-build"
+            )
             windows_workflow_path = root / ".github/workflows/windows-native-preflight.yml"
             with windows_workflow_path.open("rb") as source:
                 windows_payload = source.read(262145)

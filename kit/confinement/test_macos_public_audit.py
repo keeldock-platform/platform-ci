@@ -68,6 +68,19 @@ class FakeAuditAPI(FakeAPI):
         return self.log_bytes
 
 
+class FakeMultiAuditAPI(FakeAPI):
+    def __init__(self, pages, logs):
+        super().__init__(pages)
+        self.logs = logs
+        self.log_calls = []
+
+    def log_text(self, job_id):
+        self.log_calls.append(job_id)
+        if job_id not in self.logs:
+            raise audit.AuditRefusal("log_unavailable")
+        return self.logs[job_id]
+
+
 class FakeResponse:
     def __init__(self, body, headers):
         self.status = 200
@@ -117,6 +130,19 @@ class CanaryTests(unittest.TestCase):
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.inspect_public_bytes(b"prefix=" + needle, CONTROL_SHA)
         self.assertEqual(caught.exception.reason, "canary_exposed")
+
+    def test_reviewed_canary_common_encodings_are_scanned_without_changing_legacy_scan(self):
+        marker = audit.derive_reviewed_canary(CONTROL_SHA)
+        self.assertEqual(marker, b"KD-RB-CANARY-" + CONTROL_SHA[:16].encode("ascii"))
+        audit.inspect_public_bytes(marker, CONTROL_SHA)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.inspect_reviewed_public_bytes(marker, CONTROL_SHA)
+        self.assertEqual(caught.exception.reason, "canary_exposed")
+        for needle in audit._reviewed_canary_variants(CONTROL_SHA):
+            with self.subTest(encoding=needle[:12]):
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.inspect_reviewed_public_bytes(b"prefix=" + needle, CONTROL_SHA)
+                self.assertEqual(caught.exception.reason, "canary_exposed")
 
 
 class InventoryTests(unittest.TestCase):
@@ -414,6 +440,127 @@ def audit_fixture():
     return pages, env, native_job, native_detail
 
 
+def reviewed_audit_fixture():
+    run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+    jobs_path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+    )
+    snapshot_check_url = "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/303"
+    smoke_check_url = "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/305"
+    audit_check_url = "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/304"
+    snapshot_job = {
+        "id": 202,
+        "run_id": int(RUN_ID),
+        "run_attempt": int(RUN_ATTEMPT),
+        "head_sha": CONTROL_SHA,
+        "name": audit.REVIEWED_SNAPSHOT_JOB_NAME,
+        "status": "completed",
+        "conclusion": "success",
+        "check_run_url": snapshot_check_url,
+    }
+    smoke_job = {
+        "id": 203,
+        "run_id": int(RUN_ID),
+        "run_attempt": int(RUN_ATTEMPT),
+        "head_sha": CONTROL_SHA,
+        "name": audit.REVIEWED_SMOKE_JOB_NAME,
+        "status": "completed",
+        "conclusion": "success",
+        "check_run_url": smoke_check_url,
+    }
+    audit_job = {
+        "id": 204,
+        "run_id": int(RUN_ID),
+        "run_attempt": int(RUN_ATTEMPT),
+        "head_sha": CONTROL_SHA,
+        "name": audit.REVIEWED_AUDIT_JOB_NAME,
+        "status": "in_progress",
+        "conclusion": None,
+        "check_run_url": audit_check_url,
+    }
+    snapshot_detail = dict(snapshot_job, steps=[{
+        "number": 1,
+        "name": "Snapshot cache inventory",
+        "status": "completed",
+        "conclusion": "success",
+    }])
+    smoke_detail = dict(smoke_job, steps=[
+        {
+            "number": 1,
+            "name": "Validate source-free control tree",
+            "status": "completed",
+            "conclusion": "success",
+        },
+        {
+            "number": 2,
+            "name": "Run source-free reviewed build smoke",
+            "status": "completed",
+            "conclusion": "success",
+        },
+    ])
+    snapshot_check = "/repos/keeldock-platform/platform-ci/check-runs/303"
+    smoke_check = "/repos/keeldock-platform/platform-ci/check-runs/305"
+    snapshot_annotations = snapshot_check + "/annotations?per_page=100&page=1"
+    smoke_annotations = smoke_check + "/annotations?per_page=100&page=1"
+    artifact_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID + "/artifacts?per_page=100&page=1"
+    cache_path = "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+    pages = {
+        run_path: ({
+            "id": int(RUN_ID),
+            "run_attempt": int(RUN_ATTEMPT),
+            "head_sha": CONTROL_SHA,
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "path": audit.REVIEWED_WORKFLOW_PATH,
+            "repository": {"full_name": audit.REPOSITORY},
+        }, {}),
+        jobs_path: ({"total_count": 3, "jobs": [snapshot_job, smoke_job, audit_job]}, {}),
+        "/repos/keeldock-platform/platform-ci/actions/jobs/202": (snapshot_detail, {}),
+        "/repos/keeldock-platform/platform-ci/actions/jobs/203": (smoke_detail, {}),
+        snapshot_check: ({
+            "id": 303,
+            "head_sha": CONTROL_SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "output": {"title": "snapshot", "summary": "snapshot complete", "annotations_count": 0},
+        }, {}),
+        smoke_check: ({
+            "id": 305,
+            "head_sha": CONTROL_SHA,
+            "status": "completed",
+            "conclusion": "success",
+            "output": {"title": "smoke", "summary": "smoke complete", "annotations_count": 0},
+        }, {}),
+        snapshot_annotations: ([], {}),
+        smoke_annotations: ([], {}),
+        artifact_path: ({"total_count": 0, "artifacts": []}, {}),
+        cache_path: ({"total_count": 0, "actions_caches": []}, {}),
+    }
+    marker = (
+        "macos-build=synthetic-smoke-passed schema=1 source=none control-sha=" + CONTROL_SHA
+        + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+        + " image-os=macos-15-arm64 image-version=20260907.0337.1 macos-version=15.7.9"
+        + " architecture=arm64 xcode=26.0 xcode-build=17A324 clang=17.0.0 sdk=26.0"
+        + " developer-mode=disabled privilege=separate-nonadmin sudo=denied"
+        + " compile=passed link=passed load-test=passed capture=passed"
+        + " summary-standin=write-denied cleanup=complete seatbelt=not-run pf=not-run\n"
+    ).encode("ascii")
+    env = {
+        "GITHUB_REPOSITORY": audit.REPOSITORY,
+        "GITHUB_RUN_ID": RUN_ID,
+        "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
+        "CI_SHA": CONTROL_SHA,
+        "GITHUB_TOKEN": "t" * 32,
+        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_digest([]),
+    }
+    logs = {
+        202: b"macos-public-surface-audit=snapshot-ready\n",
+        203: marker,
+    }
+    return pages, env, logs
+
+
 class AuditRunTests(unittest.TestCase):
     def test_audit_passes_only_after_all_surfaces_and_receipt(self):
         pages, env, _, _ = audit_fixture()
@@ -533,6 +680,171 @@ class AuditRunTests(unittest.TestCase):
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.run("audit", env, FakeAuditAPI(pages))
         self.assertEqual(caught.exception.reason, "inventory_changed")
+
+    def test_reviewed_audit_requires_both_producers_and_audits_each_named_surface(self):
+        pages, env, logs = reviewed_audit_fixture()
+        api = FakeMultiAuditAPI(pages, logs)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = audit.run("reviewed-audit", env, api)
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "macos-public-surface-audit=synthetic-smoke-audited\n")
+        self.assertEqual(api.log_calls, [202, 203])
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/artifacts?per_page=100&page=1",
+            api.calls,
+        )
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1",
+            api.calls,
+        )
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/check-runs/303/annotations?per_page=100&page=1",
+            api.calls,
+        )
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/check-runs/305/annotations?per_page=100&page=1",
+            api.calls,
+        )
+
+    def test_reviewed_audit_refuses_missing_cache_annotation_or_job_evidence(self):
+        pages, env, logs = reviewed_audit_fixture()
+        env["MACOS_CACHE_SNAPSHOT"] = ""
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, api)
+        self.assertEqual(caught.exception.reason, "inventory_changed")
+        self.assertEqual(api.log_calls, [202, 203])
+
+        pages, env, logs = reviewed_audit_fixture()
+        pages[
+            "/repos/keeldock-platform/platform-ci/check-runs/305/annotations?per_page=100&page=1"
+        ] = ([], {})
+        pages["/repos/keeldock-platform/platform-ci/check-runs/305"][0]["output"]["annotations_count"] = 1
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "pagination_incomplete")
+
+        pages, env, logs = reviewed_audit_fixture()
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        pages[jobs_path][0]["jobs"].pop(1)
+        pages[jobs_path][0]["total_count"] = 2
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "api_schema")
+
+        pages, env, logs = reviewed_audit_fixture()
+        logs.pop(203)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "log_unavailable")
+
+    def test_reviewed_audit_refuses_marker_identity_cache_artifact_and_job_failures(self):
+        pages, env, logs = reviewed_audit_fixture()
+        logs[203] = logs[203].replace(CONTROL_SHA.encode("ascii"), b"f" * 40)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = reviewed_audit_fixture()
+        logs[203] = logs[203].replace(b"image-os=macos-15-arm64", b"image-os=macos-latest")
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = reviewed_audit_fixture()
+        logs[203] += b"macos-build=unexpected\n"
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = reviewed_audit_fixture()
+        pages[
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/artifacts?per_page=100&page=1"
+        ] = ({"total_count": 1, "artifacts": [{
+            "id": 707,
+            "name": "unexpected",
+            "size_in_bytes": 1,
+            "expired": False,
+        }]}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "artifact_found")
+
+        pages, env, logs = reviewed_audit_fixture()
+        pages[
+            "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        ] = ({"total_count": 1, "actions_caches": [{
+            "id": 808,
+            "ref": "refs/heads/main",
+            "key": "changed-entry",
+            "version": "v1",
+            "last_accessed_at": None,
+            "created_at": "2026-10-25T00:00:00Z",
+            "size_in_bytes": 1,
+        }]}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "inventory_changed")
+
+        pages, env, logs = reviewed_audit_fixture()
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        pages[jobs_path][0]["jobs"][1]["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/actions/jobs/203"][0]["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/check-runs/305"][0]["conclusion"] = "failure"
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "native_job_failed")
+
+    def test_reviewed_audit_scans_runtime_canary_in_logs_check_outputs_annotations_and_caches(self):
+        canary = audit.derive_reviewed_canary(CONTROL_SHA)
+
+        pages, env, logs = reviewed_audit_fixture()
+        logs[203] += b"\n" + canary
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "canary_exposed")
+
+        pages, env, logs = reviewed_audit_fixture()
+        pages["/repos/keeldock-platform/platform-ci/check-runs/305"][0]["output"]["summary"] = canary.decode("ascii")
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "canary_exposed")
+
+        pages, env, logs = reviewed_audit_fixture()
+        pages["/repos/keeldock-platform/platform-ci/check-runs/305"][0]["output"]["annotations_count"] = 1
+        pages[
+            "/repos/keeldock-platform/platform-ci/check-runs/305/annotations?per_page=100&page=1"
+        ] = ([{"id": 1, "message": canary.decode("ascii")}], {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "canary_exposed")
+
+        pages, env, logs = reviewed_audit_fixture()
+        cache = {
+            "id": 808,
+            "ref": "refs/heads/main",
+            "key": "synthetic-" + canary.decode("ascii"),
+            "version": "v1",
+            "last_accessed_at": None,
+            "created_at": "2026-10-25T00:00:00Z",
+            "size_in_bytes": 1,
+        }
+        env["MACOS_CACHE_SNAPSHOT"] = audit.cache_inventory_digest([cache])
+        pages[
+            "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        ] = ({"total_count": 1, "actions_caches": [cache]}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "canary_exposed")
 
     def test_api_403_is_a_fixed_refusal_without_response_text(self):
         class DeniedOpener:
