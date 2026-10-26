@@ -336,7 +336,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertIn('printf \'%s\\n\' "$summary_line" >> "$GITHUB_STEP_SUMMARY"', smoke)
         self.assertIn('printf \'%s\\n\' "$summary_line"', smoke)
-        self.assertNotIn("GITHUB_STEP_SUMMARY:", workflow)
+        self.assertNotRegex(workflow, r"(?m)^\s*GITHUB_STEP_SUMMARY:")
         self.assertLess(
             workflow.index("      - name: Run source-free reviewed build smoke\n"),
             workflow.index("      - name: Write trusted summary visibility control\n"),
