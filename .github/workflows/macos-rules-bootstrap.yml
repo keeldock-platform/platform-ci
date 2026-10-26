@@ -345,38 +345,86 @@ jobs:
             --base-branch "$REQUESTED_BASE_BRANCH" --concern rules-bootstrap 2>/dev/null)"
           bootstrap_status=$?
           set -e
+          network_family='macos-rules-'
+          network_state='network=observed'
+          network_re="^${network_family}${network_state} schema=1 mode=host-level control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) source-sha=([a-f0-9]{40}) interface-count=([1-4]) dns-query-count=(0|[1-9][0-9]{0,4}) tcp-syn-count=(0|[1-9][0-9]{0,4}) dns-name-hashes=(none|[a-f0-9]{64}(,[a-f0-9]{64}){0,15}) tcp-destination-hashes=(none|[a-f0-9]{64}(,[a-f0-9]{64}){0,15}) hashes-truncated=(true|false) capture-limited=(true|false) capture=private cleanup=complete worker-attribution=not-claimed completeness=not-claimed network-blocking=not-claimed$"
           success_re="^${marker_prefix}${success_state} schema=1 control-sha=[a-f0-9]{40} run-id=[1-9][0-9]{0,18} run-attempt=[1-9][0-9]{0,18} source-sha=[a-f0-9]{40} base-sha=[a-f0-9]{40} base-branch=(main|develop|uat) candidate-class=(permanent-tip|signed-descendant) suites=rules\.hooks,rules\.sync,rules\.static,rules\.public,plan-ids token-revocation=confirmed-before-execution lease-cleanup=complete process-cleanup=complete identity-cleanup=complete summary-guard=append-sibling-create-readback-restore source-tree=uid-read-only dash-version=0\.5\.13\.5 dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0 dash-binary-sha256=[a-f0-9]{64} reviewed-diff-sha256=[a-f0-9]{64} same-job-memory=not-verified$"
           refusal_re="^${marker_prefix}${refusal_state} schema=1 reason=(invalid_input|control_identity_invalid|bootstrap_gate_refused|developer_mode_unavailable|plan_snapshot_refused|dash_bottle_unavailable|dash_bottle_invalid|dash_identity_invalid|context_unavailable|toolchain_unavailable|runner_controls_unavailable|probe_identity_unavailable|storage_unavailable|source_lease_unavailable|source_identity_invalid|source_tree_invalid|summary_guard_failed|suite_failed|plan_ids_failed|cleanup_incomplete|internal_error) stage=(arguments|context|bootstrap_gate|developer_mode|plan_snapshot|dash_download|dash_archive|dash_verify|toolchain|runner_controls|identity|storage|source_lease|source_identity|source_tree|summary_guard|rules\.hooks|rules\.sync|rules\.static|rules\.public|plan-ids|cleanup) control-sha=([a-f0-9]{40}|unknown) run-id=([1-9][0-9]{0,18}|unknown) run-attempt=([1-9][0-9]{0,18}|unknown) token-revocation=(not-read|confirmed|unconfirmed)$"
-          if [[ "$bootstrap_output" =~ $success_re ]]; then
-            if [[ "$bootstrap_output" == *" control-sha=$CI_SHA "* \
-              && "$bootstrap_output" == *" run-id=$GITHUB_RUN_ID "* \
-              && "$bootstrap_output" == *" run-attempt=$GITHUB_RUN_ATTEMPT "* \
-              && "$bootstrap_output" == *" source-sha=$REQUESTED_SOURCE_SHA "* \
-              && "$bootstrap_output" == *" base-sha=$REQUESTED_BASE_SHA "* \
-              && "$bootstrap_output" == *" base-branch=$REQUESTED_BASE_BRANCH "* \
-              && "$bootstrap_output" == *" reviewed-diff-sha256=$SOURCE_REVIEWED_DIFF_SHA256"* ]]; then
+          line_count=0
+          first_line=''
+          second_line=''
+          if [[ -n "$bootstrap_output" ]]; then
+            while IFS= read -r output_line || [[ -n "$output_line" ]]; do
+              line_count=$((line_count + 1))
+              if [[ "$line_count" -eq 1 ]]; then
+                first_line="$output_line"
+              elif [[ "$line_count" -eq 2 ]]; then
+                second_line="$output_line"
+              else
+                line_count=3
+                break
+              fi
+            done <<< "$bootstrap_output"
+          fi
+          receipt_line=''
+          network_line=''
+          network_valid=0
+          if [[ "$line_count" -eq 1 ]]; then
+            receipt_line="$first_line"
+          elif [[ "$line_count" -eq 2 ]]; then
+            network_line="$first_line"
+            receipt_line="$second_line"
+            if [[ "$network_line" =~ $network_re ]]; then
+              network_dns_count="${BASH_REMATCH[6]}"
+              network_tcp_count="${BASH_REMATCH[7]}"
+              if (( network_dns_count <= 65535 && network_tcp_count <= 65535 )) \
+                && [[ "$network_line" == *" control-sha=$CI_SHA "* \
+                  && "$network_line" == *" run-id=$GITHUB_RUN_ID "* \
+                  && "$network_line" == *" run-attempt=$GITHUB_RUN_ATTEMPT "* \
+                  && "$network_line" == *" source-sha=$REQUESTED_SOURCE_SHA "* ]]; then
+                network_valid=1
+              fi
+            fi
+          fi
+          if [[ "$receipt_line" =~ $success_re ]]; then
+            if [[ "$receipt_line" == *" control-sha=$CI_SHA "* \
+              && "$receipt_line" == *" run-id=$GITHUB_RUN_ID "* \
+              && "$receipt_line" == *" run-attempt=$GITHUB_RUN_ATTEMPT "* ]]; then
               write_token_state confirmed
-              if [[ "$bootstrap_status" -eq 0 ]]; then
-                printf '%s\n' "$bootstrap_output"
+              if [[ "$bootstrap_status" -eq 0 && "$line_count" -eq 2 \
+                && "$network_valid" -eq 1 \
+                && "$receipt_line" == *" source-sha=$REQUESTED_SOURCE_SHA "* \
+                && "$receipt_line" == *" base-sha=$REQUESTED_BASE_SHA "* \
+                && "$receipt_line" == *" base-branch=$REQUESTED_BASE_BRANCH "* \
+                && "$receipt_line" == *" reviewed-diff-sha256=$SOURCE_REVIEWED_DIFF_SHA256"* ]]; then
+                printf '%s\n' "$network_line"
+                printf '%s\n' "$receipt_line"
                 exit 0
               fi
               exit 1
             fi
-          elif [[ "$bootstrap_output" =~ $refusal_re ]]; then
-            if [[ "$bootstrap_output" == *" control-sha=$CI_SHA "* \
-              && "$bootstrap_output" == *" run-id=$GITHUB_RUN_ID "* \
-              && "$bootstrap_output" == *" run-attempt=$GITHUB_RUN_ATTEMPT "* ]]; then
-              case "$bootstrap_output" in
-                *" token-revocation=not-read") token_state=not-read ;;
-                *" token-revocation=confirmed") token_state=confirmed ;;
-                *" token-revocation=unconfirmed") token_state=unconfirmed ;;
-                *) token_state=invalid ;;
-              esac
-              printf '%s\n' "$bootstrap_output"
+          elif [[ "$receipt_line" =~ $refusal_re ]]; then
+            refusal_control="${BASH_REMATCH[3]}"
+            refusal_run="${BASH_REMATCH[4]}"
+            refusal_attempt="${BASH_REMATCH[5]}"
+            token_state="${BASH_REMATCH[6]}"
+            if [[ "$refusal_control" == "$CI_SHA" \
+              && "$refusal_run" == "$GITHUB_RUN_ID" \
+              && "$refusal_attempt" == "$GITHUB_RUN_ATTEMPT" ]]; then
               if [[ "$token_state" != "not-read" ]]; then
                 write_token_state "$token_state"
+                if [[ "$line_count" -eq 2 && "$network_valid" -eq 1 ]]; then
+                  printf '%s\n' "$network_line"
+                fi
+                printf '%s\n' "$receipt_line"
                 exit 1
               fi
+              if run_revoke_cli; then
+                write_token_state confirmed
+                refuse_after_fallback confirmed
+              fi
+              write_token_state unconfirmed
+              refuse_after_fallback unconfirmed
             fi
           fi
           if run_revoke_cli; then

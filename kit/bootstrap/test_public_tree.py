@@ -141,6 +141,8 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("kit/confinement/macos_cache_client/index.js", result)
         self.assertIn("kit/confinement/macos_reviewed_build.py", result)
         self.assertIn("kit/confinement/test_macos_reviewed_build.py", result)
+        self.assertIn("kit/confinement/macos_network_observer.py", result)
+        self.assertIn("kit/confinement/test_macos_network_observer.py", result)
         self.assertIn("kit/confinement/macos_source_reader.py", result)
         self.assertIn("kit/confinement/test_macos_source_reader.py", result)
         self.assertIn("kit/confinement/macos_harness.py", result)
@@ -173,6 +175,8 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_macos_rules_bootstrap.py',
             'kit/confinement/macos_core_bootstrap.py',
             'kit/confinement/test_macos_core_bootstrap.py',
+            'kit/confinement/macos_network_observer.py',
+            'kit/confinement/test_macos_network_observer.py',
             '.github/workflows/macos-rules-bootstrap.yml',
             '.github/workflows/macos-core-bootstrap.yml',
             'kit/confinement/macos_private_validation.py',

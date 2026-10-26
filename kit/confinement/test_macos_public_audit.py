@@ -520,19 +520,43 @@ def reviewed_audit_fixture():
     smoke_detail = dict(smoke_job, steps=[
         {
             "number": 1,
-            "name": "Validate source-free control tree",
+            "name": "Set up job",
             "status": "completed",
             "conclusion": "success",
         },
         {
             "number": 2,
-            "name": "Run source-free reviewed build smoke",
+            "name": "Fetch reviewed main control",
             "status": "completed",
             "conclusion": "success",
         },
         {
             "number": 3,
+            "name": "Validate source-free control tree",
+            "status": "completed",
+            "conclusion": "success",
+        },
+        {
+            "number": 4,
+            "name": "Prove source-free network observer",
+            "status": "completed",
+            "conclusion": "success",
+        },
+        {
+            "number": 5,
+            "name": "Run source-free reviewed build smoke",
+            "status": "completed",
+            "conclusion": "success",
+        },
+        {
+            "number": 6,
             "name": "Write trusted summary visibility control",
+            "status": "completed",
+            "conclusion": "success",
+        },
+        {
+            "number": 7,
+            "name": "Complete job",
             "status": "completed",
             "conclusion": "success",
         },
@@ -591,6 +615,16 @@ def reviewed_audit_fixture():
         + "macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA
         + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT + "\n"
     ).encode("ascii")
+    network_selftest = (
+        "2026-10-26T12:34:56.1234567Z macos-network-observer=selftest-passed schema=1"
+        + " mode=host-level control-sha=" + CONTROL_SHA + " run-id=" + RUN_ID
+        + " run-attempt=" + RUN_ATTEMPT + " source-sha=none interface-count=1"
+        + " dns-query-count=1 tcp-syn-count=1 dns-name-hashes=" + "1" * 64
+        + " tcp-destination-hashes=" + "2" * 64
+        + " hashes-truncated=false capture=private capture-limited=false cleanup=complete"
+        + " worker-attribution=not-claimed completeness=not-claimed"
+        + " network-blocking=not-claimed\n"
+    ).encode("ascii")
     env = {
         "GITHUB_REPOSITORY": audit.REPOSITORY,
         "GITHUB_RUN_ID": RUN_ID,
@@ -601,7 +635,7 @@ def reviewed_audit_fixture():
     }
     logs = {
         202: b"macos-public-surface-audit=snapshot-ready\n",
-        203: marker + summary_control,
+        203: marker + network_selftest + summary_control,
     }
     return pages, env, logs
 
@@ -1001,7 +1035,19 @@ def bootstrap_audit_fixture(kind):
             + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
             + " repository-id=" + audit.BOOTSTRAP_SOURCE_REPOSITORY_IDS["rules-bootstrap"]
         ).encode("ascii")
-        producer_log = preflight + b"\n" + source_binding + b"\n" + success + b"\n" + summary + b"\n"
+        network = (
+            "2026-10-26T12:34:56.1234567Z macos-rules-network=observed schema=1 mode=host-level control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " source-sha=" + source_sha + " interface-count=2 dns-query-count=1 tcp-syn-count=1"
+            + " dns-name-hashes=" + "1" * 64 + " tcp-destination-hashes=" + "2" * 64
+            + " hashes-truncated=false capture-limited=false capture=private cleanup=complete"
+            + " worker-attribution=not-claimed completeness=not-claimed"
+            + " network-blocking=not-claimed"
+        ).encode("ascii")
+        producer_log = (
+            preflight + b"\n" + source_binding + b"\n" + network + b"\n"
+            + success + b"\n" + summary + b"\n"
+        )
         env = {
             "REQUESTED_SOURCE_SHA": source_sha,
             "REQUESTED_BASE_SHA": base_sha,
@@ -1020,8 +1066,8 @@ def bootstrap_audit_fixture(kind):
         snapshot_steps = ("Fetch control", "Audit source-read settings", "Snapshot cache")
         producer_steps = (
             "Fetch control", "Test control", "Run reviewed smoke", "Protect inventory",
-            "Core preflight", "Validate reader settings", "Mint reader token",
-            "Validate core bootstrap",
+            "Core preflight", "Write trusted summary visibility control",
+            "Validate reader settings", "Mint reader token", "Validate core bootstrap",
         )
         smoke = (
             "macos-build=synthetic-smoke-passed schema=1 source=none control-sha=" + CONTROL_SHA
@@ -1045,6 +1091,10 @@ def bootstrap_audit_fixture(kind):
             + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
             + " repository-id=" + audit.BOOTSTRAP_SOURCE_REPOSITORY_IDS["core-bootstrap"]
         ).encode("ascii")
+        summary_control = (
+            "2026-10-26T12:34:56.1234567Z macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+        ).encode("ascii")
         success = (
             "macos-core-bootstrap=verified schema=1 control-sha=" + CONTROL_SHA
             + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
@@ -1064,7 +1114,7 @@ def bootstrap_audit_fixture(kind):
             b"success_state='verified'\nrefusal_state='refused'\n"
         )
         producer_log = (
-            smoke + b"\n" + preflight + b"\n" + bootstrap_command_echo + b"\n"
+            smoke + b"\n" + preflight + b"\n" + summary_control + b"\n" + bootstrap_command_echo + b"\n"
             + binding_command_echo + b"\n"
             + source_binding + b"\n" + success + b"\n"
         )
@@ -1479,6 +1529,21 @@ class BootstrapAuditTests(unittest.TestCase):
                 self.assertTrue(any(path.endswith("/deployment-branch-policies?per_page=100&page=1") for path in api.calls))
 
     def test_rules_audit_refuses_missing_or_mismatched_run_bindings_and_fallback(self):
+        def change_network(old, new):
+            def mutate(pages, env, logs):
+                lines = logs[803].splitlines()
+                index = next(i for i, line in enumerate(lines) if b"macos-rules-network=" in line)
+                lines[index] = lines[index].replace(old, new, 1)
+                logs[803] = b"\n".join(lines) + b"\n"
+            return mutate
+
+        def duplicate_network(pages, env, logs):
+            line = next(
+                line for line in logs[803].splitlines()
+                if b"macos-rules-network=" in line
+            )
+            logs[803] += line + b"\n"
+
         mutations = (
             lambda pages, env, logs: logs.__setitem__(803, logs[803].replace(
                 b"reviewed-diff-sha256=" + b"d" * 64,
@@ -1503,6 +1568,22 @@ class BootstrapAuditTests(unittest.TestCase):
                     "/repos/keeldock-platform/platform-ci/actions/jobs/803"
                 ][0]["steps"] if step["name"] == "Revoke token if bootstrap did not confirm"
             ).update(conclusion="success"),
+            change_network(b"macos-rules-network=observed", b"macos-rules-network=missing"),
+            change_network(b"source-sha=" + b"b" * 40, b"source-sha=" + b"f" * 40),
+            change_network(b"interface-count=2", b"interface-count=0"),
+            change_network(b"dns-query-count=1", b"dns-query-count=65536"),
+            change_network(b"capture-limited=false", b"capture-limited=unknown"),
+            change_network(b"worker-attribution=not-claimed", b"worker-attribution=claimed"),
+            change_network(b"network-blocking=not-claimed", b"network-blocking=blocked"),
+            change_network(
+                b"dns-name-hashes=" + b"1" * 64,
+                b"dns-name-hashes=" + b"2" * 64 + b"," + b"1" * 64,
+            ),
+            change_network(
+                b"dns-name-hashes=" + b"1" * 64,
+                b"dns-name-hashes=" + b",".join([b"3" * 64] * 17),
+            ),
+            duplicate_network,
         )
         for index, mutate in enumerate(mutations):
             with self.subTest(mutation=index):
@@ -1525,10 +1606,29 @@ class BootstrapAuditTests(unittest.TestCase):
             lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
                 b"summary-sentinel=written", b"summary-sentinel=not-written", 1
             )),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"macos-summary-control=trusted-write",
+                b"macos-summary-control=missing", 1
+            )),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813] + b"\n" + next(
+                line for line in logs[813].splitlines() if b"macos-summary-control=" in line
+            ) + b"\n"),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA.encode("ascii"),
+                b"macos-summary-control=trusted-write schema=1 control-sha=" + b"f" * 40,
+                1,
+            )),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA.encode("ascii")
+                + b" run-id=" + RUN_ID.encode("ascii"),
+                b"macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA.encode("ascii")
+                + b" run-id=1",
+                1,
+            )),
             lambda pages, env, logs: env.__setitem__("SOURCE_SHA", "f" * 40),
             lambda pages, env, logs: pages[
                 "/repos/keeldock-platform/platform-ci/actions/jobs/813"
-            ][0]["steps"][8].update(conclusion="failure"),
+            ][0]["steps"][9].update(conclusion="failure"),
             lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
                 b"macos-core-source-binding=verified", b"macos-core-source-binding=missing", 1
             )),
@@ -1586,6 +1686,10 @@ class BootstrapAuditTests(unittest.TestCase):
             lambda steps: next(
                 step for step in steps if step["name"] == "Post Mint reader token"
             ).update(name="Unexpected post step"),
+            lambda steps: steps.pop(next(
+                index for index, step in enumerate(steps)
+                if step["name"] == "Post Mint reader token"
+            )),
         )
         for index, mutate in enumerate(mutations):
             with self.subTest(mutation=index):
@@ -1594,6 +1698,141 @@ class BootstrapAuditTests(unittest.TestCase):
                 mutate(steps)
                 with self.assertRaises(audit.AuditRefusal):
                     audit.run("core-bootstrap-audit", env, FakeMultiAuditAPI(pages, logs))
+
+    def test_bootstrap_audit_scans_surfaces_then_refuses_pre_mint_failures(self):
+        for kind, producer_id, check_id, mint_name, post_name in (
+            (
+                "rules-bootstrap", 803, 903,
+                "Mint scoped source-reader token", "Post Mint scoped source-reader token",
+            ),
+            (
+                "core-bootstrap", 813, 913,
+                "Mint reader token", "Post Mint reader token",
+            ),
+        ):
+            with self.subTest(kind=kind):
+                pages, env, logs = bootstrap_audit_fixture(kind)
+                detail_path = "/repos/keeldock-platform/platform-ci/actions/jobs/" + str(producer_id)
+                detail = pages[detail_path][0]
+                steps = detail["steps"]
+                mint = next(step for step in steps if step["name"] == mint_name)
+                mint["conclusion"] = "skipped"
+                steps.remove(next(step for step in steps if step["name"] == post_name))
+                for step in steps:
+                    if step["number"] > mint["number"] and step["name"] != "Complete job":
+                        step["conclusion"] = "skipped"
+                detail["conclusion"] = "failure"
+                pages[detail_path] = (detail, {})
+                jobs_path = (
+                    "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+                    + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+                )
+                producer_name = (
+                    audit.RULES_BOOTSTRAP_PRODUCER_JOB_NAME
+                    if kind == "rules-bootstrap"
+                    else audit.CORE_BOOTSTRAP_PRODUCER_JOB_NAME
+                )
+                producer_job = next(
+                    job for job in pages[jobs_path][0]["jobs"]
+                    if job["name"] == producer_name
+                )
+                producer_job["conclusion"] = "failure"
+                check_path = "/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id)
+                pages[check_path][0]["conclusion"] = "failure"
+                logs[producer_id] = b"macos-bootstrap=refused schema=1 reason=preflight_failed\n"
+                api = FakeMultiAuditAPI(pages, logs)
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.run(kind + "-audit", env, api)
+                self.assertEqual(caught.exception.reason, "native_job_failed")
+                self.assertEqual(api.log_calls, [802 if kind == "rules-bootstrap" else 812, producer_id])
+                self.assertTrue(any(path.endswith("/annotations?per_page=100&page=1") for path in api.calls))
+                self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
+                self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
+
+    def test_rules_failed_suite_observation_is_still_bound_after_surface_scan(self):
+        pages, env, logs = bootstrap_audit_fixture("rules-bootstrap")
+        detail_path = "/repos/keeldock-platform/platform-ci/actions/jobs/803"
+        detail = pages[detail_path][0]
+        next(step for step in detail["steps"] if step["name"] == "Run fixed rules bootstrap").update(
+            conclusion="failure"
+        )
+        detail["conclusion"] = "failure"
+        pages[detail_path] = (detail, {})
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        producer_job = next(
+            job for job in pages[jobs_path][0]["jobs"]
+            if job["name"] == audit.RULES_BOOTSTRAP_PRODUCER_JOB_NAME
+        )
+        producer_job["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/check-runs/903"][0]["conclusion"] = "failure"
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rules-bootstrap-audit", env, api)
+        self.assertEqual(caught.exception.reason, "native_job_failed")
+        self.assertEqual(api.log_calls, [802, 803])
+
+        pages, env, logs = bootstrap_audit_fixture("rules-bootstrap")
+        detail_path = "/repos/keeldock-platform/platform-ci/actions/jobs/803"
+        detail = pages[detail_path][0]
+        next(step for step in detail["steps"] if step["name"] == "Run fixed rules bootstrap").update(
+            conclusion="failure"
+        )
+        detail["conclusion"] = "failure"
+        pages[detail_path] = (detail, {})
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        producer_job = next(
+            job for job in pages[jobs_path][0]["jobs"]
+            if job["name"] == audit.RULES_BOOTSTRAP_PRODUCER_JOB_NAME
+        )
+        producer_job["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/check-runs/903"][0]["conclusion"] = "failure"
+        lines = logs[803].splitlines()
+        network_index = next(i for i, line in enumerate(lines) if b"macos-rules-network=" in line)
+        lines[network_index] = lines[network_index].replace(
+            b"source-sha=" + b"b" * 40,
+            b"source-sha=" + b"f" * 40,
+            1,
+        )
+        logs[803] = b"\n".join(lines) + b"\n"
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rules-bootstrap-audit", env, api)
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+        self.assertEqual(api.log_calls, [802, 803])
+
+        pages, env, logs = bootstrap_audit_fixture("rules-bootstrap")
+        detail_path = "/repos/keeldock-platform/platform-ci/actions/jobs/803"
+        detail = pages[detail_path][0]
+        next(step for step in detail["steps"] if step["name"] == "Run fixed rules bootstrap").update(
+            conclusion="failure"
+        )
+        detail["conclusion"] = "failure"
+        pages[detail_path] = (detail, {})
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        producer_job = next(
+            job for job in pages[jobs_path][0]["jobs"]
+            if job["name"] == audit.RULES_BOOTSTRAP_PRODUCER_JOB_NAME
+        )
+        producer_job["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/check-runs/903"][0]["conclusion"] = "failure"
+        logs[803] = b"\n".join(
+            line for line in logs[803].splitlines()
+            if b"macos-rules-network=" not in line
+        ) + b"\n"
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rules-bootstrap-audit", env, api)
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+        self.assertEqual(api.log_calls, [802, 803])
 
 
 class CacheProofAuditTests(unittest.TestCase):
@@ -1914,6 +2153,79 @@ class AuditRunTests(unittest.TestCase):
             "/repos/keeldock-platform/platform-ci/check-runs/305/annotations?per_page=100&page=1",
             api.calls,
         )
+
+    def test_reviewed_audit_requires_exact_observer_step_topology(self):
+        for mutation in (
+            lambda steps: steps.pop(next(
+                index for index, step in enumerate(steps)
+                if step["name"] == "Prove source-free network observer"
+            )),
+            lambda steps: next(
+                step for step in steps
+                if step["name"] == "Prove source-free network observer"
+            ).update(name="Other observer"),
+        ):
+            pages, env, logs = reviewed_audit_fixture()
+            steps = pages["/repos/keeldock-platform/platform-ci/actions/jobs/203"][0]["steps"]
+            mutation(steps)
+            with self.assertRaises(audit.AuditRefusal) as caught:
+                audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+            self.assertEqual(caught.exception.reason, "api_schema")
+
+    def test_reviewed_audit_requires_exact_run_bound_network_selftest(self):
+        pages, env, logs = reviewed_audit_fixture()
+        marker = next(
+            line for line in logs[203].splitlines()
+            if b"macos-network-observer=" in line
+        )
+        mutations = (
+            b"",
+            marker.replace(CONTROL_SHA.encode("ascii"), b"f" * 40),
+            marker.replace(b"run-id=" + RUN_ID.encode("ascii"), b"run-id=1"),
+            marker.replace(
+                b"run-attempt=" + RUN_ATTEMPT.encode("ascii"), b"run-attempt=1"
+            ),
+            marker.replace(b"source-sha=none", b"source-sha=" + b"b" * 40),
+            marker.replace(b"interface-count=1", b"interface-count=0"),
+            marker.replace(b"dns-query-count=1", b"dns-query-count=0"),
+            marker.replace(b"tcp-syn-count=1", b"tcp-syn-count=65536"),
+            marker.replace(b"hashes-truncated=false", b"hashes-truncated=unknown"),
+            marker.replace(b"capture=private", b"capture=public"),
+            marker.replace(b"capture-limited=false", b"capture-limited=true"),
+            marker.replace(b"cleanup=complete", b"cleanup=incomplete"),
+            marker.replace(b"worker-attribution=not-claimed", b"worker-attribution=claimed"),
+            marker.replace(b"completeness=not-claimed", b"completeness=complete"),
+            marker.replace(b"network-blocking=not-claimed", b"network-blocking=blocked"),
+            marker.replace(
+                b"dns-name-hashes=" + b"1" * 64,
+                b"dns-name-hashes=" + b"2" * 64 + b"," + b"1" * 64,
+            ),
+            marker.replace(
+                b"tcp-destination-hashes=" + b"2" * 64,
+                b"tcp-destination-hashes=" + b",".join([b"2" * 64] * 2),
+            ),
+            b"untrusted-prefix " + marker,
+        )
+        for index, replacement in enumerate(mutations):
+            with self.subTest(mutation=index):
+                pages, env, logs = reviewed_audit_fixture()
+                logs[203] = logs[203].replace(marker, replacement)
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+                self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = reviewed_audit_fixture()
+        logs[203] += marker + b"\n"
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = reviewed_audit_fixture()
+        many_hashes = b",".join([b"3" * 64] * 17)
+        logs[203] = logs[203].replace(b"1" * 64, many_hashes, 1)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
 
     def test_reviewed_audit_requires_exact_summary_control_identity(self):
         control = (

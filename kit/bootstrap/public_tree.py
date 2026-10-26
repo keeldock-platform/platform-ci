@@ -36,6 +36,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/macos_cache_client/index.js",
         "kit/confinement/macos_reviewed_build.py",
         "kit/confinement/test_macos_reviewed_build.py",
+        "kit/confinement/macos_network_observer.py",
+        "kit/confinement/test_macos_network_observer.py",
         'kit/confinement/macos_rules_bootstrap.py',
         'kit/confinement/test_macos_rules_bootstrap.py',
         'kit/confinement/macos_core_bootstrap.py',
@@ -66,12 +68,14 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    '.github/workflows/macos-rules-bootstrap.yml': '0a7875b43365267da678157d663873d3f868a0c811b05c4d6091d1bf3e9d5366',
-    '.github/workflows/macos-core-bootstrap.yml': '7c110953eca3e99d502fbf32cb2bd176e4aceb92d22074bd4a5060cb1e4e4597',
-    'kit/confinement/macos_rules_bootstrap.py': '7dc297bf39d1cca2bde087ea6e806cea8a88684bc3a3829d0688b43bf1b67fc2',
-    'kit/confinement/test_macos_rules_bootstrap.py': '6981c44551604fdd995f7bbac7d269f13557dae1e66ba142e428ac0d88edc82d',
+    '.github/workflows/macos-rules-bootstrap.yml': '002de702a0d0f7447f8c750ae3d37a5a80aa18824d88d0688f7f2b2c3e4ac3d4',
+    '.github/workflows/macos-core-bootstrap.yml': '25dbd661672e7b57384b2ffcd9934e62fb20688c94ee29ca97d2ab0eebc7109f',
+    'kit/confinement/macos_rules_bootstrap.py': '99428c2ab2ce71d2372faa2ec140a8cb9321442b4b4fdebf73260a69b17cbc9d',
+    'kit/confinement/test_macos_rules_bootstrap.py': '306fef659ab8486baa9ef77530f988f1dd29ea5714dd24d41778075fcd7c7dbd',
     'kit/confinement/macos_core_bootstrap.py': '8f27ed84b98d2c3fcf45d2c12f330f9a324ab00f542058c8e095765989555b00',
     'kit/confinement/test_macos_core_bootstrap.py': '0d0bee2301702fa0bcfa97956bd788d8dd743a5eeab14e96fc23186916b6e400',
+    'kit/confinement/macos_network_observer.py': 'a10e06f379cb28aa2990cddb5c61aec2959b30eebaf77773e3a9e500cc24c2bf',
+    'kit/confinement/test_macos_network_observer.py': '2e29ed279f813a0db4ad2650f2ac1d7558080fc0584ed1b5fa2d574494ad4071',
     'kit/confinement/macos_private_validation.py': 'de9e453ad6c560b02eb3fa7f3d41a171ff088e4eecef8483a79f49d79423d871',
     'kit/confinement/test_macos_private_validation.py': '9db800f00d633947d9fb321e9b181b7565ababd94c2fbd7440e15fdb5abaab58',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',

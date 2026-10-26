@@ -154,6 +154,18 @@ REVIEWED_SMOKE_MARKER_RE = re.compile(
     rb"cleanup=complete seatbelt=not-run pf=not-run"
     rb"(?=\r?(?:\n|$))"
 )
+REVIEWED_NETWORK_SELFTEST_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-network-observer=selftest-passed schema=1 mode=host-level "
+    rb"control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) "
+    rb"run-attempt=([1-9][0-9]{0,18}) source-sha=none interface-count=1 "
+    rb"dns-query-count=([1-9][0-9]{0,4}) tcp-syn-count=([1-9][0-9]{0,4}) "
+    rb"dns-name-hashes=([a-f0-9]{64}(?:,[a-f0-9]{64}){0,15}) "
+    rb"tcp-destination-hashes=([a-f0-9]{64}(?:,[a-f0-9]{64}){0,15}) "
+    rb"hashes-truncated=(true|false) capture=private capture-limited=false cleanup=complete "
+    rb"worker-attribution=not-claimed completeness=not-claimed "
+    rb"network-blocking=not-claimed(?=\r?(?:\n|$))"
+)
 REVIEWED_SUMMARY_CONTROL_MARKER_RE = re.compile(
     rb"(?m)^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     rb"(?:\.[0-9]+)?Z )?macos-summary-control=trusted-write schema=1 "
@@ -182,6 +194,19 @@ RULES_BOOTSTRAP_SUCCESS_MARKER_RE = re.compile(
     rb"dash-version=0\.5\.13\.5 dash-bottle-sha256=0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0 "
     rb"dash-binary-sha256=([a-f0-9]{64}) reviewed-diff-sha256=([a-f0-9]{64}) "
     rb"same-job-memory=not-verified(?=\r?(?:\n|$))"
+)
+RULES_BOOTSTRAP_NETWORK_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-rules-network=observed schema=1 mode=host-level "
+    rb"control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) "
+    rb"run-attempt=([1-9][0-9]{0,18}) source-sha=([a-f0-9]{40}) "
+    rb"interface-count=([1-4]) dns-query-count=(0|[1-9][0-9]{0,4}) "
+    rb"tcp-syn-count=(0|[1-9][0-9]{0,4}) "
+    rb"dns-name-hashes=(none|[a-f0-9]{64}(?:,[a-f0-9]{64}){0,15}) "
+    rb"tcp-destination-hashes=(none|[a-f0-9]{64}(?:,[a-f0-9]{64}){0,15}) "
+    rb"hashes-truncated=(true|false) capture-limited=(true|false) "
+    rb"capture=private cleanup=complete worker-attribution=not-claimed "
+    rb"completeness=not-claimed network-blocking=not-claimed(?=\r?(?:\n|$))"
 )
 RULES_BOOTSTRAP_SUMMARY_CONTROL_MARKER_RE = re.compile(
     rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
@@ -969,6 +994,17 @@ def _reviewed_jobs(api, run_id, run_attempt, control_sha):
         api, smoke, run_id, run_attempt, control_sha, REVIEWED_SMOKE_JOB_NAME
     )
     steps = smoke_detail[0].get("steps", [])
+    expected_steps = (
+        "Set up job",
+        "Fetch reviewed main control",
+        "Validate source-free control tree",
+        "Prove source-free network observer",
+        "Run source-free reviewed build smoke",
+        "Write trusted summary visibility control",
+        "Complete job",
+    )
+    if [step.get("name") for step in steps if type(step) is dict] != list(expected_steps):
+        _fail("api_schema")
     summary_steps = [
         step for step in steps
         if type(step) is dict and step.get("name") == "Write trusted summary visibility control"
@@ -1326,12 +1362,31 @@ def _source_reader_audit(api, kind, control_sha, run_id, run_attempt, env):
     return 0
 
 
-def _bootstrap_job_steps(detail, expected_names, skipped_names=(), post_names=()):
+def _bootstrap_job_steps(
+    detail, expected_names, skipped_names=(), post_names=(), optional_post_actions=()
+):
     steps = detail.get("steps")
     if type(steps) is not list or any(type(step) is not dict for step in steps):
         _fail("api_schema")
-    expected_api_names = ["Set up job", *expected_names, *post_names, "Complete job"]
-    if [step.get("name") for step in steps] != expected_api_names:
+    step_names = [step.get("name") for step in steps]
+    post_action_by_name = dict(optional_post_actions)
+    if (len(post_action_by_name) != len(optional_post_actions)
+            or not set(post_action_by_name).issubset(set(post_names))
+            or not set(post_action_by_name.values()).issubset(set(expected_names))):
+        _fail("api_schema")
+    step_by_name = {step.get("name"): step for step in steps}
+    if len(step_by_name) != len(steps):
+        _fail("api_schema")
+    present_posts = [name for name in post_names if name in step_by_name]
+    for post_name in post_names:
+        if post_name in step_by_name:
+            continue
+        action_step = step_by_name.get(post_action_by_name.get(post_name))
+        if (action_step is None or action_step.get("status") != "completed"
+                or action_step.get("conclusion") != "skipped"):
+            _fail("api_schema")
+    expected_api_names = ["Set up job", *expected_names, *present_posts, "Complete job"]
+    if step_names != expected_api_names:
         _fail("api_schema")
     skipped_names = set(skipped_names)
     if (not skipped_names.issubset(set(expected_names))
@@ -1388,6 +1443,10 @@ def _bootstrap_jobs(api, kind, run_id, run_attempt, control_sha):
         allowed_skips = ("Revoke token if bootstrap did not confirm",)
         snapshot_post_steps = ()
         producer_post_steps = ("Post Mint scoped source-reader token",)
+        snapshot_optional_post_actions = ()
+        producer_optional_post_actions = (
+            ("Post Mint scoped source-reader token", "Mint scoped source-reader token"),
+        )
     elif kind == "core-bootstrap":
         expected_names = {
             CORE_BOOTSTRAP_SNAPSHOT_JOB_NAME,
@@ -1408,6 +1467,7 @@ def _bootstrap_jobs(api, kind, run_id, run_attempt, control_sha):
             "Run reviewed smoke",
             "Protect inventory",
             "Core preflight",
+            "Write trusted summary visibility control",
             "Validate reader settings",
             "Mint reader token",
             "Validate core bootstrap",
@@ -1415,6 +1475,10 @@ def _bootstrap_jobs(api, kind, run_id, run_attempt, control_sha):
         allowed_skips = ()
         snapshot_post_steps = ()
         producer_post_steps = ("Post Mint reader token",)
+        snapshot_optional_post_actions = ()
+        producer_optional_post_actions = (
+            ("Post Mint reader token", "Mint reader token"),
+        )
     else:
         _fail("invalid_input")
     if len(jobs) != len(expected_names) or {job.get("name") for job in jobs} != expected_names:
@@ -1427,15 +1491,15 @@ def _bootstrap_jobs(api, kind, run_id, run_attempt, control_sha):
             or audit_job.get("status") != "in_progress"):
         _fail("run_identity_mismatch")
     details = {}
-    for name, expected_steps, post_steps in (
-        (snapshot_name, snapshot_steps, snapshot_post_steps),
-        (producer_name, producer_steps, producer_post_steps),
+    for name, expected_steps, post_steps, optional_posts in (
+        (snapshot_name, snapshot_steps, snapshot_post_steps, snapshot_optional_post_actions),
+        (producer_name, producer_steps, producer_post_steps, producer_optional_post_actions),
     ):
         detail = _job_detail(api, by_name[name], run_id, run_attempt, control_sha, name)
         skipped = allowed_skips if name == producer_name else ()
         details[name] = (
             detail[0], detail[1],
-            _bootstrap_job_steps(detail[0], expected_steps, skipped, post_steps),
+            _bootstrap_job_steps(detail[0], expected_steps, skipped, post_steps, optional_posts),
         )
     return details
 
@@ -1505,6 +1569,32 @@ def _inspect_rules_bootstrap_markers(raw, control_sha, run_id, run_attempt, env)
         _fail("receipt_invalid")
     if source_binding[3] != BOOTSTRAP_SOURCE_REPOSITORY_IDS["rules-bootstrap"].encode("ascii"):
         _fail("receipt_invalid")
+    _inspect_rules_network_observation(raw, control_sha, run_id, run_attempt, source_sha)
+
+
+def _inspect_rules_network_observation(raw, control_sha, run_id, run_attempt, source_sha):
+    marker = b"macos-rules-network="
+    if type(raw) is not bytes or raw.count(marker) != 1:
+        _fail("receipt_invalid")
+    matches = list(RULES_BOOTSTRAP_NETWORK_MARKER_RE.finditer(raw))
+    if len(matches) != 1:
+        _fail("receipt_invalid")
+    match = matches[0]
+    expected = (
+        control_sha.encode("ascii"), run_id.encode("ascii"),
+        run_attempt.encode("ascii"), source_sha.encode("ascii"),
+    )
+    if match.groups()[:4] != expected:
+        _fail("receipt_invalid")
+    if int(match.group(6)) > 65535 or int(match.group(7)) > 65535:
+        _fail("receipt_invalid")
+    for group in (8, 9):
+        hashes = match.group(group)
+        if hashes == b"none":
+            continue
+        items = hashes.split(b",")
+        if items != sorted(set(items)):
+            _fail("receipt_invalid")
 
 
 def _inspect_core_bootstrap_markers(raw, control_sha, run_id, run_attempt, env):
@@ -1533,6 +1623,7 @@ def _inspect_core_bootstrap_markers(raw, control_sha, run_id, run_attempt, env):
     if source_binding[3] != BOOTSTRAP_SOURCE_REPOSITORY_IDS["core-bootstrap"].encode("ascii"):
         _fail("receipt_invalid")
     _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt)
+    _inspect_reviewed_summary_control_marker(raw, control_sha, run_id, run_attempt)
 
 
 def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):
@@ -1557,6 +1648,23 @@ def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):
     _scan_annotations(api, producer_job, producer_check_id, control_sha, reviewed=True)
     _fetch_artifacts(api, run_id)
     cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+    if (snapshot_job.get("conclusion") != "success" or not snapshot_steps_success
+            or producer_job.get("conclusion") != "success" or not producer_steps_success):
+        if kind == "rules-bootstrap":
+            rules_step = next(
+                step for step in producer_job.get("steps", [])
+                if type(step) is dict and step.get("name") == "Run fixed rules bootstrap"
+            )
+            if ((rules_step.get("status") == "completed"
+                    and rules_step.get("conclusion") != "skipped")
+                    or b"macos-rules-network=" in producer_log):
+                source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+                if not _valid_sha(source_sha):
+                    _fail("receipt_invalid")
+                _inspect_rules_network_observation(
+                    producer_log, control_sha, run_id, run_attempt, source_sha
+                )
+        _fail("native_job_failed")
     baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
     if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
         _fail("inventory_changed")
@@ -1578,9 +1686,6 @@ def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):
         _inspect_rules_bootstrap_markers(producer_log, control_sha, run_id, run_attempt, env)
     else:
         _inspect_core_bootstrap_markers(producer_log, control_sha, run_id, run_attempt, env)
-    if (snapshot_job.get("conclusion") != "success" or not snapshot_steps_success
-            or producer_job.get("conclusion") != "success" or not producer_steps_success):
-        _fail("native_job_failed")
     print(
         "macos-" + kind + "-audit=verified schema=1 control-sha=" + control_sha
         + " run-id=" + run_id + " run-attempt=" + run_attempt
@@ -1597,6 +1702,25 @@ def _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt):
     match = matches[0]
     if match.group(1) != control_sha.encode("ascii") or match.group(2) != run_id.encode("ascii") or match.group(3) != run_attempt.encode("ascii"):
         _fail("receipt_invalid")
+
+
+def _inspect_reviewed_network_selftest_marker(raw, control_sha, run_id, run_attempt):
+    if type(raw) is not bytes:
+        _fail("receipt_invalid")
+    matches = list(REVIEWED_NETWORK_SELFTEST_MARKER_RE.finditer(raw))
+    marker = b"macos-network-observer="
+    if len(matches) != 1 or raw.count(marker) != 1:
+        _fail("receipt_invalid")
+    match = matches[0]
+    if (match.group(1) != control_sha.encode("ascii")
+            or match.group(2) != run_id.encode("ascii")
+            or match.group(3) != run_attempt.encode("ascii")
+            or int(match.group(4)) > 65535 or int(match.group(5)) > 65535):
+        _fail("receipt_invalid")
+    for group in (6, 7):
+        items = match.group(group).split(b",")
+        if items != sorted(set(items)):
+            _fail("receipt_invalid")
 
 
 def _inspect_reviewed_summary_control_marker(raw, control_sha, run_id, run_attempt):
@@ -1908,6 +2032,7 @@ def run(phase, environ=None, api=None):
                 or smoke[0].get("conclusion") != "success" or not smoke[2]):
             _fail("native_job_failed")
         _inspect_reviewed_smoke_marker(smoke_log, control_sha, run_id, run_attempt)
+        _inspect_reviewed_network_selftest_marker(smoke_log, control_sha, run_id, run_attempt)
         _inspect_reviewed_summary_control_marker(smoke_log, control_sha, run_id, run_attempt)
         print("macos-public-surface-audit=synthetic-smoke-audited")
         return 0
