@@ -435,6 +435,26 @@ class TreeEntryTests(unittest.TestCase):
 
 
 class ControlGitCommandTests(unittest.TestCase):
+    def test_empty_graft_override_suppresses_only_its_deprecation_advice(self):
+        environment = subject._base_git_environment(Path("/tmp"))
+        settings = {
+            environment["GIT_CONFIG_KEY_" + str(index)]: environment["GIT_CONFIG_VALUE_" + str(index)]
+            for index in range(int(environment["GIT_CONFIG_COUNT"]))
+        }
+        self.assertEqual(environment["GIT_GRAFT_FILE"], "/dev/null")
+        self.assertEqual(environment["GIT_NO_REPLACE_OBJECTS"], "1")
+        self.assertEqual(settings["advice.graftFileDeprecated"], "false")
+        self.assertEqual(settings["core.hooksPath"], "/dev/null")
+        self.assertEqual(settings["credential.helper"], "")
+
+    def test_git_error_and_other_stderr_still_refuse(self):
+        for returncode, stderr in ((0, b"unexpected diagnostic"), (1, b"")):
+            with self.subTest(returncode=returncode):
+                result = subject.subprocess.CompletedProcess(("git",), returncode, b"", stderr)
+                with self.assertRaises(subject.Refusal) as refusal:
+                    subject._require_git_success(result, "configuration")
+                self.assertEqual(refusal.exception.reason, "revocation_policy_invalid")
+
     def test_control_commands_bind_only_the_exact_resolved_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -257,6 +257,7 @@ def _base_git_environment(home, authorization=None):
     }
     settings = [
         ("core.hooksPath", "/dev/null"),
+        ("advice.graftFileDeprecated", "false"),
         ("fetch.fsckObjects", "true"),
         ("transfer.fsckObjects", "true"),
         ("protocol.version", "2"),
