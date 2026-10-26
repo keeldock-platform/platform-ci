@@ -748,19 +748,19 @@ class AuditRunTests(unittest.TestCase):
         logs[203] = logs[203].replace(CONTROL_SHA.encode("ascii"), b"f" * 40)
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
-        self.assertEqual(caught.exception.reason, "smoke_marker_missing")
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
 
         pages, env, logs = reviewed_audit_fixture()
         logs[203] = logs[203].replace(b"image-os=macos-15-arm64", b"image-os=macos-latest")
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
-        self.assertEqual(caught.exception.reason, "smoke_marker_missing")
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
 
         pages, env, logs = reviewed_audit_fixture()
         logs[203] += b"macos-build=unexpected\n"
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
-        self.assertEqual(caught.exception.reason, "smoke_marker_missing")
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
 
         pages, env, logs = reviewed_audit_fixture()
         pages[

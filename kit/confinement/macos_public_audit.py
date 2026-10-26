@@ -88,7 +88,6 @@ REASONS = frozenset(
         "workflow_command_exposed",
         "receipt_invalid",
         "native_job_failed",
-        "smoke_marker_missing",
         "output_unavailable",
         "internal_error",
     )
@@ -689,10 +688,10 @@ def _reviewed_jobs(api, run_id, run_attempt, control_sha):
 def _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt):
     matches = list(REVIEWED_SMOKE_MARKER_RE.finditer(raw))
     if len(matches) != 1 or raw.count(b"macos-build=") != 1:
-        _fail("smoke_marker_missing")
+        _fail("receipt_invalid")
     match = matches[0]
     if match.group(1) != control_sha.encode("ascii") or match.group(2) != run_id.encode("ascii") or match.group(3) != run_attempt.encode("ascii"):
-        _fail("smoke_marker_missing")
+        _fail("receipt_invalid")
 
 
 def _scan_annotations(api, job, check_id, control_sha, reviewed=False):
