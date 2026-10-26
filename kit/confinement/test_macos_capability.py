@@ -1236,6 +1236,206 @@ class TrustedToolchainTests(unittest.TestCase):
         self.assertEqual(raised.exception.check, "probe_process_toolchain")
         lstat.assert_not_called()
 
+
+class WorkerToolResolutionTests(unittest.TestCase):
+    def _toolchain(self, origin):
+        if origin == "clt":
+            developer = "/Library/Developer/CommandLineTools"
+            python = developer + "/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9"
+        else:
+            developer = TEST_TOOLCHAIN["developer_directory"]
+            python = TEST_TOOLCHAIN["python"]
+        return {
+            "python": python,
+            "clang": "/trusted/clang",
+            "sdk": "/trusted/sdk",
+            "linker": "/trusted/ld",
+            "developer_directory": developer,
+        }
+
+    def _resolve(self, toolchain, *, overrides=None, missing=(), shadows=None):
+        python = PurePosixPath(toolchain["python"])
+        developer = PurePosixPath(toolchain["developer_directory"])
+        python_entry = python.parent / "python3"
+        git_entry = developer / "usr" / "bin" / "git"
+        resolved = {
+            toolchain["python"]: python,
+            python_entry.as_posix(): python,
+            git_entry.as_posix(): git_entry,
+            "/usr/bin/env": PurePosixPath("/usr/bin/env"),
+            "/usr/bin/ssh-keygen": PurePosixPath("/usr/bin/ssh-keygen"),
+        }
+        resolved.update(overrides or {})
+        shadows = shadows or {}
+        for key in missing:
+            resolved.pop(key, None)
+        directories = {
+            toolchain["developer_directory"]: developer,
+            python.parent.as_posix(): python.parent,
+            (developer / "usr" / "bin").as_posix(): developer / "usr" / "bin",
+            "/usr/bin": PurePosixPath("/usr/bin"),
+            "/bin": PurePosixPath("/bin"),
+            "/usr/sbin": PurePosixPath("/usr/sbin"),
+            "/sbin": PurePosixPath("/sbin"),
+        }
+
+        def lstat(candidate):
+            if candidate.as_posix() in shadows:
+                return types.SimpleNamespace(st_uid=0)
+            raise FileNotFoundError
+
+        with patch.object(
+            macos_capability,
+            "_resolve_trusted_path",
+            side_effect=lambda raw, **kwargs: resolved[raw],
+        ) as resolve_path:
+            with patch.object(
+                macos_capability,
+                "_resolve_worker_path_directory",
+                side_effect=lambda raw: directories[raw],
+            ):
+                with patch.object(Path, "lstat", autospec=True, side_effect=lambda self: lstat(self)):
+                    result = macos_capability._resolve_worker_tools(toolchain)
+        return result, resolve_path
+
+    def test_xcode_and_command_line_tools_bind_python_and_git_to_the_same_install(self):
+        for origin in ("xcode", "clt"):
+            with self.subTest(origin=origin):
+                toolchain = self._toolchain(origin)
+                result, resolver = self._resolve(toolchain)
+                python_directory = PurePosixPath(toolchain["python"]).parent.as_posix()
+                developer_bin = toolchain["developer_directory"] + "/usr/bin"
+                self.assertEqual(result["python"], toolchain["python"])
+                self.assertEqual(result["git"], developer_bin + "/git")
+                self.assertEqual(result["env"], "/usr/bin/env")
+                self.assertEqual(result["ssh_keygen"], "/usr/bin/ssh-keygen")
+                self.assertEqual(
+                    result["path"].split(":"),
+                    [python_directory, developer_bin, "/usr/bin", "/bin", "/usr/sbin", "/sbin"],
+                )
+                self.assertTrue(
+                    any(
+                        call.args[0] == python_directory + "/python3"
+                        and call.kwargs.get("reject_python_shim") is True
+                        for call in resolver.call_args_list
+                    )
+                )
+
+    def test_python_entry_must_resolve_to_the_trusted_interpreter(self):
+        toolchain = self._toolchain("clt")
+        python_entry = (PurePosixPath(toolchain["python"]).parent / "python3").as_posix()
+        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+            self._resolve(toolchain, overrides={python_entry: PurePosixPath("/untrusted/python3")})
+        self.assertEqual(raised.exception.check, "probe_process_toolchain")
+
+    def test_missing_python_or_git_fails_closed_without_a_system_fallback(self):
+        toolchain = self._toolchain("clt")
+        python_entry = (PurePosixPath(toolchain["python"]).parent / "python3").as_posix()
+        git_entry = (PurePosixPath(toolchain["developer_directory"]) / "usr" / "bin" / "git").as_posix()
+        for missing in (python_entry, git_entry):
+            with self.subTest(missing=missing):
+                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                    self._resolve(toolchain, missing=(missing,))
+                self.assertEqual(raised.exception.check, "probe_process_toolchain")
+
+    def test_git_must_resolve_inside_the_selected_developer_directory(self):
+        toolchain = self._toolchain("xcode")
+        git_entry = (PurePosixPath(toolchain["developer_directory"]) / "usr" / "bin" / "git").as_posix()
+        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+            self._resolve(toolchain, overrides={git_entry: PurePosixPath("/usr/bin/git")})
+        self.assertEqual(raised.exception.check, "probe_process_toolchain")
+
+    def test_preceding_path_git_must_resolve_to_the_selected_developer_git(self):
+        toolchain = self._toolchain("xcode")
+        python_git = (PurePosixPath(toolchain["python"]).parent / "git").as_posix()
+        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+            self._resolve(
+                toolchain,
+                overrides={python_git: PurePosixPath("/usr/bin/git")},
+                shadows={python_git: True},
+            )
+        self.assertEqual(raised.exception.check, "probe_process_toolchain")
+
+    def test_matching_preceding_path_git_alias_keeps_the_selected_target(self):
+        toolchain = self._toolchain("clt")
+        python_git = (PurePosixPath(toolchain["python"]).parent / "git").as_posix()
+        expected_git = PurePosixPath(toolchain["developer_directory"]) / "usr" / "bin" / "git"
+        result, _ = self._resolve(
+            toolchain,
+            overrides={python_git: expected_git},
+            shadows={python_git: True},
+        )
+        self.assertEqual(result["git"], expected_git.as_posix())
+
+    def test_toolchain_schema_and_python_layout_are_closed(self):
+        toolchain = self._toolchain("clt")
+        for invalid in (
+            {**toolchain, "extra": "value"},
+            {key: value for key, value in toolchain.items() if key != "linker"},
+        ):
+            with self.subTest(keys=tuple(invalid)):
+                with self.assertRaises(macos_capability.ProbeFailure):
+                    macos_capability._resolve_worker_tools(invalid)
+        invalid = {**toolchain, "developer_directory": "/trusted/other"}
+        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+            self._resolve(invalid)
+        self.assertEqual(raised.exception.check, "probe_process_toolchain")
+
+    def test_path_delimiter_in_a_trusted_install_name_is_refused(self):
+        developer = "/Applications/Toolchain:Fixture.app/Contents/Developer"
+        toolchain = {
+            "python": developer + "/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9",
+            "clang": "/trusted/clang",
+            "sdk": "/trusted/sdk",
+            "linker": "/trusted/ld",
+            "developer_directory": developer,
+        }
+        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+            self._resolve(toolchain)
+        self.assertEqual(raised.exception.check, "probe_process_toolchain")
+
+    def test_worker_path_directories_reject_group_or_world_write_and_nonroot_owners(self):
+        path = Path("/trusted/bin")
+        safe = stat.S_IFDIR | 0o755
+
+        def metadata(component, *, unsafe=None):
+            text = component.as_posix()
+            mode = safe
+            owner = 0
+            group = 80
+            if unsafe == "group" and text == "/trusted":
+                mode = stat.S_IFDIR | 0o775
+                group = macos_capability.PROBE_PRIMARY_GID
+            elif unsafe == "admin" and text == "/trusted":
+                mode = stat.S_IFDIR | 0o775
+            elif unsafe == "world" and text == "/":
+                mode = stat.S_IFDIR | 0o777
+            elif unsafe == "owner" and text == "/trusted/bin":
+                owner = 501
+            return types.SimpleNamespace(st_uid=owner, st_gid=group, st_mode=mode)
+
+        with patch.object(macos_capability, "_resolve_trusted_path", return_value=path):
+            with patch.object(Path, "stat", autospec=True, side_effect=lambda self: metadata(self)):
+                self.assertEqual(macos_capability._resolve_worker_path_directory("/trusted/bin"), path)
+            for unsafe in ("group", "world", "owner"):
+                with self.subTest(unsafe=unsafe):
+                    with patch.object(
+                        Path,
+                        "stat",
+                        autospec=True,
+                        side_effect=lambda self, unsafe=unsafe: metadata(self, unsafe=unsafe),
+                    ):
+                        with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                            macos_capability._resolve_worker_path_directory("/trusted/bin")
+                    self.assertEqual(raised.exception.check, "probe_process_toolchain")
+            with patch.object(
+                Path,
+                "stat",
+                autospec=True,
+                side_effect=lambda self: metadata(self, unsafe="admin"),
+            ):
+                self.assertEqual(macos_capability._resolve_worker_path_directory("/trusted/bin"), path)
+
     def test_runner_control_refusal_emits_only_allowlisted_check(self):
         refusal = macos_capability.ProbeFailure("runner_control_unavailable", check="diagnostics_layout")
         self.assertEqual(
