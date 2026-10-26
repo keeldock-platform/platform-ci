@@ -188,6 +188,63 @@ class PhysicalInterfaceTests(unittest.TestCase):
                 observer._system_interfaces()
         self.assertEqual((caught.exception.reason, caught.exception.stage), ("interface_unavailable", "interface_hardware"))
 
+    def test_system_interfaces_skips_valid_unaddressed_hardware_and_keeps_addressed_device(self):
+        hardware = b"Hardware Port: Wi-Fi\nDevice: en0\nHardware Port: Ethernet\nDevice: en1\n"
+        capture = b"1.en0 [Up, Running]\n2.en1 [Up, Running]\n"
+        no_address = b"en0: flags=8863<UP,RUNNING> mtu 1500\n"
+        address = b"en1: flags=8863<UP,RUNNING> mtu 1500\n inet 192.0.2.10 netmask 0xffffff00\n"
+        with patch.object(observer, "_run_fixed_command", side_effect=(hardware, capture, no_address, address)):
+            interfaces = observer._system_interfaces()
+        self.assertEqual(
+            interfaces,
+            ({"name": "en1", "addresses": frozenset(("192.0.2.10",))},),
+        )
+
+    def test_system_interfaces_refuses_when_every_valid_hardware_device_is_unaddressed(self):
+        hardware = b"Hardware Port: Wi-Fi\nDevice: en0\nHardware Port: Ethernet\nDevice: en1\n"
+        capture = b"1.en0 [Up, Running]\n2.en1 [Up, Running]\n"
+        first = b"en0: flags=8863<UP,RUNNING> mtu 1500\n"
+        second = b"en1: flags=8863<UP,RUNNING> mtu 1500\n"
+        with patch.object(observer, "_run_fixed_command", side_effect=(hardware, capture, first, second)):
+            with self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._system_interfaces()
+        self.assertEqual((caught.exception.reason, caught.exception.stage), ("interface_unavailable", "interface_address"))
+
+    def test_ifconfig_header_and_address_records_must_be_well_formed(self):
+        cases = (
+            b"",
+            b"interface output unavailable\n",
+            b"en1: flags=8863<UP,RUNNING> mtu 1500\n inet 192.0.2.10 netmask 0xffffff00\n",
+            b"en0: flags=nothex<UP,RUNNING> mtu 1500\n",
+            b"en0: flags=8863<UP,Running> mtu 1500\n",
+            b"en0: flags=8863<UP,UP> mtu 1500\n",
+            b"en0: flags=8863<UP,RUNNING>mtu 1500\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\nen1: flags=8863<UP,RUNNING> mtu 1500\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\nunexpected body\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inet\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inet6\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inet invalid-address\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inet6 192.0.2.10\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inet6 fe80::1%\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inet6 fe80::1%%en0\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inet6 fe80::1%en1\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inet 2001:db8::1\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inetgarbage 192.0.2.10\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n inet 192.0.2.10\x1b\n",
+            b"en0: flags=8863<UP,RUNNING> mtu 1500\n\xff\n",
+        )
+        for output in cases:
+            with self.subTest(output=output), self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._parse_local_addresses(output, "interface_address", "en0")
+            self.assertEqual((caught.exception.reason, caught.exception.stage), ("interface_unavailable", "interface_address"))
+
+    def test_ifconfig_valid_inactive_device_has_no_usable_addresses(self):
+        output = b"en0: flags=8863<BROADCAST> mtu 1500\n inet 192.0.2.10 netmask 0xffffff00\n"
+        self.assertEqual(
+            observer._parse_local_addresses(output, "interface_address", "en0"),
+            frozenset(),
+        )
+
     def test_physical_discovery_parser_failures_keep_their_fixed_leaf_stage(self):
         for parser, stage in (
             (observer._parse_hardware_devices, "interface_hardware"),
