@@ -765,6 +765,22 @@ class WorkflowPolicyTests(unittest.TestCase):
                     self.assertIn("core-bootstrap-settings", workflow)
                     self.assertIn("core-bootstrap-snapshot", workflow)
                     self.assertIn("Core preflight", workflow)
+                    self.assertIn("      - name: Write trusted summary visibility control\n", workflow)
+                    self.assertLess(
+                        workflow.index("      - name: Core preflight\n"),
+                        workflow.index("      - name: Write trusted summary visibility control\n"),
+                    )
+                    self.assertLess(
+                        workflow.index("      - name: Write trusted summary visibility control\n"),
+                        workflow.index("      - name: Validate reader settings\n"),
+                    )
+                    generic_summary = workflow.split(
+                        "      - name: Write trusted summary visibility control\n", 1
+                    )[1].split("      - name: Validate reader settings\n", 1)[0]
+                    self.assertIn('summary_prefix="macos-summary-"', generic_summary)
+                    self.assertIn("control=trusted-write schema=1 control-sha=$CI_SHA", generic_summary)
+                    self.assertIn('printf \'%s\\n\' "$summary_line" >> "$GITHUB_STEP_SUMMARY"', generic_summary)
+                    self.assertNotIn("source-sha", generic_summary)
                     self.assertIn("Validate reader settings", workflow)
                     self.assertIn('"$SOURCE_REPOSITORY_ID" != "1430959909"', workflow)
                     self.assertIn(

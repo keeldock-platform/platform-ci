@@ -69,7 +69,7 @@ ALLOWED_FILES = {
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
     '.github/workflows/macos-rules-bootstrap.yml': '002de702a0d0f7447f8c750ae3d37a5a80aa18824d88d0688f7f2b2c3e4ac3d4',
-    '.github/workflows/macos-core-bootstrap.yml': '7c110953eca3e99d502fbf32cb2bd176e4aceb92d22074bd4a5060cb1e4e4597',
+    '.github/workflows/macos-core-bootstrap.yml': '25dbd661672e7b57384b2ffcd9934e62fb20688c94ee29ca97d2ab0eebc7109f',
     'kit/confinement/macos_rules_bootstrap.py': '99428c2ab2ce71d2372faa2ec140a8cb9321442b4b4fdebf73260a69b17cbc9d',
     'kit/confinement/test_macos_rules_bootstrap.py': '306fef659ab8486baa9ef77530f988f1dd29ea5714dd24d41778075fcd7c7dbd',
     'kit/confinement/macos_core_bootstrap.py': '8f27ed84b98d2c3fcf45d2c12f330f9a324ab00f542058c8e095765989555b00',

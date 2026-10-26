@@ -1467,6 +1467,7 @@ def _bootstrap_jobs(api, kind, run_id, run_attempt, control_sha):
             "Run reviewed smoke",
             "Protect inventory",
             "Core preflight",
+            "Write trusted summary visibility control",
             "Validate reader settings",
             "Mint reader token",
             "Validate core bootstrap",
@@ -1622,6 +1623,7 @@ def _inspect_core_bootstrap_markers(raw, control_sha, run_id, run_attempt, env):
     if source_binding[3] != BOOTSTRAP_SOURCE_REPOSITORY_IDS["core-bootstrap"].encode("ascii"):
         _fail("receipt_invalid")
     _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt)
+    _inspect_reviewed_summary_control_marker(raw, control_sha, run_id, run_attempt)
 
 
 def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):

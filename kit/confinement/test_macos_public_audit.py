@@ -1066,8 +1066,8 @@ def bootstrap_audit_fixture(kind):
         snapshot_steps = ("Fetch control", "Audit source-read settings", "Snapshot cache")
         producer_steps = (
             "Fetch control", "Test control", "Run reviewed smoke", "Protect inventory",
-            "Core preflight", "Validate reader settings", "Mint reader token",
-            "Validate core bootstrap",
+            "Core preflight", "Write trusted summary visibility control",
+            "Validate reader settings", "Mint reader token", "Validate core bootstrap",
         )
         smoke = (
             "macos-build=synthetic-smoke-passed schema=1 source=none control-sha=" + CONTROL_SHA
@@ -1091,6 +1091,10 @@ def bootstrap_audit_fixture(kind):
             + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
             + " repository-id=" + audit.BOOTSTRAP_SOURCE_REPOSITORY_IDS["core-bootstrap"]
         ).encode("ascii")
+        summary_control = (
+            "2026-10-26T12:34:56.1234567Z macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+        ).encode("ascii")
         success = (
             "macos-core-bootstrap=verified schema=1 control-sha=" + CONTROL_SHA
             + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
@@ -1110,7 +1114,7 @@ def bootstrap_audit_fixture(kind):
             b"success_state='verified'\nrefusal_state='refused'\n"
         )
         producer_log = (
-            smoke + b"\n" + preflight + b"\n" + bootstrap_command_echo + b"\n"
+            smoke + b"\n" + preflight + b"\n" + summary_control + b"\n" + bootstrap_command_echo + b"\n"
             + binding_command_echo + b"\n"
             + source_binding + b"\n" + success + b"\n"
         )
@@ -1602,10 +1606,29 @@ class BootstrapAuditTests(unittest.TestCase):
             lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
                 b"summary-sentinel=written", b"summary-sentinel=not-written", 1
             )),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"macos-summary-control=trusted-write",
+                b"macos-summary-control=missing", 1
+            )),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813] + b"\n" + next(
+                line for line in logs[813].splitlines() if b"macos-summary-control=" in line
+            ) + b"\n"),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA.encode("ascii"),
+                b"macos-summary-control=trusted-write schema=1 control-sha=" + b"f" * 40,
+                1,
+            )),
+            lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
+                b"macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA.encode("ascii")
+                + b" run-id=" + RUN_ID.encode("ascii"),
+                b"macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA.encode("ascii")
+                + b" run-id=1",
+                1,
+            )),
             lambda pages, env, logs: env.__setitem__("SOURCE_SHA", "f" * 40),
             lambda pages, env, logs: pages[
                 "/repos/keeldock-platform/platform-ci/actions/jobs/813"
-            ][0]["steps"][8].update(conclusion="failure"),
+            ][0]["steps"][9].update(conclusion="failure"),
             lambda pages, env, logs: logs.__setitem__(813, logs[813].replace(
                 b"macos-core-source-binding=verified", b"macos-core-source-binding=missing", 1
             )),
