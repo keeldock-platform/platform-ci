@@ -975,10 +975,14 @@ def _verify_acl_rule(path, ls_executable, username, rights):
     entries = _acl_entries(path, ls_executable)
     if len(entries) != 1:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
-    prefix = "0: user:" + username + " allow "
-    if not entries[0].startswith(prefix):
+    entry = entries[0]
+    if not entry.startswith(" ") or entry.startswith("  "):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
-    actual = entries[0][len(prefix):].split(",")
+    entry = entry[1:]
+    prefix = "0: user:" + username + " allow "
+    if not entry.startswith(prefix):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    actual = entry[len(prefix):].split(",")
     if len(actual) != len(set(actual)) or set(actual) != set(rights):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
 

@@ -270,6 +270,45 @@ class StorageRootValidationTests(unittest.TestCase):
         self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
 
 
+class AclEntryTests(unittest.TestCase):
+    def _read_entries(self, entry):
+        output = b"drwx------  2 root  wheel  64 Oct 27 00:00 storage-root\n"
+        output += entry.encode("ascii") + b"\n"
+        result = SimpleNamespace(returncode=0, stderr=b"", stdout=output)
+        with patch.object(subject, "_run_process", return_value=result):
+            return subject._acl_entries(Path("/tmp/storage-root"), "/bin/ls")
+
+    def test_accepts_the_single_space_emitted_by_apple_ls(self):
+        entries = self._read_entries(" 0: user:runner allow search")
+        self.assertEqual(entries, [" 0: user:runner allow search"])
+        with patch.object(subject, "_acl_entries", return_value=entries):
+            subject._verify_acl_rule(Path("/tmp/storage-root"), "/bin/ls", "runner", ("search",))
+
+    def test_refuses_malformed_acl_spacing_and_nonmatching_rules(self):
+        for entry in (
+            "0: user:runner allow search",
+            "  0: user:runner allow search",
+            "\t0: user:runner allow search",
+            " 1: user:runner allow search",
+            " 0: user:other allow search",
+            " 0: user:runner deny search",
+            " 0: user:runner allow list,search",
+            " 0: user:runner allow search,search",
+            " 0: user:runner allow search inherited",
+        ):
+            with self.subTest(entry=entry), patch.object(subject, "_acl_entries", return_value=[entry]):
+                with self.assertRaises(subject.Refusal) as result:
+                    subject._verify_acl_rule(Path("/tmp/storage-root"), "/bin/ls", "runner", ("search",))
+                self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_snapshot_invalid", "bootstrap"))
+
+    def test_refuses_multiple_acl_entries(self):
+        entries = [" 0: user:runner allow search", " 1: user:runner allow search"]
+        with patch.object(subject, "_acl_entries", return_value=entries):
+            with self.assertRaises(subject.Refusal) as result:
+                subject._verify_acl_rule(Path("/tmp/storage-root"), "/bin/ls", "runner", ("search",))
+        self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_snapshot_invalid", "bootstrap"))
+
+
 class RevocationResultTests(unittest.TestCase):
     class Reader:
         TOKEN_ENV = "SOURCE_READER_TOKEN"
