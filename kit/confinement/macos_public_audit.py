@@ -54,12 +54,20 @@ REVIEWED_SMOKE_MARKER_RE = re.compile(
     rb"clang=[0-9]+(?:\.[0-9]+){0,3} sdk=[0-9]+(?:\.[0-9]+){0,3} "
     rb"developer-mode=disabled privilege=separate-nonadmin sudo=denied "
     rb"compile=passed link=passed load-test=passed capture=passed "
-    rb"summary-standin=write-denied cleanup=complete seatbelt=not-run pf=not-run"
+    rb"summary-standin=write-denied real-summary=write-denied "
+    rb"cleanup=complete seatbelt=not-run pf=not-run"
     rb"(?=\r?(?:\n|$))"
+)
+REVIEWED_SUMMARY_CONTROL_MARKER_RE = re.compile(
+    rb"(?m)^(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    rb"(?:\.[0-9]+)?Z )?macos-summary-control=trusted-write schema=1 "
+    rb"control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) "
+    rb"run-attempt=([1-9][0-9]{0,18})(?=\r?(?:\n|$))"
 )
 CANARY_DOMAIN = b"keeldock" + b"-macos-ci-canary-v1\0"
 CANARY_PREFIX = b"KD-MACOS-CI-CANARY-v1:"
 REVIEWED_CANARY_PREFIX = b"KD-RB-CANARY-"
+REVIEWED_SUMMARY_DIRECT_CANARY = b"KD-RB-SUMMARY-DIRECT-WRITE-CANARY-v1"
 CANARY_COMMANDS = (
     b"::error file=canary.txt,line=1::",
     b"::warning::",
@@ -183,6 +191,18 @@ def _reviewed_canary_variants(control_sha):
     }
 
 
+def _reviewed_summary_canary_variants():
+    value = REVIEWED_SUMMARY_DIRECT_CANARY
+    return {
+        value,
+        value.upper(),
+        value.hex().encode("ascii"),
+        base64.b64encode(value),
+        base64.urlsafe_b64encode(value).rstrip(b"="),
+        urllib.parse.quote_from_bytes(value, safe="").encode("ascii"),
+    }
+
+
 def canary_needles(control_sha):
     variants = _canary_variants(control_sha)
     values = set(variants)
@@ -208,7 +228,10 @@ def inspect_public_bytes(raw, control_sha):
 
 def inspect_reviewed_public_bytes(raw, control_sha):
     inspect_public_bytes(raw, control_sha)
-    for needle in _reviewed_canary_variants(control_sha):
+    for needle in (
+        _reviewed_canary_variants(control_sha)
+        | _reviewed_summary_canary_variants()
+    ):
         if needle and needle in raw:
             _fail("canary_exposed")
 
@@ -768,10 +791,20 @@ def _reviewed_jobs(api, run_id, run_attempt, control_sha):
         _fail("run_identity_mismatch")
     snapshot = next(job for job in jobs if job.get("name") == REVIEWED_SNAPSHOT_JOB_NAME)
     smoke = next(job for job in jobs if job.get("name") == REVIEWED_SMOKE_JOB_NAME)
-    return (
-        _job_detail(api, snapshot, run_id, run_attempt, control_sha, REVIEWED_SNAPSHOT_JOB_NAME),
-        _job_detail(api, smoke, run_id, run_attempt, control_sha, REVIEWED_SMOKE_JOB_NAME),
+    snapshot_detail = _job_detail(
+        api, snapshot, run_id, run_attempt, control_sha, REVIEWED_SNAPSHOT_JOB_NAME
     )
+    smoke_detail = _job_detail(
+        api, smoke, run_id, run_attempt, control_sha, REVIEWED_SMOKE_JOB_NAME
+    )
+    steps = smoke_detail[0].get("steps", [])
+    summary_steps = [
+        step for step in steps
+        if type(step) is dict and step.get("name") == "Write trusted summary visibility control"
+    ]
+    if len(summary_steps) != 1:
+        _fail("api_schema")
+    return snapshot_detail, smoke_detail
 
 
 def _cache_proof_keys(run_id, run_attempt):
@@ -862,6 +895,17 @@ def _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt):
         _fail("receipt_invalid")
     match = matches[0]
     if match.group(1) != control_sha.encode("ascii") or match.group(2) != run_id.encode("ascii") or match.group(3) != run_attempt.encode("ascii"):
+        _fail("receipt_invalid")
+
+
+def _inspect_reviewed_summary_control_marker(raw, control_sha, run_id, run_attempt):
+    matches = list(REVIEWED_SUMMARY_CONTROL_MARKER_RE.finditer(raw))
+    if len(matches) != 1 or raw.count(b"macos-summary-control=") != 1:
+        _fail("receipt_invalid")
+    match = matches[0]
+    if (match.group(1) != control_sha.encode("ascii")
+            or match.group(2) != run_id.encode("ascii")
+            or match.group(3) != run_attempt.encode("ascii")):
         _fail("receipt_invalid")
 
 
@@ -1107,6 +1151,7 @@ def run(phase, environ=None, api=None):
                 or smoke[0].get("conclusion") != "success" or not smoke[2]):
             _fail("native_job_failed")
         _inspect_reviewed_smoke_marker(smoke_log, control_sha, run_id, run_attempt)
+        _inspect_reviewed_summary_control_marker(smoke_log, control_sha, run_id, run_attempt)
         print("macos-public-surface-audit=synthetic-smoke-audited")
         return 0
 

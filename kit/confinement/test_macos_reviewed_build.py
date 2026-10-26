@@ -1,7 +1,11 @@
 import contextlib
 import io
+import os
 from pathlib import Path
+import stat
 import subprocess
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -46,6 +50,7 @@ def success_record(**changes):
         "load_test": "passed",
         "capture": "passed",
         "summary_standin": "write_denied",
+        "real_summary": "write_denied",
         "cleanup": "complete",
         "seatbelt": "not_run",
         "pf": "not_run",
@@ -226,6 +231,7 @@ class ChildEnvironmentTests(unittest.TestCase):
         )
         self.assertFalse(any(key.startswith(("GITHUB_", "ACTIONS_", "CI_")) for key in environment))
         self.assertNotIn("GITHUB_STEP_SUMMARY", environment)
+        self.assertNotIn("CI_STEP_SUMMARY", environment)
         self.assertNotIn("GITHUB_OUTPUT", environment)
 
     def test_capture_probe_contains_a_synthetic_standin_not_a_runner_summary_path(self):
@@ -235,6 +241,170 @@ class ChildEnvironmentTests(unittest.TestCase):
         self.assertNotIn("GITHUB_OUTPUT", reviewed_build.LOAD_TEST_SCRIPT)
         self.assertNotIn("ACTIONS_RUNTIME_TOKEN", reviewed_build.LOAD_TEST_SCRIPT)
 
+    def test_real_summary_path_is_an_argument_and_never_a_child_environment_value(self):
+        summary_path = "/runner/work/_temp/_runner_file_commands/step_summary_fixture"
+        parent_probe = str(Path(summary_path).parent / (Path(summary_path).name + ".kd-rb-123-1"))
+        argv = reviewed_build._probe_argv(
+            "/usr/bin/python3",
+            reviewed_build.SUMMARY_FILE_SCRIPT,
+            summary_path,
+            parent_probe,
+        )
+        self.assertEqual(argv[-2:], (summary_path, parent_probe))
+        self.assertIn("os.open(summary_path, os.O_WRONLY | os.O_APPEND | nofollow)", reviewed_build.SUMMARY_FILE_SCRIPT)
+        self.assertIn("parent_probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow", reviewed_build.SUMMARY_FILE_SCRIPT)
+        self.assertNotIn("CI_STEP_SUMMARY", reviewed_build.SUMMARY_FILE_SCRIPT)
+        self.assertNotIn("GITHUB_STEP_SUMMARY", reviewed_build.SUMMARY_FILE_SCRIPT)
+
+
+@unittest.skipUnless(
+    sys.platform == "darwin"
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "O_DIRECTORY")
+    and os.open in getattr(os, "supports_dir_fd", ()),
+    "requires macOS no-follow descriptor support",
+)
+class RealSummaryFileTests(unittest.TestCase):
+    def _temporary_summary(self):
+        home = Path.home()
+        temporary = tempfile.TemporaryDirectory(dir=str(home))
+        directory = Path(temporary.name)
+        summary = directory / "step_summary_fixture"
+        descriptor = os.open(summary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+        return temporary, home, directory, summary
+
+    def test_runner_file_guard_binds_owner_inode_and_empty_contents(self):
+        temporary, home, directory, summary = self._temporary_summary()
+        guard = None
+        try:
+            runner_uid = home.stat().st_uid
+            with patch.dict(
+                "os.environ",
+                {"RUNNER_HOME": str(home), "CI_STEP_SUMMARY": str(summary)},
+                clear=False,
+            ):
+                guard = reviewed_build._prepare_runner_summary(runner_uid + 1)
+            self.assertEqual(guard["original_contents"], b"")
+            self.assertEqual(guard["original_info"].st_uid, runner_uid)
+            self.assertEqual(stat.S_IMODE(guard["original_info"].st_mode), 0o600)
+            self.assertEqual(guard["original_info"].st_nlink, 1)
+        finally:
+            if guard is not None:
+                reviewed_build._close_runner_summary(guard)
+            temporary.cleanup()
+
+    def test_runner_file_guard_refuses_a_writable_parent(self):
+        temporary, home, directory, summary = self._temporary_summary()
+        try:
+            os.chmod(directory, 0o777)
+            with patch.dict(
+                "os.environ",
+                {"RUNNER_HOME": str(home), "CI_STEP_SUMMARY": str(summary)},
+                clear=False,
+            ):
+                with self.assertRaises(reviewed_build.Refusal) as raised:
+                    reviewed_build._prepare_runner_summary(home.stat().st_uid + 1)
+            self.assertEqual(raised.exception.reason, "summary_file_unavailable")
+            self.assertEqual(raised.exception.stage, "summary_file")
+        finally:
+            os.chmod(directory, 0o700)
+            temporary.cleanup()
+
+    def test_runner_file_restoration_clears_a_synthetic_direct_write(self):
+        temporary, home, directory, summary = self._temporary_summary()
+        guard = None
+        try:
+            runner_uid = home.stat().st_uid
+            with patch.dict(
+                "os.environ",
+                {"RUNNER_HOME": str(home), "CI_STEP_SUMMARY": str(summary)},
+                clear=False,
+            ):
+                guard = reviewed_build._prepare_runner_summary(runner_uid + 1)
+            os.write(guard["descriptor"], reviewed_build.REAL_SUMMARY_CANARY)
+            reviewed_build._restore_runner_summary(guard)
+            self.assertEqual(reviewed_build._read_summary_descriptor(guard["descriptor"]), b"")
+            info = summary.lstat()
+            self.assertEqual(info.st_uid, runner_uid)
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+            self.assertEqual(info.st_nlink, 1)
+        finally:
+            if guard is not None:
+                reviewed_build._close_runner_summary(guard)
+            temporary.cleanup()
+
+    def test_direct_write_and_parent_create_attempts_refuse_and_restore(self):
+        temporary, home, directory, summary = self._temporary_summary()
+        guard = None
+        try:
+            runner_uid = home.stat().st_uid
+            with patch.dict(
+                "os.environ",
+                {"RUNNER_HOME": str(home), "CI_STEP_SUMMARY": str(summary)},
+                clear=False,
+            ):
+                guard = reviewed_build._prepare_runner_summary(runner_uid + 1)
+
+            def simulate_child(argv, uid, *, env, timeout, failure_reason, python_executable):
+                Path(argv[-2]).write_bytes(reviewed_build.REAL_SUMMARY_CANARY)
+                Path(argv[-1]).write_bytes(b"KD-RB-PARENT-WRITE-CANARY-v1\n")
+                return subprocess.CompletedProcess(argv, 0, reviewed_build.REAL_SUMMARY_ALLOWED_MARKER, b"")
+
+            with patch.object(reviewed_build.capability, "_run_as_probe_user", side_effect=simulate_child):
+                with self.assertRaises(reviewed_build.Refusal) as raised:
+                    reviewed_build._run_real_summary_probe(
+                        guard,
+                        runner_uid + 1,
+                        env={},
+                        python_executable="/usr/bin/python3",
+                        binding={"run_id": "123", "run_attempt": "1"},
+                    )
+            self.assertEqual(raised.exception.reason, "summary_file_write_allowed")
+            self.assertEqual(raised.exception.stage, "summary_file")
+            self.assertEqual(summary.read_bytes(), b"")
+            self.assertEqual(tuple(directory.glob("*.kd-rb-*")), ())
+            info = summary.lstat()
+            self.assertEqual(info.st_uid, runner_uid)
+            self.assertEqual(stat.S_IMODE(info.st_mode), 0o600)
+        finally:
+            if guard is not None:
+                reviewed_build._close_runner_summary(guard)
+            temporary.cleanup()
+
+    def test_denied_child_write_is_accepted_only_after_runner_file_readback(self):
+        temporary, home, directory, summary = self._temporary_summary()
+        guard = None
+        try:
+            runner_uid = home.stat().st_uid
+            with patch.dict(
+                "os.environ",
+                {"RUNNER_HOME": str(home), "CI_STEP_SUMMARY": str(summary)},
+                clear=False,
+            ):
+                guard = reviewed_build._prepare_runner_summary(runner_uid + 1)
+
+            def simulate_child(argv, uid, *, env, timeout, failure_reason, python_executable):
+                return subprocess.CompletedProcess(argv, 0, reviewed_build.REAL_SUMMARY_MARKER, b"")
+
+            with patch.object(reviewed_build.capability, "_run_as_probe_user", side_effect=simulate_child):
+                reviewed_build._run_real_summary_probe(
+                    guard,
+                    runner_uid + 1,
+                    env={},
+                    python_executable="/usr/bin/python3",
+                    binding={"run_id": "123", "run_attempt": "1"},
+                )
+            self.assertEqual(summary.read_bytes(), b"")
+            self.assertEqual(tuple(directory.glob("*.kd-rb-*")), ())
+            self.assertTrue(guard["child_termination_confirmed"])
+        finally:
+            if guard is not None:
+                reviewed_build._close_runner_summary(guard)
+            temporary.cleanup()
+
+
+class CanaryArgumentTests(unittest.TestCase):
     def test_canary_argument_is_ascii_text_and_child_encodes_before_output(self):
         expected = reviewed_build._canary(CONTROL_SHA).decode("ascii")
         argv = reviewed_build._probe_argv(
@@ -324,7 +494,8 @@ class FixedRecordTests(unittest.TestCase):
             + " compiler-origin=command-line-tools clang=17.0.0 sdk=15.5"
             + " developer-mode=disabled privilege=separate-nonadmin"
             + " sudo=denied compile=passed link=passed load-test=passed capture=passed"
-            + " summary-standin=write-denied cleanup=complete seatbelt=not-run pf=not-run"
+            + " summary-standin=write-denied real-summary=write-denied"
+            + " cleanup=complete seatbelt=not-run pf=not-run"
         )
         self.assertEqual(line, expected)
         self.assertNotIn("::error", line)
@@ -338,6 +509,7 @@ class FixedRecordTests(unittest.TestCase):
             success_record(pf="enforced"),
             success_record(source="private"),
             success_record(capture="unknown"),
+            success_record(real_summary="unknown"),
             success_record(xcode_version="26.1", xcode_build="17B55"),
             success_record(compiler_origin="xcode"),
         ):

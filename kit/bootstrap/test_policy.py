@@ -325,13 +325,28 @@ class WorkflowPolicyTests(unittest.TestCase):
             "  macos-public-surface-audit:\n", 1
         )[0]
         self.assertNotIn("GITHUB_TOKEN", smoke)
+        self.assertIn('CI_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \\', smoke)
+        self.assertIn('RUNNER_HOME="$HOME" \\', smoke)
+        self.assertIn("      - name: Write trusted summary visibility control\n", smoke)
+        self.assertIn('summary_prefix="macos-summary-"', smoke)
+        self.assertIn(
+            'summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA '
+            'run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT"',
+            smoke,
+        )
+        self.assertIn('printf \'%s\\n\' "$summary_line" >> "$GITHUB_STEP_SUMMARY"', smoke)
+        self.assertIn('printf \'%s\\n\' "$summary_line"', smoke)
+        self.assertNotIn("GITHUB_STEP_SUMMARY:", workflow)
+        self.assertLess(
+            workflow.index("      - name: Run source-free reviewed build smoke\n"),
+            workflow.index("      - name: Write trusted summary visibility control\n"),
+        )
         snapshot = workflow.split("  macos-public-snapshot:\n", 1)[1].split(
             "  macos-reviewed-smoke:\n", 1
         )[0]
         self.assertNotIn("GITHUB_TOKEN", snapshot.split("      - name: Snapshot cache inventory\n", 1)[0])
         audit_job = workflow.split("  macos-public-surface-audit:\n", 1)[1]
         self.assertNotIn("GITHUB_TOKEN", audit_job.split("      - name: Audit public surfaces\n", 1)[0])
-        self.assertNotIn("GITHUB_STEP_SUMMARY", workflow)
         for forbidden in (
             "secrets.",
             "source-read",
@@ -363,6 +378,8 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace("    if: ${{ always() }}\n", "    if: ${{ success() }}\n"),
             base.replace("      actions: read\n      checks: read\n", "      actions: write\n      checks: write\n"),
             base.replace("      - name: Run source-free reviewed build smoke\n", ""),
+            base.replace("      - name: Write trusted summary visibility control\n", ""),
+            base.replace('            CI_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \\\n', ""),
             base.replace("      - name: Audit public surfaces\n", "      - name: Extra execution\n        run: echo unreviewed\n      - name: Audit public surfaces\n"),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
             base.replace("      CI_WORKSPACE: ${{ github.workspace }}\n", "      GITHUB_TOKEN: ${{ github.token }}\n      CI_WORKSPACE: ${{ github.workspace }}\n"),

@@ -110,6 +110,7 @@ jobs:
             CI_REPOSITORY="$CI_REPOSITORY" \
             CI_SERVER_URL="$CI_SERVER_URL" \
             CI_SHA="$CI_SHA" \
+            CI_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
             GITHUB_RUN_ID="$GITHUB_RUN_ID" \
             GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
             ImageOS="$ImageOS" \
@@ -119,6 +120,25 @@ jobs:
             CI_WORKSPACE="$CI_WORKSPACE" \
             PYTHONDONTWRITEBYTECODE=1 \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_reviewed_build.py --control-sha "$CI_SHA"
+      - name: Write trusted summary visibility control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          if [[ -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            exit 1
+          fi
+          summary_prefix="macos-summary-"
+          summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT"
+          printf '%s\n' "$summary_line" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$summary_line"
   macos-public-surface-audit:
     if: ${{ always() }}
     needs: [macos-public-snapshot, macos-reviewed-smoke]

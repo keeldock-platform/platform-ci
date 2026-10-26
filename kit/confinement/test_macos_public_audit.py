@@ -164,6 +164,18 @@ class CanaryTests(unittest.TestCase):
                     audit.inspect_reviewed_public_bytes(b"prefix=" + needle, CONTROL_SHA)
                 self.assertEqual(caught.exception.reason, "canary_exposed")
 
+    def test_reviewed_summary_direct_write_canary_and_encodings_are_reviewed_only(self):
+        marker = b"KD-RB-SUMMARY-DIRECT-WRITE-CANARY-v1"
+        self.assertEqual(marker, audit.REVIEWED_SUMMARY_DIRECT_CANARY)
+        variants = audit._reviewed_summary_canary_variants()
+        self.assertIn(marker, variants)
+        for needle in variants:
+            with self.subTest(encoding=needle[:12]):
+                audit.inspect_public_bytes(b"prefix=" + needle, CONTROL_SHA)
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.inspect_reviewed_public_bytes(b"prefix=" + needle, CONTROL_SHA)
+                self.assertEqual(caught.exception.reason, "canary_exposed")
+
 
 class InventoryTests(unittest.TestCase):
     def test_cache_digest_is_order_independent_and_metadata_sensitive(self):
@@ -518,6 +530,12 @@ def reviewed_audit_fixture():
             "status": "completed",
             "conclusion": "success",
         },
+        {
+            "number": 3,
+            "name": "Write trusted summary visibility control",
+            "status": "completed",
+            "conclusion": "success",
+        },
     ])
     snapshot_check = "/repos/keeldock-platform/platform-ci/check-runs/303"
     smoke_check = "/repos/keeldock-platform/platform-ci/check-runs/305"
@@ -565,7 +583,13 @@ def reviewed_audit_fixture():
         + " compiler-origin=command-line-tools clang=17.0.0 sdk=26.0"
         + " developer-mode=disabled privilege=separate-nonadmin sudo=denied"
         + " compile=passed link=passed load-test=passed capture=passed"
-        + " summary-standin=write-denied cleanup=complete seatbelt=not-run pf=not-run\n"
+        + " summary-standin=write-denied real-summary=write-denied"
+        + " cleanup=complete seatbelt=not-run pf=not-run\n"
+    ).encode("ascii")
+    summary_control = (
+        "2026-10-26T12:34:56.1234567Z "
+        + "macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA
+        + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT + "\n"
     ).encode("ascii")
     env = {
         "GITHUB_REPOSITORY": audit.REPOSITORY,
@@ -577,7 +601,7 @@ def reviewed_audit_fixture():
     }
     logs = {
         202: b"macos-public-surface-audit=snapshot-ready\n",
-        203: marker,
+        203: marker + summary_control,
     }
     return pages, env, logs
 
@@ -1031,6 +1055,36 @@ class AuditRunTests(unittest.TestCase):
             api.calls,
         )
 
+    def test_reviewed_audit_requires_exact_summary_control_identity(self):
+        control = (
+            b"macos-summary-control=trusted-write schema=1 control-sha="
+            + CONTROL_SHA.encode("ascii")
+            + b" run-id=" + RUN_ID.encode("ascii")
+            + b" run-attempt=" + RUN_ATTEMPT.encode("ascii") + b"\n"
+        )
+        for replacement in (
+            b"",
+            control.replace(CONTROL_SHA.encode("ascii"), b"f" * 40),
+            control.replace(b"run-id=" + RUN_ID.encode("ascii"), b"run-id=1"),
+            control.replace(b"run-attempt=" + RUN_ATTEMPT.encode("ascii"), b"run-attempt=1"),
+            b"prefixed " + control,
+            control[:-1] + b" extra\n",
+            control + control,
+        ):
+            with self.subTest(replacement=replacement):
+                pages, env, logs = reviewed_audit_fixture()
+                self.assertIn(control, logs[203])
+                logs[203] = logs[203].replace(control, replacement)
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+                self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = reviewed_audit_fixture()
+        pages["/repos/keeldock-platform/platform-ci/actions/jobs/203"][0]["steps"].pop()
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "api_schema")
+
     def test_reviewed_audit_accepts_selected_xcode_toolchain_origin(self):
         pages, env, logs = reviewed_audit_fixture()
         logs[203] = logs[203].replace(
@@ -1079,6 +1133,12 @@ class AuditRunTests(unittest.TestCase):
     def test_reviewed_audit_refuses_marker_identity_cache_artifact_and_job_failures(self):
         pages, env, logs = reviewed_audit_fixture()
         logs[203] = logs[203].replace(CONTROL_SHA.encode("ascii"), b"f" * 40)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = reviewed_audit_fixture()
+        logs[203] = logs[203].replace(b" real-summary=write-denied", b"")
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
         self.assertEqual(caught.exception.reason, "receipt_invalid")
@@ -1166,6 +1226,48 @@ class AuditRunTests(unittest.TestCase):
 
     def test_reviewed_audit_scans_runtime_canary_in_logs_check_outputs_annotations_and_caches(self):
         canary = audit.derive_reviewed_canary(CONTROL_SHA)
+
+        pages, env, logs = reviewed_audit_fixture()
+        logs[203] += b"\n" + canary
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "canary_exposed")
+
+        pages, env, logs = reviewed_audit_fixture()
+        pages["/repos/keeldock-platform/platform-ci/check-runs/305"][0]["output"]["summary"] = canary.decode("ascii")
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "canary_exposed")
+
+        pages, env, logs = reviewed_audit_fixture()
+        pages["/repos/keeldock-platform/platform-ci/check-runs/305"][0]["output"]["annotations_count"] = 1
+        pages[
+            "/repos/keeldock-platform/platform-ci/check-runs/305/annotations?per_page=100&page=1"
+        ] = ([{"id": 1, "message": canary.decode("ascii")}], {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "canary_exposed")
+
+        pages, env, logs = reviewed_audit_fixture()
+        cache = {
+            "id": 808,
+            "ref": "refs/heads/main",
+            "key": "synthetic-" + canary.decode("ascii"),
+            "version": "v1",
+            "last_accessed_at": None,
+            "created_at": "2026-10-25T00:00:00Z",
+            "size_in_bytes": 1,
+        }
+        env["MACOS_CACHE_SNAPSHOT"] = audit.cache_inventory_digest([cache])
+        pages[
+            "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        ] = ({"total_count": 1, "actions_caches": [cache]}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "canary_exposed")
+
+    def test_reviewed_audit_scans_static_summary_canary_in_logs_checks_annotations_and_caches(self):
+        canary = audit.REVIEWED_SUMMARY_DIRECT_CANARY
 
         pages, env, logs = reviewed_audit_fixture()
         logs[203] += b"\n" + canary
