@@ -541,7 +541,8 @@ def reviewed_audit_fixture():
         "macos-build=synthetic-smoke-passed schema=1 source=none control-sha=" + CONTROL_SHA
         + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
         + " image-os=macos-15-arm64 image-version=20260907.0337.1 macos-version=15.7.9"
-        + " architecture=arm64 xcode=26.0 xcode-build=17A324 clang=17.0.0 sdk=26.0"
+        + " architecture=arm64 xcode=26.0 xcode-build=17A324"
+        + " compiler-origin=command-line-tools clang=17.0.0 sdk=26.0"
         + " developer-mode=disabled privilege=separate-nonadmin sudo=denied"
         + " compile=passed link=passed load-test=passed capture=passed"
         + " summary-standin=write-denied cleanup=complete seatbelt=not-run pf=not-run\n"
@@ -708,6 +709,16 @@ class AuditRunTests(unittest.TestCase):
             api.calls,
         )
 
+    def test_reviewed_audit_accepts_selected_xcode_toolchain_origin(self):
+        pages, env, logs = reviewed_audit_fixture()
+        logs[203] = logs[203].replace(
+            b"compiler-origin=command-line-tools",
+            b"compiler-origin=xcode",
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(result, 0)
+
     def test_reviewed_audit_refuses_missing_cache_annotation_or_job_evidence(self):
         pages, env, logs = reviewed_audit_fixture()
         env["MACOS_CACHE_SNAPSHOT"] = ""
@@ -752,6 +763,15 @@ class AuditRunTests(unittest.TestCase):
 
         pages, env, logs = reviewed_audit_fixture()
         logs[203] = logs[203].replace(b"image-os=macos-15-arm64", b"image-os=macos-latest")
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = reviewed_audit_fixture()
+        logs[203] = logs[203].replace(
+            b"compiler-origin=command-line-tools",
+            b"compiler-origin=unknown",
+        )
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.run("reviewed-audit", env, FakeMultiAuditAPI(pages, logs))
         self.assertEqual(caught.exception.reason, "receipt_invalid")

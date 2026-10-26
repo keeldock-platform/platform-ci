@@ -267,21 +267,70 @@ def _single_ascii_line(payload, pattern):
     return value if pattern.fullmatch(value) is not None else None
 
 
-def _host_identity(binding, toolchain):
-    if platform.system() != "Darwin" or platform.machine() not in ARCHITECTURES:
-        raise Refusal("runner_identity_unavailable", "toolchain")
-    env = {
+def _is_xcode_developer_directory(path):
+    return (
+        isinstance(path, Path)
+        and path.name == "Developer"
+        and path.parent.name == "Contents"
+        and path.parent.parent.name.startswith("Xcode")
+        and path.parent.parent.name.endswith(".app")
+        and path.parent.parent.parent == Path("/Applications")
+    )
+
+
+def _compiler_origin(toolchain):
+    developer_directory = Path(toolchain.get("developer_directory", ""))
+    if developer_directory.as_posix() == "/Library/Developer/CommandLineTools":
+        return "command-line-tools"
+    if _is_xcode_developer_directory(developer_directory):
+        return "xcode"
+    raise Refusal("toolchain_unavailable", "toolchain")
+
+
+def _selected_xcode_directory():
+    base_env = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": "/var/empty",
-        "DEVELOPER_DIR": toolchain["developer_directory"],
         "LANG": "C",
         "LC_ALL": "C",
     }
-    product_result = _run_command(("/usr/bin/sw_vers", "-productVersion"), env=env, timeout=5)
+    try:
+        selector = capability._resolve_trusted_path("/usr/bin/xcode-select")
+    except capability.ProbeFailure:
+        raise Refusal("toolchain_unavailable", "toolchain") from None
+    result = _run_command((selector, "--print-path"), env=base_env, timeout=5)
+    if result.returncode != 0 or result.stderr:
+        raise Refusal("toolchain_unavailable", "toolchain")
+    try:
+        raw_path = capability._read_tool_path(result)
+        selected = capability._resolve_trusted_path(raw_path, directory=True)
+    except capability.ProbeFailure:
+        raise Refusal("toolchain_unavailable", "toolchain") from None
+    if not _is_xcode_developer_directory(selected):
+        raise Refusal("toolchain_unavailable", "toolchain")
+    return selected
+
+
+def _host_identity(binding, toolchain):
+    if platform.system() != "Darwin" or platform.machine() not in ARCHITECTURES:
+        raise Refusal("runner_identity_unavailable", "toolchain")
+    compiler_origin = _compiler_origin(toolchain)
+    base_env = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": "/var/empty",
+        "LANG": "C",
+        "LC_ALL": "C",
+    }
+    selected_xcode = _selected_xcode_directory()
+    if compiler_origin == "xcode" and toolchain["developer_directory"] != selected_xcode.as_posix():
+        raise Refusal("toolchain_unavailable", "toolchain")
+    xcode_env = {**base_env, "DEVELOPER_DIR": selected_xcode.as_posix()}
+    compiler_env = {**base_env, "DEVELOPER_DIR": toolchain["developer_directory"]}
+    product_result = _run_command(("/usr/bin/sw_vers", "-productVersion"), env=base_env, timeout=5)
     if product_result.returncode != 0 or product_result.stderr:
         raise Refusal("runner_identity_unavailable", "toolchain")
     product_version = _single_ascii_line(product_result.stdout, PRODUCT_VERSION)
-    xcode_result = _run_command(("/usr/bin/xcodebuild", "-version"), env=env, timeout=10, max_output=MAX_VERSION_OUTPUT)
+    xcode_result = _run_command(("/usr/bin/xcodebuild", "-version"), env=xcode_env, timeout=10, max_output=MAX_VERSION_OUTPUT)
     if xcode_result.returncode != 0 or xcode_result.stderr:
         raise Refusal("toolchain_unavailable", "toolchain")
     try:
@@ -294,7 +343,7 @@ def _host_identity(binding, toolchain):
     xcode_build = xcode_lines[1][len("Build version "):]
     if not _valid_run_value(TOOL_VERSION, xcode_version) or re.fullmatch(r"[A-Za-z0-9.]+", xcode_build) is None:
         raise Refusal("toolchain_unavailable", "toolchain")
-    clang_result = _run_command((toolchain["clang"], "--version"), env=env, timeout=10, max_output=MAX_VERSION_OUTPUT)
+    clang_result = _run_command((toolchain["clang"], "--version"), env=compiler_env, timeout=10, max_output=MAX_VERSION_OUTPUT)
     if clang_result.returncode != 0 or clang_result.stderr:
         raise Refusal("toolchain_unavailable", "toolchain")
     try:
@@ -304,7 +353,7 @@ def _host_identity(binding, toolchain):
     clang_match = re.match(r"^Apple clang version ([0-9]+(?:\.[0-9]+){0,3})(?:\s|$)", clang_first)
     clang_version = clang_match.group(1) if clang_match is not None else None
     sdk_result = _run_command(
-        ("/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-version"), env=env, timeout=10,
+        ("/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-version"), env=compiler_env, timeout=10,
     )
     if sdk_result.returncode != 0 or sdk_result.stderr:
         raise Refusal("toolchain_unavailable", "toolchain")
@@ -320,6 +369,7 @@ def _host_identity(binding, toolchain):
         "architecture": platform.machine(),
         "xcode_version": xcode_version,
         "xcode_build": xcode_build,
+        "compiler_origin": compiler_origin,
         "clang_version": clang_version,
         "sdk_version": sdk_version,
     }
@@ -643,7 +693,8 @@ def _run_synthetic_smoke(control_sha):
 def _format_success(record):
     required = (
         "schema_version", "control_sha", "run_id", "run_attempt", "image_os", "image_version",
-        "macos_version", "architecture", "xcode_version", "xcode_build", "clang_version", "sdk_version",
+        "macos_version", "architecture", "xcode_version", "xcode_build", "compiler_origin",
+        "clang_version", "sdk_version",
         "developer_mode", "privilege", "sudo", "compile", "link", "load_test", "capture",
         "summary_standin", "cleanup", "seatbelt", "pf", "source",
     )
@@ -652,6 +703,8 @@ def _format_success(record):
     if type(record["schema_version"]) is not int or record["schema_version"] != SCHEMA_VERSION or not valid_sha(record["control_sha"]):
         raise Refusal("internal_error", "preflight")
     if not _valid_run_value(RUN_ID, record["run_id"]) or not _valid_run_value(RUN_ATTEMPT, record["run_attempt"]):
+        raise Refusal("internal_error", "preflight")
+    if type(record["compiler_origin"]) is not str or record["compiler_origin"] not in {"command-line-tools", "xcode"}:
         raise Refusal("internal_error", "preflight")
     for key, pattern in (("image_os", IMAGE_OS), ("image_version", IMAGE_VERSION), ("macos_version", PRODUCT_VERSION),
                          ("architecture", re.compile(r"(?:arm64|x86_64)\Z")), ("xcode_version", TOOL_VERSION),
@@ -680,6 +733,7 @@ def _format_success(record):
         "architecture=" + record["architecture"],
         "xcode=" + record["xcode_version"],
         "xcode-build=" + record["xcode_build"],
+        "compiler-origin=" + record["compiler_origin"],
         "clang=" + record["clang_version"],
         "sdk=" + record["sdk_version"],
         "developer-mode=disabled",

@@ -41,6 +41,7 @@ REVIEWED_SMOKE_MARKER_RE = re.compile(
     rb"macos-version=[0-9]+\.[0-9]+(?:\.[0-9]+)? "
     rb"architecture=(?:arm64|x86_64) "
     rb"xcode=[0-9]+(?:\.[0-9]+){0,3} xcode-build=[A-Za-z0-9.]+ "
+    rb"compiler-origin=(?:command-line-tools|xcode) "
     rb"clang=[0-9]+(?:\.[0-9]+){0,3} sdk=[0-9]+(?:\.[0-9]+){0,3} "
     rb"developer-mode=disabled privilege=separate-nonadmin sudo=denied "
     rb"compile=passed link=passed load-test=passed capture=passed "
