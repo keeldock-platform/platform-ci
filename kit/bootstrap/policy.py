@@ -453,7 +453,7 @@ jobs:
 """
 
 
-MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE = """name: macos-reviewed-build
+MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE = r"""name: macos-reviewed-build
 on:
   workflow_dispatch:
 cache-mode: none
