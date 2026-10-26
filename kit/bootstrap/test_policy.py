@@ -422,7 +422,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             1,
         )
         self.assertIn('"${CI_SERVER_URL%/}/actions/cache.git"', workflow)
-        self.assertIn("git fetch --quiet --no-tags --depth=1 origin " + MACOS_CACHE_PROOF_ACTION_SHA, workflow)
+        self.assertIn('git -C "$client_dir" fetch --quiet --no-tags --depth=1 origin ' + MACOS_CACHE_PROOF_ACTION_SHA, workflow)
         self.assertIn("macos-cache-client-source=verified schema=1 action-sha=", workflow)
         self.assertIn("uses: ./kit/confinement/macos_cache_client", workflow)
         self.assertIn("mode: read\n", workflow)
@@ -507,8 +507,8 @@ class WorkflowPolicyTests(unittest.TestCase):
                          "          mode: write\n          path: ${{ runner.temp }}/macos-public-cache/fixture.txt\n"),
             base.replace("          mode: write\n          path: ${{ runner.temp }}/macos-public-cache-write/fixture.txt\n",
                          "          mode: read\n          path: ${{ runner.temp }}/macos-public-cache-write/fixture.txt\n"),
-            base.replace("git fetch --quiet --no-tags --depth=1 origin " + MACOS_CACHE_PROOF_ACTION_SHA,
-                         "git fetch --quiet --no-tags --depth=1 origin " + "0" * 40),
+            base.replace('git -C "$client_dir" fetch --quiet --no-tags --depth=1 origin ' + MACOS_CACHE_PROOF_ACTION_SHA,
+                         'git -C "$client_dir" fetch --quiet --no-tags --depth=1 origin ' + "0" * 40),
             base.replace("uses: ./kit/confinement/macos_cache_client",
                          "uses: actions/cache/restore@" + MACOS_CACHE_PROOF_ACTION_SHA, 1),
             base.replace(MACOS_CACHE_PROOF_ACTION_SHA, "0" * 40),
