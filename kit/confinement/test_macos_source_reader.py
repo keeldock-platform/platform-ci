@@ -133,7 +133,7 @@ class SourceReaderPreflightTests(unittest.TestCase):
             "total_count": 1,
             "repositories": [{"id": REPOSITORY_ID}, {"id": REPOSITORY_ID + 1}],
         }).encode("utf-8")
-        invalid_name = repository_list(full_name="secret-owner/private/project")
+        invalid_name = repository_list(full_name="opaque-owner/invalid/extra")
         cases = (
             (malformed, "repository_schema_invalid"),
             (invalid_count_shape, "repository_schema_invalid"),
@@ -166,7 +166,7 @@ class SourceReaderPreflightTests(unittest.TestCase):
                     "schema_version", "status", "reason", "repository_scope", "metadata", "revocation",
                 })
                 self.assertEqual([call.args[0] for call in exchange.call_args_list], ["GET", "DELETE", "GET"])
-                self.assertNotIn("secret-owner/private/project", json.dumps(result))
+                self.assertNotIn("opaque-owner/invalid/extra", json.dumps(result))
                 self.assertNotIn("private-detail", json.dumps(result))
 
     def test_rejects_writable_repository_permission_when_present(self):

@@ -62,7 +62,7 @@ PINNED_FILE_SHA256 = {
     "kit/confinement/windows_native_preflight.ps1": "8dbaaaad105c2fe0439dedb1b7c9572b8e7ec74a8db29f8edcab91169b06c58b",
     "kit/confinement/test_windows_native_preflight.py": "02d6bcf6d52d4c5f26589b6da8e224b5f0b3f8f57255e00c135f666caed613fe",
     "kit/confinement/macos_source_reader.py": "6136fb62344200150dcde814b40a418e271d07e12d192a325ef6a300f86f3a6e",
-    "kit/confinement/test_macos_source_reader.py": "d52dbe4312bce569c78a97917f9d824c0d0922c275e10d521f7050633ec2241b",
+    "kit/confinement/test_macos_source_reader.py": "9bc94c91afd7cf483e382c12983f189edfebcc202d5709502c671a82769c04f0",
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(
