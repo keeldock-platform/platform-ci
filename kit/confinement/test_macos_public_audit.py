@@ -904,12 +904,12 @@ class SourceReaderSettingsTests(unittest.TestCase):
 
     def test_settings_refuse_missing_or_ambiguous_branch_policy_metadata(self):
         for kind, mutate in (
-            ("rules", lambda env, policies: policies[0]["branch_policies"][0].pop("type")),
-            ("rules", lambda env, policies: policies[0]["branch_policies"][0].update(type="tag")),
-            ("rules", lambda env, policies: policies[0]["branch_policies"][0].update(name="release/*")),
-            ("rules", lambda env, policies: policies[0].update(
+            ("rules", lambda env, policies: policies["branch_policies"][0].pop("type")),
+            ("rules", lambda env, policies: policies["branch_policies"][0].update(type="tag")),
+            ("rules", lambda env, policies: policies["branch_policies"][0].update(name="release/*")),
+            ("rules", lambda env, policies: policies.update(
                 total_count=2,
-                branch_policies=policies[0]["branch_policies"] + [{
+                branch_policies=policies["branch_policies"] + [{
                     "id": 991122,
                     "name": "release/*",
                     "type": "branch",
