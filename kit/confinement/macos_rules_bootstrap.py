@@ -111,6 +111,10 @@ OBSERVER_STAGE_LABELS = frozenset((
     ("finish", "observer_finish"),
     ("parse", "observer_parse"),
 ))
+CLEANUP_STAGES = frozenset((
+    "cleanup_lease", "cleanup_storage", "cleanup_worker", "cleanup_summary",
+    "cleanup_dash", "cleanup_unknown",
+))
 REASONS = frozenset((
     "invalid_input", "control_identity_invalid", "bootstrap_gate_refused", "developer_mode_unavailable",
     "plan_snapshot_refused", "dash_bottle_unavailable", "dash_bottle_invalid",
@@ -130,7 +134,7 @@ STAGES = frozenset((
     "observer_import", "observer_interface_hardware", "observer_interface_capture",
     "observer_interface_address", "observer_interface", "observer_binding",
     "observer_start", "observer_finish", "observer_parse", "observer_record", "observer_missing",
-    *GATES, "cleanup",
+    *GATES, "cleanup", *CLEANUP_STAGES,
 ))
 
 SUMMARY_GUARD_SCRIPT = r'''
@@ -335,7 +339,7 @@ def _revoke_pending_token(environ, token_reference=None):
             pass
         return True
     except BaseException:
-        raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise _cleanup_failure("cleanup_unknown") from None
 
 
 def _valid_sha(value):
@@ -344,6 +348,39 @@ def _valid_sha(value):
 
 def _safe_id(value):
     return type(value) is str and DECIMAL_RE.fullmatch(value) is not None
+
+
+def _is_cleanup_failure(error):
+    return type(error) is Refusal and error.reason == "cleanup_incomplete"
+
+
+def _cleanup_failure(stage, cleanup_state=None):
+    if type(stage) is not str or stage not in CLEANUP_STAGES:
+        stage = "cleanup_unknown"
+    if type(cleanup_state) is dict:
+        first = cleanup_state.get("first")
+        if type(first) is str and first in CLEANUP_STAGES:
+            stage = first
+        else:
+            cleanup_state["first"] = stage
+    return Refusal("cleanup_incomplete", stage)
+
+
+def _preserve_cleanup_failure(failure, stage, cleanup_state=None):
+    if _is_cleanup_failure(failure):
+        if failure.stage in CLEANUP_STAGES:
+            return _cleanup_failure(failure.stage, cleanup_state)
+        return _cleanup_failure("cleanup_unknown", cleanup_state)
+    return _cleanup_failure(stage, cleanup_state)
+
+
+def _attempt_cleanup_steps(failure, steps, cleanup_state=None):
+    for stage, action in steps:
+        try:
+            action()
+        except BaseException:
+            failure = _preserve_cleanup_failure(failure, stage, cleanup_state)
+    return failure
 
 
 def _parse_request(argv):
@@ -441,7 +478,7 @@ def _record_runtime_revocation(runtime, state, token, request, binding, environ,
     return True
 
 
-def _runtime_lease_refusal(runtime, error):
+def _runtime_lease_refusal(runtime, error, cleanup_state=None):
     runtime_refusal = getattr(runtime, "Refusal", None)
     if not isinstance(runtime_refusal, type) or not isinstance(error, runtime_refusal):
         return Refusal("source_lease_unavailable", "source_lease")
@@ -449,7 +486,7 @@ def _runtime_lease_refusal(runtime, error):
     stage = getattr(error, "stage", None)
     if ((type(reason) is str and reason == "cleanup_incomplete")
             or (type(stage) is str and stage == "cleanup")):
-        return Refusal("cleanup_incomplete", "cleanup")
+        return _cleanup_failure("cleanup_lease", cleanup_state)
     if type(reason) is str and reason in SOURCE_VALIDATION_REASONS:
         return Refusal(reason, "source_lease")
     return Refusal("source_lease_unavailable", "source_lease")
@@ -869,16 +906,16 @@ def prepare_dash(environ=None):
             try:
                 reviewed._cleanup((home_parent,), uid, toolchain)
             except BaseException:
-                failure = Refusal("cleanup_incomplete", "cleanup")
+                failure = _preserve_cleanup_failure(failure, "cleanup_worker")
         elif uid is not None or home_parent is not None:
-            failure = Refusal("cleanup_incomplete", "cleanup")
+            failure = _preserve_cleanup_failure(failure, "cleanup_worker")
         if failure is not None and created:
             try:
                 shutil.rmtree(directory)
                 if directory.exists() or directory.is_symlink():
                     raise OSError("not removed")
             except BaseException:
-                failure = Refusal("cleanup_incomplete", "cleanup")
+                failure = _preserve_cleanup_failure(failure, "cleanup_dash")
     if failure is not None:
         raise failure
     return {
@@ -1002,7 +1039,8 @@ def _run_tree_probe(source, uid, home, toolchain, capability):
         raise Refusal("source_tree_invalid", "source_tree") from None
 
 
-def _summary_guard(uid, home, toolchain, reviewed, capability, root, binding, environ, guard_state):
+def _summary_guard(uid, home, toolchain, reviewed, capability, root, binding, environ, guard_state,
+                   cleanup_state=None):
     try:
         if (not environ.get("GITHUB_STEP_SUMMARY")
                 or environ.get("CI_STEP_SUMMARY") != environ.get("GITHUB_STEP_SUMMARY")
@@ -1034,11 +1072,11 @@ def _summary_guard(uid, home, toolchain, reviewed, capability, root, binding, en
             capability._remove_probe_tree(scratch)
     except BaseException as error:
         if getattr(error, "reason", None) == "cleanup_incomplete":
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+            raise _cleanup_failure("cleanup_summary", cleanup_state) from None
         raise Refusal("summary_guard_failed", "summary_guard") from None
 
 
-def _finish_summary_guard(guard, reviewed, *, worker_cleanup_confirmed):
+def _finish_summary_guard(guard, reviewed, *, worker_cleanup_confirmed, cleanup_state=None):
     if guard is None:
         return
     failed = not worker_cleanup_confirmed
@@ -1055,10 +1093,11 @@ def _finish_summary_guard(guard, reviewed, *, worker_cleanup_confirmed):
     except BaseException:
         failed = True
     if failed:
-        raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise _cleanup_failure("cleanup_summary", cleanup_state) from None
 
 
-def _probe_summary_after_commands(guard, uid, home, toolchain, reviewed, capability, binding):
+def _probe_summary_after_commands(guard, uid, home, toolchain, reviewed, capability, binding,
+                                 cleanup_state=None):
     env = reviewed._child_environment(home, Path("/tmp"), toolchain)
     try:
         presence = capability._probe_uid_processes_present(
@@ -1066,7 +1105,7 @@ def _probe_summary_after_commands(guard, uid, home, toolchain, reviewed, capabil
         )
         present, _ = capability._presence_result(presence)
         if present:
-            raise Refusal("cleanup_incomplete", "cleanup")
+            raise _cleanup_failure("cleanup_summary", cleanup_state)
         reviewed._run_real_summary_probe(
             guard, uid, env=env, python_executable=toolchain["python"], binding=binding
         )
@@ -1074,7 +1113,7 @@ def _probe_summary_after_commands(guard, uid, home, toolchain, reviewed, capabil
         raise
     except BaseException as error:
         if getattr(error, "reason", None) == "cleanup_incomplete":
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+            raise _cleanup_failure("cleanup_summary", cleanup_state) from None
         raise Refusal("summary_guard_failed", "summary_guard") from None
 
 
@@ -1094,7 +1133,7 @@ def _grant_read_acl(path, *, directory):
 
 
 def _create_plan_snapshot(binding, request, definitions, definitions_sha256, reviewed_diff_sha256, worker_uid, home,
-                          toolchain, capability):
+                          toolchain, capability, cleanup_state=None):
     directory = _run_directory(binding).with_name(_run_directory(binding).name + "-ids")
     created = False
     try:
@@ -1144,7 +1183,7 @@ def _create_plan_snapshot(binding, request, definitions, definitions_sha256, rev
             if directory.exists() or directory.is_symlink():
                 raise OSError("not removed")
         except BaseException:
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+            raise _cleanup_failure("cleanup_storage", cleanup_state) from None
     raise failure
 
 
@@ -1199,7 +1238,7 @@ def _worker_environment(source, dash_directory, home, storage):
     }
 
 
-def _probe_worker_privilege(worker_uid, home, storage, toolchain, reviewed):
+def _probe_worker_privilege(worker_uid, home, storage, toolchain, reviewed, cleanup_state=None):
     try:
         environment = reviewed._child_environment(home, storage, toolchain)
         reviewed._run_probe_step(
@@ -1212,12 +1251,12 @@ def _probe_worker_privilege(worker_uid, home, storage, toolchain, reviewed):
         )
     except BaseException as error:
         if getattr(error, "reason", None) == "cleanup_incomplete":
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+            raise _cleanup_failure("cleanup_unknown", cleanup_state) from None
         raise Refusal("probe_identity_unavailable", "identity") from None
     return "sudo-denied"
 
 
-def _observer_refusal(observer, error):
+def _observer_refusal(observer, error, cleanup_state=None):
     refusal_type = getattr(observer, "ObserverRefusal", None)
     if not isinstance(refusal_type, type) or type(error) is not refusal_type:
         return Refusal("runner_controls_unavailable", "runner_controls")
@@ -1225,7 +1264,7 @@ def _observer_refusal(observer, error):
     stage = getattr(error, "stage", None)
     if ((type(reason) is str and reason == "cleanup_incomplete")
             or (type(stage) is str and stage == "cleanup")):
-        return Refusal("cleanup_incomplete", "cleanup")
+        return _cleanup_failure("cleanup_unknown", cleanup_state)
     if (type(reason) is str and type(stage) is str
             and (reason, stage) in OBSERVER_REASON_STAGE_PAIRS):
         wrapper_stage = next(
@@ -1276,7 +1315,7 @@ def _validate_network_record(record, binding, source_sha):
     return record
 
 
-def _start_network_observation(binding, source_sha):
+def _start_network_observation(binding, source_sha, cleanup_state=None):
     try:
         observer = _load_control_sibling("macos_network_observer")
     except BaseException:
@@ -1291,17 +1330,17 @@ def _start_network_observation(binding, source_sha):
             binding["control_sha"], binding["run_id"], binding["run_attempt"], source_sha,
         )
     except BaseException as error:
-        raise _observer_refusal(observer, error) from None
+        raise _observer_refusal(observer, error, cleanup_state) from None
     if type(session) is not session_type:
         raise Refusal("runner_controls_unavailable", "observer_import")
     return observer, session
 
 
-def _finish_network_observation(observer, session, binding, source_sha):
+def _finish_network_observation(observer, session, binding, source_sha, cleanup_state=None):
     try:
         record = session.finish()
     except BaseException as error:
-        raise _observer_refusal(observer, error) from None
+        raise _observer_refusal(observer, error, cleanup_state) from None
     try:
         return _validate_network_record(record, binding, source_sha)
     except Refusal:
@@ -1338,7 +1377,7 @@ def _format_network_observed(record):
     )
 
 
-def _execute(command, stage, worker_uid, toolchain, environment, capability):
+def _execute(command, stage, worker_uid, toolchain, environment, capability, cleanup_state=None):
     reason = "plan_ids_failed" if stage == "plan-ids" else "suite_failed"
     try:
         result = capability._run_as_probe_user(
@@ -1348,7 +1387,10 @@ def _execute(command, stage, worker_uid, toolchain, environment, capability):
         )
         if type(result.returncode) is not int or result.returncode != 0:
             raise ValueError
-    except BaseException:
+    except BaseException as error:
+        if (getattr(error, "reason", None) == "cleanup_incomplete"
+                or getattr(error, "stage", None) == "cleanup"):
+            raise _cleanup_failure("cleanup_unknown", cleanup_state) from None
         raise Refusal(reason, stage) from None
 
 
@@ -1363,7 +1405,7 @@ def _cleanup_prepared_dash(directory):
         if directory.exists() or directory.is_symlink():
             raise OSError("not removed")
     except BaseException:
-        raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise _cleanup_failure("cleanup_dash") from None
 
 
 def cleanup_dash(environ=None):
@@ -1399,6 +1441,7 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
     revocation_state = None
     retained_token = lifecycle.get("token_reference")
     privilege_check = None
+    cleanup_state = {"first": None}
     completed = []
     failure = None
     worker_cleanup_confirmed = False
@@ -1430,7 +1473,7 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
 
         _summary_guard(
             worker_uid, home, toolchain, reviewed, capability, root, binding, environ,
-            summary_guard_state,
+            summary_guard_state, cleanup_state,
         )
 
         try:
@@ -1457,7 +1500,7 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
             _record_runtime_revocation(
                 runtime, revocation_state, retained_token, request, binding, environ, lifecycle,
             )
-            raise _runtime_lease_refusal(runtime, error) from None
+            raise _runtime_lease_refusal(runtime, error, cleanup_state) from None
 
         try:
             with lease_context as lease:
@@ -1469,12 +1512,12 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
                 source = _validate_source_path(lease.source_path, request, storage_root, reviewed)
                 _run_tree_probe(source, worker_uid, home, toolchain, capability)
                 privilege_check = _probe_worker_privilege(
-                    worker_uid, home, worker_storage, toolchain, reviewed,
+                    worker_uid, home, worker_storage, toolchain, reviewed, cleanup_state,
                 )
                 environment = _worker_environment(source, dash_directory, home, worker_storage)
                 original_cwd = Path.cwd()
                 network_observer, network_session = _start_network_observation(
-                    binding, request["source_sha"],
+                    binding, request["source_sha"], cleanup_state,
                 )
                 commands_started = False
                 command_failure = None
@@ -1485,26 +1528,29 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
                     for suite in SUITES:
                         commands_started = True
                         _execute(("/bin/sh", "ci/run-suite.sh", suite), suite,
-                                 worker_uid, toolchain, environment, capability)
+                                 worker_uid, toolchain, environment, capability, cleanup_state)
                         completed.append(suite)
                     snapshot_directory = _create_plan_snapshot(
                         binding, request, definitions, definitions_sha256, reviewed_diff_sha256,
-                        worker_uid, home, toolchain, capability,
+                        worker_uid, home, toolchain, capability, cleanup_state,
                     )
                     commands_started = True
                     _execute(("/bin/sh", "tests/check-plan-ids.sh", str(snapshot_directory)),
-                             "plan-ids", worker_uid, toolchain, environment, capability)
+                             "plan-ids", worker_uid, toolchain, environment, capability,
+                             cleanup_state)
                     completed.append("plan-ids")
                 except BaseException as error:
                     command_failure = error
                 finally:
+                    cwd_failure = None
                     try:
                         os.chdir(original_cwd)
                     except BaseException:
-                        command_failure = Refusal("cleanup_incomplete", "cleanup")
+                        cwd_failure = _cleanup_failure("cleanup_unknown", cleanup_state)
                     try:
                         observation = _finish_network_observation(
                             network_observer, network_session, binding, request["source_sha"],
+                            cleanup_state,
                         )
                         lifecycle["network_observation_marker"] = _format_network_observed(observation)
                     except BaseException as error:
@@ -1514,15 +1560,22 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
                             if commands_started:
                                 _probe_summary_after_commands(
                                     summary_guard_state["guard"], worker_uid, home, toolchain,
-                                    reviewed, capability, binding,
+                                    reviewed, capability, binding, cleanup_state,
                                 )
                         except BaseException as error:
                             summary_failure = error
 
-                if any(getattr(error, "reason", None) == "cleanup_incomplete"
-                       for error in (command_failure, observation_failure, summary_failure)
-                       if error is not None):
-                    raise Refusal("cleanup_incomplete", "cleanup")
+                first_cleanup_failure = None
+                for error in (command_failure, cwd_failure, observation_failure, summary_failure):
+                    if error is not None and getattr(error, "reason", None) == "cleanup_incomplete":
+                        stage = getattr(error, "stage", None)
+                        first_cleanup_failure = _cleanup_failure(
+                            stage if type(stage) is str and stage in CLEANUP_STAGES else "cleanup_unknown",
+                            cleanup_state,
+                        )
+                        break
+                if first_cleanup_failure is not None:
+                    raise first_cleanup_failure
                 if command_failure is not None:
                     raise command_failure
                 if summary_failure is not None:
@@ -1541,63 +1594,79 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
             )
             runtime_refusal = getattr(runtime, "Refusal", None)
             if isinstance(runtime_refusal, type) and isinstance(error, runtime_refusal):
-                raise _runtime_lease_refusal(runtime, error) from None
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+                raise _runtime_lease_refusal(runtime, error, cleanup_state) from None
+            raise _cleanup_failure("cleanup_unknown", cleanup_state) from None
 
         if completed != list(GATES) or lease_record is None or privilege_check != "sudo-denied":
             raise Refusal("source_lease_unavailable", "source_lease")
         if storage_root.exists() and any(storage_root.iterdir()):
-            raise Refusal("cleanup_incomplete", "cleanup")
+            raise _cleanup_failure("cleanup_storage", cleanup_state)
         capability._verify_storage_directory(worker_storage, storage_identity, worker_uid)
     except Refusal as error:
-        failure = error
+        failure = _cleanup_failure(error.stage, cleanup_state) if _is_cleanup_failure(error) else error
     except BaseException:
-        failure = Refusal("internal_error", "context")
+        failure = (
+            _cleanup_failure("cleanup_unknown", cleanup_state)
+            if cleanup_state.get("first") in CLEANUP_STAGES
+            else Refusal("internal_error", "context")
+        )
     finally:
-        if storage_root_created:
-            try:
-                if storage_root.exists() and any(storage_root.iterdir()):
-                    failure = Refusal("cleanup_incomplete", "cleanup")
-            except BaseException:
-                failure = Refusal("cleanup_incomplete", "cleanup")
-        if toolchain is not None:
-            try:
-                paths = tuple(path for path in (
-                    worker_storage, home_parent, snapshot_directory,
-                    storage_root if storage_root_created else None,
+        first_cleanup = cleanup_state.get("first")
+        if first_cleanup in CLEANUP_STAGES or _is_cleanup_failure(failure):
+            failure = _preserve_cleanup_failure(
+                failure,
+                first_cleanup if first_cleanup in CLEANUP_STAGES
+                else getattr(failure, "stage", "cleanup_unknown"),
+                cleanup_state,
+            )
+
+        def check_storage():
+            if storage_root_created and storage_root.exists() and any(storage_root.iterdir()):
+                raise OSError
+
+        def cleanup_worker():
+            nonlocal worker_cleanup_confirmed
+            paths = (
+                worker_storage, home_parent, snapshot_directory,
+                storage_root if storage_root_created else None,
+            )
+            if toolchain is not None:
+                existing = tuple(
+                    path for path in paths
+                    if path is not None and (path.exists() or path.is_symlink())
                 )
-                              if path is not None and path.exists())
-                reviewed._cleanup(paths, worker_uid, toolchain)
+                reviewed._cleanup(existing, worker_uid, toolchain)
                 worker_cleanup_confirmed = True
-            except BaseException:
-                failure = Refusal("cleanup_incomplete", "cleanup")
-        else:
-            try:
-                for path in (
-                    worker_storage, home_parent, snapshot_directory,
-                    storage_root if storage_root_created else None,
-                ):
+                return
+            failed = False
+            for path in paths:
+                try:
                     if path is not None and (path.exists() or path.is_symlink()):
                         capability._remove_probe_tree(path)
-                if worker_uid is not None or home_parent is not None:
-                    failure = Refusal("cleanup_incomplete", "cleanup")
-            except BaseException:
-                failure = Refusal("cleanup_incomplete", "cleanup")
-        try:
+                except BaseException:
+                    failed = True
+            if worker_uid is not None or home_parent is not None:
+                failed = True
+            if failed:
+                raise OSError
+
+        def finish_summary():
             _finish_summary_guard(
                 summary_guard_state["guard"], reviewed,
                 worker_cleanup_confirmed=worker_cleanup_confirmed,
+                cleanup_state=cleanup_state,
             )
-        except BaseException:
-            failure = Refusal("cleanup_incomplete", "cleanup")
-        try:
-            _cleanup_prepared_dash(dash_directory)
-        except BaseException:
-            failure = Refusal("cleanup_incomplete", "cleanup")
+
+        failure = _attempt_cleanup_steps(failure, (
+            ("cleanup_storage", check_storage),
+            ("cleanup_worker", cleanup_worker),
+            ("cleanup_summary", finish_summary),
+            ("cleanup_dash", lambda: _cleanup_prepared_dash(dash_directory)),
+        ), cleanup_state)
     if failure is not None:
         raise failure
     if lease_record is None or completed != list(GATES):
-        raise Refusal("cleanup_incomplete", "cleanup")
+        raise _cleanup_failure("cleanup_unknown")
     return {
         "schema_version": SCHEMA_VERSION,
         "control_sha": binding["control_sha"],

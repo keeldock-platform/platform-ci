@@ -600,7 +600,110 @@ class RuntimeLeaseRefusalTests(unittest.TestCase):
 
     def test_cleanup_refusal_keeps_cleanup_classification(self):
         error = self.mapped("cleanup_incomplete", "cleanup")
-        self.assertEqual((error.reason, error.stage), ("cleanup_incomplete", "cleanup"))
+        self.assertEqual((error.reason, error.stage), ("cleanup_incomplete", "cleanup_lease"))
+
+
+class CleanupFailureTests(unittest.TestCase):
+    def test_each_cleanup_step_uses_its_fixed_stage(self):
+        stages = (
+            "cleanup_lease", "cleanup_storage", "cleanup_worker", "cleanup_summary",
+            "cleanup_dash", "cleanup_unknown",
+        )
+        for failing_stage in stages:
+            with self.subTest(stage=failing_stage):
+                calls = []
+                steps = []
+                for stage in stages:
+                    def action(current=stage):
+                        calls.append(current)
+                        if current == failing_stage:
+                            raise RuntimeError("private-cleanup-detail")
+                    steps.append((stage, action))
+                failure = bootstrap._attempt_cleanup_steps(None, tuple(steps))
+                self.assertEqual(calls, list(stages))
+                self.assertEqual((failure.reason, failure.stage),
+                                 ("cleanup_incomplete", failing_stage))
+
+    def test_cleanup_attempts_all_steps_and_preserves_first_cleanup_leaf(self):
+        calls = []
+        secret = "private-cleanup-detail"
+
+        def action(name, fails=False):
+            def invoke():
+                calls.append(name)
+                if fails:
+                    raise RuntimeError(secret)
+            return invoke
+
+        failure = bootstrap._attempt_cleanup_steps(
+            bootstrap.Refusal("suite_failed", "rules.hooks"),
+            (
+                ("cleanup_storage", action("storage", True)),
+                ("cleanup_worker", action("worker", True)),
+                ("cleanup_summary", action("summary")),
+                ("cleanup_dash", action("dash", True)),
+            ),
+        )
+        self.assertEqual(calls, ["storage", "worker", "summary", "dash"])
+        self.assertEqual((failure.reason, failure.stage), ("cleanup_incomplete", "cleanup_storage"))
+        line = bootstrap._format_refusal(failure, {
+            "CI_SHA": CONTROL, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1",
+        })
+        self.assertIn("stage=cleanup_storage", line)
+        self.assertNotIn(secret, line)
+
+    def test_existing_cleanup_leaf_wins_while_later_cleanup_is_attempted(self):
+        calls = []
+
+        def later():
+            calls.append("later")
+            raise RuntimeError("private-later-detail")
+
+        failure = bootstrap._attempt_cleanup_steps(
+            bootstrap.Refusal("cleanup_incomplete", "cleanup_lease"),
+            (("cleanup_worker", later),),
+        )
+        self.assertEqual(calls, ["later"])
+        self.assertEqual((failure.reason, failure.stage), ("cleanup_incomplete", "cleanup_lease"))
+
+    def test_first_body_cleanup_survives_lease_exit_and_later_cleanup(self):
+        calls = []
+        cleanup_state = {"first": None}
+        body_failure = bootstrap._cleanup_failure("cleanup_summary", cleanup_state)
+        lease_exit_failure = bootstrap._cleanup_failure("cleanup_lease", cleanup_state)
+
+        def fail(name):
+            def invoke():
+                calls.append(name)
+                raise RuntimeError("private-cleanup-detail")
+            return invoke
+
+        failure = bootstrap._attempt_cleanup_steps(
+            lease_exit_failure,
+            (("cleanup_worker", fail("worker")), ("cleanup_dash", fail("dash"))),
+            cleanup_state,
+        )
+        self.assertEqual((body_failure.reason, body_failure.stage),
+                         ("cleanup_incomplete", "cleanup_summary"))
+        self.assertEqual(calls, ["worker", "dash"])
+        self.assertEqual((failure.reason, failure.stage), ("cleanup_incomplete", "cleanup_summary"))
+
+    def test_gate_failure_remains_when_every_cleanup_step_succeeds(self):
+        calls = []
+        original = bootstrap.Refusal("suite_failed", "rules.sync")
+        failure = bootstrap._attempt_cleanup_steps(
+            original,
+            (("cleanup_worker", lambda: calls.append("worker")),
+             ("cleanup_dash", lambda: calls.append("dash"))),
+        )
+        self.assertIs(failure, original)
+        self.assertEqual(calls, ["worker", "dash"])
+
+    def test_unknown_cleanup_step_uses_closed_unknown_label(self):
+        failure = bootstrap._attempt_cleanup_steps(
+            None, (("untrusted-stage", lambda: (_ for _ in ()).throw(RuntimeError("hidden"))),),
+        )
+        self.assertEqual((failure.reason, failure.stage), ("cleanup_incomplete", "cleanup_unknown"))
 
 
 class WorkerPrivilegeTests(unittest.TestCase):
@@ -631,7 +734,7 @@ class WorkerPrivilegeTests(unittest.TestCase):
             raise bootstrap.Refusal("runner_controls_unavailable", "runner_controls")
 
         def fail_cleanup(*args, **kwargs):
-            raise bootstrap.Refusal("cleanup_incomplete", "cleanup")
+            raise bootstrap.Refusal("cleanup_incomplete", "cleanup_unknown")
 
         reviewed = SimpleNamespace(
             PRIVILEGE_SCRIPT="fixed-probe",
@@ -820,8 +923,9 @@ class NetworkObservationTests(unittest.TestCase):
             def finish(self):
                 raise NetworkObservationTests.ObserverRefusal("cleanup_incomplete", "cleanup")
 
-        with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete"):
+        with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete") as caught:
             bootstrap._finish_network_observation(observer, Session(), binding_value(), SOURCE)
+        self.assertEqual(caught.exception.stage, "cleanup_unknown")
 
     def test_missing_observer_marker_has_a_fixed_leaf(self):
         for lifecycle in ({}, {"network_observation_marker": "untrusted marker"}):
@@ -875,11 +979,12 @@ class SummaryGuardTests(unittest.TestCase):
             _restore_runner_summary=lambda guard: events.append("summary-restored"),
             _close_runner_summary=lambda guard: events.append("guard-closed"),
         )
-        with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete"):
+        with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete") as caught:
             bootstrap._finish_summary_guard(
                 {"parent_probe_name": "summary.kd-probe"}, reviewed,
                 worker_cleanup_confirmed=False,
             )
+        self.assertEqual(caught.exception.stage, "cleanup_summary")
         self.assertEqual(events, ["guard-closed"])
 
     def test_post_command_summary_check_censuses_worker_before_restore_probe(self):
@@ -926,8 +1031,9 @@ class OutputTests(unittest.TestCase):
     def test_missing_source_reader_makes_pending_cleanup_incomplete(self):
         environment = {"SOURCE_READER_TOKEN": "opaque-test-token"}
         with patch.object(bootstrap, "_load_control_sibling", side_effect=ImportError("reader unavailable")):
-            with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete"):
+            with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete") as caught:
                 bootstrap._revoke_pending_token(environment)
+        self.assertEqual(caught.exception.stage, "cleanup_unknown")
 
     def test_cleanup_receipt_requires_exact_success_schema(self):
         environment = {"SOURCE_READER_TOKEN": "opaque-test-token"}
