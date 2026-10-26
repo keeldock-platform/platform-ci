@@ -1,10 +1,12 @@
 import base64
 import datetime
 import hashlib
+import stat
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 from unittest.mock import patch
 
 import macos_private_validation as subject
@@ -174,6 +176,98 @@ class SourceRefTests(unittest.TestCase):
         self.assertIsNone(
             subject._check_source_ref_binding(request, {subject.SOURCE_CANDIDATE_REF_ENV: "refs/heads/develop"})
         )
+
+
+@unittest.skipUnless(subject.os.name == "posix", "storage-root semantics use POSIX paths")
+class StorageRootValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.storage = Path("/tmp/storage-root-fixture")
+        self.parent = Path("/tmp")
+        self.directory = self._info(mode=stat.S_IFDIR | 0o700)
+        self.parent_directory = self._info(mode=stat.S_IFDIR | 0o1777)
+
+    @staticmethod
+    def _info(*, device=1, inode=2, uid=0, mode, links=2):
+        return SimpleNamespace(st_dev=device, st_ino=inode, st_uid=uid, st_mode=mode, st_nlink=links)
+
+    def _validate(self, *, named=None, resolved=None, parent=None, resolved_path=None, nonempty=False):
+        resolved_path = self.storage if resolved_path is None else resolved_path
+        named = self.directory if named is None else named
+        resolved = named if resolved is None else resolved
+        parent = self.parent_directory if parent is None else parent
+
+        def resolve(path, strict=False):
+            if path == self.storage:
+                return resolved_path
+            if path == self.parent:
+                return self.parent
+            return path
+
+        def lstat(path):
+            if path == self.storage:
+                return named
+            if path == resolved_path:
+                return resolved
+            if path == self.parent:
+                return parent
+            raise AssertionError("unexpected path metadata request")
+
+        entries = iter((object(),)) if nonempty else iter(())
+        with patch.object(type(self.storage), "resolve", autospec=True, side_effect=resolve), \
+                patch.object(type(self.storage), "lstat", autospec=True, side_effect=lstat), \
+                patch.object(subject.os, "scandir", return_value=nullcontext(entries)):
+            return subject._validate_storage_root(self.storage)
+
+    def test_accepts_a_concrete_path_object_for_a_valid_root_owned_directory(self):
+        self.assertIsInstance(self.storage, Path)
+        self.assertEqual(self._validate(), self.storage)
+
+    def test_refuses_nonabsolute_or_nonpath_values(self):
+        for value in (Path("relative-storage-root"), object()):
+            with self.subTest(value=type(value).__name__), self.assertRaises(subject.Refusal) as result:
+                subject._validate_storage_root(value)
+            self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
+
+    def test_refuses_nonroot_storage_directory(self):
+        with self.assertRaises(subject.Refusal) as result:
+            self._validate(named=self._info(uid=501, mode=stat.S_IFDIR | 0o700))
+        self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
+
+    def test_refuses_storage_directory_with_unexpected_link_count(self):
+        with self.assertRaises(subject.Refusal) as result:
+            self._validate(named=self._info(mode=stat.S_IFDIR | 0o700, links=1))
+        self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
+
+    def test_refuses_permissive_storage_mode(self):
+        with self.assertRaises(subject.Refusal) as result:
+            self._validate(named=self._info(mode=stat.S_IFDIR | 0o770))
+        self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
+
+    def test_refuses_a_symlink_identity_change(self):
+        target = Path("/tmp/storage-root-target")
+        with self.assertRaises(subject.Refusal) as result:
+            self._validate(
+                named=self._info(mode=stat.S_IFLNK | 0o777),
+                resolved=self._info(inode=3, mode=stat.S_IFDIR | 0o700),
+                resolved_path=target,
+            )
+        self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
+
+    def test_refuses_untrusted_parent_and_nonempty_directory(self):
+        for parent_info, nonempty in (
+            (self._info(uid=501, mode=stat.S_IFDIR | 0o1777), False),
+            (self._info(mode=stat.S_IFDIR | 0o0777), False),
+            (self.parent_directory, True),
+        ):
+            with self.subTest(parent=parent_info, nonempty=nonempty), self.assertRaises(subject.Refusal) as result:
+                self._validate(parent=parent_info, nonempty=nonempty)
+            self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
+
+    def test_refuses_path_outside_the_fixed_temporary_parent(self):
+        outside = Path("/tmp/nested/storage-root-fixture")
+        with self.assertRaises(subject.Refusal) as result:
+            self._validate(resolved_path=outside)
+        self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
 
 
 class RevocationResultTests(unittest.TestCase):

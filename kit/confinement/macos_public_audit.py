@@ -215,6 +215,29 @@ RULES_BOOTSTRAP_SUMMARY_CONTROL_MARKER_RE = re.compile(
     rb"source-sha=([a-f0-9]{40}) base-sha=([a-f0-9]{40}) reviewed-diff-sha256=([a-f0-9]{64})"
     rb"(?=\r?(?:\n|$))"
 )
+RULES_BOOTSTRAP_EARLY_SOURCE_REASONS = (
+    "invalid_input",
+    "context_unavailable",
+    "configuration_unavailable",
+    "source_reader_unavailable",
+    "repository_scope_invalid",
+    "source_fetch_unavailable",
+    "revocation_unconfirmed",
+    "base_invalid",
+    "signature_invalid",
+    "revocation_policy_invalid",
+    "bootstrap_snapshot_invalid",
+    "bootstrap_not_approved",
+    "internal_error",
+)
+RULES_BOOTSTRAP_EARLY_SOURCE_REFUSAL_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-rules-bootstrap=refused schema=1 reason=("
+    + b"|".join(re.escape(reason.encode("ascii")) for reason in RULES_BOOTSTRAP_EARLY_SOURCE_REASONS)
+    + rb") stage=source_lease control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"token-revocation=confirmed(?=\r?(?:\n|$))"
+)
 RULES_BOOTSTRAP_SOURCE_BINDING_MARKER_RE = re.compile(
     rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
     + rb"macos-rules-source-binding=verified schema=1 control-sha=([a-f0-9]{40}) "
@@ -1597,6 +1620,73 @@ def _inspect_rules_network_observation(raw, control_sha, run_id, run_attempt, so
             _fail("receipt_invalid")
 
 
+def _inspect_rules_early_source_refusal(raw, producer_job, control_sha, run_id, run_attempt, env):
+    marker = b"macos-rules-bootstrap=refused"
+    if type(raw) is not bytes:
+        _fail("receipt_invalid")
+    if raw.count(marker) == 0:
+        return False
+    if (raw.count(marker) != 1 or b"macos-rules-bootstrap=passed" in raw
+            or b"macos-rules-network=" in raw or b"macos-rules-summary-control=" in raw):
+        _fail("receipt_invalid")
+    matches = list(RULES_BOOTSTRAP_EARLY_SOURCE_REFUSAL_MARKER_RE.finditer(raw))
+    if len(matches) != 1:
+        _fail("receipt_invalid")
+    refusal = matches[0]
+    expected_identity = (
+        control_sha.encode("ascii"), run_id.encode("ascii"), run_attempt.encode("ascii"),
+    )
+    if refusal.groups()[1:] != expected_identity:
+        _fail("receipt_invalid")
+
+    source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+    base_sha = env.get("REQUESTED_BASE_SHA", "")
+    base_branch = env.get("REQUESTED_BASE_BRANCH", "")
+    reviewed_diff = env.get("REVIEWED_DIFF_SHA256", "")
+    if (not _valid_sha(source_sha) or not _valid_sha(base_sha)
+            or base_branch not in {"main", "develop", "uat"}
+            or HEX_DIGEST_RE.fullmatch(reviewed_diff) is None):
+        _fail("invalid_input")
+    preflight = _one_bootstrap_marker(
+        raw, b"macos-rules-bootstrap=preflight-passed", RULES_BOOTSTRAP_PREFLIGHT_MARKER_RE
+    )
+    source_binding = _one_bootstrap_marker(
+        raw, b"macos-rules-source-binding=verified", RULES_BOOTSTRAP_SOURCE_BINDING_MARKER_RE
+    )
+    if (preflight[:3] != expected_identity or source_binding[:3] != expected_identity
+            or preflight[3:6] != (
+                source_sha.encode("ascii"), base_sha.encode("ascii"), base_branch.encode("ascii"),
+            )
+            or preflight[7] != reviewed_diff.encode("ascii")
+            or source_binding[3] != BOOTSTRAP_SOURCE_REPOSITORY_IDS["rules-bootstrap"].encode("ascii")):
+        _fail("receipt_invalid")
+
+    step_by_name = {
+        step.get("name"): step
+        for step in producer_job.get("steps", [])
+        if type(step) is dict and type(step.get("name")) is str
+    }
+    rules_step = step_by_name.get("Run fixed rules bootstrap")
+    if (type(rules_step) is not dict or rules_step.get("status") != "completed"
+            or rules_step.get("conclusion") != "failure"):
+        _fail("receipt_invalid")
+    for step_name in (
+        "Fetch reviewed main control",
+        "Validate source-free control tree",
+        "Seal exact control signer inventory",
+        "Prepare pinned public dash before token mint",
+        "Preflight protected bootstrap and review binding",
+        "Validate source-reader scope configuration",
+        "Mint scoped source-reader token",
+        "Verify selected installation identity",
+    ):
+        step = step_by_name.get(step_name)
+        if (type(step) is not dict or step.get("status") != "completed"
+                or step.get("conclusion") != "success"):
+            _fail("receipt_invalid")
+    return True
+
+
 def _inspect_core_bootstrap_markers(raw, control_sha, run_id, run_attempt, env):
     source_sha = env.get("SOURCE_SHA", "")
     if not _valid_sha(source_sha):
@@ -1655,6 +1745,13 @@ def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):
                 step for step in producer_job.get("steps", [])
                 if type(step) is dict and step.get("name") == "Run fixed rules bootstrap"
             )
+            if (rules_step.get("status") == "completed"
+                    and rules_step.get("conclusion") == "failure"
+                    and b"macos-rules-network=" not in producer_log
+                    and _inspect_rules_early_source_refusal(
+                        producer_log, producer_job, control_sha, run_id, run_attempt, env
+                    )):
+                _fail("native_job_failed")
             if ((rules_step.get("status") == "completed"
                     and rules_step.get("conclusion") != "skipped")
                     or b"macos-rules-network=" in producer_log):
