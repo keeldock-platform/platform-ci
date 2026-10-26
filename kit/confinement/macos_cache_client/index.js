@@ -178,25 +178,39 @@ function main() {
     return;
   }
 
-  const warnings = lines.filter((line) => line.startsWith("::warning::"));
+  const nonDebugLines = lines.filter((line) => !line.startsWith("::debug::"));
+  const warnings = nonDebugLines.filter((line) => line.startsWith("::warning::"));
   const denialPrefix = mode === "read" ? "cache read denied:" : "cache write denied:";
   const readV1Prefix = "::warning::Failed to restore: " + denialPrefix;
   const readV2Prefix = "::warning::Failed to restore: Failed to GetCacheEntryDownloadURL: "
     + "Received non-retryable error: ";
   const writePrefix = "::warning::Failed to save: Unable to reserve cache with key " + key
     + ". More details: " + denialPrefix;
-  const matching = lines.filter((line) => mode === "read"
+  const matching = nonDebugLines.filter((line) => mode === "read"
     ? (line.startsWith(readV1Prefix)
       || (line.startsWith(readV2Prefix) && line.includes(denialPrefix)))
     : line.startsWith(writePrefix)
   );
-  const commands = lines.filter((line) => line.startsWith("::"));
-  if (warnings.length !== 1 || matching.length !== 1
-      || commands.length !== 1 || commands[0] !== matching[0]) {
-    refuse(mode === "read" && cacheMissLines.length === 1
-      && cacheMissLines[0] === expectedCacheMiss
-      ? "cache_miss"
-      : "service_denial_missing");
+  const commands = nonDebugLines.filter((line) => line.startsWith("::"));
+  if (warnings.length > 1) {
+    refuse("service_denial_ambiguous");
+    return;
+  }
+  if (warnings.length === 1 && matching.length !== 1) {
+    refuse("service_denial_unrecognized");
+    return;
+  }
+  if (warnings.length === 0) {
+    if (mode === "read" && cacheMissLines.length === 1
+        && cacheMissLines[0] === expectedCacheMiss && commands.length === 0) {
+      refuse("cache_miss");
+      return;
+    }
+    refuse("service_denial_missing");
+    return;
+  }
+  if (matching.length !== 1 || commands.length !== 1 || commands[0] !== matching[0]) {
+    refuse("workflow_command_unexpected");
     return;
   }
   if (mode === "read" && (cacheMissLines.length !== 1
