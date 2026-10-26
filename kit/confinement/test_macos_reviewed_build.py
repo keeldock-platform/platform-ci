@@ -1,5 +1,6 @@
 import contextlib
 import io
+import inspect
 import os
 from pathlib import Path
 import stat
@@ -403,6 +404,82 @@ class RealSummaryFileTests(unittest.TestCase):
                 reviewed_build._close_runner_summary(guard)
             temporary.cleanup()
 
+    def test_summary_cleanup_failure_with_empty_error_classes_keeps_census_unavailable(self):
+        temporary, home, directory, summary = self._temporary_summary()
+        guard = None
+        try:
+            runner_uid = home.stat().st_uid
+            with patch.dict(
+                "os.environ",
+                {"RUNNER_HOME": str(home), "CI_STEP_SUMMARY": str(summary)},
+                clear=False,
+            ):
+                guard = reviewed_build._prepare_runner_summary(runner_uid + 1)
+            failure = reviewed_build.capability.ProbeFailure(
+                "native_preflight_unavailable",
+                cleanup_complete=False,
+                check="probe_process_survivor",
+                survivor_classes=(),
+            )
+            with patch.object(reviewed_build.capability, "_run_as_probe_user", side_effect=failure):
+                with patch.object(reviewed_build, "_read_survivor_classes", return_value=(None, "unavailable")) as census:
+                    with self.assertRaises(reviewed_build.Refusal) as raised:
+                        reviewed_build._run_real_summary_probe(
+                            guard,
+                            runner_uid + 1,
+                            env={},
+                            python_executable="/usr/bin/python3",
+                            binding={"run_id": "123", "run_attempt": "1"},
+                        )
+            census.assert_called_once_with(runner_uid + 1, "/usr/bin/python3")
+            self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+            self.assertEqual(raised.exception.tool_phase, "summary")
+            self.assertEqual(raised.exception.survivor_classes, "unavailable")
+            self.assertFalse(guard["child_termination_confirmed"])
+            self.assertEqual(summary.read_bytes(), b"")
+        finally:
+            if guard is not None:
+                reviewed_build._close_runner_summary(guard)
+            temporary.cleanup()
+
+    def test_summary_cleanup_failure_uses_current_census_not_error_categories(self):
+        temporary, home, directory, summary = self._temporary_summary()
+        guard = None
+        try:
+            runner_uid = home.stat().st_uid
+            with patch.dict(
+                "os.environ",
+                {"RUNNER_HOME": str(home), "CI_STEP_SUMMARY": str(summary)},
+                clear=False,
+            ):
+                guard = reviewed_build._prepare_runner_summary(runner_uid + 1)
+            failure = reviewed_build.capability.ProbeFailure(
+                "native_preflight_unavailable",
+                cleanup_complete=False,
+                check="probe_process_survivor",
+                survivor_classes=("python", "other"),
+            )
+            with patch.object(reviewed_build.capability, "_run_as_probe_user", side_effect=failure):
+                with patch.object(reviewed_build, "_read_survivor_classes", return_value=(False, "none")) as census:
+                    with self.assertRaises(reviewed_build.Refusal) as raised:
+                        reviewed_build._run_real_summary_probe(
+                            guard,
+                            runner_uid + 1,
+                            env={},
+                            python_executable="/usr/bin/python3",
+                            binding={"run_id": "123", "run_attempt": "1"},
+                        )
+            census.assert_called_once_with(runner_uid + 1, "/usr/bin/python3")
+            self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+            self.assertEqual(raised.exception.tool_phase, "summary")
+            self.assertEqual(raised.exception.survivor_classes, "none")
+            self.assertFalse(guard["child_termination_confirmed"])
+            self.assertEqual(summary.read_bytes(), b"")
+        finally:
+            if guard is not None:
+                reviewed_build._close_runner_summary(guard)
+            temporary.cleanup()
+
 
 class CanaryArgumentTests(unittest.TestCase):
     def test_canary_argument_is_ascii_text_and_child_encodes_before_output(self):
@@ -469,6 +546,62 @@ class PrivilegeProbeTests(unittest.TestCase):
                     stage="privilege",
                     expected_stdout=reviewed_build.PRIVILEGE_MARKER,
                 )
+
+    def test_child_cleanup_failure_uses_the_closed_survivor_readback(self):
+        failure = reviewed_build.capability.ProbeFailure(
+            "native_preflight_unavailable",
+            cleanup_complete=False,
+            check="probe_process_survivor",
+            survivor_classes=("python", "other"),
+        )
+        with patch.object(reviewed_build.capability, "_run_as_probe_user", side_effect=failure):
+            with patch.object(reviewed_build, "_read_survivor_classes", return_value=(True, ("ps",))) as census:
+                with self.assertRaises(reviewed_build.Refusal) as raised:
+                    reviewed_build._run_probe_step(
+                        ("synthetic",),
+                        501,
+                        env={},
+                        python_executable="/usr/bin/python3",
+                        stage="storage",
+                        expected_stdout=reviewed_build.WORKER_TOOL_MARKER,
+                        tool_phase="git",
+                    )
+        census.assert_called_once_with(501, "/usr/bin/python3")
+        self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+        self.assertEqual(raised.exception.tool_phase, "git")
+        self.assertEqual(raised.exception.survivor_classes, ("ps",))
+
+    def test_cleanup_uncertainty_without_a_valid_survivor_result_stays_unavailable(self):
+        failure = reviewed_build.capability.ProbeFailure(
+            "native_preflight_unavailable",
+            cleanup_complete=False,
+            check="probe_process_census",
+        )
+        with patch.object(reviewed_build.capability, "_run_as_probe_user", side_effect=failure):
+            with patch.object(reviewed_build, "_read_survivor_classes", return_value=(None, "unavailable")) as census:
+                with self.assertRaises(reviewed_build.Refusal) as raised:
+                    reviewed_build._run_probe_step(
+                        ("synthetic",),
+                        501,
+                        env={},
+                        python_executable="/usr/bin/python3",
+                        stage="storage",
+                        expected_stdout=reviewed_build.WORKER_TOOL_MARKER,
+                        tool_phase="ssh",
+                    )
+        census.assert_called_once_with(501, "/usr/bin/python3")
+        self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+        self.assertEqual(raised.exception.tool_phase, "ssh")
+        self.assertEqual(raised.exception.survivor_classes, "unavailable")
+
+    def test_git_add_uses_only_documented_arguments(self):
+        self.assertIn('"git", "-C", repository, "add", "--", "fixture.txt"', reviewed_build.WORKER_TOOL_SCRIPT)
+        self.assertNotIn('"add", "--quiet"', reviewed_build.WORKER_TOOL_SCRIPT)
+
+    def test_git_init_uses_an_explicit_empty_template_directory(self):
+        self.assertIn('template_path = os.path.join(root, "template")', reviewed_build.WORKER_TOOL_SCRIPT)
+        self.assertIn('"--template=" + template_path', reviewed_build.WORKER_TOOL_SCRIPT)
+        self.assertIn('template = root / "template"', inspect.getsource(reviewed_build._create_worker_tool_fixture))
 
     def test_privilege_check_failure_has_a_closed_reason(self):
         failure = reviewed_build.capability.ProbeFailure("native_preflight_unavailable")
@@ -537,10 +670,200 @@ class FixedRecordTests(unittest.TestCase):
         self.assertEqual(
             line,
             "macos-build=refused schema=1 reason=internal_error stage=preflight"
-            + " control-sha=" + CONTROL_SHA + " run-id=123456789 run-attempt=1",
+            + " control-sha=" + CONTROL_SHA + " run-id=123456789 run-attempt=1"
+            + " tool-phase=unknown survivor-classes=unavailable",
         )
         self.assertNotIn("unexpected diagnostic", line)
         self.assertNotIn("private location", line)
+
+    def test_refusal_formatter_emits_only_the_fixed_diagnostic_suffix(self):
+        refusal = reviewed_build.Refusal(
+            "cleanup_incomplete",
+            "cleanup",
+            tool_phase="git",
+            survivor_classes=("python", "ps", "other"),
+        )
+        line = reviewed_build._format_refusal(refusal, CONTROL_SHA, binding_environment())
+        self.assertTrue(line.endswith("tool-phase=git survivor-classes=python,ps,other"))
+        self.assertEqual(line.split()[-2:], ["tool-phase=git", "survivor-classes=python,ps,other"])
+
+    def test_refusal_formatter_rejects_noncanonical_diagnostic_values(self):
+        refusal = reviewed_build.Refusal(
+            "cleanup_incomplete", "cleanup",
+            tool_phase="private phase",
+            survivor_classes=("other", "python", "python"),
+        )
+        line = reviewed_build._format_refusal(refusal, CONTROL_SHA, binding_environment())
+        self.assertTrue(line.endswith("tool-phase=unknown survivor-classes=unavailable"))
+
+    def test_survivor_diagnostics_distinguish_absent_unclassified_and_unavailable(self):
+        self.assertEqual(
+            reviewed_build.SURVIVOR_CLASS_ORDER,
+            reviewed_build.capability.SURVIVOR_CLASS_ORDER,
+        )
+        cases = (
+            ((False, ()), (False, "none")),
+            ((True, ()), (True, "unclassified")),
+            ((True, ("python", "other")), (True, ("python", "other"))),
+            ((False, ("python",)), (None, "unavailable")),
+            ((True, ("other", "python")), (None, "unavailable")),
+        )
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(reviewed_build._survivor_classes_from_presence(value), expected)
+
+    def test_first_tool_diagnostic_survives_a_later_cleanup_failure(self):
+        cleanup = reviewed_build.Refusal(
+            "cleanup_incomplete", "cleanup",
+            tool_phase="cleanup", survivor_classes=("unknown",),
+        )
+        preserved = reviewed_build._preserve_first_diagnostic(
+            cleanup, ("ssh", ("python", "other")),
+        )
+        self.assertEqual((preserved.reason, preserved.stage), ("cleanup_incomplete", "cleanup"))
+        self.assertEqual(preserved.tool_phase, "ssh")
+        self.assertEqual(preserved.survivor_classes, ("python", "other"))
+
+
+class WorkerToolFixtureTests(unittest.TestCase):
+    def test_python_command_payload_preserves_its_newline_escape(self):
+        commands = []
+        writes = []
+
+        def capture(command, **kwargs):
+            commands.append((command, kwargs))
+            return subprocess.CompletedProcess(
+                command, 0, b"KD-RB:worker-python=passed\n", b"",
+            )
+
+        namespace = {"__name__": "worker_tool_test"}
+        with patch.dict("os.environ", {"HOME": "fixture-home", "TMPDIR": "fixture-temp"}, clear=False):
+            with patch.object(reviewed_build.sys, "argv", ["worker-tool", "python", "fixture-root"]):
+                with patch.object(reviewed_build.subprocess, "run", side_effect=capture):
+                    with patch.object(reviewed_build.os, "write", side_effect=lambda fd, data: writes.append(data) or len(data)):
+                        exec(reviewed_build.WORKER_TOOL_SCRIPT, namespace)
+        self.assertEqual(len(commands), 1)
+        payload = commands[0][0][-1]
+        self.assertIn(r"passed\n')", payload)
+        self.assertNotIn("\n", payload)
+        self.assertEqual(writes, [reviewed_build.WORKER_TOOL_MARKER])
+
+    def test_fixed_worker_tool_operations_are_censused_between_steps(self):
+        calls = []
+        toolchain = {"python": "/trusted/python"}
+        with patch.object(reviewed_build, "_run_probe_step", side_effect=lambda *args, **kwargs: calls.append((args, kwargs))):
+            with patch.object(reviewed_build, "_worker_census") as census:
+                reviewed_build._run_worker_tool_fixture(
+                    Path("synthetic-root"),
+                    501,
+                    {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+                    toolchain,
+                )
+        operations = [arguments[0][-2] for arguments, _ in calls]
+        phases = [options["tool_phase"] for _, options in calls]
+        self.assertEqual(
+            operations,
+            ["python", "git-init", "git-add", "git-commit", "ssh-keygen", "ssh-sign", "ssh-verify"],
+        )
+        self.assertEqual(phases, ["python", "git", "git", "git", "ssh", "ssh", "ssh"])
+        self.assertEqual(
+            [call.args[2] for call in census.call_args_list],
+            ["python", "git", "git", "git", "ssh", "ssh", "ssh"],
+        )
+
+    def test_summary_probes_bracket_tools_and_keep_the_original_post_c_probe(self):
+        source = inspect.getsource(reviewed_build._run_synthetic_smoke)
+        summary_offsets = []
+        offset = 0
+        while True:
+            offset = source.find("_run_real_summary_probe(", offset)
+            if offset < 0:
+                break
+            summary_offsets.append(offset)
+            offset += 1
+        self.assertEqual(len(summary_offsets), 2)
+        first_baseline = source.index('_worker_census(identity_uid, toolchain["python"], "baseline")')
+        second_baseline = source.index(
+            '_worker_census(identity_uid, toolchain["python"], "baseline")',
+            first_baseline + 1,
+        )
+        tools = source.index("_run_worker_tool_fixture(")
+        compile_stage = source.index('stage = "compile"')
+        load_stage = source.index('stage = "load_test"')
+        cleanup = source.index("_cleanup((build_storage", summary_offsets[1])
+        self.assertLess(first_baseline, summary_offsets[0])
+        self.assertLess(summary_offsets[0], second_baseline)
+        self.assertLess(second_baseline, tools)
+        self.assertLess(tools, compile_stage)
+        self.assertLess(compile_stage, load_stage)
+        self.assertLess(load_stage, summary_offsets[1])
+        self.assertLess(summary_offsets[1], cleanup)
+
+    def test_worker_tool_script_has_no_network_agent_or_shell_surface(self):
+        script = reviewed_build.WORKER_TOOL_SCRIPT
+        self.assertIn('"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"', script)
+        self.assertIn('"GIT_CONFIG_NOSYSTEM": "1"', script)
+        self.assertIn('"GIT_CONFIG_GLOBAL": "/dev/null"', script)
+        self.assertIn('"GIT_OPTIONAL_LOCKS": "0"', script)
+        self.assertIn('"GIT_CONFIG_COUNT": "1"', script)
+        self.assertIn('"GIT_CONFIG_KEY_0": "safe.directory"', script)
+        self.assertIn('"GIT_CONFIG_VALUE_0": repository', script)
+        self.assertIn('"GIT_TERMINAL_PROMPT": "0"', script)
+        self.assertIn('"ssh-keygen", "-q", "-Y", "sign"', script)
+        self.assertIn('"ssh-keygen", "-q", "-Y", "verify"', script)
+        self.assertNotIn("SSH_AUTH_SOCK", script)
+        self.assertNotIn("shell=True", script)
+        self.assertNotIn("https://", script)
+
+    def test_native_tool_streams_are_discarded_and_only_python_marker_is_captured(self):
+        self.assertIn('if expected_stdout is None:', reviewed_build.WORKER_TOOL_SCRIPT)
+        self.assertIn('arguments["stdout"] = subprocess.DEVNULL', reviewed_build.WORKER_TOOL_SCRIPT)
+        self.assertIn('arguments["stderr"] = subprocess.DEVNULL', reviewed_build.WORKER_TOOL_SCRIPT)
+        self.assertIn('arguments["stdout"] = subprocess.PIPE', reviewed_build.WORKER_TOOL_SCRIPT)
+
+
+class WorkerDiagnosticTests(unittest.TestCase):
+    def test_failed_tool_with_confirmed_cleanup_reads_the_closed_current_census(self):
+        failure = reviewed_build.capability.ProbeFailure(
+            "native_preflight_unavailable", cleanup_complete=True,
+        )
+        with patch.object(reviewed_build.capability, "_run_as_probe_user", side_effect=failure):
+            with patch.object(reviewed_build, "_read_survivor_classes", return_value=(True, ("python", "other"))) as census:
+                with self.assertRaises(reviewed_build.Refusal) as raised:
+                    reviewed_build._run_probe_step(
+                        ("synthetic",),
+                        501,
+                        env={},
+                        python_executable="/usr/bin/python3",
+                        stage="storage",
+                        expected_stdout=reviewed_build.WORKER_TOOL_MARKER,
+                        tool_phase="git",
+                    )
+        census.assert_called_once_with(501, "/usr/bin/python3")
+        self.assertEqual(raised.exception.reason, "synthetic_build_failed")
+        self.assertEqual(raised.exception.tool_phase, "git")
+        self.assertEqual(raised.exception.survivor_classes, ("python", "other"))
+
+    def test_capture_mismatch_uses_census_without_exposing_output(self):
+        result = subprocess.CompletedProcess(("synthetic",), 1, b"private output", b"private error")
+        with patch.object(reviewed_build.capability, "_run_as_probe_user", return_value=result):
+            with patch.object(reviewed_build, "_read_survivor_classes", return_value=(False, "none")) as census:
+                with self.assertRaises(reviewed_build.Refusal) as raised:
+                    reviewed_build._run_probe_step(
+                        ("synthetic",),
+                        501,
+                        env={},
+                        python_executable="/usr/bin/python3",
+                        stage="storage",
+                        expected_stdout=reviewed_build.WORKER_TOOL_MARKER,
+                        tool_phase="ssh",
+                    )
+        census.assert_called_once_with(501, "/usr/bin/python3")
+        self.assertEqual(raised.exception.reason, "capture_invalid")
+        self.assertEqual(raised.exception.tool_phase, "ssh")
+        self.assertEqual(raised.exception.survivor_classes, "none")
+        self.assertNotIn("private output", str(raised.exception))
+        self.assertNotIn("private error", str(raised.exception))
 
 
 class CliTests(unittest.TestCase):
@@ -553,7 +876,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue(),
             "macos-build=refused schema=1 reason=invalid_control_identity stage=context"
-            + " control-sha=unknown run-id=unknown run-attempt=unknown\n",
+            + " control-sha=unknown run-id=unknown run-attempt=unknown"
+            + " tool-phase=unknown survivor-classes=unavailable\n",
         )
         self.assertNotIn("source-command", output.getvalue())
 
@@ -566,7 +890,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             output.getvalue(),
             "macos-build=refused schema=1 reason=invalid_control_identity stage=context"
-            + " control-sha=unknown run-id=unknown run-attempt=unknown\n",
+            + " control-sha=unknown run-id=unknown run-attempt=unknown"
+            + " tool-phase=unknown survivor-classes=unavailable\n",
         )
 
 
