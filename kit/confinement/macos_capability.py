@@ -1175,6 +1175,37 @@ def _resolve_trusted_path(raw, *, directory=False, reject_python_shim=False):
     return _trusted_path_metadata(resolved, directory=directory)
 
 
+def _resolve_worker_path_directory(raw):
+    path = _resolve_trusted_path(raw, directory=True)
+    try:
+        for component in list(reversed(path.parents)) + [path]:
+            metadata = component.stat()
+            if (
+                metadata.st_uid != 0
+                or metadata.st_mode & stat.S_IWOTH
+                or (metadata.st_mode & stat.S_IWGRP and metadata.st_gid == PROBE_PRIMARY_GID)
+            ):
+                raise ValueError
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain") from None
+    return path
+
+
+def _validate_worker_path_shadow(directory, name, expected):
+    candidate = (directory / name).as_posix()
+    try:
+        metadata = Path(candidate).lstat()
+    except FileNotFoundError:
+        return
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain") from None
+    if metadata.st_uid != 0:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+    resolved = _resolve_trusted_path(candidate)
+    if resolved != expected:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+
+
 def _python_developer_directory(path):
     text = path.as_posix()
     semantic_path = PurePosixPath(text)
@@ -1240,11 +1271,78 @@ def _resolve_toolchain_file(raw, developer_directory, *, kind):
                 and relative[0] == "SDKs"
                 and re.fullmatch(r"MacOSX[0-9]*(?:\.[0-9]+)*\.sdk", sdk_name) is not None
             )
+    elif kind == "git":
+        valid = relative == ("usr", "bin", "git")
     else:
         valid = False
     if not valid:
         raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
     return path
+
+
+def _resolve_worker_tools(toolchain):
+    expected_keys = {"python", "clang", "sdk", "linker", "developer_directory"}
+    if type(toolchain) is not dict or set(toolchain) != expected_keys:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain")
+    try:
+        python = _resolve_trusted_path(toolchain["python"], reject_python_shim=True)
+        if python.as_posix() != toolchain["python"]:
+            raise ValueError
+        developer_directory = _resolve_worker_path_directory(toolchain["developer_directory"])
+        if (
+            developer_directory.as_posix() != toolchain["developer_directory"]
+            or _python_developer_directory(python).as_posix() != developer_directory.as_posix()
+        ):
+            raise ValueError
+        python_directory = _resolve_worker_path_directory(python.parent.as_posix())
+        python_entry = _resolve_trusted_path(
+            (python_directory / "python3").as_posix(),
+            reject_python_shim=True,
+        )
+        if python_entry != python:
+            raise ValueError
+        developer_bin = _resolve_worker_path_directory(
+            (developer_directory / "usr" / "bin").as_posix()
+        )
+        git = _resolve_toolchain_file(
+            (developer_bin / "git").as_posix(),
+            developer_directory,
+            kind="git",
+        )
+        if git.parent != developer_bin:
+            raise ValueError
+        _validate_worker_path_shadow(python_directory, "git", git)
+        env = _resolve_trusted_path("/usr/bin/env")
+        ssh_keygen = _resolve_trusted_path("/usr/bin/ssh-keygen")
+        if env.as_posix() != "/usr/bin/env" or ssh_keygen.as_posix() != "/usr/bin/ssh-keygen":
+            raise ValueError
+        _validate_worker_path_shadow(python_directory, "ssh-keygen", ssh_keygen)
+        _validate_worker_path_shadow(developer_bin, "ssh-keygen", ssh_keygen)
+        system_directories = tuple(
+            _resolve_worker_path_directory(value)
+            for value in ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+        )
+        path_directories = (
+            python_directory.as_posix(),
+            developer_bin.as_posix(),
+        ) + tuple(directory.as_posix() for directory in system_directories)
+        if any(not value or any(character in value for character in (":", "\n", "\0"))
+               for value in path_directories):
+            raise ValueError
+        path = ":".join(path_directories)
+        if len(os.fsencode(path)) > MAX_TOOL_PATH_BYTES:
+            raise ValueError
+    except ProbeFailure:
+        raise
+    except BaseException:
+        raise ProbeFailure("native_preflight_unavailable", check="probe_process_toolchain") from None
+    return {
+        "python": python.as_posix(),
+        "git": git.as_posix(),
+        "env": env.as_posix(),
+        "ssh_keygen": ssh_keygen.as_posix(),
+        "path": path,
+    }
 
 
 def _resolve_trusted_toolchain():

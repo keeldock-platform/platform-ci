@@ -7,7 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 _CONTROL_DIRECTORY = Path(__file__).resolve(strict=True).parent
@@ -133,7 +133,7 @@ try:
     signature_path = payload_path + ".sig"
     identity = "fixture@example.invalid"
     environment = {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "PATH": os.environ["PATH"],
         "HOME": os.environ["HOME"],
         "TMPDIR": os.environ["TMPDIR"],
         "LANG": "C",
@@ -567,9 +567,27 @@ def _host_identity(binding, toolchain):
     }
 
 
-def _child_environment(home, storage, toolchain):
+def _child_environment(home, storage, toolchain, worker_tools=None):
+    if worker_tools is None:
+        path = "/usr/bin:/bin:/usr/sbin:/sbin"
+    else:
+        if (
+            type(worker_tools) is not dict
+            or set(worker_tools) != {"python", "git", "env", "ssh_keygen", "path"}
+            or type(worker_tools.get("path")) is not str
+            or not worker_tools["path"]
+            or len(os.fsencode(worker_tools["path"])) > capability.MAX_TOOL_PATH_BYTES
+            or "\n" in worker_tools["path"]
+            or "\0" in worker_tools["path"]
+            or any(
+                not PurePosixPath(component).is_absolute()
+                for component in worker_tools["path"].split(":")
+            )
+        ):
+            raise Refusal("toolchain_unavailable", "toolchain")
+        path = worker_tools["path"]
     return {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "PATH": path,
         "HOME": str(home),
         "TMPDIR": str(storage),
         "DEVELOPER_DIR": toolchain["developer_directory"],
@@ -1275,6 +1293,7 @@ def _run_synthetic_smoke(control_sha):
         raise Refusal("toolchain_unavailable", "toolchain_module")
     binding, root = _safe_context(control_sha)
     toolchain = None
+    worker_tools = None
     identity_uid = None
     home_parent = None
     home = None
@@ -1288,6 +1307,7 @@ def _run_synthetic_smoke(control_sha):
     try:
         stage = "toolchain_resolve"
         toolchain = capability._resolve_trusted_toolchain()
+        worker_tools = capability._resolve_worker_tools(toolchain)
         identity = _host_identity(binding, toolchain)
         stage = "developer_mode"
         capability._disable_developer_mode()
@@ -1300,7 +1320,7 @@ def _run_synthetic_smoke(control_sha):
         build_storage = Path(tempfile.mkdtemp(prefix="macos-reviewed-build-", dir="/tmp"))
         storage_identity = capability._prepare_storage_directory(build_storage, identity_uid)
         build_storage = Path(storage_identity[0])
-        child_env = _child_environment(home, build_storage, toolchain)
+        child_env = _child_environment(home, build_storage, toolchain, worker_tools)
         stage = "privilege"
         _run_probe_step(
             _probe_argv(toolchain["python"], PRIVILEGE_SCRIPT),

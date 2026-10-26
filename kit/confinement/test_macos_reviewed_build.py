@@ -163,6 +163,27 @@ class ToolchainStageTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason, "toolchain_unavailable")
         self.assertEqual(raised.exception.stage, "toolchain_resolve")
 
+    def test_worker_tool_path_failure_precedes_identity_and_worker_creation(self):
+        toolchain = {
+            "python": "/trusted/python",
+            "clang": "/trusted/clang",
+            "sdk": "/trusted/sdk",
+            "linker": "/trusted/ld",
+            "developer_directory": "/trusted/Developer",
+        }
+        failure = reviewed_build.capability.ProbeFailure("native_preflight_unavailable")
+        with patch.object(reviewed_build, "_safe_context", return_value=({}, Path("/tmp/root"))):
+            with patch.object(reviewed_build.capability, "_resolve_trusted_toolchain", return_value=toolchain):
+                with patch.object(reviewed_build.capability, "_resolve_worker_tools", side_effect=failure):
+                    with patch.object(reviewed_build.capability, "_disable_developer_mode") as disable:
+                        with patch.object(reviewed_build.capability, "_create_probe_identity") as create_identity:
+                            with self.assertRaises(reviewed_build.Refusal) as raised:
+                                reviewed_build._run_synthetic_smoke(CONTROL_SHA)
+        self.assertEqual(raised.exception.reason, "toolchain_unavailable")
+        self.assertEqual(raised.exception.stage, "toolchain_resolve")
+        disable.assert_not_called()
+        create_identity.assert_not_called()
+
     def test_host_version_queries_report_only_their_fixed_stage(self):
         clt_toolchain = {
             "developer_directory": "/Library/Developer/CommandLineTools",
@@ -221,10 +242,20 @@ class ToolchainStageTests(unittest.TestCase):
 
 class ChildEnvironmentTests(unittest.TestCase):
     def test_native_child_receives_only_fixed_build_environment(self):
+        worker_path = (
+            "/trusted/python/bin:/trusted/Developer/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        )
         environment = reviewed_build._child_environment(
             "/tmp/probe-home",
             "/tmp/probe-storage",
             {"developer_directory": "/Applications/Xcode.app/Contents/Developer"},
+            {
+                "python": "/trusted/python",
+                "git": "/trusted/git",
+                "env": "/usr/bin/env",
+                "ssh_keygen": "/usr/bin/ssh-keygen",
+                "path": worker_path,
+            },
         )
         self.assertEqual(
             set(environment),
@@ -234,6 +265,31 @@ class ChildEnvironmentTests(unittest.TestCase):
         self.assertNotIn("GITHUB_STEP_SUMMARY", environment)
         self.assertNotIn("CI_STEP_SUMMARY", environment)
         self.assertNotIn("GITHUB_OUTPUT", environment)
+        self.assertEqual(environment["PATH"], worker_path)
+
+    def test_existing_three_argument_caller_keeps_its_environment_contract(self):
+        environment = reviewed_build._child_environment(
+            "/tmp/probe-home",
+            "/tmp/probe-storage",
+            {"developer_directory": "/Applications/Xcode.app/Contents/Developer"},
+        )
+        self.assertEqual(environment["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+
+    def test_native_child_rejects_malformed_resolved_path_record(self):
+        for worker_tools in (
+            {"python": "/trusted/python", "git": "/trusted/git", "env": "/usr/bin/env", "ssh_keygen": "/usr/bin/ssh-keygen", "path": ""},
+            {"python": "/trusted/python", "git": "/trusted/git", "env": "/usr/bin/env", "ssh_keygen": "/usr/bin/ssh-keygen", "path": "/safe\n/unsafe"},
+            {"python": "/trusted/python", "git": "/trusted/git", "env": "/usr/bin/env", "ssh_keygen": "/usr/bin/ssh-keygen", "path": "relative:/safe"},
+            {"python": "/trusted/python", "git": "/trusted/git", "env": "/usr/bin/env", "ssh_keygen": "/usr/bin/ssh-keygen", "path": "/safe", "extra": "x"},
+        ):
+            with self.subTest(worker_tools=worker_tools):
+                with self.assertRaisesRegex(reviewed_build.Refusal, "toolchain_unavailable"):
+                    reviewed_build._child_environment(
+                        "/tmp/probe-home",
+                        "/tmp/probe-storage",
+                        {"developer_directory": "/Applications/Xcode.app/Contents/Developer"},
+                        worker_tools,
+                    )
 
     def test_capture_probe_contains_a_synthetic_standin_not_a_runner_summary_path(self):
         self.assertIn("os.open(summary_standin", reviewed_build.LOAD_TEST_SCRIPT)
@@ -737,7 +793,12 @@ class WorkerToolFixtureTests(unittest.TestCase):
             )
 
         namespace = {"__name__": "worker_tool_test"}
-        with patch.dict("os.environ", {"HOME": "fixture-home", "TMPDIR": "fixture-temp"}, clear=False):
+        worker_path = "/trusted/python/bin:/trusted/Developer/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        with patch.dict(
+            "os.environ",
+            {"HOME": "fixture-home", "TMPDIR": "fixture-temp", "PATH": worker_path},
+            clear=False,
+        ):
             with patch.object(reviewed_build.sys, "argv", ["worker-tool", "python", "fixture-root"]):
                 with patch.object(reviewed_build.subprocess, "run", side_effect=capture):
                     with patch.object(reviewed_build.os, "write", side_effect=lambda fd, data: writes.append(data) or len(data)):
@@ -746,17 +807,19 @@ class WorkerToolFixtureTests(unittest.TestCase):
         payload = commands[0][0][-1]
         self.assertIn(r"passed\n')", payload)
         self.assertNotIn("\n", payload)
+        self.assertEqual(commands[0][1]["env"]["PATH"], worker_path)
         self.assertEqual(writes, [reviewed_build.WORKER_TOOL_MARKER])
 
     def test_fixed_worker_tool_operations_are_censused_between_steps(self):
         calls = []
         toolchain = {"python": "/trusted/python"}
+        worker_path = "/trusted/python/bin:/trusted/Developer/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         with patch.object(reviewed_build, "_run_probe_step", side_effect=lambda *args, **kwargs: calls.append((args, kwargs))):
             with patch.object(reviewed_build, "_worker_census") as census:
                 reviewed_build._run_worker_tool_fixture(
                     Path("synthetic-root"),
                     501,
-                    {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+                    {"PATH": worker_path},
                     toolchain,
                 )
         operations = [arguments[0][-2] for arguments, _ in calls]
@@ -766,6 +829,10 @@ class WorkerToolFixtureTests(unittest.TestCase):
             ["python", "git-init", "git-add", "git-commit", "ssh-keygen", "ssh-sign", "ssh-verify"],
         )
         self.assertEqual(phases, ["python", "git", "git", "git", "ssh", "ssh", "ssh"])
+        self.assertEqual(
+            [options["env"]["PATH"] for _, options in calls],
+            [worker_path] * len(calls),
+        )
         self.assertEqual(
             [call.args[2] for call in census.call_args_list],
             ["python", "git", "git", "git", "ssh", "ssh", "ssh"],
@@ -801,7 +868,8 @@ class WorkerToolFixtureTests(unittest.TestCase):
 
     def test_worker_tool_script_has_no_network_agent_or_shell_surface(self):
         script = reviewed_build.WORKER_TOOL_SCRIPT
-        self.assertIn('"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"', script)
+        self.assertIn('"PATH": os.environ["PATH"]', script)
+        self.assertNotIn('"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"', script)
         self.assertIn('"GIT_CONFIG_NOSYSTEM": "1"', script)
         self.assertIn('"GIT_CONFIG_GLOBAL": "/dev/null"', script)
         self.assertIn('"GIT_OPTIONAL_LOCKS": "0"', script)
