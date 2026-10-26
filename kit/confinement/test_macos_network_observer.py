@@ -225,6 +225,63 @@ class CaptureParserTests(unittest.TestCase):
         self.assertNotEqual(records[0], records[1])
 
 
+class CaptureReadinessTests(unittest.TestCase):
+    def _session_and_capture(self, key):
+        class Process:
+            def poll(self):
+                return None
+
+        session = type("Session", (), {
+            "_hash_key": key,
+            "_dns_udp_ports": frozenset((53,)),
+            "_dns_tcp_ports": frozenset(),
+        })()
+        capture = {
+            "path": "capture-fixture",
+            "addresses": frozenset((LOCAL_V4,)),
+            "process": Process(),
+        }
+        return session, capture
+
+    def test_positive_drain_requires_expected_dns_and_tcp_hmacs(self):
+        key = b"q" * 32
+        expected_dns = observer.hmac.new(
+            key,
+            b"dns\x00" + observer._encode_dns_name(DNS_NAME),
+            observer.hashlib.sha256,
+        ).hexdigest()
+        expected_tcp = observer.hmac.new(
+            key,
+            b"tcp\x00" + REMOTE_V4.encode("ascii") + b":443",
+            observer.hashlib.sha256,
+        ).hexdigest()
+        session, capture = self._session_and_capture(key)
+        data = pcap((udp_packet(54000, 53, dns_query(DNS_NAME)), tcp_syn_packet(54001, 443)))
+        with patch.object(observer, "_read_capture_snapshot", return_value=data) as snapshot:
+            observer._wait_for_expected_fixture(session, capture, expected_dns, expected_tcp)
+        snapshot.assert_called_once_with("capture-fixture")
+
+    def test_positive_drain_refuses_unexpected_fixture_hashes(self):
+        key = b"r" * 32
+        session, capture = self._session_and_capture(key)
+        data = pcap((udp_packet(54000, 53, dns_query("other.invalid")), tcp_syn_packet(54001, 444)))
+        with patch.object(observer, "_read_capture_snapshot", return_value=data), \
+                patch.object(observer.time, "monotonic", side_effect=(0.0, 4.0)):
+            with self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._wait_for_expected_fixture(session, capture, "c" * 64, "d" * 64)
+        self.assertEqual((caught.exception.reason, caught.exception.stage), ("capture_invalid", "selftest"))
+
+    def test_capture_readiness_requires_valid_header_with_configured_snaplen(self):
+        with patch.object(observer, "_read_capture_snapshot", return_value=b"x" * 24), \
+                patch.object(observer, "_pcap_header", return_value=("<", observer.MAX_SNAPSHOT_BYTES, 1)):
+            self.assertTrue(observer._capture_header_ready("capture-fixture"))
+        with patch.object(observer, "_read_capture_snapshot", return_value=b"x" * 24), \
+                patch.object(observer, "_pcap_header", return_value=("<", observer.MAX_SNAPSHOT_BYTES - 1, 1)):
+            with self.assertRaises(observer.ObserverRefusal) as caught:
+                observer._capture_header_ready("capture-fixture")
+        self.assertEqual((caught.exception.reason, caught.exception.stage), ("capture_invalid", "start"))
+
+
 class ObservationLifecycleTests(unittest.TestCase):
     def make_session(self):
         binding = observer._validated_binding(CONTROL_SHA, RUN_ID, RUN_ATTEMPT, SOURCE_SHA)
@@ -383,8 +440,8 @@ class ObservationLifecycleTests(unittest.TestCase):
 
         process = Process()
         with patch.object(observer, "_create_capture_file", return_value="capture-fixture"), \
-                patch.object(observer.subprocess, "Popen", return_value=process), \
-                patch.object(observer.time, "sleep", side_effect=OSError):
+                patch.object(observer.subprocess, "Popen", return_value=process) as popen, \
+                patch.object(observer, "_wait_capture_ready", side_effect=OSError) as readiness:
             with self.assertRaises(observer.ObserverRefusal) as caught:
                 observer._start_capture(
                     "session-fixture",
@@ -396,6 +453,23 @@ class ObservationLifecycleTests(unittest.TestCase):
         self.assertEqual(process.signals, [observer.signal.SIGINT])
         self.assertTrue(process.waited)
         self.assertTrue(process.terminated)
+        readiness.assert_called_once_with(process, "capture-fixture")
+        arguments = popen.call_args.args[0]
+        self.assertIn("--immediate-mode", arguments)
+        self.assertIn("-U", arguments)
+
+    def test_capture_start_waits_for_a_valid_pcap_header_and_live_process(self):
+        class Process:
+            def poll(self):
+                return None
+
+        process = Process()
+        with patch.object(observer, "_capture_header_ready", side_effect=(False, True)) as ready, \
+                patch.object(observer.time, "monotonic", side_effect=(0.0, 0.0, 0.1)), \
+                patch.object(observer.time, "sleep") as sleep:
+            observer._wait_capture_ready(process, "capture-fixture")
+        self.assertEqual(ready.call_count, 2)
+        sleep.assert_called_once_with(observer.STARTUP_POLL_SECONDS)
 
     def test_start_capture_reports_uncertain_process_cleanup(self):
         class Process:
@@ -413,7 +487,7 @@ class ObservationLifecycleTests(unittest.TestCase):
 
         with patch.object(observer, "_create_capture_file", return_value="capture-fixture"), \
                 patch.object(observer.subprocess, "Popen", return_value=Process()), \
-                patch.object(observer.time, "sleep", side_effect=OSError):
+                patch.object(observer, "_wait_capture_ready", side_effect=OSError):
             with self.assertRaises(observer.ObserverRefusal) as caught:
                 observer._start_capture(
                     "session-fixture",
@@ -523,6 +597,43 @@ class OutputContractTests(unittest.TestCase):
                 self.assertEqual(len(output.getvalue().splitlines()), 1)
                 self.assertIn("reason=" + reason, output.getvalue())
                 self.assertNotIn("Traceback", output.getvalue())
+
+    def test_refusal_diagnostics_are_fixed_and_bind_expected_fixture_hashes(self):
+        details = observer._selftest_diagnostics(
+            "receipt",
+            valid_record(),
+            "c" * 64,
+            "d" * 64,
+        )
+        error = observer.ObserverRefusal("capture_invalid", "selftest", details)
+        line = observer._format_refusal_line(error, CONTROL_SHA, RUN_ID, RUN_ATTEMPT)
+        self.assertIn(
+            "selftest-stage=receipt dns-query-count=1 tcp-syn-count=1 "
+            "dns-expected-match=yes tcp-expected-match=yes capture-limited=false",
+            line,
+        )
+        self.assertNotIn(DNS_NAME, line)
+        self.assertNotIn(REMOTE_V4, line)
+
+    def test_refusal_diagnostics_use_unknown_for_invalid_values(self):
+        details = observer._selftest_diagnostics(
+            "untrusted-stage",
+            valid_record(dns_query_count=True, tcp_syn_count=-1, capture_limited="false"),
+            "e" * 64,
+            "f" * 64,
+        )
+        line = observer._format_refusal_line(
+            observer.ObserverRefusal("capture_invalid", "selftest", details),
+            CONTROL_SHA,
+            RUN_ID,
+            RUN_ATTEMPT,
+        )
+        self.assertIn(
+            "selftest-stage=unknown dns-query-count=unknown tcp-syn-count=unknown "
+            "dns-expected-match=no tcp-expected-match=no capture-limited=unknown",
+            line,
+        )
+        self.assertNotIn("untrusted-stage", line)
 
 
 if __name__ == "__main__":
