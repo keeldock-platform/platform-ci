@@ -47,7 +47,10 @@ REASONS = frozenset((
     "arguments_invalid", "binding_invalid", "interface_unavailable", "observer_unavailable",
     "capture_invalid", "cleanup_incomplete", "internal_error",
 ))
-STAGES = frozenset(("arguments", "binding", "interface", "start", "finish", "parse", "cleanup", "selftest"))
+STAGES = frozenset((
+    "arguments", "binding", "interface", "interface_hardware", "interface_capture",
+    "interface_address", "start", "finish", "parse", "cleanup", "selftest",
+))
 SELFTEST_DIAGNOSTIC_STAGES = frozenset((
     "unknown", "fixture_setup", "capture_started", "dns_exchange", "tcp_exchange",
     "capture_drain", "capture_finished", "receipt",
@@ -204,13 +207,13 @@ def _run_fixed_command(arguments, stage):
     return result.stdout
 
 
-def _parse_hardware_devices(output):
+def _parse_hardware_devices(output, stage="interface"):
     if type(output) is not bytes or len(output) > MAX_TOOL_OUTPUT_BYTES:
-        raise ObserverRefusal("interface_unavailable", "interface")
+        raise ObserverRefusal("interface_unavailable", stage)
     try:
         lines = output.decode("ascii").splitlines()
     except UnicodeDecodeError:
-        raise ObserverRefusal("interface_unavailable", "interface") from None
+        raise ObserverRefusal("interface_unavailable", stage) from None
     devices = []
     for line in lines:
         match = re.fullmatch(r"\s*Device:\s*([A-Za-z0-9_.-]+)\s*", line)
@@ -219,40 +222,40 @@ def _parse_hardware_devices(output):
         name = match.group(1)
         if INTERFACE_RE.fullmatch(name) is not None:
             if name in devices:
-                raise ObserverRefusal("interface_unavailable", "interface")
+                raise ObserverRefusal("interface_unavailable", stage)
             devices.append(name)
     return tuple(devices)
 
 
-def _parse_capture_devices(output):
+def _parse_capture_devices(output, stage="interface"):
     if type(output) is not bytes or len(output) > MAX_TOOL_OUTPUT_BYTES:
-        raise ObserverRefusal("interface_unavailable", "interface")
+        raise ObserverRefusal("interface_unavailable", stage)
     try:
         lines = output.decode("ascii").splitlines()
     except UnicodeDecodeError:
-        raise ObserverRefusal("interface_unavailable", "interface") from None
+        raise ObserverRefusal("interface_unavailable", stage) from None
     devices = {}
     for line in lines:
         match = re.fullmatch(r"\s*[1-9][0-9]*\.([A-Za-z0-9_.-]+)(?:\s+(.*))?\s*", line)
         if match is None:
-            raise ObserverRefusal("interface_unavailable", "interface")
+            raise ObserverRefusal("interface_unavailable", stage)
         name = match.group(1)
         details = match.group(2) or ""
         flags_match = re.search(r"\[([A-Za-z, ]+)\]", details)
         flags = set() if flags_match is None else {item.strip() for item in flags_match.group(1).split(",")}
         if name in devices:
-            raise ObserverRefusal("interface_unavailable", "interface")
+            raise ObserverRefusal("interface_unavailable", stage)
         devices[name] = {"up": "Up" in flags, "running": "Running" in flags}
     return devices
 
 
-def _parse_local_addresses(output):
+def _parse_local_addresses(output, stage="interface"):
     if type(output) is not bytes or len(output) > MAX_TOOL_OUTPUT_BYTES:
-        raise ObserverRefusal("interface_unavailable", "interface")
+        raise ObserverRefusal("interface_unavailable", stage)
     try:
         lines = output.decode("ascii").splitlines()
     except UnicodeDecodeError:
-        raise ObserverRefusal("interface_unavailable", "interface") from None
+        raise ObserverRefusal("interface_unavailable", stage) from None
     addresses = set()
     for line in lines:
         match = re.match(r"\s*inet\s+([^\s]+)", line)
@@ -277,11 +280,13 @@ def _interface_key(name):
 
 def _system_interfaces():
     hardware_output = _run_fixed_command(
-        (NETWORKSETUP_PATH, "-listallhardwareports"), "interface"
+        (NETWORKSETUP_PATH, "-listallhardwareports"), "interface_hardware"
     )
-    capture_output = _run_fixed_command((TCPDUMP_PATH, "-D"), "interface")
-    hardware = _parse_hardware_devices(hardware_output)
-    capture_devices = _parse_capture_devices(capture_output)
+    hardware = _parse_hardware_devices(hardware_output, "interface_hardware")
+    if not hardware:
+        raise ObserverRefusal("interface_unavailable", "interface_hardware")
+    capture_output = _run_fixed_command((TCPDUMP_PATH, "-D"), "interface_capture")
+    capture_devices = _parse_capture_devices(capture_output, "interface_capture")
     names = sorted(
         (
             name for name in hardware
@@ -290,13 +295,13 @@ def _system_interfaces():
         key=_interface_key,
     )
     if not names or len(names) > MAX_INTERFACES:
-        raise ObserverRefusal("interface_unavailable", "interface")
+        raise ObserverRefusal("interface_unavailable", "interface_capture")
     result = []
     for name in names:
-        output = _run_fixed_command((IFCONFIG_PATH, name), "interface")
-        addresses = _parse_local_addresses(output)
+        output = _run_fixed_command((IFCONFIG_PATH, name), "interface_address")
+        addresses = _parse_local_addresses(output, "interface_address")
         if not addresses:
-            raise ObserverRefusal("interface_unavailable", "interface")
+            raise ObserverRefusal("interface_unavailable", "interface_address")
         result.append({"name": name, "addresses": addresses})
     return tuple(result)
 
@@ -1018,6 +1023,56 @@ def _tcpdump_interfaces():
     return _parse_capture_devices(output)
 
 
+def _validate_physical_selftest_record(record, binding, interface_count):
+    required = {
+        "schema_version", "status", "mode", "control_sha", "run_id", "run_attempt", "source_sha",
+        "interface_count", "dns_query_count", "tcp_syn_count", "dns_name_hashes",
+        "tcp_destination_hashes", "hashes_truncated", "capture_limited", "capture", "cleanup",
+        "worker_attribution", "completeness", "network_blocking",
+    }
+    if type(record) is not dict or set(record) != required:
+        raise ObserverRefusal("capture_invalid", "finish")
+    if (
+        type(record["schema_version"]) is not int or record["schema_version"] != SCHEMA_VERSION
+        or record["status"] != "observed" or record["mode"] != "host-level"
+        or record["control_sha"] != binding["control_sha"]
+        or record["run_id"] != binding["run_id"]
+        or record["run_attempt"] != binding["run_attempt"]
+        or record["source_sha"] != "none"
+        or type(record["interface_count"]) is not int or record["interface_count"] != interface_count
+        or not 1 <= record["interface_count"] <= MAX_INTERFACES
+        or type(record["dns_query_count"]) is not int or not 0 <= record["dns_query_count"] <= MAX_COUNT
+        or type(record["tcp_syn_count"]) is not int or not 0 <= record["tcp_syn_count"] <= MAX_COUNT
+        or type(record["hashes_truncated"]) is not bool
+        or record["capture_limited"] is not False
+        or record["capture"] != "private" or record["cleanup"] != "complete"
+        or record["worker_attribution"] != "not-claimed"
+        or record["completeness"] != "not-claimed"
+        or record["network_blocking"] != "not-claimed"
+    ):
+        raise ObserverRefusal("capture_invalid", "finish")
+    for name in ("dns_name_hashes", "tcp_destination_hashes"):
+        values = record[name]
+        if (
+            type(values) is not list or len(values) > MAX_HASHES
+            or any(type(value) is not str or HASH_RE.fullmatch(value) is None for value in values)
+            or values != sorted(set(values))
+        ):
+            raise ObserverRefusal("capture_invalid", "finish")
+
+
+def _physical_selftest_capture(binding):
+    _require_macos_root("start")
+    interfaces = _system_interfaces()
+    expression = _capture_filter(frozenset((53,)), frozenset((53,)))
+    filters = {interface["name"]: expression for interface in interfaces}
+    session = _start_session(
+        binding, interfaces, frozenset((53,)), frozenset((53,)), filters,
+    )
+    record = session.finish()
+    _validate_physical_selftest_record(record, binding, len(interfaces))
+
+
 def _encode_dns_name(domain):
     try:
         labels = domain.encode("ascii").split(b".")
@@ -1042,6 +1097,7 @@ def _make_dns_response(query):
 
 def _selftest_record(binding):
     _require_macos_root("selftest")
+    _physical_selftest_capture(binding)
     devices = _tcpdump_interfaces()
     if devices.get("lo0") != {"up": True, "running": True}:
         raise ObserverRefusal("interface_unavailable", "interface")

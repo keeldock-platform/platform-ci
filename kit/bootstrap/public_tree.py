@@ -68,14 +68,14 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    '.github/workflows/macos-rules-bootstrap.yml': 'f43d15e7d5c3f4727ba19a7d57399bea811bd42ccfd60d4d026869a738868de7',
+    '.github/workflows/macos-rules-bootstrap.yml': '5cce6803c2f8f79ec89ee7246cf56ab4f7e003e82154af97a383b4477ed75be8',
     '.github/workflows/macos-core-bootstrap.yml': '25dbd661672e7b57384b2ffcd9934e62fb20688c94ee29ca97d2ab0eebc7109f',
-    'kit/confinement/macos_rules_bootstrap.py': '839b563a5dfaf4f178b50683ae9a7c85cdb3f9cdcefa09271f7536bbc4693b5d',
-    'kit/confinement/test_macos_rules_bootstrap.py': '893077b65e56124231c44b2cf09172a70751ff62c9135d69dc044d29890bb50c',
+    'kit/confinement/macos_rules_bootstrap.py': 'a35a560a3da2a27e3a9e4246c67bb082d90c0ec3195aad650092ce9356fa4898',
+    'kit/confinement/test_macos_rules_bootstrap.py': '269ad0e3cafc5bee71f009cd6d03cd552ff37a80b87b28c85750b1cd86813b84',
     'kit/confinement/macos_core_bootstrap.py': '8f27ed84b98d2c3fcf45d2c12f330f9a324ab00f542058c8e095765989555b00',
     'kit/confinement/test_macos_core_bootstrap.py': '0d0bee2301702fa0bcfa97956bd788d8dd743a5eeab14e96fc23186916b6e400',
-    'kit/confinement/macos_network_observer.py': 'f3299c0ab0ff57cc7e730b1866787dbd8d30e1864ce2ee42f423c34f5c09d74c',
-    'kit/confinement/test_macos_network_observer.py': '86e00de416f13189f6d1e065119dd79de9689bbc345e05682ec3fa69ebb3c31d',
+    'kit/confinement/macos_network_observer.py': '27cd10d59e66c5caa175af27b4ec6ad7668a5902e3d28e32379cc9bbfec23a83',
+    'kit/confinement/test_macos_network_observer.py': 'f029989c694f0bb4393f958b69125cc8a00ba0c79672c05027d531bf81076800',
     'kit/confinement/macos_private_validation.py': '0a53ff9e7c207bc7dfebab3783dee84e154b19ff89e41cdf71ee2368df9b2071',
     'kit/confinement/test_macos_private_validation.py': '75927d0feae62678312d41e18f6cf8431ff849afabb88ea16c60d8c58c65cce2',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
