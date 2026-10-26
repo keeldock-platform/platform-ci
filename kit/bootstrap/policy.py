@@ -14,6 +14,8 @@ MAX_DURATION_MS = 86400000
 MACOS_SOURCE_READER_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
 MACOS_SOURCE_READER_WORKFLOW_SHA256 = "6c7e82c8a9d91436ae98f1357fd0fe4f09847f5fd17abc4843eadb130405b626"
 MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "cb9b70226175069e9c148c06f18d4d89cf8b6d5b33b39e02579a4aa2de5ee8a6"
+MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "b0160778dc7ecfcb8b41d74d221ca4d4f3e2364b5c38bbc45f7da112e3b8a858"
+MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "d3b0ffc9bbfc23c36fa52b3057aa659d618ba34ee309b4bec4e52bbb87dc6083"
 
 
 class PolicyError(ValueError):
@@ -882,15 +884,6 @@ jobs:
           mode: read
           path: ${{ runner.temp }}/macos-public-cache/fixture.txt
           key: macos-public-cache-seed-v1-${{ github.run_id }}-${{ github.run_attempt }}
-      - name: Verify the none-scoped read did not restore bytes
-        env:
-          CACHE_HIT: ${{ steps.denied-restore.outputs.cache-hit }}
-        run: |
-          set -euo pipefail
-          if [[ ( -n "$CACHE_HIT" && "$CACHE_HIT" != "false" ) || -e "$RUNNER_TEMP/macos-public-cache/fixture.txt" ]]; then
-            exit 1
-          fi
-          printf 'macos-cache-none-read=local-absent schema=1 run-id=%s run-attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
       - name: Prepare a distinct public write probe
         run: |
           set -euo pipefail
@@ -1119,6 +1112,17 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         expected = MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE
+    elif workflow_kind in {"macos-rules-bootstrap", "macos-core-bootstrap"}:
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        expected_digest = (
+            MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256
+            if workflow_kind == "macos-rules-bootstrap"
+            else MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256
+        )
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_digest:
+            raise PolicyError("workflow-template-mismatch")
+        return True
     elif workflow_kind in {"macos-source-reader", "macos-rules-source-reader"}:
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")

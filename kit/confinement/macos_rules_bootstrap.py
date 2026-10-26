@@ -42,6 +42,7 @@ MAX_CAPTURE_BYTES = 65536
 MAX_PLAN_BYTES = 48 * 1024
 MAX_PLAN_LINES = 20000
 PLAN_ROW_RE = re.compile(rb"\|[ \t]*(?:MC|CI|CR|[DRHKXCM])[0-9]+[ \t]*\|\Z")
+TOKEN_RE = re.compile(r"[!-~]{1,4096}\Z")
 
 DASH_FORMULA = "homebrew/core/dash-shell"
 DASH_VERSION = "0.5.13.5"
@@ -251,21 +252,26 @@ def _load_control():
     return reviewed, capability, boundary
 
 
-def _revoke_pending_token(environ):
-    token = environ.get("SOURCE_READER_TOKEN", "")
-    if not token:
+def _revoke_pending_token(environ, token_reference=None):
+    token = token_reference
+    if token is None:
+        token = environ.get("SOURCE_READER_TOKEN", "")
+    if type(token) is not str or TOKEN_RE.fullmatch(token) is None:
         return False
     try:
         reader = _load_control_sibling("macos_source_reader")
-        result = reader.run(environ=environ)
+        reader_environment = dict(environ)
+        reader_environment["SOURCE_READER_TOKEN"] = token
+        result = reader.run(environ=reader_environment)
         required = {"schema_version", "status", "reason", "repository_scope", "metadata", "revocation"}
         if (type(result) is not dict or set(result) != required
                 or type(result.get("schema_version")) is not int or result.get("schema_version") != 1
                 or type(result.get("status")) is not str or result.get("status") != "passed"
                 or type(result.get("reason")) is not str or result.get("reason") != "ok"
+                or type(result.get("repository_scope")) is not str
                 or result.get("repository_scope") != "verified"
-                or result.get("metadata") != "verified"
-                or result.get("revocation") != "confirmed"):
+                or type(result.get("metadata")) is not str or result.get("metadata") != "verified"
+                or type(result.get("revocation")) is not str or result.get("revocation") != "confirmed"):
             raise ValueError
         try:
             environ.pop("SOURCE_READER_TOKEN", None)
@@ -1150,6 +1156,8 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
         try:
             with lease_context as lease:
                 _validate_lease_record(lease.record, request, binding, worker_uid)
+                lifecycle["token_revocation"] = "confirmed"
+                lifecycle["token_reference"] = None
                 source = _validate_source_path(lease.source_path, request, storage_root, reviewed)
                 _run_tree_probe(source, worker_uid, home, toolchain, capability)
                 environment = _worker_environment(source, dash_directory, home, worker_storage)
@@ -1195,13 +1203,6 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
     except BaseException:
         failure = Refusal("internal_error", "context")
     finally:
-        if environ.get("SOURCE_READER_TOKEN", "") and not lifecycle["token_revoke_handled"]:
-            try:
-                _revoke_pending_token(environ)
-                lifecycle["token_revoke_handled"] = True
-            except Refusal:
-                lifecycle["token_revoke_handled"] = True
-                failure = Refusal("cleanup_incomplete", "cleanup")
         if storage_root_created:
             try:
                 if storage_root.exists() and any(storage_root.iterdir()):
@@ -1319,7 +1320,7 @@ def _format_success(record):
     )
 
 
-def _format_refusal(error, environ):
+def _format_refusal(error, environ, lifecycle=None):
     reason = error.reason if type(error) is Refusal else "internal_error"
     stage = error.stage if type(error) is Refusal else "context"
     control = environ.get("CI_SHA", "")
@@ -1331,9 +1332,17 @@ def _format_refusal(error, environ):
         run_id = "unknown"
     if not _safe_id(attempt):
         attempt = "unknown"
+    token_revocation = "not-read"
+    if type(lifecycle) is dict:
+        value = lifecycle.get("token_revocation", "not-read")
+        if value in ("not-read", "confirmed", "unconfirmed"):
+            token_revocation = value
+        else:
+            token_revocation = "unconfirmed"
     return (
         "macos-rules-bootstrap=refused schema=1 reason=" + reason + " stage=" + stage
         + " control-sha=" + control + " run-id=" + run_id + " run-attempt=" + attempt
+        + " token-revocation=" + token_revocation
     )
 
 
@@ -1341,16 +1350,44 @@ def _validate_cli(argv):
     if type(argv) not in (tuple, list) or not argv:
         raise Refusal("invalid_input", "arguments")
     if argv[0] == "prepare-dash" and len(argv) == 1:
-        return "prepare-dash", None
+        return "prepare-dash", None, False
     if argv[0] == "cleanup-dash" and len(argv) == 1:
-        return "cleanup-dash", None
-    if argv[0] in ("preflight", "run"):
-        return argv[0], _parse_request(argv[1:])
+        return "cleanup-dash", None, False
+    if argv[0] == "preflight":
+        return "preflight", _parse_request(argv[1:]), False
+    if argv[0] == "run" and len(argv) >= 2 and argv[1] == "--token-stdin":
+        return "run", _parse_request(argv[2:]), True
     raise Refusal("invalid_input", "arguments")
 
 
-def _run(mode, request, environ, lifecycle):
+def _read_token_stdin(lifecycle):
+    lifecycle["token_revocation"] = "unconfirmed"
+    try:
+        raw = sys.stdin.buffer.read(4097)
+    except BaseException:
+        raise Refusal("invalid_input", "arguments") from None
+    candidate = raw
+    for delimiter in (b"\n", b"\r"):
+        if delimiter in candidate:
+            candidate = candidate.split(delimiter, 1)[0]
+    if type(candidate) is bytes and 1 <= len(candidate) <= 4096 and all(33 <= item <= 126 for item in candidate):
+        lifecycle["token_reference"] = candidate.decode("ascii")
+    if type(raw) is not bytes or not 1 <= len(raw) <= 4096:
+        raise Refusal("invalid_input", "arguments")
+    try:
+        token = raw.decode("ascii")
+    except UnicodeDecodeError:
+        raise Refusal("invalid_input", "arguments") from None
+    if TOKEN_RE.fullmatch(token) is None:
+        raise Refusal("invalid_input", "arguments")
+    lifecycle["token_reference"] = token
+    return token
+
+
+def _run(mode, request, token_stdin, environ, lifecycle):
     if mode != "run" and environ.get("SOURCE_READER_TOKEN", ""):
+        raise Refusal("control_identity_invalid", "context")
+    if mode == "run" and environ.get("SOURCE_READER_TOKEN", ""):
         raise Refusal("control_identity_invalid", "context")
     if mode == "prepare-dash":
         return prepare_dash(environ)
@@ -1369,19 +1406,34 @@ def _run(mode, request, environ, lifecycle):
             "dash_binary_sha256": dash_record["binary_sha256"], "definitions_sha256": definitions_sha256,
             "reviewed_diff_sha256": reviewed_diff_sha256,
         }
+    if not token_stdin:
+        raise Refusal("invalid_input", "arguments")
+    token = _read_token_stdin(lifecycle)
+    runtime_environment = dict(environ)
+    runtime_environment["SOURCE_READER_TOKEN"] = token
     return _run_private(
         request, binding, root, definitions, definitions_sha256, reviewed_diff_sha256,
-        dash_directory, dash_record, reviewed, capability, environ, lifecycle,
+        dash_directory, dash_record, reviewed, capability, runtime_environment, lifecycle,
     )
 
 
 def main(argv=None, environ=None):
     args = sys.argv[1:] if argv is None else argv
     env = os.environ if environ is None else environ
-    lifecycle = {"token_revoke_handled": False}
+    lifecycle = {"token_revocation": "not-read", "token_reference": None}
+    legacy_token_present = "SOURCE_READER_TOKEN" in env
+    legacy_token = env.pop("SOURCE_READER_TOKEN", None) if legacy_token_present else None
+    if legacy_token_present:
+        lifecycle["token_revocation"] = "unconfirmed"
+        if type(legacy_token) is str and TOKEN_RE.fullmatch(legacy_token) is not None:
+            lifecycle["token_reference"] = legacy_token
     try:
-        mode, request = _validate_cli(args)
-        result = _run(mode, request, env, lifecycle)
+        if legacy_token_present:
+            raise Refusal("control_identity_invalid", "context")
+        mode, request, token_stdin = _validate_cli(args)
+        result = _run(mode, request, token_stdin, env, lifecycle)
+        if mode == "run" and lifecycle["token_revocation"] != "confirmed":
+            raise Refusal("source_lease_unavailable", "source_lease")
         if mode == "prepare-dash":
             line = (
                 "macos-rules-dash=prepared version=" + result["version"]
@@ -1412,23 +1464,24 @@ def main(argv=None, environ=None):
         print(line)
         return 0
     except Refusal as error:
-        if not lifecycle["token_revoke_handled"] and env.get("SOURCE_READER_TOKEN", ""):
+        if lifecycle["token_revocation"] == "unconfirmed" and lifecycle["token_reference"] is not None:
             try:
-                _revoke_pending_token(env)
-                lifecycle["token_revoke_handled"] = True
+                if _revoke_pending_token(env, lifecycle["token_reference"]):
+                    lifecycle["token_revocation"] = "confirmed"
+                    lifecycle["token_reference"] = None
             except Refusal:
-                error = Refusal("cleanup_incomplete", "cleanup")
-        print(_format_refusal(error, env))
+                pass
+        print(_format_refusal(error, env, lifecycle))
         return 1
     except BaseException:
-        if not lifecycle["token_revoke_handled"] and env.get("SOURCE_READER_TOKEN", ""):
+        if lifecycle["token_revocation"] == "unconfirmed" and lifecycle["token_reference"] is not None:
             try:
-                _revoke_pending_token(env)
-                lifecycle["token_revoke_handled"] = True
+                if _revoke_pending_token(env, lifecycle["token_reference"]):
+                    lifecycle["token_revocation"] = "confirmed"
+                    lifecycle["token_reference"] = None
             except Refusal:
-                print(_format_refusal(Refusal("cleanup_incomplete", "cleanup"), env))
-                return 1
-        print(_format_refusal(Refusal("internal_error", "context"), env))
+                pass
+        print(_format_refusal(Refusal("internal_error", "context"), env, lifecycle))
         return 1
 
 

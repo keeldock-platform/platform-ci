@@ -76,7 +76,49 @@ class RequestAndGateTests(unittest.TestCase):
                 "--source-sha", SOURCE, "--base-sha", BASE, "--base-branch", "main",
                 "--concern", "rules-bootstrap", "--suite", "rules.hooks",
             ))
-        self.assertEqual(bootstrap._validate_cli(("cleanup-dash",)), ("cleanup-dash", None))
+        self.assertEqual(bootstrap._validate_cli(("cleanup-dash",)), ("cleanup-dash", None, False))
+        self.assertEqual(
+            bootstrap._validate_cli((
+                "run", "--token-stdin", "--source-sha", SOURCE, "--base-sha", BASE,
+                "--base-branch", "main", "--concern", "rules-bootstrap",
+            )),
+            ("run", request_value(), True),
+        )
+        with self.assertRaises(bootstrap.Refusal):
+            bootstrap._validate_cli((
+                "run", "--source-sha", SOURCE, "--base-sha", BASE,
+                "--base-branch", "main", "--concern", "rules-bootstrap",
+            ))
+        with self.assertRaises(bootstrap.Refusal):
+            bootstrap._validate_cli((
+                "preflight", "--token-stdin", "--source-sha", SOURCE, "--base-sha", BASE,
+                "--base-branch", "main", "--concern", "rules-bootstrap",
+            ))
+
+    def test_token_stdin_accepts_only_exact_bounded_header_safe_value(self):
+        lifecycle = {"token_revocation": "not-read", "token_reference": None}
+        with patch("sys.stdin", SimpleNamespace(buffer=io.BytesIO(b"opaque-test-token"))):
+            self.assertEqual(bootstrap._read_token_stdin(lifecycle), "opaque-test-token")
+        self.assertEqual(lifecycle, {
+            "token_revocation": "unconfirmed", "token_reference": "opaque-test-token",
+        })
+
+    def test_token_stdin_rejects_trailing_records_and_keeps_only_safe_candidate(self):
+        for raw in (b"opaque-test-token\n", b"opaque-test-token\nsecond", b"opaque test token", b"x" * 4097):
+            with self.subTest(size=len(raw)):
+                lifecycle = {"token_revocation": "not-read", "token_reference": None}
+                with patch("sys.stdin", SimpleNamespace(buffer=io.BytesIO(raw))):
+                    with self.assertRaisesRegex(bootstrap.Refusal, "invalid_input"):
+                        bootstrap._read_token_stdin(lifecycle)
+                self.assertEqual(lifecycle["token_revocation"], "unconfirmed")
+        lifecycle = {"token_revocation": "not-read", "token_reference": None}
+        with patch("sys.stdin", SimpleNamespace(buffer=io.BytesIO(b"opaque-test-token\nextra"))):
+            with self.assertRaises(bootstrap.Refusal):
+                bootstrap._read_token_stdin(lifecycle)
+        self.assertEqual(lifecycle["token_reference"], "opaque-test-token")
+        lifecycle = {"token_revocation": "not-read", "token_reference": None}
+        with patch("sys.stdin", SimpleNamespace(buffer=io.BytesIO(b"x" * 4096))):
+            self.assertEqual(bootstrap._read_token_stdin(lifecycle), "x" * 4096)
 
     def test_sha_allowlist_mismatch_refuses_before_snapshot_or_source_reader(self):
         request = request_value()
@@ -178,8 +220,8 @@ class RequestAndGateTests(unittest.TestCase):
                 with patch.object(bootstrap, "_load_control_sibling") as loader:
                     with self.assertRaisesRegex(bootstrap.Refusal, "bootstrap_gate_refused"):
                         bootstrap._run(
-                            "run", request_value(), environment,
-                            {"token_revoke_handled": False},
+                            "run", request_value(), True, environment,
+                            {"token_revocation": "not-read", "token_reference": None},
                         )
         loader.assert_not_called()
 
@@ -187,14 +229,19 @@ class RequestAndGateTests(unittest.TestCase):
         token = "opaque-test-token-value"
         output = io.StringIO()
         argv = (
-            "run", "--source-sha", SOURCE, "--base-sha", BASE,
+            "run", "--token-stdin", "--source-sha", SOURCE, "--base-sha", BASE,
             "--base-branch", "main", "--concern", "rules-bootstrap",
         )
-        with patch.object(bootstrap, "_run", side_effect=bootstrap.Refusal("bootstrap_gate_refused", "bootstrap_gate")):
+        def refused_after_token(mode, request, token_stdin, env, lifecycle):
+            lifecycle["token_revocation"] = "unconfirmed"
+            lifecycle["token_reference"] = token
+            raise bootstrap.Refusal("bootstrap_gate_refused", "bootstrap_gate")
+
+        with patch.object(bootstrap, "_run", side_effect=refused_after_token):
             with patch.object(bootstrap, "_revoke_pending_token", return_value=True) as revoke:
                 with patch("sys.stdout", output):
-                    self.assertEqual(bootstrap.main(argv, {"SOURCE_READER_TOKEN": token}), 1)
-        revoke.assert_called_once()
+                    self.assertEqual(bootstrap.main(argv, {}), 1)
+        revoke.assert_called_once_with({}, token)
         self.assertNotIn(token, output.getvalue())
 
 
@@ -405,7 +452,8 @@ class OutputTests(unittest.TestCase):
 
         with patch.object(bootstrap, "_load_control_sibling", side_effect=load_sibling):
             self.assertTrue(bootstrap._revoke_pending_token(environment))
-        self.assertEqual(calls, [environment])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["SOURCE_READER_TOKEN"], "opaque-test-token")
         self.assertNotIn("SOURCE_READER_TOKEN", environment)
 
     def test_missing_source_reader_makes_pending_cleanup_incomplete(self):
@@ -414,17 +462,35 @@ class OutputTests(unittest.TestCase):
             with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete"):
                 bootstrap._revoke_pending_token(environment)
 
+    def test_cleanup_receipt_requires_exact_success_schema(self):
+        environment = {"SOURCE_READER_TOKEN": "opaque-test-token"}
+        record = {
+            "schema_version": 1,
+            "status": "passed",
+            "reason": "ok",
+            "repository_scope": "verified",
+            "metadata": "verified",
+            "revocation": "confirmed",
+            "extra": "untrusted",
+        }
+        reader = SimpleNamespace(run=lambda *, environ: record)
+        with patch.object(bootstrap, "_load_control_sibling", return_value=reader):
+            with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete"):
+                bootstrap._revoke_pending_token(environment)
+        self.assertIn("SOURCE_READER_TOKEN", environment)
+
     def test_runtime_refusal_remains_the_owner_after_token_consumption(self):
         token = "opaque-test-token"
         output = io.StringIO()
         argv = (
-            "run", "--source-sha", SOURCE, "--base-sha", BASE,
+            "run", "--token-stdin", "--source-sha", SOURCE, "--base-sha", BASE,
             "--base-branch", "main", "--concern", "rules-bootstrap",
         )
-        environment = {"SOURCE_READER_TOKEN": token}
+        environment = {}
 
-        def failed_after_confirmed_revoke(mode, request, env, lifecycle):
-            env.pop("SOURCE_READER_TOKEN", None)
+        def failed_after_confirmed_revoke(mode, request, token_stdin, env, lifecycle):
+            lifecycle["token_revocation"] = "confirmed"
+            lifecycle["token_reference"] = None
             raise bootstrap.Refusal("source_lease_unavailable", "source_lease")
 
         with patch.object(bootstrap, "_run", side_effect=failed_after_confirmed_revoke):
@@ -437,8 +503,13 @@ class OutputTests(unittest.TestCase):
     def test_refusal_formatter_never_includes_exception_or_secret_text(self):
         error = bootstrap.Refusal("source_lease_unavailable", "source_lease")
         error.secret = "private-token-value"
-        line = bootstrap._format_refusal(error, {"CI_SHA": CONTROL, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"})
+        line = bootstrap._format_refusal(
+            error,
+            {"CI_SHA": CONTROL, "GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"},
+            {"token_revocation": "unconfirmed"},
+        )
         self.assertIn("reason=source_lease_unavailable", line)
+        self.assertTrue(line.endswith("token-revocation=unconfirmed"))
         self.assertNotIn("private-token-value", line)
 
     def test_success_formatter_is_closed_and_marks_memory_as_unverified(self):

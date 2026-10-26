@@ -14,6 +14,8 @@ PLATFORM_FILES = frozenset(
         ".github/workflows/macos-cache-proof.yml",
         ".github/workflows/macos-source-reader-preflight.yml",
         ".github/workflows/macos-rules-reader-preflight.yml",
+        ".github/workflows/macos-rules-bootstrap.yml",
+        ".github/workflows/macos-core-bootstrap.yml",
         ".github/workflows/windows-native-preflight.yml",
         "ci/policy.json",
         "ci/revoked-signer-fingerprints",
@@ -36,6 +38,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/test_macos_reviewed_build.py",
         'kit/confinement/macos_rules_bootstrap.py',
         'kit/confinement/test_macos_rules_bootstrap.py',
+        'kit/confinement/macos_core_bootstrap.py',
+        'kit/confinement/test_macos_core_bootstrap.py',
         "kit/confinement/macos_private_validation.py",
         "kit/confinement/test_macos_private_validation.py",
         "kit/confinement/macos_source_reader.py",
@@ -62,8 +66,12 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    'kit/confinement/macos_rules_bootstrap.py': 'ab22e0676456923bccb4235a2644c70ce378d7b225867260aad3daea6fd7db7c',
-    'kit/confinement/test_macos_rules_bootstrap.py': '2ec8c215650a5ba70bb74f924bdf59a1487b03227d9229178569116126c1f624',
+    '.github/workflows/macos-rules-bootstrap.yml': 'b0160778dc7ecfcb8b41d74d221ca4d4f3e2364b5c38bbc45f7da112e3b8a858',
+    '.github/workflows/macos-core-bootstrap.yml': 'd3b0ffc9bbfc23c36fa52b3057aa659d618ba34ee309b4bec4e52bbb87dc6083',
+    'kit/confinement/macos_rules_bootstrap.py': '7dc297bf39d1cca2bde087ea6e806cea8a88684bc3a3829d0688b43bf1b67fc2',
+    'kit/confinement/test_macos_rules_bootstrap.py': '6981c44551604fdd995f7bbac7d269f13557dae1e66ba142e428ac0d88edc82d',
+    'kit/confinement/macos_core_bootstrap.py': 'cafe0f16467225b64d6c4957a8488cf886b81c0036a62ec71735d6c439481d6d',
+    'kit/confinement/test_macos_core_bootstrap.py': 'a0cec855c469b6ef3cf9243f8bf9632ebb8f2d61a42cf9f6e0d306681b20ab22',
     'kit/confinement/macos_private_validation.py': 'eda795756d4906c29d65391ca5783e47ea85515347ac8947f16bd911728413a2',
     'kit/confinement/test_macos_private_validation.py': '6131673d3f930073250d087ebd4ccafc2f182cd7004975c48f2ab6b7e4de981d',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',

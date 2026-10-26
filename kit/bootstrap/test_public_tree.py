@@ -171,6 +171,10 @@ class PublicTreeTests(unittest.TestCase):
         expected = {
             'kit/confinement/macos_rules_bootstrap.py',
             'kit/confinement/test_macos_rules_bootstrap.py',
+            'kit/confinement/macos_core_bootstrap.py',
+            'kit/confinement/test_macos_core_bootstrap.py',
+            '.github/workflows/macos-rules-bootstrap.yml',
+            '.github/workflows/macos-core-bootstrap.yml',
             'kit/confinement/macos_private_validation.py',
             'kit/confinement/test_macos_private_validation.py',
             'ci/revoked-signer-fingerprints',
