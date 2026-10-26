@@ -5,6 +5,7 @@ import tarfile
 from types import MappingProxyType, SimpleNamespace
 import unittest
 from unittest.mock import patch
+import urllib.parse
 import urllib.request
 
 import macos_rules_bootstrap as bootstrap
@@ -201,7 +202,12 @@ class PublicBottleTests(unittest.TestCase):
     def test_bottle_urls_are_fixed_public_reads(self):
         self.assertEqual(bootstrap.DASH_BOTTLE_SHA256, "0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0")
         self.assertTrue(bootstrap.DASH_BOTTLE_URL.startswith("https://ghcr.io/v2/homebrew/core/dash-shell/blobs/"))
-        self.assertIn("repository:homebrew/core/dash-shell:pull", bootstrap.DASH_TOKEN_URL)
+        token_url = urllib.parse.urlsplit(bootstrap.DASH_TOKEN_URL)
+        self.assertEqual((token_url.scheme, token_url.netloc, token_url.path), ("https", "ghcr.io", "/token"))
+        self.assertEqual(
+            urllib.parse.parse_qs(token_url.query, keep_blank_values=True, strict_parsing=True),
+            {"scope": ["repository:homebrew/core/dash-shell:pull"]},
+        )
 
     def test_safe_tar_names_reject_traversal_and_non_posix_paths(self):
         self.assertEqual(bootstrap._safe_tar_name("dash-shell/0.5.13.5/bin/dash"), "dash-shell/0.5.13.5/bin/dash")
