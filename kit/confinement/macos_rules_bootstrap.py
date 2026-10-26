@@ -25,6 +25,10 @@ BASE_BRANCHES = frozenset(("main", "develop", "uat"))
 CONCERN = "rules-bootstrap"
 SUITES = ("rules.hooks", "rules.sync", "rules.static", "rules.public")
 GATES = SUITES + ("plan-ids",)
+CONTROL_SIBLINGS = frozenset((
+    "macos_reviewed_build", "macos_capability", "macos_boundary_guard",
+    "macos_private_validation", "macos_source_reader", "macos_network_observer",
+))
 REQUIRED_SOURCE_FILES = (
     "ci/run-suite.sh",
     "tests/run-hook-tests.sh",
@@ -210,11 +214,7 @@ class _PinnedRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _load_control_sibling(name):
-    allowed = {
-        "macos_reviewed_build", "macos_capability", "macos_boundary_guard",
-        "macos_private_validation", "macos_source_reader"
-    }
-    if type(name) is not str or name not in allowed:
+    if type(name) is not str or name not in CONTROL_SIBLINGS:
         raise ImportError("control module unavailable")
     directory = Path(__file__).resolve(strict=True).parent
     path = (directory / (name + ".py")).resolve(strict=True)
@@ -365,6 +365,24 @@ def _validate_bootstrap_gate(request, binding, environ):
         raise Refusal("bootstrap_gate_refused", "bootstrap_gate")
     definitions, definitions_sha256 = _validate_plan_definitions(environ)
     return definitions, definitions_sha256, reviewed_diff_sha256
+
+
+def _record_runtime_revocation(runtime, state, token, request, binding, environ, lifecycle):
+    repository_id = environ.get("SOURCE_REPOSITORY_ID", "")
+    if (state is None or not _safe_id(repository_id)
+            or type(token) is not str or TOKEN_RE.fullmatch(token) is None):
+        return False
+    try:
+        confirmed = runtime.revocation_confirmed(
+            state, token, repository_id, request, binding,
+        )
+    except BaseException:
+        return False
+    if confirmed is not True:
+        return False
+    lifecycle["token_revocation"] = "confirmed"
+    lifecycle["token_reference"] = None
+    return True
 
 
 def _safe_candidate_ref(candidate_ref, request):
@@ -1044,6 +1062,112 @@ def _worker_environment(source, dash_directory, home, storage):
     }
 
 
+def _probe_worker_privilege(worker_uid, home, storage, toolchain, reviewed):
+    try:
+        environment = reviewed._child_environment(home, storage, toolchain)
+        reviewed._run_probe_step(
+            reviewed._probe_argv(toolchain["python"], reviewed.PRIVILEGE_SCRIPT),
+            worker_uid,
+            env=environment,
+            python_executable=toolchain["python"],
+            stage="privilege",
+            expected_stdout=reviewed.PRIVILEGE_MARKER,
+        )
+    except BaseException as error:
+        if getattr(error, "reason", None) == "cleanup_incomplete":
+            raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise Refusal("probe_identity_unavailable", "identity") from None
+    return "sudo-denied"
+
+
+def _observer_refusal(error):
+    if getattr(error, "reason", None) == "cleanup_incomplete":
+        return Refusal("cleanup_incomplete", "cleanup")
+    return Refusal("runner_controls_unavailable", "runner_controls")
+
+
+def _validate_network_record(record, binding, source_sha):
+    keys = {
+        "schema_version", "status", "mode", "control_sha", "run_id", "run_attempt", "source_sha",
+        "interface_count", "dns_query_count", "tcp_syn_count", "dns_name_hashes",
+        "tcp_destination_hashes", "hashes_truncated", "capture_limited", "capture", "cleanup",
+        "worker_attribution", "completeness", "network_blocking",
+    }
+    if type(record) is not dict or set(record) != keys:
+        raise Refusal("runner_controls_unavailable", "runner_controls")
+    if (type(record["schema_version"]) is not int or record["schema_version"] != 1
+            or record["status"] != "observed" or record["mode"] != "host-level"
+            or record["control_sha"] != binding["control_sha"]
+            or record["run_id"] != binding["run_id"]
+            or record["run_attempt"] != binding["run_attempt"]
+            or record["source_sha"] != source_sha
+            or not _valid_sha(record["control_sha"]) or not _valid_sha(record["source_sha"])
+            or not _safe_id(record["run_id"]) or not _safe_id(record["run_attempt"])
+            or type(record["status"]) is not str or type(record["mode"]) is not str
+            or type(record["interface_count"]) is not int or not 1 <= record["interface_count"] <= 4
+            or type(record["dns_query_count"]) is not int
+            or not 0 <= record["dns_query_count"] <= 65535
+            or type(record["tcp_syn_count"]) is not int or not 0 <= record["tcp_syn_count"] <= 65535
+            or type(record["hashes_truncated"]) is not bool
+            or type(record["capture_limited"]) is not bool
+            or any(type(record[key]) is not str for key in (
+                "capture", "cleanup", "worker_attribution", "completeness", "network_blocking",
+            ))
+            or record["capture"] != "private" or record["cleanup"] != "complete"
+            or record["worker_attribution"] != "not-claimed"
+            or record["completeness"] != "not-claimed"
+            or record["network_blocking"] != "not-claimed"):
+        raise Refusal("runner_controls_unavailable", "runner_controls")
+    for key in ("dns_name_hashes", "tcp_destination_hashes"):
+        values = record[key]
+        if (type(values) is not list or len(values) > 16
+                or any(type(value) is not str or SHA256_RE.fullmatch(value) is None for value in values)
+                or values != sorted(set(values))):
+            raise Refusal("runner_controls_unavailable", "runner_controls")
+    return record
+
+
+def _start_network_observation(binding, source_sha):
+    try:
+        observer = _load_control_sibling("macos_network_observer")
+        return observer.start_observation(
+            binding["control_sha"], binding["run_id"], binding["run_attempt"], source_sha,
+        )
+    except BaseException as error:
+        raise _observer_refusal(error) from None
+
+
+def _finish_network_observation(session, binding, source_sha):
+    try:
+        record = session.finish()
+        return _validate_network_record(record, binding, source_sha)
+    except Refusal:
+        raise
+    except BaseException as error:
+        raise _observer_refusal(error) from None
+
+
+def _format_network_observed(record):
+    def hashes(key):
+        return ",".join(record[key]) or "none"
+
+    return (
+        "macos-rules-network=observed schema=1 mode=host-level"
+        + " control-sha=" + record["control_sha"]
+        + " run-id=" + record["run_id"] + " run-attempt=" + record["run_attempt"]
+        + " source-sha=" + record["source_sha"]
+        + " interface-count=" + str(record["interface_count"])
+        + " dns-query-count=" + str(record["dns_query_count"])
+        + " tcp-syn-count=" + str(record["tcp_syn_count"])
+        + " dns-name-hashes=" + hashes("dns_name_hashes")
+        + " tcp-destination-hashes=" + hashes("tcp_destination_hashes")
+        + " hashes-truncated=" + str(record["hashes_truncated"]).lower()
+        + " capture-limited=" + str(record["capture_limited"]).lower()
+        + " capture=private cleanup=complete worker-attribution=not-claimed"
+        + " completeness=not-claimed network-blocking=not-claimed"
+    )
+
+
 def _execute(command, stage, worker_uid, toolchain, environment, capability):
     reason = "plan_ids_failed" if stage == "plan-ids" else "suite_failed"
     try:
@@ -1101,6 +1225,10 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
     snapshot_directory = None
     summary_guard_state = {"guard": None}
     lease_record = None
+    runtime = None
+    revocation_state = None
+    retained_token = lifecycle.get("token_reference")
+    privilege_check = None
     completed = []
     failure = None
     worker_cleanup_confirmed = False
@@ -1137,6 +1265,7 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
 
         try:
             runtime = _load_control_sibling("macos_private_validation")
+            revocation_state = runtime.RevocationState()
             runtime_request = runtime.parse_request((
                 "--source-sha", request["source_sha"],
                 "--base-sha", request["base_sha"],
@@ -1146,54 +1275,110 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
             if runtime_request != request:
                 raise ValueError
             lease_context = runtime.validated_source(
-                request, binding, root, environ, worker_uid=worker_uid, storage_root=storage_root
+                request, binding, root, environ, worker_uid=worker_uid, storage_root=storage_root,
+                revocation_state=revocation_state,
             )
         except Refusal:
+            _record_runtime_revocation(
+                runtime, revocation_state, retained_token, request, binding, environ, lifecycle,
+            )
             raise
-        except BaseException:
+        except BaseException as error:
+            _record_runtime_revocation(
+                runtime, revocation_state, retained_token, request, binding, environ, lifecycle,
+            )
+            runtime_refusal = getattr(runtime, "Refusal", None)
+            if (isinstance(runtime_refusal, type) and isinstance(error, runtime_refusal)
+                    and getattr(error, "reason", None) == "cleanup_incomplete"):
+                raise Refusal("cleanup_incomplete", "cleanup") from None
             raise Refusal("source_lease_unavailable", "source_lease") from None
 
         try:
             with lease_context as lease:
+                if not _record_runtime_revocation(
+                    runtime, revocation_state, retained_token, request, binding, environ, lifecycle,
+                ):
+                    raise Refusal("source_lease_unavailable", "source_lease")
                 _validate_lease_record(lease.record, request, binding, worker_uid)
-                lifecycle["token_revocation"] = "confirmed"
-                lifecycle["token_reference"] = None
                 source = _validate_source_path(lease.source_path, request, storage_root, reviewed)
                 _run_tree_probe(source, worker_uid, home, toolchain, capability)
+                privilege_check = _probe_worker_privilege(
+                    worker_uid, home, worker_storage, toolchain, reviewed,
+                )
                 environment = _worker_environment(source, dash_directory, home, worker_storage)
                 original_cwd = Path.cwd()
+                network_session = _start_network_observation(binding, request["source_sha"])
+                commands_started = False
+                command_failure = None
+                observation_failure = None
+                summary_failure = None
                 try:
                     os.chdir(source)
-                    commands_started = False
-                    try:
-                        for suite in SUITES:
-                            commands_started = True
-                            _execute(("/bin/sh", "ci/run-suite.sh", suite), suite,
-                                     worker_uid, toolchain, environment, capability)
-                            completed.append(suite)
-                        snapshot_directory = _create_plan_snapshot(
-                            binding, request, definitions, definitions_sha256, reviewed_diff_sha256,
-                            worker_uid, home, toolchain, capability,
-                        )
+                    for suite in SUITES:
                         commands_started = True
-                        _execute(("/bin/sh", "tests/check-plan-ids.sh", str(snapshot_directory)),
-                                 "plan-ids", worker_uid, toolchain, environment, capability)
-                        completed.append("plan-ids")
-                    finally:
-                        if commands_started:
-                            _probe_summary_after_commands(
-                                summary_guard_state["guard"], worker_uid, home, toolchain,
-                                reviewed, capability, binding,
-                            )
+                        _execute(("/bin/sh", "ci/run-suite.sh", suite), suite,
+                                 worker_uid, toolchain, environment, capability)
+                        completed.append(suite)
+                    snapshot_directory = _create_plan_snapshot(
+                        binding, request, definitions, definitions_sha256, reviewed_diff_sha256,
+                        worker_uid, home, toolchain, capability,
+                    )
+                    commands_started = True
+                    _execute(("/bin/sh", "tests/check-plan-ids.sh", str(snapshot_directory)),
+                             "plan-ids", worker_uid, toolchain, environment, capability)
+                    completed.append("plan-ids")
+                except BaseException as error:
+                    command_failure = error
                 finally:
-                    os.chdir(original_cwd)
+                    try:
+                        os.chdir(original_cwd)
+                    except BaseException:
+                        command_failure = Refusal("cleanup_incomplete", "cleanup")
+                    try:
+                        observation = _finish_network_observation(
+                            network_session, binding, request["source_sha"],
+                        )
+                        lifecycle["network_observation_marker"] = _format_network_observed(observation)
+                    except BaseException as error:
+                        observation_failure = error
+                    finally:
+                        try:
+                            if commands_started:
+                                _probe_summary_after_commands(
+                                    summary_guard_state["guard"], worker_uid, home, toolchain,
+                                    reviewed, capability, binding,
+                                )
+                        except BaseException as error:
+                            summary_failure = error
+
+                if any(getattr(error, "reason", None) == "cleanup_incomplete"
+                       for error in (command_failure, observation_failure, summary_failure)
+                       if error is not None):
+                    raise Refusal("cleanup_incomplete", "cleanup")
+                if command_failure is not None:
+                    raise command_failure
+                if summary_failure is not None:
+                    raise summary_failure
+                if observation_failure is not None:
+                    raise observation_failure
                 lease_record = dict(lease.record)
         except Refusal:
+            _record_runtime_revocation(
+                runtime, revocation_state, retained_token, request, binding, environ, lifecycle,
+            )
             raise
-        except BaseException:
+        except BaseException as error:
+            _record_runtime_revocation(
+                runtime, revocation_state, retained_token, request, binding, environ, lifecycle,
+            )
+            runtime_refusal = getattr(runtime, "Refusal", None)
+            if isinstance(runtime_refusal, type) and isinstance(error, runtime_refusal):
+                if getattr(error, "reason", None) == "cleanup_incomplete":
+                    raise Refusal("cleanup_incomplete", "cleanup") from None
+                raise Refusal("source_lease_unavailable", "source_lease") from None
             raise Refusal("cleanup_incomplete", "cleanup") from None
 
-        if completed != list(GATES) or lease_record is None:
+        if completed != list(GATES) or lease_record is None or privilege_check != "sudo-denied":
             raise Refusal("source_lease_unavailable", "source_lease")
         if storage_root.exists() and any(storage_root.iterdir()):
             raise Refusal("cleanup_incomplete", "cleanup")
@@ -1408,6 +1593,8 @@ def _run(mode, request, token_stdin, environ, lifecycle):
         }
     if not token_stdin:
         raise Refusal("invalid_input", "arguments")
+    if not _safe_id(environ.get("SOURCE_REPOSITORY_ID", "")):
+        raise Refusal("bootstrap_gate_refused", "bootstrap_gate")
     token = _read_token_stdin(lifecycle)
     runtime_environment = dict(environ)
     runtime_environment["SOURCE_READER_TOKEN"] = token
@@ -1420,7 +1607,11 @@ def _run(mode, request, token_stdin, environ, lifecycle):
 def main(argv=None, environ=None):
     args = sys.argv[1:] if argv is None else argv
     env = os.environ if environ is None else environ
-    lifecycle = {"token_revocation": "not-read", "token_reference": None}
+    lifecycle = {
+        "token_revocation": "not-read",
+        "token_reference": None,
+        "network_observation_marker": None,
+    }
     legacy_token_present = "SOURCE_READER_TOKEN" in env
     legacy_token = env.pop("SOURCE_READER_TOKEN", None) if legacy_token_present else None
     if legacy_token_present:
@@ -1461,6 +1652,11 @@ def main(argv=None, environ=None):
             )
         else:
             line = _format_success(result)
+        if mode == "run":
+            observed = lifecycle["network_observation_marker"]
+            if type(observed) is not str or not observed.startswith("macos-rules-network=observed "):
+                raise Refusal("runner_controls_unavailable", "runner_controls")
+            line = observed + "\n" + line
         print(line)
         return 0
     except Refusal as error:
@@ -1471,7 +1667,11 @@ def main(argv=None, environ=None):
                     lifecycle["token_reference"] = None
             except Refusal:
                 pass
-        print(_format_refusal(error, env, lifecycle))
+        refusal = _format_refusal(error, env, lifecycle)
+        observed = lifecycle["network_observation_marker"]
+        if type(observed) is str and observed.startswith("macos-rules-network=observed "):
+            refusal = observed + "\n" + refusal
+        print(refusal)
         return 1
     except BaseException:
         if lifecycle["token_revocation"] == "unconfirmed" and lifecycle["token_reference"] is not None:
@@ -1481,7 +1681,11 @@ def main(argv=None, environ=None):
                     lifecycle["token_reference"] = None
             except Refusal:
                 pass
-        print(_format_refusal(Refusal("internal_error", "context"), env, lifecycle))
+        refusal = _format_refusal(Refusal("internal_error", "context"), env, lifecycle)
+        observed = lifecycle["network_observation_marker"]
+        if type(observed) is str and observed.startswith("macos-rules-network=observed "):
+            refusal = observed + "\n" + refusal
+        print(refusal)
         return 1
 
 

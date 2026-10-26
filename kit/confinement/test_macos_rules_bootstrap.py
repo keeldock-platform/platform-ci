@@ -39,6 +39,32 @@ def binding_value(**changes):
     return value
 
 
+def network_record_value(**changes):
+    value = {
+        "schema_version": 1,
+        "status": "observed",
+        "mode": "host-level",
+        "control_sha": CONTROL,
+        "run_id": "123456789",
+        "run_attempt": "2",
+        "source_sha": SOURCE,
+        "interface_count": 2,
+        "dns_query_count": 3,
+        "tcp_syn_count": 4,
+        "dns_name_hashes": ["a" * 64, "b" * 64],
+        "tcp_destination_hashes": ["c" * 64],
+        "hashes_truncated": False,
+        "capture_limited": False,
+        "capture": "private",
+        "cleanup": "complete",
+        "worker_attribution": "not-claimed",
+        "completeness": "not-claimed",
+        "network_blocking": "not-claimed",
+    }
+    value.update(changes)
+    return value
+
+
 def definitions_environment(raw=b"| D99999999 |\n| CI99999999 |\n"):
     return {
         "RULES_ID_DEFINITIONS": raw.decode("ascii"),
@@ -225,6 +251,26 @@ class RequestAndGateTests(unittest.TestCase):
                         )
         loader.assert_not_called()
 
+    def test_run_requires_repository_id_before_reading_token(self):
+        environment = {"SOURCE_REPOSITORY_ID": ""}
+        with patch.object(bootstrap, "_load_control", return_value=(object(), object(), object())):
+            with patch.object(bootstrap, "_public_context", return_value=(binding_value(), "/control")):
+                with patch.object(
+                    bootstrap, "_validate_bootstrap_gate",
+                    return_value=(b"| D99999999 |\n", "e" * 64, "f" * 64),
+                ):
+                    with patch.object(
+                        bootstrap, "_verify_prepared_dash",
+                        return_value=("dash-dir", {"binary_sha256": "a" * 64}),
+                    ):
+                        with patch.object(bootstrap, "_read_token_stdin") as read_token:
+                            with self.assertRaisesRegex(bootstrap.Refusal, "bootstrap_gate_refused"):
+                                bootstrap._run(
+                                    "run", request_value(), True, environment,
+                                    {"token_revocation": "not-read", "token_reference": None},
+                                )
+        read_token.assert_not_called()
+
     def test_prelease_refusal_explicitly_revokes_token_without_echoing_it(self):
         token = "opaque-test-token-value"
         output = io.StringIO()
@@ -365,6 +411,143 @@ class LeaseRecordTests(unittest.TestCase):
                     )
 
 
+class WorkerPrivilegeTests(unittest.TestCase):
+    def test_worker_privilege_uses_the_reviewed_probe_for_the_exact_worker(self):
+        events = []
+        environment = {"PATH": "/usr/bin:/bin", "HOME": "home", "TMPDIR": "storage"}
+        argv = ("python", "-I", "-S", "-B", "-c", "fixed-probe")
+        reviewed = SimpleNamespace(
+            PRIVILEGE_SCRIPT="fixed-probe",
+            PRIVILEGE_MARKER=b"KD-RB:privilege=sudo-denied\n",
+            _child_environment=lambda home, storage, toolchain: environment,
+            _probe_argv=lambda python, script: argv,
+            _run_probe_step=lambda command, uid, **kwargs: events.append((command, uid, kwargs)),
+        )
+        result = bootstrap._probe_worker_privilege(
+            502, "home", "storage", {"python": "python"}, reviewed,
+        )
+        self.assertEqual(result, "sudo-denied")
+        self.assertEqual(events, [(argv, 502, {
+            "env": environment,
+            "python_executable": "python",
+            "stage": "privilege",
+            "expected_stdout": b"KD-RB:privilege=sudo-denied\n",
+        })])
+
+    def test_worker_privilege_refuses_and_preserves_cleanup_failure(self):
+        def fail_probe(*args, **kwargs):
+            raise bootstrap.Refusal("runner_controls_unavailable", "runner_controls")
+
+        def fail_cleanup(*args, **kwargs):
+            raise bootstrap.Refusal("cleanup_incomplete", "cleanup")
+
+        reviewed = SimpleNamespace(
+            PRIVILEGE_SCRIPT="fixed-probe",
+            PRIVILEGE_MARKER=b"KD-RB:privilege=sudo-denied\n",
+            _child_environment=lambda *args: {},
+            _probe_argv=lambda *args: (),
+            _run_probe_step=fail_probe,
+        )
+        with self.assertRaisesRegex(bootstrap.Refusal, "probe_identity_unavailable"):
+            bootstrap._probe_worker_privilege(502, "home", "storage", {"python": "python"}, reviewed)
+        reviewed._run_probe_step = fail_cleanup
+        with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete"):
+            bootstrap._probe_worker_privilege(502, "home", "storage", {"python": "python"}, reviewed)
+
+
+class NetworkObservationTests(unittest.TestCase):
+    def test_loader_allowlist_adds_only_the_fixed_network_observer(self):
+        self.assertEqual(bootstrap.CONTROL_SIBLINGS, frozenset((
+            "macos_reviewed_build", "macos_capability", "macos_boundary_guard",
+            "macos_private_validation", "macos_source_reader", "macos_network_observer",
+        )))
+        with self.assertRaises(ImportError):
+            bootstrap._load_control_sibling("unreviewed_module")
+
+    def test_observer_uses_the_validated_source_and_run_binding(self):
+        binding = binding_value()
+        session = object()
+        calls = []
+        observer = SimpleNamespace(
+            start_observation=lambda *args: calls.append(args) or session,
+        )
+        with patch.object(bootstrap, "_load_control_sibling", return_value=observer):
+            self.assertIs(bootstrap._start_network_observation(binding, SOURCE), session)
+        self.assertEqual(calls, [(CONTROL, "123456789", "2", SOURCE)])
+
+    def test_real_observer_record_schema_matches_wrapper_without_host_capture(self):
+        observer = bootstrap._load_control_sibling("macos_network_observer")
+        binding = {
+            "control_sha": CONTROL,
+            "run_id": "123456789",
+            "run_attempt": "2",
+            "source_sha": SOURCE,
+        }
+        empty_pcap = bytes.fromhex(
+            "d4c3b2a10200040000000000000000000002000001000000"
+        )
+        session = observer.ObservationSession(
+            binding,
+            "synthetic-capture-dir",
+            ({"path": "synthetic-capture", "addresses": frozenset()},),
+            frozenset(),
+            frozenset(),
+            observer.time.monotonic(),
+            b"synthetic-per-run-key",
+        )
+        with patch.object(observer, "_stop_capture"):
+            with patch.object(observer, "_read_capture_file", return_value=empty_pcap):
+                with patch.object(observer, "_remove_private_directory"):
+                    record = session.finish()
+        self.assertIs(type(record["dns_name_hashes"]), list)
+        self.assertIs(type(record["tcp_destination_hashes"]), list)
+        self.assertEqual(
+            bootstrap._validate_network_record(record, binding_value(), SOURCE), record
+        )
+
+    def test_observation_record_and_public_marker_keep_only_bound_counts_and_hashes(self):
+        record = network_record_value()
+        result = bootstrap._validate_network_record(record, binding_value(), SOURCE)
+        line = bootstrap._format_network_observed(result)
+        self.assertIn("mode=host-level", line)
+        self.assertIn("control-sha=" + CONTROL, line)
+        self.assertIn("source-sha=" + SOURCE, line)
+        self.assertIn("dns-name-hashes=" + ",".join(record["dns_name_hashes"]), line)
+        self.assertIn("tcp-destination-hashes=" + ",".join(record["tcp_destination_hashes"]), line)
+        self.assertIn("worker-attribution=not-claimed", line)
+        self.assertIn("completeness=not-claimed", line)
+        self.assertIn("network-blocking=not-claimed", line)
+        self.assertNotIn("example", line)
+
+    def test_observer_record_refuses_unbound_or_malformed_values(self):
+        cases = (
+            {"source_sha": "d" * 40},
+            {"interface_count": True},
+            {"dns_name_hashes": ["b" * 64, "a" * 64]},
+            {"tcp_destination_hashes": ["not-a-hash"]},
+            {"network_blocking": "blocked"},
+            {"unexpected": "value"},
+        )
+        for changes in cases:
+            with self.subTest(keys=tuple(changes)):
+                with self.assertRaisesRegex(bootstrap.Refusal, "runner_controls_unavailable"):
+                    bootstrap._validate_network_record(
+                        network_record_value(**changes), binding_value(), SOURCE
+                    )
+
+    def test_observer_cleanup_refusal_stays_a_cleanup_failure(self):
+        class CleanupError(Exception):
+            reason = "cleanup_incomplete"
+            stage = "cleanup"
+
+        class Session:
+            def finish(self):
+                raise CleanupError("closed observer cleanup refusal")
+
+        with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete"):
+            bootstrap._finish_network_observation(Session(), binding_value(), SOURCE)
+
+
 class SummaryGuardTests(unittest.TestCase):
     def test_actual_summary_guard_stays_open_through_worker_cleanup(self):
         events = []
@@ -479,6 +662,37 @@ class OutputTests(unittest.TestCase):
                 bootstrap._revoke_pending_token(environment)
         self.assertIn("SOURCE_READER_TOKEN", environment)
 
+    def test_runtime_revocation_receipt_requires_bound_proof(self):
+        token = "opaque-test-token"
+        request = request_value()
+        binding = binding_value()
+        environment = {"SOURCE_REPOSITORY_ID": "987654321"}
+        lifecycle = {"token_revocation": "unconfirmed", "token_reference": token}
+        calls = []
+        runtime = SimpleNamespace(
+            revocation_confirmed=lambda *args: calls.append(args) or True,
+        )
+        state = object()
+        self.assertTrue(bootstrap._record_runtime_revocation(
+            runtime, state, token, request, binding, environment, lifecycle,
+        ))
+        self.assertEqual(calls, [(state, token, "987654321", request, binding)])
+        self.assertEqual(lifecycle, {"token_revocation": "confirmed", "token_reference": None})
+
+        lifecycle = {"token_revocation": "unconfirmed", "token_reference": token}
+        runtime.revocation_confirmed = lambda *args: False
+        self.assertFalse(bootstrap._record_runtime_revocation(
+            runtime, state, token, request, binding, environment, lifecycle,
+        ))
+        self.assertEqual(lifecycle, {"token_revocation": "unconfirmed", "token_reference": token})
+
+        environment["SOURCE_REPOSITORY_ID"] = ""
+        runtime.revocation_confirmed = lambda *args: True
+        self.assertFalse(bootstrap._record_runtime_revocation(
+            runtime, state, token, request, binding, environment, lifecycle,
+        ))
+        self.assertEqual(lifecycle["token_revocation"], "unconfirmed")
+
     def test_runtime_refusal_remains_the_owner_after_token_consumption(self):
         token = "opaque-test-token"
         output = io.StringIO()
@@ -511,6 +725,29 @@ class OutputTests(unittest.TestCase):
         self.assertIn("reason=source_lease_unavailable", line)
         self.assertTrue(line.endswith("token-revocation=unconfirmed"))
         self.assertNotIn("private-token-value", line)
+
+    def test_failed_suite_keeps_a_valid_observation_before_its_refusal(self):
+        output = io.StringIO()
+        argv = (
+            "run", "--token-stdin", "--source-sha", SOURCE, "--base-sha", BASE,
+            "--base-branch", "main", "--concern", "rules-bootstrap",
+        )
+        observed = bootstrap._format_network_observed(
+            bootstrap._validate_network_record(network_record_value(), binding_value(), SOURCE)
+        )
+
+        def failed_suite(mode, request, token_stdin, env, lifecycle):
+            lifecycle["token_revocation"] = "confirmed"
+            lifecycle["network_observation_marker"] = observed
+            raise bootstrap.Refusal("suite_failed", "rules.hooks")
+
+        with patch.object(bootstrap, "_run", side_effect=failed_suite):
+            with patch("sys.stdout", output):
+                self.assertEqual(bootstrap.main(argv, {}), 1)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[0], observed)
+        self.assertIn("reason=suite_failed", lines[1])
+        self.assertTrue(lines[1].endswith("token-revocation=confirmed"))
 
     def test_success_formatter_is_closed_and_marks_memory_as_unverified(self):
         record = {

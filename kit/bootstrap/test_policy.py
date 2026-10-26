@@ -38,6 +38,7 @@ MACOS_SOURCE_READER_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/wo
 MACOS_RULES_SOURCE_READER_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rules-reader-preflight.yml"
 MACOS_RULES_BOOTSTRAP_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rules-bootstrap.yml"
 MACOS_CORE_BOOTSTRAP_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-core-bootstrap.yml"
+MACOS_CORE_BOOTSTRAP_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_core_bootstrap.py"
 MACOS_CACHE_CLIENT_ACTION = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/action.yml"
 MACOS_CACHE_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/index.js"
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-native-preflight.yml"
@@ -330,6 +331,10 @@ class WorkflowPolicyTests(unittest.TestCase):
         )
         self.assertIn("test_macos*.py", workflow)
         self.assertIn("kit/confinement/macos_reviewed_build.py --control-sha \"$CI_SHA\"", workflow)
+        self.assertIn(
+            "kit/confinement/macos_network_observer.py selftest",
+            workflow,
+        )
         self.assertIn('if [[ -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]', workflow)
         self.assertIn('ImageOS="$ImageOS"', workflow)
         self.assertIn('ImageVersion="$ImageVersion"', workflow)
@@ -337,6 +342,17 @@ class WorkflowPolicyTests(unittest.TestCase):
             "  macos-public-surface-audit:\n", 1
         )[0]
         self.assertNotIn("GITHUB_TOKEN", smoke)
+        observer = smoke.split("      - name: Prove source-free network observer\n", 1)[1].split(
+            "      - name: Run source-free reviewed build smoke\n", 1
+        )[0]
+        self.assertIn('CI_SHA="$CI_SHA" \\', observer)
+        self.assertIn('GITHUB_RUN_ID="$GITHUB_RUN_ID" \\', observer)
+        self.assertIn('GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \\', observer)
+        self.assertIn("sudo -n -- env -i", observer)
+        self.assertIn("kit/confinement/macos_network_observer.py selftest", observer)
+        self.assertNotIn("GITHUB_TOKEN", observer)
+        self.assertNotIn("GITHUB_STEP_SUMMARY", observer)
+        self.assertNotIn("GITHUB_OUTPUT", observer)
         self.assertIn('CI_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \\', smoke)
         self.assertIn('RUNNER_HOME="$HOME" \\', smoke)
         self.assertIn("      - name: Write trusted summary visibility control\n", smoke)
@@ -349,6 +365,14 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn('printf \'%s\\n\' "$summary_line" >> "$GITHUB_STEP_SUMMARY"', smoke)
         self.assertIn('printf \'%s\\n\' "$summary_line"', smoke)
         self.assertNotRegex(workflow, r"(?m)^\s*GITHUB_STEP_SUMMARY:")
+        self.assertLess(
+            workflow.index("      - name: Prove source-free network observer\n"),
+            workflow.index("      - name: Run source-free reviewed build smoke\n"),
+        )
+        self.assertLess(
+            workflow.index("      - name: Validate source-free control tree\n"),
+            workflow.index("      - name: Prove source-free network observer\n"),
+        )
         self.assertLess(
             workflow.index("      - name: Run source-free reviewed build smoke\n"),
             workflow.index("      - name: Write trusted summary visibility control\n"),
@@ -390,6 +414,7 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace("    if: ${{ always() }}\n", "    if: ${{ success() }}\n"),
             base.replace("      actions: read\n      checks: read\n", "      actions: write\n      checks: write\n"),
             base.replace("      - name: Run source-free reviewed build smoke\n", ""),
+            base.replace("      - name: Prove source-free network observer\n", ""),
             base.replace("      - name: Write trusted summary visibility control\n", ""),
             base.replace('            CI_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \\\n', ""),
             base.replace("      - name: Audit public surfaces\n", "      - name: Extra execution\n        run: echo unreviewed\n      - name: Audit public surfaces\n"),
@@ -728,6 +753,10 @@ class WorkflowPolicyTests(unittest.TestCase):
                     self.assertIn("--phase revoke --token-stdin", workflow)
                     self.assertNotIn('SOURCE_READER_TOKEN="$SOURCE_READER_TOKEN"', workflow)
                     self.assertIn("marker_prefix='macos-rules-bootstrap='", workflow)
+                    self.assertIn('network_dns_count="${BASH_REMATCH[6]}"', workflow)
+                    self.assertIn('network_tcp_count="${BASH_REMATCH[7]}"', workflow)
+                    self.assertIn('network_dns_count="${BASH_REMATCH[6]}"', workflow)
+                    self.assertIn('network_tcp_count="${BASH_REMATCH[7]}"', workflow)
                     self.assertNotIn("macos-rules-bootstrap=passed", workflow)
                     self.assertNotIn("macos-rules-bootstrap=refused", workflow)
                     self.assertNotIn('{"metadata":', workflow)
@@ -749,6 +778,36 @@ class WorkflowPolicyTests(unittest.TestCase):
                     self.assertNotIn('SOURCE_READER_TOKEN="$SOURCE_READER_TOKEN"', workflow)
                     self.assertIn("macos-core-source-binding=", workflow)
                     self.assertIn("Validate core bootstrap", workflow)
+                    core_tree = ast.parse(MACOS_CORE_BOOTSTRAP_SOURCE.read_text(encoding="utf-8"))
+                    source_reasons = None
+                    for statement in core_tree.body:
+                        if not isinstance(statement, ast.Assign):
+                            continue
+                        if not any(
+                            isinstance(target, ast.Name)
+                            and target.id == "SOURCE_VALIDATION_REASONS"
+                            for target in statement.targets
+                        ):
+                            continue
+                        value = statement.value
+                        if (not isinstance(value, ast.Call)
+                                or not isinstance(value.func, ast.Name)
+                                or value.func.id != "frozenset"
+                                or len(value.args) != 1):
+                            raise AssertionError("core source refusal reasons must be a closed literal set")
+                        source_reasons = set(ast.literal_eval(value.args[0]))
+                        break
+                    self.assertIsNotNone(source_reasons)
+                    refusal_line = next(
+                        line for line in workflow.splitlines()
+                        if line.strip().startswith("refusal_re=")
+                    )
+                    workflow_reasons = set(
+                        refusal_line.split(" reason=(", 1)[1]
+                        .split(") stage=", 1)[0]
+                        .split("|")
+                    )
+                    self.assertTrue(source_reasons.issubset(workflow_reasons))
                     self.assertIn("--token-stdin", workflow)
                     self.assertIn("--phase revoke --token-stdin", workflow)
                     self.assertIn("token-revocation=(not-read|confirmed|unconfirmed)", workflow)

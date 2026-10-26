@@ -14,7 +14,7 @@ MAX_DURATION_MS = 86400000
 MACOS_SOURCE_READER_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
 MACOS_SOURCE_READER_WORKFLOW_SHA256 = "6c7e82c8a9d91436ae98f1357fd0fe4f09847f5fd17abc4843eadb130405b626"
 MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "cb9b70226175069e9c148c06f18d4d89cf8b6d5b33b39e02579a4aa2de5ee8a6"
-MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "0a7875b43365267da678157d663873d3f868a0c811b05c4d6091d1bf3e9d5366"
+MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "002de702a0d0f7447f8c750ae3d37a5a80aa18824d88d0688f7f2b2c3e4ac3d4"
 MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "7c110953eca3e99d502fbf32cb2bd176e4aceb92d22074bd4a5060cb1e4e4597"
 
 
@@ -556,6 +556,24 @@ jobs:
           python3 -B kit/bootstrap/test_public_tree.py
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
           python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+      - name: Prove source-free network observer
+        run: |
+          set -euo pipefail
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          sudo -n -- env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            CI_SHA="$CI_SHA" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_network_observer.py selftest
       - name: Run source-free reviewed build smoke
         run: |
           set -euo pipefail
