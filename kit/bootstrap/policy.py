@@ -622,6 +622,349 @@ jobs:
 """
 
 
+MACOS_CACHE_PROOF_ACTION_SHA = "3edfce9056124e459a23f683a21433670d47daca"
+MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE = r"""name: macos-cache-proof
+on:
+  workflow_dispatch:
+cache-mode: none
+permissions: {}
+jobs:
+  macos-cache-public-snapshot:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      actions: read
+    outputs:
+      cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Snapshot cache inventory
+        id: snapshot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py cache-proof-snapshot
+  macos-cache-seed:
+    needs: macos-cache-public-snapshot
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-15
+    cache-mode: write
+    timeout-minutes: 10
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Prepare public cache fixture
+        run: |
+          set -euo pipefail
+          fixture_dir="$RUNNER_TEMP/macos-public-cache"
+          mkdir -p "$fixture_dir"
+          printf '%s\n' 'Public macOS cache fixture v1' > "$fixture_dir/fixture.txt"
+      - name: Save public cache fixture
+        id: save
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/macos-public-cache/fixture.txt
+          key: macos-public-cache-seed-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Confirm seed step completed
+        env:
+          SAVE_OUTCOME: ${{ steps.save.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$SAVE_OUTCOME" != "success" ]]; then
+            exit 1
+          fi
+          printf 'macos-cache-seed=step-complete schema=1 run-id=%s run-attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+  macos-cache-positive:
+    needs: macos-cache-seed
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-15
+    cache-mode: read
+    timeout-minutes: 10
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Restore the known public cache fixture
+        id: restore
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        with:
+          path: ${{ runner.temp }}/macos-public-cache/fixture.txt
+          key: macos-public-cache-seed-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+      - name: Verify exact fixture bytes after a cache hit
+        env:
+          CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ "$CACHE_HIT" != "true" ]]; then
+            exit 1
+          fi
+          expected="$RUNNER_TEMP/macos-public-cache-expected.txt"
+          printf '%s\n' 'Public macOS cache fixture v1' > "$expected"
+          cmp -s "$expected" "$RUNNER_TEMP/macos-public-cache/fixture.txt"
+          printf 'macos-cache-positive=restored schema=1 run-id=%s run-attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+  macos-cache-none-probe:
+    needs: macos-cache-positive
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-15
+    cache-mode: none
+    timeout-minutes: 10
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Require fixture is absent before the denied read
+        run: |
+          set -euo pipefail
+          if [[ -e "$RUNNER_TEMP/macos-public-cache/fixture.txt" ]]; then
+            exit 1
+          fi
+      - name: Request the known fixture with the none-scoped token
+        id: denied-restore
+        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
+        env:
+          ACTIONS_CACHE_MODE: read
+        with:
+          path: ${{ runner.temp }}/macos-public-cache/fixture.txt
+          key: macos-public-cache-seed-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Verify the none-scoped read did not restore bytes
+        env:
+          CACHE_HIT: ${{ steps.denied-restore.outputs.cache-hit }}
+        run: |
+          set -euo pipefail
+          if [[ ( -n "$CACHE_HIT" && "$CACHE_HIT" != "false" ) || -e "$RUNNER_TEMP/macos-public-cache/fixture.txt" ]]; then
+            exit 1
+          fi
+          printf 'macos-cache-none-read=local-absent schema=1 run-id=%s run-attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+      - name: Prepare a distinct public write probe
+        run: |
+          set -euo pipefail
+          fixture_dir="$RUNNER_TEMP/macos-public-cache-write"
+          mkdir -p "$fixture_dir"
+          printf '%s\n' 'Public macOS cache write probe v1' > "$fixture_dir/fixture.txt"
+      - name: Request a cache save with the none-scoped token
+        id: denied-save
+        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
+        env:
+          ACTIONS_CACHE_MODE: write
+        with:
+          path: ${{ runner.temp }}/macos-public-cache-write/fixture.txt
+          key: macos-public-cache-none-write-v1-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Confirm save request completed
+        env:
+          SAVE_OUTCOME: ${{ steps.denied-save.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$SAVE_OUTCOME" != "success" ]]; then
+            exit 1
+          fi
+          printf 'macos-cache-none-save=request-finished schema=1 run-id=%s run-attempt=%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+  macos-cache-public-audit:
+    if: ${{ always() }}
+    needs: [macos-cache-public-snapshot, macos-cache-seed, macos-cache-positive, macos-cache-none-probe]
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      actions: read
+      checks: read
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      MACOS_CACHE_SNAPSHOT: ${{ needs.macos-cache-public-snapshot.outputs.cache_snapshot }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Audit cache proof and public surfaces
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py cache-proof-audit
+  macos-cache-cleanup:
+    if: ${{ always() }}
+    needs: [macos-cache-public-snapshot, macos-cache-seed, macos-cache-positive, macos-cache-none-probe, macos-cache-public-audit]
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      actions: write
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Remove only this run attempt cache fixtures
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py cache-proof-cleanup
+"""
+
+
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE = """name: windows-native-preflight
 on:
   workflow_dispatch:
@@ -733,6 +1076,10 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         expected = MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE
+    elif workflow_kind == "macos-cache-proof":
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        expected = MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE
     elif workflow_kind == "windows-native-preflight":
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")

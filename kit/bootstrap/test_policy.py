@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 from policy import (
     MACOS_CAPABILITY_WORKFLOW_TEMPLATE,
+    MACOS_CACHE_PROOF_ACTION_SHA,
+    MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE,
     MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE,
     PolicyError,
     encode_public_result,
@@ -25,6 +27,7 @@ PLATFORM_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/pub
 LINUX_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/linux-confinement.yml"
 MACOS_CAPABILITY_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-capability.yml"
 MACOS_REVIEWED_BUILD_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-reviewed-build.yml"
+MACOS_CACHE_PROOF_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-cache-proof.yml"
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-native-preflight.yml"
 PROBE_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_capability.py"
 PLATFORM_ACTION = Path(__file__).resolve().parent / "action.yml"
@@ -372,6 +375,96 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertNotEqual(changed, base)
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(changed, "platform", "macos-reviewed-build")
+
+    def test_actual_macos_cache_proof_workflow_is_manual_source_free_and_independently_audited(self):
+        workflow = MACOS_CACHE_PROOF_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(workflow, MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE)
+        self.assertTrue(validate_workflow_text(workflow, "platform", "macos-cache-proof"))
+        self.assertIn("workflow_dispatch:\ncache-mode: none\npermissions: {}", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertEqual(workflow.count("runs-on: macos-15"), 3)
+        self.assertEqual(workflow.count("cache-mode: none"), 5)
+        self.assertIn("  macos-cache-seed:\n", workflow)
+        self.assertIn("    cache-mode: write\n", workflow)
+        self.assertIn("  macos-cache-positive:\n", workflow)
+        self.assertIn("    cache-mode: read\n", workflow)
+        self.assertIn("  macos-cache-none-probe:\n", workflow)
+        self.assertIn("ACTIONS_CACHE_MODE: read", workflow)
+        self.assertIn("ACTIONS_CACHE_MODE: write", workflow)
+        self.assertIn("fail-on-cache-miss: true", workflow)
+        self.assertIn("cmp -s", workflow)
+        action_prefix = "uses: actions/cache/"
+        self.assertEqual(workflow.count(action_prefix), 4)
+        self.assertEqual(
+            workflow.count("uses: actions/cache/restore@" + MACOS_CACHE_PROOF_ACTION_SHA),
+            2,
+        )
+        self.assertEqual(
+            workflow.count("uses: actions/cache/save@" + MACOS_CACHE_PROOF_ACTION_SHA),
+            2,
+        )
+        self.assertIn("cache-proof-snapshot", workflow)
+        self.assertIn("cache-proof-audit", workflow)
+        self.assertIn("cache-proof-cleanup", workflow)
+        self.assertIn("actions: read\n      checks: read", workflow)
+        self.assertEqual(workflow.count("actions: write"), 1)
+        self.assertIn("if: ${{ always() }}", workflow)
+        self.assertIn(
+            "needs: [macos-cache-public-snapshot, macos-cache-seed, macos-cache-positive, macos-cache-none-probe]",
+            workflow,
+        )
+        self.assertIn("macos-cache-public-audit", workflow)
+        seed = workflow.split("  macos-cache-seed:\n", 1)[1].split("  macos-cache-positive:\n", 1)[0]
+        positive = workflow.split("  macos-cache-positive:\n", 1)[1].split("  macos-cache-none-probe:\n", 1)[0]
+        probe = workflow.split("  macos-cache-none-probe:\n", 1)[1].split("  macos-cache-public-audit:\n", 1)[0]
+        cleanup = workflow.split("  macos-cache-cleanup:\n", 1)[1]
+        for runner_job in (seed, positive, probe):
+            self.assertNotIn("GITHUB_TOKEN", runner_job)
+            self.assertNotIn("secrets.", runner_job)
+        self.assertNotIn("actions: write", workflow.split("  macos-cache-cleanup:\n", 1)[0])
+        self.assertIn("actions: write", cleanup)
+        for forbidden in (
+            "source-read",
+            "environment:",
+            "inputs:",
+            "actions/checkout",
+            "upload-artifact",
+            "download-artifact",
+            "GITHUB_STEP_SUMMARY",
+            "GITHUB_OUTPUT",
+            "continue-on-error:",
+            "uses: actions/cache@",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "macos-cache-proof")
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "platform")
+
+    def test_macos_cache_proof_rejects_mode_pin_scope_and_evidence_bypasses(self):
+        base = MACOS_CACHE_PROOF_WORKFLOW.read_text(encoding="utf-8")
+        mutations = (
+            base.replace("cache-mode: none\n", "cache-mode: read\n", 1),
+            base.replace("    cache-mode: write\n", "    cache-mode: none\n", 1),
+            base.replace("    cache-mode: read\n", "    cache-mode: none\n", 1),
+            base.replace("ACTIONS_CACHE_MODE: read", "ACTIONS_CACHE_MODE: none"),
+            base.replace("ACTIONS_CACHE_MODE: write", "ACTIONS_CACHE_MODE: none"),
+            base.replace(MACOS_CACHE_PROOF_ACTION_SHA, "0" * 40),
+            base.replace("fail-on-cache-miss: true", "fail-on-cache-miss: false"),
+            base.replace("cmp -s", "true " + chr(35) + " invalid-comment"),
+            base.replace("needs: [macos-cache-public-snapshot, macos-cache-seed, macos-cache-positive, macos-cache-none-probe]", "needs: macos-cache-none-probe"),
+            base.replace("if: ${{ always() }}", "if: ${{ success() }}"),
+            base.replace("      actions: read\n      checks: read\n", "      actions: write\n      checks: write\n"),
+            base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
+            base.replace("macos-cache", "source-read", 1),
+            base.replace("macos-cache-public-audit", "macos-cache-seed"),
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(changed, base)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "macos-cache-proof")
 
     def test_actual_windows_native_preflight_matches_closed_manual_main_shape(self):
         workflow = WINDOWS_NATIVE_PREFLIGHT_WORKFLOW.read_text(encoding="utf-8")

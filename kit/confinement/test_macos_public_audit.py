@@ -3,8 +3,10 @@ import contextlib
 import email.message
 import io
 import json
+import tempfile
 import urllib.error
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import macos_public_audit as audit
@@ -79,6 +81,24 @@ class FakeMultiAuditAPI(FakeAPI):
         if job_id not in self.logs:
             raise audit.AuditRefusal("log_unavailable")
         return self.logs[job_id]
+
+
+class FakeCleanupAPI(FakeAPI):
+    def __init__(self, pages, cache_items):
+        super().__init__(pages)
+        self.cache_items = list(cache_items)
+        self.deleted_cache_ids = []
+
+    def json(self, path):
+        cache_path = "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        if path == cache_path:
+            self.calls.append(path)
+            return {"total_count": len(self.cache_items), "actions_caches": list(self.cache_items)}, FakeHeaders({})
+        return super().json(path)
+
+    def delete_cache(self, cache_id):
+        self.deleted_cache_ids.append(cache_id)
+        self.cache_items = [item for item in self.cache_items if item["id"] != cache_id]
 
 
 class FakeResponse:
@@ -560,6 +580,308 @@ def reviewed_audit_fixture():
         203: marker,
     }
     return pages, env, logs
+
+
+def cache_proof_keys():
+    suffix = RUN_ID + "-" + RUN_ATTEMPT
+    return (
+        audit.CACHE_PROOF_SEED_KEY_PREFIX + suffix,
+        audit.CACHE_PROOF_NONE_WRITE_KEY_PREFIX + suffix,
+    )
+
+
+def cache_proof_audit_fixture():
+    run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+    jobs_path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+    )
+    artifact_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID + "/artifacts?per_page=100&page=1"
+    cache_path = "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+    job_specs = (
+        (audit.CACHE_PROOF_SNAPSHOT_JOB_NAME, 402, 502, "completed", "success", (
+            "Fetch reviewed main control", "Snapshot cache inventory",
+        )),
+        (audit.CACHE_PROOF_SEED_JOB_NAME, 403, 503, "completed", "success", (
+            "Fetch reviewed main control", "Prepare public cache fixture", "Save public cache fixture",
+            "Confirm seed step completed",
+        )),
+        (audit.CACHE_PROOF_POSITIVE_JOB_NAME, 404, 504, "completed", "success", (
+            "Fetch reviewed main control", "Restore the known public cache fixture",
+            "Verify exact fixture bytes after a cache hit",
+        )),
+        (audit.CACHE_PROOF_NONE_JOB_NAME, 405, 505, "completed", "success", (
+            "Fetch reviewed main control", "Require fixture is absent before the denied read",
+            "Request the known fixture with the none-scoped token",
+            "Verify the none-scoped read did not restore bytes", "Prepare a distinct public write probe",
+            "Request a cache save with the none-scoped token", "Confirm save request completed",
+        )),
+        (audit.CACHE_PROOF_AUDIT_JOB_NAME, 406, 506, "in_progress", None, ()),
+        (audit.CACHE_PROOF_CLEANUP_JOB_NAME, 407, 507, "queued", None, ()),
+    )
+    pages = {
+        run_path: ({
+            "id": int(RUN_ID),
+            "run_attempt": int(RUN_ATTEMPT),
+            "head_sha": CONTROL_SHA,
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "path": audit.CACHE_PROOF_WORKFLOW_PATH,
+            "repository": {"full_name": audit.REPOSITORY},
+        }, {}),
+    }
+    jobs = []
+    logs = {}
+    cache_items = [{
+        "id": 901,
+        "ref": "refs/heads/main",
+        "key": cache_proof_keys()[0],
+        "version": "fixture-version-v1",
+        "last_accessed_at": "2026-10-26T00:01:00Z",
+        "created_at": "2026-10-26T00:00:00Z",
+        "size_in_bytes": 128,
+    }]
+    seed_key, write_key = cache_proof_keys()
+    logs_by_name = {
+        audit.CACHE_PROOF_SNAPSHOT_JOB_NAME: b"macos-cache-proof=snapshot-ready\n",
+        audit.CACHE_PROOF_SEED_JOB_NAME: (
+            b"Cache saved with key: " + seed_key.encode("ascii")
+            + b"\nmacos-cache-seed=step-complete schema=1 run-id=" + RUN_ID.encode("ascii")
+            + b" run-attempt=" + RUN_ATTEMPT.encode("ascii") + b"\n"
+        ),
+        audit.CACHE_PROOF_POSITIVE_JOB_NAME: (
+            b"Cache restored from key: " + seed_key.encode("ascii")
+            + b"\nmacos-cache-positive=restored schema=1 run-id=" + RUN_ID.encode("ascii")
+            + b" run-attempt=" + RUN_ATTEMPT.encode("ascii") + b"\n"
+        ),
+        audit.CACHE_PROOF_NONE_JOB_NAME: (
+            b"::warning::Failed to restore: cache read denied: scope none\n"
+            b"Cache not found for input keys: " + seed_key.encode("ascii") + b"\n"
+            b"macos-cache-none-read=local-absent schema=1 run-id=" + RUN_ID.encode("ascii")
+            + b" run-attempt=" + RUN_ATTEMPT.encode("ascii")
+            + b"\n::warning::Unable to reserve cache with key " + write_key.encode("ascii")
+            + b". More details: cache write denied: scope none\n"
+            b"macos-cache-none-save=request-finished schema=1 run-id=" + RUN_ID.encode("ascii")
+            + b" run-attempt=" + RUN_ATTEMPT.encode("ascii") + b"\n"
+        ),
+    }
+    for name, job_id, check_id, status, conclusion, step_names in job_specs:
+        check_url = "https://api.github.com/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id)
+        record = {
+            "id": job_id,
+            "run_id": int(RUN_ID),
+            "run_attempt": int(RUN_ATTEMPT),
+            "head_sha": CONTROL_SHA,
+            "name": name,
+            "status": status,
+            "conclusion": conclusion,
+            "check_run_url": check_url,
+        }
+        jobs.append(record)
+        if status == "completed":
+            detail = dict(record, steps=[{
+                "number": index,
+                "name": step_name,
+                "status": "completed",
+                "conclusion": "success",
+            } for index, step_name in enumerate(step_names, 1)])
+            pages["/repos/keeldock-platform/platform-ci/actions/jobs/" + str(job_id)] = (detail, {})
+            check_path = "/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id)
+            pages[check_path] = ({
+                "id": check_id,
+                "head_sha": CONTROL_SHA,
+                "status": "completed",
+                "conclusion": "success",
+                "output": {"title": name, "summary": "cache proof fixture", "annotations_count": 0},
+            }, {})
+            pages[check_path + "/annotations?per_page=100&page=1"] = ([], {})
+            logs[job_id] = logs_by_name[name]
+    pages[jobs_path] = ({"total_count": len(jobs), "jobs": jobs}, {})
+    pages[artifact_path] = ({"total_count": 0, "artifacts": []}, {})
+    pages[cache_path] = ({"total_count": len(cache_items), "actions_caches": cache_items}, {})
+    env = {
+        "GITHUB_REPOSITORY": audit.REPOSITORY,
+        "GITHUB_RUN_ID": RUN_ID,
+        "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
+        "CI_SHA": CONTROL_SHA,
+        "GITHUB_TOKEN": "t" * 32,
+        "MACOS_CACHE_SNAPSHOT": audit.cache_inventory_digest([]),
+    }
+    return pages, env, logs, cache_items
+
+
+class CacheProofAuditTests(unittest.TestCase):
+    def test_cache_probe_log_scanner_only_allows_the_two_expected_warning_commands(self):
+        _, write_key = cache_proof_keys()
+        allowed = (
+            b"::warning::Failed to restore: cache read denied: scope none\n"
+            b"::warning::Unable to reserve cache with key " + write_key.encode("ascii")
+            + b". More details: cache write denied: scope none\n"
+        )
+        audit.inspect_cache_probe_public_bytes(allowed, CONTROL_SHA, write_key)
+
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.inspect_cache_probe_public_bytes(
+                b"::warning::unrelated cache read denied: notice\n", CONTROL_SHA, write_key
+            )
+        self.assertEqual(caught.exception.reason, "workflow_command_exposed")
+
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.inspect_cache_probe_public_bytes(
+                b"::warning::Unable to reserve cache with key wrong-key. More details: cache write denied: scope none\n",
+                CONTROL_SHA,
+                write_key,
+            )
+        self.assertEqual(caught.exception.reason, "workflow_command_exposed")
+
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.inspect_cache_probe_public_bytes(
+                b"::warning::Failed to restore: cache read denied: ::set-output name=leak::value\n",
+                CONTROL_SHA,
+                write_key,
+            )
+        self.assertEqual(caught.exception.reason, "workflow_command_exposed")
+
+        canary = audit.derive_reviewed_canary(CONTROL_SHA)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.inspect_cache_probe_public_bytes(
+                b"::warning::Failed to restore: cache read denied: " + canary + b"\n",
+                CONTROL_SHA,
+                write_key,
+            )
+        self.assertEqual(caught.exception.reason, "canary_exposed")
+
+    def test_cache_proof_snapshot_requires_empty_fixture_scope_and_writes_inventory_baseline(self):
+        pages, env, _, _ = cache_proof_audit_fixture()
+        cache_path = "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        pages[cache_path] = ({"total_count": 0, "actions_caches": []}, {})
+        with tempfile.TemporaryDirectory() as temporary:
+            output_path = Path(temporary) / "github-output"
+            output_path.write_text("", encoding="ascii")
+            env["GITHUB_OUTPUT"] = str(output_path)
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = audit.run("cache-proof-snapshot", env, FakeAPI(pages))
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                output_path.read_text(encoding="ascii"),
+                "cache_snapshot=" + audit.cache_inventory_digest([]) + "\n",
+            )
+
+        pages, env, _, cache_items = cache_proof_audit_fixture()
+        pages[cache_path] = ({"total_count": 1, "actions_caches": cache_items}, {})
+        with tempfile.TemporaryDirectory() as temporary:
+            env["GITHUB_OUTPUT"] = str(Path(temporary) / "github-output")
+            with self.assertRaises(audit.AuditRefusal) as caught:
+                audit.run("cache-proof-snapshot", env, FakeAPI(pages))
+        self.assertEqual(caught.exception.reason, "inventory_changed")
+
+    def test_cache_proof_requires_seed_hit_and_both_explicit_service_denials(self):
+        pages, env, logs, _ = cache_proof_audit_fixture()
+        api = FakeMultiAuditAPI(pages, logs)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = audit.run("cache-proof-audit", env, api)
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "macos-cache-proof=seeded-positive-and-none-denials-audited\n")
+        self.assertEqual(api.log_calls, [402, 403, 404, 405])
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/artifacts?per_page=100&page=1",
+            api.calls,
+        )
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/check-runs/505/annotations?per_page=100&page=1",
+            api.calls,
+        )
+
+        pages, env, logs, _ = cache_proof_audit_fixture()
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        pages[jobs_path][0]["jobs"] = [
+            item for item in pages[jobs_path][0]["jobs"]
+            if item["name"] != audit.CACHE_PROOF_CLEANUP_JOB_NAME
+        ]
+        pages[jobs_path][0]["total_count"] = 5
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(audit.run("cache-proof-audit", env, FakeMultiAuditAPI(pages, logs)), 0)
+
+        cases = (
+            ("positive miss", lambda logs, pages: logs.__setitem__(404, logs[404].replace(
+                b"Cache restored from key:", b"Cache not found for input keys:")), "receipt_invalid"),
+            ("read denial missing", lambda logs, pages: logs.__setitem__(405, logs[405].replace(
+                b"cache read denied:", b"cache request failed:")), "workflow_command_exposed"),
+            ("write denial missing", lambda logs, pages: logs.__setitem__(405, logs[405].replace(
+                b"cache write denied:", b"cache request failed:")), "workflow_command_exposed"),
+            ("read unexpectedly succeeded", lambda logs, pages: logs.__setitem__(405, logs[405] +
+                b"Cache restored from key: " + cache_proof_keys()[0].encode("ascii")), "receipt_invalid"),
+        )
+        for label, mutate, reason in cases:
+            with self.subTest(case=label):
+                pages, env, logs, _ = cache_proof_audit_fixture()
+                mutate(logs, pages)
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.run("cache-proof-audit", env, FakeMultiAuditAPI(pages, logs))
+                self.assertEqual(caught.exception.reason, reason)
+
+    def test_cache_proof_requires_known_seed_metadata_and_no_write_entry(self):
+        pages, env, logs, cache_items = cache_proof_audit_fixture()
+        pages[
+            "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        ] = ({"total_count": 0, "actions_caches": []}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("cache-proof-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "inventory_changed")
+
+        pages, env, logs, cache_items = cache_proof_audit_fixture()
+        _, write_key = cache_proof_keys()
+        write_cache = dict(cache_items[0], id=902, key=write_key)
+        pages[
+            "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        ] = ({"total_count": 2, "actions_caches": cache_items + [write_cache]}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("cache-proof-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "inventory_changed")
+
+        pages, env, logs, cache_items = cache_proof_audit_fixture()
+        cache_items[0]["ref"] = "refs/heads/another-branch"
+        pages[
+            "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1"
+        ] = ({"total_count": 1, "actions_caches": cache_items}, {})
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("cache-proof-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "inventory_changed")
+
+    def test_cache_proof_cleanup_deletes_only_the_run_attempt_fixture_keys(self):
+        pages, env, _, cache_items = cache_proof_audit_fixture()
+        _, write_key = cache_proof_keys()
+        write_cache = dict(cache_items[0], id=902, key=write_key)
+        unrelated_cache = dict(
+            cache_items[0],
+            id=903,
+            key="unrelated-public-cache-v1",
+        )
+        api = FakeCleanupAPI(pages, cache_items + [write_cache, unrelated_cache])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = audit.run("cache-proof-cleanup", env, api)
+        self.assertEqual(result, 0)
+        self.assertEqual(sorted(api.deleted_cache_ids), [901, 902])
+        self.assertEqual([item["key"] for item in api.cache_items], ["unrelated-public-cache-v1"])
+        self.assertEqual(
+            output.getvalue(),
+            "macos-cache-cleanup=complete schema=1 run-id=" + RUN_ID
+            + " run-attempt=" + RUN_ATTEMPT + "\n",
+        )
+
+        pages, env, _, cache_items = cache_proof_audit_fixture()
+        other_ref_entry = dict(cache_items[0], id=904, ref="refs/heads/other")
+        api = FakeCleanupAPI(pages, cache_items + [other_ref_entry])
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("cache-proof-cleanup", env, api)
+        self.assertEqual(caught.exception.reason, "inventory_changed")
+        self.assertEqual(api.deleted_cache_ids, [])
 
 
 class AuditRunTests(unittest.TestCase):
