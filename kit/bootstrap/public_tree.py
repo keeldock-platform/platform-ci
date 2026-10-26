@@ -70,8 +70,8 @@ MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
     '.github/workflows/macos-rules-bootstrap.yml': '002de702a0d0f7447f8c750ae3d37a5a80aa18824d88d0688f7f2b2c3e4ac3d4',
     '.github/workflows/macos-core-bootstrap.yml': '25dbd661672e7b57384b2ffcd9934e62fb20688c94ee29ca97d2ab0eebc7109f',
-    'kit/confinement/macos_rules_bootstrap.py': '5e42091c9bf179342bfd43ac3c6025e4969de66bd7c33d2ef4453096f17d619a',
-    'kit/confinement/test_macos_rules_bootstrap.py': 'd5f0dab8776c9911786a2b789a2e7eeb08292afaa03d7ebc2a84f983f61e0d90',
+    'kit/confinement/macos_rules_bootstrap.py': '720905e99a5b912d8f9a0cfa2594e9636b278e94f296e826a0c0375895fabe1c',
+    'kit/confinement/test_macos_rules_bootstrap.py': '73ae6c8362655aaa86049d16188080e7c658f3f88e813456fc1a9e98f7a120e0',
     'kit/confinement/macos_core_bootstrap.py': '8f27ed84b98d2c3fcf45d2c12f330f9a324ab00f542058c8e095765989555b00',
     'kit/confinement/test_macos_core_bootstrap.py': '0d0bee2301702fa0bcfa97956bd788d8dd743a5eeab14e96fc23186916b6e400',
     'kit/confinement/macos_network_observer.py': 'f3299c0ab0ff57cc7e730b1866787dbd8d30e1864ce2ee42f423c34f5c09d74c',
