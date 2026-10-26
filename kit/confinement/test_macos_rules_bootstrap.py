@@ -308,6 +308,30 @@ class PublicBottleTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIsNone(bootstrap._safe_tar_name(value))
 
+    def test_pax_timestamp_and_owner_values_are_strictly_bounded(self):
+        self.assertTrue(bootstrap._safe_pax_headers({"mtime": "253402300799.999999999", "uid": "0"}))
+        for headers in (
+            {"mtime": "253402300800"},
+            {"ctime": "-62135596801"},
+            {"mtime": "1e9"},
+            {"uid": "1"},
+            {"path": bootstrap.DASH_BINARY_MEMBER},
+        ):
+            with self.subTest(headers=headers):
+                self.assertFalse(bootstrap._safe_pax_headers(headers))
+
+    def test_native_sparse_and_contiguous_tar_member_types_are_rejected(self):
+        regular = tarfile.TarInfo(bootstrap.DASH_BINARY_MEMBER)
+        self.assertTrue(bootstrap._safe_archive_member_type(regular))
+        for member_type in (tarfile.CONTTYPE, tarfile.GNUTYPE_SPARSE):
+            with self.subTest(member_type=member_type):
+                member = tarfile.TarInfo(bootstrap.DASH_BINARY_MEMBER)
+                member.type = member_type
+                self.assertFalse(bootstrap._safe_archive_member_type(member))
+        sparse = tarfile.TarInfo(bootstrap.DASH_BINARY_MEMBER)
+        sparse.sparse = [(0, 1)]
+        self.assertFalse(bootstrap._safe_archive_member_type(sparse))
+
     def test_cross_host_redirect_drops_registry_authorization(self):
         request = urllib.request.Request(
             "https://ghcr.io/v2/homebrew/core/dash-shell/blobs/sha256:abc",
@@ -327,19 +351,22 @@ class PublicBottleTests(unittest.TestCase):
         self.assertIsNone(redirected)
 
     def test_invalid_tar_is_closed_refusal(self):
-        with self.assertRaisesRegex(bootstrap.Refusal, "dash_bottle_invalid"):
+        with self.assertRaises(bootstrap.Refusal) as caught:
             bootstrap._extract_dash_member(b"not a tarball")
+        self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
+        self.assertEqual(caught.exception.stage, "dash_archive_structure")
 
-    def test_bounded_archive_extracts_only_the_pinned_regular_binary(self):
+    def test_bounded_archive_accepts_only_bounded_pax_metadata(self):
         formula = b"verified formula fixture\n"
         binary = b"public dash fixture bytes\n"
         output = io.BytesIO()
-        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
             for name in ("dash-shell", "dash-shell/0.5.13.5", "dash-shell/0.5.13.5/bin",
                          "dash-shell/0.5.13.5/.brew"):
                 directory = tarfile.TarInfo(name)
                 directory.type = tarfile.DIRTYPE
                 directory.mode = 0o755
+                directory.pax_headers = {"mtime": "1782491111.5", "uid": "0", "gid": "0"}
                 archive.addfile(directory)
             for name, payload, mode in (
                 (bootstrap.DASH_BINARY_MEMBER, binary, 0o755),
@@ -348,9 +375,38 @@ class PublicBottleTests(unittest.TestCase):
                 member = tarfile.TarInfo(name)
                 member.size = len(payload)
                 member.mode = mode
+                member.pax_headers = {
+                    "mtime": "1782491111.5",
+                    "atime": "1782491112",
+                    "ctime": "1782491113.5",
+                    "LIBARCHIVE.creationtime": "1782491114.25",
+                    "uid": "0",
+                    "gid": "0",
+                    "hdrcharset": "UTF-8",
+                }
                 archive.addfile(member, io.BytesIO(payload))
         with patch.object(bootstrap, "DASH_FORMULA_SHA256", hashlib.sha256(formula).hexdigest()):
             self.assertEqual(bootstrap._extract_dash_member(output.getvalue()), binary)
+
+    def test_pax_path_link_size_and_sparse_overrides_are_closed_refusals(self):
+        for key, value in (
+            ("path", bootstrap.DASH_BINARY_MEMBER),
+            ("linkpath", "unused"),
+            ("size", "1"),
+            ("GNU.sparse.map", "0,1"),
+        ):
+            with self.subTest(key=key):
+                output = io.BytesIO()
+                with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+                    member = tarfile.TarInfo(bootstrap.DASH_BINARY_MEMBER)
+                    member.size = 1
+                    member.mode = 0o755
+                    member.pax_headers = {key: value}
+                    archive.addfile(member, io.BytesIO(b"x"))
+                with self.assertRaises(bootstrap.Refusal) as caught:
+                    bootstrap._extract_dash_member(output.getvalue())
+                self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
+                self.assertEqual(caught.exception.stage, "dash_archive_pax_metadata")
 
     def test_bounded_archive_rejects_link_members(self):
         output = io.BytesIO()
@@ -359,8 +415,23 @@ class PublicBottleTests(unittest.TestCase):
             link.type = tarfile.SYMTYPE
             link.linkname = "../../etc/passwd"
             archive.addfile(link)
-        with self.assertRaisesRegex(bootstrap.Refusal, "dash_bottle_invalid"):
+        with self.assertRaises(bootstrap.Refusal) as caught:
             bootstrap._extract_dash_member(output.getvalue())
+        self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
+        self.assertEqual(caught.exception.stage, "dash_archive_member")
+
+    def test_bounded_archive_rejects_contiguous_members(self):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.GNU_FORMAT) as archive:
+            member = tarfile.TarInfo(bootstrap.DASH_BINARY_MEMBER)
+            member.type = tarfile.CONTTYPE
+            member.mode = 0o755
+            member.size = 1
+            archive.addfile(member, io.BytesIO(b"x"))
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._extract_dash_member(output.getvalue())
+        self.assertEqual(caught.exception.reason, "dash_bottle_invalid")
+        self.assertEqual(caught.exception.stage, "dash_archive_member")
 
 
 class LeaseRecordTests(unittest.TestCase):
