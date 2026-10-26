@@ -319,7 +319,7 @@ class RequestAndGateTests(unittest.TestCase):
 class PublicBottleTests(unittest.TestCase):
     def test_bottle_urls_are_fixed_public_reads(self):
         self.assertEqual(bootstrap.DASH_BOTTLE_SHA256, "0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0")
-        self.assertEqual(bootstrap.DASH_FORMULA_SHA256, "7a414fa6d299c0697053cb3f796b94d13682cd43c20e8ba62ce515cb3a1c3d14")
+        self.assertEqual(bootstrap.DASH_FORMULA_SHA256, "6c709b56df106be6b2109a5a8647e24d4fadb5533394abfc55e564478fd53cb4")
         self.assertTrue(bootstrap.DASH_BOTTLE_URL.startswith("https://ghcr.io/v2/homebrew/core/dash-shell/blobs/"))
         token_url = urllib.parse.urlsplit(bootstrap.DASH_TOKEN_URL)
         self.assertEqual((token_url.scheme, token_url.netloc, token_url.path), ("https", "ghcr.io", "/token"))

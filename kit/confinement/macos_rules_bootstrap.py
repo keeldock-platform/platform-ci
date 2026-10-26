@@ -51,7 +51,7 @@ TOKEN_RE = re.compile(r"[!-~]{1,4096}\Z")
 
 DASH_FORMULA = "homebrew/core/dash-shell"
 DASH_VERSION = "0.5.13.5"
-DASH_FORMULA_SHA256 = "7a414fa6d299c0697053cb3f796b94d13682cd43c20e8ba62ce515cb3a1c3d14"
+DASH_FORMULA_SHA256 = "6c709b56df106be6b2109a5a8647e24d4fadb5533394abfc55e564478fd53cb4"
 DASH_BOTTLE_SHA256 = "0e104457d0d188129596ee04e4f88ab6039baf9a03e183820caf0aa333d581d0"
 DASH_BOTTLE_URL = (
     "https://ghcr.io/v2/homebrew/core/dash-shell/blobs/sha256:" + DASH_BOTTLE_SHA256
