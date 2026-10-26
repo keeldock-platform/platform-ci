@@ -635,10 +635,11 @@ def cache_proof_audit_fixture():
             "Verify exact fixture bytes after a cache hit",
         )),
         (audit.CACHE_PROOF_NONE_JOB_NAME, 405, 505, "completed", "success", (
-            "Fetch reviewed main control", "Require fixture is absent before the denied read",
-            "Request the known fixture with the none-scoped token",
+            "Fetch reviewed main control", "Fetch the exact pinned public cache client",
+            "Require fixture is absent before the denied read",
+            "Request the known fixture through the pinned cache client",
             "Verify the none-scoped read did not restore bytes", "Prepare a distinct public write probe",
-            "Request a cache save with the none-scoped token", "Confirm save request completed",
+            "Request a save through the pinned cache client", "Confirm save request completed",
         )),
         (audit.CACHE_PROOF_AUDIT_JOB_NAME, 406, 506, "in_progress", None, ()),
         (audit.CACHE_PROOF_CLEANUP_JOB_NAME, 407, 507, "queued", None, ()),
@@ -679,12 +680,18 @@ def cache_proof_audit_fixture():
             + b" run-attempt=" + RUN_ATTEMPT.encode("ascii") + b"\n"
         ),
         audit.CACHE_PROOF_NONE_JOB_NAME: (
-            b"::warning::Failed to restore: cache read denied: scope none\n"
-            b"Cache not found for input keys: " + seed_key.encode("ascii") + b"\n"
+            b"macos-cache-client-source=verified schema=1 action-sha="
+            + audit.CACHE_PROOF_ACTION_SHA.encode("ascii") + b"\n"
+            b"macos-cache-client=read-denied schema=1 action-sha="
+            + audit.CACHE_PROOF_ACTION_SHA.encode("ascii") + b" key=" + seed_key.encode("ascii")
+            + b" control-sha=" + CONTROL_SHA.encode("ascii") + b" run-id=" + RUN_ID.encode("ascii")
+            + b" run-attempt=" + RUN_ATTEMPT.encode("ascii") + b" node=24.0.0\n"
             b"macos-cache-none-read=local-absent schema=1 run-id=" + RUN_ID.encode("ascii")
             + b" run-attempt=" + RUN_ATTEMPT.encode("ascii")
-            + b"\n::warning::Unable to reserve cache with key " + write_key.encode("ascii")
-            + b". More details: cache write denied: scope none\n"
+            + b"\nmacos-cache-client=write-denied schema=1 action-sha="
+            + audit.CACHE_PROOF_ACTION_SHA.encode("ascii") + b" key=" + write_key.encode("ascii")
+            + b" control-sha=" + CONTROL_SHA.encode("ascii") + b" run-id=" + RUN_ID.encode("ascii")
+            + b" run-attempt=" + RUN_ATTEMPT.encode("ascii") + b" node=24.0.0\n"
             b"macos-cache-none-save=request-finished schema=1 run-id=" + RUN_ID.encode("ascii")
             + b" run-attempt=" + RUN_ATTEMPT.encode("ascii") + b"\n"
         ),
@@ -735,43 +742,35 @@ def cache_proof_audit_fixture():
 
 
 class CacheProofAuditTests(unittest.TestCase):
-    def test_cache_probe_log_scanner_only_allows_the_two_expected_warning_commands(self):
-        _, write_key = cache_proof_keys()
+    def test_cache_probe_log_scanner_only_allows_fixed_client_markers(self):
         allowed = (
-            b"::warning::Failed to restore: cache read denied: scope none\n"
-            b"::warning::Unable to reserve cache with key " + write_key.encode("ascii")
-            + b". More details: cache write denied: scope none\n"
+            b"macos-cache-client=read-denied schema=1\n"
+            b"macos-cache-client=write-denied schema=1\n"
         )
-        audit.inspect_cache_probe_public_bytes(allowed, CONTROL_SHA, write_key)
+        audit.inspect_cache_probe_public_bytes(allowed, CONTROL_SHA)
 
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.inspect_cache_probe_public_bytes(
-                b"::warning::unrelated cache read denied: notice\n", CONTROL_SHA, write_key
+                b"::warning::unrelated cache read denied: notice\n", CONTROL_SHA
             )
         self.assertEqual(caught.exception.reason, "workflow_command_exposed")
 
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.inspect_cache_probe_public_bytes(
-                b"::warning::Unable to reserve cache with key wrong-key. More details: cache write denied: scope none\n",
-                CONTROL_SHA,
-                write_key,
+                b"Cache restore skipped because cache access is unavailable\n", CONTROL_SHA
             )
         self.assertEqual(caught.exception.reason, "workflow_command_exposed")
 
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.inspect_cache_probe_public_bytes(
-                b"::warning::Failed to restore: cache read denied: ::set-output name=leak::value\n",
-                CONTROL_SHA,
-                write_key,
+                b"cache read denied: scope none\n", CONTROL_SHA
             )
         self.assertEqual(caught.exception.reason, "workflow_command_exposed")
 
         canary = audit.derive_reviewed_canary(CONTROL_SHA)
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.inspect_cache_probe_public_bytes(
-                b"::warning::Failed to restore: cache read denied: " + canary + b"\n",
-                CONTROL_SHA,
-                write_key,
+                b"macos-cache-client=read-denied schema=1 " + canary + b"\n", CONTROL_SHA
             )
         self.assertEqual(caught.exception.reason, "canary_exposed")
 
@@ -835,11 +834,17 @@ class CacheProofAuditTests(unittest.TestCase):
             ("positive miss", lambda logs, pages: logs.__setitem__(404, logs[404].replace(
                 b"Cache restored from key:", b"Cache not found for input keys:")), "receipt_invalid"),
             ("read denial missing", lambda logs, pages: logs.__setitem__(405, logs[405].replace(
-                b"cache read denied:", b"cache request failed:")), "workflow_command_exposed"),
+                b"macos-cache-client=read-denied", b"macos-cache-client=read-missed")), "receipt_invalid"),
             ("write denial missing", lambda logs, pages: logs.__setitem__(405, logs[405].replace(
-                b"cache write denied:", b"cache request failed:")), "workflow_command_exposed"),
+                b"macos-cache-client=write-denied", b"macos-cache-client=write-missed")), "receipt_invalid"),
+            ("wrong action pin", lambda logs, pages: logs.__setitem__(405, logs[405].replace(
+                audit.CACHE_PROOF_ACTION_SHA.encode("ascii"), b"0" * 40, 1)), "receipt_invalid"),
+            ("wrong run identity", lambda logs, pages: logs.__setitem__(405, logs[405].replace(
+                b"run-attempt=" + RUN_ATTEMPT.encode("ascii"), b"run-attempt=9", 1)), "receipt_invalid"),
+            ("node outside action runtime", lambda logs, pages: logs.__setitem__(405, logs[405].replace(
+                b"node=24.0.0", b"node=22.0.0", 1)), "receipt_invalid"),
             ("read unexpectedly succeeded", lambda logs, pages: logs.__setitem__(405, logs[405] +
-                b"Cache restored from key: " + cache_proof_keys()[0].encode("ascii")), "receipt_invalid"),
+                b"Cache restored from key: " + cache_proof_keys()[0].encode("ascii")), "workflow_command_exposed"),
         )
         for label, mutate, reason in cases:
             with self.subTest(case=label):

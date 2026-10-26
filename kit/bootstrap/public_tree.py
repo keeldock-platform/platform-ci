@@ -27,6 +27,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/test_macos_deny_default.py",
         "kit/confinement/macos_public_audit.py",
         "kit/confinement/test_macos_public_audit.py",
+        "kit/confinement/macos_cache_client/action.yml",
+        "kit/confinement/macos_cache_client/index.js",
         "kit/confinement/macos_reviewed_build.py",
         "kit/confinement/test_macos_reviewed_build.py",
         "kit/confinement/macos_harness.py",

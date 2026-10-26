@@ -203,18 +203,34 @@ jobs:
           if [[ "$actual_sha" != "$CI_SHA" ]]; then
             exit 1
           fi
+      - name: Fetch the exact pinned public cache client
+        run: |
+          set -euo pipefail
+          client_dir="$RUNNER_TEMP/macos-cache-client"
+          if [[ -e "$client_dir" || -L "$client_dir" ]]; then
+            exit 1
+          fi
+          git init -q "$client_dir" 2>/dev/null
+          git -C "$client_dir" config core.autocrlf false 2>/dev/null
+          git -C "$client_dir" remote add origin "${CI_SERVER_URL%/}/actions/cache.git" 2>/dev/null
+          git -C "$client_dir" fetch --quiet --no-tags --depth=1 origin 3edfce9056124e459a23f683a21433670d47daca 2>/dev/null
+          git -C "$client_dir" checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_client_sha="$(git -C "$client_dir" rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_client_sha" != "3edfce9056124e459a23f683a21433670d47daca" ]]; then
+            exit 1
+          fi
+          printf 'macos-cache-client-source=verified schema=1 action-sha=%s\n' "$actual_client_sha"
       - name: Require fixture is absent before the denied read
         run: |
           set -euo pipefail
           if [[ -e "$RUNNER_TEMP/macos-public-cache/fixture.txt" ]]; then
             exit 1
           fi
-      - name: Request the known fixture with the none-scoped token
+      - name: Request the known fixture through the pinned cache client
         id: denied-restore
-        uses: actions/cache/restore@3edfce9056124e459a23f683a21433670d47daca
-        env:
-          ACTIONS_CACHE_MODE: read
+        uses: ./kit/confinement/macos_cache_client
         with:
+          mode: read
           path: ${{ runner.temp }}/macos-public-cache/fixture.txt
           key: macos-public-cache-seed-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Verify the none-scoped read did not restore bytes
@@ -232,12 +248,11 @@ jobs:
           fixture_dir="$RUNNER_TEMP/macos-public-cache-write"
           mkdir -p "$fixture_dir"
           printf '%s\n' 'Public macOS cache write probe v1' > "$fixture_dir/fixture.txt"
-      - name: Request a cache save with the none-scoped token
+      - name: Request a save through the pinned cache client
         id: denied-save
-        uses: actions/cache/save@3edfce9056124e459a23f683a21433670d47daca
-        env:
-          ACTIONS_CACHE_MODE: write
+        uses: ./kit/confinement/macos_cache_client
         with:
+          mode: write
           path: ${{ runner.temp }}/macos-public-cache-write/fixture.txt
           key: macos-public-cache-none-write-v1-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Confirm save request completed

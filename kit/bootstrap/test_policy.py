@@ -28,6 +28,8 @@ LINUX_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/linux-
 MACOS_CAPABILITY_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-capability.yml"
 MACOS_REVIEWED_BUILD_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-reviewed-build.yml"
 MACOS_CACHE_PROOF_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-cache-proof.yml"
+MACOS_CACHE_CLIENT_ACTION = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/action.yml"
+MACOS_CACHE_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/index.js"
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-native-preflight.yml"
 PROBE_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_capability.py"
 PLATFORM_ACTION = Path(__file__).resolve().parent / "action.yml"
@@ -406,20 +408,44 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertIn("  macos-cache-positive:\n", workflow)
         self.assertIn("    cache-mode: read\n", workflow)
         self.assertIn("  macos-cache-none-probe:\n", workflow)
-        self.assertIn("ACTIONS_CACHE_MODE: read", workflow)
-        self.assertIn("ACTIONS_CACHE_MODE: write", workflow)
+        self.assertNotIn("ACTIONS_CACHE_MODE:", workflow)
         self.assertIn("fail-on-cache-miss: true", workflow)
         self.assertIn("cmp -s", workflow)
         action_prefix = "uses: actions/cache/"
-        self.assertEqual(workflow.count(action_prefix), 4)
+        self.assertEqual(workflow.count(action_prefix), 2)
         self.assertEqual(
             workflow.count("uses: actions/cache/restore@" + MACOS_CACHE_PROOF_ACTION_SHA),
-            2,
+            1,
         )
         self.assertEqual(
             workflow.count("uses: actions/cache/save@" + MACOS_CACHE_PROOF_ACTION_SHA),
-            2,
+            1,
         )
+        self.assertIn('"${CI_SERVER_URL%/}/actions/cache.git"', workflow)
+        self.assertIn("git fetch --quiet --no-tags --depth=1 origin " + MACOS_CACHE_PROOF_ACTION_SHA, workflow)
+        self.assertIn("macos-cache-client-source=verified schema=1 action-sha=", workflow)
+        self.assertIn("uses: ./kit/confinement/macos_cache_client", workflow)
+        self.assertIn("mode: read\n", workflow)
+        self.assertIn("mode: write\n", workflow)
+        client_metadata = MACOS_CACHE_CLIENT_ACTION.read_text(encoding="utf-8")
+        self.assertIn("description:", client_metadata)
+        self.assertIn("using: node24", client_metadata)
+        self.assertIn("main: index.js", client_metadata)
+        self.assertIn("The cache operation to request.", client_metadata)
+        self.assertIn("The public fixture path used by the cache operation.", client_metadata)
+        self.assertIn("The exact run-scoped public cache key.", client_metadata)
+        client_source = MACOS_CACHE_CLIENT_SOURCE.read_text(encoding="utf-8")
+        self.assertIn('process.env.ACTIONS_CACHE_MODE !== "none"', client_source)
+        self.assertIn("{ ACTIONS_CACHE_MODE: mode }", client_source)
+        self.assertIn('"dist/restore-only/index.js"', client_source)
+        self.assertIn('"dist/save-only/index.js"', client_source)
+        self.assertIn('process.env.ACTIONS_RUNTIME_TOKEN', client_source)
+        self.assertIn('cache read denied:"', client_source)
+        self.assertIn('cache write denied:"', client_source)
+        self.assertIn('(403) Forbidden: cache read denied:', client_source)
+        self.assertIn('(403) Forbidden: cache write denied:', client_source)
+        self.assertIn('" key=" + key + " control-sha="', client_source)
+        self.assertIn('process.version.match(/^v24\\.', client_source)
         self.assertIn("cache-proof-snapshot", workflow)
         self.assertIn("cache-proof-audit", workflow)
         self.assertIn("cache-proof-cleanup", workflow)
@@ -440,6 +466,10 @@ class WorkflowPolicyTests(unittest.TestCase):
             self.assertNotIn("secrets.", runner_job)
         self.assertNotIn("actions: write", workflow.split("  macos-cache-cleanup:\n", 1)[0])
         self.assertIn("actions: write", cleanup)
+        self.assertIn("Fetch the exact pinned public cache client", probe)
+        self.assertIn("Request the known fixture through the pinned cache client", probe)
+        self.assertIn("Request a save through the pinned cache client", probe)
+        self.assertNotIn("ACTIONS_CACHE_MODE", probe)
         for forbidden in (
             "source-read",
             "environment:",
@@ -465,8 +495,22 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace("cache-mode: none\n", "cache-mode: read\n", 1),
             base.replace("    cache-mode: write\n", "    cache-mode: none\n", 1),
             base.replace("    cache-mode: read\n", "    cache-mode: none\n", 1),
-            base.replace("ACTIONS_CACHE_MODE: read", "ACTIONS_CACHE_MODE: none"),
-            base.replace("ACTIONS_CACHE_MODE: write", "ACTIONS_CACHE_MODE: none"),
+            base.replace(
+                "  macos-cache-none-probe:\n    needs: macos-cache-positive\n"
+                "    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}\n"
+                "    runs-on: macos-15\n    cache-mode: none\n",
+                "  macos-cache-none-probe:\n    needs: macos-cache-positive\n"
+                "    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}\n"
+                "    runs-on: macos-15\n    cache-mode: read\n",
+            ),
+            base.replace("          mode: read\n          path: ${{ runner.temp }}/macos-public-cache/fixture.txt\n",
+                         "          mode: write\n          path: ${{ runner.temp }}/macos-public-cache/fixture.txt\n"),
+            base.replace("          mode: write\n          path: ${{ runner.temp }}/macos-public-cache-write/fixture.txt\n",
+                         "          mode: read\n          path: ${{ runner.temp }}/macos-public-cache-write/fixture.txt\n"),
+            base.replace("git fetch --quiet --no-tags --depth=1 origin " + MACOS_CACHE_PROOF_ACTION_SHA,
+                         "git fetch --quiet --no-tags --depth=1 origin " + "0" * 40),
+            base.replace("uses: ./kit/confinement/macos_cache_client",
+                         "uses: actions/cache/restore@" + MACOS_CACHE_PROOF_ACTION_SHA, 1),
             base.replace(MACOS_CACHE_PROOF_ACTION_SHA, "0" * 40),
             base.replace("fail-on-cache-miss: true", "fail-on-cache-miss: false"),
             base.replace("cmp -s", "true " + chr(35) + " invalid-comment"),
