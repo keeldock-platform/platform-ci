@@ -127,6 +127,8 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn(".github/workflows/macos-capability.yml", result)
         self.assertIn(".github/workflows/macos-reviewed-build.yml", result)
         self.assertIn(".github/workflows/macos-cache-proof.yml", result)
+        self.assertIn(".github/workflows/macos-source-reader-preflight.yml", result)
+        self.assertIn(".github/workflows/macos-rules-reader-preflight.yml", result)
         self.assertIn(".github/workflows/windows-native-preflight.yml", result)
         self.assertIn("kit/confinement/macos_boundary_guard.py", result)
         self.assertIn("kit/confinement/test_macos_boundary_guard.py", result)
@@ -139,6 +141,8 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("kit/confinement/macos_cache_client/index.js", result)
         self.assertIn("kit/confinement/macos_reviewed_build.py", result)
         self.assertIn("kit/confinement/test_macos_reviewed_build.py", result)
+        self.assertIn("kit/confinement/macos_source_reader.py", result)
+        self.assertIn("kit/confinement/test_macos_source_reader.py", result)
         self.assertIn("kit/confinement/macos_harness.py", result)
         self.assertIn("kit/confinement/macos_capability.py", result)
         self.assertIn("kit/confinement/macos_capability.swift", result)
@@ -163,12 +167,14 @@ class PublicTreeTests(unittest.TestCase):
             with self.assertRaisesRegex(PublicTreeError, "tree-shape"):
                 scan_tree(root, "platform")
 
-    def test_windows_native_preflight_controls_have_public_tree_hash_pins(self):
+    def test_reviewed_windows_and_source_reader_controls_have_public_tree_hash_pins(self):
         expected = {
             ".github/workflows/windows-native-preflight.yml",
             "kit/confinement/windows_native_preflight.cs",
             "kit/confinement/windows_native_preflight.ps1",
             "kit/confinement/test_windows_native_preflight.py",
+            "kit/confinement/macos_source_reader.py",
+            "kit/confinement/test_macos_source_reader.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))

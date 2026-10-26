@@ -26,6 +26,60 @@ CACHE_PROOF_CLEANUP_JOB_NAME = "macos-cache-cleanup"
 CACHE_PROOF_ACTION_SHA = "3edfce9056124e459a23f683a21433670d47daca"
 CACHE_PROOF_SEED_KEY_PREFIX = "macos-public-cache-seed-v1-"
 CACHE_PROOF_NONE_WRITE_KEY_PREFIX = "macos-public-cache-none-write-v1-"
+SOURCE_READER_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
+SOURCE_READER_CONFIGURATIONS = {
+    "core": {
+        "workflow_path": ".github/workflows/macos-source-reader-preflight.yml",
+        "environment_name": "source-read",
+        "environment_id": 25337167708,
+        "branch_policy_id": 64386356,
+    },
+    "rules": {
+        "workflow_path": ".github/workflows/macos-rules-reader-preflight.yml",
+        "environment_name": "rules-source-read",
+        "environment_id": 25357465381,
+        "branch_policy_id": 64411429,
+    },
+}
+SOURCE_READER_PHASES = {
+    "source-reader-settings-core": ("settings", "core"),
+    "source-reader-snapshot-core": ("snapshot", "core"),
+    "source-reader-audit-core": ("audit", "core"),
+    "source-reader-settings-rules": ("settings", "rules"),
+    "source-reader-snapshot-rules": ("snapshot", "rules"),
+    "source-reader-audit-rules": ("audit", "rules"),
+}
+SOURCE_READER_SETTINGS_JOB_NAME = "macos-source-reader-settings"
+SOURCE_READER_TOKEN_JOB_NAME = "macos-source-reader-token"
+SOURCE_READER_AUDIT_JOB_NAME = "macos-source-reader-audit"
+SOURCE_READER_SUCCESS_RECORD = (
+    b'{"metadata":"verified","reason":"ok","repository_scope":"verified",'
+    b'"revocation":"confirmed","schema_version":1,"status":"passed"}'
+)
+_GITHUB_LOG_TIMESTAMP = (
+    rb"(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    rb"(?:\.[0-9]+)?Z )?"
+)
+SOURCE_READER_INSTALLATION_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-source-reader-installation=verified schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"installation-id=([1-9][0-9]{0,18})(?=\r?(?:\n|$))"
+)
+SOURCE_READER_SCOPE_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-source-reader-scope=verified schema=1 action-sha="
+    + SOURCE_READER_ACTION_SHA.encode("ascii")
+    + rb" control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"installation-id=([1-9][0-9]{0,18}) repository-id=([1-9][0-9]{0,18}) "
+    rb"repositories=1 permission=contents-read metadata=verified revocation=confirmed "
+    rb"source-content=not-read(?=\r?(?:\n|$))"
+)
+SOURCE_READER_SUCCESS_RECORD_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP + re.escape(SOURCE_READER_SUCCESS_RECORD)
+    + rb"(?=\r?(?:\n|$))"
+)
 API_ORIGIN = "https://api.github.com"
 API_HOST = "api.github.com"
 API_VERSION = "2022-11-28"
@@ -898,6 +952,202 @@ def _cache_proof_jobs(api, run_id, run_attempt, control_sha):
     return details
 
 
+def _source_reader_configuration(kind):
+    if type(kind) is not str or kind not in SOURCE_READER_CONFIGURATIONS:
+        _fail("invalid_input")
+    return SOURCE_READER_CONFIGURATIONS[kind]
+
+
+def _validate_source_reader_branch_policy(item):
+    if (type(item) is not dict or not _exact_int(item.get("id"), 1)
+            or item.get("name") != "main" or item.get("type") != "branch"):
+        _fail("api_schema")
+
+
+def _verify_source_reader_environment(api, kind, control_sha, run_id, run_attempt):
+    configuration = _source_reader_configuration(kind)
+    environment_path = (
+        "/repos/keeldock-platform/platform-ci/environments/"
+        + configuration["environment_name"]
+    )
+    environment, _ = api.json(environment_path)
+    branch_policy = environment.get("deployment_branch_policy") if type(environment) is dict else None
+    if (type(environment) is not dict
+            or type(environment.get("id")) is not int
+            or environment.get("id") != configuration["environment_id"]
+            or environment.get("name") != configuration["environment_name"]
+            or type(branch_policy) is not dict
+            or type(branch_policy.get("custom_branch_policies")) is not bool
+            or branch_policy.get("custom_branch_policies") is not True
+            or type(branch_policy.get("protected_branches")) is not bool
+            or branch_policy.get("protected_branches") is not False):
+        _fail("api_schema")
+    policies_path = environment_path + "/deployment-branch-policies"
+    policies = _read_counted_collection(
+        api, policies_path, "branch_policies", 100, _validate_source_reader_branch_policy
+    )
+    if (len(policies) != 1
+            or policies[0].get("id") != configuration["branch_policy_id"]
+            or policies[0].get("name") != "main"
+            or policies[0].get("type") != "branch"):
+        _fail("api_schema")
+    return (
+        "macos-source-environment=verified schema=1 kind=" + kind
+        + " name=" + configuration["environment_name"]
+        + " environment-id=" + str(configuration["environment_id"])
+        + " policy-id=" + str(configuration["branch_policy_id"])
+        + " custom-branch-policies=true protected-branches=false branch=main branch-type=branch"
+        + " control-sha=" + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+    ).encode("ascii")
+
+
+def _source_reader_step_names(job, expected_names):
+    steps = job.get("steps")
+    actual = [step.get("name") for step in steps] if type(steps) is list else []
+    if len(actual) != len(set(actual)) or any(name not in actual for name in expected_names):
+        _fail("api_schema")
+
+
+def _source_reader_jobs(api, run_id, run_attempt, control_sha):
+    path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + run_id
+        + "/attempts/" + run_attempt + "/jobs"
+    )
+    jobs = _read_counted_collection(api, path, "jobs", 10000, _validate_job_record)
+    expected_names = {
+        SOURCE_READER_SETTINGS_JOB_NAME,
+        SOURCE_READER_TOKEN_JOB_NAME,
+        SOURCE_READER_AUDIT_JOB_NAME,
+    }
+    if (len(jobs) != len(expected_names)
+            or {job.get("name") for job in jobs} != expected_names):
+        _fail("api_schema")
+    by_name = {job["name"]: job for job in jobs}
+    audit_job = by_name[SOURCE_READER_AUDIT_JOB_NAME]
+    if (audit_job.get("run_id") != int(run_id)
+            or audit_job.get("run_attempt") != int(run_attempt)
+            or audit_job.get("head_sha") != control_sha
+            or audit_job.get("status") != "in_progress"):
+        _fail("run_identity_mismatch")
+    expected_steps = {
+        SOURCE_READER_SETTINGS_JOB_NAME: (
+            "Fetch reviewed main control",
+            "Validate source-free control tree",
+            "Verify exact protected environment settings",
+            "Snapshot public surfaces",
+        ),
+        SOURCE_READER_TOKEN_JOB_NAME: (
+            "Fetch reviewed main control",
+            "Validate source-reader scope configuration",
+            "Mint scoped source-reader token",
+            "Verify selected installation identity",
+            "Verify one-repository read scope and revoke token",
+            "Write trusted summary visibility control",
+        ),
+    }
+    details = {}
+    for name, step_names in expected_steps.items():
+        details[name] = _job_detail(api, by_name[name], run_id, run_attempt, control_sha, name)
+        _source_reader_step_names(details[name][0], step_names)
+    return details
+
+
+def _require_source_reader_log_line(raw, expected, marker):
+    if (type(raw) is not bytes or not raw
+            or len(re.findall(
+                rb"(?m)^" + _GITHUB_LOG_TIMESTAMP + re.escape(expected) + rb"(?=\r?(?:\n|$))",
+                raw,
+            )) != 1
+            or raw.count(marker) != 1):
+        _fail("receipt_invalid")
+
+
+def _inspect_source_reader_markers(settings_log, token_log, kind, control_sha, run_id, run_attempt):
+    configuration = _source_reader_configuration(kind)
+    expected_settings = (
+        "macos-source-environment=verified schema=1 kind=" + kind
+        + " name=" + configuration["environment_name"]
+        + " environment-id=" + str(configuration["environment_id"])
+        + " policy-id=" + str(configuration["branch_policy_id"])
+        + " custom-branch-policies=true protected-branches=false branch=main branch-type=branch"
+        + " control-sha=" + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+    ).encode("ascii")
+    snapshot_line = (
+        "macos-source-reader-snapshot=ready schema=1 control-sha=" + control_sha
+        + " run-id=" + run_id + " run-attempt=" + run_attempt
+    ).encode("ascii")
+    _require_source_reader_log_line(
+        settings_log, expected_settings, b"macos-source-environment="
+    )
+    _require_source_reader_log_line(
+        settings_log, snapshot_line, b"macos-source-reader-snapshot="
+    )
+    installation_matches = list(SOURCE_READER_INSTALLATION_MARKER_RE.finditer(token_log))
+    scope_matches = list(SOURCE_READER_SCOPE_MARKER_RE.finditer(token_log))
+    record_matches = list(SOURCE_READER_SUCCESS_RECORD_RE.finditer(token_log))
+    if (len(installation_matches) != 1 or token_log.count(b"macos-source-reader-installation=") != 1
+            or len(scope_matches) != 1 or token_log.count(b"macos-source-reader-scope=") != 1
+            or len(record_matches) != 1 or token_log.count(b'{"metadata":') != 1):
+        _fail("receipt_invalid")
+    installation = installation_matches[0].groups()
+    scope = scope_matches[0].groups()
+    expected_sha = control_sha.encode("ascii")
+    expected_run = run_id.encode("ascii")
+    expected_attempt = run_attempt.encode("ascii")
+    if (installation[:3] != (expected_sha, expected_run, expected_attempt)
+            or scope[:3] != (expected_sha, expected_run, expected_attempt)
+            or installation[3] != scope[3]
+            or not _positive_decimal(scope[4].decode("ascii"))):
+        _fail("receipt_invalid")
+    _inspect_reviewed_summary_control_marker(token_log, control_sha, run_id, run_attempt)
+
+
+def _source_reader_audit(api, kind, control_sha, run_id, run_attempt, env):
+    configuration = _source_reader_configuration(kind)
+    _validate_run(api, run_id, run_attempt, control_sha, configuration["workflow_path"])
+    details = _source_reader_jobs(api, run_id, run_attempt, control_sha)
+    settings_job, settings_check_id, settings_steps_success = details[SOURCE_READER_SETTINGS_JOB_NAME]
+    token_job, token_check_id, token_steps_success = details[SOURCE_READER_TOKEN_JOB_NAME]
+    settings_log = api.log_text(settings_job["id"])
+    token_log = api.log_text(token_job["id"])
+    inspect_reviewed_public_bytes(settings_log, control_sha)
+    inspect_reviewed_public_bytes(token_log, control_sha)
+    _scan_annotations(api, settings_job, settings_check_id, control_sha, reviewed=True)
+    _scan_annotations(api, token_job, token_check_id, control_sha, reviewed=True)
+    _fetch_artifacts(api, run_id)
+    cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+    baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
+    if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
+        _fail("inventory_changed")
+    settings_marker = _verify_source_reader_environment(
+        api, kind, control_sha, run_id, run_attempt
+    )
+    if settings_job.get("conclusion") != "success" or not settings_steps_success:
+        _fail("native_job_failed")
+    if token_job.get("conclusion") != "success" or not token_steps_success:
+        _fail("native_job_failed")
+    _inspect_source_reader_markers(
+        settings_log, token_log, kind, control_sha, run_id, run_attempt
+    )
+    expected_settings = (
+        "macos-source-environment=verified schema=1 kind=" + kind
+        + " name=" + configuration["environment_name"]
+        + " environment-id=" + str(configuration["environment_id"])
+        + " policy-id=" + str(configuration["branch_policy_id"])
+        + " custom-branch-policies=true protected-branches=false branch=main branch-type=branch"
+        + " control-sha=" + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+    ).encode("ascii")
+    if settings_marker != expected_settings:
+        _fail("api_schema")
+    print(
+        "macos-source-reader-audit=verified schema=1 kind=" + kind
+        + " control-sha=" + control_sha + " run-id=" + run_id
+        + " run-attempt=" + run_attempt + " scope=one-private-repository-read"
+        + " revocation=confirmed source-content=not-read"
+    )
+    return 0
+
+
 def _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt):
     matches = list(REVIEWED_SMOKE_MARKER_RE.finditer(raw))
     if len(matches) != 1 or raw.count(b"macos-build=") != 1:
@@ -1027,10 +1277,11 @@ def _write_output(key, value, env):
 
 def run(phase, environ=None, api=None):
     env = os.environ if environ is None else environ
-    if phase not in {
+    supported_phases = {
         "snapshot", "audit", "reviewed-snapshot", "reviewed-audit",
         "cache-proof-snapshot", "cache-proof-audit", "cache-proof-cleanup",
-    }:
+    } | set(SOURCE_READER_PHASES)
+    if phase not in supported_phases:
         _fail("invalid_input")
     repository = env.get("GITHUB_REPOSITORY", "")
     run_id = env.get("GITHUB_RUN_ID", "")
@@ -1046,6 +1297,28 @@ def run(phase, environ=None, api=None):
         _fail("invalid_input")
     if phase in {"snapshot", "reviewed-snapshot", "cache-proof-snapshot"}:
         return _snapshot(phase, api, control_sha, run_id, run_attempt, env)
+
+    if phase in SOURCE_READER_PHASES:
+        operation, kind = SOURCE_READER_PHASES[phase]
+        configuration = _source_reader_configuration(kind)
+        if operation == "audit":
+            return _source_reader_audit(api, kind, control_sha, run_id, run_attempt, env)
+        _validate_run(api, run_id, run_attempt, control_sha, configuration["workflow_path"])
+        if operation == "settings":
+            print(
+                _verify_source_reader_environment(
+                    api, kind, control_sha, run_id, run_attempt
+                ).decode("ascii")
+            )
+            return 0
+        if operation == "snapshot":
+            digest = _fetch_caches(api, control_sha, reviewed=True)
+            _write_output("cache_snapshot", digest, env)
+            print(
+                "macos-source-reader-snapshot=ready schema=1 control-sha=" + control_sha
+                + " run-id=" + run_id + " run-attempt=" + run_attempt
+            )
+            return 0
 
     if phase == "cache-proof-audit":
         _validate_run(api, run_id, run_attempt, control_sha, CACHE_PROOF_WORKFLOW_PATH)
@@ -1186,10 +1459,10 @@ def run(phase, environ=None, api=None):
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
-    if len(args) != 1 or args[0] not in {
+    if len(args) != 1 or args[0] not in ({
         "snapshot", "audit", "reviewed-snapshot", "reviewed-audit",
         "cache-proof-snapshot", "cache-proof-audit", "cache-proof-cleanup",
-    }:
+    } | set(SOURCE_READER_PHASES)):
         print("macos-public-surface-audit=refused reason=invalid_input")
         return 2
     try:

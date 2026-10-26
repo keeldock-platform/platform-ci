@@ -1,0 +1,232 @@
+name: macos-rules-reader-preflight
+on:
+  workflow_dispatch:
+cache-mode: none
+permissions: {}
+jobs:
+  macos-source-reader-settings:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 15
+    permissions:
+      actions: read
+    outputs:
+      cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Validate source-free control tree
+        run: |
+          set -euo pipefail
+          python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_public_tree.py
+          python3 -B -m unittest discover -s kit/confinement -p "test_macos*.py"
+          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+      - name: Verify exact protected environment settings
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py source-reader-settings-rules
+      - name: Snapshot public surfaces
+        id: snapshot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py source-reader-snapshot-rules
+  macos-source-reader-token:
+    needs: macos-source-reader-settings
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    environment: rules-source-read
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 10
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Validate source-reader scope configuration
+        env:
+          SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
+          SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_READER_CLIENT_ID" =~ ^[A-Za-z0-9._-]{1,100}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$SOURCE_READER_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$SOURCE_REPOSITORY_ID" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$SOURCE_REPOSITORY_OWNER" =~ ^[A-Za-z0-9_.-]{1,100}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$SOURCE_REPOSITORY_NAME" =~ ^[A-Za-z0-9_.-]{1,100}$ ]]; then
+            exit 1
+          fi
+      - name: Mint scoped source-reader token
+        id: source-reader-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        with:
+          client-id: ${{ vars.SOURCE_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+          owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+          permission-contents: read
+      - name: Verify selected installation identity
+        env:
+          EXPECTED_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          ACTUAL_INSTALLATION_ID: ${{ steps.source-reader-token.outputs.installation-id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$ACTUAL_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ || "$ACTUAL_INSTALLATION_ID" != "$EXPECTED_INSTALLATION_ID" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          reader_prefix="macos-source-reader-"
+          printf '%sinstallation=verified schema=1 control-sha=%s run-id=%s run-attempt=%s installation-id=%s\n' "$reader_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$ACTUAL_INSTALLATION_ID"
+      - name: Verify one-repository read scope and revoke token
+        if: ${{ always() && steps.source-reader-token.outcome != 'skipped' }}
+        env:
+          SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          helper_json="$(env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C SOURCE_READER_TOKEN="$SOURCE_READER_TOKEN" SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" python3 -I -S -B kit/confinement/macos_source_reader.py)"
+          expected_json='{"meta''data":"verified","reason":"ok",'
+          expected_json+='"repository_scope":"verified","revocation":"confirmed",'
+          expected_json+='"schema_version":1,"status":"passed"}'
+          if [[ "$helper_json" != "$expected_json" ]]; then
+            exit 1
+          fi
+          if [[ ! "$SOURCE_READER_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$SOURCE_REPOSITORY_ID" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          printf '%s\n' "$helper_json"
+          reader_prefix="macos-source-reader-"
+          printf '%sscope=verified schema=1 action-sha=64ab729a6294000f5aa4a4bc0b73d1f32bc45510 control-sha=%s run-id=%s run-attempt=%s installation-id=%s repository-id=%s repositories=1 permission=contents-read metadata=verified revocation=confirmed source-content=not-read\n' "$reader_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_READER_INSTALLATION_ID" "$SOURCE_REPOSITORY_ID"
+      - name: Write trusted summary visibility control
+        run: |
+          set -euo pipefail
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          if [[ -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            exit 1
+          fi
+          summary_prefix="macos-summary-"
+          summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT"
+          printf '%s\n' "$summary_line" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$summary_line"
+  macos-source-reader-audit:
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    needs: [macos-source-reader-settings, macos-source-reader-token]
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      checks: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      MACOS_CACHE_SNAPSHOT: ${{ needs.macos-source-reader-settings.outputs.cache_snapshot }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Audit token scope and public surfaces
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py source-reader-audit-rules

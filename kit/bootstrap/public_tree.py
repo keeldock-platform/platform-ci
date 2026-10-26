@@ -12,6 +12,8 @@ PLATFORM_FILES = frozenset(
         ".github/workflows/macos-capability.yml",
         ".github/workflows/macos-reviewed-build.yml",
         ".github/workflows/macos-cache-proof.yml",
+        ".github/workflows/macos-source-reader-preflight.yml",
+        ".github/workflows/macos-rules-reader-preflight.yml",
         ".github/workflows/windows-native-preflight.yml",
         "ci/policy.json",
         "kit/bootstrap/action.yml",
@@ -31,6 +33,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/macos_cache_client/index.js",
         "kit/confinement/macos_reviewed_build.py",
         "kit/confinement/test_macos_reviewed_build.py",
+        "kit/confinement/macos_source_reader.py",
+        "kit/confinement/test_macos_source_reader.py",
         "kit/confinement/macos_harness.py",
         "kit/confinement/test_macos_harness.py",
         "kit/confinement/macos_capability.py",
@@ -57,6 +61,8 @@ PINNED_FILE_SHA256 = {
     "kit/confinement/windows_native_preflight.cs": "ba0f8859db9d8bcc1e4c8274520bcb67a3292cb311f553127e1f29fe13838543",
     "kit/confinement/windows_native_preflight.ps1": "8dbaaaad105c2fe0439dedb1b7c9572b8e7ec74a8db29f8edcab91169b06c58b",
     "kit/confinement/test_windows_native_preflight.py": "02d6bcf6d52d4c5f26589b6da8e224b5f0b3f8f57255e00c135f666caed613fe",
+    "kit/confinement/macos_source_reader.py": "00958e11bcaa10dc3ebccbe6ee8aadd119400653e7b2a3d8dfae68419cc5b63c",
+    "kit/confinement/test_macos_source_reader.py": "930d334fe774d13c9e2282fef10672f30f2bd04b32a494fe4075f5a18630fae5",
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(
