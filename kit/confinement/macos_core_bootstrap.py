@@ -39,7 +39,16 @@ REASONS = frozenset((
     "invalid_input", "bootstrap_gate_refused", "context_unavailable", "control_import_unavailable",
     "revocation_policy_invalid", "runner_controls_unavailable", "probe_identity_unavailable",
     "summary_write_allowed", "summary_changed", "lock_invalid", "manifest_mismatch",
-    "source_lease_unavailable", "cleanup_incomplete", "internal_error",
+    "source_lease_unavailable", "configuration_unavailable", "source_reader_unavailable",
+    "repository_scope_invalid", "source_fetch_unavailable", "revocation_unconfirmed",
+    "base_invalid", "signature_invalid", "bootstrap_snapshot_invalid", "bootstrap_not_approved",
+    "cleanup_incomplete", "internal_error",
+))
+SOURCE_VALIDATION_REASONS = frozenset((
+    "invalid_input", "context_unavailable", "configuration_unavailable", "source_reader_unavailable",
+    "repository_scope_invalid", "source_fetch_unavailable", "revocation_unconfirmed", "base_invalid",
+    "signature_invalid", "revocation_policy_invalid", "bootstrap_snapshot_invalid",
+    "bootstrap_not_approved", "cleanup_incomplete", "internal_error",
 ))
 STAGES = frozenset((
     "input", "gate", "context", "import", "inventory", "toolchain", "controls", "identity",
@@ -182,6 +191,19 @@ def _cleanup_after_refusal(environ, token_read, token_value, token_confirmed):
         except BaseException:
             return False
     return _revoke_pending_token(environ)
+
+
+def _runtime_revocation_confirmed(runtime, state, token, repository_id, request, binding):
+    if runtime is None or state is None or type(token) is not str:
+        return False
+    verifier = getattr(runtime, "revocation_confirmed", None)
+    if not callable(verifier):
+        return False
+    try:
+        result = verifier(state, token, repository_id, request, binding)
+    except BaseException:
+        return False
+    return type(result) is bool and result
 
 
 def _clean_reader_record(result):
@@ -749,6 +771,11 @@ def run(arguments=None, environ=None, token_reader=None):
     token_read = False
     token_value = None
     token_confirmed = False
+    runtime = None
+    request = None
+    binding = None
+    revocation_state = None
+    expected_repository_id = environment.get("SOURCE_REPOSITORY_ID", "")
     try:
         phase, source_sha, token_stdin = _parse_arguments(actual_arguments)
         phase_hint = phase
@@ -782,17 +809,44 @@ def run(arguments=None, environ=None, token_reader=None):
             "base_branch": "main",
             "concern": "core-bootstrap",
         }
+        revocation_state = runtime.RevocationState()
         try:
-            with runtime.validated_source(request, binding, root, environment) as lease:
-                record = _validate_lease_record(runtime, lease.record, binding, source_sha)
-                if "SOURCE_READER_TOKEN" in environment:
+            with runtime.validated_source(
+                request,
+                binding,
+                root,
+                environment,
+                revocation_state=revocation_state,
+            ) as lease:
+                token_confirmed = _runtime_revocation_confirmed(
+                    runtime,
+                    revocation_state,
+                    token_value,
+                    expected_repository_id,
+                    request,
+                    binding,
+                )
+                if not token_confirmed:
                     raise Refusal("source_lease_unavailable", "source_lease")
-                token_confirmed = True
+                record = _validate_lease_record(runtime, lease.record, binding, source_sha)
                 manifest = _verify_lock_manifest(lease.source_path)
         except runtime.Refusal as error:
-            if error.stage == "cleanup":
+            token_confirmed = token_confirmed or _runtime_revocation_confirmed(
+                runtime,
+                revocation_state,
+                token_value,
+                expected_repository_id,
+                request,
+                binding,
+            )
+            if error.stage == "cleanup" or error.reason == "cleanup_incomplete":
                 raise Refusal("cleanup_incomplete", "cleanup") from None
-            raise Refusal("source_lease_unavailable", "source_lease") from None
+            reason = (
+                error.reason
+                if type(error.reason) is str and error.reason in SOURCE_VALIDATION_REASONS
+                else "source_lease_unavailable"
+            )
+            raise Refusal(reason, "source_lease") from None
         except Refusal:
             raise
         except BaseException:
@@ -802,6 +856,15 @@ def run(arguments=None, environ=None, token_reader=None):
         _append_summary(summary_identity, line)
         return line, None
     except Refusal as error:
+        if phase_hint == "bootstrap":
+            token_confirmed = token_confirmed or _runtime_revocation_confirmed(
+                runtime,
+                revocation_state,
+                token_value,
+                expected_repository_id,
+                request,
+                binding,
+            )
         cleanup = _cleanup_after_refusal(environment, token_read, token_value, token_confirmed)
         token_state = None
         if phase_hint == "bootstrap":
@@ -820,6 +883,15 @@ def run(arguments=None, environ=None, token_reader=None):
         return _format_refusal(error, control_sha, environment, source_sha, token_state), 1
     except BaseException:
         error = Refusal("internal_error", "input")
+        if phase_hint == "bootstrap":
+            token_confirmed = token_confirmed or _runtime_revocation_confirmed(
+                runtime,
+                revocation_state,
+                token_value,
+                expected_repository_id,
+                request,
+                binding,
+            )
         cleanup = _cleanup_after_refusal(environment, token_read, token_value, token_confirmed)
         token_state = None
         if phase_hint == "bootstrap":

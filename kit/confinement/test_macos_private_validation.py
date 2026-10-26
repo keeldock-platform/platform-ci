@@ -186,6 +186,83 @@ class RevocationResultTests(unittest.TestCase):
         def run(self, environ=None):
             return self.result
 
+    def _run_snapshot_refusal_after_revocation(self, failure_stage):
+        token = "opaque-token-for-proof"
+        request = {
+            "source_sha": "a" * 40,
+            "base_sha": "a" * 40,
+            "base_branch": "main",
+            "concern": "core-bootstrap",
+        }
+        binding = {
+            "control_sha": "b" * 40,
+            "run_id": "12",
+            "run_attempt": "2",
+            "image_os": "macos-test",
+            "image_version": "1",
+        }
+        environment = {
+            "SOURCE_READER_TOKEN": token,
+            "SOURCE_REPOSITORY_ID": "123",
+        }
+        result = {
+            "schema_version": 1,
+            "status": "passed",
+            "reason": "ok",
+            "repository_scope": "verified",
+            "metadata": "verified",
+            "revocation": "confirmed",
+        }
+
+        class Reader:
+            TOKEN_ENV = "SOURCE_READER_TOKEN"
+
+            @staticmethod
+            def run(environ=None):
+                return result
+
+        def completed(returncode=0, stdout=b"", stderr=b""):
+            return subject.subprocess.CompletedProcess(("git",), returncode, stdout, stderr)
+
+        if failure_stage == "fetch":
+            commands = (completed(), completed(), completed(1))
+            expected = ("source_fetch_unavailable", "fetch")
+        else:
+            commands = (
+                completed(), completed(), completed(), completed(stdout=b"a" * 40 + b"\n"),
+                completed(stdout=b"a" * 40 + b"\n"), completed(stdout=b"false\n"), completed(),
+            )
+            expected = ("signature_invalid", "signature")
+        state = subject.RevocationState()
+        signer_inventory = (
+            None if failure_stage == "fetch"
+            else subject.Refusal("signature_invalid", "signature")
+        )
+        with patch.object(subject, "_resolve_trusted_executable", side_effect=lambda path: path), \
+                patch.object(subject, "_safe_temp_root", return_value=Path("snapshot-fixture")), \
+                patch.object(subject, "_control_inventory", return_value=()), \
+                patch.object(subject, "_load_source_reader", return_value=Reader), \
+                patch.object(subject, "_repository_configuration", return_value=(123, "owner", "repo", token)), \
+                patch.object(subject, "_verify_repository_scope"), \
+                patch.object(subject, "_base_git_environment", return_value={}), \
+                patch.object(subject, "_run_process", side_effect=commands), \
+                patch.object(subject, "_source_entry", return_value=("100644", "blob", "d" * 40)), \
+                patch.object(subject, "_read_source_blob", return_value=b"signer fixture\n"), \
+                patch.object(subject, "_signer_inventory", side_effect=signer_inventory), \
+                patch.object(subject, "_remove_tree"):
+            with self.assertRaises(subject.Refusal) as refusal:
+                subject._source_snapshot(
+                    request,
+                    binding,
+                    Path("control-root"),
+                    environment,
+                    revocation_state=state,
+                )
+        self.assertEqual((refusal.exception.reason, refusal.exception.stage), expected)
+        self.assertTrue(subject.revocation_confirmed(state, token, "123", request, binding))
+        self.assertNotIn("SOURCE_READER_TOKEN", environment)
+        return state, token, request, binding
+
     def test_exact_revocation_success_record_and_token_removal(self):
         environment = {"SOURCE_READER_TOKEN": "masked-token"}
         result = {
@@ -199,7 +276,7 @@ class RevocationResultTests(unittest.TestCase):
         self.assertEqual(subject._revoke_token(self.Reader(result), environment), result)
         self.assertNotIn("SOURCE_READER_TOKEN", environment)
 
-    def test_noncanonical_revocation_record_refuses_and_removes_token(self):
+    def test_noncanonical_revocation_record_refuses_and_retains_token(self):
         environment = {"SOURCE_READER_TOKEN": "masked-token"}
         result = {
             "schema_version": 1,
@@ -213,7 +290,182 @@ class RevocationResultTests(unittest.TestCase):
         with self.assertRaises(subject.Refusal) as refusal:
             subject._revoke_token(self.Reader(result), environment)
         self.assertEqual((refusal.exception.reason, refusal.exception.stage), ("revocation_unconfirmed", "revoke"))
-        self.assertNotIn("SOURCE_READER_TOKEN", environment)
+        self.assertEqual(environment["SOURCE_READER_TOKEN"], "masked-token")
+
+    def test_revocation_proof_binds_token_repository_control_source_and_run(self):
+        token = "opaque-token-for-proof"
+        repository_id = "123"
+        request = {
+            "source_sha": "a" * 40,
+            "base_sha": "a" * 40,
+            "base_branch": "main",
+            "concern": "core-bootstrap",
+        }
+        binding = {
+            "control_sha": "b" * 40,
+            "run_id": "12",
+            "run_attempt": "2",
+            "image_os": "macos-test",
+            "image_version": "1",
+        }
+        result = {
+            "schema_version": 1,
+            "status": "passed",
+            "reason": "ok",
+            "repository_scope": "verified",
+            "metadata": "verified",
+            "revocation": "confirmed",
+        }
+        environment = {"SOURCE_READER_TOKEN": token}
+        state = subject.RevocationState()
+        subject._revoke_token(
+            self.Reader(result),
+            environment,
+            revocation_state=state,
+            retained_token=token,
+            repository_id=repository_id,
+            request=request,
+            binding=binding,
+        )
+        self.assertTrue(subject.revocation_confirmed(state, token, repository_id, request, binding))
+        self.assertFalse(subject.revocation_confirmed(state, "different-token", repository_id, request, binding))
+        self.assertFalse(subject.revocation_confirmed(state, token, "124", request, binding))
+        changed_binding = dict(binding, run_attempt="3")
+        self.assertFalse(subject.revocation_confirmed(state, token, repository_id, request, changed_binding))
+        changed_request = dict(request, source_sha="c" * 40)
+        self.assertFalse(subject.revocation_confirmed(state, token, repository_id, changed_request, binding))
+
+    def test_unconfirmed_reader_result_never_creates_a_revocation_proof(self):
+        token = "opaque-token-for-proof"
+        request = {
+            "source_sha": "a" * 40,
+            "base_sha": "a" * 40,
+            "base_branch": "main",
+            "concern": "core-bootstrap",
+        }
+        binding = {
+            "control_sha": "b" * 40,
+            "run_id": "12",
+            "run_attempt": "2",
+            "image_os": "macos-test",
+            "image_version": "1",
+        }
+        refused = {
+            "schema_version": 1,
+            "status": "refused",
+            "reason": "revocation_unconfirmed",
+            "repository_scope": "verified",
+            "metadata": "verified",
+            "revocation": "unconfirmed",
+        }
+        environment = {"SOURCE_READER_TOKEN": token}
+        state = subject.RevocationState()
+        with self.assertRaises(subject.Refusal):
+            subject._revoke_token(
+                self.Reader(refused),
+                environment,
+                revocation_state=state,
+                retained_token=token,
+                repository_id="123",
+                request=request,
+                binding=binding,
+            )
+        self.assertEqual(environment["SOURCE_READER_TOKEN"], token)
+        self.assertFalse(subject.revocation_confirmed(state, token, "123", request, binding))
+
+    def test_confirmed_remote_receipt_survives_local_token_cleanup_failure(self):
+        token = "opaque-token-for-proof"
+        request = {
+            "source_sha": "a" * 40,
+            "base_sha": "a" * 40,
+            "base_branch": "main",
+            "concern": "core-bootstrap",
+        }
+        binding = {
+            "control_sha": "b" * 40,
+            "run_id": "12",
+            "run_attempt": "2",
+            "image_os": "macos-test",
+            "image_version": "1",
+        }
+        result = {
+            "schema_version": 1,
+            "status": "passed",
+            "reason": "ok",
+            "repository_scope": "verified",
+            "metadata": "verified",
+            "revocation": "confirmed",
+        }
+
+        class NoPop(dict):
+            def pop(self, key, default=None):
+                raise OSError
+
+        environment = NoPop({"SOURCE_READER_TOKEN": token})
+        state = subject.RevocationState()
+        with self.assertRaises(subject.Refusal) as refusal:
+            subject._revoke_token(
+                self.Reader(result), environment,
+                revocation_state=state,
+                retained_token=token,
+                repository_id="123",
+                request=request,
+                binding=binding,
+            )
+        self.assertEqual((refusal.exception.reason, refusal.exception.stage), ("cleanup_incomplete", "cleanup"))
+        self.assertTrue(subject.revocation_confirmed(state, token, "123", request, binding))
+        self.assertEqual(environment["SOURCE_READER_TOKEN"], token)
+
+    def test_proof_state_cannot_be_reused(self):
+        token = "opaque-token-for-proof"
+        request = {
+            "source_sha": "a" * 40,
+            "base_sha": "a" * 40,
+            "base_branch": "main",
+            "concern": "core-bootstrap",
+        }
+        binding = {
+            "control_sha": "b" * 40,
+            "run_id": "12",
+            "run_attempt": "2",
+            "image_os": "macos-test",
+            "image_version": "1",
+        }
+        result = {
+            "schema_version": 1,
+            "status": "passed",
+            "reason": "ok",
+            "repository_scope": "verified",
+            "metadata": "verified",
+            "revocation": "confirmed",
+        }
+        state = subject.RevocationState()
+        first_environment = {"SOURCE_READER_TOKEN": token}
+        subject._revoke_token(
+            self.Reader(result), first_environment,
+            revocation_state=state,
+            retained_token=token,
+            repository_id="123",
+            request=request,
+            binding=binding,
+        )
+        second_environment = {"SOURCE_READER_TOKEN": token}
+        with self.assertRaises(subject.Refusal):
+            subject._revoke_token(
+                self.Reader(result), second_environment,
+                revocation_state=state,
+                retained_token=token,
+                repository_id="123",
+                request=request,
+                binding=binding,
+            )
+        self.assertEqual(second_environment["SOURCE_READER_TOKEN"], token)
+
+    def test_pending_fetch_refusal_retains_exact_revocation_receipt(self):
+        self._run_snapshot_refusal_after_revocation("fetch")
+
+    def test_later_signature_refusal_retains_exact_revocation_receipt(self):
+        self._run_snapshot_refusal_after_revocation("signature")
 
     def test_source_lease_is_immutable(self):
         lease = subject.SourceLease(Path("/tmp/lease"), MappingProxyType({"source_sha": "a" * 40}))
@@ -454,6 +706,25 @@ class ControlGitCommandTests(unittest.TestCase):
                 with self.assertRaises(subject.Refusal) as refusal:
                     subject._require_git_success(result, "configuration")
                 self.assertEqual(refusal.exception.reason, "revocation_policy_invalid")
+
+    def test_worktree_add_suppresses_git_feedback_and_still_rejects_other_stderr(self):
+        arguments = subject._worktree_add_arguments(
+            "/usr/bin/git", Path("source-fixture"), "a" * 40,
+        )
+        self.assertEqual(arguments, (
+            "/usr/bin/git", "worktree", "add", "--quiet", "--detach", "--no-checkout",
+            "source-fixture", "a" * 40,
+        ))
+        self.assertEqual(subject._require_git_success(
+            subject.subprocess.CompletedProcess(arguments, 0, b"", b""), "bootstrap",
+        ), b"")
+        with self.assertRaises(subject.Refusal) as refusal:
+            subject._require_git_success(
+                subject.subprocess.CompletedProcess(arguments, 0, b"", b"unexpected"), "bootstrap",
+            )
+        self.assertEqual((refusal.exception.reason, refusal.exception.stage), (
+            "bootstrap_snapshot_invalid", "bootstrap",
+        ))
 
     def test_control_commands_bind_only_the_exact_resolved_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:
