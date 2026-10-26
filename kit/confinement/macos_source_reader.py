@@ -21,9 +21,18 @@ TOKEN_PATTERN = SAFE_TOKEN_PATTERN
 FULL_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
 METADATA_PATH_PATTERN = re.compile(r"/repos/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}\Z")
 ROLE_PERMISSION_KEYS = frozenset(("pull", "push", "admin", "maintain", "triage"))
+REASONS = frozenset((
+    "token_unavailable", "arguments_invalid", "token_invalid", "configuration_invalid",
+    "repository_list_unavailable", "repository_schema_invalid", "repository_count_invalid",
+    "repository_id_invalid", "repository_private_invalid", "repository_permissions_invalid",
+    "repository_name_invalid", "metadata_unavailable", "ok", "revocation_unconfirmed",
+    "internal_error",
+))
 
 
 def _record(status, reason, repository_scope, metadata, revocation):
+    if type(reason) is not str or reason not in REASONS:
+        reason = "internal_error"
     return {
         "schema_version": 1,
         "status": status,
@@ -128,23 +137,32 @@ def _permissions_are_read_only(value):
     return False
 
 
-def _repository_entry(body, expected_repository_id):
+def _repository_entry_diagnostic(body, expected_repository_id):
     value = _json_object(body)
-    if value is None or type(value.get("total_count")) is not int or value.get("total_count") != 1:
-        return None
+    if value is None or type(value.get("total_count")) is not int:
+        return None, "repository_schema_invalid"
     repositories = value.get("repositories")
-    if type(repositories) is not list or len(repositories) != 1:
-        return None
+    if type(repositories) is not list:
+        return None, "repository_schema_invalid"
+    if value.get("total_count") != 1 or len(repositories) != 1:
+        return None, "repository_count_invalid"
     repository = repositories[0]
     if type(repository) is not dict:
-        return None
+        return None, "repository_schema_invalid"
     if type(repository.get("id")) is not int or repository.get("id") != expected_repository_id:
-        return None
-    if repository.get("private") is not True or not _permissions_are_read_only(repository):
-        return None
+        return None, "repository_id_invalid"
+    if repository.get("private") is not True:
+        return None, "repository_private_invalid"
+    if not _permissions_are_read_only(repository):
+        return None, "repository_permissions_invalid"
     full_name = repository.get("full_name")
     if type(full_name) is not str or FULL_NAME_PATTERN.fullmatch(full_name) is None:
-        return None
+        return None, "repository_name_invalid"
+    return full_name, None
+
+
+def _repository_entry(body, expected_repository_id):
+    full_name, unused_reason = _repository_entry_diagnostic(body, expected_repository_id)
     return full_name
 
 
@@ -201,9 +219,9 @@ def run(environ=None, preflight_allowed=True):
             if status != 200:
                 reason = "repository_list_unavailable"
             else:
-                full_name = _repository_entry(body, expected_repository_id)
+                full_name, scope_reason = _repository_entry_diagnostic(body, expected_repository_id)
                 if full_name is None:
-                    reason = "repository_scope_invalid"
+                    reason = scope_reason
                 else:
                     repository_scope = "verified"
                     metadata_path = "/repos/" + full_name
