@@ -249,28 +249,65 @@ def _parse_capture_devices(output, stage="interface"):
     return devices
 
 
-def _parse_local_addresses(output, stage="interface"):
+def _parse_local_addresses(output, stage="interface", expected_name=None):
     if type(output) is not bytes or len(output) > MAX_TOOL_OUTPUT_BYTES:
         raise ObserverRefusal("interface_unavailable", stage)
     try:
-        lines = output.decode("ascii").splitlines()
+        text = output.decode("ascii")
     except UnicodeDecodeError:
         raise ObserverRefusal("interface_unavailable", stage) from None
+    if any((ord(character) < 32 and character not in "\r\n\t") or ord(character) == 127 for character in text):
+        raise ObserverRefusal("interface_unavailable", stage)
+    lines = text.splitlines()
+    active = True
+    if expected_name is not None:
+        if type(expected_name) is not str or INTERFACE_RE.fullmatch(expected_name) is None or not lines:
+            raise ObserverRefusal("interface_unavailable", stage)
+        header_pattern = (
+            re.escape(expected_name)
+            + r": flags=[0-9A-Fa-f]+<([A-Z0-9_,]*)>(?: [\x20-\x7e]{1,256})?"
+        )
+        match = re.fullmatch(header_pattern, lines[0])
+        if match is None:
+            raise ObserverRefusal("interface_unavailable", stage)
+        flag_text = match.group(1)
+        flags = [] if not flag_text else flag_text.split(",")
+        if (len(flags) != len(set(flags))
+                or any(re.fullmatch(r"[A-Z0-9_]+", flag) is None for flag in flags)):
+            raise ObserverRefusal("interface_unavailable", stage)
+        active = "UP" in flags and "RUNNING" in flags
     addresses = set()
-    for line in lines:
-        match = re.match(r"\s*inet\s+([^\s]+)", line)
-        if match is None:
-            match = re.match(r"\s*inet6\s+([^\s]+)", line)
-        if match is None:
+    body_lines = lines if expected_name is None else lines[1:]
+    for line in body_lines:
+        if not line:
             continue
-        address_text = match.group(1).split("%", 1)[0]
+        if expected_name is not None and line[0] not in (" ", "\t"):
+            raise ObserverRefusal("interface_unavailable", stage)
+        body = line.lstrip()
+        if not body.startswith("inet"):
+            continue
+        fields = body.split()
+        if len(fields) < 2 or fields[0] not in ("inet", "inet6"):
+            raise ObserverRefusal("interface_unavailable", stage)
+        family = fields[0]
+        address_text = fields[1]
+        if family == "inet6":
+            if "%" in address_text:
+                if address_text.count("%") != 1:
+                    raise ObserverRefusal("interface_unavailable", stage)
+                address_text, zone = address_text.split("%", 1)
+                if (INTERFACE_RE.fullmatch(zone) is None
+                        or (expected_name is not None and zone != expected_name)):
+                    raise ObserverRefusal("interface_unavailable", stage)
         try:
             address = ipaddress.ip_address(address_text)
         except ValueError:
-            continue
+            raise ObserverRefusal("interface_unavailable", stage) from None
+        if (family == "inet" and address.version != 4) or (family == "inet6" and address.version != 6):
+            raise ObserverRefusal("interface_unavailable", stage)
         if not address.is_unspecified:
             addresses.add(str(address))
-    return frozenset(addresses)
+    return frozenset(addresses) if active else frozenset()
 
 
 def _interface_key(name):
@@ -299,10 +336,12 @@ def _system_interfaces():
     result = []
     for name in names:
         output = _run_fixed_command((IFCONFIG_PATH, name), "interface_address")
-        addresses = _parse_local_addresses(output, "interface_address")
+        addresses = _parse_local_addresses(output, "interface_address", name)
         if not addresses:
-            raise ObserverRefusal("interface_unavailable", "interface_address")
+            continue
         result.append({"name": name, "addresses": addresses})
+    if not result:
+        raise ObserverRefusal("interface_unavailable", "interface_address")
     return tuple(result)
 
 
