@@ -36,6 +36,8 @@ MAX_COUNT = 65535
 MAX_OBSERVATION_SECONDS = 3600
 COMMAND_TIMEOUT_SECONDS = 8
 STARTUP_WAIT_SECONDS = 3
+STARTUP_POLL_SECONDS = 0.05
+SELFTEST_DRAIN_SECONDS = 3
 STOP_WAIT_SECONDS = 5
 MAX_TOOL_OUTPUT_BYTES = 32768
 MAX_CAPTURE_DIRECTORY_ENTRIES = MAX_INTERFACES
@@ -46,6 +48,10 @@ REASONS = frozenset((
     "capture_invalid", "cleanup_incomplete", "internal_error",
 ))
 STAGES = frozenset(("arguments", "binding", "interface", "start", "finish", "parse", "cleanup", "selftest"))
+SELFTEST_DIAGNOSTIC_STAGES = frozenset((
+    "unknown", "fixture_setup", "capture_started", "dns_exchange", "tcp_exchange",
+    "capture_drain", "capture_finished", "receipt",
+))
 NETWORK_ENV = {
     "HOME": "/var/empty",
     "LANG": "C",
@@ -57,9 +63,10 @@ NETWORK_ENV = {
 
 
 class ObserverRefusal(Exception):
-    def __init__(self, reason, stage):
+    def __init__(self, reason, stage, diagnostics=None):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "finish"
+        self.diagnostics = diagnostics
         super().__init__(self.reason)
 
 
@@ -69,6 +76,92 @@ def _valid_sha(value):
 
 def _valid_decimal(value):
     return type(value) is str and DECIMAL_RE.fullmatch(value) is not None
+
+
+def _selftest_diagnostics(stage, record, expected_dns_hash=None, expected_tcp_hash=None):
+    stage_value = stage if type(stage) is str and stage in SELFTEST_DIAGNOSTIC_STAGES else "unknown"
+
+    def count_value(name):
+        if type(record) is not dict:
+            return None
+        value = record.get(name)
+        return value if type(value) is int and 0 <= value <= MAX_COUNT else None
+
+    def expected_match(name, expected_hash):
+        if type(record) is not dict or type(expected_hash) is not str or HASH_RE.fullmatch(expected_hash) is None:
+            return None
+        values = record.get(name)
+        if type(values) not in (list, tuple) or any(type(value) is not str for value in values):
+            return None
+        return expected_hash in values
+
+    capture_limited = None
+    if type(record) is dict and type(record.get("capture_limited")) is bool:
+        capture_limited = record["capture_limited"]
+    return {
+        "selftest_stage": stage_value,
+        "dns_query_count": count_value("dns_query_count"),
+        "tcp_syn_count": count_value("tcp_syn_count"),
+        "dns_expected_match": expected_match("dns_name_hashes", expected_dns_hash),
+        "tcp_expected_match": expected_match("tcp_destination_hashes", expected_tcp_hash),
+        "capture_limited": capture_limited,
+    }
+
+
+def _format_refusal_line(error, control_sha, run_id, run_attempt):
+    line = (
+        "macos-network-observer=refused schema=1 reason=" + error.reason
+        + " stage=" + error.stage + " control-sha=" + control_sha
+        + " run-id=" + run_id + " run-attempt=" + run_attempt
+    )
+    diagnostics = error.diagnostics
+    expected = {
+        "selftest_stage", "dns_query_count", "tcp_syn_count", "dns_expected_match",
+        "tcp_expected_match", "capture_limited",
+    }
+    if type(diagnostics) is not dict or set(diagnostics) != expected:
+        return line
+    stage = diagnostics["selftest_stage"]
+    if type(stage) is not str or stage not in SELFTEST_DIAGNOSTIC_STAGES:
+        return line
+
+    def count_text(name):
+        value = diagnostics[name]
+        if type(value) is int and 0 <= value <= MAX_COUNT:
+            return str(value)
+        if value is None:
+            return "unknown"
+        return None
+
+    def match_text(name):
+        value = diagnostics[name]
+        if type(value) is bool:
+            return "yes" if value else "no"
+        if value is None:
+            return "unknown"
+        return None
+
+    dns_count = count_text("dns_query_count")
+    tcp_count = count_text("tcp_syn_count")
+    dns_match = match_text("dns_expected_match")
+    tcp_match = match_text("tcp_expected_match")
+    limited = diagnostics["capture_limited"]
+    if type(limited) is bool:
+        limited_text = "true" if limited else "false"
+    elif limited is None:
+        limited_text = "unknown"
+    else:
+        return line
+    if None in (dns_count, tcp_count, dns_match, tcp_match):
+        return line
+    return (
+        line + " selftest-stage=" + stage
+        + " dns-query-count=" + dns_count
+        + " tcp-syn-count=" + tcp_count
+        + " dns-expected-match=" + dns_match
+        + " tcp-expected-match=" + tcp_match
+        + " capture-limited=" + limited_text
+    )
 
 
 def _validated_binding(control_sha, run_id, run_attempt, source_sha):
@@ -266,6 +359,67 @@ def _create_capture_file(directory, index):
     return path
 
 
+def _read_capture_snapshot(path):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size < 0
+                    or info.st_size > MAX_CAPTURE_BYTES):
+                raise ValueError
+            if info.st_size < 24:
+                return None
+            chunks = []
+            remaining = info.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(65536, remaining))
+                if not chunk:
+                    return None
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            path_info = os.lstat(path)
+            if ((after.st_dev, after.st_ino) != (info.st_dev, info.st_ino)
+                    or not stat.S_ISREG(after.st_mode) or after.st_uid != 0
+                    or after.st_nlink != 1 or stat.S_IMODE(after.st_mode) != 0o600
+                    or after.st_size < info.st_size
+                    or not stat.S_ISREG(path_info.st_mode)
+                    or path_info.st_uid != 0 or path_info.st_nlink != 1
+                    or stat.S_IMODE(path_info.st_mode) != 0o600
+                    or (path_info.st_dev, path_info.st_ino) != (info.st_dev, info.st_ino)):
+                raise ValueError
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except BaseException:
+        raise ObserverRefusal("capture_invalid", "start") from None
+
+
+def _capture_header_ready(path):
+    data = _read_capture_snapshot(path)
+    if data is None:
+        return False
+    unused_endian, snaplen, unused_linktype = _pcap_header(data[:24])
+    if snaplen != MAX_SNAPSHOT_BYTES:
+        raise ObserverRefusal("capture_invalid", "start")
+    return True
+
+
+def _wait_capture_ready(process, path):
+    deadline = time.monotonic() + STARTUP_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise ObserverRefusal("observer_unavailable", "start")
+        if _capture_header_ready(path):
+            if process.poll() is None:
+                return
+            raise ObserverRefusal("observer_unavailable", "start")
+        time.sleep(STARTUP_POLL_SECONDS)
+    raise ObserverRefusal("observer_unavailable", "start")
+
+
 def _capture_filter(dns_udp_ports, dns_tcp_ports, tcp_ports=None):
     if tcp_ports is None:
         return "udp port 53 or tcp port 53 or (tcp[tcpflags] & 2 != 0)"
@@ -284,8 +438,10 @@ def _start_capture(directory, index, interface, filter_expression):
         "-i", interface["name"],
         "-n",
         "-p",
+        "--immediate-mode",
         "-s", str(MAX_SNAPSHOT_BYTES),
         "-c", str(MAX_CAPTURE_PACKETS),
+        "-U",
         "-w", path,
         filter_expression,
     )
@@ -300,9 +456,7 @@ def _start_capture(directory, index, interface, filter_expression):
             close_fds=True,
             start_new_session=True,
         )
-        time.sleep(0.15)
-        if process.poll() is not None:
-            raise ValueError
+        _wait_capture_ready(process, path)
     except BaseException:
         if process is not None:
             _terminate_unregistered_process(process)
@@ -661,6 +815,32 @@ def _parse_pcap(data, local_addresses, key, dns_udp_ports, dns_tcp_ports):
     }
 
 
+def _wait_for_expected_fixture(session, capture, expected_dns_hash, expected_tcp_hash):
+    deadline = time.monotonic() + SELFTEST_DRAIN_SECONDS
+    while True:
+        data = _read_capture_snapshot(capture["path"])
+        if data is not None:
+            try:
+                parsed = _parse_pcap(
+                    data,
+                    capture["addresses"],
+                    session._hash_key,
+                    session._dns_udp_ports,
+                    session._dns_tcp_ports,
+                )
+            except ObserverRefusal as error:
+                if error.reason != "capture_invalid":
+                    raise
+            else:
+                if (parsed["dns_query_count"] >= 1 and parsed["tcp_syn_count"] >= 1
+                        and expected_dns_hash in parsed["dns_name_hashes"]
+                        and expected_tcp_hash in parsed["tcp_destination_hashes"]):
+                    return
+        if time.monotonic() >= deadline or capture["process"].poll() is not None:
+            raise ObserverRefusal("capture_invalid", "selftest")
+        time.sleep(STARTUP_POLL_SECONDS)
+
+
 def _remove_private_directory(directory):
     try:
         resolved = os.path.realpath(directory)
@@ -871,8 +1051,12 @@ def _selftest_record(binding):
     tcp_client = None
     accepted = None
     session = None
+    session_finish_attempted = False
     failure = None
     record = None
+    diagnostic_stage = "fixture_setup"
+    expected_dns_hash = None
+    expected_tcp_hash = None
     try:
         dns_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         dns_server.bind(("127.0.0.1", 0))
@@ -893,9 +1077,21 @@ def _selftest_record(binding):
             frozenset(),
             {"lo0": expression},
         )
+        diagnostic_stage = "capture_started"
+        expected_dns_hash = hmac.new(
+            session._hash_key,
+            b"dns\x00" + _encode_dns_name(DNS_DOMAIN),
+            hashlib.sha256,
+        ).hexdigest()
+        expected_tcp_hash = hmac.new(
+            session._hash_key,
+            b"tcp\x00" + b"127.0.0.1:" + str(tcp_port).encode("ascii"),
+            hashlib.sha256,
+        ).hexdigest()
         query = _make_dns_query()
         dns_client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         dns_client.settimeout(3)
+        diagnostic_stage = "dns_exchange"
         dns_client.sendto(query, ("127.0.0.1", dns_port))
         received_query, peer = dns_server.recvfrom(512)
         if received_query != query:
@@ -906,14 +1102,24 @@ def _selftest_record(binding):
             raise ObserverRefusal("observer_unavailable", "selftest")
         tcp_client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tcp_client.settimeout(3)
+        diagnostic_stage = "tcp_exchange"
         tcp_client.connect(("127.0.0.1", tcp_port))
         accepted, unused_address = tcp_server.accept()
         tcp_client.close()
         tcp_client = None
         accepted.close()
         accepted = None
+        diagnostic_stage = "capture_drain"
+        _wait_for_expected_fixture(
+            session,
+            session._captures[0],
+            expected_dns_hash,
+            expected_tcp_hash,
+        )
+        session_finish_attempted = True
         record = session.finish()
         session = None
+        diagnostic_stage = "capture_finished"
     except ObserverRefusal as error:
         failure = error
     except BaseException:
@@ -926,19 +1132,44 @@ def _selftest_record(binding):
                 except BaseException:
                     if failure is None:
                         failure = ObserverRefusal("cleanup_incomplete", "cleanup")
-        if session is not None:
+        if session is not None and not session_finish_attempted:
+            session_finish_attempted = True
             try:
-                session.finish()
+                cleanup_record = session.finish()
+                if record is None:
+                    record = cleanup_record
             except ObserverRefusal as error:
                 if failure is None or error.reason == "cleanup_incomplete":
                     failure = error
     if failure is not None:
-        raise failure
+        raise ObserverRefusal(
+            failure.reason,
+            failure.stage,
+            _selftest_diagnostics(
+                diagnostic_stage,
+                record,
+                expected_dns_hash,
+                expected_tcp_hash,
+            ),
+        )
+    diagnostic_stage = "receipt"
     if (type(record) is not dict or record.get("dns_query_count", 0) < 1
+            or type(expected_dns_hash) is not str
+            or expected_dns_hash not in record.get("dns_name_hashes", ())
             or record.get("tcp_syn_count", 0) < 1
-            or not record.get("dns_name_hashes") or not record.get("tcp_destination_hashes")
+            or type(expected_tcp_hash) is not str
+            or expected_tcp_hash not in record.get("tcp_destination_hashes", ())
             or record.get("capture_limited") is not False):
-        raise ObserverRefusal("capture_invalid", "selftest")
+        raise ObserverRefusal(
+            "capture_invalid",
+            "selftest",
+            _selftest_diagnostics(
+                diagnostic_stage,
+                record,
+                expected_dns_hash,
+                expected_tcp_hash,
+            ),
+        )
     return record
 
 
@@ -1009,30 +1240,18 @@ def main(arguments=None, environ=None):
     control_sha, run_id, run_attempt = _safe_identity_fields(environment)
     if type(actual_arguments) is not list or actual_arguments != ["selftest"]:
         error = ObserverRefusal("arguments_invalid", "arguments")
-        sys.stdout.write(
-            "macos-network-observer=refused schema=1 reason=" + error.reason
-            + " stage=" + error.stage + " control-sha=" + control_sha
-            + " run-id=" + run_id + " run-attempt=" + run_attempt + "\n"
-        )
+        sys.stdout.write(_format_refusal_line(error, control_sha, run_id, run_attempt) + "\n")
         return 1
     if (control_sha == "unknown" or run_id == "unknown" or run_attempt == "unknown"):
         error = ObserverRefusal("binding_invalid", "binding")
-        sys.stdout.write(
-            "macos-network-observer=refused schema=1 reason=" + error.reason
-            + " stage=" + error.stage + " control-sha=" + control_sha
-            + " run-id=" + run_id + " run-attempt=" + run_attempt + "\n"
-        )
+        sys.stdout.write(_format_refusal_line(error, control_sha, run_id, run_attempt) + "\n")
         return 1
     try:
         binding = _validated_binding(control_sha, run_id, run_attempt, None)
         record = _selftest_record(binding)
         line = _format_selftest_record(record)
     except ObserverRefusal as error:
-        line = (
-            "macos-network-observer=refused schema=1 reason=" + error.reason
-            + " stage=" + error.stage + " control-sha=" + control_sha
-            + " run-id=" + run_id + " run-attempt=" + run_attempt
-        )
+        line = _format_refusal_line(error, control_sha, run_id, run_attempt)
         sys.stdout.write(line + "\n")
         return 1
     except BaseException:
