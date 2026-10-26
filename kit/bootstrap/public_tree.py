@@ -62,7 +62,7 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    'kit/confinement/macos_rules_bootstrap.py': '16a2cf7408383c9373905166e6344da99c2a10d881de4f7781e5d7debc8fa5da',
+    'kit/confinement/macos_rules_bootstrap.py': 'ab22e0676456923bccb4235a2644c70ce378d7b225867260aad3daea6fd7db7c',
     'kit/confinement/test_macos_rules_bootstrap.py': 'ae4f78c68a3314027b480839efcb708659884a3c0d50555e2e094d29b48fcf15',
     'kit/confinement/macos_private_validation.py': 'eda795756d4906c29d65391ca5783e47ea85515347ac8947f16bd911728413a2',
     'kit/confinement/test_macos_private_validation.py': '6131673d3f930073250d087ebd4ccafc2f182cd7004975c48f2ab6b7e4de981d',
