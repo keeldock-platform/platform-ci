@@ -68,16 +68,16 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    '.github/workflows/macos-rules-bootstrap.yml': '002de702a0d0f7447f8c750ae3d37a5a80aa18824d88d0688f7f2b2c3e4ac3d4',
+    '.github/workflows/macos-rules-bootstrap.yml': 'f43d15e7d5c3f4727ba19a7d57399bea811bd42ccfd60d4d026869a738868de7',
     '.github/workflows/macos-core-bootstrap.yml': '25dbd661672e7b57384b2ffcd9934e62fb20688c94ee29ca97d2ab0eebc7109f',
-    'kit/confinement/macos_rules_bootstrap.py': '720905e99a5b912d8f9a0cfa2594e9636b278e94f296e826a0c0375895fabe1c',
-    'kit/confinement/test_macos_rules_bootstrap.py': '73ae6c8362655aaa86049d16188080e7c658f3f88e813456fc1a9e98f7a120e0',
+    'kit/confinement/macos_rules_bootstrap.py': '839b563a5dfaf4f178b50683ae9a7c85cdb3f9cdcefa09271f7536bbc4693b5d',
+    'kit/confinement/test_macos_rules_bootstrap.py': '893077b65e56124231c44b2cf09172a70751ff62c9135d69dc044d29890bb50c',
     'kit/confinement/macos_core_bootstrap.py': '8f27ed84b98d2c3fcf45d2c12f330f9a324ab00f542058c8e095765989555b00',
     'kit/confinement/test_macos_core_bootstrap.py': '0d0bee2301702fa0bcfa97956bd788d8dd743a5eeab14e96fc23186916b6e400',
     'kit/confinement/macos_network_observer.py': 'f3299c0ab0ff57cc7e730b1866787dbd8d30e1864ce2ee42f423c34f5c09d74c',
     'kit/confinement/test_macos_network_observer.py': '86e00de416f13189f6d1e065119dd79de9689bbc345e05682ec3fa69ebb3c31d',
-    'kit/confinement/macos_private_validation.py': 'de9e453ad6c560b02eb3fa7f3d41a171ff088e4eecef8483a79f49d79423d871',
-    'kit/confinement/test_macos_private_validation.py': '9db800f00d633947d9fb321e9b181b7565ababd94c2fbd7440e15fdb5abaab58',
+    'kit/confinement/macos_private_validation.py': '162986177f523c3cc8a499af90706520d9f3aff1601a4b26146080a63167b36b',
+    'kit/confinement/test_macos_private_validation.py': '312758ab7658dfdd44efbe9aeebb7b2aebcc07320d38a33d149c0472d0dbf848',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     ".github/workflows/windows-native-preflight.yml": "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb",
     "kit/confinement/windows_native_preflight.cs": "ba0f8859db9d8bcc1e4c8274520bcb67a3292cb311f553127e1f29fe13838543",

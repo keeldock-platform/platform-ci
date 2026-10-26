@@ -743,6 +743,26 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertNotIn("SOURCE_READER_PRIVATE_KEY", audit_section)
                 self.assertNotIn("SOURCE_READER_APP_PRIVATE_KEY", audit_section)
                 if workflow_kind == "macos-rules-bootstrap":
+                    refusal_pattern = next(
+                        line for line in workflow.splitlines() if "refusal_re=" in line
+                    )
+                    for reason in (
+                        "invalid_input",
+                        "context_unavailable",
+                        "configuration_unavailable",
+                        "source_reader_unavailable",
+                        "repository_scope_invalid",
+                        "source_fetch_unavailable",
+                        "revocation_unconfirmed",
+                        "base_invalid",
+                        "signature_invalid",
+                        "revocation_policy_invalid",
+                        "bootstrap_snapshot_invalid",
+                        "bootstrap_not_approved",
+                        "cleanup_incomplete",
+                        "internal_error",
+                    ):
+                        self.assertIn(reason, refusal_pattern)
                     self.assertIn("RULES_ID_DEFINITIONS", workflow)
                     self.assertIn("SOURCE_CANDIDATE_REF", workflow)
                     self.assertIn("Validate source-reader scope configuration", workflow)

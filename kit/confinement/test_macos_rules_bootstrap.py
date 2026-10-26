@@ -567,6 +567,42 @@ class LeaseRecordTests(unittest.TestCase):
                     )
 
 
+class RuntimeLeaseRefusalTests(unittest.TestCase):
+    class RuntimeRefusal(Exception):
+        def __init__(self, reason, stage):
+            self.reason = reason
+            self.stage = stage
+
+    def mapped(self, reason, stage):
+        runtime = SimpleNamespace(Refusal=self.RuntimeRefusal)
+        error = self.RuntimeRefusal(reason, stage)
+        return bootstrap._runtime_lease_refusal(runtime, error)
+
+    def test_before_yield_known_reason_is_preserved_as_closed_source_lease_reason(self):
+        error = self.mapped("bootstrap_not_approved", "configuration")
+        self.assertEqual((error.reason, error.stage), ("bootstrap_not_approved", "source_lease"))
+
+    def test_inside_lease_known_reason_is_preserved_as_closed_source_lease_reason(self):
+        error = self.mapped("signature_invalid", "signature")
+        self.assertEqual((error.reason, error.stage), ("signature_invalid", "source_lease"))
+
+    def test_before_yield_unknown_reason_is_not_echoed(self):
+        reason = "unlisted-reason\nunsafe-detail"
+        error = self.mapped(reason, "configuration")
+        self.assertEqual((error.reason, error.stage), ("source_lease_unavailable", "source_lease"))
+        self.assertNotIn(reason, str(error))
+
+    def test_inside_lease_unknown_reason_is_not_echoed(self):
+        reason = "unlisted-reason\nunsafe-detail"
+        error = self.mapped(reason, "signature")
+        self.assertEqual((error.reason, error.stage), ("source_lease_unavailable", "source_lease"))
+        self.assertNotIn(reason, str(error))
+
+    def test_cleanup_refusal_keeps_cleanup_classification(self):
+        error = self.mapped("cleanup_incomplete", "cleanup")
+        self.assertEqual((error.reason, error.stage), ("cleanup_incomplete", "cleanup"))
+
+
 class WorkerPrivilegeTests(unittest.TestCase):
     def test_worker_privilege_uses_the_reviewed_probe_for_the_exact_worker(self):
         events = []

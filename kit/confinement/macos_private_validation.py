@@ -1432,7 +1432,7 @@ def _check_worker_identity(root, worker_uid):
 
 def _validate_storage_root(storage_root):
     try:
-        if type(storage_root) not in (str, Path) or not str(storage_root).startswith("/"):
+        if not isinstance(storage_root, (str, Path)) or not str(storage_root).startswith("/"):
             raise ValueError
         supplied = Path(storage_root)
         named = supplied.lstat()

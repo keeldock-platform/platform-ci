@@ -1739,7 +1739,15 @@ class BootstrapAuditTests(unittest.TestCase):
                 producer_job["conclusion"] = "failure"
                 check_path = "/repos/keeldock-platform/platform-ci/check-runs/" + str(check_id)
                 pages[check_path][0]["conclusion"] = "failure"
-                logs[producer_id] = b"macos-bootstrap=refused schema=1 reason=preflight_failed\n"
+                if kind == "rules-bootstrap":
+                    logs[producer_id] = (
+                        "2026-10-26T12:34:56.1234567Z macos-rules-bootstrap=refused schema=1 "
+                        "reason=dash_bottle_invalid stage=dash_archive_content control-sha=" + CONTROL_SHA
+                        + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+                        + " token-revocation=not-read\n"
+                    ).encode("ascii")
+                else:
+                    logs[producer_id] = b"macos-bootstrap=refused schema=1 reason=preflight_failed\n"
                 api = FakeMultiAuditAPI(pages, logs)
                 with self.assertRaises(audit.AuditRefusal) as caught:
                     audit.run(kind + "-audit", env, api)
@@ -1748,6 +1756,112 @@ class BootstrapAuditTests(unittest.TestCase):
                 self.assertTrue(any(path.endswith("/annotations?per_page=100&page=1") for path in api.calls))
                 self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
                 self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
+
+    def test_rules_source_lease_refusal_without_observer_is_scanned_then_refused(self):
+        self.assertEqual(
+            set(audit.RULES_BOOTSTRAP_EARLY_SOURCE_REASONS),
+            {
+                "invalid_input", "context_unavailable", "configuration_unavailable",
+                "source_reader_unavailable", "repository_scope_invalid", "source_fetch_unavailable",
+                "revocation_unconfirmed", "base_invalid", "signature_invalid",
+                "revocation_policy_invalid", "bootstrap_snapshot_invalid", "bootstrap_not_approved",
+                "internal_error",
+            },
+        )
+
+        def failed_fixture(reason="bootstrap_snapshot_invalid", token_state="confirmed"):
+            pages, env, logs = bootstrap_audit_fixture("rules-bootstrap")
+            detail_path = "/repos/keeldock-platform/platform-ci/actions/jobs/803"
+            detail = pages[detail_path][0]
+            steps = detail["steps"]
+            run_step = next(step for step in steps if step["name"] == "Run fixed rules bootstrap")
+            run_step.update(status="completed", conclusion="failure")
+            next(
+                step for step in steps
+                if step["name"] == "Write trusted summary visibility control"
+            ).update(conclusion="skipped")
+            detail["conclusion"] = "failure"
+            pages[detail_path] = (detail, {})
+            jobs_path = (
+                "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+                + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+            )
+            producer_job = next(
+                job for job in pages[jobs_path][0]["jobs"]
+                if job["name"] == audit.RULES_BOOTSTRAP_PRODUCER_JOB_NAME
+            )
+            producer_job["conclusion"] = "failure"
+            pages["/repos/keeldock-platform/platform-ci/check-runs/903"][0]["conclusion"] = "failure"
+            old_lines = logs[803].splitlines()
+            preflight = next(line for line in old_lines if b"macos-rules-bootstrap=preflight-passed" in line)
+            source_binding = next(line for line in old_lines if b"macos-rules-source-binding=verified" in line)
+            refusal = (
+                "2026-10-26T12:34:56.1234567Z macos-rules-bootstrap=refused schema=1 reason="
+                + reason + " stage=source_lease control-sha=" + CONTROL_SHA
+                + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+                + " token-revocation=" + token_state
+            ).encode("ascii")
+            logs[803] = preflight + b"\n" + source_binding + b"\n" + refusal + b"\n"
+            return pages, env, logs
+
+        def change_refusal(logs, old, new):
+            lines = logs[803].splitlines()
+            index = next(i for i, line in enumerate(lines) if b"macos-rules-bootstrap=refused" in line)
+            lines[index] = lines[index].replace(old, new, 1)
+            logs[803] = b"\n".join(lines) + b"\n"
+
+        pages, env, logs = failed_fixture()
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rules-bootstrap-audit", env, api)
+        self.assertEqual(caught.exception.reason, "native_job_failed")
+        self.assertEqual(api.log_calls, [802, 803])
+        self.assertTrue(any(path.endswith("/annotations?per_page=100&page=1") for path in api.calls))
+        self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
+        self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
+
+        mutations = (
+            lambda logs: logs.__setitem__(803, logs[803] + logs[803].splitlines()[-1] + b"\n"),
+            lambda logs: change_refusal(
+                logs, b"control-sha=" + CONTROL_SHA.encode("ascii"), b"control-sha=" + b"f" * 40
+            ),
+            lambda logs: change_refusal(
+                logs, b"run-id=" + RUN_ID.encode("ascii"), b"run-id=999"
+            ),
+            lambda logs: change_refusal(
+                logs, b"run-attempt=" + RUN_ATTEMPT.encode("ascii"), b"run-attempt=999"
+            ),
+            lambda logs: logs.__setitem__(803, logs[803].replace(
+                b"repository-id=1428198872", b"repository-id=999999", 1
+            )),
+            lambda logs: logs.__setitem__(803, logs[803].replace(
+                b"reason=bootstrap_snapshot_invalid", b"reason=source_lease_unavailable", 1
+            )),
+            lambda logs: logs.__setitem__(803, logs[803].replace(
+                b"token-revocation=confirmed", b"token-revocation=unconfirmed", 1
+            )),
+            lambda logs: logs.__setitem__(803, logs[803] + b"macos-rules-network=unexpected\n"),
+        )
+        for index, mutate in enumerate(mutations):
+            with self.subTest(mutation=index):
+                pages, env, logs = failed_fixture()
+                mutate(logs)
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.run(
+                        "rules-bootstrap-audit", env, FakeMultiAuditAPI(pages, logs)
+                    )
+                self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = failed_fixture()
+        detail = pages["/repos/keeldock-platform/platform-ci/actions/jobs/803"][0]
+        next(step for step in detail["steps"] if step["name"] == "Mint scoped source-reader token").update(
+            conclusion="failure"
+        )
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run(
+                "rules-bootstrap-audit", env, FakeMultiAuditAPI(pages, logs)
+            )
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
 
     def test_rules_failed_suite_observation_is_still_bound_after_surface_scan(self):
         pages, env, logs = bootstrap_audit_fixture("rules-bootstrap")
@@ -1768,6 +1882,17 @@ class BootstrapAuditTests(unittest.TestCase):
         )
         producer_job["conclusion"] = "failure"
         pages["/repos/keeldock-platform/platform-ci/check-runs/903"][0]["conclusion"] = "failure"
+        lines = logs[803].splitlines()
+        preflight = next(line for line in lines if b"macos-rules-bootstrap=preflight-passed" in line)
+        source_binding = next(line for line in lines if b"macos-rules-source-binding=verified" in line)
+        network = next(line for line in lines if b"macos-rules-network=" in line)
+        refusal = (
+            "2026-10-26T12:34:56.1234567Z macos-rules-bootstrap=refused schema=1 "
+            "reason=suite_failed stage=rules.hooks control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " token-revocation=confirmed"
+        ).encode("ascii")
+        logs[803] = preflight + b"\n" + source_binding + b"\n" + network + b"\n" + refusal + b"\n"
         api = FakeMultiAuditAPI(pages, logs)
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.run("rules-bootstrap-audit", env, api)

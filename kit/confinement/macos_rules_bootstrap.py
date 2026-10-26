@@ -78,6 +78,12 @@ RUN_PREFIX = "macos-ci-check-"
 GHCR_HOST = "ghcr.io"
 GHCR_REDIRECT_HOST = "pkg-containers.githubusercontent.com"
 
+SOURCE_VALIDATION_REASONS = frozenset((
+    "invalid_input", "context_unavailable", "configuration_unavailable", "source_reader_unavailable",
+    "repository_scope_invalid", "source_fetch_unavailable", "revocation_unconfirmed", "base_invalid",
+    "signature_invalid", "revocation_policy_invalid", "bootstrap_snapshot_invalid",
+    "bootstrap_not_approved", "cleanup_incomplete", "internal_error",
+))
 REASONS = frozenset((
     "invalid_input", "control_identity_invalid", "bootstrap_gate_refused", "developer_mode_unavailable",
     "plan_snapshot_refused", "dash_bottle_unavailable", "dash_bottle_invalid",
@@ -86,7 +92,7 @@ REASONS = frozenset((
     "source_lease_unavailable", "source_identity_invalid", "source_tree_invalid",
     "summary_guard_failed", "suite_failed", "plan_ids_failed",
     "cleanup_incomplete", "internal_error",
-))
+)) | SOURCE_VALIDATION_REASONS
 STAGES = frozenset((
     "arguments", "context", "bootstrap_gate", "developer_mode", "plan_snapshot", "dash_download",
     "dash_archive", "dash_archive_structure", "dash_archive_pax_metadata",
@@ -403,6 +409,20 @@ def _record_runtime_revocation(runtime, state, token, request, binding, environ,
     lifecycle["token_revocation"] = "confirmed"
     lifecycle["token_reference"] = None
     return True
+
+
+def _runtime_lease_refusal(runtime, error):
+    runtime_refusal = getattr(runtime, "Refusal", None)
+    if not isinstance(runtime_refusal, type) or not isinstance(error, runtime_refusal):
+        return Refusal("source_lease_unavailable", "source_lease")
+    reason = getattr(error, "reason", None)
+    stage = getattr(error, "stage", None)
+    if ((type(reason) is str and reason == "cleanup_incomplete")
+            or (type(stage) is str and stage == "cleanup")):
+        return Refusal("cleanup_incomplete", "cleanup")
+    if type(reason) is str and reason in SOURCE_VALIDATION_REASONS:
+        return Refusal(reason, "source_lease")
+    return Refusal("source_lease_unavailable", "source_lease")
 
 
 def _safe_candidate_ref(candidate_ref, request):
@@ -1374,11 +1394,7 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
             _record_runtime_revocation(
                 runtime, revocation_state, retained_token, request, binding, environ, lifecycle,
             )
-            runtime_refusal = getattr(runtime, "Refusal", None)
-            if (isinstance(runtime_refusal, type) and isinstance(error, runtime_refusal)
-                    and getattr(error, "reason", None) == "cleanup_incomplete"):
-                raise Refusal("cleanup_incomplete", "cleanup") from None
-            raise Refusal("source_lease_unavailable", "source_lease") from None
+            raise _runtime_lease_refusal(runtime, error) from None
 
         try:
             with lease_context as lease:
@@ -1460,9 +1476,7 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
             )
             runtime_refusal = getattr(runtime, "Refusal", None)
             if isinstance(runtime_refusal, type) and isinstance(error, runtime_refusal):
-                if getattr(error, "reason", None) == "cleanup_incomplete":
-                    raise Refusal("cleanup_incomplete", "cleanup") from None
-                raise Refusal("source_lease_unavailable", "source_lease") from None
+                raise _runtime_lease_refusal(runtime, error) from None
             raise Refusal("cleanup_incomplete", "cleanup") from None
 
         if completed != list(GATES) or lease_record is None or privilege_check != "sudo-denied":
