@@ -73,6 +73,8 @@ REASONS = frozenset((
 STAGES = frozenset((
     "context", "toolchain", "developer_mode", "identity", "privilege", "storage",
     "compile", "link", "load_test", "capture", "cleanup", "preflight",
+    "toolchain_module", "toolchain_resolve", "xcode_select_path", "xcode_select_query",
+    "xcode_version", "clang_version", "sdk_version",
 ))
 SUMMARY_STANDIN = b"synthetic-summary-standin-v1\n"
 SUMMARY_MARKER = b"KD-RB:summary-standin=write-denied\n"
@@ -238,7 +240,8 @@ def _binding(control_sha, environ):
     }
 
 
-def _run_command(argv, *, env, timeout, max_output=MAX_TOOL_OUTPUT):
+def _run_command(argv, *, env, timeout, max_output=MAX_TOOL_OUTPUT, failure_stage="toolchain"):
+    stage = failure_stage if type(failure_stage) is str and failure_stage in STAGES else "toolchain"
     try:
         result = subprocess.run(
             [str(part) for part in argv],
@@ -251,9 +254,9 @@ def _run_command(argv, *, env, timeout, max_output=MAX_TOOL_OUTPUT):
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        raise Refusal("toolchain_unavailable", "toolchain") from None
+        raise Refusal("toolchain_unavailable", stage) from None
     if len(result.stdout) > max_output or len(result.stderr) > max_output:
-        raise Refusal("toolchain_unavailable", "toolchain")
+        raise Refusal("toolchain_unavailable", stage)
     return result
 
 
@@ -284,7 +287,7 @@ def _compiler_origin(toolchain):
         return "command-line-tools"
     if _is_xcode_developer_directory(developer_directory):
         return "xcode"
-    raise Refusal("toolchain_unavailable", "toolchain")
+    raise Refusal("toolchain_unavailable", "toolchain_resolve")
 
 
 def _selected_xcode_directory():
@@ -297,17 +300,23 @@ def _selected_xcode_directory():
     try:
         selector = capability._resolve_trusted_path("/usr/bin/xcode-select")
     except capability.ProbeFailure:
-        raise Refusal("toolchain_unavailable", "toolchain") from None
-    result = _run_command((selector, "--print-path"), env=base_env, timeout=5)
+        raise Refusal("toolchain_unavailable", "xcode_select_path") from None
+    result = _run_command(
+        (selector, "--print-path"), env=base_env, timeout=5,
+        failure_stage="xcode_select_query",
+    )
     if result.returncode != 0 or result.stderr:
-        raise Refusal("toolchain_unavailable", "toolchain")
+        raise Refusal("toolchain_unavailable", "xcode_select_query")
     try:
         raw_path = capability._read_tool_path(result)
+    except capability.ProbeFailure:
+        raise Refusal("toolchain_unavailable", "xcode_select_query") from None
+    try:
         selected = capability._resolve_trusted_path(raw_path, directory=True)
     except capability.ProbeFailure:
-        raise Refusal("toolchain_unavailable", "toolchain") from None
+        raise Refusal("toolchain_unavailable", "xcode_select_path") from None
     if not _is_xcode_developer_directory(selected):
-        raise Refusal("toolchain_unavailable", "toolchain")
+        raise Refusal("toolchain_unavailable", "xcode_select_path")
     return selected
 
 
@@ -323,46 +332,57 @@ def _host_identity(binding, toolchain):
     }
     selected_xcode = _selected_xcode_directory()
     if compiler_origin == "xcode" and toolchain["developer_directory"] != selected_xcode.as_posix():
-        raise Refusal("toolchain_unavailable", "toolchain")
+        raise Refusal("toolchain_unavailable", "xcode_select_path")
     xcode_env = {**base_env, "DEVELOPER_DIR": selected_xcode.as_posix()}
     compiler_env = {**base_env, "DEVELOPER_DIR": toolchain["developer_directory"]}
     product_result = _run_command(("/usr/bin/sw_vers", "-productVersion"), env=base_env, timeout=5)
     if product_result.returncode != 0 or product_result.stderr:
         raise Refusal("runner_identity_unavailable", "toolchain")
     product_version = _single_ascii_line(product_result.stdout, PRODUCT_VERSION)
-    xcode_result = _run_command(("/usr/bin/xcodebuild", "-version"), env=xcode_env, timeout=10, max_output=MAX_VERSION_OUTPUT)
+    xcode_result = _run_command(
+        ("/usr/bin/xcodebuild", "-version"), env=xcode_env, timeout=10,
+        max_output=MAX_VERSION_OUTPUT, failure_stage="xcode_version",
+    )
     if xcode_result.returncode != 0 or xcode_result.stderr:
-        raise Refusal("toolchain_unavailable", "toolchain")
+        raise Refusal("toolchain_unavailable", "xcode_version")
     try:
         xcode_lines = xcode_result.stdout.decode("ascii", "strict").splitlines()
     except UnicodeDecodeError:
-        raise Refusal("toolchain_unavailable", "toolchain") from None
+        raise Refusal("toolchain_unavailable", "xcode_version") from None
     if len(xcode_lines) != 2 or not xcode_lines[0].startswith("Xcode ") or not xcode_lines[1].startswith("Build version "):
-        raise Refusal("toolchain_unavailable", "toolchain")
+        raise Refusal("toolchain_unavailable", "xcode_version")
     xcode_version = xcode_lines[0][len("Xcode "):]
     xcode_build = xcode_lines[1][len("Build version "):]
     if not _valid_run_value(TOOL_VERSION, xcode_version) or re.fullmatch(r"[A-Za-z0-9.]+", xcode_build) is None:
-        raise Refusal("toolchain_unavailable", "toolchain")
-    clang_result = _run_command((toolchain["clang"], "--version"), env=compiler_env, timeout=10, max_output=MAX_VERSION_OUTPUT)
+        raise Refusal("toolchain_unavailable", "xcode_version")
+    clang_result = _run_command(
+        (toolchain["clang"], "--version"), env=compiler_env, timeout=10,
+        max_output=MAX_VERSION_OUTPUT, failure_stage="clang_version",
+    )
     if clang_result.returncode != 0 or clang_result.stderr:
-        raise Refusal("toolchain_unavailable", "toolchain")
+        raise Refusal("toolchain_unavailable", "clang_version")
     try:
         clang_first = clang_result.stdout.decode("ascii", "strict").splitlines()[0]
     except (UnicodeDecodeError, IndexError):
-        raise Refusal("toolchain_unavailable", "toolchain") from None
+        raise Refusal("toolchain_unavailable", "clang_version") from None
     clang_match = re.match(r"^Apple clang version ([0-9]+(?:\.[0-9]+){0,3})(?:\s|$)", clang_first)
     clang_version = clang_match.group(1) if clang_match is not None else None
     sdk_result = _run_command(
         ("/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-version"), env=compiler_env, timeout=10,
+        failure_stage="sdk_version",
     )
     if sdk_result.returncode != 0 or sdk_result.stderr:
-        raise Refusal("toolchain_unavailable", "toolchain")
+        raise Refusal("toolchain_unavailable", "sdk_version")
     sdk_version = _single_ascii_line(sdk_result.stdout, TOOL_VERSION)
     if (
         product_version is None or clang_version is None
         or not _valid_run_value(TOOL_VERSION, clang_version) or sdk_version is None
     ):
-        raise Refusal("toolchain_unavailable", "toolchain")
+        if product_version is None:
+            raise Refusal("runner_identity_unavailable", "toolchain")
+        if clang_version is None or not _valid_run_value(TOOL_VERSION, clang_version):
+            raise Refusal("toolchain_unavailable", "clang_version")
+        raise Refusal("toolchain_unavailable", "sdk_version")
     return {
         **binding,
         "macos_version": product_version,
@@ -569,7 +589,7 @@ def _safe_context(control_sha):
 
 def _run_synthetic_smoke(control_sha):
     if capability is None:
-        raise Refusal("toolchain_unavailable", "toolchain")
+        raise Refusal("toolchain_unavailable", "toolchain_module")
     binding, root = _safe_context(control_sha)
     toolchain = None
     identity_uid = None
@@ -581,6 +601,7 @@ def _run_synthetic_smoke(control_sha):
     record = None
     stage = "toolchain"
     try:
+        stage = "toolchain_resolve"
         toolchain = capability._resolve_trusted_toolchain()
         identity = _host_identity(binding, toolchain)
         stage = "developer_mode"
