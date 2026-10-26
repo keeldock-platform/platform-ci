@@ -2,6 +2,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -785,12 +786,78 @@ class WorkflowPolicyTests(unittest.TestCase):
                         "cleanup_summary",
                         "cleanup_dash",
                         "cleanup_unknown",
+                        "cleanup_summary_census",
+                        "cleanup_summary_present",
+                        "cleanup_summary_probe",
+                        "cleanup_summary_restore",
+                        "cleanup_summary_close",
+                        "cleanup_summary_present_python",
+                        "cleanup_summary_present_ps",
+                        "cleanup_summary_present_developer_shim",
+                        "cleanup_summary_present_helper_preferences",
+                        "cleanup_summary_present_helper_notifications",
+                        "cleanup_summary_present_helper_launch_services",
+                        "cleanup_summary_present_helper_security",
+                        "cleanup_summary_present_helper_trust",
+                        "cleanup_summary_present_helper_containers",
+                        "cleanup_summary_present_apple_system_path",
                         "cleanup",
                     ):
                         self.assertIn(stage, refusal_pattern)
-                    for stage in ("cleanup_cache", "cleanup_private", "cleanup_unknown_extra"):
+                    for stage in (
+                        "cleanup_cache",
+                        "cleanup_private",
+                        "cleanup_unknown_extra",
+                        "cleanup_summary_present_unknown",
+                    ):
                         self.assertNotIn(stage, refusal_pattern)
                     self.assertNotIn("arguments_invalid", refusal_pattern)
+                    refusal_source = re.search(r'refusal_re="([^"]+)"', refusal_pattern).group(1)
+                    refusal_source = refusal_source.replace(
+                        "${marker_prefix}", "macos-rules-bootstrap="
+                    ).replace("${refusal_state}", "refused")
+                    refusal_parser = re.compile(refusal_source)
+                    summary_cleanup_stages = (
+                        "cleanup_summary_census",
+                        "cleanup_summary_present",
+                        "cleanup_summary_probe",
+                        "cleanup_summary_restore",
+                        "cleanup_summary_close",
+                        "cleanup_summary_present_python",
+                        "cleanup_summary_present_ps",
+                        "cleanup_summary_present_developer_shim",
+                        "cleanup_summary_present_helper_preferences",
+                        "cleanup_summary_present_helper_notifications",
+                        "cleanup_summary_present_helper_launch_services",
+                        "cleanup_summary_present_helper_security",
+                        "cleanup_summary_present_helper_trust",
+                        "cleanup_summary_present_helper_containers",
+                        "cleanup_summary_present_apple_system_path",
+                    )
+                    control_sha = "c" * 40
+                    run_id = "103"
+                    run_attempt = "2"
+                    for stage in summary_cleanup_stages:
+                        marker = (
+                            "macos-rules-bootstrap=refused schema=1 reason=cleanup_incomplete "
+                            f"stage={stage} control-sha={control_sha} run-id={run_id} "
+                            f"run-attempt={run_attempt} token-revocation=confirmed"
+                        )
+                        match = refusal_parser.fullmatch(marker)
+                        self.assertIsNotNone(match, stage)
+                        self.assertEqual(len(match.groups()), 6)
+                        self.assertEqual(
+                            match.groups()[2:],
+                            (control_sha, run_id, run_attempt, "confirmed"),
+                        )
+                    self.assertIsNone(
+                        refusal_parser.fullmatch(
+                            "macos-rules-bootstrap=refused schema=1 reason=cleanup_incomplete "
+                            f"stage=cleanup_summary_present_unknown control-sha={control_sha} "
+                            f"run-id={run_id} run-attempt={run_attempt} "
+                            "token-revocation=confirmed"
+                        )
+                    )
                     self.assertIn("RULES_ID_DEFINITIONS", workflow)
                     self.assertIn("SOURCE_CANDIDATE_REF", workflow)
                     self.assertIn("Validate source-reader scope configuration", workflow)
@@ -805,6 +872,10 @@ class WorkflowPolicyTests(unittest.TestCase):
                     self.assertIn('network_tcp_count="${BASH_REMATCH[7]}"', workflow)
                     self.assertIn('network_dns_count="${BASH_REMATCH[6]}"', workflow)
                     self.assertIn('network_tcp_count="${BASH_REMATCH[7]}"', workflow)
+                    self.assertIn('refusal_control="${BASH_REMATCH[3]}"', workflow)
+                    self.assertIn('refusal_run="${BASH_REMATCH[4]}"', workflow)
+                    self.assertIn('refusal_attempt="${BASH_REMATCH[5]}"', workflow)
+                    self.assertIn('token_state="${BASH_REMATCH[6]}"', workflow)
                     self.assertNotIn("macos-rules-bootstrap=passed", workflow)
                     self.assertNotIn("macos-rules-bootstrap=refused", workflow)
                     self.assertNotIn('{"metadata":', workflow)

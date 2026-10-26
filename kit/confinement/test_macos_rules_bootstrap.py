@@ -605,10 +605,7 @@ class RuntimeLeaseRefusalTests(unittest.TestCase):
 
 class CleanupFailureTests(unittest.TestCase):
     def test_each_cleanup_step_uses_its_fixed_stage(self):
-        stages = (
-            "cleanup_lease", "cleanup_storage", "cleanup_worker", "cleanup_summary",
-            "cleanup_dash", "cleanup_unknown",
-        )
+        stages = tuple(sorted(bootstrap.CLEANUP_STAGES))
         for failing_stage in stages:
             with self.subTest(stage=failing_stage):
                 calls = []
@@ -987,11 +984,61 @@ class SummaryGuardTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage, "cleanup_summary")
         self.assertEqual(events, ["guard-closed"])
 
+    def test_summary_restore_failure_is_first_and_close_is_still_attempted(self):
+        events = []
+
+        def fail_restore(guard):
+            events.append("restore")
+            raise RuntimeError("private-restore-detail")
+
+        def fail_close(guard):
+            events.append("close")
+            raise RuntimeError("private-close-detail")
+
+        reviewed = SimpleNamespace(
+            _remove_summary_parent_probe=lambda guard, name: events.append("probe-removed"),
+            _restore_runner_summary=fail_restore,
+            _close_runner_summary=fail_close,
+        )
+        cleanup_state = {"first": None}
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._finish_summary_guard(
+                {"parent_probe_name": "summary.kd-probe"}, reviewed,
+                worker_cleanup_confirmed=True, cleanup_state=cleanup_state,
+            )
+        self.assertEqual(events, ["probe-removed", "restore", "close"])
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("cleanup_incomplete", "cleanup_summary_restore"))
+        self.assertEqual(cleanup_state["first"], "cleanup_summary_restore")
+        self.assertNotIn("private-restore-detail", str(caught.exception))
+        self.assertNotIn("private-close-detail", str(caught.exception))
+
+    def test_summary_close_failure_has_its_own_stage(self):
+        events = []
+
+        def fail_close(guard):
+            events.append("close")
+            raise RuntimeError("private-close-detail")
+
+        reviewed = SimpleNamespace(
+            _remove_summary_parent_probe=lambda guard, name: events.append("probe-removed"),
+            _restore_runner_summary=lambda guard: events.append("restore"),
+            _close_runner_summary=fail_close,
+        )
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._finish_summary_guard(
+                {"parent_probe_name": "summary.kd-probe"}, reviewed,
+                worker_cleanup_confirmed=True,
+            )
+        self.assertEqual(events, ["probe-removed", "restore", "close"])
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("cleanup_incomplete", "cleanup_summary_close"))
+
     def test_post_command_summary_check_censuses_worker_before_restore_probe(self):
         events = []
         capability = SimpleNamespace(
-            _probe_uid_processes_present=lambda *args, **kwargs: events.append("census") or False,
-            _presence_result=lambda value: (value, ()),
+            _probe_uid_processes_present=lambda *args, **kwargs: events.append("census") or (False, ()),
+            _presence_result=lambda value: events.append("validate") or value,
         )
         reviewed = SimpleNamespace(
             _child_environment=lambda *args: {},
@@ -1000,7 +1047,180 @@ class SummaryGuardTests(unittest.TestCase):
         bootstrap._probe_summary_after_commands(
             {}, 502, "home", {"python": "python"}, reviewed, capability, binding_value()
         )
-        self.assertEqual(events, ["census", "readback-restore"])
+        self.assertEqual(events, ["census", "validate", "readback-restore"])
+
+    def test_census_single_allowlisted_class_gets_a_fixed_present_stage(self):
+        events = []
+        capability = SimpleNamespace(
+            _probe_uid_processes_present=lambda *args, **kwargs: (True, ("python",)),
+            _presence_result=lambda value: events.append("validated") or value,
+        )
+        reviewed = SimpleNamespace(
+            _child_environment=lambda *args: {},
+            _run_real_summary_probe=lambda *args, **kwargs: events.append("probe"),
+        )
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._probe_summary_after_commands(
+                {}, 502, "home", {"python": "python"}, reviewed, capability, binding_value()
+            )
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("cleanup_incomplete", "cleanup_summary_present_python"))
+        self.assertEqual(events, ["validated"])
+
+    def test_present_leaf_survives_later_summary_restore_and_close_failures(self):
+        events = []
+        cleanup_state = {"first": None}
+
+        def fail_restore(guard):
+            events.append("restore")
+            raise RuntimeError("private-restore-detail")
+
+        def fail_close(guard):
+            events.append("close")
+            raise RuntimeError("private-close-detail")
+
+        capability = SimpleNamespace(
+            _probe_uid_processes_present=lambda *args, **kwargs: (True, ("ps",)),
+            _presence_result=lambda value: value,
+        )
+        reviewed = SimpleNamespace(
+            _child_environment=lambda *args: {},
+            _run_real_summary_probe=lambda *args, **kwargs: events.append("probe"),
+            _remove_summary_parent_probe=lambda guard, name: events.append("probe-removed"),
+            _restore_runner_summary=fail_restore,
+            _close_runner_summary=fail_close,
+        )
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._probe_summary_after_commands(
+                {}, 502, "home", {"python": "python"}, reviewed, capability, binding_value(),
+                cleanup_state,
+            )
+        self.assertEqual(caught.exception.stage, "cleanup_summary_present_ps")
+        with self.assertRaises(bootstrap.Refusal) as finished:
+            bootstrap._finish_summary_guard(
+                {"parent_probe_name": "summary.kd-probe"}, reviewed,
+                worker_cleanup_confirmed=True, cleanup_state=cleanup_state,
+            )
+        self.assertEqual((finished.exception.reason, finished.exception.stage),
+                         ("cleanup_incomplete", "cleanup_summary_present_ps"))
+        self.assertEqual(events, ["probe-removed", "restore", "close"])
+
+    def test_multiple_or_unapproved_survivor_classes_use_generic_present_stage(self):
+        for classes in (("python", "ps"), ("other",), ("unknown",), ("additional",)):
+            with self.subTest(classes=classes):
+                events = []
+                capability = SimpleNamespace(
+                    _probe_uid_processes_present=lambda *args, **kwargs: (True, classes),
+                    _presence_result=lambda value: events.append("validated") or value,
+                )
+                reviewed = SimpleNamespace(
+                    _child_environment=lambda *args: {},
+                    _run_real_summary_probe=lambda *args, **kwargs: events.append("probe"),
+                )
+                with self.assertRaises(bootstrap.Refusal) as caught:
+                    bootstrap._probe_summary_after_commands(
+                        {}, 502, "home", {"python": "python"}, reviewed, capability, binding_value()
+                    )
+                self.assertEqual((caught.exception.reason, caught.exception.stage),
+                                 ("cleanup_incomplete", "cleanup_summary_present"))
+                self.assertEqual(events, ["validated"])
+
+    def test_census_validation_failure_is_distinct_and_never_runs_summary_probe(self):
+        events = []
+        cleanup_state = {"first": None}
+
+        def fail_remove(guard, name):
+            events.append("probe-removed")
+            raise RuntimeError("private-remove-detail")
+
+        def fail_restore(guard):
+            events.append("restore")
+            raise RuntimeError("private-restore-detail")
+
+        def fail_close(guard):
+            events.append("close")
+            raise RuntimeError("private-close-detail")
+
+        def reject_presence(value):
+            events.append("validation-failed")
+            raise ValueError("private-census-detail")
+
+        capability = SimpleNamespace(
+            _probe_uid_processes_present=lambda *args, **kwargs: events.append("census") or object(),
+            _presence_result=reject_presence,
+        )
+        reviewed = SimpleNamespace(
+            _child_environment=lambda *args: {},
+            _run_real_summary_probe=lambda *args, **kwargs: events.append("probe"),
+            _remove_summary_parent_probe=fail_remove,
+            _restore_runner_summary=fail_restore,
+            _close_runner_summary=fail_close,
+        )
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._probe_summary_after_commands(
+                {}, 502, "home", {"python": "python"}, reviewed, capability, binding_value(),
+                cleanup_state,
+            )
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("cleanup_incomplete", "cleanup_summary_census"))
+        self.assertEqual(cleanup_state["first"], "cleanup_summary_census")
+        self.assertEqual(events, ["census", "validation-failed"])
+        self.assertNotIn("private-census-detail", str(caught.exception))
+        with self.assertRaises(bootstrap.Refusal) as finished:
+            bootstrap._finish_summary_guard(
+                {"parent_probe_name": "summary.kd-probe"}, reviewed,
+                worker_cleanup_confirmed=True, cleanup_state=cleanup_state,
+            )
+        self.assertEqual((finished.exception.reason, finished.exception.stage),
+                         ("cleanup_incomplete", "cleanup_summary_census"))
+        self.assertEqual(events, ["census", "validation-failed", "probe-removed", "restore", "close"])
+
+    def test_native_preflight_census_failure_is_cleanup_and_blocks_summary_probe(self):
+        events = []
+
+        def fail_census(*args, **kwargs):
+            events.append("census")
+            error = RuntimeError("private-native-detail")
+            error.reason = "native_preflight_unavailable"
+            error.cleanup_complete = False
+            raise error
+
+        capability = SimpleNamespace(
+            _probe_uid_processes_present=fail_census,
+            _presence_result=lambda value: events.append("validated") or value,
+        )
+        reviewed = SimpleNamespace(
+            _child_environment=lambda *args: {},
+            _run_real_summary_probe=lambda *args, **kwargs: events.append("probe"),
+        )
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._probe_summary_after_commands(
+                {}, 502, "home", {"python": "python"}, reviewed, capability, binding_value()
+            )
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("cleanup_incomplete", "cleanup_summary_census"))
+        self.assertEqual(events, ["census"])
+        self.assertNotIn("private-native-detail", str(caught.exception))
+
+    def test_summary_probe_cleanup_has_a_fixed_probe_stage(self):
+        capability = SimpleNamespace(
+            _probe_uid_processes_present=lambda *args, **kwargs: (False, ()),
+            _presence_result=lambda value: value,
+        )
+
+        def fail_probe(*args, **kwargs):
+            raise bootstrap.Refusal("cleanup_incomplete", "cleanup")
+
+        reviewed = SimpleNamespace(
+            _child_environment=lambda *args: {},
+            _run_real_summary_probe=fail_probe,
+        )
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            bootstrap._probe_summary_after_commands(
+                {}, 502, "home", {"python": "python"}, reviewed, capability, binding_value()
+            )
+        self.assertEqual((caught.exception.reason, caught.exception.stage),
+                         ("cleanup_incomplete", "cleanup_summary_probe"))
 
 
 class OutputTests(unittest.TestCase):
