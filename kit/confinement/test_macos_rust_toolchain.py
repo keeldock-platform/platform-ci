@@ -288,6 +288,83 @@ class RustToolchainContractTests(unittest.TestCase):
 
         self.assertIsNone(rust.Refusal("gate_failed", command_check="unknown_check_value").command_check)
 
+    def test_diagnostic_capture_decodes_only_bounded_worker_frame(self):
+        output = b"KD-CAPTURE 1 7 4 4 0 0\nfmt\n"
+        result = SimpleNamespace(returncode=0, stdout=output, stderr=b"warn")
+        decoded = rust._decode_command_capture(result, ("cargo", "fmt"))
+        self.assertEqual(decoded.args, ("cargo", "fmt"))
+        self.assertEqual(decoded.returncode, 7)
+        self.assertEqual(decoded.stdout, b"fmt\n")
+        self.assertEqual(decoded.stderr, b"warn")
+        self.assertIs(decoded.stdout_truncated, False)
+        self.assertIs(decoded.stderr_truncated, False)
+
+        for stdout, stderr in (
+            (b"KD-CAPTURE 1 7 5 4 0 0\nfmt\n", b"warn"),
+            (b"KD-CAPTURE 1 7 3 4 0 0\nfmt\n", b"warnx"),
+            (b"KD-CAPTURE 1 7 3 4 2 0\nfmt\n", b"warn"),
+            (b"KD-CAPTURE 1 256 0 0 0 0\n", b""),
+            (b"KD-CAPTURE 1 7 3 4 0 0\nfmt\nextra", b"warn"),
+        ):
+            with self.subTest(stdout=stdout[:32], stderr=stderr), self.assertRaises(rust.Refusal):
+                rust._decode_command_capture(
+                    SimpleNamespace(returncode=0, stdout=stdout, stderr=stderr), ("cargo", "fmt"),
+                )
+
+        prefix = b"fmt\n" + (b"x" * (rust.DIAGNOSTIC_STREAM_LIMIT - 4))
+        frame = (b"KD-CAPTURE 1 7 " + str(len(prefix)).encode("ascii")
+                 + b" 4 1 0\n" + prefix)
+        truncated = rust._decode_command_capture(
+            SimpleNamespace(returncode=0, stdout=frame, stderr=b"warn"), ("cargo", "fmt"),
+        )
+        self.assertEqual(len(truncated.stdout), rust.DIAGNOSTIC_STREAM_LIMIT)
+        self.assertEqual(truncated.stdout[:4], b"fmt\n")
+        self.assertIs(truncated.stdout_truncated, True)
+        self.assertIs(truncated.stderr_truncated, False)
+
+    def test_opt_in_nonzero_capture_uses_fixed_python_wrapper_and_keeps_success_default(self):
+        prefix = b"failed\n" + (b"x" * (rust.DIAGNOSTIC_STREAM_LIMIT - len(b"failed\n")))
+        error_prefix = b"detail\n" + (b"y" * (rust.DIAGNOSTIC_STREAM_LIMIT - len(b"detail\n")))
+        captured = SimpleNamespace(
+            returncode=0,
+            stdout=(b"KD-CAPTURE 1 9 " + str(len(prefix)).encode("ascii")
+                    + b" " + str(len(error_prefix)).encode("ascii") + b" 1 1\n" + prefix),
+            stderr=error_prefix,
+        )
+        calls = []
+
+        def run_as_probe_user(argv, uid, **kwargs):
+            calls.append((argv, uid, kwargs))
+            return captured
+
+        capability = SimpleNamespace(_run_as_probe_user=run_as_probe_user)
+        result = rust._run_worker_command(
+            ("cargo", "test", "--locked"), 502, {"PATH": "/usr/bin"}, "/usr/bin/python3",
+            capability, stage="workspace_tests", deadline=rust.time.monotonic() + 30,
+            allow_nonzero_capture=True,
+        )
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (9, prefix, error_prefix))
+        self.assertEqual(len(result.stdout), rust.DIAGNOSTIC_STREAM_LIMIT)
+        self.assertEqual(len(result.stderr), rust.DIAGNOSTIC_STREAM_LIMIT)
+        self.assertIs(result.stdout_truncated, True)
+        self.assertIs(result.stderr_truncated, True)
+        self.assertEqual(calls[0][1], 502)
+        self.assertTrue(calls[0][0][:6] == (
+            "/usr/bin/python3", "-I", "-S", "-B", "-c", rust.COMMAND_CAPTURE_SCRIPT,
+        ))
+        self.assertEqual(calls[0][0][6:], ("cargo", "test", "--locked"))
+        self.assertIs(calls[0][2]["command_diagnostics"], True)
+
+        ordinary = SimpleNamespace(returncode=0, stdout=b"ok", stderr=b"")
+        calls.clear()
+        capability._run_as_probe_user = lambda argv, uid, **kwargs: calls.append(argv) or ordinary
+        normal = rust._run_worker_command(
+            ("cargo", "fmt"), 502, {}, "/usr/bin/python3", capability,
+            stage="format", deadline=rust.time.monotonic() + 30,
+        )
+        self.assertIs(normal, ordinary)
+        self.assertEqual(calls, [("cargo", "fmt")])
+
 
 if __name__ == "__main__":
     unittest.main()

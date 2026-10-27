@@ -53,7 +53,7 @@ def _upload_marker(digest, archive_digest, size=128):
     ).encode("ascii")
 
 
-def _fixture():
+def _fixture(*, retention_seconds=24 * 60 * 60 - 2, created_offset_seconds=-300, now=None):
     member = _ciphertext("macos-15")
     archive = _archive(member)
     cipher_digests = {
@@ -61,8 +61,9 @@ def _fixture():
         for runner in subject.RUNNERS
     }
     archive_digest = hashlib.sha256(archive).hexdigest()
-    created = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(minutes=5)
-    expires = created + timedelta(days=1)
+    current = datetime.now(timezone.utc).replace(microsecond=0) if now is None else now
+    created = current + timedelta(seconds=created_offset_seconds)
+    expires = created + timedelta(seconds=retention_seconds)
     jobs = []
     checks = {}
     annotations = {}
@@ -235,12 +236,39 @@ class MarkerTests(unittest.TestCase):
 class ProviderShapeTests(unittest.TestCase):
     def test_full_provider_shaped_run_audits_one_mac_upload_and_all_matrix_jobs(self):
         state, env = _fixture()
+        created = subject._parse_api_time(state["artifacts"][0]["created_at"])
+        expires = subject._parse_api_time(state["artifacts"][0]["expires_at"])
+        self.assertEqual(expires - created, timedelta(days=1) - timedelta(seconds=2))
         marker, api = _audit(state, env)
         self.assertIn("status=passed", marker)
         self.assertIn("producers=3 ciphertexts=3", marker)
         self.assertIn("/actions/artifacts/97531/zip", api.requests[0].full_url)
         self.assertEqual(api.requests[0].get_header("Authorization"), "Bearer " + api._token)
         self.assertIsNone(api.requests[1].get_header("Authorization"))
+
+    def test_artifact_expiry_accepts_live_short_lifetimes_and_rejects_out_of_bounds(self):
+        now = datetime(2026, 10, 28, 4, 0, 0, tzinfo=timezone.utc)
+        identity = {"run_id": RUN_ID, "repository_id": REPOSITORY_ID, "sha": CONTROL_SHA}
+        for lifetime in (2, 60, 3600, 24 * 60 * 60 - 2, 24 * 60 * 60):
+            with self.subTest(lifetime=lifetime):
+                state, unused_env = _fixture(
+                    retention_seconds=lifetime, created_offset_seconds=-1, now=now,
+                )
+                self.assertEqual(
+                    subject._validate_artifact_record(
+                        state["artifacts"][0], identity, None, now=now,
+                    ),
+                    state["artifacts"][0]["size_in_bytes"],
+                )
+        for lifetime, created_offset in ((0, -1), (-1, -1), (24 * 60 * 60 + 1, -1), (60, 1), (60, -61)):
+            with self.subTest(lifetime=lifetime, created_offset=created_offset):
+                state, unused_env = _fixture(
+                    retention_seconds=lifetime, created_offset_seconds=created_offset, now=now,
+                )
+                with self.assertRaises(subject.SmokeAuditRefusal):
+                    subject._validate_artifact_record(
+                        state["artifacts"][0], identity, None, now=now,
+                    )
 
     def test_archive_redirect_rejects_untrusted_blob_host(self):
         class RedirectAPI:

@@ -55,6 +55,9 @@ def main():
                 (".github/workflows/macos-rules-bootstrap.yml", "macos-rules-bootstrap"),
                 (".github/workflows/macos-core-bootstrap.yml", "macos-core-bootstrap"),
                 (".github/workflows/node-lock-smoke.yml", "node-lock-smoke"),
+                (".github/workflows/node-lock-return.yml", "node-lock-return"),
+                (".github/workflows/core-rust-format-return.yml", "core-rust-format-return"),
+                (".github/workflows/core-build-diagnostic-return.yml", "core-build-diagnostic-return"),
                 (".github/workflows/development-feedback-smoke.yml", "development-feedback-smoke"),
             ):
                 source_reader_path = root / path

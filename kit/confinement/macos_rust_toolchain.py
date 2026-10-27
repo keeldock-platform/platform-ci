@@ -43,7 +43,60 @@ COMMAND_CHECKS = frozenset((
 ))
 SOURCE_COMMAND_STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "feedback_lock", "feedback_format",
 ))
+DIAGNOSTIC_STREAM_LIMIT = 32_768
+COMMAND_CAPTURE_SCRIPT = '''\
+import os, selectors, subprocess, sys
+limit = 32768
+out = bytearray()
+err = bytearray()
+out_overflow = 0
+err_overflow = 0
+process = None
+try:
+    process = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, close_fds=True)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, (1, out))
+    selector.register(process.stderr, selectors.EVENT_READ, (2, err))
+    while selector.get_map():
+        for key, unused_mask in selector.select():
+            chunk = os.read(key.fileobj.fileno(), 4096)
+            if not chunk:
+                selector.unregister(key.fileobj)
+                key.fileobj.close()
+            else:
+                remaining = max(0, limit - len(key.data[1]))
+                if remaining:
+                    key.data[1].extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    if key.data[0] == 1:
+                        out_overflow = 1
+                    else:
+                        err_overflow = 1
+    status = process.wait()
+except BaseException:
+    status = 256
+    out_overflow = 2
+if status < 0:
+    status = 256
+header = ("KD-CAPTURE 1 %d %d %d %d %d\\n"
+          % (status, len(out), len(err), out_overflow, err_overflow)).encode("ascii")
+def write_all(fd, data):
+    offset = 0
+    while offset < len(data):
+        count = os.write(fd, data[offset:])
+        if count <= 0:
+            raise OSError
+        offset += count
+try:
+    write_all(1, header)
+    write_all(1, out)
+    write_all(2, err)
+except BaseException:
+    raise SystemExit(2)
+'''
 MAX_DOWNLOAD_SECONDS = 120
 MAX_INSTALL_SECONDS = 240
 MAX_TOOL_SECONDS = 120
@@ -924,11 +977,21 @@ def _worker_environment(home, storage, prefix, tools, host_toolchain, worker_too
 
 def _run_worker_command(
     argv, uid, env, python_executable, capability, *, stage, deadline, timeout=MAX_TOOL_SECONDS,
+    allow_nonzero_capture=False,
 ):
     command_diagnostics = type(stage) is str and stage in SOURCE_COMMAND_STAGES
+    if type(allow_nonzero_capture) is not bool or allow_nonzero_capture and not command_diagnostics:
+        raise Refusal("capture_invalid", command_check="capture_invalid")
+    if type(argv) not in (tuple, list) or not argv:
+        raise Refusal("capture_invalid", command_check="capture_invalid" if command_diagnostics else None)
+    command = tuple(argv)
+    if allow_nonzero_capture:
+        if any(type(part) is not str or not part or "\x00" in part for part in argv):
+            raise Refusal("capture_invalid", command_check="capture_invalid")
+        command = (python_executable, "-I", "-S", "-B", "-c", COMMAND_CAPTURE_SCRIPT, *argv)
     try:
         result = capability._run_as_probe_user(
-            argv,
+            command,
             uid,
             env=env,
             timeout=_bounded_timeout(deadline, timeout),
@@ -959,12 +1022,42 @@ def _run_worker_command(
         raise Refusal("capture_invalid", command_check="capture_invalid" if command_diagnostics else None)
     if len(result.stdout) > MAX_CAPTURE_BYTES or len(result.stderr) > MAX_CAPTURE_BYTES:
         raise Refusal("capture_invalid", command_check="capture_overflow" if command_diagnostics else None)
+    if allow_nonzero_capture:
+        return _decode_command_capture(result, argv)
     if result.returncode != 0:
         raise Refusal(
             "smoke_failed" if stage == "smoke" else "version_mismatch",
             command_check="nonzero_exit" if command_diagnostics else None,
         )
     return result
+
+
+def _decode_command_capture(result, argv):
+    if (type(result.returncode) is not int or result.returncode != 0
+            or type(result.stdout) is not bytes or type(result.stderr) is not bytes):
+        raise Refusal("capture_invalid", command_check="capture_invalid")
+    header, separator, payload = result.stdout.partition(b"\n")
+    try:
+        fields = header.decode("ascii", "strict").split(" ")
+        if (not separator or len(fields) != 7 or fields[:2] != ["KD-CAPTURE", "1"]
+                or any(not field.isdigit() for field in fields[2:])):
+            raise ValueError
+        status, stdout_size, stderr_size, stdout_overflow, stderr_overflow = (
+            int(value) for value in fields[2:]
+        )
+    except (UnicodeError, ValueError):
+        raise Refusal("capture_invalid", command_check="capture_invalid") from None
+    if (status > 255 or stdout_size > DIAGNOSTIC_STREAM_LIMIT
+            or stderr_size > DIAGNOSTIC_STREAM_LIMIT
+            or stdout_overflow not in (0, 1, 2) or stderr_overflow not in (0, 1, 2)
+            or len(payload) != stdout_size or len(result.stderr) != stderr_size):
+        raise Refusal("capture_invalid", command_check="capture_invalid")
+    if stdout_overflow == 2 or stderr_overflow == 2 or status < 0:
+        raise Refusal("capture_invalid", command_check="helper_failure")
+    decoded = subprocess.CompletedProcess(tuple(argv), status, payload, result.stderr)
+    decoded.stdout_truncated = bool(stdout_overflow)
+    decoded.stderr_truncated = bool(stderr_overflow)
+    return decoded
 
 
 def _decode_single_line(raw):
