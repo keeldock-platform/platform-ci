@@ -17,6 +17,7 @@ MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "cb9b70226175069e9c148c06f18d4d89cf8
 MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "a91387440f8caceadf8f19f7c87feb3d82377eb3c9e1813de48b518992d48807"
 MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "08cf50d62e18e52661befe3153294c2d188b8a980f914437dab7cbd899744b81"
 MACOS_CORE_CONTRACT_WORKFLOW_SHA256 = "38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096"
+DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256 = "3e53e91d392c7477391132c7b09e36566a9390b77ab2d2e5ac670d9597c6ef27"
 
 
 class PolicyError(ValueError):
@@ -1475,6 +1476,12 @@ def consumer_workflow_template(pool, pin):
 def validate_workflow_text(text, pool, workflow_kind="public-policy"):
     if type(text) is not str or type(pool) is not str or pool not in PUBLIC_POOLS:
         raise PolicyError("workflow-input")
+    if workflow_kind == "development-feedback-smoke":
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256:
+            raise PolicyError("workflow-template-mismatch")
+        return True
     if workflow_kind == "node-lock-smoke":
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
