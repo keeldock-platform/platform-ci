@@ -346,6 +346,42 @@ class ProviderShapeTests(unittest.TestCase):
         marker, _ = _audit(state, env)
         self.assertIn("status=passed", marker)
 
+    def test_repeated_exact_macos_capacity_notice_is_bounded(self):
+        for count in (3, subject.MAX_MACOS_CAPACITY_NOTICES):
+            state, env = _fixture()
+            state["annotations"][CHECK_IDS["macos-15"]] = [
+                copy.deepcopy(CAPACITY_NOTICE) for _ in range(count)
+            ]
+            state["checks"][CHECK_IDS["macos-15"]]["output"]["annotations_count"] = count
+            with self.subTest(count=count):
+                marker, _ = _audit(state, env)
+                self.assertIn("status=passed", marker)
+
+    def test_excess_or_mixed_repeated_capacity_notices_refuse(self):
+        state, env = _fixture()
+        count = subject.MAX_MACOS_CAPACITY_NOTICES + 1
+        state["annotations"][CHECK_IDS["macos-15"]] = [
+            copy.deepcopy(CAPACITY_NOTICE) for _ in range(count)
+        ]
+        state["checks"][CHECK_IDS["macos-15"]]["output"]["annotations_count"] = count
+        with self.assertRaises(subject.SmokeAuditRefusal):
+            _audit(state, env)
+
+        state, env = _fixture()
+        state["annotations"][CHECK_IDS["macos-15"]] = [
+            copy.deepcopy(CAPACITY_NOTICE) for _ in range(3)
+        ]
+        state["annotations"][CHECK_IDS["macos-15"]][1]["message"] = "unexpected notice"
+        state["checks"][CHECK_IDS["macos-15"]]["output"]["annotations_count"] = 3
+        with self.assertRaises(subject.SmokeAuditRefusal):
+            _audit(state, env)
+
+        state, env = _fixture()
+        state["annotations"][CHECK_IDS["ubuntu-24.04"]] = [copy.deepcopy(CAPACITY_NOTICE)]
+        state["checks"][CHECK_IDS["ubuntu-24.04"]]["output"]["annotations_count"] = 1
+        with self.assertRaises(subject.SmokeAuditRefusal):
+            _audit(state, env)
+
     def test_encrypted_archive_must_not_contain_the_fixture_canary(self):
         state, env = _fixture()
         tainted_member = subject.CANARY + b"-" + b"x" * (128 - len(subject.CANARY) - 1)

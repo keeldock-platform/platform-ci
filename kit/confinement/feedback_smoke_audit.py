@@ -27,6 +27,7 @@ ARTIFACT_PREFIX = "development-feedback-smoke-"
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
 MAX_SUMMARY_BYTES = 16 * 1024
 MAX_LOG_BYTES = 32 * 1024 * 1024
+MAX_MACOS_CAPACITY_NOTICES = 64
 CANARY = b"feedback-smoke-canary-7c49b2"
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 SHA40_RE = re.compile(r"[a-f0-9]{40}\Z")
@@ -319,10 +320,19 @@ def _audit_check(api, job, identity, runner):
                     continue
                 if len(encoded) > MAX_SUMMARY_BYTES or CANARY in encoded:
                     valid = False
-    expected_annotations = [_macos_capacity_notice(identity["sha"])] if runner == "macos-15" else []
-    if (annotations is None or annotations_count is None
-            or len(annotations) != annotations_count
-            or (annotations and annotations != expected_annotations)):
+    expected_notice = _macos_capacity_notice(identity["sha"])
+    annotations_valid = annotations is not None and annotations_count is not None
+    if annotations_valid and len(annotations) != annotations_count:
+        annotations_valid = False
+    if annotations_valid:
+        if runner == "macos-15":
+            annotations_valid = (
+                len(annotations) <= MAX_MACOS_CAPACITY_NOTICES
+                and all(item == expected_notice for item in annotations)
+            )
+        else:
+            annotations_valid = len(annotations) == 0
+    if not annotations_valid:
         valid = False
 
     try:
