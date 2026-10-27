@@ -75,8 +75,8 @@ ALLOWED_FILES = {
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
-    'kit/confinement/macos_core_contract.py': 'ba066bbc55b3a65a0647e0be4b54a707f874e4fd65ec96478771c5ad7b2b081e',
-    'kit/confinement/test_macos_core_contract.py': '9b2731a47a5005edcb7eb51a92e75345509fbaa70f1ac04e428b3d32ab7bffcd',
+    'kit/confinement/macos_core_contract.py': 'adcde4efbd47b3bd73e95d2410b32a244621afd5043b5f433e36708dc6727845',
+    'kit/confinement/test_macos_core_contract.py': '12cdce5d427f7775ac18e3c7197c48297f17a628e92b98f903190a2bb33a88eb',
     '.github/workflows/macos-rust-toolchain-smoke.yml': 'cdf7068f8887c22958d74f3c2cc0a73c5c8c4c41f4eff0b43e16e47f61e58bb7',
     'kit/confinement/macos_rust_toolchain.py': 'a27c103b1d6c4fbf9fef24469ade69668e01c949e3108dc89dc3dbd63ac14b49',
     'kit/confinement/test_macos_rust_toolchain.py': '27c40bc8d42a3df6e88209d6cb8ea99cd9e80107310f1eb639dbfb2f6638727a',

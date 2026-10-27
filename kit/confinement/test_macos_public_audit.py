@@ -1902,6 +1902,85 @@ class SourceReaderAuditTests(unittest.TestCase):
             audit.run("source-reader-audit-core", env, FakeMultiAuditAPI(pages, logs))
 
 
+class CoreContractAuditDiagnosticTests(unittest.TestCase):
+    def test_self_job_identity_clauses_keep_refusing_with_closed_diagnostics(self):
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        cases = (
+            ("run_id", int(RUN_ID) + 1, "audit_job_run_id_mismatch"),
+            ("run_attempt", int(RUN_ATTEMPT) + 1, "audit_job_run_attempt_mismatch"),
+            ("head_sha", "f" * 40, "audit_job_head_sha_mismatch"),
+            ("status", "queued", "audit_job_status_queued"),
+            ("status", "completed", "audit_job_status_completed"),
+        )
+        for field, replacement, diagnostic in cases:
+            with self.subTest(field=field, diagnostic=diagnostic):
+                pages, env, logs = bootstrap_audit_fixture("core-contract")
+                audit_job = next(
+                    job for job in pages[jobs_path][0]["jobs"]
+                    if job["name"] == audit.CORE_CONTRACT_AUDIT_JOB_NAME
+                )
+                audit_job[field] = replacement
+                with self.assertRaises(audit.CoreContractAuditRefusal) as caught:
+                    audit.run("core-contract-audit", env, FakeMultiAuditAPI(pages, logs))
+                self.assertEqual(caught.exception.reason, "run_identity_mismatch")
+                self.assertEqual(caught.exception.diagnostic, diagnostic)
+
+    def test_run_validation_identity_refusal_gets_only_a_fixed_phase_class(self):
+        pages, env, logs = bootstrap_audit_fixture("core-contract")
+        run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        pages[run_path][0]["head_sha"] = "f" * 40
+        with self.assertRaises(audit.CoreContractAuditRefusal) as caught:
+            audit.run("core-contract-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "run_identity_mismatch")
+        self.assertEqual(caught.exception.diagnostic, "run_validation_identity")
+
+    def test_main_emits_only_allowlisted_diagnostics_for_the_contract_audit_phase(self):
+        expected = (
+            "macos-core-contract-audit-diagnostic=audit_job_status_queued\n"
+            "macos-public-surface-audit=refused reason=run_identity_mismatch\n"
+        )
+        output = io.StringIO()
+        error = audit.CoreContractAuditRefusal(
+            "run_identity_mismatch", "audit_job_status_queued",
+        )
+        with mock.patch.object(audit, "run", side_effect=error), contextlib.redirect_stdout(output):
+            result = audit.main(["core-contract-audit"])
+        self.assertEqual(result, 2)
+        self.assertEqual(output.getvalue(), expected)
+
+        for diagnostic in ("untrusted-api-value", ["unhashable", "value"]):
+            with self.subTest(diagnostic_type=type(diagnostic).__name__):
+                output = io.StringIO()
+                error = audit.CoreContractAuditRefusal(
+                    "run_identity_mismatch", "audit_job_status_queued",
+                )
+                error.diagnostic = diagnostic
+                with mock.patch.object(audit, "run", side_effect=error), contextlib.redirect_stdout(output):
+                    result = audit.main(["core-contract-audit"])
+                self.assertEqual(result, 2)
+                self.assertEqual(
+                    output.getvalue(),
+                    "macos-public-surface-audit=refused reason=run_identity_mismatch\n",
+                )
+                self.assertNotIn("untrusted-api-value", output.getvalue())
+
+    def test_diagnostic_does_not_change_other_phase_output(self):
+        output = io.StringIO()
+        error = audit.CoreContractAuditRefusal(
+            "run_identity_mismatch", "audit_job_status_queued",
+        )
+        with mock.patch.object(audit, "run", side_effect=error), contextlib.redirect_stdout(output):
+            result = audit.main(["audit"])
+        self.assertEqual(result, 2)
+        self.assertEqual(
+            output.getvalue(),
+            "macos-public-surface-audit=refused reason=run_identity_mismatch\n",
+        )
+
+
 class BootstrapAuditTests(unittest.TestCase):
     def test_rules_and_core_bootstrap_require_settings_snapshot_and_producer_evidence(self):
         for kind, expected_output, expected_logs in (

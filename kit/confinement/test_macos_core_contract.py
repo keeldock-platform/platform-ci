@@ -68,6 +68,46 @@ class CoreContractTests(unittest.TestCase):
             with self.subTest(arguments=invalid), self.assertRaises(subject.Refusal):
                 subject._parse_arguments(invalid)
 
+    def test_privilege_identity_accepts_the_native_primary_group_20(self):
+        worker_uid = 504
+        self.assertIn(subject.PRIVILEGE_IDENTITY_CHECK, subject.PRIVILEGE_SCRIPT)
+
+        def check(real_uid, effective_uid, primary_gid):
+            simulated_os = SimpleNamespace(
+                getuid=lambda: real_uid,
+                geteuid=lambda: effective_uid,
+                getgid=lambda: primary_gid,
+                getgroups=lambda: [20],
+            )
+            exec(subject.PRIVILEGE_IDENTITY_CHECK, {"os": simulated_os, "uid": worker_uid})
+
+        check(worker_uid, worker_uid, 20)
+        for real_uid, effective_uid, primary_gid in (
+            (worker_uid + 1, worker_uid, 20),
+            (worker_uid, worker_uid + 1, 20),
+            (worker_uid, worker_uid, 21),
+        ):
+            with self.subTest(real_uid=real_uid, effective_uid=effective_uid, primary_gid=primary_gid):
+                with self.assertRaises(SystemExit):
+                    check(real_uid, effective_uid, primary_gid)
+
+    def test_privilege_probe_preserves_helper_cleanup_failure(self):
+        cleanup_error = subject.Refusal("cleanup_incomplete", "cleanup")
+
+        def fail_probe(*unused_args, **unused_kwargs):
+            raise cleanup_error
+
+        reviewed = SimpleNamespace(
+            _child_environment=lambda *unused_args: {},
+            _probe_argv=lambda *unused_args: ("python",),
+            _run_probe_step=fail_probe,
+            _worker_census=lambda *unused_args: None,
+        )
+        with self.assertRaises(subject.Refusal) as raised:
+            subject._run_privilege_probe(504, Path.cwd(), {"python": "/usr/bin/python3"}, reviewed)
+        self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+        self.assertEqual(raised.exception.stage, "cleanup")
+
     def test_review_binding_requires_every_protected_value(self):
         request = _request()
         binding = _binding()

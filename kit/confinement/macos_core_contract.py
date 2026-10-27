@@ -58,11 +58,14 @@ STAGES = frozenset((
     "conformance_tests", "cleanup", "receipt", "internal",
 ))
 
+PRIVILEGE_IDENTITY_CHECK = """\
+if os.getuid() != uid or os.geteuid() != uid or os.getgid() != 20:
+    raise SystemExit(51)
+"""
 PRIVILEGE_SCRIPT = '''\
 import os, subprocess, sys
 uid = int(sys.argv[1])
-if os.getuid() != uid or os.geteuid() != uid or os.getgid() != 20 or os.getgroups() != []:
-    raise SystemExit(51)
+''' + PRIVILEGE_IDENTITY_CHECK + '''\
 base_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": os.environ["HOME"], "LANG": "C", "LC_ALL": "C"}
 try:
     developer = subprocess.run(("/usr/sbin/DevToolsSecurity", "-status"), stdin=subprocess.DEVNULL,
@@ -510,7 +513,9 @@ def _run_privilege_probe(worker_uid, home, host_toolchain, reviewed):
             stage="privilege", expected_stdout=PRIVILEGE_MARKER,
         )
         reviewed._worker_census(worker_uid, host_toolchain["python"], "privilege")
-    except BaseException:
+    except BaseException as error:
+        if getattr(error, "reason", None) == "cleanup_incomplete":
+            raise Refusal("cleanup_incomplete", "cleanup") from None
         raise Refusal("runner_unavailable", "worker_setup") from None
 
 
