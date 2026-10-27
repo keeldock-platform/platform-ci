@@ -19,6 +19,7 @@ from policy import (
     MACOS_CORE_CONTRACT_WORKFLOW_SHA256,
     MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE,
     MACOS_RUST_TOOLCHAIN_WORKFLOW_TEMPLATE,
+    NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE,
     MACOS_SOURCE_READER_ACTION_SHA,
     MACOS_SOURCE_READER_WORKFLOW_SHA256,
     PolicyError,
@@ -43,6 +44,7 @@ MACOS_RULES_SOURCE_READER_WORKFLOW = Path(__file__).resolve().parents[2] / ".git
 MACOS_RULES_BOOTSTRAP_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rules-bootstrap.yml"
 MACOS_CORE_BOOTSTRAP_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-core-bootstrap.yml"
 MACOS_CORE_CONTRACT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-core-contract.yml"
+NODE_LOCK_SMOKE_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/node-lock-smoke.yml"
 MACOS_CORE_BOOTSTRAP_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_core_bootstrap.py"
 MACOS_CACHE_CLIENT_ACTION = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/action.yml"
 MACOS_CACHE_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/index.js"
@@ -138,6 +140,39 @@ class WorkflowPolicyTests(unittest.TestCase):
 
     def test_actual_platform_workflow_matches_closed_supported_shape(self):
         self.assertTrue(validate_workflow_text(self._platform_workflow(), "platform"))
+
+    def test_node_lock_smoke_workflow_is_closed_source_free_and_cross_platform(self):
+        workflow = NODE_LOCK_SMOKE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(workflow, "platform", "node-lock-smoke"))
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "node-lock-smoke")
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "platform")
+
+    def test_node_lock_smoke_workflow_rejects_source_cache_and_runtime_changes(self):
+        base = NODE_LOCK_SMOKE_WORKFLOW.read_text(encoding="utf-8")
+        mutations = (
+            base.replace("  workflow_dispatch:\n", "  pull_request:\n", 1),
+            base.replace("      - \"**\"\n", "      - main\n", 1),
+            base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
+            base.replace("          - macos-15\n", "          - macos-latest\n", 1),
+            base.replace("      fail-fast: true\n", "      fail-fast: false\n", 1),
+            base.replace("949feb2413d6458794dcd2491c4babbbce0c15c1", "a" * 40, 1),
+            base.replace('node-version: "24.22.1"', 'node-version: "24"', 1),
+            base.replace("check-latest: false", "check-latest: true", 1),
+            base.replace('cache: ""', 'cache: "npm"', 1),
+            base.replace("package-manager-cache: false", "package-manager-cache: true", 1),
+            base.replace('== "11.19.1"', '== "11.19.0"', 1),
+            base.replace("test_node_lock_manifest.mjs", "unreviewed.mjs", 1),
+            base.replace('test_node_lock_receipt.py"', 'test_policy.py"', 1),
+            base.replace("      - name: Run source-free helper tests\n", "      - name: Extra step\n        run: echo extra\n      - name: Run source-free helper tests\n", 1),
+            base.replace("  workflow_dispatch:\n", "  workflow_dispatch:\n    inputs: {}\n", 1),
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation_index=index):
+                self.assertNotEqual(changed, base)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "node-lock-smoke")
 
     def test_actual_linux_workflow_matches_closed_supported_shape(self):
         workflow = LINUX_WORKFLOW.read_text(encoding="utf-8")

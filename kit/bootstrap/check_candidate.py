@@ -54,6 +54,7 @@ def main():
                 (".github/workflows/macos-rules-reader-preflight.yml", "macos-rules-source-reader"),
                 (".github/workflows/macos-rules-bootstrap.yml", "macos-rules-bootstrap"),
                 (".github/workflows/macos-core-bootstrap.yml", "macos-core-bootstrap"),
+                (".github/workflows/node-lock-smoke.yml", "node-lock-smoke"),
             ):
                 source_reader_path = root / path
                 with source_reader_path.open("rb") as source:

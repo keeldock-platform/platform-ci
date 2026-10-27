@@ -7,6 +7,13 @@ from pathlib import Path
 PLATFORM_FILES = frozenset(
     (
         ".github/workflows/public-policy.yml",
+        '.github/workflows/node-lock-smoke.yml',
+        'kit/confinement/node_lock_envelope.mjs',
+        'kit/confinement/test_node_lock_envelope.mjs',
+        'kit/confinement/node_lock_manifest.mjs',
+        'kit/confinement/test_node_lock_manifest.mjs',
+        'kit/confinement/node_lock_receipt.py',
+        'kit/confinement/test_node_lock_receipt.py',
         ".github/workflows/linux-confinement.yml",
         ".github/workflows/windows-attestation-permission-probe.yml",
         ".github/workflows/macos-capability.yml",
@@ -74,6 +81,13 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
+    '.github/workflows/node-lock-smoke.yml': 'fc9287e22cc03d19679ca0bf505fc9576e155f29460fb96939b5c150788d8c32',
+    'kit/confinement/node_lock_envelope.mjs': 'a2a01d63f4bc863215de33e89f2ce580b352670acc9e0910226b8cbf21d10372',
+    'kit/confinement/test_node_lock_envelope.mjs': '674c6f7b7734e5132770ee5142b4dce929d9b186e0f542f1a8c0a048d98e56c6',
+    'kit/confinement/node_lock_manifest.mjs': 'd64ff3d3d6fee05e8e75e8461301a0fd95cc01e9f4ffcfb323483ee7d2fa23ad',
+    'kit/confinement/test_node_lock_manifest.mjs': 'b90d9c5564c5f13231924a91d0a4ac7a79403ae25ad42ca42ebb28330bd35666',
+    'kit/confinement/node_lock_receipt.py': '09343f1e607ff7f9e5313a6c62c7ffff3c4e828f6bf9ad52c810d9fbe4ce1d80',
+    'kit/confinement/test_node_lock_receipt.py': '34238cf9f55d74f706c26cf9132aa000f99bdee2c6a758902ef3a682bc028f66',
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
     'kit/confinement/macos_core_contract.py': '5498e04dbb50ab3e5d024d6d4bb7c238a8baefb198f85a50b8bc6f2d58d23227',
     'kit/confinement/test_macos_core_contract.py': 'da8a7a03b36b9cc35e5b00fa28dca959267e2efc86f3b6dbbd6c4d04369a76a4',
