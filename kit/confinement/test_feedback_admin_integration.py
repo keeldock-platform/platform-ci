@@ -125,11 +125,7 @@ class EncryptedProviderShapedAPI(ProviderShapedAPI):
         self.logs = self._logs()
 
 
-def _qualified_node_runtime():
-    candidate = shutil.which("node")
-    if candidate is None:
-        raise AssertionError("pinned Node runtime is unavailable")
-    path = os.path.realpath(candidate)
+def _require_pinned_node_version(path):
     version = subprocess.run(
         [path, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, cwd=os.sep, env={"PATH": os.defpath},
@@ -137,18 +133,84 @@ def _qualified_node_runtime():
     )
     if version.returncode != 0 or version.stdout not in (b"v24.22.1\n", b"v24.22.1\r\n"):
         raise AssertionError("hosted integration requires the pinned Node release")
-    digest = hashlib.sha256()
+
+
+def _qualified_node_runtime(private_directory):
+    candidate = shutil.which("node")
+    if candidate is None:
+        raise AssertionError("pinned Node runtime is unavailable")
+    private_info = os.stat(private_directory, follow_symlinks=False)
+    if (not stat.S_ISDIR(private_info.st_mode) or private_info.st_uid != os.getuid()
+            or stat.S_IMODE(private_info.st_mode) != 0o700):
+        raise AssertionError("temporary runtime parent is not private")
+    source_path = os.path.realpath(candidate)
+    _require_pinned_node_version(source_path)
+    runtime_directory = os.path.join(private_directory, "node-runtime")
+    os.mkdir(runtime_directory, 0o700)
+    os.chmod(runtime_directory, 0o700)
+    destination = os.path.join(runtime_directory, "node")
+    source_digest = hashlib.sha256()
     size = 0
-    with open(path, "rb") as runtime:
+    source_fd = destination_fd = None
+    try:
+        source_fd = os.open(source_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        source_info = os.fstat(source_fd)
+        if (not stat.S_ISREG(source_info.st_mode)
+                or not 0 < source_info.st_size <= feedback_admin.MAX_RUNTIME_BYTES):
+            raise AssertionError("pinned Node runtime has invalid file metadata")
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o500,
+        )
         while True:
-            chunk = runtime.read(1024 * 1024)
+            chunk = os.read(source_fd, 1024 * 1024)
             if not chunk:
                 break
             size += len(chunk)
             if size > feedback_admin.MAX_RUNTIME_BYTES:
                 raise AssertionError("pinned Node runtime exceeds the configured bound")
-            digest.update(chunk)
-    return path, digest.hexdigest()
+            source_digest.update(chunk)
+            view = memoryview(chunk)
+            offset = 0
+            while offset < len(view):
+                written = os.write(destination_fd, view[offset:])
+                if written <= 0:
+                    raise AssertionError("pinned Node runtime copy was incomplete")
+                offset += written
+        os.fchmod(destination_fd, 0o500)
+        os.fsync(destination_fd)
+        copied_info = os.fstat(destination_fd)
+        if (size != source_info.st_size or not stat.S_ISREG(copied_info.st_mode)
+                or copied_info.st_uid != os.getuid()
+                or copied_info.st_nlink != 1 or stat.S_IMODE(copied_info.st_mode) != 0o500
+                or copied_info.st_size != size):
+            raise AssertionError("private Node runtime copy has invalid metadata")
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        if source_fd is not None:
+            os.close(source_fd)
+    directory_fd = os.open(
+        runtime_directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    digest = source_digest.hexdigest()
+    copied_digest = hashlib.sha256()
+    with open(destination, "rb") as runtime:
+        while True:
+            chunk = runtime.read(1024 * 1024)
+            if not chunk:
+                break
+            copied_digest.update(chunk)
+    if copied_digest.hexdigest() != digest:
+        raise AssertionError("private Node runtime copy changed bytes")
+    _require_pinned_node_version(destination)
+    return destination, digest
 
 
 def _encrypt_fixture(node_path, public_spki_base64, context, now):
@@ -225,7 +287,6 @@ def _summary_review(request, api, job_names):
                      "native owner-wrapper integration requires POSIX filesystem semantics")
 class FeedbackAdminHostedIntegrationTests(unittest.TestCase):
     def test_real_key_encryption_authenticated_collection_release_and_replay_refusal(self):
-        node_path, node_hash = _qualified_node_runtime()
         profile = feedback_request.PROFILES["core-node-lock-return"]
         job_names = (
             profile["producer_job"] + "-settings",
@@ -245,7 +306,9 @@ class FeedbackAdminHostedIntegrationTests(unittest.TestCase):
         }
 
         with tempfile.TemporaryDirectory(prefix="feedback-admin-integration-") as temporary:
-            state_directory = os.path.realpath(os.path.join(temporary, "owner-state"))
+            private_directory = os.path.realpath(temporary)
+            node_path, node_hash = _qualified_node_runtime(private_directory)
+            state_directory = os.path.join(private_directory, "owner-state")
             admin = feedback_admin.FeedbackAdmin(
                 state_directory,
                 node_runtime_path=node_path,

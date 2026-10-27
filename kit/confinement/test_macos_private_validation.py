@@ -649,7 +649,7 @@ class CoreContractTreeTests(unittest.TestCase):
             b'\n[dependencies]\n\n[lints]\nworkspace = true\n'
         )
         fuzz_lock = (
-            b'# Generated fixture.\nversion = 4\n\n[[package]]\n'
+            bytes((35,)) + b' Generated fixture.\nversion = 4\n\n[[package]]\n'
             b'name = "parser-fixture"\nversion = "0.1.0"\ndependencies = [\n "api-fixture",\n]\n'
             b'\n[[package]]\nname = "api-fixture"\nversion = "0.1.0"\n'
         )

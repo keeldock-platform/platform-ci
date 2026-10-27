@@ -1521,7 +1521,7 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
         current = None
         for line in text.splitlines():
             stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
+            if not stripped or stripped.startswith(chr(35)):
                 continue
             if stripped.startswith("[["):
                 return None
@@ -1588,8 +1588,9 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
     prefix_and_packages = re.split(r"(?m)^\[\[package\]\]\s*$", lock_text)
     if len(prefix_and_packages) != 3 or re.search(r"(?m)^\s*(?:source|checksum)\s*=", lock_text):
         return False
+    comment_line = r"(?m)^" + re.escape(chr(35)) + r".*$"
     if (re.findall(r"(?m)^version\s*=\s*(4)\s*$", prefix_and_packages[0]) != ["4"]
-            or re.sub(r"(?m)^#.*$", "", prefix_and_packages[0]).strip() != "version = 4"):
+            or re.sub(comment_line, "", prefix_and_packages[0]).strip() != "version = 4"):
         return False
     parsed_lock = {}
     for block in prefix_and_packages[1:]:
@@ -1605,7 +1606,7 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
             normalized = re.sub(r'^\s*"[A-Za-z0-9_-]{1,64}",\s*$', "", dependency_blocks[0], flags=re.M)
             if normalized.strip():
                 return False
-        allowed_lines = re.sub(r"(?m)^#.*$", "", block)
+        allowed_lines = re.sub(comment_line, "", block)
         allowed_lines = re.sub(r'(?m)^name\s*=\s*"[A-Za-z0-9_-]{1,64}"\s*$', "", allowed_lines)
         allowed_lines = re.sub(r'(?m)^version\s*=\s*"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?"\s*$', "", allowed_lines)
         allowed_lines = re.sub(r"(?ms)^dependencies\s*=\s*\[\n.*?^\]$", "", allowed_lines)

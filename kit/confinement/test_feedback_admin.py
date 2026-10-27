@@ -58,19 +58,30 @@ def _expectation():
     }
 
 
+def _spki_for_key_path(path):
+    name = os.path.basename(path)
+    if not name.startswith("key-") or not name.endswith(".der"):
+        raise AssertionError("unexpected synthetic key name")
+    return SPKI + bytes.fromhex(name[4:-4])
+
+
 def _fake_helper(message, *, plaintext_pipe=False):
     if message["operation"] == "keygen":
+        nonce = os.path.basename(message["private_key_path"])[4:-4]
+        nonce_bytes = bytes.fromhex(nonce)
+        private_key = PRIVATE_KEY + nonce_bytes
+        public_spki = _spki_for_key_path(message["private_key_path"])
         fd = os.open(message["private_key_path"], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.write(fd, PRIVATE_KEY)
+            os.write(fd, private_key)
             os.fchmod(fd, 0o400)
             os.fsync(fd)
         finally:
             os.close(fd)
         result = {
             "schema_version": 1,
-            "public_spki_base64": base64.b64encode(SPKI).decode("ascii"),
-            "recipient_fingerprint": hashlib.sha256(SPKI).hexdigest(),
+            "public_spki_base64": base64.b64encode(public_spki).decode("ascii"),
+            "recipient_fingerprint": hashlib.sha256(public_spki).hexdigest(),
             "modulus_length": 3072,
             "public_exponent": "65537",
         }
@@ -169,7 +180,10 @@ class FeedbackAdminTests(unittest.TestCase):
     def test_request_creation_persists_private_key_and_only_returns_public_material(self):
         result = self.create()
         self.assertEqual(set(result), {"request", "canonical_record", "public_spki_base64", "recipient_fingerprint"})
-        self.assertEqual(result["request"]["recipient_fingerprint"], hashlib.sha256(SPKI).hexdigest())
+        expected_spki = _spki_for_key_path(
+            os.path.join(self.directory, "key-" + result["request"]["nonce"] + ".der"),
+        )
+        self.assertEqual(result["request"]["recipient_fingerprint"], hashlib.sha256(expected_spki).hexdigest())
         self.assertNotIn(PRIVATE_KEY, repr(result).encode("utf-8"))
         key_path = os.path.join(self.directory, "key-" + result["request"]["nonce"] + ".der")
         info = os.stat(key_path, follow_symlinks=False)
@@ -216,7 +230,7 @@ class FeedbackAdminTests(unittest.TestCase):
         with mock.patch.object(subject.time, "time", side_effect=lambda: clock[0]), \
                 mock.patch.object(self.admin, "_qualified_node", side_effect=qualify), \
                 mock.patch("subprocess.Popen", return_value=FakeProcess()):
-            stdout, unused_plaintext = self.admin._run_helper(message)
+            stdout, unused_plaintext = subject.FeedbackAdmin._run_helper(self.admin, message)
         self.assertEqual(captured["message"]["now"], NOW + 1)
         self.assertEqual(stdout, b'{"schema_version":1,"ok":true}\n')
 
@@ -429,6 +443,7 @@ class FeedbackAdminTests(unittest.TestCase):
             self.admin.expire_requests()
         diagnostic = self.create("build_diagnostics")["request"]
         self.assertEqual(diagnostic["kind"], "build_diagnostics")
+        self.assertNotEqual(diagnostic["recipient_fingerprint"], patch_request["recipient_fingerprint"])
 
     def test_private_state_directory_rejects_symlink_aliases(self):
         base = os.path.realpath(self.temporary.name)
