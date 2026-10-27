@@ -103,6 +103,13 @@ STAGES = frozenset((
     "input", "context", "configuration", "source_scope", "fetch", "revoke",
     "history", "signature", "revocation", "bootstrap", "cleanup",
 ))
+FETCH_DIAGNOSTIC_OPERATIONS = frozenset((
+    "git_init", "remote_add", "base_fetch", "base_ref", "candidate_fetch",
+    "source_ref", "shallow_check", "remote_remove", "source_snapshot",
+))
+FETCH_DIAGNOSTIC_CLASSES = frozenset((
+    "exit_nonzero", "stderr_present", "process_failure", "unexpected_exception",
+))
 SOURCE_REPOSITORY_ID_ENV = "SOURCE_REPOSITORY_ID"
 SOURCE_REPOSITORY_OWNER_ENV = "SOURCE_REPOSITORY_OWNER"
 SOURCE_REPOSITORY_NAME_ENV = "SOURCE_REPOSITORY_NAME"
@@ -123,9 +130,19 @@ COMMAND_TIMEOUT_SECONDS = 60
 
 
 class Refusal(Exception):
-    def __init__(self, reason, stage):
+    def __init__(self, reason, stage, source_diagnostic=None):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "input"
+        self.source_diagnostic = None
+        if (
+            self.reason == "source_fetch_unavailable" and self.stage == "fetch"
+            and type(source_diagnostic) is tuple and len(source_diagnostic) == 2
+            and type(source_diagnostic[0]) is str
+            and source_diagnostic[0] in FETCH_DIAGNOSTIC_OPERATIONS
+            and type(source_diagnostic[1]) is str
+            and source_diagnostic[1] in FETCH_DIAGNOSTIC_CLASSES
+        ):
+            self.source_diagnostic = source_diagnostic
         super().__init__(self.reason)
 
 
@@ -416,7 +433,7 @@ def _run_process(
     return subprocess.CompletedProcess(argv, process.returncode, bytes(buffers["stdout"]), bytes(buffers["stderr"]))
 
 
-def _require_git_success(result, stage):
+def _require_git_success(result, stage, *, operation=None):
     if result.returncode != 0 or result.stderr:
         reason = {
             "signature": "signature_invalid",
@@ -424,8 +441,48 @@ def _require_git_success(result, stage):
             "configuration": "revocation_policy_invalid",
             "bootstrap": "bootstrap_snapshot_invalid",
         }.get(stage, "source_fetch_unavailable")
-        raise Refusal(reason, stage)
+        diagnostic = None
+        if (
+            stage == "fetch" and type(operation) is str
+            and operation in FETCH_DIAGNOSTIC_OPERATIONS
+        ):
+            diagnostic = (
+                operation,
+                "exit_nonzero" if result.returncode != 0 else "stderr_present",
+            )
+        raise Refusal(reason, stage, diagnostic)
     return result.stdout
+
+
+def _run_source_git(operation, argv, *, cwd, environ, timeout=COMMAND_TIMEOUT_SECONDS):
+    if type(operation) is not str or operation not in FETCH_DIAGNOSTIC_OPERATIONS - {"source_snapshot"}:
+        raise Refusal("source_fetch_unavailable", "fetch")
+    try:
+        result = _run_process(
+            argv,
+            cwd=cwd,
+            environ=environ,
+            timeout=timeout,
+            stage="fetch",
+        )
+    except Refusal as error:
+        if error.reason == "source_fetch_unavailable" and error.stage == "fetch":
+            raise Refusal(
+                error.reason, error.stage, (operation, "process_failure"),
+            ) from None
+        raise
+    except BaseException:
+        raise Refusal(
+            "source_fetch_unavailable", "fetch", (operation, "unexpected_exception"),
+        ) from None
+    try:
+        return _require_git_success(result, "fetch", operation=operation)
+    except Refusal:
+        raise
+    except BaseException:
+        raise Refusal(
+            "source_fetch_unavailable", "fetch", (operation, "unexpected_exception"),
+        ) from None
 
 
 def _one_line_sha(payload):
@@ -1676,22 +1733,23 @@ def _source_snapshot(
             ("x-access-token:" + token).encode("ascii")
         ).decode("ascii")
         git_environment = _base_git_environment(temporary, authorization)
-        init_result = _run_process(
+        _run_source_git(
+            "git_init",
             (git_executable, "init", "--quiet", "--bare", str(repository)),
             cwd=temporary,
             environ=_base_git_environment(temporary),
         )
-        _require_git_success(init_result, "fetch")
         remote_url = "https://github.com/" + owner + "/" + repository_name + ".git"
-        remote_result = _run_process(
+        _run_source_git(
+            "remote_add",
             (git_executable, "remote", "add", "source", remote_url),
             cwd=repository,
             environ=git_environment,
         )
-        _require_git_success(remote_result, "fetch")
         branch_ref = "refs/heads/" + request["base_branch"]
         destination_ref = "refs/remotes/source/" + request["base_branch"]
-        fetch_result = _run_process(
+        _run_source_git(
+            "base_fetch",
             (
                 git_executable, "fetch", "--quiet", "--no-tags",
                 "source", branch_ref + ":" + destination_ref,
@@ -1700,19 +1758,20 @@ def _source_snapshot(
             environ=git_environment,
             timeout=300,
         )
-        _require_git_success(fetch_result, "fetch")
-        branch_result = _run_process(
+        branch_payload = _run_source_git(
+            "base_ref",
             (git_executable, "rev-parse", "--verify", destination_ref + "^{commit}"),
             cwd=repository,
             environ=git_environment,
         )
-        actual_base = _one_line_sha(_require_git_success(branch_result, "fetch"))
+        actual_base = _one_line_sha(branch_payload)
         if actual_base != request["base_sha"]:
             raise Refusal("base_invalid", "history")
         source_ref = destination_ref
         if candidate_ref is not None:
             candidate_destination = "refs/remotes/source/candidate"
-            candidate_fetch = _run_process(
+            _run_source_git(
+                "candidate_fetch",
                 (
                     git_executable, "fetch", "--quiet", "--no-tags",
                     "source", candidate_ref + ":" + candidate_destination,
@@ -1721,21 +1780,22 @@ def _source_snapshot(
                 environ=git_environment,
                 timeout=300,
             )
-            _require_git_success(candidate_fetch, "fetch")
             source_ref = candidate_destination
-        source_result = _run_process(
+        source_payload = _run_source_git(
+            "source_ref",
             (git_executable, "rev-parse", "--verify", source_ref + "^{commit}"),
             cwd=repository,
             environ=git_environment,
         )
-        if _one_line_sha(_require_git_success(source_result, "fetch")) != request["source_sha"]:
+        if _one_line_sha(source_payload) != request["source_sha"]:
             raise Refusal("base_invalid", "history")
-        shallow_result = _run_process(
+        shallow_payload = _run_source_git(
+            "shallow_check",
             (git_executable, "rev-parse", "--is-shallow-repository"),
             cwd=repository,
             environ=git_environment,
         )
-        if _require_git_success(shallow_result, "fetch") != b"false\n":
+        if shallow_payload != b"false\n":
             raise Refusal("base_invalid", "history")
         signer_entry = _source_entry(
             repository, git_executable, git_environment, request["base_sha"], signer_path,
@@ -1746,17 +1806,19 @@ def _source_snapshot(
         signer_payload = _read_source_blob(
             repository, git_executable, git_environment, signer_entry[2], MAX_SIGNER_BYTES,
         )
-        remove_remote = _run_process(
+        _run_source_git(
+            "remote_remove",
             (git_executable, "remote", "remove", "source"),
             cwd=repository,
             environ=git_environment,
         )
-        _require_git_success(remove_remote, "fetch")
         git_environment = None
     except Refusal as error:
         pending_failure = error
     except BaseException:
-        pending_failure = Refusal("source_fetch_unavailable", "fetch")
+        pending_failure = Refusal(
+            "source_fetch_unavailable", "fetch", ("source_snapshot", "unexpected_exception"),
+        )
     finally:
         if git_environment is not None:
             git_environment.clear()
