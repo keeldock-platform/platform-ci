@@ -810,7 +810,7 @@ class WorkerToolsTests(unittest.TestCase):
             _cleanup=lambda *args: events.append("cleanup-worker"),
         )
 
-        with patch.object(bootstrap.os, "geteuid", return_value=0):
+        with patch.object(bootstrap.os, "geteuid", return_value=0, create=True):
             with patch.object(
                 bootstrap, "_cleanup_prepared_dash",
                 side_effect=lambda value: events.append("cleanup-dash"),
