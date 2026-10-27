@@ -244,6 +244,9 @@ REASONS = frozenset(
         "probe_timeout",
     )
 )
+COMMAND_CHECKS = frozenset((
+    "spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow", "helper_failure",
+))
 RUNNER_CONTROL_CHECKS = frozenset(
     (
         "temp_reference",
@@ -315,6 +318,7 @@ class ProbeFailure(Exception):
     def __init__(
         self, reason, cleanup_complete=True, check=None, survivor_classes=None,
         sandbox_stage=None, sandbox_failure=None, missing_roles=None, snapshot_rejections=None,
+        command_check=None,
     ):
         super().__init__(reason if reason in REASONS else "native_preflight_unavailable")
         self.reason = reason if reason in REASONS else "native_preflight_unavailable"
@@ -327,6 +331,10 @@ class ProbeFailure(Exception):
             self.check = check
         else:
             self.check = None
+        self.command_check = (
+            command_check if self.reason == "native_preflight_unavailable"
+            and type(command_check) is str and command_check in COMMAND_CHECKS else None
+        )
         if isinstance(survivor_classes, (tuple, list, set, frozenset)):
             self.survivor_classes = tuple(
                 category for category in SURVIVOR_CLASS_ORDER if category in survivor_classes
@@ -1420,6 +1428,7 @@ def _probe_user_command(argv, uid, python_executable):
 
 def _spawn_probe_user(
     argv, uid, *, env, python_executable, cwd=None, failure_reason, failure_check=None, failure_stage=None,
+    command_diagnostics=False,
 ):
     command = _probe_user_command(argv, uid, python_executable)
     launch_env = env if env is not None else {
@@ -1442,9 +1451,15 @@ def _spawn_probe_user(
             extra_groups=(),
         )
     except TypeError:
-        raise ProbeFailure("native_preflight_unavailable", check="probe_process_launch") from None
+        raise ProbeFailure(
+            "native_preflight_unavailable", check="probe_process_launch",
+            command_check="spawn_failure" if command_diagnostics is True else None,
+        ) from None
     except (OSError, subprocess.SubprocessError):
-        raise ProbeFailure(failure_reason, check=failure_check, sandbox_stage=failure_stage) from None
+        raise ProbeFailure(
+            failure_reason, check=failure_check, sandbox_stage=failure_stage,
+            command_check="spawn_failure" if command_diagnostics is True else None,
+        ) from None
 
 
 def _classify_exit(returncode, codes):
@@ -1478,6 +1493,7 @@ def _run_as_probe_user(
     failure_stage_exit=None,
     survivor_check="probe_process_survivor",
     control_survivor_diagnostics=False,
+    command_diagnostics=False,
     python_executable,
 ):
     if uid <= 0:
@@ -1491,6 +1507,7 @@ def _run_as_probe_user(
         failure_reason=failure_reason,
         failure_check=failure_check,
         failure_stage=failure_stage_spawn,
+        command_diagnostics=command_diagnostics,
     )
     stdout_capture = _Capture(process.stdout)
     stderr_capture = _Capture(process.stderr)
@@ -1584,9 +1601,16 @@ def _run_as_probe_user(
                 except (OSError, ValueError):
                     pass
     if timed_out or wait_uncertain:
-        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_timeout")
+        command_check = "timeout" if timed_out else "helper_failure"
+        raise ProbeFailure(
+            "native_preflight_unavailable", cleanup_complete=False, check="probe_process_timeout",
+            command_check=command_check if command_diagnostics is True else None,
+        )
     if stdout_capture.overflow or stderr_capture.overflow:
-        raise ProbeFailure(failure_reason, check=failure_check, sandbox_stage=failure_stage_overflow)
+        raise ProbeFailure(
+            failure_reason, check=failure_check, sandbox_stage=failure_stage_overflow,
+            command_check="capture_overflow" if command_diagnostics is True else None,
+        )
     stderr = _strip_probe_identity_record(bytes(stderr_capture.data))
     if process.returncode != 0:
         raise ProbeFailure(
@@ -1594,6 +1618,7 @@ def _run_as_probe_user(
             check=failure_check,
             sandbox_stage=failure_stage_exit,
             sandbox_failure=_classify_exit(process.returncode, CONTROL_EXIT_FAILURES),
+            command_check="nonzero_exit" if command_diagnostics is True else None,
         )
     return subprocess.CompletedProcess(command, process.returncode, bytes(stdout_capture.data), stderr)
 

@@ -238,6 +238,56 @@ class RustToolchainContractTests(unittest.TestCase):
         self.assertFalse({"GITHUB_TOKEN", "GH_TOKEN", "RUSTUP_TOOLCHAIN", "CARGO_REGISTRIES_CRATES_IO_TOKEN"}
                          & set(env))
 
+    def test_worker_command_refusals_carry_only_closed_private_checks(self):
+        class ProbeFailure(Exception):
+            def __init__(self, *, cleanup_complete=True, command_check=None):
+                self.cleanup_complete = cleanup_complete
+                self.command_check = command_check
+
+        deadline = rust.time.monotonic() + 30
+
+        def invoke(result=None, error=None, stage="format"):
+            def run_as_probe_user(*unused_args, **unused_kwargs):
+                if error is not None:
+                    raise error
+                return result
+
+            capability = SimpleNamespace(
+                ProbeFailure=ProbeFailure,
+                _run_as_probe_user=run_as_probe_user,
+            )
+            return rust._run_worker_command(
+                ("cargo", "fmt"), 502, {}, "/usr/bin/python3", capability,
+                stage=stage, deadline=deadline,
+            )
+
+        cases = (
+            (ProbeFailure(command_check="spawn_failure"), None, "version_mismatch", "spawn_failure"),
+            (ProbeFailure(command_check="unknown_check_value"), None, "version_mismatch", "helper_failure"),
+            (None, SimpleNamespace(returncode=9, stdout=b"", stderr=b""), "version_mismatch", "nonzero_exit"),
+            (None, SimpleNamespace(returncode=0, stdout="private", stderr=b""), "capture_invalid", "capture_invalid"),
+            (None, SimpleNamespace(
+                returncode=0, stdout=b"x" * (rust.MAX_CAPTURE_BYTES + 1), stderr=b"",
+            ), "capture_invalid", "capture_overflow"),
+        )
+        for error, result, expected_reason, expected_check in cases:
+            with self.subTest(command_check=expected_check), self.assertRaises(rust.Refusal) as raised:
+                invoke(result=result, error=error)
+            self.assertEqual(raised.exception.reason, expected_reason)
+            self.assertEqual(raised.exception.command_check, expected_check)
+
+        with self.assertRaises(rust.Refusal) as timed_out:
+            invoke(error=ProbeFailure(cleanup_complete=False, command_check="timeout"))
+        self.assertEqual(timed_out.exception.reason, "cleanup_incomplete")
+        self.assertEqual(timed_out.exception.command_check, "timeout")
+
+        with self.assertRaises(rust.Refusal) as smoke_failed:
+            invoke(result=SimpleNamespace(returncode=9, stdout=b"", stderr=b""), stage="smoke")
+        self.assertEqual(smoke_failed.exception.reason, "smoke_failed")
+        self.assertIsNone(smoke_failed.exception.command_check)
+
+        self.assertIsNone(rust.Refusal("gate_failed", command_check="unknown_check_value").command_check)
+
 
 if __name__ == "__main__":
     unittest.main()

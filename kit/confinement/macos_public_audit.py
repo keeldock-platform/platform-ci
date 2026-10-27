@@ -404,6 +404,13 @@ CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS = frozenset(
 CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS = frozenset(
     "source_lease_open_" + error_class for error_class in CORE_CONTRACT_SOURCE_LEASE_OPEN_CLASSES
 )
+CORE_CONTRACT_GATE_DIAGNOSTICS = frozenset((
+    "source_gate_spawn_failure", "source_gate_nonzero_exit", "source_gate_helper_failure",
+    "source_gate_capture_invalid", "source_gate_capture_overflow",
+))
+CORE_CONTRACT_GATE_STAGES = frozenset((
+    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+))
 CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "none", "unavailable", "load_controls", "review_binding", "host_preflight",
     "temp_root_check", "smoke_receipt", "token_input", "token_revocation",
@@ -432,6 +439,7 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
 )) | (
     CORE_CONTRACT_RUNTIME_DIAGNOSTICS | CORE_CONTRACT_FETCH_DIAGNOSTICS
     | CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS | CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS
+    | CORE_CONTRACT_GATE_DIAGNOSTICS
 )
 CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS = frozenset((
     "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",
@@ -1555,6 +1563,14 @@ def _core_contract_runtime_failure_mapping(runtime_reason):
 
 def _core_contract_refusal_diagnostic_matches(value):
     diagnostic = value["diagnostic"]
+    if diagnostic in CORE_CONTRACT_GATE_DIAGNOSTICS:
+        if value["stage"] not in CORE_CONTRACT_GATE_STAGES:
+            return False
+        if diagnostic == "source_gate_capture_invalid":
+            return value["reason"] == "capture_invalid"
+        if diagnostic == "source_gate_capture_overflow":
+            return value["reason"] in {"gate_failed", "capture_invalid"}
+        return value["reason"] == "gate_failed"
     if diagnostic in CORE_CONTRACT_RUNTIME_DIAGNOSTICS:
         for runtime_stage in CORE_CONTRACT_RUNTIME_STAGES:
             for runtime_reason in CORE_CONTRACT_RUNTIME_REASONS:

@@ -1959,6 +1959,40 @@ class CoreContractReceiptTests(unittest.TestCase):
                         "source_validation_failed", "source_validation", diagnostic,
                     ))
 
+    def test_source_gate_diagnostics_refuse_unrelated_reasons_stages_and_fields(self):
+        def payload(reason, stage, diagnostic, **extra):
+            return json.dumps(
+                {"schema_version": 1, "status": "refused", "reason": reason,
+                 "stage": stage, "diagnostic": diagnostic, **extra},
+                ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+            ).encode("ascii")
+
+        for stage in audit.CORE_CONTRACT_GATE_STAGES:
+            for diagnostic in audit.CORE_CONTRACT_GATE_DIAGNOSTICS:
+                reasons = ("capture_invalid",) if diagnostic == "source_gate_capture_invalid" else ("gate_failed",)
+                if diagnostic == "source_gate_capture_overflow":
+                    reasons += ("capture_invalid",)
+                for reason in reasons:
+                    with self.subTest(stage=stage, diagnostic=diagnostic, reason=reason):
+                        value = audit._core_contract_refusal_value(payload(reason, stage, diagnostic))
+                        self.assertEqual(value["diagnostic"], diagnostic)
+                for invalid_reason in ("source_validation_failed", "cleanup_incomplete", "internal_error"):
+                    with self.subTest(stage=stage, diagnostic=diagnostic, invalid_reason=invalid_reason):
+                        with self.assertRaises(audit.AuditRefusal):
+                            audit._core_contract_refusal_value(payload(invalid_reason, stage, diagnostic))
+                with self.assertRaises(audit.AuditRefusal):
+                    audit._core_contract_refusal_value(payload(reasons[0], "source_validation", diagnostic))
+                with self.assertRaises(audit.AuditRefusal):
+                    audit._core_contract_refusal_value(payload(reasons[0], stage, diagnostic, returncode=1))
+        for diagnostic in ("source_gate_private_text", "source_gate_nonzero_exit\n", True, [], None):
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaises(audit.AuditRefusal):
+                    audit._core_contract_refusal_value(payload("gate_failed", "format", diagnostic))
+        with self.assertRaises(audit.AuditRefusal):
+            audit._core_contract_refusal_value(payload("gate_failed", "format", "source_gate_capture_invalid"))
+        with self.assertRaises(audit.AuditRefusal):
+            audit._core_contract_refusal_value(payload("capture_invalid", "format", "source_gate_nonzero_exit"))
+
     def test_private_source_refusal_payload_cap_stays_closed(self):
         env = core_contract_publish_environment("1")
         output = io.BytesIO()

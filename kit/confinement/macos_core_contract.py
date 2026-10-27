@@ -123,9 +123,18 @@ SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS = (
     frozenset(SOURCE_LEASE_OPEN_ERROR_DIAGNOSTICS.values())
     | frozenset(("source_lease_open_other",))
 )
+SOURCE_GATE_COMMAND_DIAGNOSTICS = {
+    "spawn_failure": "source_gate_spawn_failure",
+    "nonzero_exit": "source_gate_nonzero_exit",
+    "helper_failure": "source_gate_helper_failure",
+    "capture_invalid": "source_gate_capture_invalid",
+    "capture_overflow": "source_gate_capture_overflow",
+}
+SOURCE_GATE_DIAGNOSTICS = frozenset(SOURCE_GATE_COMMAND_DIAGNOSTICS.values())
 PRESERVED_SOURCE_DIAGNOSTICS = (
     SOURCE_RUNTIME_DIAGNOSTICS | SOURCE_FETCH_DIAGNOSTICS
     | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
+    | SOURCE_GATE_DIAGNOSTICS
 )
 PRIVILEGE_PROBE_CHECK_DIAGNOSTICS = {
     "probe_process_group_cleanup": "worker_privilege_probe_group_cleanup",
@@ -148,6 +157,7 @@ CLEANUP_DIAGNOSTICS = frozenset((
 DIAGNOSTICS = (
     OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | SOURCE_RUNTIME_DIAGNOSTICS
     | SOURCE_FETCH_DIAGNOSTICS | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
+    | SOURCE_GATE_DIAGNOSTICS
     | frozenset(("none", "unavailable"))
 )
 DETAILED_DIAGNOSTICS = DIAGNOSTICS - frozenset(("none", "unavailable"))
@@ -694,6 +704,14 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
         except BaseException as error:
             if getattr(error, "reason", None) == "cleanup_incomplete":
                 raise Refusal("cleanup_incomplete", "cleanup") from None
+            command_check = getattr(error, "command_check", None)
+            diagnostic = (
+                SOURCE_GATE_COMMAND_DIAGNOSTICS.get(command_check)
+                if type(command_check) is str else None
+            )
+            if diagnostic is not None and stage in GATE_NAMES:
+                reason = "capture_invalid" if getattr(error, "reason", None) == "capture_invalid" else "gate_failed"
+                raise Refusal(reason, stage, diagnostic=diagnostic) from None
             if getattr(error, "reason", None) == "capture_invalid":
                 raise Refusal("capture_invalid", stage) from None
             raise Refusal("gate_failed", stage) from None
