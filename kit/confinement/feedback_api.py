@@ -28,6 +28,7 @@ MAX_JOBS = 16
 MAX_ARTIFACT_AGE_SECONDS = 24 * 60 * 60
 MAX_CAPACITY_NOTICES = 64
 MAX_MARKER_BYTES = 16 * 1024
+PRODUCER_TOKEN_FALLBACK_STEP = "Revoke token when producer did not confirm"
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 ACTOR_RE = re.compile(r"[A-Za-z0-9-]{1,39}\Z")
@@ -122,6 +123,56 @@ def _one_json_marker(raw, pattern):
     if type(value) is not dict or canonical != encoded:
         _refuse()
     return value
+
+
+def _producer_success_summary_present(log, request, profile):
+    if type(log) is not bytes or len(log) > public_audit.MAX_LOG_BYTES:
+        return False
+    expected = (
+        "KD-FEEDBACK-PRODUCER-SUMMARY schema=1 request-id="
+        + request["request_id"] + " profile=" + profile["kind"] + " status=encrypted"
+    ).encode("ascii")
+    prefix = b"KD-FEEDBACK-PRODUCER-SUMMARY "
+    records = []
+    for line in log.splitlines():
+        if line.startswith(prefix):
+            records.append(line)
+        elif len(line) > 30 and line[4:5] == b"-" and b"Z " in line[:32]:
+            marker = line.split(b"Z ", 1)
+            if len(marker) == 2 and marker[1].startswith(prefix):
+                records.append(marker[1])
+    return len(records) == 1 and records[0] == expected
+
+
+def _feedback_job_steps_success(detail, job_name, profile, request, log):
+    """Accept successful job steps, including the producer's confirmed-token fallback skip."""
+    producer_job = job_name == profile["producer_job"]
+    summary_confirmed = producer_job and _producer_success_summary_present(log, request, profile)
+    if producer_job and not summary_confirmed:
+        return False
+    if public_audit._validate_job_steps(detail):
+        return True
+    if not summary_confirmed:
+        return False
+    steps = detail.get("steps") if type(detail) is dict else None
+    if type(steps) is not list:
+        return False
+    fallback_name_count = sum(
+        step.get("name") == PRODUCER_TOKEN_FALLBACK_STEP
+        for step in steps if type(step) is dict
+    )
+    skipped_fallback = 0
+    for step in steps:
+        if type(step) is not dict or step.get("status") != "completed":
+            return False
+        if step.get("conclusion") == "success":
+            continue
+        if (step.get("conclusion") == "skipped"
+                and step.get("name") == PRODUCER_TOKEN_FALLBACK_STEP):
+            skipped_fallback += 1
+            continue
+        return False
+    return skipped_fallback == 1 and fallback_name_count == 1
 
 
 def _check_run(api, request, profile, expected_actor_login, run_id, run_attempt):
@@ -272,7 +323,7 @@ def _scan_check(api, detail, check_id, job_name, control_sha, *, allow_capacity_
         _refuse()
 
 
-def _normalize_jobs(api, run, profile):
+def _normalize_jobs(api, run, profile, request):
     run_id = str(run["id"])
     attempt = str(run["run_attempt"])
     path = (
@@ -293,11 +344,10 @@ def _normalize_jobs(api, run, profile):
     normalized = []
     details_by_name = {}
     for job in jobs:
-        detail, check_id, steps_success = public_audit._job_detail(
+        detail, check_id, unused_steps_success = public_audit._job_detail(
             api, job, run_id, attempt, run["head_sha"], job["name"],
         )
-        if (detail.get("status") != "completed" or detail.get("conclusion") != "success"
-                or not steps_success):
+        if detail.get("status") != "completed" or detail.get("conclusion") != "success":
             _refuse()
         _scan_check(
             api, detail, check_id, job["name"], run["head_sha"],
@@ -306,6 +356,8 @@ def _normalize_jobs(api, run, profile):
         )
         log = api.log_text(job["id"])
         public_audit.inspect_public_bytes(log, run["head_sha"])
+        if not _feedback_job_steps_success(detail, job["name"], profile, request, log):
+            _refuse()
         normalized.append({
             "id": job["id"], "name": job["name"], "run_id": job["run_id"],
             "run_attempt": job["run_attempt"], "head_sha": job["head_sha"],
@@ -526,7 +578,7 @@ def collect_feedback_evidence(api, request, *, expected_actor_login, run_id, run
             _refuse()
         run_record = _check_run(api, request, profile, expected_actor_login, run_id, run_attempt)
         history = _history(api, request, profile, run_record, expected_actor_login, now)
-        normalized_jobs, job_details = _normalize_jobs(api, run_record, profile)
+        normalized_jobs, job_details = _normalize_jobs(api, run_record, profile, request)
         producer_name = profile["producer_job"]
         audit_name = profile["auditor_job"]
         producer_job = next(job for job in normalized_jobs if job["name"] == producer_name)

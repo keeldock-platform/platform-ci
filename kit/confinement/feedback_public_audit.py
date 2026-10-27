@@ -395,9 +395,8 @@ def audit_live(environ=None, api_factory=None, *, now=None):
             surfaces_ok = False
         detail = None
         check_id = None
-        steps_success = False
         try:
-            detail, check_id, steps_success = public_audit._job_detail(
+            detail, check_id, unused_steps_success = public_audit._job_detail(
                 api, job, run_id, "1", control_sha, name,
             )
         except Exception:
@@ -411,7 +410,7 @@ def audit_live(environ=None, api_factory=None, *, now=None):
         if not check_ok:
             surfaces_ok = False
         if detail is not None:
-            if detail.get("conclusion") != "success" or not steps_success:
+            if detail.get("conclusion") != "success":
                 surfaces_ok = False
             details[name] = detail
         try:
@@ -421,6 +420,11 @@ def audit_live(environ=None, api_factory=None, *, now=None):
         except Exception:
             surfaces_ok = False
             logs[name] = b""
+        if (detail is not None
+                and not feedback_api._feedback_job_steps_success(
+                    detail, name, profile, request, logs[name],
+                )):
+            surfaces_ok = False
 
     expected_artifact_name = "feedback-" + profile["kind"] + "-" + request["request_id"]
     artifact_records = []
