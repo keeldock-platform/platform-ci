@@ -109,6 +109,38 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(raised.exception.stage, "cleanup")
         self.assertEqual(raised.exception.diagnostic, "worker_privilege_probe")
 
+    def test_privilege_probe_maps_only_the_closed_native_cleanup_checks(self):
+        cases = (
+            ("probe_process_group_cleanup", "worker_privilege_probe_group_cleanup"),
+            ("probe_process_capture_cleanup", "worker_privilege_probe_capture_cleanup"),
+            ("probe_process_census", "worker_privilege_probe_census"),
+            ("probe_process_survivor", "worker_privilege_probe_survivor"),
+            ("probe_process_timeout", "worker_privilege_probe_timeout"),
+            ("untrusted-private-check", "worker_privilege_probe"),
+            (None, "worker_privilege_probe"),
+            (["probe_process_census"], "worker_privilege_probe"),
+            ({"probe_process_census": True}, "worker_privilege_probe"),
+            (7, "worker_privilege_probe"),
+        )
+        for probe_check, expected_diagnostic in cases:
+            cleanup_error = subject.Refusal("cleanup_incomplete", "cleanup")
+            cleanup_error.probe_check = probe_check
+
+            def fail_probe(*unused_args, **unused_kwargs):
+                raise cleanup_error
+
+            reviewed = SimpleNamespace(
+                _child_environment=lambda *unused_args: {},
+                _probe_argv=lambda *unused_args: ("python",),
+                _run_probe_step=fail_probe,
+                _worker_census=lambda *unused_args: None,
+            )
+            with self.subTest(probe_check=probe_check), self.assertRaises(subject.Refusal) as raised:
+                subject._run_privilege_probe(504, Path.cwd(), {"python": "/usr/bin/python3"}, reviewed)
+            self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+            self.assertEqual(raised.exception.stage, "cleanup")
+            self.assertEqual(raised.exception.diagnostic, expected_diagnostic)
+
     def test_privilege_census_cleanup_has_a_distinct_diagnostic(self):
         def fail_census(*unused_args):
             raise subject.Refusal("cleanup_incomplete", "cleanup")

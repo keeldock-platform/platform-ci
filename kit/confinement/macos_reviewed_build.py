@@ -57,6 +57,10 @@ PRODUCT_VERSION = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?\Z")
 TOOL_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){0,3}\Z")
 ARCHITECTURES = frozenset(("arm64", "x86_64"))
 TOOL_PHASES = ("baseline", "python", "git", "ssh", "summary", "cleanup", "unknown")
+PROBE_CLEANUP_CHECKS = frozenset((
+    "probe_process_group_cleanup", "probe_process_capture_cleanup", "probe_process_census",
+    "probe_process_survivor", "probe_process_timeout",
+))
 SURVIVOR_CLASS_ORDER = (
     "python",
     "ps",
@@ -406,11 +410,16 @@ else:
 
 
 class Refusal(Exception):
-    def __init__(self, reason, stage, *, tool_phase="unknown", survivor_classes="unavailable"):
+    def __init__(
+        self, reason, stage, *, tool_phase="unknown", survivor_classes="unavailable", probe_check=None,
+    ):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "preflight"
         self.tool_phase = tool_phase
         self.survivor_classes = survivor_classes
+        self.probe_check = (
+            probe_check if type(probe_check) is str and probe_check in PROBE_CLEANUP_CHECKS else None
+        )
         super().__init__(self.reason)
 
 
@@ -1139,6 +1148,9 @@ def _run_probe_step(
                 "cleanup_incomplete", "cleanup",
                 tool_phase=tool_phase,
                 survivor_classes=diagnostic_classes,
+                probe_check=(
+                    error.check if type(error.check) is str and error.check in PROBE_CLEANUP_CHECKS else None
+                ),
             ) from None
         reason = "privilege_check_failed" if stage == "privilege" else "synthetic_build_failed"
         raise Refusal(
