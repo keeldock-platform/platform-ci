@@ -2217,8 +2217,8 @@ class BootstrapAuditTests(unittest.TestCase):
             audit.run("core-contract-audit", env, api)
         self.assertEqual(caught.exception.reason, "receipt_invalid")
         self.assertEqual(api.log_calls, [822, 823])
-        self.assertTrue(any(path.endswith("/check-runs/922/annotations") for path in api.calls))
-        self.assertTrue(any(path.endswith("/check-runs/923/annotations") for path in api.calls))
+        self.assertTrue(any(path.endswith("/check-runs/922/annotations?per_page=100&page=1") for path in api.calls))
+        self.assertTrue(any(path.endswith("/check-runs/923/annotations?per_page=100&page=1") for path in api.calls))
         self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
         self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
 
