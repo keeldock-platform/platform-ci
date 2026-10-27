@@ -87,7 +87,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/node_lock_manifest.mjs': 'd64ff3d3d6fee05e8e75e8461301a0fd95cc01e9f4ffcfb323483ee7d2fa23ad',
     'kit/confinement/test_node_lock_manifest.mjs': 'b90d9c5564c5f13231924a91d0a4ac7a79403ae25ad42ca42ebb28330bd35666',
     'kit/confinement/node_lock_receipt.py': '09343f1e607ff7f9e5313a6c62c7ffff3c4e828f6bf9ad52c810d9fbe4ce1d80',
-    'kit/confinement/test_node_lock_receipt.py': '46a2fd93e61aec35e7d9be120d19036b9de9ac6630ccedd41194096e34a6556c',
+    'kit/confinement/test_node_lock_receipt.py': '34238cf9f55d74f706c26cf9132aa000f99bdee2c6a758902ef3a682bc028f66',
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
     'kit/confinement/macos_core_contract.py': '5498e04dbb50ab3e5d024d6d4bb7c238a8baefb198f85a50b8bc6f2d58d23227',
     'kit/confinement/test_macos_core_contract.py': 'da8a7a03b36b9cc35e5b00fa28dca959267e2efc86f3b6dbbd6c4d04369a76a4',

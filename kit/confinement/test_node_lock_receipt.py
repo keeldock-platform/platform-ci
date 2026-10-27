@@ -442,7 +442,7 @@ class NodeLockReceiptTests(unittest.TestCase):
             subject._zip_member(oversized)
 
     def test_zip_member_mode_without_file_type_is_allowed_only_when_non_executable(self):
-        fixture = _fixture()
+        fixture = list(_fixture())
         payload = b"synthetic encrypted envelope"
         fixture[4] = _make_zip(payload, mode=0o600 << 16)
         archive_digest = hashlib.sha256(fixture[4]).hexdigest()
