@@ -25,12 +25,11 @@ export const LOCK_ENVELOPE_LIMITS = Object.freeze({
 
 const MAGIC = Buffer.from('KDLE', 'ascii');
 const VERSION = 1;
-const SUITE = 1;
 const OAEP_PADDING = constants.RSA_PKCS1_OAEP_PADDING;
 const HEADER_BYTES = 4 + 1 + 1 + 32 + 32 + LOCK_ENVELOPE_LIMITS.wrappedKeyBytes
   + LOCK_ENVELOPE_LIMITS.ivBytes + 4;
 const FRAME_OVERHEAD = HEADER_BYTES + LOCK_ENVELOPE_LIMITS.tagBytes;
-const CONTEXT_FIELDS = Object.freeze([
+const LOCK_CONTEXT_FIELDS = Object.freeze([
   'request_id',
   'nonce',
   'recipient_fingerprint',
@@ -47,6 +46,40 @@ const CONTEXT_FIELDS = Object.freeze([
   'run_attempt',
   'expiry',
 ]);
+const FEEDBACK_CONTEXT_FIELDS = Object.freeze([
+  ...LOCK_CONTEXT_FIELDS.slice(0, 4),
+  'kind',
+  ...LOCK_CONTEXT_FIELDS.slice(4),
+]);
+export const RETURN_PROFILES = Object.freeze({
+  'core-node-lock-return': Object.freeze({
+    id: 1,
+    concern: 'core-node-lock-return',
+    kind: 'lock',
+    producerJob: 'node-lock-return',
+    artifactMember: 'lock-return-v1.enc',
+    contextDomain: 'node-lock-return-context-v1',
+    contextFields: LOCK_CONTEXT_FIELDS,
+  }),
+  'core-rust-format-return': Object.freeze({
+    id: 2,
+    concern: 'core-rust-format-return',
+    kind: 'rust_patch',
+    producerJob: 'core-rust-format-return',
+    artifactMember: 'rust-format-return-v1.enc',
+    contextDomain: 'node-feedback-return-context-v1',
+    contextFields: FEEDBACK_CONTEXT_FIELDS,
+  }),
+  'core-build-diagnostic-return': Object.freeze({
+    id: 3,
+    concern: 'core-build-diagnostic-return',
+    kind: 'build_diagnostics',
+    producerJob: 'core-build-diagnostic-return',
+    artifactMember: 'build-diagnostic-return-v1.enc',
+    contextDomain: 'node-feedback-return-context-v1',
+    contextFields: FEEDBACK_CONTEXT_FIELDS,
+  }),
+});
 const HEX_256 = /^[a-f0-9]{64}$/u;
 const GIT_SHA = /^[a-f0-9]{40}$/u;
 const BASE_BRANCHES = new Set(['main', 'develop', 'uat']);
@@ -98,14 +131,42 @@ function isPositiveApiId(value) {
   }
 }
 
-function normalizeContext(input) {
-  const context = plainDataObject(input, CONTEXT_FIELDS);
+function contextProfile(input) {
+  let concern;
+  try {
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) reject('invalid_context');
+    const descriptor = Object.getOwnPropertyDescriptor(input, 'concern');
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) reject('invalid_context');
+    concern = descriptor.value;
+  } catch (error) {
+    if (error instanceof LockEnvelopeError) throw error;
+    reject('invalid_context');
+  }
+  if (typeof concern !== 'string' || !Object.hasOwn(RETURN_PROFILES, concern)) reject('invalid_context');
+  const profile = RETURN_PROFILES[concern];
+  return profile;
+}
+
+export function returnProfileForContext(input) {
+  try {
+    const profile = contextProfile(input);
+    normalizeContext(input, profile);
+    return profile;
+  } catch (error) {
+    if (error instanceof LockEnvelopeError) throw error;
+    reject('invalid_context');
+  }
+}
+
+function normalizeContext(input, profile = contextProfile(input)) {
+  const context = plainDataObject(input, profile.contextFields);
   if (typeof context.request_id !== 'string' || !HEX_256.test(context.request_id)) reject('invalid_context');
   if (typeof context.nonce !== 'string' || !HEX_256.test(context.nonce)) reject('invalid_context');
   if (typeof context.recipient_fingerprint !== 'string' || !HEX_256.test(context.recipient_fingerprint)) {
     reject('invalid_context');
   }
-  if (context.concern !== 'core-node-lock-return') reject('invalid_context');
+  if (context.concern !== profile.concern) reject('invalid_context');
+  if (profile.id !== 1 && context.kind !== profile.kind) reject('invalid_context');
   if (!isPositiveApiId(context.repository_id)) reject('invalid_context');
   if (typeof context.source_sha !== 'string' || !GIT_SHA.test(context.source_sha)) reject('invalid_context');
   if (typeof context.base_sha !== 'string' || !GIT_SHA.test(context.base_sha)) reject('invalid_context');
@@ -116,7 +177,7 @@ function normalizeContext(input) {
   }
   if (context.workflow_ref !== 'refs/heads/main') reject('invalid_context');
   if (!isPositiveApiId(context.run_id)) reject('invalid_context');
-  if (context.producer_job !== 'node-lock-return') reject('invalid_context');
+  if (context.producer_job !== profile.producerJob) reject('invalid_context');
   if (context.run_attempt !== 1) reject('invalid_context');
   if (!Number.isSafeInteger(context.expiry) || context.expiry < 1) reject('invalid_context');
   return context;
@@ -129,11 +190,12 @@ function validateTime(context, now) {
   }
 }
 
-/** Return the one canonical ASCII AAD record for a validated lock-return context. */
+/** Return the canonical ASCII AAD record for one validated return profile. */
 export function canonicalContext(input) {
-  const context = normalizeContext(input);
-  const lines = ['node-lock-return-context-v1'];
-  for (const field of CONTEXT_FIELDS) lines.push(`${field}=${context[field]}`);
+  const profile = contextProfile(input);
+  const context = normalizeContext(input, profile);
+  const lines = [profile.contextDomain];
+  for (const field of profile.contextFields) lines.push(`${field}=${context[field]}`);
   const bytes = Buffer.from(`${lines.join('\n')}\n`, 'ascii');
   if (bytes.byteLength > LOCK_ENVELOPE_LIMITS.contextBytes) reject('context_too_large');
   return bytes;
@@ -149,12 +211,14 @@ function parseCanonicalContextUnchecked(input) {
   const text = bytes.toString('ascii');
   if (!text.endsWith('\n') || text.includes('\r')) reject('invalid_context');
   const lines = text.slice(0, -1).split('\n');
-  if (lines.length !== CONTEXT_FIELDS.length + 1 || lines[0] !== 'node-lock-return-context-v1') {
-    reject('invalid_context');
-  }
+  const domain = lines[0];
+  const domainFields = domain === 'node-lock-return-context-v1'
+    ? LOCK_CONTEXT_FIELDS
+    : domain === 'node-feedback-return-context-v1' ? FEEDBACK_CONTEXT_FIELDS : null;
+  if (!domainFields || lines.length !== domainFields.length + 1) reject('invalid_context');
   const context = Object.create(null);
-  for (let index = 0; index < CONTEXT_FIELDS.length; index += 1) {
-    const field = CONTEXT_FIELDS[index];
+  for (let index = 0; index < domainFields.length; index += 1) {
+    const field = domainFields[index];
     const prefix = `${field}=`;
     const line = lines[index + 1];
     if (!line.startsWith(prefix)) reject('invalid_context');
@@ -164,6 +228,8 @@ function parseCanonicalContextUnchecked(input) {
   if (!/^[1-9][0-9]{0,15}$/u.test(context.expiry)) reject('invalid_context');
   context.run_attempt = Number(context.run_attempt);
   context.expiry = Number(context.expiry);
+  const profile = contextProfile(context);
+  if (profile.contextDomain !== domain) reject('invalid_context');
   const canonical = canonicalContext(context);
   if (!canonical.equals(bytes)) reject('invalid_context');
   return Object.freeze({ ...context });
@@ -206,18 +272,18 @@ function publicFingerprint(publicKey) {
 }
 
 function contextMaterial(contextInput, now) {
-  const context = normalizeContext(contextInput);
+  const profile = contextProfile(contextInput);
+  const context = normalizeContext(contextInput, profile);
   validateTime(context, now);
   const aad = canonicalContext(context);
   const digest = createHash('sha256').update(aad).digest();
   const requestId = Buffer.from(context.request_id, 'hex');
-  return { context, aad, digest, requestId };
+  return { context, profile, aad, digest, requestId };
 }
 
-/** Encrypt a bounded synthetic-or-reviewed lock byte string for one explicit context. */
-function encryptLockUnchecked({ lockBytes, recipientPublicKey, context, now }) {
+function encryptReturnEnvelopeUnchecked({ payloadBytes, recipientPublicKey, context, now }) {
   const material = contextMaterial(context, now);
-  const plaintext = asBytes(lockBytes, LOCK_ENVELOPE_LIMITS.plaintextBytes, 'plaintext_too_large');
+  const plaintext = asBytes(payloadBytes, LOCK_ENVELOPE_LIMITS.plaintextBytes, 'plaintext_too_large');
   const publicKey = checkedRsaKey(recipientPublicKey, 'public');
   if (publicFingerprint(publicKey) !== material.context.recipient_fingerprint) reject('recipient_mismatch');
 
@@ -242,7 +308,7 @@ function encryptLockUnchecked({ lockBytes, recipientPublicKey, context, now }) {
     let offset = 0;
     MAGIC.copy(frame, offset); offset += MAGIC.byteLength;
     frame[offset++] = VERSION;
-    frame[offset++] = SUITE;
+    frame[offset++] = material.profile.id;
     material.requestId.copy(frame, offset); offset += 32;
     material.digest.copy(frame, offset); offset += 32;
     wrappedKey.copy(frame, offset); offset += wrappedKey.byteLength;
@@ -260,22 +326,38 @@ function encryptLockUnchecked({ lockBytes, recipientPublicKey, context, now }) {
   }
 }
 
-export function encryptLock(options) {
+export function encryptReturnEnvelope(options) {
   try {
-    return encryptLockUnchecked(options);
+    return encryptReturnEnvelopeUnchecked(options);
   } catch (error) {
     if (error instanceof LockEnvelopeError) throw error;
     reject('invalid_input');
   }
 }
 
-/** Decrypt only after the caller validates receipt/API evidence and supplies its expected context. */
-function decryptLockUnchecked({ envelope, recipientPrivateKey, expectedContext, now }) {
+export function encryptLock(options) {
+  try {
+    if (contextProfile(options?.context).id !== 1) reject('invalid_context');
+    return encryptReturnEnvelopeUnchecked({
+      payloadBytes: options.lockBytes,
+      recipientPublicKey: options.recipientPublicKey,
+      context: options.context,
+      now: options.now,
+    });
+  } catch (error) {
+    if (error instanceof LockEnvelopeError) throw error;
+    reject('invalid_input');
+  }
+}
+
+function decryptReturnEnvelopeUnchecked({ envelope, recipientPrivateKey, expectedContext, now }) {
   const material = contextMaterial(expectedContext, now);
   const frame = asBytes(envelope, LOCK_ENVELOPE_LIMITS.frameBytes, 'frame_too_large');
   if (frame.byteLength < FRAME_OVERHEAD) reject('invalid_frame');
   if (!frame.subarray(0, MAGIC.byteLength).equals(MAGIC)) reject('invalid_frame');
-  if (frame[4] !== VERSION || frame[5] !== SUITE) reject('unsupported_profile');
+  if (frame[4] !== VERSION) reject('unsupported_profile');
+  if (!Object.values(RETURN_PROFILES).some((profile) => profile.id === frame[5])) reject('unsupported_profile');
+  if (frame[5] !== material.profile.id) reject('context_mismatch');
 
   let offset = 6;
   const requestId = frame.subarray(offset, offset + 32); offset += 32;
@@ -319,9 +401,19 @@ function decryptLockUnchecked({ envelope, recipientPrivateKey, expectedContext, 
   }
 }
 
+export function decryptReturnEnvelope(options) {
+  try {
+    return decryptReturnEnvelopeUnchecked(options);
+  } catch (error) {
+    if (error instanceof LockEnvelopeError) throw error;
+    reject('invalid_input');
+  }
+}
+
 export function decryptLock(options) {
   try {
-    return decryptLockUnchecked(options);
+    if (contextProfile(options?.expectedContext).id !== 1) reject('invalid_context');
+    return decryptReturnEnvelopeUnchecked(options);
   } catch (error) {
     if (error instanceof LockEnvelopeError) throw error;
     reject('invalid_input');

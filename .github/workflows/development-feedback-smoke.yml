@@ -1,0 +1,178 @@
+name: development-feedback-smoke
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+permissions: {}
+jobs:
+  feedback-smoke-producer:
+    name: feedback-smoke-producer ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - macos-15
+          - windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Fetch public control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "workflow_dispatch" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Set up the pinned Node runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.1"
+          check-latest: false
+          cache: ""
+          package-manager-cache: false
+      - name: Run source-free feedback tests
+        run: |
+          set -euo pipefail
+          [[ "$(node --version)" == "v24.22.1" ]]
+          [[ "$(npm --version)" == "11.19.1" ]]
+          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_smoke.mjs
+          python_command=python3
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python_command=python
+          fi
+          "$python_command" -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
+          "$python_command" -B -m unittest discover -s kit/confinement -p "test_feedback_request.py"
+          "$python_command" -B -m unittest discover -s kit/confinement -p "test_feedback_smoke_audit.py"
+      - name: Create and round-trip encrypted fixture
+        id: smoke
+        run: |
+          set -euo pipefail
+          node kit/confinement/feedback_smoke.mjs | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Upload the single macOS ciphertext fixture
+        if: runner.os == 'macOS'
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: development-feedback-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/feedback-smoke/lock-return-v1.enc
+          archive: true
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+          if-no-files-found: error
+      - name: Record uploader identity
+        if: runner.os == 'macOS'
+        env:
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          CIPHERTEXT_SHA256: ${{ steps.smoke.outputs.ciphertext_sha256 }}
+          CIPHERTEXT_SIZE: ${{ steps.smoke.outputs.ciphertext_size }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ || "$GITHUB_RUN_ATTEMPT" != "1" ]]; then
+            exit 1
+          fi
+          if [[ ! "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,18}$ \
+            || ! "$ARTIFACT_DIGEST" =~ ^[a-f0-9]{64}$ \
+            || ! "$CIPHERTEXT_SHA256" =~ ^[a-f0-9]{64}$ \
+            || ! "$CIPHERTEXT_SIZE" =~ ^[1-9][0-9]{0,6}$ ]]; then
+            exit 1
+          fi
+          artifact_name="development-feedback-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          marker="KD-FEEDBACK-UPLOAD schema=1 control-sha=${CI_SHA} run-id=${GITHUB_RUN_ID} run-attempt=1 artifact-id=${ARTIFACT_ID} artifact-digest=${ARTIFACT_DIGEST} artifact-name=${artifact_name} ciphertext-sha256=${CIPHERTEXT_SHA256} ciphertext-size=${CIPHERTEXT_SIZE}"
+          printf '%s\n' "$marker" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$marker"
+      - name: Remove local encrypted fixture
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          fixture_dir="${RUNNER_TEMP%/}/feedback-smoke"
+          fixture_file="$fixture_dir/lock-return-v1.enc"
+          if [[ -e "$fixture_file" || -L "$fixture_file" ]]; then
+            if [[ ! -f "$fixture_file" || -L "$fixture_file" ]]; then
+              exit 1
+            fi
+            rm -f -- "$fixture_file"
+          fi
+          if [[ -d "$fixture_dir" && ! -L "$fixture_dir" ]]; then
+            rmdir -- "$fixture_dir"
+          elif [[ -e "$fixture_dir" || -L "$fixture_dir" ]]; then
+            exit 1
+          fi
+  feedback-smoke-audit:
+    if: ${{ always() }}
+    needs: feedback-smoke-producer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      actions: read
+      checks: read
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      GITHUB_RUN_ID: ${{ github.run_id }}
+      GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+    steps:
+      - name: Fetch public control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "workflow_dispatch" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Audit producer checks and uploaded ciphertext
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/feedback_smoke_audit.py

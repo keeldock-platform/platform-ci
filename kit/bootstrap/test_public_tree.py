@@ -172,6 +172,15 @@ class PublicTreeTests(unittest.TestCase):
     def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
             '.github/workflows/node-lock-smoke.yml',
+            '.github/workflows/development-feedback-smoke.yml',
+            'kit/confinement/development_feedback.mjs',
+            'kit/confinement/test_development_feedback.mjs',
+            'kit/confinement/feedback_request.py',
+            'kit/confinement/test_feedback_request.py',
+            'kit/confinement/feedback_smoke.mjs',
+            'kit/confinement/test_feedback_smoke.mjs',
+            'kit/confinement/feedback_smoke_audit.py',
+            'kit/confinement/test_feedback_smoke_audit.py',
             'kit/confinement/node_lock_envelope.mjs',
             'kit/confinement/test_node_lock_envelope.mjs',
             'kit/confinement/node_lock_manifest.mjs',

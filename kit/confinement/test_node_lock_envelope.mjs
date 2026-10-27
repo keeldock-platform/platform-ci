@@ -8,13 +8,17 @@ import { before, test } from 'node:test';
 import {
   canonicalContext,
   decryptLock,
+  decryptReturnEnvelope,
   encryptLock,
+  encryptReturnEnvelope,
   LOCK_ENVELOPE_LIMITS,
   LockEnvelopeError,
   parseCanonicalContext,
+  returnProfileForContext,
+  RETURN_PROFILES,
 } from './node_lock_envelope.mjs';
 
-const NOW = 1_999_999_000;
+const NOW = 1_793_160_000;
 const PAYLOAD = Buffer.from('{"name":"fixture-lock","lockfileVersion":3}\n', 'utf8');
 let recipient;
 let otherRecipient;
@@ -41,6 +45,28 @@ function sampleContext(recipientKey = recipient?.publicKey) {
     workflow_ref: 'refs/heads/main',
     run_id: '987654321',
     producer_job: 'node-lock-return',
+    run_attempt: 1,
+    expiry: NOW + 3600,
+  };
+}
+
+function feedbackContext(profileName, recipientKey = recipient?.publicKey) {
+  const profile = RETURN_PROFILES[profileName];
+  return {
+    request_id: '1'.repeat(64),
+    nonce: '2'.repeat(64),
+    recipient_fingerprint: fingerprint(recipientKey),
+    concern: profile.concern,
+    kind: profile.kind,
+    repository_id: '123456',
+    source_sha: 'a'.repeat(40),
+    base_sha: 'b'.repeat(40),
+    control_sha: 'c'.repeat(40),
+    base_branch: 'main',
+    reviewed_diff_sha256: 'd'.repeat(64),
+    workflow_ref: 'refs/heads/main',
+    run_id: '987654321',
+    producer_job: profile.producerJob,
     run_attempt: 1,
     expiry: NOW + 3600,
   };
@@ -95,6 +121,86 @@ test('canonical context has the fixed field order and rejects duplicates', () =>
   assert.throws(() => parseCanonicalContext(Buffer.from(
     reorderedLines.join('\n'), 'ascii',
   )), LockEnvelopeError);
+});
+
+test('lock context keeps the original canonical AAD byte shape', () => {
+  const lines = [
+    'node-lock-return-context-v1',
+    `request_id=${'1'.repeat(64)}`,
+    `nonce=${'2'.repeat(64)}`,
+    `recipient_fingerprint=${fingerprint(recipient.publicKey)}`,
+    'concern=core-node-lock-return',
+    'repository_id=123456',
+    `source_sha=${'a'.repeat(40)}`,
+    `base_sha=${'b'.repeat(40)}`,
+    `control_sha=${'c'.repeat(40)}`,
+    'base_branch=main',
+    `reviewed_diff_sha256=${'d'.repeat(64)}`,
+    'workflow_ref=refs/heads/main',
+    'run_id=987654321',
+    'producer_job=node-lock-return',
+    'run_attempt=1',
+    `expiry=${NOW + 3600}`,
+    '',
+  ];
+  assert.deepEqual(canonicalContext(context), Buffer.from(lines.join('\n'), 'ascii'));
+  assert.equal(frame[5], 1);
+});
+
+test('closed feedback profiles bind kind, producer, canonical fields, and frame id', () => {
+  for (const name of ['core-rust-format-return', 'core-build-diagnostic-return']) {
+    const expected = feedbackContext(name);
+    const profile = RETURN_PROFILES[name];
+    const aad = canonicalContext(expected);
+    assert.equal(returnProfileForContext(expected), profile);
+    assert.ok(aad.toString('ascii').startsWith('node-feedback-return-context-v1\n'));
+    assert.match(aad.toString('ascii'), /\nconcern=[^\n]+\nkind=[^\n]+\nrepository_id=/u);
+    assert.deepEqual(parseCanonicalContext(aad), expected);
+    const payload = Buffer.from(`synthetic ${profile.kind}\n`, 'utf8');
+    const encrypted = encryptReturnEnvelope({
+      payloadBytes: payload,
+      recipientPublicKey: recipient.publicKey,
+      context: expected,
+      now: NOW,
+    });
+    assert.equal(encrypted[5], profile.id);
+    assert.deepEqual(decryptReturnEnvelope({
+      envelope: encrypted,
+      recipientPrivateKey: recipient.privateKey,
+      expectedContext: expected,
+      now: NOW,
+    }), payload);
+    assert.throws(() => decryptLock({
+      envelope: encrypted,
+      recipientPrivateKey: recipient.privateKey,
+      expectedContext: expected,
+      now: NOW,
+    }), LockEnvelopeError);
+  }
+});
+
+test('feedback profile rejects mismatched concern, kind, producer, and cross-profile frames', () => {
+  const rust = feedbackContext('core-rust-format-return');
+  const diagnostic = feedbackContext('core-build-diagnostic-return');
+  for (const invalid of [
+    { ...rust, kind: 'build_diagnostics' },
+    { ...rust, concern: 'core-build-diagnostic-return' },
+    { ...rust, producer_job: 'core-build-diagnostic-return' },
+  ]) {
+    assert.throws(() => canonicalContext(invalid), LockEnvelopeError);
+  }
+  const encrypted = encryptReturnEnvelope({
+    payloadBytes: Buffer.from('synthetic patch\n'),
+    recipientPublicKey: recipient.publicKey,
+    context: rust,
+    now: NOW,
+  });
+  assert.throws(() => decryptReturnEnvelope({
+    envelope: encrypted,
+    recipientPrivateKey: recipient.privateKey,
+    expectedContext: diagnostic,
+    now: NOW,
+  }), LockEnvelopeError);
 });
 
 test('context is closed, canonical, bounded, and fixed to the producer concern', () => {

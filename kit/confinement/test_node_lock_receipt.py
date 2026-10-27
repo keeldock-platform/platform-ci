@@ -7,33 +7,36 @@ import unittest
 import zipfile
 
 import node_lock_receipt as subject
+import feedback_request as request_subject
 
 
 NOW = 1_800_000_000
 CI_REPOSITORY_ID = 987654321
 ACTOR_LOGIN = "review-owner"
-ARTIFACT_NAME = "node-lock-return-24680-1"
 RUN_ID = 24680
 PRODUCER_JOB_ID = 13579
 AUDITOR_JOB_ID = 13580
 ARTIFACT_ID = 97531
 
 
-def _request():
-    return {
-        "request_id": "a" * 64,
-        "nonce": "b" * 64,
-        "recipient_fingerprint": "c" * 64,
-        "concern": subject.CONCERN,
+def _request(kind="lock"):
+    request_profile = request_subject.PROFILE_BY_KIND[kind]
+    return request_subject.create_request({
+        "kind": kind,
+        "concern": request_profile["concern"],
+        "ci_repository_id": str(CI_REPOSITORY_ID),
+        "workflow_path": request_profile["workflow_path"],
+        "workflow_ref": subject.WORKFLOW_REF,
         "repository_id": "1430959909",
         "source_sha": "d" * 40,
         "base_sha": "e" * 40,
         "control_sha": "f" * 40,
         "base_branch": "develop",
         "reviewed_diff_sha256": "1" * 64,
-        "workflow_ref": subject.WORKFLOW_REF,
+        "recipient_fingerprint": "c" * 64,
+        "nonce": "b" * 64,
         "expiry": NOW + 3600,
-    }
+    }, now=NOW)
 
 
 def _make_zip(payload=b"synthetic encrypted envelope", *, name=subject.ZIP_MEMBER,
@@ -126,22 +129,28 @@ def _zip_with_hidden_tail(compression, payload=b"synthetic encrypted envelope"):
     return bytes(updated)
 
 
-def _fixture():
-    request = _request()
+def _fixture(kind="lock"):
+    request = _request(kind)
+    profile = request_subject.PROFILE_BY_KIND[kind]
+    artifact_name = kind + "-return-24680-1"
     payload = b"synthetic encrypted envelope"
-    archive_bytes = _make_zip(payload)
+    archive_bytes = _make_zip(payload, name=profile["member_name"])
     archive_digest = hashlib.sha256(archive_bytes).hexdigest()
     ciphertext_digest = hashlib.sha256(payload).hexdigest()
-    context = dict(request)
+    context_fields = (
+        subject.CONTEXT_FIELDS if profile["profile_id"] == 1
+        else subject.FEEDBACK_CONTEXT_FIELDS
+    )
+    context = {name: request[name] for name in context_fields if name in request}
     context.update({
         "run_id": str(RUN_ID),
-        "producer_job": subject.PRODUCER_JOB,
+        "producer_job": profile["producer_job"],
         "run_attempt": 1,
     })
     receipt = {
         "schema_version": subject.SCHEMA_VERSION,
         "status": "passed",
-        "job_name": subject.PRODUCER_JOB,
+        "job_name": profile["producer_job"],
         **context,
         "artifact_id": ARTIFACT_ID,
         "ciphertext_digest": ciphertext_digest,
@@ -156,7 +165,7 @@ def _fixture():
         "id": RUN_ID,
         "repository_id": CI_REPOSITORY_ID,
         "head_sha": request["control_sha"],
-        "workflow_path": subject.WORKFLOW_PATH,
+        "workflow_path": profile["workflow_path"],
         "workflow_ref": subject.WORKFLOW_REF,
         "event": "workflow_dispatch",
         "status": "completed",
@@ -176,7 +185,7 @@ def _fixture():
         }
     artifact = {
         "id": ARTIFACT_ID,
-        "name": ARTIFACT_NAME,
+        "name": artifact_name,
         "repository_id": CI_REPOSITORY_ID,
         "run_id": RUN_ID,
         "head_sha": request["control_sha"],
@@ -189,8 +198,8 @@ def _fixture():
     api_evidence = {
         "run": run,
         "jobs": [
-            job(PRODUCER_JOB_ID, subject.PRODUCER_JOB),
-            job(AUDITOR_JOB_ID, subject.AUDITOR_JOB),
+            job(PRODUCER_JOB_ID, profile["producer_job"]),
+            job(AUDITOR_JOB_ID, profile["auditor_job"]),
         ],
         "artifacts": [artifact],
         "request_history": {
@@ -206,7 +215,7 @@ def _fixture():
     arguments = {
         "ci_repository_id": CI_REPOSITORY_ID,
         "actor_login": ACTOR_LOGIN,
-        "artifact_name": ARTIFACT_NAME,
+        "artifact_name": artifact_name,
         "now": NOW,
     }
     return request, receipt, api_evidence, producer_output, archive_bytes, arguments
@@ -227,11 +236,11 @@ class NodeLockReceiptTests(unittest.TestCase):
 
     def test_context_encoding_matches_the_fixed_node_field_order(self):
         request, unused_receipt, unused_api, unused_output, unused_archive, unused_args = _fixture()
-        context = dict(request)
+        context = {name: request[name] for name in subject.CONTEXT_FIELDS if name in request}
         context.update({"run_id": str(RUN_ID), "producer_job": subject.PRODUCER_JOB, "run_attempt": 1})
         expected = (
             "node-lock-return-context-v1\n"
-            "request_id=" + "a" * 64 + "\n"
+            "request_id=" + request["request_id"] + "\n"
             "nonce=" + "b" * 64 + "\n"
             "recipient_fingerprint=" + "c" * 64 + "\n"
             "concern=" + subject.CONCERN + "\n"
@@ -257,6 +266,38 @@ class NodeLockReceiptTests(unittest.TestCase):
         self.assertEqual(result["context"]["run_id"], str(RUN_ID))
         self.assertEqual(result["context"]["producer_job"], subject.PRODUCER_JOB)
         self.assertEqual(set(result), {"context", "ciphertext"})
+
+    def test_format_and_diagnostic_receipts_use_distinct_fixed_profiles(self):
+        for kind in ("rust_patch", "build_diagnostics"):
+            fixture = _fixture(kind)
+            profile = request_subject.PROFILE_BY_KIND[kind]
+            result = self.validate(fixture)
+            self.assertEqual(result["context"]["kind"], kind)
+            self.assertEqual(result["context"]["concern"], profile["concern"])
+            self.assertEqual(result["context"]["producer_job"], profile["producer_job"])
+            self.assertEqual(result["ciphertext"], b"synthetic encrypted envelope")
+            context = {name: fixture[1][name] for name in subject.FEEDBACK_CONTEXT_FIELDS}
+            self.assertTrue(
+                subject.canonical_context(context).startswith(
+                    b"node-feedback-return-context-v1\n"
+                )
+            )
+            fixture[1]["kind"] = "build_diagnostics" if kind == "rust_patch" else "rust_patch"
+            with self.subTest(kind=kind):
+                self.assert_refused(*fixture[:5], **fixture[5])
+
+    def test_ciphertext_archive_helper_accepts_only_fixed_registered_member_names(self):
+        payload = b"synthetic encrypted envelope"
+        for profile in request_subject.PROFILES.values():
+            archive = _make_zip(payload, name=profile["member_name"])
+            self.assertEqual(
+                subject.validate_ciphertext_archive(
+                    archive, member_name=profile["member_name"],
+                ),
+                payload,
+            )
+        with self.assertRaises(subject.Refusal):
+            subject.validate_ciphertext_archive(_make_zip(payload), member_name="other.enc")
 
     def test_receipt_context_tampering_is_refused_without_echoing_values(self):
         for field, value in (
@@ -367,6 +408,9 @@ class NodeLockReceiptTests(unittest.TestCase):
         self.assert_refused(*fixture[:5], **fixture[5])
         fixture = _fixture()
         fixture[3]["archive_digest"] = "0" * 64
+        self.assert_refused(*fixture[:5], **fixture[5])
+        fixture = _fixture()
+        fixture[3]["request_history"] = fixture[2]["request_history"]
         self.assert_refused(*fixture[:5], **fixture[5])
         fixture = _fixture()
         fixture[2]["artifacts"].append(copy.deepcopy(fixture[2]["artifacts"][0]))

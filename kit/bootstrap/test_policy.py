@@ -138,6 +138,15 @@ class WorkflowPolicyTests(unittest.TestCase):
     def _platform_workflow(self):
         return PLATFORM_WORKFLOW.read_text(encoding="utf-8")
 
+    def test_development_feedback_smoke_requires_reviewed_platform_workflow(self):
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/development-feedback-smoke.yml"
+        workflow = path.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(workflow, "platform", "development-feedback-smoke"))
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "development-feedback-smoke")
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow + "\npermissions: write-all\n", "platform", "development-feedback-smoke")
+
     def test_actual_platform_workflow_matches_closed_supported_shape(self):
         self.assertTrue(validate_workflow_text(self._platform_workflow(), "platform"))
 
