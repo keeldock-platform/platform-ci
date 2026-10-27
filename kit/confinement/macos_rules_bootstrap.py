@@ -1246,13 +1246,10 @@ def _verify_plan_snapshot(directory, request, binding, definitions_sha256, revie
         raise Refusal("plan_snapshot_refused", "plan_snapshot") from None
 
 
-def _worker_environment(source, dash_directory, home, storage):
-    return {
-        "PATH": dash_directory.as_posix() + ":/usr/bin:/bin:/usr/sbin:/sbin",
-        "HOME": str(home),
-        "TMPDIR": str(storage),
-        "LANG": "C",
-        "LC_ALL": "C",
+def _worker_environment(source, dash_directory, home, storage, toolchain, worker_tools, reviewed):
+    environment = reviewed._child_environment(home, storage, toolchain, worker_tools)
+    environment.update({
+        "PATH": dash_directory.as_posix() + ":" + environment["PATH"],
         "PYTHONDONTWRITEBYTECODE": "1",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": "/dev/null",
@@ -1261,7 +1258,8 @@ def _worker_environment(source, dash_directory, home, storage):
         "GIT_CONFIG_VALUE_0": str(source),
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_OPTIONAL_LOCKS": "0",
-    }
+    })
+    return environment
 
 
 def _probe_worker_privilege(worker_uid, home, storage, toolchain, reviewed, cleanup_state=None):
@@ -1453,6 +1451,7 @@ def cleanup_dash(environ=None):
 def _run_private(request, binding, root, definitions, definitions_sha256, reviewed_diff_sha256,
                  dash_directory, dash_record, reviewed, capability, environ, lifecycle):
     toolchain = None
+    worker_tools = None
     worker_uid = None
     home_parent = None
     home = None
@@ -1482,6 +1481,7 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
             raise Refusal("developer_mode_unavailable", "developer_mode") from None
         try:
             toolchain = capability._resolve_trusted_toolchain()
+            worker_tools = capability._resolve_worker_tools(toolchain)
             worker_uid, home_parent, home = capability._create_probe_identity(root)
             os.mkdir(storage_root, 0o700)
             storage_root_created = True
@@ -1540,7 +1540,9 @@ def _run_private(request, binding, root, definitions, definitions_sha256, review
                 privilege_check = _probe_worker_privilege(
                     worker_uid, home, worker_storage, toolchain, reviewed, cleanup_state,
                 )
-                environment = _worker_environment(source, dash_directory, home, worker_storage)
+                environment = _worker_environment(
+                    source, dash_directory, home, worker_storage, toolchain, worker_tools, reviewed,
+                )
                 original_cwd = Path.cwd()
                 network_observer, network_session = _start_network_observation(
                     binding, request["source_sha"], cleanup_state,

@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import tarfile
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -745,6 +746,85 @@ class WorkerPrivilegeTests(unittest.TestCase):
         reviewed._run_probe_step = fail_cleanup
         with self.assertRaisesRegex(bootstrap.Refusal, "cleanup_incomplete"):
             bootstrap._probe_worker_privilege(502, "home", "storage", {"python": "python"}, reviewed)
+
+
+class WorkerToolsTests(unittest.TestCase):
+    def test_suite_environment_places_verified_dash_before_resolved_worker_tools(self):
+        toolchain = {"python": "/trusted/python3", "developer_directory": "/trusted/developer"}
+        worker_tools = {
+            "python": "/trusted/python3",
+            "git": "/trusted/developer/usr/bin/git",
+            "env": "/usr/bin/env",
+            "ssh_keygen": "/usr/bin/ssh-keygen",
+            "path": "/trusted/python:/trusted/developer/usr/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        }
+        base_environment = {
+            "PATH": worker_tools["path"],
+            "HOME": "worker-home",
+            "TMPDIR": "worker-storage",
+            "DEVELOPER_DIR": toolchain["developer_directory"],
+            "LANG": "C",
+            "LC_ALL": "C",
+        }
+        calls = []
+        reviewed = SimpleNamespace(
+            _child_environment=lambda *args: calls.append(args) or dict(base_environment),
+        )
+        environment = bootstrap._worker_environment(
+            "/source", Path("/prepared-dash"), "worker-home", "worker-storage",
+            toolchain, worker_tools, reviewed,
+        )
+        self.assertEqual(calls, [("worker-home", "worker-storage", toolchain, worker_tools)])
+        self.assertEqual(
+            environment["PATH"], "/prepared-dash:" + worker_tools["path"],
+        )
+        self.assertEqual(environment["DEVELOPER_DIR"], toolchain["developer_directory"])
+        self.assertEqual(environment["GIT_CONFIG_VALUE_0"], "/source")
+        self.assertEqual(environment["GIT_CONFIG_GLOBAL"], "/dev/null")
+        self.assertEqual(environment["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(environment["GIT_CONFIG_COUNT"], "1")
+
+    def test_worker_tools_are_resolved_before_creating_the_worker_identity(self):
+        events = []
+        toolchain = {"python": "/trusted/python3", "developer_directory": "/trusted/developer"}
+        worker_tools = {
+            "python": "/trusted/python3",
+            "git": "/trusted/developer/usr/bin/git",
+            "env": "/usr/bin/env",
+            "ssh_keygen": "/usr/bin/ssh-keygen",
+            "path": "/trusted/python:/trusted/developer/usr/bin:/usr/bin:/bin",
+        }
+
+        def create_identity(root):
+            events.append("identity")
+            raise RuntimeError("stop before identity setup")
+
+        capability = SimpleNamespace(
+            MAX_CAPTURE_BYTES=bootstrap.MAX_CAPTURE_BYTES,
+            _disable_developer_mode=lambda: events.append("developer-mode"),
+            _resolve_trusted_toolchain=lambda: events.append("toolchain") or toolchain,
+            _resolve_worker_tools=lambda value: events.append(("worker-tools", value)) or worker_tools,
+            _create_probe_identity=create_identity,
+        )
+        reviewed = SimpleNamespace(
+            _cleanup=lambda *args: events.append("cleanup-worker"),
+        )
+
+        with patch.object(bootstrap.os, "geteuid", return_value=0, create=True):
+            with patch.object(
+                bootstrap, "_cleanup_prepared_dash",
+                side_effect=lambda value: events.append("cleanup-dash"),
+            ):
+                with self.assertRaisesRegex(bootstrap.Refusal, "probe_identity_unavailable"):
+                    bootstrap._run_private(
+                        request_value(), binding_value(), "root", "definitions", "d" * 64, "e" * 64,
+                        Path("/prepared-dash"), {}, reviewed, capability, {},
+                        {"token_reference": None},
+                    )
+        self.assertEqual(events[:4], [
+            "developer-mode", "toolchain", ("worker-tools", toolchain), "identity",
+        ])
+        self.assertEqual(events[4:], ["cleanup-worker", "cleanup-dash"])
 
 
 class NetworkObservationTests(unittest.TestCase):
