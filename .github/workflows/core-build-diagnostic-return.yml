@@ -309,6 +309,7 @@ jobs:
           repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
           permission-contents: read
           permission-metadata: read
+          skip-token-revoke: true
       - name: Verify installation identity
         env:
           EXPECTED_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
@@ -442,7 +443,7 @@ jobs:
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$line"
       - name: Revoke token when producer did not confirm
-        if: ${{ always() && steps.source-token.outcome == 'success' && steps.producer.outputs.token_revocation != 'confirmed' }}
+        if: ${{ always() && steps.source-token.outputs.token != '' && steps.producer.outputs.token_revocation != 'confirmed' }}
         env:
           SOURCE_READER_TOKEN: ${{ steps.source-token.outputs.token }}
           SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
