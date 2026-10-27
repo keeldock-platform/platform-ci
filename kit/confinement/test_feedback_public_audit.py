@@ -180,14 +180,25 @@ class LiveAuditProvider(macos_public_audit.GitHubAPI):
             if job["status"] != "completed":
                 continue
             conclusion = job["conclusion"]
+            steps = [{
+                "number": 1,
+                "name": "Set up job",
+                "status": "completed",
+                "conclusion": conclusion,
+            }]
+            profile = feedback_request.PROFILES[self.request["concern"]]
+            if job["name"] == profile["producer_job"] and conclusion == "success":
+                steps.extend([
+                    {"number": 8, "name": "Run and publish encrypted feedback",
+                     "status": "completed", "conclusion": "success"},
+                    {"number": 12, "name": feedback_api.PRODUCER_TOKEN_FALLBACK_STEP,
+                     "status": "completed", "conclusion": "skipped"},
+                    {"number": 13, "name": "Remove staged ciphertext",
+                     "status": "completed", "conclusion": "success"},
+                ])
             details[job["id"]] = {
                 **job,
-                "steps": [{
-                    "number": 1,
-                    "name": "Set up job",
-                    "status": "completed",
-                    "conclusion": conclusion,
-                }],
+                "steps": steps,
             }
         return details
 
@@ -563,6 +574,34 @@ class LiveProviderPipelineTests(unittest.TestCase):
             {"completed", "queued", "in_progress", "waiting", "pending", "requested"},
         )
         self.assertTrue(all(query.get("filter") == ["all"] for query in history_queries))
+
+    def test_live_audit_rejects_unknown_producer_skip_even_with_success_summary(self):
+        request, key = _request()
+        profile = feedback_request.PROFILES[request["concern"]]
+        environment = _environment(request, key, profile["auditor_job"])
+        environment["GITHUB_TOKEN"] = "A" * 24
+        api = LiveAuditProvider(request)
+        fallback = next(step for step in api.details[103]["steps"]
+                        if step["name"] == feedback_api.PRODUCER_TOKEN_FALLBACK_STEP)
+        fallback["name"] = "Unexpected skipped cleanup"
+        with self.assertRaises(subject.FeedbackAuditRefusal):
+            subject.audit_live(
+                environment, api_factory=lambda unused_token: api, now=NOW,
+            )
+
+    def test_live_audit_requires_producer_success_summary_for_skipped_fallback(self):
+        request, key = _request()
+        profile = feedback_request.PROFILES[request["concern"]]
+        environment = _environment(request, key, profile["auditor_job"])
+        environment["GITHUB_TOKEN"] = "A" * 24
+        api = LiveAuditProvider(request)
+        api.logs[103] = api.logs[103].replace(
+            b"KD-FEEDBACK-PRODUCER-SUMMARY ", b"KD-FEEDBACK-OTHER-SUMMARY ",
+        )
+        with self.assertRaises(subject.FeedbackAuditRefusal):
+            subject.audit_live(
+                environment, api_factory=lambda unused_token: api, now=NOW,
+            )
 
     def test_timestamped_cache_snapshot_log_uses_actual_provider_line_shape(self):
         digest = macos_public_audit.cache_inventory_digest([])

@@ -78,15 +78,23 @@ class ProviderShapedAPI(macos_public_audit.GitHubAPI):
         ]
 
     def _details(self):
-        return {
-            101 + index: {
-                **job,
-                "steps": [{
-                    "number": 1, "name": "Set up job", "status": "completed", "conclusion": "success",
-                }],
-            }
-            for index, job in enumerate(self.jobs)
-        }
+        profile = feedback_request.PROFILES[self.request_record["concern"]]
+        details = {}
+        for index, job in enumerate(self.jobs):
+            steps = [{
+                "number": 1, "name": "Set up job", "status": "completed", "conclusion": "success",
+            }]
+            if job["name"] == profile["producer_job"]:
+                steps.extend([
+                    {"number": 8, "name": "Run and publish encrypted feedback",
+                     "status": "completed", "conclusion": "success"},
+                    {"number": 12, "name": feedback_api.PRODUCER_TOKEN_FALLBACK_STEP,
+                     "status": "completed", "conclusion": "skipped"},
+                    {"number": 13, "name": "Remove staged ciphertext",
+                     "status": "completed", "conclusion": "success"},
+                ])
+            details[101 + index] = {**job, "steps": steps}
+        return details
 
     def _logs(self):
         profile = feedback_request.PROFILES[self.request_record["concern"]]
@@ -133,6 +141,9 @@ class ProviderShapedAPI(macos_public_audit.GitHubAPI):
         logs = {101 + index: b"trusted fixed job summary\n" for index in range(4)}
         logs[103] = (
             "KD-FEEDBACK-PRODUCER " + producer_line + "\n" + upload_line + "\n"
+            + "KD-FEEDBACK-PRODUCER-SUMMARY schema=1 request-id="
+            + self.request_record["request_id"] + " profile=" + profile["kind"]
+            + " status=encrypted\n"
         ).encode("ascii")
         logs[104] = ("KD-FEEDBACK-AUDIT " + receipt_line + "\n").encode("ascii")
         return logs
@@ -304,6 +315,102 @@ class FeedbackAPIProviderShapeTests(unittest.TestCase):
         self.assertEqual(result["artifact_name"], "feedback-rust_patch-" + self.request["request_id"])
         self.assertEqual(len(result["api_evidence"]["jobs"]), 4)
         self.assertEqual(len(result["archive_bytes"]), result["receipt"]["archive_size"])
+
+    def test_confirmed_producer_may_skip_only_its_token_fallback(self):
+        self.assertEqual(len(self._collect()["api_evidence"]["jobs"]), 4)
+
+        producer_steps = self.api.details[103]["steps"]
+        fallback = next(step for step in producer_steps
+                        if step["name"] == feedback_api.PRODUCER_TOKEN_FALLBACK_STEP)
+        fallback["name"] = "Unexpected skipped cleanup"
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+    def test_skipped_fallback_requires_the_exact_producer_success_summary(self):
+        self.api.logs[103] = self.api.logs[103].replace(
+            b"KD-FEEDBACK-PRODUCER-SUMMARY ", b"KD-FEEDBACK-OTHER-SUMMARY ",
+        )
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+    def test_conflicting_producer_summary_records_are_refused(self):
+        profile = feedback_request.PROFILES[self.request["concern"]]
+        wrong_records = (
+            "KD-FEEDBACK-PRODUCER-SUMMARY schema=1 request-id="
+            + self.request["request_id"] + " profile=wrong_profile status=encrypted\n",
+            "KD-FEEDBACK-PRODUCER-SUMMARY schema=1 request-id="
+            + ("0" * 64) + " profile=" + profile["kind"] + " status=encrypted\n",
+            "KD-FEEDBACK-PRODUCER-SUMMARY schema=1 request-id="
+            + self.request["request_id"] + " profile=" + profile["kind"]
+            + " status=encrypted extra=1\n",
+        )
+        for wrong_record in wrong_records:
+            with self.subTest(record=wrong_record):
+                self.api = ProviderShapedAPI(self.request, self.now)
+                self.api.logs[103] += wrong_record.encode("ascii")
+                with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+                    self._collect()
+
+    def test_producer_summary_shell_echo_is_not_a_second_record(self):
+        self.api.logs[103] = (
+            b'2026-10-28T04:00:00Z line="KD-FEEDBACK-PRODUCER-SUMMARY schema=1"\n'
+            + self.api.logs[103]
+        )
+        self.assertEqual(len(self._collect()["api_evidence"]["jobs"]), 4)
+
+    def test_producer_success_always_requires_its_exact_success_summary(self):
+        fallback = next(step for step in self.api.details[103]["steps"]
+                        if step["name"] == feedback_api.PRODUCER_TOKEN_FALLBACK_STEP)
+        fallback["conclusion"] = "success"
+        self.api.logs[103] = self.api.logs[103].replace(
+            b"KD-FEEDBACK-PRODUCER-SUMMARY ", b"KD-FEEDBACK-OTHER-SUMMARY ",
+        )
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+    def test_duplicate_or_noncompleted_fallback_steps_are_refused(self):
+        producer_steps = self.api.details[103]["steps"]
+        fallback = next(step for step in producer_steps
+                        if step["name"] == feedback_api.PRODUCER_TOKEN_FALLBACK_STEP)
+        producer_steps.append({**fallback, "number": 14})
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+        self.api = ProviderShapedAPI(self.request, self.now)
+        fallback = next(step for step in self.api.details[103]["steps"]
+                        if step["name"] == feedback_api.PRODUCER_TOKEN_FALLBACK_STEP)
+        fallback["status"] = "in_progress"
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+    def test_successful_duplicate_fallback_name_cannot_accompany_allowed_skip(self):
+        producer_steps = self.api.details[103]["steps"]
+        fallback = next(step for step in producer_steps
+                        if step["name"] == feedback_api.PRODUCER_TOKEN_FALLBACK_STEP)
+        producer_steps.append({**fallback, "number": 14, "conclusion": "success"})
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+    def test_fallback_rejects_every_other_status_and_conclusion(self):
+        for status, conclusion in (
+            ("queued", "success"),
+            ("in_progress", "success"),
+            ("completed", "failure"),
+            ("completed", "cancelled"),
+        ):
+            with self.subTest(status=status, conclusion=conclusion):
+                self.api = ProviderShapedAPI(self.request, self.now)
+                fallback = next(step for step in self.api.details[103]["steps"]
+                                if step["name"] == feedback_api.PRODUCER_TOKEN_FALLBACK_STEP)
+                fallback["status"] = status
+                fallback["conclusion"] = conclusion
+                with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+                    self._collect()
+
+    def test_nonproducer_job_cannot_use_the_producer_fallback_skip(self):
+        self.api.details[101]["steps"] = list(self.api.details[103]["steps"])
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
 
     def test_closed_capacity_notices_are_allowed_only_on_macos_jobs(self):
         notice = {
