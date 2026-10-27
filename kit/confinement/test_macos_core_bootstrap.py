@@ -36,13 +36,14 @@ def _lock(file_digest="a" * 64, hook_path=HOOK_PATH, signature="verified"):
     return ((chr(35) + " generated fixture\n") + "\n".join(lines) + "\n").encode("ascii")
 
 
-def _run_runtime_refusal(reason, stage, proof_confirmed):
+def _run_runtime_refusal(reason, stage, proof_confirmed, source_diagnostic=None):
     token = "!" * 32
 
     class RuntimeRefusal(Exception):
-        def __init__(self, value, where):
+        def __init__(self, value, where, diagnostic=None):
             self.reason = value
             self.stage = where
+            self.source_diagnostic = diagnostic
 
     class Runtime:
         Refusal = RuntimeRefusal
@@ -62,7 +63,7 @@ def _run_runtime_refusal(reason, stage, proof_confirmed):
         def validated_source(request, binding, root, environ, *, revocation_state=None):
             revocation_state.confirmed = proof_confirmed
             environ.pop("SOURCE_READER_TOKEN", None)
-            raise RuntimeRefusal(reason, stage)
+            raise RuntimeRefusal(reason, stage, source_diagnostic)
 
     source_reader = type("Reader", (), {
         "run": staticmethod(lambda environ: {
@@ -301,6 +302,51 @@ class InputTests(unittest.TestCase):
         self.assertNotIn("macos-core-bootstrap=verified", line)
         self.assertNotIn("SOURCE_READER_TOKEN", environment)
         reader_loader.assert_not_called()
+
+    def test_source_fetch_diagnostic_is_allowlisted_and_follows_confirmed_revocation(self):
+        line, status, environment, reader_loader = _run_runtime_refusal(
+            "source_fetch_unavailable", "fetch", True, ("base_fetch", "stderr_present"),
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("reason=source_fetch_unavailable stage=source_lease", line)
+        self.assertIn("source-diagnostic=base_fetch.stderr_present", line)
+        self.assertIn("token-revocation=confirmed", line)
+        self.assertNotIn("SOURCE_READER_TOKEN", environment)
+        reader_loader.assert_not_called()
+
+    def test_malformed_or_unrelated_source_diagnostics_are_omitted(self):
+        cases = (
+            (("base_fetch", "unlisted_failure"), "source_fetch_unavailable", "fetch"),
+            (("unlisted_operation", "stderr_present"), "source_fetch_unavailable", "fetch"),
+            (["base_fetch", "stderr_present"], "source_fetch_unavailable", "fetch"),
+            (("base_fetch", "stderr_present"), "source_fetch_unavailable", "revoke"),
+            (("base_fetch", "stderr_present"), "signature_invalid", "signature"),
+        )
+        for source_diagnostic, reason, stage in cases:
+            with self.subTest(source_diagnostic=source_diagnostic, reason=reason, stage=stage):
+                line, status, unused_environment, unused_reader = _run_runtime_refusal(
+                    reason, stage, True, source_diagnostic,
+                )
+                self.assertEqual(status, 1)
+                self.assertNotIn("source-diagnostic=", line)
+
+    def test_refusal_formatter_revalidates_mutable_source_diagnostic(self):
+        refusal = subject.Refusal(
+            "source_fetch_unavailable", "source_lease", ("base_fetch", "stderr_present"),
+        )
+        refusal.source_diagnostic = ("base_fetch", "unlisted_failure")
+        line = subject._format_refusal(refusal, "b" * 40, {}, "a" * 40, "confirmed")
+        self.assertIn("reason=source_fetch_unavailable stage=source_lease", line)
+        self.assertNotIn("source-diagnostic=", line)
+
+    def test_unconfirmed_revocation_discards_source_diagnostic(self):
+        line, status, unused_environment, unused_reader = _run_runtime_refusal(
+            "source_fetch_unavailable", "fetch", False, ("base_fetch", "stderr_present"),
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("reason=cleanup_incomplete stage=cleanup", line)
+        self.assertIn("token-revocation=unconfirmed", line)
+        self.assertNotIn("source-diagnostic=", line)
 
     def test_cleanup_refusal_keeps_confirmed_token_receipt_without_acceptance(self):
         line, status, environment, reader_loader = _run_runtime_refusal(

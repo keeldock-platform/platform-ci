@@ -54,6 +54,13 @@ STAGES = frozenset((
     "input", "gate", "context", "import", "inventory", "toolchain", "controls", "identity",
     "summary", "source_lease", "lock", "manifest", "cleanup",
 ))
+SOURCE_DIAGNOSTIC_OPERATIONS = frozenset((
+    "git_init", "remote_add", "base_fetch", "base_ref", "candidate_fetch",
+    "source_ref", "shallow_check", "remote_remove", "source_snapshot",
+))
+SOURCE_DIAGNOSTIC_CLASSES = frozenset((
+    "exit_nonzero", "stderr_present", "process_failure", "unexpected_exception",
+))
 CORE_SOURCE_GATE_ENV = "CORE_BOOTSTRAP_ALLOWED_SHA"
 CORE_CONTROL_GATE_ENV = "CORE_BOOTSTRAP_ALLOWED_CONTROL_SHA"
 MAX_LOCK_BYTES = 262144
@@ -81,9 +88,19 @@ if os.write(1, marker) != len(marker):
 
 
 class Refusal(Exception):
-    def __init__(self, reason, stage):
+    def __init__(self, reason, stage, source_diagnostic=None):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "input"
+        self.source_diagnostic = None
+        if (
+            self.reason == "source_fetch_unavailable" and self.stage == "source_lease"
+            and type(source_diagnostic) is tuple and len(source_diagnostic) == 2
+            and type(source_diagnostic[0]) is str
+            and source_diagnostic[0] in SOURCE_DIAGNOSTIC_OPERATIONS
+            and type(source_diagnostic[1]) is str
+            and source_diagnostic[1] in SOURCE_DIAGNOSTIC_CLASSES
+        ):
+            self.source_diagnostic = source_diagnostic
         super().__init__(self.reason)
 
 
@@ -757,6 +774,17 @@ def _format_refusal(error, control_sha, environ, source_sha, token_state=None):
         + " stage=" + error.stage + " control-sha=" + safe_control
         + " run-id=" + run_id + " run-attempt=" + attempt + " source-sha=" + safe_source
     )
+    source_diagnostic = error.source_diagnostic
+    if (
+        error.reason == "source_fetch_unavailable" and error.stage == "source_lease"
+        and type(source_diagnostic) is tuple and len(source_diagnostic) == 2
+        and type(source_diagnostic[0]) is str
+        and source_diagnostic[0] in SOURCE_DIAGNOSTIC_OPERATIONS
+        and type(source_diagnostic[1]) is str
+        and source_diagnostic[1] in SOURCE_DIAGNOSTIC_CLASSES
+    ):
+        operation, failure_class = source_diagnostic
+        line += " source-diagnostic=" + operation + "." + failure_class
     if token_state in TOKEN_REFUSAL_STATES:
         line += " token-revocation=" + token_state
     return line
@@ -846,7 +874,18 @@ def run(arguments=None, environ=None, token_reader=None):
                 if type(error.reason) is str and error.reason in SOURCE_VALIDATION_REASONS
                 else "source_lease_unavailable"
             )
-            raise Refusal(reason, "source_lease") from None
+            source_diagnostic = None
+            if reason == "source_fetch_unavailable" and error.stage == "fetch":
+                candidate = getattr(error, "source_diagnostic", None)
+                if (
+                    type(candidate) is tuple and len(candidate) == 2
+                    and type(candidate[0]) is str
+                    and candidate[0] in SOURCE_DIAGNOSTIC_OPERATIONS
+                    and type(candidate[1]) is str
+                    and candidate[1] in SOURCE_DIAGNOSTIC_CLASSES
+                ):
+                    source_diagnostic = candidate
+            raise Refusal(reason, "source_lease", source_diagnostic) from None
         except Refusal:
             raise
         except BaseException:

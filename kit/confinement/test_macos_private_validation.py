@@ -840,6 +840,41 @@ class ControlGitCommandTests(unittest.TestCase):
                     subject._require_git_success(result, "configuration")
                 self.assertEqual(refusal.exception.reason, "revocation_policy_invalid")
 
+    def test_fetch_refusal_has_only_closed_operation_and_failure_labels(self):
+        cases = (
+            (1, b"private diagnostic", "exit_nonzero"),
+            (0, b"private diagnostic", "stderr_present"),
+        )
+        for returncode, stderr, failure_class in cases:
+            result = subject.subprocess.CompletedProcess(("git",), returncode, b"", stderr)
+            with self.subTest(returncode=returncode), self.assertRaises(subject.Refusal) as refusal:
+                subject._require_git_success(result, "fetch", operation="base_fetch")
+            self.assertEqual(refusal.exception.reason, "source_fetch_unavailable")
+            self.assertEqual(refusal.exception.stage, "fetch")
+            self.assertEqual(refusal.exception.source_diagnostic, ("base_fetch", failure_class))
+            self.assertEqual(str(refusal.exception), "source_fetch_unavailable")
+
+    def test_source_git_labels_process_and_unexpected_failures_without_exception_text(self):
+        with patch.object(
+            subject, "_run_process", side_effect=subject.Refusal("source_fetch_unavailable", "fetch"),
+        ):
+            with self.assertRaises(subject.Refusal) as process_refusal:
+                subject._run_source_git("candidate_fetch", ("git", "fetch"), cwd=Path("/tmp"), environ={})
+        self.assertEqual(process_refusal.exception.source_diagnostic, ("candidate_fetch", "process_failure"))
+        self.assertEqual(str(process_refusal.exception), "source_fetch_unavailable")
+
+        with patch.object(subject, "_run_process", side_effect=RuntimeError("private exception text")):
+            with self.assertRaises(subject.Refusal) as unexpected_refusal:
+                subject._run_source_git("base_fetch", ("git", "fetch"), cwd=Path("/tmp"), environ={})
+        self.assertEqual(unexpected_refusal.exception.source_diagnostic, ("base_fetch", "unexpected_exception"))
+        self.assertEqual(str(unexpected_refusal.exception), "source_fetch_unavailable")
+
+    def test_unknown_source_git_operation_has_no_diagnostic(self):
+        with self.assertRaises(subject.Refusal) as refusal:
+            subject._run_source_git("unlisted_operation", ("git", "fetch"), cwd=Path("/tmp"), environ={})
+        self.assertEqual((refusal.exception.reason, refusal.exception.stage), ("source_fetch_unavailable", "fetch"))
+        self.assertIsNone(refusal.exception.source_diagnostic)
+
     def test_worktree_add_suppresses_git_feedback_and_still_rejects_other_stderr(self):
         arguments = subject._worktree_add_arguments(
             "/usr/bin/git", Path("source-fixture"), "a" * 40,
