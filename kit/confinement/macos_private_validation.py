@@ -676,6 +676,327 @@ def _control_inventory(root, control_sha, git_executable, temp_root):
                 raise Refusal("cleanup_incomplete", "cleanup") from None
 
 
+@dataclass(repr=False)
+class _ControlInventoryOwnership:
+    root: Path
+    root_fd: int
+    ci_fd: int
+    inventory_fd: int
+    root_identity: tuple
+    ci_identity: tuple
+    inventory_identity: tuple
+    root_owner: tuple
+    ci_owner: tuple
+    inventory_owner: tuple
+    root_mode: int
+    ci_mode: int
+    inventory_mode: int
+    contents: bytes
+    closed: bool = False
+
+
+def _control_owner(info):
+    return info.st_uid, info.st_gid
+
+
+def _control_identity(info):
+    return info.st_dev, info.st_ino
+
+
+def _control_safe_mode(info):
+    return not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)
+
+
+def _control_inventory_snapshot(state):
+    root_info = os.fstat(state.root_fd)
+    root_named = state.root.lstat()
+    ci_info = os.fstat(state.ci_fd)
+    ci_named = os.stat("ci", dir_fd=state.root_fd, follow_symlinks=False)
+    inventory_info = os.fstat(state.inventory_fd)
+    inventory_named = os.stat(
+        "revoked-signer-fingerprints", dir_fd=state.ci_fd, follow_symlinks=False,
+    )
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or _control_identity(root_info) != state.root_identity
+        or _control_identity(root_named) != state.root_identity
+        or _control_owner(root_info) != state.root_owner
+        or stat.S_IMODE(root_info.st_mode) != state.root_mode
+        or not _control_safe_mode(root_info)
+        or not stat.S_ISDIR(ci_info.st_mode)
+        or _control_identity(ci_info) != state.ci_identity
+        or _control_identity(ci_named) != state.ci_identity
+        or _control_owner(ci_info) not in (state.ci_owner, (0, 0))
+        or stat.S_IMODE(ci_info.st_mode) != state.ci_mode
+        or not _control_safe_mode(ci_info)
+        or not stat.S_ISREG(inventory_info.st_mode)
+        or _control_identity(inventory_info) != state.inventory_identity
+        or _control_identity(inventory_named) != state.inventory_identity
+        or _control_owner(inventory_info) not in (state.inventory_owner, (0, 0))
+        or inventory_info.st_nlink != 1
+        or inventory_named.st_nlink != 1
+        or stat.S_IMODE(inventory_info.st_mode) != state.inventory_mode
+        or not _control_safe_mode(inventory_info)
+        or inventory_info.st_size != len(state.contents)
+        or inventory_info.st_size > MAX_INVENTORY_BYTES
+    ):
+        raise ValueError
+    return root_info, ci_info, inventory_info
+
+
+def _read_control_inventory_descriptor(descriptor):
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    payload = bytearray()
+    while len(payload) <= MAX_INVENTORY_BYTES:
+        chunk = os.read(descriptor, min(4096, MAX_INVENTORY_BYTES + 1 - len(payload)))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if len(payload) > MAX_INVENTORY_BYTES:
+        raise ValueError
+    return bytes(payload)
+
+
+def _close_control_inventory_descriptors(descriptors):
+    failed = False
+    for descriptor in reversed(descriptors):
+        if descriptor is not None and descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                failed = True
+    if failed:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+
+
+def _restore_control_inventory(state):
+    if type(state) is not _ControlInventoryOwnership or state.closed:
+        raise Refusal("cleanup_incomplete", "cleanup")
+    failed = False
+    try:
+        unused_root, ci_info, inventory_info = _control_inventory_snapshot(state)
+        if _read_control_inventory_descriptor(state.inventory_fd) != state.contents:
+            raise ValueError
+        if _control_owner(inventory_info) != state.inventory_owner:
+            os.fchown(state.inventory_fd, *state.inventory_owner)
+        unused_root, ci_info, inventory_info = _control_inventory_snapshot(state)
+        if (_control_owner(inventory_info) != state.inventory_owner
+                or _read_control_inventory_descriptor(state.inventory_fd) != state.contents):
+            raise ValueError
+        if _control_owner(ci_info) != state.ci_owner:
+            os.fchown(state.ci_fd, *state.ci_owner)
+        unused_root, ci_info, inventory_info = _control_inventory_snapshot(state)
+        if (_control_owner(ci_info) != state.ci_owner
+                or _control_owner(inventory_info) != state.inventory_owner):
+            raise ValueError
+    except BaseException:
+        failed = True
+    finally:
+        descriptors = (state.root_fd, state.ci_fd, state.inventory_fd)
+        state.closed = True
+        try:
+            _close_control_inventory_descriptors(descriptors)
+        except BaseException:
+            failed = True
+    if failed:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+
+
+def _close_control_inventory(state):
+    if type(state) is not _ControlInventoryOwnership or state.closed:
+        raise Refusal("cleanup_incomplete", "cleanup")
+    failed = False
+    try:
+        unused_root, ci_info, inventory_info = _control_inventory_snapshot(state)
+        if (_control_owner(ci_info) != (0, 0) or _control_owner(inventory_info) != (0, 0)
+                or _read_control_inventory_descriptor(state.inventory_fd) != state.contents):
+            raise ValueError
+    except BaseException:
+        failed = True
+    finally:
+        state.closed = True
+        try:
+            _close_control_inventory_descriptors((state.root_fd, state.ci_fd, state.inventory_fd))
+        except BaseException:
+            failed = True
+    if failed:
+        raise Refusal("cleanup_incomplete", "cleanup") from None
+
+
+def _prepare_control_inventory(root, control_sha, runner_temp):
+    descriptors = []
+    state = None
+    try:
+        if not _full_sha(control_sha) or not isinstance(root, Path) or not isinstance(runner_temp, Path):
+            raise ValueError
+        runner_path = runner_temp.resolve(strict=True)
+        runner_info = runner_temp.lstat()
+        if (runner_path != runner_temp or not stat.S_ISDIR(runner_info.st_mode)
+                or runner_info.st_uid == 0):
+            raise ValueError
+        runner_uid = runner_info.st_uid
+        control_root = root.resolve(strict=True)
+        root_named = control_root.lstat()
+        if (control_root != root or not stat.S_ISDIR(root_named.st_mode)
+                or root_named.st_uid not in (0, runner_uid) or not _control_safe_mode(root_named)):
+            raise ValueError
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        directory = getattr(os, "O_DIRECTORY", None)
+        if (nofollow is None or directory is None or os.open not in os.supports_dir_fd
+                or os.stat not in os.supports_dir_fd or os.stat not in os.supports_follow_symlinks):
+            raise ValueError
+        flags = os.O_RDONLY | nofollow | directory | getattr(os, "O_CLOEXEC", 0)
+        root_fd = os.open(control_root, flags)
+        descriptors.append(root_fd)
+        root_info = os.fstat(root_fd)
+        if (_control_identity(root_info) != _control_identity(root_named)
+                or not stat.S_ISDIR(root_info.st_mode)
+                or root_info.st_uid not in (runner_uid, 0)
+                or not _control_safe_mode(root_info)):
+            raise ValueError
+        ci_named = os.stat("ci", dir_fd=root_fd, follow_symlinks=False)
+        if (not stat.S_ISDIR(ci_named.st_mode) or ci_named.st_uid not in (0, runner_uid)
+                or not _control_safe_mode(ci_named)):
+            raise ValueError
+        ci_fd = os.open("ci", flags, dir_fd=root_fd)
+        descriptors.append(ci_fd)
+        ci_info = os.fstat(ci_fd)
+        if (_control_identity(ci_info) != _control_identity(ci_named)
+                or ci_info.st_uid not in (runner_uid, 0)
+                or not _control_safe_mode(ci_info)):
+            raise ValueError
+        inventory_name = "revoked-signer-fingerprints"
+        inventory_named = os.stat(inventory_name, dir_fd=ci_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(inventory_named.st_mode) or inventory_named.st_uid not in (0, runner_uid)
+                or inventory_named.st_nlink != 1 or inventory_named.st_size > MAX_INVENTORY_BYTES
+                or not _control_safe_mode(inventory_named)):
+            raise ValueError
+        inventory_fd = os.open(
+            inventory_name, os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0), dir_fd=ci_fd,
+        )
+        descriptors.append(inventory_fd)
+        inventory_info = os.fstat(inventory_fd)
+        if (_control_identity(inventory_info) != _control_identity(inventory_named)
+                or inventory_info.st_uid not in (runner_uid, 0)
+                or inventory_info.st_nlink != 1 or inventory_info.st_size > MAX_INVENTORY_BYTES
+                or not stat.S_ISREG(inventory_info.st_mode) or not _control_safe_mode(inventory_info)):
+            raise ValueError
+        contents = _read_control_inventory_descriptor(inventory_fd)
+        if len(contents) != inventory_info.st_size:
+            raise ValueError
+        root_after, ci_after, inventory_after = os.fstat(root_fd), os.fstat(ci_fd), os.fstat(inventory_fd)
+        root_named_after = control_root.lstat()
+        ci_named_after = os.stat("ci", dir_fd=root_fd, follow_symlinks=False)
+        inventory_named_after = os.stat(inventory_name, dir_fd=ci_fd, follow_symlinks=False)
+        if (
+            _control_identity(root_after) != _control_identity(root_info)
+            or _control_identity(root_named_after) != _control_identity(root_info)
+            or _control_identity(ci_after) != _control_identity(ci_info)
+            or _control_identity(ci_named_after) != _control_identity(ci_info)
+            or _control_identity(inventory_after) != _control_identity(inventory_info)
+            or _control_identity(inventory_named_after) != _control_identity(inventory_info)
+            or _control_owner(root_after) != _control_owner(root_info)
+            or _control_owner(ci_after) != _control_owner(ci_info)
+            or _control_owner(inventory_after) != _control_owner(inventory_info)
+            or stat.S_IMODE(root_after.st_mode) != stat.S_IMODE(root_info.st_mode)
+            or stat.S_IMODE(ci_after.st_mode) != stat.S_IMODE(ci_info.st_mode)
+            or stat.S_IMODE(inventory_after.st_mode) != stat.S_IMODE(inventory_info.st_mode)
+            or not _control_safe_mode(root_after)
+            or not _control_safe_mode(ci_after)
+            or not _control_safe_mode(inventory_after)
+            or inventory_after.st_nlink != 1
+            or inventory_after.st_size != inventory_info.st_size
+            or inventory_named_after.st_nlink != 1
+            or inventory_after.st_mtime_ns != inventory_info.st_mtime_ns
+            or inventory_after.st_ctime_ns != inventory_info.st_ctime_ns
+        ):
+            raise ValueError
+        git_executable = _resolve_trusted_executable("/usr/bin/git")
+        env = _base_git_environment(runner_path)
+        listing = _run_process(
+            _control_git_command(git_executable, control_root, "ls-tree", "-z", control_sha,
+                                 "--", REVOCATION_INVENTORY),
+            cwd=control_root, environ=env, stage="revocation",
+        )
+        entry = _parse_single_tree_entry(_require_git_success(listing, "configuration"), REVOCATION_INVENTORY)
+        if entry is None or entry[0] != "100644" or entry[1] != "blob":
+            raise ValueError
+        blob_result = _run_process(
+            _control_git_command(git_executable, control_root, "cat-file", "blob", entry[2]),
+            cwd=control_root, environ=env, stage="revocation",
+        )
+        blob = _require_git_success(blob_result, "configuration")
+        if len(blob) > MAX_INVENTORY_BYTES or contents != blob:
+            raise ValueError
+        _parse_fingerprint_inventory(blob)
+        root_verified, ci_verified, inventory_verified = (
+            os.fstat(root_fd), os.fstat(ci_fd), os.fstat(inventory_fd),
+        )
+        if (_control_identity(root_verified) != _control_identity(root_info)
+                or _control_identity(control_root.lstat()) != _control_identity(root_info)
+                or _control_owner(root_verified) != _control_owner(root_info)
+                or stat.S_IMODE(root_verified.st_mode) != stat.S_IMODE(root_info.st_mode)
+                or not _control_safe_mode(root_verified)
+                or _control_identity(ci_verified) != _control_identity(ci_info)
+                or _control_identity(os.stat("ci", dir_fd=root_fd, follow_symlinks=False)) != _control_identity(ci_info)
+                or _control_owner(ci_verified) != _control_owner(ci_info)
+                or stat.S_IMODE(ci_verified.st_mode) != stat.S_IMODE(ci_info.st_mode)
+                or not _control_safe_mode(ci_verified)
+                or _control_identity(inventory_verified) != _control_identity(inventory_info)
+                or _control_identity(os.stat(inventory_name, dir_fd=ci_fd, follow_symlinks=False))
+                != _control_identity(inventory_info)
+                or _control_owner(inventory_verified) != _control_owner(inventory_info)
+                or stat.S_IMODE(inventory_verified.st_mode) != stat.S_IMODE(inventory_info.st_mode)
+                or not _control_safe_mode(inventory_verified)
+                or inventory_verified.st_nlink != 1
+                or inventory_verified.st_size != inventory_info.st_size
+                or inventory_verified.st_mtime_ns != inventory_info.st_mtime_ns
+                or inventory_verified.st_ctime_ns != inventory_info.st_ctime_ns
+                or _read_control_inventory_descriptor(inventory_fd) != blob):
+            raise ValueError
+        state = _ControlInventoryOwnership(
+            root=control_root, root_fd=root_fd, ci_fd=ci_fd, inventory_fd=inventory_fd,
+            root_identity=_control_identity(root_info), ci_identity=_control_identity(ci_info),
+            inventory_identity=_control_identity(inventory_info), root_owner=_control_owner(root_info),
+            ci_owner=_control_owner(ci_info), inventory_owner=_control_owner(inventory_info),
+            root_mode=stat.S_IMODE(root_info.st_mode), ci_mode=stat.S_IMODE(ci_info.st_mode),
+            inventory_mode=stat.S_IMODE(inventory_info.st_mode), contents=blob,
+        )
+        _control_inventory_snapshot(state)
+        os.fchown(ci_fd, 0, 0)
+        _control_inventory_snapshot(state)
+        os.fchown(inventory_fd, 0, 0)
+        unused_root, ci_info, inventory_info = _control_inventory_snapshot(state)
+        if (_control_owner(ci_info) != (0, 0) or _control_owner(inventory_info) != (0, 0)
+                or _read_control_inventory_descriptor(inventory_fd) != blob):
+            raise ValueError
+        return state
+    except Refusal as error:
+        if state is not None:
+            try:
+                _restore_control_inventory(state)
+            except BaseException:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+        else:
+            try:
+                _close_control_inventory_descriptors(descriptors)
+            except BaseException:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise error
+    except BaseException:
+        if state is not None:
+            try:
+                _restore_control_inventory(state)
+            except BaseException:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+        else:
+            try:
+                _close_control_inventory_descriptors(descriptors)
+            except BaseException:
+                raise Refusal("cleanup_incomplete", "cleanup") from None
+        raise Refusal("revocation_policy_invalid", "revocation") from None
+
+
 def _control_git_command(git_executable, control_root, *arguments):
     try:
         resolved_root = Path(control_root).resolve(strict=True)

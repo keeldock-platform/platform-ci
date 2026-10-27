@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import macos_core_contract as subject
+import macos_private_validation as private_validation
 
 
 SOURCE_SHA = "a" * 40
@@ -141,6 +142,109 @@ class CoreContractTests(unittest.TestCase):
         )
         self.assertNotIn("private helper failure", str(raised.exception))
         self.assertEqual(calls, ["developer_mode", "summary_guard_finish"])
+
+    def _run_inventory_lifecycle(self, restore_fails=False, prepare_fails=False,
+                                 fail_after_worker=False, worker_cleanup_fails=False):
+        calls = []
+
+        def prepare(*arguments):
+            calls.append(("prepare", arguments))
+            if prepare_fails:
+                raise private_validation.Refusal("revocation_policy_invalid", "revocation")
+            return object()
+
+        def restore(unused_state):
+            calls.append(("restore",))
+            if restore_fails:
+                raise RuntimeError("cleanup refused")
+
+        def close_only(unused_state):
+            calls.append(("close_only",))
+
+        def create_worker(*unused):
+            calls.append(("worker_identity",))
+            if fail_after_worker:
+                return 504, Path("/tmp/worker-parent"), Path("/tmp/worker-home")
+            raise RuntimeError("worker setup failed")
+
+        def cleanup(*unused):
+            calls.append(("worker_cleanup",))
+            if worker_cleanup_fails:
+                raise RuntimeError("worker cleanup failed")
+
+        capability = SimpleNamespace(
+            _disable_developer_mode=lambda: calls.append(("developer_mode",)),
+            _resolve_trusted_toolchain=lambda: calls.append(("toolchain",)) or {"python": "/usr/bin/python3"},
+            _resolve_worker_tools=lambda *unused: calls.append(("worker_tools",)) or {},
+            _create_probe_identity=create_worker,
+        )
+        runtime = SimpleNamespace(
+            Refusal=private_validation.Refusal,
+            REASONS=private_validation.REASONS,
+            STAGES=private_validation.STAGES,
+            RevocationState=lambda: calls.append(("revocation_state",)),
+            parse_request=lambda *unused: _request(),
+            validated_source=lambda *unused, **kwargs: calls.append(("source_lease",)),
+            _prepare_control_inventory=prepare,
+            _restore_control_inventory=restore,
+            _close_control_inventory=close_only,
+        )
+        reviewed = SimpleNamespace(_cleanup=cleanup)
+        rules = SimpleNamespace(
+            _finish_summary_guard=lambda *unused, **kwargs: calls.append(("summary_guard_finish",)),
+        )
+        controls = (reviewed, capability, runtime, SimpleNamespace(), rules)
+        with patch.object(subject.os, "geteuid", return_value=0, create=True):
+            with patch.object(subject, "_check_temp_root", return_value=None):
+                with patch.object(subject, "_make_directory",
+                                  side_effect=subject.Refusal("runner_unavailable", "worker_setup")):
+                    with self.assertRaises(subject.Refusal) as raised:
+                        subject._run_source(
+                            _request(), _binding(), Path.cwd(), Path.cwd(), {}, controls,
+                            DIFF_SHA256, 10**12, {},
+                        )
+        return calls, raised.exception
+
+    def test_inventory_is_prepared_before_worker_and_restored_after_cleanup(self):
+        calls, refusal = self._run_inventory_lifecycle(fail_after_worker=True)
+        labels = [call[0] for call in calls]
+        self.assertEqual(
+            labels,
+            ["developer_mode", "toolchain", "worker_tools", "prepare", "worker_identity",
+             "worker_cleanup", "summary_guard_finish", "restore"],
+        )
+        self.assertNotIn("source_lease", labels)
+        self.assertEqual((refusal.reason, refusal.stage, refusal.diagnostic),
+                         ("runner_unavailable", "worker_setup", "create_run_directory"))
+
+    def test_inventory_preparation_failure_stops_before_worker_and_source_lease(self):
+        calls, refusal = self._run_inventory_lifecycle(prepare_fails=True)
+        labels = [call[0] for call in calls]
+        self.assertNotIn("worker_identity", labels)
+        self.assertNotIn("source_lease", labels)
+        self.assertNotIn("restore", labels)
+        self.assertEqual(
+            (refusal.reason, refusal.stage, refusal.diagnostic),
+            ("source_validation_failed", "source_validation",
+             "source_runtime_revocation_revocation_policy_invalid"),
+        )
+
+    def test_inventory_restore_failure_takes_cleanup_priority(self):
+        calls, refusal = self._run_inventory_lifecycle(restore_fails=True, fail_after_worker=True)
+        self.assertEqual(calls[-1][0], "restore")
+        self.assertEqual((refusal.reason, refusal.stage, refusal.diagnostic),
+                         ("cleanup_incomplete", "cleanup", "worker_cleanup"))
+
+    def test_unconfirmed_worker_cleanup_closes_without_restoring_ownership(self):
+        calls, refusal = self._run_inventory_lifecycle(
+            fail_after_worker=True, worker_cleanup_fails=True,
+        )
+        labels = [call[0] for call in calls]
+        self.assertLess(labels.index("worker_cleanup"), labels.index("summary_guard_finish"))
+        self.assertLess(labels.index("summary_guard_finish"), labels.index("close_only"))
+        self.assertNotIn("restore", labels)
+        self.assertNotIn("source_lease", labels)
+        self.assertEqual((refusal.reason, refusal.stage), ("cleanup_incomplete", "cleanup"))
 
     def test_worker_sudo_check_accepts_only_explicit_denial(self):
         devnull = object()
