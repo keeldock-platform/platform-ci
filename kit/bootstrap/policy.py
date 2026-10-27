@@ -16,6 +16,7 @@ MACOS_SOURCE_READER_WORKFLOW_SHA256 = "6c7e82c8a9d91436ae98f1357fd0fe4f09847f5fd
 MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256 = "cb9b70226175069e9c148c06f18d4d89cf8b6d5b33b39e02579a4aa2de5ee8a6"
 MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256 = "a91387440f8caceadf8f19f7c87feb3d82377eb3c9e1813de48b518992d48807"
 MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256 = "08cf50d62e18e52661befe3153294c2d188b8a980f914437dab7cbd899744b81"
+MACOS_CORE_CONTRACT_WORKFLOW_SHA256 = "38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096"
 
 
 class PolicyError(ValueError):
@@ -1416,13 +1417,15 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         expected = MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE
-    elif workflow_kind in {"macos-rules-bootstrap", "macos-core-bootstrap"}:
+    elif workflow_kind in {"macos-rules-bootstrap", "macos-core-bootstrap", "macos-core-contract"}:
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         expected_digest = (
             MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256
             if workflow_kind == "macos-rules-bootstrap"
             else MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256
+            if workflow_kind == "macos-core-bootstrap"
+            else MACOS_CORE_CONTRACT_WORKFLOW_SHA256
         )
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_digest:
             raise PolicyError("workflow-template-mismatch")

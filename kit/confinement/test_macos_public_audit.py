@@ -41,6 +41,90 @@ def encode_receipt(value):
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
+def core_contract_value():
+    return {
+        "schema_version": 1,
+        "concern": "core-contract",
+        "status": "passed",
+        "control_sha": CONTROL_SHA,
+        "source_sha": "b" * 40,
+        "base_sha": "a" * 40,
+        "base_branch": "develop",
+        "reviewed_diff_sha256": "c" * 64,
+        "run_id": RUN_ID,
+        "run_attempt": RUN_ATTEMPT,
+        "repository_id": "1430959909",
+        "candidate_class": "signed-descendant",
+        "signer_authority": "bound_base",
+        "signatures": "all_new_commits_verified",
+        "ancestry": "base_ancestor",
+        "token_revocation": "confirmed_before_execution",
+        "offline": True,
+        "image_os": "macos-15-arm64",
+        "image_version": "20261027.0337.1",
+        "toolchain_versions": {
+            "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+            "cargo": "1.99.1",
+            "rustfmt": "1.10.0",
+            "clippy": "0.1.99",
+        },
+        "gates": {
+            "format": "passed", "clippy": "passed", "workspace_tests": "passed",
+            "api_tests": "passed", "mock_tests": "passed", "conformance_tests": "passed",
+        },
+        "gate_count": 6,
+        "gates_passed": 6,
+        "gates_failed": 0,
+        "suites": ["core.static", "core.host-api", "core.mock-host", "core.conformance"],
+        "suite_count": 4,
+        "suites_passed": 4,
+        "suites_failed": 0,
+        "source_tree": "uid_read_only",
+        "lease_cleanup": "complete",
+        "process_cleanup": "complete",
+        "identity_cleanup": "complete",
+        "summary_guard": "append_sibling_create_readback_restore",
+        "summary_guard_bypass_test": "passed",
+        "positive_sentinel": "passed",
+        "network_observation": "captured",
+    }
+
+
+def core_contract_line(value=None, prefix=b"KD-CORE-CONTRACT "):
+    item = core_contract_value() if value is None else value
+    payload = json.dumps(item, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
+    return prefix + payload + b"\n"
+
+
+def core_contract_publish_environment(driver_status="0"):
+    source_sha = "b" * 40
+    base_sha = "a" * 40
+    diff_sha = "c" * 64
+    return {
+        "GITHUB_REPOSITORY": audit.REPOSITORY,
+        "GITHUB_EVENT_NAME": "workflow_dispatch",
+        "GITHUB_REF": "refs/heads/main",
+        "GITHUB_SHA": CONTROL_SHA,
+        "CI_SHA": CONTROL_SHA,
+        "GITHUB_RUN_ID": RUN_ID,
+        "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
+        "REQUESTED_SOURCE_SHA": source_sha,
+        "REQUESTED_BASE_SHA": base_sha,
+        "REQUESTED_BASE_BRANCH": "develop",
+        "SOURCE_REPOSITORY_ID": "1430959909",
+        "CORE_CONTRACT_ALLOWED_SHA": source_sha,
+        "CORE_CONTRACT_ALLOWED_CONTROL_SHA": CONTROL_SHA,
+        "CORE_CONTRACT_REVIEWED_SOURCE_SHA": source_sha,
+        "CORE_CONTRACT_REVIEWED_BASE_SHA": base_sha,
+        "CORE_CONTRACT_REVIEWED_BASE_BRANCH": "develop",
+        "CORE_CONTRACT_REVIEWED_CANDIDATE_REF": "refs/heads/plan/core-contract-validation",
+        "CORE_CONTRACT_REVIEWED_DIFF_SHA256": diff_sha,
+        "ImageOS": "macos-15-arm64",
+        "ImageVersion": "20261027.0337.1",
+        "DRIVER_EXIT_STATUS": driver_status,
+    }
+
+
 class FakeHeaders(dict):
     def get_content_type(self):
         return self.get("Content-Type", "application/json").split(";", 1)[0].strip().lower()
@@ -1217,6 +1301,123 @@ def bootstrap_audit_fixture(kind):
         )
         env = {"SOURCE_SHA": source_sha}
         skipped_step = None
+    elif kind == "core-contract":
+        snapshot_name = audit.CORE_CONTRACT_SETTINGS_JOB_NAME
+        producer_name = audit.CORE_CONTRACT_PRODUCER_JOB_NAME
+        audit_name = audit.CORE_CONTRACT_AUDIT_JOB_NAME
+        snapshot_id, snapshot_check = 822, 922
+        producer_id, producer_check = 823, 923
+        audit_id, audit_check = 824, 924
+        snapshot_steps = (
+            "Fetch reviewed main control", "Validate requested source identity",
+            "Verify source-read environment", "Snapshot cache inventory",
+        )
+        producer_steps = (
+            "Fetch reviewed main control", "Validate source-free control tree",
+            "Run source-free reviewed build smoke", "Run source-free Rust toolchain smoke",
+            "Write trusted summary visibility control", "Validate protected contract binding",
+            "Validate source-reader scope configuration", "Mint scoped source-reader token",
+            "Verify selected installation identity", "Run fixed core contract",
+            "Revoke token if contract did not confirm", "Write trusted contract summary control",
+        )
+        source_sha = "b" * 40
+        base_sha = "a" * 40
+        reviewed_diff = "c" * 64
+        env = {
+            "REQUESTED_SOURCE_SHA": source_sha,
+            "REQUESTED_BASE_SHA": base_sha,
+            "REQUESTED_BASE_BRANCH": "develop",
+            "REVIEWED_DIFF_SHA256": reviewed_diff,
+        }
+        smoke = (
+            "macos-build=synthetic-smoke-passed schema=1 source=none control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " image-os=macos-15-arm64 image-version=20261027.0337.1 macos-version=15.7.9"
+            + " architecture=arm64 xcode=not-used xcode-build=not-used"
+            + " compiler-origin=command-line-tools clang=16.0.0 sdk=15.0"
+            + " developer-mode=disabled privilege=separate-nonadmin sudo=denied"
+            + " compile=passed link=passed load-test=passed capture=passed"
+            + " summary-standin=write-denied real-summary=write-denied"
+            + " cleanup=complete seatbelt=not-run pf=not-run"
+        ).encode("ascii")
+        rust_value = {
+            "schema_version": 1,
+            "concern": "rust-toolchain-smoke",
+            "status": "passed",
+            "control_sha": CONTROL_SHA,
+            "run_id": RUN_ID,
+            "run_attempt": RUN_ATTEMPT,
+            "host": "aarch64-apple-darwin",
+            "toolchain": "1.99.1",
+            "components": {
+                "rustc": "23948a0a9c162fd2952defb3fb0462c44e8fcfd1a4ab8a274a1e1bdb2cf810a3",
+                "rust-std": "fe79d6ab5a0321de26463999d8c112b8ad3eafbcbcf822d66a2300b45dde1031",
+                "cargo": "685e563d94db1f003ffa5f5831439eec02569b9950b69867953c8213269c1eaf",
+                "rustfmt-preview": "8b80dda570f140ee9ced8799294e812bba847a025f185bae4cba85a2ba235570",
+                "clippy-preview": "c463f31831196702fc544900a0dc4c1837905327507fbec751fe46e59ca098bf",
+            },
+            "versions": {
+                "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+                "cargo": "1.99.1",
+                "rustfmt": "1.10.0",
+                "clippy": "0.1.99",
+            },
+            "target": "aarch64-apple-darwin",
+            "smoke": {"fmt": "passed", "clippy": "passed", "test": "passed"},
+            "source": "none",
+            "offline": True,
+            "cleanup": "complete",
+        }
+        rust_line = (
+            b"KD-RUST-SMOKE "
+            + json.dumps(rust_value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
+        )
+        generic_summary = (
+            "macos-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+        ).encode("ascii")
+        binding = (
+            "macos-core-contract-binding=verified schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " source-sha=" + source_sha + " base-sha=" + base_sha
+            + " base-branch=develop candidate-class=signed-descendant reviewed-diff-sha256=" + reviewed_diff
+        ).encode("ascii")
+        scope = (
+            "macos-core-contract-reader-scope=verified schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " repository-id=1430959909"
+        ).encode("ascii")
+        installation = (
+            "macos-core-contract-reader-installation=verified schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " installation-id=7654321"
+        ).encode("ascii")
+        contract_summary = (
+            "macos-core-contract-summary-control=trusted-write schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " source-sha=" + source_sha + " base-sha=" + base_sha
+            + " reviewed-diff-sha256=" + reviewed_diff
+        ).encode("ascii")
+        marker_script_echo = (
+            b'contract_prefix="macos-core-contract-"\n'
+            b"printf '%sbinding=verified schema=1 control-sha=%s run-id=%s run-attempt=%s source-sha=%s base-sha=%s base-branch=%s candidate-class=%s reviewed-diff-sha256=%s\\n' \\\n"
+            b'  "$contract_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$REQUESTED_SOURCE_SHA" "$REQUESTED_BASE_SHA" "$REQUESTED_BASE_BRANCH" "$candidate_class" "$CORE_CONTRACT_REVIEWED_DIFF_SHA256"\n'
+            b'reader_prefix="macos-core-contract-reader-"\n'
+            b"printf '%sscope=verified schema=1 control-sha=%s run-id=%s run-attempt=%s repository-id=%s\\n' \\\n"
+            b'  "$reader_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_REPOSITORY_ID"\n'
+            b"printf '%sinstallation=verified schema=1 control-sha=%s run-id=%s run-attempt=%s installation-id=%s\\n' \\\n"
+            b'  "$reader_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$ACTUAL_INSTALLATION_ID"\n'
+            b'contract_summary_prefix="macos-core-contract-summary-"\n'
+            b'contract_summary_line="${contract_summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT source-sha=$REQUESTED_SOURCE_SHA base-sha=$REQUESTED_BASE_SHA reviewed-diff-sha256=$CORE_CONTRACT_REVIEWED_DIFF_SHA256"\n'
+            b'printf "%s\\n" "$contract_summary_line" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"\n'
+        )
+        contract = core_contract_line()
+        producer_log = (
+            smoke + b"\n" + rust_line + b"\n" + generic_summary + b"\n" + marker_script_echo
+            + binding + b"\n" + scope + b"\n" + installation + b"\n"
+            + contract + contract_summary + b"\n"
+        )
+        skipped_step = "Revoke token if contract did not confirm"
     else:
         raise AssertionError("unknown bootstrap fixture kind")
 
@@ -1268,7 +1469,7 @@ def bootstrap_audit_fixture(kind):
             step_records = []
             post_names = (
                 ("Post Mint scoped source-reader token",)
-                if name == producer_name and kind == "rules-bootstrap"
+                if name == producer_name and kind in {"rules-bootstrap", "core-contract"}
                 else ("Post Mint reader token",)
                 if name == producer_name and kind == "core-bootstrap"
                 else ()
@@ -1308,7 +1509,7 @@ def bootstrap_audit_fixture(kind):
 
 class SourceReaderSettingsTests(unittest.TestCase):
     def test_settings_require_exact_environment_and_one_main_branch_policy(self):
-        for kind in ("core", "rules", "core-bootstrap", "rules-bootstrap"):
+        for kind in ("core", "rules", "core-bootstrap", "rules-bootstrap", "core-contract"):
             with self.subTest(kind=kind):
                 pages = source_reader_settings_fixture(kind)
                 api = FakeAPI(pages)
@@ -1364,23 +1565,24 @@ class BootstrapDispatchGuardTests(unittest.TestCase):
         return result, output.getvalue(), api
 
     def test_settings_guard_allows_current_and_completed_runs(self):
-        kind = "core-bootstrap"
-        current = bootstrap_dispatch_run(kind)
-        completed = bootstrap_dispatch_run(
-            kind, run_id="765432101", sha="f" * 40, status="completed"
-        )
-        pages, env, collection_path = bootstrap_dispatch_settings_fixture(
-            kind, [current, completed]
-        )
-        result, output, api = self._run_settings(kind, pages, env)
-        self.assertEqual(result, 0)
-        self.assertIn(
-            "macos-bootstrap-dispatch=single-active-verified schema=1 kind=core-bootstrap",
-            output,
-        )
-        self.assertEqual(api.calls[0], "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID)
-        self.assertEqual(api.calls[1], collection_path + "?branch=main&event=workflow_dispatch&per_page=100&page=1")
-        self.assertTrue(api.calls[2].endswith("/environments/source-read"))
+        for kind in ("core-bootstrap", "core-contract"):
+            with self.subTest(kind=kind):
+                current = bootstrap_dispatch_run(kind)
+                completed = bootstrap_dispatch_run(
+                    kind, run_id="765432101", sha="f" * 40, status="completed"
+                )
+                pages, env, collection_path = bootstrap_dispatch_settings_fixture(
+                    kind, [current, completed]
+                )
+                result, output, api = self._run_settings(kind, pages, env)
+                self.assertEqual(result, 0)
+                self.assertIn(
+                    "macos-bootstrap-dispatch=single-active-verified schema=1 kind=" + kind,
+                    output,
+                )
+                self.assertEqual(api.calls[0], "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID)
+                self.assertEqual(api.calls[1], collection_path + "?branch=main&event=workflow_dispatch&per_page=100&page=1")
+                self.assertTrue(api.calls[2].endswith("/environments/source-read"))
 
     def test_settings_guard_refuses_other_active_main_dispatch_even_at_an_older_sha(self):
         kind = "rules-bootstrap"
@@ -1476,6 +1678,7 @@ class BootstrapDispatchGuardTests(unittest.TestCase):
         for kind, snapshot_job_id in (
             ("rules-bootstrap", 802),
             ("core-bootstrap", 812),
+            ("core-contract", 822),
         ):
             with self.subTest(kind=kind):
                 _, _, logs = bootstrap_audit_fixture(kind)
@@ -1496,6 +1699,108 @@ class BootstrapDispatchGuardTests(unittest.TestCase):
                             changed, kind, CONTROL_SHA, RUN_ID, RUN_ATTEMPT
                         )
                     self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+
+class CoreContractReceiptTests(unittest.TestCase):
+    def test_publisher_accepts_only_the_full_canonical_context_bound_pass_receipt(self):
+        raw = core_contract_line()
+        output = io.BytesIO()
+        result = audit.publish_core_contract_receipt(
+            core_contract_publish_environment(), io.BytesIO(raw), output
+        )
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), raw)
+        audit_context = {
+            "REQUESTED_SOURCE_SHA": "b" * 40,
+            "REQUESTED_BASE_SHA": "a" * 40,
+            "REQUESTED_BASE_BRANCH": "develop",
+            "REVIEWED_DIFF_SHA256": "c" * 64,
+        }
+        self.assertEqual(
+            audit._inspect_core_contract_receipt(raw, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, audit_context)[0],
+            "passed",
+        )
+
+    def test_publisher_rejects_duplicate_unknown_wrong_type_and_trailing_input(self):
+        good = core_contract_value()
+        good_line = core_contract_line(good)
+        duplicate = good_line.replace(
+            b'"schema_version":1,', b'"schema_version":1,"schema_version":1,', 1
+        )
+        unknown_value = dict(good)
+        unknown_value["unexpected"] = "field"
+        wrong_type_value = dict(good)
+        wrong_type_value["gate_count"] = True
+        wrong_binding_value = dict(good)
+        wrong_binding_value["source_sha"] = "d" * 40
+        wrong_source_tree_value = dict(good)
+        wrong_source_tree_value["source_tree"] = "writable"
+        cases = (
+            (duplicate, core_contract_publish_environment()),
+            (core_contract_line(unknown_value), core_contract_publish_environment()),
+            (core_contract_line(wrong_type_value), core_contract_publish_environment()),
+            (core_contract_line(wrong_binding_value), core_contract_publish_environment()),
+            (core_contract_line(wrong_source_tree_value), core_contract_publish_environment()),
+            (good_line + b"trailing", core_contract_publish_environment()),
+            (good_line.replace(b" ", b"  ", 1), core_contract_publish_environment()),
+            (good_line, {**core_contract_publish_environment(), "CORE_CONTRACT_ALLOWED_CONTROL_SHA": "d" * 40}),
+            (good_line, {**core_contract_publish_environment(), "CORE_CONTRACT_REVIEWED_CANDIDATE_REF": "refs/heads/../wrong"}),
+            (good_line, {**core_contract_publish_environment(), "DRIVER_EXIT_STATUS": "1"}),
+        )
+        for index, (raw, env) in enumerate(cases):
+            with self.subTest(case=index):
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.publish_core_contract_receipt(env, io.BytesIO(raw), io.BytesIO())
+
+    def test_publisher_accepts_only_a_closed_canonical_refusal_on_failure(self):
+        value = {
+            "schema_version": 1,
+            "status": "refused",
+            "stage": "source_lease",
+            "reason": "source_validation_failed",
+        }
+        raw = core_contract_line(value, b"KD-CORE-CONTRACT-REFUSAL ")
+        env = core_contract_publish_environment("1")
+        output = io.BytesIO()
+        self.assertEqual(audit.publish_core_contract_receipt(env, io.BytesIO(raw), output), 0)
+        self.assertEqual(output.getvalue(), raw)
+        for invalid in (
+            raw + b"extra",
+            raw.replace(
+                b'"reason":"source_validation_failed",',
+                b'"reason":"source_validation_failed","reason":"source_validation_failed",',
+                1,
+            ),
+            core_contract_line({**value, "control_sha": CONTROL_SHA}, b"KD-CORE-CONTRACT-REFUSAL "),
+            core_contract_line({**value, "reason": "unknown"}, b"KD-CORE-CONTRACT-REFUSAL "),
+        ):
+            with self.subTest(payload=invalid[-40:]):
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.publish_core_contract_receipt(env, io.BytesIO(invalid), io.BytesIO())
+
+    def test_public_audit_binds_success_receipt_to_requested_commit_and_review_hash(self):
+        raw = core_contract_line()
+        env = {
+            "REQUESTED_SOURCE_SHA": "b" * 40,
+            "REQUESTED_BASE_SHA": "a" * 40,
+            "REQUESTED_BASE_BRANCH": "develop",
+            "REVIEWED_DIFF_SHA256": "c" * 64,
+        }
+        self.assertEqual(
+            audit._inspect_core_contract_receipt(raw, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, env)[0],
+            "passed",
+        )
+        for key, value in (
+            ("REQUESTED_SOURCE_SHA", "d" * 40),
+            ("REQUESTED_BASE_SHA", "e" * 40),
+            ("REQUESTED_BASE_BRANCH", "main"),
+            ("REVIEWED_DIFF_SHA256", "f" * 64),
+        ):
+            with self.subTest(field=key):
+                changed = dict(env)
+                changed[key] = value
+                with self.assertRaises(audit.AuditRefusal):
+                    audit._inspect_core_contract_receipt(raw, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, changed)
 
 
 class SourceReaderAuditTests(unittest.TestCase):
@@ -1610,6 +1915,11 @@ class BootstrapAuditTests(unittest.TestCase):
                 "macos-core-bootstrap-audit=verified schema=1",
                 [812, 813],
             ),
+            (
+                "core-contract",
+                "macos-core-contract-audit=verified schema=1",
+                [822, 823],
+            ),
         ):
             with self.subTest(kind=kind):
                 pages, env, logs = bootstrap_audit_fixture(kind)
@@ -1624,6 +1934,66 @@ class BootstrapAuditTests(unittest.TestCase):
                 self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
                 self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
                 self.assertTrue(any(path.endswith("/deployment-branch-policies?per_page=100&page=1") for path in api.calls))
+
+    def test_core_contract_failure_audits_logs_checks_artifacts_and_caches_before_refusing(self):
+        pages, env, logs = bootstrap_audit_fixture("core-contract")
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        producer_job = next(
+            job for job in pages[jobs_path][0]["jobs"]
+            if job["name"] == audit.CORE_CONTRACT_PRODUCER_JOB_NAME
+        )
+        producer_job["conclusion"] = "failure"
+        producer_detail_path = "/repos/keeldock-platform/platform-ci/actions/jobs/823"
+        producer_detail = pages[producer_detail_path][0]
+        producer_detail["conclusion"] = "failure"
+        contract_step = next(
+            step for step in producer_detail["steps"] if step["name"] == "Run fixed core contract"
+        )
+        contract_step["conclusion"] = "failure"
+        fallback_step = next(
+            step for step in producer_detail["steps"]
+            if step["name"] == "Revoke token if contract did not confirm"
+        )
+        fallback_step["conclusion"] = "success"
+        summary_step = next(
+            step for step in producer_detail["steps"]
+            if step["name"] == "Write trusted contract summary control"
+        )
+        summary_step["conclusion"] = "skipped"
+        producer_check_path = "/repos/keeldock-platform/platform-ci/check-runs/923"
+        pages[producer_check_path][0]["conclusion"] = "failure"
+        refusal_value = {
+            "schema_version": 1,
+            "status": "refused",
+            "stage": "source_lease",
+            "reason": "source_validation_failed",
+        }
+        refusal_line = core_contract_line(refusal_value, b"KD-CORE-CONTRACT-REFUSAL ")
+        cleanup_line = (
+            "macos-core-contract-cleanup=confirmed schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT + "\n"
+        ).encode("ascii")
+        cleanup_script_echo = (
+            b'cleanup_marker_prefix="macos-core-contract-"\n'
+            b"printf '%scleanup=unconfirmed schema=1 control-sha=%s run-id=%s run-attempt=%s\\n' \\\n"
+            b'  "$cleanup_marker_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"\n'
+            b"printf '%scleanup=confirmed schema=1 control-sha=%s run-id=%s run-attempt=%s\\n' \\\n"
+            b'  "$cleanup_marker_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"\n'
+        )
+        logs[823] = logs[823].replace(core_contract_line(), refusal_line)
+        logs[823] = logs[823].replace(
+            b"macos-core-contract-summary-control=trusted-write", b"", 1
+        ) + cleanup_script_echo + cleanup_line
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("core-contract-audit", env, api)
+        self.assertEqual(caught.exception.reason, "native_job_failed")
+        self.assertEqual(api.log_calls, [822, 823])
+        self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
+        self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
 
     def test_rules_audit_refuses_missing_or_mismatched_run_bindings_and_fallback(self):
         def change_network(old, new):

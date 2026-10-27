@@ -16,6 +16,7 @@ from policy import (
     MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256,
     MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256,
     MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256,
+    MACOS_CORE_CONTRACT_WORKFLOW_SHA256,
     MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE,
     MACOS_RUST_TOOLCHAIN_WORKFLOW_TEMPLATE,
     MACOS_SOURCE_READER_ACTION_SHA,
@@ -41,6 +42,7 @@ MACOS_SOURCE_READER_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/wo
 MACOS_RULES_SOURCE_READER_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rules-reader-preflight.yml"
 MACOS_RULES_BOOTSTRAP_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rules-bootstrap.yml"
 MACOS_CORE_BOOTSTRAP_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-core-bootstrap.yml"
+MACOS_CORE_CONTRACT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-core-contract.yml"
 MACOS_CORE_BOOTSTRAP_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_core_bootstrap.py"
 MACOS_CACHE_CLIENT_ACTION = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/action.yml"
 MACOS_CACHE_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/index.js"
@@ -1117,6 +1119,85 @@ class WorkflowPolicyTests(unittest.TestCase):
                 ):
                     with self.assertRaises(PolicyError):
                         validate_workflow_text(changed, "platform", workflow_kind)
+
+    def test_core_contract_workflow_is_a_fixed_protected_source_read_lane(self):
+        workflow = MACOS_CORE_CONTRACT_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(hashlib.sha256(workflow.encode("utf-8")).hexdigest(), MACOS_CORE_CONTRACT_WORKFLOW_SHA256)
+        self.assertTrue(validate_workflow_text(workflow, "platform", "macos-core-contract"))
+        self.assertTrue(workflow.startswith("name: macos-core-contract\non:\n  workflow_dispatch:\n"))
+        self.assertIn("cache-mode: none\npermissions: {}", workflow)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("environment: source-read", workflow)
+        self.assertEqual(workflow.count("environment:"), 1)
+        for job in (
+            "macos-core-contract-settings",
+            "macos-core-contract",
+            "macos-core-contract-audit",
+        ):
+            self.assertIn("  " + job + ":\n", workflow)
+        self.assertIn("if: ${{ always() && github.event_name == 'workflow_dispatch'", workflow)
+        self.assertIn("actions: read\n      checks: read", workflow)
+        self.assertIn("uses: actions/create-github-app-token@" + MACOS_SOURCE_READER_ACTION_SHA, workflow)
+        self.assertIn("permission-contents: read", workflow)
+        self.assertIn("permission-metadata: read", workflow)
+        self.assertIn("CORE_CONTRACT_ALLOWED_SHA", workflow)
+        self.assertIn("CORE_CONTRACT_ALLOWED_CONTROL_SHA", workflow)
+        for binding in (
+            "CORE_CONTRACT_REVIEWED_SOURCE_SHA",
+            "CORE_CONTRACT_REVIEWED_BASE_SHA",
+            "CORE_CONTRACT_REVIEWED_BASE_BRANCH",
+            "CORE_CONTRACT_REVIEWED_CANDIDATE_REF",
+            "CORE_CONTRACT_REVIEWED_DIFF_SHA256",
+        ):
+            self.assertIn(binding, workflow)
+        self.assertLess(workflow.index("Run source-free reviewed build smoke"), workflow.index("Mint scoped source-reader token"))
+        self.assertLess(workflow.index("Run source-free Rust toolchain smoke"), workflow.index("Mint scoped source-reader token"))
+        self.assertLess(workflow.index("Validate protected contract binding"), workflow.index("Mint scoped source-reader token"))
+        self.assertIn("--token-stdin", workflow)
+        self.assertIn("--source-sha \"$REQUESTED_SOURCE_SHA\" --base-sha \"$REQUESTED_BASE_SHA\"", workflow)
+        self.assertIn("--base-branch \"$REQUESTED_BASE_BRANCH\"", workflow)
+        self.assertIn("core-contract-publish", workflow)
+        self.assertIn(">\"$stdout_file\" 2>\"$stderr_file\"", workflow)
+        self.assertIn("<\"$stdout_file\" >\"$validated_file\" 2>\"$validator_stderr_file\"", workflow)
+        self.assertIn("Revoke token if contract did not confirm", workflow)
+        self.assertIn("--phase revoke --token-stdin", workflow)
+        self.assertIn('contract_prefix="macos-core-contract-"', workflow)
+        self.assertIn("printf '%sbinding=verified", workflow)
+        self.assertIn('cleanup_marker_prefix="macos-core-contract-"', workflow)
+        self.assertIn("printf '%scleanup=confirmed", workflow)
+        self.assertIn('2>/dev/null >> "$GITHUB_OUTPUT"', workflow)
+        self.assertNotIn("KD-CORE-CONTRACT ", workflow)
+        self.assertNotIn("KD-CORE-CONTRACT-REFUSAL ", workflow)
+        self.assertNotIn("macos-core-contract-binding=", workflow)
+        self.assertNotIn("macos-core-contract-cleanup=", workflow)
+        binding_output = next(line for line in workflow.splitlines() if "candidate-class=%s reviewed-diff-sha256=%s" in line)
+        self.assertNotIn("CORE_CONTRACT_REVIEWED_CANDIDATE_REF", binding_output)
+        for forbidden in (
+            "actions/checkout",
+            "upload-artifact",
+            "download-artifact",
+            "workflow_call:",
+            "pull_request:",
+            "pull_request_target:",
+            chr(47) + "Users/",
+            "keeldock" + "-" + "core",
+            "keeldock" + "-" + "host-api",
+            "keeldock" + "-" + "host-mock",
+            "keeldock" + "-" + "host-conformance",
+            "/usr/bin/python3",
+        ):
+            self.assertNotIn(forbidden, workflow)
+        for changed in (
+            workflow.replace("cache-mode: none", "cache-mode: write", 1),
+            workflow.replace("environment: source-read", "environment: untrusted", 1),
+            workflow.replace(MACOS_SOURCE_READER_ACTION_SHA, "0" * 40),
+            workflow.replace("actions: read\n      checks: read", "actions: write\n      checks: read"),
+            workflow.replace("always() && github.event_name", "success() && github.event_name", 1),
+            workflow.replace("permission-contents: read", "permission-contents: write", 1),
+            workflow.replace("core-contract-publish", "missing-publisher", 1),
+        ):
+            with self.assertRaises(PolicyError):
+                validate_workflow_text(changed, "platform", "macos-core-contract")
 
     def test_actual_windows_native_preflight_matches_closed_manual_main_shape(self):
         workflow = WINDOWS_NATIVE_PREFLIGHT_WORKFLOW.read_text(encoding="utf-8")

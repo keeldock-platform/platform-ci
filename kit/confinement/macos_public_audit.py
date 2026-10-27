@@ -20,6 +20,10 @@ RUST_TOOLCHAIN_WORKFLOW_PATH = ".github/workflows/macos-rust-toolchain-smoke.yml
 RUST_TOOLCHAIN_SNAPSHOT_JOB_NAME = "macos-rust-toolchain-snapshot"
 RUST_TOOLCHAIN_SMOKE_JOB_NAME = "macos-rust-toolchain-smoke"
 RUST_TOOLCHAIN_AUDIT_JOB_NAME = "macos-rust-toolchain-audit"
+CORE_CONTRACT_WORKFLOW_PATH = ".github/workflows/macos-core-contract.yml"
+CORE_CONTRACT_SETTINGS_JOB_NAME = "macos-core-contract-settings"
+CORE_CONTRACT_PRODUCER_JOB_NAME = "macos-core-contract"
+CORE_CONTRACT_AUDIT_JOB_NAME = "macos-core-contract-audit"
 CACHE_PROOF_WORKFLOW_PATH = ".github/workflows/macos-cache-proof.yml"
 CACHE_PROOF_SNAPSHOT_JOB_NAME = "macos-cache-public-snapshot"
 CACHE_PROOF_SEED_JOB_NAME = "macos-cache-seed"
@@ -34,6 +38,7 @@ SOURCE_READER_ACTION_SHA = "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
 BOOTSTRAP_SOURCE_REPOSITORY_IDS = {
     "rules-bootstrap": "1428198872",
     "core-bootstrap": "1430959909",
+    "core-contract": "1430959909",
 }
 SOURCE_READER_CONFIGURATIONS = {
     "core": {
@@ -60,6 +65,12 @@ SOURCE_READER_CONFIGURATIONS = {
         "environment_id": 25337167708,
         "branch_policy_id": 64386356,
     },
+    "core-contract": {
+        "workflow_path": CORE_CONTRACT_WORKFLOW_PATH,
+        "environment_name": "source-read",
+        "environment_id": 25337167708,
+        "branch_policy_id": 64386356,
+    },
 }
 SOURCE_READER_PHASES = {
     "source-reader-settings-core": ("settings", "core"),
@@ -74,6 +85,9 @@ SOURCE_READER_PHASES = {
     "core-bootstrap-settings": ("settings", "core-bootstrap"),
     "core-bootstrap-snapshot": ("snapshot", "core-bootstrap"),
     "core-bootstrap-audit": ("bootstrap-audit", "core-bootstrap"),
+    "core-contract-settings": ("settings", "core-contract"),
+    "core-contract-snapshot": ("snapshot", "core-contract"),
+    "core-contract-audit": ("contract-audit", "core-contract"),
 }
 SOURCE_READER_SETTINGS_JOB_NAME = "macos-source-reader-settings"
 SOURCE_READER_TOKEN_JOB_NAME = "macos-source-reader-token"
@@ -84,6 +98,7 @@ RULES_BOOTSTRAP_AUDIT_JOB_NAME = "macos-rules-bootstrap-audit"
 CORE_BOOTSTRAP_SNAPSHOT_JOB_NAME = "macos-public-snapshot"
 CORE_BOOTSTRAP_PRODUCER_JOB_NAME = "macos-core-bootstrap"
 CORE_BOOTSTRAP_AUDIT_JOB_NAME = "macos-core-bootstrap-audit"
+CORE_CONTRACT_SNAPSHOT_JOB_NAME = CORE_CONTRACT_SETTINGS_JOB_NAME
 SOURCE_READER_SUCCESS_RECORD = (
     b'{"metadata":"verified","reason":"ok","repository_scope":"verified",'
     b'"revocation":"confirmed","schema_version":1,"status":"passed"}'
@@ -137,6 +152,8 @@ MAX_PAGES = 100
 MAX_WORKFLOW_RUNS = PAGE_SIZE * MAX_PAGES
 MAX_RECEIPT_BYTES = 16 * 1024
 MAX_RUST_TOOLCHAIN_CAPTURE_BYTES = 16 * 1024
+MAX_CORE_CONTRACT_CAPTURE_BYTES = 8192
+MAX_CORE_CONTRACT_REFUSAL_BYTES = 512
 ACTIVE_WORKFLOW_RUN_STATUSES = frozenset(
     ("queued", "in_progress", "waiting", "pending", "requested")
 )
@@ -289,6 +306,61 @@ CORE_BOOTSTRAP_SOURCE_BINDING_MARKER_RE = re.compile(
     rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
     rb"repository-id=([1-9][0-9]{0,18})(?=\r?(?:\n|$))"
 )
+CORE_CONTRACT_BINDING_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-core-contract-binding=verified schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"source-sha=([a-f0-9]{40}) base-sha=([a-f0-9]{40}) "
+    rb"base-branch=(main|develop|uat) candidate-class=(permanent-tip|signed-descendant) "
+    rb"reviewed-diff-sha256=([a-f0-9]{64})(?=\r?(?:\n|$))"
+)
+CORE_CONTRACT_READER_SCOPE_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-core-contract-reader-scope=verified schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"repository-id=([1-9][0-9]{0,18})(?=\r?(?:\n|$))"
+)
+CORE_CONTRACT_READER_INSTALLATION_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-core-contract-reader-installation=verified schema=1 control-sha=([a-f0-9]{40}) "
+    rb"run-id=([1-9][0-9]{0,18}) run-attempt=([1-9][0-9]{0,18}) "
+    rb"installation-id=([1-9][0-9]{0,18})(?=\r?(?:\n|$))"
+)
+CORE_CONTRACT_SUCCESS_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"KD-CORE-CONTRACT (\{[^\r\n]{1,8192}\})(?=\r?(?:\n|$))"
+)
+CORE_CONTRACT_REFUSAL_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"KD-CORE-CONTRACT-REFUSAL (\{[^\r\n]{1,512}\})(?=\r?(?:\n|$))"
+)
+CORE_CONTRACT_SUMMARY_CONTROL_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-core-contract-summary-control=trusted-write schema=1 "
+    rb"control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) "
+    rb"run-attempt=([1-9][0-9]{0,18}) source-sha=([a-f0-9]{40}) "
+    rb"base-sha=([a-f0-9]{40}) reviewed-diff-sha256=([a-f0-9]{64})"
+    rb"(?=\r?(?:\n|$))"
+)
+CORE_CONTRACT_CLEANUP_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"macos-core-contract-cleanup=(confirmed|unconfirmed) schema=1 "
+    rb"control-sha=([a-f0-9]{40}) run-id=([1-9][0-9]{0,18}) "
+    rb"run-attempt=([1-9][0-9]{0,18})(?=\r?(?:\n|$))"
+)
+CORE_CONTRACT_REFUSAL_REASONS = frozenset((
+    "invalid_input", "unsupported_host", "runner_unavailable", "source_validation_failed",
+    "token_revocation_unconfirmed", "source_binding_mismatch", "source_diff_mismatch",
+    "toolchain_install_failed", "toolchain_version_mismatch", "gate_failed",
+    "network_observation_failed", "summary_guard_failed", "capture_invalid",
+    "cleanup_incomplete", "internal_error",
+))
+CORE_CONTRACT_REFUSAL_STAGES = frozenset((
+    "arguments", "context", "host", "source_validation", "source_lease", "source_tree",
+    "source_diff", "toolchain_install", "worker_setup", "summary_guard", "observer",
+    "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
+    "conformance_tests", "cleanup", "receipt", "internal",
+))
 CANARY_DOMAIN = b"keeldock" + b"-macos-ci-canary-v1\0"
 CANARY_PREFIX = b"KD-MACOS-CI-CANARY-v1:"
 REVIEWED_CANARY_PREFIX = b"KD-RB-CANARY-"
@@ -1214,6 +1286,337 @@ def publish_rust_toolchain_receipt(environ=None, stdin=None, stdout=None):
     return 0
 
 
+def _core_contract_context(env, *, require_protected_binding):
+    repository = env.get("GITHUB_REPOSITORY", "")
+    event_name = env.get("GITHUB_EVENT_NAME", "")
+    ref = env.get("GITHUB_REF", "")
+    control_sha = env.get("CI_SHA", "")
+    github_sha = env.get("GITHUB_SHA", "")
+    run_id = env.get("GITHUB_RUN_ID", "")
+    run_attempt = env.get("GITHUB_RUN_ATTEMPT", "")
+    source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+    base_sha = env.get("REQUESTED_BASE_SHA", "")
+    base_branch = env.get("REQUESTED_BASE_BRANCH", "")
+    repository_id = env.get("SOURCE_REPOSITORY_ID", "")
+    if (repository != REPOSITORY or event_name != "workflow_dispatch"
+            or ref != "refs/heads/main" or not _valid_sha(control_sha)
+            or github_sha != control_sha or not _positive_decimal(run_id)
+            or not _positive_decimal(run_attempt) or not _valid_sha(source_sha)
+            or not _valid_sha(base_sha) or base_branch not in {"main", "develop", "uat"}
+            or repository_id != BOOTSTRAP_SOURCE_REPOSITORY_IDS["core-contract"]):
+        _fail("invalid_input")
+    reviewed_diff = env.get("CORE_CONTRACT_REVIEWED_DIFF_SHA256", "")
+    if HEX_DIGEST_RE.fullmatch(reviewed_diff) is None:
+        _fail("invalid_input")
+    if require_protected_binding:
+        candidate_ref = env.get("CORE_CONTRACT_REVIEWED_CANDIDATE_REF", "")
+        if (env.get("CORE_CONTRACT_ALLOWED_SHA") != source_sha
+                or env.get("CORE_CONTRACT_ALLOWED_CONTROL_SHA") != control_sha
+                or env.get("CORE_CONTRACT_REVIEWED_SOURCE_SHA") != source_sha
+                or env.get("CORE_CONTRACT_REVIEWED_BASE_SHA") != base_sha
+                or env.get("CORE_CONTRACT_REVIEWED_BASE_BRANCH") != base_branch
+                or type(candidate_ref) is not str):
+            _fail("invalid_input")
+        if source_sha == base_sha:
+            if candidate_ref != "refs/heads/" + base_branch:
+                _fail("invalid_input")
+        else:
+            if (re.fullmatch(
+                    r"refs/heads/(?:feat|fix|chore|plan)/[A-Za-z0-9][A-Za-z0-9._/-]{0,126}",
+                    candidate_ref,
+                ) is None
+                    or any(part in ("", ".", "..") for part in candidate_ref.removeprefix("refs/heads/").split("/"))
+                    or ".." in candidate_ref or "@{" in candidate_ref or candidate_ref.endswith("/")):
+                _fail("invalid_input")
+    return {
+        "control_sha": control_sha,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "repository_id": repository_id,
+        "source_sha": source_sha,
+        "base_sha": base_sha,
+        "base_branch": base_branch,
+        "reviewed_diff_sha256": reviewed_diff,
+        "candidate_class": "permanent-tip" if source_sha == base_sha else "signed-descendant",
+    }
+
+
+def _core_contract_success_value(payload, context, image_os, image_version):
+    try:
+        value = json.loads(payload.decode("ascii", "strict"), object_pairs_hook=_no_duplicate_pairs)
+    except AuditRefusal:
+        _fail("capture_invalid")
+    except Exception:
+        _fail("capture_invalid")
+    required = {
+        "schema_version", "concern", "status", "control_sha", "source_sha", "base_sha",
+        "base_branch", "reviewed_diff_sha256", "run_id", "run_attempt", "repository_id",
+        "candidate_class", "signer_authority", "signatures", "ancestry", "token_revocation",
+        "offline", "image_os", "image_version", "toolchain_versions", "gates", "gate_count",
+        "gates_passed", "gates_failed", "suites", "suite_count", "suites_passed",
+        "suites_failed", "source_tree", "lease_cleanup", "process_cleanup", "identity_cleanup", "summary_guard",
+        "summary_guard_bypass_test", "positive_sentinel", "network_observation",
+    }
+    if type(value) is not dict or set(value) != required:
+        _fail("capture_invalid")
+    expected = {
+        "schema_version": 1,
+        "concern": "core-contract",
+        "status": "passed",
+        "control_sha": context["control_sha"],
+        "source_sha": context["source_sha"],
+        "base_sha": context["base_sha"],
+        "base_branch": context["base_branch"],
+        "reviewed_diff_sha256": context["reviewed_diff_sha256"],
+        "run_id": context["run_id"],
+        "run_attempt": context["run_attempt"],
+        "repository_id": context["repository_id"],
+        "candidate_class": context["candidate_class"],
+        "signer_authority": "bound_base",
+        "signatures": "all_new_commits_verified",
+        "ancestry": "base_ancestor",
+        "token_revocation": "confirmed_before_execution",
+        "offline": True,
+        "image_os": image_os,
+        "image_version": image_version,
+        "gates": {
+            "format": "passed", "clippy": "passed", "workspace_tests": "passed",
+            "api_tests": "passed", "mock_tests": "passed", "conformance_tests": "passed",
+        },
+        "gate_count": 6,
+        "gates_passed": 6,
+        "gates_failed": 0,
+        "suites": ["core.static", "core.host-api", "core.mock-host", "core.conformance"],
+        "suite_count": 4,
+        "suites_passed": 4,
+        "suites_failed": 0,
+        "source_tree": "uid_read_only",
+        "lease_cleanup": "complete",
+        "process_cleanup": "complete",
+        "identity_cleanup": "complete",
+        "summary_guard": "append_sibling_create_readback_restore",
+        "summary_guard_bypass_test": "passed",
+        "positive_sentinel": "passed",
+        "network_observation": "captured",
+    }
+    for key, expected_value in expected.items():
+        if type(expected_value) is int:
+            if not _exact_int(value.get(key), 0) or value[key] != expected_value:
+                _fail("capture_invalid")
+        elif type(expected_value) is bool:
+            if type(value.get(key)) is not bool or value[key] is not expected_value:
+                _fail("capture_invalid")
+        elif type(expected_value) is dict:
+            if type(value.get(key)) is not dict or value[key] != expected_value:
+                _fail("capture_invalid")
+        elif type(expected_value) is list:
+            if type(value.get(key)) is not list or value[key] != expected_value:
+                _fail("capture_invalid")
+        elif (type(value.get(key)) is not str
+                or (expected_value is not None and value[key] != expected_value)):
+            _fail("capture_invalid")
+    versions = value.get("toolchain_versions")
+    if (type(versions) is not dict or set(versions) != {"rustc", "cargo", "rustfmt", "clippy"}
+            or any(type(item) is not str for item in versions.values())
+            or versions.get("rustc") != "1.99.1 (58cf8f9c3 2026-10-13)"
+            or versions.get("cargo") not in {"0.100.0", "1.99.0", "1.99.1"}
+            or versions.get("rustfmt") != "1.10.0"
+            or versions.get("clippy") != "0.1.99"):
+        _fail("capture_invalid")
+    receipt_image_os = value.get("image_os")
+    receipt_image_version = value.get("image_version")
+    if (type(receipt_image_os) is not str
+            or (image_os is not None and receipt_image_os != image_os)
+            or re.fullmatch(r"macos-?[0-9]{1,2}(?:-(?:arm64|x64|intel))?", receipt_image_os) is None
+            or type(receipt_image_version) is not str
+            or (image_version is not None and receipt_image_version != image_version)
+            or re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", receipt_image_version) is None):
+        _fail("capture_invalid")
+    try:
+        canonical = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
+    except Exception:
+        _fail("capture_invalid")
+    if canonical != payload:
+        _fail("capture_invalid")
+    return value
+
+
+def _core_contract_refusal_value(payload):
+    try:
+        value = json.loads(payload.decode("ascii", "strict"), object_pairs_hook=_no_duplicate_pairs)
+    except AuditRefusal:
+        _fail("capture_invalid")
+    except Exception:
+        _fail("capture_invalid")
+    if (type(value) is not dict or set(value) != {"schema_version", "status", "stage", "reason"}
+            or type(value.get("schema_version")) is not int or value["schema_version"] != 1
+            or type(value.get("status")) is not str or value["status"] != "refused"
+            or type(value.get("stage")) is not str or value["stage"] not in CORE_CONTRACT_REFUSAL_STAGES
+            or type(value.get("reason")) is not str or value["reason"] not in CORE_CONTRACT_REFUSAL_REASONS):
+        _fail("capture_invalid")
+    try:
+        canonical = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
+    except Exception:
+        _fail("capture_invalid")
+    if canonical != payload:
+        _fail("capture_invalid")
+    return value
+
+
+def publish_core_contract_receipt(environ=None, stdin=None, stdout=None):
+    env = os.environ if environ is None else environ
+    context = _core_contract_context(env, require_protected_binding=True)
+    image_os = env.get("ImageOS", "")
+    image_version = env.get("ImageVersion", "")
+    driver_status = env.get("DRIVER_EXIT_STATUS", "")
+    if driver_status not in {"0", "1"}:
+        _fail("invalid_input")
+    source = sys.stdin.buffer if stdin is None else stdin
+    destination = sys.stdout.buffer if stdout is None else stdout
+    maximum = MAX_CORE_CONTRACT_CAPTURE_BYTES if driver_status == "0" else MAX_CORE_CONTRACT_REFUSAL_BYTES
+    try:
+        raw = source.read(maximum + 1)
+        trailing = source.read(1)
+    except Exception:
+        _fail("capture_invalid")
+    if (type(raw) is not bytes or len(raw) > maximum or trailing != b""
+            or not raw.endswith(b"\n") or raw.count(b"\n") != 1 or b"\r" in raw):
+        _fail("capture_invalid")
+    success_prefix = b"KD-CORE-CONTRACT "
+    refusal_prefix = b"KD-CORE-CONTRACT-REFUSAL "
+    if driver_status == "0" and raw.startswith(success_prefix):
+        _core_contract_success_value(raw[len(success_prefix):-1], context, image_os, image_version)
+    elif driver_status == "1" and raw.startswith(refusal_prefix):
+        _core_contract_refusal_value(raw[len(refusal_prefix):-1])
+    else:
+        _fail("capture_invalid")
+    try:
+        remaining = memoryview(raw)
+        while remaining:
+            written = destination.write(remaining)
+            if written is None or written <= 0:
+                _fail("capture_invalid")
+            remaining = remaining[written:]
+        destination.flush()
+    except AuditRefusal:
+        raise
+    except Exception:
+        _fail("capture_invalid")
+    return 0
+
+
+def _core_contract_audit_context(control_sha, run_id, run_attempt, env):
+    source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+    base_sha = env.get("REQUESTED_BASE_SHA", "")
+    base_branch = env.get("REQUESTED_BASE_BRANCH", "")
+    reviewed_diff = env.get("REVIEWED_DIFF_SHA256", "")
+    if (not _valid_sha(source_sha) or not _valid_sha(base_sha)
+            or base_branch not in {"main", "develop", "uat"}
+            or HEX_DIGEST_RE.fullmatch(reviewed_diff) is None):
+        _fail("invalid_input")
+    return {
+        "control_sha": control_sha,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "repository_id": BOOTSTRAP_SOURCE_REPOSITORY_IDS["core-contract"],
+        "source_sha": source_sha,
+        "base_sha": base_sha,
+        "base_branch": base_branch,
+        "reviewed_diff_sha256": reviewed_diff,
+        "candidate_class": "permanent-tip" if source_sha == base_sha else "signed-descendant",
+    }
+
+
+def _inspect_core_contract_receipt(raw, control_sha, run_id, run_attempt, env):
+    if type(raw) is not bytes:
+        _fail("receipt_invalid")
+    success_marker = b"KD-CORE-CONTRACT "
+    refusal_marker = b"KD-CORE-CONTRACT-REFUSAL "
+    success = list(CORE_CONTRACT_SUCCESS_MARKER_RE.finditer(raw))
+    refusals = list(CORE_CONTRACT_REFUSAL_MARKER_RE.finditer(raw))
+    if raw.count(success_marker) == 1 and not refusals and len(success) == 1:
+        context = _core_contract_audit_context(control_sha, run_id, run_attempt, env)
+        if (context["control_sha"] != control_sha or context["run_id"] != run_id
+                or context["run_attempt"] != run_attempt):
+            _fail("receipt_invalid")
+        payload = success[0].group(1)
+        if len(payload) + len(success_marker) + 1 > MAX_CORE_CONTRACT_CAPTURE_BYTES:
+            _fail("receipt_invalid")
+        try:
+            value = _core_contract_success_value(payload, context, None, None)
+        except AuditRefusal:
+            _fail("receipt_invalid")
+        return "passed", value
+    if raw.count(refusal_marker) == 1 and not success and len(refusals) == 1:
+        payload = refusals[0].group(1)
+        if len(payload) + len(refusal_marker) + 1 > MAX_CORE_CONTRACT_REFUSAL_BYTES:
+            _fail("receipt_invalid")
+        try:
+            value = _core_contract_refusal_value(payload)
+        except AuditRefusal:
+            _fail("receipt_invalid")
+        return "refused", value
+    if success or refusals or success_marker in raw or refusal_marker in raw:
+        _fail("receipt_invalid")
+    return "absent", None
+
+
+def _inspect_core_contract_binding_markers(
+    raw, control_sha, run_id, run_attempt, env, *, require_summary=True, require_installation=True,
+):
+    context = _core_contract_audit_context(control_sha, run_id, run_attempt, env)
+    binding = list(CORE_CONTRACT_BINDING_MARKER_RE.finditer(raw))
+    scope = list(CORE_CONTRACT_READER_SCOPE_MARKER_RE.finditer(raw))
+    installation = list(CORE_CONTRACT_READER_INSTALLATION_MARKER_RE.finditer(raw))
+    summary = list(CORE_CONTRACT_SUMMARY_CONTROL_MARKER_RE.finditer(raw))
+    if (len(binding) != 1 or raw.count(b"macos-core-contract-binding=") != 1
+            or len(scope) != 1 or raw.count(b"macos-core-contract-reader-scope=") != 1
+            or len(installation) > 1 or raw.count(b"macos-core-contract-reader-installation=") != len(installation)
+            or (require_installation and len(installation) != 1)
+            or len(summary) > 1 or raw.count(b"macos-core-contract-summary-control=") != len(summary)
+            or (require_summary and len(summary) != 1)):
+        _fail("receipt_invalid")
+    expected_context = (
+        control_sha.encode("ascii"), run_id.encode("ascii"), run_attempt.encode("ascii"),
+        context["source_sha"].encode("ascii"), context["base_sha"].encode("ascii"),
+        context["base_branch"].encode("ascii"), context["candidate_class"].encode("ascii"),
+        context["reviewed_diff_sha256"].encode("ascii"),
+    )
+    if binding[0].groups() != expected_context:
+        _fail("receipt_invalid")
+    expected_scope = (
+        control_sha.encode("ascii"), run_id.encode("ascii"), run_attempt.encode("ascii"),
+        context["repository_id"].encode("ascii"),
+    )
+    if scope[0].groups() != expected_scope:
+        _fail("receipt_invalid")
+    if installation and installation[0].groups()[:3] != (
+        control_sha.encode("ascii"), run_id.encode("ascii"), run_attempt.encode("ascii"),
+    ):
+        _fail("receipt_invalid")
+    if summary and summary[0].groups() != (
+        control_sha.encode("ascii"), run_id.encode("ascii"), run_attempt.encode("ascii"),
+        context["source_sha"].encode("ascii"), context["base_sha"].encode("ascii"),
+        context["reviewed_diff_sha256"].encode("ascii"),
+    ):
+        _fail("receipt_invalid")
+    return context
+
+
+def _inspect_core_contract_cleanup(raw, control_sha, run_id, run_attempt, *, required):
+    marker = b"macos-core-contract-cleanup="
+    matches = list(CORE_CONTRACT_CLEANUP_MARKER_RE.finditer(raw)) if type(raw) is bytes else []
+    if required:
+        if len(matches) != 1 or raw.count(marker) != 1 or matches[0].group(1) != b"confirmed":
+            _fail("receipt_invalid")
+        if matches[0].groups()[1:] != (
+            control_sha.encode("ascii"), run_id.encode("ascii"), run_attempt.encode("ascii"),
+        ):
+            _fail("receipt_invalid")
+    elif matches or (type(raw) is bytes and marker in raw):
+        _fail("receipt_invalid")
+
+
 def _cache_proof_keys(run_id, run_attempt):
     if not _positive_decimal(run_id) or not _positive_decimal(run_attempt):
         _fail("invalid_input")
@@ -1704,6 +2107,109 @@ def _bootstrap_jobs(api, kind, run_id, run_attempt, control_sha):
     return details
 
 
+def _core_contract_producer_steps_success(detail):
+    steps = detail.get("steps")
+    if type(steps) is not list or any(type(step) is not dict for step in steps):
+        _fail("api_schema")
+    expected = (
+        "Fetch reviewed main control",
+        "Validate source-free control tree",
+        "Run source-free reviewed build smoke",
+        "Run source-free Rust toolchain smoke",
+        "Write trusted summary visibility control",
+        "Validate protected contract binding",
+        "Validate source-reader scope configuration",
+        "Mint scoped source-reader token",
+        "Verify selected installation identity",
+        "Run fixed core contract",
+        "Revoke token if contract did not confirm",
+        "Write trusted contract summary control",
+    )
+    post_name = "Post Mint scoped source-reader token"
+    step_names = [step.get("name") for step in steps]
+    if not steps:
+        return False
+    post_present = post_name in step_names
+    expected_names = ["Set up job", *expected]
+    if post_present:
+        expected_names.append(post_name)
+    expected_names.append("Complete job")
+    if step_names != expected_names or len(set(step_names)) != len(step_names):
+        _fail("api_schema")
+    by_name = {step["name"]: step for step in steps}
+    contract = by_name["Run fixed core contract"]
+    mint = by_name["Mint scoped source-reader token"]
+    fallback = by_name["Revoke token if contract did not confirm"]
+    summary = by_name["Write trusted contract summary control"]
+    contract_passed = contract.get("status") == "completed" and contract.get("conclusion") == "success"
+    if contract_passed:
+        if (fallback.get("status") != "completed" or fallback.get("conclusion") != "skipped"
+                or summary.get("status") != "completed" or summary.get("conclusion") != "success"):
+            _fail("api_schema")
+    else:
+        if summary.get("status") != "completed" or summary.get("conclusion") != "skipped":
+            _fail("api_schema")
+        if mint.get("status") == "completed" and mint.get("conclusion") == "success":
+            if fallback.get("status") != "completed" or fallback.get("conclusion") not in {"success", "failure"}:
+                _fail("api_schema")
+        elif fallback.get("status") != "completed" or fallback.get("conclusion") != "skipped":
+            _fail("api_schema")
+    if not post_present:
+        if mint.get("status") == "completed" and mint.get("conclusion") == "success":
+            _fail("api_schema")
+    elif (by_name[post_name].get("status") != "completed"
+            or by_name[post_name].get("conclusion") not in {"success", "failure"}):
+        _fail("api_schema")
+    success = True
+    for step in steps:
+        name = step.get("name")
+        if name == "Revoke token if contract did not confirm" and contract_passed:
+            continue
+        if name == "Post Mint scoped source-reader token" and not post_present:
+            continue
+        if step.get("status") != "completed" or step.get("conclusion") != "success":
+            success = False
+    return success
+
+
+def _core_contract_jobs(api, run_id, run_attempt, control_sha):
+    path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + run_id
+        + "/attempts/" + run_attempt + "/jobs"
+    )
+    jobs = _read_counted_collection(api, path, "jobs", 10000, _validate_job_record)
+    expected_names = {
+        CORE_CONTRACT_SETTINGS_JOB_NAME,
+        CORE_CONTRACT_PRODUCER_JOB_NAME,
+        CORE_CONTRACT_AUDIT_JOB_NAME,
+    }
+    if len(jobs) != len(expected_names) or {job.get("name") for job in jobs} != expected_names:
+        _fail("api_schema")
+    by_name = {job["name"]: job for job in jobs}
+    audit_job = by_name[CORE_CONTRACT_AUDIT_JOB_NAME]
+    if (audit_job.get("run_id") != int(run_id)
+            or audit_job.get("run_attempt") != int(run_attempt)
+            or audit_job.get("head_sha") != control_sha
+            or audit_job.get("status") != "in_progress"):
+        _fail("run_identity_mismatch")
+    details = {}
+    for name in (CORE_CONTRACT_SETTINGS_JOB_NAME, CORE_CONTRACT_PRODUCER_JOB_NAME):
+        detail = _job_detail(api, by_name[name], run_id, run_attempt, control_sha, name)
+        if name == CORE_CONTRACT_SETTINGS_JOB_NAME:
+            steps_success = _bootstrap_job_steps(
+                detail[0], (
+                    "Fetch reviewed main control",
+                    "Validate requested source identity",
+                    "Verify source-read environment",
+                    "Snapshot cache inventory",
+                ),
+            ) if detail[0].get("steps") else False
+        else:
+            steps_success = _core_contract_producer_steps_success(detail[0])
+        details[name] = (detail[0], detail[1], steps_success)
+    return details
+
+
 def _one_bootstrap_marker(raw, marker, pattern):
     matches = list(pattern.finditer(raw)) if type(raw) is bytes else []
     if len(matches) != 1 or raw.count(marker) != 1:
@@ -1969,6 +2475,116 @@ def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):
     return 0
 
 
+def _core_contract_audit(api, control_sha, run_id, run_attempt, env):
+    configuration = _source_reader_configuration("core-contract")
+    _validate_run(api, run_id, run_attempt, control_sha, configuration["workflow_path"])
+    details = _core_contract_jobs(api, run_id, run_attempt, control_sha)
+    settings_job, settings_check_id, settings_steps_success = details[CORE_CONTRACT_SETTINGS_JOB_NAME]
+    producer_job, producer_check_id, producer_steps_success = details[CORE_CONTRACT_PRODUCER_JOB_NAME]
+
+    settings_log = api.log_text(settings_job["id"]) if settings_job.get("steps") else b""
+    producer_log = api.log_text(producer_job["id"]) if producer_job.get("steps") else b""
+    if settings_log:
+        inspect_reviewed_public_bytes(settings_log, control_sha)
+    if producer_log:
+        inspect_reviewed_public_bytes(producer_log, control_sha)
+    _scan_annotations(api, settings_job, settings_check_id, control_sha, reviewed=True)
+    _scan_annotations(api, producer_job, producer_check_id, control_sha, reviewed=True)
+    _fetch_artifacts(api, run_id)
+    cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+    baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
+    if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
+        _fail("inventory_changed")
+
+    settings_marker = _verify_source_reader_environment(
+        api, "core-contract", control_sha, run_id, run_attempt
+    )
+    expected_settings = (
+        "macos-source-environment=verified schema=1 kind=core-contract"
+        + " name=" + configuration["environment_name"]
+        + " environment-id=" + str(configuration["environment_id"])
+        + " policy-id=" + str(configuration["branch_policy_id"])
+        + " custom-branch-policies=true protected-branches=false branch=main branch-type=branch"
+        + " control-sha=" + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+    ).encode("ascii")
+    if settings_marker != expected_settings:
+        _fail("api_schema")
+    if settings_job.get("conclusion") == "success" and settings_steps_success:
+        _inspect_bootstrap_settings_snapshot(settings_log, "core-contract", control_sha, run_id, run_attempt)
+    else:
+        _fail("native_job_failed")
+
+    producer_steps = {
+        step.get("name"): step
+        for step in producer_job.get("steps", [])
+        if type(step) is dict and type(step.get("name")) is str
+    }
+    core_step = producer_steps.get("Run fixed core contract")
+    mint_step = producer_steps.get("Mint scoped source-reader token")
+    fallback_step = producer_steps.get("Revoke token if contract did not confirm")
+    if core_step is None:
+        if producer_log and (
+            b"KD-CORE-CONTRACT " in producer_log or b"KD-CORE-CONTRACT-REFUSAL " in producer_log
+        ):
+            _inspect_core_contract_receipt(producer_log, control_sha, run_id, run_attempt, env)
+        _fail("native_job_failed")
+
+    if producer_log:
+        if producer_steps.get("Run source-free reviewed build smoke", {}).get("conclusion") == "success":
+            _inspect_reviewed_smoke_marker(producer_log, control_sha, run_id, run_attempt)
+        if producer_steps.get("Run source-free Rust toolchain smoke", {}).get("conclusion") == "success":
+            _inspect_rust_toolchain_receipt(producer_log, control_sha, run_id, run_attempt)
+        elif b"KD-RUST-REFUSAL" in producer_log:
+            matches = list(RUST_TOOLCHAIN_REFUSAL_MARKER_RE.finditer(producer_log))
+            if len(matches) != 1 or producer_log.count(b"KD-RUST-REFUSAL") != 1:
+                _fail("receipt_invalid")
+        if producer_steps.get("Write trusted summary visibility control", {}).get("conclusion") == "success":
+            _inspect_reviewed_summary_control_marker(producer_log, control_sha, run_id, run_attempt)
+
+    contract_state, contract_value = _inspect_core_contract_receipt(
+        producer_log, control_sha, run_id, run_attempt, env
+    ) if producer_log else ("absent", None)
+    if (producer_steps.get("Validate protected contract binding", {}).get("conclusion") == "success"
+            and producer_steps.get("Validate source-reader scope configuration", {}).get("conclusion") == "success"):
+        if contract_state == "passed":
+            _inspect_core_contract_binding_markers(
+                producer_log, control_sha, run_id, run_attempt, env, require_summary=True,
+            )
+        else:
+            _inspect_core_contract_binding_markers(
+                producer_log, control_sha, run_id, run_attempt, env, require_summary=False,
+                require_installation=(
+                    producer_steps.get("Verify selected installation identity", {}).get("conclusion") == "success"
+                ),
+            )
+    if fallback_step is not None and fallback_step.get("conclusion") in {"success", "failure"}:
+        _inspect_core_contract_cleanup(
+            producer_log, control_sha, run_id, run_attempt, required=True,
+        )
+    else:
+        _inspect_core_contract_cleanup(
+            producer_log, control_sha, run_id, run_attempt, required=False,
+        )
+
+    if (producer_job.get("conclusion") != "success" or not producer_steps_success
+            or contract_state != "passed" or type(contract_value) is not dict):
+        _fail("native_job_failed")
+    if (core_step.get("status") != "completed" or core_step.get("conclusion") != "success"
+            or mint_step is None or mint_step.get("conclusion") != "success"
+            or fallback_step is None or fallback_step.get("conclusion") != "skipped"):
+        _fail("receipt_invalid")
+    print(
+        "macos-core-contract-audit=verified schema=1 control-sha=" + control_sha
+        + " run-id=" + run_id + " run-attempt=" + run_attempt
+        + " source-sha=" + env.get("REQUESTED_SOURCE_SHA", "")
+        + " base-sha=" + env.get("REQUESTED_BASE_SHA", "")
+        + " reviewed-diff-sha256=" + env.get("REVIEWED_DIFF_SHA256", "")
+        + " public-surfaces=logs,checks,annotations,artifacts,caches summary-ui=required"
+        + " source-admission=not-authorized"
+    )
+    return 0
+
+
 def _inspect_reviewed_smoke_marker(raw, control_sha, run_id, run_attempt):
     matches = list(REVIEWED_SMOKE_MARKER_RE.finditer(raw))
     if len(matches) != 1 or raw.count(b"macos-build=") != 1:
@@ -2170,11 +2786,13 @@ def run(phase, environ=None, api=None):
             return _source_reader_audit(api, kind, control_sha, run_id, run_attempt, env)
         if operation == "bootstrap-audit":
             return _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env)
+        if operation == "contract-audit":
+            return _core_contract_audit(api, control_sha, run_id, run_attempt, env)
         current_run = _validate_run(
             api, run_id, run_attempt, control_sha, configuration["workflow_path"]
         )
         if operation == "settings":
-            if kind in {"rules-bootstrap", "core-bootstrap"}:
+            if kind in {"rules-bootstrap", "core-bootstrap", "core-contract"}:
                 print(
                     _verify_bootstrap_dispatch_guard(
                         api, kind, current_run, control_sha, run_id, run_attempt
@@ -2384,6 +3002,19 @@ def run(phase, environ=None, api=None):
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
+    if args and args[0] == "core-contract-publish":
+        if len(args) != 1:
+            print("macos-core-contract-publish=refused reason=invalid_input")
+            return 2
+        try:
+            return publish_core_contract_receipt()
+        except AuditRefusal as error:
+            reason = error.reason if error.reason in {"invalid_input", "capture_invalid"} else "internal_error"
+            print("macos-core-contract-publish=refused reason=" + reason)
+            return 2
+        except BaseException:
+            print("macos-core-contract-publish=refused reason=internal_error")
+            return 2
     if args and args[0] == "rust-toolchain-publish":
         if len(args) != 1:
             return _rust_toolchain_publish_refusal("invalid_input")
