@@ -106,12 +106,6 @@ uid = int(sys.argv[1])
 ''' + PRIVILEGE_IDENTITY_CHECK + '''\
 base_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": os.environ["HOME"], "LANG": "C", "LC_ALL": "C"}
 try:
-    developer = subprocess.run(("/usr/sbin/DevToolsSecurity", "-status"), stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=base_env,
-                               timeout=3, close_fds=True, check=False)
-    if (developer.returncode != 0 or developer.stderr
-            or developer.stdout != b"Developer mode is currently disabled.\\n"):
-        raise SystemExit(52)
     sudo = subprocess.run(("/usr/bin/sudo", "-n", "/usr/bin/true"), stdin=subprocess.DEVNULL,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=base_env,
                           timeout=3, close_fds=True, check=False)

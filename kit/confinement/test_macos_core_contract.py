@@ -1,5 +1,6 @@
 """Contract tests for the fixed private-source core runner."""
 
+import builtins
 import copy
 from contextlib import contextmanager
 import json
@@ -9,6 +10,7 @@ import shutil
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import macos_core_contract as subject
 
@@ -90,6 +92,111 @@ class CoreContractTests(unittest.TestCase):
             with self.subTest(real_uid=real_uid, effective_uid=effective_uid, primary_gid=primary_gid):
                 with self.assertRaises(SystemExit):
                     check(real_uid, effective_uid, primary_gid)
+
+    def test_worker_privilege_probe_runs_census_immediately_after_probe(self):
+        calls = []
+        reviewed = SimpleNamespace(
+            _child_environment=lambda *unused_args: {},
+            _probe_argv=lambda *args: ("python", "-I", "-S", "-B", "-c", args[1], args[2]),
+            _run_probe_step=lambda *args, **kwargs: calls.append(("probe", args, kwargs)),
+            _worker_census=lambda *args: calls.append(("census", args, {})),
+        )
+
+        subject._run_privilege_probe(504, Path.cwd(), {"python": "/usr/bin/python3"}, reviewed)
+
+        self.assertEqual([call[0] for call in calls], ["probe", "census"])
+
+    def test_developer_mode_failure_stops_before_worker_and_source_lease(self):
+        calls = []
+
+        def reject_developer_mode():
+            calls.append("developer_mode")
+            raise RuntimeError("private helper failure")
+
+        capability = SimpleNamespace(
+            _disable_developer_mode=reject_developer_mode,
+            _resolve_trusted_toolchain=lambda: calls.append("toolchain"),
+            _create_probe_identity=lambda *args: calls.append("worker_identity"),
+        )
+        runtime = SimpleNamespace(
+            RevocationState=lambda: calls.append("revocation_state"),
+            parse_request=lambda *args: calls.append("parse_request"),
+            validated_source=lambda *args, **kwargs: calls.append("source_lease"),
+        )
+        rules = SimpleNamespace(
+            _finish_summary_guard=lambda *args, **kwargs: calls.append("summary_guard_finish"),
+        )
+        controls = (SimpleNamespace(), capability, runtime, SimpleNamespace(), rules)
+        with patch.object(subject.os, "geteuid", return_value=0, create=True):
+            with patch.object(subject, "_check_temp_root", return_value=None):
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject._run_source(
+                        _request(), _binding(), Path.cwd(), Path.cwd(), {}, controls,
+                        DIFF_SHA256, 10**12, {},
+                    )
+
+        self.assertEqual(
+            (raised.exception.reason, raised.exception.stage, raised.exception.diagnostic),
+            ("runner_unavailable", "worker_setup", "disable_developer_mode"),
+        )
+        self.assertNotIn("private helper failure", str(raised.exception))
+        self.assertEqual(calls, ["developer_mode", "summary_guard_finish"])
+
+    def test_worker_sudo_check_accepts_only_explicit_denial(self):
+        devnull = object()
+        pipe = object()
+
+        def run_probe(sudo_result):
+            calls = []
+            writes = []
+            modules = {
+                "os": SimpleNamespace(
+                    getuid=lambda: 504,
+                    geteuid=lambda: 504,
+                    getgid=lambda: 20,
+                    environ={"HOME": "/worker-home"},
+                    write=lambda descriptor, payload: writes.append((descriptor, payload)) or len(payload),
+                ),
+                "subprocess": SimpleNamespace(
+                    DEVNULL=devnull, PIPE=pipe,
+                    run=lambda argv, **kwargs: calls.append((argv, kwargs)) or sudo_result,
+                ),
+                "sys": SimpleNamespace(argv=("probe", "504")),
+            }
+
+            def import_module(name, globals=None, locals=None, fromlist=(), level=0):
+                if name in modules:
+                    return modules[name]
+                return builtins.__import__(name, globals, locals, fromlist, level)
+
+            script_globals = {
+                "__builtins__": {**builtins.__dict__, "__import__": import_module},
+            }
+            exec(subject.PRIVILEGE_SCRIPT, script_globals)
+            return calls, writes
+
+        denied = SimpleNamespace(
+            returncode=1, stdout=b"", stderr=b"sudo: a password is required\n",
+        )
+        calls, writes = run_probe(denied)
+        self.assertEqual(calls[0][0], ("/usr/bin/sudo", "-n", "/usr/bin/true"))
+        self.assertEqual(calls[0][1]["timeout"], 3)
+        self.assertEqual(calls[0][1]["stdin"], devnull)
+        self.assertEqual(calls[0][1]["stdout"], pipe)
+        self.assertEqual(calls[0][1]["stderr"], pipe)
+        self.assertTrue(calls[0][1]["close_fds"])
+        self.assertEqual(writes, [(1, subject.PRIVILEGE_MARKER)])
+
+        malformed_results = (
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            SimpleNamespace(returncode=1, stdout=b"unexpected", stderr=b"sudo: a password is required\n"),
+            SimpleNamespace(returncode=1, stdout=b"", stderr=b"permission denied\n"),
+        )
+        for result in malformed_results:
+            with self.subTest(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr):
+                with self.assertRaises(SystemExit) as raised:
+                    run_probe(result)
+                self.assertEqual(raised.exception.code, 54)
 
     def test_privilege_probe_preserves_helper_cleanup_failure(self):
         cleanup_error = subject.Refusal("cleanup_incomplete", "cleanup")
