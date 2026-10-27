@@ -11,6 +11,7 @@ PLATFORM_FILES = frozenset(
         ".github/workflows/windows-attestation-permission-probe.yml",
         ".github/workflows/macos-capability.yml",
         ".github/workflows/macos-reviewed-build.yml",
+        ".github/workflows/macos-rust-toolchain-smoke.yml",
         ".github/workflows/macos-cache-proof.yml",
         ".github/workflows/macos-source-reader-preflight.yml",
         ".github/workflows/macos-rules-reader-preflight.yml",
@@ -36,6 +37,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/macos_cache_client/index.js",
         "kit/confinement/macos_reviewed_build.py",
         "kit/confinement/test_macos_reviewed_build.py",
+        "kit/confinement/macos_rust_toolchain.py",
+        "kit/confinement/test_macos_rust_toolchain.py",
         "kit/confinement/macos_network_observer.py",
         "kit/confinement/test_macos_network_observer.py",
         'kit/confinement/macos_rules_bootstrap.py',
@@ -68,6 +71,9 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
+    '.github/workflows/macos-rust-toolchain-smoke.yml': 'cdf7068f8887c22958d74f3c2cc0a73c5c8c4c41f4eff0b43e16e47f61e58bb7',
+    'kit/confinement/macos_rust_toolchain.py': 'a27c103b1d6c4fbf9fef24469ade69668e01c949e3108dc89dc3dbd63ac14b49',
+    'kit/confinement/test_macos_rust_toolchain.py': '27c40bc8d42a3df6e88209d6cb8ea99cd9e80107310f1eb639dbfb2f6638727a',
     '.github/workflows/macos-rules-bootstrap.yml': 'a91387440f8caceadf8f19f7c87feb3d82377eb3c9e1813de48b518992d48807',
     '.github/workflows/macos-core-bootstrap.yml': '08cf50d62e18e52661befe3153294c2d188b8a980f914437dab7cbd899744b81',
     'kit/confinement/macos_rules_bootstrap.py': '9e86a0e5f100614f6a845723994760e186536b40abb6109701537e3e231b4308',

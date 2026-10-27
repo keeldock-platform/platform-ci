@@ -640,6 +640,103 @@ def reviewed_audit_fixture():
     return pages, env, logs
 
 
+def rust_toolchain_receipt_value():
+    return {
+        "schema_version": 1,
+        "concern": "rust-toolchain-smoke",
+        "status": "passed",
+        "control_sha": CONTROL_SHA,
+        "run_id": RUN_ID,
+        "run_attempt": RUN_ATTEMPT,
+        "host": "aarch64-apple-darwin",
+        "toolchain": "1.99.1",
+        "components": {
+            "rustc": "23948a0a9c162fd2952defb3fb0462c44e8fcfd1a4ab8a274a1e1bdb2cf810a3",
+            "rust-std": "fe79d6ab5a0321de26463999d8c112b8ad3eafbcbcf822d66a2300b45dde1031",
+            "cargo": "685e563d94db1f003ffa5f5831439eec02569b9950b69867953c8213269c1eaf",
+            "rustfmt-preview": "8b80dda570f140ee9ced8799294e812bba847a025f185bae4cba85a2ba235570",
+            "clippy-preview": "c463f31831196702fc544900a0dc4c1837905327507fbec751fe46e59ca098bf",
+        },
+        "versions": {
+            "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+            "cargo": "0.100.0",
+            "rustfmt": "1.10.0",
+            "clippy": "0.1.99",
+        },
+        "target": "aarch64-apple-darwin",
+        "smoke": {"fmt": "passed", "clippy": "passed", "test": "passed"},
+        "source": "none",
+        "offline": True,
+        "cleanup": "complete",
+    }
+
+
+def rust_toolchain_line(value):
+    return b"KD-RUST-SMOKE " + json.dumps(
+        value, sort_keys=True, separators=(",", ":")
+    ).encode("ascii")
+
+
+def rust_refusal_line(reason):
+    return b"KD-RUST-" + b"REFUSAL reason=" + reason.encode("ascii") + b"\n"
+
+
+def rust_toolchain_audit_fixture():
+    pages, env, logs = reviewed_audit_fixture()
+    run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+    jobs_path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+        + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+    )
+    pages[run_path][0]["path"] = audit.RUST_TOOLCHAIN_WORKFLOW_PATH
+    jobs = pages[jobs_path][0]["jobs"]
+    by_name = {job["name"]: job for job in jobs}
+    snapshot = by_name.pop(audit.REVIEWED_SNAPSHOT_JOB_NAME)
+    smoke = by_name.pop(audit.REVIEWED_SMOKE_JOB_NAME)
+    audit_job = by_name.pop(audit.REVIEWED_AUDIT_JOB_NAME)
+    snapshot["name"] = audit.RUST_TOOLCHAIN_SNAPSHOT_JOB_NAME
+    smoke["name"] = audit.RUST_TOOLCHAIN_SMOKE_JOB_NAME
+    audit_job["name"] = audit.RUST_TOOLCHAIN_AUDIT_JOB_NAME
+    pages[jobs_path][0]["jobs"] = [snapshot, smoke, audit_job]
+    pages["/repos/keeldock-platform/platform-ci/actions/jobs/202"][0]["name"] = snapshot["name"]
+    pages["/repos/keeldock-platform/platform-ci/actions/jobs/202"][0]["steps"] = [
+        {"number": index, "name": name, "status": "completed", "conclusion": "success"}
+        for index, name in enumerate((
+            "Set up job", "Fetch reviewed main control", "Snapshot cache inventory", "Complete job",
+        ), 1)
+    ]
+    pages["/repos/keeldock-platform/platform-ci/actions/jobs/203"][0]["name"] = smoke["name"]
+    pages["/repos/keeldock-platform/platform-ci/actions/jobs/203"][0]["steps"] = [
+        {"number": index, "name": name, "status": "completed", "conclusion": "success"}
+        for index, name in enumerate((
+            "Set up job", "Fetch reviewed main control", "Validate source-free control tree",
+            "Run source-free reviewed build smoke", "Run source-free Rust toolchain smoke",
+            "Write trusted summary visibility control", "Complete job",
+        ), 1)
+    ]
+    c_smoke = next(line for line in logs[203].splitlines() if b"macos-build=" in line)
+    summary_control = next(
+        line for line in logs[203].splitlines() if b"macos-summary-control=" in line
+    )
+    snapshot_marker = (
+        "macos-rust-toolchain-snapshot=ready schema=1 control-sha=" + CONTROL_SHA
+        + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT + "\n"
+    ).encode("ascii")
+    logs[202] = snapshot_marker
+    logs[203] = (
+        c_smoke + b"\n"
+        + b'Run source-free Rust toolchain smoke\n'
+        + b'  rust_marker_prefix="KD-RUST-"\n'
+        + b'  rust_success_prefix="${rust_marker_prefix}SMOKE "\n'
+        + b'  rust_refusal_prefix="${rust_marker_prefix}REFUSAL reason="\n'
+        + b'  summary_prefix="macos-summary-"\n'
+        + b'  summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT"\n'
+        + rust_toolchain_line(rust_toolchain_receipt_value()) + b"\n"
+        + summary_control + b"\n"
+    )
+    return pages, env, logs
+
+
 def cache_proof_keys():
     suffix = RUN_ID + "-" + RUN_ATTEMPT
     return (
@@ -2191,6 +2288,285 @@ class AuditRunTests(unittest.TestCase):
         with self.assertRaises(audit.AuditRefusal) as caught:
             audit.run("audit", env, api)
         self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+    def test_rust_toolchain_publisher_emits_only_the_validated_canonical_receipt(self):
+        class BinaryChannel:
+            def __init__(self, value):
+                self.buffer = value
+
+        publisher_env = {
+            "GITHUB_REPOSITORY": audit.REPOSITORY,
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REF": "refs/heads/main",
+            "CI_SHA": CONTROL_SHA,
+            "GITHUB_SHA": CONTROL_SHA,
+            "GITHUB_RUN_ID": RUN_ID,
+            "GITHUB_RUN_ATTEMPT": RUN_ATTEMPT,
+        }
+
+        def invoke(raw, updates=None):
+            stdout = io.BytesIO()
+            source = io.BytesIO(raw)
+            context = dict(publisher_env)
+            if updates:
+                context.update(updates)
+            with mock.patch.dict(audit.os.environ, context, clear=True):
+                with mock.patch.object(audit.sys, "stdin", BinaryChannel(source)):
+                    with mock.patch.object(audit.sys, "stdout", BinaryChannel(stdout)):
+                        result = audit.main(["rust-toolchain-publish"])
+            return result, stdout.getvalue()
+
+        canonical = rust_toolchain_line(rust_toolchain_receipt_value()) + b"\n"
+        result, output = invoke(canonical)
+        self.assertEqual(result, 0)
+        self.assertEqual(output, canonical)
+        for cargo_version in ("1.99.0", "1.99.1"):
+            with self.subTest(cargo_version=cargo_version):
+                value = json.loads(json.dumps(rust_toolchain_receipt_value()))
+                value["versions"]["cargo"] = cargo_version
+                accepted = rust_toolchain_line(value) + b"\n"
+                result, output = invoke(accepted)
+                self.assertEqual(result, 0)
+                self.assertEqual(output, accepted)
+
+        invalid_receipts = (
+            ("unknown key", lambda value: value.update(untrusted="value")),
+            ("wrong cargo version", lambda value: value["versions"].update(cargo="1.99.2")),
+            ("untyped cargo version", lambda value: value["versions"].update(cargo=[])),
+            ("wrong run binding", lambda value: value.update(run_id=str(int(RUN_ID) + 1))),
+            ("numeric run binding", lambda value: value.update(run_id=int(RUN_ID))),
+            ("numeric attempt binding", lambda value: value.update(run_attempt=int(RUN_ATTEMPT))),
+            ("noncanonical attempt", lambda value: value.update(run_attempt="02")),
+            ("wrong control binding", lambda value: value.update(control_sha="f" * 40)),
+            ("synthetic source", lambda value: value.update(source="synthetic")),
+            ("private receipt path", lambda value: value.update(receipt_path="/tmp/receipt.json")),
+        )
+        for label, mutate in invalid_receipts:
+            with self.subTest(case=label):
+                value = json.loads(json.dumps(rust_toolchain_receipt_value()))
+                mutate(value)
+                result, output = invoke(rust_toolchain_line(value) + b"\n")
+                self.assertEqual(result, 2)
+                self.assertEqual(output, b"KD-RUST-REFUSAL reason=capture_invalid\n")
+
+        duplicate_key = canonical[:-2] + b',"status":"passed"}\n'
+        for label, raw in (
+            ("duplicate JSON key", duplicate_key),
+            ("unterminated extra bytes", canonical + b"extra"),
+            ("second line", canonical + b"extra\n"),
+            ("runtime refusal", b"KD-RUST-REFUSAL reason=smoke_failed\n"),
+        ):
+            with self.subTest(capture=label):
+                result, output = invoke(raw)
+                self.assertEqual(result, 2)
+                self.assertEqual(output, b"KD-RUST-REFUSAL reason=capture_invalid\n")
+
+        for label, context in (
+            ("non-dispatch event", {"GITHUB_EVENT_NAME": "push"}),
+            ("non-main ref", {"GITHUB_REF": "refs/heads/feature"}),
+            ("wrong repository", {"GITHUB_REPOSITORY": "untrusted/repository"}),
+            ("wrong GitHub SHA", {"GITHUB_SHA": "f" * 40}),
+        ):
+            with self.subTest(context=label):
+                result, output = invoke(canonical, context)
+                self.assertEqual(result, 2)
+                self.assertEqual(output, b"KD-RUST-REFUSAL reason=invalid_input\n")
+
+    def test_rust_toolchain_audit_requires_both_bound_producers_and_all_public_surfaces(self):
+        pages, env, logs = rust_toolchain_audit_fixture()
+        api = FakeMultiAuditAPI(pages, logs)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = audit.run("rust-toolchain-audit", env, api)
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output.getvalue(),
+            "macos-rust-toolchain-audit=verified schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT
+            + " public-surfaces=logs,checks,annotations,artifacts,caches summary-ui=required"
+            + " source-admission=not-authorized\n",
+        )
+        self.assertEqual(api.log_calls, [202, 203])
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/artifacts?per_page=100&page=1",
+            api.calls,
+        )
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1",
+            api.calls,
+        )
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/check-runs/303/annotations?per_page=100&page=1",
+            api.calls,
+        )
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/check-runs/305/annotations?per_page=100&page=1",
+            api.calls,
+        )
+
+    def test_rust_toolchain_audit_refuses_missing_duplicate_and_wrongly_bound_jobs(self):
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        run_path = "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+
+        def remove_smoke_job(pages):
+            jobs = pages[jobs_path][0]
+            jobs["jobs"] = [job for job in jobs["jobs"]
+                            if job["name"] != audit.RUST_TOOLCHAIN_SMOKE_JOB_NAME]
+            jobs["total_count"] -= 1
+
+        def duplicate_snapshot_job(pages):
+            jobs = pages[jobs_path][0]
+            jobs["jobs"].append(dict(jobs["jobs"][0], id=999))
+            jobs["total_count"] += 1
+
+        cases = (
+            ("missing job", remove_smoke_job, "api_schema"),
+            ("duplicate job", duplicate_snapshot_job, "api_schema"),
+            ("workflow path", lambda pages: pages[run_path][0].update(path="other.yml"), "run_identity_mismatch"),
+            (
+                "smoke control sha",
+                lambda pages: pages[jobs_path][0]["jobs"][1].update(head_sha="f" * 40),
+                "run_identity_mismatch",
+            ),
+            (
+                "snapshot attempt",
+                lambda pages: pages[jobs_path][0]["jobs"][0].update(run_attempt=int(RUN_ATTEMPT) + 1),
+                "run_identity_mismatch",
+            ),
+            (
+                "audit already completed",
+                lambda pages: pages[jobs_path][0]["jobs"][2].update(status="completed"),
+                "run_identity_mismatch",
+            ),
+        )
+        for label, mutate, reason in cases:
+            with self.subTest(case=label):
+                pages, env, logs = rust_toolchain_audit_fixture()
+                mutate(pages)
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.run("rust-toolchain-audit", env, FakeMultiAuditAPI(pages, logs))
+                self.assertEqual(caught.exception.reason, reason)
+
+    def test_rust_toolchain_audit_refuses_receipt_schema_duplicates_and_run_binding(self):
+        mutations = (
+            ("wrong control", lambda value: value.update(control_sha="f" * 40)),
+            ("wrong run", lambda value: value.update(run_id=str(int(RUN_ID) + 1))),
+            ("wrong attempt", lambda value: value.update(run_attempt=str(int(RUN_ATTEMPT) + 1))),
+            ("missing status", lambda value: value.pop("status")),
+            ("extra path", lambda value: value.update(receipt_path="/tmp/private")),
+            ("wrong toolchain", lambda value: value.update(toolchain="1.99.0")),
+            ("wrong component digest", lambda value: value["components"].update(rustc="0" * 64)),
+            ("source present", lambda value: value.update(source="private")),
+            ("offline false", lambda value: value.update(offline=False)),
+            ("boolean schema", lambda value: value.update(schema_version=True)),
+            ("missing smoke result", lambda value: value["smoke"].pop("fmt")),
+        )
+        for label, mutate in mutations:
+            with self.subTest(case=label):
+                pages, env, logs = rust_toolchain_audit_fixture()
+                value = rust_toolchain_receipt_value()
+                mutate(value)
+                line = next(item for item in logs[203].splitlines() if item.startswith(b"KD-RUST-SMOKE "))
+                logs[203] = logs[203].replace(line, rust_toolchain_line(value))
+                with self.assertRaises(audit.AuditRefusal) as caught:
+                    audit.run("rust-toolchain-audit", env, FakeMultiAuditAPI(pages, logs))
+                self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = rust_toolchain_audit_fixture()
+        value = rust_toolchain_receipt_value()
+        duplicate = rust_toolchain_line(value)[:-1] + b',"status":"passed"}'
+        old = next(item for item in logs[203].splitlines() if item.startswith(b"KD-RUST-SMOKE "))
+        logs[203] = logs[203].replace(old, duplicate)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rust-toolchain-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+        pages, env, logs = rust_toolchain_audit_fixture()
+        line = next(item for item in logs[203].splitlines() if item.startswith(b"KD-RUST-SMOKE "))
+        logs[203] += line + b"\n"
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rust-toolchain-audit", env, FakeMultiAuditAPI(pages, logs))
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+
+    def test_rust_toolchain_audit_scans_available_surfaces_even_when_producer_fails(self):
+        pages, env, logs = rust_toolchain_audit_fixture()
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        smoke_job = pages[jobs_path][0]["jobs"][1]
+        smoke_job["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/actions/jobs/203"][0]["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/check-runs/305"][0]["conclusion"] = "failure"
+        logs[203] = b"source-free control failed\n"
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rust-toolchain-audit", env, api)
+        self.assertEqual(caught.exception.reason, "native_job_failed")
+        self.assertEqual(api.log_calls, [202, 203])
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/artifacts?per_page=100&page=1",
+            api.calls,
+        )
+        self.assertIn(
+            "/repos/keeldock-platform/platform-ci/actions/caches?per_page=100&page=1",
+            api.calls,
+        )
+        self.assertTrue(any(path.endswith("/annotations?per_page=100&page=1") for path in api.calls))
+
+        pages, env, logs = rust_toolchain_audit_fixture()
+        smoke_job = pages[jobs_path][0]["jobs"][1]
+        smoke_job["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/actions/jobs/203"][0]["conclusion"] = "failure"
+        pages["/repos/keeldock-platform/platform-ci/actions/jobs/203"][0]["steps"] = []
+        pages["/repos/keeldock-platform/platform-ci/check-runs/305"][0]["conclusion"] = "failure"
+        logs.pop(203)
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rust-toolchain-audit", env, api)
+        self.assertEqual(caught.exception.reason, "native_job_failed")
+        self.assertEqual(api.log_calls, [202])
+        self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
+        self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
+        self.assertTrue(any(path.endswith("/annotations?per_page=100&page=1") for path in api.calls))
+
+    def test_rust_toolchain_audit_recognizes_one_composed_closed_refusal_line(self):
+        pages, env, logs = rust_toolchain_audit_fixture()
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        smoke_job = pages[jobs_path][0]["jobs"][1]
+        smoke_job["conclusion"] = "failure"
+        smoke_detail = pages["/repos/keeldock-platform/platform-ci/actions/jobs/203"][0]
+        smoke_detail["conclusion"] = "failure"
+        for step in smoke_detail["steps"]:
+            if step["name"] == "Run source-free Rust toolchain smoke":
+                step["conclusion"] = "failure"
+            if step["name"] == "Write trusted summary visibility control":
+                step["conclusion"] = "skipped"
+        pages["/repos/keeldock-platform/platform-ci/check-runs/305"][0]["conclusion"] = "failure"
+        c_smoke = next(line for line in logs[203].splitlines() if b"macos-build=" in line)
+        logs[203] = (
+            c_smoke + b"\n"
+            + b'  rust_marker_prefix="KD-RUST-"\n'
+            + b'  rust_refusal_prefix="${rust_marker_prefix}REFUSAL reason="\n'
+            + b'  printf \'%s%s\\n\' "$rust_refusal_prefix" "smoke_failed"\n'
+            + rust_refusal_line("smoke_failed")
+        )
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("rust-toolchain-audit", env, api)
+        self.assertEqual(caught.exception.reason, "native_job_failed")
+        self.assertEqual(api.log_calls, [202, 203])
+        self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
+        self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
+        self.assertTrue(any(path.endswith("/annotations?per_page=100&page=1") for path in api.calls))
 
     def test_wrong_run_attempt_sha_and_duplicate_native_job_refuse(self):
         jobs_path = (
