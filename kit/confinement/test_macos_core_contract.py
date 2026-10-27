@@ -565,6 +565,35 @@ class CoreContractTests(unittest.TestCase):
             {"diagnostic", "reason", "schema_version", "stage", "status"},
         )
 
+    def test_feedback_gate_capture_returns_only_bounded_failure_and_never_pass_map(self):
+        calls = []
+
+        def run_command(*unused_args, **kwargs):
+            self.assertIs(kwargs["allow_nonzero_capture"], True)
+            return SimpleNamespace(
+                returncode=9, stdout=b"bounded stdout", stderr=b"bounded stderr",
+                stdout_truncated=True, stderr_truncated=False,
+            )
+
+        rust = SimpleNamespace(_run_worker_command=run_command)
+        with patch.object(subject, "_source_commands", return_value=(
+                ("workspace_tests", ("cargo", "test", "--locked")),)):
+            with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
+                    _worker_census=lambda *args: calls.append(args[-1]))):
+                outcome = subject._run_gates(
+                    Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                    rust, {"cargo": Path("/toolchain/bin/cargo")}, subject.time.monotonic() + 30,
+                    capture_failure=True,
+                )
+        self.assertEqual(outcome["failed_stage"], "workspace_tests")
+        self.assertEqual(outcome["returncode"], 9)
+        self.assertEqual(outcome["stdout"], b"bounded stdout")
+        self.assertEqual(outcome["stderr"], b"bounded stderr")
+        self.assertIs(outcome["stdout_truncated"], True)
+        self.assertIs(outcome["stderr_truncated"], False)
+        self.assertNotIn("gates", outcome)
+        self.assertEqual(calls, ["workspace_tests"])
+
     def test_unexpected_command_error_keeps_capture_invalid_diagnostic_through_reattachment(self):
         rust = subject._load_control_sibling("macos_rust_toolchain")
 

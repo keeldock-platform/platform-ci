@@ -37,8 +37,14 @@ BASE_BRANCHES = frozenset(("main", "develop", "uat"))
 ALLOWED_CONTROL_SIBLINGS = frozenset((
     "macos_capability", "macos_reviewed_build", "macos_boundary_guard",
     "macos_private_validation", "macos_source_reader", "macos_network_observer",
-    "macos_rust_toolchain", "macos_rules_bootstrap",
+    "macos_rust_toolchain", "macos_rules_bootstrap", "macos_feedback_producer",
 ))
+FEEDBACK_TREE_LABELS = {
+    "core-contract": "core_contract",
+    "core-node-lock-return": "core_node_lock_return",
+    "core-rust-format-return": "core_rust_format_return",
+    "core-build-diagnostic-return": "core_build_diagnostic_return",
+}
 GATE_NAMES = (
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
 )
@@ -482,8 +488,9 @@ def _validate_source_lease(record, request, binding, worker_uid, runtime):
         raise Refusal("source_validation_failed", "source_lease")
     expected = {
         "source_sha": request["source_sha"], "base_sha": request["base_sha"],
-        "base_branch": request["base_branch"], "concern": CONCERN,
-        "signature": "verified", "rules_lock": "present", "tree": "core_contract",
+        "base_branch": request["base_branch"], "concern": request["concern"],
+        "signature": "verified", "rules_lock": "present",
+        "tree": FEEDBACK_TREE_LABELS.get(request["concern"]),
         "source_execution": "not_run_at_yield", "app_build": "not_run", "cleanup": "lease_open",
         "repository_scope": "verified", "metadata": "verified", "control_sha": binding["control_sha"],
         "run_id": binding["run_id"], "run_attempt": binding["run_attempt"],
@@ -691,7 +698,8 @@ def _run_inside_source(source, original_cwd, command):
             raise Refusal("cleanup_incomplete", "cleanup", diagnostic="cwd_restore") from None
 
 
-def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools, deadline):
+def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools, deadline,
+               capture_failure=False):
     completed = []
     for stage, argv in _source_commands(source, tools):
         if time.monotonic() >= deadline:
@@ -700,6 +708,7 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
             result = rust._run_worker_command(
                 argv, uid, environment, host_toolchain["python"], capability,
                 stage=stage, deadline=deadline, timeout=MAX_COMMAND_SECONDS,
+                allow_nonzero_capture=capture_failure,
             )
         except BaseException as error:
             if getattr(error, "reason", None) == "cleanup_incomplete":
@@ -715,7 +724,7 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
             if getattr(error, "reason", None) == "capture_invalid":
                 raise Refusal("capture_invalid", stage) from None
             raise Refusal("gate_failed", stage) from None
-        if (type(result.returncode) is not int or result.returncode != 0
+        if (type(result.returncode) is not int
                 or type(result.stdout) is not bytes or type(result.stderr) is not bytes
                 or len(result.stdout) > MAX_CAPTURE_BYTES or len(result.stderr) > MAX_CAPTURE_BYTES):
             raise Refusal("capture_invalid", stage)
@@ -723,7 +732,20 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
             _load_control_sibling("macos_reviewed_build")._worker_census(uid, host_toolchain["python"], stage)
         except BaseException:
             raise Refusal("cleanup_incomplete", "cleanup") from None
+        if result.returncode != 0:
+            if capture_failure:
+                return {
+                    "completed": tuple(completed), "failed_stage": stage,
+                    "returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
+                    "stdout_truncated": getattr(result, "stdout_truncated", False),
+                    "stderr_truncated": getattr(result, "stderr_truncated", False),
+                }
+            raise Refusal("capture_invalid", stage)
         completed.append(stage)
+    if capture_failure:
+        return {"completed": tuple(completed), "failed_stage": None, "returncode": 0,
+                "stdout": b"", "stderr": b"", "stdout_truncated": False,
+                "stderr_truncated": False}
     if tuple(completed) != GATE_NAMES:
         raise Refusal("gate_failed", "receipt")
     return {name: "passed" for name in GATE_NAMES}
@@ -917,7 +939,8 @@ def _toolchain_refusal(error, stage):
     return Refusal("runner_unavailable", "worker_setup")
 
 
-def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha256, deadline, lifecycle):
+def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha256, deadline, lifecycle,
+                feedback=None):
     reviewed, capability, runtime, rust, rules = controls
     host_toolchain = None
     worker_tools = None
@@ -938,6 +961,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
     lease_record = None
     versions = None
     gates = None
+    feedback_result = None
     network_observer = None
     network_session = None
     network_captured = False
@@ -1014,7 +1038,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
         revocation_state = runtime.RevocationState()
         runtime_request = runtime.parse_request((
             "--source-sha", request["source_sha"], "--base-sha", request["base_sha"],
-            "--base-branch", request["base_branch"], "--concern", CONCERN,
+            "--base-branch", request["base_branch"], "--concern", request["concern"],
         ))
         if runtime_request != request:
             raise Refusal("source_binding_mismatch", "source_lease", diagnostic=operation)
@@ -1094,14 +1118,41 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                 )
                 phase = "worker_setup"
                 operation = "source_gates"
-                gates = _run_inside_source(
-                    source,
-                    original_cwd,
-                    lambda: _run_gates(
-                        source, environment, worker_uid, host_toolchain, capability, rust,
-                        toolchain_paths.command_paths(), deadline,
-                    ),
-                )
+                if feedback is None:
+                    gates = _run_inside_source(
+                        source,
+                        original_cwd,
+                        lambda: _run_gates(
+                            source, environment, worker_uid, host_toolchain, capability, rust,
+                            toolchain_paths.command_paths(), deadline,
+                        ),
+                    )
+                else:
+                    producer = _load_control_sibling("macos_feedback_producer")
+                    if feedback["profile"]["kind"] == "build_diagnostics":
+                        outcome = _run_inside_source(
+                            source,
+                            original_cwd,
+                            lambda: _run_gates(
+                                source, environment, worker_uid, host_toolchain, capability, rust,
+                                toolchain_paths.command_paths(), deadline, capture_failure=True,
+                            ),
+                        )
+                        feedback_result = {
+                            "payload_bytes": producer.build_diagnostic_payload(outcome),
+                            "expected_manifest": None, "reviewed_rust_paths": None,
+                            "source_result": "gate_failure" if outcome["failed_stage"] else "all_gates_completed",
+                        }
+                    else:
+                        feedback_result = _run_inside_source(
+                            source,
+                            original_cwd,
+                            lambda: producer.run_source_profile(
+                                feedback["dispatch"], source, worker_storage, worker_uid, environment,
+                                toolchain_paths.command_paths(), host_toolchain, capability, rust,
+                                reviewed, deadline, feedback["node"], feedback.get("npm_cli"),
+                            ),
+                        )
                 operation = "worker_storage_verify"
                 capability._verify_storage_directory(worker_storage, storage_identity, worker_uid)
         except Refusal as error:
@@ -1288,15 +1339,26 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
         raise diagnostics.attach(
             Refusal("cleanup_incomplete", "cleanup"), "source_revocation_check", cleanup_state.get("first"),
         )
-    if (lease_record is None or versions is None or gates is None or tuple(gates) != GATE_NAMES
-            or not network_captured or not summary_guard_passed or not worker_cleanup_confirmed):
+    if feedback is None:
+        complete_source_run = (
+            lease_record is not None and versions is not None and gates is not None
+            and tuple(gates) == GATE_NAMES
+        )
+    else:
+        complete_source_run = (
+            lease_record is not None and versions is not None and type(feedback_result) is dict
+            and type(feedback_result.get("payload_bytes")) is bytes
+            and bool(feedback_result["payload_bytes"])
+        )
+    if (not complete_source_run or not network_captured or not summary_guard_passed
+            or not worker_cleanup_confirmed):
         raise diagnostics.attach(
             Refusal("cleanup_incomplete", "cleanup"), "source_lease_cleanup", cleanup_state.get("first"),
         )
-    return lease_record, versions, gates, network_captured, summary_guard_passed
+    return lease_record, versions, gates if feedback is None else feedback_result, network_captured, summary_guard_passed
 
 
-def _execute(arguments, environ, token_reference, lifecycle):
+def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None):
     operation = "load_controls"
     try:
         started = time.monotonic()
@@ -1305,6 +1367,24 @@ def _execute(arguments, environ, token_reference, lifecycle):
         reviewed, capability, boundary, runtime, rust, rules = controls
         operation = "arguments"
         request = _parse_arguments(arguments)
+        feedback = None
+        feedback_producer = None
+        if feedback_kind is not None:
+            feedback_producer = _load_control_sibling("macos_feedback_producer")
+            try:
+                dispatch = feedback_producer.validate_dispatch(feedback_kind, environ)
+                full_request = dispatch["request"]
+                if any(request[name] != full_request[name]
+                       for name in ("source_sha", "base_sha", "base_branch")):
+                    raise ValueError
+                request["concern"] = dispatch["profile"]["concern"]
+                feedback = {"profile": dispatch["profile"], "dispatch": dispatch}
+            except feedback_producer.FeedbackRefusal:
+                raise Refusal("invalid_input", "arguments") from None
+            except Refusal:
+                raise
+            except BaseException:
+                raise Refusal("runner_unavailable", "context") from None
         operation = "context"
         binding, root, runner_temp = _validate_context(environ, reviewed, capability, boundary, rust)
         operation = "review_binding"
@@ -1318,6 +1398,18 @@ def _execute(arguments, environ, token_reference, lifecycle):
         _check_temp_root()
         operation = "smoke_receipt"
         smoke_versions = _validate_smoke_receipt(runner_temp, binding, rust)
+        if feedback is not None:
+            operation = "toolchain_node"
+            try:
+                node, npm_cli = feedback_producer.resolve_node(
+                    environ, require_npm=feedback["profile"]["kind"] == "lock",
+                )
+                feedback["node"] = node
+                feedback["npm_cli"] = npm_cli
+            except feedback_producer.FeedbackRefusal:
+                raise Refusal("runner_unavailable", "worker_setup") from None
+            except BaseException:
+                raise Refusal("runner_unavailable", "worker_setup") from None
         operation = "token_input"
         if type(token_reference) is not str or TOKEN_RE.fullmatch(token_reference) is None:
             raise Refusal("token_revocation_unconfirmed", "source_lease")
@@ -1328,6 +1420,7 @@ def _execute(arguments, environ, token_reference, lifecycle):
             lease_record, versions, gates, network_captured, summary_guard_passed = _run_source(
                 request, binding, root, runner_temp, environ,
                 (reviewed, capability, runtime, rust, rules), diff_sha256, deadline, lifecycle,
+                feedback=feedback,
             )
         finally:
             lifecycle.pop("token_reference", None)
@@ -1335,6 +1428,14 @@ def _execute(arguments, environ, token_reference, lifecycle):
         if (time.monotonic() >= deadline or versions != smoke_versions
                 or lifecycle.get("token_revocation") != "confirmed_before_execution"):
             raise Refusal("runner_unavailable", "receipt")
+        if feedback is not None:
+            producer = _load_control_sibling("macos_feedback_producer")
+            ciphertext = producer.encrypt_after_cleanup(feedback["dispatch"], gates, feedback["node"])
+            receipt = producer.write_output(runner_temp, feedback["dispatch"], ciphertext)
+            payload = receipt.encode("ascii", "strict")
+            if len(payload) > MAX_RECEIPT_BYTES:
+                raise Refusal("capture_invalid", "receipt")
+            return payload
         record = _build_success_record(binding, request, lease_record, diff_sha256, versions, gates)
         _validate_success_record(
             record, binding, request, lease_record, diff_sha256, versions, gates,
@@ -1368,7 +1469,7 @@ def _format_refusal(error):
     return payload[:-1]
 
 
-def main(arguments=None, environ=None, stdin=None, stdout=None):
+def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=None):
     actual_arguments = sys.argv[1:] if arguments is None else arguments
     environment = dict(os.environ) if environ is None else dict(environ)
     input_stream = sys.stdin.buffer if stdin is None else stdin
@@ -1404,7 +1505,8 @@ def main(arguments=None, environ=None, stdin=None, stdout=None):
     try:
         if failure is not None:
             raise failure
-        result = _execute(actual_arguments, environment, token_reference, lifecycle)
+        result = _execute(actual_arguments, environment, token_reference, lifecycle,
+                          feedback_kind=feedback_kind)
     except Refusal as error:
         failure = error
     except BaseException:
@@ -1429,9 +1531,11 @@ def main(arguments=None, environ=None, stdin=None, stdout=None):
                 )
                 break
     if failure is not None:
-        output_stream.write("KD-CORE-CONTRACT-REFUSAL " + _format_refusal(failure).decode("ascii") + "\n")
+        prefix = "KD-FEEDBACK-PRODUCER-REFUSAL " if feedback_kind is not None else "KD-CORE-CONTRACT-REFUSAL "
+        output_stream.write(prefix + _format_refusal(failure).decode("ascii") + "\n")
         return 1
-    output_stream.write("KD-CORE-CONTRACT " + result.decode("ascii") + "\n")
+    prefix = "KD-FEEDBACK-PRODUCER " if feedback_kind is not None else "KD-CORE-CONTRACT "
+    output_stream.write(prefix + result.decode("ascii") + "\n")
     return 0
 
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import datetime
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import selectors
@@ -82,7 +83,14 @@ OWNER_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 FINGERPRINT_PATTERN = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 BRANCHES = frozenset(("main", "develop", "uat"))
-CONCERNS = frozenset(("core-bootstrap", "rules-bootstrap", "core-contract"))
+FEEDBACK_PROFILE_CONCERNS = frozenset((
+    "core-node-lock-return",
+    "core-rust-format-return",
+    "core-build-diagnostic-return",
+))
+CORE_CONTRACT_CONCERNS = frozenset(("core-contract",)) | FEEDBACK_PROFILE_CONCERNS
+SOURCE_DESCENDANT_CONCERNS = frozenset(("rules-bootstrap",)) | CORE_CONTRACT_CONCERNS
+CONCERNS = frozenset(("core-bootstrap", "rules-bootstrap")) | CORE_CONTRACT_CONCERNS
 REASONS = frozenset((
     "invalid_input",
     "context_unavailable",
@@ -152,12 +160,67 @@ CORE_CONTRACT_ROOT_FILES = frozenset((
     "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml",
 ))
 CORE_CONTRACT_PACKAGE_FILES = frozenset(("Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md"))
+CORE_CONTRACT_FEEDBACK_FILES = frozenset((
+    ".node-version",
+    ".npmrc",
+    "package.json",
+    "tsconfig.base.json",
+    "packages/host-api/CHANGELOG.md",
+    "packages/host-api/CONTRACT.md",
+    "packages/host-api/README.md",
+    "packages/host-api/package.json",
+    "packages/host-api/tsconfig.json",
+    "packages/host-api/src/budget.ts",
+    "packages/host-api/src/effects.ts",
+    "packages/host-api/src/entitlements.ts",
+    "packages/host-api/src/errors.ts",
+    "packages/host-api/src/ids.ts",
+    "packages/host-api/src/index.ts",
+    "packages/host-api/src/manifest.ts",
+    "packages/host-api/src/metadata.ts",
+    "packages/host-api/src/module.ts",
+    "packages/host-api/src/plugin.ts",
+    "packages/host-api/src/result.ts",
+    "packages/host-api/src/streams.ts",
+    "packages/host-api/src/version.ts",
+    "packages/host-api/tests/budget-streams.test.ts",
+    "packages/host-api/tests/entitlements-errors.test.ts",
+    "packages/host-api/tests/ids-version.test.ts",
+    "packages/host-api/tests/manifest-metadata.test.ts",
+))
+CORE_CONTRACT_FOUNDATION_FILES = frozenset((
+    "docs/adr/0002-parser-corpus-workspace.md",
+    "docs/adr/0003-npm-contract-workspace.md",
+    "fuzz/ARCHITECTURE.md",
+    "fuzz/Cargo.lock",
+    "fuzz/Cargo.toml",
+    "fuzz/README.md",
+    "fuzz/fuzz_targets/identifiers.rs",
+    "fuzz/fuzz_targets/tool_error_codes.rs",
+    "fuzz/fuzz_targets/versions.rs",
+    "fuzz/src/main.rs",
+))
+CORE_CONTRACT_FUZZ_CORPUS_TARGETS = frozenset((
+    "identifiers", "tool_error_codes", "versions",
+))
+CORE_CONTRACT_FUZZ_CORPUS_PATH = re.compile(
+    r"fuzz/corpus/(identifiers|tool_error_codes|versions)/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z"
+)
+CORE_CONTRACT_TREE_BY_CONCERN = {
+    "core-contract": "core_contract",
+    "core-node-lock-return": "core_node_lock_return",
+    "core-rust-format-return": "core_rust_format_return",
+    "core-build-diagnostic-return": "core_build_diagnostic_return",
+}
 CORE_CONTRACT_RULES_TAG_PATTERN = re.compile(r"tag v2\.[0-9]+\.[0-9]+\Z")
 CORE_CONTRACT_TOOLCHAIN = b'[toolchain]\nchannel = "1.99.1"\ncomponents = ["rustfmt", "clippy"]\nprofile = "minimal"\n'
 MAX_SIGNER_BYTES = 65536
 MAX_INVENTORY_BYTES = 16384
 MAX_TREE_BYTES = 1024 * 1024
 MAX_CORE_CONTRACT_FILE_BYTES = 1024 * 1024
+MAX_FUZZ_CORPUS_FILES = 256
+MAX_FUZZ_CORPUS_FILE_BYTES = 4096
+MAX_FUZZ_CORPUS_TOTAL_BYTES = 128 * 1024
 MAX_GIT_OUTPUT = 65536
 MAX_COMMITS = 20000
 MAX_TREE_ENTRIES = 20000
@@ -1371,20 +1434,219 @@ def _contract_tree_entries(repository, git_executable, repo_env, commit):
     return entries
 
 
-def _contract_blob(repository, git_executable, repo_env, entries, path, *, core_check):
+def _contract_blob(
+    repository, git_executable, repo_env, entries, path, *, core_check,
+    max_bytes=MAX_CORE_CONTRACT_FILE_BYTES,
+):
+    if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_CORE_CONTRACT_FILE_BYTES:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check)
     entry = entries.get(path)
     if entry is None or entry[0] not in ("100644", "100755"):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check)
-    result = _run_process(
-        (git_executable, "cat-file", "blob", entry[1]),
-        cwd=repository,
-        environ=repo_env,
-        max_output=MAX_CORE_CONTRACT_FILE_BYTES,
-        stage="bootstrap",
-    )
-    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_CORE_CONTRACT_FILE_BYTES:
+    try:
+        result = _run_process(
+            (git_executable, "cat-file", "blob", entry[1]),
+            cwd=repository,
+            environ=repo_env,
+            max_output=max_bytes,
+            stage="bootstrap",
+        )
+    except Refusal as error:
+        if error.reason == "cleanup_incomplete":
+            raise
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check) from None
+    if result.returncode != 0 or result.stderr or len(result.stdout) > max_bytes:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check)
     return result.stdout
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
+
+
+def _feedback_manifest_shape(root_payload, package_payload):
+    try:
+        root_manifest = json.loads(
+            root_payload.decode("utf-8", "strict"), object_pairs_hook=_unique_json_object,
+        )
+        package_manifest = json.loads(
+            package_payload.decode("utf-8", "strict"), object_pairs_hook=_unique_json_object,
+        )
+    except (AttributeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return False
+    if type(root_manifest) is not dict or type(package_manifest) is not dict:
+        return False
+    scripts = root_manifest.get("scripts")
+    package_scripts = package_manifest.get("scripts")
+    engines = root_manifest.get("engines")
+    return (
+        root_manifest.get("private") is True
+        and root_manifest.get("workspaces") == ["packages/*"]
+        and root_manifest.get("packageManager") == "npm@11.19.1"
+        and type(engines) is dict
+        and engines.get("node") == "24.22.1"
+        and engines.get("npm") == "11.19.1"
+        and type(scripts) is dict
+        and all(type(name) is str and type(value) is str for name, value in scripts.items())
+        and type(package_manifest.get("name")) is str
+        and type(package_manifest.get("version")) is str
+        and package_manifest.get("type") == "module"
+        and type(package_manifest.get("exports")) is dict
+        and type(package_scripts) is dict
+        and all(type(name) is str and type(value) is str for name, value in package_scripts.items())
+        and not any(name in package_scripts for name in ("preinstall", "install", "postinstall"))
+    )
+
+
+def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
+    if any(type(payload) is not bytes or len(payload) > MAX_CORE_CONTRACT_FILE_BYTES
+           for payload in (fuzz_payload, api_payload, lock_payload)):
+        return False
+    try:
+        fuzz_text = fuzz_payload.decode("utf-8", "strict")
+        api_text = api_payload.decode("utf-8", "strict")
+        lock_text = lock_payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return False
+    if any("\r" in text for text in (fuzz_text, api_text, lock_text)):
+        return False
+
+    def parse_sections(text):
+        sections = {}
+        current = None
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(chr(35)):
+                continue
+            if stripped.startswith("[["):
+                return None
+            section = re.fullmatch(r"\[([A-Za-z0-9_.-]{1,128})\]", stripped)
+            if section is not None:
+                current = section.group(1)
+                if current in sections:
+                    return None
+                sections[current] = {}
+                continue
+            assignment = re.fullmatch(r"([A-Za-z0-9_.-]{1,128})\s*=\s*(.{1,4096})", stripped)
+            if current is None or assignment is None:
+                return None
+            key, value = assignment.groups()
+            if key in sections[current]:
+                return None
+            sections[current][key] = value.strip()
+        return sections
+
+    fuzz_sections = parse_sections(fuzz_text)
+    api_sections = parse_sections(api_text)
+    if fuzz_sections is None or api_sections is None:
+        return False
+    package = fuzz_sections.get("package")
+    dependencies = fuzz_sections.get("dependencies")
+    workspace = fuzz_sections.get("workspace")
+    lints = fuzz_sections.get("lints.rust")
+    api_package = api_sections.get("package")
+    if (set(fuzz_sections) != {"package", "dependencies", "workspace", "lints.rust"}
+            or set(api_sections) != {"package", "dependencies", "lints"}
+            or type(package) is not dict or type(dependencies) is not dict
+            or type(workspace) is not dict or type(lints) is not dict
+            or type(api_package) is not dict):
+        return False
+    if (set(package) != {"name", "description", "version", "edition", "rust-version", "publish"}
+            or set(api_package) != {
+                "name", "description", "version.workspace", "edition.workspace",
+                "rust-version.workspace", "publish.workspace",
+            }
+            or re.fullmatch(r'"[A-Za-z0-9_-]{1,64}"', package.get("name", "")) is None
+            or re.fullmatch(r'"[^"]{1,256}"', package.get("description", "")) is None
+            or re.fullmatch(r'"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?"', package.get("version", "")) is None
+            or package.get("edition") != '"2024"'
+            or package.get("rust-version") != '"1.99.1"'
+            or package.get("publish") != "false"
+            or any(api_package.get(name) != "true" for name in (
+                "version.workspace", "edition.workspace", "rust-version.workspace", "publish.workspace",
+            ))
+            or re.fullmatch(r'"[^"]{1,256}"', api_package.get("description", "")) is None
+            or set(workspace) != {"resolver"} or workspace.get("resolver") != '"3"'
+            or set(lints) != {"unsafe_code", "warnings"}
+            or lints.get("unsafe_code") != '"forbid"'
+            or lints.get("warnings") != '"deny"'):
+        return False
+    api_name_raw = api_package.get("name", "")
+    if re.fullmatch(r'"[A-Za-z0-9_-]{1,64}"', api_name_raw) is None:
+        return False
+    api_name = api_name_raw[1:-1]
+    fuzz_name = package["name"][1:-1]
+    if (set(dependencies) != {api_name}
+            or dependencies[api_name] != '{ path = "../crates/host/api" }'):
+        return False
+
+    prefix_and_packages = re.split(r"(?m)^\[\[package\]\]\s*$", lock_text)
+    if len(prefix_and_packages) != 3 or re.search(r"(?m)^\s*(?:source|checksum)\s*=", lock_text):
+        return False
+    comment_line = r"(?m)^" + re.escape(chr(35)) + r".*$"
+    if (re.findall(r"(?m)^version\s*=\s*(4)\s*$", prefix_and_packages[0]) != ["4"]
+            or re.sub(comment_line, "", prefix_and_packages[0]).strip() != "version = 4"):
+        return False
+    parsed_lock = {}
+    for block in prefix_and_packages[1:]:
+        name_matches = re.findall(r'(?m)^name\s*=\s*"([A-Za-z0-9_-]{1,64})"\s*$', block)
+        version_matches = re.findall(r'(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?)"\s*$', block)
+        dependency_blocks = re.findall(r"(?ms)^dependencies\s*=\s*\[\n(.*?)^\]$", block)
+        if len(name_matches) != 1 or len(version_matches) != 1 or len(dependency_blocks) > 1:
+            return False
+        name = name_matches[0]
+        dependencies_in_lock = []
+        if dependency_blocks:
+            dependencies_in_lock = re.findall(r'^\s*"([A-Za-z0-9_-]{1,64})",\s*$', dependency_blocks[0], re.M)
+            normalized = re.sub(r'^\s*"[A-Za-z0-9_-]{1,64}",\s*$', "", dependency_blocks[0], flags=re.M)
+            if normalized.strip():
+                return False
+        allowed_lines = re.sub(comment_line, "", block)
+        allowed_lines = re.sub(r'(?m)^name\s*=\s*"[A-Za-z0-9_-]{1,64}"\s*$', "", allowed_lines)
+        allowed_lines = re.sub(r'(?m)^version\s*=\s*"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?"\s*$', "", allowed_lines)
+        allowed_lines = re.sub(r"(?ms)^dependencies\s*=\s*\[\n.*?^\]$", "", allowed_lines)
+        if allowed_lines.strip() or name in parsed_lock:
+            return False
+        parsed_lock[name] = dependencies_in_lock
+    return parsed_lock == {fuzz_name: [api_name], api_name: []}
+
+
+def _feedback_corpus_paths_shape(corpus_paths):
+    if (type(corpus_paths) is not list or not 1 <= len(corpus_paths) <= MAX_FUZZ_CORPUS_FILES
+            or any(type(path) is not str for path in corpus_paths)
+            or len(set(corpus_paths)) != len(corpus_paths)):
+        return False
+    targets = set()
+    for path in corpus_paths:
+        match = CORE_CONTRACT_FUZZ_CORPUS_PATH.fullmatch(path)
+        if match is None:
+            return False
+        targets.add(match.group(1))
+    return targets == CORE_CONTRACT_FUZZ_CORPUS_TARGETS
+
+
+def _feedback_corpus_shape(corpus_paths, payloads):
+    if (not _feedback_corpus_paths_shape(corpus_paths)
+            or type(payloads) is not dict or set(payloads) != set(corpus_paths)):
+        return False
+    total_bytes = 0
+    for path in corpus_paths:
+        payload = payloads[path]
+        if type(payload) is not bytes or len(payload) > MAX_FUZZ_CORPUS_FILE_BYTES:
+            return False
+        try:
+            payload.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            return False
+        total_bytes += len(payload)
+        if total_bytes > MAX_FUZZ_CORPUS_TOTAL_BYTES:
+            return False
+    return True
 
 
 def _core_contract_admin_mode(path):
@@ -1403,7 +1665,18 @@ def _core_contract_admin_mode(path):
     return None
 
 
-def _core_contract_package_mode(path):
+def _core_contract_foundation_path(path):
+    return (
+        type(path) is str
+        and (
+            path in CORE_CONTRACT_FEEDBACK_FILES
+            or path in CORE_CONTRACT_FOUNDATION_FILES
+            or CORE_CONTRACT_FUZZ_CORPUS_PATH.fullmatch(path) is not None
+        )
+    )
+
+
+def _core_contract_package_mode(path, *, feedback_profile=False):
     package_files = CORE_CONTRACT_PACKAGE_FILES
     for crate_root in CORE_CONTRACT_CRATE_ROOTS:
         prefix = "/".join(crate_root)
@@ -1417,16 +1690,22 @@ def _core_contract_package_mode(path):
                 and relative.rsplit("/", 1)[-1] != "build.rs"
             ):
                 return "100644"
+    if feedback_profile and _core_contract_foundation_path(path):
+        return "100644"
     return None
 
 
-def _core_contract_expected_mode(path):
+def _core_contract_expected_mode(path, *, concern="core-contract"):
+    if type(concern) is not str or concern not in CORE_CONTRACT_CONCERNS:
+        return None
     if path in CORE_CONTRACT_ROOT_FILES:
         return "100644"
     admin_mode = _core_contract_admin_mode(path)
     if admin_mode is not None:
         return admin_mode
-    return _core_contract_package_mode(path)
+    return _core_contract_package_mode(
+        path, feedback_profile=concern in FEEDBACK_PROFILE_CONCERNS,
+    )
 
 
 def _parse_rules_v2_file_manifest(payload):
@@ -1498,7 +1777,11 @@ def _core_contract_policy_matches_base(base_entries, entries):
     return policy_paths == base_policy_paths
 
 
-def _safe_core_contract_tree(repository, git_executable, repo_env, base_commit, commit):
+def _safe_core_contract_tree(
+    repository, git_executable, repo_env, base_commit, commit, *, concern="core-contract",
+):
+    if type(concern) is not str or concern not in CORE_CONTRACT_CONCERNS:
+        raise Refusal("bootstrap_not_approved", "configuration")
     base_entries = _contract_tree_entries(repository, git_executable, repo_env, base_commit)
     entries = _contract_tree_entries(repository, git_executable, repo_env, commit)
     signer_path = "/".join(SIGNER_PATH_PARTS)
@@ -1512,8 +1795,67 @@ def _safe_core_contract_tree(repository, git_executable, repo_env, base_commit, 
         required.add(prefix + "/src/lib.rs")
     if not required.issubset(entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+    foundation_present = any(
+        _core_contract_foundation_path(path)
+        for path in entries
+        if path not in CORE_CONTRACT_ROOT_FILES
+    )
+    if concern == "core-node-lock-return" and not foundation_present:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+    if foundation_present:
+        if concern not in FEEDBACK_PROFILE_CONCERNS:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
+        if not CORE_CONTRACT_FEEDBACK_FILES.issubset(entries) or not CORE_CONTRACT_FOUNDATION_FILES.issubset(entries):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+        corpus_paths = []
+        for path in entries:
+            if path.startswith("fuzz/corpus/"):
+                if (CORE_CONTRACT_FUZZ_CORPUS_PATH.fullmatch(path) is None
+                        or len(corpus_paths) >= MAX_FUZZ_CORPUS_FILES):
+                    raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
+                corpus_paths.append(path)
+        if not _feedback_corpus_paths_shape(corpus_paths):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
+        corpus_payloads = {}
+        corpus_total_bytes = 0
+        for path in corpus_paths:
+            payload = _contract_blob(
+                repository, git_executable, repo_env, entries, path,
+                core_check="tree_entries", max_bytes=MAX_FUZZ_CORPUS_FILE_BYTES,
+            )
+            corpus_total_bytes += len(payload)
+            if corpus_total_bytes > MAX_FUZZ_CORPUS_TOTAL_BYTES:
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
+            try:
+                payload.decode("utf-8", "strict")
+            except UnicodeDecodeError:
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries") from None
+            corpus_payloads[path] = payload
+        if not _feedback_corpus_shape(corpus_paths, corpus_payloads):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
+        root_package = _contract_blob(
+            repository, git_executable, repo_env, entries, "package.json", core_check="package_decode",
+        )
+        host_package = _contract_blob(
+            repository, git_executable, repo_env, entries,
+            "packages/host-api/package.json", core_check="package_decode",
+        )
+        if not _feedback_manifest_shape(root_package, host_package):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+        fuzz_manifest = _contract_blob(
+            repository, git_executable, repo_env, entries, "fuzz/Cargo.toml", core_check="package_decode",
+        )
+        fuzz_lock = _contract_blob(
+            repository, git_executable, repo_env, entries, "fuzz/Cargo.lock", core_check="package_decode",
+        )
+        api_cargo = _contract_blob(
+            repository, git_executable, repo_env, entries,
+            "/".join(CORE_CONTRACT_CRATE_ROOTS[0]) + "/Cargo.toml", core_check="package_decode",
+        )
+        if not _feedback_fuzz_manifest_shape(fuzz_manifest, api_cargo, fuzz_lock):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
     for path, (mode, unused_object_id) in entries.items():
-        expected_mode = _core_contract_expected_mode(path)
+        expected_mode = _core_contract_expected_mode(path, concern=concern)
         if mode != expected_mode or expected_mode is None:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
     if not _core_contract_policy_matches_base(base_entries, entries):
@@ -2097,7 +2439,7 @@ def _check_rules_bootstrap_gate(request, environ):
 
 
 def _check_core_contract_gate(request, environ):
-    if request["concern"] != "core-contract":
+    if request["concern"] not in CORE_CONTRACT_CONCERNS:
         return
     control_sha = environ.get("CI_SHA", "")
     if (
@@ -2116,7 +2458,7 @@ def _check_source_ref_binding(request, environ):
         if candidate_ref and candidate_ref != "refs/heads/" + request["base_branch"]:
             raise Refusal("bootstrap_not_approved", "configuration")
         return None
-    if request["concern"] not in {"rules-bootstrap", "core-contract"} or type(candidate_ref) is not str:
+    if request["concern"] not in SOURCE_DESCENDANT_CONCERNS or type(candidate_ref) is not str:
         raise Refusal("bootstrap_not_approved", "configuration")
     if re.fullmatch(r"refs/heads/(?:feat|fix|chore|plan)/[A-Za-z0-9][A-Za-z0-9._/-]{0,126}", candidate_ref) is None:
         raise Refusal("bootstrap_not_approved", "configuration")
@@ -2281,7 +2623,7 @@ def validated_source(
         raise Refusal("context_unavailable", "context") from None
     if current_binding != binding or current_root != supplied_root:
         raise Refusal("context_unavailable", "context")
-    worker_required = request["concern"] in {"rules-bootstrap", "core-contract"}
+    worker_required = request["concern"] in SOURCE_DESCENDANT_CONCERNS
     if worker_required:
         _check_worker_identity(current_root, worker_uid)
         storage_root = _validate_storage_root(storage_root)
@@ -2309,7 +2651,7 @@ def validated_source(
                 source_path,
                 storage_root,
                 worker_uid,
-                core_contract=request["concern"] == "core-contract",
+                core_contract=request["concern"] in CORE_CONTRACT_CONCERNS,
             )
             worker_access = "uid_read_only"
         record["repository_scope"] = "verified"
@@ -2327,7 +2669,7 @@ def validated_source(
         record["tree"] = {
             "core-bootstrap": "core_administrative",
             "rules-bootstrap": "rules_regular_files",
-            "core-contract": "core_contract",
+            **CORE_CONTRACT_TREE_BY_CONCERN,
         }[request["concern"]]
         record["worker_access"] = worker_access
         record["source_execution"] = "not_run_at_yield"
@@ -2579,15 +2921,18 @@ def _source_snapshot(
             _safe_rules_tree(repository, git_executable, env, request["source_sha"])
             rules_lock = "not-applicable"
             tree_kind = "rules_regular_files"
-        else:
+        elif request["concern"] in CORE_CONTRACT_CONCERNS:
             _safe_core_contract_tree(
                 repository, git_executable, env, request["base_sha"], request["source_sha"],
+                concern=request["concern"],
             )
             rules_lock = "present"
-            tree_kind = "core_contract"
+            tree_kind = CORE_CONTRACT_TREE_BY_CONCERN[request["concern"]]
+        else:
+            raise Refusal("bootstrap_not_approved", "configuration")
         source_path = _checkout_source(
             repository, git_executable, env, temporary, request["source_sha"],
-            core_contract=request["concern"] == "core-contract",
+            core_contract=request["concern"] in CORE_CONTRACT_CONCERNS,
         )
         record = {
             "repository_id": str(repository_id),
@@ -2644,7 +2989,7 @@ def _format_success(record, binding):
         "tree": {
             "core-bootstrap": "core_administrative",
             "rules-bootstrap": "rules_regular_files",
-            "core-contract": "core_contract",
+            **CORE_CONTRACT_TREE_BY_CONCERN,
         }.get(record.get("concern")),
         "source_execution": "not_run_at_yield",
         "repository_scope": "verified",
@@ -2660,7 +3005,7 @@ def _format_success(record, binding):
     }
     if any(record[key] != value for key, value in fixed.items()):
         raise Refusal("internal_error", "input")
-    return " ".join((
+    fields = [
         "macos-private-validation=verified",
         "schema=" + str(SCHEMA_VERSION),
         "control-sha=" + binding["control_sha"],
@@ -2679,7 +3024,10 @@ def _format_success(record, binding):
         "source-execution=not-run",
         "app-build=not-run",
         "cleanup=complete",
-    ))
+    ]
+    if record["concern"] in FEEDBACK_PROFILE_CONCERNS:
+        fields.append("tree=" + record["tree"])
+    return " ".join(fields)
 
 
 def _safe_identity_fields(control_sha, environ):

@@ -138,6 +138,28 @@ class WorkflowPolicyTests(unittest.TestCase):
     def _platform_workflow(self):
         return PLATFORM_WORKFLOW.read_text(encoding="utf-8")
 
+    def test_feedback_return_workflows_require_exact_reviewed_platform_definitions(self):
+        for kind in ("node-lock-return", "core-rust-format-return", "core-build-diagnostic-return"):
+            with self.subTest(workflow=kind):
+                path = Path(__file__).resolve().parents[2] / (".github/workflows/" + kind + ".yml")
+                workflow = path.read_text(encoding="utf-8")
+                self.assertTrue(validate_workflow_text(workflow, "platform", kind))
+                for pool in ("connect", "workspace", "data"):
+                    with self.assertRaises(PolicyError):
+                        validate_workflow_text(workflow, pool, kind)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(workflow, "platform")
+                mutations = (
+                    workflow + "\npermissions: write-all\n",
+                    workflow.replace("retention-days: 1", "retention-days: 90", 1),
+                    workflow.replace("environment: source-read", "environment: unrestricted", 1),
+                    workflow.replace("macos-15", "macos-latest", 1),
+                )
+                for changed in mutations:
+                    self.assertNotEqual(changed, workflow)
+                    with self.assertRaises(PolicyError):
+                        validate_workflow_text(changed, "platform", kind)
+
     def test_development_feedback_smoke_requires_reviewed_platform_workflow(self):
         path = Path(__file__).resolve().parents[2] / ".github/workflows/development-feedback-smoke.yml"
         workflow = path.read_text(encoding="utf-8")

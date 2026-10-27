@@ -369,7 +369,7 @@ def _audit_check(api, job, identity, runner):
     return cipher, upload, valid
 
 
-def _validate_artifact_record(record, identity, upload):
+def _validate_artifact_record(record, identity, upload, *, now=None):
     if (type(record) is not dict or not _exact_int(record.get("id"), 1)
             or record.get("name") != ARTIFACT_PREFIX + identity["run_id"] + "-1"
             or not _exact_int(record.get("size_in_bytes"), 1)
@@ -391,8 +391,12 @@ def _validate_artifact_record(record, identity, upload):
     created = _parse_api_time(record.get("created_at"))
     expires = _parse_api_time(record.get("expires_at"))
     retention = expires - created
-    if (abs(retention - timedelta(days=1)) > timedelta(seconds=1)
-            or expires <= datetime.now(timezone.utc)):
+    current = datetime.now(timezone.utc) if now is None else now
+    if (not isinstance(current, datetime) or current.tzinfo is None
+            or current.utcoffset() != timedelta(0)
+            or created > current or expires <= current
+            or retention <= timedelta(0) or retention > timedelta(days=1)
+            or expires - current > timedelta(days=1)):
         _fail("artifact_invalid")
     return record["size_in_bytes"]
 
