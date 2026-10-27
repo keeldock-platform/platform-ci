@@ -165,6 +165,7 @@ class RustToolchainContractTests(unittest.TestCase):
         self.assertNotIn("stderr", body)
         self.assertLessEqual(len(payload), 8192)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX native path validation")
     def test_toolchain_paths_accept_absolute_pathlib_paths_and_reject_relative_paths(self):
         root = PRIVATE_TMP / "rust-toolchain-smoke-run"
         prefix = root / "toolchain"
@@ -204,6 +205,7 @@ class RustToolchainContractTests(unittest.TestCase):
                 component_hashes=tuple((component.name, component.sha256) for component in rust.COMPONENTS),
             )
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX worker environment paths")
     def test_worker_environment_is_allowlisted_and_offline(self):
         class ReviewedBuildStub:
             @staticmethod

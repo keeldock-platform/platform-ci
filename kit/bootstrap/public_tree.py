@@ -73,7 +73,7 @@ MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
     '.github/workflows/macos-rust-toolchain-smoke.yml': 'cdf7068f8887c22958d74f3c2cc0a73c5c8c4c41f4eff0b43e16e47f61e58bb7',
     'kit/confinement/macos_rust_toolchain.py': 'a27c103b1d6c4fbf9fef24469ade69668e01c949e3108dc89dc3dbd63ac14b49',
-    'kit/confinement/test_macos_rust_toolchain.py': 'd1d70029c7dbbb95db0dad0890e5437623e111b0a685c02d3e252285c3188756',
+    'kit/confinement/test_macos_rust_toolchain.py': '27c40bc8d42a3df6e88209d6cb8ea99cd9e80107310f1eb639dbfb2f6638727a',
     '.github/workflows/macos-rules-bootstrap.yml': 'a91387440f8caceadf8f19f7c87feb3d82377eb3c9e1813de48b518992d48807',
     '.github/workflows/macos-core-bootstrap.yml': '08cf50d62e18e52661befe3153294c2d188b8a980f914437dab7cbd899744b81',
     'kit/confinement/macos_rules_bootstrap.py': '9e86a0e5f100614f6a845723994760e186536b40abb6109701537e3e231b4308',
