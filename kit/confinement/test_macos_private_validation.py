@@ -4,7 +4,7 @@ import hashlib
 import stat
 import tempfile
 import unittest
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +16,132 @@ def _ssh_key_blob(start=0):
     algorithm = b"ssh-ed25519"
     public_key = bytes((start + offset) % 256 for offset in range(32))
     return len(algorithm).to_bytes(4, "big") + algorithm + len(public_key).to_bytes(4, "big") + public_key
+
+
+class _FakeStat:
+    def __init__(self, mode, uid, gid, device, inode, size=0, links=1):
+        self.st_mode = mode
+        self.st_uid = uid
+        self.st_gid = gid
+        self.st_dev = device
+        self.st_ino = inode
+        self.st_size = size
+        self.st_nlink = links
+        self.st_mtime_ns = 10
+        self.st_ctime_ns = 11
+
+
+class _InventoryHarness:
+    def __init__(self, root, runner_temp, contents, blob=None):
+        self.root = root
+        self.runner_temp = runner_temp
+        self.contents = contents
+        self.blob = contents if blob is None else blob
+        self.runner_uid = 501
+        self.runner = _FakeStat(stat.S_IFDIR | 0o700, self.runner_uid, 20, 1, 4, links=2)
+        self.root_info = _FakeStat(stat.S_IFDIR | 0o755, self.runner_uid, 20, 1, 1, links=2)
+        self.ci_info = _FakeStat(stat.S_IFDIR | 0o755, self.runner_uid, 20, 1, 2, links=2)
+        self.inventory_info = _FakeStat(
+            stat.S_IFREG | 0o644, self.runner_uid, 20, 1, 3, len(contents),
+        )
+        self.swap_ci = False
+        self.fchown_calls = []
+        self.closed = []
+        self.offset = 0
+        self.fail_inventory_chown = False
+        self.fail_inventory_restore = False
+        self.original_stat = subject.os.stat
+        self.original_path_lstat = Path.lstat
+
+    def open(self, path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is None and Path(path) == self.root:
+            return 10
+        if dir_fd == 10 and path == "ci":
+            return 11
+        if dir_fd == 11 and path == "revoked-signer-fingerprints":
+            return 12
+        raise OSError
+
+    def stat(self, path, *, dir_fd=None, follow_symlinks=True):
+        if dir_fd == 10 and path == "ci":
+            if self.swap_ci:
+                return _FakeStat(stat.S_IFDIR | 0o755, 0, 0, 1, 20, links=2)
+            return self.ci_info
+        if dir_fd == 11 and path == "revoked-signer-fingerprints":
+            return self.inventory_info
+        if Path(path) == self.root:
+            return self.root_info
+        if Path(path) == self.runner_temp:
+            return self.runner
+        return self.original_stat(path, follow_symlinks=follow_symlinks)
+
+    def path_lstat(self, path):
+        if path == self.root:
+            return self.root_info
+        if path == self.runner_temp:
+            return self.runner
+        return self.original_path_lstat(path)
+
+    def fstat(self, descriptor):
+        return {10: self.root_info, 11: self.ci_info, 12: self.inventory_info}[descriptor]
+
+    def read(self, descriptor, size):
+        if descriptor != 12:
+            raise OSError
+        payload = self.contents[self.offset:self.offset + size]
+        self.offset += len(payload)
+        return payload
+
+    def lseek(self, descriptor, offset, whence):
+        if descriptor != 12 or offset != 0:
+            raise OSError
+        self.offset = 0
+        return 0
+
+    def fchown(self, descriptor, uid, gid):
+        self.fchown_calls.append((descriptor, uid, gid))
+        if descriptor == 12 and uid != self.runner_uid and self.fail_inventory_chown:
+            self.fail_inventory_chown = False
+            raise OSError
+        if descriptor == 12 and uid == self.runner_uid and self.fail_inventory_restore:
+            raise OSError
+        info = self.fstat(descriptor)
+        info.st_uid = uid
+        info.st_gid = gid
+        info.st_ctime_ns += 1
+
+    def close(self, descriptor):
+        self.closed.append(descriptor)
+
+    def process(self, argv, **kwargs):
+        if "ls-tree" in argv:
+            digest = hashlib.sha1(self.blob).hexdigest().encode("ascii")
+            output = b"100644 blob " + digest + b"\t" + subject.REVOCATION_INVENTORY.encode("ascii") + b"\x00"
+        else:
+            output = self.blob
+        return subject.subprocess.CompletedProcess(argv, 0, output, b"")
+
+    def patches(self):
+        stack = ExitStack()
+        for name, replacement in (
+            ("open", self.open), ("stat", self.stat), ("fstat", self.fstat),
+            ("read", self.read), ("lseek", self.lseek), ("fchown", self.fchown),
+            ("close", self.close),
+        ):
+            stack.enter_context(patch.object(subject.os, name, replacement, create=True))
+        stack.enter_context(patch.object(
+            subject.os, "supports_dir_fd", {self.open, self.stat}, create=True,
+        ))
+        stack.enter_context(patch.object(
+            subject.os, "supports_follow_symlinks", {self.stat}, create=True,
+        ))
+        stack.enter_context(patch.object(Path, "lstat", lambda path: self.path_lstat(path)))
+        stack.enter_context(patch.object(subject.os, "O_NOFOLLOW", 0x100, create=True))
+        stack.enter_context(patch.object(subject.os, "O_DIRECTORY", 0x10000, create=True))
+        stack.enter_context(patch.object(subject, "_resolve_trusted_executable", return_value="/usr/bin/git"))
+        stack.enter_context(patch.object(subject, "_base_git_environment", return_value={}))
+        stack.enter_context(patch.object(subject, "_run_process", side_effect=self.process))
+        return stack
 
 
 class RequestTests(unittest.TestCase):
@@ -1268,6 +1394,111 @@ class TreeEntryTests(unittest.TestCase):
         for payload in invalid:
             with self.subTest(payload=payload):
                 self.assertIsNone(subject._parse_single_tree_entry(payload, "ci/revoked-signer-fingerprints"))
+
+
+class ControlInventoryPreparationTests(unittest.TestCase):
+    def _paths(self, temporary):
+        base = Path(temporary).resolve(strict=True)
+        root = base / "control"
+        runner_temp = base / "runner"
+        root.mkdir()
+        runner_temp.mkdir()
+        return root, runner_temp
+
+    def test_preparation_binds_blob_and_restores_only_the_fixed_objects(self):
+        contents = b"SHA256:" + b"A" * 43 + b"\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root, runner_temp = self._paths(temporary)
+            harness = _InventoryHarness(root, runner_temp, contents)
+            with harness.patches():
+                state = subject._prepare_control_inventory(root, "a" * 40, runner_temp)
+                self.assertEqual(harness.fchown_calls, [(11, 0, 0), (12, 0, 0)])
+                self.assertEqual((harness.ci_info.st_uid, harness.inventory_info.st_uid), (0, 0))
+                subject._restore_control_inventory(state)
+                self.assertEqual(
+                    (harness.ci_info.st_uid, harness.ci_info.st_gid,
+                     harness.inventory_info.st_uid, harness.inventory_info.st_gid),
+                    (harness.runner_uid, 20, harness.runner_uid, 20),
+                )
+            self.assertEqual(harness.closed, [12, 11, 10])
+
+    def test_wrong_git_blob_refuses_before_ownership_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root, runner_temp = self._paths(temporary)
+            harness = _InventoryHarness(root, runner_temp, b"local\n", blob=b"pinned\n")
+            with harness.patches(), self.assertRaises(subject.Refusal) as raised:
+                subject._prepare_control_inventory(root, "a" * 40, runner_temp)
+            self.assertEqual((raised.exception.reason, raised.exception.stage),
+                             ("revocation_policy_invalid", "revocation"))
+            self.assertEqual(harness.fchown_calls, [])
+            self.assertEqual(harness.closed, [12, 11, 10])
+
+    def test_linked_inventory_objects_are_rejected_without_repair(self):
+        for mode, links in ((stat.S_IFREG | 0o644, 2), (stat.S_IFLNK | 0o777, 1)):
+            with tempfile.TemporaryDirectory() as temporary:
+                root, runner_temp = self._paths(temporary)
+                harness = _InventoryHarness(root, runner_temp, b"")
+                harness.inventory_info.st_mode = mode
+                harness.inventory_info.st_nlink = links
+                with harness.patches(), self.assertRaises(subject.Refusal):
+                    subject._prepare_control_inventory(root, "a" * 40, runner_temp)
+                self.assertEqual(harness.fchown_calls, [])
+                self.assertEqual(harness.closed, [11, 10])
+
+    def test_partial_preparation_failure_rolls_back_and_closes_every_descriptor(self):
+        contents = b"SHA256:" + b"B" * 43 + b"\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root, runner_temp = self._paths(temporary)
+            harness = _InventoryHarness(root, runner_temp, contents)
+            harness.fail_inventory_chown = True
+            with harness.patches(), self.assertRaises(subject.Refusal) as raised:
+                subject._prepare_control_inventory(root, "a" * 40, runner_temp)
+            self.assertEqual((raised.exception.reason, raised.exception.stage),
+                             ("revocation_policy_invalid", "revocation"))
+            self.assertEqual((harness.ci_info.st_uid, harness.inventory_info.st_uid),
+                             (harness.runner_uid, harness.runner_uid))
+            self.assertEqual(harness.fchown_calls,
+                             [(11, 0, 0), (12, 0, 0), (11, harness.runner_uid, 20)])
+            self.assertEqual(harness.closed, [12, 11, 10])
+
+    def test_swapped_path_and_restore_failure_refuse_and_close_all_descriptors(self):
+        contents = b""
+        with tempfile.TemporaryDirectory() as temporary:
+            root, runner_temp = self._paths(temporary)
+            harness = _InventoryHarness(root, runner_temp, contents)
+            with harness.patches():
+                state = subject._prepare_control_inventory(root, "a" * 40, runner_temp)
+                harness.swap_ci = True
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject._restore_control_inventory(state)
+                self.assertEqual((raised.exception.reason, raised.exception.stage),
+                                 ("cleanup_incomplete", "cleanup"))
+            self.assertEqual(harness.fchown_calls, [(11, 0, 0), (12, 0, 0)])
+            self.assertEqual(harness.closed, [12, 11, 10])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root, runner_temp = self._paths(temporary)
+            harness = _InventoryHarness(root, runner_temp, contents)
+            with harness.patches():
+                state = subject._prepare_control_inventory(root, "a" * 40, runner_temp)
+                harness.fail_inventory_restore = True
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject._restore_control_inventory(state)
+                self.assertEqual((raised.exception.reason, raised.exception.stage),
+                                 ("cleanup_incomplete", "cleanup"))
+            self.assertEqual(harness.closed, [12, 11, 10])
+
+    def test_close_only_keeps_root_ownership_when_cleanup_is_unconfirmed(self):
+        contents = b"SHA256:" + b"C" * 43 + b"\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root, runner_temp = self._paths(temporary)
+            harness = _InventoryHarness(root, runner_temp, contents)
+            with harness.patches():
+                state = subject._prepare_control_inventory(root, "a" * 40, runner_temp)
+                subject._close_control_inventory(state)
+                self.assertEqual((harness.ci_info.st_uid, harness.inventory_info.st_uid), (0, 0))
+            self.assertEqual(harness.fchown_calls, [(11, 0, 0), (12, 0, 0)])
+            self.assertEqual(harness.closed, [12, 11, 10])
 
 
 class ControlGitCommandTests(unittest.TestCase):

@@ -914,6 +914,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
     tools = None
     summary_guard_state = {"guard": None}
     cleanup_state = {"first": None}
+    control_inventory_state = None
     revocation_state = None
     retained_token = lifecycle.get("token_reference")
     lease_record = None
@@ -948,11 +949,24 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
             host_toolchain = capability._resolve_trusted_toolchain()
             operation = "resolve_worker_tools"
             worker_tools = capability._resolve_worker_tools(host_toolchain)
+            operation = "source_lease_request"
+            control_inventory_state = runtime._prepare_control_inventory(
+                root, binding["control_sha"], runner_temp,
+            )
             operation = "create_worker_identity"
             worker_uid, home_parent, home = capability._create_probe_identity(root)
         except Refusal as error:
             raise diagnostics.attach(error, operation) from None
-        except BaseException:
+        except BaseException as error:
+            runtime_refusal = getattr(runtime, "Refusal", None)
+            if isinstance(runtime_refusal, type) and isinstance(error, runtime_refusal):
+                mapped_refusal = _runtime_refusal(runtime, error)
+                runtime_diagnostic = _source_runtime_diagnostic(runtime, error)
+                if runtime_diagnostic is not None:
+                    mapped_refusal = Refusal(
+                        mapped_refusal.reason, mapped_refusal.stage, diagnostic=runtime_diagnostic,
+                    )
+                raise diagnostics.attach(mapped_refusal, operation) from None
             raise Refusal("runner_unavailable", "worker_setup", diagnostic=operation) from None
         operation = "create_run_directory"
         run_root = _make_directory(RUN_PREFIX, 0o711)
@@ -1227,6 +1241,24 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
             failure = diagnostics.attach(
                 Refusal("cleanup_incomplete", "cleanup"), operation, cleanup_state.get("first"),
             )
+        if control_inventory_state is not None:
+            operation = "worker_cleanup"
+            if worker_cleanup_confirmed:
+                try:
+                    runtime._restore_control_inventory(control_inventory_state)
+                except BaseException:
+                    failure = diagnostics.attach(
+                        Refusal("cleanup_incomplete", "cleanup"), operation, cleanup_state.get("first"),
+                    )
+            else:
+                try:
+                    runtime._close_control_inventory(control_inventory_state)
+                except BaseException:
+                    pass
+                failure = diagnostics.attach(
+                    Refusal("cleanup_incomplete", "cleanup"), operation, cleanup_state.get("first"),
+                )
+            control_inventory_state = None
 
     if failure is not None:
         if getattr(failure, "reason", None) == "cleanup_incomplete":
