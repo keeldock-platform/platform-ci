@@ -2181,12 +2181,116 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
                         macos_capability._run_as_probe_user(["/usr/bin/true"], 502, timeout=3)
         self.assertEqual(raised.exception.check, "probe_process_timeout")
         self.assertFalse(raised.exception.cleanup_complete)
+        self.assertIsNone(raised.exception.command_check)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertEqual(popen.call_args.kwargs["close_fds"], True)
         self.assertEqual(popen.call_args.kwargs["user"], 502)
         self.assertEqual(popen.call_args.kwargs["group"], macos_capability.PROBE_PRIMARY_GID)
         self.assertEqual(popen.call_args.kwargs["extra_groups"], ())
         cleanup.assert_called_once_with(process)
+
+    def test_probe_user_command_timeout_remains_incomplete_and_privately_classified(self):
+        class StubProcess:
+            pid = 12359
+            stdout = io.BytesIO(b"")
+            stderr = io.BytesIO(b"")
+            returncode = None
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired("private command", timeout)
+
+            def poll(self):
+                return self.returncode
+
+        process = StubProcess()
+        with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+            with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(
+                            ["/usr/bin/true"], 502,
+                            failure_reason="native_preflight_unavailable",
+                            failure_check="probe_process_toolchain",
+                            command_diagnostics=True,
+                            python_executable=TEST_TOOLCHAIN["python"],
+                        )
+        self.assertEqual(raised.exception.command_check, "timeout")
+        self.assertEqual(raised.exception.check, "probe_process_timeout")
+        self.assertFalse(raised.exception.cleanup_complete)
+        self.assertNotIn("private command", str(raised.exception))
+
+    def test_probe_failure_command_check_accepts_only_fixed_values(self):
+        expected = {
+            "spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow", "helper_failure",
+        }
+        for value in expected:
+            with self.subTest(value=value):
+                failure = macos_capability.ProbeFailure(
+                    "native_preflight_unavailable", command_check=value,
+                )
+                self.assertEqual(failure.command_check, value)
+        for value in ("unknown_check_value", "private detail", [], None):
+            with self.subTest(value_type=type(value).__name__):
+                failure = macos_capability.ProbeFailure(
+                    "native_preflight_unavailable", command_check=value,
+                )
+                self.assertIsNone(failure.command_check)
+        failure = macos_capability.ProbeFailure("probe_identity_unavailable", command_check="spawn_failure")
+        self.assertIsNone(failure.command_check)
+
+    def test_probe_user_command_diagnostics_are_opt_in_and_classify_spawn_failure(self):
+        arguments = {
+            "failure_reason": "native_preflight_unavailable",
+            "failure_check": "probe_process_toolchain",
+            "python_executable": TEST_TOOLCHAIN["python"],
+        }
+        for enabled, expected in ((True, "spawn_failure"), (False, None)):
+            with self.subTest(command_diagnostics=enabled):
+                with patch.object(macos_capability.subprocess, "Popen", side_effect=OSError("private path")):
+                    with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                        macos_capability._run_as_probe_user(
+                            ["/usr/bin/true"], 502, command_diagnostics=enabled, **arguments,
+                        )
+                self.assertEqual(raised.exception.command_check, expected)
+                self.assertNotIn("private path", str(raised.exception))
+
+    def test_probe_user_command_diagnostics_classify_nonzero_and_capture_overflow(self):
+        class StubProcess:
+            pid = 12358
+            returncode = 23
+
+            def __init__(self, stdout):
+                self.stdout = io.BytesIO(stdout)
+                self.stderr = io.BytesIO(macos_capability.PROBE_IDENTITY_VERIFIED)
+
+            def wait(self, timeout):
+                return self.returncode
+
+            def poll(self):
+                return self.returncode
+
+        cases = (
+            (b"safe output", 23, "nonzero_exit"),
+            (b"x" * (macos_capability.MAX_CAPTURE_BYTES + 1), 0, "capture_overflow"),
+        )
+        for output, returncode, expected in cases:
+            with self.subTest(command_check=expected):
+                process = StubProcess(output)
+                process.returncode = returncode
+                with patch.object(macos_capability.subprocess, "Popen", return_value=process):
+                    with patch.object(macos_capability, "_terminate_probe_tree", return_value=True):
+                        with patch.object(macos_capability, "_probe_uid_processes_present", return_value=(False, ())):
+                            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                macos_capability._run_as_probe_user(
+                                    ["/usr/bin/true"], 502,
+                                    failure_reason="native_preflight_unavailable",
+                                    failure_check="probe_process_toolchain",
+                                    command_diagnostics=True,
+                                    python_executable=TEST_TOOLCHAIN["python"],
+                                )
+                self.assertEqual(raised.exception.command_check, expected)
+                self.assertNotIn("safe output", str(raised.exception))
+                self.assertNotIn(str(returncode), str(raised.exception))
 
     def test_probe_user_census_detects_detached_child_after_group_cleanup(self):
         class StubProcess:

@@ -38,6 +38,12 @@ MAX_MEMBER_BYTES = 1024 * 1024 * 1024
 MAX_UNPACKED_COMPONENT_BYTES = 4 * 1024 * 1024 * 1024
 MAX_TOTAL_PREFIX_BYTES = 4 * 1024 * 1024 * 1024
 MAX_CAPTURE_BYTES = 65_536
+COMMAND_CHECKS = frozenset((
+    "spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow", "helper_failure",
+))
+SOURCE_COMMAND_STAGES = frozenset((
+    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+))
 MAX_DOWNLOAD_SECONDS = 120
 MAX_INSTALL_SECONDS = 240
 MAX_TOOL_SECONDS = 120
@@ -127,8 +133,11 @@ SYNTHETIC_LIB_RS = (
 
 
 class Refusal(Exception):
-    def __init__(self, reason):
+    def __init__(self, reason, command_check=None):
         self.reason = reason if reason in REASONS else "internal_error"
+        self.command_check = (
+            command_check if type(command_check) is str and command_check in COMMAND_CHECKS else None
+        )
         super().__init__(self.reason)
 
 
@@ -916,6 +925,7 @@ def _worker_environment(home, storage, prefix, tools, host_toolchain, worker_too
 def _run_worker_command(
     argv, uid, env, python_executable, capability, *, stage, deadline, timeout=MAX_TOOL_SECONDS,
 ):
+    command_diagnostics = type(stage) is str and stage in SOURCE_COMMAND_STAGES
     try:
         result = capability._run_as_probe_user(
             argv,
@@ -924,21 +934,36 @@ def _run_worker_command(
             timeout=_bounded_timeout(deadline, timeout),
             failure_reason="native_preflight_unavailable",
             failure_check="probe_process_toolchain",
+            command_diagnostics=command_diagnostics,
             python_executable=python_executable,
         )
     except capability.ProbeFailure as error:
+        command_check = getattr(error, "command_check", None)
+        if not command_diagnostics:
+            command_check = None
+        elif type(command_check) is not str or command_check not in COMMAND_CHECKS:
+            command_check = "helper_failure"
         if not error.cleanup_complete:
-            raise Refusal("cleanup_incomplete") from None
-        raise Refusal("smoke_failed" if stage == "smoke" else "version_mismatch") from None
+            raise Refusal("cleanup_incomplete", command_check=command_check) from None
+        raise Refusal(
+            "smoke_failed" if stage == "smoke" else "version_mismatch",
+            command_check=command_check,
+        ) from None
     except Refusal:
         raise
     except BaseException:
-        raise Refusal("capture_invalid") from None
-    if (type(result.returncode) is not int or type(result.stdout) is not bytes or type(result.stderr) is not bytes
-            or len(result.stdout) > MAX_CAPTURE_BYTES or len(result.stderr) > MAX_CAPTURE_BYTES):
-        raise Refusal("capture_invalid")
+        raise Refusal(
+            "capture_invalid", command_check="capture_invalid" if command_diagnostics else None,
+        ) from None
+    if (type(result.returncode) is not int or type(result.stdout) is not bytes or type(result.stderr) is not bytes):
+        raise Refusal("capture_invalid", command_check="capture_invalid" if command_diagnostics else None)
+    if len(result.stdout) > MAX_CAPTURE_BYTES or len(result.stderr) > MAX_CAPTURE_BYTES:
+        raise Refusal("capture_invalid", command_check="capture_overflow" if command_diagnostics else None)
     if result.returncode != 0:
-        raise Refusal("smoke_failed" if stage == "smoke" else "version_mismatch")
+        raise Refusal(
+            "smoke_failed" if stage == "smoke" else "version_mismatch",
+            command_check="nonzero_exit" if command_diagnostics else None,
+        )
     return result
 
 

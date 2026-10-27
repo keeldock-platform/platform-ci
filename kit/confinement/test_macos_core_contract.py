@@ -507,6 +507,93 @@ class CoreContractTests(unittest.TestCase):
         self.assertIn(str(source / "crates/host/mock/Cargo.toml"), commands[4][1])
         self.assertIn(str(source / "crates/host/conformance/Cargo.toml"), commands[5][1])
 
+    def test_source_gate_diagnostics_map_closed_checks_and_preserve_the_refusal_schema(self):
+        cases = (
+            ("spawn_failure", "version_mismatch", "gate_failed", "source_gate_spawn_failure"),
+            ("nonzero_exit", "version_mismatch", "gate_failed", "source_gate_nonzero_exit"),
+            ("helper_failure", "version_mismatch", "gate_failed", "source_gate_helper_failure"),
+            ("capture_invalid", "capture_invalid", "capture_invalid", "source_gate_capture_invalid"),
+            ("capture_overflow", "version_mismatch", "gate_failed", "source_gate_capture_overflow"),
+        )
+        for command_check, cause_reason, expected_reason, expected_diagnostic in cases:
+            with self.subTest(command_check=command_check):
+                class CommandFailure(Exception):
+                    def __init__(self):
+                        self.reason = cause_reason
+                        self.command_check = command_check
+
+                def fail_command(*unused_args, **unused_kwargs):
+                    raise CommandFailure()
+
+                rust = SimpleNamespace(_run_worker_command=fail_command)
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject._run_gates(
+                        Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                        rust, {"cargo": Path("/toolchain/bin/cargo")}, subject.time.monotonic() + 30,
+                    )
+                self.assertEqual(raised.exception.reason, expected_reason)
+                self.assertEqual(raised.exception.stage, "format")
+                attached = subject._FailureDiagnostics().attach(raised.exception, "source_gates")
+                payload = subject._format_refusal(attached)
+                record = json.loads(payload)
+                self.assertEqual(record["diagnostic"], expected_diagnostic)
+                self.assertEqual(record["reason"], expected_reason)
+                self.assertEqual(record["stage"], "format")
+                self.assertEqual(set(record), {"diagnostic", "reason", "schema_version", "stage", "status"})
+                self.assertEqual(payload, subject._canonical_json(record)[:-1])
+
+    def test_source_gate_cleanup_failure_keeps_cleanup_priority_over_command_check(self):
+        class CleanupFailure(Exception):
+            reason = "cleanup_incomplete"
+            command_check = "nonzero_exit"
+
+        def fail_command(*unused_args, **unused_kwargs):
+            raise CleanupFailure()
+
+        rust = SimpleNamespace(_run_worker_command=fail_command)
+        with self.assertRaises(subject.Refusal) as raised:
+            subject._run_gates(
+                Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                rust, {"cargo": Path("/toolchain/bin/cargo")}, subject.time.monotonic() + 30,
+            )
+        self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+        self.assertEqual(raised.exception.stage, "cleanup")
+        attached = subject._FailureDiagnostics().attach(raised.exception, "source_gates")
+        self.assertNotIn(attached.diagnostic, subject.SOURCE_GATE_DIAGNOSTICS)
+        self.assertEqual(
+            set(json.loads(subject._format_refusal(attached))),
+            {"diagnostic", "reason", "schema_version", "stage", "status"},
+        )
+
+    def test_unexpected_command_error_keeps_capture_invalid_diagnostic_through_reattachment(self):
+        rust = subject._load_control_sibling("macos_rust_toolchain")
+
+        class ProbeFailure(Exception):
+            pass
+
+        def fail_command(*unused_args, **unused_kwargs):
+            raise RuntimeError("private helper detail")
+
+        capability = SimpleNamespace(ProbeFailure=ProbeFailure, _run_as_probe_user=fail_command)
+        with self.assertRaises(subject.Refusal) as raised:
+            subject._run_gates(
+                Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, capability,
+                rust, {"cargo": Path("/toolchain/bin/cargo")}, subject.time.monotonic() + 30,
+            )
+        attached = raised.exception
+        diagnostics = subject._FailureDiagnostics()
+        for operation in ("source_gates", "source_lease_open", "source_gates"):
+            attached = diagnostics.attach(attached, operation)
+        payload = subject._format_refusal(attached)
+        record = json.loads(payload)
+        self.assertEqual(
+            record,
+            {"diagnostic": "source_gate_capture_invalid", "reason": "capture_invalid",
+             "schema_version": 1, "stage": "format", "status": "refused"},
+        )
+        self.assertEqual(payload, subject._canonical_json(record)[:-1])
+        self.assertNotIn(b"private helper detail", payload)
+
     def test_source_cwd_is_restored_before_lease_removes_checkout_on_success_and_failure(self):
         original_cwd = Path.cwd()
         with tempfile.TemporaryDirectory() as temporary:
