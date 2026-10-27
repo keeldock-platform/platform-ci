@@ -49,6 +49,7 @@ PUBLIC_AUDIT_REASONS = frozenset((
     "canary_exposed",
     "workflow_command_exposed",
     "receipt_invalid",
+    "capture_invalid",
     "native_job_failed",
     "output_unavailable",
     "internal_error",
