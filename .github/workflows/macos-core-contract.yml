@@ -1,0 +1,594 @@
+name: macos-core-contract
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Reviewed source commit
+        required: true
+        type: string
+      base_sha:
+        description: Reviewed base commit
+        required: true
+        type: string
+      base_branch:
+        description: Reviewed base branch
+        required: true
+        type: choice
+        options:
+          - main
+          - develop
+          - uat
+cache-mode: none
+permissions: {}
+jobs:
+  macos-core-contract-settings:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 10
+    permissions:
+      actions: read
+    outputs:
+      cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_BASE_SHA: ${{ inputs.base_sha }}
+      REQUESTED_BASE_BRANCH: ${{ inputs.base_branch }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Validate requested source identity
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ \
+            || ! "$REQUESTED_BASE_SHA" =~ ^[a-f0-9]{40}$ \
+            || ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          case "$REQUESTED_BASE_BRANCH" in
+            main|develop|uat) ;;
+            *) exit 1 ;;
+          esac
+      - name: Verify source-read environment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py core-contract-settings
+      - name: Snapshot cache inventory
+        id: snapshot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py core-contract-snapshot
+  macos-core-contract:
+    needs: macos-core-contract-settings
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-15
+    environment: source-read
+    cache-mode: none
+    timeout-minutes: 60
+    permissions: {}
+    outputs:
+      reviewed_diff_sha256: ${{ steps.contract-binding.outputs.reviewed_diff_sha256 }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_BASE_SHA: ${{ inputs.base_sha }}
+      REQUESTED_BASE_BRANCH: ${{ inputs.base_branch }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Validate source-free control tree
+        run: |
+          set -euo pipefail
+          python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_public_tree.py
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
+          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+      - name: Run source-free reviewed build smoke
+        run: |
+          set -euo pipefail
+          if [[ -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]; then
+            exit 1
+          fi
+          sudo -n -- env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            CI_EVENT_NAME="$CI_EVENT_NAME" \
+            CI_REF="$CI_REF" \
+            CI_REPOSITORY="$CI_REPOSITORY" \
+            CI_SERVER_URL="$CI_SERVER_URL" \
+            CI_SHA="$CI_SHA" \
+            CI_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            ImageOS="$ImageOS" \
+            ImageVersion="$ImageVersion" \
+            RUNNER_HOME="$HOME" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            CI_WORKSPACE="$CI_WORKSPACE" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_reviewed_build.py --control-sha "$CI_SHA"
+      - name: Run source-free Rust toolchain smoke
+        run: |
+          set -euo pipefail
+          rust_marker_prefix="KD-RUST-"
+          rust_success_prefix="${rust_marker_prefix}SMOKE "
+          rust_refusal_prefix="${rust_marker_prefix}REFUSAL reason="
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ \
+            || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ \
+            || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "invalid_input"
+            exit 1
+          fi
+          if [[ -z "${RUNNER_TEMP:-}" || "$RUNNER_TEMP" != /* || -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "runner_unavailable"
+            exit 1
+          fi
+          if ! capture_dir="$(/usr/bin/mktemp -d "${RUNNER_TEMP%/}/rust-toolchain-smoke.XXXXXX" 2>/dev/null)"; then
+            printf '%s%s\n' "$rust_refusal_prefix" "runner_unavailable"
+            exit 1
+          fi
+          stdout_file="$capture_dir/stdout"
+          stderr_file="$capture_dir/stderr"
+          validated_file="$capture_dir/validated"
+          validator_stderr_file="$capture_dir/validator-stderr"
+          trap '/bin/rm -rf "$capture_dir" 2>/dev/null' EXIT
+          set +e
+          sudo -n -- /usr/bin/env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$CI_SHA" \
+            >"$stdout_file" 2>"$stderr_file"
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "smoke_failed"
+            exit 1
+          fi
+          set +e
+          /usr/bin/env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            CI_SHA="$CI_SHA" \
+            GITHUB_SHA="$GITHUB_SHA" \
+            GITHUB_REPOSITORY="$CI_REPOSITORY" \
+            GITHUB_EVENT_NAME="$CI_EVENT_NAME" \
+            GITHUB_REF="$CI_REF" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_public_audit.py rust-toolchain-publish \
+            <"$stdout_file" >"$validated_file" 2>"$validator_stderr_file"
+          validator_status=$?
+          set -e
+          if [[ "$validator_status" -ne 0 ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "capture_invalid"
+            exit 1
+          fi
+          if [[ ! -f "$validated_file" || ! -r "$validated_file" \
+            || "$(/usr/bin/wc -l < "$validated_file" 2>/dev/null)" -ne 1 \
+            || "$(/usr/bin/wc -c < "$validated_file" 2>/dev/null)" -gt 16384 ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "capture_invalid"
+            exit 1
+          fi
+          IFS= read -r receipt_line < "$validated_file" || {
+            printf '%s%s\n' "$rust_refusal_prefix" "capture_invalid"
+            exit 1
+          }
+          if [[ "$receipt_line" != "${rust_success_prefix}"* ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "capture_invalid"
+            exit 1
+          fi
+          if ! /bin/rm -rf "$capture_dir" 2>/dev/null; then
+            printf '%s%s\n' "$rust_refusal_prefix" "cleanup_incomplete"
+            exit 1
+          fi
+          trap - EXIT
+          if ! printf '%s\n' "$receipt_line" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"; then
+            printf '%s%s\n' "$rust_refusal_prefix" "runner_unavailable"
+            exit 1
+          fi
+          printf '%s\n' "$receipt_line"
+      - name: Write trusted summary visibility control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ \
+            || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ \
+            || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          if [[ -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            exit 1
+          fi
+          summary_prefix="macos-summary-"
+          summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT"
+          printf '%s\n' "$summary_line" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$summary_line"
+      - name: Validate protected contract binding
+        id: contract-binding
+        env:
+          CORE_CONTRACT_ALLOWED_SHA: ${{ vars.CORE_CONTRACT_ALLOWED_SHA }}
+          CORE_CONTRACT_ALLOWED_CONTROL_SHA: ${{ vars.CORE_CONTRACT_ALLOWED_CONTROL_SHA }}
+          CORE_CONTRACT_REVIEWED_SOURCE_SHA: ${{ vars.CORE_CONTRACT_REVIEWED_SOURCE_SHA }}
+          CORE_CONTRACT_REVIEWED_BASE_SHA: ${{ vars.CORE_CONTRACT_REVIEWED_BASE_SHA }}
+          CORE_CONTRACT_REVIEWED_BASE_BRANCH: ${{ vars.CORE_CONTRACT_REVIEWED_BASE_BRANCH }}
+          CORE_CONTRACT_REVIEWED_CANDIDATE_REF: ${{ secrets.CORE_CONTRACT_REVIEWED_CANDIDATE_REF }}
+          CORE_CONTRACT_REVIEWED_DIFF_SHA256: ${{ vars.CORE_CONTRACT_REVIEWED_DIFF_SHA256 }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ \
+            || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ \
+            || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ \
+            || ! "$REQUESTED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ \
+            || ! "$REQUESTED_BASE_SHA" =~ ^[a-f0-9]{40}$ \
+            || ! "$CORE_CONTRACT_REVIEWED_DIFF_SHA256" =~ ^[a-f0-9]{64}$ ]]; then
+            exit 1
+          fi
+          case "$REQUESTED_BASE_BRANCH" in
+            main|develop|uat) ;;
+            *) exit 1 ;;
+          esac
+          if [[ "$CORE_CONTRACT_ALLOWED_SHA" != "$REQUESTED_SOURCE_SHA" \
+            || "$CORE_CONTRACT_ALLOWED_CONTROL_SHA" != "$CI_SHA" \
+            || "$CORE_CONTRACT_REVIEWED_SOURCE_SHA" != "$REQUESTED_SOURCE_SHA" \
+            || "$CORE_CONTRACT_REVIEWED_BASE_SHA" != "$REQUESTED_BASE_SHA" \
+            || "$CORE_CONTRACT_REVIEWED_BASE_BRANCH" != "$REQUESTED_BASE_BRANCH" ]]; then
+            exit 1
+          fi
+          if [[ -z "$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" \
+            || "$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" != refs/heads/* ]]; then
+            exit 1
+          fi
+          if [[ "$REQUESTED_SOURCE_SHA" == "$REQUESTED_BASE_SHA" ]]; then
+            if [[ "$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" != "refs/heads/$REQUESTED_BASE_BRANCH" ]]; then
+              exit 1
+            fi
+            candidate_class="permanent-tip"
+          else
+            case "$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" in
+              refs/heads/feat/*|refs/heads/fix/*|refs/heads/chore/*|refs/heads/plan/*) ;;
+              *) exit 1 ;;
+            esac
+            candidate_class="signed-descendant"
+          fi
+          contract_prefix="macos-core-contract-"
+          printf '%sbinding=verified schema=1 control-sha=%s run-id=%s run-attempt=%s source-sha=%s base-sha=%s base-branch=%s candidate-class=%s reviewed-diff-sha256=%s\n' \
+            "$contract_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+            "$REQUESTED_SOURCE_SHA" "$REQUESTED_BASE_SHA" "$REQUESTED_BASE_BRANCH" \
+            "$candidate_class" "$CORE_CONTRACT_REVIEWED_DIFF_SHA256"
+          printf 'reviewed_diff_sha256=%s\n' "$CORE_CONTRACT_REVIEWED_DIFF_SHA256" 2>/dev/null >> "$GITHUB_OUTPUT"
+      - name: Validate source-reader scope configuration
+        env:
+          SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
+          SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$SOURCE_READER_CLIENT_ID" =~ ^[A-Za-z0-9]{20,100}$ \
+            || ! "$SOURCE_READER_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ \
+            || ! "$SOURCE_REPOSITORY_ID" =~ ^[1-9][0-9]{0,18}$ \
+            || ! "$SOURCE_REPOSITORY_OWNER" =~ ^[A-Za-z0-9_.-]{1,100}$ \
+            || ! "$SOURCE_REPOSITORY_NAME" =~ ^[A-Za-z0-9_.-]{1,100}$ ]]; then
+            exit 1
+          fi
+          if [[ "$SOURCE_REPOSITORY_ID" != "1430959909" ]]; then
+            exit 1
+          fi
+          reader_prefix="macos-core-contract-reader-"
+          printf '%sscope=verified schema=1 control-sha=%s run-id=%s run-attempt=%s repository-id=%s\n' \
+            "$reader_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_REPOSITORY_ID"
+      - name: Mint scoped source-reader token
+        id: source-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.SOURCE_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+          owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+          permission-contents: read
+          permission-metadata: read
+      - name: Verify selected installation identity
+        env:
+          EXPECTED_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          ACTUAL_INSTALLATION_ID: ${{ steps.source-token.outputs.installation-id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$EXPECTED_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ \
+            || "$ACTUAL_INSTALLATION_ID" != "$EXPECTED_INSTALLATION_ID" ]]; then
+            exit 1
+          fi
+          reader_prefix="macos-core-contract-reader-"
+          printf '%sinstallation=verified schema=1 control-sha=%s run-id=%s run-attempt=%s installation-id=%s\n' \
+            "$reader_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$ACTUAL_INSTALLATION_ID"
+      - name: Run fixed core contract
+        id: core-contract
+        env:
+          SOURCE_READER_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+          CORE_CONTRACT_ALLOWED_SHA: ${{ vars.CORE_CONTRACT_ALLOWED_SHA }}
+          CORE_CONTRACT_ALLOWED_CONTROL_SHA: ${{ vars.CORE_CONTRACT_ALLOWED_CONTROL_SHA }}
+          CORE_CONTRACT_REVIEWED_SOURCE_SHA: ${{ vars.CORE_CONTRACT_REVIEWED_SOURCE_SHA }}
+          CORE_CONTRACT_REVIEWED_BASE_SHA: ${{ vars.CORE_CONTRACT_REVIEWED_BASE_SHA }}
+          CORE_CONTRACT_REVIEWED_BASE_BRANCH: ${{ vars.CORE_CONTRACT_REVIEWED_BASE_BRANCH }}
+          CORE_CONTRACT_REVIEWED_CANDIDATE_REF: ${{ secrets.CORE_CONTRACT_REVIEWED_CANDIDATE_REF }}
+          CORE_CONTRACT_REVIEWED_DIFF_SHA256: ${{ vars.CORE_CONTRACT_REVIEWED_DIFF_SHA256 }}
+        run: |
+          set -euo pipefail
+          contract_marker_prefix="KD-CORE-"
+          contract_success_prefix="${contract_marker_prefix}CONTRACT "
+          contract_refusal_prefix="${contract_marker_prefix}CONTRACT-REFUSAL "
+          if [[ -z "${ImageOS:-}" || -z "${ImageVersion:-}" \
+            || -z "${RUNNER_TEMP:-}" || "$RUNNER_TEMP" != /* \
+            || -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            exit 1
+          fi
+          if ! capture_dir="$(/usr/bin/mktemp -d "${RUNNER_TEMP%/}/core-contract.XXXXXX" 2>/dev/null)"; then
+            exit 1
+          fi
+          stdout_file="$capture_dir/stdout"
+          stderr_file="$capture_dir/stderr"
+          validated_file="$capture_dir/validated"
+          validator_stderr_file="$capture_dir/validator-stderr"
+          trap '/bin/rm -rf "$capture_dir" 2>/dev/null' EXIT
+          set +e
+          printf '%s' "$SOURCE_READER_TOKEN" | sudo -n -- /usr/bin/env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME=/var/root \
+            LANG=C \
+            LC_ALL=C \
+            PYTHONDONTWRITEBYTECODE=1 \
+            CI_EVENT_NAME="$CI_EVENT_NAME" \
+            CI_REF="$CI_REF" \
+            CI_REPOSITORY="$CI_REPOSITORY" \
+            CI_SERVER_URL="$CI_SERVER_URL" \
+            CI_SHA="$CI_SHA" \
+            CI_WORKSPACE="$CI_WORKSPACE" \
+            CI_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            GITHUB_ENV="$GITHUB_ENV" \
+            GITHUB_OUTPUT="$GITHUB_OUTPUT" \
+            GITHUB_PATH="$GITHUB_PATH" \
+            GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            ImageOS="$ImageOS" \
+            ImageVersion="$ImageVersion" \
+            RUNNER_HOME="$HOME" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            REQUESTED_SOURCE_SHA="$REQUESTED_SOURCE_SHA" \
+            REQUESTED_BASE_SHA="$REQUESTED_BASE_SHA" \
+            REQUESTED_BASE_BRANCH="$REQUESTED_BASE_BRANCH" \
+            CORE_CONTRACT_ALLOWED_SHA="$CORE_CONTRACT_ALLOWED_SHA" \
+            CORE_CONTRACT_ALLOWED_CONTROL_SHA="$CORE_CONTRACT_ALLOWED_CONTROL_SHA" \
+            CORE_CONTRACT_REVIEWED_SOURCE_SHA="$CORE_CONTRACT_REVIEWED_SOURCE_SHA" \
+            CORE_CONTRACT_REVIEWED_BASE_SHA="$CORE_CONTRACT_REVIEWED_BASE_SHA" \
+            CORE_CONTRACT_REVIEWED_BASE_BRANCH="$CORE_CONTRACT_REVIEWED_BASE_BRANCH" \
+            CORE_CONTRACT_REVIEWED_CANDIDATE_REF="$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" \
+            CORE_CONTRACT_REVIEWED_DIFF_SHA256="$CORE_CONTRACT_REVIEWED_DIFF_SHA256" \
+            SOURCE_READER_INSTALLATION_ID="$SOURCE_READER_INSTALLATION_ID" \
+            SOURCE_READER_CLIENT_ID="$SOURCE_READER_CLIENT_ID" \
+            SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
+            SOURCE_REPOSITORY_OWNER="$SOURCE_REPOSITORY_OWNER" \
+            SOURCE_REPOSITORY_NAME="$SOURCE_REPOSITORY_NAME" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+            -I -S -B kit/confinement/macos_core_contract.py run --token-stdin \
+            --source-sha "$REQUESTED_SOURCE_SHA" --base-sha "$REQUESTED_BASE_SHA" \
+            --base-branch "$REQUESTED_BASE_BRANCH" \
+            >"$stdout_file" 2>"$stderr_file"
+          driver_status=$?
+          set -e
+          set +e
+          /usr/bin/env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            CI_SHA="$CI_SHA" \
+            GITHUB_SHA="$GITHUB_SHA" \
+            GITHUB_REPOSITORY="$CI_REPOSITORY" \
+            GITHUB_EVENT_NAME="$CI_EVENT_NAME" \
+            GITHUB_REF="$CI_REF" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            REQUESTED_SOURCE_SHA="$REQUESTED_SOURCE_SHA" \
+            REQUESTED_BASE_SHA="$REQUESTED_BASE_SHA" \
+            REQUESTED_BASE_BRANCH="$REQUESTED_BASE_BRANCH" \
+            CORE_CONTRACT_ALLOWED_SHA="$CORE_CONTRACT_ALLOWED_SHA" \
+            CORE_CONTRACT_ALLOWED_CONTROL_SHA="$CORE_CONTRACT_ALLOWED_CONTROL_SHA" \
+            CORE_CONTRACT_REVIEWED_SOURCE_SHA="$CORE_CONTRACT_REVIEWED_SOURCE_SHA" \
+            CORE_CONTRACT_REVIEWED_BASE_SHA="$CORE_CONTRACT_REVIEWED_BASE_SHA" \
+            CORE_CONTRACT_REVIEWED_BASE_BRANCH="$CORE_CONTRACT_REVIEWED_BASE_BRANCH" \
+            CORE_CONTRACT_REVIEWED_CANDIDATE_REF="$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" \
+            CORE_CONTRACT_REVIEWED_DIFF_SHA256="$CORE_CONTRACT_REVIEWED_DIFF_SHA256" \
+            SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
+            ImageOS="$ImageOS" \
+            ImageVersion="$ImageVersion" \
+            DRIVER_EXIT_STATUS="$driver_status" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+            -I -S -B kit/confinement/macos_public_audit.py core-contract-publish \
+            <"$stdout_file" >"$validated_file" 2>"$validator_stderr_file"
+          validator_status=$?
+          set -e
+          if [[ "$validator_status" -ne 0 || ! -f "$validated_file" || ! -r "$validated_file" \
+            || "$(/usr/bin/wc -l < "$validated_file" 2>/dev/null)" -ne 1 \
+            || "$(/usr/bin/wc -c < "$validated_file" 2>/dev/null)" -gt 8192 ]]; then
+            exit 1
+          fi
+          IFS= read -r contract_line < "$validated_file" || exit 1
+          if [[ "$driver_status" -eq 0 && "$contract_line" == "${contract_success_prefix}"* ]]; then
+            if ! printf 'token_revocation=confirmed\n' 2>/dev/null >> "$GITHUB_OUTPUT"; then
+              exit 1
+            fi
+            if ! /bin/rm -rf "$capture_dir" 2>/dev/null; then
+              exit 1
+            fi
+            trap - EXIT
+            if ! printf '%s\n' "$contract_line" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"; then
+              exit 1
+            fi
+            printf '%s\n' "$contract_line"
+            exit 0
+          fi
+          if [[ "$driver_status" -ne 0 && "$contract_line" == "${contract_refusal_prefix}"* ]]; then
+            if ! /bin/rm -rf "$capture_dir" 2>/dev/null; then
+              exit 1
+            fi
+            trap - EXIT
+            printf '%s\n' "$contract_line"
+            exit 1
+          fi
+          exit 1
+      - name: Revoke token if contract did not confirm
+        if: ${{ always() && steps.source-token.outcome == 'success' && steps.core-contract.outputs.token_revocation != 'confirmed' }}
+        env:
+          SOURCE_READER_TOKEN: ${{ steps.source-token.outputs.token }}
+          SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+        run: |
+          set -euo pipefail
+          cleanup_marker_prefix="macos-core-contract-"
+          if [[ -z "$SOURCE_READER_TOKEN" || -z "$GITHUB_STEP_SUMMARY" ]]; then
+            exit 1
+          fi
+          cleanup_prefix='{'
+          cleanup_record="${cleanup_prefix}\"metadata\":\"verified\",\"reason\":\"ok\",\"repository_scope\":\"verified\",\"revocation\":\"confirmed\",\"schema_version\":1,\"status\":\"passed\"}"
+          set +e
+          revoke_output="$(printf '%s' "$SOURCE_READER_TOKEN" | sudo -n -- /usr/bin/env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+            -I -S -B kit/confinement/macos_core_bootstrap.py --phase revoke --token-stdin 2>/dev/null)"
+          revoke_status=$?
+          set -e
+          if [[ "$revoke_status" -ne 0 || "$revoke_output" != "$cleanup_record" ]]; then
+            printf '%scleanup=unconfirmed schema=1 control-sha=%s run-id=%s run-attempt=%s\n' \
+              "$cleanup_marker_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            exit 1
+          fi
+          printf '%scleanup=confirmed schema=1 control-sha=%s run-id=%s run-attempt=%s\n' \
+            "$cleanup_marker_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+      - name: Write trusted contract summary control
+        if: ${{ success() && steps.core-contract.outputs.token_revocation == 'confirmed' }}
+        env:
+          CORE_CONTRACT_REVIEWED_DIFF_SHA256: ${{ vars.CORE_CONTRACT_REVIEWED_DIFF_SHA256 }}
+        run: |
+          set -euo pipefail
+          contract_summary_prefix="macos-core-contract-summary-"
+          contract_summary_line="${contract_summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT source-sha=$REQUESTED_SOURCE_SHA base-sha=$REQUESTED_BASE_SHA reviewed-diff-sha256=$CORE_CONTRACT_REVIEWED_DIFF_SHA256"
+          printf '%s\n' "$contract_summary_line" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$contract_summary_line"
+  macos-core-contract-audit:
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    needs:
+      - macos-core-contract-settings
+      - macos-core-contract
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      checks: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_BASE_SHA: ${{ inputs.base_sha }}
+      REQUESTED_BASE_BRANCH: ${{ inputs.base_branch }}
+      MACOS_CACHE_SNAPSHOT: ${{ needs.macos-core-contract-settings.outputs.cache_snapshot }}
+      REVIEWED_DIFF_SHA256: ${{ needs.macos-core-contract.outputs.reviewed_diff_sha256 }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Audit core contract public surfaces
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py core-contract-audit

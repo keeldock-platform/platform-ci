@@ -42,6 +42,15 @@ class RequestTests(unittest.TestCase):
         ))
         self.assertEqual(request["concern"], "rules-bootstrap")
 
+    def test_core_contract_request_is_closed(self):
+        request = subject.parse_request((
+            "--source-sha", "a" * 40,
+            "--base-sha", "b" * 40,
+            "--base-branch", "main",
+            "--concern", "core-contract",
+        ))
+        self.assertEqual(request["concern"], "core-contract")
+
     def test_extra_or_unrecognized_arguments_refuse(self):
         values = (
             "--source-sha", "a" * 40,
@@ -81,6 +90,29 @@ class BootstrapGateTests(unittest.TestCase):
             subject._check_rules_bootstrap_gate(request, environment)
         self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
 
+    def test_core_contract_requires_its_own_exact_protected_shas(self):
+        request = {
+            "source_sha": "a" * 40,
+            "base_sha": "b" * 40,
+            "base_branch": "main",
+            "concern": "core-contract",
+        }
+        environment = {
+            "CI_SHA": "c" * 40,
+            subject.CORE_CONTRACT_SOURCE_GATE_ENV: "a" * 40,
+            subject.CORE_CONTRACT_CONTROL_GATE_ENV: "c" * 40,
+        }
+        subject._check_core_contract_gate(request, environment)
+        for key, value in (
+            (subject.CORE_CONTRACT_SOURCE_GATE_ENV, "d" * 40),
+            (subject.CORE_CONTRACT_CONTROL_GATE_ENV, "d" * 40),
+            ("CI_SHA", "invalid"),
+        ):
+            changed = dict(environment, **{key: value})
+            with self.subTest(key=key), self.assertRaises(subject.Refusal) as result:
+                subject._check_core_contract_gate(request, changed)
+            self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
+
     def test_missing_rules_gate_refuses_before_context_or_helper_loading(self):
         request = {
             "source_sha": "a" * 40,
@@ -102,6 +134,51 @@ class BootstrapGateTests(unittest.TestCase):
         self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
         context.assert_not_called()
         reader.assert_not_called()
+
+    def test_missing_core_contract_gate_refuses_before_context_or_helper_loading(self):
+        request = {
+            "source_sha": "a" * 40,
+            "base_sha": "b" * 40,
+            "base_branch": "main",
+            "concern": "core-contract",
+        }
+        binding = {
+            "control_sha": "c" * 40,
+            "run_id": "1",
+            "run_attempt": "1",
+            "image_os": "macos-test",
+            "image_version": "1",
+        }
+        environment = {
+            "CI_SHA": "c" * 40,
+            subject.RULES_BOOTSTRAP_SOURCE_GATE_ENV: "a" * 40,
+            subject.RULES_BOOTSTRAP_CONTROL_GATE_ENV: "c" * 40,
+        }
+        with patch.object(subject, "_safe_context") as context, patch.object(subject, "_load_source_reader") as reader:
+            with self.assertRaises(subject.Refusal) as result:
+                with subject.validated_source(request, binding, Path("/missing"), environment):
+                    self.fail("unapproved contract source lease opened")
+        self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
+        context.assert_not_called()
+        reader.assert_not_called()
+
+    def test_core_contract_snapshot_cannot_be_opened_with_rules_gate_values(self):
+        request = {
+            "source_sha": "a" * 40,
+            "base_sha": "b" * 40,
+            "base_branch": "main",
+            "concern": "core-contract",
+        }
+        environment = {
+            "CI_SHA": "c" * 40,
+            subject.RULES_BOOTSTRAP_SOURCE_GATE_ENV: "a" * 40,
+            subject.RULES_BOOTSTRAP_CONTROL_GATE_ENV: "c" * 40,
+        }
+        with patch.object(subject, "_resolve_trusted_executable") as resolve:
+            with self.assertRaises(subject.Refusal) as result:
+                subject._source_snapshot(request, {}, Path("/tmp"), environment)
+        self.assertEqual((result.exception.reason, result.exception.stage), ("bootstrap_not_approved", "configuration"))
+        resolve.assert_not_called()
 
     def test_missing_candidate_ref_refuses_before_context_or_helper_loading(self):
         request = {
@@ -145,6 +222,24 @@ class SourceRefTests(unittest.TestCase):
             "refs/heads/feat/reviewed-candidate",
         )
 
+    def test_core_contract_descendant_requires_fixed_safe_candidate_ref(self):
+        request = {
+            "source_sha": "a" * 40,
+            "base_sha": "b" * 40,
+            "base_branch": "main",
+            "concern": "core-contract",
+        }
+        self.assertEqual(
+            subject._check_source_ref_binding(
+                request,
+                {subject.SOURCE_CANDIDATE_REF_ENV: "refs/heads/feat/reviewed-contract"},
+            ),
+            "refs/heads/feat/reviewed-contract",
+        )
+        for value in ("refs/heads/users/candidate", "refs/heads/feat/../candidate"):
+            with self.subTest(value=value), self.assertRaises(subject.Refusal):
+                subject._check_source_ref_binding(request, {subject.SOURCE_CANDIDATE_REF_ENV: value})
+
     def test_invalid_candidate_ref_and_core_descendant_refuse(self):
         request = {
             "source_sha": "a" * 40,
@@ -176,6 +271,152 @@ class SourceRefTests(unittest.TestCase):
         self.assertIsNone(
             subject._check_source_ref_binding(request, {subject.SOURCE_CANDIDATE_REF_ENV: "refs/heads/develop"})
         )
+
+
+class CoreContractTreeTests(unittest.TestCase):
+    def test_core_contract_path_scope_is_limited_to_workspace_and_three_crates(self):
+        for path in subject.CORE_CONTRACT_ROOT_FILES:
+            self.assertEqual(subject._core_contract_expected_mode(path), "100644")
+        for root in subject.CORE_CONTRACT_CRATE_ROOTS:
+            prefix = "/".join(root)
+            for path in (
+                prefix + "/Cargo.toml",
+                prefix + "/README.md",
+                prefix + "/CONTRACT.md",
+                prefix + "/CHANGELOG.md",
+                prefix + "/src/lib.rs",
+                prefix + "/tests/nested/contract.rs",
+            ):
+                with self.subTest(path=path):
+                    self.assertEqual(subject._core_contract_expected_mode(path), "100644")
+        for path in (
+            "crates/host/core/src/lib.rs",
+            "crates/host/api/build.rs",
+            "crates/host/api/src/build.rs",
+            "crates/host/api/tests/build.rs",
+            ".cargo/config.toml",
+            "ci/run-suite.sh",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(subject._core_contract_expected_mode(path))
+
+    def test_rules_lock_requires_v2_and_only_manifested_installed_files(self):
+        rules_file = subject.RULES_DIRECTORY + "/rules/shared/rust.md"
+        hooks_file = subject.RULES_DIRECTORY + "/hooks/shared/check-shared-lock.sh"
+        digest = hashlib.sha256(b"fixture").hexdigest()
+        payload = (
+            "format 3\n"
+            "profile full\n"
+            "tag v2.4.1\n"
+            "signature verified\n"
+            "file AGENTS.md " + digest + "\n"
+            "file " + rules_file + " " + digest + "\n"
+            "file " + hooks_file + " " + digest + "\n"
+        ).encode("ascii")
+        self.assertEqual(set(subject._rules_v2_file_manifest(payload)), {"AGENTS.md", rules_file, hooks_file})
+        for invalid in (
+            payload.replace(b"tag v2.4.1", b"tag v1.4.1"),
+            payload.replace(rules_file.encode("ascii"), b"outside/rules.md"),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(subject.Refusal):
+                subject._rules_v2_file_manifest(invalid)
+
+    def test_contract_tree_parser_refuses_a_link_entry(self):
+        payload = b"120000 blob " + b"a" * 40 + b"\tcrates/host/api/src/lib.rs\x00"
+        result = subject.subprocess.CompletedProcess(("git",), 0, payload, b"")
+        with patch.object(subject, "_run_process", return_value=result):
+            with self.assertRaises(subject.Refusal) as refusal:
+                subject._contract_tree_entries("repository", "/usr/bin/git", {}, "a" * 40)
+        self.assertEqual((refusal.exception.reason, refusal.exception.stage), ("bootstrap_snapshot_invalid", "bootstrap"))
+
+    def test_core_contract_keeps_signer_authority_and_installed_rules_from_base(self):
+        signer = "/".join(subject.SIGNER_PATH_PARTS)
+        lock = subject.RULES_LOCK_PATH
+        base = {
+            signer: ("100644", "a" * 40),
+            lock: ("100644", "b" * 40),
+        }
+        self.assertTrue(subject._core_contract_policy_matches_base(base, dict(base)))
+        changed_signer = dict(base)
+        changed_signer[signer] = ("100644", "c" * 40)
+        changed_rules = dict(base)
+        changed_rules[lock] = ("100644", "d" * 40)
+        added_rules = dict(base)
+        added_rules[subject.RULES_DIRECTORY + "/rules/shared/extra.md"] = ("100644", "e" * 40)
+        self.assertFalse(subject._core_contract_policy_matches_base(base, changed_signer))
+        self.assertFalse(subject._core_contract_policy_matches_base(base, changed_rules))
+        self.assertFalse(subject._core_contract_policy_matches_base(base, added_rules))
+
+
+class CoreContractLeaseTests(unittest.TestCase):
+    def test_core_contract_uses_read_only_worker_lease_and_strict_cleanup(self):
+        source_sha = "d" * 40
+        base_sha = "b" * 40
+        control_sha = "c" * 40
+        branch = "refs/heads/feat/reviewed-contract"
+        request = {
+            "source_sha": source_sha,
+            "base_sha": base_sha,
+            "base_branch": "main",
+            "concern": "core-contract",
+        }
+        binding = {
+            "control_sha": control_sha,
+            "run_id": "12",
+            "run_attempt": "1",
+            "image_os": "macos-test",
+            "image_version": "1",
+        }
+        environment = {
+            "CI_SHA": control_sha,
+            subject.CORE_CONTRACT_SOURCE_GATE_ENV: source_sha,
+            subject.CORE_CONTRACT_CONTROL_GATE_ENV: control_sha,
+            subject.SOURCE_CANDIDATE_REF_ENV: branch,
+        }
+        record = {
+            "source_sha": source_sha,
+            "base_sha": base_sha,
+            "base_branch": "main",
+            "concern": "core-contract",
+            "candidate_class": "signed-descendant",
+            "signature": "verified",
+            "rules_lock": "present",
+            "tree": "core_contract",
+            "source_execution": "not_run",
+            "app_build": "not_run",
+            "cleanup": "lease_open",
+        }
+        with tempfile.TemporaryDirectory() as parent:
+            root = Path(parent).resolve()
+            storage = Path("/tmp/core-contract-storage")
+            temporary = Path("/tmp/core-contract-snapshot")
+            source = temporary / "source"
+            snapshot = patch.object(subject, "_source_snapshot", return_value=(record, temporary, source))
+            worker_grant = patch.object(subject, "_grant_worker_readonly", return_value="/usr/bin/python3")
+            worker_absent = patch.object(subject, "_assert_worker_absent")
+            with patch.object(subject, "_safe_context", return_value=(binding, root)), \
+                    patch.object(subject, "_check_worker_identity"), \
+                    patch.object(subject, "_validate_storage_root", return_value=storage), \
+                    patch.object(subject, "_add_storage_search_acl") as add_acl, \
+                    snapshot as source_snapshot, worker_grant as grant, worker_absent as absent, \
+                    patch.object(subject, "_remove_tree") as remove_tree, \
+                    patch.object(subject, "_remove_storage_search_acl") as remove_acl:
+                with subject.validated_source(
+                    request, binding, root, environment, worker_uid=501, storage_root=storage,
+                ) as lease:
+                    self.assertEqual(lease.record["concern"], "core-contract")
+                    self.assertEqual(lease.record["tree"], "core_contract")
+                    self.assertEqual(lease.record["worker_access"], "uid_read_only")
+                    self.assertEqual(lease.record["token_revocation"], "confirmed_before_yield")
+                    self.assertEqual(lease.record["source_execution"], "not_run_at_yield")
+                self.assertEqual(add_acl.call_count, 1)
+                self.assertEqual(grant.call_count, 1)
+                self.assertEqual(absent.call_count, 1)
+                self.assertEqual(remove_tree.call_args.args, (temporary,))
+                self.assertEqual(remove_acl.call_args.args, (storage,))
+                self.assertEqual(source_snapshot.call_args.kwargs["candidate_ref"], branch)
+                self.assertTrue(source_snapshot.call_args.kwargs["retain"])
+                self.assertEqual(source_snapshot.call_args.kwargs["temp_parent"], storage)
 
 
 @unittest.skipUnless(subject.os.name == "posix", "storage-root semantics use POSIX paths")
@@ -618,8 +859,12 @@ class EvidenceTests(unittest.TestCase):
             "concern": concern,
             "candidate_class": "permanent-tip",
             "signature": "verified",
-            "rules_lock": "present" if concern == "core-bootstrap" else "not-applicable",
-            "tree": "core_administrative" if concern == "core-bootstrap" else "rules_regular_files",
+            "rules_lock": "not-applicable" if concern == "rules-bootstrap" else "present",
+            "tree": {
+                "core-bootstrap": "core_administrative",
+                "rules-bootstrap": "rules_regular_files",
+                "core-contract": "core_contract",
+            }[concern],
             "source_execution": "not_run_at_yield",
             "app_build": "not_run",
             "cleanup": "complete",
@@ -669,6 +914,22 @@ class EvidenceTests(unittest.TestCase):
         }
         line = subject._format_success(self._record("rules-bootstrap"), binding)
         self.assertIn("rules-lock=not-applicable", line.split())
+
+    def test_core_contract_receipt_requires_v2_tree_and_worker_lease(self):
+        binding = {
+            "control_sha": "c" * 40,
+            "run_id": "12",
+            "run_attempt": "1",
+            "image_os": "macos-test",
+            "image_version": "1",
+        }
+        record = self._record("core-contract")
+        record["candidate_class"] = "signed-descendant"
+        record["source_sha"] = "d" * 40
+        line = subject._format_success(record, binding)
+        self.assertIn("concern=core-contract", line.split())
+        self.assertIn("rules-lock=present", line.split())
+        self.assertIn("source-execution=not-run", line.split())
 
     def test_candidate_class_must_match_source_and_base_binding(self):
         binding = {

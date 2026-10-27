@@ -82,7 +82,7 @@ OWNER_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 FINGERPRINT_PATTERN = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 BRANCHES = frozenset(("main", "develop", "uat"))
-CONCERNS = frozenset(("core-bootstrap", "rules-bootstrap"))
+CONCERNS = frozenset(("core-bootstrap", "rules-bootstrap", "core-contract"))
 REASONS = frozenset((
     "invalid_input",
     "context_unavailable",
@@ -116,13 +116,27 @@ SOURCE_REPOSITORY_NAME_ENV = "SOURCE_REPOSITORY_NAME"
 SOURCE_CANDIDATE_REF_ENV = "SOURCE_CANDIDATE_REF"
 RULES_BOOTSTRAP_SOURCE_GATE_ENV = "RULES_BOOTSTRAP_ALLOWED_SHA"
 RULES_BOOTSTRAP_CONTROL_GATE_ENV = "RULES_BOOTSTRAP_ALLOWED_CONTROL_SHA"
+CORE_CONTRACT_SOURCE_GATE_ENV = "CORE_CONTRACT_ALLOWED_SHA"
+CORE_CONTRACT_CONTROL_GATE_ENV = "CORE_CONTRACT_ALLOWED_CONTROL_SHA"
 REVOCATION_INVENTORY = "ci/revoked-signer-fingerprints"
 SIGNER_PATH_PARTS = ("docs", "commit-signers")
 RULES_DIRECTORY = chr(46) + "claude"
 RULES_LOCK_PATH = RULES_DIRECTORY + "/shared.lock"
+CORE_CONTRACT_CRATE_ROOTS = (
+    ("crates", "host", "api"),
+    ("crates", "host", "mock"),
+    ("crates", "host", "conformance"),
+)
+CORE_CONTRACT_ROOT_FILES = frozenset((
+    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml",
+))
+CORE_CONTRACT_PACKAGE_FILES = frozenset(("Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md"))
+CORE_CONTRACT_RULES_TAG_PATTERN = re.compile(r"tag v2\.[0-9]+\.[0-9]+\Z")
+CORE_CONTRACT_TOOLCHAIN = b'[toolchain]\nchannel = "1.99.1"\ncomponents = ["rustfmt", "clippy"]\nprofile = "minimal"\n'
 MAX_SIGNER_BYTES = 65536
 MAX_INVENTORY_BYTES = 16384
 MAX_TREE_BYTES = 1024 * 1024
+MAX_CORE_CONTRACT_FILE_BYTES = 1024 * 1024
 MAX_GIT_OUTPUT = 65536
 MAX_COMMITS = 20000
 MAX_TREE_ENTRIES = 20000
@@ -965,6 +979,241 @@ def _safe_rules_tree(repository, git_executable, repo_env, commit):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
 
 
+def _contract_tree_entries(repository, git_executable, repo_env, commit):
+    result = _run_process(
+        (git_executable, "ls-tree", "-r", "-z", commit),
+        cwd=repository,
+        environ=repo_env,
+        max_output=MAX_TREE_BYTES,
+        stage="bootstrap",
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_TREE_BYTES:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    if result.stdout and not result.stdout.endswith(b"\x00"):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    entries = {}
+    folded = set()
+    for raw_entry in result.stdout.split(b"\x00"):
+        if not raw_entry:
+            continue
+        try:
+            metadata, path_bytes = raw_entry.split(b"\t", 1)
+            mode, object_type, object_id = metadata.decode("ascii").split()
+            path = path_bytes.decode("utf-8", "strict")
+        except (ValueError, UnicodeDecodeError):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+        components = path.split("/")
+        if (
+            len(entries) >= MAX_TREE_ENTRIES
+            or object_type != "blob"
+            or mode not in ("100644", "100755")
+            or re.fullmatch(r"[a-f0-9]{40}", object_id) is None
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in ("", ".", "..") for part in components)
+            or components[0] == ".git"
+            or unicodedata.normalize("NFC", path) != path
+            or re.fullmatch(r"[A-Za-z0-9._/-]+", path) is None
+            or path.casefold() in folded
+        ):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+        entries[path] = (mode, object_id)
+        folded.add(path.casefold())
+    return entries
+
+
+def _contract_blob(repository, git_executable, repo_env, entries, path):
+    entry = entries.get(path)
+    if entry is None or entry[0] not in ("100644", "100755"):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    result = _run_process(
+        (git_executable, "cat-file", "blob", entry[1]),
+        cwd=repository,
+        environ=repo_env,
+        max_output=MAX_CORE_CONTRACT_FILE_BYTES,
+        stage="bootstrap",
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_CORE_CONTRACT_FILE_BYTES:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    return result.stdout
+
+
+def _core_contract_admin_mode(path):
+    root_files = {".gitignore", "AGENTS.md", "CLAUDE.md", "README.md"}
+    known_paths = {
+        RULES_LOCK_PATH,
+        RULES_DIRECTORY + "/settings.json",
+        "/".join(SIGNER_PATH_PARTS),
+    }
+    if path in root_files or path in known_paths:
+        return "100644"
+    if path.startswith(RULES_DIRECTORY + "/rules/shared/") and path.endswith(".md"):
+        return "100644"
+    if path.startswith(RULES_DIRECTORY + "/hooks/shared/") and path.endswith(".sh"):
+        return "100755"
+    return None
+
+
+def _core_contract_package_mode(path):
+    package_files = CORE_CONTRACT_PACKAGE_FILES
+    for crate_root in CORE_CONTRACT_CRATE_ROOTS:
+        prefix = "/".join(crate_root)
+        if path.startswith(prefix + "/"):
+            relative = path[len(prefix) + 1:]
+            if relative in package_files:
+                return "100644"
+            if (
+                relative.startswith(("src/", "tests/"))
+                and relative.endswith(".rs")
+                and relative.rsplit("/", 1)[-1] != "build.rs"
+            ):
+                return "100644"
+    return None
+
+
+def _core_contract_expected_mode(path):
+    if path in CORE_CONTRACT_ROOT_FILES:
+        return "100644"
+    admin_mode = _core_contract_admin_mode(path)
+    if admin_mode is not None:
+        return admin_mode
+    return _core_contract_package_mode(path)
+
+
+def _rules_v2_file_manifest(payload):
+    try:
+        text = payload.decode("ascii", "strict")
+        lines = text.splitlines()
+    except (AttributeError, UnicodeDecodeError):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+    if b"\r" in payload or not payload.endswith(b"\n"):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    for required in ("format 3", "profile full", "signature verified"):
+        if lines.count(required) != 1:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    tags = [line for line in lines if line.startswith("tag ")]
+    if len(tags) != 1 or CORE_CONTRACT_RULES_TAG_PATTERN.fullmatch(tags[0]) is None:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    files = {}
+    folded = set()
+    rules_prefix = RULES_DIRECTORY + "/rules/shared/"
+    hooks_prefix = RULES_DIRECTORY + "/hooks/shared/"
+    for line in lines:
+        if not line.startswith("file "):
+            continue
+        fields = line.split(" ")
+        if len(fields) != 3:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+        path, digest = fields[1], fields[2]
+        allowed = (
+            path == "AGENTS.md"
+            or path.startswith(rules_prefix) and path.endswith(".md")
+            or path.startswith(hooks_prefix) and path.endswith(".sh")
+        )
+        if (
+            not allowed
+            or re.fullmatch(r"[a-f0-9]{64}", digest) is None
+            or path.casefold() in folded
+        ):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+        files[path] = digest
+        folded.add(path.casefold())
+    if (
+        "AGENTS.md" not in files
+        or not any(path.startswith(rules_prefix) for path in files)
+        or not any(path.startswith(hooks_prefix) for path in files)
+    ):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    return files
+
+
+def _core_contract_policy_matches_base(base_entries, entries):
+    signer_path = "/".join(SIGNER_PATH_PARTS)
+    policy_paths = {
+        path: entry for path, entry in entries.items()
+        if path == "AGENTS.md" or path == signer_path or path.startswith(RULES_DIRECTORY + "/")
+    }
+    base_policy_paths = {
+        path: entry for path, entry in base_entries.items()
+        if path == "AGENTS.md" or path == signer_path or path.startswith(RULES_DIRECTORY + "/")
+    }
+    return policy_paths == base_policy_paths
+
+
+def _safe_core_contract_tree(repository, git_executable, repo_env, base_commit, commit):
+    base_entries = _contract_tree_entries(repository, git_executable, repo_env, base_commit)
+    entries = _contract_tree_entries(repository, git_executable, repo_env, commit)
+    signer_path = "/".join(SIGNER_PATH_PARTS)
+    required = {
+        ".gitignore", "AGENTS.md", "CLAUDE.md", "README.md", RULES_LOCK_PATH,
+        RULES_DIRECTORY + "/settings.json", signer_path,
+    } | set(CORE_CONTRACT_ROOT_FILES)
+    for crate_root in CORE_CONTRACT_CRATE_ROOTS:
+        prefix = "/".join(crate_root)
+        required.update(prefix + "/" + path for path in CORE_CONTRACT_PACKAGE_FILES)
+        required.add(prefix + "/src/lib.rs")
+    if not required.issubset(entries):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    for path, (mode, unused_object_id) in entries.items():
+        expected_mode = _core_contract_expected_mode(path)
+        if mode != expected_mode or expected_mode is None:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    if not _core_contract_policy_matches_base(base_entries, entries):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+
+    lock_payload = _contract_blob(repository, git_executable, repo_env, entries, RULES_LOCK_PATH)
+    manifest = _rules_v2_file_manifest(lock_payload)
+    installed_paths = {
+        path for path in entries
+        if path == "AGENTS.md"
+        or path.startswith(RULES_DIRECTORY + "/rules/shared/")
+        or path.startswith(RULES_DIRECTORY + "/hooks/shared/")
+    }
+    if installed_paths != set(manifest):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    total_rules_bytes = 0
+    for path, expected_hash in manifest.items():
+        payload = _contract_blob(repository, git_executable, repo_env, entries, path)
+        total_rules_bytes += len(payload)
+        if total_rules_bytes > MAX_TREE_BYTES or hashlib.sha256(payload).hexdigest() != expected_hash:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+
+    workspace = _contract_blob(repository, git_executable, repo_env, entries, "Cargo.toml")
+    try:
+        workspace_text = workspace.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+    members = re.findall(r"(?m)^members\s*=\s*\[([^\]\r\n]*)\]\s*$", workspace_text)
+    expected_members = ", ".join('"' + "/".join(root) + '"' for root in CORE_CONTRACT_CRATE_ROOTS)
+    if members != [expected_members]:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+
+    lock_text = _contract_blob(repository, git_executable, repo_env, entries, "Cargo.lock")
+    try:
+        lock_text = lock_text.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+    if (
+        re.search(r"(?m)^version\s*=\s*4\s*$", lock_text) is None
+        or len(re.findall(r"(?m)^\[\[package\]\]$", lock_text)) != len(CORE_CONTRACT_CRATE_ROOTS)
+        or re.search(r"(?m)^\s*source\s*=", lock_text) is not None
+    ):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    if _contract_blob(repository, git_executable, repo_env, entries, "rust-toolchain.toml") != CORE_CONTRACT_TOOLCHAIN:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+    for crate_root in CORE_CONTRACT_CRATE_ROOTS:
+        payload = _contract_blob(
+            repository, git_executable, repo_env, entries, "/".join(crate_root) + "/Cargo.toml",
+        )
+        try:
+            manifest_text = payload.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap") from None
+        if re.search(r"(?m)^\s*build\s*=", manifest_text) is not None:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap")
+
+
 LEASE_ACCESS_SCRIPT = '''\
 import errno
 import os
@@ -1441,6 +1690,18 @@ def _check_rules_bootstrap_gate(request, environ):
         raise Refusal("bootstrap_not_approved", "configuration")
 
 
+def _check_core_contract_gate(request, environ):
+    if request["concern"] != "core-contract":
+        return
+    control_sha = environ.get("CI_SHA", "")
+    if (
+        not _full_sha(control_sha)
+        or environ.get(CORE_CONTRACT_SOURCE_GATE_ENV) != request["source_sha"]
+        or environ.get(CORE_CONTRACT_CONTROL_GATE_ENV) != control_sha
+    ):
+        raise Refusal("bootstrap_not_approved", "configuration")
+
+
 def _check_source_ref_binding(request, environ):
     candidate_ref = environ.get(SOURCE_CANDIDATE_REF_ENV, "")
     if request["concern"] == "core-bootstrap" and request["source_sha"] != request["base_sha"]:
@@ -1449,7 +1710,7 @@ def _check_source_ref_binding(request, environ):
         if candidate_ref and candidate_ref != "refs/heads/" + request["base_branch"]:
             raise Refusal("bootstrap_not_approved", "configuration")
         return None
-    if request["concern"] != "rules-bootstrap" or type(candidate_ref) is not str:
+    if request["concern"] not in {"rules-bootstrap", "core-contract"} or type(candidate_ref) is not str:
         raise Refusal("bootstrap_not_approved", "configuration")
     if re.fullmatch(r"refs/heads/(?:feat|fix|chore|plan)/[A-Za-z0-9][A-Za-z0-9._/-]{0,126}", candidate_ref) is None:
         raise Refusal("bootstrap_not_approved", "configuration")
@@ -1599,6 +1860,7 @@ def validated_source(
 ):
     _check_request(request)
     _check_rules_bootstrap_gate(request, environ)
+    _check_core_contract_gate(request, environ)
     candidate_ref = _check_source_ref_binding(request, environ)
     _validate_binding(binding)
     if revocation_state is not None and (
@@ -1613,14 +1875,15 @@ def validated_source(
         raise Refusal("context_unavailable", "context") from None
     if current_binding != binding or current_root != supplied_root:
         raise Refusal("context_unavailable", "context")
-    if request["concern"] == "rules-bootstrap":
+    worker_required = request["concern"] in {"rules-bootstrap", "core-contract"}
+    if worker_required:
         _check_worker_identity(current_root, worker_uid)
         storage_root = _validate_storage_root(storage_root)
     storage_acl = False
     temporary = None
     worker_python = None
     try:
-        if request["concern"] == "rules-bootstrap":
+        if worker_required:
             storage_acl = True
             _add_storage_search_acl(storage_root)
         record, temporary, source_path = _source_snapshot(
@@ -1630,11 +1893,11 @@ def validated_source(
             environ,
             candidate_ref=candidate_ref,
             retain=True,
-            temp_parent=storage_root if request["concern"] == "rules-bootstrap" else None,
+            temp_parent=storage_root if worker_required else None,
             revocation_state=revocation_state,
         )
         worker_access = "not_applicable"
-        if request["concern"] == "rules-bootstrap":
+        if worker_required:
             worker_python = _grant_worker_readonly(temporary, source_path, storage_root, worker_uid)
             worker_access = "uid_read_only"
         record["repository_scope"] = "verified"
@@ -1649,7 +1912,11 @@ def validated_source(
         record["signatures"] = "all_new_commits_verified"
         record["ancestry"] = "base_ancestor"
         record["revocation_policy"] = "current_control_fingerprints"
-        record["tree"] = "core_administrative" if request["concern"] == "core-bootstrap" else "rules_regular_files"
+        record["tree"] = {
+            "core-bootstrap": "core_administrative",
+            "rules-bootstrap": "rules_regular_files",
+            "core-contract": "core_contract",
+        }[request["concern"]]
         record["worker_access"] = worker_access
         record["source_execution"] = "not_run_at_yield"
         record["cleanup"] = "lease_open"
@@ -1657,7 +1924,7 @@ def validated_source(
     except BaseException:
         _revoke_on_early_refusal(environ, revocation_state, request, binding)
         cleanup_safe = True
-        if request["concern"] == "rules-bootstrap" and temporary is not None:
+        if worker_required and temporary is not None:
             try:
                 census_python = worker_python or capability._resolve_trusted_toolchain()["python"]
                 _assert_worker_absent(worker_uid, census_python)
@@ -1675,7 +1942,7 @@ def validated_source(
     finally:
         cleanup_error = None
         cleanup_safe = True
-        if request["concern"] == "rules-bootstrap":
+        if worker_required:
             try:
                 _assert_worker_absent(worker_uid, worker_python)
             except BaseException:
@@ -1707,6 +1974,8 @@ def _source_snapshot(
     temp_parent=None,
     revocation_state=None,
 ):
+    _check_request(request)
+    _check_core_contract_gate(request, environ)
     if candidate_ref != _check_source_ref_binding(request, environ):
         raise Refusal("bootstrap_not_approved", "configuration")
     git_executable = _resolve_trusted_executable("/usr/bin/git")
@@ -1894,10 +2163,16 @@ def _source_snapshot(
             _administrative_tree(repository, git_executable, env, request["source_sha"])
             rules_lock = "present"
             tree_kind = "core_administrative"
-        else:
+        elif request["concern"] == "rules-bootstrap":
             _safe_rules_tree(repository, git_executable, env, request["source_sha"])
             rules_lock = "not-applicable"
             tree_kind = "rules_regular_files"
+        else:
+            _safe_core_contract_tree(
+                repository, git_executable, env, request["base_sha"], request["source_sha"],
+            )
+            rules_lock = "present"
+            tree_kind = "core_contract"
         source_path = _checkout_source(
             repository, git_executable, env, temporary, request["source_sha"],
         )
@@ -1952,8 +2227,12 @@ def _format_success(record, binding):
         raise Refusal("internal_error", "input")
     fixed = {
         "signature": "verified",
-        "rules_lock": "present" if record.get("concern") == "core-bootstrap" else "not-applicable",
-        "tree": "core_administrative" if record.get("concern") == "core-bootstrap" else "rules_regular_files",
+        "rules_lock": "not-applicable" if record.get("concern") == "rules-bootstrap" else "present",
+        "tree": {
+            "core-bootstrap": "core_administrative",
+            "rules-bootstrap": "rules_regular_files",
+            "core-contract": "core_contract",
+        }.get(record.get("concern")),
         "source_execution": "not_run_at_yield",
         "repository_scope": "verified",
         "metadata": "verified",

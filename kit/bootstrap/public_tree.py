@@ -17,6 +17,7 @@ PLATFORM_FILES = frozenset(
         ".github/workflows/macos-rules-reader-preflight.yml",
         ".github/workflows/macos-rules-bootstrap.yml",
         ".github/workflows/macos-core-bootstrap.yml",
+        ".github/workflows/macos-core-contract.yml",
         ".github/workflows/windows-native-preflight.yml",
         "ci/policy.json",
         "ci/revoked-signer-fingerprints",
@@ -45,6 +46,8 @@ PLATFORM_FILES = frozenset(
         'kit/confinement/test_macos_rules_bootstrap.py',
         'kit/confinement/macos_core_bootstrap.py',
         'kit/confinement/test_macos_core_bootstrap.py',
+        'kit/confinement/macos_core_contract.py',
+        'kit/confinement/test_macos_core_contract.py',
         "kit/confinement/macos_private_validation.py",
         "kit/confinement/test_macos_private_validation.py",
         "kit/confinement/macos_source_reader.py",
@@ -71,6 +74,9 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
+    '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
+    'kit/confinement/macos_core_contract.py': 'ba066bbc55b3a65a0647e0be4b54a707f874e4fd65ec96478771c5ad7b2b081e',
+    'kit/confinement/test_macos_core_contract.py': '9b2731a47a5005edcb7eb51a92e75345509fbaa70f1ac04e428b3d32ab7bffcd',
     '.github/workflows/macos-rust-toolchain-smoke.yml': 'cdf7068f8887c22958d74f3c2cc0a73c5c8c4c41f4eff0b43e16e47f61e58bb7',
     'kit/confinement/macos_rust_toolchain.py': 'a27c103b1d6c4fbf9fef24469ade69668e01c949e3108dc89dc3dbd63ac14b49',
     'kit/confinement/test_macos_rust_toolchain.py': '27c40bc8d42a3df6e88209d6cb8ea99cd9e80107310f1eb639dbfb2f6638727a',
@@ -82,8 +88,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_macos_core_bootstrap.py': 'f8e56bde25e64fc691adc25c3288924179797b83c8d6da66ef21c5fad256c38e',
     'kit/confinement/macos_network_observer.py': 'a7cf6cb16e68f00513e9f8ee08d52511619b18bb8edd37205faf907dcf0a98d9',
     'kit/confinement/test_macos_network_observer.py': '0187ffbe5a7b7395b2edc2025a4dd3e4c0adf5a48c881f8878578010d76307a3',
-    'kit/confinement/macos_private_validation.py': 'c50dc22b6a0024ac387724771665fd1396bd64abe85a772e07cf852b56ec7464',
-    'kit/confinement/test_macos_private_validation.py': 'da59832cb3de5388779d8d6f3a2a0e3ea339fd3b9a1bb892fbfee4bf70d9d02d',
+    'kit/confinement/macos_private_validation.py': '153757260fe9932ccae1d3817c120b4f57207bb2a26be1c93c04c0226a1e4731',
+    'kit/confinement/test_macos_private_validation.py': 'c29c0a408c848d4e1b33ce673162dd436201b2de672f0c5ac6d7c6ee92e16b41',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     ".github/workflows/windows-native-preflight.yml": "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb",
     "kit/confinement/windows_native_preflight.cs": "ba0f8859db9d8bcc1e4c8274520bcb67a3292cb311f553127e1f29fe13838543",
