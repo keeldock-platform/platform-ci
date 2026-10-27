@@ -107,6 +107,69 @@ class CoreContractTests(unittest.TestCase):
             subject._run_privilege_probe(504, Path.cwd(), {"python": "/usr/bin/python3"}, reviewed)
         self.assertEqual(raised.exception.reason, "cleanup_incomplete")
         self.assertEqual(raised.exception.stage, "cleanup")
+        self.assertEqual(raised.exception.diagnostic, "worker_privilege_probe")
+
+    def test_privilege_census_cleanup_has_a_distinct_diagnostic(self):
+        def fail_census(*unused_args):
+            raise subject.Refusal("cleanup_incomplete", "cleanup")
+
+        reviewed = SimpleNamespace(
+            _child_environment=lambda *unused_args: {},
+            _probe_argv=lambda *unused_args: ("python",),
+            _run_probe_step=lambda *unused_args, **unused_kwargs: None,
+            _worker_census=fail_census,
+        )
+        with self.assertRaises(subject.Refusal) as raised:
+            subject._run_privilege_probe(504, Path.cwd(), {"python": "/usr/bin/python3"}, reviewed)
+        self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+        self.assertEqual(raised.exception.diagnostic, "worker_privilege_census")
+
+    def test_failure_diagnostics_are_closed_and_keep_first_cleanup_cause(self):
+        diagnostics = subject._FailureDiagnostics()
+        ordinary = diagnostics.attach(
+            subject.Refusal("runner_unavailable", "worker_setup"), "worker_privilege_probe",
+        )
+        self.assertEqual(ordinary.diagnostic, "worker_privilege_probe")
+        cleanup = diagnostics.attach(
+            subject.Refusal("cleanup_incomplete", "cleanup"), "worker_cleanup", "cleanup_worker",
+        )
+        later_cleanup = diagnostics.attach(
+            subject.Refusal("cleanup_incomplete", "cleanup"), "summary_guard_finish", "cleanup_summary_close",
+        )
+        self.assertEqual(cleanup.diagnostic, "cleanup_worker")
+        self.assertEqual(later_cleanup.diagnostic, "cleanup_worker")
+
+        empty = subject._FailureDiagnostics().attach(
+            subject.Refusal("invalid_input", "arguments"), "arguments",
+        )
+        unclassified = subject._FailureDiagnostics().attach(RuntimeError("private"), "unavailable")
+        self.assertEqual(empty.diagnostic, "none")
+        self.assertEqual(unclassified.diagnostic, "unavailable")
+
+    def test_lease_exit_preserves_earlier_body_cleanup_diagnostic(self):
+        diagnostics = subject._FailureDiagnostics()
+        cleanup_state = {"first": None}
+
+        @contextmanager
+        def failing_lease_exit():
+            try:
+                yield object()
+            finally:
+                raise subject.Refusal(
+                    "cleanup_incomplete", "cleanup", diagnostic="source_lease_cleanup",
+                )
+
+        with self.assertRaises(subject.Refusal) as raised:
+            with subject._lease_with_diagnostic_capture(
+                failing_lease_exit(), diagnostics, lambda: "worker_privilege_probe", cleanup_state,
+            ):
+                raise subject.Refusal(
+                    "cleanup_incomplete", "cleanup", diagnostic="worker_privilege_probe",
+                )
+
+        preserved = diagnostics.attach(raised.exception, "source_lease_cleanup", cleanup_state["first"])
+        self.assertEqual(preserved.reason, "cleanup_incomplete")
+        self.assertEqual(preserved.diagnostic, "worker_privilege_probe")
 
     def test_review_binding_requires_every_protected_value(self):
         request = _request()
@@ -219,15 +282,18 @@ class CoreContractTests(unittest.TestCase):
 
     def test_refusal_is_closed_canonical_and_never_echoes_diagnostics(self):
         error = subject.Refusal("arbitrary-private-value", "untrusted-stage")
+        error.diagnostic = "untrusted-private-diagnostic"
         payload = subject._format_refusal(error)
         record = json.loads(payload)
         self.assertEqual(
             record,
-            {"reason": "internal_error", "schema_version": 1, "stage": "internal", "status": "refused"},
+            {"diagnostic": "unavailable", "reason": "internal_error", "schema_version": 1,
+             "stage": "internal", "status": "refused"},
         )
         self.assertEqual(payload, subject._canonical_json(record)[:-1])
         self.assertNotIn(b"arbitrary-private-value", payload)
         self.assertNotIn(b"untrusted-stage", payload)
+        self.assertNotIn(b"untrusted-private-diagnostic", payload)
 
 
 if __name__ == "__main__":

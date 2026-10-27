@@ -361,6 +361,29 @@ CORE_CONTRACT_REFUSAL_STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
     "conformance_tests", "cleanup", "receipt", "internal",
 ))
+CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
+    "none", "unavailable", "load_controls", "review_binding", "host_preflight",
+    "temp_root_check", "smoke_receipt", "token_input", "token_revocation",
+    "disable_developer_mode", "resolve_host_toolchain", "resolve_worker_tools",
+    "create_worker_identity", "create_run_directory", "create_source_storage",
+    "prepare_worker_storage", "worker_identity_check", "worker_privilege_probe",
+    "worker_privilege_census", "summary_guard_setup", "source_lease_request",
+    "source_lease_open", "source_revocation_check", "source_lease_record",
+    "source_path_validation", "source_tree_probe", "resolve_git", "git_diff_verification",
+    "network_observer_start", "toolchain_install", "toolchain_tree_check",
+    "worker_environment", "toolchain_version_probe", "toolchain_version_match",
+    "source_gates", "worker_storage_verify", "cwd_restore", "network_observer_finish",
+    "summary_guard_probe", "source_lease_cleanup", "worker_cleanup",
+    "fallback_tree_cleanup", "summary_guard_finish", "success_receipt", "output_write",
+    "cleanup_lease", "cleanup_storage", "cleanup_worker", "cleanup_summary",
+    "cleanup_summary_census", "cleanup_summary_present", "cleanup_summary_present_python",
+    "cleanup_summary_present_ps", "cleanup_summary_present_developer_shim",
+    "cleanup_summary_present_helper_preferences", "cleanup_summary_present_helper_notifications",
+    "cleanup_summary_present_helper_launch_services", "cleanup_summary_present_helper_security",
+    "cleanup_summary_present_helper_trust", "cleanup_summary_present_helper_containers",
+    "cleanup_summary_present_apple_system_path", "cleanup_summary_probe",
+    "cleanup_summary_restore", "cleanup_summary_close", "cleanup_dash", "cleanup_unknown",
+))
 CANARY_DOMAIN = b"keeldock" + b"-macos-ci-canary-v1\0"
 CANARY_PREFIX = b"KD-MACOS-CI-CANARY-v1:"
 REVIEWED_CANARY_PREFIX = b"KD-RB-CANARY-"
@@ -1471,11 +1494,17 @@ def _core_contract_refusal_value(payload):
         _fail("capture_invalid")
     except Exception:
         _fail("capture_invalid")
-    if (type(value) is not dict or set(value) != {"schema_version", "status", "stage", "reason"}
+    if (type(value) is not dict
+            or set(value) != {"schema_version", "status", "stage", "reason", "diagnostic"}
             or type(value.get("schema_version")) is not int or value["schema_version"] != 1
             or type(value.get("status")) is not str or value["status"] != "refused"
             or type(value.get("stage")) is not str or value["stage"] not in CORE_CONTRACT_REFUSAL_STAGES
-            or type(value.get("reason")) is not str or value["reason"] not in CORE_CONTRACT_REFUSAL_REASONS):
+            or type(value.get("reason")) is not str or value["reason"] not in CORE_CONTRACT_REFUSAL_REASONS
+            or type(value.get("diagnostic")) is not str
+            or value["diagnostic"] not in CORE_CONTRACT_REFUSAL_DIAGNOSTICS):
+        _fail("capture_invalid")
+    if (value["diagnostic"] == "none"
+            and value["stage"] not in {"arguments", "context", "host"}):
         _fail("capture_invalid")
     try:
         canonical = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")

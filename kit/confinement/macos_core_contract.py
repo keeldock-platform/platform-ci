@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import platform
 import re
@@ -57,6 +58,33 @@ STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
     "conformance_tests", "cleanup", "receipt", "internal",
 ))
+OPERATION_DIAGNOSTICS = frozenset((
+    "load_controls", "review_binding", "host_preflight", "temp_root_check", "smoke_receipt",
+    "token_input", "token_revocation", "disable_developer_mode", "resolve_host_toolchain",
+    "resolve_worker_tools", "create_worker_identity", "create_run_directory", "create_source_storage",
+    "prepare_worker_storage", "worker_identity_check", "worker_privilege_probe",
+    "worker_privilege_census", "summary_guard_setup", "source_lease_request", "source_lease_open",
+    "source_revocation_check", "source_lease_record", "source_path_validation", "source_tree_probe",
+    "resolve_git", "git_diff_verification", "network_observer_start", "toolchain_install",
+    "toolchain_tree_check", "worker_environment", "toolchain_version_probe", "toolchain_version_match",
+    "source_gates", "worker_storage_verify", "cwd_restore", "network_observer_finish",
+    "summary_guard_probe", "source_lease_cleanup", "worker_cleanup", "fallback_tree_cleanup",
+    "summary_guard_finish", "success_receipt", "output_write",
+))
+CLEANUP_DIAGNOSTICS = frozenset((
+    "cleanup_lease", "cleanup_storage", "cleanup_worker", "cleanup_summary",
+    "cleanup_summary_census", "cleanup_summary_present", "cleanup_summary_present_python",
+    "cleanup_summary_present_ps",
+    "cleanup_summary_present_developer_shim", "cleanup_summary_present_helper_preferences",
+    "cleanup_summary_present_helper_notifications", "cleanup_summary_present_helper_launch_services",
+    "cleanup_summary_present_helper_security", "cleanup_summary_present_helper_trust",
+    "cleanup_summary_present_helper_containers", "cleanup_summary_present_apple_system_path",
+    "cleanup_summary_probe", "cleanup_summary_restore", "cleanup_summary_close", "cleanup_dash",
+    "cleanup_unknown",
+))
+DIAGNOSTICS = OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | frozenset(("none", "unavailable"))
+DETAILED_DIAGNOSTICS = DIAGNOSTICS - frozenset(("none", "unavailable"))
+NO_OPERATION_STAGES = frozenset(("arguments", "context", "host"))
 
 PRIVILEGE_IDENTITY_CHECK = """\
 if os.getuid() != uid or os.geteuid() != uid or os.getgid() != 20:
@@ -89,10 +117,60 @@ PRIVILEGE_MARKER = b"KD-CORE-CONTRACT:privilege=verified\n"
 
 
 class Refusal(Exception):
-    def __init__(self, reason, stage):
+    def __init__(self, reason, stage, diagnostic=None):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "internal"
+        if type(diagnostic) is str and diagnostic in DIAGNOSTICS:
+            self.diagnostic = diagnostic
+        elif self.stage in NO_OPERATION_STAGES:
+            self.diagnostic = "none"
+        else:
+            self.diagnostic = "unavailable"
         super().__init__(self.reason)
+
+
+class _FailureDiagnostics:
+    def __init__(self):
+        self.first_cleanup = None
+
+    def remember_cleanup(self, error, operation, cleanup_stage=None):
+        if self.first_cleanup is not None:
+            return
+        if type(cleanup_stage) is str and cleanup_stage in CLEANUP_DIAGNOSTICS:
+            self.first_cleanup = cleanup_stage
+        elif type(getattr(error, "diagnostic", None)) is str and error.diagnostic in DETAILED_DIAGNOSTICS:
+            self.first_cleanup = error.diagnostic
+        elif type(operation) is str and operation in OPERATION_DIAGNOSTICS:
+            self.first_cleanup = operation
+        else:
+            self.first_cleanup = "unavailable"
+
+    def attach(self, error, operation, cleanup_stage=None):
+        reason = getattr(error, "reason", None)
+        stage = getattr(error, "stage", "internal")
+        if type(error) is not Refusal:
+            reason, stage = "internal_error", "internal"
+        if reason == "cleanup_incomplete":
+            self.remember_cleanup(error, operation, cleanup_stage)
+            return Refusal(reason, stage, diagnostic=self.first_cleanup)
+        if type(getattr(error, "diagnostic", None)) is str and error.diagnostic in OPERATION_DIAGNOSTICS:
+            return Refusal(reason, stage, diagnostic=error.diagnostic)
+        if stage in NO_OPERATION_STAGES and operation not in OPERATION_DIAGNOSTICS:
+            return Refusal(reason, stage, diagnostic="none")
+        if type(operation) is str and operation in OPERATION_DIAGNOSTICS:
+            return Refusal(reason, stage, diagnostic=operation)
+        return Refusal(reason, stage, diagnostic="unavailable")
+
+
+@contextmanager
+def _lease_with_diagnostic_capture(lease_context, diagnostics, operation_getter, cleanup_state):
+    with lease_context as lease:
+        try:
+            yield lease
+        except BaseException as error:
+            if getattr(error, "reason", None) == "cleanup_incomplete":
+                diagnostics.remember_cleanup(error, operation_getter(), cleanup_state.get("first"))
+            raise
 
 
 def _load_control_sibling(name):
@@ -505,18 +583,23 @@ def _worker_environment(home, storage, prefix, tools, host_toolchain, worker_too
 
 
 def _run_privilege_probe(worker_uid, home, host_toolchain, reviewed):
-    environment = reviewed._child_environment(home, Path("/tmp"), host_toolchain)
     try:
+        environment = reviewed._child_environment(home, Path("/tmp"), host_toolchain)
         reviewed._run_probe_step(
             reviewed._probe_argv(host_toolchain["python"], PRIVILEGE_SCRIPT, str(worker_uid)),
             worker_uid, env=environment, python_executable=host_toolchain["python"],
             stage="privilege", expected_stdout=PRIVILEGE_MARKER,
         )
+    except BaseException as error:
+        if getattr(error, "reason", None) == "cleanup_incomplete":
+            raise Refusal("cleanup_incomplete", "cleanup", diagnostic="worker_privilege_probe") from None
+        raise Refusal("runner_unavailable", "worker_setup", diagnostic="worker_privilege_probe") from None
+    try:
         reviewed._worker_census(worker_uid, host_toolchain["python"], "privilege")
     except BaseException as error:
         if getattr(error, "reason", None) == "cleanup_incomplete":
-            raise Refusal("cleanup_incomplete", "cleanup") from None
-        raise Refusal("runner_unavailable", "worker_setup") from None
+            raise Refusal("cleanup_incomplete", "cleanup", diagnostic="worker_privilege_census") from None
+        raise Refusal("runner_unavailable", "worker_setup", diagnostic="worker_privilege_census") from None
 
 
 def _run_inside_source(source, original_cwd, command):
@@ -527,7 +610,7 @@ def _run_inside_source(source, original_cwd, command):
         try:
             os.chdir(original_cwd)
         except BaseException:
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+            raise Refusal("cleanup_incomplete", "cleanup", diagnostic="cwd_restore") from None
 
 
 def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools, deadline):
@@ -739,46 +822,69 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
     network_captured = False
     summary_guard_passed = False
     worker_cleanup_confirmed = False
-    original_cwd = Path.cwd()
     failure = None
+    diagnostics = _FailureDiagnostics()
+    try:
+        original_cwd = Path.cwd()
+    except BaseException:
+        raise Refusal("internal_error", "internal", diagnostic="cwd_restore") from None
+    operation = "host_preflight"
     phase = "source_validation"
     try:
+        operation = "host_preflight"
         if os.geteuid() != 0:
             raise Refusal("unsupported_host", "host")
+        operation = "context"
         if time.monotonic() >= deadline:
             raise Refusal("runner_unavailable", "context")
+        operation = "temp_root_check"
         _check_temp_root()
         try:
+            operation = "disable_developer_mode"
             capability._disable_developer_mode()
+            operation = "resolve_host_toolchain"
             host_toolchain = capability._resolve_trusted_toolchain()
+            operation = "resolve_worker_tools"
             worker_tools = capability._resolve_worker_tools(host_toolchain)
+            operation = "create_worker_identity"
             worker_uid, home_parent, home = capability._create_probe_identity(root)
-        except Refusal:
-            raise
+        except Refusal as error:
+            raise diagnostics.attach(error, operation) from None
         except BaseException:
-            raise Refusal("runner_unavailable", "worker_setup") from None
+            raise Refusal("runner_unavailable", "worker_setup", diagnostic=operation) from None
+        operation = "create_run_directory"
         run_root = _make_directory(RUN_PREFIX, 0o711)
+        operation = "create_source_storage"
         lease_storage = _make_directory("macos-core-contract-source-", 0o700)
+        operation = "prepare_worker_storage"
         worker_storage, storage_identity = _prepare_worker_storage(run_root, worker_uid, capability)
+        operation = "worker_identity_check"
         if worker_uid == os.stat(runner_temp).st_uid:
             raise Refusal("runner_unavailable", "worker_setup")
+        operation = "worker_privilege_probe"
         _run_privilege_probe(worker_uid, home, host_toolchain, reviewed)
         try:
+            operation = "summary_guard_setup"
             rules._summary_guard(
                 worker_uid, home, host_toolchain, reviewed, capability, root, binding, environ,
                 summary_guard_state, cleanup_state,
             )
             summary_guard_passed = True
         except BaseException:
-            raise Refusal("summary_guard_failed", "summary_guard") from None
+            raise diagnostics.attach(
+                Refusal("summary_guard_failed", "summary_guard"), operation,
+                cleanup_state.get("first"),
+            ) from None
 
+        operation = "source_lease_request"
         revocation_state = runtime.RevocationState()
         runtime_request = runtime.parse_request((
             "--source-sha", request["source_sha"], "--base-sha", request["base_sha"],
             "--base-branch", request["base_branch"], "--concern", CONCERN,
         ))
         if runtime_request != request:
-            raise Refusal("source_binding_mismatch", "source_lease")
+            raise Refusal("source_binding_mismatch", "source_lease", diagnostic=operation)
+        operation = "source_lease_open"
         lease_context = runtime.validated_source(
             request, binding, root, environ, worker_uid=worker_uid,
             storage_root=lease_storage, revocation_state=revocation_state,
@@ -788,41 +894,56 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
         summary_failure = None
         cwd_failure = None
         try:
-            with lease_context as lease:
+            with _lease_with_diagnostic_capture(
+                lease_context, diagnostics, lambda: operation, cleanup_state,
+            ) as lease:
+                operation = "source_revocation_check"
                 if not runtime.revocation_confirmed(
                     revocation_state, retained_token, environ.get(runtime.SOURCE_REPOSITORY_ID_ENV), request, binding,
                 ):
-                    raise Refusal("token_revocation_unconfirmed", "source_lease")
+                    raise Refusal("token_revocation_unconfirmed", "source_lease", diagnostic=operation)
                 lifecycle["token_revocation"] = "confirmed_before_execution"
+                operation = "source_lease_record"
                 lease_record = _validate_source_lease(lease.record, request, binding, worker_uid, runtime)
                 phase = "source_tree"
+                operation = "source_path_validation"
                 source = _validate_source_path(lease.source_path, lease_storage)
+                operation = "source_tree_probe"
                 rules._run_tree_probe(source, worker_uid, home, host_toolchain, capability)
+                operation = "resolve_git"
                 git_executable = runtime._resolve_trusted_executable("/usr/bin/git")
                 phase = "source_diff"
+                operation = "git_diff_verification"
                 _stream_git_diff_hash(
                     source, request["base_sha"], request["source_sha"], diff_sha256,
                     str(git_executable), deadline,
                 )
                 if time.monotonic() >= deadline:
-                    raise Refusal("runner_unavailable", "toolchain_install")
+                    raise Refusal("runner_unavailable", "toolchain_install", diagnostic="toolchain_install")
 
                 phase = "observer"
+                operation = "network_observer_start"
                 network_observer, network_session = rules._start_network_observation(
                     binding, request["source_sha"], cleanup_state,
                 )
                 phase = "toolchain_install"
+                operation = "toolchain_install"
                 prefix, tools = rust._install_pinned_toolchain(run_root, capability, deadline)
+                operation = "toolchain_tree_check"
                 rust._check_installed_tree(prefix, deadline)
+                operation = "worker_environment"
                 environment = _worker_environment(
                     home, worker_storage, prefix, tools, host_toolchain, worker_tools,
                     reviewed, source,
                 )
+                operation = "toolchain_version_probe"
                 versions = rust._read_toolchain_versions(
                     prefix, tools, worker_uid, environment, host_toolchain["python"], capability, deadline,
                 )
+                operation = "smoke_receipt"
                 if versions != _validate_smoke_receipt(runner_temp, binding, rust):
-                    raise Refusal("toolchain_version_mismatch", "toolchain_install")
+                    raise Refusal("toolchain_version_mismatch", "toolchain_install", diagnostic="toolchain_version_match")
+                operation = "toolchain_version_match"
                 toolchain_paths = rust.ToolchainPaths(
                     root=run_root, prefix=prefix,
                     rustc=tools["rustc"], cargo=tools["cargo"], rustfmt=tools["rustfmt"],
@@ -832,11 +953,13 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                     rustfmt_version=versions["rustfmt"], clippy_version=versions["clippy"],
                     component_hashes=tuple((component.name, component.sha256) for component in rust.COMPONENTS),
                 )
+                operation = "worker_environment"
                 environment = _worker_environment(
                     home, worker_storage, prefix, toolchain_paths.command_paths(), host_toolchain,
                     worker_tools, reviewed, source,
                 )
                 phase = "worker_setup"
+                operation = "source_gates"
                 gates = _run_inside_source(
                     source,
                     original_cwd,
@@ -845,18 +968,24 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                         toolchain_paths.command_paths(), deadline,
                     ),
                 )
+                operation = "worker_storage_verify"
                 capability._verify_storage_directory(worker_storage, storage_identity, worker_uid)
         except Refusal as error:
-            command_failure = error
+            command_failure = diagnostics.attach(error, operation, cleanup_state.get("first"))
         except BaseException as error:
             runtime_refusal = getattr(runtime, "Refusal", None)
             if isinstance(runtime_refusal, type) and isinstance(error, runtime_refusal):
-                command_failure = _runtime_refusal(runtime, error)
+                if getattr(error, "reason", None) == "cleanup_incomplete":
+                    operation = "source_lease_cleanup"
+                command_failure = diagnostics.attach(_runtime_refusal(runtime, error), operation,
+                                                    cleanup_state.get("first"))
             elif phase in ("source_validation", "source_tree"):
-                command_failure = Refusal("source_validation_failed", phase)
+                command_failure = Refusal("source_validation_failed", phase, diagnostic=operation)
             else:
-                command_failure = _toolchain_refusal(error, phase)
+                command_failure = diagnostics.attach(_toolchain_refusal(error, phase), operation,
+                                                    cleanup_state.get("first"))
         finally:
+            operation = "cwd_restore"
             try:
                 current_cwd = Path.cwd()
             except BaseException:
@@ -865,8 +994,11 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                 try:
                     os.chdir(original_cwd)
                 except BaseException:
-                    cwd_failure = Refusal("cleanup_incomplete", "cleanup")
+                    cwd_failure = diagnostics.attach(
+                        Refusal("cleanup_incomplete", "cleanup"), operation, cleanup_state.get("first"),
+                    )
             if network_session is not None and not network_captured:
+                operation = "network_observer_finish"
                 try:
                     record = rules._finish_network_observation(
                         network_observer, network_session, binding, request["source_sha"], cleanup_state,
@@ -875,31 +1007,38 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                         raise ValueError
                     network_captured = True
                 except BaseException as error:
-                    observer_failure = (
-                        Refusal("cleanup_incomplete", "cleanup")
-                        if getattr(error, "reason", None) == "cleanup_incomplete"
-                        else Refusal("network_observation_failed", "observer")
-                    )
+                    refusal = (Refusal("cleanup_incomplete", "cleanup")
+                               if getattr(error, "reason", None) == "cleanup_incomplete"
+                               else Refusal("network_observation_failed", "observer"))
+                    observer_failure = diagnostics.attach(refusal, operation, cleanup_state.get("first"))
             if summary_guard_state["guard"] is not None:
+                operation = "summary_guard_probe"
                 try:
                     rules._probe_summary_after_commands(
                         summary_guard_state["guard"], worker_uid, home, host_toolchain,
                         reviewed, capability, binding, cleanup_state,
                     )
                 except BaseException as error:
-                    summary_failure = (
-                        Refusal("cleanup_incomplete", "cleanup")
-                        if getattr(error, "reason", None) == "cleanup_incomplete"
-                        else Refusal("summary_guard_failed", "summary_guard")
-                    )
+                    refusal = (Refusal("cleanup_incomplete", "cleanup")
+                               if getattr(error, "reason", None) == "cleanup_incomplete"
+                               else Refusal("summary_guard_failed", "summary_guard"))
+                    summary_failure = diagnostics.attach(refusal, operation, cleanup_state.get("first"))
         if cleanup_state.get("first") is not None:
-            raise Refusal("cleanup_incomplete", "cleanup")
+            raise diagnostics.attach(
+                Refusal("cleanup_incomplete", "cleanup"), "source_lease_cleanup", cleanup_state.get("first"),
+            )
         if any(
             getattr(error, "reason", None) == "cleanup_incomplete"
             for error in (cwd_failure, summary_failure, observer_failure, command_failure)
             if error is not None
         ):
-            raise Refusal("cleanup_incomplete", "cleanup")
+            cleanup_error = next(
+                error for error in (cwd_failure, summary_failure, observer_failure, command_failure)
+                if error is not None and getattr(error, "reason", None) == "cleanup_incomplete"
+            )
+            raise diagnostics.attach(
+                cleanup_error, getattr(cleanup_error, "diagnostic", "unavailable"), cleanup_state.get("first"),
+            )
         if summary_failure is not None:
             raise summary_failure
         if observer_failure is not None:
@@ -907,10 +1046,12 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
         if command_failure is not None:
             raise command_failure
     except Refusal as error:
-        failure = error
+        failure = diagnostics.attach(error, operation, cleanup_state.get("first"))
     except BaseException:
-        failure = Refusal("internal_error", "internal")
+        failure = diagnostics.attach(Refusal("internal_error", "internal"), operation,
+                                    cleanup_state.get("first"))
     finally:
+        operation = "source_revocation_check"
         if revocation_state is not None and retained_token is not None:
             try:
                 if runtime.revocation_confirmed(
@@ -920,7 +1061,10 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
             except BaseException:
                 pass
         if cleanup_state.get("first") is not None:
-            failure = Refusal("cleanup_incomplete", "cleanup")
+            failure = diagnostics.attach(
+                Refusal("cleanup_incomplete", "cleanup"), operation, cleanup_state.get("first"),
+            )
+        operation = "cwd_restore"
         try:
             current_cwd = Path.cwd()
         except BaseException:
@@ -929,17 +1073,23 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
             try:
                 os.chdir(original_cwd)
             except BaseException:
-                failure = Refusal("cleanup_incomplete", "cleanup")
+                failure = diagnostics.attach(
+                    Refusal("cleanup_incomplete", "cleanup"), operation, cleanup_state.get("first"),
+                )
         cleanup_paths = tuple(path for path in (worker_storage, home_parent, run_root, lease_storage) if path is not None)
         if host_toolchain is not None and (worker_uid is not None or cleanup_paths):
+            operation = "worker_cleanup"
             try:
                 reviewed._cleanup(cleanup_paths, worker_uid, host_toolchain)
                 worker_cleanup_confirmed = True
             except BaseException:
-                failure = Refusal("cleanup_incomplete", "cleanup")
+                failure = diagnostics.attach(
+                    Refusal("cleanup_incomplete", "cleanup"), operation, cleanup_state.get("first"),
+                )
         else:
             cleanup_failed = False
             for path in cleanup_paths:
+                operation = "fallback_tree_cleanup"
                 try:
                     capability._remove_probe_tree(path)
                 except BaseException:
@@ -947,9 +1097,12 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
             if worker_uid is not None or home_parent is not None:
                 cleanup_failed = True
             if cleanup_failed:
-                failure = Refusal("cleanup_incomplete", "cleanup")
+                failure = diagnostics.attach(
+                    Refusal("cleanup_incomplete", "cleanup"), operation, cleanup_state.get("first"),
+                )
             else:
                 worker_cleanup_confirmed = True
+        operation = "summary_guard_finish"
         try:
             rules._finish_summary_guard(
                 summary_guard_state["guard"], reviewed,
@@ -957,71 +1110,97 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                 cleanup_state=cleanup_state,
             )
         except BaseException:
-            failure = Refusal("cleanup_incomplete", "cleanup")
+            failure = diagnostics.attach(
+                Refusal("cleanup_incomplete", "cleanup"), operation, cleanup_state.get("first"),
+            )
 
     if failure is not None:
         if getattr(failure, "reason", None) == "cleanup_incomplete":
-            raise Refusal("cleanup_incomplete", "cleanup")
+            raise diagnostics.attach(failure, operation, cleanup_state.get("first"))
         if getattr(failure, "reason", None) in REASONS and getattr(failure, "stage", None) in STAGES:
             raise failure
-        raise Refusal("internal_error", "internal")
+        raise Refusal("internal_error", "internal", diagnostic="unavailable")
+    if lifecycle.get("token_revocation") != "confirmed_before_execution":
+        raise diagnostics.attach(
+            Refusal("cleanup_incomplete", "cleanup"), "source_revocation_check", cleanup_state.get("first"),
+        )
     if (lease_record is None or versions is None or gates is None or tuple(gates) != GATE_NAMES
-            or lifecycle.get("token_revocation") != "confirmed_before_execution"
             or not network_captured or not summary_guard_passed or not worker_cleanup_confirmed):
-        raise Refusal("cleanup_incomplete", "cleanup")
+        raise diagnostics.attach(
+            Refusal("cleanup_incomplete", "cleanup"), "source_lease_cleanup", cleanup_state.get("first"),
+        )
     return lease_record, versions, gates, network_captured, summary_guard_passed
 
 
 def _execute(arguments, environ, token_reference, lifecycle):
-    started = time.monotonic()
-    deadline = started + MAX_TOTAL_SECONDS
-    controls = _load_controls()
-    reviewed, capability, boundary, runtime, rust, rules = controls
-    request = _parse_arguments(arguments)
-    binding, root, runner_temp = _validate_context(environ, reviewed, capability, boundary, rust)
-    diff_sha256, candidate_ref = _validate_review_gate(request, binding, environ, runtime)
-    environ[runtime.SOURCE_CANDIDATE_REF_ENV] = candidate_ref
-    if os.geteuid() != 0 or sys.platform != "darwin" or platform.machine() not in ("arm64", "aarch64"):
-        raise Refusal("unsupported_host", "host")
-    _check_temp_root()
-    smoke_versions = _validate_smoke_receipt(runner_temp, binding, rust)
-    if type(token_reference) is not str or TOKEN_RE.fullmatch(token_reference) is None:
-        raise Refusal("token_revocation_unconfirmed", "source_lease")
-    environ["SOURCE_READER_TOKEN"] = token_reference
-    lifecycle["token_reference"] = token_reference
+    operation = "load_controls"
     try:
-        lease_record, versions, gates, network_captured, summary_guard_passed = _run_source(
-            request, binding, root, runner_temp, environ,
-            (reviewed, capability, runtime, rust, rules), diff_sha256, deadline, lifecycle,
+        started = time.monotonic()
+        deadline = started + MAX_TOTAL_SECONDS
+        controls = _load_controls()
+        reviewed, capability, boundary, runtime, rust, rules = controls
+        operation = "arguments"
+        request = _parse_arguments(arguments)
+        operation = "context"
+        binding, root, runner_temp = _validate_context(environ, reviewed, capability, boundary, rust)
+        operation = "review_binding"
+        diff_sha256, candidate_ref = _validate_review_gate(request, binding, environ, runtime)
+        environ[runtime.SOURCE_CANDIDATE_REF_ENV] = candidate_ref
+        operation = "host_preflight"
+        if (os.geteuid() != 0 or sys.platform != "darwin"
+                or platform.machine() not in ("arm64", "aarch64")):
+            raise Refusal("unsupported_host", "host")
+        operation = "temp_root_check"
+        _check_temp_root()
+        operation = "smoke_receipt"
+        smoke_versions = _validate_smoke_receipt(runner_temp, binding, rust)
+        operation = "token_input"
+        if type(token_reference) is not str or TOKEN_RE.fullmatch(token_reference) is None:
+            raise Refusal("token_revocation_unconfirmed", "source_lease")
+        environ["SOURCE_READER_TOKEN"] = token_reference
+        lifecycle["token_reference"] = token_reference
+        try:
+            operation = "source_gates"
+            lease_record, versions, gates, network_captured, summary_guard_passed = _run_source(
+                request, binding, root, runner_temp, environ,
+                (reviewed, capability, runtime, rust, rules), diff_sha256, deadline, lifecycle,
+            )
+        finally:
+            lifecycle.pop("token_reference", None)
+        operation = "success_receipt"
+        if (time.monotonic() >= deadline or versions != smoke_versions
+                or lifecycle.get("token_revocation") != "confirmed_before_execution"):
+            raise Refusal("runner_unavailable", "receipt")
+        record = _build_success_record(binding, request, lease_record, diff_sha256, versions, gates)
+        _validate_success_record(
+            record, binding, request, lease_record, diff_sha256, versions, gates,
+            network_captured, summary_guard_passed,
         )
-    except Refusal:
-        raise
+        payload = _canonical_json(record)
+        if len(payload) > MAX_RECEIPT_BYTES - len("KD-CORE-CONTRACT ".encode("ascii")):
+            raise Refusal("capture_invalid", "receipt")
+        return payload[:-1]
+    except Refusal as error:
+        raise _FailureDiagnostics().attach(error, operation) from None
     except BaseException:
-        raise Refusal("internal_error", "internal") from None
-    finally:
-        lifecycle.pop("token_reference", None)
-    if (time.monotonic() >= deadline or versions != smoke_versions
-            or lifecycle.get("token_revocation") != "confirmed_before_execution"):
-        raise Refusal("runner_unavailable", "receipt")
-    record = _build_success_record(binding, request, lease_record, diff_sha256, versions, gates)
-    _validate_success_record(
-        record, binding, request, lease_record, diff_sha256, versions, gates,
-        network_captured, summary_guard_passed,
-    )
-    payload = _canonical_json(record)
-    if len(payload) > MAX_RECEIPT_BYTES - len("KD-CORE-CONTRACT ".encode("ascii")):
-        raise Refusal("capture_invalid", "receipt")
-    return payload[:-1]
+        diagnostic = operation if operation in OPERATION_DIAGNOSTICS else "unavailable"
+        raise Refusal("internal_error", "internal", diagnostic=diagnostic) from None
 
 
 def _format_refusal(error):
     reason = error.reason if type(error) is Refusal else "internal_error"
     stage = error.stage if type(error) is Refusal else "internal"
-    record = {"schema_version": SCHEMA_VERSION, "status": "refused", "stage": stage, "reason": reason}
+    diagnostic = error.diagnostic if type(error) is Refusal else "unavailable"
+    if type(diagnostic) is not str or diagnostic not in DIAGNOSTICS:
+        diagnostic = "unavailable"
+    record = {
+        "diagnostic": diagnostic, "reason": reason, "schema_version": SCHEMA_VERSION,
+        "stage": stage, "status": "refused",
+    }
     payload = _canonical_json(record)
     prefix_bytes = len("KD-CORE-CONTRACT-REFUSAL ".encode("ascii"))
     if len(payload) + prefix_bytes > MAX_REFUSAL_BYTES:
-        return b'{"reason":"internal_error","schema_version":1,"stage":"internal","status":"refused"}'
+        return b'{"diagnostic":"unavailable","reason":"internal_error","schema_version":1,"stage":"internal","status":"refused"}'
     return payload[:-1]
 
 
@@ -1032,6 +1211,7 @@ def main(arguments=None, environ=None, stdin=None, stdout=None):
     output_stream = sys.stdout if stdout is None else stdout
     token_reference = None
     lifecycle = {"token_revocation": "unconfirmed"}
+    failure_diagnostics = _FailureDiagnostics()
     failure = None
     pending_tokens = []
     try:
@@ -1064,8 +1244,9 @@ def main(arguments=None, environ=None, stdin=None, stdout=None):
     except Refusal as error:
         failure = error
     except BaseException:
-        failure = Refusal("internal_error", "internal")
+        failure = Refusal("internal_error", "internal", diagnostic="unavailable")
     if failure is not None:
+        failure = failure_diagnostics.attach(failure, getattr(failure, "diagnostic", "unavailable"))
         for pending_token in pending_tokens:
             if (pending_token == token_reference
                     and lifecycle.get("token_revocation") == "confirmed_before_execution"):
@@ -1075,9 +1256,13 @@ def main(arguments=None, environ=None, stdin=None, stdout=None):
                 if rules._revoke_pending_token(environment, pending_token):
                     lifecycle["token_revocation"] = "confirmed_before_execution"
                 else:
-                    failure = Refusal("cleanup_incomplete", "cleanup")
+                    failure = failure_diagnostics.attach(
+                        Refusal("cleanup_incomplete", "cleanup"), "token_revocation",
+                    )
             except BaseException:
-                failure = Refusal("cleanup_incomplete", "cleanup")
+                failure = failure_diagnostics.attach(
+                    Refusal("cleanup_incomplete", "cleanup"), "token_revocation",
+                )
                 break
     if failure is not None:
         output_stream.write("KD-CORE-CONTRACT-REFUSAL " + _format_refusal(failure).decode("ascii") + "\n")
