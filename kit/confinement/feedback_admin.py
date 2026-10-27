@@ -1028,7 +1028,8 @@ class FeedbackAdmin:
                         import feedback_api
                     evidence = feedback_api.collect_feedback_evidence(
                         api_client, request, expected_actor_login=self.actor_login,
-                        run_id=manual_summary_review["run_id"], run_attempt=1, now=collection_time,
+                        run_id=str(manual_summary_review["run_id"]),
+                        run_attempt=1, now=collection_time,
                     )
                 except Exception:
                     _refuse()

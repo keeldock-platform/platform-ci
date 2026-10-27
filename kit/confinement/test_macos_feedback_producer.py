@@ -67,6 +67,11 @@ def _dispatch(kind="build_diagnostics"):
     return request, environment
 
 
+def _validated_dispatch(kind):
+    _request, environment = _dispatch(kind)
+    return producer.validate_dispatch(kind, environment, now=NOW)
+
+
 class MacosFeedbackProducerTests(unittest.TestCase):
     def test_dispatch_binds_each_closed_profile_and_omits_lock_kind_from_context(self):
         for kind in producer.PROFILE_BY_KIND:
@@ -141,7 +146,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertNotIn("stdout", record)
         self.assertNotIn("stderr", record)
 
-    def test_publisher_requires_exact_single_profile_receipt_and_context(self):
+    def test_publisher_receipt_parser_requires_exact_single_profile_and_context(self):
         _, environment = _dispatch("build_diagnostics")
         dispatch = producer.validate_dispatch("build_diagnostics", environment, now=NOW)
         receipt = producer.producer_receipt(dispatch, {
@@ -160,7 +165,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             for altered, kind in (
                 (line + line, "build_diagnostics"),
                 (line, "rust_patch"),
-                (line.replace(b"b" * 64, b"c" * 64), "build_diagnostics"),
+                (line.replace(b"b" * 64, b"g" * 64), "build_diagnostics"),
             ):
                 with self.subTest(kind=kind, size=len(altered)), self.assertRaises(producer.FeedbackRefusal):
                     producer._parse_producer_line(altered, kind, environment)
@@ -206,9 +211,10 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertEqual(raised.exception.reason, "capture_invalid")
 
     def test_lock_profile_uses_fixed_script_disabled_registry_command_and_restores_cwd(self):
-        dispatch, _environment = _dispatch("lock")
+        dispatch = _validated_dispatch("lock")
         calls = []
         command_result = SimpleNamespace(returncode=0, stdout=b"quiet", stderr=b"")
+        worker_home = str(Path(tempfile.gettempdir()) / "worker-home")
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -234,7 +240,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                                 with patch.object(producer.os, "chdir", side_effect=lambda path:
                                         calls.append(("cwd", path))):
                                     result = producer.run_source_profile(
-                                        dispatch, source, worker_storage, 501, {"HOME": "/worker-home"},
+                                        dispatch, source, worker_storage, 501, {"HOME": worker_home},
                                         {}, {"python": "/trusted/python"},
                                         SimpleNamespace(PROBE_PRIMARY_GID=20), object(), object(),
                                         10**12, Path("/trusted/node"), Path("/trusted/npm-cli.js"),
@@ -257,9 +263,10 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertEqual(result["source_result"], "command_completed")
 
     def test_lock_profile_refuses_unavailable_dedicated_tmp_before_command(self):
-        dispatch, _environment = _dispatch("lock")
+        dispatch = _validated_dispatch("lock")
         calls = []
         worker_storage = Path("/synthetic-worker")
+        worker_home = str(Path(tempfile.gettempdir()) / "worker-home")
 
         def refuse_feedback_tmp(path, *unused_args):
             path = Path(path)
@@ -275,7 +282,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                         with self.assertRaises(producer.FeedbackRefusal) as raised:
                             producer.run_source_profile(
                                 dispatch, Path("/synthetic-source"), worker_storage, 501,
-                                {"HOME": "/worker-home"}, {}, {"python": "/trusted/python"},
+                                {"HOME": worker_home}, {}, {"python": "/trusted/python"},
                                 SimpleNamespace(PROBE_PRIMARY_GID=20), object(), object(),
                                 10**12, Path("/trusted/node"), Path("/trusted/npm-cli.js"),
                             )
@@ -283,7 +290,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertNotIn("command", calls)
 
     def test_source_profile_failure_restores_source_cwd_and_never_returns_payload(self):
-        dispatch, _environment = _dispatch("rust_patch")
+        dispatch = _validated_dispatch("rust_patch")
         calls = []
 
         def reject_command(*unused_args, **unused_kwargs):

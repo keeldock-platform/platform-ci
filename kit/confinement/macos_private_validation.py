@@ -3005,7 +3005,7 @@ def _format_success(record, binding):
     }
     if any(record[key] != value for key, value in fixed.items()):
         raise Refusal("internal_error", "input")
-    return " ".join((
+    fields = [
         "macos-private-validation=verified",
         "schema=" + str(SCHEMA_VERSION),
         "control-sha=" + binding["control_sha"],
@@ -3024,7 +3024,10 @@ def _format_success(record, binding):
         "source-execution=not-run",
         "app-build=not-run",
         "cleanup=complete",
-    ))
+    ]
+    if record["concern"] in FEEDBACK_PROFILE_CONCERNS:
+        fields.append("tree=" + record["tree"])
+    return " ".join(fields)
 
 
 def _safe_identity_fields(control_sha, environ):

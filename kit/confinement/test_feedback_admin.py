@@ -310,6 +310,37 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.directory,
                          "return-" + result["request"]["request_id"] + "-lock.payload")))
 
+    def test_collector_receives_the_canonical_run_id_and_complete_evidence_contract(self):
+        result = self.create()
+        request = result["request"]
+        evidence, trusted = self.evidence_for(request)
+        gate = self.summary_gate(request)
+        api_client = object()
+        calls = []
+        module = types.ModuleType("feedback_api")
+
+        def collect(api, collector_request, **kwargs):
+            calls.append((api, collector_request, dict(kwargs)))
+            return evidence
+
+        module.collect_feedback_evidence = collect
+        self.assertEqual(set(evidence), set(subject.EVIDENCE_FIELDS))
+        with mock.patch.dict(sys.modules, {"feedback_api": module}), \
+                mock.patch.object(subject.node_lock_receipt, "validate_receipt", return_value=trusted):
+            self.admin.consume_return(request["request_id"], api_client, manual_summary_review=gate)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIs(calls[0][0], api_client)
+        self.assertEqual(calls[0][1], request)
+        self.assertEqual(set(calls[0][2]), {"expected_actor_login", "run_id", "run_attempt", "now"})
+        self.assertEqual(calls[0][2]["expected_actor_login"], ACTOR_LOGIN)
+        self.assertEqual(calls[0][2]["run_id"], str(RUN_ID))
+        self.assertIs(type(calls[0][2]["run_id"]), str)
+        self.assertEqual(calls[0][2]["run_attempt"], 1)
+        self.assertIs(type(calls[0][2]["run_attempt"]), int)
+        self.assertEqual(calls[0][2]["now"], NOW)
+        self.assertIs(type(calls[0][2]["now"]), int)
+
     def test_success_consumes_and_retires_key_before_private_output(self):
         result = self.create()
         request = result["request"]

@@ -1445,6 +1445,7 @@ class EvidenceTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 self.assertIn(field, line.split())
+        self.assertNotIn("tree=core_administrative", line.split())
 
     def test_rules_record_cannot_claim_core_lock_presence(self):
         binding = {
@@ -1472,6 +1473,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertIn("concern=core-contract", line.split())
         self.assertIn("rules-lock=present", line.split())
         self.assertIn("source-execution=not-run", line.split())
+        self.assertNotIn("tree=core_contract", line.split())
 
     def test_feedback_receipt_preserves_profile_specific_tree_binding(self):
         binding = {
