@@ -1758,14 +1758,87 @@ class CoreContractReceiptTests(unittest.TestCase):
             "status": "refused",
             "stage": "source_lease",
             "reason": "source_validation_failed",
+            "diagnostic": "source_lease_request",
         }
         raw = core_contract_line(value, b"KD-CORE-CONTRACT-REFUSAL ")
         env = core_contract_publish_environment("1")
         output = io.BytesIO()
         self.assertEqual(audit.publish_core_contract_receipt(env, io.BytesIO(raw), output), 0)
         self.assertEqual(output.getvalue(), raw)
+        cleanup_value = {
+            "schema_version": 1,
+            "status": "refused",
+            "stage": "cleanup",
+            "reason": "cleanup_incomplete",
+            "diagnostic": "worker_cleanup",
+        }
+        cleanup_raw = core_contract_line(cleanup_value, b"KD-CORE-CONTRACT-REFUSAL ")
+        cleanup_output = io.BytesIO()
+        self.assertEqual(
+            audit.publish_core_contract_receipt(env, io.BytesIO(cleanup_raw), cleanup_output), 0
+        )
+        self.assertEqual(cleanup_output.getvalue(), cleanup_raw)
+        preflight_value = {
+            "schema_version": 1,
+            "status": "refused",
+            "stage": "context",
+            "reason": "invalid_input",
+            "diagnostic": "none",
+        }
+        preflight_raw = core_contract_line(preflight_value, b"KD-CORE-CONTRACT-REFUSAL ")
+        self.assertEqual(
+            audit.publish_core_contract_receipt(
+                core_contract_publish_environment("1"), io.BytesIO(preflight_raw), io.BytesIO()
+            ),
+            0,
+        )
+        internal_value = {
+            "schema_version": 1,
+            "status": "refused",
+            "stage": "internal",
+            "reason": "internal_error",
+            "diagnostic": "unavailable",
+        }
+        internal_raw = core_contract_line(internal_value, b"KD-CORE-CONTRACT-REFUSAL ")
+        self.assertEqual(
+            audit.publish_core_contract_receipt(
+                core_contract_publish_environment("1"), io.BytesIO(internal_raw), io.BytesIO()
+            ),
+            0,
+        )
+        classified_internal_value = {**internal_value, "diagnostic": "worker_cleanup"}
+        classified_internal_raw = core_contract_line(
+            classified_internal_value, b"KD-CORE-CONTRACT-REFUSAL "
+        )
+        self.assertEqual(
+            audit.publish_core_contract_receipt(
+                core_contract_publish_environment("1"),
+                io.BytesIO(classified_internal_raw), io.BytesIO(),
+            ),
+            0,
+        )
+        unclassified_cleanup_value = {
+            "schema_version": 1,
+            "status": "refused",
+            "stage": "cleanup",
+            "reason": "cleanup_incomplete",
+            "diagnostic": "unavailable",
+        }
+        unclassified_cleanup_raw = core_contract_line(
+            unclassified_cleanup_value, b"KD-CORE-CONTRACT-REFUSAL "
+        )
+        self.assertEqual(
+            audit.publish_core_contract_receipt(
+                core_contract_publish_environment("1"),
+                io.BytesIO(unclassified_cleanup_raw), io.BytesIO(),
+            ),
+            0,
+        )
+        missing_diagnostic = dict(value)
+        del missing_diagnostic["diagnostic"]
         for invalid in (
             raw + b"extra",
+            core_contract_line(missing_diagnostic, b"KD-CORE-CONTRACT-REFUSAL "),
             raw.replace(
                 b'"reason":"source_validation_failed",',
                 b'"reason":"source_validation_failed","reason":"source_validation_failed",',
@@ -1773,10 +1846,17 @@ class CoreContractReceiptTests(unittest.TestCase):
             ),
             core_contract_line({**value, "control_sha": CONTROL_SHA}, b"KD-CORE-CONTRACT-REFUSAL "),
             core_contract_line({**value, "reason": "unknown"}, b"KD-CORE-CONTRACT-REFUSAL "),
+            core_contract_line({**value, "diagnostic": "unknown"}, b"KD-CORE-CONTRACT-REFUSAL "),
+            core_contract_line({**value, "diagnostic": True}, b"KD-CORE-CONTRACT-REFUSAL "),
+            core_contract_line({**value, "diagnostic": "none"}, b"KD-CORE-CONTRACT-REFUSAL "),
         ):
             with self.subTest(payload=invalid[-40:]):
+                rejected_output = io.BytesIO()
                 with self.assertRaises(audit.AuditRefusal):
-                    audit.publish_core_contract_receipt(env, io.BytesIO(invalid), io.BytesIO())
+                    audit.publish_core_contract_receipt(
+                        env, io.BytesIO(invalid), rejected_output
+                    )
+                self.assertEqual(rejected_output.getvalue(), b"")
 
     def test_public_audit_binds_success_receipt_to_requested_commit_and_review_hash(self):
         raw = core_contract_line()
@@ -2049,6 +2129,7 @@ class BootstrapAuditTests(unittest.TestCase):
             "status": "refused",
             "stage": "source_lease",
             "reason": "source_validation_failed",
+            "diagnostic": "source_lease_request",
         }
         refusal_line = core_contract_line(refusal_value, b"KD-CORE-CONTRACT-REFUSAL ")
         cleanup_line = (
@@ -2071,6 +2152,73 @@ class BootstrapAuditTests(unittest.TestCase):
             audit.run("core-contract-audit", env, api)
         self.assertEqual(caught.exception.reason, "native_job_failed")
         self.assertEqual(api.log_calls, [822, 823])
+        self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
+        self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
+
+    def test_core_contract_unconfirmed_cleanup_refusal_stays_fail_closed_after_public_scans(self):
+        pages, env, logs = bootstrap_audit_fixture("core-contract")
+        jobs_path = (
+            "/repos/keeldock-platform/platform-ci/actions/runs/" + RUN_ID
+            + "/attempts/" + RUN_ATTEMPT + "/jobs?per_page=100&page=1"
+        )
+        producer_job = next(
+            job for job in pages[jobs_path][0]["jobs"]
+            if job["name"] == audit.CORE_CONTRACT_PRODUCER_JOB_NAME
+        )
+        producer_job["conclusion"] = "failure"
+        producer_detail_path = "/repos/keeldock-platform/platform-ci/actions/jobs/823"
+        producer_detail = pages[producer_detail_path][0]
+        producer_detail["conclusion"] = "failure"
+        contract_step = next(
+            step for step in producer_detail["steps"] if step["name"] == "Run fixed core contract"
+        )
+        contract_step["conclusion"] = "failure"
+        fallback_step = next(
+            step for step in producer_detail["steps"]
+            if step["name"] == "Revoke token if contract did not confirm"
+        )
+        fallback_step["conclusion"] = "success"
+        summary_step = next(
+            step for step in producer_detail["steps"]
+            if step["name"] == "Write trusted contract summary control"
+        )
+        summary_step["conclusion"] = "skipped"
+        pages["/repos/keeldock-platform/platform-ci/check-runs/923"][0]["conclusion"] = "failure"
+        refusal_value = {
+            "schema_version": 1,
+            "status": "refused",
+            "stage": "cleanup",
+            "reason": "cleanup_incomplete",
+            "diagnostic": "worker_cleanup",
+        }
+        refusal_line = core_contract_line(refusal_value, b"KD-CORE-CONTRACT-REFUSAL ")
+        refusal_state, parsed_refusal = audit._inspect_core_contract_receipt(
+            refusal_line, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, env
+        )
+        self.assertEqual(refusal_state, "refused")
+        self.assertEqual(parsed_refusal["diagnostic"], "worker_cleanup")
+        cleanup_line = (
+            "macos-core-contract-cleanup=unconfirmed schema=1 control-sha=" + CONTROL_SHA
+            + " run-id=" + RUN_ID + " run-attempt=" + RUN_ATTEMPT + "\n"
+        ).encode("ascii")
+        cleanup_script_echo = (
+            b'cleanup_marker_prefix="macos-core-contract-"\n'
+            b"printf '%scleanup=unconfirmed schema=1 control-sha=%s run-id=%s run-attempt=%s\\n' \\\n"
+            b'  "$cleanup_marker_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"\n'
+            b"printf '%scleanup=confirmed schema=1 control-sha=%s run-id=%s run-attempt=%s\\n' \\\n"
+            b'  "$cleanup_marker_prefix" "$CI_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"\n'
+        )
+        logs[823] = logs[823].replace(core_contract_line(), refusal_line)
+        logs[823] = logs[823].replace(
+            b"macos-core-contract-summary-control=trusted-write", b"", 1
+        ) + cleanup_script_echo + cleanup_line
+        api = FakeMultiAuditAPI(pages, logs)
+        with self.assertRaises(audit.AuditRefusal) as caught:
+            audit.run("core-contract-audit", env, api)
+        self.assertEqual(caught.exception.reason, "receipt_invalid")
+        self.assertEqual(api.log_calls, [822, 823])
+        self.assertTrue(any(path.endswith("/check-runs/922/annotations") for path in api.calls))
+        self.assertTrue(any(path.endswith("/check-runs/923/annotations") for path in api.calls))
         self.assertTrue(any(path.endswith("/artifacts?per_page=100&page=1") for path in api.calls))
         self.assertTrue(any(path.endswith("/actions/caches?per_page=100&page=1") for path in api.calls))
 
