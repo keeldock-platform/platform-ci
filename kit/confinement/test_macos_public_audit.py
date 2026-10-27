@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import macos_public_audit as audit
+import macos_private_validation as source_runtime
 
 
 CONTROL_SHA = "0123456789abcdef" * 2 + "01234567"
@@ -1883,6 +1884,88 @@ class CoreContractReceiptTests(unittest.TestCase):
                         env, io.BytesIO(invalid), rejected_output
                     )
                 self.assertEqual(rejected_output.getvalue(), b"")
+
+    def test_private_source_diagnostics_match_the_closed_runtime_contract(self):
+        self.assertEqual(audit.CORE_CONTRACT_RUNTIME_REASONS, source_runtime.REASONS)
+        self.assertEqual(audit.CORE_CONTRACT_RUNTIME_STAGES, source_runtime.STAGES)
+        self.assertEqual(audit.CORE_CONTRACT_FETCH_OPERATIONS, source_runtime.FETCH_DIAGNOSTIC_OPERATIONS)
+        self.assertEqual(audit.CORE_CONTRACT_FETCH_CLASSES, source_runtime.FETCH_DIAGNOSTIC_CLASSES)
+        self.assertEqual(audit.CORE_CONTRACT_BOOTSTRAP_CHECKS, source_runtime.CORE_BOOTSTRAP_CHECKS)
+
+        expected_mapping = {
+            "cleanup_incomplete": ("cleanup_incomplete", "cleanup"),
+            "revocation_unconfirmed": ("token_revocation_unconfirmed", "source_validation"),
+            "signature_invalid": ("source_binding_mismatch", "source_validation"),
+            "base_invalid": ("source_binding_mismatch", "source_validation"),
+            "bootstrap_not_approved": ("source_binding_mismatch", "source_validation"),
+            "invalid_input": ("invalid_input", "source_validation"),
+        }
+
+        def refusal_payload(reason, stage, diagnostic):
+            return json.dumps(
+                {
+                    "schema_version": 1, "status": "refused", "stage": stage,
+                    "reason": reason, "diagnostic": diagnostic,
+                },
+                ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+            ).encode("ascii")
+
+        for runtime_reason in source_runtime.REASONS:
+            expected_reason, expected_stage = expected_mapping.get(
+                runtime_reason, ("source_validation_failed", "source_validation"),
+            )
+            for runtime_stage in source_runtime.STAGES:
+                diagnostic = "source_runtime_" + runtime_stage + "_" + runtime_reason
+                with self.subTest(runtime_reason=runtime_reason, runtime_stage=runtime_stage):
+                    parsed = audit._core_contract_refusal_value(
+                        refusal_payload(expected_reason, expected_stage, diagnostic),
+                    )
+                    self.assertEqual(parsed["diagnostic"], diagnostic)
+
+        for operation in source_runtime.FETCH_DIAGNOSTIC_OPERATIONS:
+            for failure_class in source_runtime.FETCH_DIAGNOSTIC_CLASSES:
+                diagnostic = "source_fetch_" + operation + "_" + failure_class
+                audit._core_contract_refusal_value(refusal_payload(
+                    "source_validation_failed", "source_validation", diagnostic,
+                ))
+        for check in source_runtime.CORE_BOOTSTRAP_CHECKS:
+            audit._core_contract_refusal_value(refusal_payload(
+                "source_validation_failed", "source_validation", "source_bootstrap_" + check,
+            ))
+        for error_class in audit.CORE_CONTRACT_SOURCE_LEASE_OPEN_CLASSES:
+            audit._core_contract_refusal_value(refusal_payload(
+                "source_validation_failed", "source_validation", "source_lease_open_" + error_class,
+            ))
+
+        invalid_values = (
+            ("source_validation_failed", "source_validation", "source_runtime_fetch_cleanup_incomplete"),
+            ("source_binding_mismatch", "source_validation", "source_runtime_fetch_source_fetch_unavailable"),
+            ("source_binding_mismatch", "source_validation", "source_runtime_bootstrap_bootstrap_snapshot_invalid"),
+            ("source_validation_failed", "source_lease", "source_bootstrap_tree_entries"),
+            ("source_validation_failed", "source_tree", "source_lease_open_not_found"),
+            ("source_validation_failed", "source_validation", "source_fetch_untrusted_process_failure"),
+            ("source_validation_failed", "source_validation", "source_bootstrap_untrusted_check"),
+            ("source_validation_failed", "source_validation", "source_lease_open_untrusted_class"),
+        )
+        for reason, stage, diagnostic in invalid_values:
+            with self.subTest(reason=reason, stage=stage, diagnostic=diagnostic):
+                with self.assertRaises(audit.AuditRefusal):
+                    audit._core_contract_refusal_value(refusal_payload(reason, stage, diagnostic))
+
+        for diagnostic in (True, None, [], {"source": "runtime"}, "x" * 513):
+            with self.subTest(diagnostic=diagnostic):
+                with self.assertRaises(audit.AuditRefusal):
+                    audit._core_contract_refusal_value(refusal_payload(
+                        "source_validation_failed", "source_validation", diagnostic,
+                    ))
+
+    def test_private_source_refusal_payload_cap_stays_closed(self):
+        env = core_contract_publish_environment("1")
+        output = io.BytesIO()
+        oversized = b"KD-CORE-CONTRACT-REFUSAL " + b" " * audit.MAX_CORE_CONTRACT_REFUSAL_BYTES + b"\n"
+        with self.assertRaises(audit.AuditRefusal):
+            audit.publish_core_contract_receipt(env, io.BytesIO(oversized), output)
+        self.assertEqual(output.getvalue(), b"")
 
     def test_public_audit_binds_success_receipt_to_requested_commit_and_review_hash(self):
         raw = core_contract_line()
