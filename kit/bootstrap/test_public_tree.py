@@ -171,6 +171,9 @@ class PublicTreeTests(unittest.TestCase):
 
     def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
+            '.github/workflows/macos-rust-toolchain-smoke.yml',
+            'kit/confinement/macos_rust_toolchain.py',
+            'kit/confinement/test_macos_rust_toolchain.py',
             'kit/confinement/macos_rules_bootstrap.py',
             'kit/confinement/test_macos_rules_bootstrap.py',
             'kit/confinement/macos_core_bootstrap.py',

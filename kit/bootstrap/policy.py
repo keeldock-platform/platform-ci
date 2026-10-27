@@ -666,6 +666,279 @@ jobs:
 """
 
 
+MACOS_RUST_TOOLCHAIN_WORKFLOW_TEMPLATE = r"""name: macos-rust-toolchain-smoke
+on:
+  workflow_dispatch:
+cache-mode: none
+permissions: {}
+jobs:
+  macos-rust-toolchain-snapshot:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      actions: read
+    outputs:
+      cache_snapshot: ${{ steps.snapshot.outputs.cache_snapshot }}
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Snapshot cache inventory
+        id: snapshot
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py rust-toolchain-snapshot
+  macos-rust-toolchain-smoke:
+    needs: macos-rust-toolchain-snapshot
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-15
+    cache-mode: none
+    timeout-minutes: 35
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Validate source-free control tree
+        run: |
+          set -euo pipefail
+          python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_public_tree.py
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
+          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+      - name: Run source-free reviewed build smoke
+        run: |
+          set -euo pipefail
+          if [[ -z "${ImageOS:-}" || -z "${ImageVersion:-}" ]]; then
+            exit 1
+          fi
+          sudo -n -- env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            CI_EVENT_NAME="$CI_EVENT_NAME" \
+            CI_REF="$CI_REF" \
+            CI_REPOSITORY="$CI_REPOSITORY" \
+            CI_SERVER_URL="$CI_SERVER_URL" \
+            CI_SHA="$CI_SHA" \
+            CI_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            ImageOS="$ImageOS" \
+            ImageVersion="$ImageVersion" \
+            RUNNER_HOME="$HOME" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            CI_WORKSPACE="$CI_WORKSPACE" \
+            PYTHONDONTWRITEBYTECODE=1 \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_reviewed_build.py --control-sha "$CI_SHA"
+      - name: Run source-free Rust toolchain smoke
+        run: |
+          set -euo pipefail
+          rust_marker_prefix="KD-RUST-"
+          rust_success_prefix="${rust_marker_prefix}SMOKE "
+          rust_refusal_prefix="${rust_marker_prefix}REFUSAL reason="
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ \
+            || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ \
+            || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "invalid_input"
+            exit 1
+          fi
+          if [[ -z "${RUNNER_TEMP:-}" || "$RUNNER_TEMP" != /* || -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "runner_unavailable"
+            exit 1
+          fi
+          if ! capture_dir="$(/usr/bin/mktemp -d "${RUNNER_TEMP%/}/rust-toolchain-smoke.XXXXXX" 2>/dev/null)"; then
+            printf '%s%s\n' "$rust_refusal_prefix" "runner_unavailable"
+            exit 1
+          fi
+          stdout_file="$capture_dir/stdout"
+          stderr_file="$capture_dir/stderr"
+          validated_file="$capture_dir/validated"
+          validator_stderr_file="$capture_dir/validator-stderr"
+          trap '/bin/rm -rf "$capture_dir" 2>/dev/null' EXIT
+          set +e
+          sudo -n -- /usr/bin/env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_rust_toolchain.py --control-sha "$CI_SHA" \
+            >"$stdout_file" 2>"$stderr_file"
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "smoke_failed"
+            exit 1
+          fi
+          set +e
+          /usr/bin/env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            LANG=C \
+            LC_ALL=C \
+            CI_SHA="$CI_SHA" \
+            GITHUB_SHA="$GITHUB_SHA" \
+            GITHUB_REPOSITORY="$CI_REPOSITORY" \
+            GITHUB_EVENT_NAME="$CI_EVENT_NAME" \
+            GITHUB_REF="$CI_REF" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_public_audit.py rust-toolchain-publish \
+            <"$stdout_file" >"$validated_file" 2>"$validator_stderr_file"
+          validator_status=$?
+          set -e
+          if [[ "$validator_status" -ne 0 ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "capture_invalid"
+            exit 1
+          fi
+          if [[ ! -f "$validated_file" || ! -r "$validated_file" \
+            || "$(/usr/bin/wc -l < "$validated_file" 2>/dev/null)" -ne 1 \
+            || "$(/usr/bin/wc -c < "$validated_file" 2>/dev/null)" -gt 16384 ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "capture_invalid"
+            exit 1
+          fi
+          IFS= read -r receipt_line < "$validated_file" || {
+            printf '%s%s\n' "$rust_refusal_prefix" "capture_invalid"
+            exit 1
+          }
+          if [[ "$receipt_line" != "${rust_success_prefix}"* ]]; then
+            printf '%s%s\n' "$rust_refusal_prefix" "capture_invalid"
+            exit 1
+          fi
+          if ! /bin/rm -rf "$capture_dir" 2>/dev/null; then
+            printf '%s%s\n' "$rust_refusal_prefix" "cleanup_incomplete"
+            exit 1
+          fi
+          trap - EXIT
+          if ! printf '%s\n' "$receipt_line" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"; then
+            printf '%s%s\n' "$rust_refusal_prefix" "runner_unavailable"
+            exit 1
+          fi
+          printf '%s\n' "$receipt_line"
+      - name: Write trusted summary visibility control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ \
+            || ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,18}$ \
+            || ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,18}$ ]]; then
+            exit 1
+          fi
+          if [[ -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            exit 1
+          fi
+          summary_prefix="macos-summary-"
+          summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT"
+          printf '%s\n' "$summary_line" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$summary_line"
+  macos-rust-toolchain-audit:
+    if: ${{ always() }}
+    needs: [macos-rust-toolchain-snapshot, macos-rust-toolchain-smoke]
+    runs-on: ubuntu-24.04
+    cache-mode: none
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      actions: read
+      checks: read
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      MACOS_CACHE_SNAPSHOT: ${{ needs.macos-rust-toolchain-snapshot.outputs.cache_snapshot }}
+    steps:
+      - name: Fetch reviewed main control
+        run: |
+          set -euo pipefail
+          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
+            exit 1
+          fi
+          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
+            exit 1
+          fi
+          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            exit 1
+          fi
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
+          if [[ "$actual_sha" != "$CI_SHA" ]]; then
+            exit 1
+          fi
+      - name: Audit public surfaces
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/macos_public_audit.py rust-toolchain-audit
+"""
+
+
 MACOS_CACHE_PROOF_ACTION_SHA = "3edfce9056124e459a23f683a21433670d47daca"
 MACOS_CACHE_PROOF_WORKFLOW_TEMPLATE = r"""name: macos-cache-proof
 on:
@@ -1135,6 +1408,10 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         expected = MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE
+    elif workflow_kind == "macos-rust-toolchain-smoke":
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        expected = MACOS_RUST_TOOLCHAIN_WORKFLOW_TEMPLATE
     elif workflow_kind == "macos-cache-proof":
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")

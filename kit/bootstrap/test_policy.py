@@ -17,6 +17,7 @@ from policy import (
     MACOS_RULES_BOOTSTRAP_WORKFLOW_SHA256,
     MACOS_CORE_BOOTSTRAP_WORKFLOW_SHA256,
     MACOS_REVIEWED_BUILD_WORKFLOW_TEMPLATE,
+    MACOS_RUST_TOOLCHAIN_WORKFLOW_TEMPLATE,
     MACOS_SOURCE_READER_ACTION_SHA,
     MACOS_SOURCE_READER_WORKFLOW_SHA256,
     PolicyError,
@@ -34,6 +35,7 @@ PLATFORM_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/pub
 LINUX_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/linux-confinement.yml"
 MACOS_CAPABILITY_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-capability.yml"
 MACOS_REVIEWED_BUILD_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-reviewed-build.yml"
+MACOS_RUST_TOOLCHAIN_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rust-toolchain-smoke.yml"
 MACOS_CACHE_PROOF_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-cache-proof.yml"
 MACOS_SOURCE_READER_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-source-reader-preflight.yml"
 MACOS_RULES_SOURCE_READER_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rules-reader-preflight.yml"
@@ -403,6 +405,160 @@ class WorkflowPolicyTests(unittest.TestCase):
             validate_workflow_text(workflow, "connect", "macos-reviewed-build")
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow, "platform")
+
+    def test_actual_macos_rust_toolchain_workflow_is_source_free_and_independently_audited(self):
+        workflow = MACOS_RUST_TOOLCHAIN_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(workflow, MACOS_RUST_TOOLCHAIN_WORKFLOW_TEMPLATE)
+        self.assertTrue(validate_workflow_text(workflow, "platform", "macos-rust-toolchain-smoke"))
+        self.assertIn("workflow_dispatch:\ncache-mode: none\npermissions: {}", workflow)
+        self.assertEqual(workflow.count("cache-mode: none"), 4)
+        self.assertIn("github.ref == 'refs/heads/main'", workflow)
+        self.assertIn("runs-on: macos-15", workflow)
+        self.assertIn("needs: macos-rust-toolchain-snapshot", workflow)
+        self.assertIn(
+            "needs: [macos-rust-toolchain-snapshot, macos-rust-toolchain-smoke]", workflow
+        )
+        self.assertIn("if: ${{ always() }}", workflow)
+        self.assertIn("actions: read\n      checks: read", workflow)
+        self.assertIn("rust-toolchain-snapshot", workflow)
+        self.assertIn("rust-toolchain-audit", workflow)
+        self.assertIn("kit/confinement/macos_reviewed_build.py --control-sha", workflow)
+        self.assertIn(
+            "kit/confinement/macos_rust_toolchain.py --control-sha \"$CI_SHA\"", workflow
+        )
+        self.assertIn(
+            "kit/confinement/macos_public_audit.py rust-toolchain-publish", workflow
+        )
+        self.assertIn(
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_public_audit.py rust-toolchain-publish",
+            workflow,
+        )
+        self.assertIn(
+            "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_rust_toolchain.py",
+            workflow,
+        )
+        self.assertIn("GITHUB_RUN_ID=\"$GITHUB_RUN_ID\" \\\n", workflow)
+        self.assertIn("GITHUB_RUN_ATTEMPT=\"$GITHUB_RUN_ATTEMPT\" \\\n", workflow)
+        self.assertIn("CI_SHA=\"$CI_SHA\" \\\n", workflow)
+        self.assertIn("GITHUB_SHA=\"$GITHUB_SHA\" \\\n", workflow)
+        self.assertIn("GITHUB_REPOSITORY=\"$CI_REPOSITORY\" \\\n", workflow)
+        self.assertIn("GITHUB_EVENT_NAME=\"$CI_EVENT_NAME\" \\\n", workflow)
+        self.assertIn("GITHUB_REF=\"$CI_REF\" \\\n", workflow)
+        self.assertIn('>"$stdout_file" 2>"$stderr_file"', workflow)
+        self.assertIn(
+            '<"$stdout_file" >"$validated_file" 2>"$validator_stderr_file"', workflow
+        )
+        self.assertIn(
+            'printf \'%s\\n\' "$receipt_line" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"',
+            workflow,
+        )
+        self.assertIn('rust_marker_prefix="KD-RUST-"', workflow)
+        self.assertIn('rust_success_prefix="${rust_marker_prefix}SMOKE "', workflow)
+        self.assertIn('rust_refusal_prefix="${rust_marker_prefix}REFUSAL reason="', workflow)
+        self.assertNotIn("KD-RUST-SMOKE ", workflow)
+        self.assertNotIn("KD-RUST-REFUSAL", workflow)
+        self.assertIn(
+            'printf \'%s%s\\n\' "$rust_refusal_prefix" "capture_invalid"', workflow
+        )
+        self.assertIn(
+            'printf \'%s%s\\n\' "$rust_refusal_prefix" "smoke_failed"', workflow
+        )
+        self.assertIn('summary_prefix="macos-summary-"', workflow)
+        self.assertIn(
+            'summary_line="${summary_prefix}control=trusted-write schema=1 control-sha=$CI_SHA run-id=$GITHUB_RUN_ID run-attempt=$GITHUB_RUN_ATTEMPT"',
+            workflow,
+        )
+        self.assertIn("CI_WORKSPACE: ${{ github.workspace }}", workflow)
+        self.assertIn(
+            'check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"', workflow
+        )
+        self.assertNotIn("inputs:", workflow)
+        for forbidden in (
+            "secrets.",
+            "source-read",
+            "environment:",
+            "actions/checkout",
+            "upload-artifact",
+            "download-artifact",
+            "uses:",
+            "continue-on-error:",
+            "MACOS_NATIVE_RECEIPT_B64URL",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+        snapshot = workflow.split("  macos-rust-toolchain-snapshot:\n", 1)[1].split(
+            "  macos-rust-toolchain-smoke:\n", 1
+        )[0]
+        smoke = workflow.split("  macos-rust-toolchain-smoke:\n", 1)[1].split(
+            "  macos-rust-toolchain-audit:\n", 1
+        )[0]
+        audit = workflow.split("  macos-rust-toolchain-audit:\n", 1)[1]
+        self.assertIn("actions: read", snapshot)
+        self.assertNotIn("checks: read", snapshot)
+        self.assertNotIn("GITHUB_TOKEN", smoke)
+        self.assertNotIn("GITHUB_TOKEN", audit.split("      - name: Audit public surfaces\n", 1)[0])
+        self.assertLess(
+            smoke.index("Validate source-free control tree"),
+            smoke.index("Run source-free reviewed build smoke"),
+        )
+        self.assertLess(
+            smoke.index("Run source-free reviewed build smoke"),
+            smoke.index("Run source-free Rust toolchain smoke"),
+        )
+        self.assertLess(
+            smoke.index("Run source-free Rust toolchain smoke"),
+            smoke.index("Write trusted summary visibility control"),
+        )
+        rust_smoke = smoke.split("      - name: Run source-free Rust toolchain smoke\n", 1)[1].split(
+            "      - name: Write trusted summary visibility control\n", 1
+        )[0]
+        publisher = rust_smoke.index("macos_public_audit.py rust-toolchain-publish")
+        capture_cleanup = rust_smoke.index('if ! /bin/rm -rf "$capture_dir"')
+        summary_publication = rust_smoke.index(
+            'printf \'%s\\n\' "$receipt_line" 2>/dev/null >> "$GITHUB_STEP_SUMMARY"'
+        )
+        log_publication = rust_smoke.index('          printf \'%s\\n\' "$receipt_line"\n')
+        self.assertLess(publisher, capture_cleanup)
+        self.assertLess(capture_cleanup, summary_publication)
+        self.assertLess(publisher, log_publication)
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "macos-rust-toolchain-smoke")
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "platform")
+
+    def test_macos_rust_toolchain_workflow_rejects_source_cache_and_audit_bypasses(self):
+        base = MACOS_RUST_TOOLCHAIN_WORKFLOW.read_text(encoding="utf-8")
+        mutations = (
+            base.replace("  workflow_dispatch:\n", "  push:\n"),
+            base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
+            base.replace("runs-on: macos-15", "runs-on: macos-latest"),
+            base.replace("cache-mode: none\n", "cache-mode: read\n", 1),
+            base.replace("    cache-mode: none\n", "", 1),
+            base.replace("    if: ${{ always() }}\n", "    if: ${{ success() }}\n"),
+            base.replace("      actions: read\n      checks: read\n", "      actions: write\n      checks: write\n"),
+            base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
+            base.replace("      - name: Run source-free Rust toolchain smoke\n", ""),
+            base.replace("macos_public_audit.py rust-toolchain-publish", "macos_public_audit.py rust-toolchain-audit"),
+            base.replace(
+                "/Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/macos_rust_toolchain.py",
+                "/usr/bin/python3 -I -S -B kit/confinement/macos_rust_toolchain.py",
+            ),
+            base.replace("      - name: Write trusted summary visibility control\n", ""),
+            base.replace("      - name: Validate source-free control tree\n", ""),
+            base.replace("needs: [macos-rust-toolchain-snapshot, macos-rust-toolchain-smoke]", "needs: macos-rust-toolchain-smoke"),
+            base.replace('  if: ${{ always() }}\n', '  if: ${{ success() }}\n'),
+            base.replace("kit/confinement/macos_rust_toolchain.py --control-sha", "kit/confinement/macos_reviewed_build.py --control-sha"),
+            base.replace('GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \\\n', ""),
+            base.replace('>"$stdout_file" 2>"$stderr_file"', ""),
+            base.replace("      - name: Run source-free reviewed build smoke\n", "      - name: Extra execution\n        run: echo extra\n      - name: Run source-free reviewed build smoke\n"),
+            base.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n"),
+            base + "  unexpected:\n    runs-on: ubuntu-24.04\n    steps: []\n",
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(changed, base)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "macos-rust-toolchain-smoke")
 
     def test_macos_reviewed_build_workflow_rejects_cache_source_and_audit_bypasses(self):
         base = MACOS_REVIEWED_BUILD_WORKFLOW.read_text(encoding="utf-8")

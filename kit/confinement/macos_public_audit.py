@@ -16,6 +16,10 @@ REVIEWED_WORKFLOW_PATH = ".github/workflows/macos-reviewed-build.yml"
 REVIEWED_SNAPSHOT_JOB_NAME = "macos-public-snapshot"
 REVIEWED_SMOKE_JOB_NAME = "macos-reviewed-smoke"
 REVIEWED_AUDIT_JOB_NAME = "macos-public-surface-audit"
+RUST_TOOLCHAIN_WORKFLOW_PATH = ".github/workflows/macos-rust-toolchain-smoke.yml"
+RUST_TOOLCHAIN_SNAPSHOT_JOB_NAME = "macos-rust-toolchain-snapshot"
+RUST_TOOLCHAIN_SMOKE_JOB_NAME = "macos-rust-toolchain-smoke"
+RUST_TOOLCHAIN_AUDIT_JOB_NAME = "macos-rust-toolchain-audit"
 CACHE_PROOF_WORKFLOW_PATH = ".github/workflows/macos-cache-proof.yml"
 CACHE_PROOF_SNAPSHOT_JOB_NAME = "macos-cache-public-snapshot"
 CACHE_PROOF_SEED_JOB_NAME = "macos-cache-seed"
@@ -88,6 +92,17 @@ _GITHUB_LOG_TIMESTAMP = (
     rb"(?:[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     rb"(?:\.[0-9]+)?Z )?"
 )
+RUST_TOOLCHAIN_SUCCESS_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"KD-RUST-SMOKE (\{[^\r\n]{1,16384}\})(?=\r?(?:\n|$))"
+)
+RUST_TOOLCHAIN_REFUSAL_MARKER_RE = re.compile(
+    rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
+    + rb"KD-RUST-REFUSAL reason=(invalid_input|unsupported_host|runner_unavailable|"
+    rb"download_unavailable|archive_hash_mismatch|archive_invalid|install_failed|"
+    rb"version_mismatch|target_unavailable|smoke_failed|capture_invalid|"
+    rb"cleanup_incomplete|internal_error)(?=\r?(?:\n|$))"
+)
 SOURCE_READER_INSTALLATION_MARKER_RE = re.compile(
     rb"(?m)^" + _GITHUB_LOG_TIMESTAMP
     + rb"macos-source-reader-installation=verified schema=1 control-sha=([a-f0-9]{40}) "
@@ -121,6 +136,7 @@ MAX_ANNOTATIONS = 10000
 MAX_PAGES = 100
 MAX_WORKFLOW_RUNS = PAGE_SIZE * MAX_PAGES
 MAX_RECEIPT_BYTES = 16 * 1024
+MAX_RUST_TOOLCHAIN_CAPTURE_BYTES = 16 * 1024
 ACTIVE_WORKFLOW_RUN_STATUSES = frozenset(
     ("queued", "in_progress", "waiting", "pending", "requested")
 )
@@ -1037,6 +1053,166 @@ def _reviewed_jobs(api, run_id, run_attempt, control_sha):
     return snapshot_detail, smoke_detail
 
 
+def _rust_toolchain_jobs(api, run_id, run_attempt, control_sha):
+    path = (
+        "/repos/keeldock-platform/platform-ci/actions/runs/" + run_id
+        + "/attempts/" + run_attempt + "/jobs"
+    )
+    jobs = _read_counted_collection(api, path, "jobs", 10000, _validate_job_record)
+    expected_names = {
+        RUST_TOOLCHAIN_SNAPSHOT_JOB_NAME,
+        RUST_TOOLCHAIN_SMOKE_JOB_NAME,
+        RUST_TOOLCHAIN_AUDIT_JOB_NAME,
+    }
+    if len(jobs) != len(expected_names) or {job.get("name") for job in jobs} != expected_names:
+        _fail("api_schema")
+    by_name = {job["name"]: job for job in jobs}
+    audit_job = by_name[RUST_TOOLCHAIN_AUDIT_JOB_NAME]
+    if (audit_job.get("run_id") != int(run_id)
+            or audit_job.get("run_attempt") != int(run_attempt)
+            or audit_job.get("head_sha") != control_sha
+            or audit_job.get("status") != "in_progress"):
+        _fail("run_identity_mismatch")
+    expected_steps = {
+        RUST_TOOLCHAIN_SNAPSHOT_JOB_NAME: (
+            "Set up job", "Fetch reviewed main control", "Snapshot cache inventory", "Complete job",
+        ),
+        RUST_TOOLCHAIN_SMOKE_JOB_NAME: (
+            "Set up job", "Fetch reviewed main control", "Validate source-free control tree",
+            "Run source-free reviewed build smoke", "Run source-free Rust toolchain smoke",
+            "Write trusted summary visibility control", "Complete job",
+        ),
+    }
+    details = {}
+    for name in (RUST_TOOLCHAIN_SNAPSHOT_JOB_NAME, RUST_TOOLCHAIN_SMOKE_JOB_NAME):
+        detail = _job_detail(api, by_name[name], run_id, run_attempt, control_sha, name)
+        steps = detail[0].get("steps", [])
+        if not (by_name[name].get("conclusion") != "success" and not steps):
+            if [step.get("name") for step in steps if type(step) is dict] != list(expected_steps[name]):
+                _fail("api_schema")
+        details[name] = detail
+    return details
+
+
+def _inspect_rust_toolchain_snapshot(raw, control_sha, run_id, run_attempt):
+    expected = (
+        "macos-rust-toolchain-snapshot=ready schema=1 control-sha=" + control_sha
+        + " run-id=" + run_id + " run-attempt=" + run_attempt
+    ).encode("ascii")
+    _require_source_reader_log_line(
+        raw, expected, b"macos-rust-toolchain-snapshot="
+    )
+
+
+def _inspect_rust_toolchain_receipt(raw, control_sha, run_id, run_attempt):
+    if type(raw) is not bytes:
+        _fail("receipt_invalid")
+    marker = b"KD-RUST-SMOKE "
+    matches = list(RUST_TOOLCHAIN_SUCCESS_MARKER_RE.finditer(raw))
+    if (len(matches) != 1 or raw.count(marker) != 1
+            or b"KD-RUST-REFUSAL" in raw):
+        _fail("receipt_invalid")
+    payload = matches[0].group(1)
+    if len(payload) > 16384:
+        _fail("receipt_invalid")
+    try:
+        value = json.loads(payload.decode("ascii", "strict"), object_pairs_hook=_no_duplicate_pairs)
+    except AuditRefusal:
+        _fail("receipt_invalid")
+    except Exception:
+        _fail("receipt_invalid")
+    required = {
+        "schema_version", "concern", "status", "control_sha", "run_id", "run_attempt",
+        "host", "toolchain", "components", "versions", "target", "smoke", "source",
+        "offline", "cleanup",
+    }
+    if type(value) is not dict or set(value) != required:
+        _fail("receipt_invalid")
+    expected_components = {
+        "rustc": "23948a0a9c162fd2952defb3fb0462c44e8fcfd1a4ab8a274a1e1bdb2cf810a3",
+        "rust-std": "fe79d6ab5a0321de26463999d8c112b8ad3eafbcbcf822d66a2300b45dde1031",
+        "cargo": "685e563d94db1f003ffa5f5831439eec02569b9950b69867953c8213269c1eaf",
+        "rustfmt-preview": "8b80dda570f140ee9ced8799294e812bba847a025f185bae4cba85a2ba235570",
+        "clippy-preview": "c463f31831196702fc544900a0dc4c1837905327507fbec751fe46e59ca098bf",
+    }
+    expected_versions = {
+        "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+        "rustfmt": "1.10.0",
+        "clippy": "0.1.99",
+    }
+    expected_smoke = {"fmt": "passed", "clippy": "passed", "test": "passed"}
+    if (type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or value["concern"] != "rust-toolchain-smoke" or value["status"] != "passed"
+            or value["control_sha"] != control_sha
+            or type(value["run_id"]) is not str or not _positive_decimal(value["run_id"])
+            or value["run_id"] != run_id
+            or type(value["run_attempt"]) is not str
+            or not _positive_decimal(value["run_attempt"])
+            or value["run_attempt"] != run_attempt
+            or value["host"] != "aarch64-apple-darwin" or value["toolchain"] != "1.99.1"
+            or value["target"] != "aarch64-apple-darwin"
+            or value["components"] != expected_components
+            or type(value["versions"]) is not dict
+            or set(value["versions"]) != {"rustc", "cargo", "rustfmt", "clippy"}
+            or any(value["versions"].get(key) != version for key, version in expected_versions.items())
+            or type(value["versions"].get("cargo")) is not str
+            or value["versions"]["cargo"] not in {"0.100.0", "1.99.0", "1.99.1"}
+            or value["smoke"] != expected_smoke
+            or value["source"] != "none" or value["offline"] is not True
+            or value["cleanup"] != "complete"):
+        _fail("receipt_invalid")
+    canonical = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    try:
+        if canonical.encode("ascii") != payload:
+            _fail("receipt_invalid")
+    except UnicodeEncodeError:
+        _fail("receipt_invalid")
+
+
+def publish_rust_toolchain_receipt(environ=None, stdin=None, stdout=None):
+    env = os.environ if environ is None else environ
+    repository = env.get("GITHUB_REPOSITORY", "")
+    event_name = env.get("GITHUB_EVENT_NAME", "")
+    ref = env.get("GITHUB_REF", "")
+    control_sha = env.get("CI_SHA", "")
+    github_sha = env.get("GITHUB_SHA", "")
+    run_id = env.get("GITHUB_RUN_ID", "")
+    run_attempt = env.get("GITHUB_RUN_ATTEMPT", "")
+    if (repository != REPOSITORY or event_name != "workflow_dispatch"
+            or ref != "refs/heads/main" or not _valid_sha(control_sha)
+            or github_sha != control_sha or not _positive_decimal(run_id)
+            or not _positive_decimal(run_attempt)):
+        _fail("invalid_input")
+    source = sys.stdin.buffer if stdin is None else stdin
+    destination = sys.stdout.buffer if stdout is None else stdout
+    try:
+        raw = source.read(MAX_RUST_TOOLCHAIN_CAPTURE_BYTES + 1)
+        trailing = source.read(1)
+    except Exception:
+        _fail("capture_invalid")
+    if (type(raw) is not bytes or len(raw) > MAX_RUST_TOOLCHAIN_CAPTURE_BYTES
+            or trailing != b"" or not raw.startswith(b"KD-RUST-SMOKE ")
+            or not raw.endswith(b"\n") or raw.count(b"\n") != 1 or b"\r" in raw):
+        _fail("capture_invalid")
+    try:
+        _inspect_rust_toolchain_receipt(raw, control_sha, run_id, run_attempt)
+    except AuditRefusal:
+        _fail("capture_invalid")
+    try:
+        remaining = memoryview(raw)
+        while remaining:
+            written = destination.write(remaining)
+            if written is None or written <= 0:
+                _fail("capture_invalid")
+            remaining = remaining[written:]
+        destination.flush()
+    except AuditRefusal:
+        raise
+    except Exception:
+        _fail("capture_invalid")
+    return 0
+
+
 def _cache_proof_keys(run_id, run_attempt):
     if not _positive_decimal(run_id) or not _positive_decimal(run_attempt):
         _fail("invalid_input")
@@ -1895,6 +2071,7 @@ def _snapshot(phase, api, control_sha, run_id, run_attempt, env):
     workflow_path = (
         CACHE_PROOF_WORKFLOW_PATH if phase == "cache-proof-snapshot"
         else REVIEWED_WORKFLOW_PATH if phase == "reviewed-snapshot"
+        else RUST_TOOLCHAIN_WORKFLOW_PATH if phase == "rust-toolchain-snapshot"
         else _source_reader_configuration(bootstrap_kind)["workflow_path"]
         if bootstrap_kind is not None else WORKFLOW_PATH
     )
@@ -1904,7 +2081,7 @@ def _snapshot(phase, api, control_sha, run_id, run_attempt, env):
         control_sha,
         reviewed=phase in {
             "reviewed-snapshot", "cache-proof-snapshot",
-            "rules-bootstrap-snapshot", "core-bootstrap-snapshot",
+            "rules-bootstrap-snapshot", "core-bootstrap-snapshot", "rust-toolchain-snapshot",
         },
     )
     if phase == "cache-proof-snapshot":
@@ -1914,7 +2091,7 @@ def _snapshot(phase, api, control_sha, run_id, run_attempt, env):
     digest = cache_inventory_digest(caches)
     if phase in {
         "snapshot", "reviewed-snapshot", "cache-proof-snapshot",
-        "rules-bootstrap-snapshot", "core-bootstrap-snapshot",
+        "rules-bootstrap-snapshot", "core-bootstrap-snapshot", "rust-toolchain-snapshot",
     }:
         _write_output("cache_snapshot", digest, env)
         if phase == "cache-proof-snapshot":
@@ -1922,6 +2099,11 @@ def _snapshot(phase, api, control_sha, run_id, run_attempt, env):
         elif bootstrap_kind is not None:
             print(
                 "macos-" + bootstrap_kind + "-snapshot=ready schema=1 control-sha="
+                + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
+            )
+        elif phase == "rust-toolchain-snapshot":
+            print(
+                "macos-rust-toolchain-snapshot=ready schema=1 control-sha="
                 + control_sha + " run-id=" + run_id + " run-attempt=" + run_attempt
             )
         else:
@@ -1959,6 +2141,7 @@ def run(phase, environ=None, api=None):
     supported_phases = {
         "snapshot", "audit", "reviewed-snapshot", "reviewed-audit",
         "cache-proof-snapshot", "cache-proof-audit", "cache-proof-cleanup",
+        "rust-toolchain-snapshot", "rust-toolchain-audit",
     } | set(SOURCE_READER_PHASES)
     if phase not in supported_phases:
         _fail("invalid_input")
@@ -1974,7 +2157,9 @@ def run(phase, environ=None, api=None):
         api = GitHubAPI(token)
     elif type(token) is not str or TOKEN_RE.fullmatch(token) is None:
         _fail("invalid_input")
-    if phase in {"snapshot", "reviewed-snapshot", "cache-proof-snapshot"}:
+    if phase in {
+        "snapshot", "reviewed-snapshot", "cache-proof-snapshot", "rust-toolchain-snapshot",
+    }:
         return _snapshot(phase, api, control_sha, run_id, run_attempt, env)
 
     if phase in SOURCE_READER_PHASES:
@@ -2134,6 +2319,51 @@ def run(phase, environ=None, api=None):
         print("macos-public-surface-audit=synthetic-smoke-audited")
         return 0
 
+    if phase == "rust-toolchain-audit":
+        _validate_run(api, run_id, run_attempt, control_sha, RUST_TOOLCHAIN_WORKFLOW_PATH)
+        details = _rust_toolchain_jobs(api, run_id, run_attempt, control_sha)
+        snapshot_detail, snapshot_check_id, snapshot_steps_success = details[
+            RUST_TOOLCHAIN_SNAPSHOT_JOB_NAME
+        ]
+        smoke_detail, smoke_check_id, smoke_steps_success = details[RUST_TOOLCHAIN_SMOKE_JOB_NAME]
+        snapshot_log = api.log_text(snapshot_detail["id"]) if snapshot_detail.get("steps") else b""
+        smoke_log = api.log_text(smoke_detail["id"]) if smoke_detail.get("steps") else b""
+        if snapshot_log:
+            inspect_reviewed_public_bytes(snapshot_log, control_sha)
+        if smoke_log:
+            inspect_reviewed_public_bytes(smoke_log, control_sha)
+        _scan_annotations(
+            api, snapshot_detail, snapshot_check_id, control_sha, reviewed=True
+        )
+        _scan_annotations(
+            api, smoke_detail, smoke_check_id, control_sha, reviewed=True
+        )
+        _fetch_artifacts(api, run_id)
+        cache_digest = _fetch_caches(api, control_sha, reviewed=True)
+        baseline = env.get("MACOS_CACHE_SNAPSHOT", "")
+        if HEX_DIGEST_RE.fullmatch(baseline) is None or cache_digest != baseline:
+            _fail("inventory_changed")
+        if (snapshot_detail.get("conclusion") != "success" or not snapshot_steps_success
+                or smoke_detail.get("conclusion") != "success" or not smoke_steps_success):
+            if smoke_log and b"KD-RUST-REFUSAL" in smoke_log:
+                refusal = list(RUST_TOOLCHAIN_REFUSAL_MARKER_RE.finditer(smoke_log))
+                if len(refusal) != 1 or smoke_log.count(b"KD-RUST-REFUSAL") != 1:
+                    _fail("receipt_invalid")
+            _fail("native_job_failed")
+        _inspect_rust_toolchain_snapshot(
+            snapshot_log, control_sha, run_id, run_attempt
+        )
+        _inspect_reviewed_smoke_marker(smoke_log, control_sha, run_id, run_attempt)
+        _inspect_reviewed_summary_control_marker(smoke_log, control_sha, run_id, run_attempt)
+        _inspect_rust_toolchain_receipt(smoke_log, control_sha, run_id, run_attempt)
+        print(
+            "macos-rust-toolchain-audit=verified schema=1 control-sha=" + control_sha
+            + " run-id=" + run_id + " run-attempt=" + run_attempt
+            + " public-surfaces=logs,checks,annotations,artifacts,caches summary-ui=required"
+            + " source-admission=not-authorized"
+        )
+        return 0
+
     _validate_run(api, run_id, run_attempt, control_sha)
     job, check_id, steps_success = _native_job(api, run_id, run_attempt, control_sha)
     log_bytes = api.log_text(job["id"])
@@ -2153,9 +2383,20 @@ def run(phase, environ=None, api=None):
 
 def main(argv=None):
     args = sys.argv[1:] if argv is None else argv
+    if args and args[0] == "rust-toolchain-publish":
+        if len(args) != 1:
+            return _rust_toolchain_publish_refusal("invalid_input")
+        try:
+            return publish_rust_toolchain_receipt()
+        except AuditRefusal as error:
+            reason = error.reason if error.reason in {"invalid_input", "capture_invalid"} else "internal_error"
+            return _rust_toolchain_publish_refusal(reason)
+        except BaseException:
+            return _rust_toolchain_publish_refusal("internal_error")
     if len(args) != 1 or args[0] not in ({
         "snapshot", "audit", "reviewed-snapshot", "reviewed-audit",
         "cache-proof-snapshot", "cache-proof-audit", "cache-proof-cleanup",
+        "rust-toolchain-snapshot", "rust-toolchain-audit",
     } | set(SOURCE_READER_PHASES)):
         print("macos-public-surface-audit=refused reason=invalid_input")
         return 2
@@ -2167,6 +2408,19 @@ def main(argv=None):
     except BaseException:
         print("macos-public-surface-audit=refused reason=internal_error")
         return 2
+
+
+def _rust_toolchain_publish_refusal(reason):
+    if reason not in {"invalid_input", "capture_invalid", "internal_error"}:
+        reason = "internal_error"
+    try:
+        sys.stdout.buffer.write(
+            ("KD-RUST-REFUSAL reason=" + reason + "\n").encode("ascii")
+        )
+        sys.stdout.buffer.flush()
+    except Exception:
+        return 2
+    return 2
 
 
 if __name__ == "__main__":
