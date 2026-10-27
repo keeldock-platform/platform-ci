@@ -65,6 +65,47 @@ class RequestTests(unittest.TestCase):
                 self.assertEqual((result.exception.reason, result.exception.stage), ("invalid_input", "input"))
 
 
+class CoreCheckTests(unittest.TestCase):
+    def test_core_check_values_are_closed_and_preserve_the_original_refusal(self):
+        expected = {
+            "tree_entries", "required_files", "path_mode", "base_policy", "rules_manifest",
+            "rules_inventory", "rules_hash", "workspace_decode", "workspace_members",
+            "cargo_lock_decode", "cargo_lock_shape", "toolchain", "package_decode",
+            "package_build", "checkout", "lease_paths", "lease_acl", "lease_access",
+            "lease_census",
+        }
+        self.assertEqual(subject.CORE_BOOTSTRAP_CHECKS, expected)
+        for check in expected:
+            with self.subTest(check=check):
+                refusal = subject.Refusal(
+                    "bootstrap_snapshot_invalid", "bootstrap", core_check=check,
+                )
+                self.assertEqual(
+                    (refusal.reason, refusal.stage, refusal.core_check),
+                    ("bootstrap_snapshot_invalid", "bootstrap", check),
+                )
+                self.assertEqual(str(refusal), "bootstrap_snapshot_invalid")
+
+    def test_core_check_discards_unknown_values_and_non_core_refusals(self):
+        for check in ("private-value", 17, object()):
+            with self.subTest(check=type(check).__name__):
+                refusal = subject.Refusal(
+                    "bootstrap_snapshot_invalid", "bootstrap", core_check=check,
+                )
+                self.assertIsNone(refusal.core_check)
+        for reason, stage in (
+            ("source_fetch_unavailable", "fetch"),
+            ("cleanup_incomplete", "cleanup"),
+            ("bootstrap_snapshot_invalid", "configuration"),
+        ):
+            with self.subTest(reason=reason, stage=stage):
+                refusal = subject.Refusal(
+                    reason, stage, core_check="tree_entries",
+                )
+                self.assertIsNone(refusal.core_check)
+                self.assertEqual((refusal.reason, refusal.stage), (reason, stage))
+
+
 class BootstrapGateTests(unittest.TestCase):
     def test_missing_control_sibling_imports_refuse_with_closed_context_stage(self):
         with patch.object(subject, "capability", None), patch.object(subject, "reviewed_build", None):
@@ -318,8 +359,13 @@ class CoreContractTreeTests(unittest.TestCase):
             payload.replace(b"tag v2.4.1", b"tag v1.4.1"),
             payload.replace(rules_file.encode("ascii"), b"outside/rules.md"),
         ):
-            with self.subTest(invalid=invalid), self.assertRaises(subject.Refusal):
-                subject._rules_v2_file_manifest(invalid)
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(subject.Refusal) as refusal:
+                    subject._rules_v2_file_manifest(invalid)
+            self.assertEqual(
+                (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+                ("bootstrap_snapshot_invalid", "bootstrap", "rules_manifest"),
+            )
 
     def test_contract_tree_parser_refuses_a_link_entry(self):
         payload = b"120000 blob " + b"a" * 40 + b"\tcrates/host/api/src/lib.rs\x00"
@@ -327,7 +373,151 @@ class CoreContractTreeTests(unittest.TestCase):
         with patch.object(subject, "_run_process", return_value=result):
             with self.assertRaises(subject.Refusal) as refusal:
                 subject._contract_tree_entries("repository", "/usr/bin/git", {}, "a" * 40)
-        self.assertEqual((refusal.exception.reason, refusal.exception.stage), ("bootstrap_snapshot_invalid", "bootstrap"))
+        self.assertEqual(
+            (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
+        )
+
+    @staticmethod
+    def _required_core_contract_entries():
+        paths = {
+            ".gitignore", "AGENTS.md", "CLAUDE.md", "README.md", subject.RULES_LOCK_PATH,
+            subject.RULES_DIRECTORY + "/settings.json", "/".join(subject.SIGNER_PATH_PARTS),
+        } | set(subject.CORE_CONTRACT_ROOT_FILES)
+        for crate_root in subject.CORE_CONTRACT_CRATE_ROOTS:
+            prefix = "/".join(crate_root)
+            paths.update(prefix + "/" + item for item in subject.CORE_CONTRACT_PACKAGE_FILES)
+            paths.add(prefix + "/src/lib.rs")
+        return {path: ("100644", "a" * 40) for path in paths}
+
+    def test_core_contract_required_file_and_path_mode_checks_are_tagged(self):
+        for entries, check in (
+            ({}, "required_files"),
+            ({**self._required_core_contract_entries(), ".gitignore": ("100755", "a" * 40)}, "path_mode"),
+        ):
+            with self.subTest(check=check), patch.object(
+                subject, "_contract_tree_entries", side_effect=(entries, entries),
+            ), self.assertRaises(subject.Refusal) as refusal:
+                subject._safe_core_contract_tree(
+                    "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+                )
+            self.assertEqual(
+                (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+                ("bootstrap_snapshot_invalid", "bootstrap", check),
+            )
+
+    def test_core_contract_base_policy_mismatch_is_tagged(self):
+        entries = self._required_core_contract_entries()
+        base_entries = dict(entries)
+        signer = "/".join(subject.SIGNER_PATH_PARTS)
+        base_entries[signer] = ("100644", "b" * 40)
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(base_entries, entries),
+        ), self.assertRaises(subject.Refusal) as refusal:
+            subject._safe_core_contract_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+            )
+        self.assertEqual(
+            (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "base_policy"),
+        )
+
+    def test_core_checkout_labels_only_core_contract_and_preserves_cleanup_refusal(self):
+        failed = subject.subprocess.CompletedProcess(("git",), 1, b"", b"")
+        with patch.object(subject, "_run_process", return_value=failed):
+            with self.assertRaises(subject.Refusal) as core_refusal:
+                subject._checkout_source(
+                    Path("/tmp/repository"), "/usr/bin/git", {}, Path("/tmp/lease"),
+                    "a" * 40, core_contract=True,
+                )
+        self.assertEqual(
+            (core_refusal.exception.reason, core_refusal.exception.stage, core_refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "checkout"),
+        )
+        with patch.object(subject, "_run_process", return_value=failed):
+            with self.assertRaises(subject.Refusal) as other_refusal:
+                subject._checkout_source(
+                    Path("/tmp/repository"), "/usr/bin/git", {}, Path("/tmp/lease"),
+                    "a" * 40,
+                )
+        self.assertEqual(
+            (other_refusal.exception.reason, other_refusal.exception.stage, other_refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", None),
+        )
+        cleanup = subject.Refusal("cleanup_incomplete", "cleanup")
+        with patch.object(subject, "_run_process", side_effect=cleanup):
+            with self.assertRaises(subject.Refusal) as cleanup_refusal:
+                subject._checkout_source(
+                    Path("/tmp/repository"), "/usr/bin/git", {}, Path("/tmp/lease"),
+                    "a" * 40, core_contract=True,
+                )
+        self.assertEqual(
+            (cleanup_refusal.exception.reason, cleanup_refusal.exception.stage, cleanup_refusal.exception.core_check),
+            ("cleanup_incomplete", "cleanup", None),
+        )
+
+    def test_core_lease_path_and_census_refusals_are_tagged(self):
+        with patch.object(subject.os, "walk", side_effect=OSError):
+            with self.assertRaises(subject.Refusal) as path_refusal:
+                subject._lease_paths(Path("/tmp/lease"), core_contract=True)
+        self.assertEqual(
+            (path_refusal.exception.reason, path_refusal.exception.stage, path_refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "lease_paths"),
+        )
+
+        path_type = type(Path("/tmp/lease"))
+        file_info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_uid=0)
+        with patch.object(subject, "MAX_TEMP_PATHS", 1), \
+                patch.object(subject.os, "walk", return_value=[("/tmp/lease", [], ["item"])]) as walk, \
+                patch.object(path_type, "lstat", return_value=file_info):
+            with self.assertRaises(subject.Refusal) as census_refusal:
+                subject._lease_paths(Path("/tmp/lease"), core_contract=True)
+        walk.assert_called_once()
+        self.assertEqual(
+            (census_refusal.exception.reason, census_refusal.exception.stage, census_refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "lease_census"),
+        )
+
+    def test_core_worker_lease_labels_acl_and_access_checks(self):
+        directory = Path("/tmp/lease-directory")
+        with patch.object(subject, "capability", SimpleNamespace(USERNAME="worker")), \
+                patch.object(subject, "_resolve_trusted_executable", return_value="/bin/chmod"), \
+                patch.object(subject, "_lease_paths", return_value=([directory], [])), \
+                patch.object(
+                    subject, "_run_acl_command",
+                    side_effect=subject.Refusal("bootstrap_snapshot_invalid", "bootstrap"),
+                ):
+            with self.assertRaises(subject.Refusal) as acl_refusal:
+                subject._grant_worker_readonly(
+                    Path("/tmp/lease"), Path("/tmp/source"), Path("/tmp/storage"), 501,
+                    core_contract=True,
+                )
+        self.assertEqual(
+            (acl_refusal.exception.reason, acl_refusal.exception.stage, acl_refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "lease_acl"),
+        )
+
+        capability = SimpleNamespace(
+            USERNAME="worker",
+            _resolve_trusted_toolchain=lambda: {"python": "/usr/bin/python3"},
+            _run_as_probe_user=lambda *args, **kwargs: SimpleNamespace(
+                returncode=1, stdout=b"", stderr=b"",
+            ),
+        )
+        with patch.object(subject, "capability", capability), \
+                patch.object(subject, "_resolve_trusted_executable", return_value="/bin/chmod"), \
+                patch.object(subject, "_lease_paths", return_value=([], [])), \
+                patch.object(Path, "is_file", return_value=True), \
+                patch.object(Path, "exists", return_value=False):
+            with self.assertRaises(subject.Refusal) as access_refusal:
+                subject._grant_worker_readonly(
+                    Path("/tmp/lease"), Path("/tmp/source"), Path("/tmp/storage"), 501,
+                    core_contract=True,
+                )
+        self.assertEqual(
+            (access_refusal.exception.reason, access_refusal.exception.stage, access_refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "lease_access"),
+        )
 
     def test_core_contract_keeps_signer_authority_and_installed_rules_from_base(self):
         signer = "/".join(subject.SIGNER_PATH_PARTS)

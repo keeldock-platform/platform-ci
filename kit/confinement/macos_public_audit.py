@@ -361,6 +361,49 @@ CORE_CONTRACT_REFUSAL_STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
     "conformance_tests", "cleanup", "receipt", "internal",
 ))
+CORE_CONTRACT_RUNTIME_REASONS = frozenset((
+    "invalid_input", "context_unavailable", "configuration_unavailable",
+    "source_reader_unavailable", "repository_scope_invalid", "source_fetch_unavailable",
+    "revocation_unconfirmed", "base_invalid", "signature_invalid", "revocation_policy_invalid",
+    "bootstrap_snapshot_invalid", "bootstrap_not_approved", "cleanup_incomplete", "internal_error",
+))
+CORE_CONTRACT_RUNTIME_STAGES = frozenset((
+    "input", "context", "configuration", "source_scope", "fetch", "revoke",
+    "history", "signature", "revocation", "bootstrap", "cleanup",
+))
+CORE_CONTRACT_FETCH_OPERATIONS = frozenset((
+    "git_init", "remote_add", "base_fetch", "base_ref", "candidate_fetch",
+    "source_ref", "shallow_check", "remote_remove", "source_snapshot",
+))
+CORE_CONTRACT_FETCH_CLASSES = frozenset((
+    "exit_nonzero", "stderr_present", "process_failure", "unexpected_exception",
+))
+CORE_CONTRACT_BOOTSTRAP_CHECKS = frozenset((
+    "tree_entries", "required_files", "path_mode", "base_policy", "rules_manifest",
+    "rules_inventory", "rules_hash", "workspace_decode", "workspace_members",
+    "cargo_lock_decode", "cargo_lock_shape", "toolchain", "package_decode",
+    "package_build", "checkout", "lease_paths", "lease_acl", "lease_access", "lease_census",
+))
+CORE_CONTRACT_SOURCE_LEASE_OPEN_CLASSES = frozenset((
+    "type_error", "attribute_error", "value_error", "permission_error", "not_found",
+    "timeout", "os_error", "other",
+))
+CORE_CONTRACT_RUNTIME_DIAGNOSTICS = frozenset(
+    "source_runtime_" + stage + "_" + reason
+    for stage in CORE_CONTRACT_RUNTIME_STAGES
+    for reason in CORE_CONTRACT_RUNTIME_REASONS
+)
+CORE_CONTRACT_FETCH_DIAGNOSTICS = frozenset(
+    "source_fetch_" + operation + "_" + failure_class
+    for operation in CORE_CONTRACT_FETCH_OPERATIONS
+    for failure_class in CORE_CONTRACT_FETCH_CLASSES
+)
+CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS = frozenset(
+    "source_bootstrap_" + check for check in CORE_CONTRACT_BOOTSTRAP_CHECKS
+)
+CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS = frozenset(
+    "source_lease_open_" + error_class for error_class in CORE_CONTRACT_SOURCE_LEASE_OPEN_CLASSES
+)
 CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "none", "unavailable", "load_controls", "review_binding", "host_preflight",
     "temp_root_check", "smoke_receipt", "token_input", "token_revocation",
@@ -386,7 +429,10 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "cleanup_summary_present_helper_trust", "cleanup_summary_present_helper_containers",
     "cleanup_summary_present_apple_system_path", "cleanup_summary_probe",
     "cleanup_summary_restore", "cleanup_summary_close", "cleanup_dash", "cleanup_unknown",
-))
+)) | (
+    CORE_CONTRACT_RUNTIME_DIAGNOSTICS | CORE_CONTRACT_FETCH_DIAGNOSTICS
+    | CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS | CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS
+)
 CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS = frozenset((
     "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",
     "worker_privilege_probe_census", "worker_privilege_probe_survivor",
@@ -1495,6 +1541,46 @@ def _core_contract_success_value(payload, context, image_os, image_version):
     return value
 
 
+def _core_contract_runtime_failure_mapping(runtime_reason):
+    if runtime_reason == "cleanup_incomplete":
+        return "cleanup_incomplete", "cleanup"
+    if runtime_reason == "revocation_unconfirmed":
+        return "token_revocation_unconfirmed", "source_validation"
+    if runtime_reason in {"signature_invalid", "base_invalid", "bootstrap_not_approved"}:
+        return "source_binding_mismatch", "source_validation"
+    if runtime_reason == "invalid_input":
+        return "invalid_input", "source_validation"
+    return "source_validation_failed", "source_validation"
+
+
+def _core_contract_refusal_diagnostic_matches(value):
+    diagnostic = value["diagnostic"]
+    if diagnostic in CORE_CONTRACT_RUNTIME_DIAGNOSTICS:
+        for runtime_stage in CORE_CONTRACT_RUNTIME_STAGES:
+            for runtime_reason in CORE_CONTRACT_RUNTIME_REASONS:
+                if diagnostic == "source_runtime_" + runtime_stage + "_" + runtime_reason:
+                    return (value["reason"], value["stage"]) == _core_contract_runtime_failure_mapping(
+                        runtime_reason,
+                    )
+        return False
+    if diagnostic in CORE_CONTRACT_FETCH_DIAGNOSTICS:
+        return (
+            value["reason"] == "source_validation_failed"
+            and value["stage"] == "source_validation"
+        )
+    if diagnostic in CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS:
+        return (
+            value["reason"] == "source_validation_failed"
+            and value["stage"] == "source_validation"
+        )
+    if diagnostic in CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS:
+        return (
+            value["reason"] == "source_validation_failed"
+            and value["stage"] == "source_validation"
+        )
+    return True
+
+
 def _core_contract_refusal_value(payload):
     try:
         value = json.loads(payload.decode("ascii", "strict"), object_pairs_hook=_no_duplicate_pairs)
@@ -1516,6 +1602,8 @@ def _core_contract_refusal_value(payload):
         _fail("capture_invalid")
     if (value["diagnostic"] in CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS
             and (value["stage"] != "cleanup" or value["reason"] != "cleanup_incomplete")):
+        _fail("capture_invalid")
+    if not _core_contract_refusal_diagnostic_matches(value):
         _fail("capture_invalid")
     try:
         canonical = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")

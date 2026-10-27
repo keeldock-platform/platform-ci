@@ -45,6 +45,38 @@ GATE_NAMES = (
 SUITE_NAMES = (
     "core.static", "core.host-api", "core.mock-host", "core.conformance",
 )
+PRIVATE_VALIDATION_REASONS = frozenset((
+    "invalid_input", "context_unavailable", "configuration_unavailable",
+    "source_reader_unavailable", "repository_scope_invalid", "source_fetch_unavailable",
+    "revocation_unconfirmed", "base_invalid", "signature_invalid", "revocation_policy_invalid",
+    "bootstrap_snapshot_invalid", "bootstrap_not_approved", "cleanup_incomplete", "internal_error",
+))
+PRIVATE_VALIDATION_STAGES = frozenset((
+    "input", "context", "configuration", "source_scope", "fetch", "revoke",
+    "history", "signature", "revocation", "bootstrap", "cleanup",
+))
+PRIVATE_FETCH_OPERATIONS = frozenset((
+    "git_init", "remote_add", "base_fetch", "base_ref", "candidate_fetch",
+    "source_ref", "shallow_check", "remote_remove", "source_snapshot",
+))
+PRIVATE_FETCH_CLASSES = frozenset((
+    "exit_nonzero", "stderr_present", "process_failure", "unexpected_exception",
+))
+CORE_BOOTSTRAP_CHECKS = frozenset((
+    "tree_entries", "required_files", "path_mode", "base_policy", "rules_manifest",
+    "rules_inventory", "rules_hash", "workspace_decode", "workspace_members",
+    "cargo_lock_decode", "cargo_lock_shape", "toolchain", "package_decode",
+    "package_build", "checkout", "lease_paths", "lease_acl", "lease_access", "lease_census",
+))
+SOURCE_LEASE_OPEN_ERROR_DIAGNOSTICS = {
+    TypeError: "source_lease_open_type_error",
+    AttributeError: "source_lease_open_attribute_error",
+    ValueError: "source_lease_open_value_error",
+    PermissionError: "source_lease_open_permission_error",
+    FileNotFoundError: "source_lease_open_not_found",
+    TimeoutError: "source_lease_open_timeout",
+    OSError: "source_lease_open_os_error",
+}
 REASONS = frozenset((
     "invalid_input", "unsupported_host", "runner_unavailable", "source_validation_failed",
     "token_revocation_unconfirmed", "source_binding_mismatch", "source_diff_mismatch",
@@ -74,6 +106,27 @@ OPERATION_DIAGNOSTICS = frozenset((
     "summary_guard_probe", "source_lease_cleanup", "worker_cleanup", "fallback_tree_cleanup",
     "summary_guard_finish", "success_receipt", "output_write",
 ))
+SOURCE_RUNTIME_DIAGNOSTICS = frozenset(
+    "source_runtime_" + stage + "_" + reason
+    for stage in PRIVATE_VALIDATION_STAGES
+    for reason in PRIVATE_VALIDATION_REASONS
+)
+SOURCE_FETCH_DIAGNOSTICS = frozenset(
+    "source_fetch_" + operation + "_" + failure_class
+    for operation in PRIVATE_FETCH_OPERATIONS
+    for failure_class in PRIVATE_FETCH_CLASSES
+)
+SOURCE_BOOTSTRAP_DIAGNOSTICS = frozenset(
+    "source_bootstrap_" + check for check in CORE_BOOTSTRAP_CHECKS
+)
+SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS = (
+    frozenset(SOURCE_LEASE_OPEN_ERROR_DIAGNOSTICS.values())
+    | frozenset(("source_lease_open_other",))
+)
+PRESERVED_SOURCE_DIAGNOSTICS = (
+    SOURCE_RUNTIME_DIAGNOSTICS | SOURCE_FETCH_DIAGNOSTICS
+    | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
+)
 PRIVILEGE_PROBE_CHECK_DIAGNOSTICS = {
     "probe_process_group_cleanup": "worker_privilege_probe_group_cleanup",
     "probe_process_capture_cleanup": "worker_privilege_probe_capture_cleanup",
@@ -92,7 +145,11 @@ CLEANUP_DIAGNOSTICS = frozenset((
     "cleanup_summary_probe", "cleanup_summary_restore", "cleanup_summary_close", "cleanup_dash",
     "cleanup_unknown",
 ))
-DIAGNOSTICS = OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | frozenset(("none", "unavailable"))
+DIAGNOSTICS = (
+    OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | SOURCE_RUNTIME_DIAGNOSTICS
+    | SOURCE_FETCH_DIAGNOSTICS | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
+    | frozenset(("none", "unavailable"))
+)
 DETAILED_DIAGNOSTICS = DIAGNOSTICS - frozenset(("none", "unavailable"))
 NO_OPERATION_STAGES = frozenset(("arguments", "context", "host"))
 
@@ -157,8 +214,10 @@ class _FailureDiagnostics:
         if reason == "cleanup_incomplete":
             self.remember_cleanup(error, operation, cleanup_stage)
             return Refusal(reason, stage, diagnostic=self.first_cleanup)
-        if type(getattr(error, "diagnostic", None)) is str and error.diagnostic in OPERATION_DIAGNOSTICS:
-            return Refusal(reason, stage, diagnostic=error.diagnostic)
+        diagnostic = getattr(error, "diagnostic", None)
+        if (type(diagnostic) is str
+                and diagnostic in (OPERATION_DIAGNOSTICS | PRESERVED_SOURCE_DIAGNOSTICS)):
+            return Refusal(reason, stage, diagnostic=diagnostic)
         if stage in NO_OPERATION_STAGES and operation not in OPERATION_DIAGNOSTICS:
             return Refusal(reason, stage, diagnostic="none")
         if type(operation) is str and operation in OPERATION_DIAGNOSTICS:
@@ -767,6 +826,40 @@ def _runtime_refusal(runtime, error):
     return Refusal("source_validation_failed", "source_validation")
 
 
+def _source_runtime_diagnostic(runtime, error):
+    try:
+        if (getattr(runtime, "REASONS", None) != PRIVATE_VALIDATION_REASONS
+                or getattr(runtime, "STAGES", None) != PRIVATE_VALIDATION_STAGES):
+            return None
+        reason = getattr(error, "reason", None)
+        stage = getattr(error, "stage", None)
+        if (type(reason) is not str or reason not in PRIVATE_VALIDATION_REASONS
+                or type(stage) is not str or stage not in PRIVATE_VALIDATION_STAGES):
+            return None
+        if (reason == "bootstrap_snapshot_invalid" and stage == "bootstrap"):
+            if getattr(runtime, "CORE_BOOTSTRAP_CHECKS", None) == CORE_BOOTSTRAP_CHECKS:
+                check = getattr(error, "core_check", None)
+                if type(check) is str and check in CORE_BOOTSTRAP_CHECKS:
+                    return "source_bootstrap_" + check
+        if reason == "source_fetch_unavailable" and stage == "fetch":
+            if (getattr(runtime, "FETCH_DIAGNOSTIC_OPERATIONS", None) == PRIVATE_FETCH_OPERATIONS
+                    and getattr(runtime, "FETCH_DIAGNOSTIC_CLASSES", None) == PRIVATE_FETCH_CLASSES):
+                source_diagnostic = getattr(error, "source_diagnostic", None)
+                if (type(source_diagnostic) is tuple and len(source_diagnostic) == 2
+                        and type(source_diagnostic[0]) is str
+                        and source_diagnostic[0] in PRIVATE_FETCH_OPERATIONS
+                        and type(source_diagnostic[1]) is str
+                        and source_diagnostic[1] in PRIVATE_FETCH_CLASSES):
+                    return "source_fetch_" + source_diagnostic[0] + "_" + source_diagnostic[1]
+        return "source_runtime_" + stage + "_" + reason
+    except BaseException:
+        return None
+
+
+def _source_lease_open_exception_diagnostic(error):
+    return SOURCE_LEASE_OPEN_ERROR_DIAGNOSTICS.get(type(error), "source_lease_open_other")
+
+
 def _make_directory(prefix, mode):
     path = None
     try:
@@ -986,10 +1079,22 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
             if isinstance(runtime_refusal, type) and isinstance(error, runtime_refusal):
                 if getattr(error, "reason", None) == "cleanup_incomplete":
                     operation = "source_lease_cleanup"
-                command_failure = diagnostics.attach(_runtime_refusal(runtime, error), operation,
-                                                    cleanup_state.get("first"))
+                mapped_refusal = _runtime_refusal(runtime, error)
+                runtime_diagnostic = _source_runtime_diagnostic(runtime, error)
+                if runtime_diagnostic is not None:
+                    mapped_refusal = Refusal(
+                        mapped_refusal.reason, mapped_refusal.stage, diagnostic=runtime_diagnostic,
+                    )
+                command_failure = diagnostics.attach(
+                    mapped_refusal, operation, cleanup_state.get("first"),
+                )
             elif phase in ("source_validation", "source_tree"):
-                command_failure = Refusal("source_validation_failed", phase, diagnostic=operation)
+                diagnostic = (
+                    _source_lease_open_exception_diagnostic(error)
+                    if phase == "source_validation" and operation == "source_lease_open"
+                    else operation
+                )
+                command_failure = Refusal("source_validation_failed", phase, diagnostic=diagnostic)
             else:
                 command_failure = diagnostics.attach(_toolchain_refusal(error, phase), operation,
                                                     cleanup_state.get("first"))

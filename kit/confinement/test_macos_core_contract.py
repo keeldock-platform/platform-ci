@@ -285,6 +285,49 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(empty.diagnostic, "none")
         self.assertEqual(unclassified.diagnostic, "unavailable")
 
+    def test_source_failure_details_survive_outer_reattach_and_cleanup_keeps_first_cause(self):
+        source_failures = (
+            ("invalid_input", "source_validation", "source_runtime_input_invalid_input"),
+            ("source_validation_failed", "source_validation", "source_fetch_git_init_process_failure"),
+            ("source_validation_failed", "source_validation", "source_bootstrap_tree_entries"),
+            ("source_validation_failed", "source_validation", "source_lease_open_permission_error"),
+        )
+        for reason, stage, diagnostic in source_failures:
+            diagnostics = subject._FailureDiagnostics()
+            failure = subject.Refusal(reason, stage, diagnostic=diagnostic)
+            for operation in ("source_lease_open", "source_lease_record", "source_tree_probe"):
+                failure = diagnostics.attach(failure, operation)
+                with self.subTest(diagnostic=diagnostic, operation=operation):
+                    self.assertEqual(failure.diagnostic, diagnostic)
+            payload = subject._format_refusal(failure)
+            record = json.loads(payload)
+            self.assertEqual(record["diagnostic"], diagnostic)
+            self.assertEqual(payload, subject._canonical_json(record)[:-1])
+
+        diagnostics = subject._FailureDiagnostics()
+        primary = diagnostics.attach(
+            subject.Refusal(
+                "source_validation_failed", "source_validation",
+                diagnostic="source_fetch_git_init_process_failure",
+            ),
+            "source_lease_open",
+        )
+        cleanup = diagnostics.attach(
+            subject.Refusal("cleanup_incomplete", "cleanup"),
+            "source_lease_cleanup", "cleanup_lease",
+        )
+        later_cleanup = diagnostics.attach(
+            subject.Refusal("cleanup_incomplete", "cleanup"),
+            "worker_cleanup", "cleanup_worker",
+        )
+        self.assertEqual(primary.diagnostic, "source_fetch_git_init_process_failure")
+        self.assertEqual(cleanup.diagnostic, "cleanup_lease")
+        self.assertEqual(later_cleanup.diagnostic, "cleanup_lease")
+        self.assertEqual(
+            json.loads(subject._format_refusal(later_cleanup))["diagnostic"],
+            "cleanup_lease",
+        )
+
     def test_lease_exit_preserves_earlier_body_cleanup_diagnostic(self):
         diagnostics = subject._FailureDiagnostics()
         cleanup_state = {"first": None}
@@ -433,6 +476,141 @@ class CoreContractTests(unittest.TestCase):
         self.assertNotIn(b"arbitrary-private-value", payload)
         self.assertNotIn(b"untrusted-stage", payload)
         self.assertNotIn(b"untrusted-private-diagnostic", payload)
+
+    def test_private_runtime_diagnostic_enums_track_the_bound_validator(self):
+        runtime = subject._load_control_sibling("macos_private_validation")
+        self.assertEqual(subject.PRIVATE_VALIDATION_REASONS, runtime.REASONS)
+        self.assertEqual(subject.PRIVATE_VALIDATION_STAGES, runtime.STAGES)
+        self.assertEqual(subject.PRIVATE_FETCH_OPERATIONS, runtime.FETCH_DIAGNOSTIC_OPERATIONS)
+        self.assertEqual(subject.PRIVATE_FETCH_CLASSES, runtime.FETCH_DIAGNOSTIC_CLASSES)
+        self.assertEqual(subject.CORE_BOOTSTRAP_CHECKS, runtime.CORE_BOOTSTRAP_CHECKS)
+        self.assertEqual(
+            subject.SOURCE_RUNTIME_DIAGNOSTICS,
+            frozenset(
+                "source_runtime_" + stage + "_" + reason
+                for stage in runtime.STAGES for reason in runtime.REASONS
+            ),
+        )
+        self.assertEqual(
+            subject.SOURCE_FETCH_DIAGNOSTICS,
+            frozenset(
+                "source_fetch_" + operation + "_" + failure_class
+                for operation in runtime.FETCH_DIAGNOSTIC_OPERATIONS
+                for failure_class in runtime.FETCH_DIAGNOSTIC_CLASSES
+            ),
+        )
+
+    def test_private_runtime_reason_stage_failures_have_bounded_diagnostics(self):
+        runtime = subject._load_control_sibling("macos_private_validation")
+        expected_mapping = {
+            "cleanup_incomplete": ("cleanup_incomplete", "cleanup"),
+            "revocation_unconfirmed": ("token_revocation_unconfirmed", "source_validation"),
+            "signature_invalid": ("source_binding_mismatch", "source_validation"),
+            "base_invalid": ("source_binding_mismatch", "source_validation"),
+            "bootstrap_not_approved": ("source_binding_mismatch", "source_validation"),
+            "invalid_input": ("invalid_input", "source_validation"),
+        }
+        for reason in runtime.REASONS:
+            for stage in runtime.STAGES:
+                error = runtime.Refusal(reason, stage)
+                with self.subTest(reason=reason, stage=stage):
+                    diagnostic = subject._source_runtime_diagnostic(runtime, error)
+                    self.assertEqual(diagnostic, "source_runtime_" + stage + "_" + reason)
+                    mapped = subject._runtime_refusal(runtime, error)
+                    self.assertEqual(
+                        (mapped.reason, mapped.stage),
+                        expected_mapping.get(reason, ("source_validation_failed", "source_validation")),
+                    )
+                    refusal = subject.Refusal(
+                        mapped.reason, mapped.stage, diagnostic=diagnostic,
+                    )
+                    self.assertLessEqual(len(subject._format_refusal(refusal)), subject.MAX_REFUSAL_BYTES)
+
+        for reason, stage in ((["invalid_input"], "input"), ("invalid_input", ["input"])):
+            error = SimpleNamespace(reason=reason, stage=stage)
+            with self.subTest(reason=reason, stage=stage):
+                self.assertIsNone(subject._source_runtime_diagnostic(runtime, error))
+
+    def test_private_runtime_fetch_diagnostic_preserves_only_closed_operation_classes(self):
+        runtime = subject._load_control_sibling("macos_private_validation")
+        for operation in runtime.FETCH_DIAGNOSTIC_OPERATIONS:
+            for failure_class in runtime.FETCH_DIAGNOSTIC_CLASSES:
+                error = runtime.Refusal(
+                    "source_fetch_unavailable", "fetch", (operation, failure_class),
+                )
+                with self.subTest(operation=operation, failure_class=failure_class):
+                    self.assertEqual(
+                        subject._source_runtime_diagnostic(runtime, error),
+                        "source_fetch_" + operation + "_" + failure_class,
+                    )
+        malformed = (
+            ("untrusted-operation", "process_failure"),
+            ("git_init", "untrusted-class"),
+            ["git_init", "process_failure"],
+            {"operation": "git_init", "class": "process_failure"},
+            ("git_init",),
+        )
+        for source_diagnostic in malformed:
+            error = SimpleNamespace(
+                reason="source_fetch_unavailable", stage="fetch",
+                source_diagnostic=source_diagnostic,
+            )
+            with self.subTest(source_diagnostic=source_diagnostic):
+                self.assertEqual(
+                    subject._source_runtime_diagnostic(runtime, error),
+                    "source_runtime_fetch_source_fetch_unavailable",
+                )
+
+    def test_private_runtime_bootstrap_check_is_closed_and_bound_to_bootstrap_failure(self):
+        runtime = subject._load_control_sibling("macos_private_validation")
+        for check in subject.CORE_BOOTSTRAP_CHECKS:
+            error = runtime.Refusal("bootstrap_snapshot_invalid", "bootstrap")
+            error.core_check = check
+            with self.subTest(check=check):
+                self.assertEqual(
+                    subject._source_runtime_diagnostic(runtime, error),
+                    "source_bootstrap_" + check,
+                )
+        for check in ("untrusted-check", None, ["tree_entries"], {"tree_entries": True}, 7):
+            error = runtime.Refusal("bootstrap_snapshot_invalid", "bootstrap")
+            error.core_check = check
+            with self.subTest(check=check):
+                self.assertEqual(
+                    subject._source_runtime_diagnostic(runtime, error),
+                    "source_runtime_bootstrap_bootstrap_snapshot_invalid",
+                )
+        wrong_reason = runtime.Refusal("bootstrap_not_approved", "bootstrap")
+        wrong_reason.core_check = "tree_entries"
+        self.assertEqual(
+            subject._source_runtime_diagnostic(runtime, wrong_reason),
+            "source_runtime_bootstrap_bootstrap_not_approved",
+        )
+
+    def test_source_lease_open_unknown_exception_class_uses_only_fixed_type_labels(self):
+        class CustomTypeError(TypeError):
+            pass
+
+        cases = (
+            (TypeError("private message"), "source_lease_open_type_error"),
+            (AttributeError("private path"), "source_lease_open_attribute_error"),
+            (ValueError("private value"), "source_lease_open_value_error"),
+            (PermissionError("private path"), "source_lease_open_permission_error"),
+            (FileNotFoundError("private path"), "source_lease_open_not_found"),
+            (TimeoutError("private timing"), "source_lease_open_timeout"),
+            (OSError("private path"), "source_lease_open_os_error"),
+            (CustomTypeError("private subclass"), "source_lease_open_other"),
+            (RuntimeError("private message"), "source_lease_open_other"),
+        )
+        for error, expected in cases:
+            with self.subTest(error_type=type(error).__name__):
+                diagnostic = subject._source_lease_open_exception_diagnostic(error)
+                self.assertEqual(diagnostic, expected)
+                refusal = subject.Refusal(
+                    "source_validation_failed", "source_validation", diagnostic=diagnostic,
+                )
+                payload = subject._format_refusal(refusal)
+                self.assertLessEqual(len(payload), subject.MAX_REFUSAL_BYTES)
+                self.assertNotIn(str(error).encode("utf-8"), payload)
 
 
 if __name__ == "__main__":
