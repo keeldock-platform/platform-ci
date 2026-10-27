@@ -408,6 +408,15 @@ REASONS = frozenset(
         "internal_error",
     )
 )
+CORE_CONTRACT_AUDIT_DIAGNOSTICS = frozenset((
+    "run_validation_identity",
+    "audit_job_run_id_mismatch",
+    "audit_job_run_attempt_mismatch",
+    "audit_job_head_sha_mismatch",
+    "audit_job_status_queued",
+    "audit_job_status_completed",
+    "audit_job_status_not_in_progress",
+))
 
 
 class AuditRefusal(Exception):
@@ -418,6 +427,20 @@ class AuditRefusal(Exception):
 
 def _fail(reason):
     raise AuditRefusal(reason)
+
+
+class CoreContractAuditRefusal(AuditRefusal):
+    def __init__(self, reason, diagnostic):
+        super().__init__(reason)
+        self.diagnostic = (
+            diagnostic
+            if type(diagnostic) is str and diagnostic in CORE_CONTRACT_AUDIT_DIAGNOSTICS
+            else None
+        )
+
+
+def _fail_core_contract_audit_identity(diagnostic):
+    raise CoreContractAuditRefusal("run_identity_mismatch", diagnostic)
 
 
 def _exact_int(value, minimum=0):
@@ -2187,11 +2210,18 @@ def _core_contract_jobs(api, run_id, run_attempt, control_sha):
         _fail("api_schema")
     by_name = {job["name"]: job for job in jobs}
     audit_job = by_name[CORE_CONTRACT_AUDIT_JOB_NAME]
-    if (audit_job.get("run_id") != int(run_id)
-            or audit_job.get("run_attempt") != int(run_attempt)
-            or audit_job.get("head_sha") != control_sha
-            or audit_job.get("status") != "in_progress"):
-        _fail("run_identity_mismatch")
+    if audit_job.get("run_id") != int(run_id):
+        _fail_core_contract_audit_identity("audit_job_run_id_mismatch")
+    if audit_job.get("run_attempt") != int(run_attempt):
+        _fail_core_contract_audit_identity("audit_job_run_attempt_mismatch")
+    if audit_job.get("head_sha") != control_sha:
+        _fail_core_contract_audit_identity("audit_job_head_sha_mismatch")
+    if audit_job.get("status") != "in_progress":
+        status_diagnostic = {
+            "queued": "audit_job_status_queued",
+            "completed": "audit_job_status_completed",
+        }.get(audit_job.get("status"), "audit_job_status_not_in_progress")
+        _fail_core_contract_audit_identity(status_diagnostic)
     details = {}
     for name in (CORE_CONTRACT_SETTINGS_JOB_NAME, CORE_CONTRACT_PRODUCER_JOB_NAME):
         detail = _job_detail(api, by_name[name], run_id, run_attempt, control_sha, name)
@@ -2477,7 +2507,14 @@ def _bootstrap_audit(api, kind, control_sha, run_id, run_attempt, env):
 
 def _core_contract_audit(api, control_sha, run_id, run_attempt, env):
     configuration = _source_reader_configuration("core-contract")
-    _validate_run(api, run_id, run_attempt, control_sha, configuration["workflow_path"])
+    try:
+        _validate_run(api, run_id, run_attempt, control_sha, configuration["workflow_path"])
+    except AuditRefusal as error:
+        if error.reason == "run_identity_mismatch":
+            raise CoreContractAuditRefusal(
+                error.reason, "run_validation_identity",
+            ) from None
+        raise
     details = _core_contract_jobs(api, run_id, run_attempt, control_sha)
     settings_job, settings_check_id, settings_steps_success = details[CORE_CONTRACT_SETTINGS_JOB_NAME]
     producer_job, producer_check_id, producer_steps_success = details[CORE_CONTRACT_PRODUCER_JOB_NAME]
@@ -3034,6 +3071,14 @@ def main(argv=None):
         return 2
     try:
         return run(args[0])
+    except CoreContractAuditRefusal as error:
+        if (len(args) == 1 and args[0] == "core-contract-audit"
+                and error.reason == "run_identity_mismatch"
+                and type(error.diagnostic) is str
+                and error.diagnostic in CORE_CONTRACT_AUDIT_DIAGNOSTICS):
+            print("macos-core-contract-audit-diagnostic=" + error.diagnostic)
+        print("macos-public-surface-audit=refused reason=" + error.reason)
+        return 2
     except AuditRefusal as error:
         print("macos-public-surface-audit=refused reason=" + error.reason)
         return 2
