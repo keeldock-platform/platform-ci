@@ -1778,6 +1778,24 @@ class CoreContractReceiptTests(unittest.TestCase):
             audit.publish_core_contract_receipt(env, io.BytesIO(cleanup_raw), cleanup_output), 0
         )
         self.assertEqual(cleanup_output.getvalue(), cleanup_raw)
+        for diagnostic in (
+            "worker_privilege_probe_group_cleanup",
+            "worker_privilege_probe_capture_cleanup",
+            "worker_privilege_probe_census",
+            "worker_privilege_probe_survivor",
+            "worker_privilege_probe_timeout",
+        ):
+            classified_probe_cleanup = {**cleanup_value, "diagnostic": diagnostic}
+            classified_probe_cleanup_raw = core_contract_line(
+                classified_probe_cleanup, b"KD-CORE-CONTRACT-REFUSAL ",
+            )
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(
+                    audit.publish_core_contract_receipt(
+                        env, io.BytesIO(classified_probe_cleanup_raw), io.BytesIO(),
+                    ),
+                    0,
+                )
         preflight_value = {
             "schema_version": 1,
             "status": "refused",
@@ -1847,6 +1865,14 @@ class CoreContractReceiptTests(unittest.TestCase):
             core_contract_line({**value, "control_sha": CONTROL_SHA}, b"KD-CORE-CONTRACT-REFUSAL "),
             core_contract_line({**value, "reason": "unknown"}, b"KD-CORE-CONTRACT-REFUSAL "),
             core_contract_line({**value, "diagnostic": "unknown"}, b"KD-CORE-CONTRACT-REFUSAL "),
+            core_contract_line(
+                {**value, "diagnostic": "worker_privilege_probe_group_cleanup"},
+                b"KD-CORE-CONTRACT-REFUSAL ",
+            ),
+            core_contract_line(
+                {**cleanup_value, "stage": "worker_setup", "diagnostic": "worker_privilege_probe_timeout"},
+                b"KD-CORE-CONTRACT-REFUSAL ",
+            ),
             core_contract_line({**value, "diagnostic": True}, b"KD-CORE-CONTRACT-REFUSAL "),
             core_contract_line({**value, "diagnostic": "none"}, b"KD-CORE-CONTRACT-REFUSAL "),
         ):

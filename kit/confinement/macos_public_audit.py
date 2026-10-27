@@ -367,6 +367,9 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "disable_developer_mode", "resolve_host_toolchain", "resolve_worker_tools",
     "create_worker_identity", "create_run_directory", "create_source_storage",
     "prepare_worker_storage", "worker_identity_check", "worker_privilege_probe",
+    "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",
+    "worker_privilege_probe_census", "worker_privilege_probe_survivor",
+    "worker_privilege_probe_timeout",
     "worker_privilege_census", "summary_guard_setup", "source_lease_request",
     "source_lease_open", "source_revocation_check", "source_lease_record",
     "source_path_validation", "source_tree_probe", "resolve_git", "git_diff_verification",
@@ -383,6 +386,11 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "cleanup_summary_present_helper_trust", "cleanup_summary_present_helper_containers",
     "cleanup_summary_present_apple_system_path", "cleanup_summary_probe",
     "cleanup_summary_restore", "cleanup_summary_close", "cleanup_dash", "cleanup_unknown",
+))
+CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS = frozenset((
+    "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",
+    "worker_privilege_probe_census", "worker_privilege_probe_survivor",
+    "worker_privilege_probe_timeout",
 ))
 CANARY_DOMAIN = b"keeldock" + b"-macos-ci-canary-v1\0"
 CANARY_PREFIX = b"KD-MACOS-CI-CANARY-v1:"
@@ -1505,6 +1513,9 @@ def _core_contract_refusal_value(payload):
         _fail("capture_invalid")
     if (value["diagnostic"] == "none"
             and value["stage"] not in {"arguments", "context", "host"}):
+        _fail("capture_invalid")
+    if (value["diagnostic"] in CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS
+            and (value["stage"] != "cleanup" or value["reason"] != "cleanup_incomplete")):
         _fail("capture_invalid")
     try:
         canonical = json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")

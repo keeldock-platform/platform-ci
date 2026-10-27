@@ -63,6 +63,9 @@ OPERATION_DIAGNOSTICS = frozenset((
     "token_input", "token_revocation", "disable_developer_mode", "resolve_host_toolchain",
     "resolve_worker_tools", "create_worker_identity", "create_run_directory", "create_source_storage",
     "prepare_worker_storage", "worker_identity_check", "worker_privilege_probe",
+    "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",
+    "worker_privilege_probe_census", "worker_privilege_probe_survivor",
+    "worker_privilege_probe_timeout",
     "worker_privilege_census", "summary_guard_setup", "source_lease_request", "source_lease_open",
     "source_revocation_check", "source_lease_record", "source_path_validation", "source_tree_probe",
     "resolve_git", "git_diff_verification", "network_observer_start", "toolchain_install",
@@ -71,6 +74,13 @@ OPERATION_DIAGNOSTICS = frozenset((
     "summary_guard_probe", "source_lease_cleanup", "worker_cleanup", "fallback_tree_cleanup",
     "summary_guard_finish", "success_receipt", "output_write",
 ))
+PRIVILEGE_PROBE_CHECK_DIAGNOSTICS = {
+    "probe_process_group_cleanup": "worker_privilege_probe_group_cleanup",
+    "probe_process_capture_cleanup": "worker_privilege_probe_capture_cleanup",
+    "probe_process_census": "worker_privilege_probe_census",
+    "probe_process_survivor": "worker_privilege_probe_survivor",
+    "probe_process_timeout": "worker_privilege_probe_timeout",
+}
 CLEANUP_DIAGNOSTICS = frozenset((
     "cleanup_lease", "cleanup_storage", "cleanup_worker", "cleanup_summary",
     "cleanup_summary_census", "cleanup_summary_present", "cleanup_summary_present_python",
@@ -592,7 +602,12 @@ def _run_privilege_probe(worker_uid, home, host_toolchain, reviewed):
         )
     except BaseException as error:
         if getattr(error, "reason", None) == "cleanup_incomplete":
-            raise Refusal("cleanup_incomplete", "cleanup", diagnostic="worker_privilege_probe") from None
+            probe_check = getattr(error, "probe_check", None)
+            diagnostic = (
+                PRIVILEGE_PROBE_CHECK_DIAGNOSTICS.get(probe_check, "worker_privilege_probe")
+                if type(probe_check) is str else "worker_privilege_probe"
+            )
+            raise Refusal("cleanup_incomplete", "cleanup", diagnostic=diagnostic) from None
         raise Refusal("runner_unavailable", "worker_setup", diagnostic="worker_privilege_probe") from None
     try:
         reviewed._worker_census(worker_uid, host_toolchain["python"], "privilege")

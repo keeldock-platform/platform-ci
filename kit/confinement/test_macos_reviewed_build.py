@@ -891,6 +891,32 @@ class WorkerToolFixtureTests(unittest.TestCase):
 
 
 class WorkerDiagnosticTests(unittest.TestCase):
+    def test_privilege_cleanup_checks_are_preserved_only_from_the_closed_set(self):
+        expected = {
+            "probe_process_group_cleanup": "probe_process_group_cleanup",
+            "probe_process_capture_cleanup": "probe_process_capture_cleanup",
+            "probe_process_census": "probe_process_census",
+            "probe_process_survivor": "probe_process_survivor",
+            "probe_process_timeout": "probe_process_timeout",
+            "untrusted-private-check": None,
+        }
+        for check, expected_check in expected.items():
+            failure = reviewed_build.capability.ProbeFailure(
+                "native_preflight_unavailable", cleanup_complete=False, check=check,
+            )
+            with self.subTest(check=check):
+                with patch.object(reviewed_build.capability, "_run_as_probe_user", side_effect=failure):
+                    with patch.object(reviewed_build, "_read_survivor_classes", return_value=(False, "none")):
+                        with self.assertRaises(reviewed_build.Refusal) as raised:
+                            reviewed_build._run_probe_step(
+                                ("synthetic",), 501, env={}, python_executable="/usr/bin/python3",
+                                stage="privilege", expected_stdout=reviewed_build.PRIVILEGE_MARKER,
+                                tool_phase="unknown",
+                            )
+                self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+                self.assertEqual(raised.exception.probe_check, expected_check)
+                self.assertNotIn("untrusted-private-check", str(raised.exception))
+
     def test_failed_tool_with_confirmed_cleanup_reads_the_closed_current_census(self):
         failure = reviewed_build.capability.ProbeFailure(
             "native_preflight_unavailable", cleanup_complete=True,
