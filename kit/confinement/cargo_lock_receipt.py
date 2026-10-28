@@ -1190,7 +1190,7 @@ def _vendor_digest_header(digest, relative, is_directory, mode, size):
     digest.update(size.to_bytes(8, "big"))
 
 
-def vendor_tree_inventory_fd(root_fd, require_read_only=None):
+def vendor_tree_inventory_fd(root_fd, require_read_only=None, copy_file=None):
     """Inspect an anchored vendor tree using no-follow descriptor-relative opens."""
     if os.name == "nt" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
         _refuse("cargo_archive_invalid")
@@ -1282,25 +1282,39 @@ def vendor_tree_inventory_fd(root_fd, require_read_only=None):
                         _refuse("cargo_archive_invalid")
                     if require_read_only is not None:
                         require_read_only(file_fd)
+                    copy_fd = copy_file(relative) if copy_file is not None else None
                     file_digest = hashlib.sha256()
-                    size = 0
-                    while True:
-                        chunk = os.read(file_fd, 1024 * 1024)
-                        if not chunk:
-                            break
-                        size += len(chunk)
-                        if size > MAX_FILE_BYTES:
+                    try:
+                        size = 0
+                        while True:
+                            chunk = os.read(file_fd, 1024 * 1024)
+                            if not chunk:
+                                break
+                            size += len(chunk)
+                            if size > MAX_FILE_BYTES:
+                                _refuse("cargo_archive_invalid")
+                            digest.update(chunk)
+                            file_digest.update(chunk)
+                            if copy_fd is not None:
+                                view = memoryview(chunk)
+                                while view:
+                                    written = os.write(copy_fd, view)
+                                    if written <= 0:
+                                        _refuse("cargo_archive_invalid")
+                                    view = view[written:]
+                        after = os.fstat(file_fd)
+                        if (size != metadata.st_size or after.st_dev != metadata.st_dev
+                                or after.st_ino != metadata.st_ino
+                                or after.st_size != metadata.st_size
+                                or after.st_mode != metadata.st_mode
+                                or after.st_mtime_ns != opened.st_mtime_ns):
                             _refuse("cargo_archive_invalid")
-                        digest.update(chunk)
-                        file_digest.update(chunk)
-                    after = os.fstat(file_fd)
-                    if (size != metadata.st_size or after.st_dev != metadata.st_dev
-                            or after.st_ino != metadata.st_ino
-                            or after.st_size != metadata.st_size
-                            or after.st_mode != metadata.st_mode
-                            or after.st_mtime_ns != opened.st_mtime_ns):
-                        _refuse("cargo_archive_invalid")
-                    file_hashes[relative] = file_digest.hexdigest()
+                        if copy_fd is not None:
+                            os.fchmod(copy_fd, 0o444)
+                        file_hashes[relative] = file_digest.hexdigest()
+                    finally:
+                        if copy_fd is not None:
+                            os.close(copy_fd)
                 finally:
                     os.close(file_fd)
             finally:

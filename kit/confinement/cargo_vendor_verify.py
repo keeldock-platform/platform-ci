@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 from pathlib import Path
+import secrets
 import stat
 import sys
 
@@ -245,18 +246,107 @@ def _verify_inventory(root_fd, items, file_hashes, packages, require_read_only):
             _refuse()
 
 
+def _materialize_vendor(root_fd, items, expected_digest, require_read_only, staging_root):
+    parent_fd = None
+    stage_fd = None
+    stage_name = None
+    stage_identity = None
+    stage_created = False
+    final_name = ".cargo-vendor-" + secrets.token_hex(16)
+    try:
+        parent_fd, target = cargo._open_target_directory(staging_root)
+        stage_name = ".cargo-stage-" + secrets.token_hex(16)
+        os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
+        stage_created = True
+        stage_fd = os.open(
+            stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        stage_identity = cargo._file_identity(os.fstat(stage_fd))
+        directories = sorted(
+            (relative for relative, item in items.items() if item[0]),
+            key=lambda relative: (relative.count("/"), relative),
+        )
+        for relative in directories:
+            parts = relative.split("/")
+            directory_fd = cargo._open_relative_directory(stage_fd, parts[:-1])
+            try:
+                os.mkdir(parts[-1], 0o700, dir_fd=directory_fd)
+            finally:
+                os.close(directory_fd)
+
+        def open_copy(relative):
+            parts = relative.split("/")
+            directory_fd = cargo._open_relative_directory(stage_fd, parts[:-1])
+            try:
+                return os.open(
+                    parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=directory_fd,
+                )
+            finally:
+                os.close(directory_fd)
+
+        copied_digest = cargo.vendor_tree_inventory_fd(
+            root_fd, require_read_only, open_copy,
+        )[0]
+        if not hmac.compare_digest(copied_digest, expected_digest):
+            _refuse()
+        for relative in reversed(directories):
+            directory_fd = cargo._open_relative_directory(stage_fd, relative.split("/"))
+            try:
+                os.fchmod(directory_fd, 0o555)
+            finally:
+                os.close(directory_fd)
+        os.fchmod(stage_fd, 0o555)
+        materialized_digest = cargo.vendor_tree_inventory_fd(stage_fd)[0]
+        if not hmac.compare_digest(materialized_digest, expected_digest):
+            _refuse()
+        cargo._publish_stage(parent_fd, stage_name, final_name, stage_identity)
+        stage_name = None
+        return target / final_name, parent_fd, stage_fd, final_name, stage_identity
+    except BaseException:
+        if stage_created and parent_fd is not None:
+            for name in (stage_name, final_name):
+                if name is not None:
+                    try:
+                        cargo._remove_stage(parent_fd, name, stage_identity)
+                    except (OSError, cargo.Refusal):
+                        pass
+        if stage_fd is not None:
+            os.close(stage_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        raise
+
+
+def _require_materialized_path(parent_fd, stage_fd, target, final_name):
+    comparison_fd = None
+    try:
+        comparison_fd, unused_target = cargo._open_target_directory(target)
+        if (cargo._file_identity(os.fstat(comparison_fd))
+                != cargo._file_identity(os.fstat(parent_fd))
+                or cargo._entry_identity(comparison_fd, final_name)
+                != cargo._file_identity(os.fstat(stage_fd))):
+            _refuse()
+    finally:
+        if comparison_fd is not None:
+            os.close(comparison_fd)
+
+
 def verify_vendor_tree(
         lock_bytes, lock_receipt, expected_lock_context, authorized_audits,
-        vendor_directory, vendor_receipt_bytes, trusted_vendor_receipt_sha256):
+        vendor_directory, vendor_receipt_bytes, trusted_vendor_receipt_sha256,
+        trusted_staging_root):
     """Check lock, vendor receipt, package files and offline Cargo settings.
 
     The trusted vendor receipt digest must come from the protected preparation
     handoff. The lock receipt context and audit mapping must also be independently
-    authenticated. The physical vendor path has root-owned, non-writable
-    ancestors, no extended macOS ACLs, and read-only storage for every member.
-    Linux also requires a read-only superblock. The trusted handoff must keep
-    that mount and namespace through Cargo consumption. Windows refuses until
-    its native handle and ACL handoff is implemented.
+    authenticated. A descriptor-bound copy is published under a preexisting
+    private staging root checked by the receipt helper. Cargo receives only the
+    frozen copy. The preparation job excludes untrusted same-user processes;
+    a privileged actor controlling mounts or the private root remains trusted,
+    as in the receipt handoff. Windows refuses until a native handle and ACL
+    handoff is implemented.
     """
     if type(lock_receipt) is bytes:
         lock_record = cargo.decode_receipt(lock_receipt)
@@ -281,6 +371,8 @@ def verify_vendor_tree(
     require_read_only = lambda descriptor: _require_read_only_mount(
         descriptor, read_only_superblocks,
     )
+    materialized = None
+    environment = None
     try:
         try:
             vendor_digest, items, file_hashes = cargo.vendor_tree_inventory_fd(
@@ -293,35 +385,52 @@ def verify_vendor_tree(
         _verify_inventory(
             root_fd, items, file_hashes, lock_record["packages"], require_read_only,
         )
-        try:
-            final_digest = cargo.vendor_tree_inventory_fd(root_fd, require_read_only)[0]
-        except cargo.Refusal:
-            _refuse()
-        if not hmac.compare_digest(final_digest, vendor_digest):
-            _refuse()
         _require_same_path(root_fd, physical_root, read_only_superblocks)
-        cargo_arguments, environment = cargo.cargo_config_for_vendor(physical_root)
         try:
-            expected_setting = (
-                "source.verified-vendor.directory="
-                + json.dumps(str(physical_root), ensure_ascii=True)
+            materialized = _materialize_vendor(
+                root_fd, items, vendor_digest, require_read_only, trusted_staging_root,
             )
-            if expected_setting not in cargo_arguments:
-                _refuse()
-            _require_same_path(root_fd, physical_root, read_only_superblocks)
-        except cargo.Refusal:
+        except (cargo.Refusal, OSError, TypeError, ValueError):
+            _refuse()
+        materialized_path, parent_fd, stage_fd, final_name, stage_identity = materialized
+        cargo_arguments, environment = cargo.cargo_config_for_vendor(materialized_path)
+        expected_setting = (
+            "source.verified-vendor.directory="
+            + json.dumps(str(materialized_path), ensure_ascii=True)
+        )
+        if expected_setting not in cargo_arguments:
+            _refuse()
+        try:
+            _require_materialized_path(
+                parent_fd, stage_fd, materialized_path.parent, final_name,
+            )
+        except (cargo.Refusal, OSError, TypeError, ValueError):
+            _refuse()
+        return {
+            "vendor_sha256": vendor_digest,
+            "materialized_vendor_directory": materialized_path,
+            "cargo_arguments": cargo_arguments,
+            "environment": environment,
+        }
+    except BaseException:
+        if materialized is not None:
+            unused_path, parent_fd, unused_stage_fd, final_name, stage_identity = materialized
+            try:
+                cargo._remove_stage(parent_fd, final_name, stage_identity)
+            except (OSError, cargo.Refusal):
+                pass
+        if environment is not None:
             for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
                 try:
                     os.rmdir(environment[key])
                 except (KeyError, OSError):
                     pass
-            raise
-        return {
-            "vendor_sha256": final_digest,
-            "cargo_arguments": cargo_arguments,
-            "environment": environment,
-        }
+        raise
     finally:
+        if materialized is not None:
+            unused_path, parent_fd, stage_fd, unused_name, unused_identity = materialized
+            os.close(stage_fd)
+            os.close(parent_fd)
         os.close(root_fd)
 
 

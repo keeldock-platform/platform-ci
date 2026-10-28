@@ -59,13 +59,14 @@ def _authorized_audits(record):
     }
 
 
-def _write_vendor(directory, manifest_package=CHECKSUM):
+def _write_vendor(directory, manifest_package=CHECKSUM,
+                  source_bytes=b"pub fn value() -> u8 { 1 }\n"):
     package = Path(directory) / "serde-1.0.1"
     source = package / "src"
     source.mkdir(parents=True)
     files = {
         "Cargo.toml": b"[package]\nname='serde'\nversion='1.0.1'\n",
-        "src/lib.rs": b"pub fn value() -> u8 { 1 }\n",
+        "src/lib.rs": source_bytes,
     }
     file_hashes = {}
     for relative, content in files.items():
@@ -97,13 +98,15 @@ def _vendor_receipt(record, vendor_digest, changes=None):
     return data, hashlib.sha256(data).hexdigest()
 
 
-def _verify(vendor, record, vendor_receipt, trusted_digest, lock_bytes=LOCK_BYTES):
-    with patch.object(subject.os, "geteuid", return_value=1001), patch.object(
-            subject, "_require_protected_ancestor"), patch.object(
-                subject, "_require_read_only_mount"):
+def _verify(vendor, record, vendor_receipt, trusted_digest, lock_bytes=LOCK_BYTES,
+            staging_root=None):
+    if staging_root is None:
+        staging_root = vendor.parent
+    with patch.object(subject, "_require_protected_ancestor"), patch.object(
+            subject, "_require_read_only_mount"):
         return subject.verify_vendor_tree(
             lock_bytes, record, _lock_context(record), _authorized_audits(record),
-            vendor, vendor_receipt, trusted_digest,
+            vendor, vendor_receipt, trusted_digest, staging_root,
         )
 
 
@@ -127,6 +130,17 @@ def _unfreeze(directory):
 def _remove_cargo_environment(environment):
     for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
         os.rmdir(environment[key])
+
+
+def _remove_materialized(result):
+    materialized = result["materialized_vendor_directory"]
+    parent_fd = os.open(
+        materialized.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        cargo._remove_stage(parent_fd, materialized.name)
+    finally:
+        os.close(parent_fd)
 
 
 def _scan_vendor(vendor):
@@ -163,9 +177,21 @@ class CargoVendorVerifyTests(unittest.TestCase):
                 self.assertIn("net.offline=true", rendered)
                 self.assertIn("source.crates-io.replace-with", rendered)
                 self.assertIn("source.verified-vendor.directory", rendered)
+                materialized = result["materialized_vendor_directory"]
+                self.assertNotEqual(materialized, vendor)
+                self.assertEqual(materialized.parent, Path(temporary).resolve())
+                self.assertEqual(materialized.parent.stat().st_uid, os.geteuid())
+                self.assertEqual(materialized.parent.stat().st_mode & 0o777, 0o700)
+                self.assertFalse(materialized.is_symlink())
+                self.assertEqual(materialized.stat().st_mode & 0o777, 0o555)
+                self.assertEqual(
+                    (materialized / "serde-1.0.1" / "src" / "lib.rs").read_bytes(),
+                    (vendor / "serde-1.0.1" / "src" / "lib.rs").read_bytes(),
+                )
+                self.assertEqual(cargo.vendor_tree_digest(materialized), digest)
                 self.assertIn(
                     "source.verified-vendor.directory="
-                    + json.dumps(str(vendor.resolve()), ensure_ascii=True),
+                    + json.dumps(str(materialized), ensure_ascii=True),
                     result["cargo_arguments"],
                 )
                 self.assertNotIn("CARGO_NET_OFFLINE", result["environment"])
@@ -173,6 +199,68 @@ class CargoVendorVerifyTests(unittest.TestCase):
             finally:
                 if "result" in locals():
                     _remove_cargo_environment(result["environment"])
+                    _remove_materialized(result)
+                _unfreeze(vendor)
+
+    def test_non_private_staging_root_is_refused_before_configuration(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            vendor = base / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            staging_root = base / "public"
+            staging_root.mkdir()
+            staging_root.chmod(0o755)
+            try:
+                with patch.object(
+                        cargo, "cargo_config_for_vendor",
+                        side_effect=AssertionError("configuration was requested")):
+                    with self.assertRaises(cargo.Refusal) as raised:
+                        _verify(
+                            vendor, record, receipt, trusted_digest,
+                            staging_root=staging_root,
+                        )
+                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+                self.assertEqual(list(staging_root.iterdir()), [])
+            finally:
+                _unfreeze(vendor)
+
+    def test_wrong_cargo_path_discards_the_materialized_tree(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            vendor = base / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            original_config = cargo.cargo_config_for_vendor
+            created_environment = {}
+
+            def wrong_config(path):
+                arguments, environment = original_config(path)
+                created_environment.update(environment)
+                wrong_setting = (
+                    "source.verified-vendor.directory="
+                    + json.dumps(str(vendor), ensure_ascii=True)
+                )
+                arguments = [
+                    wrong_setting if value.startswith(
+                        "source.verified-vendor.directory=",
+                    ) else value for value in arguments
+                ]
+                return arguments, environment
+
+            try:
+                with patch.object(cargo, "cargo_config_for_vendor", side_effect=wrong_config):
+                    with self.assertRaises(cargo.Refusal) as raised:
+                        _verify(vendor, record, receipt, trusted_digest)
+                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+                self.assertEqual(list(base.iterdir()), [vendor])
+                for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
+                    self.assertFalse(Path(created_environment[key]).exists())
+            finally:
                 _unfreeze(vendor)
 
     def test_vendor_receipt_digest_must_be_from_trusted_handoff(self):
@@ -375,6 +463,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
                         subject.verify_vendor_tree(
                             LOCK_BYTES, record, _lock_context(record),
                             _authorized_audits(record), vendor, receipt, trusted_digest,
+                            vendor.parent,
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -396,6 +485,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
                         subject.verify_vendor_tree(
                             LOCK_BYTES, record, _lock_context(record),
                             _authorized_audits(record), vendor, receipt, trusted_digest,
+                            vendor.parent,
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -421,6 +511,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
                         subject.verify_vendor_tree(
                             LOCK_BYTES, record, _lock_context(record),
                             _authorized_audits(record), vendor, receipt, trusted_digest,
+                            vendor.parent,
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -452,6 +543,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
                         subject.verify_vendor_tree(
                             LOCK_BYTES, record, _lock_context(record),
                             _authorized_audits(record), vendor, receipt, trusted_digest,
+                            vendor.parent,
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -474,6 +566,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
                         subject.verify_vendor_tree(
                             LOCK_BYTES, record, _lock_context(record),
                             _authorized_audits(record), vendor, receipt, trusted_digest,
+                            vendor.parent,
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -583,7 +676,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
                     finally:
                         _unfreeze(vendor)
 
-    def test_ancestor_swap_after_scan_cannot_change_cargo_tree(self):
+    def test_ancestor_swap_during_configuration_keeps_cargo_on_the_copy(self):
         record = _lock_receipt()
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -597,32 +690,79 @@ class CargoVendorVerifyTests(unittest.TestCase):
             replacement.mkdir()
             replacement_vendor = replacement / "vendor"
             replacement_vendor.mkdir()
-            self.assertEqual(_write_vendor(replacement_vendor), digest)
+            replacement_digest = _write_vendor(
+                replacement_vendor, source_bytes=b"pub fn value() -> u8 { 9 }\n",
+            )
+            self.assertNotEqual(replacement_digest, digest)
             moved = base / "moved"
             original_config = cargo.cargo_config_for_vendor
-            created_environment = {}
+            result = None
 
             def swap_then_config(path):
                 parent.rename(moved)
                 replacement.rename(parent)
-                arguments, environment = original_config(path)
-                created_environment.update(environment)
-                return arguments, environment
+                return original_config(path)
 
             try:
                 with patch.object(cargo, "cargo_config_for_vendor", side_effect=swap_then_config):
-                    with self.assertRaises(cargo.Refusal) as raised:
-                        _verify(vendor, record, receipt, trusted_digest)
-                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
-                for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
-                    self.assertFalse(Path(created_environment[key]).exists())
+                    result = _verify(
+                        vendor, record, receipt, trusted_digest, staging_root=base,
+                    )
+                materialized = result["materialized_vendor_directory"]
+                self.assertEqual(cargo.vendor_tree_digest(materialized), digest)
+                self.assertEqual(cargo.vendor_tree_digest(vendor), replacement_digest)
+                self.assertIn(
+                    "source.verified-vendor.directory="
+                    + json.dumps(str(materialized), ensure_ascii=True),
+                    result["cargo_arguments"],
+                )
             finally:
-                for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
-                    if key in created_environment:
-                        try:
-                            os.rmdir(created_environment[key])
-                        except OSError:
-                            pass
+                if result is not None:
+                    _remove_cargo_environment(result["environment"])
+                    _remove_materialized(result)
+                for path in (vendor, moved / "vendor", replacement_vendor):
+                    _unfreeze(path)
+
+    def test_ancestor_swap_after_return_cannot_change_cargo_tree(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            parent = base / "handoff"
+            parent.mkdir()
+            vendor = parent / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            replacement = base / "replacement"
+            replacement.mkdir()
+            replacement_vendor = replacement / "vendor"
+            replacement_vendor.mkdir()
+            replacement_digest = _write_vendor(
+                replacement_vendor, source_bytes=b"pub fn value() -> u8 { 9 }\n",
+            )
+            self.assertNotEqual(replacement_digest, digest)
+            moved = base / "moved"
+            result = None
+            try:
+                result = _verify(
+                    vendor, record, receipt, trusted_digest, staging_root=base,
+                )
+                parent.rename(moved)
+                replacement.rename(parent)
+                setting = [
+                    value.split("=", 1)[1] for value in result["cargo_arguments"]
+                    if value.startswith("source.verified-vendor.directory=")
+                ]
+                self.assertEqual(len(setting), 1)
+                cargo_path = Path(json.loads(setting[0]))
+                self.assertEqual(cargo_path, result["materialized_vendor_directory"])
+                self.assertEqual(cargo.vendor_tree_digest(cargo_path), digest)
+                self.assertEqual(cargo.vendor_tree_digest(vendor), replacement_digest)
+                self.assertNotEqual(cargo_path, vendor)
+            finally:
+                if result is not None:
+                    _remove_cargo_environment(result["environment"])
+                    _remove_materialized(result)
                 for path in (vendor, moved / "vendor", replacement_vendor):
                     _unfreeze(path)
 
@@ -641,6 +781,7 @@ class WindowsVendorHandoffTests(unittest.TestCase):
                     subject.verify_vendor_tree(
                         LOCK_BYTES, record, _lock_context(record),
                         _authorized_audits(record), vendor, receipt, trusted_digest,
+                        vendor.parent,
                     )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
