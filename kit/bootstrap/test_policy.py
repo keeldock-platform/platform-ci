@@ -175,6 +175,28 @@ class WorkflowPolicyTests(unittest.TestCase):
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow + "\npermissions: write-all\n", "platform", "development-feedback-smoke")
 
+    def test_attestation_probe_requires_manual_main_and_minimal_permission_checks(self):
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/attestation-probe.yml"
+        workflow = path.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(workflow, "platform", "attestation-probe"))
+        self.assertIn("attestations:write,id-token:write", workflow)
+        self.assertIn("verifier_permissions=actions:read,attestations:read", workflow)
+        mutations = (
+            workflow.replace("  workflow_dispatch:\n", "  push:\n", 1),
+            workflow.replace("          - windows-2025\n", "          - windows-latest\n", 1),
+            workflow.replace("--deny-self-hosted-runners", ""),
+            workflow.replace(
+                "uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 " + chr(35) + " v4.2.2",
+                "uses: actions/attest@v4",
+                1,
+            ),
+            workflow + "\n",
+        )
+        for changed in mutations:
+            with self.subTest(length=len(changed)):
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "attestation-probe")
+
     def test_actual_platform_workflow_matches_closed_supported_shape(self):
         self.assertTrue(validate_workflow_text(self._platform_workflow(), "platform"))
 
@@ -1475,6 +1497,7 @@ class LaneRegistryTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[2]
         shared_files = {
             "public-policy": ".github/workflows/public-policy.yml",
+            "attestation-probe": ".github/workflows/attestation-probe.yml",
             "node-lock-smoke": ".github/workflows/node-lock-smoke.yml",
             "macos-capability": ".github/workflows/macos-capability.yml",
             "macos-reviewed-build": ".github/workflows/macos-reviewed-build.yml",

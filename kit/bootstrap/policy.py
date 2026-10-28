@@ -1321,6 +1321,7 @@ SHARED_WORKFLOW_KINDS = frozenset(
         "public-policy",
         "node-lock-smoke",
         "development-feedback-smoke",
+        "attestation-probe",
         "macos-capability",
         "macos-reviewed-build",
         "macos-rust-toolchain-smoke",
@@ -1388,6 +1389,87 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256:
+            raise PolicyError("workflow-template-mismatch")
+        return True
+    if workflow_kind == "attestation-probe":
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        required = (
+            "name: attestation-probe\non:\n  workflow_dispatch:\npermissions: {}\n",
+            "  require-main:\n",
+            "EVENT_NAME: ${{ github.event_name }}\n          EVENT_REF: ${{ github.ref }}\n",
+            "  attest-proposed:\n",
+            "    permissions:\n      actions: read\n      attestations: write\n      id-token: write\n",
+            "  attest-minimal:\n",
+            "    permissions:\n      attestations: write\n      id-token: write\n",
+            "  without-id-token:\n",
+            "    permissions:\n      attestations: write\n",
+            "  without-attestations:\n",
+            "    permissions:\n      id-token: write\n",
+            "  verify:\n",
+            "    permissions:\n      actions: read\n      attestations: read\n",
+            "runs-on: ubuntu-24.04",
+            "        runner:\n          - ubuntu-24.04\n          - windows-2025\n",
+            "runs-on: ${{ matrix.runner }}",
+            "KD-ATTESTATION-PROBE mapping=$mapping",
+            "--cert-oidc-issuer 'https://token.actions.githubusercontent.com'",
+            "--deny-self-hosted-runners",
+            "@('--audience', 'sigstore', '--issuer', 'https://token.actions.githubusercontent.com', '--run-id', $env:GH_RUN_ID, '--run-attempt', $env:GH_RUN_ATTEMPT)",
+            "--job-id $jobIds[$entry.job]",
+            "tampered-subject-accepted",
+            "cross-job-not-rejected",
+            "attempt-not-distinguished",
+            "minimal_permissions[ubuntu-24.04]",
+            "minimal_permissions[windows-2025]",
+            "if ($mapping -ne 'available') { exit 1 }",
+        )
+        if any(fragment not in text for fragment in required):
+            raise PolicyError("workflow-template-mismatch")
+        matrix = "        runner:\n          - ubuntu-24.04\n          - windows-2025\n"
+        if text.count(matrix) != 4 or text.count("runs-on: ${{ matrix.runner }}") != 4:
+            raise PolicyError("workflow-template-mismatch")
+        permission_blocks = (
+            "    permissions:\n      contents: read\n    steps:\n",
+            "    permissions:\n      actions: read\n      attestations: write\n      id-token: write\n",
+            "    permissions:\n      attestations: write\n      id-token: write\n",
+            "    permissions:\n      attestations: write\n    env:\n",
+            "    permissions:\n      id-token: write\n    env:\n",
+            "    permissions:\n      actions: read\n      attestations: read\n",
+        )
+        if any(text.count(block) != 1 for block in permission_blocks):
+            raise PolicyError("workflow-template-mismatch")
+        if text.count("if ($env:ATTEST_OUTCOME -ne 'failure')") != 2:
+            raise PolicyError("workflow-template-mismatch")
+        if not text.endswith("\n") or text.endswith("\n\n"):
+            raise PolicyError("workflow-template-mismatch")
+        if any(
+            marker in text
+            for marker in ("  push:\n", "  pull_request:\n", "  schedule:\n", "  workflow_call:\n", "inputs:")
+        ):
+            raise PolicyError("workflow-template-mismatch")
+        action_lines = re.findall(r"(?m)^\s*uses:\s+.*$", text)
+        action_pattern = re.compile(
+            r"\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}\s+"
+            + re.escape(chr(35))
+            + r"\s+v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?"
+        )
+        if not action_lines or any(action_pattern.fullmatch(line) is None for line in action_lines):
+            raise PolicyError("workflow-template-mismatch")
+        action_refs = re.findall(
+            r"(?m)^\s*uses:\s+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40})\s+",
+            text,
+        )
+        expected_action_refs = [
+            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+            "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+            "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+            "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9",
+            "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+            "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+            "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+            "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6",
+        ]
+        if sorted(action_refs) != sorted(expected_action_refs):
             raise PolicyError("workflow-template-mismatch")
         return True
     if workflow_kind == "node-lock-smoke":
