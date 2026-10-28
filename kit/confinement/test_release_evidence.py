@@ -12,6 +12,10 @@ import release_evidence as subject
 
 CANARY = "0123456789abcdef" * 4
 CONFIG = log_canary.compute_config(CANARY)
+PLAIN_LOG_PROFILE = (
+    b"safe log", b"safe evidence", b"safe", b"first log", b"second log",
+    b"stage=build result=complete", b"A" * len(CANARY),
+)
 
 
 def _entry(path, role, payload):
@@ -24,7 +28,8 @@ def _manifest(items):
 
 def _scan(root, manifest):
     with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
-        return subject.scan_evidence(root, manifest)
+        with mock.patch.object(subject, "PINNED_PLAIN_LOG_LINES", PLAIN_LOG_PROFILE):
+            return subject.scan_evidence(root, manifest)
 
 
 def _write(root, path, payload):
@@ -76,9 +81,10 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 return original_feed(scanner, chunk)
 
             with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
-                with mock.patch.object(subject, "READ_CHUNK_BYTES", 5):
-                    with mock.patch.object(log_canary.Scanner, "feed", bounded_feed):
-                        verdict = subject.scan_evidence(root, manifest)
+                with mock.patch.object(subject, "PINNED_PLAIN_LOG_LINES", PLAIN_LOG_PROFILE):
+                    with mock.patch.object(subject, "READ_CHUNK_BYTES", 5):
+                        with mock.patch.object(log_canary.Scanner, "feed", bounded_feed):
+                            verdict = subject.scan_evidence(root, manifest)
             self.assertFalse(verdict.accepted)
             self.assertEqual(verdict.reason, "compressed_unsupported")
             self.assertEqual(verdict.files_scanned, 2)
@@ -129,7 +135,8 @@ class ReleaseEvidenceTests(unittest.TestCase):
             _write(root, "build.log", payload)
             manifest = _manifest((_entry("build.log", "log", payload),))
             with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
-                self.assertTrue(subject.scan_evidence(root, manifest).accepted)
+                with mock.patch.object(subject, "PINNED_PLAIN_LOG_LINES", PLAIN_LOG_PROFILE):
+                    self.assertTrue(subject.scan_evidence(root, manifest).accepted)
             with mock.patch.object(log_canary, "PINNED_CONFIG", None):
                 verdict = subject.scan_evidence(root, manifest)
             self.assertFalse(verdict.accepted)
@@ -240,6 +247,46 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 (root / name).unlink()
             self.assertTrue(subject.OPEN_QUESTIONS)
 
+    def test_signatureless_brotli_renamed_as_log_requires_admitted_plain_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = b"\x06"
+            _write(root, "build.log", payload)
+            manifest = _manifest((_entry("build.log", "log", payload),))
+            with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
+                unpinned = subject.scan_evidence(root, manifest)
+            self.assertFalse(unpinned.accepted)
+            self.assertEqual(unpinned.reason, "log_profile_unpinned")
+            verdict = _scan(root, manifest)
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.reason, "log_profile_invalid")
+            self.assertEqual(verdict.files_scanned, 1)
+
+    def test_plain_log_profile_refuses_unreviewed_printable_content(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = b"unreviewed text\n"
+            _write(root, "build.log", payload)
+            manifest = _manifest((_entry("build.log", "log", payload),))
+            verdict = _scan(root, manifest)
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.reason, "log_profile_invalid")
+
+    def test_plain_log_profile_configuration_is_closed_and_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = b"safe log\n"
+            _write(root, "build.log", payload)
+            manifest = _manifest((_entry("build.log", "log", payload),))
+            for profile in ("safe log", (), (b"safe log\n",),
+                            (b"safe log", b"safe log"), (b"A" * 513,)):
+                with self.subTest(profile=profile):
+                    with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
+                        with mock.patch.object(subject, "PINNED_PLAIN_LOG_LINES", profile):
+                            verdict = subject.scan_evidence(root, manifest)
+                    self.assertFalse(verdict.accepted)
+                    self.assertEqual(verdict.reason, "log_profile_invalid")
+
     def test_container_signatures_refuse_renamed_evidence_files(self):
         signatures = (
             b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07\x00",
@@ -309,10 +356,72 @@ class ReleaseEvidenceTests(unittest.TestCase):
             self.assertFalse(verdict.accepted)
             self.assertEqual(verdict.reason, "file_changed")
 
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "mkfifo"), "FIFO unavailable")
+    def test_mid_scan_fifo_replacement_cannot_block_file_open(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = b"first log\n"
+            second = b"second log\n"
+            _write(root, "a.log", first)
+            target = _write(root, "b.log", second)
+            manifest = _manifest((_entry("a.log", "log", first), _entry("b.log", "log", second)))
+            original_feed = log_canary.Scanner.feed
+            original_open = os.open
+            replaced = [False]
+
+            def replace_during_scan(scanner, chunk):
+                if b"first log" in chunk and not replaced[0]:
+                    target.unlink()
+                    os.mkfifo(target)
+                    replaced[0] = True
+                return original_feed(scanner, chunk)
+
+            def guarded_open(path, flags, *args, **kwargs):
+                if str(path).endswith("b.log") and not flags & os.O_NONBLOCK:
+                    raise AssertionError("blocking FIFO open")
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(subject.os, "open", side_effect=guarded_open):
+                with mock.patch.object(log_canary.Scanner, "feed", replace_during_scan):
+                    verdict = _scan(root, manifest)
+            self.assertTrue(replaced[0])
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.reason, "file_not_regular")
+
+    @unittest.skipUnless(os.name == "posix" and hasattr(os, "mkfifo"), "FIFO unavailable")
+    def test_fifo_replacement_before_source_recheck_cannot_block(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = b"safe log\n"
+            target = _write(root, "build.log", payload)
+            manifest = _manifest((_entry("build.log", "log", payload),))
+            original_verify = subject._verify_snapshot_source
+            original_open = os.open
+            replaced = [False]
+
+            def replace_before_recheck(*args):
+                if not replaced[0]:
+                    target.unlink()
+                    os.mkfifo(target)
+                    replaced[0] = True
+                return original_verify(*args)
+
+            def guarded_open(path, flags, *args, **kwargs):
+                if str(path).endswith("build.log") and not flags & os.O_NONBLOCK:
+                    raise AssertionError("blocking FIFO open")
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(subject.os, "open", side_effect=guarded_open):
+                with mock.patch.object(subject, "_verify_snapshot_source", replace_before_recheck):
+                    verdict = _scan(root, manifest)
+            self.assertTrue(replaced[0])
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.reason, "file_not_regular")
+
     def test_scanned_file_rewrite_with_restored_mtime_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            first = b"A" * len(CANARY)
+            first = b"A" * len(CANARY) + b"\n"
             second = b"second log\n"
             target = _write(root, "a.log", first)
             _write(root, "b.log", second)
@@ -323,7 +432,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
 
             def rewrite_during_scan(scanner, chunk):
                 if b"second" in chunk and not changed[0]:
-                    target.write_bytes(CANARY.encode("ascii"))
+                    target.write_bytes(CANARY.encode("ascii") + b"\n")
                     os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
                     changed[0] = True
                 return original_feed(scanner, chunk)

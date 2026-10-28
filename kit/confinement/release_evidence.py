@@ -31,7 +31,7 @@ REFUSAL_REASONS = frozenset((
     "file_missing", "file_unreadable", "file_not_regular", "file_over_limit",
     "file_size_mismatch", "file_digest_mismatch", "file_changed", "canary_present",
     "canary_unscanned", "canary_config_invalid", "compressed_unsupported",
-    "tree_changed", "internal_error",
+    "log_profile_unpinned", "log_profile_invalid", "tree_changed", "internal_error",
 ))
 COMPRESSED_SUFFIXES = (
     ".gz", ".gzip", ".zip", ".tgz", ".tar", ".bz2", ".xz", ".zst", ".lz4",
@@ -47,9 +47,12 @@ COMPRESSED_SIGNATURES = (
 CONTAINER_HEADER_BYTES = 512
 TAR_SIGNATURE_OFFSET = 257
 TAR_SIGNATURES = (b"ustar\x00", b"ustar  ")
+MAX_LOG_LINE_BYTES = 512
+MAX_LOG_PROFILE_LINES = 1000
+PINNED_PLAIN_LOG_LINES = None
 OPEN_QUESTIONS = (
-    "No bounded artifact extraction profile is admitted. Artifact bytes are scanned, but every "
-    "artifact verdict refuses until signatureless and internally compressed contents are covered.",
+    "No plain-log producer profile or bounded artifact extraction profile is admitted by default. "
+    "Each requires a separately reviewed and pinned admission before its verdict can pass.",
 )
 
 
@@ -297,6 +300,36 @@ def _compressed_prefix(data):
     )
 
 
+def _resolve_plain_log_profile():
+    lines = PINNED_PLAIN_LOG_LINES
+    if lines is None:
+        raise EvidenceRefusal("log_profile_unpinned")
+    if type(lines) is not tuple or not 0 < len(lines) <= MAX_LOG_PROFILE_LINES:
+        raise EvidenceRefusal("log_profile_invalid")
+    for line in lines:
+        if (type(line) is not bytes or not 0 < len(line) <= MAX_LOG_LINE_BYTES
+                or any(byte < 32 or byte > 126 for byte in line)):
+            raise EvidenceRefusal("log_profile_invalid")
+    if len(set(lines)) != len(lines):
+        raise EvidenceRefusal("log_profile_invalid")
+    return frozenset(lines)
+
+
+def _check_plain_log(chunks, profile):
+    carry = b""
+    for chunk in chunks:
+        if any(byte != 10 and (byte < 32 or byte > 126) for byte in chunk):
+            raise EvidenceRefusal("log_profile_invalid")
+        parts = (carry + chunk).split(b"\n")
+        if any(line not in profile for line in parts[:-1]):
+            raise EvidenceRefusal("log_profile_invalid")
+        carry = parts[-1]
+        if len(carry) > MAX_LOG_LINE_BYTES:
+            raise EvidenceRefusal("log_profile_invalid")
+    if carry:
+        raise EvidenceRefusal("log_profile_invalid")
+
+
 def _file_identity(metadata):
     return (
         metadata.st_dev, metadata.st_ino, metadata.st_size,
@@ -306,6 +339,8 @@ def _file_identity(metadata):
 
 def _open_evidence_file(root, root_descriptor, item):
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if os.name == "posix":
+        flags |= os.O_NONBLOCK
     if root_descriptor is None:
         path = os.path.join(root, *item.path.split("/"))
         metadata = os.lstat(path)
@@ -398,6 +433,8 @@ def _verify_snapshot_source(root, root_descriptor, item, expected_metadata, dige
         raise EvidenceRefusal("file_unreadable") from None
     try:
         before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise EvidenceRefusal("file_not_regular")
         if _file_identity(before) != _file_identity(expected_metadata):
             raise EvidenceRefusal("tree_changed")
         check = hashlib.sha256()
@@ -446,6 +483,10 @@ def scan_evidence(root, manifest):
         config = _resolve_config()
         snapshots = []
         ordered_items = sorted(manifest.items, key=lambda value: value.path)
+        plain_log_profile = (
+            _resolve_plain_log_profile()
+            if any(item.role == "log" for item in ordered_items) else None
+        )
         for item in ordered_items:
             count, snapshot = _scan_file(
                 root_path, root_descriptor, item, files[item.path], config
@@ -453,6 +494,8 @@ def scan_evidence(root, manifest):
             snapshots.append(EvidenceSnapshot(item.path, count, item.sha256, snapshot))
             bytes_scanned += count
             scanned += 1
+            if item.role == "log":
+                _check_plain_log(snapshot, plain_log_profile)
         for item, snapshot in zip(ordered_items, snapshots):
             _verify_snapshot_source(
                 root_path, root_descriptor, item, files[item.path],
