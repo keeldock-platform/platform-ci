@@ -285,6 +285,22 @@ hostedTest('audit refuses vulnerable and unrequested package responses without a
     }) }),
     (error) => error instanceof NodeContractError && error.code === 'vulnerable_dependency',
   );
+  const benignNoName = await validate({ responseBody: JSON.stringify({
+    typescript: [{ vulnerable_versions: '<6.0.0', cvss: 7.5 }],
+  }) });
+  assert.equal(benignNoName.result.advisory_count, 1);
+  await assert.rejects(
+    validate({ responseBody: JSON.stringify({
+      typescript: [{ vulnerable_versions: '<6.0.4' }],
+    }) }),
+    (error) => error instanceof NodeContractError && error.code === 'vulnerable_dependency',
+  );
+  await assert.rejects(
+    validate({ responseBody: JSON.stringify({
+      typescript: [{ name: 'other-package', vulnerable_versions: '<6.0.0' }],
+    }) }),
+    (error) => error instanceof NodeContractError && error.code === 'audit_response_invalid',
+  );
   let calls = 0;
   await assert.rejects(
     validate({ responseBody: JSON.stringify({ unknown: [] }), fetchImpl: async () => {
