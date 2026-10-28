@@ -1093,12 +1093,14 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
     the job must exclude untrusted processes running as the same user. A same-user
     writer can replace the staging entry between its identity check and rename;
     the post-check refuses, but the replacement can remain published.
+    The package root is frozen through its original descriptor after publication.
     """
     root, entries, file_hashes, package_hash = _inspect_archive(name, version, data, expected_sha256)
     if os.name == "nt":
         return _extract_archive_windows(root, entries, file_hashes, package_hash, target_dir)
     parent_fd = None
     stage_name = None
+    published_name = None
     stage_created = False
     stage_identity = None
     try:
@@ -1147,11 +1149,15 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
                 os.fchmod(directory_fd, 0o555)
             finally:
                 os.close(directory_fd)
-        os.fchmod(stage_fd, 0o555)
-        os.close(stage_fd)
-        stage_fd = None
         _publish_stage(parent_fd, stage_name, root, stage_identity)
         stage_name = None
+        published_name = root
+        os.fchmod(stage_fd, 0o555)
+        if _entry_identity(parent_fd, root) != stage_identity:
+            _refuse("cargo_archive_invalid")
+        os.close(stage_fd)
+        stage_fd = None
+        published_name = None
         return target / root
     except Refusal:
         raise
@@ -1163,6 +1169,11 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
         if stage_created and stage_name is not None and parent_fd is not None:
             try:
                 _remove_stage(parent_fd, stage_name, stage_identity)
+            except (OSError, Refusal):
+                pass
+        if published_name is not None and parent_fd is not None:
+            try:
+                _remove_stage(parent_fd, published_name, stage_identity)
             except (OSError, Refusal):
                 pass
         if parent_fd is not None:

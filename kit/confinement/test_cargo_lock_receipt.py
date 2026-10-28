@@ -663,6 +663,42 @@ class CargoLockReceiptTests(unittest.TestCase):
             package_root.chmod(0o755)
             Path(temporary).chmod(0o755)
 
+    @unittest.skipIf(os.name == "nt", "POSIX publication")
+    def test_extractor_publishes_writable_root_and_cleans_failed_final_freeze(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        publish = subject._publish_stage
+        chmod = subject.os.fchmod
+        published = [False]
+        freeze_failed = [False]
+        stage_modes = []
+
+        def capture_publish(parent_fd, stage_name, final_name, identity):
+            stage_modes.append(os.stat(
+                stage_name, dir_fd=parent_fd, follow_symlinks=False,
+            ).st_mode & 0o777)
+            publish(parent_fd, stage_name, final_name, identity)
+            published[0] = True
+
+        def fail_final_freeze(descriptor, mode):
+            if published[0] and mode == 0o555 and not freeze_failed[0]:
+                freeze_failed[0] = True
+                raise OSError("final freeze failed")
+            return chmod(descriptor, mode)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(subject, "_publish_stage", side_effect=capture_publish), patch.object(
+                subject.os, "fchmod", side_effect=fail_final_freeze,
+            ):
+                _assert_refused(
+                    self,
+                    lambda: subject.extract_archive("serde", "1.0.1", data, digest, temporary),
+                    "cargo_archive_invalid",
+                )
+            self.assertEqual(stage_modes, [0o700])
+            self.assertTrue(freeze_failed[0])
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
     def test_extractor_refuses_symlink_ancestor(self):
         data = _archive()
         digest = hashlib.sha256(data).hexdigest()
