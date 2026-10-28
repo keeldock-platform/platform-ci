@@ -87,6 +87,18 @@ def vm_readv_self_control(nonce):
     return done == len(marker) and target.raw == marker
 
 
+BPF_SYSCTL = "/proc/sys/kernel/unprivileged_bpf_disabled"
+PERF_SYSCTL = "/proc/sys/kernel/perf_event_paranoid"
+
+
+def restrict_kernel():
+    if harness._read_sysctl(BPF_SYSCTL) == "0":
+        harness._set_sysctl(BPF_SYSCTL, "1")
+    paranoid = harness._read_sysctl(PERF_SYSCTL)
+    if re.fullmatch(r"-?[0-9]{1,2}", paranoid) is None or int(paranoid) < 3:
+        harness._set_sysctl(PERF_SYSCTL, "3")
+
+
 def transcript_hits(lines, nonce, needles):
     marker = "kd-log-" + nonce
     count = 0
@@ -172,6 +184,7 @@ class Boundary:
         if set_kernel:
             try:
                 harness._prepare_kernel()
+                restrict_kernel()
             except harness.ProofFailure as failure:
                 raise BoundaryRefusal("readback_failed", None, failure.reason)
         self.readback_before_drop()
@@ -369,7 +382,7 @@ class Boundary:
 
     def channel_process_memory(self):
         token = canaries.control_token("environ", self.nonce)
-        extra = {canaries.CANARY_ENV_NAME: self.canary} if self.fault == "canary-env" else None
+        extra = {canaries.CANARY_ENV_NAME: self.derived_canary} if self.fault == "canary-env" else None
         peer = session.start_peer(token, extra)
         try:
             targets = [os.getpid(), 1] + find_pids(WORKER_NAMES)
@@ -627,11 +640,17 @@ def run_harden(arguments):
         if paths.get("leaks") != [] or paths.get("tested") != len(targets):
             raise BoundaryRefusal("readback_failed", "runner_files")
     except BoundaryRefusal as refusal:
-        emitter.emit(channels.verdict_line("selftest", refusal, 0))
+        line = (
+            channels.LINE_PREFIX + "-HARDEN schema=" + str(channels.SCHEMA_VERSION)
+            + " result=refused reason=" + refusal.reason
+        )
+        if refusal.channel is not None:
+            line += " channel=" + refusal.channel
+        emitter.emit(line + " project-execution=not_started")
         return 1
     emitter.emit(
         channels.LINE_PREFIX + "-HARDEN schema=" + str(channels.SCHEMA_VERSION)
-        + " targets=" + str(len(targets)) + " changed=" + str(changed) + " readable=0"
+        + " result=accepted targets=" + str(len(targets)) + " changed=" + str(changed) + " readable=0"
     )
     return 0
 

@@ -372,7 +372,7 @@ class LinuxSeccompNumberTests(unittest.TestCase):
         "ptrace": 101, "pivot_root": 155, "chroot": 161, "mount": 165, "umount2": 166,
         "add_key": 248, "request_key": 249, "keyctl": 250, "unshare": 272, "perf_event_open": 298,
         "setns": 308, "process_vm_readv": 310, "process_vm_writev": 311, "bpf": 321, "userfaultfd": 323,
-        "open_tree": 428, "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432,
+        "open_tree": 428, "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432, "fspick": 433,
         "pidfd_getfd": 438, "mount_setattr": 442,
     }
 

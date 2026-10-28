@@ -19,6 +19,7 @@ __all__ = [
     "LinuxBoundaryFaultTests",
     "LinuxBoundaryCommandTests",
     "LinuxBoundaryReviewFixTests",
+    "LinuxBoundarySecondReviewTests",
 ]
 
 SHA = "a" * 40
@@ -49,6 +50,15 @@ def blocked(channel):
 
 def result(stdout=b"", timed_out=False):
     return SimpleNamespace(stdout=stdout, stderr=b"", timed_out=timed_out, readback={})
+
+
+def realistic(subject, outcome):
+    for form in fixtures.FORMS[:outcome[0]]:
+        total = len(fixtures.fixture_rules(form))
+        uncontrolled = len(fixtures.uncontrolled_attempts(form))
+        subject.fixture_controlled += total - uncontrolled
+        subject.fixture_uncontrolled += uncontrolled
+    return outcome
 
 
 class LinuxBoundaryDecisionTests(unittest.TestCase):
@@ -141,7 +151,7 @@ class LinuxBoundaryPhaseTests(unittest.TestCase):
         subject.scope = "3"
         table = outcomes or {}
         with patch.object(boundary.Boundary, "run_channel", side_effect=lambda channel: table.get(channel, blocked(channel))), \
-             patch.object(boundary.Boundary, "run_fixtures", return_value=fixtures_result):
+             patch.object(boundary.Boundary, "run_fixtures", side_effect=lambda: realistic(subject, fixtures_result)):
             record, refusal = boundary.run_phase(subject, phase, phase == "selftest")
         return record, refusal, emitter.stream.getvalue().splitlines()
 
@@ -150,7 +160,8 @@ class LinuxBoundaryPhaseTests(unittest.TestCase):
         self.assertIsNone(refusal)
         self.assertTrue(channels.record_accepts(record))
         self.assertEqual(len([line for line in output if line.startswith("KD-LINUX-CHANNEL")]), 11)
-        self.assertIn("KD-LINUX-FIXTURES schema=1 phase=selftest forms=5/5 result=complete", output)
+        self.assertIn("KD-LINUX-FIXTURES schema=1 phase=selftest forms=5/5 result=complete controlled=24 uncontrolled=30", output)
+        self.assertEqual(record["fixture_attempts"], {"controlled": 24, "uncontrolled": 30})
         self.assertEqual(
             output[-1],
             "linux-source-boundary=accepted phase=selftest channels=11/11 project-execution=permitted",
@@ -442,13 +453,14 @@ class LinuxBoundaryReviewFixTests(unittest.TestCase):
             with patch("linux_boundary.sys.stdout", out), \
                  patch("linux_boundary.canaries.run_walker", return_value={"leaks": [], "tested": 3}):
                 self.assertEqual(boundary.run_harden(args), 0)
-            self.assertEqual(out.getvalue(), "KD-LINUX-HARDEN schema=1 targets=3 changed=2 readable=0\n")
+            self.assertEqual(out.getvalue(), "KD-LINUX-HARDEN schema=1 result=accepted targets=3 changed=2 readable=0\n")
             harden.assert_called_once_with(targets)
             out = io.StringIO()
             with patch("linux_boundary.sys.stdout", out), \
                  patch("linux_boundary.canaries.run_walker", return_value={"leaks": [1], "tested": 3}):
                 self.assertEqual(boundary.run_harden(args), 1)
-            self.assertIn("reason=readback_failed channel=runner_files", out.getvalue())
+            self.assertIn("KD-LINUX-HARDEN schema=1 result=refused reason=readback_failed channel=runner_files", out.getvalue())
+            self.assertNotIn("phase=", out.getvalue())
             self.assertTrue(out.getvalue().strip().endswith("project-execution=not_started"))
         with patch("linux_boundary.os.geteuid", return_value=0), \
              patch("linux_boundary.canaries.runner_root", return_value=None), \
@@ -491,6 +503,61 @@ class LinuxBoundaryReviewFixTests(unittest.TestCase):
     def test_vm_readv_self_read_control_uses_the_reviewed_syscall_number(self):
         self.assertEqual(boundary.PROCESS_VM_READV, 310)
         self.assertTrue(boundary.vm_readv_self_control("0123456789abcdef01234567"))
+
+
+
+class LinuxBoundarySecondReviewTests(unittest.TestCase):
+    def test_kernel_restriction_sets_permissive_bpf_and_perf_values_and_leaves_strict_ones(self):
+        cases = (
+            ({"bpf": "0", "perf": "2"}, [("bpf", "1"), ("perf", "3")]),
+            ({"bpf": "0", "perf": "x"}, [("bpf", "1"), ("perf", "3")]),
+            ({"bpf": "1", "perf": "3"}, []),
+            ({"bpf": "2", "perf": "4"}, []),
+            ({"bpf": "2", "perf": "-1"}, [("perf", "3")]),
+        )
+        paths = {boundary.BPF_SYSCTL: "bpf", boundary.PERF_SYSCTL: "perf"}
+        for current, expected in cases:
+            writes = []
+            with self.subTest(current=current), \
+                 patch("linux_boundary.harness._read_sysctl", side_effect=lambda path, current=current: current[paths[path]]), \
+                 patch("linux_boundary.harness._set_sysctl", side_effect=lambda path, value: writes.append((paths[path], value))):
+                boundary.restrict_kernel()
+            self.assertEqual(writes, expected)
+
+    def test_prepare_applies_the_restriction_after_the_base_kernel_setup_and_converts_failures(self):
+        order = []
+        subject, unused = make()
+        with patch("linux_boundary.os.geteuid", return_value=0), patch("linux_boundary.verify_control_sha"), \
+             patch("linux_boundary.harness._prepare_kernel", side_effect=lambda: order.append("base")), \
+             patch("linux_boundary.restrict_kernel", side_effect=lambda: order.append("restrict")), \
+             patch.object(boundary.Boundary, "readback_before_drop", side_effect=lambda: order.append("readback") or (_ for _ in ()).throw(BoundaryRefusal("environment"))):
+            with self.assertRaises(BoundaryRefusal):
+                subject.prepare(True)
+        self.assertEqual(order, ["base", "restrict", "readback"])
+        failing, unused = make()
+        with patch("linux_boundary.os.geteuid", return_value=0), patch("linux_boundary.verify_control_sha"), \
+             patch("linux_boundary.harness._prepare_kernel"), \
+             patch("linux_boundary.restrict_kernel", side_effect=harness.ProofFailure(43)):
+            with self.assertRaises(BoundaryRefusal) as raised:
+                failing.prepare(True)
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("readback_failed", 43))
+
+    def test_canary_env_fault_hands_the_peer_only_the_derived_canary(self):
+        subject, unused = make()
+        subject.canary = "real-secret-value-0123456789"
+        subject.derived_canary = "d" * 64
+        captured = {}
+
+        def peer(token, extra=None):
+            captured["extra"] = extra
+            raise BoundaryRefusal("environment")
+
+        subject.fault = "canary-env"
+        with patch("linux_boundary.session.start_peer", side_effect=peer):
+            with self.assertRaises(BoundaryRefusal):
+                subject.channel_process_memory()
+        self.assertEqual(captured["extra"], {"KD_CANARY_SECRET": "d" * 64})
+        self.assertNotIn(subject.canary, captured["extra"].values())
 
 
 if __name__ == "__main__":
