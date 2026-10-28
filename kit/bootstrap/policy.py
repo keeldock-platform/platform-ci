@@ -1331,8 +1331,7 @@ SHARED_WORKFLOW_KINDS = frozenset(
         "macos-source-reader",
         "macos-rules-source-reader",
     )
-    | frozenset(FEEDBACK_RETURN_WORKFLOW_SHA256)
-)
+) | frozenset(FEEDBACK_RETURN_WORKFLOW_SHA256)
 LANE_MODULES = (policy_linux, policy_windows, policy_handoff)
 LANE_DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
 
@@ -1395,16 +1394,6 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         expected = NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE
-    elif workflow_kind in LANE_WORKFLOW_TEMPLATES:
-        if pool != "platform":
-            raise PolicyError("workflow-kind-pool")
-        expected = LANE_WORKFLOW_TEMPLATES[workflow_kind]
-    elif workflow_kind in LANE_WORKFLOW_SHA256:
-        if pool != "platform":
-            raise PolicyError("workflow-kind-pool")
-        if hashlib.sha256(text.encode("utf-8")).hexdigest() != LANE_WORKFLOW_SHA256[workflow_kind]:
-            raise PolicyError("workflow-template-mismatch")
-        return True
     elif workflow_kind == "macos-capability":
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
@@ -1443,6 +1432,16 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
             else MACOS_RULES_SOURCE_READER_WORKFLOW_SHA256
         )
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_digest:
+            raise PolicyError("workflow-template-mismatch")
+        return True
+    elif workflow_kind in LANE_WORKFLOW_TEMPLATES:
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        expected = LANE_WORKFLOW_TEMPLATES[workflow_kind]
+    elif workflow_kind in LANE_WORKFLOW_SHA256:
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != LANE_WORKFLOW_SHA256[workflow_kind]:
             raise PolicyError("workflow-template-mismatch")
         return True
     elif workflow_kind != "public-policy":
