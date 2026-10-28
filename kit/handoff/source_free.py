@@ -19,9 +19,29 @@ ATTESTER_PERMISSION_PROFILE = {
     "attestations": "write",
     "actions": "read",
 }
+ATTESTER_JOB_ID = "capsule-attester"
+ATTESTER_NEEDS = ("linux-fetch-encrypt",)
+ATTESTER_RUNNER = "ubuntu-24.04"
+ATTESTER_TRIGGER = "dispatch-main"
+ATTESTER_JOB_FIELDS = frozenset(("id", "needs", "runs-on", "checkout", "trigger"))
 ATTESTATION_ACTION_SHA = "1e69f48acb82d1966a394da916b4c1698aa569d6"
 SYNTHETIC_PATHS = (".fixture/secret.txt", "src/fixture.txt")
 MAX_PUBLIC_FILE_BYTES = 65536
+MAX_PUBLIC_OUTPUTS = 256
+REPARSE_POINT_ATTRIBUTE = 0x400
+READ_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_BINARY", 0)
+)
+CREATE_FLAGS = (
+    os.O_WRONLY
+    | os.O_CREAT
+    | os.O_EXCL
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_BINARY", 0)
+)
 
 
 class HandoffRefusal(ValueError):
@@ -49,14 +69,44 @@ class SyntheticTree:
         return "SyntheticTree(<local-only>)"
 
 
-def validate_attestation_permissions(value, attester=False):
-    expected = ATTESTER_PERMISSION_PROFILE if attester is True else ATTESTATION_PERMISSION_PROFILE
-    return type(value) is dict and value == expected
+def validate_attestation_permissions(value):
+    return type(value) is dict and value == ATTESTATION_PERMISSION_PROFILE
+
+
+def validate_attester_permissions(value, job):
+    if type(value) is not dict or value != ATTESTER_PERMISSION_PROFILE:
+        return False
+    if type(job) is not dict or set(job) != ATTESTER_JOB_FIELDS:
+        return False
+    needs = job["needs"]
+    return (
+        job["id"] == ATTESTER_JOB_ID
+        and type(job["id"]) is str
+        and type(needs) in (list, tuple)
+        and tuple(needs) == ATTESTER_NEEDS
+        and type(job["runs-on"]) is str
+        and job["runs-on"] == ATTESTER_RUNNER
+        and job["checkout"] is False
+        and type(job["trigger"]) is str
+        and job["trigger"] == ATTESTER_TRIGGER
+    )
+
+
+def _is_reparse(status):
+    attributes = getattr(status, "st_file_attributes", 0)
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", REPARSE_POINT_ATTRIBUTE))
+
+
+def _reparse_at(path):
+    try:
+        return _is_reparse(os.lstat(path))
+    except OSError:
+        return False
 
 
 def create_synthetic_git_tree(root):
     root = Path(root)
-    if root.is_symlink():
+    if root.is_symlink() or _reparse_at(root):
         raise HandoffRefusal("synthetic-root-invalid")
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -146,26 +196,41 @@ def _run_git(root, arguments, environment):
 def scan_public_outputs(paths, canary):
     if type(canary) is not str or re.fullmatch(r"synthetic-[a-f0-9]{64}", canary) is None:
         raise HandoffRefusal("canary-invalid")
+    if type(paths) not in (list, tuple) or not 0 < len(paths) <= MAX_PUBLIC_OUTPUTS:
+        raise HandoffRefusal("public-output-set-invalid")
     needle = canary.encode("ascii")
     for candidate in paths:
+        if not isinstance(candidate, (str, os.PathLike)):
+            raise HandoffRefusal("public-output-set-invalid")
         path = Path(candidate)
         try:
-            path_before = path.lstat()
+            path_before = os.lstat(path)
         except OSError:
             raise HandoffRefusal("public-output-unreadable")
-        if not stat.S_ISREG(path_before.st_mode):
+        if not stat.S_ISREG(path_before.st_mode) or _is_reparse(path_before):
             raise HandoffRefusal("public-output-invalid")
         if path_before.st_size > MAX_PUBLIC_FILE_BYTES:
             raise HandoffRefusal("public-output-too-large")
         try:
-            with path.open("rb") as source:
-                opened_before = os.fstat(source.fileno())
-                payload = source.read(MAX_PUBLIC_FILE_BYTES + 1)
-                opened_after = os.fstat(source.fileno())
-            path_after = path.lstat()
+            descriptor = os.open(str(path), READ_FLAGS)
         except OSError:
             raise HandoffRefusal("public-output-unreadable")
-        if not stat.S_ISREG(opened_before.st_mode) or not stat.S_ISREG(opened_after.st_mode):
+        try:
+            source = os.fdopen(descriptor, "rb")
+        except OSError:
+            os.close(descriptor)
+            raise HandoffRefusal("public-output-unreadable")
+        try:
+            with source:
+                opened_before = os.fstat(source.fileno())
+                if not stat.S_ISREG(opened_before.st_mode) or _is_reparse(opened_before):
+                    raise HandoffRefusal("public-output-invalid")
+                payload = source.read(MAX_PUBLIC_FILE_BYTES + 1)
+                opened_after = os.fstat(source.fileno())
+            path_after = os.lstat(path)
+        except OSError:
+            raise HandoffRefusal("public-output-unreadable")
+        if not stat.S_ISREG(opened_after.st_mode) or not stat.S_ISREG(path_after.st_mode):
             raise HandoffRefusal("public-output-invalid")
         if (
             len(payload) > MAX_PUBLIC_FILE_BYTES
@@ -218,13 +283,23 @@ def safe_gate_report(stage, reason):
 def write_safe_gate_report(path, stage, reason):
     report = safe_gate_report(stage, reason)
     destination = Path(path)
-    if destination.is_symlink():
+    if destination.is_symlink() or _reparse_at(destination):
         raise HandoffRefusal("report-path-invalid")
+    payload = (json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii")
     try:
-        destination.write_text(
-            json.dumps(report, sort_keys=True, separators=(",", ":")) + "\n",
-            encoding="utf-8",
-        )
+        descriptor = os.open(str(destination), CREATE_FLAGS, 0o600)
+    except FileExistsError:
+        raise HandoffRefusal("report-path-invalid")
+    except OSError:
+        raise HandoffRefusal("report-write-failed")
+    try:
+        target = os.fdopen(descriptor, "wb")
+    except OSError:
+        os.close(descriptor)
+        raise HandoffRefusal("report-write-failed")
+    try:
+        with target:
+            target.write(payload)
     except OSError:
         raise HandoffRefusal("report-write-failed")
     return report
@@ -242,19 +317,24 @@ def refuse_unproven_gate(gate):
     raise HandoffRefusal(reason)
 
 
+class _QuietParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise HandoffRefusal("synthetic-input-invalid")
+
+
 def _main(arguments):
-    parser = argparse.ArgumentParser()
+    parser = _QuietParser(add_help=False)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    create = commands.add_parser("create")
+    create = commands.add_parser("create", add_help=False)
     create.add_argument("--root", required=True)
 
-    report = commands.add_parser("report")
+    report = commands.add_parser("report", add_help=False)
     report.add_argument("--path", required=True)
     report.add_argument("--stage", required=True)
     report.add_argument("--reason", required=True)
 
-    refuse = commands.add_parser("refuse")
+    refuse = commands.add_parser("refuse", add_help=False)
     refuse.add_argument("--gate", required=True)
 
     options = parser.parse_args(arguments)
@@ -280,7 +360,7 @@ def main(arguments=None):
     except HandoffRefusal as refusal:
         print("handoff=refused reason=" + refusal.code)
         return 1
-    except (OSError, UnicodeError):
+    except Exception:
         print("handoff=refused reason=synthetic-input-invalid")
         return 1
 

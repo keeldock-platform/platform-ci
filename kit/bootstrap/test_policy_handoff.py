@@ -22,7 +22,24 @@ HANDOFF_LANE_FILES = (
 )
 
 
+def declared_permission_lines(text):
+    return [line for line in text.splitlines() if "permissions" in line]
+
+
 class HandoffWorkflowPolicyTests(unittest.TestCase):
+    def test_workflow_declares_exactly_one_empty_permissions_key(self):
+        workflow = HANDOFF_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(declared_permission_lines(workflow), ["permissions: {}"])
+        self.assertEqual(workflow.count("permissions"), 1)
+        self.assertIn("\npermissions: {}\njobs:\n", workflow)
+        for widened in (
+            workflow.replace("    timeout-minutes: 10\n", "    timeout-minutes: 10\n    permissions: {}\n"),
+            workflow.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
+            workflow.replace("permissions: {}\n", ""),
+        ):
+            with self.subTest(widened=len(widened)):
+                self.assertNotEqual(declared_permission_lines(widened), ["permissions: {}"])
+
     def test_actual_handoff_workflow_matches_closed_source_free_shape(self):
         workflow = HANDOFF_WORKFLOW.read_text(encoding="utf-8")
         self.assertTrue(validate_workflow_text(workflow, "platform", HANDOFF_KIND))
@@ -45,6 +62,9 @@ class HandoffWorkflowPolicyTests(unittest.TestCase):
             "outputs:",
             "pull_request_target",
             "continue-on-error",
+            "needs:",
+            "workflow_run",
+            "environment:",
             "-latest",
         ):
             with self.subTest(forbidden=forbidden):
