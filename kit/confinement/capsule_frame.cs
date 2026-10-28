@@ -1266,6 +1266,8 @@ namespace KeelDock.Platform.CapsuleFrame
                     }
                     if (index == 16)
                     {
+                        if (!CapsuleCodec.OpenAesGcm(aesKey, nonce, pair.Item1, pair.Item2, aad).SequenceEqual(plain))
+                            throw new CapsuleRefusal(RefusalCode.Crypto);
                         byte[] corruptTag = (byte[])pair.Item2.Clone();
                         corruptTag[0] ^= 1;
                         RequireCryptoRefusal(aesKey, nonce, pair.Item1, corruptTag, aad);

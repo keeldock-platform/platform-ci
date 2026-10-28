@@ -1,7 +1,12 @@
 """Explicit CI gate for reviewed C sharp capsule vectors.
 
-This file intentionally has no test_ prefix. Ordinary unittest discovery cannot
-count a pending vector fixture as interoperability coverage.
+The producer label and reviewed artifact digest record vector origin, not
+independent authorship. C sharp authoring followed Python-source inspection,
+so framing and parser provenance remain unverified. Direct design-offset
+assertions mitigate shared layout defects; published primitive fixtures and
+platform OpenSSL mitigate shared crypto defects. A separate provenance review
+is still required before the protocol gate can close. The file has no test_
+prefix, so ordinary unittest discovery cannot count pending vector coverage.
 """
 
 import base64
@@ -126,25 +131,75 @@ def vector_inputs():
 class CapsuleVectorGate(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        with FIXTURE.open("r", encoding="ascii") as source:
-            checked_in = json.load(source)
+        if (os.environ.get("GITHUB_ACTIONS") != "true"
+                or os.environ.get("GITHUB_WORKFLOW") != "capsule-vectors"
+                or os.environ.get("GITHUB_REF") != "refs/heads/main"
+                or os.environ.get("RUNNER_OS") != "Linux"):
+            raise AssertionError("vector CI provenance context invalid")
+        control_sha = os.environ.get("GITHUB_SHA", "")
+        run_id = os.environ.get("GITHUB_RUN_ID", "")
+        attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+        if (len(control_sha) != 40 or any(char not in "0123456789abcdef" for char in control_sha)
+                or not run_id.isdecimal() or int(run_id) < 1
+                or not attempt.isdecimal() or int(attempt) < 1):
+            raise AssertionError("vector CI run identity invalid")
+        fixture_bytes = FIXTURE.read_bytes().removesuffix(b"\n")
+        checked_in = json.loads(fixture_bytes)
         encoded = os.environ.get("KD_CAPSULE_VECTOR_B64")
         if not encoded:
             raise AssertionError("C sharp CI vectors missing")
-        generated = json.loads(gzip.decompress(base64.b64decode(encoded, validate=True)))
+        generated_bytes = gzip.decompress(base64.b64decode(encoded, validate=True))
+        generated = json.loads(generated_bytes)
         if generated.get("producer") != "independent-csharp":
             raise AssertionError("vector producer invalid")
         if generated.get("format") != "KDWH-v1-protocol-vectors":
             raise AssertionError("vector format invalid")
         cls.vectors = generated
         cls.checked_in = checked_in
+        cls.generated_digest = hashlib.sha256(generated_bytes).hexdigest()
+        cls.reviewed_digest = hashlib.sha256(fixture_bytes).hexdigest()
         cls.provider = SystemAesGcm()
+        print("capsule-vector-provenance=observed source=windows-2025-add-type"
+              " run_id=" + run_id + " attempt=" + attempt + " control_sha=" + control_sha
+              + " generated_sha256=" + cls.generated_digest
+              + " reviewed_sha256=" + cls.reviewed_digest
+              + " authorship=unreviewed")
 
     def test_reviewed_fixture_required(self):
         self.assertEqual(self.checked_in.get("status"), "generated",
                          "reviewed vectors missing or pending")
         self.assertEqual(self.vectors, self.checked_in,
                          "C sharp CI vectors differ from reviewed fixture")
+        self.assertEqual(self.generated_digest, self.reviewed_digest,
+                         "reviewed fixture bytes differ from C sharp CI artifact")
+
+    def test_design_layout_oracle(self):
+        record = bytes.fromhex(self.vectors["key_record_hex"])
+        header = bytes.fromhex(self.vectors["header_hex"])
+        self.assertEqual(len(record), 320)
+        self.assertEqual(len(header), 65536)
+        self.assertEqual(record[:12], b"KDWHKEY1\x00\x01\x00\x01")
+        self.assertEqual(record[12:20], (1).to_bytes(8, "big"))
+        self.assertEqual(record[40:48], (2).to_bytes(8, "big"))
+        self.assertEqual(record[48:52], (3).to_bytes(4, "big"))
+        self.assertEqual(record[100:165], BASE_POINT)
+        self.assertEqual(record[245:253], (286261248).to_bytes(8, "big"))
+        self.assertEqual(record[285:320], bytes(35))
+        self.assertEqual(header[:12], b"KDWHCAP1\x00\x01\x00\x01")
+        self.assertEqual(header[12:16], bytes(4))
+        self.assertEqual(header[16:24], (1).to_bytes(8, "big"))
+        self.assertEqual(header[44:52], (2).to_bytes(8, "big"))
+        self.assertEqual(header[52:56], (3).to_bytes(4, "big"))
+        self.assertEqual(header[72:104], hashlib.sha256(BASE_POINT).digest())
+        self.assertEqual(header[104:136], hashlib.sha256(record).digest())
+        self.assertEqual(header[136:201], BASE_POINT)
+        self.assertEqual(header[201:233], bytes(range(32)))
+        self.assertEqual(header[233:237], bytes.fromhex("a1b2c3d4"))
+        self.assertEqual(header[317:321], (16).to_bytes(4, "big"))
+        self.assertEqual(header[321:325], (256).to_bytes(4, "big"))
+        self.assertEqual(header[325:329], (1048576).to_bytes(4, "big"))
+        self.assertEqual(header[329:337], (286261248).to_bytes(8, "big"))
+        self.assertEqual(header[337:], bytes(65536 - 337))
 
     def test_published_primitive_fixtures(self):
         self.assertEqual(BASE_POINT[1:33].hex(),
