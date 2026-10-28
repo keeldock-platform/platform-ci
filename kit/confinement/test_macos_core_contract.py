@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -507,6 +508,102 @@ class CoreContractTests(unittest.TestCase):
         self.assertIn(str(source / "crates/host/mock/Cargo.toml"), commands[4][1])
         self.assertIn(str(source / "crates/host/conformance/Cargo.toml"), commands[5][1])
 
+    def test_foundation_parser_commands_are_fixed_offline_and_not_in_the_default_gate_set(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            test_root = Path(temporary)
+            source = test_root / "source"
+            tools = {"cargo": test_root / "toolchain" / "bin" / "cargo"}
+            legacy = subject._source_commands(source, tools)
+            foundation = subject._source_commands(source, tools, include_parser=True)
+        self.assertEqual(tuple(stage for stage, unused_argv in legacy), subject.GATE_NAMES)
+        self.assertEqual(tuple(stage for stage, unused_argv in foundation),
+                         subject.GATE_NAMES + subject.PARSER_GATE_NAMES)
+        parser_format, parser_clippy, parser_replay = foundation[-3:]
+        self.assertEqual(parser_format[1], (
+            str(tools["cargo"]), "--locked", "--offline", "fmt", "--manifest-path",
+            str(source / "fuzz/Cargo.toml"), "--all", "--", "--check",
+        ))
+        self.assertEqual(parser_clippy[1], (
+            str(tools["cargo"]), "clippy", "--offline", "--manifest-path",
+            str(source / "fuzz/Cargo.toml"), "--all-targets", "--locked", "--", "-D", "warnings",
+        ))
+        self.assertEqual(parser_replay[1], (
+            str(tools["cargo"]), "run", "--locked", "--offline", "--manifest-path",
+            str(source / "fuzz/Cargo.toml"),
+        ))
+        with self.assertRaises(subject.Refusal):
+            subject._source_commands(source, tools, include_parser=1)
+
+    def test_locked_foundation_lease_marker_is_limited_to_diagnostics(self):
+        request = {**_request(), "concern": "core-build-diagnostic-return"}
+        binding = _binding()
+        record = {
+            **binding, **request, "repository_id": "67890", "candidate_class": "signed-descendant",
+            "signature": "verified", "rules_lock": "present", "tree": subject.LOCKED_FOUNDATION_TREE,
+            "source_execution": "not_run_at_yield", "app_build": "not_run", "cleanup": "lease_open",
+            "repository_scope": "verified", "metadata": "verified",
+            "token_revocation": "confirmed_before_yield", "signer_authority": "bound_base",
+            "signatures": "all_new_commits_verified", "ancestry": "base_ancestor",
+            "revocation_policy": "current_control_fingerprints", "worker_access": "uid_read_only",
+        }
+        self.assertEqual(subject._validate_source_lease(
+            record, request, binding, 504, private_validation,
+        )["tree"], subject.LOCKED_FOUNDATION_TREE)
+        for concern in ("core-contract", "core-node-lock-return", "core-rust-format-return"):
+            with self.subTest(concern=concern), self.assertRaises(subject.Refusal):
+                subject._validate_source_lease(
+                    {**record, "concern": concern}, {**request, "concern": concern},
+                    binding, 504, private_validation,
+                )
+        for tree in ("core_build_diagnostic_return_v3", "core_node_lock_return"):
+            with self.subTest(tree=tree), self.assertRaises(subject.Refusal):
+                subject._validate_source_lease({**record, "tree": tree}, request, binding, 504, private_validation)
+        with self.assertRaises(subject.Refusal):
+            subject._validate_source_lease(record, request, binding, 504, SimpleNamespace())
+        legacy = {**record, "tree": "core_build_diagnostic_return"}
+        self.assertEqual(subject._validate_source_lease(
+            legacy, request, binding, 504, private_validation,
+        )["tree"], "core_build_diagnostic_return")
+
+    def test_fuzz_workspace_selection_requires_a_validated_feedback_lease(self):
+        source = Path("/synthetic-source")
+        marker = source / "fuzz/Cargo.toml"
+        required = frozenset((
+            "fuzz/Cargo.toml", "fuzz/Cargo.lock", "fuzz/src/main.rs",
+            "fuzz/fuzz_targets/identifiers.rs", "fuzz/fuzz_targets/tool_error_codes.rs",
+            "fuzz/fuzz_targets/versions.rs",
+        ))
+        runtime = SimpleNamespace(CORE_CONTRACT_FOUNDATION_FILES=required)
+        marker_info = SimpleNamespace(
+            st_mode=stat.S_IFREG | 0o400, st_uid=0, st_nlink=1,
+        )
+        original_lstat = Path.lstat
+
+        def marker_lstat(path, *args, **kwargs):
+            if path == marker:
+                return marker_info
+            return original_lstat(path, *args, **kwargs)
+
+        with patch.object(Path, "lstat", marker_lstat):
+            self.assertTrue(subject._validated_fuzz_workspace(
+                source, {"concern": "core-rust-format-return"}, runtime,
+            ))
+            self.assertFalse(subject._validated_fuzz_workspace(
+                source, {"concern": "core-contract"}, runtime,
+            ))
+        with patch.object(Path, "lstat", side_effect=FileNotFoundError):
+            self.assertFalse(subject._validated_fuzz_workspace(
+                source, {"concern": "core-rust-format-return"}, runtime,
+            ))
+            with self.assertRaises(subject.Refusal):
+                subject._validated_fuzz_workspace(
+                    source, {"concern": "core-node-lock-return"}, runtime,
+                )
+            with self.assertRaises(subject.Refusal):
+                subject._validated_fuzz_workspace(
+                    source, {"concern": "core-rust-format-return"}, SimpleNamespace(),
+                )
+
     def test_source_gate_diagnostics_map_closed_checks_and_preserve_the_refusal_schema(self):
         cases = (
             ("spawn_failure", "version_mismatch", "gate_failed", "source_gate_spawn_failure"),
@@ -591,8 +688,43 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(outcome["stderr"], b"bounded stderr")
         self.assertIs(outcome["stdout_truncated"], True)
         self.assertIs(outcome["stderr_truncated"], False)
+        self.assertEqual(outcome["selected_gates"], ("workspace_tests",))
+        self.assertEqual(outcome["completed"], ())
         self.assertNotIn("gates", outcome)
         self.assertEqual(calls, ["workspace_tests"])
+
+    def test_foundation_parser_failure_reports_selected_and_completed_stages(self):
+        source = Path("/synthetic-source")
+        tools = {"cargo": Path("/toolchain/bin/cargo")}
+        commands = subject._source_commands(source, tools, include_parser=True)
+        calls = []
+
+        def run_command(argv, *unused_args, **kwargs):
+            stage = kwargs["stage"]
+            calls.append(stage)
+            return SimpleNamespace(
+                returncode=7 if stage == "parser_clippy" else 0,
+                stdout=b"bounded", stderr=b"",
+            )
+
+        rust = SimpleNamespace(_run_worker_command=run_command)
+        with patch.object(subject, "_source_commands", return_value=commands):
+            with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
+                    _worker_census=lambda *args: None)):
+                outcome = subject._run_gates(
+                    source, {}, 502, {"python": "/usr/bin/python3"}, object(), rust, tools,
+                    subject.time.monotonic() + 30, capture_failure=True, include_parser=True,
+                )
+        self.assertEqual(outcome["selected_gates"], subject.GATE_NAMES + subject.PARSER_GATE_NAMES)
+        self.assertEqual(outcome["completed"], subject.GATE_NAMES + ("parser_format",))
+        self.assertEqual(outcome["failed_stage"], "parser_clippy")
+        self.assertEqual(calls, list(subject.GATE_NAMES + ("parser_format", "parser_clippy")))
+        self.assertNotIn("gates", outcome)
+        with self.assertRaises(subject.Refusal):
+            subject._run_gates(
+                source, {}, 502, {"python": "/usr/bin/python3"}, object(), rust, tools,
+                subject.time.monotonic() + 30, include_parser=True,
+            )
 
     def test_unexpected_command_error_keeps_capture_invalid_diagnostic_through_reattachment(self):
         rust = subject._load_control_sibling("macos_rust_toolchain")

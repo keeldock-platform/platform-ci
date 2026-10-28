@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import stat
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -78,6 +79,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             request, environment = _dispatch(kind)
             result = producer.validate_dispatch(kind, environment, now=NOW)
             self.assertEqual(result["request"], request)
+            self.assertEqual(result["profile"], producer.PROFILE_BY_KIND[kind])
             self.assertEqual(result["context"]["concern"], request["concern"])
             self.assertEqual(result["context"]["run_id"], "9876")
             self.assertEqual(result["context"]["producer_job"],
@@ -155,6 +157,8 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             "member_size": 256,
         })
         line = ("KD-FEEDBACK-PRODUCER " + receipt + "\n").encode("ascii")
+        invalid_digest_line = line.replace(b"b" * 64, b"g" * 64)
+        self.assertNotEqual(invalid_digest_line, line)
         with patch.object(producer.time, "time", return_value=NOW):
             checked, record, canonical = producer._parse_producer_line(
                 line, "build_diagnostics", environment,
@@ -165,7 +169,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             for altered, kind in (
                 (line + line, "build_diagnostics"),
                 (line, "rust_patch"),
-                (line.replace(b"b" * 64, b"g" * 64), "build_diagnostics"),
+                (invalid_digest_line, "build_diagnostics"),
             ):
                 with self.subTest(kind=kind, size=len(altered)), self.assertRaises(producer.FeedbackRefusal):
                     producer._parse_producer_line(altered, kind, environment)
@@ -175,6 +179,8 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         stderr_prefix = b"bounded stderr\n" + (b"y" * (32_768 - len(b"bounded stderr\n")))
         payload = producer.build_diagnostic_payload({
             "failed_stage": "workspace_tests",
+            "selected_gates": producer.DIAGNOSTIC_BASE_GATES,
+            "completed": ("format", "clippy"),
             "returncode": 9,
             "stdout": stdout_prefix,
             "stderr": stderr_prefix,
@@ -183,7 +189,8 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         })
         self.assertTrue(payload.startswith(
             b"KD-BUILD-DIAGNOSTICS schema=1 stage=workspace_tests stdout_truncated=true "
-            b"stderr_truncated=true exit=9\n"
+            b"stderr_truncated=true exit=9 selected_gates=format,clippy,workspace_tests,api_tests,"
+            b"mock_tests,conformance_tests completed_gates=format,clippy\n"
         ))
         self.assertIn(stdout_prefix, payload)
         self.assertIn(stderr_prefix, payload)
@@ -191,9 +198,45 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         with self.assertRaises(producer.FeedbackRefusal):
             producer.build_diagnostic_payload({
                 "failed_stage": "workspace_tests", "returncode": 9,
+                "selected_gates": producer.DIAGNOSTIC_BASE_GATES,
+                "completed": ("format", "clippy"),
                 "stdout": b"x", "stderr": b"y", "stdout_truncated": "yes",
                 "stderr_truncated": False,
             })
+
+    def test_build_diagnostic_payload_reports_full_parser_selection_and_refuses_skipped_stages(self):
+        selected = producer.DIAGNOSTIC_GATE_SELECTIONS[1]
+        successful = producer.build_diagnostic_payload({
+            "failed_stage": None, "selected_gates": selected, "completed": selected,
+            "returncode": 0, "stdout": b"", "stderr": b"",
+            "stdout_truncated": False, "stderr_truncated": False,
+        })
+        self.assertEqual(
+            successful,
+            ("KD-BUILD-DIAGNOSTICS schema=1 selected_gates=" + ",".join(selected)
+             + " completed_gates=" + ",".join(selected) + " result=all-gates-completed\n").encode("ascii"),
+        )
+        for outcome in (
+            {
+                "failed_stage": "parser_replay", "selected_gates": producer.DIAGNOSTIC_BASE_GATES,
+                "completed": producer.DIAGNOSTIC_BASE_GATES, "returncode": 9,
+                "stdout": b"", "stderr": b"", "stdout_truncated": False,
+                "stderr_truncated": False,
+            },
+            {
+                "failed_stage": "parser_replay", "selected_gates": selected,
+                "completed": selected[:-2], "returncode": 9,
+                "stdout": b"", "stderr": b"", "stdout_truncated": False,
+                "stderr_truncated": False,
+            },
+            {
+                "failed_stage": None, "selected_gates": selected,
+                "completed": selected[:-1], "returncode": 0, "stdout": b"", "stderr": b"",
+                "stdout_truncated": False, "stderr_truncated": False,
+            },
+        ):
+            with self.subTest(outcome=outcome), self.assertRaises(producer.FeedbackRefusal):
+                producer.build_diagnostic_payload(outcome)
 
     def test_worker_refuses_invalid_capture_framing_without_publishing_output(self):
         error = RuntimeError("synthetic malformed frame")
@@ -210,84 +253,45 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             )
         self.assertEqual(raised.exception.reason, "capture_invalid")
 
-    def test_lock_profile_uses_fixed_script_disabled_registry_command_and_restores_cwd(self):
+    def test_foundation_payload_requires_all_rust_parser_and_node_stages(self):
+        import foundation_node_feedback as adapter
+        import macos_node_contract as contract
+        rust_result = {
+            "selected_gates": adapter.RUST_FOUNDATION_GATES,
+            "completed": adapter.RUST_FOUNDATION_GATES, "failed_stage": None,
+            "returncode": 0, "stdout": b"", "stderr": b"",
+            "stdout_truncated": False, "stderr_truncated": False,
+        }
+        outcome = adapter.extend_diagnostic_outcome(
+            rust_result, lambda: {"mode": "verify", "status": "passed", "stages": adapter.NODE_GATE_NAMES},
+            contract,
+        )
+        payload = producer.build_diagnostic_payload(outcome)
+        self.assertIn(b"typescript_typecheck,typescript_tests", payload)
+        self.assertIn(b"result=all-gates-completed", payload)
+        self.assertEqual(outcome["completed"], adapter.FULL_FOUNDATION_GATES)
+        for missing in (1, 2, 4):
+            with self.subTest(missing=missing), self.assertRaises(producer.FeedbackRefusal):
+                producer.build_diagnostic_payload({
+                    **outcome, "completed": outcome["completed"][:-missing],
+                })
+        failed = {**outcome, "failed_stage": "typescript_tests", "completed": outcome["completed"][:-1],
+                  "returncode": 1, "stdout": b"private bounded error", "stderr": b""}
+        self.assertIn(b"stage=typescript_tests", producer.build_diagnostic_payload(failed))
+
+    def test_legacy_lock_generator_refuses_before_copy_or_execution(self):
         dispatch = _validated_dispatch("lock")
-        calls = []
-        command_result = SimpleNamespace(returncode=0, stdout=b"quiet", stderr=b"")
-        worker_home = str(Path(tempfile.gettempdir()) / "worker-home")
-
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            source.mkdir()
-            worker_storage = root / "worker"
-            worker_storage.mkdir()
-            (worker_storage / "tmp").mkdir()
-
-            def create_worker_directory(path, *args):
-                path = Path(path)
-                calls.append(("directory", (path, *args)))
-                if path.exists():
-                    raise producer.FeedbackRefusal("output_unavailable")
-
-            with patch.object(producer, "_expected_manifest", return_value={"root": {}, "workspaces": []}):
-                with patch.object(producer, "_copy_reviewed_files", side_effect=lambda *args:
-                        calls.append(("copy", args))):
-                    with patch.object(producer, "_make_worker_directory", side_effect=create_worker_directory):
-                        with patch.object(producer, "_run_worker", side_effect=lambda *args, **kwargs:
-                                calls.append(("command", args, kwargs)) or command_result):
-                            with patch.object(producer, "_read_worker_file", return_value=b"lock-bytes"):
-                                with patch.object(producer.os, "chdir", side_effect=lambda path:
-                                        calls.append(("cwd", path))):
-                                    result = producer.run_source_profile(
-                                        dispatch, source, worker_storage, 501, {"HOME": worker_home},
-                                        {}, {"python": "/trusted/python"},
-                                        SimpleNamespace(PROBE_PRIMARY_GID=20), object(), object(),
-                                        10**12, Path("/trusted/node"), Path("/trusted/npm-cli.js"),
-                                    )
-        command = next(call for call in calls if call[0] == "command")
-        argv = command[1][1]
-        self.assertIn("--package-lock-only", argv)
-        self.assertIn("--ignore-scripts", argv)
-        self.assertIn("--registry=https://registry.npmjs.org/", argv)
-        self.assertNotIn("--offline", argv)
-        self.assertTrue(command[2]["allow_nonzero_capture"])
-        directories = [call[1][0] for call in calls if call[0] == "directory"]
-        self.assertIn(worker_storage / producer.FEEDBACK_TEMP_DIRECTORY, directories)
-        self.assertNotIn(worker_storage / "tmp", directories)
-        self.assertEqual(command[1][3]["TMPDIR"], str(worker_storage / producer.FEEDBACK_TEMP_DIRECTORY))
-        self.assertEqual([call[1] for call in calls if call[0] == "cwd"], [
-            worker_storage / "feedback-node-lock", source,
-        ])
-        self.assertEqual(result["payload_bytes"], b"lock-bytes")
-        self.assertEqual(result["source_result"], "command_completed")
-
-    def test_lock_profile_refuses_unavailable_dedicated_tmp_before_command(self):
-        dispatch = _validated_dispatch("lock")
-        calls = []
-        worker_storage = Path("/synthetic-worker")
-        worker_home = str(Path(tempfile.gettempdir()) / "worker-home")
-
-        def refuse_feedback_tmp(path, *unused_args):
-            path = Path(path)
-            calls.append(path)
-            if path == worker_storage / producer.FEEDBACK_TEMP_DIRECTORY:
-                raise producer.FeedbackRefusal("output_unavailable")
-
-        with patch.object(producer, "_expected_manifest", return_value={"root": {}, "workspaces": []}):
-            with patch.object(producer, "_copy_reviewed_files", return_value=None):
-                with patch.object(producer, "_make_worker_directory", side_effect=refuse_feedback_tmp):
-                    with patch.object(producer, "_run_worker", side_effect=lambda *args, **kwargs:
-                            calls.append("command")):
-                        with self.assertRaises(producer.FeedbackRefusal) as raised:
-                            producer.run_source_profile(
-                                dispatch, Path("/synthetic-source"), worker_storage, 501,
-                                {"HOME": worker_home}, {}, {"python": "/trusted/python"},
-                                SimpleNamespace(PROBE_PRIMARY_GID=20), object(), object(),
-                                10**12, Path("/trusted/node"), Path("/trusted/npm-cli.js"),
-                            )
-        self.assertEqual(raised.exception.reason, "output_unavailable")
-        self.assertNotIn("command", calls)
+        with patch.object(producer, "_copy_reviewed_files") as copy_files:
+            with patch.object(producer, "_run_worker") as run_worker:
+                with self.assertRaises(producer.FeedbackRefusal):
+                    producer.run_source_profile(
+                        dispatch, Path("/synthetic-source"), Path("/synthetic-worker"),
+                        501, {}, {}, {"python": "/trusted/python"},
+                        SimpleNamespace(PROBE_PRIMARY_GID=20), object(), object(),
+                        10**12, Path("/trusted/node"), Path("/trusted/npm-cli.js"),
+                    )
+        copy_files.assert_not_called()
+        run_worker.assert_not_called()
 
     def test_source_profile_failure_restores_source_cwd_and_never_returns_payload(self):
         dispatch = _validated_dispatch("rust_patch")
@@ -312,6 +316,114 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertEqual(calls[0], Path("/synthetic-worker/feedback-rust-format"))
         self.assertEqual(calls[-1], Path("/synthetic-source"))
         self.assertIn("command", calls)
+
+    def test_full_foundation_rust_formatter_copies_fuzz_workspace_and_returns_only_rust_paths(self):
+        dispatch = _validated_dispatch("rust_patch")
+        fuzz_paths = producer.FOUNDATION_FUZZ_RUST_PATHS
+        reviewed_paths = tuple(sorted(("crates/host/api/src/lib.rs",) + fuzz_paths))
+        calls = []
+        command_result = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            worker_storage = root / "worker"
+            worker_storage.mkdir()
+
+            def record_copy(source_path, destination, relative_paths, worker_uid, primary_gid):
+                calls.append(("copy", source_path, destination, tuple(relative_paths), worker_uid, primary_gid))
+
+            def record_command(*args, **kwargs):
+                calls.append(("command", args[1], args[6], kwargs))
+                return command_result
+
+            def record_patch(source_path, formatted, paths, worker_uid):
+                calls.append(("patch", source_path, formatted, tuple(paths), worker_uid))
+                return b"synthetic-format-patch"
+
+            with patch.object(producer, "_reviewed_rust_paths", return_value=reviewed_paths) as reviewed:
+                with patch.object(producer, "_copy_reviewed_files", side_effect=record_copy):
+                    with patch.object(producer, "_run_worker", side_effect=record_command):
+                        with patch.object(producer, "_rust_format_patch", side_effect=record_patch):
+                            with patch.object(producer.os, "chdir", side_effect=lambda path:
+                                    calls.append(("cwd", path))):
+                                result = producer.run_source_profile(
+                                    dispatch, source, worker_storage, 501, {},
+                                    {"cargo": Path("/trusted/cargo")}, {"python": "/trusted/python"},
+                                    SimpleNamespace(PROBE_PRIMARY_GID=20), object(), object(),
+                                    10**12, Path("/trusted/node"), None,
+                                    validated_fuzz_workspace=True,
+                                )
+
+        self.assertEqual(reviewed.call_args.kwargs, {"include_fuzz": True})
+        copy_call = next(call for call in calls if call[0] == "copy")
+        copied_paths = set(copy_call[3])
+        self.assertTrue(set(producer.FOUNDATION_FUZZ_MANIFESTS).issubset(copied_paths))
+        self.assertTrue(set(fuzz_paths).issubset(copied_paths))
+        self.assertNotIn("fuzz/corpus/seed", copied_paths)
+        format_calls = [call for call in calls if call[0] == "command"]
+        self.assertEqual([call[2] for call in format_calls], ["feedback_format", "feedback_parser_format"])
+        self.assertEqual(format_calls[0][1][3], str(worker_storage / "feedback-rust-format/Cargo.toml"))
+        self.assertEqual(format_calls[1][1][5], str(worker_storage / "feedback-rust-format/fuzz/Cargo.toml"))
+        self.assertEqual(format_calls[1][1][1:3], ("--locked", "--offline"))
+        self.assertTrue(all(call[3]["allow_nonzero_capture"] for call in format_calls))
+        patch_call = next(call for call in calls if call[0] == "patch")
+        self.assertEqual(patch_call[1], source)
+        self.assertNotEqual(patch_call[2], source)
+        self.assertEqual(patch_call[3], tuple(sorted(reviewed_paths)))
+        self.assertEqual(result["payload_bytes"], b"synthetic-format-patch")
+        self.assertEqual(result["reviewed_rust_paths"], list(sorted(reviewed_paths)))
+        self.assertNotIn("fuzz/Cargo.toml", result["reviewed_rust_paths"])
+        self.assertNotIn("fuzz/Cargo.lock", result["reviewed_rust_paths"])
+
+    def test_reviewed_fuzz_rust_paths_are_fixed_and_reject_unsafe_entries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            crate_source = source / "crates/host/api/src"
+            crate_source.mkdir(parents=True)
+            (crate_source / "lib.rs").touch()
+            for package_root in producer.PACKAGE_ROOTS[1:]:
+                (source / package_root / "src").mkdir(parents=True)
+
+            expected_files = {source / path for path in producer.FOUNDATION_FUZZ_RUST_PATHS}
+            crate_file = crate_source / "lib.rs"
+            source_directories = {
+                source / package_root / "src" for package_root in producer.PACKAGE_ROOTS
+            }
+            file_info = SimpleNamespace(st_mode=stat.S_IFREG | 0o400, st_uid=0, st_nlink=1)
+            directory_info = SimpleNamespace(st_mode=stat.S_IFDIR | 0o500, st_uid=0, st_nlink=1)
+            original_lstat = Path.lstat
+
+            def fixture_lstat(path, *args, **kwargs):
+                if path in expected_files or path == crate_file:
+                    return file_info
+                if path in source_directories:
+                    return directory_info
+                return original_lstat(path, *args, **kwargs)
+
+            with patch.object(Path, "lstat", fixture_lstat):
+                legacy = producer._reviewed_rust_paths(source)
+                complete = producer._reviewed_rust_paths(source, include_fuzz=True)
+
+            self.assertEqual(legacy, ("crates/host/api/src/lib.rs",))
+            self.assertEqual(
+                complete,
+                tuple(sorted(("crates/host/api/src/lib.rs",) + producer.FOUNDATION_FUZZ_RUST_PATHS)),
+            )
+
+            unsafe_info = SimpleNamespace(st_mode=stat.S_IFREG | 0o400, st_uid=0, st_nlink=2)
+            unsafe_path = source / producer.FOUNDATION_FUZZ_RUST_PATHS[0]
+
+            def unsafe_lstat(path, *args, **kwargs):
+                if path == unsafe_path:
+                    return unsafe_info
+                return fixture_lstat(path, *args, **kwargs)
+
+            with patch.object(Path, "lstat", unsafe_lstat):
+                with self.assertRaises(producer.FeedbackRefusal) as raised:
+                    producer._reviewed_rust_paths(source, include_fuzz=True)
+            self.assertEqual(raised.exception.reason, "manifest_invalid")
 
     def test_cli_accepts_only_fixed_run_and_publisher_shapes(self):
         kind, core_args = producer._parse_cli([

@@ -63,7 +63,7 @@ jobs:
           set -euo pipefail
           [[ "$(node --version)" == "v24.22.1" ]]
           [[ "$(npm --version)" == "11.19.1" ]]
-          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs
+          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs kit/confinement/test_node_contract_validation.mjs
           python_command=python3
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             python_command=python
@@ -71,8 +71,14 @@ jobs:
           "$python_command" -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
           "$python_command" -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
           "$python_command" -B -m unittest discover -s kit/confinement -p "test_macos_feedback_producer.py"
+          if [[ "$RUNNER_OS" != "Windows" ]]; then
+            "$python_command" -B -m unittest discover -s kit/confinement -p "test_macos_node_contract.py"
+            "$python_command" -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"
+          fi
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos_node_contract.py"
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"
           fi
       - name: Create and round-trip encrypted fixture
         id: smoke

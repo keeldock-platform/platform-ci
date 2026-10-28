@@ -118,11 +118,12 @@ jobs:
           set -euo pipefail
           [[ "$(node --version)" == "v24.22.1" ]]
           [[ "$(npm --version)" == "11.19.1" ]]
-          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs
+          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs kit/confinement/test_node_contract_validation.mjs
           python3 -B kit/bootstrap/test_policy.py
           python3 -B kit/bootstrap/test_public_tree.py
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
       - name: Record source-free preparation and Rust toolchain proof
         id: prepare
@@ -229,11 +230,12 @@ jobs:
           [[ "$EXPECTED_PREPARE_RUST_SMOKE_DIGEST" =~ ^[a-f0-9]{64}$ ]]
           [[ "$(node --version)" == "v24.22.1" ]]
           [[ "$(npm --version)" == "11.19.1" ]]
-          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs
+          node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs kit/confinement/test_node_contract_validation.mjs
           python3 -B kit/bootstrap/test_policy.py
           python3 -B kit/bootstrap/test_public_tree.py
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
           [[ -n "${ImageOS:-}" && -n "${ImageVersion:-}" ]]
           capture_dir="$(/usr/bin/mktemp -d "${RUNNER_TEMP%/}/feedback-rust-smoke.XXXXXX" 2>/dev/null)"
@@ -333,6 +335,7 @@ jobs:
           CORE_CONTRACT_REVIEWED_BASE_BRANCH: ${{ vars.CORE_CONTRACT_REVIEWED_BASE_BRANCH }}
           CORE_CONTRACT_REVIEWED_CANDIDATE_REF: ${{ secrets.CORE_CONTRACT_REVIEWED_CANDIDATE_REF }}
           CORE_CONTRACT_REVIEWED_DIFF_SHA256: ${{ vars.CORE_CONTRACT_REVIEWED_DIFF_SHA256 }}
+          CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON: ${{ secrets.CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON }}
         run: |
           set -euo pipefail
           [[ -n "${ImageOS:-}" && -n "${ImageVersion:-}" && -n "${RUNNER_TEMP:-}" ]]
@@ -368,6 +371,7 @@ jobs:
             CORE_CONTRACT_REVIEWED_BASE_BRANCH="$CORE_CONTRACT_REVIEWED_BASE_BRANCH" \
             CORE_CONTRACT_REVIEWED_CANDIDATE_REF="$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" \
             CORE_CONTRACT_REVIEWED_DIFF_SHA256="$CORE_CONTRACT_REVIEWED_DIFF_SHA256" \
+            CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON="$CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON" \
             SOURCE_READER_INSTALLATION_ID="$SOURCE_READER_INSTALLATION_ID" \
             SOURCE_READER_CLIENT_ID="$SOURCE_READER_CLIENT_ID" SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
             SOURCE_REPOSITORY_OWNER="$SOURCE_REPOSITORY_OWNER" SOURCE_REPOSITORY_NAME="$SOURCE_REPOSITORY_NAME" \

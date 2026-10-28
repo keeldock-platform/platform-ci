@@ -159,6 +159,9 @@ CORE_CONTRACT_CRATE_ROOTS = (
 CORE_CONTRACT_ROOT_FILES = frozenset((
     "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml",
 ))
+CORE_CONTRACT_PACKAGE_LOCK_PATH = "package-lock.json"
+CORE_CONTRACT_PACKAGE_LOCK_TREE = "core_build_diagnostic_return_with_package_lock"
+MAX_FEEDBACK_LOCK_BYTES = 4 * 1024 * 1024 - 64 * 1024
 CORE_CONTRACT_PACKAGE_FILES = frozenset(("Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md"))
 CORE_CONTRACT_FEEDBACK_FILES = frozenset((
     ".node-version",
@@ -1438,7 +1441,10 @@ def _contract_blob(
     repository, git_executable, repo_env, entries, path, *, core_check,
     max_bytes=MAX_CORE_CONTRACT_FILE_BYTES,
 ):
-    if type(max_bytes) is not int or not 1 <= max_bytes <= MAX_CORE_CONTRACT_FILE_BYTES:
+    if (type(max_bytes) is not int or not 1 <= max_bytes <= MAX_FEEDBACK_LOCK_BYTES
+            or max_bytes > MAX_CORE_CONTRACT_FILE_BYTES
+            and (path != CORE_CONTRACT_PACKAGE_LOCK_PATH
+                 or core_check != "package_decode" or max_bytes != MAX_FEEDBACK_LOCK_BYTES)):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check)
     entry = entries.get(path)
     if entry is None or entry[0] not in ("100644", "100755"):
@@ -1698,6 +1704,8 @@ def _core_contract_package_mode(path, *, feedback_profile=False):
 def _core_contract_expected_mode(path, *, concern="core-contract"):
     if type(concern) is not str or concern not in CORE_CONTRACT_CONCERNS:
         return None
+    if path == CORE_CONTRACT_PACKAGE_LOCK_PATH:
+        return "100644" if concern == "core-build-diagnostic-return" else None
     if path in CORE_CONTRACT_ROOT_FILES:
         return "100644"
     admin_mode = _core_contract_admin_mode(path)
@@ -1800,6 +1808,10 @@ def _safe_core_contract_tree(
         for path in entries
         if path not in CORE_CONTRACT_ROOT_FILES
     )
+    package_lock_present = CORE_CONTRACT_PACKAGE_LOCK_PATH in entries
+    if (concern == "core-build-diagnostic-return" and package_lock_present
+            and not foundation_present):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     if concern == "core-node-lock-return" and not foundation_present:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     if foundation_present:
@@ -1854,6 +1866,15 @@ def _safe_core_contract_tree(
         )
         if not _feedback_fuzz_manifest_shape(fuzz_manifest, api_cargo, fuzz_lock):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+        if concern == "core-build-diagnostic-return" and package_lock_present:
+            if entries[CORE_CONTRACT_PACKAGE_LOCK_PATH][0] != "100644":
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
+            package_lock = _contract_blob(
+                repository, git_executable, repo_env, entries, CORE_CONTRACT_PACKAGE_LOCK_PATH,
+                core_check="package_decode", max_bytes=MAX_FEEDBACK_LOCK_BYTES,
+            )
+            if not package_lock:
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
     for path, (mode, unused_object_id) in entries.items():
         expected_mode = _core_contract_expected_mode(path, concern=concern)
         if mode != expected_mode or expected_mode is None:
@@ -1883,7 +1904,6 @@ def _safe_core_contract_tree(
         total_rules_bytes += len(payload)
         if total_rules_bytes > MAX_TREE_BYTES or hashlib.sha256(payload).hexdigest() != expected_hash:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="rules_hash")
-
     workspace = _contract_blob(
         repository, git_executable, repo_env, entries, "Cargo.toml",
         core_check="workspace_decode",
@@ -1927,6 +1947,10 @@ def _safe_core_contract_tree(
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
         if re.search(r"(?m)^\s*build\s*=", manifest_text) is not None:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_build")
+    tree_kind = CORE_CONTRACT_TREE_BY_CONCERN[concern]
+    if concern == "core-build-diagnostic-return" and package_lock_present:
+        tree_kind = CORE_CONTRACT_PACKAGE_LOCK_TREE
+    return tree_kind
 
 
 LEASE_ACCESS_SCRIPT = '''\
@@ -2666,11 +2690,11 @@ def validated_source(
         record["signatures"] = "all_new_commits_verified"
         record["ancestry"] = "base_ancestor"
         record["revocation_policy"] = "current_control_fingerprints"
-        record["tree"] = {
-            "core-bootstrap": "core_administrative",
-            "rules-bootstrap": "rules_regular_files",
-            **CORE_CONTRACT_TREE_BY_CONCERN,
-        }[request["concern"]]
+        if request["concern"] not in CORE_CONTRACT_CONCERNS:
+            record["tree"] = {
+                "core-bootstrap": "core_administrative",
+                "rules-bootstrap": "rules_regular_files",
+            }[request["concern"]]
         record["worker_access"] = worker_access
         record["source_execution"] = "not_run_at_yield"
         record["cleanup"] = "lease_open"
@@ -2922,12 +2946,11 @@ def _source_snapshot(
             rules_lock = "not-applicable"
             tree_kind = "rules_regular_files"
         elif request["concern"] in CORE_CONTRACT_CONCERNS:
-            _safe_core_contract_tree(
+            tree_kind = _safe_core_contract_tree(
                 repository, git_executable, env, request["base_sha"], request["source_sha"],
                 concern=request["concern"],
             )
             rules_lock = "present"
-            tree_kind = CORE_CONTRACT_TREE_BY_CONCERN[request["concern"]]
         else:
             raise Refusal("bootstrap_not_approved", "configuration")
         source_path = _checkout_source(
@@ -2983,14 +3006,18 @@ def _format_success(record, binding):
         or (record["concern"] == "core-bootstrap" and record["source_sha"] != record["base_sha"])
     ):
         raise Refusal("internal_error", "input")
+    expected_tree = {
+        "core-bootstrap": "core_administrative",
+        "rules-bootstrap": "rules_regular_files",
+        **CORE_CONTRACT_TREE_BY_CONCERN,
+    }.get(record.get("concern"))
+    if (record.get("concern") == "core-build-diagnostic-return"
+            and record.get("tree") == CORE_CONTRACT_PACKAGE_LOCK_TREE):
+        expected_tree = CORE_CONTRACT_PACKAGE_LOCK_TREE
     fixed = {
         "signature": "verified",
         "rules_lock": "not-applicable" if record.get("concern") == "rules-bootstrap" else "present",
-        "tree": {
-            "core-bootstrap": "core_administrative",
-            "rules-bootstrap": "rules_regular_files",
-            **CORE_CONTRACT_TREE_BY_CONCERN,
-        }.get(record.get("concern")),
+        "tree": expected_tree,
         "source_execution": "not_run_at_yield",
         "repository_scope": "verified",
         "metadata": "verified",
