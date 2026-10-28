@@ -1014,6 +1014,163 @@ class NetworkObservationTests(unittest.TestCase):
 
 
 class SummaryGuardTests(unittest.TestCase):
+    def test_summary_guard_failure_labels_are_fixed_by_check(self):
+        checks = (
+            "input", "protect_controls", "runner_identity", "prepare_summary", "real_probe",
+            "verify_controls", "make_scratch", "write_denial_probe", "standin_check", "remove_scratch",
+        )
+
+        def fail(*unused_args, **unused_kwargs):
+            raise RuntimeError("private probe detail")
+
+        for check in checks:
+            capability = SimpleNamespace(
+                _protect_runner_controls=lambda root: (501, (), ("summary-path",)),
+                _verify_runner_controls_are_private=lambda *args, **kwargs: None,
+                _remove_probe_tree=lambda path: None,
+            )
+            reviewed = SimpleNamespace(
+                _prepare_runner_summary=lambda uid: {},
+                _run_real_summary_probe=lambda *args, **kwargs: None,
+                _child_environment=lambda *args: {},
+                _make_control_scratch=lambda: ("scratch", "standin"),
+                _probe_argv=lambda *args: (),
+                _run_probe_step=lambda *args, **kwargs: None,
+                _assert_standin_unchanged=lambda path: None,
+            )
+            environment = {
+                "CI_STEP_SUMMARY": "summary-path", "GITHUB_STEP_SUMMARY": "summary-path",
+                "RUNNER_HOME": "runner-home",
+            }
+            if check == "input":
+                environment["CI_STEP_SUMMARY"] = "other-summary"
+            elif check == "protect_controls":
+                capability._protect_runner_controls = fail
+            elif check == "runner_identity":
+                capability._protect_runner_controls = lambda root: (502, (), ("summary-path",))
+            elif check == "prepare_summary":
+                reviewed._prepare_runner_summary = fail
+            elif check == "real_probe":
+                reviewed._run_real_summary_probe = fail
+            elif check == "verify_controls":
+                capability._verify_runner_controls_are_private = fail
+            elif check == "make_scratch":
+                reviewed._make_control_scratch = fail
+            elif check == "write_denial_probe":
+                reviewed._run_probe_step = fail
+            elif check == "standin_check":
+                reviewed._assert_standin_unchanged = fail
+            else:
+                capability._remove_probe_tree = fail
+
+            with self.subTest(check=check):
+                with self.assertRaises(bootstrap.Refusal) as caught:
+                    bootstrap._summary_guard(
+                        502, "home", {"python": "python"}, reviewed, capability, "root",
+                        binding_value(), environment, {"guard": None},
+                    )
+                if check == "remove_scratch":
+                    self.assertEqual(
+                        (caught.exception.reason, caught.exception.stage, caught.exception.diagnostic),
+                        ("cleanup_incomplete", "cleanup_summary", "remove_scratch"),
+                    )
+                else:
+                    self.assertEqual(
+                        (caught.exception.reason, caught.exception.stage, caught.exception.diagnostic),
+                        ("summary_guard_failed", "summary_guard", check),
+                    )
+                self.assertNotIn("private probe detail", str(caught.exception))
+
+    def test_scratch_cleanup_preserves_operational_failure_or_takes_cleanup_priority(self):
+        def fail(*unused_args, **unused_kwargs):
+            raise RuntimeError("private probe detail")
+
+        for check in ("write_denial_probe", "standin_check"):
+            for cleanup_fails in (False, True):
+                capability = SimpleNamespace(
+                    _protect_runner_controls=lambda root: (501, (), ("summary-path",)),
+                    _verify_runner_controls_are_private=lambda *args, **kwargs: None,
+                    _remove_probe_tree=fail if cleanup_fails else (lambda path: None),
+                )
+                reviewed = SimpleNamespace(
+                    _prepare_runner_summary=lambda uid: {},
+                    _run_real_summary_probe=lambda *args, **kwargs: None,
+                    _child_environment=lambda *args: {},
+                    _make_control_scratch=lambda: ("scratch", "standin"),
+                    _probe_argv=lambda *args: (),
+                    _run_probe_step=(
+                        fail if check == "write_denial_probe" else (lambda *args, **kwargs: None)
+                    ),
+                    _assert_standin_unchanged=(
+                        fail if check == "standin_check" else (lambda path: None)
+                    ),
+                )
+                with self.subTest(check=check, cleanup_fails=cleanup_fails):
+                    with self.assertRaises(bootstrap.Refusal) as caught:
+                        bootstrap._summary_guard(
+                            502, "home", {"python": "python"}, reviewed, capability, "root",
+                            binding_value(), {
+                                "CI_STEP_SUMMARY": "summary-path", "GITHUB_STEP_SUMMARY": "summary-path",
+                                "RUNNER_HOME": "runner-home",
+                            }, {"guard": None},
+                        )
+                    if cleanup_fails:
+                        self.assertEqual(
+                            (caught.exception.reason, caught.exception.stage, caught.exception.diagnostic),
+                            ("cleanup_incomplete", "cleanup_summary", "remove_scratch"),
+                        )
+                    else:
+                        self.assertEqual(
+                            (caught.exception.reason, caught.exception.stage, caught.exception.diagnostic),
+                            ("summary_guard_failed", "summary_guard", check),
+                        )
+
+    def test_summary_guard_preserves_only_closed_runner_control_subchecks(self):
+        class ProbeFailure(Exception):
+            def __init__(self, check):
+                self.check = check
+                self.reason = "runner_control_unavailable"
+
+        class OtherProbeFailure(Exception):
+            @property
+            def check(self):
+                raise AssertionError("untrusted check attribute was read")
+
+        for subcheck, expected in (
+            ("file_reference", "protect_controls_file_reference"),
+            ("directory_type_owner", "protect_controls_directory_type_owner"),
+            ("file_permissions", "protect_controls_file_permissions"),
+            ("unlisted_check", "protect_controls"),
+            ("malicious_check", "protect_controls"),
+        ):
+            def fail_protection(unused_root):
+                if subcheck == "malicious_check":
+                    raise OtherProbeFailure()
+                raise ProbeFailure(subcheck)
+
+            capability = SimpleNamespace(
+                ProbeFailure=ProbeFailure,
+                _protect_runner_controls=fail_protection,
+            )
+            with self.subTest(subcheck=subcheck):
+                with self.assertRaises(bootstrap.Refusal) as caught:
+                    bootstrap._summary_guard(
+                        502, "home", {"python": "python"}, SimpleNamespace(), capability, "root",
+                        binding_value(), {
+                            "CI_STEP_SUMMARY": "summary-path", "GITHUB_STEP_SUMMARY": "summary-path",
+                            "RUNNER_HOME": "runner-home",
+                        }, {"guard": None},
+                    )
+                self.assertEqual(caught.exception.diagnostic, expected)
+
+    def test_summary_guard_refusal_discards_unknown_diagnostic_values(self):
+        for invalid in ("private detail", None, [], object()):
+            with self.subTest(value_type=type(invalid).__name__):
+                refusal = bootstrap.Refusal(
+                    "summary_guard_failed", "summary_guard", diagnostic=invalid,
+                )
+                self.assertIsNone(refusal.diagnostic)
+
     def test_actual_summary_guard_stays_open_through_worker_cleanup(self):
         events = []
         guard = {"parent_probe_name": "summary.kd-probe"}

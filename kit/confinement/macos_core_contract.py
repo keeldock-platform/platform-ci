@@ -142,11 +142,23 @@ SOURCE_GATE_COMMAND_DIAGNOSTICS = {
     "capture_overflow": "source_gate_capture_overflow",
 }
 SOURCE_GATE_DIAGNOSTICS = frozenset(SOURCE_GATE_COMMAND_DIAGNOSTICS.values())
+SUMMARY_GUARD_CHECKS = frozenset((
+    "input", "protect_controls", "runner_identity", "prepare_summary", "real_probe",
+    "verify_controls", "make_scratch", "write_denial_probe", "standin_check", "remove_scratch",
+    "protect_controls_workspace_owner", "protect_controls_directory_type_owner",
+    "protect_controls_directory_permissions", "protect_controls_file_reference",
+    "protect_controls_file_type_owner", "protect_controls_file_permissions",
+))
+SUMMARY_GUARD_DIAGNOSTIC_MAP = {
+    check: "summary_guard_" + check for check in SUMMARY_GUARD_CHECKS
+}
+SUMMARY_GUARD_DIAGNOSTICS = frozenset(SUMMARY_GUARD_DIAGNOSTIC_MAP.values())
 PRESERVED_SOURCE_DIAGNOSTICS = (
     SOURCE_RUNTIME_DIAGNOSTICS | SOURCE_FETCH_DIAGNOSTICS
     | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
     | SOURCE_GATE_DIAGNOSTICS
 )
+PRESERVED_SUMMARY_GUARD_DIAGNOSTICS = SUMMARY_GUARD_DIAGNOSTICS
 PRIVILEGE_PROBE_CHECK_DIAGNOSTICS = {
     "probe_process_group_cleanup": "worker_privilege_probe_group_cleanup",
     "probe_process_capture_cleanup": "worker_privilege_probe_capture_cleanup",
@@ -168,7 +180,7 @@ CLEANUP_DIAGNOSTICS = frozenset((
 DIAGNOSTICS = (
     OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | SOURCE_RUNTIME_DIAGNOSTICS
     | SOURCE_FETCH_DIAGNOSTICS | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
-    | SOURCE_GATE_DIAGNOSTICS
+    | SOURCE_GATE_DIAGNOSTICS | SUMMARY_GUARD_DIAGNOSTICS
     | frozenset(("none", "unavailable"))
 )
 DETAILED_DIAGNOSTICS = DIAGNOSTICS - frozenset(("none", "unavailable"))
@@ -239,6 +251,10 @@ class _FailureDiagnostics:
         if (type(diagnostic) is str
                 and diagnostic in (OPERATION_DIAGNOSTICS | PRESERVED_SOURCE_DIAGNOSTICS)):
             return Refusal(reason, stage, diagnostic=diagnostic)
+        if (type(error) is Refusal and reason == "summary_guard_failed" and stage == "summary_guard"
+                and type(diagnostic) is str
+                and diagnostic in PRESERVED_SUMMARY_GUARD_DIAGNOSTICS):
+            return Refusal(reason, stage, diagnostic=diagnostic)
         if stage in NO_OPERATION_STAGES and operation not in OPERATION_DIAGNOSTICS:
             return Refusal(reason, stage, diagnostic="none")
         if type(operation) is str and operation in OPERATION_DIAGNOSTICS:
@@ -294,6 +310,24 @@ def _valid_sha256(value):
 
 def _safe_id(value):
     return type(value) is str and DECIMAL_RE.fullmatch(value) is not None
+
+
+def _summary_guard_diagnostic(error, rules):
+    rules_refusal = getattr(rules, "Refusal", None)
+    if not isinstance(rules_refusal, type) or type(error) is not rules_refusal:
+        return None
+    reason = getattr(error, "reason", None)
+    stage = getattr(error, "stage", None)
+    if (type(reason) is not str or type(stage) is not str
+            or (reason, stage) not in (
+                ("summary_guard_failed", "summary_guard"),
+                ("cleanup_incomplete", "cleanup_summary"),
+            )):
+        return None
+    check = getattr(error, "diagnostic", None)
+    if type(check) is str and check in SUMMARY_GUARD_DIAGNOSTIC_MAP:
+        return SUMMARY_GUARD_DIAGNOSTIC_MAP[check]
+    return None
 
 
 def _unique_object(pairs):
@@ -1088,9 +1122,10 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                 summary_guard_state, cleanup_state,
             )
             summary_guard_passed = True
-        except BaseException:
+        except BaseException as error:
+            diagnostic = _summary_guard_diagnostic(error, rules)
             raise diagnostics.attach(
-                Refusal("summary_guard_failed", "summary_guard"), operation,
+                Refusal("summary_guard_failed", "summary_guard", diagnostic=diagnostic), operation,
                 cleanup_state.get("first"),
             ) from None
 

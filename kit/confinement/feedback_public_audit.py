@@ -40,7 +40,7 @@ AUDIT_FAILURE_PHASES = frozenset((
     "job_surfaces", "check_surfaces", "job_steps", "job_logs",
     "artifact_inventory", "artifact_download", "cache_snapshot",
     "summary_markers", "producer_evidence", "receipt", "unavailable",
-))
+)) | feedback_api.HISTORY_FAILURE_PHASES
 
 
 class FeedbackAuditRefusal(Exception):
@@ -289,8 +289,10 @@ def prepare(environ=None, *, now=None):
 def _history_for_live_run(api, request, profile, run, actor, now):
     try:
         history = feedback_api._history(api, request, profile, run, actor, now, live=True)
+    except feedback_api.HistoryRefusal as error:
+        _refuse(error.diagnostic)
     except Exception:
-        _refuse()
+        _refuse("history")
     return history
 
 
@@ -421,7 +423,9 @@ def audit_live(environ=None, api_factory=None, *, now=None):
         _refuse("workflow")
     try:
         _history_for_live_run(api, request, profile, run, actor, current)
-    except FeedbackAuditRefusal:
+    except FeedbackAuditRefusal as error:
+        if error.phase in feedback_api.HISTORY_FAILURE_PHASES:
+            _refuse(error.phase)
         _refuse("history")
     except BaseException:
         _refuse("history")

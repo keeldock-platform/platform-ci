@@ -692,6 +692,51 @@ class LiveProviderPipelineTests(unittest.TestCase):
         self.assertEqual(caught.exception.phase, "jobs")
         self.assertNotIn("canary-private-value", str(caught.exception))
 
+    def test_history_collection_diagnostics_stay_closed_through_live_audit(self):
+        for api_reason, expected_phase in (
+            ("api_status", "history_completed_api_status"),
+            ("api_schema", "history_completed_api_schema"),
+            ("pagination_incomplete", "history_completed_api_pagination"),
+            ("api_unavailable", "history_completed_api_unavailable"),
+        ):
+            with self.subTest(reason=api_reason):
+                request, key = _request()
+                profile = feedback_request.PROFILES[request["concern"]]
+                environment = _environment(request, key, profile["auditor_job"])
+                environment["GITHUB_TOKEN"] = "A" * 24
+                api = LiveAuditProvider(request)
+                original_reader = subject.public_audit._read_counted_collection
+
+                def fail_history(client, path, *args, **kwargs):
+                    if "/actions/workflows/" in path and path.endswith("/runs"):
+                        raise macos_public_audit.AuditRefusal(api_reason)
+                    return original_reader(client, path, *args, **kwargs)
+
+                with patch.object(
+                    subject.public_audit, "_read_counted_collection", side_effect=fail_history,
+                ):
+                    with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+                        subject.audit_live(
+                            environment, api_factory=lambda unused_token: api, now=NOW,
+                        )
+                self.assertEqual(caught.exception.phase, expected_phase)
+                self.assertEqual(caught.exception.reason, "feedback_audit_invalid")
+                self.assertNotIn(api_reason, str(caught.exception))
+
+        request, key = _request()
+        profile = feedback_request.PROFILES[request["concern"]]
+        environment = _environment(request, key, profile["auditor_job"])
+        environment["GITHUB_TOKEN"] = "A" * 24
+        api = LiveAuditProvider(request)
+        with patch.object(
+            subject.public_audit, "_read_counted_collection",
+            side_effect=RuntimeError("private provider response"),
+        ):
+            with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+                subject.audit_live(environment, api_factory=lambda unused_token: api, now=NOW)
+        self.assertEqual(caught.exception.phase, "history_completed_api_unavailable")
+        self.assertNotIn("private provider response", str(caught.exception))
+
     def test_late_failures_keep_first_phase_while_audit_scans_remaining_surfaces(self):
         for expected_phase in (
             "check_surfaces", "job_logs", "artifact_inventory", "artifact_download",
@@ -788,6 +833,15 @@ class LiveProviderPipelineTests(unittest.TestCase):
         valid = prefix + b'{"phase":"history","reason":"feedback_audit_invalid","schema_version":1}\n'
         expected = prefix + b'{"phase":"history","reason":"feedback_audit_invalid","schema_version":1}'
         self.assertEqual(subject.normalize_refusal(valid), expected.decode("ascii"))
+        for phase in feedback_api.HISTORY_FAILURE_PHASES:
+            record = json.dumps(
+                {"phase": phase, "reason": "feedback_audit_invalid", "schema_version": 1},
+                ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+            ).encode("ascii")
+            self.assertEqual(
+                subject.normalize_refusal(prefix + record),
+                (prefix + record).decode("ascii"),
+            )
         unavailable = subject._failure_record("unavailable")
         invalid_records = (
             prefix + b'{"phase":"canary-private-value","reason":"feedback_audit_invalid","schema_version":1}',
