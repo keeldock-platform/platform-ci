@@ -78,9 +78,11 @@ runs:
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_macos*.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement*.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_log_canary.py"
+        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_lock_receipt.py"
         if [[ "${RUNNER_OS:-}" == "macOS" ]]; then
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_macos*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_log_canary.py"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_lock_receipt.py"
         fi
         "$python_bin" -B "$CI_ACTION_PATH/check_candidate.py" --root "$CI_WORKSPACE" --pool "$CI_POOL" --sha "$CI_SHA"
