@@ -48,6 +48,8 @@ PLATFORM_FILES = frozenset(
         'kit/confinement/test_node_lock_manifest.mjs',
         'kit/confinement/node_lock_receipt.py',
         'kit/confinement/test_node_lock_receipt.py',
+        'kit/confinement/cargo_lock_receipt.py',
+        'kit/confinement/test_cargo_lock_receipt.py',
         ".github/workflows/linux-confinement.yml",
         ".github/workflows/windows-attestation-permission-probe.yml",
         ".github/workflows/attestation-probe.yml",
@@ -80,6 +82,9 @@ PLATFORM_FILES = frozenset(
         "kit/bootstrap/test_policy_linux.py",
         "kit/bootstrap/test_policy_windows.py",
         "kit/bootstrap/test_public_tree.py",
+        ".github/workflows/windows-handoff-synthetic.yml",
+        "kit/handoff/source_free.py",
+        "kit/handoff/test_source_free.py",
         "kit/confinement/macos_boundary_guard.py",
         "kit/confinement/test_macos_boundary_guard.py",
         "kit/confinement/macos_canary_scan.py",
@@ -209,10 +214,10 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_feedback_api.py': 'a748ca0ad084de64bbec47f4d2413f4ae35d6b932d8010847f59cec700f27fae',
     'kit/confinement/feedback_public_audit.py': 'beef023a68e01343c5e8f3e883ba99be75f79924eeaca8fdcaabe9d7401960cb',
     'kit/confinement/test_feedback_public_audit.py': '4a7b822645c7051a4f1999e5961482000a0c58c7c31d9a6ec106a88b8426b5e7',
-    'kit/confinement/role_signer.py': '87c18eb689c7330f13038f189d5a70a09ae196a4fb3e35b5cc6d548e07ad42e1',
-    'kit/confinement/test_role_signer.py': '7431757b2c50412e9891fb5913554fe86c58d80a4eeb9d418a138a18ff1ad688',
-    'kit/bootstrap/policy_handoff.py': 'dcb4f93de856a420a6f03e962538721643cc5c20db1c233f5f9ff101fede22ba',
-    'kit/bootstrap/test_policy_handoff.py': '1f92875997eb589042739af43e0d10599dc01ff0a039fa70b6cfdc6f9ce878f6',
+    'kit/confinement/role_signer.py': '37d4a2f174e02d5c3ed9b00535e4a3caaa84d90c6e25ba236f24d8194de4e4a9',
+    'kit/confinement/test_role_signer.py': 'd3ff93284775e53acd5f6328b25b6f0c4058878ac9a817fe06aa0e69e855f864',
+    'kit/bootstrap/policy_handoff.py': 'a219e9cb880cea6bc6444ad6c8c4d7209e83bb9c7be5c7dbef15630a20e5269d',
+    'kit/bootstrap/test_policy_handoff.py': '0544070f4012476a03fed541aab9c8ba0c60ab9d2ef94c9882e15e43b4f085ec',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(

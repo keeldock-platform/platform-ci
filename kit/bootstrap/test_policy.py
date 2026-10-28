@@ -1406,11 +1406,30 @@ class LaneRegistryTests(unittest.TestCase):
         )
         self.assertEqual(
             set(policy.WORKFLOW_KIND_LANES),
-            {"linux-confinement", "windows-native-preflight", "windows-confinement"},
+            {
+                "linux-confinement",
+                "windows-native-preflight",
+                "windows-confinement",
+                "windows-handoff-synthetic",
+                "windows-source-admission",
+                "lane-h-windows-receiver",
+                "lane-h-linux-fetch-encrypt",
+                "lane-h-capsule-attester",
+                "attestation-role-signer-probe",
+            },
         )
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-confinement"], policy_windows)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["windows-handoff-synthetic"], policy_handoff)
+        for kind in (
+            "windows-source-admission",
+            "lane-h-windows-receiver",
+            "lane-h-linux-fetch-encrypt",
+            "lane-h-capsule-attester",
+            "attestation-role-signer-probe",
+        ):
+            self.assertIs(policy.WORKFLOW_KIND_LANES[kind], policy_handoff)
         self.assertEqual(
             set(policy.LANE_WORKFLOW_TEMPLATES) | set(policy.LANE_WORKFLOW_SHA256),
             set(policy.WORKFLOW_KIND_LANES),
@@ -1435,6 +1454,27 @@ class LaneRegistryTests(unittest.TestCase):
     def test_candidate_workflows_follow_lane_order(self):
         self.assertEqual(
             policy.LANE_CANDIDATE_WORKFLOWS,
+            (
+                (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
+                (
+                    ".github/workflows/windows-native-preflight.yml",
+                    "windows-native-preflight",
+                    "windows-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/windows-confinement.yml",
+                    "windows-confinement",
+                    "windows-confinement-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/windows-handoff-synthetic.yml",
+                    "windows-handoff-synthetic",
+                    "handoff-workflow-too-large",
+                ),
+            ),
+        )
+        self.assertEqual(
+            policy.LANE_CANDIDATE_WORKFLOWS,
             tuple(entry for module in policy.LANE_MODULES for entry in module.CANDIDATE_WORKFLOWS),
         )
         self.assertIn(
@@ -1446,6 +1486,22 @@ class LaneRegistryTests(unittest.TestCase):
                 ".github/workflows/windows-native-preflight.yml",
                 "windows-native-preflight",
                 "windows-workflow-too-large",
+            ),
+            policy.LANE_CANDIDATE_WORKFLOWS,
+        )
+        self.assertIn(
+            (
+                ".github/workflows/windows-confinement.yml",
+                "windows-confinement",
+                "windows-confinement-workflow-too-large",
+            ),
+            policy.LANE_CANDIDATE_WORKFLOWS,
+        )
+        self.assertIn(
+            (
+                ".github/workflows/windows-handoff-synthetic.yml",
+                "windows-handoff-synthetic",
+                "handoff-workflow-too-large",
             ),
             policy.LANE_CANDIDATE_WORKFLOWS,
         )

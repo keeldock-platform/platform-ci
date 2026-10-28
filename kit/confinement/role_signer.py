@@ -2274,7 +2274,7 @@ def observed_pins(jobs_snapshot, artifact_map, artifact_directory, roles,
         measured = {}
         for field in ("sourceRepositoryDigest", "buildSignerDigest", "buildConfigDigest"):
             value = certificate.get(field)
-            if type(value) is not str or re.fullmatch(r"sha256:[a-f0-9]{64}", value) is None:
+            if type(value) is not str or not value or len(value) > 512 or not value.isprintable():
                 raise Refusal("observation-certificate-digest")
             measured[field] = value
         issuer = certificate.get("certificateIssuer")

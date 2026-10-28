@@ -28,6 +28,12 @@ DIGEST_PINS = {
     "buildConfigDigest": "sha256:" + "3" * 64,
     "certificateIssuer": "https://fulcio.example.invalid",
 }
+ALTERNATE_DIGEST_VALUES = {
+    "sourceRepositoryDigest": "sha256-base64:YWJjZA==",
+    "buildSignerDigest": "sha256-base64:ZWZnaA==",
+    "buildConfigDigest": "sha256-base64:aWprbA==",
+    "certificateIssuer": "https://fulcio.example.invalid",
+}
 CERTIFICATE_FIELDS = (
     "buildSignerURI",
     "subjectAlternativeName",
@@ -92,7 +98,8 @@ def fixture_binding(role="windows-receiver", record=None, profile="probe"):
     return record, signed_subject, binding
 
 
-def fixture_certificate(role="windows-receiver", profile="probe", changes=None):
+def fixture_certificate(role="windows-receiver", profile="probe", changes=None,
+                        digest_values=None):
     expected = subject.certificate_expectations(
         profile,
         REPOSITORY,
@@ -104,7 +111,7 @@ def fixture_certificate(role="windows-receiver", profile="probe", changes=None):
         99101,
         role,
         subject.ROLE_RUNNERS[role],
-        dict(DIGEST_PINS),
+        dict(DIGEST_PINS if digest_values is None else digest_values),
     )
     certificate = {field: expected[field] for field in CERTIFICATE_FIELDS}
     certificate["sourceRepositoryIdentifier"] = "8150001"
@@ -215,7 +222,8 @@ def fixture_predicate(role="windows-receiver", record=None):
     return record, signed_subject, binding, predicate
 
 
-def fixture_successful_evidence(root, profile="probe"):
+def fixture_successful_evidence(root, profile="probe", digest_values=None):
+    digest_values = DIGEST_PINS if digest_values is None else digest_values
     record = fixture_record(profile=profile)
     transfer = subject.validate_key_record(record, 8150001, CONTROL_SHA, RUN_ID,
                                            RUN_ATTEMPT, REPOSITORY + "/" +
@@ -244,7 +252,8 @@ def fixture_successful_evidence(root, profile="probe"):
             "payload": base64.b64encode(payload).decode("ascii"),
             "signatures": [{"sig": "synthetic"}],
         }}
-        unused_expected, certificate = fixture_certificate(role, profile)
+        unused_expected, certificate = fixture_certificate(
+            role, profile, digest_values=digest_values)
         verified = {"verificationResult": {
             "signature": {"certificate": certificate}, "statement": statement}}
         name = "role-statement-%s-%s-%s-%s" % (role, RUN_ID, RUN_ATTEMPT, transfer)
@@ -304,7 +313,7 @@ def fixture_successful_evidence(root, profile="probe"):
         "provider_snapshots": provider_snapshots,
         "control_root": ROOT, "evidence_root": root,
         "api_name_pins": fixture_api_names(),
-        "digest_pins": {role: dict(DIGEST_PINS) for role in subject.ROLE_ORDER},
+        "digest_pins": {role: dict(digest_values) for role in subject.ROLE_ORDER},
     }
 
 
@@ -1080,7 +1089,8 @@ class ArtifactAndStageTests(unittest.TestCase):
 
     def test_full_probe_observation_records_mappings_but_cannot_accept_them(self):
         with tempfile.TemporaryDirectory() as temporary:
-            evidence = fixture_successful_evidence(temporary)
+            evidence = fixture_successful_evidence(
+                temporary, digest_values=ALTERNATE_DIGEST_VALUES)
             write_full_cli_evidence(temporary, evidence)
             command = [
                 "verify-snapshot", "--profile", "probe", "--repository", REPOSITORY,
@@ -1097,6 +1107,8 @@ class ArtifactAndStageTests(unittest.TestCase):
             self.assertEqual(subject.main(command + ["--observe", "--observation-output", str(output)]), 0)
             observed = json.loads(output.read_text(encoding="ascii"))
             self.assertEqual(observed["acceptance"], "blocked")
+            self.assertEqual(observed["certificate_digests"], {
+                role: ALTERNATE_DIGEST_VALUES for role in subject.ROLE_ORDER})
             self.assertEqual(set(observed["api_job_names"]), set(subject.ROLE_ORDER))
             self.assertEqual(observed["linux_step_ordinals"], {
                 "revoke-source-token": 5, "verify-token-rejection": 6})
@@ -1109,6 +1121,25 @@ class ArtifactAndStageTests(unittest.TestCase):
             production = command.copy()
             production[production.index("probe")] = "production-synthetic"
             self.assertEqual(subject.main(production + ["--observe", "--observation-output", str(output)]), 1)
+
+    def test_observation_bounds_raw_certificate_digest_values(self):
+        for value in ("", "x" * 513, "base64:line\nbreak"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as temporary:
+                evidence = fixture_successful_evidence(
+                    temporary, digest_values=ALTERNATE_DIGEST_VALUES)
+                role = subject.ROLE_ORDER[0]
+                artifacts = subject.validate_artifact_inventory(
+                    evidence["artifacts_snapshot"], RUN_ID, RUN_ATTEMPT,
+                    CONTROL_SHA, (role,))
+                verified_path = (Path(temporary) / "artifacts" /
+                                 artifacts[role][0]["name"] / "verified.json")
+                verified = json.loads(verified_path.read_text(encoding="ascii"))
+                verified["verificationResult"]["signature"]["certificate"]["sourceRepositoryDigest"] = value
+                verified_path.write_text(json.dumps(verified), encoding="ascii")
+                with self.assertRaisesRegex(subject.Refusal, "observation-certificate-digest"):
+                    subject.observed_pins(
+                        evidence["jobs_snapshot"], artifacts, Path(temporary) / "artifacts",
+                        (role,), RUN_ID, RUN_ATTEMPT, CONTROL_SHA, "probe")
 
     def test_production_caller_observation_is_source_free_and_still_refuses_acceptance(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1139,7 +1170,8 @@ class ArtifactAndStageTests(unittest.TestCase):
     def test_production_observation_gates_accept_an_in_progress_receiver(self):
         for gate in ("A", "B"):
             with self.subTest(gate=gate), tempfile.TemporaryDirectory() as temporary:
-                evidence = fixture_successful_evidence(temporary, "production-synthetic")
+                evidence = fixture_successful_evidence(
+                    temporary, "production-synthetic", ALTERNATE_DIGEST_VALUES)
                 arguments = fixture_transition_arguments(evidence, gate)
                 roles = subject.ROLE_ORDER[:1] if gate == "A" else subject.ROLE_ORDER[:2]
                 artifacts = subject.validate_artifact_inventory(
@@ -1147,6 +1179,8 @@ class ArtifactAndStageTests(unittest.TestCase):
                 names, digests, ordinals, unused_jobs = subject.observed_pins(
                     arguments["jobs_snapshot"], artifacts, Path(temporary) / "artifacts",
                     roles, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, "production-synthetic")
+                for role in roles:
+                    self.assertEqual(digests[role], ALTERNATE_DIGEST_VALUES)
                 arguments["api_name_pins"] = names
                 arguments["digest_pins"] = digests
                 if gate == "B":
