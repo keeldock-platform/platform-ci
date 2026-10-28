@@ -674,7 +674,7 @@ class CargoLockReceiptTests(unittest.TestCase):
             vendor.chmod(0o700)
             link = parent / "link"
             try:
-                link.symlink_to(real, target_is_directory=True)
+                link.symlink_to("real", target_is_directory=True)
             except OSError:
                 self.skipTest("symbolic links are unavailable")
             _assert_refused(
@@ -708,6 +708,51 @@ class CargoLockReceiptTests(unittest.TestCase):
             for item in sorted(package_root.rglob("*"), key=lambda value: len(value.parts), reverse=True):
                 item.chmod(0o755 if item.is_dir() else 0o644)
             package_root.chmod(0o755)
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory descriptors")
+    def test_macos_extended_acl_on_ancestor_is_refused(self):
+        library = Mock()
+        library.acl_get_fd_np.return_value = 1
+        library.acl_get_entry.return_value = 0
+        library.acl_free.return_value = 0
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(subject.sys, "platform", "darwin"), patch.object(
+                subject.ctypes, "CDLL", return_value=library,
+            ):
+                _assert_refused(
+                    self,
+                    lambda: subject._open_target_directory(temporary),
+                    "cargo_archive_invalid",
+                )
+        library.acl_get_fd_np.assert_called()
+        library.acl_get_entry.assert_called()
+        library.acl_free.assert_called()
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory descriptors")
+    def test_macos_extended_acl_on_private_target_is_refused(self):
+        library = Mock()
+        library.acl_get_entry.return_value = 0
+        library.acl_free.return_value = 0
+        with tempfile.TemporaryDirectory() as temporary:
+            target_identity = subject._file_identity(Path(temporary).stat())
+
+            def get_acl(descriptor, acl_type):
+                if subject._file_identity(os.fstat(descriptor)) == target_identity:
+                    return 1
+                subject.ctypes.set_errno(subject.errno.ENOENT)
+                return None
+
+            library.acl_get_fd_np.side_effect = get_acl
+            with patch.object(subject.sys, "platform", "darwin"), patch.object(
+                subject.ctypes, "CDLL", return_value=library,
+            ):
+                _assert_refused(
+                    self,
+                    lambda: subject._open_target_directory(temporary),
+                    "cargo_archive_invalid",
+                )
+        library.acl_get_entry.assert_called_once()
+        library.acl_free.assert_called_once()
 
     def test_extractor_cleans_failed_private_staging(self):
         data = _archive()
@@ -760,7 +805,8 @@ class CargoLockReceiptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
             descriptor, physical = subject._open_target_directory(temporary)
             try:
-                self.assertTrue(str(physical).startswith("/private/var/tmp/"))
+                expected = Path("/") / "private" / "var" / "tmp"
+                self.assertTrue(str(physical).startswith(str(expected) + os.sep))
                 self.assertEqual(subject._file_identity(os.fstat(descriptor)),
                                  subject._file_identity(physical.stat()))
             finally:

@@ -1,6 +1,7 @@
 """Bounded Cargo lock receipts and verified, source-free crate materialization."""
 
 import ctypes
+import errno
 import gzip
 import hashlib
 import hmac
@@ -765,12 +766,47 @@ def verify_archive(name, version, data, expected_sha256):
     return True
 
 
-def _require_trusted_ancestor(metadata):
+def _require_no_extended_acl(descriptor):
+    """Require a macOS directory descriptor with no extended ACL entries."""
+    if sys.platform != "darwin":
+        return
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        get_acl = library.acl_get_fd_np
+        get_acl.argtypes = (ctypes.c_int, ctypes.c_int)
+        get_acl.restype = ctypes.c_void_p
+        get_entry = library.acl_get_entry
+        get_entry.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+        get_entry.restype = ctypes.c_int
+        release = library.acl_free
+        release.argtypes = (ctypes.c_void_p,)
+        release.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        acl = get_acl(descriptor, 0x100)
+        if not acl:
+            if ctypes.get_errno() == errno.ENOENT:
+                return
+            _refuse("cargo_archive_invalid")
+        try:
+            entry = ctypes.c_void_p()
+            ctypes.set_errno(0)
+            result = get_entry(acl, 0, ctypes.byref(entry))
+            if result != -1 or ctypes.get_errno() != errno.EINVAL:
+                _refuse("cargo_archive_invalid")
+        finally:
+            if release(acl) != 0:
+                _refuse("cargo_archive_invalid")
+    except (AttributeError, OSError, TypeError, ValueError):
+        _refuse("cargo_archive_invalid")
+
+
+def _require_trusted_ancestor(metadata, descriptor):
     mode = stat.S_IMODE(metadata.st_mode)
     if (not stat.S_ISDIR(metadata.st_mode)
             or metadata.st_uid not in (0, os.geteuid())
             or ((mode & 0o022) and not (metadata.st_uid == 0 and mode & stat.S_ISVTX))):
         _refuse("cargo_archive_invalid")
+    _require_no_extended_acl(descriptor)
 
 
 def _open_target_directory(path):
@@ -790,7 +826,7 @@ def _open_target_directory(path):
             if len(pending) > 128 or len(physical_parts) > 128:
                 _refuse("cargo_archive_invalid")
             component = pending.pop(0)
-            _require_trusted_ancestor(os.fstat(descriptor))
+            _require_trusted_ancestor(os.fstat(descriptor), descriptor)
             entry = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
             if stat.S_ISLNK(entry.st_mode):
                 if private_boundary or entry.st_uid not in (0, os.geteuid()) or link_count >= 4:
@@ -815,6 +851,7 @@ def _open_target_directory(path):
         if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
                 or (mode & 0o077) or (mode & 0o700) != 0o700):
             _refuse("cargo_archive_invalid")
+        _require_no_extended_acl(descriptor)
         return descriptor, Path("/", *physical_parts)
     except BaseException:
         os.close(descriptor)
@@ -1049,10 +1086,13 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
     The target itself is the staging parent and must be a preexisting private
     directory in a trusted preparation job. POSIX ownership and permissions are
     checked along the whole ancestor chain, including root-owned sticky parents.
+    macOS ancestors and the private target must also have no extended ACL entries.
     A bounded, trusted symlink above the first private user directory is resolved
     to a physical path; symlinks below that directory are refused. Windows callers
     must isolate the target and its ancestors with runner ACLs. On every platform,
-    the job must exclude untrusted processes running as the same user.
+    the job must exclude untrusted processes running as the same user. A same-user
+    writer can replace the staging entry between its identity check and rename;
+    the post-check refuses, but the replacement can remain published.
     """
     root, entries, file_hashes, package_hash = _inspect_archive(name, version, data, expected_sha256)
     if os.name == "nt":
