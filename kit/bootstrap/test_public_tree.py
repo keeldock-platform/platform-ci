@@ -358,11 +358,12 @@ class PublicTreeTests(unittest.TestCase):
             "push-to-registry: false",
             "create-storage-record: false",
             "--deny-self-hosted-runners",
-            "probe=profile-selection result=blocked reason=failed-or-ambiguous-arm",
+            "probe=profile-comparison result=blocked reason=failed-or-ambiguous-arm",
         ):
             with self.subTest(expected=expected):
-                minimum_count = 6 if expected != "probe=profile-selection result=blocked reason=failed-or-ambiguous-arm" else 1
+                minimum_count = 6 if expected != "probe=profile-comparison result=blocked reason=failed-or-ambiguous-arm" else 1
                 self.assertGreaterEqual(workflow.count(expected), minimum_count)
+        self.assertNotIn("probe=profile-selection", workflow)
         self.assertEqual(workflow.count("gh attestation verify"), 6)
         self.assertEqual(workflow.count("continue-on-error: true"), 18)
         self.assertEqual(workflow.count("if: steps.attest.outcome == 'success'"), 6)
@@ -477,7 +478,7 @@ class PublicTreeTests(unittest.TestCase):
         success = run_gate()
         self.assertEqual(success.returncode, 0, success.stdout + success.stderr)
         self.assertIn(
-            "probe=profile-selection result=selected profile=common-intersection",
+            "probe=profile-comparison result=observed profile=common-intersection",
             success.stdout,
         )
 
