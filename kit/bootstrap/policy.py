@@ -2,6 +2,13 @@ import hashlib
 import json
 import re
 import subprocess
+from types import MappingProxyType
+
+import policy_handoff
+import policy_linux
+import policy_windows
+from policy_linux import LINUX_CONFINEMENT_WORKFLOW_TEMPLATE
+from policy_windows import WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE
 
 
 PUBLIC_POOLS = frozenset(("platform", "connect", "workspace", "data"))
@@ -174,119 +181,6 @@ jobs:
         uses: ./kit/bootstrap
         with:
           pool: platform
-"""
-
-
-LINUX_CONFINEMENT_WORKFLOW_TEMPLATE = """name: linux-confinement
-on:
-  push:
-    branches:
-      - "**"
-  pull_request:
-  workflow_dispatch:
-permissions: {}
-jobs:
-  linux-policy:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    defaults:
-      run:
-        shell: bash
-    env:
-      CI_REPOSITORY: ${{ github.repository }}
-      CI_REF: ${{ github.ref }}
-      CI_SHA: ${{ github.sha }}
-      CI_SERVER_URL: ${{ github.server_url }}
-      CI_EVENT_NAME: ${{ github.event_name }}
-      CI_WORKSPACE: ${{ github.workspace }}
-    steps:
-      - name: Fetch public candidate
-        run: |
-          set -euo pipefail
-          if [[ ! "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SERVER_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
-            exit 1
-          fi
-          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
-            if [[ ! "$CI_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]; then
-              exit 1
-            fi
-            requested_ref="$CI_REF"
-          else
-            if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
-              exit 1
-            fi
-            requested_ref="$CI_REF"
-          fi
-          git init -q . 2>/dev/null
-          git config core.autocrlf false 2>/dev/null
-          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$requested_ref" 2>/dev/null
-          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
-          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
-          if [[ "$actual_sha" != "$CI_SHA" ]]; then
-            exit 1
-          fi
-      - name: Run unprivileged source-free checks
-        run: |
-          set -euo pipefail
-          python3 -B kit/bootstrap/test_policy.py
-          python3 -B kit/bootstrap/test_public_tree.py
-          python3 -B kit/confinement/test_linux_harness.py
-          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
-  linux-confinement:
-    needs: linux-policy
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    defaults:
-      run:
-        shell: bash
-    env:
-      CI_REPOSITORY: ${{ github.repository }}
-      CI_REF: ${{ github.ref }}
-      CI_SHA: ${{ github.sha }}
-      CI_SERVER_URL: ${{ github.server_url }}
-      CI_EVENT_NAME: ${{ github.event_name }}
-      CI_WORKSPACE: ${{ github.workspace }}
-    steps:
-      - name: Fetch reviewed main control
-        run: |
-          set -euo pipefail
-          if [[ "$CI_EVENT_NAME" != "workflow_dispatch" || "$CI_REF" != "refs/heads/main" ]]; then
-            exit 1
-          fi
-          if [[ "$CI_REPOSITORY" != "keeldock-platform/platform-ci" || "$CI_SERVER_URL" != "https://github.com" ]]; then
-            exit 1
-          fi
-          if [[ ! "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]; then
-            exit 1
-          fi
-          git init -q . 2>/dev/null
-          git config core.autocrlf false 2>/dev/null
-          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
-          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
-          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
-          actual_sha="$(git rev-parse --verify HEAD 2>/dev/null)"
-          if [[ "$actual_sha" != "$CI_SHA" ]]; then
-            exit 1
-          fi
-      - name: Check reviewed control tree
-        run: |
-          set -euo pipefail
-          python3 -B kit/bootstrap/test_policy.py
-          python3 -B kit/bootstrap/test_public_tree.py
-          python3 -B kit/confinement/test_linux_harness.py
-          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
-      - name: Run Linux synthetic confinement proof
-        run: |
-          set -euo pipefail
-          sudo -n -- env PYTHONDONTWRITEBYTECODE=1 python3 -B kit/confinement/linux_harness.py --control-sha "$CI_SHA"
 """
 
 
@@ -1377,64 +1271,6 @@ jobs:
 """
 
 
-WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE = """name: windows-native-preflight
-on:
-  workflow_dispatch:
-permissions: {}
-jobs:
-  windows-native-preflight:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
-    runs-on: windows-2025
-    timeout-minutes: 20
-    defaults:
-      run:
-        shell: pwsh
-    env:
-      CI_REPOSITORY: ${{ github.repository }}
-      CI_REF: ${{ github.ref }}
-      CI_SHA: ${{ github.sha }}
-      CI_SERVER_URL: ${{ github.server_url }}
-      CI_EVENT_NAME: ${{ github.event_name }}
-      CI_WORKSPACE: ${{ github.workspace }}
-    steps:
-      - name: Fetch reviewed main control
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          if ($env:CI_EVENT_NAME -ne 'workflow_dispatch' -or $env:CI_REF -ne 'refs/heads/main') { exit 1 }
-          if ($env:CI_REPOSITORY -ne 'keeldock-platform/platform-ci' -or $env:CI_SERVER_URL -ne 'https://github.com') { exit 1 }
-          if ($env:CI_SHA -notmatch '^[a-f0-9]{40}$') { exit 1 }
-          git init --quiet . 2>$null
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          git config core.autocrlf false 2>$null
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          git remote add origin "$($env:CI_SERVER_URL)/$($env:CI_REPOSITORY).git" 2>$null
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          git fetch --quiet --no-tags --depth=1 origin $env:CI_REF 2>$null
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          git checkout --quiet --detach FETCH_HEAD 2>$null
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          $actualSha = git rev-parse --verify HEAD 2>$null
-          if ($LASTEXITCODE -ne 0 -or $actualSha.Trim() -ne $env:CI_SHA) { exit 1 }
-      - name: Validate source-free control tree
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python -B kit/bootstrap/test_policy.py
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          python -B kit/bootstrap/test_public_tree.py
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          python -B kit/confinement/test_windows_native_preflight.py
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          python -B kit/bootstrap/check_candidate.py --root $env:CI_WORKSPACE --pool platform --sha $env:CI_SHA
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-      - name: Run source-free native diagnostic
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & kit/confinement/windows_native_preflight.ps1
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-"""
-
-
 CONSUMER_ACTION_PREFIX = "keeldock-platform/platform-ci/kit/bootstrap@"
 
 
@@ -1480,6 +1316,65 @@ FEEDBACK_RETURN_WORKFLOW_SHA256 = {
 }
 
 
+SHARED_WORKFLOW_KINDS = frozenset(
+    (
+        "public-policy",
+        "node-lock-smoke",
+        "development-feedback-smoke",
+        "macos-capability",
+        "macos-reviewed-build",
+        "macos-rust-toolchain-smoke",
+        "macos-cache-proof",
+        "macos-rules-bootstrap",
+        "macos-core-bootstrap",
+        "macos-core-contract",
+        "macos-source-reader",
+        "macos-rules-source-reader",
+    )
+) | frozenset(FEEDBACK_RETURN_WORKFLOW_SHA256)
+LANE_MODULES = (policy_linux, policy_windows, policy_handoff)
+LANE_DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
+
+
+def build_lane_registry(lane_modules, shared_kinds):
+    templates = {}
+    digests = {}
+    owners = {}
+    candidates = []
+    for module in lane_modules:
+        for table, target, is_digest in (
+            (module.WORKFLOW_TEMPLATES, templates, False),
+            (module.WORKFLOW_SHA256, digests, True),
+        ):
+            for kind, value in table.items():
+                if type(kind) is not str or type(value) is not str:
+                    raise PolicyError("workflow-registry")
+                if kind in shared_kinds or kind in owners:
+                    raise PolicyError("workflow-registry")
+                if is_digest and LANE_DIGEST_PATTERN.match(value) is None:
+                    raise PolicyError("workflow-registry")
+                target[kind] = value
+                owners[kind] = module
+        for path, kind, failure_code in module.CANDIDATE_WORKFLOWS:
+            if kind not in owners or owners[kind] is not module:
+                raise PolicyError("workflow-registry")
+            candidates.append((path, kind, failure_code))
+    return (
+        MappingProxyType(templates),
+        MappingProxyType(digests),
+        MappingProxyType(owners),
+        tuple(candidates),
+    )
+
+
+(
+    LANE_WORKFLOW_TEMPLATES,
+    LANE_WORKFLOW_SHA256,
+    WORKFLOW_KIND_LANES,
+    LANE_CANDIDATE_WORKFLOWS,
+) = build_lane_registry(LANE_MODULES, SHARED_WORKFLOW_KINDS)
+
+
 def validate_workflow_text(text, pool, workflow_kind="public-policy"):
     if type(text) is not str or type(pool) is not str or pool not in PUBLIC_POOLS:
         raise PolicyError("workflow-input")
@@ -1499,10 +1394,6 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         expected = NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE
-    elif workflow_kind == "linux-confinement":
-        if pool != "platform":
-            raise PolicyError("workflow-kind-pool")
-        expected = LINUX_CONFINEMENT_WORKFLOW_TEMPLATE
     elif workflow_kind == "macos-capability":
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
@@ -1543,10 +1434,16 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != expected_digest:
             raise PolicyError("workflow-template-mismatch")
         return True
-    elif workflow_kind == "windows-native-preflight":
+    elif workflow_kind in LANE_WORKFLOW_TEMPLATES:
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
-        expected = WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE
+        expected = LANE_WORKFLOW_TEMPLATES[workflow_kind]
+    elif workflow_kind in LANE_WORKFLOW_SHA256:
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != LANE_WORKFLOW_SHA256[workflow_kind]:
+            raise PolicyError("workflow-template-mismatch")
+        return True
     elif workflow_kind != "public-policy":
         raise PolicyError("workflow-kind")
     elif pool == "platform":

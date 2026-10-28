@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -30,11 +31,17 @@ from policy import (
     validate_workflow_text,
     verify_git_head,
 )
+import policy
+import policy_handoff
+import policy_linux
+import policy_windows
+from test_policy_handoff import *
+from test_policy_linux import *
+from test_policy_windows import *
 
 
 GOOD_SHA = "a" * 40
 PLATFORM_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/public-policy.yml"
-LINUX_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/linux-confinement.yml"
 MACOS_CAPABILITY_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-capability.yml"
 MACOS_REVIEWED_BUILD_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-reviewed-build.yml"
 MACOS_RUST_TOOLCHAIN_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/macos-rust-toolchain-smoke.yml"
@@ -48,7 +55,6 @@ NODE_LOCK_SMOKE_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workfl
 MACOS_CORE_BOOTSTRAP_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_core_bootstrap.py"
 MACOS_CACHE_CLIENT_ACTION = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/action.yml"
 MACOS_CACHE_CLIENT_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_cache_client/index.js"
-WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/windows-native-preflight.yml"
 PROBE_SOURCE = Path(__file__).resolve().parents[2] / "kit/confinement/macos_capability.py"
 PLATFORM_ACTION = Path(__file__).resolve().parent / "action.yml"
 
@@ -204,47 +210,6 @@ class WorkflowPolicyTests(unittest.TestCase):
                 self.assertNotEqual(changed, base)
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(changed, "platform", "node-lock-smoke")
-
-    def test_actual_linux_workflow_matches_closed_supported_shape(self):
-        workflow = LINUX_WORKFLOW.read_text(encoding="utf-8")
-        self.assertTrue(validate_workflow_text(workflow, "platform", "linux-confinement"))
-        static_lane, privileged_lane = workflow.split("  linux-confinement:\n", 1)
-        self.assertNotIn("sudo ", static_lane)
-        self.assertIn("needs: linux-policy", privileged_lane)
-        self.assertIn("github.event_name == 'workflow_dispatch'", privileged_lane)
-        self.assertIn("github.ref == 'refs/heads/main'", privileged_lane)
-        self.assertNotIn("inputs:", workflow)
-        self.assertIn('"$CI_REF" != "refs/heads/main"', privileged_lane)
-        self.assertIn('"$CI_REPOSITORY" != "keeldock-platform/platform-ci"', privileged_lane)
-        self.assertIn("CI_SHA: ${{ github.sha }}", privileged_lane)
-        self.assertIn('if [[ "$actual_sha" != "$CI_SHA" ]]', privileged_lane)
-        self.assertIn('git fetch --quiet --no-tags --depth=1 origin "$CI_REF"', privileged_lane)
-        with self.assertRaises(PolicyError):
-            validate_workflow_text(workflow, "connect", "linux-confinement")
-        with self.assertRaises(PolicyError):
-            validate_workflow_text(workflow, "platform")
-
-    def test_linux_workflow_rejects_skips_masking_extra_execution_and_weak_permissions(self):
-        base = LINUX_WORKFLOW.read_text(encoding="utf-8")
-        mutations = (
-            base.replace("      - name: Run Linux synthetic confinement proof\n", "      - name: Extra execution\n        run: echo extra\n      - name: Run Linux synthetic confinement proof\n"),
-            base.replace("      - name: Run Linux synthetic confinement proof\n        run: |", "      - name: Run Linux synthetic confinement proof\n        if: ${{ false }}\n        run: |"),
-            base.replace("      - name: Run Linux synthetic confinement proof\n", "      - name: Run Linux synthetic confinement proof\n        continue-on-error: true\n"),
-            base.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n"),
-            base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
-            base.replace("    timeout-minutes: 15\n", "    timeout-minutes: 0\n"),
-            base.replace("  pull_request:\n", "  pull_request:\n    branches: []\n"),
-            base + "  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",
-            base.replace("    needs: linux-policy\n", ""),
-            base.replace("github.ref == 'refs/heads/main'", "always()"),
-            base.replace('"$CI_REF" != "refs/heads/main"', '"$CI_REF" != "refs/heads/feature"'),
-            base.replace('"$CI_REPOSITORY" != "keeldock-platform/platform-ci"', '"$CI_REPOSITORY" != "fork/platform-ci"'),
-            base.replace("      - name: Run unprivileged source-free checks\n", "      - name: Run unprivileged source-free checks\n        run: sudo true\n"),
-        )
-        for index, changed in enumerate(mutations):
-            with self.subTest(mutation_index=index):
-                with self.assertRaises(PolicyError):
-                    validate_workflow_text(changed, "platform", "linux-confinement")
 
     def test_actual_macos_capability_workflow_matches_closed_manual_shape(self):
         workflow = MACOS_CAPABILITY_WORKFLOW.read_text(encoding="utf-8")
@@ -1265,56 +1230,6 @@ class WorkflowPolicyTests(unittest.TestCase):
             with self.assertRaises(PolicyError):
                 validate_workflow_text(changed, "platform", "macos-core-contract")
 
-    def test_actual_windows_native_preflight_matches_closed_manual_main_shape(self):
-        workflow = WINDOWS_NATIVE_PREFLIGHT_WORKFLOW.read_text(encoding="utf-8")
-        self.assertTrue(validate_workflow_text(workflow, "platform", "windows-native-preflight"))
-        self.assertIn("workflow_dispatch:", workflow)
-        self.assertIn("github.ref == 'refs/heads/main'", workflow)
-        self.assertIn("runs-on: windows-2025", workflow)
-        self.assertIn("permissions: {}", workflow)
-        self.assertIn("CI_WORKSPACE: ${{ github.workspace }}", workflow)
-        self.assertIn("git fetch --quiet --no-tags --depth=1 origin $env:CI_REF", workflow)
-        self.assertIn("$actualSha.Trim() -ne $env:CI_SHA", workflow)
-        self.assertIn("test_windows_native_preflight.py", workflow)
-        self.assertIn("windows_native_preflight.ps1", workflow)
-        for forbidden in (
-            "inputs:",
-            "secrets.",
-            "uses:",
-            "upload-artifact",
-            "download-artifact",
-            "attest",
-            "cache:",
-            "outputs:",
-            "contents: read",
-        ):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, workflow)
-        with self.assertRaises(PolicyError):
-            validate_workflow_text(workflow, "connect", "windows-native-preflight")
-        with self.assertRaises(PolicyError):
-            validate_workflow_text(workflow, "platform")
-
-    def test_windows_native_preflight_rejects_trigger_runner_and_execution_changes(self):
-        base = WINDOWS_NATIVE_PREFLIGHT_WORKFLOW.read_text(encoding="utf-8")
-        mutations = (
-            base.replace("  workflow_dispatch:\n", "  push:\n"),
-            base.replace("github.event_name == 'workflow_dispatch'", "github.event_name == 'push'"),
-            base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
-            base.replace("    runs-on: windows-2025\n", "    runs-on: windows-latest\n"),
-            base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
-            base.replace("      - name: Run source-free native diagnostic\n", ""),
-            base.replace("python -B kit/confinement/test_windows_native_preflight.py\n", ""),
-            base.replace("      - name: Validate source-free control tree\n", "      - name: Validate source-free control tree\n        continue-on-error: true\n"),
-            base.replace("git fetch --quiet --no-tags --depth=1 origin $env:CI_REF", "git fetch --quiet origin main"),
-            base.replace("$actualSha.Trim() -ne $env:CI_SHA", "$false"),
-            base + "  extra:\n    runs-on: windows-2025\n    steps: []\n",
-        )
-        for index, changed in enumerate(mutations):
-            with self.subTest(mutation_index=index):
-                with self.assertRaises(PolicyError):
-                    validate_workflow_text(changed, "platform", "windows-native-preflight")
-
     def test_actual_workflow_rejects_skips_masking_extra_execution_and_filters(self):
         base = self._platform_workflow()
         mutations = (
@@ -1422,6 +1337,157 @@ class WorkflowPolicyTests(unittest.TestCase):
             checked_out = (checkout / ".github/workflows/public-policy.yml").read_bytes()
             self.assertEqual(checked_out, expected)
             self.assertTrue(validate_workflow_text(checked_out.decode("utf-8"), "platform"))
+
+
+class LaneRegistryTests(unittest.TestCase):
+    def test_registry_is_a_fixed_static_set_of_the_three_lane_modules(self):
+        self.assertEqual(policy.LANE_MODULES, (policy_linux, policy_windows, policy_handoff))
+        self.assertIs(type(policy.LANE_MODULES), tuple)
+
+    def test_registry_maps_each_lane_kind_to_exactly_one_lane(self):
+        self.assertEqual(
+            {kind: module for kind, module in policy.WORKFLOW_KIND_LANES.items()},
+            {
+                "linux-confinement": policy_linux,
+                "windows-native-preflight": policy_windows,
+            },
+        )
+        self.assertEqual(
+            set(policy.LANE_WORKFLOW_TEMPLATES) | set(policy.LANE_WORKFLOW_SHA256),
+            set(policy.WORKFLOW_KIND_LANES),
+        )
+        self.assertFalse(set(policy.LANE_WORKFLOW_TEMPLATES) & set(policy.LANE_WORKFLOW_SHA256))
+
+    def test_lane_kinds_never_overlap_the_shared_kinds(self):
+        self.assertFalse(set(policy.WORKFLOW_KIND_LANES) & set(policy.SHARED_WORKFLOW_KINDS))
+        self.assertIn("public-policy", policy.SHARED_WORKFLOW_KINDS)
+        self.assertIn("node-lock-smoke", policy.SHARED_WORKFLOW_KINDS)
+        self.assertIn("macos-capability", policy.SHARED_WORKFLOW_KINDS)
+
+    def test_registry_views_are_read_only(self):
+        for view in (
+            policy.LANE_WORKFLOW_TEMPLATES,
+            policy.LANE_WORKFLOW_SHA256,
+            policy.WORKFLOW_KIND_LANES,
+        ):
+            with self.assertRaises(TypeError):
+                view["injected"] = "value"
+
+    def test_candidate_workflows_follow_lane_order(self):
+        self.assertEqual(
+            policy.LANE_CANDIDATE_WORKFLOWS,
+            (
+                (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
+                (
+                    ".github/workflows/windows-native-preflight.yml",
+                    "windows-native-preflight",
+                    "windows-workflow-too-large",
+                ),
+            ),
+        )
+
+    def test_every_lane_module_exposes_the_same_interface(self):
+        for module in policy.LANE_MODULES:
+            with self.subTest(module=module.__name__):
+                self.assertIsInstance(module.WORKFLOW_TEMPLATES, dict)
+                self.assertIsInstance(module.WORKFLOW_SHA256, dict)
+                self.assertIsInstance(module.CANDIDATE_WORKFLOWS, tuple)
+                self.assertFalse(hasattr(module, "PolicyError"))
+
+    def test_registry_construction_refuses_unsafe_lane_declarations(self):
+        def lane(templates=None, digests=None, candidates=()):
+            return types.SimpleNamespace(
+                WORKFLOW_TEMPLATES=templates or {},
+                WORKFLOW_SHA256=digests or {},
+                CANDIDATE_WORKFLOWS=candidates,
+            )
+
+        shared = policy.SHARED_WORKFLOW_KINDS
+        good_digest = "a" * 64
+        self.assertEqual(
+            policy.build_lane_registry((lane({"new-kind": "text"}),), shared)[0]["new-kind"],
+            "text",
+        )
+        refused = (
+            (lane({"public-policy": "text"}),),
+            (lane({"macos-capability": "text"}),),
+            (lane({"same-kind": "one"}), lane({"same-kind": "two"})),
+            (lane({"same-kind": "one"}, {"same-kind": good_digest}),),
+            (lane({1: "text"}),),
+            (lane({"new-kind": 1}),),
+            (lane(digests={"new-kind": "A" * 64}),),
+            (lane(digests={"new-kind": "a" * 63}),),
+            (lane(digests={"new-kind": good_digest + "\n"}),),
+            (lane({"new-kind": "text"}, candidates=(("path", "other-kind", "code"),)),),
+            (
+                lane({"new-kind": "text"}),
+                lane(candidates=(("path", "new-kind", "code"),)),
+            ),
+        )
+        for lanes in refused:
+            with self.subTest(lanes=repr(lanes)):
+                with self.assertRaisesRegex(PolicyError, "workflow-registry"):
+                    policy.build_lane_registry(lanes, shared)
+
+    def test_digest_lane_kinds_are_checked_by_hash_and_platform_pool(self):
+        text = "name: digest-lane\n"
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        with patch.object(
+            policy, "LANE_WORKFLOW_SHA256", {"digest-lane": digest}
+        ), patch.object(policy, "LANE_WORKFLOW_TEMPLATES", {}):
+            self.assertTrue(validate_workflow_text(text, "platform", "digest-lane"))
+            with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
+                validate_workflow_text(text + " ", "platform", "digest-lane")
+            with self.assertRaisesRegex(PolicyError, "workflow-kind-pool"):
+                validate_workflow_text(text, "connect", "digest-lane")
+
+    def test_unknown_workflow_kinds_are_still_refused(self):
+        for kind in ("unknown", "windows-handoff", "", "Linux-Confinement"):
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(PolicyError, "workflow-kind"):
+                    validate_workflow_text("name: x\n", "platform", kind)
+
+    def test_moved_templates_keep_their_pre_split_digests_through_the_shared_module(self):
+        self.assertEqual(
+            hashlib.sha256(policy.LINUX_CONFINEMENT_WORKFLOW_TEMPLATE.encode("utf-8")).hexdigest(),
+            "f7860a422e818f238232c395a100422ab32e5a6498737a8840d52a362b96b6ae",
+        )
+        self.assertEqual(
+            hashlib.sha256(policy.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE.encode("utf-8")).hexdigest(),
+            "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb",
+        )
+
+    def test_shared_kinds_keep_accepting_and_refusing_as_before(self):
+        root = Path(__file__).resolve().parents[2]
+        shared_files = {
+            "public-policy": ".github/workflows/public-policy.yml",
+            "node-lock-smoke": ".github/workflows/node-lock-smoke.yml",
+            "macos-capability": ".github/workflows/macos-capability.yml",
+            "macos-reviewed-build": ".github/workflows/macos-reviewed-build.yml",
+            "macos-rust-toolchain-smoke": ".github/workflows/macos-rust-toolchain-smoke.yml",
+            "macos-cache-proof": ".github/workflows/macos-cache-proof.yml",
+            "macos-source-reader": ".github/workflows/macos-source-reader-preflight.yml",
+            "macos-rules-source-reader": ".github/workflows/macos-rules-reader-preflight.yml",
+            "macos-rules-bootstrap": ".github/workflows/macos-rules-bootstrap.yml",
+            "macos-core-bootstrap": ".github/workflows/macos-core-bootstrap.yml",
+            "macos-core-contract": ".github/workflows/macos-core-contract.yml",
+            "development-feedback-smoke": ".github/workflows/development-feedback-smoke.yml",
+            "node-lock-return": ".github/workflows/node-lock-return.yml",
+            "core-rust-format-return": ".github/workflows/core-rust-format-return.yml",
+            "core-build-diagnostic-return": ".github/workflows/core-build-diagnostic-return.yml",
+        }
+        self.assertEqual(set(shared_files), set(policy.SHARED_WORKFLOW_KINDS))
+        for kind, relative in shared_files.items():
+            with self.subTest(kind=kind):
+                text = (root / relative).read_text(encoding="utf-8")
+                self.assertTrue(validate_workflow_text(text, "platform", kind))
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(text + "\n", "platform", kind)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(text, "connect", kind)
+                for lane_kind in policy.WORKFLOW_KIND_LANES:
+                    with self.assertRaises(PolicyError):
+                        validate_workflow_text(text, "platform", lane_kind)
 
 
 class PublicResultTests(unittest.TestCase):
