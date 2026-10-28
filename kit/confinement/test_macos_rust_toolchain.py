@@ -281,6 +281,29 @@ class RustToolchainContractTests(unittest.TestCase):
         self.assertEqual(timed_out.exception.reason, "cleanup_incomplete")
         self.assertEqual(timed_out.exception.command_check, "timeout")
 
+        for check, classes, expected_check, expected_classes in (
+            ("probe_process_survivor", ("helper_trust",), "probe_process_survivor", ("helper_trust",)),
+            ("probe_process_timeout", (), "probe_process_timeout", ()),
+            ("probe_process_census", (), "probe_process_census", ()),
+            ("untrusted-private-check", ("python",), None, ("python",)),
+            ("probe_process_survivor", ["python"], "probe_process_survivor", ()),
+            ("probe_process_survivor", ("x" * 33,), "probe_process_survivor", ()),
+            (None, None, None, ()),
+        ):
+            failure = ProbeFailure(cleanup_complete=False, command_check="helper_failure")
+            failure.check = check
+            failure.survivor_classes = classes
+            with self.subTest(check=check, classes=classes), self.assertRaises(rust.Refusal) as classified:
+                invoke(error=failure)
+            self.assertEqual(classified.exception.reason, "cleanup_incomplete")
+            self.assertEqual(classified.exception.probe_check, expected_check)
+            self.assertEqual(classified.exception.survivor_classes, expected_classes)
+
+        with self.assertRaises(rust.Refusal) as unclassified:
+            invoke(error=ProbeFailure(cleanup_complete=False, command_check="timeout"))
+        self.assertIsNone(unclassified.exception.probe_check)
+        self.assertEqual(unclassified.exception.survivor_classes, ())
+
         with self.assertRaises(rust.Refusal) as smoke_failed:
             invoke(result=SimpleNamespace(returncode=9, stdout=b"", stderr=b""), stage="smoke")
         self.assertEqual(smoke_failed.exception.reason, "smoke_failed")

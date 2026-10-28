@@ -391,6 +391,46 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(empty.diagnostic, "none")
         self.assertEqual(unclassified.diagnostic, "unavailable")
 
+    def test_source_gates_cleanup_diagnostics_are_a_closed_member_set(self):
+        classes = (
+            "python", "ps", "developer_shim", "helper_preferences", "helper_notifications",
+            "helper_launch_services", "helper_security", "helper_trust", "helper_containers",
+            "apple_system_path", "other", "unknown", "additional",
+        )
+        expected = frozenset("source_gates_survivor_" + name for name in classes) | frozenset((
+            "source_gates_survivor_multiple", "source_gates_timeout", "source_gates_census",
+            "source_gates_group_cleanup", "source_gates_capture_cleanup", "source_gates_restore",
+            "source_gates_cleanup_unclassified", "source_gates_wait_uncertain",
+        ))
+        self.assertEqual(subject.SOURCE_GATES_CLEANUP_DIAGNOSTICS, expected)
+        self.assertTrue(expected <= subject.DIAGNOSTICS)
+        self.assertTrue(expected <= subject.DETAILED_DIAGNOSTICS)
+        self.assertNotIn("source_gates_survivor_private", subject.DIAGNOSTICS)
+
+    def test_source_gates_survivor_classes_match_the_census_class_order(self):
+        import macos_capability
+
+        self.assertEqual(subject.SOURCE_GATES_SURVIVOR_CLASSES, tuple(macos_capability.SURVIVOR_CLASS_ORDER))
+
+    def test_node_cleanup_refusal_carries_only_a_listed_source_gates_diagnostic(self):
+        for diagnostic in sorted(subject.SOURCE_GATES_CLEANUP_DIAGNOSTICS):
+            error = SimpleNamespace(reason="cleanup_incomplete", cleanup_diagnostic=diagnostic)
+            with self.subTest(diagnostic=diagnostic):
+                refusal = subject._toolchain_refusal(error, "worker_setup")
+                self.assertEqual((refusal.reason, refusal.stage), ("cleanup_incomplete", "cleanup"))
+                self.assertEqual(refusal.diagnostic, diagnostic)
+                attached = subject._FailureDiagnostics().attach(refusal, "source_gates")
+                self.assertEqual(attached.diagnostic, diagnostic)
+                self.assertEqual((attached.reason, attached.stage), ("cleanup_incomplete", "cleanup"))
+        for unlisted in ("source_gates_survivor_private", "source_gates", "worker_cleanup", 7, None):
+            error = SimpleNamespace(reason="cleanup_incomplete", cleanup_diagnostic=unlisted)
+            with self.subTest(unlisted=unlisted):
+                refusal = subject._toolchain_refusal(error, "worker_setup")
+                self.assertEqual((refusal.reason, refusal.stage), ("cleanup_incomplete", "cleanup"))
+                self.assertEqual(refusal.diagnostic, "unavailable")
+                attached = subject._FailureDiagnostics().attach(refusal, "source_gates")
+                self.assertEqual(attached.diagnostic, "source_gates")
+
     def test_summary_guard_detail_requires_exact_rules_refusal_and_known_check(self):
         class RulesRefusal(Exception):
             def __init__(self, reason, stage, diagnostic):

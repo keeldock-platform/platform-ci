@@ -411,6 +411,18 @@ CORE_CONTRACT_GATE_DIAGNOSTICS = frozenset((
 CORE_CONTRACT_GATE_STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
 ))
+CORE_CONTRACT_SOURCE_GATES_SURVIVOR_CLASSES = (
+    "python", "ps", "developer_shim", "helper_preferences", "helper_notifications",
+    "helper_launch_services", "helper_security", "helper_trust", "helper_containers",
+    "apple_system_path", "other", "unknown", "additional",
+)
+CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS = frozenset(
+    "source_gates_survivor_" + category for category in CORE_CONTRACT_SOURCE_GATES_SURVIVOR_CLASSES
+) | frozenset((
+    "source_gates_survivor_multiple", "source_gates_timeout", "source_gates_census",
+    "source_gates_group_cleanup", "source_gates_capture_cleanup", "source_gates_restore",
+    "source_gates_cleanup_unclassified", "source_gates_wait_uncertain",
+))
 CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "none", "unavailable", "load_controls", "review_binding", "host_preflight",
     "temp_root_check", "smoke_receipt", "token_input", "token_revocation",
@@ -439,7 +451,7 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
 )) | (
     CORE_CONTRACT_RUNTIME_DIAGNOSTICS | CORE_CONTRACT_FETCH_DIAGNOSTICS
     | CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS | CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS
-    | CORE_CONTRACT_GATE_DIAGNOSTICS
+    | CORE_CONTRACT_GATE_DIAGNOSTICS | CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS
 )
 CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS = frozenset((
     "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",
@@ -1616,7 +1628,8 @@ def _core_contract_refusal_value(payload):
     if (value["diagnostic"] == "none"
             and value["stage"] not in {"arguments", "context", "host"}):
         _fail("capture_invalid")
-    if (value["diagnostic"] in CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS
+    if (value["diagnostic"] in (
+            CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS | CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS)
             and (value["stage"] != "cleanup" or value["reason"] != "cleanup_incomplete")):
         _fail("capture_invalid")
     if not _core_contract_refusal_diagnostic_matches(value):

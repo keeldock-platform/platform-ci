@@ -166,6 +166,18 @@ PRIVILEGE_PROBE_CHECK_DIAGNOSTICS = {
     "probe_process_survivor": "worker_privilege_probe_survivor",
     "probe_process_timeout": "worker_privilege_probe_timeout",
 }
+SOURCE_GATES_SURVIVOR_CLASSES = (
+    "python", "ps", "developer_shim", "helper_preferences", "helper_notifications",
+    "helper_launch_services", "helper_security", "helper_trust", "helper_containers",
+    "apple_system_path", "other", "unknown", "additional",
+)
+SOURCE_GATES_CLEANUP_DIAGNOSTICS = frozenset(
+    "source_gates_survivor_" + category for category in SOURCE_GATES_SURVIVOR_CLASSES
+) | frozenset((
+    "source_gates_survivor_multiple", "source_gates_timeout", "source_gates_census",
+    "source_gates_group_cleanup", "source_gates_capture_cleanup", "source_gates_restore",
+    "source_gates_cleanup_unclassified", "source_gates_wait_uncertain",
+))
 CLEANUP_DIAGNOSTICS = frozenset((
     "cleanup_lease", "cleanup_storage", "cleanup_worker", "cleanup_summary",
     "cleanup_summary_census", "cleanup_summary_present", "cleanup_summary_present_python",
@@ -176,7 +188,7 @@ CLEANUP_DIAGNOSTICS = frozenset((
     "cleanup_summary_present_helper_containers", "cleanup_summary_present_apple_system_path",
     "cleanup_summary_probe", "cleanup_summary_restore", "cleanup_summary_close", "cleanup_dash",
     "cleanup_unknown",
-))
+)) | SOURCE_GATES_CLEANUP_DIAGNOSTICS
 DIAGNOSTICS = (
     OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | SOURCE_RUNTIME_DIAGNOSTICS
     | SOURCE_FETCH_DIAGNOSTICS | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
@@ -1017,6 +1029,9 @@ def _make_directory(prefix, mode):
 def _toolchain_refusal(error, stage):
     reason = getattr(error, "reason", None)
     if reason == "cleanup_incomplete":
+        diagnostic = getattr(error, "cleanup_diagnostic", None)
+        if type(diagnostic) is str and diagnostic in SOURCE_GATES_CLEANUP_DIAGNOSTICS:
+            return Refusal("cleanup_incomplete", "cleanup", diagnostic=diagnostic)
         return Refusal("cleanup_incomplete", "cleanup")
     if reason == "capture_invalid":
         return Refusal("capture_invalid", stage)

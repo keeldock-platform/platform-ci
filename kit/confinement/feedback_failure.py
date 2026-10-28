@@ -41,6 +41,10 @@ REASONS = getattr(_CORE_CONTRACT, "REASONS", frozenset())
 STAGES = getattr(_CORE_CONTRACT, "STAGES", frozenset())
 DIAGNOSTICS = getattr(_CORE_CONTRACT, "DIAGNOSTICS", frozenset())
 NO_OPERATION_STAGES = getattr(_CORE_CONTRACT, "NO_OPERATION_STAGES", frozenset())
+CLEANUP_BOUND_DIAGNOSTICS = (
+    getattr(_CORE_CONTRACT, "SOURCE_GATES_CLEANUP_DIAGNOSTICS", frozenset())
+    | frozenset(getattr(_CORE_CONTRACT, "PRIVILEGE_PROBE_CHECK_DIAGNOSTICS", {}).values())
+)
 
 
 def _unique_object(pairs):
@@ -82,7 +86,9 @@ def _parse_refusal(raw):
             or type(record["reason"]) is not str or record["reason"] not in REASONS
             or type(record["stage"]) is not str or record["stage"] not in STAGES
             or type(record["diagnostic"]) is not str or record["diagnostic"] not in DIAGNOSTICS
-            or record["diagnostic"] == "none" and record["stage"] not in NO_OPERATION_STAGES):
+            or record["diagnostic"] == "none" and record["stage"] not in NO_OPERATION_STAGES
+            or record["diagnostic"] in CLEANUP_BOUND_DIAGNOSTICS
+            and (record["stage"] != "cleanup" or record["reason"] != "cleanup_incomplete")):
         return None
     return record
 
