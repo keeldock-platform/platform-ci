@@ -200,7 +200,7 @@ function Invoke-Download($item) {
             [void]$response.EnsureSuccessStatusCode()
             $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
             $file = [IO.File]::Create($target)
-            $stream.CopyToAsync($file, 81920, $cancel.Token).GetAwaiter().GetResult()
+            [void]$stream.CopyToAsync($file, 81920, $cancel.Token).GetAwaiter().GetResult()
             break
         } catch {
             if ($attempt -ge 2) { throw 'download_failed' }
@@ -212,7 +212,7 @@ function Invoke-Download($item) {
             $cancel.Dispose()
         }
     }
-    return $target
+    return [string]$target
 }
 
 function Assert-Sha256([string]$path, [string]$expected, [string]$name) {
