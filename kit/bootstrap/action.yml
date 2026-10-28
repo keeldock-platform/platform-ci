@@ -107,4 +107,6 @@ runs:
         else
           exit 1
         fi
-        "$python_bin" -B "$CI_ACTION_PATH/api_budget.py" --shadow --ledger "$CI_RATE_LEDGER_PATH" --budgets "$CI_WORKSPACE/ci/api-budgets.json"
+        if ! "$python_bin" -B "$CI_ACTION_PATH/api_budget.py" --shadow --ledger "$CI_RATE_LEDGER_PATH" --budgets "$CI_WORKSPACE/ci/api-budgets.json"; then
+          printf '%s\n' 'ci.rate-budget=unavailable code=reporter-failed'
+        fi

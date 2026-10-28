@@ -5,7 +5,8 @@ from collections import deque
 from pathlib import Path
 
 
-MAX_DOCUMENT_BYTES = 262144
+MAX_BUDGET_BYTES = 262144
+MAX_LEDGER_BYTES = 8388608
 WINDOW_SECONDS = 3600
 SCOPE_NAMES = frozenset((
     "repository_token", "source_reader", "settings_auditor", "source_auditor", "pin_writer"
@@ -33,8 +34,8 @@ def _reject_constant(value):
     raise BudgetError("invalid-number")
 
 
-def _strict_json(payload):
-    if type(payload) is not bytes or len(payload) > MAX_DOCUMENT_BYTES:
+def _strict_json(payload, maximum_bytes):
+    if type(payload) is not bytes or len(payload) > maximum_bytes:
         raise BudgetError("document-size")
     try:
         text = payload.decode("ascii")
@@ -94,13 +95,13 @@ def validate_budget_document(document):
 def load_budget_document(path):
     try:
         with Path(path).open("rb") as source:
-            payload = source.read(MAX_DOCUMENT_BYTES + 1)
+            payload = source.read(MAX_BUDGET_BYTES + 1)
     except OSError:
         raise BudgetError("budget-unavailable")
-    return validate_budget_document(_strict_json(payload))
+    return validate_budget_document(_strict_json(payload, MAX_BUDGET_BYTES))
 
 
-def _validate_ledger(document, budget):
+def _validate_ledger(document, budget, shadow=False):
     if not _has_fields(
         document,
         ("schema_version", "complete", "repository", "round_id", "watchers", "requests"),
@@ -121,6 +122,7 @@ def _validate_ledger(document, budget):
     if len(watchers) > 10000 or len(requests) > 100000:
         raise BudgetError("ledger-count")
     watched = {}
+    violations = set()
     for watcher in watchers:
         if not _has_fields(watcher, ("run_id", "interval_seconds")):
             raise BudgetError("watcher-entry-schema")
@@ -128,9 +130,13 @@ def _validate_ledger(document, budget):
         if not _is_integer(run_id, 1) or run_id in watched:
             raise BudgetError("watcher-run")
         interval = watcher["interval_seconds"]
-        if (not _is_integer(interval, 1)
-                or interval < budget["watcher"]["minimum_interval_seconds"]):
+        if not _is_integer(interval, 1):
             raise BudgetError("watcher-interval")
+        if interval < budget["watcher"]["minimum_interval_seconds"]:
+            if shadow:
+                violations.add("watcher-interval")
+            else:
+                raise BudgetError("watcher-interval")
         watched[run_id] = interval
     if requests and not watchers:
         raise BudgetError("watcher-missing")
@@ -221,24 +227,39 @@ def _validate_ledger(document, budget):
                 window.popleft()
             window.append(timestamp)
             if len(window) > scope_limits["per_hour"]:
-                raise BudgetError("hour-budget-exceeded")
+                if shadow:
+                    violations.add("hour-budget-exceeded")
+                else:
+                    raise BudgetError("hour-budget-exceeded")
 
         rate_key = (authority, resource)
         previous = rate_snapshots.get(rate_key)
         if previous is not None:
             previous_reset, previous_limit, previous_remaining = previous
             if reset < previous_reset or (reset == previous_reset and limit != previous_limit):
-                raise BudgetError("rate-limit-changed")
+                if shadow:
+                    violations.add("rate-limit-changed")
+                else:
+                    raise BudgetError("rate-limit-changed")
             if reset != previous_reset and timestamp < previous_reset:
-                raise BudgetError("rate-window-changed-early")
+                if shadow:
+                    violations.add("rate-window-changed-early")
+                else:
+                    raise BudgetError("rate-window-changed-early")
             if reset == previous_reset and remaining > previous_remaining:
-                raise BudgetError("rate-limit-increased")
+                if shadow:
+                    violations.add("rate-limit-increased")
+                else:
+                    raise BudgetError("rate-limit-increased")
         rate_snapshots[rate_key] = (reset, limit, remaining)
 
         pause_key = authority
         resume_at = paused_until.get(pause_key)
         if resume_at is not None and timestamp < resume_at:
-            raise BudgetError("request-before-reset")
+            if shadow:
+                violations.add("request-before-reset")
+            else:
+                raise BudgetError("request-before-reset")
         if resume_at is not None and timestamp >= resume_at:
             del paused_until[pause_key]
         if status == 403:
@@ -254,22 +275,23 @@ def _validate_ledger(document, budget):
         "requests_per_run": requests_per_run,
         "requests_per_workflow": requests_per_workflow,
         "resume_at": tuple(sorted(set(paused_until.values()))),
+        "violations": tuple(sorted(violations)),
     }
 
 
-def check_api_budget(ledger, budget):
+def check_api_budget(ledger, budget, shadow=False):
     validated_budget = validate_budget_document(budget)
-    return _validate_ledger(ledger, validated_budget)
+    return _validate_ledger(ledger, validated_budget, shadow=shadow)
 
 
-def check_api_budget_files(ledger_path, budget_path):
+def check_api_budget_files(ledger_path, budget_path, shadow=False):
     budget = load_budget_document(budget_path)
     try:
         with Path(ledger_path).open("rb") as source:
-            payload = source.read(MAX_DOCUMENT_BYTES + 1)
+            payload = source.read(MAX_LEDGER_BYTES + 1)
     except OSError:
         raise BudgetError("ledger-unavailable")
-    return check_api_budget(_strict_json(payload), budget)
+    return check_api_budget(_strict_json(payload, MAX_LEDGER_BYTES), budget, shadow=shadow)
 
 
 def main(argv=None):
@@ -279,8 +301,11 @@ def main(argv=None):
     parser.add_argument("--shadow", action="store_true")
     arguments = parser.parse_args(argv)
     try:
-        report = check_api_budget_files(arguments.ledger, arguments.budgets)
+        report = check_api_budget_files(arguments.ledger, arguments.budgets, shadow=arguments.shadow)
     except BudgetError as error:
+        if arguments.shadow:
+            print("ci.rate-budget=unavailable code=" + error.code)
+            return 0
         print("ci.rate-budget=refused code=" + error.code)
         return 1
     if arguments.shadow:
@@ -291,6 +316,16 @@ def main(argv=None):
             print("ci.rate-budget=run run=%d requests=%d" % (run_id, count))
         for workflow, count in sorted(report["requests_per_workflow"].items()):
             print("ci.rate-budget=workflow workflow=%s requests=%d" % (workflow, count))
+        for violation in report["violations"]:
+            print("ci.rate-budget=violation code=" + violation)
+        if report["resume_at"]:
+            print("ci.rate-budget=paused pending-resets=%d resume-after=%d" % (
+                len(report["resume_at"]), max(report["resume_at"]),
+            ))
+        print("ci.rate-budget=shadow-complete violations=%d pending-resets=%d" % (
+            len(report["violations"]), len(report["resume_at"]),
+        ))
+        return 0
     if report["resume_at"]:
         print(
             "ci.rate-budget=paused requests=%d runs=%d workflows=%d pending-resets=%d resume-after=%d"

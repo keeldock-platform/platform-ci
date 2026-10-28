@@ -5,7 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from api_budget import BudgetError, check_api_budget, check_api_budget_files, load_budget_document, main
+from api_budget import (
+    MAX_BUDGET_BYTES,
+    MAX_LEDGER_BYTES,
+    BudgetError,
+    check_api_budget,
+    check_api_budget_files,
+    load_budget_document,
+    main,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -57,6 +65,22 @@ def ledger(requests, watchers=None):
         ],
         "requests": requests,
     }
+
+
+def hourly_requests():
+    requests = []
+    for index in range(1001):
+        entry = request(
+            "r%d" % index,
+            run_id=10 + index // 100,
+            workflow="workflow-%d" % (index // 100),
+            timestamp=1000 + index,
+            credential_id="token-a" if index % 2 else "token-b",
+        )
+        entry["rate_limit"]["limit"] = 5000
+        entry["rate_limit"]["remaining"] = 5000 - index
+        requests.append(entry)
+    return requests
 
 
 class BudgetDocumentTests(unittest.TestCase):
@@ -115,19 +139,17 @@ class RequestLedgerTests(unittest.TestCase):
         self.assertEqual(report["requests"], 0)
         self.assertEqual(report["runs"], 0)
 
+    def test_shadow_collects_watcher_and_header_violations_with_counts(self):
+        value = ledger([
+            request("r1", remaining=9),
+            request("r2", timestamp=1001, remaining=10),
+        ], watchers=[{"run_id": 10, "interval_seconds": 250}])
+        report = check_api_budget(value, budget_document(), shadow=True)
+        self.assertEqual(report["requests"], 2)
+        self.assertEqual(report["violations"], ("rate-limit-increased", "watcher-interval"))
+
     def test_repository_hour_cap_aggregates_token_ids_across_runs_and_workflows(self):
-        requests = []
-        for index in range(1001):
-            entry = request(
-                "r%d" % index,
-                run_id=10 + index // 100,
-                workflow="workflow-%d" % (index // 100),
-                timestamp=1000 + index,
-                credential_id="token-a" if index % 2 else "token-b",
-            )
-            entry["rate_limit"]["limit"] = 5000
-            entry["rate_limit"]["remaining"] = 5000 - index
-            requests.append(entry)
+        requests = hourly_requests()
         self.assertEqual(check_api_budget(ledger(requests[:1000]), budget_document())["requests"], 1000)
         with self.assertRaisesRegex(BudgetError, "hour-budget-exceeded"):
             check_api_budget(ledger(requests), budget_document())
@@ -202,7 +224,92 @@ class SerializedInputTests(unittest.TestCase):
         self.assertIn("ci.rate-budget=run run=10 requests=1", output.getvalue())
         self.assertIn("ci.rate-budget=workflow workflow=public-policy requests=1", output.getvalue())
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="ascii")
-        self.assertIn("--shadow --ledger \"$CI_RATE_LEDGER_PATH\"", action)
+        self.assertIn("if ! \"$python_bin\" -B \"$CI_ACTION_PATH/api_budget.py\" --shadow", action)
+        self.assertIn("--ledger \"$CI_RATE_LEDGER_PATH\"", action)
+        self.assertIn("ci.rate-budget=unavailable code=reporter-failed", action)
+
+    def test_serialized_hour_boundary_reports_violation_without_shadow_failure(self):
+        requests = hourly_requests()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            budget_path = root / "budgets.json"
+            budget_path.write_bytes(json.dumps(budget_document()).encode("ascii"))
+            ledger_path = root / "ledger.json"
+            accepted = json.dumps(ledger(requests[:1000])).encode("ascii")
+            self.assertGreater(len(accepted), MAX_BUDGET_BYTES)
+            self.assertLessEqual(len(accepted), MAX_LEDGER_BYTES)
+            ledger_path.write_bytes(accepted)
+            self.assertEqual(check_api_budget_files(ledger_path, budget_path)["requests"], 1000)
+            exceeded = json.dumps(ledger(requests)).encode("ascii")
+            self.assertLessEqual(len(exceeded), MAX_LEDGER_BYTES)
+            ledger_path.write_bytes(exceeded)
+            with self.assertRaisesRegex(BudgetError, "hour-budget-exceeded"):
+                check_api_budget_files(ledger_path, budget_path)
+            strict_output = io.StringIO()
+            with contextlib.redirect_stdout(strict_output):
+                strict_result = main(["--ledger", str(ledger_path),
+                                      "--budgets", str(budget_path)])
+            self.assertEqual(strict_result, 1)
+            self.assertEqual(strict_output.getvalue(),
+                             "ci.rate-budget=refused code=hour-budget-exceeded\n")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = main(["--shadow", "--ledger", str(ledger_path),
+                               "--budgets", str(budget_path)])
+        self.assertEqual(result, 0)
+        self.assertIn("ci.rate-budget=shadow round=round-1 requests=1001", output.getvalue())
+        self.assertIn("ci.rate-budget=violation code=hour-budget-exceeded", output.getvalue())
+        self.assertIn("ci.rate-budget=shadow-complete violations=1 pending-resets=0",
+                      output.getvalue())
+
+    def test_shadow_pending_reset_and_early_request_report_without_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            budget_path = root / "budgets.json"
+            budget_path.write_bytes(json.dumps(budget_document()).encode("ascii"))
+            ledger_path = root / "ledger.json"
+            ledger_path.write_bytes(json.dumps(ledger([
+                request("r1", status_code=403, remaining=0, reset=1500),
+            ])).encode("ascii"))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = main(["--shadow", "--ledger", str(ledger_path),
+                               "--budgets", str(budget_path)])
+            self.assertEqual(result, 0)
+            self.assertIn("ci.rate-budget=shadow round=round-1 requests=1", output.getvalue())
+            self.assertIn("ci.rate-budget=paused pending-resets=1 resume-after=1500",
+                          output.getvalue())
+            strict_output = io.StringIO()
+            with contextlib.redirect_stdout(strict_output):
+                strict_result = main(["--ledger", str(ledger_path),
+                                      "--budgets", str(budget_path)])
+            self.assertEqual(strict_result, 2)
+            self.assertIn("ci.rate-budget=paused requests=1", strict_output.getvalue())
+            ledger_path.write_bytes(json.dumps(ledger([
+                request("r1", status_code=403, remaining=0, reset=1500),
+                request("r2", timestamp=1499, remaining=0, reset=1500),
+            ])).encode("ascii"))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = main(["--shadow", "--ledger", str(ledger_path),
+                               "--budgets", str(budget_path)])
+        self.assertEqual(result, 0)
+        self.assertIn("ci.rate-budget=shadow round=round-1 requests=2", output.getvalue())
+        self.assertIn("ci.rate-budget=violation code=request-before-reset", output.getvalue())
+
+    def test_shadow_invalid_ledger_is_unavailable_without_gating(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            budget_path = root / "budgets.json"
+            budget_path.write_bytes(json.dumps(budget_document()).encode("ascii"))
+            ledger_path = root / "ledger.json"
+            ledger_path.write_bytes(b"{")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = main(["--shadow", "--ledger", str(ledger_path),
+                               "--budgets", str(budget_path)])
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "ci.rate-budget=unavailable code=document-invalid\n")
 
     def test_strict_budget_json_rejects_duplicate_nonfinite_and_non_ascii(self):
         invalid = (
