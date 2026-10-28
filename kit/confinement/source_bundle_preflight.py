@@ -1,8 +1,16 @@
-"""Bound a Git bundle before a privileged Git parser sees its objects."""
+"""Bound a Git bundle before a privileged Git parser sees its objects.
+
+The caller must enforce hard process-tree wall and CPU ceilings from BundleLimits,
+the 512 MiB aggregate memory ceiling, and the scratch-disk ceiling. Local clock
+checks are cooperative: neither a blocking stream read nor filesystem I/O can
+be interrupted here. A stream passed to preflight must have bounded read(n):
+each call returns promptly within the remaining wall budget, yields at most n
+bytes, and signals EOF with b"". The caller's outer boundary must cover the
+entire call, including stream reads and temporary-file cleanup.
+"""
 
 import hashlib
 import io
-import re
 import tempfile
 import time
 import zlib
@@ -15,7 +23,7 @@ HEADER_LINE_BYTES = 4096
 HEADER_BYTES = 8 * 1024 * 1024
 OBJECT_TYPES = {1: "commit", 2: "tree", 3: "blob", 4: "tag"}
 HEX_BYTES = frozenset(b"0123456789abcdef")
-REF_PATTERN = re.compile(rb"(?:HEAD|refs/[A-Za-z0-9._/-]+)\Z")
+REF_FORBIDDEN_BYTES = frozenset(b" ~^:?*[\\")
 REFUSAL_REASONS = frozenset((
     "input-invalid", "input-size-limit", "input-error", "bundle-header-invalid",
     "pack-header-invalid", "object-count-limit", "object-type-invalid",
@@ -98,10 +106,12 @@ def _spool(source, target, limits, deadline):
     elif hasattr(source, "read"):
         def stream_blocks():
             while True:
+                deadline.check()
                 try:
                     block = source.read(CHUNK_BYTES)
                 except Exception:
                     _refuse("input-error")
+                deadline.check()
                 if type(block) is not bytes or len(block) > CHUNK_BYTES:
                     _refuse("input-invalid")
                 if not block:
@@ -137,6 +147,19 @@ def _header_line(source):
 
 def _hex_id(raw, size):
     return len(raw) == size and all(byte in HEX_BYTES for byte in raw)
+
+
+def _valid_ref_name(name):
+    if name == b"HEAD":
+        return True
+    if not name.startswith(b"refs/") or name.endswith((b"/", b".")):
+        return False
+    if b".." in name or b"//" in name or b"@{" in name:
+        return False
+    if any(byte < 32 or byte == 127 or byte in REF_FORBIDDEN_BYTES for byte in name):
+        return False
+    return all(part and not part.startswith(b".") and not part.endswith(b".lock")
+               for part in name.split(b"/"))
 
 
 def _bundle_header(source, limits, deadline):
@@ -196,9 +219,7 @@ def _bundle_header(source, limits, deadline):
         if not _hex_id(value[:id_size], id_size):
             _refuse("bundle-header-invalid")
         name = value[id_size + 1:]
-        if REF_PATTERN.fullmatch(name) is None or b".." in name or b"//" in name:
-            _refuse("bundle-header-invalid")
-        if name.endswith(b"/") or name.endswith(b"."):
+        if not _valid_ref_name(name):
             _refuse("bundle-header-invalid")
         if name in ref_names:
             _refuse("bundle-header-invalid")
@@ -517,18 +538,21 @@ def _parse(bundle, objects, limits, input_size, bundle_sha256, deadline):
         pending = remaining
     if not ref_ids.issubset(ids):
         _refuse("bundle-header-invalid")
+    deadline.check()
     return Accepted(count, inflated, expanded, bundle_sha256)
 
 
 def preflight(source, limits=BundleLimits()) -> PreflightResult:
-    """Inspect every packed object and return an accepted record or fixed refusal."""
+    """Inspect packed objects under the caller-enforced hard resource boundary."""
     try:
         if not _limits_valid(limits):
             _refuse("input-invalid")
         deadline = _Deadline(limits)
         with tempfile.TemporaryFile() as bundle, tempfile.TemporaryFile() as objects:
             input_size, bundle_sha256 = _spool(source, bundle, limits, deadline)
-            return _parse(bundle, objects, limits, input_size, bundle_sha256, deadline)
+            result = _parse(bundle, objects, limits, input_size, bundle_sha256, deadline)
+        deadline.check()
+        return result
     except _Refusal as error:
         return Refused(error.reason if error.reason in REFUSAL_REASONS else "internal-error")
     except KeyboardInterrupt:
