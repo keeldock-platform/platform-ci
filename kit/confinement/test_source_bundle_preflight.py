@@ -228,6 +228,18 @@ class SourceBundlePreflightTests(unittest.TestCase):
         unterminated = _bundle((b"\xb0",))[:-20]
         self.assert_refusal(unterminated, "truncated")
 
+    def test_pack_size_varint_last_permitted_byte(self):
+        limits = replace(subject.BundleLimits(), max_blob_bytes=1 << 80)
+        at_limit = _object_header(3, 1 << 60)
+        one_past = _object_header(3, 1 << 67)
+        self.assertEqual(len(at_limit), 10)
+        self.assertEqual(len(one_past), 11)
+        self.assertEqual(subject._object_header(io.BytesIO(at_limit), hashlib.sha1(), limits),
+                         (3, 1 << 60))
+        with self.assertRaises(subject._Refusal) as refused:
+            subject._object_header(io.BytesIO(one_past), hashlib.sha1(), limits)
+        self.assertEqual(refused.exception.reason, "object-size-limit")
+
     def test_inflated_object_exceeding_declared_size_refuses(self):
         raw = _bundle((_entry(3, b"abcde", declared=4),))
         limits = replace(subject.BundleLimits(), max_blob_bytes=4)
@@ -286,6 +298,17 @@ class SourceBundlePreflightTests(unittest.TestCase):
         for instructions in (b"\x01\x80", b"\x01" + b"\x80" * 11 + b"\x00"):
             with self.subTest(instructions=instructions):
                 self.assert_refusal(_offset_delta(b"a", instructions), "object-invalid")
+
+    def test_delta_size_varint_last_permitted_byte(self):
+        at_limit = _varint(1 << 70)
+        one_past = _varint(1 << 77)
+        self.assertEqual(len(at_limit), 11)
+        self.assertEqual(len(one_past), 12)
+        deadline = subject._Deadline(subject.BundleLimits())
+        self.assertEqual(subject._read_varint(io.BytesIO(at_limit), deadline), 1 << 70)
+        with self.assertRaises(subject._Refusal) as refused:
+            subject._read_varint(io.BytesIO(one_past), deadline)
+        self.assertEqual(refused.exception.reason, "object-invalid")
 
     def test_delta_result_expansion_passes_at_limit_and_refuses_one_more(self):
         base = _entry(3, b"a" * 6)
