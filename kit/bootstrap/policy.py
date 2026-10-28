@@ -1314,6 +1314,7 @@ FEEDBACK_RETURN_WORKFLOW_SHA256 = {
     'core-rust-format-return': '5ac5147ad14a7948320b7cdf90be19ccfca8ac57045139ee38558ecd4c5863ca',
     'core-build-diagnostic-return': 'a667f3ca1bf73458eb39585d694eb443f5971cbe856a0b7ff49f9d7c24ed6ab4',
 }
+ATTESTATION_PROBE_WORKFLOW_SHA256 = '804d5bf224067808374c42886e615723ab1b1d77716463a3990391c812976e3e'
 
 
 SHARED_WORKFLOW_KINDS = frozenset(
@@ -1321,6 +1322,7 @@ SHARED_WORKFLOW_KINDS = frozenset(
         "public-policy",
         "node-lock-smoke",
         "development-feedback-smoke",
+        "attestation-probe",
         "macos-capability",
         "macos-reviewed-build",
         "macos-rust-toolchain-smoke",
@@ -1388,6 +1390,12 @@ def validate_workflow_text(text, pool, workflow_kind="public-policy"):
         if pool != "platform":
             raise PolicyError("workflow-kind-pool")
         if hashlib.sha256(text.encode("utf-8")).hexdigest() != DEVELOPMENT_FEEDBACK_SMOKE_WORKFLOW_SHA256:
+            raise PolicyError("workflow-template-mismatch")
+        return True
+    if workflow_kind == "attestation-probe":
+        if pool != "platform":
+            raise PolicyError("workflow-kind-pool")
+        if hashlib.sha256(text.encode("utf-8")).hexdigest() != ATTESTATION_PROBE_WORKFLOW_SHA256:
             raise PolicyError("workflow-template-mismatch")
         return True
     if workflow_kind == "node-lock-smoke":
