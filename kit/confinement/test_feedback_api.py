@@ -710,7 +710,7 @@ class FeedbackAPIProviderShapeTests(unittest.TestCase):
             self._collect()
 
     def test_duplicate_request_history_is_refused(self):
-        self.api.duplicate_history = [{
+        self.api.history_records = self.api.history_records + [{
             "id": 8124,
             "run_attempt": 1,
             "display_title": feedback_api.RUN_TITLE_PREFIX + self.request["request_id"],
