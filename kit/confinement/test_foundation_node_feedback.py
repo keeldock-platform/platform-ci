@@ -20,7 +20,7 @@ CONTROL_SHA = "c" * 40
 DIFF_SHA = "d" * 64
 NODE_OPTIONS_EXPECTED = (
     "--import=data:text/javascript;base64,"
-    "T2JqZWN0LmRlZmluZVByb3BlcnR5KHByb2Nlc3MsInRpdGxlIix7dmFsdWU6cHJvY2Vzcy50aXRsZSx3cml0YWJsZTp0cnVlLGNvbmZpZ3VyYWJsZTp0cnVlLGVudW1lcmFibGU6dHJ1ZX0pOw=="
+    "bGV0IGtkVGl0bGUgPSBTdHJpbmcocHJvY2Vzcy50aXRsZSk7T2JqZWN0LmRlZmluZVByb3BlcnR5KHByb2Nlc3MsInRpdGxlIix7Z2V0KCl7cmV0dXJuIGtkVGl0bGU7fSxzZXQodmFsdWUpe2tkVGl0bGUgPSBTdHJpbmcodmFsdWUpO30sY29uZmlndXJhYmxlOnRydWUsZW51bWVyYWJsZTp0cnVlfSk7"
 )
 
 

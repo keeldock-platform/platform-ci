@@ -18,8 +18,8 @@ REGISTRY_URL = "https://registry.npmjs.org/"
 AUDIT_ENDPOINT = "npm-bulk-advisory-v1"
 USER_CONFIG_NAME = "npm-user-empty.npmrc"
 GLOBAL_CONFIG_NAME = "npm-global-empty.npmrc"
-NODE_TITLE_MODULE_SOURCE = 'Object.defineProperty(process,"title",{value:process.title,writable:true,configurable:true,enumerable:true});'
-NODE_OPTIONS_VALUE = "--import=data:text/javascript;base64,T2JqZWN0LmRlZmluZVByb3BlcnR5KHByb2Nlc3MsInRpdGxlIix7dmFsdWU6cHJvY2Vzcy50aXRsZSx3cml0YWJsZTp0cnVlLGNvbmZpZ3VyYWJsZTp0cnVlLGVudW1lcmFibGU6dHJ1ZX0pOw=="
+NODE_TITLE_MODULE_SOURCE = 'let kdTitle = String(process.title);Object.defineProperty(process,"title",{get(){return kdTitle;},set(value){kdTitle = String(value);},configurable:true,enumerable:true});'
+NODE_OPTIONS_VALUE = "--import=data:text/javascript;base64,bGV0IGtkVGl0bGUgPSBTdHJpbmcocHJvY2Vzcy50aXRsZSk7T2JqZWN0LmRlZmluZVByb3BlcnR5KHByb2Nlc3MsInRpdGxlIix7Z2V0KCl7cmV0dXJuIGtkVGl0bGU7fSxzZXQodmFsdWUpe2tkVGl0bGUgPSBTdHJpbmcodmFsdWUpO30sY29uZmlndXJhYmxlOnRydWUsZW51bWVyYWJsZTp0cnVlfSk7"
 EMPTY_CONFIG_BYTES = b"\n"
 MAX_LOCK_BYTES = 4 * 1024 * 1024 - 64 * 1024
 MAX_REQUEST_BYTES = 6 * 1024 * 1024

@@ -265,7 +265,7 @@ class MacOSNodeContractTests(unittest.TestCase):
             self.assertEqual(entry["env"]["NODE_OPTIONS"], subject.NODE_OPTIONS_VALUE)
 
     def test_fixed_title_option_decodes_to_the_exact_module_source(self):
-        source = 'Object.defineProperty(process,"title",{value:process.title,writable:true,configurable:true,enumerable:true});'
+        source = 'let kdTitle = String(process.title);Object.defineProperty(process,"title",{get(){return kdTitle;},set(value){kdTitle = String(value);},configurable:true,enumerable:true});'
         self.assertEqual(subject.NODE_TITLE_MODULE_SOURCE, source)
         prefix = "--import=data:text/javascript;base64,"
         self.assertTrue(subject.NODE_OPTIONS_VALUE.startswith(prefix))

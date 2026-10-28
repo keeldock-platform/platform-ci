@@ -293,15 +293,13 @@ function contractConstant(name, quote) {
 }
 
 const titleProbeSource = [
-  'const descriptor = Object.getOwnPropertyDescriptor(process, "title");',
-  'const kind = "value" in descriptor ? "data" : "accessor";',
   'process.title = "kd-title-probe";',
   'const short = String(process.title);',
   'process.title = "k".repeat(4096);',
-  'process.stdout.write(JSON.stringify({ kind, short, length: String(process.title).length }));',
+  'process.stdout.write(JSON.stringify({ short, length: String(process.title).length }));',
 ].join('\n');
 
-test('the fixed Node title option makes process.title a plain data property before the main script runs', () => {
+test('the fixed Node title option keeps long process.title values intact in a script main entry', () => {
   const option = contractConstant('NODE_OPTIONS_VALUE', '"');
   const source = contractConstant('NODE_TITLE_MODULE_SOURCE', "'");
   const prefix = '--import=data:text/javascript;base64,';
@@ -325,11 +323,13 @@ test('the fixed Node title option makes process.title a plain data property befo
     assert.equal(fixed.error, undefined);
     assert.equal(fixed.status, 0);
     assert.equal(fixed.stderr, '');
-    assert.deepEqual(JSON.parse(fixed.stdout), { kind: 'data', short: 'kd-title-probe', length: 4096 });
+    assert.deepEqual(JSON.parse(fixed.stdout), { short: 'kd-title-probe', length: 4096 });
     const control = run(baseEnvironment);
     assert.equal(control.error, undefined);
     assert.equal(control.status, 0);
-    assert.equal(JSON.parse(control.stdout).kind, 'accessor');
+    if (process.platform === 'linux' || process.platform === 'darwin') {
+      assert.ok(JSON.parse(control.stdout).length < 4096);
+    }
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
