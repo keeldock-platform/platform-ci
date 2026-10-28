@@ -132,14 +132,19 @@ console.log('kd-node-summary passed=' + passed + ' failed=' + failed);
 process.exitCode = failed === 0 ? 0 : 1;
 '@
 
+function Write-Line([string]$text) {
+    [Console]::Out.WriteLine($text)
+}
+
 function Get-CleanText([string]$text, [int]$limit) {
     $value = [string]$text
     foreach ($item in $script:Redactions) {
         if (-not [string]::IsNullOrEmpty($item) -and $item.Length -gt 3) {
-            $value = [regex]::Replace($value, [regex]::Escape($item), '<path>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            $value = [regex]::Replace($value, [regex]::Escape($item), 'ROOT', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
         }
     }
-    $value = [regex]::Replace($value, '[^\x20-\x7e\r\n\t]', '?')
+    $value = $value.Replace("`r", '')
+    $value = [regex]::Replace($value, '[^A-Za-z0-9 ._=/,\n-]', '?')
     if ($value.Length -gt $limit) { $value = $value.Substring(0, $limit) }
     return $value
 }
@@ -155,7 +160,7 @@ function Write-DiagLines([string]$stage, [string]$stream, [string]$text) {
     foreach ($line in ($clean -split "`n")) {
         $trimmed = $line.TrimEnd()
         if ($trimmed.Length -gt 0) {
-            Write-Output ('kd-diag stage=' + $stage + ' stream=' + $stream + ' line=' + $trimmed)
+            Write-Line ('kd-diag stage=' + $stage + ' stream=' + $stream + ' line=' + $trimmed)
         }
     }
 }
@@ -184,10 +189,10 @@ function Invoke-Download($item) {
     while ($true) {
         $attempt += 1
         try {
-            Invoke-WebRequest -Uri $item.Url -OutFile $target -MaximumRedirection 5 -TimeoutSec 300
+            Invoke-WebRequest -Uri $item.Url -OutFile $target -MaximumRedirection 5 -TimeoutSec 90
             break
         } catch {
-            if ($attempt -ge 3) { throw 'download_failed' }
+            if ($attempt -ge 2) { throw 'download_failed' }
             Start-Sleep -Seconds (5 * $attempt)
         }
     }
@@ -214,7 +219,7 @@ function Assert-Sri([string]$path, [string]$sri, [string]$name) {
 function Invoke-Tar([string]$archive, [string]$destination) {
     New-Item -ItemType Directory -Path $destination | Out-Null
     $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
-    & $tar -xzf $archive -C $destination
+    & $tar -xzf $archive -C $destination | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'tar_failed' }
 }
 
@@ -244,26 +249,36 @@ function Get-SidRules([string]$path, [string]$sid) {
     return @($rules | Where-Object { $_.IdentityReference.Value -eq $sid })
 }
 
+function New-ScratchSet([string]$root) {
+    return @{
+        Root = $root
+        Tmp = (Join-Path $root 'tmp')
+        Profile = (Join-Path $root 'profile')
+        CargoHome = (Join-Path $root 'cargo-home')
+        Crate = (Join-Path $root 'crate')
+    }
+}
+
 function Test-Acl {
     $sid = $script:Sid
     $writeMask = [System.Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteAttributes, WriteExtendedAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
     $readMask = [System.Security.AccessControl.FileSystemRights]'ReadAndExecute'
     $ro = @(Get-SidRules $script:Layout.ReadOnly $sid)
     if ($ro.Count -ne 1 -or ($ro[0].FileSystemRights -band $writeMask) -ne 0 -or ($ro[0].FileSystemRights -band $readMask) -ne $readMask -or $ro[0].AccessControlType -ne 'Allow') { return 'ro_rule' }
-    $scratch = @(Get-SidRules $script:Layout.Scratch $sid)
+    $scratch = @(Get-SidRules $script:Lpac.Root $sid)
     $modifyMask = [System.Security.AccessControl.FileSystemRights]'Modify'
     if ($scratch.Count -ne 1 -or ($scratch[0].FileSystemRights -band $modifyMask) -ne $modifyMask -or $scratch[0].AccessControlType -ne 'Allow') { return 'scratch_rule' }
-    foreach ($path in @($script:Layout.Downloads, $script:Layout.Base)) {
+    foreach ($path in @($script:Layout.Downloads, $script:Layout.Base, $script:Control.Root, $script:Control.Tmp, $script:Control.Crate)) {
         if (@(Get-SidRules $path $sid).Count -ne 0) { return 'unexpected_rule' }
     }
     foreach ($path in @(($script:Layout.RustBin + '\rustc.exe'), ($script:Layout.MsvcBin + '\link.exe'), ($script:Layout.NodeDir + '\node.exe'), $script:Layout.LightningcssBinding, $script:Layout.RolldownBinding, $script:Layout.NodeTest)) {
         if (@(Get-SidRules $path $sid).Count -lt 1) { return 'not_inherited' }
     }
-    if (@(Get-SidRules $script:Layout.Tmp $sid).Count -lt 1) { return 'scratch_not_inherited' }
+    if (@(Get-SidRules $script:Lpac.Tmp $sid).Count -lt 1) { return 'scratch_not_inherited' }
     return 'verified'
 }
 
-function New-StageEnvironment([string]$targetName) {
+function New-StageEnvironment([hashtable]$scratch, [string]$targetName) {
     $layout = $script:Layout
     $searchPath = @($layout.RustBin, $layout.NodeDir, $layout.MsvcBin, (Join-Path $env:SystemRoot 'System32'), $env:SystemRoot) -join ';'
     return [string[]]@(
@@ -272,13 +287,13 @@ function New-StageEnvironment([string]$targetName) {
         ('SystemDrive=' + $env:SystemDrive),
         ('ComSpec=' + (Join-Path $env:SystemRoot 'System32\cmd.exe')),
         ('PATH=' + $searchPath),
-        ('TEMP=' + $layout.Tmp),
-        ('TMP=' + $layout.Tmp),
-        ('USERPROFILE=' + $layout.Profile),
-        ('APPDATA=' + $layout.Profile),
-        ('LOCALAPPDATA=' + $layout.Profile),
-        ('CARGO_HOME=' + $layout.CargoHome),
-        ('CARGO_TARGET_DIR=' + (Join-Path $layout.Scratch $targetName)),
+        ('TEMP=' + $scratch.Tmp),
+        ('TMP=' + $scratch.Tmp),
+        ('USERPROFILE=' + $scratch.Profile),
+        ('APPDATA=' + $scratch.Profile),
+        ('LOCALAPPDATA=' + $scratch.Profile),
+        ('CARGO_HOME=' + $scratch.CargoHome),
+        ('CARGO_TARGET_DIR=' + (Join-Path $scratch.Root $targetName)),
         ('CARGO_INCREMENTAL=0'),
         ('CARGO_NET_OFFLINE=true'),
         ('CARGO_BUILD_JOBS=2'),
@@ -292,35 +307,38 @@ function New-StageEnvironment([string]$targetName) {
     )
 }
 
-function Get-StageSpecs([bool]$confined) {
+function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
     $layout = $script:Layout
     $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
-    $cargoManifest = Join-Path $layout.Crate 'Cargo.toml'
+    $cargoManifest = Join-Path $scratch.Crate 'Cargo.toml'
     $specs = @()
     if ($confined) {
-        $specs += @{ Name = 'cmd_exec'; Exe = $cmd; Arguments = '/d /c echo kd-lpac-cmd'; Timeout = 60; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'kd-lpac-cmd' } }
-        $specs += @{ Name = 'acl_ro_read'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.RustBin); Timeout = 60; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'rustc\.exe' } }
-        $specs += @{ Name = 'acl_scratch_write'; Exe = $cmd; Arguments = ('/d /c copy /y nul ' + $layout.Tmp + '\kd_write.txt'); Timeout = 60; Check = { param($r) $r.ExitCode -eq 0 -and (Test-Path -LiteralPath ($script:Layout.Tmp + '\kd_write.txt')) } }
-        $specs += @{ Name = 'acl_downloads_denied'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.Downloads); Timeout = 60; Check = { param($r) $r.ExitCode -ne 0 } }
+        $specs += @{ Name = 'cmd_exec'; Exe = $cmd; Arguments = '/d /c echo kd-lpac-cmd'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'kd-lpac-cmd' } }
+        $specs += @{ Name = 'acl_ro_read'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.RustBin); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'rustc\.exe' } }
+        $specs += @{ Name = 'acl_scratch_write'; Exe = $cmd; Arguments = ('/d /c copy /y nul ' + $scratch.Tmp + '\kd_write.txt'); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and (Test-Path -LiteralPath ($script:Lpac.Tmp + '\kd_write.txt')) } }
+        $specs += @{ Name = 'acl_ro_write_denied'; Exe = $cmd; Arguments = ('/d /c copy /y nul ' + $layout.ReadOnly + '\kd_write_probe.txt'); Timeout = 30; Check = { param($r) $r.ExitCode -ne 0 -and (($r.Stdout + $r.Stderr) -match 'Access is denied') -and -not (Test-Path -LiteralPath ($script:Layout.ReadOnly + '\kd_write_probe.txt')) } }
+        $specs += @{ Name = 'acl_downloads_denied'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.Downloads); Timeout = 30; Check = { param($r) $r.ExitCode -ne 0 -and (($r.Stdout + $r.Stderr) -match 'Access is denied') } }
+    } else {
+        $specs += @{ Name = 'acl_downloads_listable'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.Downloads); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'rustc\.tar\.gz' } }
     }
-    $specs += @{ Name = 'rustc_version'; Exe = ($layout.RustBin + '\rustc.exe'); Arguments = '--version --verbose'; Timeout = 60; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match '(?m)^rustc 1\.99\.1 ' -and $r.Stdout -match '(?m)^host: x86_64-pc-windows-msvc' } }
-    $specs += @{ Name = 'cargo_version'; Exe = ($layout.RustBin + '\cargo.exe'); Arguments = '--version'; Timeout = 60; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match '(?m)^cargo (0\.100\.0|1\.99\.[01]) ' } }
-    $specs += @{ Name = 'link_banner'; Exe = ($layout.MsvcBin + '\link.exe'); Arguments = '/?'; Timeout = 60; Check = { param($r) $r.Stdout -match 'Incremental Linker' } }
-    $specs += @{ Name = 'rust_build'; Exe = ($layout.RustBin + '\cargo.exe'); Arguments = ('build --offline --manifest-path ' + $cargoManifest); Timeout = 420; Check = { param($r) $r.ExitCode -eq 0 } }
-    $specs += @{ Name = 'rust_test'; Exe = ($layout.RustBin + '\cargo.exe'); Arguments = ('test --offline --manifest-path ' + $cargoManifest); Timeout = 420; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'test result: ok\. 1 passed; 0 failed' } }
-    $specs += @{ Name = 'node_version'; Exe = ($layout.NodeDir + '\node.exe'); Arguments = '--version'; Timeout = 60; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout.Trim() -eq 'v24.22.1' } }
-    $specs += @{ Name = 'node_bindings'; Exe = ($layout.NodeDir + '\node.exe'); Arguments = $layout.NodeTest; Timeout = 90; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'kd-node-summary passed=4 failed=0' } }
+    $specs += @{ Name = 'rustc_version'; Exe = ($layout.RustBin + '\rustc.exe'); Arguments = '--version --verbose'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match '(?m)^rustc 1\.99\.1 ' -and $r.Stdout -match '(?m)^host: x86_64-pc-windows-msvc' } }
+    $specs += @{ Name = 'cargo_version'; Exe = ($layout.RustBin + '\cargo.exe'); Arguments = '--version'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match '(?m)^cargo (0\.100\.0|1\.99\.[01]) ' } }
+    $specs += @{ Name = 'link_banner'; Exe = ($layout.MsvcBin + '\link.exe'); Arguments = '/?'; Timeout = 30; Check = { param($r) $r.Stdout -match 'Incremental Linker' } }
+    $specs += @{ Name = 'rust_build'; Exe = ($layout.RustBin + '\cargo.exe'); Arguments = ('build --offline --manifest-path ' + $cargoManifest); Timeout = 240; Check = { param($r) $r.ExitCode -eq 0 } }
+    $specs += @{ Name = 'rust_test'; Exe = ($layout.RustBin + '\cargo.exe'); Arguments = ('test --offline --manifest-path ' + $cargoManifest); Timeout = 240; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'test result: ok\. 1 passed; 0 failed' } }
+    $specs += @{ Name = 'node_version'; Exe = ($layout.NodeDir + '\node.exe'); Arguments = '--version'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout.Trim() -eq 'v24.22.1' } }
+    $specs += @{ Name = 'node_bindings'; Exe = ($layout.NodeDir + '\node.exe'); Arguments = $layout.NodeTest; Timeout = 60; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'kd-node-summary passed=4 failed=0' } }
     return $specs
 }
 
-function Invoke-Ladder($sandbox, [bool]$confined) {
+function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
     $outcomes = [ordered]@{}
     $targetName = 'target-control'
     if ($confined) { $targetName = 'target-lpac' }
-    $environment = New-StageEnvironment $targetName
-    foreach ($spec in (Get-StageSpecs $confined)) {
+    $environment = New-StageEnvironment $scratch $targetName
+    foreach ($spec in (Get-StageSpecs $confined $scratch)) {
         $commandLine = '"' + $spec.Exe + '" ' + $spec.Arguments
-        $result = $sandbox.Run($confined, $spec.Exe, $commandLine, $script:Layout.Scratch, $environment, ([int]$spec.Timeout * 1000), [uint32]32)
+        $result = $sandbox.Run($confined, $spec.Exe, $commandLine, $scratch.Root, $environment, ([int]$spec.Timeout * 1000), [uint32]32)
         $passed = $false
         if ($result.Failure -eq '' -and $result.Exited -and -not $result.TimedOut) {
             $passed = [bool](& $spec.Check $result)
@@ -331,26 +349,28 @@ function Invoke-Ladder($sandbox, [bool]$confined) {
         $failureText = Get-Token $result.Failure '^[a-z_]{0,24}$'
         $verdict = 'failed'
         if ($passed) { $verdict = 'ok' }
-        Write-Output ('windows-confinement-stage=' + $spec.Name + ' confined=' + $confined.ToString().ToLowerInvariant() + ' result=' + $verdict + ' exit=' + $exitText + ' status=' + (Get-StatusName ([uint32]$result.ExitCode)) + ' ms=' + $result.ElapsedMs + ' timed_out=' + $result.TimedOut.ToString().ToLowerInvariant() + ' failure=' + $failureText + ' create_error=' + $result.CreateError + ' job=' + $jobText + ' token=' + $tokenText)
+        Write-Line ('windows-confinement-stage=' + $spec.Name + ' confined=' + $confined.ToString().ToLowerInvariant() + ' result=' + $verdict + ' exit=' + $exitText + ' status=' + (Get-StatusName ([uint32]$result.ExitCode)) + ' ms=' + $result.ElapsedMs + ' timed_out=' + $result.TimedOut.ToString().ToLowerInvariant() + ' failure=' + $failureText + ' create_error=' + $result.CreateError + ' job=' + $jobText + ' token=' + $tokenText)
         if (-not $passed) {
             if ($result.Detail) { Write-DiagLines $spec.Name 'detail' $result.Detail }
             Write-DiagLines $spec.Name 'stdout' $result.Stdout
             Write-DiagLines $spec.Name 'stderr' $result.Stderr
         } else {
             $firstLine = ($result.Stdout -split "`n" | Where-Object { $_.Trim().Length -gt 0 } | Select-Object -First 1)
-            if ($firstLine) { Write-Output ('kd-diag stage=' + $spec.Name + ' stream=first line=' + (Get-CleanText $firstLine.Trim() 160)) }
+            if ($firstLine) { Write-Line ('kd-diag stage=' + $spec.Name + ' stream=first line=' + (Get-CleanText $firstLine.Trim() 160)) }
         }
-        $outcomes[$spec.Name] = @{ Passed = $passed; Job = ($jobText -like 'assigned*'); Token = ($tokenText -like 'appcontainer=1*') }
+        $lpacProven = ($tokenText -like 'appcontainer=1,*') -and ($tokenText -like '*,lpac=1,*') -and ($tokenText -like '*,sid=match,*') -and ($tokenText -like '*,aap=absent')
+        $outcomes[$spec.Name] = @{ Passed = $passed; Job = ($jobText -like 'assigned,*'); Token = $lpacProven; Stdout = [string]$result.Stdout }
     }
     return $outcomes
 }
+
 
 try {
     if (-not [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([Runtime.InteropServices.OSPlatform]::Windows)) { throw 'platform' }
     $phase = 'runtime'
     [void](Add-Type -Path (Join-Path $PSScriptRoot 'windows_confinement.cs') -ErrorAction Stop)
     if ($Mode -eq 'compile') {
-        Write-Output 'windows-confinement-compile=observed result=compiled'
+        Write-Line 'windows-confinement-compile=observed result=compiled'
         $exitCode = 0
     } else {
         $phase = 'control_identity'
@@ -383,7 +403,7 @@ try {
             if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw 'msvc_layout' }
         }
         if (-not (Test-Path -LiteralPath (Join-Path $msvcBinSource 'link.exe'))) { throw 'msvc_layout' }
-        Write-Output ('windows-confinement-image=recorded image_os=' + $imageOs + ' image_version=' + $imageVersion + ' vs_version=' + (Get-Token ([string]$vsVersion) '^[0-9.]{1,32}$') + ' msvc_version=' + (Get-Token $msvcVersion '^[0-9.]{1,32}$') + ' sdk_version=' + (Get-Token $sdkVersion '^[0-9.]{1,32}$') + ' os_build=' + (Get-Token ([Environment]::OSVersion.Version.ToString()) '^[0-9.]{1,32}$') + ' powershell=' + (Get-Token $PSVersionTable.PSVersion.ToString() '^[0-9A-Za-z.-]{1,32}$'))
+        Write-Line ('windows-confinement-image=recorded image_os=' + $imageOs + ' image_version=' + $imageVersion + ' vs_version=' + (Get-Token ([string]$vsVersion) '^[0-9.]{1,32}$') + ' msvc_version=' + (Get-Token $msvcVersion '^[0-9.]{1,32}$') + ' sdk_version=' + (Get-Token $sdkVersion '^[0-9.]{1,32}$') + ' os_build=' + (Get-Token ([Environment]::OSVersion.Version.ToString()) '^[0-9.]{1,32}$') + ' powershell=' + (Get-Token $PSVersionTable.PSVersion.ToString() '^[0-9A-Za-z.-]{1,32}$'))
 
         $phase = 'workspace_prepare'
         $baseDirectory = Join-Path $env:RUNNER_TEMP ('kd-confinement-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -393,8 +413,9 @@ try {
             Base = $baseDirectory
             Downloads = (Join-Path $baseDirectory 'dl')
             ReadOnly = (Join-Path $baseDirectory 'ro')
-            Scratch = (Join-Path $baseDirectory 'scratch')
         }
+        $script:Lpac = New-ScratchSet (Join-Path $baseDirectory 'scratch')
+        $script:Control = New-ScratchSet (Join-Path $baseDirectory 'control')
         $layout = $script:Layout
         $layout.RustPrefix = Join-Path $layout.ReadOnly 'rust'
         $layout.RustBin = Join-Path $layout.RustPrefix 'bin'
@@ -406,13 +427,9 @@ try {
         $layout.NpmDir = Join-Path $layout.ReadOnly 'npm'
         $layout.TestDir = Join-Path $layout.ReadOnly 'tests'
         $layout.NodeTest = Join-Path $layout.TestDir 'kd_bindings.test.mjs'
-        $layout.Tmp = Join-Path $layout.Scratch 'tmp'
-        $layout.Profile = Join-Path $layout.Scratch 'profile'
-        $layout.CargoHome = Join-Path $layout.Scratch 'cargo-home'
-        $layout.Crate = Join-Path $layout.Scratch 'crate'
         $layout.LightningcssBinding = Join-Path $layout.NpmDir 'lightningcss.node'
         $layout.RolldownBinding = Join-Path $layout.NpmDir 'rolldown.node'
-        foreach ($directory in @($layout.Base, $layout.Downloads, $layout.ReadOnly, $layout.Scratch)) {
+        foreach ($directory in @($layout.Base, $layout.Downloads, $layout.ReadOnly, $script:Lpac.Root, $script:Control.Root)) {
             New-Item -ItemType Directory -Path $directory | Out-Null
         }
 
@@ -422,25 +439,24 @@ try {
 
         $phase = 'acl_grant'
         Grant-Access $layout.ReadOnly $script:Sid 'ReadAndExecute, Synchronize' $true
-        Grant-Access $layout.Scratch $script:Sid 'Modify, Synchronize' $true
+        Grant-Access $script:Lpac.Root $script:Sid 'Modify, Synchronize' $true
         $ancestors = 0
         $ancestorFailures = 0
-        $parent = Split-Path -Parent $layout.Base
-        while ($parent) {
-            try {
-                Grant-Access $parent $script:Sid 'ReadAttributes, Synchronize' $false
-                $ancestors += 1
-            } catch {
-                $ancestorFailures += 1
-            }
-            $next = Split-Path -Parent $parent
-            if (-not $next -or $next -eq $parent) { break }
-            $parent = $next
+        try {
+            Grant-Access (Split-Path -Parent $layout.Base) $script:Sid 'ReadAttributes, Synchronize' $false
+            $ancestors += 1
+        } catch {
+            $ancestorFailures += 1
         }
-        foreach ($directory in @($layout.Tmp, $layout.Profile, $layout.CargoHome, $layout.Crate, (Join-Path $layout.Crate 'src'), $layout.RustPrefix, $layout.NodeDir, $layout.NpmDir, $layout.TestDir)) {
+        foreach ($set in @($script:Lpac, $script:Control)) {
+            foreach ($directory in @($set.Tmp, $set.Profile, $set.CargoHome, $set.Crate, (Join-Path $set.Crate 'src'))) {
+                New-Item -ItemType Directory -Force -Path $directory | Out-Null
+            }
+        }
+        foreach ($directory in @($layout.RustPrefix, $layout.NodeDir, $layout.NpmDir, $layout.TestDir)) {
             New-Item -ItemType Directory -Force -Path $directory | Out-Null
         }
-        Write-Output ('windows-confinement-acl=granted ro=read_execute scratch=modify ancestors_read_attributes=' + $ancestors + ' ancestors_failed=' + $ancestorFailures)
+        Write-Line ('windows-confinement-acl=granted ro=read_execute scratch=modify ancestors_read_attributes=' + $ancestors + ' ancestors_failed=' + $ancestorFailures)
 
         $phase = 'fetch'
         foreach ($item in ($Downloads + @($NodeDownload))) {
@@ -451,7 +467,7 @@ try {
             $path = Invoke-Download $item
             Assert-Sri $path $item.Sri $item.Name
         }
-        Write-Output 'windows-confinement-fetch=verified rust_components=3 node=1 npm_bindings=2'
+        Write-Line 'windows-confinement-fetch=verified rust_components=3 node=1 npm_bindings=2'
 
         $phase = 'stage_rust'
         foreach ($item in $Downloads) {
@@ -495,18 +511,20 @@ try {
         $phase = 'stage_sources'
         $hash = [string][char]35
         $encoding = New-Object System.Text.UTF8Encoding($false)
-        [IO.File]::WriteAllText((Join-Path $layout.Crate 'Cargo.toml'), $CargoManifestText, $encoding)
-        [IO.File]::WriteAllText((Join-Path $layout.Crate 'src\lib.rs'), $RustSourceText.Replace('KDHASH', $hash).Replace("`r`n", "`n"), $encoding)
+        foreach ($set in @($script:Lpac, $script:Control)) {
+            [IO.File]::WriteAllText((Join-Path $set.Crate 'Cargo.toml'), $CargoManifestText, $encoding)
+            [IO.File]::WriteAllText((Join-Path $set.Crate 'src\lib.rs'), $RustSourceText.Replace('KDHASH', $hash).Replace("`r`n", "`n"), $encoding)
+        }
         [IO.File]::WriteAllText($layout.NodeTest, $NodeTestText.Replace("`r`n", "`n"), $encoding)
 
         $phase = 'acl_readback'
         $aclState = Test-Acl
-        Write-Output ('windows-confinement-acl=' + $aclState)
+        Write-Line ('windows-confinement-acl=' + $aclState)
         if ($aclState -ne 'verified') { throw 'acl_readback' }
 
         $phase = 'ladder'
-        $confinedOutcomes = Invoke-Ladder $box $true
-        $controlOutcomes = Invoke-Ladder $box $false
+        $controlOutcomes = Invoke-Ladder $box $false $script:Control
+        $confinedOutcomes = Invoke-Ladder $box $true $script:Lpac
 
         $firstFailure = 'none'
         foreach ($key in $confinedOutcomes.Keys) {
@@ -520,16 +538,18 @@ try {
         if ($controlOutcomes['rust_build'].Passed -and $controlOutcomes['rust_test'].Passed) { $controlRust = 'compiled' }
         $controlNode = 'failed'
         if ($controlOutcomes['node_version'].Passed -and $controlOutcomes['node_bindings'].Passed) { $controlNode = 'ran' }
+        $cssTransform = 'failed'
+        if ($confinedOutcomes['node_bindings'].Stdout -match 'name=minifies_a_stylesheet result=pass') { $cssTransform = 'ok' }
         $aclNegative = 'denied'
-        if (-not $confinedOutcomes['acl_downloads_denied'].Passed) { $aclNegative = 'readable' }
+        if (-not ($confinedOutcomes['acl_downloads_denied'].Passed -and $confinedOutcomes['acl_ro_write_denied'].Passed -and $controlOutcomes['acl_downloads_listable'].Passed)) { $aclNegative = 'failed' }
         $jobState = 'verified'
         $tokenState = 'verified'
         foreach ($key in $confinedOutcomes.Keys) {
             if (-not $confinedOutcomes[$key].Job) { $jobState = 'unverified' }
             if (-not $confinedOutcomes[$key].Token) { $tokenState = 'unverified' }
         }
-        Write-Output ('windows-confinement-spike=observed rust=' + $rust + ' node=' + $node + ' first_failure=' + $firstFailure + ' lpac=' + $tokenState + ' job=' + $jobState + ' acl=' + $aclState + ' acl_negative=' + $aclNegative + ' control_rust=' + $controlRust + ' control_node=' + $controlNode)
-        if ($rust -eq 'compiled' -and $node -eq 'ran' -and $firstFailure -eq 'none' -and $jobState -eq 'verified' -and $tokenState -eq 'verified') { $exitCode = 0 }
+        Write-Line ('windows-confinement-spike=observed rust=' + $rust + ' node=' + $node + ' first_failure=' + $firstFailure + ' lpac=' + $tokenState + ' job=' + $jobState + ' acl=' + $aclState + ' acl_negative=' + $aclNegative + ' control_rust=' + $controlRust + ' control_node=' + $controlNode + ' css_transform=' + $cssTransform + ' rolldown=load_only vitest=not_run rolldown_call=not_run')
+        if ($rust -eq 'compiled' -and $node -eq 'ran' -and $firstFailure -eq 'none' -and $jobState -eq 'verified' -and $tokenState -eq 'verified' -and $aclNegative -eq 'denied') { $exitCode = 0 }
     }
 } catch {
     $reason = Get-CleanText ([string]$_.Exception.Message) 120
@@ -540,7 +560,10 @@ try {
 }
 
 try {
-    if ($box -ne $null) { $box.Dispose() }
+    if ($box -ne $null) {
+        $box.Dispose()
+        if (-not $box.CleanupComplete) { $cleanup = 'incomplete' }
+    }
     if ($baseDirectory -and (Test-Path -LiteralPath $baseDirectory)) {
         Remove-Item -LiteralPath $baseDirectory -Recurse -Force
     }
@@ -549,11 +572,11 @@ try {
 }
 
 if ($refusal) {
-    Write-Output ($refusal + ' cleanup=' + $cleanup)
+    Write-Line ($refusal + ' cleanup=' + $cleanup)
     exit 1
 }
 if ($Mode -eq 'spike') {
-    Write-Output ('windows-confinement-cleanup=' + $cleanup)
+    Write-Line ('windows-confinement-cleanup=' + $cleanup)
     if ($cleanup -ne 'verified') { $exitCode = 1 }
 }
 exit $exitCode

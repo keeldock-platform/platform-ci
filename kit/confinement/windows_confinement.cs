@@ -33,6 +33,9 @@ namespace KeelDock.Platform.WindowsConfinement
         private const int MaxEnvironmentCharacters = 131072;
         private const int MaxCommandLineCharacters = 32767;
         private const uint TokenQuery = 0x0008;
+        private const int TokenGroups = 2;
+        private const int TokenAppContainerSid = 31;
+        private const string AllApplicationPackagesSid = "S-1-15-2-1";
         private const int TokenIntegrityLevel = 25;
         private const int TokenIsAppContainer = 29;
         private const int TokenCapabilities = 30;
@@ -64,6 +67,7 @@ namespace KeelDock.Platform.WindowsConfinement
         private IntPtr profileSid = IntPtr.Zero;
         private string sidText = "";
         private bool profileCreated;
+        private bool cleanupComplete = true;
 
         public string SidText
         {
@@ -85,6 +89,11 @@ namespace KeelDock.Platform.WindowsConfinement
             return box;
         }
 
+        public bool CleanupComplete
+        {
+            get { return cleanupComplete; }
+        }
+
         public void Dispose()
         {
             if (profileCreated)
@@ -93,7 +102,11 @@ namespace KeelDock.Platform.WindowsConfinement
                 if (result != 0)
                 {
                     Thread.Sleep(250);
-                    Native.DeleteAppContainerProfile(profileName);
+                    result = Native.DeleteAppContainerProfile(profileName);
+                }
+                if (result != 0)
+                {
+                    cleanupComplete = false;
                 }
                 profileCreated = false;
             }
@@ -261,7 +274,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 result.Job = ReadJob(job, process, maxProcesses);
 
                 result.Failure = "token";
-                result.Token = ReadToken(process, confined);
+                result.Token = ReadToken(process, confined, profileSid);
 
                 result.Failure = "readers";
                 outThread = new Thread(Pump);
@@ -324,10 +337,20 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 CloseOne(ref outWrite);
                 CloseOne(ref errWrite);
-                JoinReader(outThread);
-                JoinReader(errThread);
-                CloseOne(ref outRead);
-                CloseOne(ref errRead);
+                bool outJoined = JoinReader(outThread);
+                bool errJoined = JoinReader(errThread);
+                if (outJoined)
+                {
+                    CloseOne(ref outRead);
+                }
+                if (errJoined)
+                {
+                    CloseOne(ref errRead);
+                }
+                if (!outJoined || !errJoined)
+                {
+                    result.Failure = "reader_join";
+                }
                 CloseOne(ref thread);
                 CloseOne(ref process);
                 CloseOne(ref job);
@@ -412,7 +435,7 @@ namespace KeelDock.Platform.WindowsConfinement
             }
         }
 
-        private static string ReadToken(IntPtr process, bool confined)
+        private static string ReadToken(IntPtr process, bool confined, IntPtr expectedSid)
         {
             IntPtr token;
             if (!Native.OpenProcessToken(process, TokenQuery, out token) || token == IntPtr.Zero)
@@ -432,18 +455,21 @@ namespace KeelDock.Platform.WindowsConfinement
                     return "appcontainer=0 integrity=0x" + integrity.ToString("x4");
                 }
                 uint capabilityCount = ReadCapabilityCount(token);
-                string lpac = "unknown";
+                string lpac = "unreadable";
                 try
                 {
                     lpac = ReadTokenDword(token, TokenIsLessPrivilegedAppContainer) == 1 ? "1" : "0";
                 }
                 catch
                 {
-                    lpac = "unknown";
+                    lpac = "unreadable";
                 }
+                string sidState = ReadContainerSidMatches(token, expectedSid) ? "match" : "mismatch";
+                string applicationPackages = ReadAllApplicationPackagesState(token);
                 string text = "appcontainer=" + isAppContainer.ToString() + " capabilities=" + capabilityCount.ToString()
-                    + " integrity=0x" + integrity.ToString("x4") + " lpac=" + lpac;
-                if (isAppContainer != 1 || capabilityCount != 0 || integrity != LowIntegrityRid || lpac == "0")
+                    + " integrity=0x" + integrity.ToString("x4") + " lpac=" + lpac + " sid=" + sidState + " aap=" + applicationPackages;
+                if (isAppContainer != 1 || capabilityCount != 0 || integrity != LowIntegrityRid || lpac != "1"
+                    || sidState != "match" || applicationPackages != "absent")
                 {
                     throw new InvalidOperationException(text);
                 }
@@ -452,6 +478,72 @@ namespace KeelDock.Platform.WindowsConfinement
             finally
             {
                 Native.CloseHandle(token);
+            }
+        }
+
+        private static bool ReadContainerSidMatches(IntPtr token, IntPtr expectedSid)
+        {
+            uint length;
+            IntPtr buffer = QueryTokenInformation(token, TokenAppContainerSid, out length);
+            try
+            {
+                if (length < (uint)IntPtr.Size)
+                {
+                    return false;
+                }
+                IntPtr actual = Marshal.ReadIntPtr(buffer);
+                return actual != IntPtr.Zero && Native.IsValidSid(actual) && Native.EqualSid(actual, expectedSid);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static string ReadAllApplicationPackagesState(IntPtr token)
+        {
+            uint length;
+            IntPtr buffer = QueryTokenInformation(token, TokenGroups, out length);
+            try
+            {
+                int groupOffset = IntPtr.Size;
+                int entrySize = IntPtr.Size * 2;
+                if (length < 4)
+                {
+                    throw new InvalidOperationException();
+                }
+                uint count = unchecked((uint)Marshal.ReadInt32(buffer));
+                if (count > 1024 || (ulong)length < (ulong)groupOffset + (ulong)count * (ulong)entrySize)
+                {
+                    throw new InvalidOperationException();
+                }
+                for (uint index = 0; index < count; ++index)
+                {
+                    IntPtr sid = Marshal.ReadIntPtr(buffer, groupOffset + (int)index * entrySize);
+                    IntPtr text;
+                    if (sid == IntPtr.Zero || !Native.ConvertSidToStringSidW(sid, out text) || text == IntPtr.Zero)
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    string value;
+                    try
+                    {
+                        value = Marshal.PtrToStringUni(text);
+                    }
+                    finally
+                    {
+                        Native.LocalFree(text);
+                    }
+                    if (string.Equals(value, AllApplicationPackagesSid, StringComparison.Ordinal))
+                    {
+                        return "present";
+                    }
+                }
+                return "absent";
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
             }
         }
 
@@ -633,12 +725,9 @@ namespace KeelDock.Platform.WindowsConfinement
             }
         }
 
-        private static void JoinReader(Thread reader)
+        private static bool JoinReader(Thread reader)
         {
-            if (reader != null)
-            {
-                reader.Join(15000);
-            }
+            return reader == null || reader.Join(15000);
         }
 
         private static void CloseOne(ref IntPtr handle)
@@ -773,6 +862,10 @@ namespace KeelDock.Platform.WindowsConfinement
 
             [DllImport("advapi32.dll", SetLastError = true)]
             internal static extern IntPtr FreeSid(IntPtr sid);
+
+            [DllImport("advapi32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool EqualSid(IntPtr sid1, IntPtr sid2);
 
             [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]

@@ -1354,8 +1354,13 @@ class LaneRegistryTests(unittest.TestCase):
                 for kind in tuple(module.WORKFLOW_TEMPLATES) + tuple(module.WORKFLOW_SHA256)
             },
         )
+        self.assertEqual(
+            set(policy.WORKFLOW_KIND_LANES),
+            {"linux-confinement", "windows-native-preflight", "windows-confinement"},
+        )
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["windows-confinement"], policy_windows)
         self.assertEqual(
             set(policy.LANE_WORKFLOW_TEMPLATES) | set(policy.LANE_WORKFLOW_SHA256),
             set(policy.WORKFLOW_KIND_LANES),
