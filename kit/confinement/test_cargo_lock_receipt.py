@@ -48,6 +48,29 @@ def _receipt(lock_bytes=LOCK_BYTES):
     }
 
 
+def _trusted_context(record):
+    context = {field: record[field] for field in subject.CONTEXT_FIELDS}
+    context["receipt_sha256"] = hashlib.sha256(subject.encode_receipt(record)).hexdigest()
+    return context
+
+
+def _authorized_audits(record):
+    return {
+        (item["name"], item["version"], item["checksum"]): item["audit_record_id"]
+        for item in record["packages"]
+    }
+
+
+def _verify_lock(lock_bytes=LOCK_BYTES, record=None, context=None, audits=None):
+    if record is None:
+        record = _receipt(lock_bytes)
+    if context is None:
+        context = _trusted_context(record)
+    if audits is None:
+        audits = _authorized_audits(record)
+    return subject.verify_lock_against_receipt(lock_bytes, record, context, audits)
+
+
 def _tar_member(archive, name, data=b"", kind="file"):
     info = tarfile.TarInfo(name)
     info.mode = 0o777
@@ -146,11 +169,12 @@ class CargoLockReceiptTests(unittest.TestCase):
         internal_name = LOCK_BYTES.replace(
             b'name = "serde"', ('name = "' + INTERNAL_PREFIX + 'private"').encode("ascii"),
         )
+        internal_underscore = LOCK_BYTES.replace(b'name = "serde"', b'name = "KeelDock_private"')
         duplicate = LOCK_BYTES + LOCK_BYTES[LOCK_BYTES.index(b"[[package]]"):]
         bad_checksum = LOCK_BYTES.replace(CHECKSUM.encode(), b"z" * 64)
         for lock_bytes in (
             no_checksum, workspace_checksum, path_source, git_source, alternate_source,
-            internal_name, duplicate, bad_checksum,
+            internal_name, internal_underscore, duplicate, bad_checksum,
         ):
             with self.subTest(lock=lock_bytes[:40]):
                 _assert_refused(self, lambda: subject.parse_cargo_lock(lock_bytes), "cargo_lock_invalid")
@@ -173,6 +197,54 @@ class CargoLockReceiptTests(unittest.TestCase):
         for lock_bytes in (unresolved, alternate_edge, malformed_edge, duplicate_edge):
             _assert_refused(self, lambda: subject.parse_cargo_lock(lock_bytes), "cargo_lock_invalid")
 
+    def test_sparse_crates_io_identity_normalizes_packages_and_edges(self):
+        sparse = subject.SPARSE_REGISTRY_SOURCE.encode("ascii")
+        registry = subject.REGISTRY_SOURCE.encode("ascii")
+        workspace = (
+            b'version = 4\n[[package]]\nname = "local"\nversion = "0.1.0"\n'
+            + b'dependencies = ["serde 1.0.1 (' + sparse + b')"]\n'
+            + LOCK_BYTES.replace(b"version = 4\n\n", b"").replace(registry, sparse)
+        )
+        parsed = subject.parse_cargo_lock(workspace)
+        self.assertEqual(parsed["packages"][0]["dependencies"][0][2], subject.REGISTRY_SOURCE)
+        self.assertEqual(parsed["packages"][1]["source"], subject.REGISTRY_SOURCE)
+        self.assertTrue(_verify_lock(workspace))
+
+    def test_lock_parser_bounds_array_work_and_package_count(self):
+        multiline = LOCK_BYTES.replace(b"dependencies = []", b"dependencies = [\n]")
+        with patch.object(subject, "MAX_DEPENDENCY_ARRAY_LINES", 1):
+            _assert_refused(self, lambda: subject.parse_cargo_lock(multiline), "cargo_lock_invalid")
+        with patch.object(subject, "MAX_DEPENDENCY_ARRAY_BYTES", 1):
+            _assert_refused(self, lambda: subject.parse_cargo_lock(LOCK_BYTES), "cargo_lock_invalid")
+        one_dependency = LOCK_BYTES.replace(
+            b"dependencies = []", b'dependencies = ["serde 1.0.1"]',
+        )
+        with patch.object(subject, "MAX_LOCK_DEPENDENCIES", 0):
+            _assert_refused(
+                self, lambda: subject.parse_cargo_lock(one_dependency), "cargo_lock_invalid",
+            )
+        second = (
+            b'[[package]]\nname = "local"\nversion = "0.1.0"\n'
+        )
+        with patch.object(subject, "MAX_LOCK_PACKAGES", 1):
+            _assert_refused(self, lambda: subject.parse_cargo_lock(LOCK_BYTES + second), "cargo_lock_invalid")
+
+    def test_numeric_prerelease_leading_zero_refused_in_urls_lock_and_edges(self):
+        _assert_refused(
+            self, lambda: subject.crate_archive_url("serde", "1.0.0-01"), "cargo_archive_invalid",
+        )
+        bad_package = LOCK_BYTES.replace(b'version = "1.0.1"', b'version = "1.0.0-01"')
+        _assert_refused(self, lambda: subject.parse_cargo_lock(bad_package), "cargo_lock_invalid")
+        _assert_refused(
+            self, lambda: subject._dependency_record("serde 1.0.0-01"), "cargo_lock_invalid",
+        )
+        self.assertIn("1.0.0-1+build.1", subject.crate_archive_url("serde", "1.0.0-1+build.1"))
+
+    def test_registry_dependency_underscore_internal_name_refused(self):
+        for source in (subject.REGISTRY_SOURCE, subject.SPARSE_REGISTRY_SOURCE):
+            edge = "KeelDock_private 1.0.1 (" + source + ")"
+            _assert_refused(self, lambda: subject._dependency_record(edge), "cargo_lock_invalid")
+
     def test_receipt_encodes_and_decodes_only_canonical_json(self):
         record = _receipt()
         encoded = subject.encode_receipt(record)
@@ -188,9 +260,12 @@ class CargoLockReceiptTests(unittest.TestCase):
         boolean_schema["schema_version"] = True
         internal_package = copy.deepcopy(record)
         internal_package["packages"][0]["name"] = INTERNAL_PREFIX + "private"
+        internal_underscore = copy.deepcopy(record)
+        internal_underscore["packages"][0]["name"] = "KeelDock_private"
         extra_package_field = copy.deepcopy(record)
         extra_package_field["packages"][0]["extra"] = "hidden"
-        for invalid in (extra, missing, wrong_sha, boolean_schema, internal_package, extra_package_field):
+        for invalid in (extra, missing, wrong_sha, boolean_schema, internal_package,
+                        internal_underscore, extra_package_field):
             _assert_refused(self, lambda: subject.encode_receipt(invalid), "cargo_receipt_invalid")
 
     def test_receipt_decoder_rejects_duplicates_noncanonical_bytes_and_oversize(self):
@@ -221,6 +296,7 @@ class CargoLockReceiptTests(unittest.TestCase):
         _assert_refused(self, lambda: subject.encode_receipt(record), "cargo_receipt_invalid")
         record["packages"].reverse()
         record["packages"][1]["name"] = "serde"
+        record["packages"][1]["version"] = "1.0.1"
         _assert_refused(self, lambda: subject.encode_receipt(record), "cargo_receipt_invalid")
         record = _receipt()
         record["packages"][0]["audit_record_id"] = "../secret"
@@ -253,24 +329,72 @@ class CargoLockReceiptTests(unittest.TestCase):
                 )
 
     def test_lock_must_match_receipt_hash_and_package_audit_mapping(self):
-        self.assertTrue(subject.verify_lock_against_receipt(LOCK_BYTES, _receipt()))
+        self.assertTrue(_verify_lock())
+        record = _receipt()
+        self.assertTrue(subject.verify_lock_against_receipt(
+            LOCK_BYTES, subject.encode_receipt(record),
+            _trusted_context(record), _authorized_audits(record),
+        ))
         _assert_refused(
             self,
-            lambda: subject.verify_lock_against_receipt(LOCK_BYTES + b"\n", _receipt()),
+            lambda: _verify_lock(LOCK_BYTES + b"\n", _receipt()),
             "cargo_lock_mismatch",
         )
         wrong_package = _receipt()
         wrong_package["packages"][0]["checksum"] = "1" * 64
         wrong_package["lock_sha256"] = hashlib.sha256(LOCK_BYTES).hexdigest()
         _assert_refused(
-            self, lambda: subject.verify_lock_against_receipt(LOCK_BYTES, wrong_package),
+            self, lambda: _verify_lock(LOCK_BYTES, wrong_package),
             "cargo_lock_mismatch",
         )
         missing_package = _receipt()
         missing_package["packages"] = []
         _assert_refused(
-            self, lambda: subject.verify_lock_against_receipt(LOCK_BYTES, missing_package),
+            self, lambda: _verify_lock(LOCK_BYTES, missing_package),
             "cargo_lock_mismatch",
+        )
+
+    def test_lock_receipt_requires_every_trusted_binding_and_provenance(self):
+        record = _receipt()
+        context = _trusted_context(record)
+        changes = {
+            "repository": "other/platform-ci",
+            "workspace_path": "crates/other",
+            "source_sha": "1" * 40,
+            "base_sha": "2" * 40,
+            "base_branch": "develop",
+            "reviewed_diff_fingerprint": "3" * 64,
+            "dependency_policy_revision": "policy-8",
+            "control_sha": "4" * 40,
+            "toolchain_hash": "5" * 64,
+            "receipt_sha256": "6" * 64,
+        }
+        for field, value in changes.items():
+            changed = dict(context)
+            changed[field] = value
+            with self.subTest(field=field):
+                _assert_refused(
+                    self,
+                    lambda: _verify_lock(LOCK_BYTES, record, changed),
+                    "cargo_lock_mismatch",
+                )
+        missing = dict(context)
+        del missing["repository"]
+        _assert_refused(self, lambda: _verify_lock(LOCK_BYTES, record, missing), "cargo_lock_mismatch")
+        extra = dict(context)
+        extra["unexpected"] = "value"
+        _assert_refused(self, lambda: _verify_lock(LOCK_BYTES, record, extra), "cargo_lock_mismatch")
+
+    def test_lock_receipt_requires_authorized_audit_mapping(self):
+        record = _receipt()
+        mapping = _authorized_audits(record)
+        identity = next(iter(mapping))
+        mapping[identity] = "audit-unreviewed"
+        _assert_refused(
+            self, lambda: _verify_lock(LOCK_BYTES, record, audits=mapping), "cargo_lock_mismatch",
+        )
+        _assert_refused(
+            self, lambda: _verify_lock(LOCK_BYTES, record, audits={}), "cargo_lock_mismatch",
         )
 
     def test_archive_url_is_fixed_and_path_components_are_strict(self):
@@ -279,6 +403,7 @@ class CargoLockReceiptTests(unittest.TestCase):
             "https://static.crates.io/crates/serde/serde-1.0.1.crate",
         )
         for name, version in (("../serde", "1.0.1"), (INTERNAL_PREFIX + "private", "1.0.1"),
+                              ("KeelDock_private", "1.0.1"),
                               ("serde", "1.0.1/evil"), ("serde", "01.0.1")):
             _assert_refused(
                 self, lambda: subject.crate_archive_url(name, version), "cargo_archive_invalid",
@@ -325,6 +450,33 @@ class CargoLockReceiptTests(unittest.TestCase):
             ),
             "cargo_archive_invalid",
         )
+
+    def test_archive_preflight_refuses_pax_and_gnu_long_name_headers(self):
+        for format_name in (tarfile.PAX_FORMAT, tarfile.GNU_FORMAT):
+            raw = io.BytesIO()
+            with tarfile.open(fileobj=raw, mode="w", format=format_name) as archive:
+                _tar_member(archive, "serde-1.0.1/Cargo.toml", b"[package]\n")
+                if format_name == tarfile.PAX_FORMAT:
+                    member = tarfile.TarInfo("serde-1.0.1/extra")
+                    member.pax_headers = {"comment": "value"}
+                    member.size = 1
+                    archive.addfile(member, io.BytesIO(b"x"))
+                else:
+                    _tar_member(archive, "serde-1.0.1/" + "a" * 110, b"x")
+            data = gzip.compress(raw.getvalue(), mtime=0)
+            with self.subTest(format_name=format_name):
+                if format_name == tarfile.PAX_FORMAT:
+                    _assert_refused(
+                        self, lambda: subject._preflight_tar_headers(raw.getvalue()),
+                        "cargo_archive_invalid",
+                    )
+                _assert_refused(
+                    self,
+                    lambda: subject.verify_archive(
+                        "serde", "1.0.1", data, hashlib.sha256(data).hexdigest(),
+                    ),
+                    "cargo_archive_invalid",
+                )
 
     def test_archive_verifier_rejects_paths_links_devices_collisions_and_roots(self):
         cases = (
@@ -393,8 +545,11 @@ class CargoLockReceiptTests(unittest.TestCase):
                 "cargo_archive_invalid",
             )
         with patch.object(subject, "MAX_ARCHIVE_BYTES", 32):
+            data = _archive()
             _assert_refused(
-                self, lambda: subject.verify_archive("serde", "1.0.1", b"x" * 33, "0" * 64),
+                self, lambda: subject.verify_archive(
+                    "serde", "1.0.1", data, hashlib.sha256(data).hexdigest(),
+                ),
                 "cargo_archive_invalid",
             )
         with patch.object(subject, "MAX_TOTAL_BYTES", 64):
@@ -408,6 +563,10 @@ class CargoLockReceiptTests(unittest.TestCase):
             )
         with patch.object(subject, "MAX_ARCHIVE_MEMBERS", 2):
             data = _archive()
+            _assert_refused(
+                self, lambda: subject._preflight_tar_headers(subject._bounded_gzip(data)),
+                "cargo_archive_invalid",
+            )
             _assert_refused(
                 self, lambda: subject.verify_archive("serde", "1.0.1", data, hashlib.sha256(data).hexdigest()),
                 "cargo_archive_invalid",
@@ -442,6 +601,84 @@ class CargoLockReceiptTests(unittest.TestCase):
             package_root.chmod(0o755)
             Path(temporary).chmod(0o755)
 
+    def test_extractor_refuses_symlink_ancestor(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            real = parent / "real"
+            vendor = real / "vendor"
+            vendor.mkdir(parents=True)
+            link = parent / "link"
+            link.symlink_to(real, target_is_directory=True)
+            _assert_refused(
+                self,
+                lambda: subject.extract_archive("serde", "1.0.1", data, digest, link / "vendor"),
+                "cargo_archive_invalid",
+            )
+            self.assertEqual(list(vendor.iterdir()), [])
+
+    def test_extractor_cleans_failed_private_staging(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(subject.os, "write", side_effect=OSError("write failed")):
+                _assert_refused(
+                    self,
+                    lambda: subject.extract_archive("serde", "1.0.1", data, digest, temporary),
+                    "cargo_archive_invalid",
+                )
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_extractor_refuses_child_directory_replaced_during_write(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        open_directory = subject._open_relative_directory
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            vendor = parent / "vendor"
+            outside = parent / "outside"
+            vendor.mkdir()
+            outside.mkdir()
+            replaced = [False]
+
+            def swap_child(root_fd, parts):
+                if parts == ["src"] and not replaced[0]:
+                    os.rmdir("src", dir_fd=root_fd)
+                    os.symlink(str(outside), "src", dir_fd=root_fd)
+                    replaced[0] = True
+                return open_directory(root_fd, parts)
+
+            with patch.object(subject, "_open_relative_directory", side_effect=swap_child):
+                _assert_refused(
+                    self,
+                    lambda: subject.extract_archive("serde", "1.0.1", data, digest, vendor),
+                    "cargo_archive_invalid",
+                )
+            self.assertTrue(replaced[0])
+            self.assertEqual(list(vendor.iterdir()), [])
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_extractor_atomic_publish_never_replaces_existing_package(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        publish = subject._publish_stage
+        with tempfile.TemporaryDirectory() as temporary:
+            def competing_writer(parent_fd, stage_name, final_name):
+                os.mkdir(final_name, dir_fd=parent_fd)
+                publish(parent_fd, stage_name, final_name)
+
+            with patch.object(subject, "_publish_stage", side_effect=competing_writer):
+                _assert_refused(
+                    self,
+                    lambda: subject.extract_archive("serde", "1.0.1", data, digest, temporary),
+                    "cargo_archive_invalid",
+                )
+            self.assertEqual(
+                sorted(item.name for item in Path(temporary).iterdir()), ["serde-1.0.1"],
+            )
+            self.assertEqual(list((Path(temporary) / "serde-1.0.1").iterdir()), [])
+
     def test_vendor_digest_rejects_links_and_changes_with_mode_or_content(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -470,8 +707,14 @@ class CargoLockReceiptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             with patch.dict(os.environ, {
                 "CARGO_HOME": "untrusted", "CARGO_NET_OFFLINE": "false",
-                "RUSTC_WRAPPER": "untrusted", "HTTP_PROXY": "proxy",
-                "ftp_proxy": "proxy", "KEELDOCK_TEST": "retained",
+                "CARGO_ENCODED_RUSTFLAGS": "untrusted", "RUSTC_WRAPPER": "untrusted",
+                "RUSTFLAGS": "untrusted", "RUSTDOC": "untrusted",
+                "RUSTDOCFLAGS": "untrusted", "SSL_CERT_FILE": "untrusted",
+                "SSL_CERT_DIR": "untrusted", "NIX_SSL_CERT_FILE": "untrusted",
+                "REQUESTS_CA_BUNDLE": "untrusted", "CURL_CA_BUNDLE": "untrusted",
+                "HTTP_PROXY": "proxy", "ftp_proxy": "proxy",
+                "KEELDOCK_TEST": "untrusted", "PATH": "/attacker",
+                "TMPDIR": "/attacker/tmp",
             }, clear=True):
                 arguments, environment = subject.cargo_config_for_vendor(temporary)
             self.addCleanup(os.rmdir, environment["CARGO_HOME"])
@@ -481,11 +724,17 @@ class CargoLockReceiptTests(unittest.TestCase):
             self.assertIn("source.crates-io.replace-with", rendered)
             self.assertIn("patch.crates-io={}", rendered)
             self.assertIn("target.x86_64-unknown-linux-gnu.runner=[]", rendered)
-            self.assertNotIn("CARGO_NET_OFFLINE", environment)
-            self.assertNotIn("RUSTC_WRAPPER", environment)
-            self.assertNotIn("HTTP_PROXY", environment)
-            self.assertNotIn("ftp_proxy", environment)
-            self.assertEqual(environment["KEELDOCK_TEST"], "retained")
+            for key in (
+                "CARGO_NET_OFFLINE", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_WRAPPER",
+                "RUSTFLAGS", "RUSTDOC", "RUSTDOCFLAGS", "SSL_CERT_FILE",
+                "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
+                "CURL_CA_BUNDLE", "HTTP_PROXY", "ftp_proxy", "KEELDOCK_TEST",
+            ):
+                with self.subTest(key=key):
+                    self.assertNotIn(key, environment)
+            self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+            self.assertEqual(environment["TMPDIR"], "/tmp")
+            self.assertEqual(set(environment), {"PATH", "TMPDIR", "CARGO_HOME"})
             self.assertTrue(Path(environment["CARGO_HOME"]).is_dir())
 
     def test_cargo_configuration_refuses_unavailable_vendor_path(self):

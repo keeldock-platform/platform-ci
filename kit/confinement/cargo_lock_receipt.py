@@ -1,11 +1,13 @@
 """Bounded Cargo lock receipts and verified, source-free crate materialization."""
 
+import ctypes
 import gzip
 import hashlib
 import hmac
 import io
 import json
 import os
+import secrets
 from pathlib import Path, PurePosixPath
 import re
 import stat
@@ -17,6 +19,7 @@ REGISTRY_SOURCE = (
     "registry+https:" + chr(47) * 2 + "github.com" + chr(47)
     + "rust-lang" + chr(47) + "crates.io-index"
 )
+SPARSE_REGISTRY_SOURCE = "sparse+https:" + chr(47) * 2 + "index.crates.io/"
 SCHEMA_VERSION = 1
 MAX_LOCK_BYTES = 4 * 1024 * 1024
 MAX_RECEIPT_BYTES = 2 * 1024 * 1024
@@ -26,6 +29,10 @@ MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_ARCHIVE_MEMBERS = 20_000
 MAX_COMPRESSION_RATIO = 200
+MAX_LOCK_PACKAGES = 20_000
+MAX_LOCK_DEPENDENCIES = 20_000
+MAX_DEPENDENCY_ARRAY_BYTES = 1024 * 1024
+MAX_DEPENDENCY_ARRAY_LINES = 20_000
 HEX40_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
 PACKAGE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -36,9 +43,7 @@ VERSION_RE = re.compile(
 )
 DEPENDENCY_RE = re.compile(
     r"(?P<name>[A-Za-z0-9][A-Za-z0-9_-]{0,63})"
-    r"(?: (?P<version>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
-    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?))?"
+    r"(?: (?P<version>[^ ()]{1,128}))?"
     r"(?: \((?P<source>[^()]*)\))?\Z"
 )
 LOCK_FIELDS = frozenset(("name", "version", "source", "checksum", "dependencies"))
@@ -48,6 +53,8 @@ RECEIPT_FIELDS = frozenset((
     "control_sha", "toolchain_hash", "lock_sha256", "packages",
 ))
 PACKAGE_RECEIPT_FIELDS = frozenset(("name", "version", "checksum", "audit_record_id"))
+CONTEXT_FIELDS = RECEIPT_FIELDS - frozenset(("schema_version", "lock_sha256", "packages"))
+TRUSTED_CONTEXT_FIELDS = CONTEXT_FIELDS | frozenset(("receipt_sha256",))
 PATH_PART_RE = re.compile(r"[A-Za-z0-9._+@ -]{1,255}\Z")
 AUDIT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 WINDOWS_RESERVED_NAMES = frozenset(("CON", "PRN", "AUX", "NUL")) | frozenset(
@@ -83,9 +90,30 @@ def _valid_hex(value, pattern):
 def _valid_package_identity(name, version):
     return (
         type(name) is str and PACKAGE_NAME_RE.fullmatch(name) is not None
-        and type(version) is str and len(version) <= 128
-        and VERSION_RE.fullmatch(version) is not None
+        and _valid_version(version)
     )
+
+
+def _valid_version(version):
+    if type(version) is not str or len(version) > 128 or VERSION_RE.fullmatch(version) is None:
+        return False
+    core = version.split("+", 1)[0]
+    if "-" in core:
+        prerelease = core.split("-", 1)[1]
+        for identifier in prerelease.split("."):
+            if identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"):
+                return False
+    return True
+
+
+def _internal_registry_name(name):
+    return name.lower().replace("_", "-").startswith("keeldock-")
+
+
+def _registry_source(source):
+    if source in (REGISTRY_SOURCE, SPARSE_REGISTRY_SOURCE):
+        return REGISTRY_SOURCE
+    return None
 
 
 def _is_link_or_reparse(path):
@@ -173,6 +201,8 @@ def _parse_string_array(value):
         else:
             _refuse("cargo_lock_invalid")
         result.append(_parse_toml_string(body[start:index]))
+        if len(result) > MAX_LOCK_DEPENDENCIES or len(result[-1]) > 512:
+            _refuse("cargo_lock_invalid")
         while index < len(body) and body[index] in " \t":
             index += 1
         if index == len(body):
@@ -187,11 +217,13 @@ def _parse_string_array(value):
     return result
 
 
-def _array_complete(value):
-    quoted = False
-    escaped = False
-    depth = 0
+def _scan_array_fragment(value, quoted=False, escaped=False, depth=0):
+    complete = False
     for character in value:
+        if complete:
+            if character not in " \t":
+                _refuse("cargo_lock_invalid")
+            continue
         if escaped:
             escaped = False
         elif quoted and character == "\\":
@@ -200,13 +232,15 @@ def _array_complete(value):
             quoted = not quoted
         elif not quoted and character == "[":
             depth += 1
+            if depth != 1:
+                _refuse("cargo_lock_invalid")
         elif not quoted and character == "]":
             depth -= 1
             if depth == 0:
-                return True
+                complete = True
             if depth < 0:
                 _refuse("cargo_lock_invalid")
-    return False
+    return complete, quoted, escaped, depth
 
 
 def _parse_lock_value(key, value):
@@ -229,15 +263,15 @@ def _dependency_record(value):
     name = match.group("name")
     version = match.group("version")
     source = match.group("source")
-    if source == REGISTRY_SOURCE and name.lower().startswith("keeldock" + "-"):
+    if source is not None and _registry_source(source) and _internal_registry_name(name):
         _refuse("cargo_lock_invalid")
     if version is not None and not _valid_package_identity(name, version):
         _refuse("cargo_lock_invalid")
-    if source is not None and source != REGISTRY_SOURCE:
+    if source is not None and _registry_source(source) is None:
         _refuse("cargo_lock_invalid")
     if source is not None and version is None:
         _refuse("cargo_lock_invalid")
-    return name, version, source
+    return name, version, _registry_source(source) if source is not None else None
 
 
 def parse_cargo_lock(lock_bytes):
@@ -256,6 +290,8 @@ def parse_cargo_lock(lock_bytes):
         if line == "[[package]]":
             if current is not None:
                 packages.append(current)
+                if len(packages) >= MAX_LOCK_PACKAGES:
+                    _refuse("cargo_lock_invalid")
             current = {}
             continue
         if "=" not in line:
@@ -265,15 +301,28 @@ def parse_cargo_lock(lock_bytes):
         if re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", key) is None:
             _refuse("cargo_lock_invalid")
         raw_value = raw_value.strip()
-        if key == "dependencies" and raw_value.startswith("[") and not _array_complete(raw_value):
+        if key == "dependencies" and raw_value.startswith("["):
             fragments = [raw_value]
-            while not _array_complete(" ".join(fragments)):
+            complete, quoted, escaped, depth = _scan_array_fragment(raw_value)
+            total_array_bytes = len(raw_value)
+            line_count = 1
+            if total_array_bytes > MAX_DEPENDENCY_ARRAY_BYTES:
+                _refuse("cargo_lock_invalid")
+            while not complete:
                 try:
                     continuation = _strip_toml_comment(next(lines)).strip()
                 except StopIteration:
                     _refuse("cargo_lock_invalid")
+                line_count += 1
+                total_array_bytes += len(continuation) + 1
+                if (line_count > MAX_DEPENDENCY_ARRAY_LINES
+                        or total_array_bytes > MAX_DEPENDENCY_ARRAY_BYTES):
+                    _refuse("cargo_lock_invalid")
                 if continuation:
                     fragments.append(continuation)
+                    complete, quoted, escaped, depth = _scan_array_fragment(
+                        continuation, quoted, escaped, depth,
+                    )
             raw_value = " ".join(fragments)
         value = _parse_lock_value(key, raw_value)
         if current is None:
@@ -300,9 +349,10 @@ def parse_cargo_lock(lock_bytes):
         if source is None:
             if checksum is not None:
                 _refuse("cargo_lock_invalid")
-        elif source == REGISTRY_SOURCE:
-            if name.lower().startswith("keeldock" + "-") or not _valid_hex(checksum, HEX64_RE):
+        elif _registry_source(source) is not None:
+            if _internal_registry_name(name) or not _valid_hex(checksum, HEX64_RE):
                 _refuse("cargo_lock_invalid")
+            package["source"] = REGISTRY_SOURCE
         else:
             _refuse("cargo_lock_invalid")
         identity = (name, version)
@@ -318,16 +368,19 @@ def parse_cargo_lock(lock_bytes):
         package["dependencies"] = parsed_dependencies
 
     by_name = {}
+    by_identity = {}
     for package in packages:
         by_name.setdefault(package["name"], []).append(package)
+        by_identity[(package["name"], package["version"])] = package
     for package in packages:
         for dependency_name, dependency_version, dependency_source in package["dependencies"]:
-            candidates = by_name.get(dependency_name, [])
-            if dependency_version is not None:
-                candidates = [item for item in candidates if item["version"] == dependency_version]
-            if dependency_source is not None:
-                candidates = [item for item in candidates if item.get("source") == dependency_source]
-            if len(candidates) != 1:
+            if dependency_version is None:
+                candidates = by_name.get(dependency_name, [])
+                candidate = candidates[0] if len(candidates) == 1 else None
+            else:
+                candidate = by_identity.get((dependency_name, dependency_version))
+            if candidate is None or (dependency_source is not None
+                                     and candidate.get("source") != dependency_source):
                 _refuse("cargo_lock_invalid")
     return {"version": lock_version, "packages": packages}
 
@@ -386,13 +439,13 @@ def _validate_receipt(record):
         if not _exact_dict(item, PACKAGE_RECEIPT_FIELDS):
             _refuse("cargo_receipt_invalid")
         if (not _valid_package_identity(item["name"], item["version"])
-                or item["name"].lower().startswith("keeldock" + "-")
+                or _internal_registry_name(item["name"])
                 or not _valid_hex(item["checksum"], HEX64_RE)
                 or type(item["audit_record_id"]) is not str
                 or AUDIT_ID_RE.fullmatch(item["audit_record_id"]) is None):
             _refuse("cargo_receipt_invalid")
         identity = (item["name"], item["version"])
-        if identity in seen or (previous is not None and identity <= previous):
+        if identity in seen or (previous is not None and identity < previous):
             _refuse("cargo_receipt_invalid")
         previous = identity
         seen.add(identity)
@@ -445,12 +498,33 @@ def decode_receipt(receipt_bytes):
     return record
 
 
-def verify_lock_against_receipt(lock_bytes, receipt):
-    """Verify exact lock bytes and audit mappings before any caller performs network use."""
+def verify_lock_against_receipt(lock_bytes, receipt, expected_context, authorized_audits):
+    """Require trusted context, receipt provenance and audit mapping before network use.
+
+    The caller obtains expected_context and authorized_audits from independently
+    authenticated policy and review records, not from the receipt or checkout.
+    """
     if type(receipt) is bytes:
         receipt = decode_receipt(receipt)
     else:
         _validate_receipt(receipt)
+    if not _exact_dict(expected_context, TRUSTED_CONTEXT_FIELDS):
+        _refuse("cargo_lock_mismatch")
+    for field in CONTEXT_FIELDS:
+        if expected_context[field] != receipt[field]:
+            _refuse("cargo_lock_mismatch")
+    if not _valid_hex(expected_context["receipt_sha256"], HEX64_RE):
+        _refuse("cargo_lock_mismatch")
+    canonical_receipt = encode_receipt(receipt)
+    if not hmac.compare_digest(
+            hashlib.sha256(canonical_receipt).hexdigest(), expected_context["receipt_sha256"]):
+        _refuse("cargo_lock_mismatch")
+    if type(authorized_audits) is not dict or len(authorized_audits) != len(receipt["packages"]):
+        _refuse("cargo_lock_mismatch")
+    for package in receipt["packages"]:
+        identity = (package["name"], package["version"], package["checksum"])
+        if authorized_audits.get(identity) != package["audit_record_id"]:
+            _refuse("cargo_lock_mismatch")
     if type(lock_bytes) is not bytes or len(lock_bytes) > MAX_LOCK_BYTES:
         _refuse("cargo_lock_mismatch")
     lock_digest = hashlib.sha256(lock_bytes).hexdigest()
@@ -472,7 +546,7 @@ def verify_lock_against_receipt(lock_bytes, receipt):
 
 def crate_archive_url(name, version):
     """Build the only permitted crate archive URL after validating path components."""
-    if not _valid_package_identity(name, version) or name.lower().startswith("keeldock" + "-"):
+    if not _valid_package_identity(name, version) or _internal_registry_name(name):
         _refuse("cargo_archive_invalid")
     return "https:" + chr(47) * 2 + "static.crates.io/crates/" + name + "/" + name + "-" + version + ".crate"
 
@@ -495,7 +569,7 @@ def _safe_path_part(part):
 
 
 def _bounded_gzip(data):
-    if type(data) is not bytes or not 1 <= len(data) <= MAX_ARCHIVE_BYTES:
+    if type(data) is not bytes or not data:
         _refuse("cargo_archive_invalid")
     if len(data) < 2 or data[:2] != b"\x1f\x8b":
         _refuse("cargo_archive_invalid")
@@ -516,6 +590,37 @@ def _bounded_gzip(data):
     except (OSError, EOFError, gzip.BadGzipFile):
         _refuse("cargo_archive_invalid")
     return output.getvalue()
+
+
+def _preflight_tar_headers(data):
+    if len(data) % 512:
+        _refuse("cargo_archive_invalid")
+    offset = 0
+    count = 0
+    while offset + 512 <= len(data):
+        header = data[offset:offset + 512]
+        if header == bytes(512):
+            for start in range(offset, len(data), 1024 * 1024):
+                chunk = data[start:start + 1024 * 1024]
+                if chunk != bytes(len(chunk)):
+                    _refuse("cargo_archive_invalid")
+            return
+        count += 1
+        if count > MAX_ARCHIVE_MEMBERS:
+            _refuse("cargo_archive_invalid")
+        member_type = header[156:157]
+        if member_type not in (b"0", b"5", b"\x00"):
+            _refuse("cargo_archive_invalid")
+        raw_size = header[124:136].strip(b"\x00 ")
+        if not raw_size or any(byte not in b"01234567" for byte in raw_size):
+            _refuse("cargo_archive_invalid")
+        size = int(raw_size, 8)
+        if size > MAX_FILE_BYTES or (member_type == b"5" and size != 0):
+            _refuse("cargo_archive_invalid")
+        offset += 512 + ((size + 511) // 512) * 512
+        if offset > len(data):
+            _refuse("cargo_archive_invalid")
+    _refuse("cargo_archive_invalid")
 
 
 def _parse_checksum_manifest(data, expected_checksum, file_hashes):
@@ -550,6 +655,7 @@ def _inspect_archive(name, version, data, expected_sha256):
     if not hmac.compare_digest(actual_digest, expected_sha256):
         _refuse("cargo_archive_invalid")
     tar_bytes = _bounded_gzip(data)
+    _preflight_tar_headers(tar_bytes)
     entries = {}
     folded = set()
     case_spellings = {}
@@ -616,7 +722,7 @@ def _inspect_archive(name, version, data, expected_sha256):
                     entries[key] = (False, content)
     except Refusal:
         raise
-    except (tarfile.TarError, OSError, UnicodeError, ValueError, EOFError):
+    except (tarfile.TarError, OSError, UnicodeError, ValueError, EOFError, RecursionError):
         _refuse("cargo_archive_invalid")
 
     root = name + "-" + version
@@ -657,6 +763,91 @@ def verify_archive(name, version, data, expected_sha256):
     return True
 
 
+def _open_target_directory(path):
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        _refuse("cargo_archive_invalid")
+    target = Path(path)
+    if not target.is_absolute() or any(part in (".", "..") for part in target.parts):
+        _refuse("cargo_archive_invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor = os.open("/", flags)
+    try:
+        for component in target.parts[1:]:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor, target
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_relative_directory(root_fd, parts):
+    descriptor = os.dup(root_fd)
+    try:
+        for component in parts:
+            next_descriptor = os.open(
+                component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_stage_file(root_fd, relative, content):
+    parts = relative.split("/")
+    parent_fd = _open_relative_directory(root_fd, parts[:-1])
+    try:
+        descriptor = os.open(
+            parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600, dir_fd=parent_fd,
+        )
+        try:
+            view = memoryview(content)
+            while view:
+                written = os.write(descriptor, view)
+                if written <= 0:
+                    _refuse("cargo_archive_invalid")
+                view = view[written:]
+            os.fchmod(descriptor, 0o444)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+
+
+def _remove_stage(parent_fd, name):
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd,
+    )
+    try:
+        os.fchmod(descriptor, 0o700)
+        for child in os.listdir(descriptor):
+            mode = os.stat(child, dir_fd=descriptor, follow_symlinks=False).st_mode
+            if stat.S_ISDIR(mode):
+                _remove_stage(descriptor, child)
+            else:
+                os.unlink(child, dir_fd=descriptor)
+    finally:
+        os.close(descriptor)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+def _publish_stage(parent_fd, stage_name, final_name):
+    rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if rename is None:
+        _refuse("cargo_archive_invalid")
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    if rename(parent_fd, stage_name.encode("ascii"), parent_fd,
+              final_name.encode("ascii"), 1) != 0:
+        raise OSError(ctypes.get_errno(), "atomic package publication failed")
+
+
 def extract_archive(name, version, data, expected_sha256, target_dir):
     """Materialize one verified crate read-only, preserving and hashing Cargo.toml.orig.
 
@@ -664,43 +855,41 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
     vendor checksum manifest covers both files when the original is present. Call
     make_vendor_read_only after adding the last package to freeze the vendor root.
     """
-    root, entries, file_hashes, package_hash = _inspect_archive(
-        name, version, data, expected_sha256,
-    )
+    root, entries, file_hashes, package_hash = _inspect_archive(name, version, data, expected_sha256)
+    parent_fd = None
+    stage_name = None
+    stage_created = False
     try:
-        target = Path(target_dir)
-        if target.exists() and (_is_link_or_reparse(target) or not target.is_dir()):
-            _refuse("cargo_archive_invalid")
-        target.mkdir(parents=True, exist_ok=True, mode=0o755)
-        if _is_link_or_reparse(target):
-            _refuse("cargo_archive_invalid")
-        package_root = target / root
-        if package_root.exists() or _is_link_or_reparse(package_root):
-            _refuse("cargo_archive_invalid")
-        package_root.mkdir(mode=0o755)
-        os.chmod(package_root, 0o755)
-        directories = {root}
+        parent_fd, target = _open_target_directory(target_dir)
+        stage_name = ".cargo-stage-" + secrets.token_hex(16)
+        os.mkdir(stage_name, 0o700, dir_fd=parent_fd)
+        stage_created = True
+        stage_fd = os.open(
+            stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        os.fchmod(stage_fd, 0o700)
+        directories = set()
         for path, (is_directory, unused_content) in entries.items():
-            parts = path.split("/")
+            if path == root:
+                continue
+            relative = path[len(root) + 1:]
+            parts = relative.split("/")
             for count in range(1, len(parts)):
                 directories.add("/".join(parts[:count]))
             if is_directory:
-                directories.add(path)
+                directories.add(relative)
         for directory in sorted(directories, key=lambda value: (value.count("/"), value)):
-            output = target.joinpath(*directory.split("/"))
-            if output == package_root:
-                continue
-            output.mkdir(mode=0o755, exist_ok=True)
-            if _is_link_or_reparse(output) or not output.is_dir():
-                _refuse("cargo_archive_invalid")
-            os.chmod(output, 0o755)
+            parts = directory.split("/")
+            directory_parent = _open_relative_directory(stage_fd, parts[:-1])
+            try:
+                os.mkdir(parts[-1], 0o700, dir_fd=directory_parent)
+            finally:
+                os.close(directory_parent)
         for path, (is_directory, content) in entries.items():
             if is_directory or path == root + "/.cargo-checksum.json":
                 continue
-            output = target.joinpath(*path.split("/"))
-            with output.open("xb") as stream:
-                stream.write(content)
-            os.chmod(output, 0o644)
+            _write_stage_file(stage_fd, path[len(root) + 1:], content)
         checksum = {
             "files": dict(sorted(file_hashes.items())),
             "package": package_hash,
@@ -708,24 +897,33 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
         checksum_bytes = json.dumps(
             checksum, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
         ).encode("ascii")
-        checksum_output = package_root / ".cargo-checksum.json"
-        with checksum_output.open("xb") as stream:
-            stream.write(checksum_bytes)
-        os.chmod(checksum_output, 0o644)
-        for path, (is_directory, unused_content) in entries.items():
-            if is_directory:
-                os.chmod(target.joinpath(*path.split("/")), 0o755)
-        for path, (is_directory, unused_content) in entries.items():
-            if not is_directory and path != root + "/.cargo-checksum.json":
-                os.chmod(target.joinpath(*path.split("/")), 0o444)
-        os.chmod(checksum_output, 0o444)
+        _write_stage_file(stage_fd, ".cargo-checksum.json", checksum_bytes)
         for directory in sorted(directories, key=lambda value: (value.count("/"), value), reverse=True):
-            os.chmod(target.joinpath(*directory.split("/")), 0o555)
+            directory_fd = _open_relative_directory(stage_fd, directory.split("/"))
+            try:
+                os.fchmod(directory_fd, 0o555)
+            finally:
+                os.close(directory_fd)
+        os.fchmod(stage_fd, 0o555)
+        os.close(stage_fd)
+        stage_fd = None
+        _publish_stage(parent_fd, stage_name, root)
+        stage_name = None
+        return target / root
     except Refusal:
         raise
     except (OSError, ValueError, TypeError):
         _refuse("cargo_archive_invalid")
-    return package_root
+    finally:
+        if "stage_fd" in locals() and stage_fd is not None:
+            os.close(stage_fd)
+        if stage_created and stage_name is not None and parent_fd is not None:
+            try:
+                _remove_stage(parent_fd, stage_name)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            os.close(parent_fd)
 
 
 def vendor_tree_digest(directory):
@@ -865,12 +1063,14 @@ def cargo_config_for_vendor(vendor_dir):
     for key, value in config_items:
         arguments.extend(("--config", key + "=" + value))
     environment = {
-        key: value for key, value in os.environ.items()
-        if (not key.startswith("CARGO_") and not key.startswith("RUSTC")
-            and "proxy" not in key.lower())
+        key: os.environ[key]
+        for key in ("HOME", "LANG", "LC_ALL", "TZ", "SYSTEMROOT", "WINDIR")
+        if key in os.environ
     }
+    environment["PATH"] = os.pathsep.join(("/usr/bin", "/bin"))
+    environment["TMPDIR"] = "/tmp"
     try:
-        fresh_cargo_home = tempfile.mkdtemp(prefix="cargo-home-")
+        fresh_cargo_home = tempfile.mkdtemp(prefix="cargo-home-", dir="/tmp")
         os.chmod(fresh_cargo_home, 0o700)
     except OSError:
         _refuse("cargo_config_invalid")
