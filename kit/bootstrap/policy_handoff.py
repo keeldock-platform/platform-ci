@@ -1,9 +1,9 @@
 """Windows handoff lane workflow validation data.
 
-This lane module registers no workflows yet. It exists so that the shared
-policy module can dispatch to a fixed set of statically imported lane modules,
-and so that the handoff lane can add its own templates and digests without
-editing any other module. It must not import the shared policy module.
+This lane module holds the digest of the one reviewed handoff workflow, which
+runs the source-free scanner and synthetic tree tests. It is imported statically
+by the shared policy module, which dispatches to it through a fixed registry. It
+must not import the shared policy module.
 
 Lane interface, identical in every lane module:
 
@@ -14,5 +14,13 @@ code that the candidate checker validates when the pool is platform.
 """
 
 WORKFLOW_TEMPLATES = {}
-WORKFLOW_SHA256 = {}
-CANDIDATE_WORKFLOWS = ()
+WORKFLOW_SHA256 = {
+    "windows-handoff-synthetic": "240c1df7025c6e69c975b4f393ec5f368846cf43552e12f2b965212ce104520a",
+}
+CANDIDATE_WORKFLOWS = (
+    (
+        ".github/workflows/windows-handoff-synthetic.yml",
+        "windows-handoff-synthetic",
+        "handoff-workflow-too-large",
+    ),
+)

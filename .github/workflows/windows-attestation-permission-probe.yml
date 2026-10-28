@@ -832,20 +832,20 @@ jobs:
           }
           Write-Output "probe=profile-comparison common_intersection=$($results.common_intersection_ubuntu)/$($results.common_intersection_windows) github_guide=$($results.github_guide_ubuntu)/$($results.github_guide_windows) actions_readme=$($results.actions_readme_ubuntu)/$($results.actions_readme_windows)"
           if ($results.Values -contains 'unverified' -or $results.Values -contains 'error') {
-            Write-Output 'probe=profile-selection result=blocked reason=failed-or-ambiguous-arm'
+            Write-Output 'probe=profile-comparison result=blocked reason=failed-or-ambiguous-arm'
             exit 1
           }
           if ($results.common_intersection_ubuntu -eq 'verified' -and $results.common_intersection_windows -eq 'verified') {
-            Write-Output 'probe=profile-selection result=selected profile=common-intersection'
+            Write-Output 'probe=profile-comparison result=observed profile=common-intersection'
             exit 0
           }
           if ($results.github_guide_ubuntu -eq 'verified' -and $results.github_guide_windows -eq 'verified') {
-            Write-Output 'probe=profile-selection result=selected profile=github-guide'
+            Write-Output 'probe=profile-comparison result=observed profile=github-guide'
             exit 0
           }
           if ($results.actions_readme_ubuntu -eq 'verified' -and $results.actions_readme_windows -eq 'verified') {
-            Write-Output 'probe=profile-selection result=selected profile=actions-readme'
+            Write-Output 'probe=profile-comparison result=observed profile=actions-readme'
             exit 0
           }
-          Write-Output 'probe=profile-selection result=blocked reason=no-shared-verified-profile'
+          Write-Output 'probe=profile-comparison result=blocked reason=no-shared-verified-profile'
           exit 1

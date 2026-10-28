@@ -339,6 +339,15 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
         self.assertIn("MaxAutomaticRedirections = 5", body)
         self.assertIn("$client.Dispose()", body)
 
+    def test_async_results_are_captured_or_discarded(self):
+        calls = re.findall(r"(?m)^\s*(.*(?:GetAsync|ReadAsStreamAsync|CopyToAsync)\(.*)$", self.wrapper)
+        self.assertEqual(len(calls), 3)
+        for call in calls:
+            with self.subTest(call=call.strip()):
+                self.assertRegex(call, r"^\s*(?:\$[A-Za-z][A-Za-z0-9_]*\s*=\s*|\[void\])")
+                self.assertIn(".GetAwaiter().GetResult()", call)
+        self.assertIn("return [string]$target", self.function_body("Invoke-Download"))
+
     def test_worst_case_runtime_fits_eighty_percent_of_the_job_timeout(self):
         specs = self.function_body("Get-StageSpecs")
         confined_branch, rest = specs.split("} else {", 1)
