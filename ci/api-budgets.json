@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "window_seconds": 3600,
+  "watcher": {
+    "maximum_per_run": 1,
+    "minimum_interval_seconds": 300
+  },
+  "credentials": {
+    "repository_token": {
+      "per_run": 1000,
+      "per_workflow": 1000,
+      "per_hour": 1000
+    },
+    "source_reader": {
+      "per_run": 1000,
+      "per_workflow": 1000,
+      "per_hour": 1000
+    },
+    "settings_auditor": {
+      "per_run": 1000,
+      "per_workflow": 1000,
+      "per_hour": 1000
+    },
+    "source_auditor": {
+      "per_run": 1000,
+      "per_workflow": 1000,
+      "per_hour": 1000
+    },
+    "pin_writer": {
+      "per_run": 1000,
+      "per_workflow": 1000,
+      "per_hour": 1000
+    }
+  }
+}
