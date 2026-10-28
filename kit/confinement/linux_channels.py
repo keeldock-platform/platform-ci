@@ -93,7 +93,7 @@ ATTEMPT_RULES = {
         ("sysctl-write", DENIED),
         ("signal-init", DENIED),
         ("chroot-escape", DENIED),
-        ("nnp-clear", DENIED),
+        ("nnp-set", DENIED),
         ("sudo", DENIED),
         ("docker", DENIED),
         ("ip-link", DENIED),
@@ -251,6 +251,7 @@ def empty_record(phase):
         "memory_canary": "not-run",
         "readable_file_canary": "not-run",
         "fixtures": "not-run",
+        "fixture_attempts": {"controlled": 0, "uncontrolled": 0},
         "result": "refused",
         "reason": "environment",
     }
@@ -259,7 +260,7 @@ def empty_record(phase):
 def validate_record(record):
     if type(record) is not dict:
         raise ValueError("record")
-    if set(record) != {"schema", "phase", "channels", "memory_canary", "readable_file_canary", "fixtures", "result", "reason"}:
+    if set(record) != {"schema", "phase", "channels", "memory_canary", "readable_file_canary", "fixtures", "fixture_attempts", "result", "reason"}:
         raise ValueError("record")
     if record["schema"] != SCHEMA_VERSION or record["phase"] not in PHASES:
         raise ValueError("record")
@@ -277,6 +278,11 @@ def validate_record(record):
     if record["memory_canary"] not in CANARY_RESULTS or record["readable_file_canary"] not in CANARY_RESULTS:
         raise ValueError("record")
     if record["fixtures"] not in ("complete", "not-run", "failed"):
+        raise ValueError("record")
+    counts = record["fixture_attempts"]
+    if type(counts) is not dict or set(counts) != {"controlled", "uncontrolled"}:
+        raise ValueError("record")
+    if any(type(value) is not int or not 0 <= value <= 500 for value in counts.values()):
         raise ValueError("record")
     if record["result"] not in ("accepted", "refused") or record["reason"] not in REASONS + ("none",):
         raise ValueError("record")
@@ -337,6 +343,7 @@ def merge_records(selftest, recheck):
         "memory_canary": combine_canary(selftest["memory_canary"], recheck["memory_canary"]),
         "readable_file_canary": combine_canary(selftest["readable_file_canary"], recheck["readable_file_canary"]),
         "fixtures": selftest["fixtures"],
+        "fixture_attempts": selftest["fixture_attempts"],
         "accepted": record_accepts(selftest) and record_accepts(recheck, require_fixtures=False),
     }
 

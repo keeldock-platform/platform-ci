@@ -1,5 +1,7 @@
 import base64
 import glob
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -75,6 +77,12 @@ def needles_for(value):
         value.encode("utf-16-le"),
     }
     return tuple(sorted(variants))
+
+
+def derive_canary(secret, label):
+    if not valid_canary(secret) or type(label) is not str or not label:
+        raise ValueError("canary")
+    return hmac.new(secret.encode("utf-8"), label.encode("ascii"), hashlib.sha256).hexdigest()
 
 
 def new_nonce_canary():
@@ -196,19 +204,54 @@ def current_cutoff_ns():
     return job_cutoff_ns(stat_text, boot_text, os.sysconf("SC_CLK_TCK"))
 
 
-def runner_targets(home, runner_temp):
+def runner_root_from_exe(exe_path):
+    if type(exe_path) is not str or ABSOLUTE_PATH.fullmatch(exe_path) is None:
+        return None
+    parent = os.path.dirname(exe_path)
+    if os.path.basename(exe_path) != "Runner.Worker" or not os.path.basename(parent).startswith("bin"):
+        return None
+    return os.path.dirname(parent)
+
+
+def runner_root():
+    pid = find_worker_pid()
+    if pid is None:
+        return None
+    try:
+        return runner_root_from_exe(os.readlink("/proc/" + str(pid) + "/exe"))
+    except OSError:
+        return None
+
+
+def required_unreadable(runner_temp, root):
+    required = []
+    if runner_temp:
+        required.append(runner_temp)
+    if root:
+        required.append(os.path.join(root, "_diag"))
+    return required
+
+
+def runner_targets(home, runner_temp, root=None):
     candidates = []
     if runner_temp:
         candidates.append(runner_temp)
         candidates.append(os.path.dirname(runner_temp))
         candidates.extend(sorted(glob.glob(os.path.join(runner_temp, "_runner_file_commands", "*"))))
+    if root:
+        candidates.append(root)
+        candidates.append(os.path.join(root, "_diag"))
+        candidates.append(os.path.join(root, "_work"))
+        candidates.append(os.path.join(root, "_work", "_temp"))
+        for name in (".credentials", ".credentials_rsaparams", ".runner"):
+            candidates.append(os.path.join(root, name))
     if home:
         for pattern in RUNNER_GLOBS:
             candidates.extend(sorted(glob.glob(os.path.join(home, pattern))))
         candidates.append(home)
     targets = []
     for path in candidates:
-        if ABSOLUTE_PATH.fullmatch(path) is None or path in targets:
+        if ABSOLUTE_PATH.fullmatch(path) is None or path in targets or not os.path.lexists(path):
             continue
         targets.append(path)
     return targets

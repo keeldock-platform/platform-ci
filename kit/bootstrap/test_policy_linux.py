@@ -238,6 +238,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
             [
                 "Fetch exact public control",
                 "Record runner image and resolve the preinstalled toolchain",
+                "Harden runner paths before the proof",
                 "Boundary self-test with generated hostile fixtures and secret canaries",
                 "Synthetic project phase marker",
                 "Re-run positive controls immediately before the first project command",
@@ -245,6 +246,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "Forced faults must fail closed",
             ],
         )
+        self.assertLess(boundary.index("linux_boundary.py harden"), boundary.index("linux_boundary.py selftest"))
         self.assertLess(boundary.index("linux_boundary.py selftest"), boundary.index("linux_boundary.py recheck"))
         self.assertLess(boundary.index("linux_boundary.py recheck"), boundary.index("linux_boundary.py merge"))
         self.assertIn("--synthetic-standin", boundary)

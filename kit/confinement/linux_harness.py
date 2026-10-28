@@ -76,6 +76,8 @@ COMPAT_SYSCALL_BIT = 0x40000000
 SECCOMP_DENY = 0x00050000 | errno.EPERM
 SECCOMP_ALLOW = 0x7FFF0000
 SOCKET_SYSCALLS = (41, 53, 425, 426, 427)
+EXTRA_DENIED_SYSCALLS = (101, 155, 161, 165, 166, 248, 249, 250, 272, 298, 308, 310, 311, 321, 323, 428, 429, 430, 431, 432, 438, 442)
+DENIED_SYSCALLS = SOCKET_SYSCALLS + EXTRA_DENIED_SYSCALLS
 SOCKET_FILTER = (
     (0x20, 0, 0, 4),
     (0x15, 1, 0, AUDIT_ARCH_NATIVE),
@@ -83,7 +85,7 @@ SOCKET_FILTER = (
     (0x20, 0, 0, 0),
     (0x45, 0, 1, COMPAT_SYSCALL_BIT),
     (0x06, 0, 0, SECCOMP_DENY),
-) + tuple(instruction for number in SOCKET_SYSCALLS for instruction in (
+) + tuple(instruction for number in DENIED_SYSCALLS for instruction in (
     (0x15, 0, 1, number),
     (0x06, 0, 0, SECCOMP_DENY),
 )) + ((0x06, 0, 0, SECCOMP_ALLOW),)

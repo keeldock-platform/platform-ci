@@ -177,13 +177,24 @@ class LinuxFixtureEvaluationTests(unittest.TestCase):
             self.assertNotIn("tcp-connect", optional)
             self.assertNotIn("output-exfil", optional)
 
-    def test_control_markers_require_tcp_udp_and_dns_evidence_bound_to_the_form_and_nonce(self):
+    def test_control_markers_cover_network_proxy_and_unix_paths_where_the_form_has_them(self):
         for form in fixtures.FORMS:
             markers = fixtures.control_markers(form, NONCE)
+            expected = ["https4", "udp", "dns_udp", "proxy"] + ([] if form == "shell" else ["unix"])
             with self.subTest(form=form):
-                self.assertEqual([listener for listener, marker in markers], ["https4", "udp", "dns_udp"])
+                self.assertEqual([listener for listener, marker in markers], expected)
                 for listener, marker in markers:
                     self.assertEqual(marker, "fx-" + fixtures.slug(form) + "-" + NONCE)
+
+    def test_boundary_attempts_and_output_are_reported_as_uncontrolled_evidence(self):
+        for form in fixtures.FORMS:
+            names = fixtures.uncontrolled_attempts(form)
+            with self.subTest(form=form):
+                self.assertIn("boundary-setuid", names)
+                self.assertIn("output-exfil", names)
+                self.assertNotIn("tcp-connect", names)
+                self.assertNotIn("proxy-connect", names)
+                self.assertEqual(len(names) + len([1 for key in fixtures.CONTROLLED if not (form == "shell" and key == "unix-connect")]), len(fixtures.fixture_rules(form)))
 
 
 if __name__ == "__main__":

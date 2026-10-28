@@ -123,6 +123,10 @@ jobs:
           printf '%s\n' "rust_sysroot=$sysroot" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/kd-records"
           printf '%s\n' "KD-LINUX-IMAGE schema=1 image-os=$ImageOS image-version=$ImageVersion rust=present node=present"
+      - name: Harden runner paths before the proof
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B kit/confinement/linux_boundary.py harden --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP"
       - name: Boundary self-test with generated hostile fixtures and secret canaries
         env:
           KD_CANARY_SECRET: kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd

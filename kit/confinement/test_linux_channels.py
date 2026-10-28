@@ -7,7 +7,13 @@ import linux_probes as probes
 from linux_channels import BoundaryRefusal
 
 
-__all__ = ["LinuxChannelModelTests", "LinuxAttemptJudgementTests", "LinuxRecordTests", "LinuxProbeSourceTests"]
+__all__ = [
+    "LinuxChannelModelTests",
+    "LinuxAttemptJudgementTests",
+    "LinuxRecordTests",
+    "LinuxProbeSourceTests",
+    "LinuxReviewFixChannelTests",
+]
 
 EXPECTED_CHANNELS = (
     "https",
@@ -317,6 +323,28 @@ class LinuxProbeSourceTests(unittest.TestCase):
         self.assertIn("ssl.SSLError", probes.PROBE_SOURCE)
         self.assertIn('"other"', probes.PROBE_SOURCE)
         self.assertIn("contained", probes.PROBE_SOURCE)
+
+
+
+class LinuxReviewFixChannelTests(unittest.TestCase):
+    def test_records_carry_bounded_fixture_attempt_counts_and_merge_keeps_them(self):
+        value = record()
+        value["fixture_attempts"] = {"controlled": 20, "uncontrolled": 25}
+        self.assertEqual(channels.load_record(channels.dump_record(value)), value)
+        for bad in ({"controlled": 1}, {"controlled": -1, "uncontrolled": 0}, {"controlled": True, "uncontrolled": 0}, {"controlled": 501, "uncontrolled": 0}, [], {"controlled": 1, "uncontrolled": 1, "x": 1}):
+            changed = json.loads(json.dumps(value))
+            changed["fixture_attempts"] = bad
+            with self.assertRaises(ValueError):
+                channels.dump_record(changed)
+        merged = channels.merge_records(value, record("recheck", fixtures="not-run"))
+        self.assertEqual(merged["fixture_attempts"], {"controlled": 20, "uncontrolled": 25})
+
+    def test_no_new_privs_is_read_from_proc_status_not_cleared(self):
+        names = [name for name, accepted in channels.ATTEMPT_RULES["boundary_disablement"]]
+        self.assertIn("nnp-set", names)
+        self.assertNotIn("nnp-clear", names)
+        self.assertIn("NoNewPrivs:", probes.PROBE_SOURCE)
+        self.assertNotIn("prctl(38", probes.PROBE_SOURCE)
 
 
 if __name__ == "__main__":

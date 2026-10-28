@@ -12,7 +12,7 @@ import linux_canaries as canaries
 from linux_channels import BoundaryRefusal
 
 
-__all__ = ["LinuxCanaryTests", "LinuxCanaryWalkTests"]
+__all__ = ["LinuxCanaryTests", "LinuxCanaryWalkTests", "LinuxReviewFixCanaryTests"]
 
 NONCE = "0123456789abcdef01234567"
 ROOT = Path(__file__).resolve().parents[2]
@@ -206,6 +206,41 @@ class LinuxCanaryWalkTests(unittest.TestCase):
         self.assertNotIn(canaries.CANARY_ENV_NAME, canaries.WALKER_ENV)
         self.assertEqual(set(canaries.WALKER_ENV), {"PATH", "LANG", "LC_ALL", "PYTHONDONTWRITEBYTECODE"})
         self.assertIsNone(re.fullmatch(canaries.ABSOLUTE_PATH.pattern, "relative/path"))
+
+
+
+class LinuxReviewFixCanaryTests(unittest.TestCase):
+    def test_runner_root_comes_from_the_worker_executable_layout_only(self):
+        self.assertEqual(canaries.runner_root_from_exe("/opt/runner/bin.2.1.0/Runner.Worker"), "/opt/runner")
+        for bad in (None, "", "relative", "/opt/runner/bin.2.1.0/Other", "/opt/runner/lib/Runner.Worker", "/opt/run ner/bin/Runner.Worker"):
+            self.assertIsNone(canaries.runner_root_from_exe(bad))
+
+    def test_required_unreadable_targets_are_temp_and_the_runner_diag(self):
+        self.assertEqual(canaries.required_unreadable("/w/_temp", "/r"), ["/w/_temp", "/r/_diag"])
+        self.assertEqual(canaries.required_unreadable("/w/_temp", None), ["/w/_temp"])
+        self.assertEqual(canaries.required_unreadable(None, None), [])
+
+    def test_targets_include_the_runner_root_diag_work_temp_and_credentials(self):
+        with tempfile.TemporaryDirectory() as base:
+            root = os.path.join(base, "runner")
+            os.makedirs(os.path.join(root, "_diag"))
+            os.makedirs(os.path.join(root, "_work", "_temp"))
+            Path(root, ".credentials").write_text("x")
+            targets = canaries.runner_targets(None, os.path.join(root, "_work", "_temp"), root)
+            for name in ("_diag", "_work", "_work/_temp", ".credentials"):
+                self.assertIn(os.path.join(root, name), targets)
+            self.assertNotIn(os.path.join(root, ".runner"), targets)
+
+    def test_derived_canary_is_a_keyed_digest_not_the_secret(self):
+        secret = "s" * 40
+        derived = canaries.derive_canary(secret, "label")
+        self.assertEqual(len(derived), 64)
+        self.assertNotIn(secret, derived)
+        self.assertNotEqual(derived, canaries.derive_canary(secret, "other"))
+        self.assertNotEqual(derived, canaries.derive_canary("t" * 40, "label"))
+        self.assertTrue(canaries.valid_canary(derived))
+        with self.assertRaises(ValueError):
+            canaries.derive_canary("short", "label")
 
 
 if __name__ == "__main__":

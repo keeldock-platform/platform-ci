@@ -11,7 +11,7 @@ import linux_session as session
 from linux_channels import BoundaryRefusal
 
 
-__all__ = ["LinuxSessionPureTests", "LinuxSessionSpecTests", "LinuxSessionLaunchTests"]
+__all__ = ["LinuxSessionPureTests", "LinuxSessionSpecTests", "LinuxSessionLaunchTests", "LinuxSeccompNumberTests"]
 
 NONCE = "0123456789abcdef01234567"
 MOUNTINFO = (
@@ -363,6 +363,39 @@ class LinuxSessionLaunchTests(unittest.TestCase):
         self.assertEqual((kwargs["user"], kwargs["group"], kwargs["extra_groups"]), (65534, 65534, []))
         self.assertEqual(kwargs["env"], {"KD_CONTROL": "token", "A": "b"})
         self.assertNotIn("preexec_fn", kwargs)
+
+
+
+class LinuxSeccompNumberTests(unittest.TestCase):
+    SYSCALL_NUMBERS = {
+        "socket": 41, "socketpair": 53, "io_uring_setup": 425, "io_uring_enter": 426, "io_uring_register": 427,
+        "ptrace": 101, "pivot_root": 155, "chroot": 161, "mount": 165, "umount2": 166,
+        "add_key": 248, "request_key": 249, "keyctl": 250, "unshare": 272, "perf_event_open": 298,
+        "setns": 308, "process_vm_readv": 310, "process_vm_writev": 311, "bpf": 321, "userfaultfd": 323,
+        "open_tree": 428, "move_mount": 429, "fsopen": 430, "fsconfig": 431, "fsmount": 432,
+        "pidfd_getfd": 438, "mount_setattr": 442,
+    }
+
+    def test_denied_syscalls_are_exactly_the_reviewed_x86_64_numbers(self):
+        self.assertEqual(sorted(harness.DENIED_SYSCALLS), sorted(self.SYSCALL_NUMBERS.values()))
+        self.assertEqual(len(set(harness.DENIED_SYSCALLS)), len(harness.DENIED_SYSCALLS))
+        required = (
+            "ptrace", "process_vm_readv", "process_vm_writev", "pidfd_getfd", "mount", "umount2", "pivot_root",
+            "move_mount", "open_tree", "fsopen", "fsmount", "fsconfig", "mount_setattr", "chroot", "unshare",
+            "setns", "keyctl", "add_key", "request_key", "bpf", "perf_event_open", "userfaultfd",
+        )
+        for name in required:
+            self.assertIn(self.SYSCALL_NUMBERS[name], harness.DENIED_SYSCALLS, name)
+
+    def test_filter_has_one_compare_and_deny_pair_per_denied_syscall(self):
+        pairs = [
+            (harness.SOCKET_FILTER[index][3], harness.SOCKET_FILTER[index + 1][3])
+            for index in range(6, len(harness.SOCKET_FILTER) - 1, 2)
+        ]
+        self.assertEqual([number for number, unused in pairs], list(harness.DENIED_SYSCALLS))
+        self.assertTrue(all(value == harness.SECCOMP_DENY for unused, value in pairs))
+        self.assertEqual(harness.SOCKET_FILTER[-1][3], harness.SECCOMP_ALLOW)
+        self.assertLess(len(harness.SOCKET_FILTER), 4096)
 
 
 if __name__ == "__main__":

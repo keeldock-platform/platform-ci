@@ -13,7 +13,13 @@ import linux_harness as harness
 from linux_channels import BoundaryRefusal
 
 
-__all__ = ["LinuxBoundaryDecisionTests", "LinuxBoundaryPhaseTests", "LinuxBoundaryFaultTests", "LinuxBoundaryCommandTests"]
+__all__ = [
+    "LinuxBoundaryDecisionTests",
+    "LinuxBoundaryPhaseTests",
+    "LinuxBoundaryFaultTests",
+    "LinuxBoundaryCommandTests",
+    "LinuxBoundaryReviewFixTests",
+]
 
 SHA = "a" * 40
 
@@ -94,7 +100,8 @@ class LinuxBoundaryDecisionTests(unittest.TestCase):
         subject, unused = make()
 
         def sysctl(path):
-            return "3" if "ptrace" in path else "0"
+            values = {"ptrace_scope": "3", "max_user_namespaces": "0", "unprivileged_bpf_disabled": "2", "perf_event_paranoid": "4"}
+            return values[path.rsplit("/", 1)[1]]
 
         with patch("linux_boundary.harness._read_sysctl", side_effect=sysctl):
             subject.readback_before_drop()
@@ -207,6 +214,12 @@ class LinuxBoundaryPhaseTests(unittest.TestCase):
             self.assertEqual(os.stat(path).st_mode & 0o077, 0)
             with open(path) as source:
                 self.assertEqual(channels.load_record(source.read()), record)
+            with self.assertRaises(FileExistsError):
+                boundary.write_record(path, record)
+            link = os.path.join(base, "link.json")
+            os.symlink(path, link)
+            with self.assertRaises(OSError):
+                boundary.write_record(link, record)
         refused = boundary.refused_record("recheck", BoundaryRefusal("environment"))
         self.assertEqual(refused["result"], "refused")
         channels.validate_record(refused)
@@ -252,6 +265,41 @@ class LinuxBoundaryFaultTests(unittest.TestCase):
             if name.startswith("fixture-"):
                 fixture_outcome.assert_called_once()
                 run_channel.assert_not_called()
+
+    def real_network_boundary(self):
+        import linux_session as session
+        subject, emitter = make()
+        store = session.EventStore()
+        subject.tripwires = SimpleNamespace(
+            store=store,
+            ipv6=False,
+            config=lambda: {"nonce": subject.nonce, "ports": {"https4": 1111, "dns_udp": 53}, "unix_path": "/ipc/docker.sock", "abstract_name": "kd-x"},
+        )
+
+        def chroot(argv, env, mode="confined", **options):
+            config = json.loads(argv[-1])
+            channel = argv[-2]
+            if mode == "open":
+                if config["ports"]["https4"] != 9 and channel == "https":
+                    store.record("https4", ("v4-" + subject.nonce + " host-" + subject.nonce).encode())
+                return result(b"")
+            rules = channels.ATTEMPT_RULES[channel]
+            return result(("".join("KDATT " + name + " " + accepted[0] + chr(10) for name, accepted in rules)).encode())
+
+        subject.chroot = chroot
+        return subject
+
+    def test_recheck_dead_is_injected_by_the_real_network_channel_for_https_only(self):
+        subject = self.real_network_boundary()
+        healthy = subject.network_channel("https")
+        self.assertEqual((healthy.status, healthy.control, healthy.refusal), ("blocked", True, None))
+        subject.fault = "recheck-dead"
+        dead = subject.network_channel("https")
+        self.assertEqual(dead.refusal.reason, "control_not_fired")
+        self.assertFalse(dead.control)
+        self.assertEqual(subject.run_channel("https").refusal.reason, "control_not_fired")
+        subject.fault = None
+        self.assertTrue(boundary.run_fault(subject, "recheck-dead"))
 
     def test_a_fault_that_does_not_refuse_or_refuses_for_another_reason_is_reported_unexpected(self):
         subject, emitter = make()
@@ -311,6 +359,7 @@ class LinuxBoundaryCommandTests(unittest.TestCase):
             with open(merged) as source:
                 self.assertTrue(json.loads(source.read())["accepted"])
             recheck["channels"]["dns"] = {"status": "blocked", "control": False}
+            os.unlink(second)
             boundary.write_record(second, recheck)
             out = io.StringIO()
             with patch("linux_boundary.sys.stdout", out):
@@ -341,6 +390,107 @@ class LinuxBoundaryCommandTests(unittest.TestCase):
         parser = boundary.build_parser()
         for command in ("selftest", "recheck", "faults", "merge"):
             self.assertEqual(parser.parse_args([command]).command, command)
+
+
+
+class LinuxBoundaryReviewFixTests(unittest.TestCase):
+    def test_readback_also_requires_bpf_and_perf_restrictions(self):
+        subject, unused = make()
+        base = {"ptrace_scope": "3", "max_user_namespaces": "0", "unprivileged_bpf_disabled": "2", "perf_event_paranoid": "4"}
+        for key, value, detail in (
+            ("unprivileged_bpf_disabled", "0", 64),
+            ("perf_event_paranoid", "1", 65),
+            ("perf_event_paranoid", "x", 65),
+        ):
+            values = dict(base, **{key: value})
+            with patch("linux_boundary.harness._read_sysctl", side_effect=lambda path, values=values: values[path.rsplit("/", 1)[1]]):
+                with self.assertRaises(BoundaryRefusal) as raised:
+                    subject.readback_before_drop()
+            self.assertEqual(raised.exception.detail, detail)
+        for value in ("1", "2"):
+            values = dict(base, unprivileged_bpf_disabled=value)
+            with patch("linux_boundary.harness._read_sysctl", side_effect=lambda path, values=values: values[path.rsplit("/", 1)[1]]):
+                subject.readback_before_drop()
+
+    def test_the_proof_only_verifies_runner_paths_and_never_hardens_them(self):
+        import inspect
+        for method in (boundary.Boundary.runner_files_outcome, boundary.Boundary.channel_runner_files, boundary.Boundary.prepare):
+            self.assertNotIn("harden_runner_paths", inspect.getsource(method))
+        self.assertIn("harden_runner_paths", inspect.getsource(boundary.run_harden))
+
+    def test_verification_refuses_when_the_temp_and_runner_diag_targets_are_not_both_present(self):
+        subject, unused = make()
+        subject.targets = ["/w/_temp", "/w"]
+        subject.required = ["/w/_temp"]
+        subject.workdir = "/tmp/unused-workdir"
+        subject.nonce = "0123456789abcdef01234567"
+        with patch("linux_boundary.canaries.plant_writable_control", return_value=("/c", "/c/f")), \
+             patch("linux_boundary.canaries.run_walker", return_value={"tested": 4, "leaks": [2, 3]}), \
+             patch("linux_boundary.os.path.lexists", return_value=True):
+            with self.assertRaises(BoundaryRefusal) as raised:
+                subject.runner_files_outcome()
+        self.assertEqual(raised.exception.reason, "scan_incomplete")
+
+    def test_harden_step_hardens_then_requires_every_target_unreadable(self):
+        args = arguments(runner_home="/h", runner_temp="/w/_temp")
+        targets = ["/w/_temp", "/r/_diag", "/h"]
+        with patch("linux_boundary.os.geteuid", return_value=0), \
+             patch("linux_boundary.canaries.runner_root", return_value="/r"), \
+             patch("linux_boundary.canaries.runner_targets", return_value=targets), \
+             patch("linux_boundary.canaries.harden_runner_paths", return_value=2) as harden:
+            out = io.StringIO()
+            with patch("linux_boundary.sys.stdout", out), \
+                 patch("linux_boundary.canaries.run_walker", return_value={"leaks": [], "tested": 3}):
+                self.assertEqual(boundary.run_harden(args), 0)
+            self.assertEqual(out.getvalue(), "KD-LINUX-HARDEN schema=1 targets=3 changed=2 readable=0\n")
+            harden.assert_called_once_with(targets)
+            out = io.StringIO()
+            with patch("linux_boundary.sys.stdout", out), \
+                 patch("linux_boundary.canaries.run_walker", return_value={"leaks": [1], "tested": 3}):
+                self.assertEqual(boundary.run_harden(args), 1)
+            self.assertIn("reason=readback_failed channel=runner_files", out.getvalue())
+            self.assertTrue(out.getvalue().strip().endswith("project-execution=not_started"))
+        with patch("linux_boundary.os.geteuid", return_value=0), \
+             patch("linux_boundary.canaries.runner_root", return_value=None), \
+             patch("linux_boundary.canaries.runner_targets", return_value=["/w/_temp"]):
+            out = io.StringIO()
+            with patch("linux_boundary.sys.stdout", out):
+                self.assertEqual(boundary.run_harden(args), 1)
+            self.assertIn("reason=scan_incomplete", out.getvalue())
+        with patch("linux_boundary.os.geteuid", return_value=1000):
+            out = io.StringIO()
+            with patch("linux_boundary.sys.stdout", out):
+                self.assertEqual(boundary.run_harden(args), 1)
+            self.assertIn("reason=environment", out.getvalue())
+
+    def test_real_mode_places_a_derived_canary_and_never_the_secret_itself(self):
+        secret = "r" * 40
+        placed = []
+        for standin, expect_secret in ((False, False), (True, True)):
+            subject, unused = make(synthetic_standin=standin)
+            value = boundary.canaries.STANDIN_VALUE if standin else secret
+            with patch("linux_boundary.os.geteuid", return_value=0), \
+                 patch("linux_boundary.verify_control_sha"), \
+                 patch.object(boundary.Boundary, "readback_before_drop"), \
+                 patch("linux_boundary.session.TripwireSet"), \
+                 patch("linux_boundary.canaries.place_canaries", side_effect=lambda directory, values, **kw: placed.append(list(values))), \
+                 patch("linux_boundary.canaries.plant_control_files"), \
+                 patch("linux_boundary.canaries.runner_root", return_value=None), \
+                 patch.dict(os.environ, {"KD_CANARY_SECRET": value}):
+                subject.prepare(False)
+            try:
+                self.assertEqual(value in placed[-1], expect_secret)
+                self.assertEqual(len(placed[-1]), 2)
+                needles = subject.secret_needles
+                self.assertIn(value.encode(), needles)
+                self.assertIn(subject.derived_canary.encode(), needles)
+                self.assertEqual(subject.derived_canary, boundary.canaries.derive_canary(value, "kd-linux-file-placement"))
+            finally:
+                subject.close()
+
+    def test_vm_readv_self_read_control_uses_the_reviewed_syscall_number(self):
+        self.assertEqual(boundary.PROCESS_VM_READV, 310)
+        self.assertTrue(boundary.vm_readv_self_control("0123456789abcdef01234567"))
 
 
 if __name__ == "__main__":

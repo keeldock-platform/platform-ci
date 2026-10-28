@@ -34,7 +34,13 @@ OPTIONAL = {
     "python": ("boundary-sudo",),
     "npm_postinstall": ("boundary-unshare", "boundary-mount", "boundary-sudo"),
 }
-CONTROL_LISTENERS = (("tcp", "https4"), ("udp", "udp"), ("dns", "dns_udp"))
+CONTROLLED = {
+    "tcp-connect": "https4",
+    "udp-send": "udp",
+    "dns-lookup": "dns_udp",
+    "proxy-connect": "proxy",
+    "unix-connect": "unix",
+}
 RUN_TIMEOUT = {
     "build_rs": 150,
     "proc_macro": 150,
@@ -511,7 +517,15 @@ def fixture_env(form, nonce, ports, unix_path, rustc=None):
 
 def control_markers(form, nonce):
     marker = "fx-" + slug(form) + "-" + nonce
-    return tuple((listener, marker) for unused, listener in CONTROL_LISTENERS)
+    return tuple(
+        (listener, marker)
+        for name, listener in CONTROLLED.items()
+        if not (form in NO_UNIX and name == "unix-connect")
+    )
+
+
+def uncontrolled_attempts(form):
+    return tuple(name for name, accepted in fixture_rules(form) if name not in CONTROLLED)
 
 
 def all_sources():

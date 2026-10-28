@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import json
 import os
 import re
@@ -39,6 +40,7 @@ FAULTS = {
     "fixture-truncated": "fixture_incomplete",
     "recheck-dead": "control_not_fired",
 }
+PROCESS_VM_READV = 310
 WORKER_NAMES = ("Runner.Worker", "Runner.Listener")
 
 
@@ -60,6 +62,29 @@ class Outcome:
         self.status = status
         self.control = bool(control)
         self.refusal = refusal
+
+
+class Iovec(ctypes.Structure):
+    _fields_ = (("base", ctypes.c_void_p), ("length", ctypes.c_size_t))
+
+
+def vm_readv_self_control(nonce):
+    marker = ("vm-" + nonce).encode("ascii")
+    source = ctypes.create_string_buffer(marker)
+    target = ctypes.create_string_buffer(len(marker))
+    local = Iovec(ctypes.cast(target, ctypes.c_void_p), len(marker))
+    remote = Iovec(ctypes.cast(source, ctypes.c_void_p), len(marker))
+    libc = ctypes.CDLL(None, use_errno=True)
+    done = libc.syscall(
+        ctypes.c_long(PROCESS_VM_READV),
+        ctypes.c_long(os.getpid()),
+        ctypes.byref(local),
+        ctypes.c_long(1),
+        ctypes.byref(remote),
+        ctypes.c_long(1),
+        ctypes.c_long(0),
+    )
+    return done == len(marker) and target.raw == marker
 
 
 def transcript_hits(lines, nonce, needles):
@@ -116,6 +141,8 @@ class Boundary:
         self.memory_canary = "not-run"
         self.readable_canary = "not-run"
         self.scope = "unread"
+        self.fixture_controlled = 0
+        self.fixture_uncontrolled = 0
 
     def close(self):
         if self.tripwires is not None:
@@ -130,6 +157,11 @@ class Boundary:
             raise BoundaryRefusal("readback_failed", None, 61)
         if harness._read_sysctl("/proc/sys/user/max_user_namespaces") != "0":
             raise BoundaryRefusal("readback_failed", None, 62)
+        if harness._read_sysctl("/proc/sys/kernel/unprivileged_bpf_disabled") not in ("1", "2"):
+            raise BoundaryRefusal("readback_failed", None, 64)
+        paranoid = harness._read_sysctl("/proc/sys/kernel/perf_event_paranoid")
+        if re.fullmatch(r"-?[0-9]{1,2}", paranoid) is None or int(paranoid) < 2:
+            raise BoundaryRefusal("readback_failed", None, 65)
         if self.arguments.runner_uid == harness.CHILD_UID:
             raise BoundaryRefusal("readback_failed", None, 23)
 
@@ -156,10 +188,17 @@ class Boundary:
             os.mkdir(path, 0o755)
         self.tripwires = session.TripwireSet(self.nonce, self.ipc_dir)
         self.nonce_canary = canaries.new_nonce_canary()
-        self.secret_needles = canaries.needles_for(self.canary) + canaries.needles_for(self.nonce_canary)
-        canaries.place_canaries(self.canary_dir, [self.canary, self.nonce_canary])
+        self.derived_canary = canaries.derive_canary(self.canary, "kd-linux-file-placement")
+        self.placed = [self.canary if self.arguments.synthetic_standin else self.derived_canary, self.nonce_canary]
+        variants = set(canaries.needles_for(self.canary))
+        variants.update(canaries.needles_for(self.derived_canary))
+        variants.update(canaries.needles_for(self.nonce_canary))
+        self.secret_needles = tuple(sorted(variants))
+        canaries.place_canaries(self.canary_dir, self.placed)
         canaries.plant_control_files(self.control_dir, self.nonce)
-        self.targets = canaries.runner_targets(self.arguments.runner_home, self.arguments.runner_temp)
+        self.runner_root = canaries.runner_root()
+        self.targets = canaries.runner_targets(self.arguments.runner_home, self.arguments.runner_temp, self.runner_root)
+        self.required = canaries.required_unreadable(self.arguments.runner_temp, self.runner_root)
 
     def probe_files(self):
         return {
@@ -237,7 +276,7 @@ class Boundary:
             mode = "open"
         if self.fault == "uid-root" and channel == "runner_ipc":
             fault = "uid-root"
-        if self.fault == "control-dead" and channel == "dns":
+        if (self.fault == "control-dead" and channel == "dns") or (self.fault == "recheck-dead" and channel == "https"):
             broken = True
         before = self.network_control(channel, broken)
         self.tripwires.store.clear()
@@ -284,7 +323,7 @@ class Boundary:
 
     def channel_runner_files(self):
         if self.fault == "canary-readable":
-            canaries.place_canaries(self.canary_dir, [self.canary, self.nonce_canary], world_readable=True)
+            canaries.place_canaries(self.canary_dir, self.placed, world_readable=True)
         try:
             return self.runner_files_outcome()
         finally:
@@ -293,14 +332,14 @@ class Boundary:
                 os.unlink(leak)
 
     def runner_files_outcome(self):
-        canaries.harden_runner_paths(self.targets)
         control_dir, control_file = canaries.plant_writable_control(os.path.join(self.workdir, "writable"))
         real = list(self.targets)
         entries = real + [control_dir, control_file]
         paths = canaries.run_walker({"mode": "paths", "targets": entries, "nonce": self.nonce}, 60)
         existing = sum(1 for path in real if os.path.lexists(path))
         leaks = paths.get("leaks")
-        if type(leaks) is not list or paths.get("tested") != existing + 2 or existing < 2:
+        required_ok = len(self.required) == 2 and all(path in real for path in self.required)
+        if type(leaks) is not list or paths.get("tested") != existing + 2 or not required_ok:
             raise BoundaryRefusal("scan_incomplete", "runner_files")
         controls_leak = (len(real) in leaks) and (len(real) + 1 in leaks)
         real_leaks = [index for index in leaks if type(index) is int and index < len(real)]
@@ -358,7 +397,7 @@ class Boundary:
             raise BoundaryRefusal("readback_failed", "process_memory", 61)
         verdict = channels.judge_attempts(channels.ATTEMPT_RULES["process_memory"], result.stdout)
         controls = channels.control_attempts_allowed(result.stdout, channels.control_names("process_memory"))
-        control = controls and scan["readable_control"]
+        control = controls and scan["readable_control"] and vm_readv_self_control(self.nonce)
         self.memory_canary = "absent" if (verdict == "ok" and not scan["secret"]) else "present"
         if scan["secret"]:
             return Outcome("observed-leak", control, BoundaryRefusal("canary_present", "process_memory"))
@@ -415,6 +454,10 @@ class Boundary:
             raise BoundaryRefusal("attempt_unexpected")
         if not control:
             raise BoundaryRefusal("control_not_fired")
+        total = len(fixtures.fixture_rules(form))
+        uncontrolled = len(fixtures.uncontrolled_attempts(form))
+        self.fixture_controlled += total - uncontrolled
+        self.fixture_uncontrolled += uncontrolled
 
     def run_fixtures(self):
         first = None
@@ -445,6 +488,7 @@ def run_phase(boundary, phase, with_fixtures):
             emitter.emit(
                 channels.LINE_PREFIX + "-FIXTURES schema=" + str(channels.SCHEMA_VERSION) + " phase=" + phase
                 + " forms=" + str(completed) + "/" + str(len(fixtures.FORMS)) + " result=" + fixtures_state
+                + " controlled=" + str(boundary.fixture_controlled) + " uncontrolled=" + str(boundary.fixture_uncontrolled)
             )
             if failure is not None and refusal is None:
                 refusal = failure
@@ -455,6 +499,10 @@ def run_phase(boundary, phase, with_fixtures):
         if outcome.refusal is not None and refusal is None:
             refusal = outcome.refusal
     record["fixtures"] = fixtures_state
+    record["fixture_attempts"] = {
+        "controlled": boundary.fixture_controlled,
+        "uncontrolled": boundary.fixture_uncontrolled,
+    }
     record["memory_canary"] = boundary.memory_canary
     record["readable_file_canary"] = boundary.readable_canary
     emitter.emit(channels.canary_line(phase, record["memory_canary"], record["readable_file_canary"]))
@@ -479,7 +527,7 @@ def run_phase(boundary, phase, with_fixtures):
 
 
 def write_record(path, record):
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         os.write(descriptor, channels.dump_record(record).encode("ascii"))
     finally:
@@ -564,6 +612,30 @@ def run_faults(arguments):
         boundary.close()
 
 
+def run_harden(arguments):
+    emitter = Emitter()
+    try:
+        if os.geteuid() != 0:
+            raise BoundaryRefusal("environment")
+        root = canaries.runner_root()
+        targets = canaries.runner_targets(arguments.runner_home, arguments.runner_temp, root)
+        required = canaries.required_unreadable(arguments.runner_temp, root)
+        if len(required) != 2 or not all(path in targets for path in required):
+            raise BoundaryRefusal("scan_incomplete", "runner_files")
+        changed = canaries.harden_runner_paths(targets)
+        paths = canaries.run_walker({"mode": "paths", "targets": targets, "nonce": os.urandom(12).hex()}, 60)
+        if paths.get("leaks") != [] or paths.get("tested") != len(targets):
+            raise BoundaryRefusal("readback_failed", "runner_files")
+    except BoundaryRefusal as refusal:
+        emitter.emit(channels.verdict_line("selftest", refusal, 0))
+        return 1
+    emitter.emit(
+        channels.LINE_PREFIX + "-HARDEN schema=" + str(channels.SCHEMA_VERSION)
+        + " targets=" + str(len(targets)) + " changed=" + str(changed) + " readable=0"
+    )
+    return 0
+
+
 def run_merge(arguments):
     emitter = Emitter()
     try:
@@ -584,7 +656,7 @@ def run_merge(arguments):
         + " fixtures=" + merged["fixtures"]
     )
     if arguments.out:
-        descriptor = os.open(arguments.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        descriptor = os.open(arguments.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
             os.write(descriptor, (json.dumps(merged, sort_keys=True, separators=(",", ":")) + chr(10)).encode("ascii"))
         finally:
@@ -602,7 +674,7 @@ def optional_path(value):
 
 def build_parser():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("command", choices=("selftest", "recheck", "faults", "merge"))
+    parser.add_argument("command", choices=("selftest", "recheck", "faults", "merge", "harden"))
     parser.add_argument("--control-sha")
     parser.add_argument("--record")
     parser.add_argument("--rust-sysroot", type=optional_path, default=None)
@@ -625,6 +697,8 @@ def main(argv=None):
             return 2
         if arguments.runner_uid < 0:
             return 2
+        if arguments.command == "harden":
+            return run_harden(arguments)
         if arguments.command == "faults":
             return run_faults(arguments)
         return run_named_phase(arguments, arguments.command)

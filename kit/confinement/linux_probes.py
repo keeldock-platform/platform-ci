@@ -264,9 +264,11 @@ def run_boundary_disablement():
     def escape():
         os.chroot("/")
 
-    def clear_no_new_privs():
-        ctypes.set_errno(0)
-        check(libc.prctl(38, 0, 0, 0, 0))
+    def no_new_privs_unset():
+        with open("/proc/self/status") as source:
+            for line in source:
+                if line.startswith("NoNewPrivs:") and line.split()[1] == "1":
+                    closed()
 
     def command(arguments):
         def action():
@@ -289,7 +291,7 @@ def run_boundary_disablement():
     attempt("sysctl-write", sysctl, accepted=BOUNDARY_DENIED)
     attempt("signal-init", signal_init, accepted=BOUNDARY_DENIED)
     attempt("chroot-escape", escape, accepted=BOUNDARY_DENIED)
-    attempt("nnp-clear", clear_no_new_privs, accepted=BOUNDARY_DENIED)
+    attempt("nnp-set", no_new_privs_unset, accepted=BOUNDARY_DENIED)
     attempt("sudo", command(["/usr/bin/sudo", "-n", "true"]), accepted=BOUNDARY_DENIED, optional=True)
     attempt("docker", command(["/usr/bin/docker", "version"]), accepted=BOUNDARY_DENIED, optional=True)
     attempt("ip-link", command(["/usr/sbin/ip", "link", "set", "lo", "up"]), accepted=BOUNDARY_DENIED, optional=True)
