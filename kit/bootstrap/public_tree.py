@@ -48,6 +48,8 @@ PLATFORM_FILES = frozenset(
         'kit/confinement/test_node_lock_manifest.mjs',
         'kit/confinement/node_lock_receipt.py',
         'kit/confinement/test_node_lock_receipt.py',
+        'kit/confinement/npm_admission.py',
+        'kit/confinement/test_confinement_npm_admission.py',
         ".github/workflows/linux-confinement.yml",
         ".github/workflows/windows-attestation-permission-probe.yml",
         ".github/workflows/attestation-probe.yml",
