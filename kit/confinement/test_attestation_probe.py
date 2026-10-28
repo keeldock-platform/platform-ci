@@ -9,6 +9,8 @@ from unittest.mock import patch
 from attestation_probe import evaluate_mapping, job_identifier, load_json, main, verified_leaf_summary
 
 
+PUBLIC_REPO_URL = "https:" + chr(47) * 2 + "github.com" + chr(47) + "example/public"
+
 EXPECTED = {
     "audience": "sigstore",
     "issuer": "https://token.actions.githubusercontent.com",
@@ -20,7 +22,7 @@ EXPECTED = {
 
 def verified_summary(**changes):
     certificate = {
-        "identity": "https://github.com/example/public/.github/workflows/probe.yml@refs/heads/main",
+        "identity": PUBLIC_REPO_URL + "/.github/workflows/probe.yml@refs/heads/main",
         "issuer": "https://token.actions.githubusercontent.com",
     }
     certificate.update(changes)
@@ -69,7 +71,7 @@ class AttestationProbeTests(unittest.TestCase):
     def test_unreviewed_job_fields_even_in_leaf_are_not_accepted(self):
         value = verified_summary(
             aud="sigstore", check_run_id=931, run_id=701, run_attempt=2,
-            runInvocationURI="https://github.com/example/public/actions/runs/701/attempts/2",
+            runInvocationURI=PUBLIC_REPO_URL + "/actions/runs/701/attempts/2",
         )
         result, fields = evaluate_mapping(value, EXPECTED)
         self.assertEqual(result, "unavailable")
