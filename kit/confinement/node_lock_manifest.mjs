@@ -1,4 +1,5 @@
 import { TextDecoder } from 'node:util';
+import { createHash } from 'node:crypto';
 
 export const LOCK_MANIFEST_LIMITS = Object.freeze({
   inputBytes: (4 * 1024 * 1024) - (64 * 1024),
@@ -383,6 +384,18 @@ function workspaceResolutionCandidates(workspacePath, name) {
   return candidates;
 }
 
+function packageResolutionCandidates(packagePath, name) {
+  let parent = packagePath;
+  const candidates = [];
+  while (parent) {
+    candidates.push(`${parent}/node_modules/${name}`);
+    const separator = parent.lastIndexOf('/');
+    parent = separator < 0 ? '' : parent.slice(0, separator);
+  }
+  candidates.push(`node_modules/${name}`);
+  return candidates;
+}
+
 function validateExpectedDirectPins(packages, expected, workspaceByName) {
   for (const group of DEPENDENCY_GROUPS) {
     for (const [name, spec] of Object.entries(expected.root[group] ?? {})) {
@@ -394,6 +407,92 @@ function validateExpectedDirectPins(packages, expected, workspaceByName) {
       }
     }
   }
+}
+
+function buildLockInventory(packages, expected, workspaceByPath, workspaceDirectories) {
+  const records = Object.create(null);
+  const packageKeys = Object.keys(packages);
+  for (const key of packageKeys) {
+    const entry = packages[key];
+    if (key !== '' && entry.link === true) continue;
+    let name;
+    let version;
+    let kind;
+    if (key === '') {
+      name = expected.root.name;
+      version = expected.root.version;
+      kind = 'root';
+    } else if (workspaceByPath.has(key)) {
+      const workspace = workspaceByPath.get(key);
+      name = workspace.name;
+      version = workspace.version;
+      kind = 'workspace';
+    } else {
+      name = nodeModulesPackageName(key, workspaceDirectories);
+      version = entry.version;
+      kind = 'registry';
+    }
+    if (typeof name !== 'string' || typeof version !== 'string') reject('invalid_package');
+    if (entry.license !== undefined
+        && (typeof entry.license !== 'string' || entry.license.length > 4096)) {
+      reject('invalid_package');
+    }
+    records[key] = {
+      name,
+      version,
+      kind,
+      integrity: kind === 'registry' ? entry.integrity : null,
+      license: typeof entry.license === 'string' ? entry.license : null,
+      dependencies: [],
+    };
+  }
+
+  for (const key of Object.keys(records)) {
+    const entry = packages[key];
+    const names = new Set();
+    for (const group of DEPENDENCY_GROUPS) {
+      const map = entry[group];
+      if (map && typeof map === 'object' && !Array.isArray(map)) {
+        for (const name of Object.keys(map)) names.add(name);
+      }
+    }
+    const dependencies = [];
+    for (const name of [...names].sort()) {
+      const candidates = key === ''
+        ? [`node_modules/${name}`]
+        : (workspaceByPath.has(key)
+          ? workspaceResolutionCandidates(key, name)
+          : packageResolutionCandidates(key, name));
+      let targetPath = candidates.find((candidate) => Object.hasOwn(packages, candidate));
+      if (targetPath && packages[targetPath].link === true) {
+        targetPath = packages[targetPath].resolved;
+      }
+      const target = targetPath === undefined ? undefined : records[targetPath];
+      if (!target) {
+        const optionalPeer = entry.peerDependenciesMeta
+          && entry.peerDependenciesMeta[name]
+          && entry.peerDependenciesMeta[name].optional === true;
+        if (entry.optionalDependencies && Object.hasOwn(entry.optionalDependencies, name)
+            || optionalPeer) continue;
+        reject('invalid_package');
+      }
+      dependencies.push({ name: target.name, version: target.version });
+    }
+    dependencies.sort((left, right) => {
+      const leftKey = `${left.name}@${left.version}`;
+      const rightKey = `${right.name}@${right.version}`;
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+    records[key].dependencies = dependencies;
+  }
+
+  const result = Object.keys(records).map((key) => records[key]);
+  result.sort((left, right) => {
+    const leftKey = `${left.name}@${left.version}:${left.kind}`;
+    const rightKey = `${right.name}@${right.version}:${right.kind}`;
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+  return result;
 }
 
 /** Validate an npm v3 lock against caller-supplied, pre-reviewed manifest metadata. */
@@ -463,14 +562,35 @@ function validateLockManifestUnchecked(lockBytes, expectedInput) {
     if (entry.name !== undefined && entry.name !== moduleName) reject('invalid_package');
   }
 
-  return Object.freeze({ packageCount: packageKeys.length, lockfileVersion: 3 });
+  return Object.freeze({
+    packageCount: packageKeys.length,
+    lockfileVersion: 3,
+    packages: buildLockInventory(packages, expected, workspaceByPath, workspaceDirectories),
+  });
 }
 
-export function validateLockManifest(lockBytes, expectedInput) {
+function checkedLockManifest(lockBytes, expectedInput) {
   try {
     return validateLockManifestUnchecked(lockBytes, expectedInput);
   } catch (error) {
     if (error instanceof LockManifestError) throw error;
     reject('invalid_manifest');
   }
+}
+
+export function validateLockManifest(lockBytes, expectedInput) {
+  const result = checkedLockManifest(lockBytes, expectedInput);
+  return Object.freeze({ packageCount: result.packageCount, lockfileVersion: result.lockfileVersion });
+}
+
+export function validateLockManifestInventory(lockBytes, expectedInput) {
+  const result = checkedLockManifest(lockBytes, expectedInput);
+  if (!(lockBytes instanceof Uint8Array)) reject('invalid_manifest');
+  return Object.freeze({
+    inventoryVersion: 1,
+    packageCount: result.packageCount,
+    lockfileVersion: result.lockfileVersion,
+    lockSha256: createHash('sha256').update(lockBytes).digest('hex'),
+    packages: result.packages,
+  });
 }
