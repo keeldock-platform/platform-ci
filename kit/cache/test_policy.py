@@ -954,7 +954,12 @@ class CapacityAdmissionTests(unittest.TestCase):
 
     def test_source_and_repository_caps_count_each_scope_entry_in_full(self):
         slots = (SLOT_A, SLOT_B, "cdefghijklmnopqr", "defghijklmnopqrs")
-        under_source = _inventory((_cache_record("source-use", SLOT_A, size=700 * 1024 * 1024),))
+        under_source = _inventory((
+            _cache_record("source-use-linux", SLOT_A, size=350 * 1024 * 1024),
+            _cache_record("source-use-windows", SLOT_A, os_name="windows",
+                          size=350 * 1024 * 1024),
+        ))
+        self.assertTrue(all(item.reported_size <= policy.ENTRY_LIMIT for item in under_source.entries))
         source_decision = policy.admit_save(
             under_source, slots, SLOT_A, "linux", "x86_64", "new-key", 100 * 1024 * 1024,
             True, True,
@@ -962,10 +967,14 @@ class CapacityAdmissionTests(unittest.TestCase):
         self.assertEqual(source_decision.reason, "source-capacity")
 
         entries = tuple(
-            _cache_record("existing-" + str(index), slots[index], key="identical-content",
-                          size=1024 * 1024 * 1024)
-            for index in range(4)
+            _cache_record("existing-" + str(index), slots[index // 2],
+                          key="identical-content-" + str(index),
+                          os_name="linux" if index % 2 == 0 else "windows",
+                          size=384 * 1024 * 1024)
+            for index in range(8)
         )
+        self.assertTrue(all(item.reported_size <= policy.ENTRY_LIMIT for item in entries))
+        self.assertEqual(sum(item.reported_size for item in entries), policy.REPOSITORY_LIMIT)
         repository_decision = policy.admit_save(
             _inventory(entries), slots, SLOT_A, "windows", "arm64", "new-key", 1, True, True,
         )
