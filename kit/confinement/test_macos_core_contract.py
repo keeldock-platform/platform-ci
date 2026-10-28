@@ -16,6 +16,10 @@ from unittest.mock import patch
 
 import macos_core_contract as subject
 import macos_private_validation as private_validation
+import feedback_failure
+import macos_node_contract as real_node_contract
+import macos_rust_toolchain as real_rust
+import test_foundation_node_feedback as foundation_tests
 
 
 SOURCE_SHA = "a" * 40
@@ -401,6 +405,7 @@ class CoreContractTests(unittest.TestCase):
             "source_gates_survivor_multiple", "source_gates_timeout", "source_gates_census",
             "source_gates_group_cleanup", "source_gates_capture_cleanup", "source_gates_restore",
             "source_gates_cleanup_unclassified", "source_gates_wait_uncertain",
+            "source_gates_audit_request",
         ))
         self.assertEqual(subject.SOURCE_GATES_CLEANUP_DIAGNOSTICS, expected)
         self.assertTrue(expected <= subject.DIAGNOSTICS)
@@ -624,6 +629,84 @@ class CoreContractTests(unittest.TestCase):
         preserved = diagnostics.attach(raised.exception, "source_lease_cleanup", cleanup_state["first"])
         self.assertEqual(preserved.reason, "cleanup_incomplete")
         self.assertEqual(preserved.diagnostic, "worker_privilege_probe")
+
+    def _real_node_refusal(self, **options):
+        harness = foundation_tests.FoundationNodeFeedbackTests()
+        with self.assertRaises(real_node_contract.NodeContractRefusal) as caught:
+            harness._run(
+                "bootstrap", "lock", validated_tree="core_node_lock_return",
+                real_node_contract=real_node_contract, **options,
+            )
+        return caught.exception
+
+    def _follow_refusal_to_the_published_line(self, body_error, expected):
+        diagnostics = subject._FailureDiagnostics()
+        cleanup_state = {"first": None}
+
+        @contextmanager
+        def lease():
+            yield object()
+
+        with self.assertRaises(real_node_contract.NodeContractRefusal) as raised:
+            with subject._lease_with_diagnostic_capture(
+                lease(), diagnostics, lambda: "source_gates", cleanup_state,
+            ):
+                raise body_error
+        attached = diagnostics.attach(
+            subject._toolchain_refusal(raised.exception, "worker_setup"), "source_gates",
+            cleanup_state["first"],
+        )
+        self.assertEqual((attached.reason, attached.stage), ("cleanup_incomplete", "cleanup"))
+        self.assertEqual(attached.diagnostic, expected)
+        later = diagnostics.attach(
+            subject.Refusal("cleanup_incomplete", "cleanup"), "worker_cleanup", None,
+        )
+        self.assertEqual(later.diagnostic, expected)
+        reattached = subject._FailureDiagnostics().attach(attached, "source_gates")
+        self.assertEqual((reattached.reason, reattached.stage), ("cleanup_incomplete", "cleanup"))
+        self.assertEqual(reattached.diagnostic, expected)
+        payload = subject._format_refusal(reattached)
+        self.assertEqual(json.loads(payload)["diagnostic"], expected)
+        line = feedback_failure.REFUSAL_PREFIX + payload + b"\n"
+        self.assertEqual(feedback_failure.normalize_refusal(line), line)
+
+    @unittest.skipUnless(os.name == "posix", "Node worker cleanup harness requires POSIX paths")
+    def test_real_worker_survivor_class_survives_lease_capture_and_reattach(self):
+        command_error = real_rust.Refusal(
+            "cleanup_incomplete", command_check="helper_failure",
+            probe_check="probe_process_survivor", survivor_classes=("ps",),
+        )
+        node_refusal = self._real_node_refusal(command_error=command_error)
+        self.assertEqual(node_refusal.reason, "cleanup_incomplete")
+        self.assertEqual(node_refusal.cleanup_diagnostic, "source_gates_survivor_ps")
+        self._follow_refusal_to_the_published_line(node_refusal, "source_gates_survivor_ps")
+
+    @unittest.skipUnless(os.name == "posix", "Node worker cleanup harness requires POSIX paths")
+    def test_real_audit_request_cleanup_failure_survives_to_the_published_line(self):
+        contract_error = real_node_contract.NodeContractRefusal(
+            "cleanup_incomplete", stage="node_dependency_audit", substage="bulk_audit",
+        )
+        node_refusal = self._real_node_refusal(contract_error=contract_error)
+        self.assertEqual(node_refusal.cleanup_diagnostic, "source_gates_audit_request")
+        self._follow_refusal_to_the_published_line(node_refusal, "source_gates_audit_request")
+
+    @unittest.skipUnless(os.name == "posix", "Node worker cleanup harness requires POSIX paths")
+    def test_other_unrecorded_node_cleanup_failure_uses_the_unclassified_fallback(self):
+        contract_error = real_node_contract.NodeContractRefusal(
+            "cleanup_incomplete", stage="node_dependency_prepare", substage="runtime_version",
+        )
+        node_refusal = self._real_node_refusal(contract_error=contract_error)
+        self.assertEqual(node_refusal.cleanup_diagnostic, "source_gates_cleanup_unclassified")
+        self._follow_refusal_to_the_published_line(node_refusal, "source_gates_cleanup_unclassified")
+
+    def test_unlisted_cleanup_diagnostic_on_a_real_node_refusal_keeps_the_generic_value(self):
+        for unlisted in ("source_gates_survivor_private", "worker_cleanup", 7, None):
+            error = real_node_contract.NodeContractRefusal(
+                "cleanup_incomplete", stage="node_dependency_audit", substage="bulk_audit",
+            )
+            error.cleanup_diagnostic = unlisted
+            with self.subTest(unlisted=unlisted):
+                self._follow_refusal_to_the_published_line(error, "source_gates")
 
     def test_review_binding_requires_every_protected_value(self):
         request = _request()

@@ -177,6 +177,7 @@ SOURCE_GATES_CLEANUP_DIAGNOSTICS = frozenset(
     "source_gates_survivor_multiple", "source_gates_timeout", "source_gates_census",
     "source_gates_group_cleanup", "source_gates_capture_cleanup", "source_gates_restore",
     "source_gates_cleanup_unclassified", "source_gates_wait_uncertain",
+    "source_gates_audit_request",
 ))
 CLEANUP_DIAGNOSTICS = frozenset((
     "cleanup_lease", "cleanup_storage", "cleanup_worker", "cleanup_summary",
@@ -244,6 +245,9 @@ class _FailureDiagnostics:
             return
         if type(cleanup_stage) is str and cleanup_stage in CLEANUP_DIAGNOSTICS:
             self.first_cleanup = cleanup_stage
+        elif (operation == "source_gates" and type(getattr(error, "cleanup_diagnostic", None)) is str
+                and error.cleanup_diagnostic in SOURCE_GATES_CLEANUP_DIAGNOSTICS):
+            self.first_cleanup = error.cleanup_diagnostic
         elif type(getattr(error, "diagnostic", None)) is str and error.diagnostic in DETAILED_DIAGNOSTICS:
             self.first_cleanup = error.diagnostic
         elif type(operation) is str and operation in OPERATION_DIAGNOSTICS:
