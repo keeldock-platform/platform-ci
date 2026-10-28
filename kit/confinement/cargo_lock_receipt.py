@@ -1181,11 +1181,153 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
             os.close(parent_fd)
 
 
+def _vendor_digest_header(digest, relative, is_directory, mode, size):
+    name_bytes = relative.encode("ascii")
+    digest.update(b"D" if is_directory else b"F")
+    digest.update(len(name_bytes).to_bytes(4, "big"))
+    digest.update(name_bytes)
+    digest.update(stat.S_IMODE(mode).to_bytes(4, "big"))
+    digest.update(size.to_bytes(8, "big"))
+
+
+def vendor_tree_inventory_fd(root_fd, require_read_only=None):
+    """Inspect an anchored vendor tree using no-follow descriptor-relative opens."""
+    if os.name == "nt" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+        _refuse("cargo_archive_invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    items = {}
+    folded = set()
+    case_spellings = {}
+    total = 0
+    try:
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            _refuse("cargo_archive_invalid")
+        if require_read_only is not None:
+            require_read_only(root_fd)
+
+        def collect(directory_fd, prefix):
+            nonlocal total
+            for name in sorted(os.listdir(directory_fd)):
+                relative = prefix + name
+                if not _safe_relative_path(relative):
+                    _refuse("cargo_archive_invalid")
+                folded_path = relative.casefold()
+                if folded_path in folded:
+                    _refuse("cargo_archive_invalid")
+                folded.add(folded_path)
+                parts = relative.split("/")
+                for count in range(1, len(parts) + 1):
+                    spelling = "/".join(parts[:count])
+                    folded_prefix = spelling.casefold()
+                    previous = case_spellings.get(folded_prefix)
+                    if previous is not None and previous != spelling:
+                        _refuse("cargo_archive_invalid")
+                    case_spellings[folded_prefix] = spelling
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                mode = metadata.st_mode
+                if (stat.S_ISLNK(mode) or getattr(metadata, "st_file_attributes", 0)
+                        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                    _refuse("cargo_archive_invalid")
+                is_directory = stat.S_ISDIR(mode)
+                if is_directory:
+                    items[relative] = (True, metadata)
+                    child_fd = os.open(name, flags, dir_fd=directory_fd)
+                    try:
+                        child = os.fstat(child_fd)
+                        if _file_identity(child) != _file_identity(metadata):
+                            _refuse("cargo_archive_invalid")
+                        if require_read_only is not None:
+                            require_read_only(child_fd)
+                        collect(child_fd, relative + "/")
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(mode):
+                    if getattr(metadata, "st_nlink", 1) != 1:
+                        _refuse("cargo_archive_invalid")
+                    total += metadata.st_size
+                    if metadata.st_size > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES:
+                        _refuse("cargo_archive_invalid")
+                    items[relative] = (False, metadata)
+                else:
+                    _refuse("cargo_archive_invalid")
+                if len(items) > MAX_ARCHIVE_MEMBERS:
+                    _refuse("cargo_archive_invalid")
+
+        collect(root_fd, "")
+        digest = hashlib.sha256()
+        digest.update(b"cargo-vendor-tree-v1\n")
+        file_hashes = {}
+        for relative, (is_directory, metadata) in sorted(
+                items.items(), key=lambda item: item[0].encode("ascii")):
+            _vendor_digest_header(
+                digest, relative, is_directory, metadata.st_mode,
+                0 if is_directory else metadata.st_size,
+            )
+            if is_directory:
+                continue
+            parts = relative.split("/")
+            parent_fd = _open_relative_directory(root_fd, parts[:-1])
+            try:
+                file_fd = os.open(
+                    parts[-1], os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0),
+                    dir_fd=parent_fd,
+                )
+                try:
+                    opened = os.fstat(file_fd)
+                    if (not stat.S_ISREG(opened.st_mode) or opened.st_dev != metadata.st_dev
+                            or opened.st_ino != metadata.st_ino
+                            or opened.st_size != metadata.st_size
+                            or opened.st_mode != metadata.st_mode
+                            or getattr(opened, "st_nlink", 1) != 1):
+                        _refuse("cargo_archive_invalid")
+                    if require_read_only is not None:
+                        require_read_only(file_fd)
+                    file_digest = hashlib.sha256()
+                    size = 0
+                    while True:
+                        chunk = os.read(file_fd, 1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_FILE_BYTES:
+                            _refuse("cargo_archive_invalid")
+                        digest.update(chunk)
+                        file_digest.update(chunk)
+                    after = os.fstat(file_fd)
+                    if (size != metadata.st_size or after.st_dev != metadata.st_dev
+                            or after.st_ino != metadata.st_ino
+                            or after.st_size != metadata.st_size
+                            or after.st_mode != metadata.st_mode
+                            or after.st_mtime_ns != opened.st_mtime_ns):
+                        _refuse("cargo_archive_invalid")
+                    file_hashes[relative] = file_digest.hexdigest()
+                finally:
+                    os.close(file_fd)
+            finally:
+                os.close(parent_fd)
+        return digest.hexdigest(), items, file_hashes
+    except Refusal:
+        raise
+    except (OSError, ValueError, TypeError, UnicodeError, RecursionError):
+        _refuse("cargo_archive_invalid")
+
+
 def vendor_tree_digest(directory):
     """Hash sorted vendor paths, permission modes and file bytes with explicit framing."""
     root = Path(directory)
     if not root.is_dir() or _is_link_or_reparse(root):
         _refuse("cargo_archive_invalid")
+    if os.name != "nt":
+        if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY"):
+            _refuse("cargo_archive_invalid")
+        try:
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            _refuse("cargo_archive_invalid")
+        try:
+            return vendor_tree_inventory_fd(descriptor)[0]
+        finally:
+            os.close(descriptor)
     items = []
     seen_folded = set()
     case_spellings = {}
@@ -1234,16 +1376,9 @@ def vendor_tree_digest(directory):
     digest = hashlib.sha256()
     digest.update(b"cargo-vendor-tree-v1\n")
     for relative, is_directory, mode in sorted(items, key=lambda item: item[0].encode("ascii")):
-        name_bytes = relative.encode("ascii")
-        digest.update(b"D" if is_directory else b"F")
-        digest.update(len(name_bytes).to_bytes(4, "big"))
-        digest.update(name_bytes)
-        digest.update(stat.S_IMODE(mode).to_bytes(4, "big"))
-        if is_directory:
-            digest.update((0).to_bytes(8, "big"))
-        else:
-            size = Path(directory, relative).stat().st_size
-            digest.update(size.to_bytes(8, "big"))
+        size = 0 if is_directory else Path(directory, relative).stat().st_size
+        _vendor_digest_header(digest, relative, is_directory, mode, size)
+        if not is_directory:
             with Path(directory, relative).open("rb") as stream:
                 while True:
                     chunk = stream.read(1024 * 1024)

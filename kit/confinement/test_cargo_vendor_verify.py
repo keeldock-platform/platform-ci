@@ -2,7 +2,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -96,10 +98,13 @@ def _vendor_receipt(record, vendor_digest, changes=None):
 
 
 def _verify(vendor, record, vendor_receipt, trusted_digest, lock_bytes=LOCK_BYTES):
-    return subject.verify_vendor_tree(
-        lock_bytes, record, _lock_context(record), _authorized_audits(record),
-        vendor, vendor_receipt, trusted_digest,
-    )
+    with patch.object(subject.os, "geteuid", return_value=1001), patch.object(
+            subject, "_require_protected_ancestor"), patch.object(
+                subject, "_require_read_only_mount"):
+        return subject.verify_vendor_tree(
+            lock_bytes, record, _lock_context(record), _authorized_audits(record),
+            vendor, vendor_receipt, trusted_digest,
+        )
 
 
 def _unfreeze(directory):
@@ -124,7 +129,26 @@ def _remove_cargo_environment(environment):
         os.rmdir(environment[key])
 
 
+def _scan_vendor(vendor):
+    descriptor = os.open(
+        vendor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+    )
+    try:
+        return cargo.vendor_tree_inventory_fd(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@unittest.skipIf(os.name == "nt", "native Windows handoff is not available")
 class CargoVendorVerifyTests(unittest.TestCase):
+    def _assert_scan_refusal(self, vendor, record, receipt, trusted_digest):
+        with self.assertRaises(cargo.Refusal) as scanned:
+            _scan_vendor(vendor)
+        self.assertEqual(scanned.exception.reason, "cargo_archive_invalid")
+        with self.assertRaises(cargo.Refusal) as verified:
+            _verify(vendor, record, receipt, trusted_digest)
+        self.assertEqual(verified.exception.reason, "cargo_vendor_invalid")
+
     def test_valid_vendor_is_bound_to_lock_receipt_and_forces_offline_config(self):
         record = _lock_receipt()
         with tempfile.TemporaryDirectory() as temporary:
@@ -139,6 +163,11 @@ class CargoVendorVerifyTests(unittest.TestCase):
                 self.assertIn("net.offline=true", rendered)
                 self.assertIn("source.crates-io.replace-with", rendered)
                 self.assertIn("source.verified-vendor.directory", rendered)
+                self.assertIn(
+                    "source.verified-vendor.directory="
+                    + json.dumps(str(vendor.resolve()), ensure_ascii=True),
+                    result["cargo_arguments"],
+                )
                 self.assertNotIn("CARGO_NET_OFFLINE", result["environment"])
                 self.assertTrue(result["environment"]["CARGO_HOME"])
             finally:
@@ -183,7 +212,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as temporary:
                     vendor = Path(temporary) / "vendor"
                     vendor.mkdir()
-                    digest = _write_vendor(vendor)
+                    original_digest = _write_vendor(vendor)
                     if add_extra:
                         vendor.chmod(0o755)
                         extra = vendor / "unreceipted-1.0.0"
@@ -209,6 +238,8 @@ class CargoVendorVerifyTests(unittest.TestCase):
                                 path.unlink()
                         package.rmdir()
                         vendor.chmod(0o555)
+                    digest = cargo.vendor_tree_digest(vendor)
+                    self.assertNotEqual(digest, original_digest)
                     receipt, trusted_digest = _vendor_receipt(record, digest)
                     try:
                         with self.assertRaises(cargo.Refusal) as raised:
@@ -283,9 +314,10 @@ class CargoVendorVerifyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             vendor = Path(temporary) / "vendor"
             vendor.mkdir()
-            digest = _write_vendor(vendor)
-            receipt, trusted_digest = _vendor_receipt(record, digest)
+            _write_vendor(vendor)
             (vendor / "serde-1.0.1" / "Cargo.toml").chmod(0o644)
+            digest = cargo.vendor_tree_digest(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
             try:
                 with self.assertRaises(cargo.Refusal) as raised:
                     _verify(vendor, record, receipt, trusted_digest)
@@ -323,6 +355,293 @@ class CargoVendorVerifyTests(unittest.TestCase):
             try:
                 with self.assertRaises(cargo.Refusal) as raised:
                     _verify(vendor, record, duplicate, trusted_digest)
+                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+            finally:
+                _unfreeze(vendor)
+
+    def test_unprotected_ancestor_is_refused_before_configuration(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            try:
+                with patch.object(subject.os, "geteuid", return_value=1001), patch.object(
+                        subject, "_require_read_only_mount"), patch.object(
+                            cargo, "cargo_config_for_vendor",
+                            side_effect=AssertionError("configuration was requested")):
+                    with self.assertRaises(cargo.Refusal) as raised:
+                        subject.verify_vendor_tree(
+                            LOCK_BYTES, record, _lock_context(record),
+                            _authorized_audits(record), vendor, receipt, trusted_digest,
+                        )
+                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+            finally:
+                _unfreeze(vendor)
+
+    def test_writable_mount_is_refused_before_configuration(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            try:
+                with patch.object(subject.os, "geteuid", return_value=1001), patch.object(
+                        subject, "_require_protected_ancestor"), patch.object(
+                            cargo, "cargo_config_for_vendor",
+                            side_effect=AssertionError("configuration was requested")):
+                    with self.assertRaises(cargo.Refusal) as raised:
+                        subject.verify_vendor_tree(
+                            LOCK_BYTES, record, _lock_context(record),
+                            _authorized_audits(record), vendor, receipt, trusted_digest,
+                        )
+                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+            finally:
+                _unfreeze(vendor)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux mount policy")
+    def test_read_only_bind_mount_with_writable_superblock_is_refused(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            try:
+                with patch.object(subject.os, "geteuid", return_value=1001), patch.object(
+                        subject, "_require_protected_ancestor"), patch.object(
+                            subject, "_read_only_superblocks", return_value=set()), patch.object(
+                                subject.os, "fstatvfs",
+                                return_value=SimpleNamespace(f_flag=os.ST_RDONLY)), patch.object(
+                                    cargo, "cargo_config_for_vendor",
+                                    side_effect=AssertionError("configuration was requested")):
+                    with self.assertRaises(cargo.Refusal) as raised:
+                        subject.verify_vendor_tree(
+                            LOCK_BYTES, record, _lock_context(record),
+                            _authorized_audits(record), vendor, receipt, trusted_digest,
+                        )
+                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+            finally:
+                _unfreeze(vendor)
+
+    def test_nested_writable_mount_is_refused_by_inventory(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            source = vendor / "serde-1.0.1" / "src" / "lib.rs"
+            target = source.stat()
+
+            def require_read_only(descriptor, unused_superblocks):
+                metadata = os.fstat(descriptor)
+                if metadata.st_dev == target.st_dev and metadata.st_ino == target.st_ino:
+                    subject._refuse()
+
+            try:
+                with patch.object(subject.os, "geteuid", return_value=1001), patch.object(
+                        subject, "_require_protected_ancestor"), patch.object(
+                            subject, "_require_read_only_mount",
+                            side_effect=require_read_only), patch.object(
+                                cargo, "cargo_config_for_vendor",
+                                side_effect=AssertionError("configuration was requested")):
+                    with self.assertRaises(cargo.Refusal) as raised:
+                        subject.verify_vendor_tree(
+                            LOCK_BYTES, record, _lock_context(record),
+                            _authorized_audits(record), vendor, receipt, trusted_digest,
+                        )
+                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+            finally:
+                _unfreeze(vendor)
+
+    def test_privileged_caller_is_refused_before_configuration(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            try:
+                with patch.object(subject.os, "geteuid", return_value=0), patch.object(
+                        subject, "_require_protected_ancestor"), patch.object(
+                            subject, "_require_read_only_mount"), patch.object(
+                                cargo, "cargo_config_for_vendor",
+                                side_effect=AssertionError("configuration was requested")):
+                    with self.assertRaises(cargo.Refusal) as raised:
+                        subject.verify_vendor_tree(
+                            LOCK_BYTES, record, _lock_context(record),
+                            _authorized_audits(record), vendor, receipt, trusted_digest,
+                        )
+                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+            finally:
+                _unfreeze(vendor)
+
+    def test_symlink_hardlink_and_special_file_are_refused_by_anchored_scan(self):
+        record = _lock_receipt()
+        for kind in ("symlink", "hardlink", "special"):
+            with self.subTest(kind=kind):
+                with tempfile.TemporaryDirectory() as temporary:
+                    vendor = Path(temporary) / "vendor"
+                    vendor.mkdir()
+                    digest = _write_vendor(vendor)
+                    receipt, trusted_digest = _vendor_receipt(record, digest)
+                    source = vendor / "serde-1.0.1" / "src"
+                    source.chmod(0o755)
+                    try:
+                        if kind == "symlink":
+                            (source / "alias.rs").symlink_to("lib.rs")
+                        elif kind == "hardlink":
+                            os.link(source / "lib.rs", source / "alias.rs")
+                        else:
+                            os.mkfifo(source / "alias.rs")
+                        source.chmod(0o555)
+                        self._assert_scan_refusal(vendor, record, receipt, trusted_digest)
+                    finally:
+                        _unfreeze(vendor)
+
+    def test_reparse_attribute_is_refused_by_anchored_scan(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            original_stat = os.stat
+
+            def reparse_stat(path, *args, **kwargs):
+                metadata = original_stat(path, *args, **kwargs)
+                if path != "src" or "dir_fd" not in kwargs:
+                    return metadata
+                return SimpleNamespace(
+                    st_mode=metadata.st_mode, st_dev=metadata.st_dev,
+                    st_ino=metadata.st_ino, st_size=metadata.st_size,
+                    st_nlink=metadata.st_nlink, st_mtime_ns=metadata.st_mtime_ns,
+                    st_file_attributes=0x400,
+                )
+
+            try:
+                with patch.object(cargo.os, "stat", side_effect=reparse_stat), patch.object(
+                        cargo, "cargo_config_for_vendor",
+                        side_effect=AssertionError("configuration was requested")):
+                    self._assert_scan_refusal(
+                        vendor, record, receipt, trusted_digest,
+                    )
+            finally:
+                _unfreeze(vendor)
+
+    def test_vendor_file_size_and_member_count_limits_are_enforced(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            try:
+                for field, limit in (
+                        ("MAX_FILE_BYTES", 10), ("MAX_TOTAL_BYTES", 10),
+                        ("MAX_ARCHIVE_MEMBERS", 2)):
+                    with self.subTest(field=field):
+                        with patch.object(cargo, field, limit):
+                            self._assert_scan_refusal(
+                                vendor, record, receipt, trusted_digest,
+                            )
+            finally:
+                _unfreeze(vendor)
+
+    def test_missing_and_extra_checksum_entries_are_refused(self):
+        record = _lock_receipt()
+        for extra_entry in (False, True):
+            with self.subTest(extra_entry=extra_entry):
+                with tempfile.TemporaryDirectory() as temporary:
+                    vendor = Path(temporary) / "vendor"
+                    vendor.mkdir()
+                    _write_vendor(vendor)
+                    manifest_path = vendor / "serde-1.0.1" / ".cargo-checksum.json"
+                    manifest_path.chmod(0o644)
+                    manifest = json.loads(manifest_path.read_text("ascii"))
+                    if extra_entry:
+                        manifest["files"]["ghost.rs"] = "0" * 64
+                    else:
+                        del manifest["files"]["src/lib.rs"]
+                    manifest_path.write_text(
+                        json.dumps(
+                            manifest, ensure_ascii=True, sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        encoding="ascii",
+                    )
+                    manifest_path.chmod(0o444)
+                    digest = cargo.vendor_tree_digest(vendor)
+                    receipt, trusted_digest = _vendor_receipt(record, digest)
+                    try:
+                        with self.assertRaises(cargo.Refusal) as raised:
+                            _verify(vendor, record, receipt, trusted_digest)
+                        self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+                    finally:
+                        _unfreeze(vendor)
+
+    def test_ancestor_swap_after_scan_cannot_change_cargo_tree(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            parent = base / "handoff"
+            parent.mkdir()
+            vendor = parent / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            replacement = base / "replacement"
+            replacement.mkdir()
+            replacement_vendor = replacement / "vendor"
+            replacement_vendor.mkdir()
+            self.assertEqual(_write_vendor(replacement_vendor), digest)
+            moved = base / "moved"
+            original_config = cargo.cargo_config_for_vendor
+            created_environment = {}
+
+            def swap_then_config(path):
+                parent.rename(moved)
+                replacement.rename(parent)
+                arguments, environment = original_config(path)
+                created_environment.update(environment)
+                return arguments, environment
+
+            try:
+                with patch.object(cargo, "cargo_config_for_vendor", side_effect=swap_then_config):
+                    with self.assertRaises(cargo.Refusal) as raised:
+                        _verify(vendor, record, receipt, trusted_digest)
+                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+                for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
+                    self.assertFalse(Path(created_environment[key]).exists())
+            finally:
+                for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
+                    if key in created_environment:
+                        try:
+                            os.rmdir(created_environment[key])
+                        except OSError:
+                            pass
+                for path in (vendor, moved / "vendor", replacement_vendor):
+                    _unfreeze(path)
+
+
+@unittest.skipUnless(os.name == "nt", "Windows handoff refusal")
+class WindowsVendorHandoffTests(unittest.TestCase):
+    def test_windows_refuses_without_native_namespace_protection(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            try:
+                with self.assertRaises(cargo.Refusal) as raised:
+                    subject.verify_vendor_tree(
+                        LOCK_BYTES, record, _lock_context(record),
+                        _authorized_audits(record), vendor, receipt, trusted_digest,
+                    )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
                 _unfreeze(vendor)
