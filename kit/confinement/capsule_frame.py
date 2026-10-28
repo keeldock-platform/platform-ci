@@ -112,6 +112,7 @@ REASON_CODES = (
 
 PROVISIONAL_CHOICES = (
     "Windows destination aliases use NFC and casefold; the exact Windows equivalence algorithm is unspecified.",
+    "Paths are limited to printable ASCII so Python casefold and Windows invariant lowercase have identical aliases.",
 )
 INDEPENDENT_PROTOCOL_VECTORS_REQUIRED = True
 
@@ -677,7 +678,7 @@ def _is_path_safe(path):
         return False
     if path.startswith("/") or "\\" in path:
         return False
-    if any(ord(char) < 32 or 127 <= ord(char) <= 159 or char in '<>:"|?*' for char in path):
+    if any(ord(char) < 32 or ord(char) > 126 or char in '<>:"|?*' for char in path):
         return False
     for component in path.split("/"):
         if component in ("", ".", "..") or component.endswith((".", " ")):
