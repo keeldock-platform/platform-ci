@@ -46,11 +46,11 @@ CALLER_PROFILES = {
     },
 }
 PINNED_WORKFLOW_SHA256 = {
-    ".github/workflows/windows-source-admission.yml": "23a81d6d45a0a02668fad7ae2567af6414e403bd3b76d055bd2dab58d997390f",
+    ".github/workflows/windows-source-admission.yml": "6637cfbaaf5a5ae228680984ce39971ab2584dd76f14790c7e6e766aca8c2cbc",
     ".github/workflows/lane-h-windows-receiver.yml": "5347fcfdf29c979f7af8c63cee48f77b856fd7cc38d34ad675da75a0b806b448",
-    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "ba01a7658328b57f44eed5c1059632ef524a3462e029dca0d677451d2f64f01b",
-    ".github/workflows/lane-h-capsule-attester.yml": "92425cb257d4ecf5317bfae2bf5df5a9f22b66f428a43f9d7f36b241579e51cc",
-    ".github/workflows/attestation-role-signer-probe.yml": "4bf03368bdd197b8a8c749ae81defc69e56915f3eef52b8bc578552eff970c91",
+    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "3cb1e0f2fcd46014839988452bdb50e1a688c7ad9e8a59098a6f7c2de96042f0",
+    ".github/workflows/lane-h-capsule-attester.yml": "5f3120c996a193bea63111024d285ee4eb9e199a01c4f4d09fee6424471e281e",
+    ".github/workflows/attestation-role-signer-probe.yml": "dc534b6df944369d24cb59e719acc84fdb5c2329c6d939af7c192a93f318e88c",
 }
 API_JOB_NAME_PINS = {
     profile: {role: None for role in ROLE_ORDER}
@@ -817,7 +817,7 @@ def validate_call_graph(graph, profile):
     return True
 
 
-def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha):
+def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha, terminal_page=None):
     if kind not in ("jobs", "artifacts", "attestations") or type(pages) is not list or not pages:
         raise Refusal("api-pages-shape")
     if type(head_sha) is not str or HEX_20.fullmatch(head_sha) is None:
@@ -829,24 +829,36 @@ def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha):
     for index, page in enumerate(pages, 1):
         if type(page) is not dict or type(page.get(key)) is not list:
             raise Refusal("api-page-shape")
-        reported = _is_u64(page.get("total_count"), positive=False)
-        if total is None:
-            total = reported
-        if reported != total or len(page[key]) > 100:
+        if len(page[key]) > 100:
             raise Refusal("api-page-count")
+        if kind != "attestations":
+            reported = _is_u64(page.get("total_count"), positive=False)
+            if total is None:
+                total = reported
+            if reported != total:
+                raise Refusal("api-page-count")
+        elif set(page) != {"attestations"}:
+            raise Refusal("api-page-fields")
         if index < len(pages) and len(page[key]) != 100:
             raise Refusal("api-pagination-incomplete")
         seen += len(page[key])
-        wrapped.append({
+        wrapped_page = {
             "page": index,
             "next_page": index + 1 if index < len(pages) else None,
-            "total_count": reported,
             key: page[key],
-        })
-    expected_pages = max(1, (total + 99) // 100)
-    if seen != total or len(pages) != expected_pages:
-        raise Refusal("api-pagination-incomplete")
-    return {
+        }
+        if kind != "attestations":
+            wrapped_page["total_count"] = reported
+        wrapped.append(wrapped_page)
+    if kind == "attestations":
+        if type(terminal_page) is not dict or set(terminal_page) != {"attestations"} or terminal_page["attestations"] != []:
+            raise Refusal("provider-terminal-page")
+        total = seen
+    else:
+        expected_pages = max(1, (total + 99) // 100)
+        if seen != total or len(pages) != expected_pages or terminal_page is not None:
+            raise Refusal("api-pagination-incomplete")
+    result = {
         "kind": kind,
         "complete": True,
         "total_count": total,
@@ -855,12 +867,17 @@ def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha):
         "head_sha": head_sha,
         "pages": wrapped,
     }
+    if kind == "attestations":
+        result["terminal_page"] = {"page": len(pages) + 1, "attestations": []}
+    return result
 
 
 def _validate_snapshot(snapshot, kind, run_id, run_attempt, head_sha):
     if type(snapshot) is not dict:
         raise Refusal("api-snapshot-shape")
     required_top = {"kind", "complete", "total_count", "run_id", "run_attempt", "head_sha", "pages"}
+    if kind == "attestations":
+        required_top.add("terminal_page")
     if set(snapshot) != required_top or snapshot["kind"] != kind or snapshot["complete"] is not True:
         raise Refusal("api-snapshot-incomplete")
     if _is_u64(snapshot["run_id"]) != _is_u64(run_id):
@@ -876,21 +893,32 @@ def _validate_snapshot(snapshot, kind, run_id, run_attempt, head_sha):
     total = _is_u64(snapshot["total_count"], positive=False)
     rows = []
     for index, page in enumerate(pages, 1):
-        if type(page) is not dict or set(page) != {"page", "next_page", "total_count", row_key}:
+        expected_fields = {"page", "next_page", row_key}
+        if kind != "attestations":
+            expected_fields.add("total_count")
+        if type(page) is not dict or set(page) != expected_fields:
             raise Refusal("api-page-fields")
         if type(page["page"]) is not int or page["page"] != index:
             raise Refusal("api-page-order")
         expected_next = index + 1 if index < len(pages) else None
         if page["next_page"] != expected_next or type(page[row_key]) is not list:
             raise Refusal("api-pagination-incomplete")
-        if _is_u64(page["total_count"], positive=False) != total or len(page[row_key]) > 100:
+        if len(page[row_key]) > 100:
+            raise Refusal("api-page-count")
+        if kind != "attestations" and _is_u64(page["total_count"], positive=False) != total:
             raise Refusal("api-page-count")
         if index < len(pages) and len(page[row_key]) != 100:
             raise Refusal("api-pagination-incomplete")
         rows.extend(page[row_key])
     expected_pages = max(1, (total + 99) // 100)
-    if len(rows) != total or len(pages) != expected_pages:
+    if len(rows) != total or (kind != "attestations" and len(pages) != expected_pages):
         raise Refusal("api-pagination-incomplete")
+    if kind == "attestations":
+        terminal = snapshot["terminal_page"]
+        if (type(terminal) is not dict or set(terminal) != {"page", "attestations"}
+                or type(terminal["page"]) is not int or terminal["page"] != len(pages) + 1
+                or terminal["attestations"] != []):
+            raise Refusal("provider-terminal-page")
     return rows
 
 
@@ -1323,20 +1351,21 @@ def validate_artifact_inventory(snapshot, run_id, run_attempt, head_sha, expecte
     return by_role
 
 
-def validate_attestation_inventory(snapshot, run_id, run_attempt, head_sha, subject_digests):
+def validate_attestation_inventory(snapshot, run_id, run_attempt, head_sha, subject_digests,
+                                   expected_roles=ROLE_ORDER):
     rows = _validate_snapshot(snapshot, "attestations", run_id, run_attempt, head_sha)
-    if type(subject_digests) is not dict or set(subject_digests) != set(ROLE_ORDER):
+    if type(subject_digests) is not dict or set(subject_digests) != set(expected_roles):
         raise Refusal("attestation-subject-map")
     seen = set()
     by_role = {}
-    expected = {subject_digests[role] for role in ROLE_ORDER}
+    expected = {subject_digests[role] for role in expected_roles}
     for row in rows:
         if type(row) is not dict:
             raise Refusal("attestation-fields")
         role = row.get("role")
         digest = row.get("subject_digest")
         statement_digest = row.get("statement_digest")
-        if role not in ROLE_ORDER or digest not in expected:
+        if role not in expected_roles or digest not in expected:
             raise Refusal("attestation-unexpected")
         if type(statement_digest) is not str or HEX_32.fullmatch(statement_digest) is None:
             raise Refusal("attestation-statement-digest")
@@ -1345,9 +1374,9 @@ def validate_attestation_inventory(snapshot, run_id, run_attempt, head_sha, subj
             continue
         seen.add(key)
         by_role.setdefault(role, set()).add(statement_digest)
-    if set(by_role) != set(ROLE_ORDER) or any(len(by_role[role]) != 1 for role in ROLE_ORDER):
+    if set(by_role) != set(expected_roles) or any(len(by_role[role]) != 1 for role in expected_roles):
         raise Refusal("attestation-cardinality")
-    return {role: next(iter(by_role[role])) for role in ROLE_ORDER}
+    return {role: next(iter(by_role[role])) for role in expected_roles}
 
 
 def signed_statement_payload(bundle_document):
@@ -1605,6 +1634,13 @@ def verify_source_free_evidence(
         Path(evidence_root) / "artifacts",
         digest_pins,
     )
+    reconcile_provider_evidence(roles, provider_snapshots, run_id, run_attempt,
+                                control_sha, ROLE_ORDER)
+    return roles
+
+
+def reconcile_provider_evidence(roles, provider_snapshots, run_id, run_attempt,
+                                control_sha, expected_roles):
     distinct_subjects = set(roles["subject_digests"].values())
     if type(provider_snapshots) is not dict or set(provider_snapshots) != distinct_subjects:
         raise Refusal("provider-listing-unavailable")
@@ -1623,42 +1659,36 @@ def verify_source_free_evidence(
             control_sha,
         )
         provider_records.extend(normalized)
+    normalized_pages = [
+        {"attestations": provider_records[index:index + 100]}
+        for index in range(0, len(provider_records), 100)
+    ] or [{"attestations": []}]
     validate_attestation_inventory(
-        {
-            "kind": "attestations",
-            "complete": True,
-            "total_count": len(provider_records),
-            "run_id": str(_is_u64(run_id)),
-            "run_attempt": str(_is_u32(run_attempt)),
-            "head_sha": control_sha,
-            "pages": [{
-                "page": 1,
-                "next_page": None,
-                "total_count": len(provider_records),
-                "attestations": provider_records,
-            }],
-        },
+        wrap_api_pages("attestations", normalized_pages,
+                       run_id, run_attempt, control_sha,
+                       terminal_page={"attestations": []}),
         run_id,
         run_attempt,
         control_sha,
         roles["subject_digests"],
+        expected_roles,
     )
-    verify_statement_cardinality(roles["artifact_records"], provider_records)
-    return roles
+    verify_statement_cardinality(roles["artifact_records"], provider_records, expected_roles)
+    return provider_records
 
 
-def verify_statement_cardinality(artifact_records, provider_records):
+def verify_statement_cardinality(artifact_records, provider_records, expected_roles=ROLE_ORDER):
     if type(artifact_records) is not list or type(provider_records) is not list:
         raise Refusal("statement-inventory-shape")
     artifacts_seen = set()
     names_seen = set()
-    statements = {role: set() for role in ROLE_ORDER}
-    artifact_roles = {role: 0 for role in ROLE_ORDER}
+    statements = {role: set() for role in expected_roles}
+    artifact_roles = {role: 0 for role in expected_roles}
     for record in artifact_records:
         if type(record) is not dict or set(record) != {"role", "artifact_id", "artifact_name", "statement_digest"}:
             raise Refusal("statement-artifact-fields")
         role = record["role"]
-        if role not in ROLE_ORDER:
+        if role not in expected_roles:
             raise Refusal("statement-artifact-role")
         artifact_id = _api_numeric_id(record["artifact_id"], "statement-artifact-id")
         name = record["artifact_name"]
@@ -1677,21 +1707,21 @@ def verify_statement_cardinality(artifact_records, provider_records):
         role = record["role"]
         subject_digest = record["subject_digest"]
         digest = record["statement_digest"]
-        if (role not in ROLE_ORDER or type(digest) is not str or HEX_32.fullmatch(digest) is None
+        if (role not in expected_roles or type(digest) is not str or HEX_32.fullmatch(digest) is None
                 or type(subject_digest) is not str or HEX_32.fullmatch(subject_digest) is None):
             raise Refusal("statement-provider-binding")
         statements[role].add(digest)
-    if any(artifact_roles[role] != 1 for role in ROLE_ORDER):
+    if any(artifact_roles[role] != 1 for role in expected_roles):
         raise Refusal("statement-artifact-cardinality")
-    if any(len(statements[role]) != 1 for role in ROLE_ORDER):
+    if any(len(statements[role]) != 1 for role in expected_roles):
         raise Refusal("statement-cardinality")
-    return {role: next(iter(statements[role])) for role in ROLE_ORDER}
+    return {role: next(iter(statements[role])) for role in expected_roles}
 
 
 def verify_transition_evidence(
     gate, profile, repository, ref, control_sha, run_id, run_attempt,
     repository_metadata, run_metadata, jobs_snapshot, artifacts_snapshot,
-    control_root, evidence_root, api_name_pins, digest_pins,
+    provider_snapshots, control_root, evidence_root, api_name_pins, digest_pins,
     step_name_pins=None, step_ordinal_pins=None, log_sections=None,
     other_log_sections=None,
 ):
@@ -1704,11 +1734,19 @@ def verify_transition_evidence(
     if type(api_name_pins) is not dict or set(api_name_pins) != set(ROLE_ORDER):
         raise Refusal("api-job-map-unresolved")
     required_roles = ROLE_ORDER[:1] if gate == "A" else ROLE_ORDER[:2]
+    job_ids = set()
+    check_urls = set()
     for role in required_roles:
+        allowed_statuses = ("in_progress", "completed") if role == "windows-receiver" else ("completed",)
         job = validate_role_job(jobs_snapshot, run_id, run_attempt, control_sha,
-                                role, api_name_pins[role], ("completed",))
-        if job["conclusion"] != "success":
+                                role, api_name_pins[role], allowed_statuses)
+        if job["status"] == "completed" and job["conclusion"] != "success":
             raise Refusal("transition-role-job-not-successful")
+        identifier = _api_numeric_id(job["id"], "api-job-id")
+        if identifier in job_ids or job["check_run_url"] in check_urls:
+            raise Refusal("transition-role-job-duplicate")
+        job_ids.add(identifier)
+        check_urls.add(job["check_run_url"])
     artifact_map = validate_artifact_inventory(
         artifacts_snapshot, run_id, run_attempt, control_sha, required_roles)
     roles = {role: artifact_map[role][0] for role in required_roles}
@@ -1723,6 +1761,8 @@ def verify_transition_evidence(
             api_name_pins["linux-fetch-encrypt"], step_name_pins,
             step_ordinal_pins, log_sections, other_log_sections,
         )
+    reconcile_provider_evidence(result, provider_snapshots, run_id, run_attempt,
+                                control_sha, required_roles)
     return result
 
 
@@ -1880,15 +1920,30 @@ def _cmd_wrap_pages(arguments):
     pages = load_json_file(arguments.input)
     if type(pages) is not list:
         raise Refusal("api-pages-shape")
+    if (arguments.kind == "attestations") != (arguments.terminal_input is not None):
+        raise Refusal("api-terminal-input")
+    terminal = load_json_file(arguments.terminal_input) if arguments.kind == "attestations" else None
     wrapped = wrap_api_pages(
         arguments.kind,
         pages,
         arguments.run_id,
         arguments.run_attempt,
         arguments.head_sha,
+        terminal_page=terminal,
     )
     _write_json(arguments.output, wrapped)
     print("pages=wrapped kind=%s count=%d" % (arguments.kind, len(pages)))
+
+
+def _cmd_next_page(arguments):
+    pages = load_json_file(arguments.input)
+    if type(pages) is not list or not pages or len(pages) >= MAX_U32:
+        raise Refusal("api-pages-shape")
+    if any(type(page) is not dict or type(page.get("attestations")) is not list
+           or set(page) != {"attestations"} or len(page["attestations"]) > 100
+           for page in pages):
+        raise Refusal("api-page-shape")
+    print(len(pages) + 1)
 
 
 def _cmd_find_artifact(arguments):
@@ -1986,18 +2041,52 @@ def _cmd_gate_transition(arguments):
         raise Refusal("transition-profile")
     jobs = load_json_file(arguments.jobs_file)
     artifacts = load_json_file(arguments.artifacts_file)
+    required_roles = ROLE_ORDER[:1] if arguments.gate == "A" else ROLE_ORDER[:2]
+    artifact_map = validate_artifact_inventory(artifacts, arguments.run_id,
+                                               arguments.run_attempt, arguments.control_sha,
+                                               required_roles)
+    providers = load_provider_snapshots(artifact_map, required_roles,
+                                        arguments.artifact_directory,
+                                        arguments.provider_directory,
+                                        arguments.run_id, arguments.run_attempt,
+                                        arguments.control_sha)
     logs = load_json_file(arguments.linux_logs) if arguments.gate == "B" else None
     verify_transition_evidence(
         arguments.gate, profile, arguments.repository, arguments.ref,
         arguments.control_sha, arguments.run_id, arguments.run_attempt,
         load_json_file(arguments.repository_metadata), load_json_file(arguments.run_metadata),
-        jobs, artifacts, arguments.root, arguments.artifact_directory,
+        jobs, artifacts, providers, arguments.root, arguments.artifact_directory,
         API_JOB_NAME_PINS[profile], CERTIFICATE_DIGEST_PINS[profile],
         API_LINUX_STEP_NAME_PINS[profile], API_LINUX_STEP_ORDINAL_PINS[profile],
         logs.get("sections") if type(logs) is dict else None,
         logs.get("other") if type(logs) is dict else None,
     )
     print("gate=%s result=verified profile=%s" % (arguments.gate, profile))
+
+
+def load_provider_snapshots(artifact_map, roles, artifact_directory,
+                            provider_directory, run_id, run_attempt, control_sha):
+    provider_snapshots = {}
+    for role in roles:
+        artifact = artifact_map[role][0]
+        subject_path = Path(artifact_directory) / artifact["name"] / "subject.bin"
+        try:
+            subject_digest = hashlib.sha256(subject_path.read_bytes()).hexdigest()
+        except OSError:
+            raise Refusal("provider-subject-unavailable")
+        if subject_digest in provider_snapshots:
+            continue
+        snapshot = load_json_file(Path(provider_directory) /
+                                  ("provider-" + subject_digest + ".json"))
+        rows = _validate_snapshot(snapshot, "attestations", run_id,
+                                  run_attempt, control_sha)
+        directory = Path(provider_directory) / ("provider-" + subject_digest)
+        verified = [load_json_file(directory / ("verified-%d.json" % index))
+                    for index in range(1, len(rows) + 1)]
+        if len(list(directory.glob("verified-*.json"))) != len(rows):
+            raise Refusal("provider-verification-cardinality")
+        provider_snapshots[subject_digest] = {"snapshot": snapshot, "verified": verified}
+    return provider_snapshots
 
 
 def _cmd_verify_snapshot(arguments):
@@ -2020,27 +2109,10 @@ def _cmd_verify_snapshot(arguments):
     run_metadata = load_json_file(arguments.run_metadata)
     artifact_map = validate_artifact_inventory(artifacts, arguments.run_id,
                                                arguments.run_attempt, arguments.control_sha)
-    provider_snapshots = {}
-    for role in ROLE_ORDER:
-        artifact = artifact_map[role][0]
-        subject_path = (Path(arguments.evidence_directory) / "artifacts" /
-                        artifact["name"] / "subject.bin")
-        try:
-            subject_digest = hashlib.sha256(subject_path.read_bytes()).hexdigest()
-        except OSError:
-            raise Refusal("provider-subject-unavailable")
-        if subject_digest in provider_snapshots:
-            continue
-        snapshot = load_json_file(Path(arguments.evidence_directory) /
-                                  ("provider-" + subject_digest + ".json"))
-        rows = _validate_snapshot(snapshot, "attestations", arguments.run_id,
-                                  arguments.run_attempt, arguments.control_sha)
-        directory = Path(arguments.evidence_directory) / ("provider-" + subject_digest)
-        verified = [load_json_file(directory / ("verified-%d.json" % index))
-                    for index in range(1, len(rows) + 1)]
-        if len(list(directory.glob("verified-*.json"))) != len(rows):
-            raise Refusal("provider-verification-cardinality")
-        provider_snapshots[subject_digest] = {"snapshot": snapshot, "verified": verified}
+    provider_snapshots = load_provider_snapshots(
+        artifact_map, ROLE_ORDER, Path(arguments.evidence_directory) / "artifacts",
+        arguments.evidence_directory, arguments.run_id, arguments.run_attempt,
+        arguments.control_sha)
     verify_source_free_evidence(
         profile,
         repository,
@@ -2086,6 +2158,9 @@ def build_parser():
     wrap.add_argument("--run-id", required=True)
     wrap.add_argument("--run-attempt", required=True)
     wrap.add_argument("--head-sha", required=True)
+    wrap.add_argument("--terminal-input")
+    next_page = commands.add_parser("next-provider-page")
+    next_page.add_argument("--input", required=True)
     find = commands.add_parser("find-artifact")
     find.add_argument("--artifacts-file", required=True)
     find.add_argument("--role", choices=ROLE_ORDER, required=True)
@@ -2135,6 +2210,7 @@ def build_parser():
     gate.add_argument("--repository-metadata", required=True)
     gate.add_argument("--run-metadata", required=True)
     gate.add_argument("--artifact-directory", required=True)
+    gate.add_argument("--provider-directory", required=True)
     gate.add_argument("--linux-logs")
     verify = commands.add_parser("verify-snapshot")
     verify.add_argument("--profile", required=True)
@@ -2159,6 +2235,8 @@ def main(argv=None):
             prepare_subject(arguments)
         elif arguments.command == "wrap-pages":
             _cmd_wrap_pages(arguments)
+        elif arguments.command == "next-provider-page":
+            _cmd_next_page(arguments)
         elif arguments.command == "find-artifact":
             _cmd_find_artifact(arguments)
         elif arguments.command == "extract-artifact":

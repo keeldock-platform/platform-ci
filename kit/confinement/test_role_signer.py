@@ -266,8 +266,9 @@ def fixture_successful_evidence(root):
     provider_snapshots = {
         digest: {
             "snapshot": subject.wrap_api_pages("attestations", [{
-                "total_count": len(rows), "attestations": rows,
-            }], RUN_ID, RUN_ATTEMPT, CONTROL_SHA),
+                "attestations": rows,
+            }], RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
+                terminal_page={"attestations": []}),
             "verified": provider_verified[digest],
         }
         for digest, rows in provider_rows.items()
@@ -311,7 +312,30 @@ def fixture_transition_arguments(evidence, gate):
         )
     }
     result["gate"] = gate
+    result["jobs_snapshot"] = copy.deepcopy(evidence["jobs_snapshot"])
+    result["jobs_snapshot"]["pages"][0]["jobs"][0]["status"] = "in_progress"
+    result["jobs_snapshot"]["pages"][0]["jobs"][0]["conclusion"] = None
     result["artifacts_snapshot"] = fixture_artifact_snapshot(artifacts)
+    subject_digests = {
+        hashlib.sha256((Path(evidence["evidence_root"]) / "artifacts" /
+                        artifact["name"] / "subject.bin").read_bytes()).hexdigest()
+        for artifact in artifacts
+    }
+    result["provider_snapshots"] = {}
+    for digest in subject_digests:
+        listing = evidence["provider_snapshots"][digest]
+        pairs = list(zip(listing["snapshot"]["pages"][0]["attestations"],
+                         listing["verified"]))
+        selected = [
+            (row, verified) for row, verified in pairs
+            if subject.signed_statement_payload(row["bundle"])[1]["predicate"]["role"] in required
+        ]
+        result["provider_snapshots"][digest] = {
+            "snapshot": subject.wrap_api_pages(
+                "attestations", [{"attestations": [copy.deepcopy(row) for row, unused in selected]}],
+                RUN_ID, RUN_ATTEMPT, CONTROL_SHA, terminal_page={"attestations": []}),
+            "verified": [copy.deepcopy(verified) for unused, verified in selected],
+        }
     result["evidence_root"] = Path(evidence["evidence_root"]) / "artifacts"
     if gate == "B":
         result.update({
@@ -734,12 +758,14 @@ class ArtifactAndStageTests(unittest.TestCase):
             digests[role] = "sha256:" + digest
             rows.append({"role": role, "subject_digest": digests[role], "statement_digest": statement_digest})
         rows.append(dict(rows[0]))
-        snapshot = subject.wrap_api_pages("attestations", [{"total_count": len(rows), "attestations": rows}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
+        snapshot = subject.wrap_api_pages("attestations", [{"attestations": rows}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
+                                          terminal_page={"attestations": []})
         result = subject.validate_attestation_inventory(snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, digests)
         self.assertEqual(set(result), set(subject.ROLE_ORDER))
         changed = copy.deepcopy(rows)
         changed.append({"role": "windows-receiver", "subject_digest": digests["windows-receiver"], "statement_digest": "f" * 64})
-        altered = subject.wrap_api_pages("attestations", [{"total_count": len(changed), "attestations": changed}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
+        altered = subject.wrap_api_pages("attestations", [{"attestations": changed}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
+                                         terminal_page={"attestations": []})
         with self.assertRaises(subject.Refusal):
             subject.validate_attestation_inventory(altered, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, digests)
 
@@ -764,10 +790,11 @@ class ArtifactAndStageTests(unittest.TestCase):
         self.assertEqual(parsed, statement)
         provider = subject.wrap_api_pages(
             "attestations",
-            [{"total_count": 1, "attestations": [{"bundle": bundle}]}],
+            [{"attestations": [{"bundle": bundle}]}],
             RUN_ID,
             RUN_ATTEMPT,
             CONTROL_SHA,
+            terminal_page={"attestations": []},
         )
         certificate_expected, certificate = fixture_certificate("windows-receiver")
         verified = {"verificationResult": {"signature": {"certificate": certificate}, "statement": statement}}
@@ -884,6 +911,15 @@ class ArtifactAndStageTests(unittest.TestCase):
                 **fixture_transition_arguments(evidence, "A")))
             self.assertTrue(subject.verify_transition_evidence(
                 **fixture_transition_arguments(evidence, "B")))
+            for gate in ("A", "B"):
+                completed = fixture_transition_arguments(evidence, gate)
+                receiver = completed["jobs_snapshot"]["pages"][0]["jobs"][0]
+                receiver["status"] = "completed"
+                receiver["conclusion"] = "success"
+                self.assertTrue(subject.verify_transition_evidence(**completed))
+                receiver["conclusion"] = "failure"
+                with self.assertRaisesRegex(subject.Refusal, "transition-role-job-not-successful"):
+                    subject.verify_transition_evidence(**completed)
         for gate in subject.GATE_REQUIREMENTS:
             with self.subTest(gate=gate):
                 with self.assertRaises(subject.Refusal):
@@ -913,8 +949,11 @@ class ArtifactAndStageTests(unittest.TestCase):
             rows.append(copy.deepcopy(rows[0]))
             listing["verified"].append(copy.deepcopy(listing["verified"][0]))
             listing["snapshot"]["total_count"] = 3
-            listing["snapshot"]["pages"][0]["total_count"] = 3
             self.assertTrue(subject.verify_source_free_evidence(**extra))
+            truncated = copy.deepcopy(evidence)
+            truncated["provider_snapshots"][shared]["snapshot"].pop("terminal_page")
+            with self.assertRaises(subject.Refusal):
+                subject.verify_source_free_evidence(**truncated)
 
     def test_cli_gate_entry_points_use_parsed_evidence_before_transition(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -931,6 +970,16 @@ class ArtifactAndStageTests(unittest.TestCase):
                     ):
                         (Path(str(prefix) + "-" + label + ".json")).write_text(
                             json.dumps(arguments[key]), encoding="ascii")
+                    provider_directory = Path(temporary) / (gate + "-providers")
+                    provider_directory.mkdir()
+                    for digest, entry in arguments["provider_snapshots"].items():
+                        (provider_directory / ("provider-" + digest + ".json")).write_text(
+                            json.dumps(entry["snapshot"]), encoding="ascii")
+                        verified_directory = provider_directory / ("provider-" + digest)
+                        verified_directory.mkdir()
+                        for index, document in enumerate(entry["verified"], 1):
+                            (verified_directory / ("verified-%d.json" % index)).write_text(
+                                json.dumps(document), encoding="ascii")
                     command = [
                         "gate-transition", "--gate", gate, "--profile", "probe",
                         "--repository", REPOSITORY, "--ref", REF,
@@ -941,6 +990,7 @@ class ArtifactAndStageTests(unittest.TestCase):
                         "--repository-metadata", str(prefix) + "-repository.json",
                         "--run-metadata", str(prefix) + "-run.json",
                         "--artifact-directory", str(Path(temporary) / "artifacts"),
+                        "--provider-directory", str(provider_directory),
                     ]
                     if gate == "B":
                         log_path = Path(str(prefix) + "-logs.json")
@@ -955,6 +1005,9 @@ class ArtifactAndStageTests(unittest.TestCase):
                             mock.patch.object(subject, "API_LINUX_STEP_ORDINAL_PINS", {
                                 "probe": {"revoke-source-token": 5, "verify-token-rejection": 6}}):
                         self.assertEqual(subject.main(command), 0)
+                        missing = next(provider_directory.glob("provider-*.json"))
+                        missing.unlink()
+                        self.assertEqual(subject.main(command), 1)
 
     def test_truncated_pages_and_partial_rerun_cannot_prove_unique_invocation(self):
         rows = fixture_jobs()
@@ -991,6 +1044,34 @@ class ArtifactAndStageTests(unittest.TestCase):
                 {"total_count": 102, "jobs": [hidden]},
             ], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
 
+    def test_provider_pages_require_the_independent_empty_terminal_page(self):
+        rows = [{"bundle": {"index": index}} for index in range(100)]
+        with self.assertRaisesRegex(subject.Refusal, "api-page-fields"):
+            subject.wrap_api_pages("attestations", [{"attestations": rows, "total_count": 100}],
+                                   RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
+                                   terminal_page={"attestations": []})
+        with self.assertRaisesRegex(subject.Refusal, "api-pagination-incomplete"):
+            subject.wrap_api_pages("attestations", [
+                {"attestations": rows[:1]}, {"attestations": rows[1:]},
+            ], RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
+                terminal_page={"attestations": []})
+        with self.assertRaisesRegex(subject.Refusal, "provider-terminal-page"):
+            subject.wrap_api_pages("attestations", [{"attestations": rows}],
+                                   RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
+        with self.assertRaisesRegex(subject.Refusal, "provider-terminal-page"):
+            subject.wrap_api_pages("attestations", [{"attestations": rows}],
+                                   RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
+                                   terminal_page={"attestations": [{"bundle": {"index": 100}}]})
+        snapshot = subject.wrap_api_pages("attestations", [{"attestations": rows}],
+                                          RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
+                                          terminal_page={"attestations": []})
+        self.assertEqual(len(subject._validate_snapshot(snapshot, "attestations",
+                                                        RUN_ID, RUN_ATTEMPT, CONTROL_SHA)), 100)
+        snapshot["terminal_page"]["page"] = 3
+        with self.assertRaisesRegex(subject.Refusal, "provider-terminal-page"):
+            subject._validate_snapshot(snapshot, "attestations", RUN_ID,
+                                       RUN_ATTEMPT, CONTROL_SHA)
+
     def test_archive_bytes_size_digest_expiry_and_members_are_bound(self):
         with tempfile.TemporaryDirectory() as temporary:
             evidence = fixture_successful_evidence(temporary)
@@ -1020,11 +1101,13 @@ class ArtifactAndStageTests(unittest.TestCase):
         for gate, cases in (
             ("A", ("repository-id", "caller", "receiver-job", "receiver-job-duplicate",
                    "receiver-record", "receiver-certificate", "receiver-subject", "receiver-nonce",
-                   "workflow-bytes", "receiver-archive", "receiver-size", "receiver-expiry")),
+                   "workflow-bytes", "receiver-archive", "receiver-size", "receiver-expiry",
+                   "receiver-provider-missing", "receiver-provider-identity", "receiver-provider-terminal")),
             ("B", ("gate-a", "receiver-binding", "linux-job", "linux-certificate",
                    "linux-nonce", "capsule-subject",
                    "revoke-step", "verify-step", "revoke-ordinal", "verify-ordinal",
-                   "revocation-line", "outside-line")),
+                   "revocation-line", "outside-line", "linux-provider-missing",
+                   "linux-provider-identity", "linux-provider-terminal")),
         ):
             for case in cases:
                 with self.subTest(gate=gate, case=case):
@@ -1073,6 +1156,19 @@ class ArtifactAndStageTests(unittest.TestCase):
                             artifacts[0]["size_in_bytes"] += 1
                         elif case == "receiver-expiry":
                             artifacts[0]["expires_at"] = "2000-01-01T00:00:00+00:00"
+                        elif case.startswith("receiver-provider-") or case.startswith("linux-provider-"):
+                            target_role = "windows-receiver" if case.startswith("receiver-") else "linux-fetch-encrypt"
+                            target_artifact = next(row for row in artifacts if row["name"].startswith(
+                                "role-statement-" + target_role + "-"))
+                            digest = hashlib.sha256((Path(temporary) / "artifacts" /
+                                                     target_artifact["name"] / "subject.bin").read_bytes()).hexdigest()
+                            if case.endswith("missing"):
+                                arguments["provider_snapshots"].pop(digest)
+                            elif case.endswith("identity"):
+                                document = arguments["provider_snapshots"][digest]["verified"][0]
+                                document["verificationResult"]["signature"]["certificate"]["buildSignerURI"] = "wrong"
+                            else:
+                                arguments["provider_snapshots"][digest]["snapshot"].pop("terminal_page")
                         elif case == "linux-job":
                             rows[1]["conclusion"] = "failure"
                         elif case == "receiver-binding":

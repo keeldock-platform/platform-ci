@@ -90,10 +90,26 @@ jobs:
           gh api --paginate --slurp "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/artifacts?per_page=100" > "$evidence/artifact-pages.json" 2>/dev/null
           python -B kit/confinement/role_signer.py wrap-pages --kind jobs --input "$evidence/jobs-pages.json" --output "$evidence/jobs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
           python -B kit/confinement/role_signer.py wrap-pages --kind artifacts --input "$evidence/artifact-pages.json" --output "$evidence/artifacts.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          for role in windows-receiver linux-fetch-encrypt; do
+            name="$(cat "$evidence/$role-name.txt")"
+            directory="$evidence/artifacts/$name"
+            subject_sha="$(sha256sum "$directory/subject.bin" | awk '{print $1}')"
+            if [[ ! -f "$evidence/provider-$subject_sha.json" ]]; then
+              provider_path="repos/$KD_REPOSITORY/attestations/sha256:$subject_sha"
+              gh api --paginate --slurp "$provider_path?per_page=100" > "$evidence/provider-$subject_sha-pages.json" 2>/dev/null
+              next_page="$(python -B kit/confinement/role_signer.py next-provider-page --input "$evidence/provider-$subject_sha-pages.json")"
+              gh api "$provider_path?per_page=100&page=$next_page" > "$evidence/provider-$subject_sha-terminal.json" 2>/dev/null
+              python -B kit/confinement/role_signer.py wrap-pages --kind attestations --input "$evidence/provider-$subject_sha-pages.json" --terminal-input "$evidence/provider-$subject_sha-terminal.json" --output "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+              python -B kit/confinement/role_signer.py export-provider --snapshot "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA" --output-directory "$evidence/provider-$subject_sha"
+              while read -r index provider_role; do
+                gh attestation verify "$directory/subject.bin" --bundle "$evidence/provider-$subject_sha/bundle-$index.json" --repo "$KD_REPOSITORY" --signer-workflow "$KD_REPOSITORY/.github/workflows/lane-h-$provider_role.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$evidence/provider-$subject_sha/verified-$index.json" 2>/dev/null
+              done < "$evidence/provider-$subject_sha/manifest.txt"
+            fi
+          done
           linux_job_id="$(python -B kit/confinement/role_signer.py find-job --profile "$KD_PROFILE" --role linux-fetch-encrypt --jobs-file "$evidence/jobs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA")"
           gh run view "$KD_RUN_ID" --repo "$KD_REPOSITORY" --job "$linux_job_id" --log > "$evidence/linux.log" 2>/dev/null
           python -B kit/confinement/role_signer.py parse-linux-logs --profile "$KD_PROFILE" --jobs-file "$evidence/jobs.json" --input "$evidence/linux.log" --output "$evidence/linux-logs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
-          python -B kit/confinement/role_signer.py gate-transition --gate B --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --jobs-file "$evidence/jobs.json" --artifacts-file "$evidence/artifacts.json" --repository-metadata "$evidence/repository.json" --run-metadata "$evidence/run.json" --artifact-directory "$evidence/artifacts" --linux-logs "$evidence/linux-logs.json"
+          python -B kit/confinement/role_signer.py gate-transition --gate B --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --jobs-file "$evidence/jobs.json" --artifacts-file "$evidence/artifacts.json" --repository-metadata "$evidence/repository.json" --run-metadata "$evidence/run.json" --artifact-directory "$evidence/artifacts" --provider-directory "$evidence" --linux-logs "$evidence/linux-logs.json"
       - name: Sign only the capsule-attester role statement
         id: attest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
