@@ -61,7 +61,12 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(set(CONFIG), {"digests", "text_length"})
         self.assertEqual(CONFIG["text_length"], 64)
         self.assertEqual(set(CONFIG["digests"]), set(subject.FORMS))
-        self.assertEqual(len(set(CONFIG["digests"].values())), len(subject.FORMS))
+        digests = CONFIG["digests"]
+        self.assertEqual(digests["base64-text-0"], digests["base64url-text-0"])
+        self.assertEqual(digests["base64-text-1"], digests["base64url-text-1"])
+        self.assertEqual(digests["base64-text-2"], digests["base64url-text-2"])
+        self.assertLess(len(set(digests.values())), len(subject.FORMS))
+        self.assertEqual(subject.scan_bytes(b"x " + CANARY.encode("ascii"), CONFIG), "present")
         encoded = json.dumps(CONFIG)
         self.assertNotIn(CANARY, encoded)
         self.assertNotIn(CANARY.encode("ascii").hex(), encoded)
@@ -109,7 +114,6 @@ class ConfigTests(unittest.TestCase):
         bad.append(dict(CONFIG, digests=dict(CONFIG["digests"], hex="A" * 64)))
         bad.append(dict(CONFIG, digests=dict(CONFIG["digests"], hex="a" * 63)))
         bad.append(dict(CONFIG, digests=dict(CONFIG["digests"], hex=5)))
-        bad.append(dict(CONFIG, digests=dict(CONFIG["digests"], hex=CONFIG["digests"]["plain"])))
         bad.append([])
         bad.append(None)
         for config in bad:

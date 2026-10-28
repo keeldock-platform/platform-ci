@@ -127,8 +127,7 @@ def _plan(config):
             or set(config["digests"]) != set(FORMS)):
         raise ScanRefusal("config_invalid")
     values = list(config["digests"].values())
-    if (any(type(value) is not str or DIGEST_RE.fullmatch(value) is None for value in values)
-            or len(set(values)) != len(values)):
+    if any(type(value) is not str or DIGEST_RE.fullmatch(value) is None for value in values):
         raise ScanRefusal("config_invalid")
     dummy = "00" * (config["text_length"] // 2)
     groups = {}
