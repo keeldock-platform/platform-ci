@@ -190,6 +190,8 @@ def run_raw_logs():
 
 
 def hunt():
+    if cfg.get("positive_control") is True:
+        os.environ["ACTIONS_RUNTIME_TOKEN"] = "tripwire-token-" + nonce
     names = [name for name in os.environ if name.startswith(("ACTIONS_", "GITHUB_", "RUNNER_"))]
     if not names:
         closed()

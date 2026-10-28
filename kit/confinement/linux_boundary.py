@@ -265,12 +265,12 @@ class Boundary:
 
     def network_control(self, channel, broken):
         self.tripwires.store.clear()
-        environment = dict(BASE_ENV)
+        config = self.config(broken)
         if channel in ("artifact_upload", "cache_upload") and not broken:
-            environment["ACTIONS_RUNTIME_TOKEN"] = "control-" + self.nonce
+            config["positive_control"] = True
         result = self.chroot(
-            self.probe_argv(channel, self.config(broken)),
-            environment,
+            self.probe_argv(channel, config),
+            BASE_ENV,
             mode="open",
             extra_fd=channel == "runner_ipc" and not broken,
         )

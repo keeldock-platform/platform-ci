@@ -188,6 +188,19 @@ class LinuxSessionSpecTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(harness.ProofFailure):
                 session.validate_spec(spec)
 
+    def test_project_session_refuses_action_and_token_names_before_launch(self):
+        for key in ("ACTIONS_RUNTIME_TOKEN", "ACTIONS_RESULTS_URL", "PROJECT_TOKEN"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as base, \
+                 patch("linux_session.netns_inode", return_value=77), \
+                 patch("linux_session.subprocess.run") as launch:
+                with self.assertRaises(BoundaryRefusal) as raised:
+                    session.run_chroot(
+                        base, NONCE, ["/usr/bin/python3"], {"PATH": "/usr/bin", key: "synthetic"},
+                        "confined", {},
+                    )
+                self.assertEqual(raised.exception.reason, "environment")
+                launch.assert_not_called()
+
     def test_host_view_uses_only_minimal_device_nodes(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = temporary + "/dev"

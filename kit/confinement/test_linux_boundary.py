@@ -1,3 +1,4 @@
+import base64
 import io
 import json
 import os
@@ -12,6 +13,8 @@ import linux_boundary as boundary
 import linux_channels as channels
 import linux_fixtures as fixtures
 import linux_harness as harness
+import linux_probes as probes
+import linux_session as session
 from linux_channels import BoundaryRefusal
 
 
@@ -280,7 +283,6 @@ class LinuxBoundaryFaultTests(unittest.TestCase):
                 run_channel.assert_not_called()
 
     def real_network_boundary(self):
-        import linux_session as session
         subject, emitter = make()
         store = session.EventStore()
         subject.tripwires = SimpleNamespace(
@@ -458,6 +460,77 @@ class LinuxBoundaryCommandTests(unittest.TestCase):
 
 
 class LinuxBoundaryReviewFixTests(unittest.TestCase):
+    def test_artifact_and_cache_positive_controls_launch_after_real_spec_validation(self):
+        for standin in (True, False):
+            with self.subTest(synthetic_standin=standin), tempfile.TemporaryDirectory() as base:
+                subject, unused = make(synthetic_standin=standin)
+                subject.workdir = base
+                subject.ipc_dir = os.path.join(base, "ipc")
+                os.mkdir(subject.ipc_dir)
+                store = session.EventStore()
+                subject.tripwires = SimpleNamespace(
+                    store=store,
+                    ipv6=False,
+                    config=lambda: {
+                        "nonce": subject.nonce,
+                        "ports": {"artifact": 2111, "cache": 2222},
+                        "unix_path": "/ipc/docker.sock",
+                        "abstract_name": "kd-" + subject.nonce,
+                    },
+                )
+                launches = []
+
+                def fake_run(command, **kwargs):
+                    self.assertIn("--inside", command)
+                    self.assertNotIn("--net", command)
+                    with open(command[-1], "rt", encoding="utf-8") as source:
+                        spec = json.load(source)
+                    channel = spec["argv"][-2]
+                    config = json.loads(spec["argv"][-1])
+                    launches.append(channel)
+                    self.assertEqual(spec["mode"], "open")
+                    self.assertEqual(spec["env"], boundary.BASE_ENV)
+                    self.assertFalse(any(key.startswith("ACTIONS_") or "TOKEN" in key for key in spec["env"]))
+                    self.assertIs(config["positive_control"], True)
+                    self.assertEqual(spec["files"]["/probe.py"], [probes.PROBE_SOURCE, 0o444])
+                    listener = "artifact" if channel == "artifact_upload" else "cache"
+
+                    def fake_urlopen(request, timeout):
+                        self.assertEqual(timeout, 1)
+                        self.assertEqual(request.get_header("Authorization"), "Bearer tripwire-token-" + subject.nonce)
+                        self.assertIn(":" + str(config["ports"][listener]) + "/", request.full_url)
+                        store.record(listener, request.full_url.encode("ascii"))
+                        return io.BytesIO(b"live")
+
+                    output = io.StringIO()
+                    with patch.dict(os.environ, spec["env"], clear=True), \
+                         patch.object(sys, "argv", spec["argv"][-3:]), \
+                         patch.object(sys, "stdout", output), \
+                         patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+                         patch("os.makedirs"), \
+                         patch("builtins.open", return_value=io.BytesIO()):
+                        exec(compile(probes.PROBE_SOURCE, "/probe.py", "exec"), {"__name__": "control_probe"})
+                        self.assertEqual(os.environ["ACTIONS_RUNTIME_TOKEN"], "tripwire-token-" + subject.nonce)
+                    transcript = output.getvalue()
+                    self.assertIn("KDATT env-hunt allowed\n", transcript)
+                    self.assertIn("KDATT endpoint-post allowed\n", transcript)
+                    reply = {
+                        "exit": 0,
+                        "timeout": False,
+                        "stdout": base64.b64encode(transcript.encode("ascii")).decode("ascii"),
+                        "stderr": "",
+                        "readback": {},
+                    }
+                    return SimpleNamespace(stdout=session.RESULT_PREFIX + json.dumps(reply).encode("ascii") + b"\n")
+
+                with patch("linux_session.subprocess.run", side_effect=fake_run), \
+                     patch("linux_session.netns_inode", return_value=77), \
+                     patch("linux_session.shutil.which", return_value="/usr/bin/unshare"):
+                    for channel in ("artifact_upload", "cache_upload"):
+                        with self.subTest(channel=channel):
+                            self.assertTrue(subject.network_control(channel, False))
+                self.assertEqual(launches, ["artifact_upload", "cache_upload"])
+
     def test_readback_also_requires_bpf_and_perf_restrictions(self):
         subject, unused = make()
         base = {"ptrace_scope": "3", "max_user_namespaces": "0", "unprivileged_bpf_disabled": "2", "perf_event_paranoid": "4"}
