@@ -325,6 +325,41 @@ hostedTest('audit refuses vulnerable and unrequested package responses without a
   );
 });
 
+function responseWithoutContentType(body) {
+  const response = new Response(body, { status: 200 });
+  response.headers.delete('content-type');
+  assert.equal(response.headers.get('content-type'), null);
+  return response;
+}
+
+hostedTest('bulk audit accepts an absent content-type header and still validates the body', async () => {
+  const clean = await validate({ fetchImpl: async () => responseWithoutContentType('{}') });
+  assert.equal(clean.result.status, 'passed');
+  assert.equal(clean.result.advisory_count, 0);
+  await assert.rejects(
+    validate({ fetchImpl: async () => responseWithoutContentType(JSON.stringify({
+      typescript: [{ name: 'typescript', vulnerable_versions: '<6.0.4' }],
+    })) }),
+    (error) => error instanceof NodeContractError && error.code === 'vulnerable_dependency',
+  );
+  await assert.rejects(
+    validate({ fetchImpl: async () => responseWithoutContentType('not json') }),
+    (error) => error instanceof NodeContractError && error.code === 'audit_response_invalid',
+  );
+});
+
+hostedTest('bulk audit refuses a present content-type header that is not JSON, including an empty one', async () => {
+  for (const value of ['text/html', 'text/plain;charset=UTF-8', '']) {
+    await assert.rejects(
+      validate({ fetchImpl: async () => new Response('{}', {
+        status: 200,
+        headers: { 'content-type': value },
+      }) }),
+      (error) => error instanceof NodeContractError && error.code === 'audit_response_invalid',
+    );
+  }
+});
+
 hostedTest('provenance binds lock, manifest, and current source while allowing the bootstrap commit to differ', async () => {
   const lockBytes = lockFixture();
   const policyEpochMs = Date.now() - (30 * 24 * 60 * 60 * 1000);

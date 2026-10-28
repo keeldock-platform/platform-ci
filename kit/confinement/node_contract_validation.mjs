@@ -406,7 +406,7 @@ async function readResponseBounded(response, maximum) {
   return result;
 }
 
-async function fetchBounded(fetchImpl, url, options, maximum, deadlineMs, nowMs) {
+async function fetchBounded(fetchImpl, url, options, maximum, deadlineMs, nowMs, allowMissingContentType = false) {
   const remaining = deadlineMs - nowMs();
   if (!safeInteger(remaining, 1)) reject('deadline_exceeded');
   const controller = new AbortController();
@@ -424,8 +424,9 @@ async function fetchBounded(fetchImpl, url, options, maximum, deadlineMs, nowMs)
       reject('audit_response_invalid');
     }
     if (response.status !== 200 || !response.ok) reject('audit_unavailable');
-    const contentType = responseHeader(response, 'content-type') ?? '';
-    if (!/^application\/(?:json|[a-z0-9.+-]+\+json)(?:\s*;|$)/iu.test(contentType)) {
+    const contentType = responseHeader(response, 'content-type');
+    const contentTypeAbsent = contentType === null && allowMissingContentType;
+    if (!contentTypeAbsent && !/^application\/(?:json|[a-z0-9.+-]+\+json)(?:\s*;|$)/iu.test(contentType ?? '')) {
       reject('audit_response_invalid');
     }
     return await readResponseBounded(response, maximum);
@@ -482,7 +483,7 @@ async function auditInventory(inventory, { fetchImpl, semver, deadlineMs, nowMs,
       headers: { accept: 'application/json', 'content-type': 'application/json' },
       body,
       signal,
-    }, NODE_CONTRACT_LIMITS.auditResponseBytes, deadlineMs, nowMs);
+    }, NODE_CONTRACT_LIMITS.auditResponseBytes, deadlineMs, nowMs, true);
   } catch (error) {
     if (error instanceof NodeContractError) throw error;
     reject('audit_unavailable');
