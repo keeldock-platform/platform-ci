@@ -1,7 +1,9 @@
 import hashlib
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import log_canary
@@ -55,7 +57,7 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 with self.assertRaises(subject.EvidenceRefusal):
                     subject.manifest_from_mapping(changed)
 
-    def test_every_listed_binary_and_log_file_is_streamed_and_hashed(self):
+    def test_binary_artifact_is_scanned_but_refused_without_an_extraction_profile(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             log = b"stage=build result=complete\n"
@@ -77,12 +79,38 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 with mock.patch.object(subject, "READ_CHUNK_BYTES", 5):
                     with mock.patch.object(log_canary.Scanner, "feed", bounded_feed):
                         verdict = subject.scan_evidence(root, manifest)
-            self.assertTrue(verdict.accepted)
-            self.assertEqual(verdict.reason, "none")
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.reason, "compressed_unsupported")
             self.assertEqual(verdict.files_scanned, 2)
             self.assertEqual(verdict.bytes_scanned, len(log) + len(artifact))
+            self.assertEqual(verdict.snapshots, ())
             self.assertLessEqual(max(chunk_sizes), 5)
             self.assertEqual(sum(chunk_sizes), len(log) + len(artifact))
+
+    def test_accepted_log_snapshot_remains_immutable_after_source_rewrite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = b"safe log\n"
+            target = _write(root, "build.log", payload)
+            manifest = _manifest((_entry("build.log", "log", payload),))
+            verdict = _scan(root, manifest)
+            self.assertTrue(verdict.accepted)
+            self.assertEqual(verdict.reason, "none")
+            self.assertEqual(len(verdict.snapshots), 1)
+            self.assertNotIn("safe log", repr(verdict))
+            target.write_bytes(CANARY.encode("ascii"))
+            self.assertEqual(
+                b"".join(verdict.snapshots[0].chunks), payload
+            )
+
+    def test_file_identity_includes_change_time(self):
+        fields = {
+            "st_dev": 1, "st_ino": 2, "st_size": 3,
+            "st_mtime_ns": 4, "st_ctime_ns": 5,
+        }
+        before = SimpleNamespace(**fields)
+        after = SimpleNamespace(**dict(fields, st_ctime_ns=6))
+        self.assertNotEqual(subject._file_identity(before), subject._file_identity(after))
 
     def test_pinned_canary_in_any_listed_file_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -189,7 +217,14 @@ class ReleaseEvidenceTests(unittest.TestCase):
             payload = b"safe evidence\n"
             _write(root, "build.log", payload)
             manifest = _manifest((_entry("build.log", "log", payload),))
-            with mock.patch.object(subject.os, "open", side_effect=OSError("unavailable")):
+            original_open = os.open
+
+            def refuse_file(path, flags, *args, **kwargs):
+                if str(path).endswith("build.log"):
+                    raise OSError("unavailable")
+                return original_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(subject.os, "open", side_effect=refuse_file):
                 verdict = _scan(root, manifest)
             self.assertEqual(verdict.reason, "file_unreadable")
 
@@ -205,6 +240,122 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 (root / name).unlink()
             self.assertTrue(subject.OPEN_QUESTIONS)
 
+    def test_container_signatures_refuse_renamed_evidence_files(self):
+        signatures = (
+            b"7z\xbc\xaf\x27\x1c", b"Rar!\x1a\x07\x00",
+            b"Rar!\x1a\x07\x01\x00", b"MSCF", b"!<arch>\n",
+            b"xar!", b"\x02\x21\x4c\x18", b"\x5f\x2a\x4d\x18",
+            b"\x00" * 257 + b"ustar\x00",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for signature in signatures:
+                with self.subTest(signature=signature[:8]):
+                    payload = signature + b"compressed contents"
+                    target = _write(root, "renamed.log", payload)
+                    manifest = _manifest((_entry("renamed.log", "log", payload),))
+                    verdict = _scan(root, manifest)
+                    self.assertFalse(verdict.accepted)
+                    self.assertEqual(verdict.reason, "compressed_unsupported")
+                    target.unlink()
+
+    def test_mid_scan_addition_is_rejected_by_final_inventory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = b"first log\n"
+            second = b"second log\n"
+            _write(root, "logs/a.log", first)
+            _write(root, "logs/b.log", second)
+            manifest = _manifest((
+                _entry("logs/a.log", "log", first),
+                _entry("logs/b.log", "log", second),
+            ))
+            original_feed = log_canary.Scanner.feed
+            added = [False]
+
+            def add_during_scan(scanner, chunk):
+                if b"second" in chunk and not added[0]:
+                    _write(root, "logs/unexpected.log", b"new evidence\n")
+                    added[0] = True
+                return original_feed(scanner, chunk)
+
+            with mock.patch.object(log_canary.Scanner, "feed", add_during_scan):
+                verdict = _scan(root, manifest)
+            self.assertTrue(added[0])
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.reason, "tree_changed")
+
+    def test_mid_scan_replacement_is_rejected_before_reading_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = b"first log\n"
+            second = b"second log\n"
+            _write(root, "a.log", first)
+            target = _write(root, "b.log", second)
+            manifest = _manifest((_entry("a.log", "log", first), _entry("b.log", "log", second)))
+            original_feed = log_canary.Scanner.feed
+            replaced = [False]
+
+            def replace_during_scan(scanner, chunk):
+                if b"first" in chunk and not replaced[0]:
+                    target.unlink()
+                    target.write_bytes(second)
+                    replaced[0] = True
+                return original_feed(scanner, chunk)
+
+            with mock.patch.object(log_canary.Scanner, "feed", replace_during_scan):
+                verdict = _scan(root, manifest)
+            self.assertTrue(replaced[0])
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.reason, "file_changed")
+
+    def test_scanned_file_rewrite_with_restored_mtime_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = b"A" * len(CANARY)
+            second = b"second log\n"
+            target = _write(root, "a.log", first)
+            _write(root, "b.log", second)
+            manifest = _manifest((_entry("a.log", "log", first), _entry("b.log", "log", second)))
+            original_feed = log_canary.Scanner.feed
+            changed = [False]
+            before = target.stat()
+
+            def rewrite_during_scan(scanner, chunk):
+                if b"second" in chunk and not changed[0]:
+                    target.write_bytes(CANARY.encode("ascii"))
+                    os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+                    changed[0] = True
+                return original_feed(scanner, chunk)
+
+            def old_metadata_identity(metadata):
+                return (metadata.st_dev, metadata.st_ino, metadata.st_size,
+                        metadata.st_mtime_ns)
+
+            with mock.patch.object(subject, "_file_identity", old_metadata_identity):
+                with mock.patch.object(log_canary.Scanner, "feed", rewrite_during_scan):
+                    verdict = _scan(root, manifest)
+            self.assertTrue(changed[0])
+            self.assertEqual(target.stat().st_mtime_ns, before.st_mtime_ns)
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.reason, "tree_changed")
+            self.assertEqual(verdict.snapshots, ())
+
+    def test_canary_scanner_budget_refusals_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = b"safe evidence\n"
+            _write(root, "build.log", payload)
+            manifest = _manifest((_entry("build.log", "log", payload),))
+            for method in ("feed", "finish"):
+                with self.subTest(method=method):
+                    refusal = log_canary.ScanRefusal("scan_limit")
+                    with mock.patch.object(log_canary.Scanner, method, side_effect=refusal):
+                        verdict = _scan(root, manifest)
+                    self.assertFalse(verdict.accepted)
+                    self.assertEqual(verdict.reason, "canary_unscanned")
+                    self.assertEqual(verdict.files_scanned, 0)
+
     def test_symlink_output_is_not_treated_as_a_regular_retained_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -217,6 +368,23 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 self.skipTest("symlink creation is unavailable")
             manifest = _manifest((_entry("build.log", "log", payload),))
             self.assertEqual(_scan(root, manifest).reason, "tree_invalid")
+
+    def test_symlink_root_with_trailing_separator_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            root = parent / "real"
+            root.mkdir()
+            payload = b"safe evidence\n"
+            _write(root, "build.log", payload)
+            link = parent / "link"
+            try:
+                link.symlink_to(root, target_is_directory=True)
+            except OSError:
+                self.skipTest("symlink creation is unavailable")
+            manifest = _manifest((_entry("build.log", "log", payload),))
+            verdict = _scan(str(link) + os.sep, manifest)
+            self.assertFalse(verdict.accepted)
+            self.assertEqual(verdict.reason, "tree_invalid")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ import hashlib
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 try:
     from . import confinement_public_audit, log_canary
@@ -40,11 +40,16 @@ COMPRESSED_SUFFIXES = (
 COMPRESSED_SIGNATURES = (
     b"\x1f\x8b", b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08", b"BZh",
     b"\xfd7zXZ\x00", b"\x28\xb5\x2f\xfd", b"\x04\x22\x4d\x18",
-    b"\x1f\x9d", b"\x1f\xa0",
+    b"\x1f\x9d", b"\x1f\xa0", b"7z\xbc\xaf\x27\x1c",
+    b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00", b"MSCF", b"!<arch>\n",
+    b"xar!", b"\x02\x21\x4c\x18",
 )
+CONTAINER_HEADER_BYTES = 512
+TAR_SIGNATURE_OFFSET = 257
+TAR_SIGNATURES = (b"ustar\x00", b"ustar  ")
 OPEN_QUESTIONS = (
-    "Container formats and internally compressed binary sections need an admitted extraction "
-    "profile before a scan can claim coverage of their uncompressed contents.",
+    "No bounded artifact extraction profile is admitted. Artifact bytes are scanned, but every "
+    "artifact verdict refuses until signatureless and internally compressed contents are covered.",
 )
 
 
@@ -71,11 +76,20 @@ class EvidenceManifest:
 
 
 @dataclass(frozen=True)
+class EvidenceSnapshot:
+    path: str
+    size: int
+    sha256: str
+    chunks: tuple = field(repr=False)
+
+
+@dataclass(frozen=True)
 class EvidenceVerdict:
     accepted: bool
     reason: str
     files_scanned: int
     bytes_scanned: int
+    snapshots: tuple = field(default=(), repr=False)
 
 
 def manifest_from_mapping(value):
@@ -149,9 +163,45 @@ def _expected_directories(items):
     return directories
 
 
-def _inventory(root):
+def _is_link(metadata):
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return stat.S_ISLNK(metadata.st_mode) or bool(reparse and attributes & reparse)
+
+
+def _anchor_root(root):
+    raw_path = os.fspath(root)
+    if type(raw_path) is not str or not raw_path:
+        raise EvidenceRefusal("tree_invalid")
+    components = raw_path.replace(os.altsep, os.sep) if os.altsep else raw_path
+    if any(part in (".", "..") for part in components.split(os.sep)):
+        raise EvidenceRefusal("tree_invalid")
+    path = os.path.normpath(raw_path)
+    try:
+        metadata = os.lstat(path)
+        if _is_link(metadata) or not stat.S_ISDIR(metadata.st_mode):
+            raise EvidenceRefusal("tree_invalid")
+        if os.name != "posix":
+            return path, None, metadata
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if _file_identity(opened) != _file_identity(metadata):
+                raise EvidenceRefusal("tree_changed")
+        except Exception:
+            os.close(descriptor)
+            raise
+        return path, descriptor, metadata
+    except EvidenceRefusal:
+        raise
+    except OSError:
+        raise EvidenceRefusal("tree_unreadable") from None
+
+
+def _inventory(root, root_descriptor):
     files = {}
-    directories = set()
+    directories = {}
     nodes = [0]
 
     def visit(directory, prefix, depth):
@@ -172,40 +222,56 @@ def _inventory(root):
                         raise EvidenceRefusal("tree_invalid")
                     try:
                         metadata = entry.stat(follow_symlinks=False)
-                        if entry.is_symlink():
+                        if _is_link(metadata):
                             raise EvidenceRefusal("tree_invalid")
                     except EvidenceRefusal:
                         raise
                     except OSError:
                         raise EvidenceRefusal("tree_unreadable") from None
                     if stat.S_ISDIR(metadata.st_mode):
-                        directories.add(relative)
-                        visit(entry.path, relative, depth + 1)
+                        directories[relative] = metadata
+                        if root_descriptor is None:
+                            visit(entry.path, relative, depth + 1)
+                        else:
+                            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                            try:
+                                child = os.open(entry.name, flags, dir_fd=directory)
+                                try:
+                                    changed = (_file_identity(os.fstat(child))
+                                               != _file_identity(metadata))
+                                except Exception:
+                                    os.close(child)
+                                    raise
+                                if changed:
+                                    os.close(child)
+                                    raise EvidenceRefusal("tree_changed")
+                            except EvidenceRefusal:
+                                raise
+                            except OSError:
+                                raise EvidenceRefusal("tree_unreadable") from None
+                            try:
+                                visit(child, relative, depth + 1)
+                            finally:
+                                os.close(child)
                     elif stat.S_ISREG(metadata.st_mode):
                         files[relative] = metadata
                     else:
                         raise EvidenceRefusal("file_not_regular")
         except OSError:
             raise EvidenceRefusal("tree_unreadable") from None
-    try:
-        root_metadata = os.lstat(root)
-    except OSError:
-        raise EvidenceRefusal("tree_unreadable") from None
-    if not stat.S_ISDIR(root_metadata.st_mode):
-        raise EvidenceRefusal("tree_invalid")
-    visit(root, "", 0)
+    visit(root_descriptor if root_descriptor is not None else root, "", 0)
     return files, directories
 
 
-def _preflight(root, manifest):
+def _preflight(root, root_descriptor, manifest):
     total_size = _validate_manifest(manifest)
-    files, directories = _inventory(root)
+    files, directories = _inventory(root, root_descriptor)
     expected = {item.path for item in manifest.items}
     if set(files) - expected:
         raise EvidenceRefusal("file_unlisted")
     if expected - set(files):
         raise EvidenceRefusal("file_missing")
-    if directories != _expected_directories(manifest.items):
+    if set(directories) != _expected_directories(manifest.items):
         raise EvidenceRefusal("file_unlisted")
     for item in manifest.items:
         if files[item.path].st_size != item.size:
@@ -215,30 +281,55 @@ def _preflight(root, manifest):
             raise EvidenceRefusal("file_over_limit")
     if total_size > MAX_EVIDENCE_TOTAL_BYTES:
         raise EvidenceRefusal("file_over_limit")
-    return files, total_size
+    return files, directories, total_size
 
 
 def _compressed_prefix(data):
-    return any(data.startswith(signature) for signature in COMPRESSED_SIGNATURES)
+    """No bounded extractor is admitted, so recognized containers are refused."""
+    return (
+        any(data.startswith(signature) for signature in COMPRESSED_SIGNATURES)
+        or (len(data) >= 4 and data[1:4] == b"\x2a\x4d\x18"
+            and 0x50 <= data[0] <= 0x5f)
+        or any(
+            data[TAR_SIGNATURE_OFFSET:].startswith(signature)
+            for signature in TAR_SIGNATURES
+        )
+    )
 
 
 def _file_identity(metadata):
     return (
         metadata.st_dev, metadata.st_ino, metadata.st_size,
-        getattr(metadata, "st_mtime_ns", int(metadata.st_mtime * 1000000000)),
+        metadata.st_mtime_ns, metadata.st_ctime_ns,
     )
 
 
-def _scan_file(root, item, expected_metadata, config):
-    path = os.path.join(root, *item.path.split("/"))
+def _open_evidence_file(root, root_descriptor, item):
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        path_metadata = os.lstat(path)
-        if not stat.S_ISREG(path_metadata.st_mode):
+    if root_descriptor is None:
+        path = os.path.join(root, *item.path.split("/"))
+        metadata = os.lstat(path)
+        if _is_link(metadata) or not stat.S_ISREG(metadata.st_mode):
             raise EvidenceRefusal("file_not_regular")
-        if _file_identity(path_metadata) != _file_identity(expected_metadata):
-            raise EvidenceRefusal("file_changed")
-        descriptor = os.open(path, flags)
+        return os.open(path, flags)
+    parent = root_descriptor
+    opened_directories = []
+    try:
+        parts = item.path.split("/")
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=parent)
+            opened_directories.append(child)
+            parent = child
+        return os.open(parts[-1], flags, dir_fd=parent)
+    finally:
+        for directory in reversed(opened_directories):
+            os.close(directory)
+
+
+def _scan_file(root, root_descriptor, item, expected_metadata, config):
+    try:
+        descriptor = _open_evidence_file(root, root_descriptor, item)
     except EvidenceRefusal:
         raise
     except OSError:
@@ -251,9 +342,9 @@ def _scan_file(root, item, expected_metadata, config):
             if _file_identity(before) != _file_identity(expected_metadata):
                 raise EvidenceRefusal("file_changed")
             digest = hashlib.sha256()
-            scanner = log_canary.Scanner(config)
             total = 0
             prefix = b""
+            chunks = []
             stream = os.fdopen(descriptor, "rb", closefd=False)
             try:
                 while True:
@@ -264,13 +355,12 @@ def _scan_file(root, item, expected_metadata, config):
                     total += len(chunk)
                     if total > item.size:
                         raise EvidenceRefusal("file_size_mismatch")
-                    if len(prefix) < 8:
-                        prefix += chunk[:8 - len(prefix)]
+                    if len(prefix) < CONTAINER_HEADER_BYTES:
+                        prefix += chunk[:CONTAINER_HEADER_BYTES - len(prefix)]
                     if _compressed_prefix(prefix):
                         raise EvidenceRefusal("compressed_unsupported")
+                    chunks.append(chunk)
                     digest.update(chunk)
-                    scanner.feed(chunk)
-                scanner.finish()
             finally:
                 stream.close()
             after = os.fstat(descriptor)
@@ -280,9 +370,13 @@ def _scan_file(root, item, expected_metadata, config):
                 raise EvidenceRefusal("file_changed")
             if digest.hexdigest() != item.sha256:
                 raise EvidenceRefusal("file_digest_mismatch")
+            scanner = log_canary.Scanner(config)
+            for chunk in chunks:
+                scanner.feed(chunk)
+            scanner.finish()
             if scanner.result() != log_canary.ABSENT:
                 raise EvidenceRefusal("canary_present")
-            return total
+            return total, tuple(chunks)
         except EvidenceRefusal:
             raise
         except log_canary.ScanRefusal as error:
@@ -291,6 +385,40 @@ def _scan_file(root, item, expected_metadata, config):
             raise EvidenceRefusal("canary_unscanned") from None
         except OSError:
             raise EvidenceRefusal("file_unreadable") from None
+    finally:
+        os.close(descriptor)
+
+
+def _verify_snapshot_source(root, root_descriptor, item, expected_metadata, digest):
+    try:
+        descriptor = _open_evidence_file(root, root_descriptor, item)
+    except EvidenceRefusal:
+        raise
+    except OSError:
+        raise EvidenceRefusal("file_unreadable") from None
+    try:
+        before = os.fstat(descriptor)
+        if _file_identity(before) != _file_identity(expected_metadata):
+            raise EvidenceRefusal("tree_changed")
+        check = hashlib.sha256()
+        total = 0
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while True:
+                chunk = stream.read(READ_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > item.size:
+                    raise EvidenceRefusal("tree_changed")
+                check.update(chunk)
+        after = os.fstat(descriptor)
+        if (total != item.size or _file_identity(after) != _file_identity(before)
+                or check.digest() != digest):
+            raise EvidenceRefusal("tree_changed")
+    except EvidenceRefusal:
+        raise
+    except OSError:
+        raise EvidenceRefusal("file_unreadable") from None
     finally:
         os.close(descriptor)
 
@@ -307,18 +435,39 @@ def _resolve_config():
 
 
 def scan_evidence(root, manifest):
-    """Return accepted only after every listed regular file is fully read and checked."""
+    """Scan bounded immutable byte snapshots and reject a changed source tree."""
     scanned = 0
     bytes_scanned = 0
+    root_descriptor = None
     try:
-        files, expected_total = _preflight(os.fspath(root), manifest)
+        _validate_manifest(manifest)
+        root_path, root_descriptor, root_metadata = _anchor_root(root)
+        files, directories, expected_total = _preflight(root_path, root_descriptor, manifest)
         config = _resolve_config()
-        for item in sorted(manifest.items, key=lambda value: value.path):
-            bytes_scanned += _scan_file(root, item, files[item.path], config)
+        snapshots = []
+        ordered_items = sorted(manifest.items, key=lambda value: value.path)
+        for item in ordered_items:
+            count, snapshot = _scan_file(
+                root_path, root_descriptor, item, files[item.path], config
+            )
+            snapshots.append(EvidenceSnapshot(item.path, count, item.sha256, snapshot))
+            bytes_scanned += count
             scanned += 1
-        final_files, final_directories = _inventory(os.fspath(root))
-        if (set(final_files) != set(files)
-                or final_directories != _expected_directories(manifest.items)
+        for item, snapshot in zip(ordered_items, snapshots):
+            _verify_snapshot_source(
+                root_path, root_descriptor, item, files[item.path],
+                bytes.fromhex(snapshot.sha256)
+            )
+        final_files, final_directories = _inventory(root_path, root_descriptor)
+        final_root = os.lstat(root_path)
+        if (_is_link(final_root)
+                or _file_identity(final_root) != _file_identity(root_metadata)
+                or set(final_files) != set(files)
+                or set(final_directories) != _expected_directories(manifest.items)
+                or any(
+                    _file_identity(final_directories[path]) != _file_identity(directories[path])
+                    for path in directories if path in final_directories
+                )
                 or any(
                     _file_identity(final_files[path]) != _file_identity(files[path])
                     for path in files
@@ -326,8 +475,13 @@ def scan_evidence(root, manifest):
             raise EvidenceRefusal("tree_changed")
         if bytes_scanned != expected_total:
             raise EvidenceRefusal("file_size_mismatch")
-        return EvidenceVerdict(True, "none", scanned, bytes_scanned)
+        if any(item.role == "artifact" for item in ordered_items):
+            raise EvidenceRefusal("compressed_unsupported")
+        return EvidenceVerdict(True, "none", scanned, bytes_scanned, tuple(snapshots))
     except EvidenceRefusal as error:
         return EvidenceVerdict(False, error.reason, scanned, bytes_scanned)
     except Exception:
         return EvidenceVerdict(False, "internal_error", scanned, bytes_scanned)
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
