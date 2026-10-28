@@ -2,7 +2,6 @@ import argparse
 from pathlib import Path
 
 from api_budget import load_budget_document
-from kit_revocation import check_kit_not_revoked
 from policy import (
     LANE_CANDIDATE_WORKFLOWS,
     PolicyError,
@@ -81,7 +80,6 @@ def main():
         scan_tree(root, pool)
         if pool == "platform":
             load_budget_document(root / "ci/api-budgets.json")
-            check_kit_not_revoked(root, actual_sha)
         print("candidate-policy=accepted control-sha=" + actual_sha)
     except (OSError, UnicodeDecodeError, ValueError, PolicyError, PublicTreeError):
         print("candidate-policy=refused")

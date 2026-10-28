@@ -7,29 +7,29 @@
   },
   "credentials": {
     "repository_token": {
-      "per_run": 1000,
-      "per_workflow": 1000,
+      "per_run": null,
+      "per_workflow": null,
       "per_hour": 1000
     },
     "source_reader": {
-      "per_run": 1000,
-      "per_workflow": 1000,
-      "per_hour": 1000
+      "per_run": null,
+      "per_workflow": null,
+      "per_hour": null
     },
     "settings_auditor": {
-      "per_run": 1000,
-      "per_workflow": 1000,
-      "per_hour": 1000
+      "per_run": null,
+      "per_workflow": null,
+      "per_hour": null
     },
     "source_auditor": {
-      "per_run": 1000,
-      "per_workflow": 1000,
-      "per_hour": 1000
+      "per_run": null,
+      "per_workflow": null,
+      "per_hour": null
     },
     "pin_writer": {
-      "per_run": 1000,
-      "per_workflow": 1000,
-      "per_hour": 1000
+      "per_run": null,
+      "per_workflow": null,
+      "per_hour": null
     }
   }
 }

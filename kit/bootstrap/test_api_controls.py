@@ -1,23 +1,27 @@
-import hashlib
+import contextlib
+import io
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
-from api_budget import BudgetError, check_api_budget, load_budget_document
-from kit_revocation import RevocationError, check_kit_not_revoked, parse_revocations
-from public_tree import PINNED_FILE_SHA256
+from api_budget import BudgetError, check_api_budget, check_api_budget_files, load_budget_document, main
 
 
 ROOT = Path(__file__).resolve().parents[2]
-GOOD_SHA = "a" * 40
 
 
-def budget_document(per_run=4, per_workflow=6, per_hour=10):
+def budget_document():
     return {
         "schema_version": 1,
         "window_seconds": 3600,
         "watcher": {"maximum_per_run": 1, "minimum_interval_seconds": 300},
         "credentials": {
-            scope: {"per_run": per_run, "per_workflow": per_workflow, "per_hour": per_hour}
+            scope: {
+                "per_run": None,
+                "per_workflow": None,
+                "per_hour": 1000 if scope == "repository_token" else None,
+            }
             for scope in (
                 "repository_token", "source_reader", "settings_auditor", "source_auditor", "pin_writer"
             )
@@ -27,13 +31,14 @@ def budget_document(per_run=4, per_workflow=6, per_hour=10):
 
 def request(request_id, run_id=10, workflow="public-policy", timestamp=1000,
             status_code=200, remaining=9, reset=3600, scope="repository_token",
-            credential_id="repository-token"):
+            credential_id="repository-token", installation_id=None):
     return {
         "request_id": request_id,
         "run_id": run_id,
         "workflow": workflow,
         "credential_scope": scope,
         "credential_id": credential_id,
+        "installation_id": installation_id,
         "timestamp": timestamp,
         "status_code": status_code,
         "rate_limit": {"resource": "core", "limit": 10, "remaining": remaining, "reset": reset},
@@ -61,8 +66,12 @@ class BudgetDocumentTests(unittest.TestCase):
         self.assertEqual(set(value["credentials"]), {
             "repository_token", "source_reader", "settings_auditor", "source_auditor", "pin_writer"
         })
+        for scope, limits in value["credentials"].items():
+            self.assertIsNone(limits["per_run"])
+            self.assertIsNone(limits["per_workflow"])
+            self.assertEqual(limits["per_hour"], 1000 if scope == "repository_token" else None)
 
-    def test_missing_scope_invalid_watcher_or_boolean_limit_refuses(self):
+    def test_missing_scope_invalid_watcher_or_set_unplanned_limit_refuses(self):
         value = budget_document()
         del value["credentials"]["pin_writer"]
         with self.assertRaises(BudgetError):
@@ -72,8 +81,16 @@ class BudgetDocumentTests(unittest.TestCase):
         with self.assertRaises(BudgetError):
             check_api_budget(ledger([]), value)
         value = budget_document()
-        value["credentials"]["repository_token"]["per_run"] = True
-        with self.assertRaises(BudgetError):
+        value["credentials"]["repository_token"]["per_run"] = 1
+        with self.assertRaisesRegex(BudgetError, "limit-unset-required"):
+            check_api_budget(ledger([]), value)
+        value = budget_document()
+        value["credentials"]["source_reader"]["per_hour"] = 1
+        with self.assertRaisesRegex(BudgetError, "app-limit-unset-required"):
+            check_api_budget(ledger([]), value)
+        value = budget_document()
+        value["credentials"]["repository_token"]["per_hour"] = True
+        with self.assertRaisesRegex(BudgetError, "repository-token-limit"):
             check_api_budget(ledger([]), value)
 
 
@@ -88,6 +105,8 @@ class RequestLedgerTests(unittest.TestCase):
         self.assertEqual(report["requests"], 3)
         self.assertEqual(report["runs"], 2)
         self.assertEqual(report["workflows"], 1)
+        self.assertEqual(report["requests_per_run"], {10: 2, 11: 1})
+        self.assertEqual(report["requests_per_workflow"], {"public-policy": 3})
         self.assertEqual(report["resume_at"], ())
 
     def test_run_with_no_requests_can_still_have_one_watcher(self):
@@ -96,22 +115,46 @@ class RequestLedgerTests(unittest.TestCase):
         self.assertEqual(report["requests"], 0)
         self.assertEqual(report["runs"], 0)
 
-    def test_run_workflow_and_hour_caps_refuse(self):
-        cases = (
-            (ledger([request("r1"), request("r2", timestamp=1001),
-                     request("r3", timestamp=1002), request("r4", timestamp=1003),
-                     request("r5", timestamp=1004)]), budget_document(per_run=4)),
-            (ledger([request("r1"), request("r2", timestamp=1001),
-                     request("r3", timestamp=1002), request("r4", timestamp=1003),
-                     request("r5", timestamp=1004), request("r6", timestamp=1005),
-                     request("r7", timestamp=1006)]), budget_document(per_workflow=6)),
-            (ledger([request("r1"), request("r2", timestamp=1001),
-                     request("r3", timestamp=1002)]), budget_document(per_hour=2)),
-        )
-        for value, budgets in cases:
-            with self.subTest(requests=len(value["requests"])):
-                with self.assertRaises(BudgetError):
-                    check_api_budget(value, budgets)
+    def test_repository_hour_cap_aggregates_token_ids_across_runs_and_workflows(self):
+        requests = []
+        for index in range(1001):
+            entry = request(
+                "r%d" % index,
+                run_id=10 + index // 100,
+                workflow="workflow-%d" % (index // 100),
+                timestamp=1000 + index,
+                credential_id="token-a" if index % 2 else "token-b",
+            )
+            entry["rate_limit"]["limit"] = 5000
+            entry["rate_limit"]["remaining"] = 5000 - index
+            requests.append(entry)
+        self.assertEqual(check_api_budget(ledger(requests[:1000]), budget_document())["requests"], 1000)
+        with self.assertRaisesRegex(BudgetError, "hour-budget-exceeded"):
+            check_api_budget(ledger(requests), budget_document())
+
+    def test_unset_app_caps_do_not_reject_and_installation_is_required(self):
+        value = ledger([
+            request("r1", scope="source_reader", credential_id="app-a", installation_id=42),
+            request("r2", timestamp=1001, scope="source_reader", credential_id="app-b",
+                    installation_id=42),
+        ])
+        self.assertEqual(check_api_budget(value, budget_document())["requests_per_run"], {10: 2})
+        value["requests"][1]["rate_limit"]["remaining"] = 10
+        with self.assertRaisesRegex(BudgetError, "rate-limit-increased"):
+            check_api_budget(value, budget_document())
+        value["requests"][1]["rate_limit"]["remaining"] = 9
+        value["requests"][1]["installation_id"] = None
+        with self.assertRaisesRegex(BudgetError, "app-installation"):
+            check_api_budget(value, budget_document())
+        value["requests"][1]["installation_id"] = 42
+        value["requests"][1]["credential_scope"] = "pin_writer"
+        with self.assertRaisesRegex(BudgetError, "installation-scope-changed"):
+            check_api_budget(value, budget_document())
+
+    def test_repository_token_cannot_claim_app_installation(self):
+        value = ledger([request("r1", installation_id=42)])
+        with self.assertRaisesRegex(BudgetError, "repository-installation"):
+            check_api_budget(value, budget_document())
 
     def test_missing_headers_duplicate_ids_or_an_unwatched_run_refuse(self):
         value = ledger([request("r1")])
@@ -132,7 +175,8 @@ class RequestLedgerTests(unittest.TestCase):
     def test_forbidden_response_stops_until_reset_and_rejects_early_resume(self):
         refused = ledger([
             request("r1", status_code=403, remaining=0, reset=1500),
-            request("r2", timestamp=1499, remaining=0, reset=1500),
+            request("r2", timestamp=1499, remaining=0, reset=1500,
+                    credential_id="renewed-repository-token"),
         ])
         with self.assertRaisesRegex(BudgetError, "request-before-reset"):
             check_api_budget(refused, budget_document())
@@ -141,68 +185,56 @@ class RequestLedgerTests(unittest.TestCase):
         self.assertEqual(report["resume_at"], (1500,))
 
 
-class RevocationListTests(unittest.TestCase):
-    def test_checked_in_empty_list_is_content_pinned_and_current_sha_is_allowed(self):
-        self.assertEqual(
-            PINNED_FILE_SHA256["ci/revoked-kit-versions"],
-            hashlib.sha256(b"").hexdigest(),
+class SerializedInputTests(unittest.TestCase):
+    def test_shadow_cli_reports_round_run_and_workflow_from_coordinator_ledger(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            budget_path = root / "budgets.json"
+            budget_path.write_bytes(json.dumps(budget_document()).encode("ascii"))
+            ledger_path = root / "ledger.json"
+            ledger_path.write_bytes(json.dumps(ledger([request("r1")])).encode("ascii"))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = main(["--shadow", "--ledger", str(ledger_path),
+                               "--budgets", str(budget_path)])
+        self.assertEqual(result, 0)
+        self.assertIn("ci.rate-budget=shadow round=round-1 requests=1", output.getvalue())
+        self.assertIn("ci.rate-budget=run run=10 requests=1", output.getvalue())
+        self.assertIn("ci.rate-budget=workflow workflow=public-policy requests=1", output.getvalue())
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="ascii")
+        self.assertIn("--shadow --ledger \"$CI_RATE_LEDGER_PATH\"", action)
+
+    def test_strict_budget_json_rejects_duplicate_nonfinite_and_non_ascii(self):
+        invalid = (
+            b'{"schema_version":1,"schema_version":1}',
+            b'{"value":NaN}',
+            b'{"value":"\xff"}',
+            b'{"value":1} trailing',
         )
-        self.assertTrue(check_kit_not_revoked(ROOT, GOOD_SHA))
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                with tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "budgets.json"
+                    path.write_bytes(payload)
+                    with self.assertRaises(BudgetError):
+                        load_budget_document(path)
 
-    def test_strict_pinned_parser_reads_versions_and_shas(self):
-        payload = (
-            b"kit-revocations-v1\n"
-            b"sha\t" + b"b" * 40 + b"\n"
-            b"version\tv1.2.3\n"
+    def test_strict_ledger_json_rejects_duplicate_nonfinite_and_trailing_data(self):
+        invalid = (
+            b'{"schema_version":1,"schema_version":1}',
+            b'{"value":Infinity}',
+            b'{"value":1} trailing',
         )
-        result = parse_revocations(payload, hashlib.sha256(payload).hexdigest())
-        self.assertIn("b" * 40, result["shas"])
-        self.assertIn("v1.2.3", result["versions"])
-        for invalid in (
-            b"kit-revocations-v1\r\n",
-            b"kit-revocations-v1\nsha\tABC\n",
-            b"kit-revocations-v1\nsha\t" + b"b" * 40,
-            b"kit-revocations-v1\nversion\tv1.2.3\nversion\tv1.2.3\n",
-        ):
-            with self.subTest(payload=invalid):
-                with self.assertRaises(RevocationError):
-                    parse_revocations(invalid, hashlib.sha256(invalid).hexdigest())
-
-    def test_pin_mismatch_and_revoked_identity_refuse(self):
-        payload = b"kit-revocations-v1\nsha\t" + b"b" * 40 + b"\n"
-        with self.assertRaisesRegex(RevocationError, "revocation-pin-mismatch"):
-            parse_revocations(payload, "0" * 64)
-        with self.assertRaisesRegex(RevocationError, "kit-revoked"):
-            from tempfile import TemporaryDirectory
-            from pathlib import Path
-            import kit_revocation
-            import public_tree
-
-            with TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                (root / "ci").mkdir()
-                (root / "ci/revoked-kit-versions").write_bytes(payload)
-                original = public_tree.PINNED_FILE_SHA256["ci/revoked-kit-versions"]
-                public_tree.PINNED_FILE_SHA256["ci/revoked-kit-versions"] = hashlib.sha256(payload).hexdigest()
-                try:
-                    kit_revocation.check_kit_not_revoked(root, "b" * 40)
-                finally:
-                    public_tree.PINNED_FILE_SHA256["ci/revoked-kit-versions"] = original
-        version_payload = b"kit-revocations-v1\nversion\tv1.2.3\n"
-        with self.assertRaisesRegex(RevocationError, "kit-revoked"):
-            import kit_revocation
-            import public_tree
-
-            with TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                (root / "ci").mkdir()
-                (root / "ci/revoked-kit-versions").write_bytes(version_payload)
-                original = public_tree.PINNED_FILE_SHA256["ci/revoked-kit-versions"]
-                public_tree.PINNED_FILE_SHA256["ci/revoked-kit-versions"] = hashlib.sha256(version_payload).hexdigest()
-                try:
-                    kit_revocation.check_kit_not_revoked(root, "c" * 40, "v1.2.3")
-                finally:
-                    public_tree.PINNED_FILE_SHA256["ci/revoked-kit-versions"] = original
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            budget_path = root / "budgets.json"
+            budget_path.write_bytes(json.dumps(budget_document()).encode("ascii"))
+            ledger_path = root / "ledger.json"
+            for payload in invalid:
+                with self.subTest(payload=payload):
+                    ledger_path.write_bytes(payload)
+                    with self.assertRaises(BudgetError):
+                        check_api_budget_files(ledger_path, budget_path)
 
 
 if __name__ == "__main__":

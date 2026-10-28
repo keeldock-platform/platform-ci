@@ -81,13 +81,13 @@ def validate_budget_document(document):
         limits = credentials[scope]
         if not _has_fields(limits, ("per_run", "per_workflow", "per_hour")):
             raise BudgetError("limit-schema")
-        for name in ("per_run", "per_workflow", "per_hour"):
-            if not _is_integer(limits[name]):
-                raise BudgetError("limit-value")
-        if limits["per_run"] > limits["per_hour"] or limits["per_workflow"] > limits["per_hour"]:
-            raise BudgetError("limit-order")
-        if scope == "repository_token" and limits["per_hour"] > 1000:
+        if limits["per_run"] is not None or limits["per_workflow"] is not None:
+            raise BudgetError("limit-unset-required")
+        if scope == "repository_token" and (type(limits["per_hour"]) is not int
+                                             or limits["per_hour"] != 1000):
             raise BudgetError("repository-token-limit")
+        if scope != "repository_token" and limits["per_hour"] is not None:
+            raise BudgetError("app-limit-unset-required")
     return document
 
 
@@ -142,12 +142,15 @@ def _validate_ledger(document, budget):
     rate_snapshots = {}
     paused_until = {}
     credential_scopes = {}
+    installation_scopes = {}
+    requests_per_run = {}
+    requests_per_workflow = {}
     previous_timestamp = -1
     for request in requests:
         if not _has_fields(
             request,
             ("request_id", "run_id", "workflow", "credential_scope", "credential_id",
-             "timestamp", "status_code", "rate_limit"),
+             "installation_id", "timestamp", "status_code", "rate_limit"),
         ):
             raise BudgetError("request-schema")
         request_id = request["request_id"]
@@ -170,6 +173,19 @@ def _validate_ledger(document, budget):
         if existing_scope is not None and existing_scope != scope:
             raise BudgetError("credential-scope-changed")
         credential_scopes[credential_id] = scope
+        installation_id = request["installation_id"]
+        if scope == "repository_token":
+            if installation_id is not None:
+                raise BudgetError("repository-installation")
+            authority = ("repository_token", document["repository"])
+        else:
+            if not _is_integer(installation_id, 1):
+                raise BudgetError("app-installation")
+            existing_installation_scope = installation_scopes.get(installation_id)
+            if existing_installation_scope is not None and existing_installation_scope != scope:
+                raise BudgetError("installation-scope-changed")
+            installation_scopes[installation_id] = scope
+            authority = ("app_installation", installation_id)
         timestamp = request["timestamp"]
         if not _is_integer(timestamp, 1) or timestamp < previous_timestamp:
             raise BudgetError("request-time")
@@ -192,24 +208,22 @@ def _validate_ledger(document, budget):
             raise BudgetError("rate-limit-value")
 
         repository = document["repository"]
-        run_key = (repository, run_id, credential_id)
-        workflow_key = (repository, document["round_id"], workflow, credential_id)
+        run_key = (repository, run_id, authority)
+        workflow_key = (repository, document["round_id"], workflow, authority)
         run_counts[run_key] = run_counts.get(run_key, 0) + 1
         workflow_counts[workflow_key] = workflow_counts.get(workflow_key, 0) + 1
+        requests_per_run[run_id] = requests_per_run.get(run_id, 0) + 1
+        requests_per_workflow[workflow] = requests_per_workflow.get(workflow, 0) + 1
         scope_limits = budget["credentials"][scope]
-        if run_counts[run_key] > scope_limits["per_run"]:
-            raise BudgetError("run-budget-exceeded")
-        if workflow_counts[workflow_key] > scope_limits["per_workflow"]:
-            raise BudgetError("workflow-budget-exceeded")
-        credential_key = (repository, credential_id)
-        window = hour_windows.setdefault(credential_key, deque())
-        while window and window[0] <= timestamp - budget["window_seconds"]:
-            window.popleft()
-        window.append(timestamp)
-        if len(window) > scope_limits["per_hour"]:
-            raise BudgetError("hour-budget-exceeded")
+        if scope_limits["per_hour"] is not None:
+            window = hour_windows.setdefault(authority, deque())
+            while window and window[0] <= timestamp - budget["window_seconds"]:
+                window.popleft()
+            window.append(timestamp)
+            if len(window) > scope_limits["per_hour"]:
+                raise BudgetError("hour-budget-exceeded")
 
-        rate_key = (repository, credential_id, resource)
+        rate_key = (authority, resource)
         previous = rate_snapshots.get(rate_key)
         if previous is not None:
             previous_reset, previous_limit, previous_remaining = previous
@@ -221,7 +235,7 @@ def _validate_ledger(document, budget):
                 raise BudgetError("rate-limit-increased")
         rate_snapshots[rate_key] = (reset, limit, remaining)
 
-        pause_key = (repository, credential_id)
+        pause_key = authority
         resume_at = paused_until.get(pause_key)
         if resume_at is not None and timestamp < resume_at:
             raise BudgetError("request-before-reset")
@@ -233,9 +247,12 @@ def _validate_ledger(document, budget):
             paused_until[pause_key] = reset
 
     return {
+        "round_id": document["round_id"],
         "requests": len(requests),
         "runs": len({key[1] for key in run_counts}),
         "workflows": len({key[2] for key in workflow_counts}),
+        "requests_per_run": requests_per_run,
+        "requests_per_workflow": requests_per_workflow,
         "resume_at": tuple(sorted(set(paused_until.values()))),
     }
 
@@ -259,21 +276,30 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--ledger", required=True)
     parser.add_argument("--budgets", required=True)
+    parser.add_argument("--shadow", action="store_true")
     arguments = parser.parse_args(argv)
     try:
         report = check_api_budget_files(arguments.ledger, arguments.budgets)
     except BudgetError as error:
-        print("api-budget=refused code=" + error.code)
+        print("ci.rate-budget=refused code=" + error.code)
         return 1
+    if arguments.shadow:
+        print("ci.rate-budget=shadow round=%s requests=%d" % (
+            report["round_id"], report["requests"],
+        ))
+        for run_id, count in sorted(report["requests_per_run"].items()):
+            print("ci.rate-budget=run run=%d requests=%d" % (run_id, count))
+        for workflow, count in sorted(report["requests_per_workflow"].items()):
+            print("ci.rate-budget=workflow workflow=%s requests=%d" % (workflow, count))
     if report["resume_at"]:
         print(
-            "api-budget=paused requests=%d runs=%d workflows=%d pending-resets=%d resume-after=%d"
+            "ci.rate-budget=paused requests=%d runs=%d workflows=%d pending-resets=%d resume-after=%d"
             % (report["requests"], report["runs"], report["workflows"],
                len(report["resume_at"]), max(report["resume_at"]))
         )
         return 2
     print(
-        "api-budget=within-limit requests=%d runs=%d workflows=%d pending-resets=0"
+        "ci.rate-budget=within-limit requests=%d runs=%d workflows=%d pending-resets=0"
         % (report["requests"], report["runs"], report["workflows"])
     )
     return 0

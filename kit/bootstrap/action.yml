@@ -4,6 +4,10 @@ inputs:
   pool:
     description: Public pool label
     required: true
+  ledger_path:
+    description: Coordinator request ledger path for the shadow API report
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -86,3 +90,21 @@ runs:
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_log_canary.py"
         fi
         "$python_bin" -B "$CI_ACTION_PATH/check_candidate.py" --root "$CI_WORKSPACE" --pool "$CI_POOL" --sha "$CI_SHA"
+    - name: ci.rate-budget shadow report
+      if: ${{ inputs.ledger_path != '' }}
+      shell: bash
+      env:
+        CI_ACTION_PATH: ${{ github.action_path }}
+        CI_WORKSPACE: ${{ github.workspace }}
+        CI_RATE_LEDGER_PATH: ${{ inputs.ledger_path }}
+        PYTHONDONTWRITEBYTECODE: "1"
+      run: |
+        set -euo pipefail
+        if command -v python3 >/dev/null 2>&1; then
+          python_bin="$(command -v python3)"
+        elif command -v python >/dev/null 2>&1; then
+          python_bin="$(command -v python)"
+        else
+          exit 1
+        fi
+        "$python_bin" -B "$CI_ACTION_PATH/api_budget.py" --shadow --ledger "$CI_RATE_LEDGER_PATH" --budgets "$CI_WORKSPACE/ci/api-budgets.json"
