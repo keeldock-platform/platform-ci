@@ -111,6 +111,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/test_macos_descriptors.py",
         "kit/confinement/linux_harness.py",
         "kit/confinement/test_linux_harness.py",
+        "kit/confinement/native_loopback_profile.py",
+        "kit/confinement/test_native_loopback_profile.py",
         "kit/confinement/windows_native_preflight.cs",
         "kit/confinement/windows_native_preflight.ps1",
         "kit/confinement/test_windows_native_preflight.py",
