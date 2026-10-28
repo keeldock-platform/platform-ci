@@ -283,7 +283,7 @@ def parse_cargo_lock(lock_bytes):
     packages = []
     current = None
     lock_version = None
-    lines = iter(text.splitlines())
+    lines = iter(text.splitlines(keepends=True))
     for raw_line in lines:
         line = _strip_toml_comment(raw_line).strip()
         if not line:
@@ -315,7 +315,7 @@ def parse_cargo_lock(lock_bytes):
                 except StopIteration:
                     _refuse("cargo_lock_invalid")
                 line_count += 1
-                total_array_bytes += len(continuation_line) + 1
+                total_array_bytes += len(continuation_line)
                 if (line_count > MAX_DEPENDENCY_ARRAY_LINES
                         or total_array_bytes > MAX_DEPENDENCY_ARRAY_BYTES):
                     _refuse("cargo_lock_invalid")
@@ -765,6 +765,14 @@ def verify_archive(name, version, data, expected_sha256):
     return True
 
 
+def _require_trusted_ancestor(metadata):
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid not in (0, os.geteuid())
+            or ((mode & 0o022) and not (metadata.st_uid == 0 and mode & stat.S_ISVTX))):
+        _refuse("cargo_archive_invalid")
+
+
 def _open_target_directory(path):
     if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
         _refuse("cargo_archive_invalid")
@@ -773,17 +781,41 @@ def _open_target_directory(path):
         _refuse("cargo_archive_invalid")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     descriptor = os.open("/", flags)
+    pending = list(target.parts[1:])
+    physical_parts = []
+    private_boundary = False
+    link_count = 0
     try:
-        for component in target.parts[1:]:
+        while pending:
+            if len(pending) > 128 or len(physical_parts) > 128:
+                _refuse("cargo_archive_invalid")
+            component = pending.pop(0)
+            _require_trusted_ancestor(os.fstat(descriptor))
+            entry = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(entry.st_mode):
+                if private_boundary or entry.st_uid not in (0, os.geteuid()) or link_count >= 4:
+                    _refuse("cargo_archive_invalid")
+                link = os.readlink(component, dir_fd=descriptor)
+                link_parts = link.split("/")
+                if not all(_safe_path_part(part) for part in link_parts):
+                    _refuse("cargo_archive_invalid")
+                pending = link_parts + pending
+                link_count += 1
+                continue
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
+            physical_parts.append(component)
+            child = os.fstat(descriptor)
+            child_mode = stat.S_IMODE(child.st_mode)
+            if child.st_uid == os.geteuid() and (child_mode & 0o077) == 0:
+                private_boundary = True
         metadata = os.fstat(descriptor)
         mode = stat.S_IMODE(metadata.st_mode)
         if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
                 or (mode & 0o077) or (mode & 0o700) != 0o700):
             _refuse("cargo_archive_invalid")
-        return descriptor, target
+        return descriptor, Path("/", *physical_parts)
     except BaseException:
         os.close(descriptor)
         raise
@@ -889,6 +921,24 @@ def _validate_windows_target(path):
         if _is_link_or_reparse(directory) or not directory.is_dir():
             _refuse("cargo_archive_invalid")
     return target
+
+
+def _trusted_windows_temp_root():
+    buffer = ctypes.create_unicode_buffer(32768)
+    try:
+        result = ctypes.windll.shell32.SHGetFolderPathW(None, 0x001c, None, 0, buffer)
+    except (AttributeError, OSError, ValueError):
+        _refuse("cargo_config_invalid")
+    if result != 0 or not buffer.value:
+        _refuse("cargo_config_invalid")
+    root = Path(buffer.value) / "Temp"
+    if not root.is_dir():
+        _refuse("cargo_config_invalid")
+    try:
+        _validate_windows_target(root)
+    except (Refusal, OSError, ValueError):
+        _refuse("cargo_config_invalid")
+    return str(root)
 
 
 def _write_windows_file(stage, relative, content):
@@ -997,9 +1047,12 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
     vendor checksum manifest covers both files when the original is present. Call
     make_vendor_read_only after adding the last package to freeze the vendor root.
     The target itself is the staging parent and must be a preexisting private
-    directory in a trusted preparation job. POSIX owner and 0700 access are
-    enforced. Windows callers must isolate it with runner ACLs. On every platform,
-    the job must exclude untrusted concurrent processes running as the same user.
+    directory in a trusted preparation job. POSIX ownership and permissions are
+    checked along the whole ancestor chain, including root-owned sticky parents.
+    A bounded, trusted symlink above the first private user directory is resolved
+    to a physical path; symlinks below that directory are refused. Windows callers
+    must isolate the target and its ancestors with runner ACLs. On every platform,
+    the job must exclude untrusted processes running as the same user.
     """
     root, entries, file_hashes, package_hash = _inspect_archive(name, version, data, expected_sha256)
     if os.name == "nt":
@@ -1224,7 +1277,9 @@ def cargo_config_for_vendor(vendor_dir):
         if not length or length >= len(buffer):
             _refuse("cargo_config_invalid")
         environment["PATH"] = buffer.value
-        temp_root = tempfile.gettempdir()
+        temp_root = _trusted_windows_temp_root()
+        environment["TEMP"] = temp_root
+        environment["TMP"] = temp_root
     else:
         environment["PATH"] = "/usr/bin:/bin"
         temp_root = "/tmp"

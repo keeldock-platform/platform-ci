@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -237,6 +238,16 @@ class CargoLockReceiptTests(unittest.TestCase):
             )
             with patch.object(subject, "MAX_DEPENDENCY_ARRAY_BYTES", 64):
                 _assert_refused(self, lambda: subject.parse_cargo_lock(lock), "cargo_lock_invalid")
+
+    def test_multiline_array_counts_exact_line_terminators(self):
+        for terminator in (b"\n", b"\r\n"):
+            array = b"dependencies = [" + terminator + b"          ]" + terminator
+            lock = LOCK_BYTES.replace(b"dependencies = []\n", array)
+            with self.subTest(terminator=terminator):
+                with patch.object(subject, "MAX_DEPENDENCY_ARRAY_BYTES", len(array) - 1):
+                    _assert_refused(self, lambda: subject.parse_cargo_lock(lock), "cargo_lock_invalid")
+                with patch.object(subject, "MAX_DEPENDENCY_ARRAY_BYTES", len(array)):
+                    self.assertEqual(subject.parse_cargo_lock(lock)["version"], 4)
 
     def test_multiline_array_scans_each_nonempty_fragment_once(self):
         dependency = b'"serde 1.0.1",'
@@ -659,7 +670,8 @@ class CargoLockReceiptTests(unittest.TestCase):
             parent = Path(temporary)
             real = parent / "real"
             vendor = real / "vendor"
-            vendor.mkdir(parents=True)
+            vendor.mkdir(parents=True, mode=0o700)
+            vendor.chmod(0o700)
             link = parent / "link"
             try:
                 link.symlink_to(real, target_is_directory=True)
@@ -671,6 +683,31 @@ class CargoLockReceiptTests(unittest.TestCase):
                 "cargo_archive_invalid",
             )
             self.assertEqual(list(vendor.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor walk")
+    def test_extractor_accepts_trusted_symlink_above_private_root(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            outer = Path(temporary)
+            outer.chmod(0o755)
+            real = outer / "real"
+            real.mkdir(mode=0o755)
+            vendor = real / "vendor"
+            vendor.mkdir(mode=0o700)
+            alias = outer / "alias"
+            try:
+                alias.symlink_to("real", target_is_directory=True)
+            except OSError:
+                self.skipTest("symbolic links are unavailable")
+            package_root = subject.extract_archive(
+                "serde", "1.0.1", data, digest, alias / "vendor",
+            )
+            self.assertEqual(package_root, (vendor / "serde-1.0.1").resolve())
+            self.assertTrue((package_root / "Cargo.toml").is_file())
+            for item in sorted(package_root.rglob("*"), key=lambda value: len(value.parts), reverse=True):
+                item.chmod(0o755 if item.is_dir() else 0o644)
+            package_root.chmod(0o755)
 
     def test_extractor_cleans_failed_private_staging(self):
         data = _archive()
@@ -698,6 +735,36 @@ class CargoLockReceiptTests(unittest.TestCase):
                 "cargo_archive_invalid",
             )
             self.assertEqual(list(target.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX ancestor permissions")
+    def test_extractor_refuses_writable_ancestor_of_private_target(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            shared = Path(temporary) / "shared"
+            shared.mkdir(mode=0o777)
+            shared.chmod(0o777)
+            target = shared / "private"
+            target.mkdir(mode=0o700)
+            _assert_refused(
+                self,
+                lambda: subject.extract_archive("serde", "1.0.1", data, digest, target),
+                "cargo_archive_invalid",
+            )
+            self.assertEqual(list(target.iterdir()), [])
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS system alias")
+    def test_macos_system_temp_alias_returns_physical_path(self):
+        if not Path("/var").is_symlink():
+            self.skipTest("system temporary path has no alias")
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
+            descriptor, physical = subject._open_target_directory(temporary)
+            try:
+                self.assertTrue(str(physical).startswith("/private/var/tmp/"))
+                self.assertEqual(subject._file_identity(os.fstat(descriptor)),
+                                 subject._file_identity(physical.stat()))
+            finally:
+                os.close(descriptor)
 
     def test_extractor_refuses_staging_source_replacement_and_preserves_replacement(self):
         data = _archive()
@@ -749,6 +816,38 @@ class CargoLockReceiptTests(unittest.TestCase):
                 finally:
                     os.close(parent_fd)
             self.assertEqual(list(target.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX publication API")
+    def test_publication_refuses_source_substitution_during_rename(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent_fd, unused_target = subject._open_target_directory(temporary)
+            try:
+                os.mkdir("stage", mode=0o700, dir_fd=parent_fd)
+                identity = subject._entry_identity(parent_fd, "stage")
+
+                def substitute(old_fd, old_name, new_fd, new_name, unused_flag):
+                    source = old_name.decode("ascii")
+                    destination = new_name.decode("ascii")
+                    os.rename(source, "moved", src_dir_fd=old_fd, dst_dir_fd=old_fd)
+                    os.mkdir(source, mode=0o700, dir_fd=old_fd)
+                    os.rename(source, destination, src_dir_fd=old_fd, dst_dir_fd=new_fd)
+                    return 0
+
+                symbol = "renameatx_np" if sys.platform == "darwin" else "renameat2"
+                library = Mock()
+                setattr(library, symbol, Mock(side_effect=substitute))
+                with patch.object(subject.ctypes, "CDLL", return_value=library):
+                    _assert_refused(
+                        self,
+                        lambda: subject._publish_stage(parent_fd, "stage", "published", identity),
+                        "cargo_archive_invalid",
+                    )
+                self.assertEqual(subject._entry_identity(parent_fd, "moved"), identity)
+                self.assertNotEqual(subject._entry_identity(parent_fd, "published"), identity)
+                os.rmdir("moved", dir_fd=parent_fd)
+                os.rmdir("published", dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
 
     @unittest.skipIf(os.name == "nt", "POSIX publication API")
     def test_macos_no_replace_publication_uses_darwin_symbol(self):
@@ -874,9 +973,10 @@ class CargoLockReceiptTests(unittest.TestCase):
                 "REQUESTS_CA_BUNDLE": "untrusted", "CURL_CA_BUNDLE": "untrusted",
                 "HTTP_PROXY": "proxy", "ftp_proxy": "proxy",
                 "KEELDOCK_TEST": "untrusted", "PATH": "/attacker",
-                "TMPDIR": "/attacker/tmp",
+                "TMPDIR": "/attacker/tmp", "TEMP": "/attacker/temp", "TMP": "/attacker/tmp2",
             }, clear=True):
-                arguments, environment = subject.cargo_config_for_vendor(temporary)
+                with patch.object(subject.tempfile, "gettempdir", side_effect=AssertionError):
+                    arguments, environment = subject.cargo_config_for_vendor(temporary)
             for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
                 self.addCleanup(os.rmdir, environment[key])
             rendered = " ".join(arguments)
@@ -897,10 +997,15 @@ class CargoLockReceiptTests(unittest.TestCase):
             if os.name != "nt":
                 self.assertEqual(environment["PATH"], "/usr/bin:/bin")
                 self.assertEqual(environment["TMPDIR"], "/tmp")
+            else:
+                self.assertEqual(environment["TEMP"], environment["TMPDIR"])
+                self.assertEqual(environment["TMP"], environment["TMPDIR"])
+                self.assertNotEqual(environment["TEMP"], "/attacker/temp")
             self.assertEqual(environment["LANG"], "C")
-            self.assertEqual(
-                set(environment), {"PATH", "TMPDIR", "HOME", "CARGO_HOME", "RUSTUP_HOME", "LANG"},
-            )
+            expected_keys = {"PATH", "TMPDIR", "HOME", "CARGO_HOME", "RUSTUP_HOME", "LANG"}
+            if os.name == "nt":
+                expected_keys.update(("TEMP", "TMP"))
+            self.assertEqual(set(environment), expected_keys)
             self.assertEqual(len({environment[key] for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME")}), 3)
             self.assertNotEqual(environment["HOME"], "untrusted")
             self.assertNotEqual(environment["RUSTUP_HOME"], "untrusted")
@@ -909,6 +1014,51 @@ class CargoLockReceiptTests(unittest.TestCase):
                     self.assertTrue(Path(environment[key]).is_dir())
                     if os.name != "nt":
                         self.assertEqual(Path(environment[key]).stat().st_mode & 0o777, 0o700)
+
+    def test_windows_temp_root_comes_from_profile_api(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "Temp"
+            root.mkdir()
+
+            def known_folder(unused_window, folder, unused_token, unused_kind, buffer):
+                self.assertEqual(folder, 0x001c)
+                buffer.value = str(root.parent)
+                return 0
+
+            shell = Mock()
+            shell.SHGetFolderPathW.side_effect = known_folder
+            with patch.object(subject.ctypes, "windll", Mock(shell32=shell), create=True):
+                with patch.object(subject.tempfile, "gettempdir", side_effect=AssertionError):
+                    with patch.dict(os.environ, {"TMPDIR": "/attacker", "TEMP": "/attacker", "TMP": "/attacker"}):
+                        self.assertEqual(subject._trusted_windows_temp_root(), str(root))
+
+    def test_windows_temp_root_refuses_missing_profile_api(self):
+        with patch.object(subject.ctypes, "windll", Mock(shell32=Mock(spec=[])), create=True):
+            _assert_refused(
+                self, subject._trusted_windows_temp_root, "cargo_config_invalid",
+            )
+
+    def test_windows_temp_root_refuses_reparse_ancestor(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary).resolve()
+            real = parent / "real"
+            (real / "Temp").mkdir(parents=True)
+            link = parent / "link"
+            try:
+                link.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest("symbolic links are unavailable")
+
+            def known_folder(unused_window, unused_folder, unused_token, unused_kind, buffer):
+                buffer.value = str(link)
+                return 0
+
+            shell = Mock()
+            shell.SHGetFolderPathW.side_effect = known_folder
+            with patch.object(subject.ctypes, "windll", Mock(shell32=shell), create=True):
+                _assert_refused(
+                    self, subject._trusted_windows_temp_root, "cargo_config_invalid",
+                )
 
     def test_cargo_configuration_refuses_unavailable_vendor_path(self):
         with tempfile.TemporaryDirectory() as temporary:
