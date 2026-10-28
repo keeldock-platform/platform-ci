@@ -347,7 +347,13 @@ class MacOSNodeContractTests(unittest.TestCase):
         self.install_committed_lock(lock_bytes)
         runner = WorkerHarness(self.project, lock_bytes=lock_bytes, mutate_config_after="typecheck")
         with self.assertRaises(subject.NodeContractRefusal) as caught:
-            self.call("verify", runner, accepted_lock=lock_bytes, accepted_provenance=provenance)
+            subject.run_node_contract(
+                "verify", project=self.project, worker_storage=self.storage,
+                worker_uid=self.uid, worker_gid=self.gid, node_executable=self.node,
+                npm_cli=self.npm, tool_cache_root=self.cache, expected_manifest=_manifest(),
+                source_identity=current_identity, run_worker=runner, deadline=time.monotonic() + 600,
+                accepted_lock=lock_bytes, accepted_provenance=provenance,
+            )
         self.assertEqual(caught.exception.reason, "tool_unavailable")
         self.assertEqual(caught.exception.stage, "typescript_tests")
         self.assertEqual(caught.exception.substage, "tests")
