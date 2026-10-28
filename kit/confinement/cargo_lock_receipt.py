@@ -256,7 +256,7 @@ def parse_cargo_lock(lock_bytes):
         if line == "[[package]]":
             if current is not None:
                 packages.append(current)
-            current = {"dependencies": []}
+            current = {}
             continue
         if "=" not in line:
             _refuse("cargo_lock_invalid")
@@ -572,9 +572,8 @@ def _inspect_archive(name, version, data, expected_sha256):
                 is_regular = member.type in (tarfile.REGTYPE, tarfile.AREGTYPE)
                 if not is_directory and not is_regular:
                     _refuse("cargo_archive_invalid")
-                if ((is_directory and not raw_name.endswith("/"))
-                        or (not is_directory and raw_name.endswith("/"))
-                        or (is_directory and raw_name.endswith("//"))):
+                if ((not is_directory and raw_name.endswith("/"))
+                        or raw_name.endswith("//")):
                     _refuse("cargo_archive_invalid")
                 relative = raw_name.rstrip("/")
                 parts = relative.split("/")

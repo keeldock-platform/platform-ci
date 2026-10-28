@@ -121,6 +121,7 @@ class CargoLockReceiptTests(unittest.TestCase):
             b"version = 4\n[[package]]\nname = 'serde'\n",
             b"\xef\xbb\xbf" + LOCK_BYTES,
             LOCK_BYTES.replace(b"name = \"serde\"", b"name = \"serde\"\nname = \"serde\""),
+            LOCK_BYTES + b"dependencies = []\n",
             LOCK_BYTES + b"[[metadata]]\n",
             LOCK_BYTES.replace(b"dependencies = []", b"dependencies = [,,]"),
         )
@@ -287,6 +288,13 @@ class CargoLockReceiptTests(unittest.TestCase):
         data = _archive()
         digest = hashlib.sha256(data).hexdigest()
         self.assertTrue(subject.verify_archive("serde", "1.0.1", data, digest))
+        bare_directory = _archive((
+            ("serde-1.0.1", b"", "directory"),
+            ("serde-1.0.1/Cargo.toml", b"[package]\nname='serde'\n"),
+        ), include_base=False)
+        self.assertTrue(subject.verify_archive(
+            "serde", "1.0.1", bare_directory, hashlib.sha256(bare_directory).hexdigest(),
+        ))
         implicit_root = _archive(
             (("serde-1.0.1/Cargo.toml", b"[package]\nname='serde'\n"),),
             include_base=False,
@@ -328,6 +336,8 @@ class CargoLockReceiptTests(unittest.TestCase):
             _archive((("other-1.0.1/file", b"bad"),)),
             _archive((("serde-1.0.1/SRC/lib.rs", b"collision"),)),
             _archive((("serde-1.0.1/src\\escape", b"bad"),)),
+            _archive((("serde-1.0.1/src/rogue/", b"bad"),)),
+            _archive((("serde-1.0.1/Cargo.toml", b"", "directory"),), include_base=False),
             _archive((("serde-1.0.1/duplicate", b"a"), ("serde-1.0.1/duplicate", b"b"))),
             _archive((("serde-1.0.1/other.txt", b"bad"), ("other-1.0.1/file", b"bad")), include_base=False),
             _archive((("serde-1.0.1/", b"", "directory"), ("serde-1.0.1/README", b"readme")), include_base=False),
