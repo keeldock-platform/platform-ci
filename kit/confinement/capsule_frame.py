@@ -3,6 +3,7 @@ import hmac
 import struct
 import threading
 import unicodedata
+from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Protocol, Sequence, Tuple
 
@@ -704,7 +705,7 @@ def _validate_manifest(manifest):
         _refuse(REASON_MANIFEST_LIMIT)
     previous_path = None
     aliases = set()
-    ancestor_aliases = set()
+    sorted_aliases = []
     total_size = 0
     for entry in manifest.entries:
         if type(entry) is not ManifestEntry:
@@ -716,14 +717,21 @@ def _validate_manifest(manifest):
             _refuse(REASON_MANIFEST_LIMIT)
         previous_path = path_bytes
         alias = unicodedata.normalize("NFC", entry.path).casefold()
-        components = alias.split("/")
-        ancestors = tuple("/".join(components[:end]) for end in range(1, len(components)))
-        if alias in aliases or alias in ancestor_aliases or any(
-            ancestor in aliases for ancestor in ancestors
+        if alias in aliases:
+            _refuse(REASON_MANIFEST_LIMIT)
+        separator = alias.find("/")
+        while separator != -1:
+            if alias[:separator] in aliases:
+                _refuse(REASON_MANIFEST_LIMIT)
+            separator = alias.find("/", separator + 1)
+        descendant_prefix = alias + "/"
+        descendant_at = bisect_left(sorted_aliases, descendant_prefix)
+        if descendant_at < len(sorted_aliases) and sorted_aliases[descendant_at].startswith(
+            descendant_prefix
         ):
             _refuse(REASON_MANIFEST_LIMIT)
         aliases.add(alias)
-        ancestor_aliases.update(ancestors)
+        sorted_aliases.insert(bisect_left(sorted_aliases, alias), alias)
         if entry.mode not in (0o100644, 0o100755):
             _refuse(REASON_MANIFEST_LIMIT)
         _check_bytes(entry.blob_id, 20)
@@ -1050,6 +1058,19 @@ class ECDHProvider(Protocol):
         ...
 
 
+class PersistentKeyUseLedger(Protocol):
+    def claim(self, key_sha256: bytes) -> bool:
+        """Atomically and durably insert the 32-byte SHA-256 of the AES key.
+
+        Return True only after the insert survives a restart. Return False if
+        this digest was ever claimed, including by another process or host.
+        Raise on storage uncertainty. Share one ledger across all senders that
+        may hold the key, and retain claims until that key is irrecoverable.
+        Never roll back a claim after failure, cancellation, or completion.
+        """
+        ...
+
+
 def derive_shared_x(provider, peer_public_point):
     validate_public_point(peer_public_point)
     try:
@@ -1061,25 +1082,37 @@ def derive_shared_x(provider, peer_public_point):
 
 
 class EncryptionSession:
-    """One process-local, single-use attempt for one derived AES key.
+    """One single-use attempt for one derived AES key.
 
-    The sender must provision a fresh key tuple for every new process attempt.
-    A session cannot be resumed after an error or interruption.
+    A trusted persistent ledger must claim SHA-256(key) before the first seal.
+    The claim is permanent, including after an error or interruption. The
+    caller must supply the same durable ledger after process and host restart;
+    fresh attempts require a fresh receiver key, sender key, salt, nonce
+    prefix, and transfer ID as specified by the capsule design.
     """
 
-    def __init__(self, provider, key, header):
+    def __init__(self, provider, key, header, use_ledger):
         _check_bytes(key, 32)
         _validate_header(header)
         if not callable(getattr(provider, "seal", None)):
             _refuse(REASON_CRYPTO)
+        if not callable(getattr(use_ledger, "claim", None)):
+            _refuse(REASON_CRYPTO)
+        header_sha256 = header_digest(encode_capsule_header(header))
         fingerprint = hashlib.sha256(key).digest()
         with _ENCRYPTION_KEYS_LOCK:
             if fingerprint in _ENCRYPTION_KEYS_USED or len(_ENCRYPTION_KEYS_USED) >= MAX_ENCRYPTION_SESSIONS:
                 _refuse(REASON_CRYPTO)
             _ENCRYPTION_KEYS_USED.add(fingerprint)
+        try:
+            claimed = use_ledger.claim(fingerprint)
+        except Exception:
+            _refuse(REASON_CRYPTO)
+        if claimed is not True:
+            _refuse(REASON_CRYPTO)
         self._provider = provider
         self._key = key
-        self._header_sha256 = header_digest(encode_capsule_header(header))
+        self._header_sha256 = header_sha256
         self._nonce_prefix = header.nonce_prefix
         self._next_index = 0
         self._failed = False
@@ -1160,6 +1193,20 @@ def _check_capsule_length(data):
 
 def encode_capsule(capsule, key_record):
     """Yield a complete capsule as bounded pieces in wire order."""
+    if type(capsule) is CapsuleView:
+        header_bytes = encode_capsule_header(capsule.header)
+        if capsule._data[:CAPSULE_HEADER_LENGTH] != header_bytes:
+            _refuse(REASON_STRUCTURE)
+        validate_header_key_binding(capsule.header, key_record)
+
+        def view_parts():
+            yield header_bytes
+            for index in range(CHUNK_COUNT):
+                start = chunk_offset(index)
+                yield bytes(capsule._data[start:start + CHUNK_RECORD_LENGTH])
+            yield bytes(capsule.trailer)
+
+        return view_parts()
     if type(capsule) is not Capsule:
         _refuse(REASON_STRUCTURE)
     _validate_header(capsule.header)

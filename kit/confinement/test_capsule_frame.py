@@ -17,12 +17,15 @@ P256_BASE_POINT = bytes.fromhex(
     "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
 )
 _TEST_CONTEXT_ACTIVE = False
-VECTOR_SOURCES = {
-    "key_header_chunk_trailer_manifest": "Approved capsule design, format tables at lines 61 through 95; layout checks only",
-    "nonce_aad_and_protocol_key": "Approved capsule design, formulas at lines 84 through 86; separate formula checks only",
-    "hkdf_prk_okm": "RFC 5869, Appendix A.1, SHA-256 test case; published primitive KAT",
-    "p256_base_point": "SEC 2, P-256 base point coordinates; published point fixture",
-    "sha256_abc": "NIST FIPS 180-4, SHA-256 message abc; published primitive KAT",
+INDEPENDENT_PRIMITIVE_KAT_SOURCES = {
+    "hkdf_prk_okm": "RFC 5869, Appendix A.1, SHA-256 test case",
+    "sha256_abc": "NIST FIPS 180-4, SHA-256 example for message abc",
+}
+PUBLISHED_POINT_FIXTURE_SOURCE = "SEC 2, P-256 base point coordinates"
+DESIGN_REGRESSION_VECTOR_SOURCES = {
+    "layout": "Approved capsule design, format tables at lines 61 through 95",
+    "nonce_aad_key": "Approved capsule design, formulas at lines 84 through 86",
+    "fake_tags_shared_x": "Test-only deterministic stub in this file; no crypto oracle",
 }
 
 
@@ -42,6 +45,8 @@ def _require_unittest_context():
 
 
 class TestOnlyDeterministicFake:
+    """Self-generated regression fake, not an AEAD or ECDH KAT provider."""
+
     def __init__(self):
         _require_unittest_context()
         self.calls = []
@@ -69,6 +74,23 @@ class RefusingFake:
     def open(self, key, nonce, ciphertext, tag, aad):
         _require_unittest_context()
         raise ValueError("refused")
+
+
+class TestOnlyUseLedger:
+    """In-memory ledger stub for contract tests; never a runtime ledger."""
+
+    def __init__(self):
+        _require_unittest_context()
+        self.claimed = set()
+        self.calls = []
+
+    def claim(self, key_sha256):
+        _require_unittest_context()
+        self.calls.append(key_sha256)
+        if key_sha256 in self.claimed:
+            return False
+        self.claimed.add(key_sha256)
+        return True
 
 
 def make_key_record(
@@ -168,6 +190,8 @@ class CapsuleFrameTests(unittest.TestCase):
         self.assertEqual(encoded.hex(), expected_hex)
         self.assertEqual(len(encoded), frame.KEY_RECORD_LENGTH)
         self.assertEqual(frame.decode_key_record(bytes.fromhex(encoded.hex())), record)
+
+    def test_sha256_published_abc_vector(self):
         self.assertEqual(
             hashlib.sha256(b"abc").hexdigest(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
@@ -255,13 +279,13 @@ class CapsuleFrameTests(unittest.TestCase):
         self.assertEqual(encoded.hex(), expected_hex)
         self.assertEqual(frame.decode_manifest(bytes.fromhex(encoded.hex())), manifest)
 
-    def test_nonce_known_answer_vectors(self):
+    def test_nonce_design_formula_vectors(self):
         prefix = bytes.fromhex("01020304")
         self.assertEqual(frame.make_nonce(prefix, 0).hex(), "010203040000000000000000")
         self.assertEqual(frame.make_nonce(prefix, 16).hex(), "010203040000000000000010")
         self.assertEqual(frame.make_nonce(prefix, 271).hex(), "01020304000000000000010f")
 
-    def test_aad_known_answer_vectors(self):
+    def test_aad_design_formula_vectors(self):
         manifest_aad = frame.make_aad(bytes(32), 0, 0)
         self.assertEqual(
             manifest_aad.hex(),
@@ -304,7 +328,7 @@ class CapsuleFrameTests(unittest.TestCase):
             "34007208d5b887185865",
         )
 
-    def test_capsule_key_matches_independent_design_formula(self):
+    def test_capsule_key_design_formula_regression(self):
         header_bytes = frame.encode_capsule_header(make_header())
         shared_x = bytes.fromhex("01" * 32)
         header_sha256 = hashlib.sha256(header_bytes).digest()
@@ -573,10 +597,11 @@ class CapsuleFrameTests(unittest.TestCase):
 
     def test_fake_chunk_seal_open_round_trip(self):
         provider = TestOnlyDeterministicFake()
+        use_ledger = TestOnlyUseLedger()
         key = bytes.fromhex("33" * 32)
         header = make_header()
         plaintext = bytes.fromhex("7c") * frame.CHUNK_PLAINTEXT_BYTES
-        session = frame.EncryptionSession(provider, key, header)
+        session = frame.EncryptionSession(provider, key, header, use_ledger)
         chunk = session.seal_chunk(0, plaintext)
         self.assertEqual(chunk.kind, 0)
         self.assertEqual(frame.open_chunk(provider, key, header, chunk), plaintext)
@@ -584,9 +609,10 @@ class CapsuleFrameTests(unittest.TestCase):
     def test_encryption_session_single_use_and_order(self):
         self.assertFalse(hasattr(frame, "seal_chunk"))
         provider = TestOnlyDeterministicFake()
+        use_ledger = TestOnlyUseLedger()
         key = bytes.fromhex("34" * 32)
         plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
-        session = frame.EncryptionSession(provider, key, make_header())
+        session = frame.EncryptionSession(provider, key, make_header(), use_ledger)
         session.seal_chunk(0, plaintext)
         self.assert_refusal(frame.REASON_CHUNK_INDEX, session.seal_chunk, 0, plaintext)
         self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 1, plaintext)
@@ -597,14 +623,16 @@ class CapsuleFrameTests(unittest.TestCase):
             provider,
             key,
             make_header(),
+            use_ledger,
         )
 
     def test_encryption_session_failure_consumes_key(self):
         provider = mock.Mock()
         provider.seal.side_effect = ValueError("provider failure")
+        use_ledger = TestOnlyUseLedger()
         key = bytes.fromhex("35" * 32)
         plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
-        session = frame.EncryptionSession(provider, key, make_header())
+        session = frame.EncryptionSession(provider, key, make_header(), use_ledger)
         self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 0, plaintext)
         self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 0, plaintext)
         self.assertEqual(provider.seal.call_count, 1)
@@ -614,13 +642,67 @@ class CapsuleFrameTests(unittest.TestCase):
             provider,
             key,
             make_header(),
+            use_ledger,
         )
+
+    def test_persistent_claim_rejects_reuse_after_process_state_reset(self):
+        provider = mock.Mock()
+        use_ledger = TestOnlyUseLedger()
+        key = bytes.fromhex("38" * 32)
+        header = make_header()
+        frame.EncryptionSession(provider, key, header, use_ledger)
+        self.assertEqual(use_ledger.calls, [hashlib.sha256(key).digest()])
+        provider.seal.assert_not_called()
+        with mock.patch.object(frame, "_ENCRYPTION_KEYS_USED", set()):
+            self.assert_refusal(
+                frame.REASON_CRYPTO,
+                frame.EncryptionSession,
+                provider,
+                key,
+                header,
+                use_ledger,
+            )
+        self.assertEqual(len(use_ledger.calls), 2)
+        provider.seal.assert_not_called()
+
+    def test_persistent_claim_is_required_and_fails_closed(self):
+        provider = mock.Mock()
+        self.assert_refusal(
+            frame.REASON_CRYPTO,
+            frame.EncryptionSession,
+            provider,
+            bytes.fromhex("39" * 32),
+            make_header(),
+            None,
+        )
+        refused_ledger = mock.Mock()
+        refused_ledger.claim.return_value = False
+        self.assert_refusal(
+            frame.REASON_CRYPTO,
+            frame.EncryptionSession,
+            provider,
+            bytes.fromhex("3a" * 32),
+            make_header(),
+            refused_ledger,
+        )
+        uncertain_ledger = mock.Mock()
+        uncertain_ledger.claim.side_effect = OSError("storage uncertain")
+        self.assert_refusal(
+            frame.REASON_CRYPTO,
+            frame.EncryptionSession,
+            provider,
+            bytes.fromhex("3b" * 32),
+            make_header(),
+            uncertain_ledger,
+        )
+        provider.seal.assert_not_called()
 
     def test_encryption_session_context_exit_aborts_partial_attempt(self):
         provider = TestOnlyDeterministicFake()
+        use_ledger = TestOnlyUseLedger()
         key = bytes.fromhex("37" * 32)
         plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
-        with frame.EncryptionSession(provider, key, make_header()) as session:
+        with frame.EncryptionSession(provider, key, make_header(), use_ledger) as session:
             session.seal_chunk(0, plaintext)
         self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 1, plaintext)
         self.assert_refusal(
@@ -629,11 +711,14 @@ class CapsuleFrameTests(unittest.TestCase):
             provider,
             key,
             make_header(),
+            use_ledger,
         )
 
     def test_encryption_session_bundle_aad_uses_all_manifest_records(self):
         provider = TestOnlyDeterministicFake()
-        session = frame.EncryptionSession(provider, bytes.fromhex("36" * 32), make_header())
+        session = frame.EncryptionSession(
+            provider, bytes.fromhex("36" * 32), make_header(), TestOnlyUseLedger()
+        )
         plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
         manifest_hasher = hashlib.sha256()
         for index in range(frame.MANIFEST_CHUNK_COUNT):
