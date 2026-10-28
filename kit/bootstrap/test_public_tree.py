@@ -185,6 +185,8 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_feedback_admin_integration.py',
             'kit/confinement/feedback_api.py',
             'kit/confinement/test_feedback_api.py',
+            'kit/confinement/feedback_failure.py',
+            'kit/confinement/test_feedback_failure.py',
             'kit/confinement/feedback_public_audit.py',
             'kit/confinement/test_feedback_public_audit.py',
             '.github/workflows/node-lock-smoke.yml',

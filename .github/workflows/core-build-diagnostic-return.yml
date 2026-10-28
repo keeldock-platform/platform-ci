@@ -342,6 +342,7 @@ jobs:
           stderr_file="$capture_dir/driver-stderr"
           publish_file="$capture_dir/publisher-stdout"
           publish_stderr="$capture_dir/publisher-stderr"
+          failure_file="$capture_dir/driver-refusal"
           node_path="$(command -v node)"
           [[ "$node_path" == /* ]]
           set +e
@@ -376,7 +377,23 @@ jobs:
             --base-branch "$REQUESTED_BASE_BRANCH" >"$stdout_file" 2>"$stderr_file"
           driver_status=$?
           set -e
-          if [[ "$driver_status" -ne 0 || "$(wc -l < "$stdout_file")" -ne 1 \
+          if [[ "$driver_status" -ne 0 ]]; then
+            set +e
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
+              -I -S -B kit/confinement/feedback_failure.py <"$stdout_file" >"$failure_file" 2>/dev/null
+            failure_status=$?
+            set -e
+            if [[ "$failure_status" -ne 0 || "$(wc -l < "$failure_file")" -ne 1 \
+              || "$(wc -c < "$failure_file")" -gt 1024 \
+              || "$(wc -c < "$stderr_file")" -gt 65536 ]]; then
+              exit 1
+            fi
+            IFS= read -r refusal_line < "$failure_file"
+            [[ "$refusal_line" == KD-FEEDBACK-PRODUCER-REFUSAL\ * ]]
+            printf '%s\n' "$refusal_line"
+            exit 1
+          fi
+          if [[ "$(wc -l < "$stdout_file")" -ne 1 \
             || "$(wc -c < "$stdout_file")" -gt 16384 || "$(wc -c < "$stderr_file")" -gt 65536 ]]; then
             exit 1
           fi
