@@ -2,12 +2,14 @@ import argparse
 import base64
 import datetime
 import hashlib
+import io
 import json
 import os
 import re
 import secrets
 import sys
 import time
+import zipfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -44,11 +46,11 @@ CALLER_PROFILES = {
     },
 }
 PINNED_WORKFLOW_SHA256 = {
-    ".github/workflows/windows-source-admission.yml": "f936e1aeb541dbcd6957d3c897af44948418dc0f2844ab3127e6ac15df561b89",
-    ".github/workflows/lane-h-windows-receiver.yml": "de59a2d8cdd1d94a84f4a3064b568e1de7ea2ac4788db79f9c15a98da025f1f8",
-    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "09a4b449f25600c32be7eff79efd7f85cb096ed22eff13565fea5d3c3fa57082",
-    ".github/workflows/lane-h-capsule-attester.yml": "2a35af114c074e34b6d01e22b63c8076c98cba2835beebe1140bc3eb71789059",
-    ".github/workflows/attestation-role-signer-probe.yml": "80f6fa5125f7901dd24f5257f1a472df1da33feaddfd583f6a30c486f0486be0",
+    ".github/workflows/windows-source-admission.yml": "23a81d6d45a0a02668fad7ae2567af6414e403bd3b76d055bd2dab58d997390f",
+    ".github/workflows/lane-h-windows-receiver.yml": "5347fcfdf29c979f7af8c63cee48f77b856fd7cc38d34ad675da75a0b806b448",
+    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "ba01a7658328b57f44eed5c1059632ef524a3462e029dca0d677451d2f64f01b",
+    ".github/workflows/lane-h-capsule-attester.yml": "92425cb257d4ecf5317bfae2bf5df5a9f22b66f428a43f9d7f36b241579e51cc",
+    ".github/workflows/attestation-role-signer-probe.yml": "4bf03368bdd197b8a8c749ae81defc69e56915f3eef52b8bc578552eff970c91",
 }
 API_JOB_NAME_PINS = {
     profile: {role: None for role in ROLE_ORDER}
@@ -822,17 +824,32 @@ def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha):
         raise Refusal("api-head-sha")
     key = "jobs" if kind == "jobs" else "artifacts" if kind == "artifacts" else "attestations"
     wrapped = []
+    total = None
+    seen = 0
     for index, page in enumerate(pages, 1):
         if type(page) is not dict or type(page.get(key)) is not list:
             raise Refusal("api-page-shape")
+        reported = _is_u64(page.get("total_count"), positive=False)
+        if total is None:
+            total = reported
+        if reported != total or len(page[key]) > 100:
+            raise Refusal("api-page-count")
+        if index < len(pages) and len(page[key]) != 100:
+            raise Refusal("api-pagination-incomplete")
+        seen += len(page[key])
         wrapped.append({
             "page": index,
             "next_page": index + 1 if index < len(pages) else None,
+            "total_count": reported,
             key: page[key],
         })
+    expected_pages = max(1, (total + 99) // 100)
+    if seen != total or len(pages) != expected_pages:
+        raise Refusal("api-pagination-incomplete")
     return {
         "kind": kind,
         "complete": True,
+        "total_count": total,
         "run_id": str(_is_u64(run_id)),
         "run_attempt": str(_is_u32(run_attempt)),
         "head_sha": head_sha,
@@ -843,7 +860,7 @@ def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha):
 def _validate_snapshot(snapshot, kind, run_id, run_attempt, head_sha):
     if type(snapshot) is not dict:
         raise Refusal("api-snapshot-shape")
-    required_top = {"kind", "complete", "run_id", "run_attempt", "head_sha", "pages"}
+    required_top = {"kind", "complete", "total_count", "run_id", "run_attempt", "head_sha", "pages"}
     if set(snapshot) != required_top or snapshot["kind"] != kind or snapshot["complete"] is not True:
         raise Refusal("api-snapshot-incomplete")
     if _is_u64(snapshot["run_id"]) != _is_u64(run_id):
@@ -856,16 +873,24 @@ def _validate_snapshot(snapshot, kind, run_id, run_attempt, head_sha):
     if type(pages) is not list or not pages:
         raise Refusal("api-pages-missing")
     row_key = "jobs" if kind == "jobs" else "artifacts" if kind == "artifacts" else "attestations"
+    total = _is_u64(snapshot["total_count"], positive=False)
     rows = []
     for index, page in enumerate(pages, 1):
-        if type(page) is not dict or set(page) != {"page", "next_page", row_key}:
+        if type(page) is not dict or set(page) != {"page", "next_page", "total_count", row_key}:
             raise Refusal("api-page-fields")
         if type(page["page"]) is not int or page["page"] != index:
             raise Refusal("api-page-order")
         expected_next = index + 1 if index < len(pages) else None
         if page["next_page"] != expected_next or type(page[row_key]) is not list:
             raise Refusal("api-pagination-incomplete")
+        if _is_u64(page["total_count"], positive=False) != total or len(page[row_key]) > 100:
+            raise Refusal("api-page-count")
+        if index < len(pages) and len(page[row_key]) != 100:
+            raise Refusal("api-pagination-incomplete")
         rows.extend(page[row_key])
+    expected_pages = max(1, (total + 99) // 100)
+    if len(rows) != total or len(pages) != expected_pages:
+        raise Refusal("api-pagination-incomplete")
     return rows
 
 
@@ -1147,7 +1172,7 @@ def validate_run_metadata(document, profile, repository, run_id, run_attempt, he
     return True
 
 
-def select_artifact_name(pages, repository_run_id, run_id, run_attempt, role):
+def select_artifact(pages, repository_run_id, run_id, run_attempt, role):
     snapshot = pages
     if type(snapshot) is list:
         wrapped = wrap_api_pages("artifacts", snapshot, run_id, run_attempt, "0" * 40)
@@ -1171,10 +1196,18 @@ def select_artifact_name(pages, repository_run_id, run_id, run_attempt, role):
         matches.append(artifact)
     if len(matches) != 1:
         raise Refusal("artifact-not-unique")
-    return matches[0]["name"]
+    selected = matches[0]
+    selected_match = ARTIFACT_NAME.fullmatch(selected["name"])
+    return dict(_validate_artifact_metadata(selected),
+                id=_api_numeric_id(selected.get("id"), "artifact-id"),
+                name=selected["name"], transfer_id=selected_match.group(4))
 
 
-def _validate_artifact_metadata(artifact):
+def select_artifact_name(pages, repository_run_id, run_id, run_attempt, role):
+    return select_artifact(pages, repository_run_id, run_id, run_attempt, role)["name"]
+
+
+def _validate_artifact_metadata(artifact, now=None):
     if artifact.get("expired") is not False:
         raise Refusal("artifact-expired")
     size = _is_u64(artifact.get("size_in_bytes"), positive=False)
@@ -1192,13 +1225,70 @@ def _validate_artifact_metadata(artifact):
         expires_at = datetime.datetime.fromisoformat(expires.replace("Z", "+00:00"))
     except ValueError:
         raise Refusal("artifact-retention")
-    duration = (expires_at - created_at).total_seconds()
-    if duration <= 0 or duration > 86400:
+    if created_at.tzinfo is None or expires_at.tzinfo is None:
         raise Refusal("artifact-retention")
-    return True
+    duration = (expires_at - created_at).total_seconds()
+    current = datetime.datetime.now(datetime.timezone.utc) if now is None else now
+    if duration <= 0 or duration > 86400 or expires_at <= current:
+        raise Refusal("artifact-retention")
+    return {"expired": False, "digest": digest, "size_in_bytes": size,
+            "created_at": created, "expires_at": expires}
 
 
-def validate_artifact_inventory(snapshot, run_id, run_attempt, head_sha):
+def validated_archive_members(artifact, archive_bytes):
+    if type(artifact) is not dict or type(archive_bytes) is not bytes:
+        raise Refusal("artifact-archive-shape")
+    metadata = _validate_artifact_metadata(artifact)
+    if len(archive_bytes) != metadata["size_in_bytes"]:
+        raise Refusal("artifact-archive-size")
+    if "sha256:" + hashlib.sha256(archive_bytes).hexdigest() != metadata["digest"]:
+        raise Refusal("artifact-archive-digest")
+    expected = {"subject.bin", "predicate.json", "bundle.json"}
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            members = archive.infolist()
+            if len(members) != len(expected) or {item.filename for item in members} != expected:
+                raise Refusal("artifact-archive-members")
+            if any(item.is_dir() or item.file_size > MAX_JSON_BYTES or
+                   (item.external_attr >> 16) & 0o170000 == 0o120000 for item in members):
+                raise Refusal("artifact-archive-member-shape")
+            if sum(item.file_size for item in members) > MAX_JSON_BYTES * 2:
+                raise Refusal("artifact-archive-uncompressed-size")
+            content = {item.filename: archive.read(item) for item in members}
+    except (OSError, zipfile.BadZipFile, RuntimeError, ValueError):
+        raise Refusal("artifact-archive-invalid")
+    if not content["subject.bin"] or not content["predicate.json"] or not content["bundle.json"]:
+        raise Refusal("artifact-archive-empty")
+    return content
+
+
+def read_bounded_archive(path, expected_size):
+    size = _is_u64(expected_size, positive=False)
+    if size <= 0 or size > MAX_JSON_BYTES * 4:
+        raise Refusal("artifact-size")
+    try:
+        archive_path = Path(path)
+        if not archive_path.is_file() or archive_path.is_symlink() or archive_path.stat().st_size != size:
+            raise Refusal("artifact-archive-size")
+        with archive_path.open("rb") as source:
+            payload = source.read(size + 1)
+    except OSError:
+        raise Refusal("artifact-archive-unavailable")
+    if len(payload) != size:
+        raise Refusal("artifact-archive-size")
+    return payload
+
+
+def extract_artifact_archive(artifact, archive_bytes, directory):
+    content = validated_archive_members(artifact, archive_bytes)
+    destination = Path(directory)
+    destination.mkdir(parents=True, exist_ok=False)
+    for name, payload in content.items():
+        (destination / name).write_bytes(payload)
+    return content
+
+
+def validate_artifact_inventory(snapshot, run_id, run_attempt, head_sha, expected_roles=ROLE_ORDER):
     artifacts = _validate_snapshot(snapshot, "artifacts", run_id, run_attempt, head_sha)
     names = set()
     identifiers = set()
@@ -1223,11 +1313,11 @@ def validate_artifact_inventory(snapshot, run_id, run_attempt, head_sha):
         workflow_run = artifact.get("workflow_run")
         if type(workflow_run) is not dict or _api_numeric_id(workflow_run.get("id"), "artifact-run-id") != _is_u64(run_id):
             raise Refusal("artifact-run-binding")
-        _validate_artifact_metadata(artifact)
-        by_role.setdefault(role, []).append({"id": identifier, "name": name, "transfer_id": transfer})
-    if set(by_role) != set(ROLE_ORDER) or any(len(by_role[role]) != 1 for role in ROLE_ORDER):
+        metadata = _validate_artifact_metadata(artifact)
+        by_role.setdefault(role, []).append(dict(metadata, id=identifier, name=name, transfer_id=transfer))
+    if set(by_role) != set(expected_roles) or any(len(by_role[role]) != 1 for role in expected_roles):
         raise Refusal("artifact-role-cardinality")
-    transfers = {by_role[role][0]["transfer_id"] for role in ROLE_ORDER}
+    transfers = {by_role[role][0]["transfer_id"] for role in expected_roles}
     if len(transfers) != 1:
         raise Refusal("artifact-transfer-mismatch")
     return by_role
@@ -1283,8 +1373,9 @@ def signed_statement_payload(bundle_document):
     return payload, statement
 
 
-def normalize_provider_attestations(snapshot, role, subject_digest, expected_predicate, run_id, run_attempt, head_sha):
-    if role not in ROLE_ORDER or type(subject_digest) is not str or HEX_32.fullmatch(subject_digest) is None:
+def normalize_provider_attestations(snapshot, subject_digest, role_expectations,
+                                    verified_documents, run_id, run_attempt, head_sha):
+    if type(subject_digest) is not str or HEX_32.fullmatch(subject_digest) is None:
         raise Refusal("provider-subject")
     rows = _validate_snapshot(
         snapshot,
@@ -1293,8 +1384,10 @@ def normalize_provider_attestations(snapshot, role, subject_digest, expected_pre
         run_attempt,
         head_sha,
     )
+    if type(role_expectations) is not dict or type(verified_documents) is not list or len(verified_documents) != len(rows):
+        raise Refusal("provider-verification-missing")
     normalized = []
-    for row in rows:
+    for row, verified in zip(rows, verified_documents):
         if type(row) is not dict or type(row.get("bundle")) is not dict:
             raise Refusal("provider-attestation-shape")
         payload, statement = signed_statement_payload(row["bundle"])
@@ -1302,10 +1395,30 @@ def normalize_provider_attestations(snapshot, role, subject_digest, expected_pre
         digest = subjects[0].get("digest") if type(subjects[0]) is dict else None
         if type(digest) is not dict or digest.get("sha256") != subject_digest or set(digest) != {"sha256"}:
             raise Refusal("provider-subject-mismatch")
+        unused_result, certificate, verified_statement = verified_result(verified)
+        matches = [
+            candidate for candidate, expected in role_expectations.items()
+            if certificate.get("buildSignerURI") == expected["certificate"]["buildSignerURI"]
+            and certificate.get("subjectAlternativeName") == expected["certificate"]["subjectAlternativeName"]
+        ]
+        if len(matches) != 1:
+            raise Refusal("provider-verified-role-identity")
+        role = matches[0]
         predicate = statement.get("predicate")
-        if predicate != expected_predicate or predicate.get("role") != role:
+        if type(predicate) is not dict or predicate.get("role") != role:
             raise Refusal("provider-role-predicate")
-        normalized.append({"role": role, "subject_digest": subject_digest, "statement_digest": hashlib.sha256(payload).hexdigest()})
+        expected = role_expectations[role]
+        statement_digest = hashlib.sha256(payload).hexdigest()
+        if (predicate != expected["predicate"] or
+                statement_digest != expected["statement_digest"] or
+                hashlib.sha256(expected["subject"]).hexdigest() != subject_digest):
+            raise Refusal("provider-role-predicate")
+        if verified_statement != statement:
+            raise Refusal("provider-verified-statement-mismatch")
+        validate_verified_statement(verified, expected["subject"], expected["predicate"],
+                                    expected["certificate"], expected["binding"])
+        normalized.append({"role": role, "subject_digest": subject_digest,
+                           "statement_digest": statement_digest})
     return normalized
 
 
@@ -1321,8 +1434,9 @@ def validate_role_artifact_set(
     artifact_map,
     evidence_root,
     digest_pins,
+    required_roles=ROLE_ORDER,
 ):
-    if type(artifact_map) is not dict or set(artifact_map) != set(ROLE_ORDER):
+    if type(artifact_map) is not dict or set(artifact_map) != set(required_roles):
         raise Refusal("role-artifact-map")
     if type(digest_pins) is not dict or set(digest_pins) != set(ROLE_ORDER):
         raise Refusal("certificate-digest-profile-unresolved")
@@ -1330,14 +1444,22 @@ def validate_role_artifact_set(
     role_subjects = {}
     role_predicates = {}
     artifact_records = []
-    for role in ROLE_ORDER:
+    provider_expectations = {}
+    for role in required_roles:
         role_digest_pins = digest_pins[role]
         if type(role_digest_pins) is not dict:
             raise Refusal("certificate-digest-profile-unresolved")
         artifact = artifact_map[role]
-        if type(artifact) is not dict or set(artifact) != {"id", "name", "transfer_id"}:
+        if type(artifact) is not dict or set(artifact) != {
+            "id", "name", "transfer_id", "expired", "digest", "size_in_bytes", "created_at", "expires_at"
+        }:
             raise Refusal("role-artifact-fields")
         directory = Path(evidence_root) / artifact["name"]
+        archive_bytes = read_bounded_archive(
+            Path(evidence_root) / (artifact["name"] + ".zip"),
+            artifact["size_in_bytes"],
+        )
+        archived = validated_archive_members(artifact, archive_bytes)
         expected_names = {"subject.bin", "predicate.json", "bundle.json", "verified.json"}
         try:
             actual_names = {item.name for item in directory.iterdir() if item.is_file()}
@@ -1354,6 +1476,12 @@ def validate_role_artifact_set(
             bundle_bytes = bundle_path.read_bytes()
         except OSError:
             raise Refusal("role-artifact-unavailable")
+        for name, payload in archived.items():
+            try:
+                if (directory / name).read_bytes() != payload:
+                    raise Refusal("role-artifact-archive-mismatch")
+            except OSError:
+                raise Refusal("role-artifact-unavailable")
         if len(signed_subject) > 4096 or len(bundle_bytes) <= 0 or len(bundle_bytes) > MAX_JSON_BYTES:
             raise Refusal("role-artifact-size")
         predicate = load_json_file(predicate_path)
@@ -1422,6 +1550,13 @@ def validate_role_artifact_set(
             "artifact_name": artifact["name"],
             "statement_digest": statement_digest,
         })
+        provider_expectations[role] = {
+            "subject": signed_subject,
+            "predicate": predicate,
+            "certificate": certificate_expected,
+            "binding": expected_binding,
+            "statement_digest": statement_digest,
+        }
     if record is None:
         raise Refusal("receiver-statement-missing")
     return {
@@ -1429,6 +1564,7 @@ def validate_role_artifact_set(
         "predicates": role_predicates,
         "subject_digests": role_subjects,
         "artifact_records": artifact_records,
+        "provider_expectations": provider_expectations,
     }
 
 
@@ -1465,19 +1601,23 @@ def verify_source_free_evidence(
         run_attempt,
         repository_id,
         owner_id,
-        artifact_map,
+        {role: artifact_map[role][0] for role in ROLE_ORDER},
         Path(evidence_root) / "artifacts",
         digest_pins,
     )
-    if type(provider_snapshots) is not dict or set(provider_snapshots) != set(ROLE_ORDER):
+    distinct_subjects = set(roles["subject_digests"].values())
+    if type(provider_snapshots) is not dict or set(provider_snapshots) != distinct_subjects:
         raise Refusal("provider-listing-unavailable")
     provider_records = []
-    for role in ROLE_ORDER:
+    for subject_digest in sorted(distinct_subjects):
+        provider = provider_snapshots[subject_digest]
+        if type(provider) is not dict or set(provider) != {"snapshot", "verified"}:
+            raise Refusal("provider-verification-missing")
         normalized = normalize_provider_attestations(
-            provider_snapshots[role],
-            role,
-            roles["subject_digests"][role],
-            roles["predicates"][role],
+            provider["snapshot"],
+            subject_digest,
+            roles["provider_expectations"],
+            provider["verified"],
             run_id,
             run_attempt,
             control_sha,
@@ -1487,12 +1627,14 @@ def verify_source_free_evidence(
         {
             "kind": "attestations",
             "complete": True,
+            "total_count": len(provider_records),
             "run_id": str(_is_u64(run_id)),
             "run_attempt": str(_is_u32(run_attempt)),
             "head_sha": control_sha,
             "pages": [{
                 "page": 1,
                 "next_page": None,
+                "total_count": len(provider_records),
                 "attestations": provider_records,
             }],
         },
@@ -1530,11 +1672,13 @@ def verify_statement_cardinality(artifact_records, provider_records):
         artifact_roles[role] += 1
         statements[role].add(digest)
     for record in provider_records:
-        if type(record) is not dict or set(record) != {"role", "statement_digest"}:
+        if type(record) is not dict or set(record) != {"role", "subject_digest", "statement_digest"}:
             raise Refusal("statement-provider-fields")
         role = record["role"]
+        subject_digest = record["subject_digest"]
         digest = record["statement_digest"]
-        if role not in ROLE_ORDER or type(digest) is not str or HEX_32.fullmatch(digest) is None:
+        if (role not in ROLE_ORDER or type(digest) is not str or HEX_32.fullmatch(digest) is None
+                or type(subject_digest) is not str or HEX_32.fullmatch(subject_digest) is None):
             raise Refusal("statement-provider-binding")
         statements[role].add(digest)
     if any(artifact_roles[role] != 1 for role in ROLE_ORDER):
@@ -1542,6 +1686,44 @@ def verify_statement_cardinality(artifact_records, provider_records):
     if any(len(statements[role]) != 1 for role in ROLE_ORDER):
         raise Refusal("statement-cardinality")
     return {role: next(iter(statements[role])) for role in ROLE_ORDER}
+
+
+def verify_transition_evidence(
+    gate, profile, repository, ref, control_sha, run_id, run_attempt,
+    repository_metadata, run_metadata, jobs_snapshot, artifacts_snapshot,
+    control_root, evidence_root, api_name_pins, digest_pins,
+    step_name_pins=None, step_ordinal_pins=None, log_sections=None,
+    other_log_sections=None,
+):
+    if gate not in ("A", "B") or profile not in CALLER_PROFILES:
+        raise Refusal("transition-gate-invalid")
+    repository_id, owner_id = validate_repository_metadata(repository_metadata, repository)
+    validate_run_metadata(run_metadata, profile, repository, run_id, run_attempt,
+                          control_sha, repository_id)
+    verify_workflow_bytes(control_root, profile)
+    if type(api_name_pins) is not dict or set(api_name_pins) != set(ROLE_ORDER):
+        raise Refusal("api-job-map-unresolved")
+    required_roles = ROLE_ORDER[:1] if gate == "A" else ROLE_ORDER[:2]
+    for role in required_roles:
+        job = validate_role_job(jobs_snapshot, run_id, run_attempt, control_sha,
+                                role, api_name_pins[role], ("completed",))
+        if job["conclusion"] != "success":
+            raise Refusal("transition-role-job-not-successful")
+    artifact_map = validate_artifact_inventory(
+        artifacts_snapshot, run_id, run_attempt, control_sha, required_roles)
+    roles = {role: artifact_map[role][0] for role in required_roles}
+    result = validate_role_artifact_set(
+        profile, repository, ref, control_sha, run_id, run_attempt,
+        repository_id, owner_id, roles, evidence_root, digest_pins,
+        required_roles=required_roles,
+    )
+    if gate == "B":
+        validate_linux_revocation_evidence(
+            jobs_snapshot, run_id, run_attempt, control_sha,
+            api_name_pins["linux-fetch-encrypt"], step_name_pins,
+            step_ordinal_pins, log_sections, other_log_sections,
+        )
+    return result
 
 
 GATE_REQUIREMENTS = {
@@ -1593,20 +1775,9 @@ GATE_REQUIREMENTS = {
 def evaluate_gate(gate, evidence):
     if gate not in GATE_REQUIREMENTS or type(evidence) is not dict:
         raise Refusal("gate-invalid")
-    required = GATE_REQUIREMENTS[gate]
-    if gate == "A":
-        allowed = set(required)
-    else:
-        allowed = set(required)
-    if set(evidence) != allowed:
-        raise Refusal("gate-evidence-fields")
-    for key in required:
-        if key == "revocation_line_count":
-            if type(evidence[key]) is not int or evidence[key] != 1:
-                raise Refusal("gate-revocation-line")
-        elif type(evidence[key]) is not bool or evidence[key] is not True:
-            raise Refusal("gate-evidence-missing")
-    return True
+    if gate in ("C", "D"):
+        raise Refusal("gate-evidence-not-implemented")
+    raise Refusal("gate-boolean-evidence-untrusted")
 
 
 def _write_json(path, value):
@@ -1724,14 +1895,109 @@ def _cmd_find_artifact(arguments):
     pages = _read_pages_argument(arguments.artifacts_file)
     if type(pages) is list:
         pages = wrap_api_pages("artifacts", pages, arguments.run_id, arguments.run_attempt, "0" * 40)
-    name = select_artifact_name(
+    artifact = select_artifact(
         pages,
         arguments.run_id,
         arguments.run_id,
         arguments.run_attempt,
         arguments.role,
     )
-    print(name)
+    print(artifact[arguments.field])
+
+
+def _cmd_extract_artifact(arguments):
+    pages = _read_pages_argument(arguments.artifacts_file)
+    if type(pages) is list:
+        pages = wrap_api_pages("artifacts", pages, arguments.run_id,
+                               arguments.run_attempt, arguments.head_sha)
+    artifact = select_artifact(pages, arguments.run_id, arguments.run_id,
+                               arguments.run_attempt, arguments.role)
+    archive = read_bounded_archive(arguments.archive_file, artifact["size_in_bytes"])
+    extract_artifact_archive(artifact, archive, arguments.output_directory)
+    print("artifact=extracted id=%d role=%s" % (artifact["id"], arguments.role))
+
+
+def _cmd_export_provider(arguments):
+    snapshot = load_json_file(arguments.snapshot)
+    rows = _validate_snapshot(snapshot, "attestations", arguments.run_id,
+                              arguments.run_attempt, arguments.head_sha)
+    directory = Path(arguments.output_directory)
+    directory.mkdir(parents=True, exist_ok=False)
+    manifest = []
+    for index, row in enumerate(rows, 1):
+        if type(row) is not dict or type(row.get("bundle")) is not dict:
+            raise Refusal("provider-attestation-shape")
+        unused_payload, statement = signed_statement_payload(row["bundle"])
+        predicate = statement.get("predicate")
+        role = predicate.get("role") if type(predicate) is dict else None
+        if role not in ROLE_ORDER:
+            raise Refusal("provider-role-predicate")
+        _write_json(directory / ("bundle-%d.json" % index), row["bundle"])
+        manifest.append("%d %s" % (index, role))
+    (directory / "manifest.txt").write_text("\n".join(manifest) + "\n", encoding="ascii")
+
+
+def _cmd_find_job(arguments):
+    snapshot = load_json_file(arguments.jobs_file)
+    role = arguments.role
+    job = validate_role_job(snapshot, arguments.run_id, arguments.run_attempt,
+                            arguments.head_sha, role,
+                            API_JOB_NAME_PINS[arguments.profile][role], ("completed",))
+    print(job["id"])
+
+
+def parse_linux_log_sections(log_text, job_name, step_names):
+    if type(log_text) is not str or type(job_name) is not str:
+        raise Refusal("linux-log-shape")
+    sections = {step_id: [] for step_id in step_names}
+    other = []
+    for line in log_text.splitlines():
+        fields = line.split("\t", 3)
+        if len(fields) != 4 or fields[0] != job_name:
+            raise Refusal("linux-log-format")
+        matches = [step_id for step_id, name in step_names.items() if fields[1] == name]
+        if len(matches) == 1:
+            sections[matches[0]].append(fields[3])
+        else:
+            other.append(fields[3])
+    if any(not lines for lines in sections.values()):
+        raise Refusal("linux-log-section-missing")
+    return {"sections": {key: "\n".join(value) for key, value in sections.items()},
+            "other": ["\n".join(other)]}
+
+
+def _cmd_parse_linux_logs(arguments):
+    jobs = load_json_file(arguments.jobs_file)
+    job = validate_role_job(jobs, arguments.run_id, arguments.run_attempt,
+                            arguments.head_sha, "linux-fetch-encrypt",
+                            API_JOB_NAME_PINS[arguments.profile]["linux-fetch-encrypt"],
+                            ("completed",))
+    try:
+        log_text = Path(arguments.input).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise Refusal("linux-log-unavailable")
+    _write_json(arguments.output, parse_linux_log_sections(
+        log_text, job["name"], API_LINUX_STEP_NAME_PINS[arguments.profile]))
+
+
+def _cmd_gate_transition(arguments):
+    profile = arguments.profile
+    if profile not in CALLER_PROFILES or arguments.repository != CONTROL_REPOSITORY:
+        raise Refusal("transition-profile")
+    jobs = load_json_file(arguments.jobs_file)
+    artifacts = load_json_file(arguments.artifacts_file)
+    logs = load_json_file(arguments.linux_logs) if arguments.gate == "B" else None
+    verify_transition_evidence(
+        arguments.gate, profile, arguments.repository, arguments.ref,
+        arguments.control_sha, arguments.run_id, arguments.run_attempt,
+        load_json_file(arguments.repository_metadata), load_json_file(arguments.run_metadata),
+        jobs, artifacts, arguments.root, arguments.artifact_directory,
+        API_JOB_NAME_PINS[profile], CERTIFICATE_DIGEST_PINS[profile],
+        API_LINUX_STEP_NAME_PINS[profile], API_LINUX_STEP_ORDINAL_PINS[profile],
+        logs.get("sections") if type(logs) is dict else None,
+        logs.get("other") if type(logs) is dict else None,
+    )
+    print("gate=%s result=verified profile=%s" % (arguments.gate, profile))
 
 
 def _cmd_verify_snapshot(arguments):
@@ -1752,10 +2018,29 @@ def _cmd_verify_snapshot(arguments):
         artifacts = wrap_api_pages("artifacts", artifacts, arguments.run_id, arguments.run_attempt, arguments.control_sha)
     repository_metadata = load_json_file(arguments.repository_metadata)
     run_metadata = load_json_file(arguments.run_metadata)
-    provider_snapshots = {
-        role: load_json_file(Path(arguments.evidence_directory) / ("provider-" + role + ".json"))
-        for role in ROLE_ORDER
-    }
+    artifact_map = validate_artifact_inventory(artifacts, arguments.run_id,
+                                               arguments.run_attempt, arguments.control_sha)
+    provider_snapshots = {}
+    for role in ROLE_ORDER:
+        artifact = artifact_map[role][0]
+        subject_path = (Path(arguments.evidence_directory) / "artifacts" /
+                        artifact["name"] / "subject.bin")
+        try:
+            subject_digest = hashlib.sha256(subject_path.read_bytes()).hexdigest()
+        except OSError:
+            raise Refusal("provider-subject-unavailable")
+        if subject_digest in provider_snapshots:
+            continue
+        snapshot = load_json_file(Path(arguments.evidence_directory) /
+                                  ("provider-" + subject_digest + ".json"))
+        rows = _validate_snapshot(snapshot, "attestations", arguments.run_id,
+                                  arguments.run_attempt, arguments.control_sha)
+        directory = Path(arguments.evidence_directory) / ("provider-" + subject_digest)
+        verified = [load_json_file(directory / ("verified-%d.json" % index))
+                    for index in range(1, len(rows) + 1)]
+        if len(list(directory.glob("verified-*.json"))) != len(rows):
+            raise Refusal("provider-verification-cardinality")
+        provider_snapshots[subject_digest] = {"snapshot": snapshot, "verified": verified}
     verify_source_free_evidence(
         profile,
         repository,
@@ -1773,7 +2058,9 @@ def _cmd_verify_snapshot(arguments):
         API_JOB_NAME_PINS[profile],
         CERTIFICATE_DIGEST_PINS[profile],
     )
-    print("probe=role-signer result=verified profile=%s" % profile)
+    if profile == "production-synthetic":
+        raise Refusal("gate-c-and-d-evidence-not-implemented")
+    print("probe=role-signer result=source-free-evidence-verified profile=%s gate-c=blocked gate-d=blocked" % profile)
 
 
 def build_parser():
@@ -1804,6 +2091,51 @@ def build_parser():
     find.add_argument("--role", choices=ROLE_ORDER, required=True)
     find.add_argument("--run-id", required=True)
     find.add_argument("--run-attempt", required=True)
+    find.add_argument("--field", choices=("id", "name"), default="name")
+    extract = commands.add_parser("extract-artifact")
+    extract.add_argument("--artifacts-file", required=True)
+    extract.add_argument("--role", choices=ROLE_ORDER, required=True)
+    extract.add_argument("--run-id", required=True)
+    extract.add_argument("--run-attempt", required=True)
+    extract.add_argument("--head-sha", required=True)
+    extract.add_argument("--archive-file", required=True)
+    extract.add_argument("--output-directory", required=True)
+    export = commands.add_parser("export-provider")
+    export.add_argument("--snapshot", required=True)
+    export.add_argument("--run-id", required=True)
+    export.add_argument("--run-attempt", required=True)
+    export.add_argument("--head-sha", required=True)
+    export.add_argument("--output-directory", required=True)
+    find_job = commands.add_parser("find-job")
+    find_job.add_argument("--profile", choices=tuple(CALLER_PROFILES), required=True)
+    find_job.add_argument("--role", choices=ROLE_ORDER, required=True)
+    find_job.add_argument("--jobs-file", required=True)
+    find_job.add_argument("--run-id", required=True)
+    find_job.add_argument("--run-attempt", required=True)
+    find_job.add_argument("--head-sha", required=True)
+    parse_logs = commands.add_parser("parse-linux-logs")
+    parse_logs.add_argument("--profile", choices=tuple(CALLER_PROFILES), required=True)
+    parse_logs.add_argument("--jobs-file", required=True)
+    parse_logs.add_argument("--input", required=True)
+    parse_logs.add_argument("--output", required=True)
+    parse_logs.add_argument("--run-id", required=True)
+    parse_logs.add_argument("--run-attempt", required=True)
+    parse_logs.add_argument("--head-sha", required=True)
+    gate = commands.add_parser("gate-transition")
+    gate.add_argument("--gate", choices=("A", "B"), required=True)
+    gate.add_argument("--profile", choices=tuple(CALLER_PROFILES), required=True)
+    gate.add_argument("--repository", required=True)
+    gate.add_argument("--ref", required=True)
+    gate.add_argument("--control-sha", required=True)
+    gate.add_argument("--run-id", required=True)
+    gate.add_argument("--run-attempt", required=True)
+    gate.add_argument("--root", default=".")
+    gate.add_argument("--jobs-file", required=True)
+    gate.add_argument("--artifacts-file", required=True)
+    gate.add_argument("--repository-metadata", required=True)
+    gate.add_argument("--run-metadata", required=True)
+    gate.add_argument("--artifact-directory", required=True)
+    gate.add_argument("--linux-logs")
     verify = commands.add_parser("verify-snapshot")
     verify.add_argument("--profile", required=True)
     verify.add_argument("--repository", required=True)
@@ -1829,6 +2161,16 @@ def main(argv=None):
             _cmd_wrap_pages(arguments)
         elif arguments.command == "find-artifact":
             _cmd_find_artifact(arguments)
+        elif arguments.command == "extract-artifact":
+            _cmd_extract_artifact(arguments)
+        elif arguments.command == "export-provider":
+            _cmd_export_provider(arguments)
+        elif arguments.command == "find-job":
+            _cmd_find_job(arguments)
+        elif arguments.command == "parse-linux-logs":
+            _cmd_parse_linux_logs(arguments)
+        elif arguments.command == "gate-transition":
+            _cmd_gate_transition(arguments)
         else:
             _cmd_verify_snapshot(arguments)
         return 0

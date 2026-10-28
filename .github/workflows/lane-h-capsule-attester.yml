@@ -14,7 +14,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      metadata: read
       actions: read
       id-token: write
       attestations: write
@@ -52,27 +51,49 @@ jobs:
       - name: Download receiver and completed Linux role evidence
         run: |
           set -euo pipefail
+          evidence="$RUNNER_TEMP/role-evidence"
+          mkdir -p "$evidence/artifacts"
           api_path="repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/artifacts?per_page=100"
-          gh api --paginate --slurp "$api_path" > "$RUNNER_TEMP/artifact-pages.json" 2>/dev/null
-          mkdir -p "$RUNNER_TEMP/receiver-record" "$RUNNER_TEMP/linux-statement"
-          receiver=$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$RUNNER_TEMP/artifact-pages.json" --role windows-receiver --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" 2>/dev/null)
-          linux=$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$RUNNER_TEMP/artifact-pages.json" --role linux-fetch-encrypt --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" 2>/dev/null)
-          gh run download "$KD_RUN_ID" --repo "$KD_REPOSITORY" --name "$receiver" --dir "$RUNNER_TEMP/receiver-record" 2>/dev/null
-          gh run download "$KD_RUN_ID" --repo "$KD_REPOSITORY" --name "$linux" --dir "$RUNNER_TEMP/linux-statement" 2>/dev/null
-          [[ -s "$RUNNER_TEMP/receiver-record/subject.bin" && -s "$RUNNER_TEMP/linux-statement/subject.bin" ]]
+          gh api --paginate --slurp "$api_path" > "$evidence/artifact-pages.json" 2>/dev/null
+          for role in windows-receiver linux-fetch-encrypt; do
+            name="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$evidence/artifact-pages.json" --role "$role" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --field name)"
+            identifier="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$evidence/artifact-pages.json" --role "$role" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --field id)"
+            printf '%s\n' "$name" > "$evidence/$role-name.txt"
+            gh api "repos/$KD_REPOSITORY/actions/artifacts/$identifier/zip" > "$evidence/artifacts/$name.zip" 2>/dev/null
+            python -B kit/confinement/role_signer.py extract-artifact --artifacts-file "$evidence/artifact-pages.json" --role "$role" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA" --archive-file "$evidence/artifacts/$name.zip" --output-directory "$evidence/artifacts/$name"
+          done
       - name: Verify receiver and completed Linux role signatures
         run: |
           set -euo pipefail
-          repository_root="https:"'//'"$KD_REPOSITORY"
-          gh attestation verify "$RUNNER_TEMP/receiver-record/subject.bin" --bundle "$RUNNER_TEMP/receiver-record/bundle.json" --repo "$KD_REPOSITORY" --signer-workflow "$repository_root/.github/workflows/lane-h-windows-receiver.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$RUNNER_TEMP/receiver-record/verified.json" 2>/dev/null
-          gh attestation verify "$RUNNER_TEMP/linux-statement/subject.bin" --bundle "$RUNNER_TEMP/linux-statement/bundle.json" --repo "$KD_REPOSITORY" --signer-workflow "$repository_root/.github/workflows/lane-h-linux-fetch-encrypt.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$RUNNER_TEMP/linux-statement/verified.json" 2>/dev/null
+          evidence="$RUNNER_TEMP/role-evidence"
+          for role in windows-receiver linux-fetch-encrypt; do
+            name="$(cat "$evidence/$role-name.txt")"
+            directory="$evidence/artifacts/$name"
+            gh attestation verify "$directory/subject.bin" --bundle "$directory/bundle.json" --repo "$KD_REPOSITORY" --signer-workflow "$KD_REPOSITORY/.github/workflows/lane-h-$role.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$directory/verified.json" 2>/dev/null
+          done
       - name: Recreate and compare the exact synthetic capsule subject
         id: subject
         run: |
           set -euo pipefail
           repository_id="$(cat "$RUNNER_TEMP/control-repository-id.txt")"
-          python -B kit/confinement/role_signer.py prepare --profile "$KD_PROFILE" --role capsule-attester --repository "$KD_REPOSITORY" --repository-id "$repository_id" --control-sha "$KD_SHA" --ref "$KD_REF" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --workflow-ref "$KD_WORKFLOW_REF" --runner "$KD_RUNNER" --receiver-record "$RUNNER_TEMP/receiver-record/subject.bin" --output-directory "$RUNNER_TEMP/role-statement"
-          cmp "$RUNNER_TEMP/role-statement/subject.bin" "$RUNNER_TEMP/linux-statement/subject.bin"
+          receiver="$(cat "$RUNNER_TEMP/role-evidence/windows-receiver-name.txt")"
+          linux="$(cat "$RUNNER_TEMP/role-evidence/linux-fetch-encrypt-name.txt")"
+          python -B kit/confinement/role_signer.py prepare --profile "$KD_PROFILE" --role capsule-attester --repository "$KD_REPOSITORY" --repository-id "$repository_id" --control-sha "$KD_SHA" --ref "$KD_REF" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --workflow-ref "$KD_WORKFLOW_REF" --runner "$KD_RUNNER" --receiver-record "$RUNNER_TEMP/role-evidence/artifacts/$receiver/subject.bin" --output-directory "$RUNNER_TEMP/role-statement"
+          cmp "$RUNNER_TEMP/role-statement/subject.bin" "$RUNNER_TEMP/role-evidence/artifacts/$linux/subject.bin"
+      - name: Apply evidence-backed Gate B before signing the capsule role
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/role-evidence"
+          gh api "repos/$KD_REPOSITORY" --jq '{id:.id,full_name:.full_name,owner_id:.owner.id,visibility:.visibility}' > "$evidence/repository.json" 2>/dev/null
+          gh api "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID" > "$evidence/run.json" 2>/dev/null
+          gh api --paginate --slurp "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/attempts/$KD_RUN_ATTEMPT/jobs?per_page=100" > "$evidence/jobs-pages.json" 2>/dev/null
+          gh api --paginate --slurp "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/artifacts?per_page=100" > "$evidence/artifact-pages.json" 2>/dev/null
+          python -B kit/confinement/role_signer.py wrap-pages --kind jobs --input "$evidence/jobs-pages.json" --output "$evidence/jobs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          python -B kit/confinement/role_signer.py wrap-pages --kind artifacts --input "$evidence/artifact-pages.json" --output "$evidence/artifacts.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          linux_job_id="$(python -B kit/confinement/role_signer.py find-job --profile "$KD_PROFILE" --role linux-fetch-encrypt --jobs-file "$evidence/jobs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA")"
+          gh run view "$KD_RUN_ID" --repo "$KD_REPOSITORY" --job "$linux_job_id" --log > "$evidence/linux.log" 2>/dev/null
+          python -B kit/confinement/role_signer.py parse-linux-logs --profile "$KD_PROFILE" --jobs-file "$evidence/jobs.json" --input "$evidence/linux.log" --output "$evidence/linux-logs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          python -B kit/confinement/role_signer.py gate-transition --gate B --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --jobs-file "$evidence/jobs.json" --artifacts-file "$evidence/artifacts.json" --repository-metadata "$evidence/repository.json" --run-metadata "$evidence/run.json" --artifact-directory "$evidence/artifacts" --linux-logs "$evidence/linux-logs.json"
       - name: Sign only the capsule-attester role statement
         id: attest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2

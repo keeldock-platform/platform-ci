@@ -1,10 +1,14 @@
 import copy
 import base64
 import hashlib
+import io
 import json
 import tempfile
 import time
 import unittest
+from unittest import mock
+import zipfile
+import datetime
 from pathlib import Path
 
 import role_signer as subject
@@ -139,9 +143,10 @@ def fixture_jobs(run_id=RUN_ID, run_attempt=RUN_ATTEMPT, head_sha=CONTROL_SHA):
 
 
 def fixture_job_snapshot(rows=None):
+    rows = fixture_jobs() if rows is None else rows
     return subject.wrap_api_pages(
         "jobs",
-        [{"total_count": 3, "jobs": fixture_jobs() if rows is None else rows}],
+        [{"total_count": len(rows), "jobs": rows}],
         RUN_ID,
         RUN_ATTEMPT,
         CONTROL_SHA,
@@ -155,6 +160,8 @@ def fixture_api_names():
 def fixture_artifacts():
     rows = []
     transfer = "b" * 32
+    created = datetime.datetime.now(datetime.timezone.utc)
+    expires = created + datetime.timedelta(hours=1)
     for index, role in enumerate(subject.ROLE_ORDER, 1):
         rows.append(
             {
@@ -164,17 +171,18 @@ def fixture_artifacts():
                 "expired": False,
                 "size_in_bytes": 4096,
                 "digest": "sha256:" + str(index) * 64,
-                "created_at": "2026-10-28T10:00:00Z",
-                "expires_at": "2026-10-29T10:00:00Z",
+                "created_at": created.isoformat(),
+                "expires_at": expires.isoformat(),
             }
         )
     return rows
 
 
 def fixture_artifact_snapshot(rows=None):
+    rows = fixture_artifacts() if rows is None else rows
     return subject.wrap_api_pages(
         "artifacts",
-        [{"total_count": 3, "artifacts": fixture_artifacts() if rows is None else rows}],
+        [{"total_count": len(rows), "artifacts": rows}],
         RUN_ID,
         RUN_ATTEMPT,
         CONTROL_SHA,
@@ -195,6 +203,175 @@ def fixture_predicate(role="windows-receiver", record=None):
         signed_subject,
     )
     return record, signed_subject, binding, predicate
+
+
+def fixture_successful_evidence(root):
+    record = fixture_record()
+    transfer = subject.validate_key_record(record, 8150001, CONTROL_SHA, RUN_ID,
+                                           RUN_ATTEMPT, WORKFLOW_REF)["transfer_id"]
+    artifact_root = Path(root) / "artifacts"
+    artifact_root.mkdir()
+    artifacts = []
+    provider_rows = {}
+    provider_verified = {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for index, role in enumerate(subject.ROLE_ORDER, 1):
+        unused_record, signed_subject, binding = fixture_binding(role, record)
+        predicate = subject.make_predicate("probe", role, REPOSITORY, CONTROL_SHA,
+                                           REF, RUN_ID, RUN_ATTEMPT, record, signed_subject)
+        statement = {
+            "_type": "https://in-toto.io/Statement/v1",
+            "subject": [{"name": "subject.bin", "digest": {
+                "sha256": hashlib.sha256(signed_subject).hexdigest()}}],
+            "predicateType": subject.PREDICATE_TYPE,
+            "predicate": predicate,
+        }
+        payload = json.dumps(statement, ensure_ascii=True, sort_keys=True,
+                             separators=(",", ":")).encode("ascii")
+        bundle = {"dsseEnvelope": {
+            "payloadType": "application/vnd.in-toto+json",
+            "payload": base64.b64encode(payload).decode("ascii"),
+            "signatures": [{"sig": "synthetic"}],
+        }}
+        unused_expected, certificate = fixture_certificate(role)
+        verified = {"verificationResult": {
+            "signature": {"certificate": certificate}, "statement": statement}}
+        name = "role-statement-%s-%s-%s-%s" % (role, RUN_ID, RUN_ATTEMPT, transfer)
+        directory = artifact_root / name
+        directory.mkdir()
+        files = {
+            "subject.bin": signed_subject,
+            "predicate.json": json.dumps(predicate, sort_keys=True).encode("ascii"),
+            "bundle.json": json.dumps(bundle, sort_keys=True).encode("ascii"),
+        }
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w") as archive:
+            for filename, value in files.items():
+                archive.writestr(filename, value)
+                (directory / filename).write_bytes(value)
+        archive_bytes = output.getvalue()
+        (artifact_root / (name + ".zip")).write_bytes(archive_bytes)
+        (directory / "verified.json").write_text(json.dumps(verified), encoding="ascii")
+        artifacts.append({
+            "id": 3000 + index, "name": name,
+            "workflow_run": {"id": int(RUN_ID)},
+            "expired": False, "size_in_bytes": len(archive_bytes),
+            "digest": "sha256:" + hashlib.sha256(archive_bytes).hexdigest(),
+            "created_at": now.isoformat(),
+            "expires_at": (now + datetime.timedelta(hours=1)).isoformat(),
+        })
+        subject_digest = hashlib.sha256(signed_subject).hexdigest()
+        provider_rows.setdefault(subject_digest, []).append({"bundle": bundle})
+        provider_verified.setdefault(subject_digest, []).append(verified)
+    provider_snapshots = {
+        digest: {
+            "snapshot": subject.wrap_api_pages("attestations", [{
+                "total_count": len(rows), "attestations": rows,
+            }], RUN_ID, RUN_ATTEMPT, CONTROL_SHA),
+            "verified": provider_verified[digest],
+        }
+        for digest, rows in provider_rows.items()
+    }
+    jobs = fixture_jobs()
+    jobs[1]["steps"].extend([
+        {"number": 5, "name": "handoff-revoke-source-token-v1",
+         "status": "completed", "conclusion": "success"},
+        {"number": 6, "name": "handoff-verify-token-rejection-v1",
+         "status": "completed", "conclusion": "success"},
+    ])
+    return {
+        "profile": "probe", "repository": REPOSITORY, "ref": REF,
+        "control_sha": CONTROL_SHA, "run_id": RUN_ID, "run_attempt": RUN_ATTEMPT,
+        "repository_metadata": {"id": 8150001, "full_name": REPOSITORY,
+                                "owner_id": 99101, "visibility": "public"},
+        "run_metadata": {"id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT),
+                         "head_sha": CONTROL_SHA,
+                         "path": subject.CALLER_PROFILES["probe"]["path"],
+                         "event": "workflow_dispatch", "head_branch": "main",
+                         "repository": {"id": 8150001, "full_name": REPOSITORY},
+                         "status": "in_progress", "conclusion": None},
+        "jobs_snapshot": fixture_job_snapshot(jobs),
+        "artifacts_snapshot": fixture_artifact_snapshot(artifacts),
+        "provider_snapshots": provider_snapshots,
+        "control_root": ROOT, "evidence_root": root,
+        "api_name_pins": fixture_api_names(),
+        "digest_pins": {role: dict(DIGEST_PINS) for role in subject.ROLE_ORDER},
+    }
+
+
+def fixture_transition_arguments(evidence, gate):
+    required = subject.ROLE_ORDER[:1] if gate == "A" else subject.ROLE_ORDER[:2]
+    artifacts = [row for row in evidence["artifacts_snapshot"]["pages"][0]["artifacts"]
+                 if any(row["name"].startswith("role-statement-" + role + "-") for role in required)]
+    result = {
+        key: evidence[key] for key in (
+            "profile", "repository", "ref", "control_sha", "run_id", "run_attempt",
+            "repository_metadata", "run_metadata", "jobs_snapshot", "control_root",
+            "api_name_pins", "digest_pins",
+        )
+    }
+    result["gate"] = gate
+    result["artifacts_snapshot"] = fixture_artifact_snapshot(artifacts)
+    result["evidence_root"] = Path(evidence["evidence_root"]) / "artifacts"
+    if gate == "B":
+        result.update({
+            "step_name_pins": dict(subject.API_LINUX_STEP_NAME_PINS["probe"]),
+            "step_ordinal_pins": {"revoke-source-token": 5, "verify-token-rejection": 6},
+            "log_sections": {
+                "revoke-source-token": "probe=source-free-revocation-simulation status=passed\n",
+                "verify-token-rejection": "handoff-revocation=confirmed\n",
+            },
+            "other_log_sections": ["other step"],
+        })
+    return result
+
+
+def mutate_artifact_nonce(root, artifact):
+    directory = Path(root) / "artifacts" / artifact["name"]
+    predicate_path = directory / "predicate.json"
+    bundle_path = directory / "bundle.json"
+    verified_path = directory / "verified.json"
+    predicate = json.loads(predicate_path.read_text(encoding="ascii"))
+    predicate["nonce"] = "0" * 32
+    predicate_path.write_text(json.dumps(predicate), encoding="ascii")
+    bundle = json.loads(bundle_path.read_text(encoding="ascii"))
+    statement = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
+    statement["predicate"]["nonce"] = "0" * 32
+    bundle["dsseEnvelope"]["payload"] = base64.b64encode(
+        json.dumps(statement, sort_keys=True).encode("ascii")).decode("ascii")
+    bundle_path.write_text(json.dumps(bundle), encoding="ascii")
+    verified = json.loads(verified_path.read_text(encoding="ascii"))
+    verified["verificationResult"]["statement"]["predicate"]["nonce"] = "0" * 32
+    verified_path.write_text(json.dumps(verified), encoding="ascii")
+    repack_artifact(root, artifact)
+
+
+def repack_artifact(root, artifact):
+    directory = Path(root) / "artifacts" / artifact["name"]
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for filename in ("subject.bin", "predicate.json", "bundle.json"):
+            archive.writestr(filename, (directory / filename).read_bytes())
+    archive_bytes = output.getvalue()
+    (Path(root) / "artifacts" / (artifact["name"] + ".zip")).write_bytes(archive_bytes)
+    artifact["size_in_bytes"] = len(archive_bytes)
+    artifact["digest"] = "sha256:" + hashlib.sha256(archive_bytes).hexdigest()
+
+
+def mutate_artifact_statement_digest(root, artifact):
+    directory = Path(root) / "artifacts" / artifact["name"]
+    bundle_path = directory / "bundle.json"
+    verified_path = directory / "verified.json"
+    bundle = json.loads(bundle_path.read_text(encoding="ascii"))
+    statement = json.loads(base64.b64decode(bundle["dsseEnvelope"]["payload"]))
+    statement["subject"][0]["digest"]["sha256"] = "0" * 64
+    bundle["dsseEnvelope"]["payload"] = base64.b64encode(
+        json.dumps(statement, sort_keys=True).encode("ascii")).decode("ascii")
+    bundle_path.write_text(json.dumps(bundle), encoding="ascii")
+    verified = json.loads(verified_path.read_text(encoding="ascii"))
+    verified["verificationResult"]["statement"]["subject"][0]["digest"]["sha256"] = "0" * 64
+    verified_path.write_text(json.dumps(verified), encoding="ascii")
+    repack_artifact(root, artifact)
 
 
 class CanonicalIdentityTests(unittest.TestCase):
@@ -300,15 +477,8 @@ class KeyRecordAndPredicateTests(unittest.TestCase):
     def test_certificate_requires_both_role_uri_and_san_and_every_identity_leaf(self):
         expected, certificate = fixture_certificate("capsule-attester")
         self.assertTrue(subject.validate_certificate(certificate, expected))
-        for field, value in (
-            ("buildSignerURI", subject._role_uri(REPOSITORY, "linux-fetch-encrypt", REF)),
-            ("subjectAlternativeName", subject._role_uri(REPOSITORY, "windows-receiver", REF)),
-            ("githubWorkflowSHA", "b" * 40),
-            ("githubWorkflowTrigger", "push"),
-            ("sourceRepositoryURI", subject.github_root("keeldock-platform/other")),
-            ("sourceRepositoryRef", "refs/heads/feature"),
-            ("buildSignerDigest", "sha256:" + "f" * 64),
-        ):
+        for field in CERTIFICATE_FIELDS:
+            value = "2" if field in ("sourceRepositoryIdentifier", "sourceRepositoryOwnerIdentifier") else "wrong"
             altered = dict(certificate, **{field: value})
             with self.subTest(field=field):
                 with self.assertRaises(subject.Refusal):
@@ -316,7 +486,7 @@ class KeyRecordAndPredicateTests(unittest.TestCase):
 
     def test_certificate_missing_type_invalid_and_unresolved_digest_values_fail_closed(self):
         expected, certificate = fixture_certificate()
-        for field in ("buildConfigURI", "sourceRepositoryOwnerIdentifier", "runInvocationURI"):
+        for field in CERTIFICATE_FIELDS:
             altered = dict(certificate)
             del altered[field]
             with self.subTest(field=field):
@@ -541,7 +711,9 @@ class ArtifactAndStageTests(unittest.TestCase):
         snapshot = fixture_artifact_snapshot()
         pages = [page for page in snapshot["pages"]]
         selected = subject.select_artifact_name(
-            {"kind": "artifacts", "complete": True, "run_id": RUN_ID, "run_attempt": RUN_ATTEMPT, "head_sha": CONTROL_SHA, "pages": pages},
+            {"kind": "artifacts", "complete": True, "total_count": 3,
+             "run_id": RUN_ID, "run_attempt": RUN_ATTEMPT,
+             "head_sha": CONTROL_SHA, "pages": pages},
             RUN_ID,
             RUN_ID,
             RUN_ATTEMPT,
@@ -549,7 +721,7 @@ class ArtifactAndStageTests(unittest.TestCase):
         )
         self.assertTrue(selected.startswith("role-statement-windows-receiver-701-2-"))
         duplicate = fixture_artifacts() + [fixture_artifacts()[0]]
-        wrapped = subject.wrap_api_pages("artifacts", [{"artifacts": duplicate}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
+        wrapped = subject.wrap_api_pages("artifacts", [{"total_count": len(duplicate), "artifacts": duplicate}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
         with self.assertRaises(subject.Refusal):
             subject.select_artifact_name(wrapped, RUN_ID, RUN_ID, RUN_ATTEMPT, "windows-receiver")
 
@@ -562,12 +734,12 @@ class ArtifactAndStageTests(unittest.TestCase):
             digests[role] = "sha256:" + digest
             rows.append({"role": role, "subject_digest": digests[role], "statement_digest": statement_digest})
         rows.append(dict(rows[0]))
-        snapshot = subject.wrap_api_pages("attestations", [{"attestations": rows}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
+        snapshot = subject.wrap_api_pages("attestations", [{"total_count": len(rows), "attestations": rows}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
         result = subject.validate_attestation_inventory(snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, digests)
         self.assertEqual(set(result), set(subject.ROLE_ORDER))
         changed = copy.deepcopy(rows)
         changed.append({"role": "windows-receiver", "subject_digest": digests["windows-receiver"], "statement_digest": "f" * 64})
-        altered = subject.wrap_api_pages("attestations", [{"attestations": changed}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
+        altered = subject.wrap_api_pages("attestations", [{"total_count": len(changed), "attestations": changed}], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
         with self.assertRaises(subject.Refusal):
             subject.validate_attestation_inventory(altered, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, digests)
 
@@ -592,16 +764,23 @@ class ArtifactAndStageTests(unittest.TestCase):
         self.assertEqual(parsed, statement)
         provider = subject.wrap_api_pages(
             "attestations",
-            [{"attestations": [{"bundle": bundle}]}],
+            [{"total_count": 1, "attestations": [{"bundle": bundle}]}],
             RUN_ID,
             RUN_ATTEMPT,
             CONTROL_SHA,
         )
+        certificate_expected, certificate = fixture_certificate("windows-receiver")
+        verified = {"verificationResult": {"signature": {"certificate": certificate}, "statement": statement}}
+        expectations = {"windows-receiver": {
+            "subject": signed_subject, "predicate": predicate,
+            "certificate": certificate_expected, "binding": binding,
+            "statement_digest": hashlib.sha256(payload).hexdigest(),
+        }}
         normalized = subject.normalize_provider_attestations(
             provider,
-            "windows-receiver",
             hashlib.sha256(signed_subject).hexdigest(),
-            predicate,
+            expectations,
+            [verified],
             RUN_ID,
             RUN_ATTEMPT,
             CONTROL_SHA,
@@ -618,7 +797,7 @@ class ArtifactAndStageTests(unittest.TestCase):
         wrong["pages"][0]["attestations"][0]["bundle"]["dsseEnvelope"]["payload"] = base64.b64encode(payload + b"x").decode("ascii")
         with self.assertRaises(subject.Refusal):
             subject.normalize_provider_attestations(
-                wrong, "windows-receiver", hashlib.sha256(signed_subject).hexdigest(), predicate,
+                wrong, hashlib.sha256(signed_subject).hexdigest(), expectations, [verified],
                 RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
             )
         malformed = copy.deepcopy(bundle)
@@ -636,13 +815,15 @@ class ArtifactAndStageTests(unittest.TestCase):
             }
             for index, role in enumerate(subject.ROLE_ORDER, 1)
         ]
-        providers = [{"role": row["role"], "statement_digest": row["statement_digest"]} for row in artifacts]
+        providers = [{"role": row["role"], "subject_digest": "1" * 64,
+                      "statement_digest": row["statement_digest"]} for row in artifacts]
         accepted = subject.verify_statement_cardinality(artifacts, providers)
         self.assertEqual(set(accepted), set(subject.ROLE_ORDER))
         with self.assertRaises(subject.Refusal):
             subject.verify_statement_cardinality(
                 artifacts,
-                providers + [{"role": "linux-fetch-encrypt", "statement_digest": "f" * 64}],
+                providers + [{"role": "linux-fetch-encrypt", "subject_digest": "1" * 64,
+                              "statement_digest": "f" * 64}],
             )
         duplicated_artifact = artifacts + [dict(artifacts[0])]
         with self.assertRaises(subject.Refusal):
@@ -692,62 +873,235 @@ class ArtifactAndStageTests(unittest.TestCase):
             )
 
     def test_gates_a_to_d_enforce_order_and_exact_required_evidence(self):
-        gate_data = {
-            "A": {
-                "receiver_key_record_valid": True,
-                "receiver_statement_valid": True,
-                "receiver_subject_exact": True,
-                "receiver_nonce_valid": True,
-                "workflow_bytes_pinned": True,
-                "receiver_job_unique": True,
-            },
-            "B": {
-                "gate_a_passed": True,
-                "receiver_binding_valid": True,
-                "capsule_subject_exact": True,
-                "linux_statement_valid": True,
-                "linux_job_completed_successfully": True,
-                "revoke_step_completed_successfully": True,
-                "verify_rejection_step_completed_successfully": True,
-                "revocation_line_count": 1,
-            },
-            "C": {
-                "gate_b_passed": True,
-                "receiver_statement_valid": True,
-                "linux_statement_valid": True,
-                "attester_statement_valid": True,
-                "capsule_subject_exact": True,
-                "all_nonces_valid": True,
-                "attester_job_completed_successfully": True,
-                "signed_receipt_valid": True,
-                "manifest_authenticated": True,
-                "git_objects_validated": True,
-            },
-            "D": {
-                "gate_c_passed": True,
-                "jobs_listing_complete": True,
-                "artifacts_listing_complete": True,
-                "attestations_listing_complete": True,
-                "one_unique_job_per_role": True,
-                "one_statement_per_role": True,
-                "all_expected_jobs_successful": True,
-                "fresh_transfer_binding": True,
-                "all_remaining_evidence_valid": True,
-                "post_run_revocation_confirmed": True,
-            },
-        }
-        for gate, evidence in gate_data.items():
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = fixture_successful_evidence(temporary)
+            self.assertEqual(len(evidence["provider_snapshots"]), 2)
+            result = subject.verify_source_free_evidence(**evidence)
+            self.assertEqual(set(result["predicates"]), set(subject.ROLE_ORDER))
+            self.assertEqual(result["subject_digests"]["linux-fetch-encrypt"],
+                             result["subject_digests"]["capsule-attester"])
+            self.assertTrue(subject.verify_transition_evidence(
+                **fixture_transition_arguments(evidence, "A")))
+            self.assertTrue(subject.verify_transition_evidence(
+                **fixture_transition_arguments(evidence, "B")))
+        for gate in subject.GATE_REQUIREMENTS:
             with self.subTest(gate=gate):
-                self.assertTrue(subject.evaluate_gate(gate, evidence))
-        for gate, evidence in gate_data.items():
-            altered = dict(evidence)
-            key = next(iter(altered))
-            altered[key] = 0 if key == "revocation_line_count" else False
-            with self.subTest(gate=gate, negative=key):
                 with self.assertRaises(subject.Refusal):
-                    subject.evaluate_gate(gate, altered)
+                    subject.evaluate_gate(gate, {
+                        field: (1 if field == "revocation_line_count" else True)
+                        for field in subject.GATE_REQUIREMENTS[gate]
+                    })
+
+    def test_shared_digest_discovery_authenticates_each_bundle_and_rejects_missing_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = fixture_successful_evidence(temporary)
+            self.assertEqual(len(evidence["provider_snapshots"]), 2)
+            shared = next(digest for digest, entry in evidence["provider_snapshots"].items()
+                          if entry["snapshot"]["total_count"] == 2)
+            missing = copy.deepcopy(evidence)
+            missing["provider_snapshots"][shared]["verified"].pop()
+            with self.assertRaises(subject.Refusal):
+                subject.verify_source_free_evidence(**missing)
+            altered = copy.deepcopy(evidence)
+            document = altered["provider_snapshots"][shared]["verified"][1]
+            document["verificationResult"]["signature"]["certificate"]["buildSignerURI"] = "wrong"
+            with self.assertRaises(subject.Refusal):
+                subject.verify_source_free_evidence(**altered)
+            extra = copy.deepcopy(evidence)
+            listing = extra["provider_snapshots"][shared]
+            rows = listing["snapshot"]["pages"][0]["attestations"]
+            rows.append(copy.deepcopy(rows[0]))
+            listing["verified"].append(copy.deepcopy(listing["verified"][0]))
+            listing["snapshot"]["total_count"] = 3
+            listing["snapshot"]["pages"][0]["total_count"] = 3
+            self.assertTrue(subject.verify_source_free_evidence(**extra))
+
+    def test_cli_gate_entry_points_use_parsed_evidence_before_transition(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = fixture_successful_evidence(temporary)
+            for gate in ("A", "B"):
+                with self.subTest(gate=gate):
+                    arguments = fixture_transition_arguments(evidence, gate)
+                    prefix = Path(temporary) / gate
+                    for label, key in (
+                        ("repository", "repository_metadata"),
+                        ("run", "run_metadata"),
+                        ("jobs", "jobs_snapshot"),
+                        ("artifacts", "artifacts_snapshot"),
+                    ):
+                        (Path(str(prefix) + "-" + label + ".json")).write_text(
+                            json.dumps(arguments[key]), encoding="ascii")
+                    command = [
+                        "gate-transition", "--gate", gate, "--profile", "probe",
+                        "--repository", REPOSITORY, "--ref", REF,
+                        "--control-sha", CONTROL_SHA, "--run-id", RUN_ID,
+                        "--run-attempt", RUN_ATTEMPT, "--root", str(ROOT),
+                        "--jobs-file", str(prefix) + "-jobs.json",
+                        "--artifacts-file", str(prefix) + "-artifacts.json",
+                        "--repository-metadata", str(prefix) + "-repository.json",
+                        "--run-metadata", str(prefix) + "-run.json",
+                        "--artifact-directory", str(Path(temporary) / "artifacts"),
+                    ]
+                    if gate == "B":
+                        log_path = Path(str(prefix) + "-logs.json")
+                        log_path.write_text(json.dumps({
+                            "sections": arguments["log_sections"],
+                            "other": arguments["other_log_sections"],
+                        }), encoding="ascii")
+                        command.extend(("--linux-logs", str(log_path)))
+                    with mock.patch.object(subject, "API_JOB_NAME_PINS", {"probe": fixture_api_names()}), \
+                            mock.patch.object(subject, "CERTIFICATE_DIGEST_PINS", {
+                                "probe": {role: dict(DIGEST_PINS) for role in subject.ROLE_ORDER}}), \
+                            mock.patch.object(subject, "API_LINUX_STEP_ORDINAL_PINS", {
+                                "probe": {"revoke-source-token": 5, "verify-token-rejection": 6}}):
+                        self.assertEqual(subject.main(command), 0)
+
+    def test_truncated_pages_and_partial_rerun_cannot_prove_unique_invocation(self):
+        rows = fixture_jobs()
+        first_page = rows + [{"name": "unrelated-%d" % index} for index in range(97)]
+        hidden = copy.deepcopy(rows[0])
+        hidden["id"] = 9001
+        hidden["check_run_url"] = hidden["check_run_url"].replace("2001", "9001")
+        with self.assertRaisesRegex(subject.Refusal, "api-pagination-incomplete"):
+            subject.wrap_api_pages("jobs", [{"total_count": 101, "jobs": first_page}],
+                                   RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
+        complete_pages = subject.wrap_api_pages("jobs", [
+            {"total_count": 101, "jobs": first_page},
+            {"total_count": 101, "jobs": [hidden]},
+        ], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
         with self.assertRaises(subject.Refusal):
-            subject.evaluate_gate("A", dict(gate_data["A"], linux_statement_valid=True))
+            subject.validate_jobs_snapshot(complete_pages, RUN_ID, RUN_ATTEMPT,
+                                           CONTROL_SHA, fixture_api_names())
+        duplicate = copy.deepcopy(rows[0])
+        duplicate["id"] = 9001
+        duplicate["check_run_url"] = duplicate["check_run_url"].replace("2001", "9001")
+        complete = fixture_job_snapshot(rows + [duplicate])
+        with self.assertRaises(subject.Refusal):
+            subject.validate_role_job(complete, RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
+                                      "windows-receiver", "job-windows-receiver", ("completed",))
+        stale = copy.deepcopy(rows)
+        stale[0]["run_attempt"] = 1
+        with self.assertRaises(subject.Refusal):
+            subject.validate_role_job(fixture_job_snapshot(stale), RUN_ID,
+                                      RUN_ATTEMPT, CONTROL_SHA, "windows-receiver",
+                                      "job-windows-receiver", ("completed",))
+        with self.assertRaises(subject.Refusal):
+            subject.wrap_api_pages("jobs", [
+                {"total_count": 101, "jobs": first_page},
+                {"total_count": 102, "jobs": [hidden]},
+            ], RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
+
+    def test_archive_bytes_size_digest_expiry_and_members_are_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            evidence = fixture_successful_evidence(temporary)
+            artifact = evidence["artifacts_snapshot"]["pages"][0]["artifacts"][0]
+            archive_path = Path(temporary) / "artifacts" / (artifact["name"] + ".zip")
+            archive_bytes = archive_path.read_bytes()
+            self.assertEqual(set(subject.validated_archive_members(artifact, archive_bytes)),
+                             {"subject.bin", "predicate.json", "bundle.json"})
+            for field, value in (("size_in_bytes", len(archive_bytes) + 1),
+                                 ("digest", "sha256:" + "0" * 64),
+                                 ("expires_at", "2000-01-01T00:00:00+00:00")):
+                altered = dict(artifact, **{field: value})
+                with self.subTest(field=field):
+                    with self.assertRaises(subject.Refusal):
+                        subject.validated_archive_members(altered, archive_bytes)
+            malicious = io.BytesIO()
+            with zipfile.ZipFile(malicious, "w") as archive:
+                archive.writestr("../subject.bin", b"wrong")
+                archive.writestr("predicate.json", b"{}")
+                archive.writestr("bundle.json", b"{}")
+            altered = dict(artifact, size_in_bytes=len(malicious.getvalue()),
+                           digest="sha256:" + hashlib.sha256(malicious.getvalue()).hexdigest())
+            with self.assertRaises(subject.Refusal):
+                subject.validated_archive_members(altered, malicious.getvalue())
+
+    def test_transition_gate_rejects_each_required_evidence_class(self):
+        for gate, cases in (
+            ("A", ("repository-id", "caller", "receiver-job", "receiver-job-duplicate",
+                   "receiver-record", "receiver-certificate", "receiver-subject", "receiver-nonce",
+                   "workflow-bytes", "receiver-archive", "receiver-size", "receiver-expiry")),
+            ("B", ("gate-a", "receiver-binding", "linux-job", "linux-certificate",
+                   "linux-nonce", "capsule-subject",
+                   "revoke-step", "verify-step", "revoke-ordinal", "verify-ordinal",
+                   "revocation-line", "outside-line")),
+        ):
+            for case in cases:
+                with self.subTest(gate=gate, case=case):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        evidence = fixture_successful_evidence(temporary)
+                        arguments = fixture_transition_arguments(evidence, gate)
+                        rows = arguments["jobs_snapshot"]["pages"][0]["jobs"]
+                        artifacts = arguments["artifacts_snapshot"]["pages"][0]["artifacts"]
+                        receiver = Path(temporary) / "artifacts" / artifacts[0]["name"]
+                        if case == "repository-id":
+                            arguments["repository_metadata"]["id"] = 8150002
+                        elif case == "caller":
+                            arguments["run_metadata"]["path"] = "other.yml"
+                        elif case == "receiver-job":
+                            rows[0]["conclusion"] = "failure"
+                        elif case == "receiver-job-duplicate":
+                            rows.append(copy.deepcopy(rows[0]))
+                            arguments["jobs_snapshot"]["total_count"] += 1
+                            arguments["jobs_snapshot"]["pages"][0]["total_count"] += 1
+                        elif case in ("receiver-certificate", "gate-a"):
+                            path = receiver / "verified.json"
+                            document = json.loads(path.read_text(encoding="ascii"))
+                            document["verificationResult"]["signature"]["certificate"]["githubWorkflowSHA"] = "b" * 40
+                            path.write_text(json.dumps(document), encoding="ascii")
+                        elif case == "receiver-record":
+                            path = receiver / "subject.bin"
+                            record = path.read_bytes()
+                            path.write_bytes(record[:-1] + b"\x01")
+                            repack_artifact(temporary, artifacts[0])
+                        elif case == "receiver-subject":
+                            mutate_artifact_statement_digest(temporary, artifacts[0])
+                        elif case == "receiver-nonce":
+                            mutate_artifact_nonce(temporary, artifacts[0])
+                        elif case == "workflow-bytes":
+                            control = Path(temporary) / "control"
+                            for relative in subject.PINNED_WORKFLOW_SHA256:
+                                path = control / relative
+                                path.parent.mkdir(parents=True, exist_ok=True)
+                                path.write_bytes((ROOT / relative).read_bytes())
+                            target = control / subject.ROLE_PATHS["windows-receiver"]
+                            target.write_bytes(target.read_bytes() + b"\n")
+                            arguments["control_root"] = control
+                        elif case == "receiver-archive":
+                            (Path(temporary) / "artifacts" / (artifacts[0]["name"] + ".zip")).write_bytes(b"wrong")
+                        elif case == "receiver-size":
+                            artifacts[0]["size_in_bytes"] += 1
+                        elif case == "receiver-expiry":
+                            artifacts[0]["expires_at"] = "2000-01-01T00:00:00+00:00"
+                        elif case == "linux-job":
+                            rows[1]["conclusion"] = "failure"
+                        elif case == "receiver-binding":
+                            artifacts[1]["name"] = artifacts[1]["name"][:-1] + "c"
+                        elif case == "linux-certificate":
+                            path = Path(temporary) / "artifacts" / artifacts[1]["name"] / "verified.json"
+                            document = json.loads(path.read_text(encoding="ascii"))
+                            document["verificationResult"]["signature"]["certificate"]["buildSignerURI"] = "wrong"
+                            path.write_text(json.dumps(document), encoding="ascii")
+                        elif case == "capsule-subject":
+                            path = Path(temporary) / "artifacts" / artifacts[1]["name"] / "subject.bin"
+                            path.write_bytes(b"wrong")
+                            repack_artifact(temporary, artifacts[1])
+                        elif case == "linux-nonce":
+                            mutate_artifact_nonce(temporary, artifacts[1])
+                        elif case == "revoke-step":
+                            rows[1]["steps"][1]["conclusion"] = "skipped"
+                        elif case == "verify-step":
+                            rows[1]["steps"][2]["conclusion"] = "skipped"
+                        elif case == "revoke-ordinal":
+                            arguments["step_ordinal_pins"]["revoke-source-token"] = 7
+                        elif case == "verify-ordinal":
+                            arguments["step_ordinal_pins"]["verify-token-rejection"] = 7
+                        elif case == "revocation-line":
+                            arguments["log_sections"]["verify-token-rejection"] += "handoff-revocation=confirmed\n"
+                        elif case == "outside-line":
+                            arguments["other_log_sections"] = ["handoff-revocation=confirmed\n"]
+                        with self.assertRaises(subject.Refusal):
+                            subject.verify_transition_evidence(**arguments)
 
 
 if __name__ == "__main__":

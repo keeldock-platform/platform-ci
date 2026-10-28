@@ -14,7 +14,6 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      metadata: read
       actions: read
       id-token: write
       attestations: write
@@ -53,28 +52,45 @@ jobs:
         run: |
           set -euo pipefail
           api_path="repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/artifacts?per_page=100"
-          mkdir -p "$RUNNER_TEMP/receiver-record"
+          evidence="$RUNNER_TEMP/role-evidence"
+          mkdir -p "$evidence/artifacts"
           selected=''
           for retry in $(seq 1 60); do
-            gh api --paginate --slurp "$api_path" > "$RUNNER_TEMP/artifact-pages.json" 2>/dev/null
-            if selected="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$RUNNER_TEMP/artifact-pages.json" --role windows-receiver --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" 2>/dev/null)"; then
-              if gh run download "$KD_RUN_ID" --repo "$KD_REPOSITORY" --name "$selected" --dir "$RUNNER_TEMP/receiver-record" 2>/dev/null; then break; fi
-            fi
+            gh api --paginate --slurp "$api_path" > "$evidence/artifact-pages.json" 2>/dev/null
+            if selected="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$evidence/artifact-pages.json" --role windows-receiver --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --field name 2>/dev/null)"; then break; fi
             selected=''
             sleep 5
           done
-          [[ -n "$selected" && -s "$RUNNER_TEMP/receiver-record/subject.bin" && -s "$RUNNER_TEMP/receiver-record/bundle.json" ]]
+          [[ -n "$selected" ]]
+          printf '%s\n' "$selected" > "$evidence/receiver-name.txt"
+          identifier="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$evidence/artifact-pages.json" --role windows-receiver --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --field id)"
+          gh api "repos/$KD_REPOSITORY/actions/artifacts/$identifier/zip" > "$evidence/artifacts/$selected.zip" 2>/dev/null
+          python -B kit/confinement/role_signer.py extract-artifact --artifacts-file "$evidence/artifact-pages.json" --role windows-receiver --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA" --archive-file "$evidence/artifacts/$selected.zip" --output-directory "$evidence/artifacts/$selected"
       - name: Verify receiver bundle before binding the synthetic capsule
         run: |
           set -euo pipefail
-          repository_root="https:"'//'"$KD_REPOSITORY"
-          gh attestation verify "$RUNNER_TEMP/receiver-record/subject.bin" --bundle "$RUNNER_TEMP/receiver-record/bundle.json" --repo "$KD_REPOSITORY" --signer-workflow "$repository_root/.github/workflows/lane-h-windows-receiver.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$RUNNER_TEMP/receiver-record/verified.json" 2>/dev/null
+          evidence="$RUNNER_TEMP/role-evidence"
+          selected="$(cat "$evidence/receiver-name.txt")"
+          directory="$evidence/artifacts/$selected"
+          gh attestation verify "$directory/subject.bin" --bundle "$directory/bundle.json" --repo "$KD_REPOSITORY" --signer-workflow "$KD_REPOSITORY/.github/workflows/lane-h-windows-receiver.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$directory/verified.json" 2>/dev/null
+      - name: Apply evidence-backed Gate A before creating the Linux subject
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/role-evidence"
+          gh api "repos/$KD_REPOSITORY" --jq '{id:.id,full_name:.full_name,owner_id:.owner.id,visibility:.visibility}' > "$evidence/repository.json" 2>/dev/null
+          gh api "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID" > "$evidence/run.json" 2>/dev/null
+          gh api --paginate --slurp "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/attempts/$KD_RUN_ATTEMPT/jobs?per_page=100" > "$evidence/jobs-pages.json" 2>/dev/null
+          gh api --paginate --slurp "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/artifacts?per_page=100" > "$evidence/artifact-pages.json" 2>/dev/null
+          python -B kit/confinement/role_signer.py wrap-pages --kind jobs --input "$evidence/jobs-pages.json" --output "$evidence/jobs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          python -B kit/confinement/role_signer.py wrap-pages --kind artifacts --input "$evidence/artifact-pages.json" --output "$evidence/artifacts.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          python -B kit/confinement/role_signer.py gate-transition --gate A --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --jobs-file "$evidence/jobs.json" --artifacts-file "$evidence/artifacts.json" --repository-metadata "$evidence/repository.json" --run-metadata "$evidence/run.json" --artifact-directory "$evidence/artifacts"
       - name: Create the fixed synthetic capsule bound to receiver bytes
         id: subject
         run: |
           set -euo pipefail
           repository_id="$(cat "$RUNNER_TEMP/control-repository-id.txt")"
-          python -B kit/confinement/role_signer.py prepare --profile "$KD_PROFILE" --role linux-fetch-encrypt --repository "$KD_REPOSITORY" --repository-id "$repository_id" --control-sha "$KD_SHA" --ref "$KD_REF" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --workflow-ref "$KD_WORKFLOW_REF" --runner "$KD_RUNNER" --receiver-record "$RUNNER_TEMP/receiver-record/subject.bin" --output-directory "$RUNNER_TEMP/role-statement"
+          selected="$(cat "$RUNNER_TEMP/role-evidence/receiver-name.txt")"
+          python -B kit/confinement/role_signer.py prepare --profile "$KD_PROFILE" --role linux-fetch-encrypt --repository "$KD_REPOSITORY" --repository-id "$repository_id" --control-sha "$KD_SHA" --ref "$KD_REF" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --workflow-ref "$KD_WORKFLOW_REF" --runner "$KD_RUNNER" --receiver-record "$RUNNER_TEMP/role-evidence/artifacts/$selected/subject.bin" --output-directory "$RUNNER_TEMP/role-statement"
       - name: handoff-revoke-source-token-v1
         id: revoke-source-token
         run: |

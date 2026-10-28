@@ -11,7 +11,6 @@ jobs:
       profile: production-synthetic
     permissions:
       contents: read
-      metadata: read
       id-token: write
       attestations: write
   linux-fetch-encrypt:
@@ -22,7 +21,6 @@ jobs:
       profile: production-synthetic
     permissions:
       contents: read
-      metadata: read
       actions: read
       id-token: write
       attestations: write
@@ -36,7 +34,6 @@ jobs:
       profile: production-synthetic
     permissions:
       contents: read
-      metadata: read
       actions: read
       id-token: write
       attestations: write
@@ -51,7 +48,6 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-      metadata: read
       actions: read
       attestations: read
     defaults:
@@ -83,31 +79,23 @@ jobs:
           gh api --paginate --slurp "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/artifacts?per_page=100" > "$evidence/artifact-pages.json" 2>/dev/null
           python -B kit/confinement/role_signer.py wrap-pages --kind jobs --input "$evidence/jobs-pages.json" --output "$evidence/jobs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
           python -B kit/confinement/role_signer.py wrap-pages --kind artifacts --input "$evidence/artifact-pages.json" --output "$evidence/artifacts.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
-          gh run download "$KD_RUN_ID" --repo "$KD_REPOSITORY" --dir "$evidence/artifacts" 2>/dev/null
-          repository_root="https:"'//'"$KD_REPOSITORY"
-          shopt -s nullglob
-          role_dirs=("$evidence"/artifacts/role-statement-*)
-          role_dir_count=0
-          for directory in "${role_dirs[@]}"; do role_dir_count=$((role_dir_count + 1)); done
-          [[ "$role_dir_count" -eq 3 ]]
-          for directory in "${role_dirs[@]}"; do
-            artifact_name="$(basename "$directory")"
-            case "$artifact_name" in
-              role-statement-windows-receiver-*) role=windows-receiver ;;
-              role-statement-linux-fetch-encrypt-*) role=linux-fetch-encrypt ;;
-              role-statement-capsule-attester-*) role=capsule-attester ;;
-              *) exit 1 ;;
-            esac
-            case "$role" in
-              windows-receiver) workflow_path='.github/workflows/lane-h-windows-receiver.yml' ;;
-              linux-fetch-encrypt) workflow_path='.github/workflows/lane-h-linux-fetch-encrypt.yml' ;;
-              capsule-attester) workflow_path='.github/workflows/lane-h-capsule-attester.yml' ;;
-            esac
-            gh attestation verify "$directory/subject.bin" --bundle "$directory/bundle.json" --repo "$KD_REPOSITORY" --signer-workflow "$repository_root$workflow_path" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$directory/verified.json" 2>/dev/null
+          for role in windows-receiver linux-fetch-encrypt capsule-attester; do
+            artifact_name="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$evidence/artifacts.json" --role "$role" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --field name)"
+            artifact_id="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$evidence/artifacts.json" --role "$role" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --field id)"
+            directory="$evidence/artifacts/$artifact_name"
+            gh api "repos/$KD_REPOSITORY/actions/artifacts/$artifact_id/zip" > "$directory.zip" 2>/dev/null
+            python -B kit/confinement/role_signer.py extract-artifact --artifacts-file "$evidence/artifacts.json" --role "$role" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA" --archive-file "$directory.zip" --output-directory "$directory"
+            gh attestation verify "$directory/subject.bin" --bundle "$directory/bundle.json" --repo "$KD_REPOSITORY" --signer-workflow "$KD_REPOSITORY/.github/workflows/lane-h-$role.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$directory/verified.json" 2>/dev/null
             subject_sha=$(sha256sum "$directory/subject.bin" | awk '{print $1}')
             printf '%s\n' "$subject_sha" > "$directory/subject.sha256"
-            gh api --paginate --slurp "repos/$KD_REPOSITORY/attestations/sha256:$subject_sha" > "$evidence/provider-$role-pages.json" 2>/dev/null
-            python -B kit/confinement/role_signer.py wrap-pages --kind attestations --input "$evidence/provider-$role-pages.json" --output "$evidence/provider-$role.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+            if [[ ! -f "$evidence/provider-$subject_sha.json" ]]; then
+              gh api --paginate --slurp "repos/$KD_REPOSITORY/attestations/sha256:$subject_sha" > "$evidence/provider-$subject_sha-pages.json" 2>/dev/null
+              python -B kit/confinement/role_signer.py wrap-pages --kind attestations --input "$evidence/provider-$subject_sha-pages.json" --output "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+              python -B kit/confinement/role_signer.py export-provider --snapshot "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA" --output-directory "$evidence/provider-$subject_sha"
+              while read -r index provider_role; do
+                gh attestation verify "$directory/subject.bin" --bundle "$evidence/provider-$subject_sha/bundle-$index.json" --repo "$KD_REPOSITORY" --signer-workflow "$KD_REPOSITORY/.github/workflows/lane-h-$provider_role.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$evidence/provider-$subject_sha/verified-$index.json" 2>/dev/null
+              done < "$evidence/provider-$subject_sha/manifest.txt"
+            fi
             sha256sum "$directory/subject.bin" "$directory/predicate.json" "$directory/bundle.json" "$directory/verified.json" >> "$evidence/file-hashes.txt"
           done
           sha256sum .github/workflows/windows-source-admission.yml .github/workflows/lane-h-windows-receiver.yml .github/workflows/lane-h-linux-fetch-encrypt.yml .github/workflows/lane-h-capsule-attester.yml > "$evidence/workflow-hashes.txt"
