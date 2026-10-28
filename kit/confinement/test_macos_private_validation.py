@@ -473,10 +473,14 @@ class SourceRefTests(unittest.TestCase):
 class CoreContractTreeTests(unittest.TestCase):
     @staticmethod
     def _module_lines(names):
-        return "".join(
+        declarations = "".join(
             chr(35) + '[path = "../fuzz_targets/' + name + '.rs"]\nmod ' + name + ';\n'
             for name in sorted(names)
-        ).encode("ascii")
+        )
+        references = "fn replay() {\n" + "".join(
+            "    let _ = " + name + "::fuzz;\n" for name in sorted(names)
+        ) + "}\n"
+        return (declarations + references).encode("ascii")
 
     @staticmethod
     def _validate_feedback_tree(entries, concern, main_payload=None):
@@ -657,9 +661,16 @@ class CoreContractTreeTests(unittest.TestCase):
             wrong_mode = dict(entries)
             wrong_mode[root_lock] = (invalid_mode, "b" * 40)
             digest = hashlib.sha256(b"x").hexdigest()
+
+            def blob_payload(unused_repository, unused_git, unused_environment,
+                             unused_entries, path, **unused):
+                if path == "fuzz/src/main.rs":
+                    return self._module_lines(subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS)
+                return b"x"
+
             with self.subTest(mode=invalid_mode), patch.object(
                 subject, "_contract_tree_entries", side_effect=(dict(wrong_mode), wrong_mode),
-            ), patch.object(subject, "_contract_blob", return_value=b"x") as blob, \
+            ), patch.object(subject, "_contract_blob", side_effect=blob_payload) as blob, \
                     patch.object(subject, "_feedback_corpus_shape", return_value=True), \
                     patch.object(subject, "_feedback_manifest_shape", return_value=True), \
                     patch.object(subject, "_feedback_fuzz_manifest_shape", return_value=True), \
@@ -1039,6 +1050,17 @@ class CoreContractTreeTests(unittest.TestCase):
             valid + b'include!("../fuzz_targets/new_target.rs");\n',
             valid + b'include_str!("../fuzz_targets/new_target.rs");\n',
             valid + b'include_str !("../fuzz_targets/new_target.rs");\n',
+            valid + b'include!("unrelated.rs");\n',
+            valid + b"// include anywhere is refused\n",
+            (chr(35) + "[cfg(any())]\n").encode("ascii") + valid,
+            (chr(35) + "[allow(dead_code)]\n").encode("ascii") + valid,
+            b"/*\n" + valid + b"\n*/",
+            b'let hidden = r"' + valid + b'";\n',
+            b'let hidden = r' + bytes((35,)) + b'"' + valid + b'"' + bytes((35,)) + b';\n',
+            b'let hidden = "\n' + valid + b'";\n',
+            valid.replace(b"new_target::fuzz", b"new_target::unused"),
+            valid.replace(b"new_target::fuzz", b"// new_target::fuzz"),
+            valid.replace(b"new_target::fuzz", b'"new_target::fuzz"'),
         )
         for payload in invalid:
             with self.subTest(payload=payload):

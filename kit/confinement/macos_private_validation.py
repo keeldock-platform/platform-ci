@@ -1680,17 +1680,39 @@ def _feedback_fuzz_modules_shape(main_payload, target_names):
         text = main_payload.decode("utf-8", "strict")
     except UnicodeDecodeError:
         return False
-    if "\r" in text or re.search(r"\binclude(?:_str)?\s*!\s*\([^)]*fuzz_targets", text, re.S):
+    raw_string = re.compile(r"\b(?:b|c)?r" + re.escape(chr(35)) + r'*"')
+    if ("\r" in text or "/*" in text or "include" in text
+            or raw_string.search(text)):
         return False
-    attribute = re.compile(r"^\s*" + re.escape(chr(35)) + r"\s*\[")
-    direct_path = re.compile(r"^\s*" + re.escape(chr(35)) + r"\s*\[\s*path\b")
+    quoted = False
+    escaped = False
+    for character in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            elif character == "\n":
+                return False
+        elif character == '"':
+            quoted = True
+    if quoted:
+        return False
+    attribute = re.compile(r"^\s*" + re.escape(chr(35)) + r"\s*!?\s*\[")
     module = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\b")
     declared = set()
+    references = set()
+    reference_patterns = {
+        name: re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"::fuzz(?![A-Za-z0-9_])")
+        for name in target_names
+    }
     lines = text.splitlines()
     index = 0
     while index < len(lines):
         line = lines[index]
-        if attribute.match(line) and (direct_path.match(line) or re.search(r"\bpath\s*=", line)):
+        if attribute.match(line):
             if index + 1 >= len(lines):
                 return False
             match = re.fullmatch(
@@ -1708,8 +1730,12 @@ def _feedback_fuzz_modules_shape(main_payload, target_names):
             continue
         if module.match(line):
             return False
+        code = re.sub(r'"(?:\\.|[^"\\])*"', '""', line).split("//", 1)[0]
+        for name in target_names - references:
+            if reference_patterns[name].search(code):
+                references.add(name)
         index += 1
-    return declared == set(target_names)
+    return declared == references == set(target_names)
 
 
 def _feedback_corpus_paths_shape(corpus_paths, target_names=None):
