@@ -139,6 +139,8 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
+    'kit/confinement/native_loopback_profile.py': '5dee8e3f29e1d9178099eeefdec9f7520efe3939ab9b8cae71406b8da48a4ab7',
+    'kit/confinement/test_native_loopback_profile.py': '9abf36345bf1263a8d7ff8ea6151a2ad8b0ed0afdb0c26f557eb898f6f9b56ae',
     'kit/confinement/foundation_node_feedback.py': 'b01ad561961f47d9c04d59f5282c82330eb3b005f93fbe302a95cc6d24ed7726',
     'kit/confinement/test_foundation_node_feedback.py': '386cbf9aeebf623c69466a68324a9fd4e48d16bc24a363fa40048537dc6cd023',
     'kit/confinement/macos_node_contract.py': '890cd2891954d4abf7db85ec4295e7aa01c4e2ca3a083ef7537904e3c3c1aeb6',

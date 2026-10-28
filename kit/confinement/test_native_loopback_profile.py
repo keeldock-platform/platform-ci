@@ -56,8 +56,19 @@ class ProfileValidationTests(unittest.TestCase):
         profile = valid_profile()
         self.assertIs(validate_profile(profile), profile)
 
-    def test_rejects_external_ipv4_and_ipv6_addresses(self):
-        for host in ("192.0.2.1", "2001:db8::1", "::1", "localhost"):
+    def test_rejects_external_and_alternate_loopback_addresses(self):
+        for host in (
+            "192.0.2.1",
+            "2001:db8::1",
+            "::1",
+            "localhost",
+            "127.0.0.2",
+            "127.1",
+            "2130706433",
+            "::ffff:127.0.0.1",
+            "169.254.169.254",
+            "fe80::1%lo0",
+        ):
             profile = valid_profile()
             endpoint = profile.channels[0]
             changed = (LoopbackEndpoint(endpoint.name, host, endpoint.port),) + profile.channels[1:]
@@ -117,6 +128,9 @@ class ProfileValidationTests(unittest.TestCase):
 
 
 class ProofPlanTests(unittest.TestCase):
+    def test_required_proof_subjects_are_fixed(self):
+        self.assertEqual(PROOF_SUBJECTS, ("test_worker", "automation_processes"))
+
     def test_positive_plan_proves_every_declared_loopback_channel_reachable(self):
         self.assertEqual(NATIVE_LOOPBACK_PROOF_PLAN.positive_loopback, POSITIVE_LOOPBACK_PROOFS)
         self.assertEqual(
@@ -132,7 +146,9 @@ class ProofPlanTests(unittest.TestCase):
         )
         self.assertTrue(all(check.expected == "reachable" for check in POSITIVE_LOOPBACK_PROOFS))
         self.assertTrue(all(check.transport == "tcp" for check in POSITIVE_LOOPBACK_PROOFS))
-        self.assertTrue(all(check.subjects == PROOF_SUBJECTS for check in POSITIVE_LOOPBACK_PROOFS))
+        self.assertTrue(
+            all(check.subjects == ("test_worker", "automation_processes") for check in POSITIVE_LOOPBACK_PROOFS)
+        )
 
     def test_negative_plan_refuses_egress_and_runner_ipc_for_every_subject(self):
         expected_probes = {
@@ -160,7 +176,9 @@ class ProofPlanTests(unittest.TestCase):
             expected_probes,
         )
         self.assertTrue(all(check.expected == "refused" for check in NEGATIVE_EGRESS_PROOFS))
-        self.assertTrue(all(check.subjects == PROOF_SUBJECTS for check in NEGATIVE_EGRESS_PROOFS))
+        self.assertTrue(
+            all(check.subjects == ("test_worker", "automation_processes") for check in NEGATIVE_EGRESS_PROOFS)
+        )
 
 
 class SourceJobProfileTests(unittest.TestCase):
