@@ -150,9 +150,9 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_windows_native_preflight.py': '02d6bcf6d52d4c5f26589b6da8e224b5f0b3f8f57255e00c135f666caed613fe',
     'kit/confinement/macos_source_reader.py': 'd3fbda5c68ac7d21761e946b0f546607b19c23ccb725e453f3fffef3321c0d70',
     'kit/confinement/test_macos_source_reader.py': 'ed8e9b850f7d3a80346ad4a6efc182b28ff9c22fa669eda241f2c5feb3ccf806',
-    '.github/workflows/node-lock-return.yml': '56f1da2365d109aa738700347e6a1dfb01e6ea4b4a2f38467f207eb7e24aafa1',
-    '.github/workflows/core-rust-format-return.yml': '207d01588ccb43f0cbf609b07786b86b50238a39a8f207eaee6cb5672c796019',
-    '.github/workflows/core-build-diagnostic-return.yml': 'f972093828b56dc40b563bda49fe1077c35fa3c4a0d9e3eecd56d1181a818270',
+    '.github/workflows/node-lock-return.yml': 'abec8966cdd041c91c0a0f6a3e9f672b96a4a45058dce5349d343489c2dd6d3d',
+    '.github/workflows/core-rust-format-return.yml': 'ddcbb0e301cd4fe09bdd87ab3658e23497adfdedefb39e01deab9877669337e2',
+    '.github/workflows/core-build-diagnostic-return.yml': '9eb4590b7055301fc2bd6bb15464066b01e1cbe0c433edb88e7bf4ec0b89554a',
     'kit/confinement/macos_feedback_producer.py': '4474457a1af8a4122aebe90901d4eb11e536a80da2ae5a7cc1f89731342e11b5',
     'kit/confinement/test_macos_feedback_producer.py': '63bfc07c37ccb828e832a043866c339d6b00867428a3d3764a5c6b9e0d4eb0a4',
     'kit/confinement/feedback_producer_crypto.mjs': 'e621131afec27d78b170e207843e76e20d4f9682cf2323c3a787ac53b6db60da',
@@ -164,8 +164,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_feedback_admin_integration.py': 'a668a1d799fe7eb10fa174a4a5141e914724968196be055f6a3f7e6b67fc5ae8',
     'kit/confinement/feedback_api.py': '9ab159b156941dc0e3431bd35e5a2823ecba11fa1971d71015a64e64332ad700',
     'kit/confinement/test_feedback_api.py': '8391e8dd3d8b87f4e1eed8a9ee0a0d99a2a3d62ebc4d495a72c3879f1162fa78',
-    'kit/confinement/feedback_public_audit.py': 'a0a22cf4839cd25900ce80f6f61aacb802111ffc06469dd9784da2a26cdf9751',
-    'kit/confinement/test_feedback_public_audit.py': 'd05d55bab36e4a4de93a0ec1389b3c1a6fb81bdba65e20adda1ef42ad3e7c52b',
+    'kit/confinement/feedback_public_audit.py': '903c4684b88ce79a9e27582473e9c568568278a2dc7c18dbea8d1579dc57a5be',
+    'kit/confinement/test_feedback_public_audit.py': 'e9c28e1049603854a14f9b42a2de2a5eab5f0c01e4e72f907234e260599af93d',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(

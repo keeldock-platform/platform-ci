@@ -531,7 +531,16 @@ jobs:
           if [[ "$audit_status" -ne 0 || "$(printf '%s\n' "$audit_line" | wc -l)" -ne 1 \
             || "$(printf '%s' "$audit_line" | wc -c)" -gt 16384 \
             || "$audit_line" != KD-FEEDBACK-AUDIT\ * ]]; then
-            printf 'KD-FEEDBACK-AUDIT-REFUSAL {"reason":"feedback_audit_invalid","schema_version":1}\n'
+            set +e
+            safe_refusal="$(printf '%s\n' "$audit_line" | python3 -B kit/confinement/feedback_public_audit.py normalize-refusal 2>/dev/null)"
+            normalize_status=$?
+            set -e
+            if [[ "$normalize_status" -ne 0 || "$(printf '%s\n' "$safe_refusal" | wc -l)" -ne 1 \
+              || "$(printf '%s' "$safe_refusal" | wc -c)" -gt 256 \
+              || "$safe_refusal" != KD-FEEDBACK-AUDIT-REFUSAL\ * ]]; then
+              safe_refusal='KD-FEEDBACK-AUDIT-REFUSAL {"phase":"unavailable","reason":"feedback_audit_invalid","schema_version":1}'
+            fi
+            printf '%s\n' "$safe_refusal"
             exit 1
           fi
           printf '%s\n' "$audit_line"
