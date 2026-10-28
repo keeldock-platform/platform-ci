@@ -354,7 +354,7 @@ class MacOSNodeContractTests(unittest.TestCase):
                 source_identity=current_identity, run_worker=runner, deadline=time.monotonic() + 600,
                 accepted_lock=lock_bytes, accepted_provenance=provenance,
             )
-        self.assertEqual(caught.exception.reason, "tool_unavailable")
+        self.assertEqual(caught.exception.reason, "command_failed")
         self.assertEqual(caught.exception.stage, "typescript_tests")
         self.assertEqual(caught.exception.substage, "tests")
         self.assertEqual(caught.exception.completed_stages, (
