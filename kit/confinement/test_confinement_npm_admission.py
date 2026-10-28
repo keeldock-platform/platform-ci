@@ -539,6 +539,40 @@ class NpmAdmissionTests(unittest.TestCase):
                 lambda raw=raw: subject._preflight_tar_headers(raw), "npm_archive_invalid",
             )
 
+    def test_tar_preflight_checks_prefixed_directory_path(self):
+        manifest = b'{"name":"sample","version":"1.0.0"}'
+        manifest_member = tarfile.TarInfo("package/package.json")
+        directory = tarfile.TarInfo("package/dir/")
+        directory.type = tarfile.DIRTYPE
+        base = gzip.decompress(_tar_with_members((
+            (manifest_member, manifest), (directory, b""),
+        )))
+        directory_offset = 1024 + (((len(manifest) + 511) // 512) * 512)
+
+        def prefixed_archive(prefix, name):
+            raw = bytearray(base)
+            header = bytearray(raw[directory_offset:directory_offset + 512])
+            header[:100] = name.encode("ascii").ljust(100, b"\x00")
+            header[345:500] = prefix.encode("ascii").ljust(155, b"\x00")
+            header[148:156] = b"        "
+            header[148:156] = ("%06o\x00 " % sum(header)).encode("ascii")
+            raw[directory_offset:directory_offset + 512] = header
+            return gzip.compress(bytes(raw), mtime=0)
+
+        valid_data = prefixed_archive("package", "dir/")
+        valid_entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(valid_data)}
+        self.assertEqual(subject.verify_tarball(valid_entry, valid_data)["file_count"], 1)
+
+        invalid_data = prefixed_archive("package/dir/", "/")
+        invalid_entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(invalid_data)}
+        self.assert_refused(
+            lambda: subject._preflight_tar_headers(gzip.decompress(invalid_data)),
+            "npm_archive_invalid",
+        )
+        self.assert_refused(
+            lambda: subject.verify_tarball(invalid_entry, invalid_data), "npm_archive_invalid",
+        )
+
     def test_tar_preflight_refuses_case_collisions_and_oversized_header(self):
         upper = tarfile.TarInfo("package/Binding.node")
         lower = tarfile.TarInfo("package/binding.node")

@@ -612,10 +612,23 @@ def _preflight_tar_headers(data):
         if member_type not in (b"0", b"5", b"\x00"):
             _refuse("npm_archive_invalid")
         raw_name = header[:100].split(b"\x00", 1)[0]
+        raw_prefix = header[345:500].split(b"\x00", 1)[0]
+        if not raw_name:
+            _refuse("npm_archive_invalid")
+        raw_path = raw_prefix + b"/" + raw_name if raw_prefix else raw_name
         if member_type == b"5":
-            if not raw_name.endswith(b"/") or raw_name.endswith(b"//"):
+            if not raw_path.endswith(b"/") or raw_path.endswith(b"//"):
                 _refuse("npm_archive_invalid")
-        elif raw_name.endswith(b"/"):
+            validated_path = raw_path[:-1]
+        else:
+            if raw_path.endswith(b"/"):
+                _refuse("npm_archive_invalid")
+            validated_path = raw_path
+        try:
+            path_text = validated_path.decode("utf-8", "strict")
+        except UnicodeError:
+            _refuse("npm_archive_invalid")
+        if not _safe_relative_archive_path(path_text):
             _refuse("npm_archive_invalid")
         size = _tar_octal(header[124:136])
         if size > MAX_PACKAGE_UNPACKED_BYTES or (member_type == b"5" and size != 0):
@@ -702,7 +715,7 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
                 relative = raw_name.rstrip("/")
                 if relative.split("/", 1)[0] != "package":
                     _refuse("npm_archive_invalid")
-                if not is_directory and raw_name.endswith("/"):
+                if raw_name.endswith("//") or (not is_directory and raw_name.endswith("/")):
                     _refuse("npm_archive_invalid")
                 folded_relative = relative.lower()
                 if relative in entries or folded_relative in folded:
