@@ -1,6 +1,7 @@
 """Digest-only scanner for a committed log canary.
 
-The canary is a lowercase hexadecimal string of at least 32 random bytes. The pinned
+The canary is a lowercase hexadecimal string of at least 32 random bytes drawn from a
+cryptographically secure generator; low-entropy values are refused. The pinned
 configuration carries only SHA-256 digests of the canary and of its fixed encodings, never the
 value. The scanner slides fixed-width windows over runs of the matching alphabet in the supplied
 bytes and compares window digests, so a match is reported as a closed enum and the matched text is
@@ -11,14 +12,22 @@ Fixed encodings covered, for the canary text and for the decoded canary bytes wh
     plain        the canary text itself, case folded
     hex          the hexadecimal encoding of the canary text bytes
     utf16le      the UTF-16LE encoding of the canary text
-    base64       standard Base64 of the text bytes and of the decoded bytes
-    base64url    URL-safe Base64 of the text bytes and of the decoded bytes
+    base64       standard Base64 of the text bytes, of the UTF-16LE text bytes and of the
+                 decoded bytes
+    base64url    URL-safe Base64 of the decoded bytes
+
+For a hexadecimal text the standard and URL-safe Base64 of the text bytes, and of the UTF-16LE
+text bytes, are always identical strings, because no sextet reaches 62 or 63. Only one form of
+each is therefore kept.
 
 Base64 forms are matched at all three alignments, using only the characters fully determined by
 the canary, so the value is found inside a larger encoded blob and with padding removed. Windows
-are also taken over a view with NUL bytes removed, which folds any UTF-16 text into plain ASCII.
-Values split across log lines or percent-escaped are out of scope: the enforced boundary, not this
-scanner, is the control for a hostile writer.
+are also taken over a view with NUL bytes removed, which folds any UTF-16 text into plain ASCII,
+and over a joined view: consecutive lines that consist entirely of Base64 or URL-safe Base64
+characters, after removing a leading log timestamp, are concatenated, so wrapped output at any
+column width is found. Work on the joined view counts toward the byte and window budgets.
+Percent-escaped values are out of scope: the enforced boundary, not this scanner, is the control
+for a hostile writer.
 """
 
 import base64
@@ -40,10 +49,16 @@ REFUSAL_REASONS = frozenset(("config_invalid", "config_unpinned", "input_invalid
 SHIFTS = (0, 1, 2)
 FORMS = ("plain", "hex", "utf16le") + tuple(
     encoding + "-" + source + "-" + str(shift)
-    for encoding in ("base64", "base64url")
-    for source in ("text", "bin")
+    for encoding, source in (
+        ("base64", "text"), ("base64", "utf16"), ("base64", "bin"), ("base64url", "bin"),
+    )
     for shift in SHIFTS
 )
+MIN_DISTINCT_NIBBLES = 12
+JOIN_LIMIT = 1024 * 1024
+LINE_LIMIT = 1024 * 1024
+TIMESTAMP_RE = re.compile(rb"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{7}Z ")
+WRAP_LINE_RE = re.compile(rb"[A-Za-z0-9+/_-]+={0,2}")
 CONFIG_FIELDS = frozenset(("digests", "text_length"))
 TEXT_RE = re.compile(r"(?:[0-9a-f]{2}){32,128}")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}")
@@ -79,7 +94,12 @@ def _form_data(label, text):
     if label == "utf16le":
         return text.encode("utf-16-le")
     encoding, source, shift = label.split("-")
-    data = raw_text if source == "text" else bytes.fromhex(text)
+    if source == "text":
+        data = raw_text
+    elif source == "utf16":
+        data = text.encode("utf-16-le")
+    else:
+        data = bytes.fromhex(text)
     return _interior(data, int(shift), encoding == "base64url")
 
 
@@ -93,7 +113,8 @@ def _form_class(label):
 
 def compute_config(text):
     """Return the pinned digest configuration for a canary value."""
-    if type(text) is not str or TEXT_RE.fullmatch(text) is None:
+    if (type(text) is not str or TEXT_RE.fullmatch(text) is None
+            or len(set(text)) < MIN_DISTINCT_NIBBLES):
         raise ScanRefusal("config_invalid")
     return {
         "digests": {
@@ -152,7 +173,51 @@ class Scanner:
         self._saw_nul = False
         self._total = 0
         self._windows = 0
+        self._tail = b""
+        self._join = b""
+        self._join_lines = 0
+        self._finished = False
         self.present = False
+
+    def _flush_join(self, keep):
+        if self._join_lines >= 2 and self._join and not self.present:
+            self._total += len(self._join)
+            if self._total > MAX_TOTAL_BYTES:
+                raise ScanRefusal("scan_limit")
+            if self._scan(self._join, False):
+                self.present = True
+        if keep:
+            self._join = self._join[-(self._carry_length - 1):]
+            self._join_lines = 2
+        else:
+            self._join = b""
+            self._join_lines = 0
+
+    def _wrap_line(self, line):
+        if line.endswith(b"\r"):
+            line = line[:-1]
+        stamp = TIMESTAMP_RE.match(line)
+        if stamp is not None:
+            line = line[stamp.end():]
+        if WRAP_LINE_RE.fullmatch(line) is None:
+            self._flush_join(False)
+            return
+        self._join += line
+        self._join_lines += 1
+        if len(self._join) > JOIN_LIMIT:
+            self._flush_join(True)
+
+    def finish(self):
+        """Process the last partial line and any joined run; idempotent."""
+        if self._finished:
+            return
+        self._finished = True
+        if self.present:
+            return
+        if self._tail:
+            self._wrap_line(self._tail)
+            self._tail = b""
+        self._flush_join(False)
 
     def _scan(self, buffer, include_utf16):
         for group in self._groups:
@@ -198,6 +263,16 @@ class Scanner:
             found = self._scan(plain, False)
         if found:
             self.present = True
+            return
+        parts = (self._tail + chunk).split(b"\n")
+        self._tail = parts.pop()
+        for line in parts:
+            self._wrap_line(line)
+            if self.present:
+                return
+        if len(self._tail) > LINE_LIMIT:
+            self._wrap_line(self._tail)
+            self._tail = b""
 
     def result(self):
         return PRESENT if self.present else ABSENT
@@ -209,6 +284,7 @@ def scan_chunks(chunks, config):
         scanner.feed(chunk)
         if scanner.present:
             break
+    scanner.finish()
     return scanner.result()
 
 

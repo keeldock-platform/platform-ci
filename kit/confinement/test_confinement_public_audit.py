@@ -24,7 +24,9 @@ SETTINGS_JOB = "linux-settings"
 BUILD_JOB = "linux-source-build"
 AUDITOR_JOB = "linux-audit"
 SETTINGS_STEPS = ("Set up job", "Check settings", "Complete job")
-BUILD_STEPS = ("Set up job", "Run boundary", "Post cleanup", "Complete job")
+BUILD_STEPS = ("Set up job", "Prepare", "Run boundary", "Post cleanup", "Complete job")
+VERDICT_STEP = "Run boundary"
+MARK = chr(35) * 2
 CANARY = hashlib.sha256(b"audit synthetic canary").hexdigest()
 CONFIG = log_canary.compute_config(CANARY)
 STAMP = b"2026-10-28T10:00:00.1234567Z "
@@ -70,6 +72,33 @@ def noise_log(label):
 
 def stamped_verdict(record):
     return STAMP + verdict.encode_line(record).encode("ascii") + b"\n"
+
+
+def _header(title):
+    return [
+        STAMP + (MARK + "[group]" + title).encode("ascii"),
+        STAMP + (MARK + "[endgroup]").encode("ascii"),
+    ]
+
+
+def build_log(line, where="boundary", extra_runs=0):
+    """A job log laid out like the runner does, with the verdict line placed in one section."""
+    out = []
+    if where == "before":
+        out.append(line.rstrip(b"\n"))
+    for key, title in (
+        ("setup", "Set up job"), ("prepare", "Run prepare"),
+        ("boundary", "Run boundary"), ("complete", "Complete job"),
+    ):
+        out.extend(_header(title))
+        out.append(STAMP + b"output of " + key.encode("ascii"))
+        if key == where:
+            out.append(line.rstrip(b"\n"))
+    for index in range(extra_runs):
+        out.extend(_header("Run extra " + str(index)))
+    if where == "after":
+        out.append(line.rstrip(b"\n"))
+    return b"\n".join(out) + b"\n"
 
 
 def make_job(job_id, check_id, name, steps, status, conclusion):
@@ -124,7 +153,8 @@ class FakeApi:
                 SETTINGS_JOB: {"steps": SETTINGS_STEPS, "optional_steps": ()},
                 BUILD_JOB: {"steps": BUILD_STEPS, "optional_steps": ("Post cleanup",)},
             },
-            "verdict_job": BUILD_JOB, "auditor_job": AUDITOR_JOB, "artifact_names": (),
+            "verdict_job": BUILD_JOB, "verdict_step": VERDICT_STEP, "auditor_job": AUDITOR_JOB,
+            "artifact_names": (),
             "cache_digest": subject.cache_inventory_digest([]),
         }
         self.run = {
@@ -148,7 +178,7 @@ class FakeApi:
         )
         self.logs = {
             101: noise_log(b"settings"),
-            102: noise_log(b"build") + stamped_verdict(record),
+            102: build_log(stamped_verdict(record)),
             103: b"unused",
         }
         self.artifacts = []
@@ -159,7 +189,7 @@ class FakeApi:
         self.calls = []
 
     def set_verdict(self, record):
-        self.logs[102] = noise_log(b"build") + stamped_verdict(record)
+        self.logs[102] = build_log(stamped_verdict(record))
 
     def set_annotations(self, check_id, items, count=None):
         self.annotations[check_id] = items
@@ -189,6 +219,8 @@ class FakeApi:
         elif base == run_path + "/artifacts":
             body = self._page("artifacts", self.artifacts, page)
         elif base == prefix + "/actions/caches":
+            if query.get("sort") != ["created_at"] or query.get("direction") != ["asc"]:
+                raise KeyError("unstable cache order")
             body = self._page("actions_caches", self.caches, page)
         else:
             matched = re.fullmatch(re.escape(prefix) + r"/check-runs/([0-9]+)(/annotations)?", base)
@@ -254,7 +286,7 @@ class AcceptanceTests(AuditCase):
                 prefix + "/check-runs/202",
                 prefix + "/check-runs/202/annotations" + query,
                 run_path + "/artifacts" + query,
-                prefix + "/actions/caches" + query,
+                prefix + "/actions/caches?sort=created_at&direction=asc&per_page=100&page=1",
             ],
         )
 
@@ -276,13 +308,11 @@ class AcceptanceTests(AuditCase):
         candidate["mode"] = "candidate"
         self.assert_refused(api, "verdict", expected=candidate)
 
-    def test_expected_artifacts_caches_and_optional_steps_are_accepted(self):
+    def test_expected_caches_and_optional_steps_are_accepted(self):
         api = FakeApi()
-        api.expected["artifact_names"] = ("capsule",)
-        api.artifacts = [make_artifact(1, "capsule")]
         api.caches = [make_cache(7)]
         api.sync_cache_digest()
-        api.jobs[1]["steps"][2]["conclusion"] = "skipped"
+        api.jobs[1]["steps"][3]["conclusion"] = "skipped"
         self.assert_accepted(api)
 
     def test_cache_digest_ignores_access_times_only(self):
@@ -409,8 +439,8 @@ class JobTests(AuditCase):
 
         cases = {
             "skipped_required": lambda steps: steps[1].update(conclusion="skipped"),
-            "failed_optional": lambda steps: steps[2].update(conclusion="failure"),
-            "cancelled_optional": lambda steps: steps[2].update(conclusion="cancelled"),
+            "failed_optional": lambda steps: steps[3].update(conclusion="failure"),
+            "cancelled_optional": lambda steps: steps[3].update(conclusion="cancelled"),
             "unfinished": lambda steps: steps[1].update(status="in_progress"),
             "no_conclusion": lambda steps: steps[1].update(conclusion=None),
             "renamed": lambda steps: steps[1].update(name="Run other"),
@@ -439,7 +469,7 @@ class VerdictTests(AuditCase):
     def test_missing_duplicate_misplaced_and_echoed_verdict_lines_are_refused(self):
         line = stamped_verdict(verdict_record())
         missing = FakeApi()
-        missing.logs[102] = noise_log(b"build")
+        missing.logs[102] = build_log(b"no verdict here")
         duplicate = FakeApi()
         duplicate.logs[102] += line
         misplaced = FakeApi()
@@ -447,7 +477,7 @@ class VerdictTests(AuditCase):
         echoed = FakeApi()
         echoed.logs[102] += b"echo " + line
         embedded = FakeApi()
-        embedded.logs[102] = noise_log(b"build") + b"prefix " + line
+        embedded.logs[102] = build_log(b"prefix " + line)
         for name, api in (
             ("missing", missing), ("duplicate", duplicate), ("misplaced", misplaced),
             ("echoed", echoed), ("embedded", embedded),
@@ -505,9 +535,33 @@ class VerdictTests(AuditCase):
             text.replace("schema=1", "schema=2"),
         ):
             api = FakeApi()
-            api.logs[102] = noise_log(b"build") + STAMP + broken.encode("ascii") + b"\n"
+            api.logs[102] = build_log(STAMP + broken.encode("ascii"))
             with self.subTest(size=len(broken)):
                 self.assert_refused(api, "verdict")
+
+    def test_the_verdict_line_must_be_inside_the_required_step_section(self):
+        line = stamped_verdict(verdict_record())
+        self.assert_accepted(FakeApi())
+        for where in ("before", "setup", "prepare", "complete", "after"):
+            api = FakeApi()
+            api.logs[102] = build_log(line, where)
+            with self.subTest(where=where):
+                self.assert_refused(api, "verdict")
+
+    def test_the_section_layout_must_match_the_steps_that_ran(self):
+        line = stamped_verdict(verdict_record())
+        api = FakeApi()
+        api.logs[102] = build_log(line, "boundary", extra_runs=1)
+        self.assert_refused(api, "verdict")
+        api = FakeApi()
+        renamed = (MARK + "[group]Run prepare").encode("ascii")
+        api.logs[102] = build_log(line).replace(renamed, (MARK + "[group]Other").encode("ascii"))
+        self.assert_refused(api, "verdict")
+
+    def test_a_skipped_optional_step_does_not_shift_the_section_mapping(self):
+        api = FakeApi()
+        api.jobs[1]["steps"][3]["conclusion"] = "skipped"
+        self.assert_accepted(api)
 
     def test_verdict_text_in_an_annotation_or_check_output_is_refused(self):
         text = verdict.encode_line(verdict_record())
@@ -576,6 +630,48 @@ class CanaryTests(AuditCase):
                 self.assert_refused(api, "log_canary", config=bad)
                 self.assertEqual(api.calls, [])
 
+    def test_canary_in_a_failed_or_cancelled_producer_log_wins_over_every_other_refusal(self):
+        leak = b"\n" + STAMP + b"leak " + CANARY.encode("ascii") + b"\n"
+        for conclusion in ("failure", "cancelled", "timed_out", "skipped", "neutral"):
+            for index, job_id in ((0, 101), (1, 102)):
+                api = FakeApi()
+                api.jobs[index]["conclusion"] = conclusion
+                api.logs[job_id] += leak
+                with self.subTest(conclusion=conclusion, job=job_id):
+                    self.assert_refused(api, "log_canary")
+        api = FakeApi()
+        api.jobs[1]["conclusion"] = "failure"
+        api.jobs[1]["steps"][2]["conclusion"] = "failure"
+        api.checks[202]["conclusion"] = "failure"
+        api.logs[102] = build_log(b"no verdict here") + leak
+        self.assert_refused(api, "log_canary")
+
+    def test_canary_wins_over_an_invalid_verdict_and_other_phases(self):
+        api = FakeApi()
+        api.set_verdict(verdict_record(gates=12))
+        api.set_annotations(201, [dict(ANNOTATION, message="x " + CANARY)])
+        self.assert_refused(api, "log_canary")
+        api = FakeApi()
+        api.jobs[1]["steps"][1]["conclusion"] = "skipped"
+        api.logs[101] += b"\n" + CANARY.encode("ascii") + b"\n"
+        self.assert_refused(api, "log_canary")
+        api = FakeApi()
+        del api.jobs[0]
+        api.logs[102] += b"\n" + CANARY.encode("ascii") + b"\n"
+        self.assert_refused(api, "log_canary")
+        api = FakeApi()
+        api.checks[202]["output"]["summary"] = "bad " + CANARY
+        api.checks[201]["head_sha"] = "cd" * 20
+        self.assert_refused(api, "log_canary")
+
+    def test_logs_that_are_not_valid_utf8_are_still_scanned_as_bytes(self):
+        api = FakeApi()
+        api.logs[101] += b"\n" + bytes((255, 254, 250)) + b" binary tail\n"
+        self.assert_accepted(api)
+        api = FakeApi()
+        api.logs[101] += b"\n" + bytes((255, 254, 250)) + CANARY.encode("ascii") + bytes((200,)) + b"\n"
+        self.assert_refused(api, "log_canary")
+
     def test_scanner_budget_exhaustion_fails_closed(self):
         api = FakeApi()
         api.logs[101] = b"a" * 1000
@@ -633,35 +729,25 @@ class SurfaceTests(AuditCase):
         api.checks[201]["output"]["text"] = "a" * (subject.MAX_CHECK_TEXT + 1)
         self.assert_refused(api, "annotations")
 
-    def test_unexpected_or_missing_artifacts_are_refused(self):
-        api = FakeApi()
-        api.artifacts = [make_artifact(1, "unexpected")]
-        self.assert_refused(api, "artifact_inventory")
-        api = FakeApi()
-        api.expected["artifact_names"] = ("capsule",)
-        self.assert_refused(api, "artifact_inventory")
-        api = FakeApi()
-        api.expected["artifact_names"] = ("capsule",)
-        api.artifacts = [make_artifact(1, "capsule"), make_artifact(2, "extra")]
-        self.assert_refused(api, "artifact_inventory")
-        api = FakeApi()
-        api.expected["artifact_names"] = ("capsule",)
-        api.artifacts = [make_artifact(1, "capsule"), make_artifact(2, "capsule")]
-        self.assert_refused(api, "artifact_inventory")
-
-    def test_artifact_records_must_belong_to_this_run(self):
-        for change in (
-            {"workflow_run": {"id": RUN_ID + 1, "head_sha": CONTROL}},
-            {"workflow_run": {"id": RUN_ID, "head_sha": "cd" * 20}},
-            {"workflow_run": None}, {"expired": "no"}, {"size_in_bytes": -1}, {"name": 5}, {"id": 0},
+    def test_any_artifact_is_refused_because_contents_are_not_scanned(self):
+        for items in (
+            [make_artifact(1, "unexpected")],
+            [make_artifact(1, "capsule"), make_artifact(2, "capsule")],
+            [dict(make_artifact(1, "capsule"), expired=True)],
+            [dict(make_artifact(1, "capsule"), workflow_run=None)],
         ):
             api = FakeApi()
-            api.expected["artifact_names"] = ("capsule",)
-            artifact = make_artifact(1, "capsule")
-            artifact.update(change)
-            api.artifacts = [artifact]
-            with self.subTest(change=change):
-                self.assert_refused(api, "artifact_inventory")
+            api.artifacts = items
+            self.assert_refused(api, "artifact_inventory")
+
+    def test_a_non_empty_expected_artifact_set_cannot_be_configured(self):
+        for names in (("capsule",), ("a", "b"), ["capsule"], (5,), "capsule"):
+            api = FakeApi()
+            api.expected["artifact_names"] = names
+            api.artifacts = [make_artifact(1, "capsule")]
+            with self.subTest(names=names):
+                self.assert_refused(api, "request")
+                self.assertEqual(api.calls, [])
 
     def test_artifact_pagination_gaps_are_refused(self):
         api = FakeApi()
@@ -804,21 +890,37 @@ class ExpectedTests(AuditCase):
                 self.assertEqual(api.calls, [])
         self.assert_refused(FakeApi(), "request", expected=[])
 
-    def test_attempt_other_than_one_is_allowed_only_outside_candidate_mode(self):
-        api = FakeApi("linux", "synthetic")
-        api.expected["run_attempt"] = 2
-        api.run["run_attempt"] = 2
-        for job in api.jobs:
-            job["run_attempt"] = 2
-        api.set_verdict(verdict_record(project_execution="not_started", gates=0, failed=0,
-                                       token_revocation="not-applicable", run_attempt=2))
-        original = api.json
+    def test_attempt_other_than_one_is_refused_in_every_mode(self):
+        for mode in ("candidate", "synthetic"):
+            for attempt in (2, 3, 99):
+                api = FakeApi("linux", mode)
+                api.expected["run_attempt"] = attempt
+                with self.subTest(mode=mode, attempt=attempt):
+                    self.assert_refused(api, "request")
+                    self.assertEqual(api.calls, [])
 
-        def routed(path):
-            return original(path.replace("/attempts/2/", "/attempts/1/"))
+    def test_the_verdict_step_is_required_and_must_be_a_mandatory_sectioned_step(self):
+        def with_build_spec(steps, optional):
+            api = FakeApi()
+            api.expected["jobs"] = dict(api.expected["jobs"])
+            api.expected["jobs"][BUILD_JOB] = {"steps": steps, "optional_steps": optional}
+            return api
 
-        api.json = routed
-        self.assert_accepted(api)
+        cases = [
+            with_build_spec(BUILD_STEPS, ("Post cleanup", VERDICT_STEP)),
+            with_build_spec(("Set up job", VERDICT_STEP, VERDICT_STEP, "Complete job"), ()),
+        ]
+        for step in ("Post cleanup", "Set up job", "Complete job", "Missing step", None, 5):
+            api = FakeApi()
+            api.expected["verdict_step"] = step
+            cases.append(api)
+        absent = FakeApi()
+        del absent.expected["verdict_step"]
+        cases.append(absent)
+        for index, api in enumerate(cases):
+            with self.subTest(case=index):
+                self.assert_refused(api, "request")
+                self.assertEqual(api.calls, [])
 
 
 class LineTests(unittest.TestCase):
@@ -897,7 +999,7 @@ class ParseAndMainTests(AuditCase):
         api = FakeApi()
         output = io.StringIO()
         with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
-            status = subject.main([], self.environment(api), lambda token: api, output)
+            status = subject.main([], self.environment(api), lambda token, repository: api, output)
         self.assertEqual(status, 0)
         self.assertEqual(output.getvalue(), ACCEPTED + "\n")
 
@@ -909,7 +1011,7 @@ class ParseAndMainTests(AuditCase):
             api = FakeApi()
             output = io.StringIO()
             with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
-                status = subject.main([], self.environment(api, **updates), lambda token: api, output)
+                status = subject.main([], self.environment(api, **updates), lambda token, repository: api, output)
             with self.subTest(updates=sorted(updates)):
                 self.assertEqual(status, 1)
                 self.assertEqual(output.getvalue(), subject.refusal_line("request") + "\n")
@@ -920,11 +1022,11 @@ class ParseAndMainTests(AuditCase):
         api.log_failures.add(102)
         output = io.StringIO()
         with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
-            status = subject.main([], self.environment(api), lambda token: api, output)
+            status = subject.main([], self.environment(api), lambda token, repository: api, output)
         self.assertEqual(status, 1)
         self.assertEqual(output.getvalue(), subject.refusal_line("job_logs") + "\n")
 
-        def broken(token):
+        def broken(token, repository):
             raise RuntimeError("secret " + CANARY)
 
         output = io.StringIO()
@@ -933,10 +1035,58 @@ class ParseAndMainTests(AuditCase):
         self.assertEqual(output.getvalue(), subject.refusal_line("unavailable") + "\n")
         self.assertNotIn(CANARY, output.getvalue())
 
+    def test_main_builds_the_client_for_the_expected_repository(self):
+        api = FakeApi()
+        seen = []
+
+        def factory(token, repository):
+            seen.append((token, repository))
+            return api
+
+        output = io.StringIO()
+        with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
+            subject.main([], self.environment(api), factory, output)
+        self.assertEqual(seen, [("token-value", REPO)])
+
+    def test_default_client_reads_logs_of_the_expected_repository_as_undecoded_bytes(self):
+        client = subject._default_api_factory("t" * 24, REPO)
+        requests = []
+        body = bytes((255, 254, 250)) + b" not utf8 " + CANARY.encode("ascii")
+
+        class Headers:
+            def __init__(self, values):
+                self.values = values
+
+            def get(self, name, default=None):
+                return self.values.get(name, default)
+
+        def fake_open(request, limit, allow_redirect=False):
+            requests.append((request.full_url, limit, allow_redirect))
+            if allow_redirect:
+                location = "https://productionresultssa7.blob.core.windows.net/logs/x?sig=1"
+                return None, Headers({"Location": location})
+            return body, Headers({})
+
+        client._open = fake_open
+        self.assertEqual(client.log_text(42), body)
+        self.assertEqual(
+            requests[0][0], "https://api.github.com/repos/" + REPO + "/actions/jobs/42/logs",
+        )
+        self.assertTrue(requests[0][2])
+        self.assertEqual(requests[1][0], "https://productionresultssa7.blob.core.windows.net/logs/x?sig=1")
+        self.assertEqual(requests[1][1], subject.MAX_LOG_BYTES)
+        for bad in (0, -1, True, "5", None):
+            with self.assertRaises(Exception):
+                client.log_text(bad)
+        for repository in ("", "no-slash", None, 5):
+            with self.assertRaises(subject.AuditRefusal) as caught:
+                subject._default_api_factory("t" * 24, repository)
+            self.assertEqual(caught.exception.phase, "request")
+
     def test_main_refuses_arguments(self):
         api = FakeApi()
         output = io.StringIO()
-        self.assertEqual(subject.main(["--flag"], self.environment(api), lambda token: api, output), 2)
+        self.assertEqual(subject.main(["--flag"], self.environment(api), lambda token, repository: api, output), 2)
         self.assertEqual(output.getvalue(), "")
 
 

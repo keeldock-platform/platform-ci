@@ -4,16 +4,21 @@ The auditor runs as its own job after the producer jobs, with read-only API acce
 or credential. It never trusts a producer summary. From the live run, job, step, check, log,
 annotation, artifact and cache records it checks that:
 
-    the run, attempt, control commit, workflow path, CI ref and title are exactly the expected ones
+    the run, attempt one, control commit, workflow path, CI ref and title are the expected ones
+    no log, check output or annotation of any completed job, whatever its conclusion, contains
+    the committed canary in any pinned encoding; this scan runs first, before any other verdict
     every expected job exists once, completed with success, and ran exactly the expected steps
     the verdict job log holds exactly one verdict line, valid under the closed verdict schema,
-    bound to the expected operating system, control commit, run and attempt, and accepted
-    no log or annotation contains the committed canary in any pinned encoding
-    the run artifact inventory equals the expected set, empty unless the caller lists names
+    bound to the expected operating system, control commit, run and attempt, accepted, and
+    inside the log section of the one required verdict step
+    the run artifact inventory is empty: artifact contents are not scanned, so no artifact is
+    admitted until a content scan exists
     the repository cache inventory equals the digest taken before the producer jobs ran
 
-Anything missing, incomplete, paginated short, cancelled, skipped or mismatched refuses. The
-public result is one fixed line and a refusal names only a closed phase, never a value.
+Because the canary scan precedes every other check, a failed or cancelled producer that leaked
+the canary still refuses with the canary phase. Anything missing, incomplete, paginated short,
+cancelled, skipped or mismatched refuses. The public result is one fixed line and a refusal
+names only a closed phase, never a value.
 
 API client interface, injected so tests use fakes:
 
@@ -36,6 +41,7 @@ import os
 import re
 import sys
 import urllib.parse
+import urllib.request
 
 try:
     from . import confinement_verdict
@@ -69,16 +75,21 @@ PHASES = frozenset((
 ))
 EXPECTED_FIELDS = frozenset((
     "repository", "os", "mode", "control_sha", "run_id", "run_attempt", "workflow_path",
-    "ci_ref", "display_title", "jobs", "verdict_job", "auditor_job", "artifact_names",
-    "cache_digest",
+    "ci_ref", "display_title", "jobs", "verdict_job", "verdict_step", "auditor_job",
+    "artifact_names", "cache_digest",
 ))
+UNSECTIONED_STEPS = ("Set up job", "Complete job")
+GROUP_MARK = bytes((35, 35)) + b"[group]"
+RUN_HEADER = GROUP_MARK + b"Run "
+SECTION_HEADERS = (GROUP_MARK + b"Post Run ", GROUP_MARK + b"Complete job")
+BOM = b"\xef\xbb\xbf"
+CACHE_QUERY = "sort=created_at&direction=asc"
 JOB_FIELDS = frozenset(("steps", "optional_steps"))
 REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}")
 WORKFLOW_RE = re.compile(r"\.github/workflows/[A-Za-z0-9_.-]{1,100}\.yml")
 SHA_RE = re.compile(r"[a-f0-9]{40}")
 DIGEST_RE = re.compile(r"[a-f0-9]{64}")
 LABEL_RE = re.compile(r"[\x20-\x7e]{1,200}")
-ARTIFACT_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}")
 VERDICT_PREFIX = confinement_verdict.LINE_PREFIX.encode("ascii")
 ACCEPTED_RE = re.compile(
     re.escape(AUDIT_PREFIX) + r" schema=1 status=accepted os=(linux|windows)"
@@ -136,8 +147,7 @@ def validate_expected(expected):
             or type(expected["mode"]) is not str or expected["mode"] not in MODES
             or type(expected["control_sha"]) is not str or SHA_RE.fullmatch(expected["control_sha"]) is None
             or not _exact_int(expected["run_id"], 1)
-            or not _exact_int(expected["run_attempt"], 1, 99)
-            or (expected["mode"] == "candidate" and expected["run_attempt"] != 1)
+            or not _is(expected["run_attempt"], 1)
             or type(expected["workflow_path"]) is not str
             or WORKFLOW_RE.fullmatch(expected["workflow_path"]) is None
             or type(expected["ci_ref"]) is not str or expected["ci_ref"] not in CI_REFS
@@ -148,8 +158,7 @@ def validate_expected(expected):
             or type(expected["auditor_job"]) is not str
             or LABEL_RE.fullmatch(expected["auditor_job"]) is None
             or expected["auditor_job"] in jobs
-            or not _text_tuple(expected["artifact_names"], 0, 20, ARTIFACT_RE)
-            or len(set(expected["artifact_names"])) != len(expected["artifact_names"])
+            or type(expected["artifact_names"]) is not tuple or expected["artifact_names"] != ()
             or type(expected["cache_digest"]) is not str
             or DIGEST_RE.fullmatch(expected["cache_digest"]) is None):
         _fail("request")
@@ -160,6 +169,12 @@ def validate_expected(expected):
                 or not _text_tuple(spec["optional_steps"], 0, 100, LABEL_RE)
                 or not set(spec["optional_steps"]).issubset(spec["steps"])):
             _fail("request")
+    verdict_spec = jobs[expected["verdict_job"]]
+    step = expected["verdict_step"]
+    if (type(step) is not str or verdict_spec["steps"].count(step) != 1
+            or step in verdict_spec["optional_steps"] or step in UNSECTIONED_STEPS
+            or step.startswith("Post ")):
+        _fail("request")
 
 
 def _resolve_config(config):
@@ -168,17 +183,18 @@ def _resolve_config(config):
     return resolved
 
 
-def _page_path(path, page):
-    return path + "?per_page=" + str(PAGE_SIZE) + "&page=" + str(page)
+def _page_path(path, page, query=""):
+    prefix = query + "&" if query else ""
+    return path + "?" + prefix + "per_page=" + str(PAGE_SIZE) + "&page=" + str(page)
 
 
-def _collect_counted(api, path, key, maximum):
+def _collect_counted(api, path, key, maximum, query=""):
     total = None
     pages = 1
     items = []
     page = 1
     while True:
-        body, unused_headers = api.json(_page_path(path, page))
+        body, unused_headers = api.json(_page_path(path, page, query))
         if (type(body) is not dict or type(body.get("total_count")) is not int
                 or body["total_count"] < 0 or type(body.get(key)) is not list):
             _fail("pagination")
@@ -253,10 +269,13 @@ def _check_steps(job, spec):
         _fail("job_steps")
 
 
-def _check_jobs(api, expected):
+def _list_jobs(api, expected):
     path = ("/repos/" + expected["repository"] + "/actions/runs/" + str(expected["run_id"])
             + "/attempts/" + str(expected["run_attempt"]) + "/jobs")
-    jobs = _collect_counted(api, path, "jobs", MAX_JOBS)
+    return _collect_counted(api, path, "jobs", MAX_JOBS)
+
+
+def _check_jobs(jobs, expected):
     names = set(expected["jobs"]) | {expected["auditor_job"]}
     if len(jobs) != len(names):
         _fail("jobs")
@@ -289,7 +308,10 @@ def _check_jobs(api, expected):
 
 
 def _check_id(job, repository):
-    parts = urllib.parse.urlsplit(job["check_run_url"])
+    url = job.get("check_run_url")
+    if type(url) is not str:
+        _fail("annotations")
+    parts = urllib.parse.urlsplit(url)
     matched = re.fullmatch(
         "/repos/" + re.escape(repository) + "/check-runs/([1-9][0-9]{0,18})", parts.path,
     )
@@ -299,63 +321,144 @@ def _check_id(job, repository):
     return int(matched.group(1))
 
 
-def _check_surfaces(api, by_name, expected):
+def _surface_texts(api, job, expected):
+    check_id = _check_id(job, expected["repository"])
+    check_path = "/repos/" + expected["repository"] + "/check-runs/" + str(check_id)
+    check, unused_headers = api.json(check_path)
+    output = check.get("output") if type(check) is dict else None
+    if (type(check) is not dict or not _is(check.get("id"), check_id)
+            or not _is(check.get("head_sha"), expected["control_sha"])
+            or not _is(check.get("status"), "completed")
+            or not _is(check.get("conclusion"), job.get("conclusion"))
+            or type(output) is not dict
+            or not _exact_int(output.get("annotations_count"), 0, MAX_ANNOTATIONS)):
+        _fail("annotations")
     texts = []
-    total = 0
-    for name in sorted(expected["jobs"]):
-        check_id = _check_id(by_name[name], expected["repository"])
-        check_path = "/repos/" + expected["repository"] + "/check-runs/" + str(check_id)
-        check, unused_headers = api.json(check_path)
-        output = check.get("output") if type(check) is dict else None
-        if (type(check) is not dict or not _is(check.get("id"), check_id)
-                or not _is(check.get("head_sha"), expected["control_sha"])
-                or not _is(check.get("status"), "completed")
-                or not _is(check.get("conclusion"), "success")
-                or type(output) is not dict
-                or not _exact_int(output.get("annotations_count"), 0, MAX_ANNOTATIONS)):
+    for field in ("title", "summary", "text"):
+        value = output.get(field)
+        if value is None:
+            continue
+        if type(value) is not str or len(value) > MAX_CHECK_TEXT:
             _fail("annotations")
-        for field in ("title", "summary", "text"):
-            value = output.get(field)
-            if value is None:
-                continue
-            if type(value) is not str or len(value) > MAX_CHECK_TEXT:
-                _fail("annotations")
-            texts.append(value)
-        annotations = _collect_annotations(
-            api, check_path + "/annotations", output["annotations_count"],
-        )
-        for annotation in annotations:
-            if type(annotation) is not dict:
-                _fail("annotations")
-            for value in annotation.values():
-                if type(value) is str:
-                    texts.append(value)
-                elif value is not None and type(value) not in (int, bool):
-                    _fail("annotations")
-        total = sum(len(text) for text in texts)
-        if total > MAX_ANNOTATION_TEXT:
+        texts.append(value)
+    annotations = _collect_annotations(
+        api, check_path + "/annotations", output["annotations_count"],
+    )
+    for annotation in annotations:
+        if type(annotation) is not dict:
             _fail("annotations")
+        for value in annotation.values():
+            if type(value) is str:
+                texts.append(value)
+            elif value is not None and type(value) not in (int, bool):
+                _fail("annotations")
     return texts
 
 
-def _check_logs(api, by_name, expected, config):
-    verdict_lines = None
-    for name in sorted(expected["jobs"]):
-        log = api.log_text(by_name[name]["id"])
-        if type(log) is not bytes or not log or len(log) > MAX_LOG_BYTES:
-            _fail("job_logs")
+def _candidates(jobs, expected):
+    chosen = [
+        job for job in jobs
+        if type(job) is dict and _exact_int(job.get("id"), 1)
+        and job.get("status") == "completed" and job.get("name") != expected["auditor_job"]
+    ]
+    return sorted(chosen, key=lambda item: item["id"])
+
+
+def _gather(api, jobs, expected):
+    """Collect the log, check output and annotations of every completed job.
+
+    Fetch problems are recorded and returned, not raised, so the canary scan covers everything
+    that could be read before any other refusal is reported.
+    """
+    logs = {}
+    texts = []
+    pending = []
+    total = 0
+    for job in _candidates(jobs, expected):
+        try:
+            log = api.log_text(job["id"])
+            if type(log) is not bytes or not log or len(log) > MAX_LOG_BYTES:
+                _fail("job_logs")
+            logs[job["id"]] = log
+        except AuditRefusal as error:
+            pending.append(error.phase)
+        except Exception:
+            pending.append("job_logs")
+        try:
+            found = _surface_texts(api, job, expected)
+            total += sum(len(text) for text in found)
+            if total > MAX_ANNOTATION_TEXT:
+                _fail("annotations")
+            texts.extend(found)
+        except AuditRefusal as error:
+            pending.append(error.phase)
+        except Exception:
+            pending.append("annotations")
+    return logs, texts, pending
+
+
+def _scan(logs, texts, config):
+    for log in logs.values():
         if _guard("log_canary", log_canary.scan_bytes, log, config) != log_canary.ABSENT:
             _fail("log_canary")
-        lines = _guard("verdict", confinement_verdict.find_lines, log)
+    if _guard("log_canary", log_canary.scan_texts, texts, config) != log_canary.ABSENT:
+        _fail("log_canary")
+
+
+def _stripped_lines(log):
+    if log.startswith(BOM):
+        log = log[3:]
+    result = []
+    for line in log.splitlines():
+        stamp = confinement_verdict.TIMESTAMP_PREFIX_RE.match(line)
+        result.append(line[stamp.end():] if stamp is not None else line)
+    return result
+
+
+def _check_section(log, job, expected):
+    ordinal = None
+    eligible = 0
+    for step in job["steps"]:
+        name = step.get("name")
+        if (step.get("conclusion") != "success" or name in UNSECTIONED_STEPS
+                or name.startswith("Post ")):
+            continue
+        if name == expected["verdict_step"]:
+            ordinal = eligible
+        eligible += 1
+    lines = _stripped_lines(log)
+    runs = [index for index, line in enumerate(lines) if line.startswith(RUN_HEADER)]
+    if ordinal is None or len(runs) != eligible:
+        _fail("verdict")
+    start = runs[ordinal]
+    following = [
+        index for index, line in enumerate(lines)
+        if index > start and (line.startswith(RUN_HEADER) or line.startswith(SECTION_HEADERS))
+    ]
+    end = following[0] if following else len(lines)
+    positions = [index for index, line in enumerate(lines) if line.startswith(VERDICT_PREFIX)]
+    if len(positions) != 1 or not start < positions[0] < end:
+        _fail("verdict")
+
+
+def _verdict_line(logs, by_name, expected):
+    line = None
+    for name in sorted(expected["jobs"]):
+        job = by_name[name]
+        log = logs.get(job["id"])
+        if log is None:
+            _fail("job_logs")
+        lines = confinement_verdict.find_lines(log)
         if log.count(VERDICT_PREFIX) != len(lines):
             _fail("verdict")
         if name == expected["verdict_job"]:
-            verdict_lines = lines
+            if len(lines) != 1:
+                _fail("verdict")
+            _check_section(log, job, expected)
+            line = lines[0]
         elif lines:
             _fail("verdict")
-    if verdict_lines is None or len(verdict_lines) != 1:
-        _fail("verdict")
-    return verdict_lines[0]
+    return line
 
 
 def _check_verdict(line, expected):
@@ -373,21 +476,7 @@ def _check_artifacts(api, expected):
     path = ("/repos/" + expected["repository"] + "/actions/runs/" + str(expected["run_id"])
             + "/artifacts")
     items = _collect_counted(api, path, "artifacts", MAX_ARTIFACTS)
-    names = []
-    identifiers = set()
-    for item in items:
-        run = item.get("workflow_run") if type(item) is dict else None
-        if (type(item) is not dict or not _exact_int(item.get("id"), 1) or item["id"] in identifiers
-                or type(item.get("name")) is not str
-                or not _exact_int(item.get("size_in_bytes"), 0)
-                or type(item.get("expired")) is not bool
-                or type(run) is not dict
-                or not _is(run.get("id"), expected["run_id"])
-                or not _is(run.get("head_sha"), expected["control_sha"])):
-            _fail("artifact_inventory")
-        identifiers.add(item["id"])
-        names.append(item["name"])
-    if len(set(names)) != len(names) or sorted(names) != sorted(expected["artifact_names"]):
+    if items:
         _fail("artifact_inventory")
 
 
@@ -416,10 +505,13 @@ def snapshot_cache_digest(api, repository):
     """Take the cache digest before producer jobs run, for later comparison by the auditor."""
     if type(repository) is not str or REPOSITORY_RE.fullmatch(repository) is None:
         _fail("request")
-    items = _collect_counted(
-        api, "/repos/" + repository + "/actions/caches", "actions_caches", MAX_CACHES,
+    return cache_inventory_digest(_collect_caches(api, repository))
+
+
+def _collect_caches(api, repository):
+    return _collect_counted(
+        api, "/repos/" + repository + "/actions/caches", "actions_caches", MAX_CACHES, CACHE_QUERY,
     )
-    return cache_inventory_digest(items)
 
 
 def accepted_line(expected):
@@ -470,17 +562,18 @@ def audit(api, expected, config=None):
     _guard("request", validate_expected, expected)
     resolved = _guard("log_canary", _resolve_config, config)
     _guard("run", _check_run, api, expected)
-    by_name = _guard("jobs", _check_jobs, api, expected)
-    line = _guard("job_logs", _check_logs, api, by_name, expected, resolved)
+    jobs = _guard("jobs", _list_jobs, api, expected)
+    logs, texts, pending = _gather(api, jobs, expected)
+    _scan(logs, texts, resolved)
+    by_name = _guard("jobs", _check_jobs, jobs, expected)
+    if pending:
+        _fail(pending[0])
+    line = _guard("verdict", _verdict_line, logs, by_name, expected)
     _guard("verdict", _check_verdict, line, expected)
-    texts = _guard("annotations", _check_surfaces, api, by_name, expected)
-    if _guard("log_canary", log_canary.scan_texts, texts, resolved) != log_canary.ABSENT:
-        _fail("log_canary")
     if any(VERDICT_PREFIX in text.encode("utf-8", "replace") for text in texts):
         _fail("annotations")
     _guard("artifact_inventory", _check_artifacts, api, expected)
-    items = _guard("cache_inventory", _collect_counted, api,
-                   "/repos/" + expected["repository"] + "/actions/caches", "actions_caches", MAX_CACHES)
+    items = _guard("cache_inventory", _collect_caches, api, expected["repository"])
     if _guard("cache_inventory", cache_inventory_digest, items) != expected["cache_digest"]:
         _fail("cache_inventory")
     return accepted_line(expected)
@@ -531,12 +624,57 @@ def _reject_constant(unused):
     raise ValueError("constant")
 
 
-def _default_api_factory(token):
+def _default_api_factory(token, repository):
+    """Build the read-only client for one repository.
+
+    It reuses the bounded transport of the existing public auditor, but fetches logs for the
+    given repository and returns them as bytes without requiring valid UTF-8, so an undecodable
+    log is still canary-scanned instead of being refused before the scan.
+    """
     try:
-        from . import macos_public_audit
+        from . import macos_public_audit as base
     except ImportError:
-        import macos_public_audit
-    return macos_public_audit.GitHubAPI(token)
+        import macos_public_audit as base
+    if type(repository) is not str or REPOSITORY_RE.fullmatch(repository) is None:
+        _fail("request")
+
+    class Client(base.GitHubAPI):
+        def log_text(self, job_id):
+            if type(job_id) is not int or job_id < 1:
+                raise ValueError("job")
+            path = "/repos/" + repository + "/actions/jobs/" + str(job_id) + "/logs"
+            request = urllib.request.Request(
+                base.API_ORIGIN + path,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "Authorization": "Bearer " + self._token,
+                    "X-GitHub-Api-Version": base.API_VERSION,
+                    "User-Agent": "confinement-public-audit",
+                    "Accept-Encoding": "identity",
+                },
+                method="GET",
+            )
+            unused, response_headers = self._open(request, 1, allow_redirect=True)
+            location = response_headers.get("Location")
+            if (type(location) is not str or not location or len(location) > 8192
+                    or any(ord(char) < 33 or ord(char) > 126 for char in location)):
+                raise ValueError("location")
+            base._validate_log_location(location)
+            blob = urllib.request.Request(
+                location,
+                headers={
+                    "Accept": "text/plain",
+                    "Accept-Encoding": "identity",
+                    "User-Agent": "confinement-public-audit",
+                },
+                method="GET",
+            )
+            data, blob_headers = self._open(blob, MAX_LOG_BYTES)
+            if blob_headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise ValueError("encoding")
+            return data
+
+    return Client(token)
 
 
 def main(arguments=None, environ=None, api_factory=None, stdout=None):
@@ -554,7 +692,9 @@ def main(arguments=None, environ=None, api_factory=None, stdout=None):
                 or env.get("GITHUB_RUN_ATTEMPT") != str(expected["run_attempt"])
                 or env.get("GITHUB_SHA") != expected["control_sha"]):
             _fail("request")
-        accepted, line = audit_line(factory(env.get("GITHUB_TOKEN", "")), expected)
+        accepted, line = audit_line(
+            factory(env.get("GITHUB_TOKEN", ""), expected["repository"]), expected,
+        )
     except AuditRefusal as error:
         accepted, line = False, refusal_line(error.phase)
     except Exception:

@@ -33,7 +33,10 @@ def _embedded(encoder, data, before, after):
 def _payloads():
     text = CANARY.encode("ascii")
     binary = bytes.fromhex(CANARY)
+    utf16 = CANARY.encode("utf-16-le")
     result = {
+        "base64-utf16-standalone": base64.b64encode(utf16),
+        "base64-utf16-unpadded": base64.b64encode(utf16).rstrip(b"="),
         "plain": text,
         "upper": text.upper(),
         "hex": text.hex().encode("ascii"),
@@ -51,6 +54,8 @@ def _payloads():
             suffix = "-" + str(before) + "-" + str(after)
             result["b64-text" + suffix] = _embedded(base64.b64encode, text, before, after)
             result["b64url-text" + suffix] = _embedded(base64.urlsafe_b64encode, text, before, after)
+            result["b64-utf16" + suffix] = _embedded(base64.b64encode, utf16, before, after)
+            result["b64url-utf16" + suffix] = _embedded(base64.urlsafe_b64encode, utf16, before, after)
             result["b64-bin" + suffix] = _embedded(base64.b64encode, binary, before, after)
             result["b64url-bin" + suffix] = _embedded(base64.urlsafe_b64encode, binary, before, after)
     return result
@@ -61,11 +66,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(set(CONFIG), {"digests", "text_length"})
         self.assertEqual(CONFIG["text_length"], 64)
         self.assertEqual(set(CONFIG["digests"]), set(subject.FORMS))
-        digests = CONFIG["digests"]
-        self.assertEqual(digests["base64-text-0"], digests["base64url-text-0"])
-        self.assertEqual(digests["base64-text-1"], digests["base64url-text-1"])
-        self.assertEqual(digests["base64-text-2"], digests["base64url-text-2"])
-        self.assertLess(len(set(digests.values())), len(subject.FORMS))
         self.assertEqual(subject.scan_bytes(b"x " + CANARY.encode("ascii"), CONFIG), "present")
         encoded = json.dumps(CONFIG)
         self.assertNotIn(CANARY, encoded)
@@ -79,8 +79,32 @@ class ConfigTests(unittest.TestCase):
     def test_forms_are_the_fixed_closed_set(self):
         self.assertEqual(len(subject.FORMS), 15)
         self.assertEqual(len(set(subject.FORMS)), 15)
-        for name in ("plain", "hex", "utf16le", "base64-text-0", "base64url-bin-2"):
+        for name in (
+            "plain", "hex", "utf16le", "base64-text-0", "base64-utf16-0", "base64-utf16-2",
+            "base64-bin-1", "base64url-bin-2",
+        ):
             self.assertIn(name, subject.FORMS)
+        self.assertEqual([name for name in subject.FORMS if name.startswith("base64url-text")], [])
+        self.assertEqual([name for name in subject.FORMS if name.startswith("base64url-utf16")], [])
+
+    def test_redundant_url_safe_text_forms_are_equal_to_the_standard_ones(self):
+        text = CANARY
+        for source in ("text", "utf16"):
+            data = text.encode("ascii") if source == "text" else text.encode("utf-16-le")
+            for shift in subject.SHIFTS:
+                self.assertEqual(
+                    subject._interior(data, shift, False), subject._interior(data, shift, True),
+                )
+
+    def test_low_entropy_canaries_are_refused(self):
+        for value in ("ab" * 32, "0" * 64, "0123456789a" * 6, "0123456789" * 7 + "01"):
+            with self.subTest(value_size=len(value), distinct=len(set(value))):
+                with self.assertRaises(subject.ScanRefusal) as caught:
+                    subject.compute_config(value)
+                self.assertEqual(caught.exception.reason, "config_invalid")
+        accepted = subject.compute_config("0123456789ab" * 6)
+        self.assertEqual(accepted["text_length"], 72)
+        self.assertEqual(subject.MIN_DISTINCT_NIBBLES, 12)
 
     def test_canary_values_that_are_not_long_lowercase_hex_are_refused(self):
         for value in ("", "a" * 62, "a" * 66 + "0", "A" * 64, "g" * 64, "a" * 258, b"a" * 64, None, 5):
@@ -226,6 +250,93 @@ class NoFalsePositiveTests(unittest.TestCase):
     def test_long_runs_of_alphabet_characters_are_absent(self):
         self.assertEqual(subject.scan_bytes(b"a" * 5000, CONFIG), "absent")
         self.assertEqual(subject.scan_bytes(b"/" * 3000 + b"A" * 3000, CONFIG), "absent")
+
+
+STAMP = b"2026-10-28T10:00:00.1234567Z "
+
+
+def _wrapped(encoded, width, stamp=True, ending=b"\n"):
+    lines = [encoded[index:index + width] for index in range(0, len(encoded), width)]
+    return ending.join((STAMP if stamp else b"") + line for line in lines)
+
+
+def _wrapped_sources():
+    text = CANARY.encode("ascii")
+    return {
+        "base64-text": base64.b64encode(text).rstrip(b"="),
+        "base64-utf16": base64.b64encode(CANARY.encode("utf-16-le")).rstrip(b"="),
+        "base64-bin": base64.b64encode(bytes.fromhex(CANARY)).rstrip(b"="),
+        "base64url-bin": base64.urlsafe_b64encode(bytes.fromhex(CANARY)).rstrip(b"="),
+        "base64-offset": base64.b64encode(b"xy" + text + b"z").rstrip(b"="),
+        "plain": text,
+    }
+
+
+class WrappedTests(unittest.TestCase):
+    def test_wrapped_encodings_are_detected_at_any_column_width(self):
+        for name, encoded in sorted(_wrapped_sources().items()):
+            for width in (7, 20, 64, 76):
+                for stamp in (True, False):
+                    for ending in (b"\n", b"\r\n"):
+                        data = _noise(3) + b"\n" + _wrapped(encoded, width, stamp, ending) + b"\n" + _noise(3)
+                        with self.subTest(form=name, width=width, stamp=stamp, ending=ending):
+                            self.assertEqual(subject.scan_bytes(data, CONFIG), "present")
+
+    def test_wrapped_value_is_detected_when_the_last_line_has_no_newline_or_padding_is_kept(self):
+        padded = base64.b64encode(CANARY.encode("ascii"))
+        self.assertEqual(subject.scan_bytes(_wrapped(padded, 20), CONFIG), "present")
+        self.assertEqual(subject.scan_bytes(_wrapped(padded, 76) + b"\n", CONFIG), "present")
+
+    def test_wrapped_value_is_detected_across_every_chunk_boundary(self):
+        data = b"before\n" + _wrapped(_wrapped_sources()["base64-text"], 20) + b"\nafter\n"
+        for cut in range(1, len(data)):
+            with self.subTest(cut=cut):
+                self.assertEqual(subject.scan_chunks([data[:cut], data[cut:]], CONFIG), "present")
+
+    def test_a_non_encoded_line_breaks_the_join(self):
+        encoded = _wrapped_sources()["base64-text"]
+        lines = [STAMP + encoded[index:index + 20] for index in range(0, len(encoded), 20)]
+        lines.insert(2, STAMP + b"plain words here")
+        self.assertEqual(subject.scan_bytes(b"\n".join(lines), CONFIG), "absent")
+        blank = list(lines)
+        blank[2] = b""
+        self.assertEqual(subject.scan_bytes(b"\n".join(blank), CONFIG), "absent")
+
+    def test_other_wrapped_values_are_absent(self):
+        other = base64.b64encode(OTHER.encode("ascii")).rstrip(b"=")
+        self.assertEqual(subject.scan_bytes(_wrapped(other, 20), CONFIG), "absent")
+
+    def test_joined_work_counts_toward_the_window_budget(self):
+        data = (b"A" * 30 + b"\n") * 200
+        self.assertEqual(subject.scan_bytes(data, CONFIG), "absent")
+        with mock.patch.object(subject, "MAX_WINDOWS", 10):
+            with self.assertRaises(subject.ScanRefusal) as caught:
+                subject.scan_bytes(data, CONFIG)
+        self.assertEqual(caught.exception.reason, "scan_limit")
+
+    def test_joined_work_counts_toward_the_byte_budget(self):
+        data = (b"A" * 30 + b"\n") * 20
+        with mock.patch.object(subject, "MAX_TOTAL_BYTES", len(data) + 100):
+            with self.assertRaises(subject.ScanRefusal) as caught:
+                subject.scan_bytes(data, CONFIG)
+        self.assertEqual(caught.exception.reason, "scan_limit")
+
+    def test_a_very_long_joined_run_is_scanned_in_bounded_pieces(self):
+        encoded = _wrapped_sources()["base64-text"]
+        with mock.patch.object(subject, "JOIN_LIMIT", 4096):
+            for lines in range(130, 140):
+                filler = (b"B" * 30 + b"\n") * lines
+                data = filler + _wrapped(encoded, 20, False) + b"\n" + filler
+                with self.subTest(lines=lines):
+                    self.assertEqual(subject.scan_bytes(data, CONFIG), "present")
+
+    def test_a_single_endless_line_is_bounded(self):
+        with mock.patch.object(subject, "LINE_LIMIT", 100):
+            scanner = subject.Scanner(CONFIG)
+            scanner.feed(b"A" * 350)
+            self.assertLessEqual(len(scanner._tail), 100)
+            scanner.finish()
+            self.assertEqual(scanner.result(), "absent")
 
 
 class BoundsTests(unittest.TestCase):
