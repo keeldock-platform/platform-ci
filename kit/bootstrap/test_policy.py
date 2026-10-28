@@ -1456,6 +1456,11 @@ class LaneRegistryTests(unittest.TestCase):
                     "windows-confinement-workflow-too-large",
                 ),
                 (
+                    ".github/workflows/capsule-vectors.yml",
+                    "capsule-vectors",
+                    "capsule-vectors-workflow-too-large",
+                ),
+                (
                     ".github/workflows/windows-handoff-synthetic.yml",
                     "windows-handoff-synthetic",
                     "handoff-workflow-too-large",
@@ -1483,6 +1488,14 @@ class LaneRegistryTests(unittest.TestCase):
                 ".github/workflows/windows-confinement.yml",
                 "windows-confinement",
                 "windows-confinement-workflow-too-large",
+            ),
+            policy.LANE_CANDIDATE_WORKFLOWS,
+        )
+        self.assertIn(
+            (
+                ".github/workflows/capsule-vectors.yml",
+                "capsule-vectors",
+                "capsule-vectors-workflow-too-large",
             ),
             policy.LANE_CANDIDATE_WORKFLOWS,
         )
