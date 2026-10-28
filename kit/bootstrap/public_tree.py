@@ -21,6 +21,8 @@ PLATFORM_FILES = frozenset(
         'kit/confinement/test_feedback_admin_integration.py',
         'kit/confinement/feedback_api.py',
         'kit/confinement/test_feedback_api.py',
+        'kit/confinement/feedback_failure.py',
+        'kit/confinement/test_feedback_failure.py',
         'kit/confinement/feedback_public_audit.py',
         'kit/confinement/test_feedback_public_audit.py',
 
@@ -107,6 +109,8 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
+    'kit/confinement/test_feedback_failure.py': 'ab2f81df1c9a857d1aae0dc0a1ad08bf0fcdaa966c43d6c7e3581eef8a09e109',
+    'kit/confinement/feedback_failure.py': 'ace31213a57e9647c14f4895f3dd887a54a831b719969c02c84cdb655125b3d8',
     '.github/workflows/development-feedback-smoke.yml': '1212e019a19c85d5cb4ef4524cae6c8aedcab4c3998c2ca46f0ee8f10ca6ce8a',
     'kit/confinement/development_feedback.mjs': '12a914f638ff0ecf9ef471b93cda4ce010db32b2a0cfd3820d532687062e117e',
     'kit/confinement/test_development_feedback.mjs': 'a29941208549298f285757ce4d8bb54be10127b498fad644b9f6497a4e47c38a',
@@ -146,9 +150,9 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_windows_native_preflight.py': '02d6bcf6d52d4c5f26589b6da8e224b5f0b3f8f57255e00c135f666caed613fe',
     'kit/confinement/macos_source_reader.py': 'd3fbda5c68ac7d21761e946b0f546607b19c23ccb725e453f3fffef3321c0d70',
     'kit/confinement/test_macos_source_reader.py': 'ed8e9b850f7d3a80346ad4a6efc182b28ff9c22fa669eda241f2c5feb3ccf806',
-    '.github/workflows/node-lock-return.yml': '418f29d1e7aa590e0787ead120b869865a34036617260d453ea771c67a34823f',
-    '.github/workflows/core-rust-format-return.yml': 'fb0d822c6036c0181e8a490d2a678768c79db08ab586a59ec18086641ef6278f',
-    '.github/workflows/core-build-diagnostic-return.yml': '0bad69667568d07eed28dfcad3deac01cf94fdb0a7ebee4cc26f03ab4f44baeb',
+    '.github/workflows/node-lock-return.yml': '56f1da2365d109aa738700347e6a1dfb01e6ea4b4a2f38467f207eb7e24aafa1',
+    '.github/workflows/core-rust-format-return.yml': '207d01588ccb43f0cbf609b07786b86b50238a39a8f207eaee6cb5672c796019',
+    '.github/workflows/core-build-diagnostic-return.yml': 'f972093828b56dc40b563bda49fe1077c35fa3c4a0d9e3eecd56d1181a818270',
     'kit/confinement/macos_feedback_producer.py': '4474457a1af8a4122aebe90901d4eb11e536a80da2ae5a7cc1f89731342e11b5',
     'kit/confinement/test_macos_feedback_producer.py': '63bfc07c37ccb828e832a043866c339d6b00867428a3d3764a5c6b9e0d4eb0a4',
     'kit/confinement/feedback_producer_crypto.mjs': 'e621131afec27d78b170e207843e76e20d4f9682cf2323c3a787ac53b6db60da',

@@ -1474,9 +1474,9 @@ def consumer_workflow_template(pool, pin):
 
 
 FEEDBACK_RETURN_WORKFLOW_SHA256 = {
-    'node-lock-return': '418f29d1e7aa590e0787ead120b869865a34036617260d453ea771c67a34823f',
-    'core-rust-format-return': 'fb0d822c6036c0181e8a490d2a678768c79db08ab586a59ec18086641ef6278f',
-    'core-build-diagnostic-return': '0bad69667568d07eed28dfcad3deac01cf94fdb0a7ebee4cc26f03ab4f44baeb',
+    'node-lock-return': '56f1da2365d109aa738700347e6a1dfb01e6ea4b4a2f38467f207eb7e24aafa1',
+    'core-rust-format-return': '207d01588ccb43f0cbf609b07786b86b50238a39a8f207eaee6cb5672c796019',
+    'core-build-diagnostic-return': 'f972093828b56dc40b563bda49fe1077c35fa3c4a0d9e3eecd56d1181a818270',
 }
 
 
