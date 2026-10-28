@@ -282,6 +282,14 @@ class WrappedTests(unittest.TestCase):
                         with self.subTest(form=name, width=width, stamp=stamp, ending=ending):
                             self.assertEqual(subject.scan_bytes(data, CONFIG), "present")
 
+    def test_timestamps_with_one_to_seven_fractional_digits_are_stripped(self):
+        encoded = _wrapped_sources()["base64-text"]
+        for digits in range(1, 8):
+            stamp = b"2026-10-28T10:00:00." + b"5" * digits + b"Z "
+            lines = [stamp + encoded[index:index + 20] for index in range(0, len(encoded), 20)]
+            with self.subTest(digits=digits):
+                self.assertEqual(subject.scan_bytes(b"\n".join(lines), CONFIG), "present")
+
     def test_wrapped_value_is_detected_when_the_last_line_has_no_newline_or_padding_is_kept(self):
         padded = base64.b64encode(CANARY.encode("ascii"))
         self.assertEqual(subject.scan_bytes(_wrapped(padded, 20), CONFIG), "present")

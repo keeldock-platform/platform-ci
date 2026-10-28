@@ -6,17 +6,21 @@ annotation, artifact and cache records it checks that:
 
     the run, attempt one, control commit, workflow path, CI ref and title are the expected ones
     no log, check output or annotation of any completed job, whatever its conclusion, contains
-    the committed canary in any pinned encoding; this scan runs first, before any other verdict
+    the committed canary in any pinned encoding; a surface that could not be read or scanned in
+    full counts as a possible leak and is reported with the canary phase
     every expected job exists once, completed with success, and ran exactly the expected steps
     the verdict job log holds exactly one verdict line, valid under the closed verdict schema,
     bound to the expected operating system, control commit, run and attempt, accepted, and
-    inside the log section of the one required verdict step
+    inside the log section of the one required verdict step; the section of a step runs from
+    its run header to the next run header or the job tail line, composite action layouts are
+    refused because their nested headers and markers cannot be mapped to job steps
     the run artifact inventory is empty: artifact contents are not scanned, so no artifact is
     admitted until a content scan exists
     the repository cache inventory equals the digest taken before the producer jobs ran
 
-Because the canary scan precedes every other check, a failed or cancelled producer that leaked
-the canary still refuses with the canary phase. Anything missing, incomplete, paginated short,
+The request, configuration, run identity and job listing are checked first, because they decide
+what is scanned. After that the canary scan precedes every other check, so a failed or
+cancelled producer that leaked the canary still refuses with the canary phase. Anything missing, incomplete, paginated short,
 cancelled, skipped or mismatched refuses. The public result is one fixed line and a refusal
 names only a closed phase, never a value.
 
@@ -81,7 +85,10 @@ EXPECTED_FIELDS = frozenset((
 UNSECTIONED_STEPS = ("Set up job", "Complete job")
 GROUP_MARK = bytes((35, 35)) + b"[group]"
 RUN_HEADER = GROUP_MARK + b"Run "
-SECTION_HEADERS = (GROUP_MARK + b"Post Run ", GROUP_MARK + b"Complete job")
+SECTION_HEADERS = (GROUP_MARK + b"Post ",)
+TAIL_LINES = (b"Post job cleanup.", b"Cleaning up orphan processes")
+START_ACTION = bytes((35, 35)) + b"[start-action "
+END_ACTION = bytes((35, 35)) + b"[end-action "
 BOM = b"\xef\xbb\xbf"
 CACHE_QUERY = "sort=created_at&direction=asc"
 JOB_FIELDS = frozenset(("steps", "optional_steps"))
@@ -321,38 +328,57 @@ def _check_id(job, repository):
     return int(matched.group(1))
 
 
-def _surface_texts(api, job, expected):
+def _surface_texts(api, job, expected, texts):
+    """Append every readable text of the job check; return None or the phase to report.
+
+    Anything that cannot be read or understood in full, or that exceeds a bound, is reported as
+    the canary phase because absence of the canary is then not proven. Texts are appended before
+    any bound or identity check is applied, so they are always scanned.
+    """
     check_id = _check_id(job, expected["repository"])
     check_path = "/repos/" + expected["repository"] + "/check-runs/" + str(check_id)
-    check, unused_headers = api.json(check_path)
+    try:
+        check, unused_headers = api.json(check_path)
+    except Exception:
+        return "log_canary"
     output = check.get("output") if type(check) is dict else None
-    if (type(check) is not dict or not _is(check.get("id"), check_id)
-            or not _is(check.get("head_sha"), expected["control_sha"])
-            or not _is(check.get("status"), "completed")
-            or not _is(check.get("conclusion"), job.get("conclusion"))
-            or type(output) is not dict
-            or not _exact_int(output.get("annotations_count"), 0, MAX_ANNOTATIONS)):
-        _fail("annotations")
-    texts = []
+    if type(output) is not dict:
+        return "log_canary"
+    unscanned = False
     for field in ("title", "summary", "text"):
         value = output.get(field)
         if value is None:
             continue
-        if type(value) is not str or len(value) > MAX_CHECK_TEXT:
-            _fail("annotations")
+        if type(value) is not str:
+            unscanned = True
+            continue
         texts.append(value)
-    annotations = _collect_annotations(
-        api, check_path + "/annotations", output["annotations_count"],
-    )
+        if len(value) > MAX_CHECK_TEXT:
+            unscanned = True
+    count = output.get("annotations_count")
+    if not _exact_int(count, 0, MAX_ANNOTATIONS):
+        return "log_canary"
+    try:
+        annotations = _collect_annotations(api, check_path + "/annotations", count)
+    except Exception:
+        return "log_canary"
     for annotation in annotations:
         if type(annotation) is not dict:
-            _fail("annotations")
+            unscanned = True
+            continue
         for value in annotation.values():
             if type(value) is str:
                 texts.append(value)
             elif value is not None and type(value) not in (int, bool):
-                _fail("annotations")
-    return texts
+                unscanned = True
+    if unscanned:
+        return "log_canary"
+    if (not _is(check.get("id"), check_id)
+            or not _is(check.get("head_sha"), expected["control_sha"])
+            or not _is(check.get("status"), "completed")
+            or not _is(check.get("conclusion"), job.get("conclusion"))):
+        return "annotations"
+    return None
 
 
 def _candidates(jobs, expected):
@@ -367,34 +393,38 @@ def _candidates(jobs, expected):
 def _gather(api, jobs, expected):
     """Collect the log, check output and annotations of every completed job.
 
-    Fetch problems are recorded and returned, not raised, so the canary scan covers everything
-    that could be read before any other refusal is reported.
+    Problems are recorded and returned, not raised, so the canary scan covers everything that
+    could be read before any other refusal is reported. The last value is true when some
+    surface could not be read or scanned in full, so absence of the canary is not proven.
     """
     logs = {}
     texts = []
     pending = []
-    total = 0
+    unscanned = False
     for job in _candidates(jobs, expected):
         try:
             log = api.log_text(job["id"])
-            if type(log) is not bytes or not log or len(log) > MAX_LOG_BYTES:
-                _fail("job_logs")
+        except Exception:
+            log = None
+        if type(log) is bytes and log:
             logs[job["id"]] = log
-        except AuditRefusal as error:
-            pending.append(error.phase)
-        except Exception:
-            pending.append("job_logs")
+            if len(log) > MAX_LOG_BYTES:
+                unscanned = True
+        else:
+            unscanned = True
         try:
-            found = _surface_texts(api, job, expected)
-            total += sum(len(text) for text in found)
-            if total > MAX_ANNOTATION_TEXT:
-                _fail("annotations")
-            texts.extend(found)
+            phase = _surface_texts(api, job, expected, texts)
         except AuditRefusal as error:
-            pending.append(error.phase)
+            phase = error.phase
         except Exception:
-            pending.append("annotations")
-    return logs, texts, pending
+            phase = "log_canary"
+        if phase == "log_canary":
+            unscanned = True
+        elif phase is not None:
+            pending.append(phase)
+        if sum(len(text) for text in texts) > MAX_ANNOTATION_TEXT:
+            unscanned = True
+    return logs, texts, pending, unscanned
 
 
 def _scan(logs, texts, config):
@@ -416,6 +446,13 @@ def _stripped_lines(log):
 
 
 def _check_section(log, job, expected):
+    """Require the single verdict line inside the log section of the verdict step.
+
+    Raw job logs have no per-step header or footer for plain steps: each step starts with a
+    run header line and its section ends at the next run header, a post header, or the job tail
+    line. Composite actions add nested run headers and start and end markers that do not map to
+    job steps, so any such marker refuses.
+    """
     ordinal = None
     eligible = 0
     for step in job["steps"]:
@@ -427,13 +464,18 @@ def _check_section(log, job, expected):
             ordinal = eligible
         eligible += 1
     lines = _stripped_lines(log)
+    if any(line.startswith(START_ACTION) or line.startswith(END_ACTION) for line in lines):
+        _fail("verdict")
     runs = [index for index, line in enumerate(lines) if line.startswith(RUN_HEADER)]
     if ordinal is None or len(runs) != eligible:
         _fail("verdict")
     start = runs[ordinal]
     following = [
         index for index, line in enumerate(lines)
-        if index > start and (line.startswith(RUN_HEADER) or line.startswith(SECTION_HEADERS))
+        if index > start and (
+            line.startswith(RUN_HEADER) or line.startswith(SECTION_HEADERS)
+            or line.rstrip() in TAIL_LINES
+        )
     ]
     end = following[0] if following else len(lines)
     positions = [index for index, line in enumerate(lines) if line.startswith(VERDICT_PREFIX)]
@@ -563,8 +605,10 @@ def audit(api, expected, config=None):
     resolved = _guard("log_canary", _resolve_config, config)
     _guard("run", _check_run, api, expected)
     jobs = _guard("jobs", _list_jobs, api, expected)
-    logs, texts, pending = _gather(api, jobs, expected)
+    logs, texts, pending, unscanned = _gather(api, jobs, expected)
     _scan(logs, texts, resolved)
+    if unscanned:
+        _fail("log_canary")
     by_name = _guard("jobs", _check_jobs, jobs, expected)
     if pending:
         _fail(pending[0])
@@ -670,8 +714,12 @@ def _default_api_factory(token, repository):
                 method="GET",
             )
             data, blob_headers = self._open(blob, MAX_LOG_BYTES)
-            if blob_headers.get("Content-Encoding", "identity").lower() != "identity":
-                raise ValueError("encoding")
+            length = blob_headers.get("Content-Length")
+            if (blob_headers.get_content_type() not in ("text/plain", "application/octet-stream")
+                    or blob_headers.get("Content-Encoding", "identity").lower() != "identity"
+                    or type(length) is not str or not length.isascii() or not length.isdecimal()
+                    or int(length) != len(data)):
+                raise ValueError("log")
             return data
 
     return Client(token)

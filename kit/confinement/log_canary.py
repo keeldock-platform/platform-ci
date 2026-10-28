@@ -57,7 +57,7 @@ FORMS = ("plain", "hex", "utf16le") + tuple(
 MIN_DISTINCT_NIBBLES = 12
 JOIN_LIMIT = 1024 * 1024
 LINE_LIMIT = 1024 * 1024
-TIMESTAMP_RE = re.compile(rb"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{7}Z ")
+TIMESTAMP_RE = re.compile(rb"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{1,7}Z ")
 WRAP_LINE_RE = re.compile(rb"[A-Za-z0-9+/_-]+={0,2}")
 CONFIG_FIELDS = frozenset(("digests", "text_length"))
 TEXT_RE = re.compile(r"(?:[0-9a-f]{2}){32,128}")

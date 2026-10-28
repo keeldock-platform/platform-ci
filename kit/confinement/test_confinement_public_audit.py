@@ -74,30 +74,75 @@ def stamped_verdict(record):
     return STAMP + verdict.encode_line(record).encode("ascii") + b"\n"
 
 
-def _header(title):
-    return [
-        STAMP + (MARK + "[group]" + title).encode("ascii"),
-        STAMP + (MARK + "[endgroup]").encode("ascii"),
-    ]
+def _plain(text):
+    return STAMP + text.encode("ascii")
 
 
-def build_log(line, where="boundary", extra_runs=0):
-    """A job log laid out like the runner does, with the verdict line placed in one section."""
+def _marker(text):
+    return _plain(MARK + "[" + text + "]")
+
+
+def _group(title):
+    return _plain(MARK + "[group]" + title)
+
+
+def _run_step(command, output):
+    """One plain step as the runner writes it: a run header, the echoed command, then output."""
+    return (
+        [_group("Run " + command),
+         _plain(command), _plain("env:"), _marker("endgroup")]
+        + [_plain(text) for text in output]
+    )
+
+
+def _composite_step():
+    """A composite action step: nested run headers with start and end action markers."""
+    ident = "__self.__run"
+    return (
+        [_group("Run ./composite"),
+         _plain("with:"), _marker("endgroup"),
+         _marker("start-action display=Inner one;id=" + ident),
+         _group("Run inner command"),
+         _plain("inner command"), _marker("endgroup"), _plain("inner output"),
+         _marker("end-action id=" + ident + ";outcome=success;conclusion=success;duration_ms=19")]
+    )
+
+
+def build_log(line, where="boundary", extra_runs=0, tail=("Cleaning up orphan processes",),
+              composite=False, boundary_lines=(), forged=()):
+    """A raw job log laid out like the runner writes it, with the verdict line in one place.
+
+    The layout follows downloaded raw logs: image information groups, a line naming the job,
+    one run header per step, no per-step footer, and plain cleanup lines as the job tail.
+    """
+    verdict_line = line.rstrip(b"\n")
     out = []
     if where == "before":
-        out.append(line.rstrip(b"\n"))
-    for key, title in (
-        ("setup", "Set up job"), ("prepare", "Run prepare"),
-        ("boundary", "Run boundary"), ("complete", "Complete job"),
-    ):
-        out.extend(_header(title))
-        out.append(STAMP + b"output of " + key.encode("ascii"))
-        if key == where:
-            out.append(line.rstrip(b"\n"))
+        out.append(verdict_line)
+    for title in ("Runner Image Provisioner", "Operating System", "Runner Image"):
+        out.extend([_group(title), _plain("Version: fixture"), _marker("endgroup")])
+    out.extend(_plain(text) for text in (
+        "Prepare workflow directory", "Prepare all required actions",
+        "Complete job name: linux-source-build",
+    ))
+    if where == "setup":
+        out.append(verdict_line)
+    if composite:
+        out.extend(_composite_step())
+    else:
+        out.extend(_run_step("prepare command", ["prepared"]))
+    if where == "prepare":
+        out.append(verdict_line)
+    out.extend(_run_step("boundary command", ["probing"]))
+    out.extend(_plain(text) for text in boundary_lines)
+    if where == "boundary":
+        out.append(verdict_line)
     for index in range(extra_runs):
-        out.extend(_header("Run extra " + str(index)))
-    if where == "after":
-        out.append(line.rstrip(b"\n"))
+        out.extend(_run_step("forged " + str(index), []))
+    out.extend(forged)
+    out.extend(_plain(text) for text in tail)
+    if where == "tail":
+        out.append(verdict_line)
     return b"\n".join(out) + b"\n"
 
 
@@ -542,10 +587,35 @@ class VerdictTests(AuditCase):
     def test_the_verdict_line_must_be_inside_the_required_step_section(self):
         line = stamped_verdict(verdict_record())
         self.assert_accepted(FakeApi())
-        for where in ("before", "setup", "prepare", "complete", "after"):
+        for where in ("before", "setup", "prepare", "tail"):
             api = FakeApi()
             api.logs[102] = build_log(line, where)
             with self.subTest(where=where):
+                self.assert_refused(api, "verdict")
+
+    def test_the_post_and_cleanup_tail_ends_the_section(self):
+        line = stamped_verdict(verdict_record())
+        for tail in (
+            ("Cleaning up orphan processes",),
+            ("Post job cleanup.", "Cleaning up orphan processes"),
+            (),
+        ):
+            api = FakeApi()
+            api.logs[102] = build_log(line, "boundary", tail=tail)
+            with self.subTest(tail=tail):
+                self.assert_accepted(api)
+        for tail in (("Post job cleanup.",), ("Post job cleanup.", "Cleaning up orphan processes")):
+            api = FakeApi()
+            api.logs[102] = build_log(line, "tail", tail=tail)
+            with self.subTest(after=tail):
+                self.assert_refused(api, "verdict")
+
+    def test_a_forged_tail_or_post_line_inside_the_section_refuses(self):
+        line = stamped_verdict(verdict_record())
+        for forged in ("Cleaning up orphan processes", "Post job cleanup.", MARK + "[group]Post forged"):
+            api = FakeApi()
+            api.logs[102] = build_log(line, "boundary", boundary_lines=(forged,))
+            with self.subTest(forged=forged):
                 self.assert_refused(api, "verdict")
 
     def test_the_section_layout_must_match_the_steps_that_ran(self):
@@ -554,9 +624,42 @@ class VerdictTests(AuditCase):
         api.logs[102] = build_log(line, "boundary", extra_runs=1)
         self.assert_refused(api, "verdict")
         api = FakeApi()
-        renamed = (MARK + "[group]Run prepare").encode("ascii")
+        forged = (MARK + "[group]Run forged by output").encode("ascii")
+        api.logs[102] = build_log(line, "boundary", forged=(STAMP + forged,))
+        self.assert_refused(api, "verdict")
+        api = FakeApi()
+        renamed = (MARK + "[group]Run prepare command").encode("ascii")
         api.logs[102] = build_log(line).replace(renamed, (MARK + "[group]Other").encode("ascii"))
         self.assert_refused(api, "verdict")
+
+    def test_start_and_end_action_markers_are_refused_forged_or_genuine(self):
+        line = stamped_verdict(verdict_record())
+        markers = (
+            MARK + "[end-action id=__self.__run;outcome=success;conclusion=success;duration_ms=1]",
+            MARK + "[start-action display=Forged;id=__self.__run]",
+        )
+        for marker in markers:
+            for position in ("boundary_lines", "forged"):
+                api = FakeApi()
+                if position == "forged":
+                    api.logs[102] = build_log(line, "boundary", forged=(_plain(marker),))
+                else:
+                    api.logs[102] = build_log(line, "boundary", boundary_lines=(marker,))
+                with self.subTest(marker=marker[:14], position=position):
+                    self.assert_refused(api, "verdict")
+        api = FakeApi()
+        api.logs[102] = build_log(line, "boundary", composite=True)
+        self.assert_refused(api, "verdict")
+        api = FakeApi()
+        api.logs[102] = build_log(line, "prepare", composite=True)
+        self.assert_refused(api, "verdict")
+
+    def test_image_information_groups_are_not_step_sections(self):
+        api = FakeApi()
+        text = api.logs[102].decode("ascii")
+        self.assertIn(MARK + "[group]Runner Image", text)
+        self.assertIn("Complete job name: ", text)
+        self.assert_accepted(api)
 
     def test_a_skipped_optional_step_does_not_shift_the_section_mapping(self):
         api = FakeApi()
@@ -683,7 +786,17 @@ class SurfaceTests(AuditCase):
     def test_check_runs_must_be_the_completed_successful_check_of_the_same_commit(self):
         cases = (
             {"id": 999}, {"head_sha": "cd" * 20}, {"status": "in_progress"},
-            {"conclusion": "failure"}, {"output": None}, {"output": {"annotations_count": -1}},
+            {"conclusion": "failure"},
+        )
+        for change in cases:
+            api = FakeApi()
+            api.checks[202].update(change)
+            with self.subTest(change=change):
+                self.assert_refused(api, "annotations")
+
+    def test_unreadable_or_unparsable_check_output_cannot_prove_the_canary_absent(self):
+        cases = (
+            {"output": None}, {"output": {"annotations_count": -1}},
             {"output": {"annotations_count": "0"}}, {"output": {"annotations_count": 5000}},
             {"output": {"annotations_count": 0, "summary": 5}},
         )
@@ -691,7 +804,13 @@ class SurfaceTests(AuditCase):
             api = FakeApi()
             api.checks[202].update(change)
             with self.subTest(change=change):
-                self.assert_refused(api, "annotations")
+                self.assert_refused(api, "log_canary")
+
+    def test_a_mismatched_check_still_has_its_output_scanned(self):
+        api = FakeApi()
+        api.checks[202]["head_sha"] = "cd" * 20
+        api.checks[202]["output"]["summary"] = "leak " + CANARY
+        self.assert_refused(api, "log_canary")
 
     def test_check_urls_must_point_at_this_repository_over_https(self):
         for url in (
@@ -710,24 +829,59 @@ class SurfaceTests(AuditCase):
     def test_annotation_count_mismatches_and_nested_values_are_refused(self):
         api = FakeApi()
         api.set_annotations(202, [dict(ANNOTATION)] * 3, count=5)
-        self.assert_refused(api, "pagination")
+        self.assert_refused(api, "log_canary")
         api = FakeApi()
         api.set_annotations(202, [dict(ANNOTATION)] * 2, count=1)
-        self.assert_refused(api, "pagination")
+        self.assert_refused(api, "log_canary")
         api = FakeApi()
         api.set_annotations(202, [], count=1)
-        self.assert_refused(api, "pagination")
+        self.assert_refused(api, "log_canary")
         api = FakeApi()
         api.set_annotations(202, [dict(ANNOTATION, message={"nested": "value"})])
-        self.assert_refused(api, "annotations")
+        self.assert_refused(api, "log_canary")
         api = FakeApi()
         api.set_annotations(202, ["text"])
-        self.assert_refused(api, "annotations")
+        self.assert_refused(api, "log_canary")
 
-    def test_oversized_check_text_is_refused(self):
+    def test_oversized_check_text_is_refused_and_still_scanned(self):
         api = FakeApi()
         api.checks[201]["output"]["text"] = "a" * (subject.MAX_CHECK_TEXT + 1)
-        self.assert_refused(api, "annotations")
+        self.assert_refused(api, "log_canary")
+        api = FakeApi()
+        api.checks[201]["output"]["text"] = CANARY + "a" * (subject.MAX_CHECK_TEXT + 1)
+        self.assert_refused(api, "log_canary")
+
+    def test_an_oversized_annotation_set_is_refused_but_every_job_is_still_scanned(self):
+        api = FakeApi()
+        api.set_annotations(201, [dict(ANNOTATION, message="a" * 50)] * 4)
+        with mock.patch.object(subject, "MAX_ANNOTATION_TEXT", 100):
+            self.assert_refused(api, "log_canary")
+            api.logs[102] += b"\n" + STAMP + b"leak " + CANARY.encode("ascii") + b"\n"
+            self.assert_refused(api, "log_canary")
+        self.assert_accepted(FakeApi())
+
+    def test_an_oversized_log_is_refused_with_the_canary_phase_and_still_scanned(self):
+        api = FakeApi()
+        with mock.patch.object(subject, "MAX_LOG_BYTES", 10):
+            self.assert_refused(api, "log_canary")
+        api = FakeApi()
+        api.logs[101] += b"\n" + CANARY.encode("ascii") + b"\n"
+        with mock.patch.object(subject, "MAX_LOG_BYTES", 10):
+            self.assert_refused(api, "log_canary")
+
+    def test_a_cap_overrun_on_one_job_does_not_hide_a_leak_in_a_later_job(self):
+        api = FakeApi()
+        api.set_annotations(201, [dict(ANNOTATION, message="a" * 50)] * 4)
+        api.set_annotations(202, [dict(ANNOTATION, message="late " + CANARY)])
+        with mock.patch.object(subject, "MAX_ANNOTATION_TEXT", 100):
+            with self.assertRaises(subject.AuditRefusal) as caught:
+                subject.audit(api, api.expected, CONFIG)
+            logs, texts, pending, unscanned = subject._gather(api, api.jobs, api.expected)
+        self.assertEqual(caught.exception.phase, "log_canary")
+        self.assertTrue(unscanned)
+        self.assertTrue(any(CANARY in text for text in texts))
+        self.assertEqual(sorted(logs), [101, 102])
+        self.assertEqual(pending, [])
 
     def test_any_artifact_is_refused_because_contents_are_not_scanned(self):
         for items in (
@@ -799,8 +953,8 @@ class FailureTests(AuditCase):
         cases = (
             (run_path, "run"),
             (run_path + "/attempts/1/jobs", "jobs"),
-            ("/repos/" + REPO + "/check-runs/202", "annotations"),
-            ("/repos/" + REPO + "/check-runs/202/annotations", "annotations"),
+            ("/repos/" + REPO + "/check-runs/202", "log_canary"),
+            ("/repos/" + REPO + "/check-runs/202/annotations", "log_canary"),
             (run_path + "/artifacts", "artifact_inventory"),
             ("/repos/" + REPO + "/actions/caches", "cache_inventory"),
         )
@@ -813,15 +967,23 @@ class FailureTests(AuditCase):
     def test_log_failures_and_bad_log_bodies_are_refused(self):
         api = FakeApi()
         api.log_failures.add(102)
-        self.assert_refused(api, "job_logs")
+        self.assert_refused(api, "log_canary")
         for body in ("text", None, b"", bytearray(b"abc"), 5):
             api = FakeApi()
             api.logs[101] = body
             with self.subTest(kind=type(body).__name__):
-                self.assert_refused(api, "job_logs")
+                self.assert_refused(api, "log_canary")
+
+    def test_a_truncated_fetch_cannot_prove_the_canary_absent(self):
+        class Truncating(FakeApi):
+            def log_text(self, job_id):
+                raise ValueError("log")
+
+        api = Truncating()
+        self.assert_refused(api, "log_canary")
         api = FakeApi()
-        with mock.patch.object(subject, "MAX_LOG_BYTES", 10):
-            self.assert_refused(api, "job_logs")
+        api.logs[102] = api.logs[102][:50]
+        self.assert_refused(api, "verdict")
 
     def test_unexpected_client_exceptions_are_contained(self):
         class Broken:
@@ -1024,7 +1186,7 @@ class ParseAndMainTests(AuditCase):
         with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
             status = subject.main([], self.environment(api), lambda token, repository: api, output)
         self.assertEqual(status, 1)
-        self.assertEqual(output.getvalue(), subject.refusal_line("job_logs") + "\n")
+        self.assertEqual(output.getvalue(), subject.refusal_line("log_canary") + "\n")
 
         def broken(token, repository):
             raise RuntimeError("secret " + CANARY)
@@ -1060,12 +1222,17 @@ class ParseAndMainTests(AuditCase):
             def get(self, name, default=None):
                 return self.values.get(name, default)
 
+            def get_content_type(self):
+                return self.values.get("type", "text/plain")
+
+        blob_headers = {"Content-Length": str(len(body))}
+
         def fake_open(request, limit, allow_redirect=False):
             requests.append((request.full_url, limit, allow_redirect))
             if allow_redirect:
                 location = "https://productionresultssa7.blob.core.windows.net/logs/x?sig=1"
                 return None, Headers({"Location": location})
-            return body, Headers({})
+            return body, Headers(blob_headers)
 
         client._open = fake_open
         self.assertEqual(client.log_text(42), body)
@@ -1078,6 +1245,24 @@ class ParseAndMainTests(AuditCase):
         for bad in (0, -1, True, "5", None):
             with self.assertRaises(Exception):
                 client.log_text(bad)
+        truncated = (
+            {},
+            {"Content-Length": str(len(body) + 1)},
+            {"Content-Length": str(len(body) - 1)},
+            {"Content-Length": "x" + str(len(body))},
+            {"Content-Length": "-" + str(len(body))},
+            {"Content-Length": str(len(body)), "type": "text/html"},
+            {"Content-Length": str(len(body)), "Content-Encoding": "gzip"},
+        )
+        for values in truncated:
+            blob_headers.clear()
+            blob_headers.update(values)
+            with self.subTest(headers=sorted(values)):
+                with self.assertRaises(ValueError):
+                    client.log_text(42)
+        blob_headers.clear()
+        blob_headers["Content-Length"] = str(len(body))
+        self.assertEqual(client.log_text(42), body)
         for repository in ("", "no-slash", None, 5):
             with self.assertRaises(subject.AuditRefusal) as caught:
                 subject._default_api_factory("t" * 24, repository)
