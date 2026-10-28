@@ -87,15 +87,14 @@ jobs:
           directory="$evidence/artifacts/$selected"
           subject_sha="$(sha256sum "$directory/subject.bin" | awk '{print $1}')"
           provider_path="repos/$KD_REPOSITORY/attestations/sha256:$subject_sha"
-          gh api --paginate --slurp "$provider_path?per_page=100" > "$evidence/provider-$subject_sha-pages.json" 2>/dev/null
-          next_page="$(python -B kit/confinement/role_signer.py next-provider-page --input "$evidence/provider-$subject_sha-pages.json")"
-          gh api "$provider_path?per_page=100&page=$next_page" > "$evidence/provider-$subject_sha-terminal.json" 2>/dev/null
-          python -B kit/confinement/role_signer.py wrap-pages --kind attestations --input "$evidence/provider-$subject_sha-pages.json" --terminal-input "$evidence/provider-$subject_sha-terminal.json" --output "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          gh api --include --paginate "$provider_path?per_page=100" > "$evidence/provider-$subject_sha-http.txt" 2>/dev/null
+          python -B kit/confinement/role_signer.py wrap-provider-http --input "$evidence/provider-$subject_sha-http.txt" --subject-digest "$subject_sha" --output "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
           python -B kit/confinement/role_signer.py export-provider --snapshot "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA" --output-directory "$evidence/provider-$subject_sha"
           while read -r index provider_role; do
             gh attestation verify "$directory/subject.bin" --bundle "$evidence/provider-$subject_sha/bundle-$index.json" --repo "$KD_REPOSITORY" --signer-workflow "$KD_REPOSITORY/.github/workflows/lane-h-$provider_role.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$evidence/provider-$subject_sha/verified-$index.json" 2>/dev/null
           done < "$evidence/provider-$subject_sha/manifest.txt"
-          python -B kit/confinement/role_signer.py gate-transition --gate A --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --jobs-file "$evidence/jobs.json" --artifacts-file "$evidence/artifacts.json" --repository-metadata "$evidence/repository.json" --run-metadata "$evidence/run.json" --artifact-directory "$evidence/artifacts" --provider-directory "$evidence"
+          gate_args=(--observe --observation-output "$evidence/gate-A-observation.json")
+          python -B kit/confinement/role_signer.py gate-transition --gate A --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --jobs-file "$evidence/jobs.json" --artifacts-file "$evidence/artifacts.json" --repository-metadata "$evidence/repository.json" --run-metadata "$evidence/run.json" --artifact-directory "$evidence/artifacts" --provider-directory "$evidence" "${gate_args[@]}"
       - name: Create the fixed synthetic capsule bound to receiver bytes
         id: subject
         run: |

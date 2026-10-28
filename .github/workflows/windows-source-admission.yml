@@ -90,10 +90,8 @@ jobs:
             printf '%s\n' "$subject_sha" > "$directory/subject.sha256"
             if [[ ! -f "$evidence/provider-$subject_sha.json" ]]; then
               provider_path="repos/$KD_REPOSITORY/attestations/sha256:$subject_sha"
-              gh api --paginate --slurp "$provider_path?per_page=100" > "$evidence/provider-$subject_sha-pages.json" 2>/dev/null
-              next_page="$(python -B kit/confinement/role_signer.py next-provider-page --input "$evidence/provider-$subject_sha-pages.json")"
-              gh api "$provider_path?per_page=100&page=$next_page" > "$evidence/provider-$subject_sha-terminal.json" 2>/dev/null
-              python -B kit/confinement/role_signer.py wrap-pages --kind attestations --input "$evidence/provider-$subject_sha-pages.json" --terminal-input "$evidence/provider-$subject_sha-terminal.json" --output "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+              gh api --include --paginate "$provider_path?per_page=100" > "$evidence/provider-$subject_sha-http.txt" 2>/dev/null
+              python -B kit/confinement/role_signer.py wrap-provider-http --input "$evidence/provider-$subject_sha-http.txt" --subject-digest "$subject_sha" --output "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
               python -B kit/confinement/role_signer.py export-provider --snapshot "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA" --output-directory "$evidence/provider-$subject_sha"
               while read -r index provider_role; do
                 gh attestation verify "$directory/subject.bin" --bundle "$evidence/provider-$subject_sha/bundle-$index.json" --repo "$KD_REPOSITORY" --signer-workflow "$KD_REPOSITORY/.github/workflows/lane-h-$provider_role.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$evidence/provider-$subject_sha/verified-$index.json" 2>/dev/null
@@ -102,6 +100,10 @@ jobs:
             sha256sum "$directory/subject.bin" "$directory/predicate.json" "$directory/bundle.json" "$directory/verified.json" >> "$evidence/file-hashes.txt"
           done
           sha256sum .github/workflows/windows-source-admission.yml .github/workflows/lane-h-windows-receiver.yml .github/workflows/lane-h-linux-fetch-encrypt.yml .github/workflows/lane-h-capsule-attester.yml > "$evidence/workflow-hashes.txt"
+          linux_job_id="$(python -B kit/confinement/role_signer.py find-job --observe --profile "$KD_PROFILE" --role linux-fetch-encrypt --jobs-file "$evidence/jobs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA")"
+          gh run view "$KD_RUN_ID" --repo "$KD_REPOSITORY" --job "$linux_job_id" --log > "$evidence/linux.log" 2>/dev/null
+          python -B kit/confinement/role_signer.py parse-linux-logs --observe --profile "$KD_PROFILE" --jobs-file "$evidence/jobs.json" --input "$evidence/linux.log" --output "$evidence/linux-logs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          python -B kit/confinement/role_signer.py verify-snapshot --observe --observation-output "$evidence/observed-mappings.json" --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --root . --jobs-file "$evidence/jobs.json" --artifacts-file "$evidence/artifacts.json" --repository-metadata "$evidence/repository.json" --run-metadata "$evidence/run.json" --evidence-directory "$evidence" --linux-logs "$evidence/linux-logs.json"
       - name: Retain source-free role evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

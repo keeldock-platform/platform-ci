@@ -11,7 +11,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 
 
 MAX_JSON_BYTES = 8388608
@@ -19,6 +19,7 @@ MAX_CERTIFICATE_FIELDS = 64
 MAX_FILE_BYTES = 262144
 MAX_U64 = (1 << 64) - 1
 MAX_U32 = (1 << 32) - 1
+MAX_PROVIDER_PAGES = 256
 CONTROL_REPOSITORY = "keeldock-platform/platform-ci"
 OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 PREDICATE_TYPE = "https://example.invalid/role-statement/v1"
@@ -46,11 +47,11 @@ CALLER_PROFILES = {
     },
 }
 PINNED_WORKFLOW_SHA256 = {
-    ".github/workflows/windows-source-admission.yml": "6637cfbaaf5a5ae228680984ce39971ab2584dd76f14790c7e6e766aca8c2cbc",
+    ".github/workflows/windows-source-admission.yml": "58aa50417238c55c26d18c903479f149ebdb92a4b7fd6bed7253147d35ec340d",
     ".github/workflows/lane-h-windows-receiver.yml": "5347fcfdf29c979f7af8c63cee48f77b856fd7cc38d34ad675da75a0b806b448",
-    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "3cb1e0f2fcd46014839988452bdb50e1a688c7ad9e8a59098a6f7c2de96042f0",
-    ".github/workflows/lane-h-capsule-attester.yml": "5f3120c996a193bea63111024d285ee4eb9e199a01c4f4d09fee6424471e281e",
-    ".github/workflows/attestation-role-signer-probe.yml": "dc534b6df944369d24cb59e719acc84fdb5c2329c6d939af7c192a93f318e88c",
+    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "fdd7355a0eabe45248fb497e49b5989645f5e2f31fd134fb6d80ac06cf52f0a7",
+    ".github/workflows/lane-h-capsule-attester.yml": "082da71f6caa218b89c688e5c73389b8d0c96d3281121b2b4fd8460db827745e",
+    ".github/workflows/attestation-role-signer-probe.yml": "e0a39e5d177e9df8ea30420673a02a5009b7211df5d2d0c2d10d5e1a9a617ef8",
 }
 API_JOB_NAME_PINS = {
     profile: {role: None for role in ROLE_ORDER}
@@ -817,12 +818,12 @@ def validate_call_graph(graph, profile):
     return True
 
 
-def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha, terminal_page=None):
-    if kind not in ("jobs", "artifacts", "attestations") or type(pages) is not list or not pages:
+def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha):
+    if kind not in ("jobs", "artifacts") or type(pages) is not list or not pages:
         raise Refusal("api-pages-shape")
     if type(head_sha) is not str or HEX_20.fullmatch(head_sha) is None:
         raise Refusal("api-head-sha")
-    key = "jobs" if kind == "jobs" else "artifacts" if kind == "artifacts" else "attestations"
+    key = kind
     wrapped = []
     total = None
     seen = 0
@@ -831,34 +832,24 @@ def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha, terminal_page=Non
             raise Refusal("api-page-shape")
         if len(page[key]) > 100:
             raise Refusal("api-page-count")
-        if kind != "attestations":
-            reported = _is_u64(page.get("total_count"), positive=False)
-            if total is None:
-                total = reported
-            if reported != total:
-                raise Refusal("api-page-count")
-        elif set(page) != {"attestations"}:
-            raise Refusal("api-page-fields")
+        reported = _is_u64(page.get("total_count"), positive=False)
+        if total is None:
+            total = reported
+        if reported != total:
+            raise Refusal("api-page-count")
         if index < len(pages) and len(page[key]) != 100:
             raise Refusal("api-pagination-incomplete")
         seen += len(page[key])
-        wrapped_page = {
+        wrapped.append({
             "page": index,
             "next_page": index + 1 if index < len(pages) else None,
+            "total_count": reported,
             key: page[key],
-        }
-        if kind != "attestations":
-            wrapped_page["total_count"] = reported
-        wrapped.append(wrapped_page)
-    if kind == "attestations":
-        if type(terminal_page) is not dict or set(terminal_page) != {"attestations"} or terminal_page["attestations"] != []:
-            raise Refusal("provider-terminal-page")
-        total = seen
-    else:
-        expected_pages = max(1, (total + 99) // 100)
-        if seen != total or len(pages) != expected_pages or terminal_page is not None:
-            raise Refusal("api-pagination-incomplete")
-    result = {
+        })
+    expected_pages = max(1, (total + 99) // 100)
+    if seen != total or len(pages) != expected_pages:
+        raise Refusal("api-pagination-incomplete")
+    return {
         "kind": kind,
         "complete": True,
         "total_count": total,
@@ -867,19 +858,138 @@ def wrap_api_pages(kind, pages, run_id, run_attempt, head_sha, terminal_page=Non
         "head_sha": head_sha,
         "pages": wrapped,
     }
-    if kind == "attestations":
-        result["terminal_page"] = {"page": len(pages) + 1, "attestations": []}
-    return result
+
+
+def provider_start_uri(subject_digest):
+    if type(subject_digest) is not str or HEX_32.fullmatch(subject_digest) is None:
+        raise Refusal("provider-subject")
+    return ("https:" + chr(47) * 2 + "api.github.com/repos/" + CONTROL_REPOSITORY
+            + "/attestations/sha256:" + subject_digest + "?per_page=100")
+
+
+def validate_provider_uri(uri, subject_digest, initial=False):
+    if (type(uri) is not str or len(uri) > 2048 or
+            any(ord(character) < 33 or ord(character) > 126 for character in uri)):
+        raise Refusal("provider-cursor-uri")
+    parts = urlsplit(uri)
+    expected_path = "/repos/" + CONTROL_REPOSITORY + "/attestations/sha256:" + subject_digest
+    if (parts.scheme != "https" or parts.netloc != "api.github.com" or
+            unquote(parts.path) != expected_path or parts.fragment):
+        raise Refusal("provider-cursor-uri")
+    try:
+        pairs = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        raise Refusal("provider-cursor-query")
+    query = dict(pairs)
+    if len(query) != len(pairs) or set(query) - {"per_page", "after", "before"}:
+        raise Refusal("provider-cursor-query")
+    if query.get("per_page") not in (None, "100"):
+        raise Refusal("provider-page-size")
+    cursors = set(query) & {"after", "before"}
+    if initial:
+        if uri != provider_start_uri(subject_digest):
+            raise Refusal("provider-start-uri")
+    elif len(cursors) != 1 or not query[next(iter(cursors))] or len(query[next(iter(cursors))]) > 512:
+        raise Refusal("provider-cursor-query")
+    return uri
+
+
+def provider_next_link(headers, subject_digest):
+    links = [value for name, value in headers if name.lower() == "link"]
+    if len(links) > 1:
+        raise Refusal("provider-link-duplicate")
+    if not links:
+        return None
+    next_uri = None
+    relations = set()
+    for entry in links[0].split(","):
+        match = re.fullmatch(r'\s*<([^<>]+)>;\s*rel="([a-z]+)"\s*', entry)
+        if match is None or match.group(2) in relations:
+            raise Refusal("provider-link-shape")
+        relation = match.group(2)
+        relations.add(relation)
+        if relation == "next":
+            next_uri = validate_provider_uri(match.group(1), subject_digest)
+    return next_uri
+
+
+def parse_provider_http(payload, subject_digest, run_id, run_attempt, head_sha):
+    if type(payload) is not bytes or len(payload) > MAX_JSON_BYTES:
+        raise Refusal("provider-http-size")
+    try:
+        source = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Refusal("provider-http-encoding")
+    decoder = json.JSONDecoder(object_pairs_hook=_pairs_without_duplicates)
+    pages = []
+    position = 0
+    request_uri = provider_start_uri(subject_digest)
+    visited = set()
+    while position < len(source):
+        if len(pages) >= MAX_PROVIDER_PAGES or request_uri in visited:
+            raise Refusal("provider-pagination-limit")
+        visited.add(request_uri)
+        boundary = re.search(r"\r?\n\r?\n", source[position:])
+        if boundary is None:
+            raise Refusal("provider-http-headers")
+        header_end = position + boundary.start()
+        header_lines = source[position:header_end].splitlines()
+        if not header_lines or re.fullmatch(r"HTTP/(?:1\.[01]|2(?:\.0)?) 200(?: .*)?", header_lines[0]) is None:
+            raise Refusal("provider-http-status")
+        headers = []
+        for line in header_lines[1:]:
+            if ":" not in line:
+                raise Refusal("provider-http-header")
+            name, value = line.split(":", 1)
+            if re.fullmatch(r"[A-Za-z0-9-]+", name) is None:
+                raise Refusal("provider-http-header")
+            headers.append((name, value.strip()))
+        next_uri = provider_next_link(headers, subject_digest)
+        body_start = header_end + len(boundary.group(0))
+        while body_start < len(source) and source[body_start] in "\r\n\t ":
+            body_start += 1
+        try:
+            document, body_end = decoder.raw_decode(source, body_start)
+        except (json.JSONDecodeError, Refusal):
+            raise Refusal("provider-http-body")
+        if type(document) is not dict or set(document) != {"attestations"} or type(document["attestations"]) is not list:
+            raise Refusal("provider-page-shape")
+        if len(document["attestations"]) > 100:
+            raise Refusal("provider-page-size")
+        pages.append({"page": len(pages) + 1, "request_uri": request_uri,
+                      "next_uri": next_uri, "attestations": document["attestations"]})
+        position = body_end
+        while position < len(source) and source[position] in "\r\n\t ":
+            position += 1
+        if next_uri is None:
+            if position != len(source):
+                raise Refusal("provider-after-terminal")
+            break
+        if position == len(source):
+            raise Refusal("provider-pagination-incomplete")
+        request_uri = next_uri
+    if not pages or pages[-1]["next_uri"] is not None:
+        raise Refusal("provider-pagination-incomplete")
+    return {"kind": "attestations", "complete": True,
+            "observed_count": sum(len(page["attestations"]) for page in pages),
+            "run_id": str(_is_u64(run_id)), "run_attempt": str(_is_u32(run_attempt)),
+            "head_sha": validate_commit_sha(head_sha), "subject_digest": subject_digest,
+            "http_sha256": hashlib.sha256(payload).hexdigest(), "pages": pages}
 
 
 def _validate_snapshot(snapshot, kind, run_id, run_attempt, head_sha):
     if type(snapshot) is not dict:
         raise Refusal("api-snapshot-shape")
-    required_top = {"kind", "complete", "total_count", "run_id", "run_attempt", "head_sha", "pages"}
+    required_top = {"kind", "complete", "run_id", "run_attempt", "head_sha", "pages"}
     if kind == "attestations":
-        required_top.add("terminal_page")
+        required_top.update(("subject_digest", "observed_count", "http_sha256"))
+    else:
+        required_top.add("total_count")
     if set(snapshot) != required_top or snapshot["kind"] != kind or snapshot["complete"] is not True:
         raise Refusal("api-snapshot-incomplete")
+    if kind == "attestations" and (type(snapshot["http_sha256"]) is not str or
+                                    HEX_32.fullmatch(snapshot["http_sha256"]) is None):
+        raise Refusal("provider-http-digest")
     if _is_u64(snapshot["run_id"]) != _is_u64(run_id):
         raise Refusal("api-run-mismatch")
     if _is_u32(snapshot["run_attempt"]) != _is_u32(run_attempt):
@@ -890,35 +1000,50 @@ def _validate_snapshot(snapshot, kind, run_id, run_attempt, head_sha):
     if type(pages) is not list or not pages:
         raise Refusal("api-pages-missing")
     row_key = "jobs" if kind == "jobs" else "artifacts" if kind == "artifacts" else "attestations"
-    total = _is_u64(snapshot["total_count"], positive=False)
+    total = _is_u64(snapshot["observed_count" if kind == "attestations" else "total_count"], positive=False)
     rows = []
+    subject_digest = snapshot.get("subject_digest") if kind == "attestations" else None
+    next_uri = provider_start_uri(subject_digest) if kind == "attestations" else None
+    visited = set()
     for index, page in enumerate(pages, 1):
-        expected_fields = {"page", "next_page", row_key}
-        if kind != "attestations":
+        expected_fields = {"page", row_key}
+        if kind == "attestations":
+            expected_fields.update(("request_uri", "next_uri"))
+        else:
+            expected_fields.add("next_page")
             expected_fields.add("total_count")
         if type(page) is not dict or set(page) != expected_fields:
             raise Refusal("api-page-fields")
         if type(page["page"]) is not int or page["page"] != index:
             raise Refusal("api-page-order")
-        expected_next = index + 1 if index < len(pages) else None
-        if page["next_page"] != expected_next or type(page[row_key]) is not list:
+        if type(page[row_key]) is not list:
             raise Refusal("api-pagination-incomplete")
         if len(page[row_key]) > 100:
             raise Refusal("api-page-count")
-        if kind != "attestations" and _is_u64(page["total_count"], positive=False) != total:
-            raise Refusal("api-page-count")
-        if index < len(pages) and len(page[row_key]) != 100:
-            raise Refusal("api-pagination-incomplete")
+        if kind == "attestations":
+            if (next_uri is None or page["request_uri"] != next_uri or
+                    next_uri in visited):
+                raise Refusal("provider-cursor-chain")
+            visited.add(next_uri)
+            next_uri = page["next_uri"]
+            if next_uri is not None:
+                validate_provider_uri(next_uri, subject_digest)
+            if (index < len(pages)) != (next_uri is not None):
+                raise Refusal("provider-pagination-incomplete")
+        else:
+            expected_next = index + 1 if index < len(pages) else None
+            if page["next_page"] != expected_next:
+                raise Refusal("api-pagination-incomplete")
+            if _is_u64(page["total_count"], positive=False) != total:
+                raise Refusal("api-page-count")
+            if index < len(pages) and len(page[row_key]) != 100:
+                raise Refusal("api-pagination-incomplete")
         rows.extend(page[row_key])
     expected_pages = max(1, (total + 99) // 100)
     if len(rows) != total or (kind != "attestations" and len(pages) != expected_pages):
         raise Refusal("api-pagination-incomplete")
-    if kind == "attestations":
-        terminal = snapshot["terminal_page"]
-        if (type(terminal) is not dict or set(terminal) != {"page", "attestations"}
-                or type(terminal["page"]) is not int or terminal["page"] != len(pages) + 1
-                or terminal["attestations"] != []):
-            raise Refusal("provider-terminal-page")
+    if kind == "attestations" and len(pages) > MAX_PROVIDER_PAGES:
+        raise Refusal("provider-pagination-limit")
     return rows
 
 
@@ -927,6 +1052,18 @@ def _api_numeric_id(value, code):
         return _is_u64(value)
     except Refusal:
         raise Refusal(code)
+
+
+def validate_api_runner(job, role):
+    name = job.get("runner_name")
+    labels = job.get("labels")
+    if type(name) is not str or not name or len(name) > 256:
+        raise Refusal("api-runner-name")
+    if (type(labels) is not list or not labels or
+            any(type(label) is not str or not label or len(label) > 128 for label in labels) or
+            len(set(labels)) != len(labels) or ROLE_RUNNERS[role] not in labels):
+        raise Refusal("api-runner-label")
+    return name, labels
 
 
 def validate_jobs_snapshot(snapshot, run_id, run_attempt, head_sha, api_name_pins):
@@ -989,8 +1126,7 @@ def validate_jobs_snapshot(snapshot, run_id, run_attempt, head_sha, api_name_pin
             raise Refusal("api-job-conclusion")
         if job["status"] != "completed" and conclusion is not None:
             raise Refusal("api-job-conclusion")
-        if job.get("runner_name") != ROLE_RUNNERS[role]:
-            raise Refusal("api-job-runner")
+        runner_name, labels = validate_api_runner(job, role)
         steps = job.get("steps")
         if type(steps) is not list:
             raise Refusal("api-job-steps")
@@ -1014,6 +1150,8 @@ def validate_jobs_snapshot(snapshot, run_id, run_attempt, head_sha, api_name_pin
             "job_id": job_id,
             "check_run_id": check_id,
             "name": job["name"],
+            "runner_name": runner_name,
+            "labels": labels,
             "status": job["status"],
             "conclusion": conclusion,
             "steps": steps,
@@ -1039,8 +1177,9 @@ def validate_role_job(snapshot, run_id, run_attempt, head_sha, role, api_name, a
         raise Refusal("api-job-run-binding")
     if "run_attempt" in job and _is_u32(job["run_attempt"]) != _is_u32(run_attempt):
         raise Refusal("api-job-attempt-binding")
-    if job.get("head_sha") != head_sha or job.get("runner_name") != ROLE_RUNNERS[role]:
+    if job.get("head_sha") != head_sha:
         raise Refusal("api-job-identity")
+    validate_api_runner(job, role)
     if job.get("status") not in allowed_statuses:
         raise Refusal("api-job-status")
     _api_numeric_id(job.get("id"), "api-job-id")
@@ -1351,21 +1490,20 @@ def validate_artifact_inventory(snapshot, run_id, run_attempt, head_sha, expecte
     return by_role
 
 
-def validate_attestation_inventory(snapshot, run_id, run_attempt, head_sha, subject_digests,
-                                   expected_roles=ROLE_ORDER):
-    rows = _validate_snapshot(snapshot, "attestations", run_id, run_attempt, head_sha)
+def validate_attestation_inventory(rows, subject_digests, expected_roles=ROLE_ORDER):
+    if type(rows) is not list:
+        raise Refusal("attestation-rows")
     if type(subject_digests) is not dict or set(subject_digests) != set(expected_roles):
         raise Refusal("attestation-subject-map")
     seen = set()
     by_role = {}
-    expected = {subject_digests[role] for role in expected_roles}
     for row in rows:
         if type(row) is not dict:
             raise Refusal("attestation-fields")
         role = row.get("role")
         digest = row.get("subject_digest")
         statement_digest = row.get("statement_digest")
-        if role not in expected_roles or digest not in expected:
+        if role not in expected_roles or digest != subject_digests[role]:
             raise Refusal("attestation-unexpected")
         if type(statement_digest) is not str or HEX_32.fullmatch(statement_digest) is None:
             raise Refusal("attestation-statement-digest")
@@ -1406,6 +1544,8 @@ def normalize_provider_attestations(snapshot, subject_digest, role_expectations,
                                     verified_documents, run_id, run_attempt, head_sha):
     if type(subject_digest) is not str or HEX_32.fullmatch(subject_digest) is None:
         raise Refusal("provider-subject")
+    if type(snapshot) is not dict or snapshot.get("subject_digest") != subject_digest:
+        raise Refusal("provider-subject-mismatch")
     rows = _validate_snapshot(
         snapshot,
         "attestations",
@@ -1659,20 +1799,7 @@ def reconcile_provider_evidence(roles, provider_snapshots, run_id, run_attempt,
             control_sha,
         )
         provider_records.extend(normalized)
-    normalized_pages = [
-        {"attestations": provider_records[index:index + 100]}
-        for index in range(0, len(provider_records), 100)
-    ] or [{"attestations": []}]
-    validate_attestation_inventory(
-        wrap_api_pages("attestations", normalized_pages,
-                       run_id, run_attempt, control_sha,
-                       terminal_page={"attestations": []}),
-        run_id,
-        run_attempt,
-        control_sha,
-        roles["subject_digests"],
-        expected_roles,
-    )
+    validate_attestation_inventory(provider_records, roles["subject_digests"], expected_roles)
     verify_statement_cardinality(roles["artifact_records"], provider_records, expected_roles)
     return provider_records
 
@@ -1920,30 +2047,29 @@ def _cmd_wrap_pages(arguments):
     pages = load_json_file(arguments.input)
     if type(pages) is not list:
         raise Refusal("api-pages-shape")
-    if (arguments.kind == "attestations") != (arguments.terminal_input is not None):
-        raise Refusal("api-terminal-input")
-    terminal = load_json_file(arguments.terminal_input) if arguments.kind == "attestations" else None
     wrapped = wrap_api_pages(
         arguments.kind,
         pages,
         arguments.run_id,
         arguments.run_attempt,
         arguments.head_sha,
-        terminal_page=terminal,
     )
     _write_json(arguments.output, wrapped)
     print("pages=wrapped kind=%s count=%d" % (arguments.kind, len(pages)))
 
 
-def _cmd_next_page(arguments):
-    pages = load_json_file(arguments.input)
-    if type(pages) is not list or not pages or len(pages) >= MAX_U32:
-        raise Refusal("api-pages-shape")
-    if any(type(page) is not dict or type(page.get("attestations")) is not list
-           or set(page) != {"attestations"} or len(page["attestations"]) > 100
-           for page in pages):
-        raise Refusal("api-page-shape")
-    print(len(pages) + 1)
+def _cmd_wrap_provider_http(arguments):
+    try:
+        source = Path(arguments.input)
+        if not source.is_file() or source.is_symlink() or source.stat().st_size > MAX_JSON_BYTES:
+            raise Refusal("provider-http-size")
+        payload = source.read_bytes()
+    except OSError:
+        raise Refusal("provider-http-unavailable")
+    wrapped = parse_provider_http(payload, arguments.subject_digest, arguments.run_id,
+                                  arguments.run_attempt, arguments.head_sha)
+    _write_json(arguments.output, wrapped)
+    print("provider=wrapped pages=%d" % len(wrapped["pages"]))
 
 
 def _cmd_find_artifact(arguments):
@@ -1995,9 +2121,17 @@ def _cmd_export_provider(arguments):
 def _cmd_find_job(arguments):
     snapshot = load_json_file(arguments.jobs_file)
     role = arguments.role
+    api_name = API_JOB_NAME_PINS[arguments.profile][role]
+    if arguments.observe:
+        jobs = _validate_snapshot(snapshot, "jobs", arguments.run_id,
+                                  arguments.run_attempt, arguments.head_sha)
+        matches = [job for job in jobs if type(job) is dict and
+                   type(job.get("name")) is str and role in job["name"]]
+        if len(matches) != 1:
+            raise Refusal("observation-job-cardinality")
+        api_name = matches[0]["name"]
     job = validate_role_job(snapshot, arguments.run_id, arguments.run_attempt,
-                            arguments.head_sha, role,
-                            API_JOB_NAME_PINS[arguments.profile][role], ("completed",))
+                            arguments.head_sha, role, api_name, ("completed",))
     print(job["id"])
 
 
@@ -2007,14 +2141,22 @@ def parse_linux_log_sections(log_text, job_name, step_names):
     sections = {step_id: [] for step_id in step_names}
     other = []
     for line in log_text.splitlines():
-        fields = line.split("\t", 3)
-        if len(fields) != 4 or fields[0] != job_name:
+        fields = line.split("\t", 2)
+        if len(fields) != 3 or fields[0] != job_name:
             raise Refusal("linux-log-format")
+        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z)[ \t]+(.*)", fields[2])
+        if match is None:
+            raise Refusal("linux-log-timestamp")
+        try:
+            datetime.datetime.strptime(match.group(1)[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            raise Refusal("linux-log-timestamp")
+        message = match.group(2)
         matches = [step_id for step_id, name in step_names.items() if fields[1] == name]
         if len(matches) == 1:
-            sections[matches[0]].append(fields[3])
+            sections[matches[0]].append(message)
         else:
-            other.append(fields[3])
+            other.append(message)
     if any(not lines for lines in sections.values()):
         raise Refusal("linux-log-section-missing")
     return {"sections": {key: "\n".join(value) for key, value in sections.items()},
@@ -2023,9 +2165,18 @@ def parse_linux_log_sections(log_text, job_name, step_names):
 
 def _cmd_parse_linux_logs(arguments):
     jobs = load_json_file(arguments.jobs_file)
+    api_name = API_JOB_NAME_PINS[arguments.profile]["linux-fetch-encrypt"]
+    if arguments.observe:
+        rows = _validate_snapshot(jobs, "jobs", arguments.run_id,
+                                  arguments.run_attempt, arguments.head_sha)
+        matches = [row for row in rows if type(row) is dict and
+                   type(row.get("name")) is str and "linux-fetch-encrypt" in row["name"]]
+        if len(matches) != 1:
+            raise Refusal("observation-job-cardinality")
+        api_name = matches[0]["name"]
     job = validate_role_job(jobs, arguments.run_id, arguments.run_attempt,
                             arguments.head_sha, "linux-fetch-encrypt",
-                            API_JOB_NAME_PINS[arguments.profile]["linux-fetch-encrypt"],
+                            api_name,
                             ("completed",))
     try:
         log_text = Path(arguments.input).read_text(encoding="utf-8")
@@ -2039,6 +2190,8 @@ def _cmd_gate_transition(arguments):
     profile = arguments.profile
     if profile not in CALLER_PROFILES or arguments.repository != CONTROL_REPOSITORY:
         raise Refusal("transition-profile")
+    if arguments.observe and not arguments.observation_output:
+        raise Refusal("observation-output-missing")
     jobs = load_json_file(arguments.jobs_file)
     artifacts = load_json_file(arguments.artifacts_file)
     required_roles = ROLE_ORDER[:1] if arguments.gate == "A" else ROLE_ORDER[:2]
@@ -2051,17 +2204,85 @@ def _cmd_gate_transition(arguments):
                                         arguments.run_id, arguments.run_attempt,
                                         arguments.control_sha)
     logs = load_json_file(arguments.linux_logs) if arguments.gate == "B" else None
+    api_pins = API_JOB_NAME_PINS[profile]
+    digest_pins = CERTIFICATE_DIGEST_PINS[profile]
+    ordinal_pins = API_LINUX_STEP_ORDINAL_PINS[profile]
+    job_observations = {}
+    if arguments.observe:
+        api_pins, digest_pins, ordinal_pins, job_observations = observed_pins(
+            jobs, artifact_map, arguments.artifact_directory, required_roles,
+            arguments.run_id, arguments.run_attempt, arguments.control_sha, profile)
     verify_transition_evidence(
         arguments.gate, profile, arguments.repository, arguments.ref,
         arguments.control_sha, arguments.run_id, arguments.run_attempt,
         load_json_file(arguments.repository_metadata), load_json_file(arguments.run_metadata),
         jobs, artifacts, providers, arguments.root, arguments.artifact_directory,
-        API_JOB_NAME_PINS[profile], CERTIFICATE_DIGEST_PINS[profile],
-        API_LINUX_STEP_NAME_PINS[profile], API_LINUX_STEP_ORDINAL_PINS[profile],
+        api_pins, digest_pins,
+        API_LINUX_STEP_NAME_PINS[profile], ordinal_pins,
         logs.get("sections") if type(logs) is dict else None,
         logs.get("other") if type(logs) is dict else None,
     )
-    print("gate=%s result=verified profile=%s" % (arguments.gate, profile))
+    if arguments.observe:
+        _write_json(arguments.observation_output, {
+            "profile": profile, "gate": arguments.gate, "acceptance": "blocked",
+            "api_job_names": api_pins, "certificate_digests": digest_pins,
+            "linux_step_ordinals": ordinal_pins,
+            "api_job_identity": job_observations,
+        })
+        print("probe=role-signer observation=collected acceptance=blocked gate=%s" % arguments.gate)
+    else:
+        print("gate=%s result=verified profile=%s" % (arguments.gate, profile))
+
+
+def observed_pins(jobs_snapshot, artifact_map, artifact_directory, roles,
+                  run_id, run_attempt, control_sha, profile):
+    if profile not in CALLER_PROFILES or not roles or set(roles) - set(ROLE_ORDER):
+        raise Refusal("observation-profile")
+    jobs = _validate_snapshot(jobs_snapshot, "jobs", run_id, run_attempt, control_sha)
+    api_pins = {role: None for role in ROLE_ORDER}
+    digest_pins = {role: None for role in ROLE_ORDER}
+    ordinal_pins = {step: None for step in API_LINUX_STEP_NAME_PINS[profile]}
+    job_observations = {}
+    for role in roles:
+        matches = [job for job in jobs if type(job) is dict and
+                   type(job.get("name")) is str and role in job["name"]]
+        if len(matches) != 1:
+            raise Refusal("observation-job-cardinality")
+        name = matches[0]["name"]
+        allowed = ("in_progress", "completed") if role == "windows-receiver" else ("completed",)
+        job = validate_role_job(jobs_snapshot, run_id, run_attempt, control_sha,
+                                role, name, allowed)
+        if job["status"] == "completed" and job["conclusion"] != "success":
+            raise Refusal("observation-job-not-successful")
+        api_pins[role] = name
+        job_observations[role] = {
+            "policy_caller_job_id": role, "policy_callee_job_id": role,
+            "job_id": _api_numeric_id(job["id"], "api-job-id"),
+            "check_run_id": _api_numeric_id(job["check_run_url"].rsplit("/", 1)[1],
+                                            "api-check-run-id"),
+            "check_run_url": job["check_run_url"],
+            "runner_name": job["runner_name"], "labels": job["labels"]}
+        if role == "linux-fetch-encrypt":
+            for step_id, step_name in API_LINUX_STEP_NAME_PINS[profile].items():
+                steps = [step for step in job["steps"] if step["name"] == step_name]
+                if len(steps) != 1:
+                    raise Refusal("observation-step-cardinality")
+                ordinal_pins[step_id] = _is_u32(steps[0]["number"])
+        artifact = artifact_map[role][0]
+        verified = load_json_file(Path(artifact_directory) / artifact["name"] / "verified.json")
+        certificate = verified_result(verified)[1]
+        measured = {}
+        for field in ("sourceRepositoryDigest", "buildSignerDigest", "buildConfigDigest"):
+            value = certificate.get(field)
+            if type(value) is not str or re.fullmatch(r"sha256:[a-f0-9]{64}", value) is None:
+                raise Refusal("observation-certificate-digest")
+            measured[field] = value
+        issuer = certificate.get("certificateIssuer")
+        if type(issuer) is not str or not issuer or len(issuer) > 512:
+            raise Refusal("observation-certificate-issuer")
+        measured["certificateIssuer"] = issuer
+        digest_pins[role] = measured
+    return api_pins, digest_pins, ordinal_pins, job_observations
 
 
 def load_provider_snapshots(artifact_map, roles, artifact_directory,
@@ -2078,6 +2299,18 @@ def load_provider_snapshots(artifact_map, roles, artifact_directory,
             continue
         snapshot = load_json_file(Path(provider_directory) /
                                   ("provider-" + subject_digest + ".json"))
+        if type(snapshot) is not dict or snapshot.get("subject_digest") != subject_digest:
+            raise Refusal("provider-subject-mismatch")
+        try:
+            source = Path(provider_directory) / ("provider-" + subject_digest + "-http.txt")
+            if not source.is_file() or source.is_symlink() or source.stat().st_size > MAX_JSON_BYTES:
+                raise Refusal("provider-http-size")
+            raw_http = source.read_bytes()
+        except OSError:
+            raise Refusal("provider-http-unavailable")
+        if parse_provider_http(raw_http, subject_digest, run_id,
+                               run_attempt, control_sha) != snapshot:
+            raise Refusal("provider-http-snapshot-mismatch")
         rows = _validate_snapshot(snapshot, "attestations", run_id,
                                   run_attempt, control_sha)
         directory = Path(provider_directory) / ("provider-" + subject_digest)
@@ -2093,6 +2326,8 @@ def _cmd_verify_snapshot(arguments):
     profile = arguments.profile
     if profile not in CALLER_PROFILES:
         raise Refusal("profile-invalid")
+    if arguments.observe and not arguments.observation_output:
+        raise Refusal("observation-output-missing")
     repository = arguments.repository
     if repository != CONTROL_REPOSITORY:
         raise Refusal("control-repository")
@@ -2113,6 +2348,24 @@ def _cmd_verify_snapshot(arguments):
         artifact_map, ROLE_ORDER, Path(arguments.evidence_directory) / "artifacts",
         arguments.evidence_directory, arguments.run_id, arguments.run_attempt,
         arguments.control_sha)
+    api_pins = API_JOB_NAME_PINS[profile]
+    digest_pins = CERTIFICATE_DIGEST_PINS[profile]
+    ordinal_pins = API_LINUX_STEP_ORDINAL_PINS[profile]
+    job_observations = {}
+    if arguments.observe:
+        api_pins, digest_pins, ordinal_pins, job_observations = observed_pins(
+            jobs, artifact_map, Path(arguments.evidence_directory) / "artifacts",
+            ROLE_ORDER, arguments.run_id, arguments.run_attempt,
+            arguments.control_sha, profile)
+        if not arguments.linux_logs:
+            raise Refusal("observation-linux-logs-missing")
+        log_document = load_json_file(arguments.linux_logs)
+        if type(log_document) is not dict or set(log_document) != {"sections", "other"}:
+            raise Refusal("observation-linux-logs-shape")
+        validate_linux_revocation_evidence(
+            jobs, arguments.run_id, arguments.run_attempt, arguments.control_sha,
+            api_pins["linux-fetch-encrypt"], API_LINUX_STEP_NAME_PINS[profile],
+            ordinal_pins, log_document["sections"], log_document["other"])
     verify_source_free_evidence(
         profile,
         repository,
@@ -2127,9 +2380,18 @@ def _cmd_verify_snapshot(arguments):
         provider_snapshots,
         arguments.root,
         arguments.evidence_directory,
-        API_JOB_NAME_PINS[profile],
-        CERTIFICATE_DIGEST_PINS[profile],
+        api_pins,
+        digest_pins,
     )
+    if arguments.observe:
+        _write_json(arguments.observation_output, {
+            "profile": profile, "acceptance": "blocked",
+            "api_job_names": api_pins, "certificate_digests": digest_pins,
+            "linux_step_ordinals": ordinal_pins,
+            "api_job_identity": job_observations,
+        })
+        print("probe=role-signer observation=collected acceptance=blocked")
+        return
     if profile == "production-synthetic":
         raise Refusal("gate-c-and-d-evidence-not-implemented")
     print("probe=role-signer result=source-free-evidence-verified profile=%s gate-c=blocked gate-d=blocked" % profile)
@@ -2152,15 +2414,19 @@ def build_parser():
     prepare.add_argument("--output-directory", required=True)
     prepare.add_argument("--receiver-record")
     wrap = commands.add_parser("wrap-pages")
-    wrap.add_argument("--kind", choices=("jobs", "artifacts", "attestations"), required=True)
+    wrap.add_argument("--kind", choices=("jobs", "artifacts"), required=True)
     wrap.add_argument("--input", required=True)
     wrap.add_argument("--output", required=True)
     wrap.add_argument("--run-id", required=True)
     wrap.add_argument("--run-attempt", required=True)
     wrap.add_argument("--head-sha", required=True)
-    wrap.add_argument("--terminal-input")
-    next_page = commands.add_parser("next-provider-page")
-    next_page.add_argument("--input", required=True)
+    provider = commands.add_parser("wrap-provider-http")
+    provider.add_argument("--input", required=True)
+    provider.add_argument("--subject-digest", required=True)
+    provider.add_argument("--output", required=True)
+    provider.add_argument("--run-id", required=True)
+    provider.add_argument("--run-attempt", required=True)
+    provider.add_argument("--head-sha", required=True)
     find = commands.add_parser("find-artifact")
     find.add_argument("--artifacts-file", required=True)
     find.add_argument("--role", choices=ROLE_ORDER, required=True)
@@ -2188,6 +2454,7 @@ def build_parser():
     find_job.add_argument("--run-id", required=True)
     find_job.add_argument("--run-attempt", required=True)
     find_job.add_argument("--head-sha", required=True)
+    find_job.add_argument("--observe", action="store_true")
     parse_logs = commands.add_parser("parse-linux-logs")
     parse_logs.add_argument("--profile", choices=tuple(CALLER_PROFILES), required=True)
     parse_logs.add_argument("--jobs-file", required=True)
@@ -2196,6 +2463,7 @@ def build_parser():
     parse_logs.add_argument("--run-id", required=True)
     parse_logs.add_argument("--run-attempt", required=True)
     parse_logs.add_argument("--head-sha", required=True)
+    parse_logs.add_argument("--observe", action="store_true")
     gate = commands.add_parser("gate-transition")
     gate.add_argument("--gate", choices=("A", "B"), required=True)
     gate.add_argument("--profile", choices=tuple(CALLER_PROFILES), required=True)
@@ -2212,6 +2480,8 @@ def build_parser():
     gate.add_argument("--artifact-directory", required=True)
     gate.add_argument("--provider-directory", required=True)
     gate.add_argument("--linux-logs")
+    gate.add_argument("--observe", action="store_true")
+    gate.add_argument("--observation-output")
     verify = commands.add_parser("verify-snapshot")
     verify.add_argument("--profile", required=True)
     verify.add_argument("--repository", required=True)
@@ -2225,6 +2495,9 @@ def build_parser():
     verify.add_argument("--repository-metadata", required=True)
     verify.add_argument("--run-metadata", required=True)
     verify.add_argument("--evidence-directory", required=True)
+    verify.add_argument("--linux-logs")
+    verify.add_argument("--observe", action="store_true")
+    verify.add_argument("--observation-output")
     return parser
 
 
@@ -2235,8 +2508,8 @@ def main(argv=None):
             prepare_subject(arguments)
         elif arguments.command == "wrap-pages":
             _cmd_wrap_pages(arguments)
-        elif arguments.command == "next-provider-page":
-            _cmd_next_page(arguments)
+        elif arguments.command == "wrap-provider-http":
+            _cmd_wrap_provider_http(arguments)
         elif arguments.command == "find-artifact":
             _cmd_find_artifact(arguments)
         elif arguments.command == "extract-artifact":

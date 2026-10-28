@@ -13,10 +13,10 @@ code that the candidate checker validates when the pool is platform.
 
 WORKFLOW_TEMPLATES = {}
 WORKFLOW_SHA256 = {
-    "windows-source-admission": "6637cfbaaf5a5ae228680984ce39971ab2584dd76f14790c7e6e766aca8c2cbc",
+    "windows-source-admission": "58aa50417238c55c26d18c903479f149ebdb92a4b7fd6bed7253147d35ec340d",
     "lane-h-windows-receiver": "5347fcfdf29c979f7af8c63cee48f77b856fd7cc38d34ad675da75a0b806b448",
-    "lane-h-linux-fetch-encrypt": "3cb1e0f2fcd46014839988452bdb50e1a688c7ad9e8a59098a6f7c2de96042f0",
-    "lane-h-capsule-attester": "5f3120c996a193bea63111024d285ee4eb9e199a01c4f4d09fee6424471e281e",
-    "attestation-role-signer-probe": "dc534b6df944369d24cb59e719acc84fdb5c2329c6d939af7c192a93f318e88c",
+    "lane-h-linux-fetch-encrypt": "fdd7355a0eabe45248fb497e49b5989645f5e2f31fd134fb6d80ac06cf52f0a7",
+    "lane-h-capsule-attester": "082da71f6caa218b89c688e5c73389b8d0c96d3281121b2b4fd8460db827745e",
+    "attestation-role-signer-probe": "e0a39e5d177e9df8ea30420673a02a5009b7211df5d2d0c2d10d5e1a9a617ef8",
 }
 CANDIDATE_WORKFLOWS = ()
