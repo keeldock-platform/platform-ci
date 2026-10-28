@@ -471,6 +471,18 @@ foreach ($case in $cases) {
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.wrapper)
 
+    def test_ancestor_count_does_not_replace_acl_readback_paths(self):
+        self.assertIn("$script:AncestorPaths = @()", self.wrapper)
+        self.assertIn("$script:AncestorPaths += $ancestorPath", self.wrapper)
+        self.assertIn("$ancestorCount = $script:AncestorPaths.Count", self.wrapper)
+        self.assertIn("' ancestors_read_attributes=' + $ancestorCount", self.wrapper)
+        self.assertNotRegex(
+            self.wrapper,
+            r"(?im)^\s*\$ancestors\s*=\s*\$script:Ancestors\.Count\b",
+        )
+        self.assertIn("foreach ($path in $script:AncestorPaths)", self.function_body("Test-Acl"))
+        self.assertIn("if ($aclState -ne 'verified') { throw 'acl_readback' }", self.wrapper)
+
     def test_workflow_runs_only_source_free_checks(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         for required in (

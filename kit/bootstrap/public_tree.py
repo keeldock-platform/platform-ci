@@ -196,6 +196,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/windows_native_preflight.cs': 'ba0f8859db9d8bcc1e4c8274520bcb67a3292cb311f553127e1f29fe13838543',
     'kit/confinement/windows_native_preflight.ps1': '8dbaaaad105c2fe0439dedb1b7c9572b8e7ec74a8db29f8edcab91169b06c58b',
     'kit/confinement/test_windows_native_preflight.py': '02d6bcf6d52d4c5f26589b6da8e224b5f0b3f8f57255e00c135f666caed613fe',
+    'kit/confinement/windows_confinement.ps1': '802f2cf91ac3d603ad76e60415678a801650d2f3e41c6547e90910ce361b627e',
+    'kit/confinement/test_windows_confinement.py': '7465760f301ba8ae05d3a26fb122f50214031924a30d708d0e9e7978ff9d29df',
     'kit/confinement/macos_source_reader.py': 'd3fbda5c68ac7d21761e946b0f546607b19c23ccb725e453f3fffef3321c0d70',
     'kit/confinement/test_macos_source_reader.py': 'ed8e9b850f7d3a80346ad4a6efc182b28ff9c22fa669eda241f2c5feb3ccf806',
     '.github/workflows/node-lock-return.yml': '6e9c157462984967427fc33961fcd2f7ca3b9755ff180d4561c981846d0b6cc0',
