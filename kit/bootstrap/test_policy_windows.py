@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = ROOT / ".github/workflows/windows-native-preflight.yml"
 WINDOWS_CONFINEMENT_WORKFLOW = ROOT / ".github/workflows/windows-confinement.yml"
 CAPSULE_VECTORS_WORKFLOW = ROOT / ".github/workflows/capsule-vectors.yml"
+CAPSULE_FRAME_WRAPPER = ROOT / "kit/confinement/capsule_frame.ps1"
 WINDOWS_WORKFLOW_SHA256_BEFORE_SPLIT = "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb"
 WINDOWS_LANE_FILES = (
     ".github/workflows/windows-native-preflight.yml",
@@ -156,6 +157,37 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
 
 
 class WindowsLaneRegistryTests(unittest.TestCase):
+    def test_capsule_frame_refusal_subreasons_are_fixed_and_routed(self):
+        wrapper = CAPSULE_FRAME_WRAPPER.read_text(encoding="ascii")
+        workflow = CAPSULE_VECTORS_WORKFLOW.read_text(encoding="ascii")
+        reasons = (
+            "compiler_missing",
+            "compile_failed",
+            "vector_generation_failed",
+            "vector_mismatch",
+            "encoding",
+        )
+        expected_allowlist = "$script:RefusalReasons = @(\n" + "\n".join(
+            "    '" + reason + "'," if index < len(reasons) - 1 else "    '" + reason + "'"
+            for index, reason in enumerate(reasons)
+        ) + "\n)"
+        self.assertIn(expected_allowlist, wrapper)
+        self.assertIn("capsule-frame=refused reason=' + $Reason", wrapper)
+        self.assertIn("-notcontains $Reason", wrapper)
+        self.assertIn(
+            "^capsule-frame=refused reason=(compiler_missing|compile_failed|vector_generation_failed|vector_mismatch|encoding)$",
+            workflow,
+        )
+        self.assertIn(r"'[^\x00-\x7F]'", workflow)
+        for reason in reasons:
+            with self.subTest(reason=reason):
+                self.assertIn("Write-Refusal '" + reason + "'", wrapper)
+                self.assertIn("Write-CapsuleRefusal '" + reason + "'", workflow)
+                self.assertIn(reason, workflow)
+        self.assertIn("Forward-CapsuleRefusal $compileOutput 'compile_failed'", workflow)
+        self.assertIn("Forward-CapsuleRefusal $vectorOutput 'vector_generation_failed'", workflow)
+        self.assertIn("2>$null", workflow)
+
     def test_capsule_vectors_exact_template_and_refusals(self):
         workflow = CAPSULE_VECTORS_WORKFLOW.read_text(encoding="ascii")
         self.assertEqual(workflow, policy_windows.CAPSULE_VECTORS_WORKFLOW_TEMPLATE)
