@@ -115,6 +115,17 @@ def _diagnostic_or_fallback(classify, error):
     return diagnostic
 
 
+def _unrecorded_cleanup_diagnostic(error, contract):
+    try:
+        node_refusal = getattr(contract, "NodeContractRefusal", None)
+        if (isinstance(node_refusal, type) and isinstance(error, node_refusal)
+                and error.stage == "node_dependency_audit" and error.substage == "bulk_audit"):
+            return "source_gates_audit_request"
+    except BaseException:
+        pass
+    return CLEANUP_UNCLASSIFIED_DIAGNOSTIC
+
+
 def _attach_cleanup_diagnostic(error, record):
     diagnostic = record.get("diagnostic")
     if (type(diagnostic) is str and getattr(error, "reason", None) == "cleanup_incomplete"):
@@ -362,6 +373,8 @@ def run_node_profile(mode, *, dispatch, source, worker_storage, worker_uid, envi
                          policy_epoch_ms, accepted_provenance, producer)
         return result
     except Exception as error:
+        if cleanup_record["diagnostic"] is None and getattr(error, "reason", None) == "cleanup_incomplete":
+            cleanup_record["diagnostic"] = _unrecorded_cleanup_diagnostic(error, contract)
         _attach_cleanup_diagnostic(error, cleanup_record)
         node_refusal = getattr(contract, "NodeContractRefusal", None)
         if isinstance(node_refusal, type) and isinstance(error, node_refusal):

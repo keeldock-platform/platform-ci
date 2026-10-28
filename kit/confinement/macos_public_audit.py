@@ -422,6 +422,7 @@ CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS = frozenset(
     "source_gates_survivor_multiple", "source_gates_timeout", "source_gates_census",
     "source_gates_group_cleanup", "source_gates_capture_cleanup", "source_gates_restore",
     "source_gates_cleanup_unclassified", "source_gates_wait_uncertain",
+    "source_gates_audit_request",
 ))
 CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "none", "unavailable", "load_controls", "review_binding", "host_preflight",

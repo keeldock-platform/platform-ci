@@ -115,8 +115,8 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    'kit/confinement/foundation_node_feedback.py': 'fe576393f762de56e73a73ff6c4b262a9ddbc8c5d18faebdd7e4bcd64cb72db1',
-    'kit/confinement/test_foundation_node_feedback.py': '3dc19f4d0df524f366a1c52668c0ac6c8d624caca7aa0fb59758136f9e53850a',
+    'kit/confinement/foundation_node_feedback.py': 'ba7d2352da3f74c12d96328277b03e71bf3cee9a4e03119dcbb18c01231f8f38',
+    'kit/confinement/test_foundation_node_feedback.py': '3beeb3c7a98a771610818c4720e81d7519f3e9db870c97dea6f53178ce6c38e4',
     'kit/confinement/macos_node_contract.py': 'cc5b3dcbc05283323ca27b626378b901c2d7db49e2c499e221fdd49f9632cfe8',
     'kit/confinement/test_macos_node_contract.py': 'e2afb54b418fad64890a35fd23e3a1cfee0ab5d66c68711484b2efab1e5bf790',
     'kit/confinement/node_contract_validation.mjs': '3784560a51e188adc8516e4bfbf8293d1f6fb01300643cf7c7edf7725d156ec3',
@@ -140,8 +140,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/node_lock_receipt.py': 'ade987d617a6cfe8a8b9f937ea6c17510a639a9ea671437625afeecd0c7e1a63',
     'kit/confinement/test_node_lock_receipt.py': '76163ace7dc4e239c16c993de84da44deaf402e42ba4fccb1a28fd8c28fae6b6',
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
-    'kit/confinement/macos_core_contract.py': '414ca75fabe6e8c6b1c2006b2d7b1df3dbfd17606a9685fa96d1e81dcc685cf9',
-    'kit/confinement/test_macos_core_contract.py': 'b5801754ac952c0918541064f61b1520f379fb50fd9f70cd2babd9afbee3a6d3',
+    'kit/confinement/macos_core_contract.py': '924289ef5ebd0823e71904a1d02d7dc3f3511dc88d9ff739f85ad3708dacd656',
+    'kit/confinement/test_macos_core_contract.py': '7b91b28ba9bdd173dd9994becc2f31400d72fe82db6f82447cb21ff857ca7eb2',
     '.github/workflows/macos-rust-toolchain-smoke.yml': 'cdf7068f8887c22958d74f3c2cc0a73c5c8c4c41f4eff0b43e16e47f61e58bb7',
     'kit/confinement/macos_rust_toolchain.py': 'e3691aca68328dc98e7b17915c3d14f0c1ea493d9498b7f0c569303fd79ec188',
     'kit/confinement/test_macos_rust_toolchain.py': '74e16bc4e75eacb00b6ba6e3e008e448a96b497c5d695ff07620abc32f4d00bf',

@@ -115,6 +115,8 @@ class FakeContract:
     def __init__(self, mode, expected_result=None):
         self.mode = mode
         self.expected_result = expected_result
+        self.contract_error = None
+        self.real_worker_result = None
         self.call = None
         self.callback_mutation = None
 
@@ -142,6 +144,14 @@ class FakeContract:
         elif self.callback_mutation == "env":
             env = dict(env)
             env["LANG"] = "C.UTF-8"
+        if self.contract_error is not None:
+            raise self.contract_error
+        if self.real_worker_result is not None:
+            self.real_worker_result(
+                kwargs["run_worker"], command, stage="node_dependency_prepare",
+                substage="runtime_version", project=cwd, environment=env,
+                deadline=kwargs["deadline"], timeout=10,
+            )
         kwargs["run_worker"](
             command, stage="node_dependency_prepare", substage="runtime_version",
             cwd=cwd, env=env, deadline=kwargs["deadline"], timeout=10,
@@ -225,7 +235,8 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
 
     def _run(self, mode, kind, *, validated_tree, accepted_provenance=None, lock_bytes=None,
              callback_mutation=None, fail_census=False, fail_restore=False,
-             census_error=None, command_error=None):
+             census_error=None, command_error=None, contract_error=None,
+             real_node_contract=None):
         producer = FakeProducer()
         profile = producer.PROFILE_BY_KIND[kind]
         dispatch = _dispatch(kind)
@@ -239,6 +250,10 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         else:
             contract.expected_result = _verify_result(lock_bytes, accepted_provenance)
         contract.callback_mutation = callback_mutation
+        contract.contract_error = contract_error
+        if real_node_contract is not None:
+            contract.NodeContractRefusal = real_node_contract.NodeContractRefusal
+            contract.real_worker_result = real_node_contract._worker_result
         events = []
         rust_result = SimpleNamespace(returncode=0, stdout=b"v24.22.1\n", stderr=b"",
                                       stdout_truncated=False, stderr_truncated=False)
