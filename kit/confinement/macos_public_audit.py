@@ -424,6 +424,57 @@ CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS = frozenset(
     "source_gates_cleanup_unclassified", "source_gates_wait_uncertain",
     "source_gates_audit_request",
 ))
+CORE_CONTRACT_SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE = (
+    ("none", (
+        "invalid_input", "tool_unavailable", "accepted_provenance_invalid", "lock_missing",
+        "lock_already_present", "manifest_invalid", "limit_exceeded", "deadline_exceeded",
+        "capture_invalid", "contract_refused",
+    )),
+    ("runtime_version", (
+        "toolchain_mismatch", "command_failed", "capture_invalid", "tool_unavailable",
+        "deadline_exceeded",
+    )),
+    ("npm_version", (
+        "toolchain_mismatch", "command_failed", "capture_invalid", "tool_unavailable",
+        "deadline_exceeded",
+    )),
+    ("lock_generation", (
+        "command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded",
+    )),
+    ("lock_validation", ("accepted_provenance_invalid",)),
+    ("bulk_audit", (
+        "limit_exceeded", "manifest_invalid", "lock_missing", "accepted_provenance_invalid",
+        "audit_unavailable", "audit_response_invalid", "vulnerable_dependency",
+        "deadline_exceeded", "capture_invalid", "command_failed", "tool_unavailable",
+    )),
+    ("npm_ci", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
+    ("typecheck", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
+    ("tests", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
+)
+CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_SUBSTAGES = (
+    "runtime_version", "npm_version", "lock_generation", "bulk_audit", "npm_ci", "typecheck",
+    "tests",
+)
+CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_CHECKS = (
+    "spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow",
+    "helper_failure",
+)
+CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
+    **{
+        "source_gates_node_" + substage + "_" + reason:
+            "capture_invalid" if reason == "capture_invalid" else "runner_unavailable"
+        for substage, reasons in CORE_CONTRACT_SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
+        for reason in reasons
+    },
+    **{
+        "source_gates_node_" + substage + "_command_" + check: "runner_unavailable"
+        for substage in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_SUBSTAGES
+        for check in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_CHECKS
+    },
+}
+CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(
+    CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS
+)
 CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "none", "unavailable", "load_controls", "review_binding", "host_preflight",
     "temp_root_check", "smoke_receipt", "token_input", "token_revocation",
@@ -453,6 +504,7 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     CORE_CONTRACT_RUNTIME_DIAGNOSTICS | CORE_CONTRACT_FETCH_DIAGNOSTICS
     | CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS | CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS
     | CORE_CONTRACT_GATE_DIAGNOSTICS | CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS
+    | CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS
 )
 CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS = frozenset((
     "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",
@@ -1576,6 +1628,11 @@ def _core_contract_runtime_failure_mapping(runtime_reason):
 
 def _core_contract_refusal_diagnostic_matches(value):
     diagnostic = value["diagnostic"]
+    if diagnostic in CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS:
+        return (
+            value["stage"] == "worker_setup"
+            and value["reason"] == CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS[diagnostic]
+        )
     if diagnostic in CORE_CONTRACT_GATE_DIAGNOSTICS:
         if value["stage"] not in CORE_CONTRACT_GATE_STAGES:
             return False
