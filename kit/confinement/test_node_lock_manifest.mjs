@@ -259,23 +259,23 @@ test('rejects extra top-level fields and malformed lock package paths', () => {
 
   const credentialQueryFunding = lockFixture();
   credentialQueryFunding.packages['node_modules/typescript'].funding = [
-    { type: 'github', url: 'https://user:pass@github.com/vitejs/vite?sponsor=1' },
+    { type: 'github', url: 'https://user:pass@example.invalid/owner/project?sponsor=1' },
   ];
   rejected(credentialQueryFunding);
 
   const plainHttpFunding = lockFixture();
-  plainHttpFunding.packages['node_modules/typescript'].funding = 'http://github.com/vitejs/vite?sponsor=1';
+  plainHttpFunding.packages['node_modules/typescript'].funding = 'http://example.invalid/owner/project?sponsor=1';
   rejected(plainHttpFunding);
 });
 
 test('accepts funding URLs that carry a query string', () => {
   const stringForm = lockFixture();
-  stringForm.packages['node_modules/typescript'].funding = 'https://github.com/vitejs/vite?sponsor=1';
+  stringForm.packages['node_modules/typescript'].funding = 'https://example.invalid/owner/project?sponsor=1';
   assert.doesNotThrow(() => validateLockManifest(bytes(stringForm), expected));
 
   const objectForm = lockFixture();
   objectForm.packages['node_modules/typescript'].funding = {
-    type: 'github', url: 'https://github.com/vitejs/vite?sponsor=1',
+    type: 'github', url: 'https://example.invalid/owner/project?sponsor=1',
   };
   assert.doesNotThrow(() => validateLockManifest(bytes(objectForm), expected));
 });
