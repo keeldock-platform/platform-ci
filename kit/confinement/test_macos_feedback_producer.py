@@ -89,6 +89,9 @@ def _main_with_fake_core_execute(execute):
             original_loader = spec.loader
 
             class Loader:
+                def create_module(self, spec):
+                    return None
+
                 def exec_module(self, module):
                     original_loader.exec_module(module)
                     module._execute = lambda actual, environ, token, lifecycle, feedback_kind=None: execute(

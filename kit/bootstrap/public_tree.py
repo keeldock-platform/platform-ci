@@ -172,7 +172,7 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/core-rust-format-return.yml': '5ac5147ad14a7948320b7cdf90be19ccfca8ac57045139ee38558ecd4c5863ca',
     '.github/workflows/core-build-diagnostic-return.yml': 'a667f3ca1bf73458eb39585d694eb443f5971cbe856a0b7ff49f9d7c24ed6ab4',
     'kit/confinement/macos_feedback_producer.py': '476ef2318d5fc048fe70459989ed42a1303318aa8328e586e938c8d553e5fb33',
-    'kit/confinement/test_macos_feedback_producer.py': '07958a013284cd73ea178efc02784127de5765f673c1597b85622ef039fb5a7f',
+    'kit/confinement/test_macos_feedback_producer.py': '0598e4f6dddda82cbc92dcdfa6c53f3c7d5ed0c8b54d47681a5a5399b29ff0ab',
     'kit/confinement/feedback_producer_crypto.mjs': 'e621131afec27d78b170e207843e76e20d4f9682cf2323c3a787ac53b6db60da',
     'kit/confinement/test_feedback_producer_crypto.mjs': '1f70ec5fd25a02257f9bf857afcd244383aec71906e45fd4ed67809c279a9c10',
     'kit/confinement/feedback_admin.py': '4f39933cf4985926c141240644d783121bbb161e5386ceab842f592d41ca2e9a',
