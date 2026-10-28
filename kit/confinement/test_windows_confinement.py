@@ -179,7 +179,9 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
         self.assertIn("Write-Line ('kd-diag stage='", diag)
 
     def token_accepted(self, text):
-        patterns = re.findall(r"\$tokenText -like '([^']+)'", self.function_body("Invoke-Ladder"))
+        proof = re.search(r"^ *\$lpacProven = (.+)$", self.function_body("Invoke-Ladder"), re.M)
+        self.assertIsNotNone(proof)
+        patterns = re.findall(r"\$tokenText -like '([^']+)'", proof.group(1))
         self.assertEqual(len(patterns), 4)
         return all(fnmatch.fnmatchcase(text, pattern) for pattern in patterns)
 
