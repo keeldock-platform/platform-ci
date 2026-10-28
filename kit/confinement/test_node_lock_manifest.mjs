@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -278,4 +282,55 @@ test('accepts funding URLs that carry a query string', () => {
     type: 'github', url: 'https://example.invalid/owner/project?sponsor=1',
   };
   assert.doesNotThrow(() => validateLockManifest(bytes(objectForm), expected));
+});
+
+const contractText = readFileSync(new URL('./macos_node_contract.py', import.meta.url), 'utf8');
+
+function contractConstant(name, quote) {
+  const matches = [...contractText.matchAll(new RegExp(`^${name} = ${quote}([^${quote}\\r\\n]+)${quote}\\r?$`, 'gm'))];
+  assert.equal(matches.length, 1);
+  return matches[0][1];
+}
+
+const titleProbeSource = [
+  'process.title = "kd-title-probe";',
+  'const short = String(process.title);',
+  'process.title = "k".repeat(4096);',
+  'process.stdout.write(JSON.stringify({ short, length: String(process.title).length }));',
+].join('\n');
+
+test('the fixed Node title option keeps long process.title values intact in a script main entry', () => {
+  const option = contractConstant('NODE_OPTIONS_VALUE', '"');
+  const source = contractConstant('NODE_TITLE_MODULE_SOURCE', "'");
+  const prefix = '--import=data:text/javascript;base64,';
+  assert.ok(option.startsWith(prefix));
+  assert.match(option, /^[A-Za-z0-9+/=,:;.\-]+$/);
+  assert.equal(Buffer.from(option.slice(prefix.length), 'base64').toString('ascii'), source);
+  const baseEnvironment = {};
+  for (const name of ['PATH', 'SystemRoot']) {
+    if (process.env[name] !== undefined) {
+      baseEnvironment[name] = process.env[name];
+    }
+  }
+  const directory = mkdtempSync(join(tmpdir(), 'kd-title-probe-'));
+  try {
+    const probeFile = join(directory, 'probe.cjs');
+    writeFileSync(probeFile, titleProbeSource);
+    const run = (environment) => spawnSync(process.execPath, [probeFile], {
+      env: environment, encoding: 'utf8', timeout: 30000, windowsHide: true, cwd: directory,
+    });
+    const fixed = run({ ...baseEnvironment, NODE_OPTIONS: option });
+    assert.equal(fixed.error, undefined);
+    assert.equal(fixed.status, 0);
+    assert.equal(fixed.stderr, '');
+    assert.deepEqual(JSON.parse(fixed.stdout), { short: 'kd-title-probe', length: 4096 });
+    const control = run(baseEnvironment);
+    assert.equal(control.error, undefined);
+    assert.equal(control.status, 0);
+    if (process.platform === 'linux' || process.platform === 'darwin') {
+      assert.ok(JSON.parse(control.stdout).length < 4096);
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

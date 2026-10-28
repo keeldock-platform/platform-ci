@@ -202,6 +202,7 @@ def _node_environment(storage, node, contract):
         "TMPDIR": str(storage / "node-tmp"),
         "LANG": "C",
         "LC_ALL": "C",
+        "NODE_OPTIONS": contract.NODE_OPTIONS_VALUE,
         "npm_config_cache": str(storage / "node-cache"),
         "npm_config_registry": contract.REGISTRY_URL,
         "npm_config_userconfig": str(storage / contract.USER_CONFIG_NAME),
