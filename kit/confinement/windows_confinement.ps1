@@ -188,12 +188,28 @@ function Invoke-Download($item) {
     $attempt = 0
     while ($true) {
         $attempt += 1
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.MaxAutomaticRedirections = 5
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $cancel = New-Object System.Threading.CancellationTokenSource
+        $cancel.CancelAfter([TimeSpan]::FromSeconds(120))
+        $stream = $null
+        $file = $null
         try {
-            Invoke-WebRequest -Uri $item.Url -OutFile $target -MaximumRedirection 5 -TimeoutSec 90
+            $response = $client.GetAsync($item.Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cancel.Token).GetAwaiter().GetResult()
+            [void]$response.EnsureSuccessStatusCode()
+            $stream = $response.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+            $file = [IO.File]::Create($target)
+            $stream.CopyToAsync($file, 81920, $cancel.Token).GetAwaiter().GetResult()
             break
         } catch {
             if ($attempt -ge 2) { throw 'download_failed' }
             Start-Sleep -Seconds (5 * $attempt)
+        } finally {
+            if ($file) { $file.Dispose() }
+            if ($stream) { $stream.Dispose() }
+            $client.Dispose()
+            $cancel.Dispose()
         }
     }
     return $target
@@ -243,6 +259,18 @@ function Grant-Access([string]$path, [string]$sid, [string]$rights, [bool]$inher
     [System.IO.FileSystemAclExtensions]::SetAccessControl($info, $security)
 }
 
+function Grant-NonPropagating([string]$path, [string]$sid) {
+    $bytes = [KeelDock.Platform.WindowsConfinement.NonPropagatingDacl]::Read($path)
+    $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($bytes, 0)
+    if ($null -eq $descriptor.DiscretionaryAcl) { throw 'dacl_missing' }
+    $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
+    $ace = New-Object System.Security.AccessControl.CommonAce([System.Security.AccessControl.AceFlags]::None, [System.Security.AccessControl.AceQualifier]::AccessAllowed, 1048704, $identity, $false, $null)
+    $descriptor.DiscretionaryAcl.InsertAce(0, $ace)
+    $updated = New-Object byte[] $descriptor.BinaryLength
+    $descriptor.GetBinaryForm($updated, 0)
+    [KeelDock.Platform.WindowsConfinement.NonPropagatingDacl]::Write($path, $updated)
+}
+
 function Get-SidRules([string]$path, [string]$sid) {
     $security = Get-Acl -LiteralPath $path
     $rules = $security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
@@ -268,8 +296,15 @@ function Test-Acl {
     $scratch = @(Get-SidRules $script:Lpac.Root $sid)
     $modifyMask = [System.Security.AccessControl.FileSystemRights]'Modify'
     if ($scratch.Count -ne 1 -or ($scratch[0].FileSystemRights -band $modifyMask) -ne $modifyMask -or $scratch[0].AccessControlType -ne 'Allow') { return 'scratch_rule' }
-    foreach ($path in @($script:Layout.Downloads, $script:Layout.Base, $script:Control.Root, $script:Control.Tmp, $script:Control.Crate)) {
+    foreach ($path in @($script:Layout.Downloads, $script:Control.Root, $script:Control.Tmp, $script:Control.Crate)) {
         if (@(Get-SidRules $path $sid).Count -ne 0) { return 'unexpected_rule' }
+    }
+    $attributeMask = [System.Security.AccessControl.FileSystemRights]'ReadAttributes, Synchronize'
+    foreach ($path in $script:Ancestors) {
+        $entries = @(Get-SidRules $path $sid)
+        if ($entries.Count -ne 1) { return 'ancestor_rule' }
+        if ($entries[0].FileSystemRights -ne $attributeMask -or $entries[0].AccessControlType -ne 'Allow' -or $entries[0].IsInherited) { return 'ancestor_rule' }
+        if ($entries[0].InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None -or $entries[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) { return 'ancestor_rule' }
     }
     foreach ($path in @(($script:Layout.RustBin + '\rustc.exe'), ($script:Layout.MsvcBin + '\link.exe'), ($script:Layout.NodeDir + '\node.exe'), $script:Layout.LightningcssBinding, $script:Layout.RolldownBinding, $script:Layout.NodeTest)) {
         if (@(Get-SidRules $path $sid).Count -lt 1) { return 'not_inherited' }
@@ -359,7 +394,7 @@ function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
             if ($firstLine) { Write-Line ('kd-diag stage=' + $spec.Name + ' stream=first line=' + (Get-CleanText $firstLine.Trim() 160)) }
         }
         $lpacProven = ($tokenText -like 'appcontainer=1,*') -and ($tokenText -like '*,lpac=1,*') -and ($tokenText -like '*,sid=match,*') -and ($tokenText -like '*,aap=absent')
-        $outcomes[$spec.Name] = @{ Passed = $passed; Job = ($jobText -like 'assigned,*'); Token = $lpacProven; Stdout = [string]$result.Stdout }
+        $outcomes[$spec.Name] = @{ Passed = $passed; Job = ($jobText -like 'assigned,*'); Token = $lpacProven; AapOnly = ($tokenText -like '*,lpac=aap_only,*'); Stdout = [string]$result.Stdout }
     }
     return $outcomes
 }
@@ -440,14 +475,19 @@ try {
         $phase = 'acl_grant'
         Grant-Access $layout.ReadOnly $script:Sid 'ReadAndExecute, Synchronize' $true
         Grant-Access $script:Lpac.Root $script:Sid 'Modify, Synchronize' $true
-        $ancestors = 0
-        $ancestorFailures = 0
-        try {
-            Grant-Access (Split-Path -Parent $layout.Base) $script:Sid 'ReadAttributes, Synchronize' $false
-            $ancestors += 1
-        } catch {
-            $ancestorFailures += 1
+        $phase = 'acl_ancestors'
+        $script:Ancestors = @()
+        $ancestorPath = $layout.Base
+        while ($ancestorPath) {
+            $script:Ancestors += $ancestorPath
+            $ancestorPath = Split-Path -Parent $ancestorPath
         }
+        foreach ($ancestorPath in $script:Ancestors) {
+            Grant-NonPropagating $ancestorPath $script:Sid
+        }
+        $ancestors = $script:Ancestors.Count
+        $ancestorFailures = 0
+        $phase = 'acl_grant'
         foreach ($set in @($script:Lpac, $script:Control)) {
             foreach ($directory in @($set.Tmp, $set.Profile, $set.CargoHome, $set.Crate, (Join-Path $set.Crate 'src'))) {
                 New-Item -ItemType Directory -Force -Path $directory | Out-Null
@@ -547,6 +587,9 @@ try {
         foreach ($key in $confinedOutcomes.Keys) {
             if (-not $confinedOutcomes[$key].Job) { $jobState = 'unverified' }
             if (-not $confinedOutcomes[$key].Token) { $tokenState = 'unverified' }
+        }
+        foreach ($key in $confinedOutcomes.Keys) {
+            if ($tokenState -eq 'unverified' -and $confinedOutcomes[$key].AapOnly) { $tokenState = 'aap_only' }
         }
         Write-Line ('windows-confinement-spike=observed rust=' + $rust + ' node=' + $node + ' first_failure=' + $firstFailure + ' lpac=' + $tokenState + ' job=' + $jobState + ' acl=' + $aclState + ' acl_negative=' + $aclNegative + ' control_rust=' + $controlRust + ' control_node=' + $controlNode + ' css_transform=' + $cssTransform + ' rolldown=load_only vitest=not_run rolldown_call=not_run')
         if ($rust -eq 'compiled' -and $node -eq 'ran' -and $firstFailure -eq 'none' -and $jobState -eq 'verified' -and $tokenState -eq 'verified' -and $aclNegative -eq 'denied') { $exitCode = 0 }

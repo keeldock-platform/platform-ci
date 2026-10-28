@@ -131,7 +131,7 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
         self.assertNotIn("Write-Output", self.wrapper)
         self.assertNotIn("Write-Host", self.wrapper)
         self.assertIn("[Console]::Out.WriteLine($text)", self.function_body("Write-Line"))
-        for name in re.findall(r"^function ([A-Za-z-]+)", self.wrapper, re.M):
+        for name in re.findall(r"^function ([A-Za-z0-9-]+)", self.wrapper, re.M):
             body = self.function_body(name)
             with self.subTest(function=name):
                 self.assertNotIn("Write-Output", body)
@@ -188,6 +188,7 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
         self.assertTrue(self.token_accepted(good))
         for bad in (
             good.replace("lpac=1", "lpac=unreadable"),
+            good.replace("lpac=1", "lpac=aap_only"),
             good.replace("lpac=1", "lpac=0"),
             good.replace("sid=match", "sid=mismatch"),
             good.replace("aap=absent", "aap=present"),
@@ -274,13 +275,67 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
         self.assertIn('result.Failure = "reader_join";', self.native)
         self.assertNotIn("CloseOne(ref outRead);\n                CloseOne(ref errRead);", self.native)
 
-    def test_ancestor_grants_stop_at_the_runner_temp_directory(self):
-        self.assertEqual(self.wrapper.count("Grant-Access (Split-Path -Parent $layout.Base)"), 1)
-        self.assertNotIn("while ($parent)", self.wrapper)
-        self.assertEqual(len(re.findall(r"^\s*Grant-Access ", self.wrapper, re.M)), 3)
+    def test_ancestor_grants_cover_the_full_chain_without_propagation(self):
+        self.assertIn("$ancestorPath = $layout.Base", self.wrapper)
+        self.assertIn("$ancestorPath = Split-Path -Parent $ancestorPath", self.wrapper)
+        self.assertIn("while ($ancestorPath) {", self.wrapper)
+        self.assertIn("Grant-NonPropagating $ancestorPath $script:Sid", self.wrapper)
+        self.assertIn("$phase = 'acl_ancestors'", self.wrapper)
+        self.assertNotIn("catch {\n            $ancestorFailures", self.wrapper)
+        self.assertEqual(len(re.findall(r"^\s*Grant-Access ", self.wrapper, re.M)), 2)
         self.assertIn("Grant-Access $layout.ReadOnly $script:Sid 'ReadAndExecute, Synchronize' $true", self.wrapper)
         self.assertIn("Grant-Access $script:Lpac.Root $script:Sid 'Modify, Synchronize' $true", self.wrapper)
-        self.assertIn("'ReadAttributes, Synchronize' $false", self.wrapper)
+        self.assertNotIn("'ReadAttributes, Synchronize' $false", self.wrapper)
+        grant = self.function_body("Grant-NonPropagating")
+        for required in ("NonPropagatingDacl]::Read", "NonPropagatingDacl]::Write", "AceFlags]::None", "1048704", "InsertAce(0, $ace)"):
+            with self.subTest(required=required):
+                self.assertIn(required, grant)
+        self.assertNotIn("SetAccessControl", grant)
+        self.assertNotIn("Set-Acl", self.wrapper)
+        self.assertEqual(0x80 | 0x100000, 1048704)
+        for required in ("SetFileSecurityW", "GetFileSecurityW", "DaclSecurityInformation = 0x00000004"):
+            with self.subTest(required=required):
+                self.assertIn(required, self.native)
+        self.assertNotIn("SetNamedSecurityInfo", self.native)
+        self.assertNotIn("preserve-symlinks", self.wrapper)
+        acl = self.function_body("Test-Acl")
+        for required in (
+            "foreach ($path in $script:Ancestors)",
+            "$entries.Count -ne 1",
+            "$entries[0].FileSystemRights -ne $attributeMask",
+            "[System.Security.AccessControl.FileSystemRights]'ReadAttributes, Synchronize'",
+            "$entries[0].IsInherited",
+            "$entries[0].InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None",
+            "$entries[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None",
+            "'ancestor_rule'",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, acl)
+        self.assertNotIn("$script:Layout.Base,", acl)
+
+    def test_unreadable_container_flag_hedge_is_spike_only_and_never_verifies(self):
+        self.assertEqual(self.native.count("private const bool SpikeAllowUnreadableLpac = true;"), 1)
+        for required in (
+            'lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match" && applicationPackages == "absent"',
+            'reported = "aap_only";',
+            '(lpac != "1" && reported != "aap_only")',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.native)
+        self.assertNotIn('lpac == "0" &&', self.native)
+        self.assertIn("lpac=aap_only", self.wrapper)
+        self.assertIn("$tokenState = 'aap_only'", self.wrapper)
+        self.assertIn("-and $tokenState -eq 'verified'", self.wrapper)
+
+    def test_downloads_are_bounded_by_a_total_deadline(self):
+        body = self.function_body("Invoke-Download")
+        self.assertIn("CancelAfter([TimeSpan]::FromSeconds(120))", body)
+        self.assertIn("$cancel.Token", body)
+        self.assertIn("ResponseHeadersRead", body)
+        self.assertNotIn("Invoke-WebRequest", self.wrapper)
+        self.assertNotIn("-TimeoutSec", self.wrapper)
+        self.assertIn("MaxAutomaticRedirections = 5", body)
+        self.assertIn("$client.Dispose()", body)
 
     def test_worst_case_runtime_fits_eighty_percent_of_the_job_timeout(self):
         specs = self.function_body("Get-StageSpecs")
@@ -294,7 +349,7 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
         ladders = total(confined_branch) + total(common) + total(control_branch) + total(common)
         downloads = len(re.findall(r"\bFile = '", self.wrapper))
         attempts = int(re.search(r"\$attempt -ge ([0-9]+)", self.wrapper).group(1))
-        per_attempt = int(re.search(r"-TimeoutSec ([0-9]+)", self.wrapper).group(1))
+        per_attempt = int(re.search(r"CancelAfter\(\[TimeSpan\]::FromSeconds\(([0-9]+)\)\)", self.wrapper).group(1))
         staging_allowance = 600
         worst = ladders + downloads * attempts * per_attempt + staging_allowance
         workflow = WORKFLOW.read_text(encoding="utf-8")

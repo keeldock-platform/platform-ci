@@ -25,6 +25,48 @@ namespace KeelDock.Platform.WindowsConfinement
         public string Stderr = "";
     }
 
+    public static class NonPropagatingDacl
+    {
+        private const uint DaclSecurityInformation = 0x00000004;
+
+        public static byte[] Read(string path)
+        {
+            uint needed = 0;
+            bool first = GetFileSecurityW(path, DaclSecurityInformation, null, 0, out needed);
+            int error = Marshal.GetLastWin32Error();
+            if (first || error != 122 || needed == 0 || needed > 65536)
+            {
+                throw new InvalidOperationException("dacl_read_size error=" + error.ToString());
+            }
+            byte[] buffer = new byte[needed];
+            if (!GetFileSecurityW(path, DaclSecurityInformation, buffer, needed, out needed))
+            {
+                throw new InvalidOperationException("dacl_read error=" + Marshal.GetLastWin32Error().ToString());
+            }
+            return buffer;
+        }
+
+        public static void Write(string path, byte[] descriptor)
+        {
+            if (descriptor == null || descriptor.Length == 0)
+            {
+                throw new InvalidOperationException("dacl_write_empty");
+            }
+            if (!SetFileSecurityW(path, DaclSecurityInformation, descriptor))
+            {
+                throw new InvalidOperationException("dacl_write error=" + Marshal.GetLastWin32Error().ToString());
+            }
+        }
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetFileSecurityW(string fileName, uint requestedInformation, byte[] securityDescriptor, uint length, out uint lengthNeeded);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetFileSecurityW(string fileName, uint securityInformation, byte[] securityDescriptor);
+    }
+
     public sealed class Sandbox : IDisposable
     {
         private const int ErrorInsufficientBuffer = 122;
@@ -33,6 +75,7 @@ namespace KeelDock.Platform.WindowsConfinement
         private const int MaxEnvironmentCharacters = 131072;
         private const int MaxCommandLineCharacters = 32767;
         private const uint TokenQuery = 0x0008;
+        private const bool SpikeAllowUnreadableLpac = true;
         private const int TokenGroups = 2;
         private const int TokenAppContainerSid = 31;
         private const string AllApplicationPackagesSid = "S-1-15-2-1";
@@ -466,9 +509,14 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 string sidState = ReadContainerSidMatches(token, expectedSid) ? "match" : "mismatch";
                 string applicationPackages = ReadAllApplicationPackagesState(token);
+                string reported = lpac;
+                if (lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match" && applicationPackages == "absent")
+                {
+                    reported = "aap_only";
+                }
                 string text = "appcontainer=" + isAppContainer.ToString() + " capabilities=" + capabilityCount.ToString()
-                    + " integrity=0x" + integrity.ToString("x4") + " lpac=" + lpac + " sid=" + sidState + " aap=" + applicationPackages;
-                if (isAppContainer != 1 || capabilityCount != 0 || integrity != LowIntegrityRid || lpac != "1"
+                    + " integrity=0x" + integrity.ToString("x4") + " lpac=" + reported + " sid=" + sidState + " aap=" + applicationPackages;
+                if (isAppContainer != 1 || capabilityCount != 0 || integrity != LowIntegrityRid || (lpac != "1" && reported != "aap_only")
                     || sidState != "match" || applicationPackages != "absent")
                 {
                     throw new InvalidOperationException(text);
