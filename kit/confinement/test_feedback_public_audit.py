@@ -730,6 +730,7 @@ class LiveProviderPipelineTests(unittest.TestCase):
 
                     def failed_inventory(client, path, *args, **kwargs):
                         if path.endswith("/actions/runs/" + str(api.run_id) + "/artifacts"):
+                            api.calls.append(path + "?per_page=100&page=1")
                             raise RuntimeError("canary-private-value")
                         return original_reader(client, path, *args, **kwargs)
 
@@ -741,8 +742,15 @@ class LiveProviderPipelineTests(unittest.TestCase):
                         feedback_api, "_download_archive", side_effect=RuntimeError("canary-private-value"),
                     ))
                 elif expected_phase == "cache_snapshot":
+                    def failed_cache_snapshot(client, control_sha):
+                        api.calls.append(
+                            "/repos/" + macos_public_audit.REPOSITORY
+                            + "/actions/caches?per_page=100&page=1",
+                        )
+                        raise RuntimeError("canary-private-value")
+
                     stack.enter_context(patch.object(
-                        subject, "_snapshot_cache", side_effect=RuntimeError("canary-private-value"),
+                        subject, "_snapshot_cache", side_effect=failed_cache_snapshot,
                     ))
                 elif expected_phase == "summary_markers":
                     api.logs[101] = api.logs[101].replace(
