@@ -204,6 +204,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_feedback_api.py': 'a748ca0ad084de64bbec47f4d2413f4ae35d6b932d8010847f59cec700f27fae',
     'kit/confinement/feedback_public_audit.py': 'beef023a68e01343c5e8f3e883ba99be75f79924eeaca8fdcaabe9d7401960cb',
     'kit/confinement/test_feedback_public_audit.py': '4a7b822645c7051a4f1999e5961482000a0c58c7c31d9a6ec106a88b8426b5e7',
+    'kit/confinement/cargo_vendor_verify.py': 'b5964d2b36909abe7ba56af424e7d58248763038e2ee20ea74eb89033602a4f6',
+    'kit/confinement/test_cargo_vendor_verify.py': '69bec4106ed3c4ac41624ddcb4719b18902d4f2556ba140257ee9e513c3bcf32',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(

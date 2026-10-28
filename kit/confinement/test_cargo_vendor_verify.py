@@ -202,6 +202,46 @@ class CargoVendorVerifyTests(unittest.TestCase):
                     _remove_materialized(result)
                 _unfreeze(vendor)
 
+    def test_stage_is_writable_at_atomic_publication_and_frozen_afterward(self):
+        record = _lock_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            original_publish = cargo._publish_stage
+            observed = []
+
+            def record_publish(parent_fd, stage_name, final_name, expected_identity):
+                stage_fd = os.open(
+                    stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    metadata = os.fstat(stage_fd)
+                    observed.append((
+                        metadata.st_mode & 0o777,
+                        cargo._file_identity(metadata) == expected_identity,
+                    ))
+                finally:
+                    os.close(stage_fd)
+                return original_publish(
+                    parent_fd, stage_name, final_name, expected_identity,
+                )
+
+            try:
+                with patch.object(cargo, "_publish_stage", side_effect=record_publish):
+                    result = _verify(vendor, record, receipt, trusted_digest)
+                self.assertEqual(observed, [(0o700, True)])
+                materialized = result["materialized_vendor_directory"]
+                self.assertEqual(materialized.stat().st_mode & 0o777, 0o555)
+                self.assertEqual(cargo.vendor_tree_digest(materialized), digest)
+            finally:
+                if "result" in locals():
+                    _remove_cargo_environment(result["environment"])
+                    _remove_materialized(result)
+                _unfreeze(vendor)
+
     def test_non_private_staging_root_is_refused_before_configuration(self):
         record = _lock_receipt()
         with tempfile.TemporaryDirectory() as temporary:

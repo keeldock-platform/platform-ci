@@ -297,12 +297,17 @@ def _materialize_vendor(root_fd, items, expected_digest, require_read_only, stag
                 os.fchmod(directory_fd, 0o555)
             finally:
                 os.close(directory_fd)
-        os.fchmod(stage_fd, 0o555)
         materialized_digest = cargo.vendor_tree_inventory_fd(stage_fd)[0]
         if not hmac.compare_digest(materialized_digest, expected_digest):
             _refuse()
         cargo._publish_stage(parent_fd, stage_name, final_name, stage_identity)
         stage_name = None
+        os.fchmod(stage_fd, 0o555)
+        published = os.fstat(stage_fd)
+        if (cargo._file_identity(published) != stage_identity
+                or stat.S_IMODE(published.st_mode) != 0o555
+                or cargo._entry_identity(parent_fd, final_name) != stage_identity):
+            _refuse()
         return target / final_name, parent_fd, stage_fd, final_name, stage_identity
     except BaseException:
         if stage_created and parent_fd is not None:
