@@ -3,6 +3,7 @@
 import builtins
 import copy
 from contextlib import contextmanager
+import io
 import json
 import os
 from pathlib import Path
@@ -389,6 +390,132 @@ class CoreContractTests(unittest.TestCase):
         unclassified = subject._FailureDiagnostics().attach(RuntimeError("private"), "unavailable")
         self.assertEqual(empty.diagnostic, "none")
         self.assertEqual(unclassified.diagnostic, "unavailable")
+
+    def test_summary_guard_detail_requires_exact_rules_refusal_and_known_check(self):
+        class RulesRefusal(Exception):
+            def __init__(self, reason, stage, diagnostic):
+                self.reason = reason
+                self.stage = stage
+                self.diagnostic = diagnostic
+
+        class OtherRulesRefusal(RulesRefusal):
+            pass
+
+        class MaliciousError(Exception):
+            @property
+            def reason(self):
+                raise AssertionError("untrusted exception attribute was read")
+
+        rules = SimpleNamespace(Refusal=RulesRefusal)
+        for check, expected_diagnostic in subject.SUMMARY_GUARD_DIAGNOSTIC_MAP.items():
+            with self.subTest(check=check):
+                error = RulesRefusal("summary_guard_failed", "summary_guard", check)
+                self.assertEqual(
+                    subject._summary_guard_diagnostic(error, rules), expected_diagnostic,
+                )
+                self.assertIn(expected_diagnostic, subject.DIAGNOSTICS)
+        accepted = RulesRefusal(
+            "summary_guard_failed", "summary_guard", "protect_controls_file_reference",
+        )
+        public_diagnostic = subject._summary_guard_diagnostic(accepted, rules)
+        self.assertEqual(public_diagnostic, "summary_guard_protect_controls_file_reference")
+        attached = subject._FailureDiagnostics().attach(
+            subject.Refusal("summary_guard_failed", "summary_guard", diagnostic=public_diagnostic),
+            "summary_guard_setup",
+        )
+        self.assertEqual(attached.diagnostic, "summary_guard_protect_controls_file_reference")
+        unrelated = subject._FailureDiagnostics().attach(
+            subject.Refusal("summary_guard_failed", "summary_guard", diagnostic=public_diagnostic),
+            "source_lease_request",
+        )
+        self.assertEqual(unrelated.diagnostic, "summary_guard_protect_controls_file_reference")
+
+        class OtherCoreRefusal(subject.Refusal):
+            pass
+
+        malformed = (
+            subject.Refusal("runner_unavailable", "summary_guard", diagnostic=public_diagnostic),
+            subject.Refusal("summary_guard_failed", "worker_setup", diagnostic=public_diagnostic),
+            OtherCoreRefusal("summary_guard_failed", "summary_guard", diagnostic=public_diagnostic),
+        )
+        for error in malformed:
+            with self.subTest(error_type=type(error).__name__, reason=error.reason, stage=error.stage):
+                reattached = subject._FailureDiagnostics().attach(error, "source_gates")
+                self.assertEqual(reattached.diagnostic, "source_gates")
+
+        cleanup_detail = RulesRefusal("cleanup_incomplete", "cleanup_summary", "remove_scratch")
+        self.assertEqual(
+            subject._summary_guard_diagnostic(cleanup_detail, rules),
+            "summary_guard_remove_scratch",
+        )
+
+        for error in (
+            OtherRulesRefusal("summary_guard_failed", "summary_guard", "input"),
+            RulesRefusal("summary_guard_failed", "summary_guard", "private detail"),
+            RulesRefusal("cleanup_incomplete", "cleanup", "remove_scratch"),
+            RulesRefusal("runner_unavailable", "worker_setup", "input"),
+            RuntimeError("private exception text"), MaliciousError(),
+        ):
+            with self.subTest(error_type=type(error).__name__):
+                self.assertIsNone(subject._summary_guard_diagnostic(error, rules))
+
+        diagnostics = subject._FailureDiagnostics()
+        original = diagnostics.attach(
+            subject.Refusal("summary_guard_failed", "summary_guard", diagnostic=public_diagnostic),
+            "summary_guard_setup",
+        )
+        self.assertEqual(original.diagnostic, "summary_guard_protect_controls_file_reference")
+        cleanup = diagnostics.attach(
+            subject.Refusal("cleanup_incomplete", "cleanup"), "summary_guard_finish", "cleanup_summary",
+        )
+        self.assertEqual((cleanup.reason, cleanup.stage, cleanup.diagnostic),
+                         ("cleanup_incomplete", "cleanup", "cleanup_summary"))
+
+    def test_summary_guard_diagnostic_survives_source_and_main_reattach(self):
+        class RulesRefusal(Exception):
+            def __init__(self, reason, stage, diagnostic):
+                self.reason = reason
+                self.stage = stage
+                self.diagnostic = diagnostic
+
+        rules = SimpleNamespace(Refusal=RulesRefusal)
+        diagnostic = subject._summary_guard_diagnostic(
+            RulesRefusal("summary_guard_failed", "summary_guard", "input"), rules,
+        )
+        refusal = subject.Refusal("summary_guard_failed", "summary_guard", diagnostic=diagnostic)
+        runtime = SimpleNamespace(SOURCE_CANDIDATE_REF_ENV="SOURCE_CANDIDATE_REF")
+        controls = (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), runtime,
+                    SimpleNamespace(), rules)
+
+        def fail_source(*unused_args, **unused_kwargs):
+            raise refusal
+
+        arguments = (
+            "run", "--token-stdin", "--source-sha", SOURCE_SHA,
+            "--base-sha", BASE_SHA, "--base-branch", "develop",
+        )
+        with patch.object(subject, "_load_controls", return_value=controls):
+            with patch.object(subject, "_validate_context", return_value=({}, Path.cwd(), Path.cwd())):
+                with patch.object(subject, "_validate_review_gate", return_value=(DIFF_SHA256, CANDIDATE_REF)):
+                    with patch.object(subject, "_check_temp_root"):
+                        with patch.object(subject, "_validate_smoke_receipt", return_value={"rustc": "fixture"}):
+                            with patch.object(subject, "_run_source", side_effect=fail_source):
+                                with patch.object(subject.os, "geteuid", return_value=0, create=True):
+                                    with patch.object(subject.sys, "platform", "darwin"):
+                                        with patch.object(subject.platform, "machine", return_value="arm64"):
+                                            with self.assertRaises(subject.Refusal) as raised:
+                                                subject._execute(arguments, {}, "x", {})
+        self.assertEqual(
+            (raised.exception.reason, raised.exception.stage, raised.exception.diagnostic),
+            ("summary_guard_failed", "summary_guard", "summary_guard_input"),
+        )
+
+        output = io.StringIO()
+        with patch.object(subject, "_execute", side_effect=raised.exception):
+            with patch.dict(subject.os.environ, {}):
+                status = subject.main(arguments=(), environ={}, stdin=io.BytesIO(), stdout=output)
+        self.assertEqual(status, 1)
+        self.assertIn('"diagnostic":"summary_guard_input"', output.getvalue())
 
     def test_source_failure_details_survive_outer_reattach_and_cleanup_keeps_first_cause(self):
         source_failures = (

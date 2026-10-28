@@ -125,6 +125,17 @@ SUMMARY_SURVIVOR_STAGES = frozenset(
     "cleanup_summary_present_" + category for category in SUMMARY_SURVIVOR_CLASSES
 )
 CLEANUP_STAGES = CLEANUP_STAGES | SUMMARY_SURVIVOR_STAGES
+SUMMARY_GUARD_CHECKS = frozenset((
+    "input", "protect_controls", "runner_identity", "prepare_summary", "real_probe",
+    "verify_controls", "make_scratch", "write_denial_probe", "standin_check", "remove_scratch",
+    "protect_controls_workspace_owner", "protect_controls_directory_type_owner",
+    "protect_controls_directory_permissions", "protect_controls_file_reference",
+    "protect_controls_file_type_owner", "protect_controls_file_permissions",
+))
+SUMMARY_GUARD_PROTECT_CHECKS = frozenset((
+    "workspace_owner", "directory_type_owner", "directory_permissions",
+    "file_reference", "file_type_owner", "file_permissions",
+))
 REASONS = frozenset((
     "invalid_input", "control_identity_invalid", "bootstrap_gate_refused", "developer_mode_unavailable",
     "plan_snapshot_refused", "dash_bottle_unavailable", "dash_bottle_invalid",
@@ -241,9 +252,11 @@ os.write(1, b"plan-id-snapshot=read-only\n")
 
 
 class Refusal(Exception):
-    def __init__(self, reason, stage, *, embedded_formula_sha256=None, verified_bottle_sha256=None):
+    def __init__(self, reason, stage, *, embedded_formula_sha256=None, verified_bottle_sha256=None,
+                 diagnostic=None):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "context"
+        self.diagnostic = diagnostic if type(diagnostic) is str and diagnostic in SUMMARY_GUARD_CHECKS else None
         self.embedded_formula_sha256 = (
             embedded_formula_sha256
             if type(embedded_formula_sha256) is str and SHA256_RE.fullmatch(embedded_formula_sha256)
@@ -364,7 +377,7 @@ def _is_cleanup_failure(error):
     return type(error) is Refusal and error.reason == "cleanup_incomplete"
 
 
-def _cleanup_failure(stage, cleanup_state=None):
+def _cleanup_failure(stage, cleanup_state=None, *, diagnostic=None):
     if type(stage) is not str or stage not in CLEANUP_STAGES:
         stage = "cleanup_unknown"
     if type(cleanup_state) is dict:
@@ -373,7 +386,7 @@ def _cleanup_failure(stage, cleanup_state=None):
             stage = first
         else:
             cleanup_state["first"] = stage
-    return Refusal("cleanup_incomplete", stage)
+    return Refusal("cleanup_incomplete", stage, diagnostic=diagnostic)
 
 
 def _preserve_cleanup_failure(failure, stage, cleanup_state=None):
@@ -1051,39 +1064,63 @@ def _run_tree_probe(source, uid, home, toolchain, capability):
 
 def _summary_guard(uid, home, toolchain, reviewed, capability, root, binding, environ, guard_state,
                    cleanup_state=None):
+    check = "input"
     try:
         if (not environ.get("GITHUB_STEP_SUMMARY")
                 or environ.get("CI_STEP_SUMMARY") != environ.get("GITHUB_STEP_SUMMARY")
                 or not environ.get("RUNNER_HOME")):
             raise ValueError
-        runner_uid, directories, files = capability._protect_runner_controls(root)
+        check = "protect_controls"
+        try:
+            runner_uid, directories, files = capability._protect_runner_controls(root)
+        except BaseException as error:
+            probe_failure = getattr(capability, "ProbeFailure", None)
+            if isinstance(probe_failure, type) and type(error) is probe_failure:
+                subcheck = getattr(error, "check", None)
+                if type(subcheck) is str and subcheck in SUMMARY_GUARD_PROTECT_CHECKS:
+                    check = "protect_controls_" + subcheck
+            raise
+        check = "runner_identity"
         if runner_uid <= 0 or runner_uid == uid:
             raise ValueError
+        check = "prepare_summary"
         guard = reviewed._prepare_runner_summary(uid)
         guard_state["guard"] = guard
+        check = "real_probe"
         reviewed._run_real_summary_probe(
             guard, uid,
             env=reviewed._child_environment(home, Path("/tmp"), toolchain),
             python_executable=toolchain["python"], binding=binding,
         )
+        check = "verify_controls"
         capability._verify_runner_controls_are_private(
             directories + files, uid, python_executable=toolchain["python"]
         )
+        check = "make_scratch"
         scratch, standin = reviewed._make_control_scratch()
         try:
             expected = b"runner-controls=write-denied summary-standin=write-denied\n"
+            check = "write_denial_probe"
             reviewed._run_probe_step(
                 reviewed._probe_argv(toolchain["python"], SUMMARY_GUARD_SCRIPT, *files, standin),
                 uid, env=reviewed._child_environment(home, Path("/tmp"), toolchain),
                 python_executable=toolchain["python"], stage="capture", expected_stdout=expected,
             )
+            check = "standin_check"
             reviewed._assert_standin_unchanged(standin)
         finally:
-            capability._remove_probe_tree(scratch)
+            try:
+                capability._remove_probe_tree(scratch)
+            except BaseException:
+                check = "remove_scratch"
+                raise _cleanup_failure(
+                    "cleanup_summary", cleanup_state, diagnostic=check,
+                ) from None
     except BaseException as error:
         if getattr(error, "reason", None) == "cleanup_incomplete":
-            raise _cleanup_failure("cleanup_summary", cleanup_state) from None
-        raise Refusal("summary_guard_failed", "summary_guard") from None
+            diagnostic = error.diagnostic if type(error) is Refusal else None
+            raise _cleanup_failure("cleanup_summary", cleanup_state, diagnostic=diagnostic) from None
+        raise Refusal("summary_guard_failed", "summary_guard", diagnostic=check) from None
 
 
 def _finish_summary_guard(guard, reviewed, *, worker_cleanup_confirmed, cleanup_state=None):

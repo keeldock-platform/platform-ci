@@ -6,6 +6,7 @@ import json
 import urllib.parse
 import zipfile
 import unittest
+from unittest.mock import patch
 
 try:
     from . import feedback_api
@@ -34,6 +35,10 @@ class ProviderShapedAPI(macos_public_audit.GitHubAPI):
         self.run_override = {}
         self.extra_artifacts = []
         self.duplicate_history = []
+        self.history_records = {status: [] for status in (
+            "completed", "queued", "in_progress", "waiting", "pending", "requested",
+        )}
+        self.history_records["completed"] = [self._history_record("completed", "success")]
         self.redirect_override = None
         self.retention_delta_seconds = -2
         self.created_offset_seconds = 0
@@ -152,6 +157,19 @@ class ProviderShapedAPI(macos_public_audit.GitHubAPI):
         with zipfile.ZipFile(io.BytesIO(self.archive), "r") as archive:
             return archive.read(archive.infolist()[0])
 
+    def _history_record(self, status, conclusion):
+        return {
+            "id": self.run_id,
+            "run_attempt": 1,
+            "display_title": feedback_api.RUN_TITLE_PREFIX + self.request_record["request_id"],
+            "head_sha": self.request_record["control_sha"],
+            "path": self.request_record["workflow_path"],
+            "event": "workflow_dispatch",
+            "head_branch": "main",
+            "status": status,
+            "conclusion": conclusion,
+        }
+
     def json(self, path):
         parsed = urllib.parse.urlsplit(path)
         route = parsed.path
@@ -178,19 +196,8 @@ class ProviderShapedAPI(macos_public_audit.GitHubAPI):
             return {"id": self.workflow_id, "path": self.request_record["workflow_path"], "state": "active"}, headers
         if route.endswith("/actions/workflows/" + str(self.workflow_id) + "/runs"):
             status = query["status"][0]
-            matches = []
+            matches = list(self.history_records[status])
             if status == "completed":
-                matches = [{
-                    "id": self.run_id,
-                    "run_attempt": 1,
-                    "display_title": feedback_api.RUN_TITLE_PREFIX + self.request_record["request_id"],
-                    "head_sha": self.request_record["control_sha"],
-                    "path": self.request_record["workflow_path"],
-                    "event": "workflow_dispatch",
-                    "head_branch": "main",
-                    "status": "completed",
-                    "conclusion": "success",
-                }]
                 matches.extend(self.duplicate_history)
             return {"total_count": len(matches), "workflow_runs": matches}, headers
         if route.endswith("/actions/runs/" + str(self.run_id) + "/attempts/1/jobs"):
@@ -308,6 +315,131 @@ class FeedbackAPIProviderShapeTests(unittest.TestCase):
             expected_actor_login="fixture-actor",
             run_id=str(self.api.run_id), run_attempt=1, now=self.now,
         )
+
+    def _history(self, *, live=False):
+        profile = feedback_request.PROFILES[self.request["concern"]]
+        run = {"id": self.api.run_id, "workflow_id": self.api.workflow_id}
+        return feedback_api._history(
+            self.api, self.request, profile, run, "fixture-actor", self.now, live=live,
+        )
+
+    def test_history_collection_refusals_are_mapped_to_closed_reasons(self):
+        for api_reason, expected in (
+            ("api_status", "history_completed_api_status"),
+            ("api_schema", "history_completed_api_schema"),
+            ("pagination_incomplete", "history_completed_api_pagination"),
+            ("api_unavailable", "history_completed_api_unavailable"),
+        ):
+            with self.subTest(reason=api_reason):
+                with patch.object(
+                    macos_public_audit, "_read_counted_collection",
+                    side_effect=macos_public_audit.AuditRefusal(api_reason),
+                ):
+                    with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+                        self._history()
+                self.assertEqual(caught.exception.diagnostic, expected)
+                self.assertNotIn(api_reason, str(caught.exception))
+
+        with patch.object(
+            macos_public_audit, "_read_counted_collection",
+            side_effect=RuntimeError("private response text"),
+        ):
+            with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+                self._history()
+        self.assertEqual(caught.exception.diagnostic, "history_completed_api_unavailable")
+        self.assertNotIn("private response text", str(caught.exception))
+
+    def test_history_api_failure_phase_names_the_fixed_query_status(self):
+        original_reader = macos_public_audit._read_counted_collection
+        for status in feedback_api.HISTORY_COLLECTION_STATUSES:
+            with self.subTest(status=status):
+                def fail_selected(client, path, *args, **kwargs):
+                    if kwargs.get("fixed_query", {}).get("status") == status:
+                        raise macos_public_audit.AuditRefusal("api_status")
+                    return original_reader(client, path, *args, **kwargs)
+
+                with patch.object(
+                    macos_public_audit, "_read_counted_collection", side_effect=fail_selected,
+                ):
+                    with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+                        self._history()
+                self.assertEqual(caught.exception.diagnostic, "history_" + status + "_api_status")
+
+    def test_history_aggregate_limit_reports_the_status_that_exceeded_it(self):
+        self.api.history_records["completed"] = [
+            dict(self.api._history_record("completed", "success"), id=8124, display_title="older run"),
+            dict(self.api._history_record("completed", "success"), id=8125, display_title="another run"),
+        ]
+        self.api.history_records["queued"] = [
+            dict(self.api._history_record("queued", None), id=8126, display_title="queued run"),
+        ]
+        with patch.object(feedback_api, "MAX_HISTORY_RUNS", 2):
+            with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+                self._history()
+        self.assertEqual(caught.exception.diagnostic, "history_queued_api_pagination")
+
+    def test_history_match_and_identity_refusals_are_distinct(self):
+        self.api.history_records["completed"] = []
+        with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+            self._history()
+        self.assertEqual(caught.exception.diagnostic, "history_match_zero")
+
+        self.api.history_records["completed"] = [self.api._history_record("completed", "success")]
+        self.api.duplicate_history = [dict(
+            self.api._history_record("completed", "success"), id=self.api.run_id + 1,
+        )]
+        with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+            self._history()
+        self.assertEqual(caught.exception.diagnostic, "history_match_multiple")
+
+        self.api.duplicate_history = []
+        self.api.history_records["completed"] = [
+            self.api._history_record("completed", "success"),
+            dict(self.api._history_record("completed", "success"), display_title="unrelated run"),
+        ]
+        with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+            self._history()
+        self.assertEqual(caught.exception.diagnostic, "history_duplicate_ids")
+
+        self.api.history_records["completed"] = [dict(
+            self.api._history_record("completed", "success"), id=self.api.run_id + 1,
+        )]
+        with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+            self._history()
+        self.assertEqual(caught.exception.diagnostic, "history_identity_mismatch")
+
+        self.api.history_records["completed"] = [self.api._history_record("completed", "success")]
+        self.api.history_records["queued"] = [dict(
+            self.api._history_record("completed", "success"),
+            display_title="unrelated run",
+        )]
+        with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+            self._history()
+        self.assertEqual(caught.exception.diagnostic, "history_duplicate_ids")
+
+    def test_malformed_history_entry_has_only_the_fixed_schema_diagnostic(self):
+        self.api.history_records["completed"] = [{"id": self.api.run_id}]
+        with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+            self._history()
+        self.assertEqual(caught.exception.diagnostic, "history_completed_api_schema")
+
+    def test_history_status_mismatch_is_distinct_from_identity(self):
+        self.api.history_records["completed"] = []
+        self.api.history_records["in_progress"] = [self.api._history_record("in_progress", None)]
+        with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+            self._history()
+        self.assertEqual(caught.exception.diagnostic, "history_status_mismatch")
+
+        self.api.history_records["in_progress"] = []
+        with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+            self._history(live=True)
+        self.assertEqual(caught.exception.diagnostic, "history_match_zero")
+
+        self.api.history_records["in_progress"] = []
+        self.api.history_records["completed"] = [self.api._history_record("completed", "success")]
+        with self.assertRaises(feedback_api.HistoryRefusal) as caught:
+            self._history(live=True)
+        self.assertEqual(caught.exception.diagnostic, "history_status_mismatch")
 
     def test_realistic_completed_provider_shape_is_accepted(self):
         result = self._collect()

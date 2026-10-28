@@ -28,6 +28,15 @@ MAX_JOBS = 16
 MAX_ARTIFACT_AGE_SECONDS = 24 * 60 * 60
 MAX_CAPACITY_NOTICES = 64
 MAX_MARKER_BYTES = 16 * 1024
+HISTORY_COLLECTION_STATUSES = ("completed", "queued", "in_progress", "waiting", "pending", "requested")
+HISTORY_API_REASONS = ("status", "schema", "pagination", "unavailable")
+HISTORY_FAILURE_PHASES = frozenset(
+    "history_" + status + "_api_" + reason
+    for status in HISTORY_COLLECTION_STATUSES for reason in HISTORY_API_REASONS
+) | frozenset((
+    "history_duplicate_ids", "history_match_zero", "history_match_multiple",
+    "history_identity_mismatch", "history_status_mismatch",
+))
 PRODUCER_TOKEN_FALLBACK_STEP = "Revoke token when producer did not confirm"
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
@@ -71,6 +80,15 @@ class FeedbackAPIRefusal(Exception):
     def __init__(self):
         self.reason = "feedback_api_invalid"
         super().__init__(self.reason)
+
+
+class HistoryRefusal(FeedbackAPIRefusal):
+    def __init__(self, diagnostic):
+        super().__init__()
+        self.diagnostic = (
+            diagnostic if type(diagnostic) is str and diagnostic in HISTORY_FAILURE_PHASES
+            else "history"
+        )
 
 
 def _refuse():
@@ -208,7 +226,7 @@ def _check_run(api, request, profile, expected_actor_login, run_id, run_attempt)
     return run
 
 
-def _validate_history_run(item):
+def _validate_history_run(item, failure_phase):
     if (type(item) is not dict or not _safe_int(item.get("id"), 1)
             or not _safe_int(item.get("run_attempt"), 1)
             or type(item.get("display_title")) is not str or len(item["display_title"]) > 256
@@ -216,7 +234,25 @@ def _validate_history_run(item):
             or type(item.get("path")) is not str or type(item.get("event")) is not str
             or type(item.get("head_branch")) is not str or type(item.get("status")) is not str
             or type(item.get("conclusion")) not in (str, type(None))):
-        _refuse()
+        raise HistoryRefusal(failure_phase)
+
+
+class _HistoryCollectionAPI:
+    def __init__(self, api):
+        self.api = api
+        self.seen_ids = set()
+
+    def json(self, path):
+        body, headers = self.api.json(path)
+        items = body.get("workflow_runs") if type(body) is dict else None
+        if type(items) is list and len(items) <= public_audit.PAGE_SIZE:
+            for item in items:
+                run_id = item.get("id") if type(item) is dict else None
+                if type(run_id) is int and run_id > 0:
+                    if run_id in self.seen_ids:
+                        raise HistoryRefusal("history_duplicate_ids")
+                    self.seen_ids.add(run_id)
+        return body, headers
 
 
 def _history(api, request, profile, run, expected_actor_login, now, *, live=False):
@@ -229,7 +265,7 @@ def _history(api, request, profile, run, expected_actor_login, now, *, live=Fals
     )
     items = []
     seen_ids = set()
-    for status in ("completed", "queued", "in_progress", "waiting", "pending", "requested"):
+    for status in HISTORY_COLLECTION_STATUSES:
         query = {
             "branch": "main",
             "created": lower_date + ".." + upper_date,
@@ -238,28 +274,53 @@ def _history(api, request, profile, run, expected_actor_login, now, *, live=Fals
             "head_sha": request["control_sha"],
             "status": status,
         }
-        page_items = public_audit._read_counted_collection(
-            api, path, "workflow_runs", MAX_HISTORY_RUNS, _validate_history_run,
-            fixed_query=query,
-        )
+        schema_phase = "history_" + status + "_api_schema"
+
+        def validate_history_item(item):
+            _validate_history_run(item, schema_phase)
+
+        try:
+            page_items = public_audit._read_counted_collection(
+                _HistoryCollectionAPI(api), path, "workflow_runs", MAX_HISTORY_RUNS, validate_history_item,
+                fixed_query=query,
+            )
+        except HistoryRefusal:
+            raise
+        except public_audit.AuditRefusal as error:
+            diagnostic = {
+                "api_status": "status",
+                "api_schema": "schema",
+                "pagination_incomplete": "pagination",
+                "api_unavailable": "unavailable",
+            }.get(getattr(error, "reason", None), "unavailable")
+            diagnostic = "history_" + status + "_api_" + diagnostic
+            raise HistoryRefusal(diagnostic) from None
+        except Exception:
+            raise HistoryRefusal("history_" + status + "_api_unavailable") from None
         if len(items) + len(page_items) > MAX_HISTORY_RUNS:
-            _refuse()
+            raise HistoryRefusal("history_" + status + "_api_pagination")
         for item in page_items:
             if item["id"] in seen_ids:
-                _refuse()
+                raise HistoryRefusal("history_duplicate_ids")
             seen_ids.add(item["id"])
         items.extend(page_items)
     matches = [
         item for item in items
         if item.get("display_title") == RUN_TITLE_PREFIX + request["request_id"]
     ]
-    if (len(matches) != 1 or matches[0].get("id") != run["id"]
-            or matches[0].get("run_attempt") != 1
-            or matches[0].get("path") != profile["workflow_path"]
-            or matches[0].get("head_sha") != request["control_sha"]
-            or matches[0].get("status") != ("in_progress" if live else "completed")
-            or matches[0].get("conclusion") != (None if live else "success")):
-        _refuse()
+    if not matches:
+        raise HistoryRefusal("history_match_zero")
+    if len(matches) != 1:
+        raise HistoryRefusal("history_match_multiple")
+    match = matches[0]
+    if (match.get("id") != run["id"]
+            or match.get("run_attempt") != 1
+            or match.get("path") != profile["workflow_path"]
+            or match.get("head_sha") != request["control_sha"]):
+        raise HistoryRefusal("history_identity_mismatch")
+    if (match.get("status") != ("in_progress" if live else "completed")
+            or match.get("conclusion") != (None if live else "success")):
+        raise HistoryRefusal("history_status_mismatch")
     return {"complete": True, "matches": [{
         "request_id": request["request_id"],
         "run_id": str(run["id"]),
