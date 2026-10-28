@@ -471,6 +471,35 @@ class SourceRefTests(unittest.TestCase):
 
 
 class CoreContractTreeTests(unittest.TestCase):
+    @staticmethod
+    def _validate_feedback_tree(entries, concern):
+        digest = hashlib.sha256(b"x").hexdigest()
+
+        def blob(unused_repository, unused_git, unused_environment, unused_entries, path, **unused):
+            if path == "Cargo.toml":
+                members = ", ".join('"' + "/".join(root) + '"'
+                                     for root in subject.CORE_CONTRACT_CRATE_ROOTS)
+                return ("[workspace]\nmembers = [" + members + "]\n").encode("utf-8")
+            if path == "Cargo.lock":
+                return ("version = 4\n" + "[[package]]\n" * len(subject.CORE_CONTRACT_CRATE_ROOTS)).encode("ascii")
+            if path == "rust-toolchain.toml":
+                return subject.CORE_CONTRACT_TOOLCHAIN
+            return b"x"
+
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(dict(entries), entries),
+        ), patch.object(subject, "_contract_blob", side_effect=blob) as blob, \
+                patch.object(subject, "_feedback_corpus_shape", return_value=True), \
+                patch.object(subject, "_feedback_manifest_shape", return_value=True), \
+                patch.object(subject, "_feedback_fuzz_manifest_shape", return_value=True), \
+                patch.object(subject, "_core_contract_policy_matches_base", return_value=True), \
+                patch.object(subject, "_rules_v2_file_manifest", return_value={"AGENTS.md": digest}):
+            marker = subject._safe_core_contract_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+                concern=concern,
+            )
+        return marker, blob
+
     def test_core_contract_path_scope_is_limited_to_workspace_and_three_crates(self):
         for path in subject.CORE_CONTRACT_ROOT_FILES:
             self.assertEqual(subject._core_contract_expected_mode(path), "100644")
@@ -514,6 +543,101 @@ class CoreContractTreeTests(unittest.TestCase):
             with self.subTest(path=path):
                 for concern in subject.FEEDBACK_PROFILE_CONCERNS:
                     self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_root_package_lock_is_admitted_only_for_build_diagnostic_verification(self):
+        path = subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
+        self.assertIsNone(subject._core_contract_expected_mode(path))
+        self.assertIsNone(subject._core_contract_expected_mode(
+            path, concern="core-node-lock-return",
+        ))
+        self.assertIsNone(subject._core_contract_expected_mode(
+            path, concern="core-rust-format-return",
+        ))
+        self.assertEqual(subject._core_contract_expected_mode(
+            path, concern="core-build-diagnostic-return",
+        ), "100644")
+        self.assertIsNone(subject._core_contract_expected_mode(
+            "Package-lock.json", concern="core-build-diagnostic-return",
+        ))
+
+    def test_build_diagnostic_tree_marker_distinguishes_optional_root_lock(self):
+        concern = "core-build-diagnostic-return"
+        entries = self._required_core_contract_entries(concern)
+        marker, blob = self._validate_feedback_tree(entries, concern)
+        self.assertEqual(marker, subject.CORE_CONTRACT_TREE_BY_CONCERN[concern])
+        self.assertFalse(any(
+            call.args[4] == subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
+            for call in blob.call_args_list
+        ))
+
+        with_lock = dict(entries)
+        with_lock[subject.CORE_CONTRACT_PACKAGE_LOCK_PATH] = ("100644", "b" * 40)
+        marker, blob = self._validate_feedback_tree(with_lock, concern)
+        self.assertEqual(marker, subject.CORE_CONTRACT_PACKAGE_LOCK_TREE)
+        lock_calls = [
+            call for call in blob.call_args_list
+            if call.args[4] == subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
+        ]
+        self.assertEqual(len(lock_calls), 1)
+        self.assertEqual(lock_calls[0].kwargs["max_bytes"], subject.MAX_FEEDBACK_LOCK_BYTES)
+
+    def test_node_lock_bootstrap_tree_keeps_source_lock_optional(self):
+        concern = "core-node-lock-return"
+        entries = self._required_core_contract_entries(concern)
+        marker, blob = self._validate_feedback_tree(entries, concern)
+        self.assertEqual(marker, subject.CORE_CONTRACT_TREE_BY_CONCERN[concern])
+        self.assertNotIn(subject.CORE_CONTRACT_PACKAGE_LOCK_PATH, entries)
+        self.assertFalse(any(
+            call.args[4] == subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
+            for call in blob.call_args_list
+        ))
+
+    def test_build_diagnostic_root_lock_requires_full_foundation_and_regular_mode(self):
+        concern = "core-build-diagnostic-return"
+        root_lock = subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
+        entries = self._required_core_contract_entries(concern)
+        entries[root_lock] = ("100644", "b" * 40)
+        self.assertEqual(
+            self._validate_feedback_tree(entries, concern)[0],
+            subject.CORE_CONTRACT_PACKAGE_LOCK_TREE,
+        )
+
+        no_foundation = {
+            path: entry for path, entry in entries.items()
+            if not subject._core_contract_foundation_path(path)
+        }
+        no_foundation[root_lock] = ("100644", "b" * 40)
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(dict(no_foundation), no_foundation),
+        ), patch.object(subject, "_contract_blob") as blob, self.assertRaises(subject.Refusal) as refusal:
+            subject._safe_core_contract_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+                concern=concern,
+            )
+        blob.assert_not_called()
+        self.assertEqual(refusal.exception.core_check, "required_files")
+
+        for invalid_mode in ("100755", "120000"):
+            wrong_mode = dict(entries)
+            wrong_mode[root_lock] = (invalid_mode, "b" * 40)
+            digest = hashlib.sha256(b"x").hexdigest()
+            with self.subTest(mode=invalid_mode), patch.object(
+                subject, "_contract_tree_entries", side_effect=(dict(wrong_mode), wrong_mode),
+            ), patch.object(subject, "_contract_blob", return_value=b"x") as blob, \
+                    patch.object(subject, "_feedback_corpus_shape", return_value=True), \
+                    patch.object(subject, "_feedback_manifest_shape", return_value=True), \
+                    patch.object(subject, "_feedback_fuzz_manifest_shape", return_value=True), \
+                    patch.object(subject, "_core_contract_policy_matches_base", return_value=True), \
+                    patch.object(subject, "_rules_v2_file_manifest", return_value={"AGENTS.md": digest}), \
+                    self.assertRaises(subject.Refusal) as refusal:
+                subject._safe_core_contract_tree(
+                    "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+                    concern=concern,
+                )
+            self.assertEqual(refusal.exception.core_check, "path_mode")
+            self.assertFalse(any(
+                call.args[4] == root_lock for call in blob.call_args_list
+            ))
 
     def test_feedback_foundation_allows_only_fixed_fuzz_and_adr_paths(self):
         fixed_paths = set(subject.CORE_CONTRACT_FOUNDATION_FILES)
@@ -611,6 +735,37 @@ class CoreContractTreeTests(unittest.TestCase):
         self.assertEqual(
             (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
             ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
+        )
+
+    def test_feedback_lock_blob_read_uses_node_manifest_limit(self):
+        path = subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
+        entries = {path: ("100644", "a" * 40)}
+        exact_payload = b"x" * subject.MAX_FEEDBACK_LOCK_BYTES
+        result = subject.subprocess.CompletedProcess(("git",), 0, exact_payload, b"")
+        with patch.object(subject, "_run_process", return_value=result) as run_process:
+            self.assertEqual(subject._contract_blob(
+                "repository", "/usr/bin/git", {}, entries, path,
+                core_check="package_decode", max_bytes=subject.MAX_FEEDBACK_LOCK_BYTES,
+            ), exact_payload)
+        self.assertEqual(
+            run_process.call_args.kwargs["max_output"], subject.MAX_FEEDBACK_LOCK_BYTES,
+        )
+
+        oversized = subject.subprocess.CompletedProcess(
+            ("git",), 0, b"x" * (subject.MAX_FEEDBACK_LOCK_BYTES + 1), b"",
+        )
+        with patch.object(subject, "_run_process", return_value=oversized) as run_process:
+            with self.assertRaises(subject.Refusal) as refusal:
+                subject._contract_blob(
+                    "repository", "/usr/bin/git", {}, entries, path,
+                    core_check="package_decode", max_bytes=subject.MAX_FEEDBACK_LOCK_BYTES,
+                )
+        self.assertEqual(
+            run_process.call_args.kwargs["max_output"], subject.MAX_FEEDBACK_LOCK_BYTES,
+        )
+        self.assertEqual(
+            (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "package_decode"),
         )
 
     def test_feedback_manifest_bytes_are_unique_and_match_the_bounded_workspace_shape(self):
@@ -1495,6 +1650,27 @@ class EvidenceTests(unittest.TestCase):
                 wrong = dict(record, tree="core_contract")
                 with self.assertRaises(subject.Refusal):
                     subject._format_success(wrong, binding)
+
+    def test_build_diagnostic_receipt_marks_only_the_validated_root_lock_tree(self):
+        binding = {
+            "control_sha": "c" * 40,
+            "run_id": "12",
+            "run_attempt": "1",
+            "image_os": "macos-test",
+            "image_version": "1",
+        }
+        record = self._record("core-build-diagnostic-return")
+        record.update({"candidate_class": "signed-descendant", "source_sha": "d" * 40})
+        legacy_line = subject._format_success(record, binding)
+        self.assertIn("tree=core_build_diagnostic_return", legacy_line.split())
+
+        record["tree"] = subject.CORE_CONTRACT_PACKAGE_LOCK_TREE
+        lock_line = subject._format_success(record, binding)
+        self.assertIn("tree=" + subject.CORE_CONTRACT_PACKAGE_LOCK_TREE, lock_line.split())
+
+        record["tree"] = "core_build_diagnostic_return_unreviewed"
+        with self.assertRaises(subject.Refusal):
+            subject._format_success(record, binding)
 
     def test_candidate_class_must_match_source_and_base_binding(self):
         binding = {

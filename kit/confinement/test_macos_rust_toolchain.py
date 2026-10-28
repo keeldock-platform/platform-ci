@@ -365,6 +365,34 @@ class RustToolchainContractTests(unittest.TestCase):
         self.assertIs(normal, ordinary)
         self.assertEqual(calls, [("cargo", "fmt")])
 
+    def test_parser_gate_stages_allow_only_bounded_failure_capture(self):
+        frame = b"KD-CAPTURE 1 7 7 0 0 0\nparser\n"
+        calls = []
+
+        def run_as_probe_user(argv, uid, **kwargs):
+            calls.append((argv, uid, kwargs))
+            return SimpleNamespace(returncode=0, stdout=frame, stderr=b"")
+
+        capability = SimpleNamespace(_run_as_probe_user=run_as_probe_user)
+        for stage in ("parser_format", "parser_clippy", "parser_replay"):
+            with self.subTest(stage=stage):
+                result = rust._run_worker_command(
+                    ("cargo", "run", "--locked", "--offline", "--manifest-path", "fuzz/Cargo.toml"),
+                    502, {"PATH": "/usr/bin"}, "/usr/bin/python3", capability,
+                    stage=stage, deadline=rust.time.monotonic() + 30,
+                    allow_nonzero_capture=True,
+                )
+                self.assertEqual(result.returncode, 7)
+                self.assertEqual(result.stdout, b"parser\n")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(all(call[2]["command_diagnostics"] for call in calls))
+        with self.assertRaises(rust.Refusal):
+            rust._run_worker_command(
+                ("cargo", "run"), 502, {"PATH": "/usr/bin"}, "/usr/bin/python3", capability,
+                stage="parser_arbitrary", deadline=rust.time.monotonic() + 30,
+                allow_nonzero_capture=True,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

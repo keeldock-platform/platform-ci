@@ -43,7 +43,9 @@ COMMAND_CHECKS = frozenset((
 ))
 SOURCE_COMMAND_STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
-    "feedback_lock", "feedback_format",
+    "parser_format", "parser_clippy", "parser_replay", "feedback_lock", "feedback_format",
+    "feedback_parser_format",
+    "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
 ))
 DIAGNOSTIC_STREAM_LIMIT = 32_768
 COMMAND_CAPTURE_SCRIPT = '''\

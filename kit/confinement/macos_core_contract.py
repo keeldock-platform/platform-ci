@@ -38,6 +38,7 @@ ALLOWED_CONTROL_SIBLINGS = frozenset((
     "macos_capability", "macos_reviewed_build", "macos_boundary_guard",
     "macos_private_validation", "macos_source_reader", "macos_network_observer",
     "macos_rust_toolchain", "macos_rules_bootstrap", "macos_feedback_producer",
+    "macos_node_contract", "foundation_node_feedback",
 ))
 FEEDBACK_TREE_LABELS = {
     "core-contract": "core_contract",
@@ -45,9 +46,12 @@ FEEDBACK_TREE_LABELS = {
     "core-rust-format-return": "core_rust_format_return",
     "core-build-diagnostic-return": "core_build_diagnostic_return",
 }
+LOCKED_FOUNDATION_TREE = "core_build_diagnostic_return_with_package_lock"
 GATE_NAMES = (
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
 )
+PARSER_GATE_NAMES = ("parser_format", "parser_clippy", "parser_replay")
+SOURCE_GATE_STAGES = GATE_NAMES + PARSER_GATE_NAMES
 SUITE_NAMES = (
     "core.static", "core.host-api", "core.mock-host", "core.conformance",
 )
@@ -94,7 +98,8 @@ STAGES = frozenset((
     "arguments", "context", "host", "source_validation", "source_lease", "source_tree",
     "source_diff", "toolchain_install", "worker_setup", "summary_guard", "observer",
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
-    "conformance_tests", "cleanup", "receipt", "internal",
+    "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
+    "cleanup", "receipt", "internal",
 ))
 OPERATION_DIAGNOSTICS = frozenset((
     "load_controls", "review_binding", "host_preflight", "temp_root_check", "smoke_receipt",
@@ -486,11 +491,16 @@ def _validate_source_lease(record, request, binding, worker_uid, runtime):
         raise Refusal("source_validation_failed", "source_lease")
     if set(record.keys()) != required:
         raise Refusal("source_validation_failed", "source_lease")
+    expected_tree = FEEDBACK_TREE_LABELS.get(request["concern"])
+    if (request["concern"] == "core-build-diagnostic-return"
+            and record.get("tree") == LOCKED_FOUNDATION_TREE
+            and getattr(runtime, "CORE_CONTRACT_PACKAGE_LOCK_TREE", None) == LOCKED_FOUNDATION_TREE):
+        expected_tree = LOCKED_FOUNDATION_TREE
     expected = {
         "source_sha": request["source_sha"], "base_sha": request["base_sha"],
         "base_branch": request["base_branch"], "concern": request["concern"],
         "signature": "verified", "rules_lock": "present",
-        "tree": FEEDBACK_TREE_LABELS.get(request["concern"]),
+        "tree": expected_tree,
         "source_execution": "not_run_at_yield", "app_build": "not_run", "cleanup": "lease_open",
         "repository_scope": "verified", "metadata": "verified", "control_sha": binding["control_sha"],
         "run_id": binding["run_id"], "run_attempt": binding["run_attempt"],
@@ -606,10 +616,12 @@ def _stream_git_diff_hash(source, base_sha, source_sha, expected_sha256, git_exe
     return actual
 
 
-def _source_commands(source, tool_paths):
+def _source_commands(source, tool_paths, *, include_parser=False):
+    if type(include_parser) is not bool:
+        raise Refusal("capture_invalid", "source_gates")
     cargo = str(tool_paths["cargo"])
     workspace_manifest = str(source / "Cargo.toml")
-    return (
+    commands = (
         ("format", (cargo, "fmt", "--manifest-path", workspace_manifest, "--all", "--", "--check")),
         ("clippy", (cargo, "clippy", "--offline", "--manifest-path", workspace_manifest,
                      "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
@@ -622,6 +634,46 @@ def _source_commands(source, tool_paths):
         ("conformance_tests", (cargo, "test", "--offline", "--manifest-path",
                                 str(source / "crates/host/conformance/Cargo.toml"), "--all-targets", "--locked")),
     )
+    if not include_parser:
+        return commands
+    fuzz_manifest = str(source / "fuzz/Cargo.toml")
+    return commands + (
+        ("parser_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", fuzz_manifest,
+                            "--all", "--", "--check")),
+        ("parser_clippy", (cargo, "clippy", "--offline", "--manifest-path", fuzz_manifest,
+                            "--all-targets", "--locked", "--", "-D", "warnings")),
+        ("parser_replay", (cargo, "run", "--locked", "--offline", "--manifest-path", fuzz_manifest)),
+    )
+
+
+def _validated_fuzz_workspace(source, lease_record, runtime):
+    concern = lease_record.get("concern") if type(lease_record) is dict else None
+    if concern == CONCERN:
+        return False
+    if concern not in FEEDBACK_TREE_LABELS:
+        raise Refusal("source_validation_failed", "source_validation")
+    foundation_files = getattr(runtime, "CORE_CONTRACT_FOUNDATION_FILES", None)
+    required = frozenset((
+        "fuzz/Cargo.toml", "fuzz/Cargo.lock", "fuzz/src/main.rs",
+        "fuzz/fuzz_targets/identifiers.rs", "fuzz/fuzz_targets/tool_error_codes.rs",
+        "fuzz/fuzz_targets/versions.rs",
+    ))
+    if type(foundation_files) is not frozenset or not required.issubset(foundation_files):
+        raise Refusal("source_validation_failed", "source_validation")
+    marker = source / "fuzz/Cargo.toml"
+    try:
+        marker_info = marker.lstat()
+    except FileNotFoundError:
+        if concern == "core-node-lock-return":
+            raise Refusal("source_validation_failed", "source_validation") from None
+        return False
+    except OSError:
+        raise Refusal("source_validation_failed", "source_validation") from None
+    if (not stat.S_ISREG(marker_info.st_mode) or stat.S_ISLNK(marker_info.st_mode)
+            or marker_info.st_uid != 0 or marker_info.st_nlink != 1
+            or marker_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)):
+        raise Refusal("source_validation_failed", "source_validation")
+    return True
 
 
 def _prepare_worker_storage(root, uid, capability):
@@ -699,9 +751,15 @@ def _run_inside_source(source, original_cwd, command):
 
 
 def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools, deadline,
-               capture_failure=False):
+               capture_failure=False, include_parser=False):
+    if type(capture_failure) is not bool or type(include_parser) is not bool:
+        raise Refusal("capture_invalid", "source_gates")
+    if include_parser and not capture_failure:
+        raise Refusal("gate_failed", "receipt")
+    commands = _source_commands(source, tools, include_parser=include_parser)
+    selected_gates = tuple(stage for stage, unused_argv in commands)
     completed = []
-    for stage, argv in _source_commands(source, tools):
+    for stage, argv in commands:
         if time.monotonic() >= deadline:
             raise Refusal("gate_failed", stage)
         try:
@@ -718,7 +776,7 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
                 SOURCE_GATE_COMMAND_DIAGNOSTICS.get(command_check)
                 if type(command_check) is str else None
             )
-            if diagnostic is not None and stage in GATE_NAMES:
+            if diagnostic is not None and stage in SOURCE_GATE_STAGES:
                 reason = "capture_invalid" if getattr(error, "reason", None) == "capture_invalid" else "gate_failed"
                 raise Refusal(reason, stage, diagnostic=diagnostic) from None
             if getattr(error, "reason", None) == "capture_invalid":
@@ -736,6 +794,7 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
             if capture_failure:
                 return {
                     "completed": tuple(completed), "failed_stage": stage,
+                    "selected_gates": selected_gates,
                     "returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
                     "stdout_truncated": getattr(result, "stdout_truncated", False),
                     "stderr_truncated": getattr(result, "stderr_truncated", False),
@@ -743,7 +802,8 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
             raise Refusal("capture_invalid", stage)
         completed.append(stage)
     if capture_failure:
-        return {"completed": tuple(completed), "failed_stage": None, "returncode": 0,
+        return {"completed": tuple(completed), "selected_gates": selected_gates,
+                "failed_stage": None, "returncode": 0,
                 "stdout": b"", "stderr": b"", "stdout_truncated": False,
                 "stderr_truncated": False}
     if tuple(completed) != GATE_NAMES:
@@ -1129,6 +1189,11 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                     )
                 else:
                     producer = _load_control_sibling("macos_feedback_producer")
+                    validated_fuzz_workspace = False
+                    if feedback["profile"]["kind"] in ("rust_patch", "build_diagnostics"):
+                        validated_fuzz_workspace = _validated_fuzz_workspace(
+                            source, lease_record, runtime,
+                        )
                     if feedback["profile"]["kind"] == "build_diagnostics":
                         outcome = _run_inside_source(
                             source,
@@ -1136,12 +1201,49 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                             lambda: _run_gates(
                                 source, environment, worker_uid, host_toolchain, capability, rust,
                                 toolchain_paths.command_paths(), deadline, capture_failure=True,
+                                include_parser=validated_fuzz_workspace,
                             ),
                         )
+                        if lease_record["tree"] == LOCKED_FOUNDATION_TREE:
+                            adapter = _load_control_sibling("foundation_node_feedback")
+                            contract = _load_control_sibling("macos_node_contract")
+                            outcome = adapter.extend_diagnostic_outcome(
+                                outcome,
+                                lambda: adapter.run_node_profile(
+                                    "verify", dispatch=feedback["dispatch"], source=source,
+                                    worker_storage=worker_storage, worker_uid=worker_uid,
+                                    environment=environment, host_toolchain=host_toolchain,
+                                    capability=capability, rust=rust, deadline=deadline,
+                                    node=feedback["node"], npm_cli=feedback["npm_cli"],
+                                    contract=contract, producer=producer, source_runtime=runtime,
+                                    tool_cache_root=feedback["tool_cache_root"],
+                                    accepted_provenance=feedback.get("accepted_node_provenance"),
+                                    validated_tree=lease_record["tree"],
+                                ),
+                                contract,
+                            )
                         feedback_result = {
                             "payload_bytes": producer.build_diagnostic_payload(outcome),
                             "expected_manifest": None, "reviewed_rust_paths": None,
                             "source_result": "gate_failure" if outcome["failed_stage"] else "all_gates_completed",
+                        }
+                    elif feedback["profile"]["kind"] == "lock":
+                        adapter = _load_control_sibling("foundation_node_feedback")
+                        node_result = adapter.run_node_profile(
+                            "bootstrap", dispatch=feedback["dispatch"], source=source,
+                            worker_storage=worker_storage, worker_uid=worker_uid,
+                            environment=environment, host_toolchain=host_toolchain,
+                            capability=capability, rust=rust, deadline=deadline,
+                            node=feedback["node"], npm_cli=feedback["npm_cli"],
+                            contract=_load_control_sibling("macos_node_contract"),
+                            producer=producer, source_runtime=runtime,
+                            tool_cache_root=feedback["tool_cache_root"],
+                            validated_tree=lease_record["tree"],
+                        )
+                        feedback_result = {
+                            "payload_bytes": node_result["lock_bytes"],
+                            "expected_manifest": producer._expected_manifest(source),
+                            "reviewed_rust_paths": None, "source_result": "command_completed",
                         }
                     else:
                         feedback_result = _run_inside_source(
@@ -1151,6 +1253,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                                 feedback["dispatch"], source, worker_storage, worker_uid, environment,
                                 toolchain_paths.command_paths(), host_toolchain, capability, rust,
                                 reviewed, deadline, feedback["node"], feedback.get("npm_cli"),
+                                validated_fuzz_workspace=validated_fuzz_workspace,
                             ),
                         )
                 operation = "worker_storage_verify"
@@ -1402,10 +1505,19 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
             operation = "toolchain_node"
             try:
                 node, npm_cli = feedback_producer.resolve_node(
-                    environ, require_npm=feedback["profile"]["kind"] == "lock",
+                    environ, require_npm=feedback["profile"]["kind"] in ("lock", "build_diagnostics"),
                 )
                 feedback["node"] = node
                 feedback["npm_cli"] = npm_cli
+                feedback["tool_cache_root"] = environ.get("RUNNER_TOOL_CACHE", "")
+                provenance = environ.get("CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON", "")
+                if provenance:
+                    if feedback["profile"]["kind"] != "build_diagnostics":
+                        raise ValueError
+                    parsed = feedback_producer._strict_json(provenance.encode("utf-8"), 16384)
+                    if type(parsed) is not dict:
+                        raise ValueError
+                    feedback["accepted_node_provenance"] = parsed
             except feedback_producer.FeedbackRefusal:
                 raise Refusal("runner_unavailable", "worker_setup") from None
             except BaseException:

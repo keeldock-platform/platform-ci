@@ -51,7 +51,25 @@ VERSION_SPEC_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
 PACKAGE_ROOTS = (
     Path("crates/host/api"), Path("crates/host/mock"), Path("crates/host/conformance"),
 )
+FOUNDATION_FUZZ_RUST_PATHS = (
+    "fuzz/src/main.rs",
+    "fuzz/fuzz_targets/identifiers.rs",
+    "fuzz/fuzz_targets/tool_error_codes.rs",
+    "fuzz/fuzz_targets/versions.rs",
+)
+FOUNDATION_FUZZ_MANIFESTS = ("fuzz/Cargo.toml", "fuzz/Cargo.lock")
 RUST_ROOT_FILES = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml")
+DIAGNOSTIC_BASE_GATES = (
+    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+)
+DIAGNOSTIC_PARSER_GATES = ("parser_format", "parser_clippy", "parser_replay")
+DIAGNOSTIC_NODE_GATES = (
+    "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
+)
+DIAGNOSTIC_GATE_SELECTIONS = (
+    DIAGNOSTIC_BASE_GATES, DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES,
+    DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES + DIAGNOSTIC_NODE_GATES,
+)
 WORKSPACE_PACKAGE_PATHS = ("packages/host-api",)
 DEPENDENCY_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 PROFILE_BY_KIND = feedback_request.PROFILE_BY_KIND
@@ -220,7 +238,25 @@ def _validate_dependency_sources(root, workspaces):
             _refuse("manifest_invalid")
 
 
-def _reviewed_rust_paths(source):
+def _validated_fuzz_rust_paths(source):
+    paths = []
+    for relative in FOUNDATION_FUZZ_RUST_PATHS:
+        target = source / relative
+        try:
+            info = target.lstat()
+        except OSError:
+            _refuse("manifest_invalid")
+        if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or info.st_uid != 0 or info.st_nlink != 1
+                or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)):
+            _refuse("manifest_invalid")
+        paths.append(relative)
+    return tuple(paths)
+
+
+def _reviewed_rust_paths(source, *, include_fuzz=False):
+    if type(include_fuzz) is not bool:
+        _refuse("manifest_invalid")
     paths = []
     for package_root in PACKAGE_ROOTS:
         source_directory = source / package_root / "src"
@@ -269,7 +305,12 @@ def _reviewed_rust_paths(source):
                             _refuse("manifest_invalid")
                     elif not stat.S_ISREG(info.st_mode) and not stat.S_ISDIR(info.st_mode):
                         _refuse("manifest_invalid")
-    if not paths:
+    if include_fuzz:
+        fuzz_paths = _validated_fuzz_rust_paths(source)
+        if set(paths) & set(fuzz_paths):
+            _refuse("manifest_invalid")
+        paths.extend(fuzz_paths)
+    if not paths or len(paths) > MAX_RUST_PATHS:
         _refuse("manifest_invalid")
     return tuple(sorted(paths))
 
@@ -642,10 +683,14 @@ def _run_worker(rust, argv, worker_uid, environment, python_executable, capabili
     return result
 
 
-def _source_root_files():
+def _source_root_files(*, include_fuzz=False):
+    if type(include_fuzz) is not bool:
+        _refuse("manifest_invalid")
     paths = list(RUST_ROOT_FILES)
     for package_root in PACKAGE_ROOTS:
         paths.append((package_root / "Cargo.toml").as_posix())
+    if include_fuzz:
+        paths.extend(FOUNDATION_FUZZ_MANIFESTS)
     return tuple(paths)
 
 
@@ -680,62 +725,42 @@ def _rust_format_patch(source, formatted, reviewed_paths, worker_uid):
 
 
 def run_source_profile(dispatch, source, worker_storage, worker_uid, environment, tools,
-                       host_toolchain, capability, rust, reviewed, deadline, node, npm_cli):
+                       host_toolchain, capability, rust, reviewed, deadline, node, npm_cli,
+                       *, validated_fuzz_workspace=False):
     kind = dispatch["profile"]["kind"]
+    if (type(validated_fuzz_workspace) is not bool
+            or validated_fuzz_workspace and kind not in ("rust_patch", "build_diagnostics")):
+        _refuse("manifest_invalid")
     if kind == "lock":
-        expected_manifest = _expected_manifest(source)
-        files = ("package.json", "packages/host-api/package.json")
-        project = worker_storage / "feedback-node-lock"
-        _copy_reviewed_files(source, project, files, worker_uid, capability.PROBE_PRIMARY_GID)
-        _make_worker_directory(worker_storage / "npm-cache", worker_uid, capability.PROBE_PRIMARY_GID)
-        _make_worker_directory(
-            worker_storage / FEEDBACK_TEMP_DIRECTORY, worker_uid, capability.PROBE_PRIMARY_GID,
-        )
-        node_env = _node_environment(environment, node, worker_storage)
-        try:
-            os.chdir(project)
-            result = _run_worker(
-                rust,
-                (node, npm_cli, "install", "--package-lock-only", "--ignore-scripts", "--audit=false",
-                 "--fund=false", "--fetch-retries=0", "--fetch-timeout=30000",
-                 "--registry=https://registry.npmjs.org/", "--userconfig=/dev/null",
-                 "--globalconfig=/dev/null", "--no-update-notifier", "--workspaces=true",
-                 "--include-workspace-root"),
-                worker_uid, node_env, host_toolchain["python"], capability, "feedback_lock", deadline,
-                allow_nonzero_capture=True,
-            )
-        finally:
-            try:
-                os.chdir(source)
-            except OSError:
-                _refuse("cleanup_incomplete")
-        if result.returncode != 0:
-            _refuse("command_failed")
-        lock_bytes = _read_worker_file(project / "package-lock.json", worker_uid, MAX_LOCK_BYTES)
-        return {"payload_bytes": lock_bytes, "expected_manifest": expected_manifest,
-                "reviewed_rust_paths": None, "source_result": "command_completed"}
+        _refuse("request_invalid")
 
     if kind == "rust_patch":
-        reviewed_paths = _reviewed_rust_paths(source)
-        copy_paths = _source_root_files() + reviewed_paths
+        reviewed_paths = _reviewed_rust_paths(source, include_fuzz=validated_fuzz_workspace)
+        copy_paths = _source_root_files(include_fuzz=validated_fuzz_workspace) + reviewed_paths
         formatted = worker_storage / "feedback-rust-format"
         _copy_reviewed_files(source, formatted, copy_paths, worker_uid, capability.PROBE_PRIMARY_GID)
+        commands = [("feedback_format", (
+            tools["cargo"], "fmt", "--manifest-path", str(formatted / "Cargo.toml"), "--all",
+        ))]
+        if validated_fuzz_workspace:
+            commands.append(("feedback_parser_format", (
+                tools["cargo"], "--locked", "--offline", "fmt", "--manifest-path",
+                str(formatted / "fuzz/Cargo.toml"), "--all",
+            )))
         try:
             os.chdir(formatted)
-            result = _run_worker(
-                rust,
-                (tools["cargo"], "fmt", "--manifest-path", str(formatted / "Cargo.toml"),
-                 "--all"),
-                worker_uid, environment, host_toolchain["python"], capability, "feedback_format", deadline,
-                allow_nonzero_capture=True,
-            )
+            for stage, argv in commands:
+                result = _run_worker(
+                    rust, argv, worker_uid, environment, host_toolchain["python"], capability,
+                    stage, deadline, allow_nonzero_capture=True,
+                )
+                if result.returncode != 0:
+                    _refuse("command_failed")
         finally:
             try:
                 os.chdir(source)
             except OSError:
                 _refuse("cleanup_incomplete")
-        if result.returncode != 0:
-            _refuse("command_failed")
         patch = _rust_format_patch(source, formatted, reviewed_paths, worker_uid)
         return {"payload_bytes": patch, "expected_manifest": None,
                 "reviewed_rust_paths": list(reviewed_paths), "source_result": "command_completed"}
@@ -744,11 +769,30 @@ def run_source_profile(dispatch, source, worker_storage, worker_uid, environment
 
 
 def build_diagnostic_payload(outcome):
+    if type(outcome) is not dict:
+        _refuse("capture_invalid")
     failed = outcome.get("failed_stage")
+    selected = outcome.get("selected_gates")
+    completed = outcome.get("completed")
+    if (type(selected) is not tuple or selected not in DIAGNOSTIC_GATE_SELECTIONS
+            or type(completed) is not tuple or any(type(stage) is not str for stage in completed)):
+        _refuse("capture_invalid")
     if failed is None:
-        return b"KD-BUILD-DIAGNOSTICS schema=1 result=all-gates-completed\n"
-    if (failed not in ("format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests")
-            or type(outcome.get("returncode")) is not int
+        if (completed != selected or type(outcome.get("returncode")) is not int
+                or outcome.get("returncode") != 0 or outcome.get("stdout") != b""
+                or outcome.get("stderr") != b""
+                or outcome.get("stdout_truncated") is not False
+                or outcome.get("stderr_truncated") is not False):
+            _refuse("capture_invalid")
+        return (
+            "KD-BUILD-DIAGNOSTICS schema=1 selected_gates=" + ",".join(selected)
+            + " completed_gates=" + ",".join(completed)
+            + " result=all-gates-completed\n"
+        ).encode("ascii")
+    if (type(failed) is not str or failed not in selected
+            or completed != selected[:selected.index(failed)]):
+        _refuse("capture_invalid")
+    if (type(outcome.get("returncode")) is not int
             or not 1 <= outcome["returncode"] <= 255
             or type(outcome.get("stdout")) is not bytes or type(outcome.get("stderr")) is not bytes):
         _refuse("capture_invalid")
@@ -760,7 +804,10 @@ def build_diagnostic_payload(outcome):
     prefix = ("KD-BUILD-DIAGNOSTICS schema=1 stage=" + failed
               + " stdout_truncated=" + ("true" if outcome["stdout_truncated"] else "false")
               + " stderr_truncated=" + ("true" if outcome["stderr_truncated"] else "false")
-              + " exit=" + str(outcome["returncode"]) + "\nstdout:\n").encode("ascii")
+              + " exit=" + str(outcome["returncode"])
+              + " selected_gates=" + ",".join(selected)
+              + " completed_gates=" + (",".join(completed) if completed else "none")
+              + "\nstdout:\n").encode("ascii")
     payload = prefix + outcome["stdout"] + b"\nstderr:\n" + outcome["stderr"]
     if len(payload) > 512 * 1024:
         _refuse("payload_invalid")
