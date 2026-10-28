@@ -514,6 +514,31 @@ class NpmAdmissionTests(unittest.TestCase):
                 "npm_archive_invalid",
             )
 
+    def test_tar_preflight_checks_raw_directory_slashes(self):
+        valid_data = _tarball("sample", "1.0.0")
+        entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(valid_data)}
+        self.assertEqual(subject.verify_tarball(entry, valid_data)["file_count"], 1)
+
+        directory = tarfile.TarInfo("package/directory/")
+        directory.type = tarfile.DIRTYPE
+        no_slash = bytearray(directory.tobuf(format=tarfile.USTAR_FORMAT))
+        no_slash[len("package/directory")] = 0
+        no_slash[148:156] = b"        "
+        no_slash[148:156] = ("%06o\x00 " % sum(no_slash)).encode("ascii")
+
+        double_slash = tarfile.TarInfo("package/directory//")
+        double_slash.type = tarfile.DIRTYPE
+        legacy_directory = tarfile.TarInfo("package/legacy/")
+        legacy_directory.type = tarfile.AREGTYPE
+        for header in (
+                bytes(no_slash),
+                double_slash.tobuf(format=tarfile.USTAR_FORMAT),
+                legacy_directory.tobuf(format=tarfile.USTAR_FORMAT)):
+            raw = header + bytes(1024)
+            self.assert_refused(
+                lambda raw=raw: subject._preflight_tar_headers(raw), "npm_archive_invalid",
+            )
+
     def test_tar_preflight_refuses_case_collisions_and_oversized_header(self):
         upper = tarfile.TarInfo("package/Binding.node")
         lower = tarfile.TarInfo("package/binding.node")

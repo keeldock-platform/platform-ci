@@ -611,6 +611,12 @@ def _preflight_tar_headers(data):
         member_type = header[156:157]
         if member_type not in (b"0", b"5", b"\x00"):
             _refuse("npm_archive_invalid")
+        raw_name = header[:100].split(b"\x00", 1)[0]
+        if member_type == b"5":
+            if not raw_name.endswith(b"/") or raw_name.endswith(b"//"):
+                _refuse("npm_archive_invalid")
+        elif raw_name.endswith(b"/"):
+            _refuse("npm_archive_invalid")
         size = _tar_octal(header[124:136])
         if size > MAX_PACKAGE_UNPACKED_BYTES or (member_type == b"5" and size != 0):
             _refuse("npm_archive_invalid")
@@ -691,12 +697,12 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
                 is_regular = member.type in (tarfile.REGTYPE, tarfile.AREGTYPE)
                 if not is_directory and not is_regular:
                     _refuse("npm_archive_invalid")
-                if member.linkname or (is_directory and not raw_name.endswith("/")):
+                if member.linkname:
                     _refuse("npm_archive_invalid")
                 relative = raw_name.rstrip("/")
                 if relative.split("/", 1)[0] != "package":
                     _refuse("npm_archive_invalid")
-                if raw_name.endswith("//") or (not is_directory and raw_name.endswith("/")):
+                if not is_directory and raw_name.endswith("/"):
                     _refuse("npm_archive_invalid")
                 folded_relative = relative.lower()
                 if relative in entries or folded_relative in folded:
