@@ -115,12 +115,12 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    'kit/confinement/foundation_node_feedback.py': 'e05f85483ab67591e0fa0f824fa095cad445910e9da280b237e13eec0744bfc3',
-    'kit/confinement/test_foundation_node_feedback.py': 'e0dd84fed2f2752a359adad3a1646a1d49523c025159c6687752c0a1c68251c7',
-    'kit/confinement/macos_node_contract.py': 'afff7f06a23d43b9de453644d44c3d7269be40e20857c57278ba7ad27f3122d6',
-    'kit/confinement/test_macos_node_contract.py': 'e0a1360b3f05c1d4cb8eb8bf5345fc96219ba2c0a5d3fddb10224db9ba4b9535',
+    'kit/confinement/foundation_node_feedback.py': '0e3719225182cf9deea2ff1f7789898bd6880d90ae9d894082e8af41c65a095c',
+    'kit/confinement/test_foundation_node_feedback.py': '78c650bd453146935ef4b97efd7696a3916bfe47772d1262db0a042c8036f2fa',
+    'kit/confinement/macos_node_contract.py': 'cc5b3dcbc05283323ca27b626378b901c2d7db49e2c499e221fdd49f9632cfe8',
+    'kit/confinement/test_macos_node_contract.py': '587e17d942a044367213f9339af4fdc9bda57f2c621e762259fae5bae92e37ba',
     'kit/confinement/node_contract_validation.mjs': '06a89ce6df589ddc0874c60fa4dbe69f86e493256561f5a623b75e456abe0ec3',
-    'kit/confinement/test_node_contract_validation.mjs': 'dbb85e9e33885dae7ffc94862cc33198de123f31ee2794895a38f8b5054bbedb',
+    'kit/confinement/test_node_contract_validation.mjs': '74a8f9c2367bff147cf702952b5b642cddd08594472f60bad011f31bf576b4c4',
     'kit/confinement/test_feedback_failure.py': 'ab2f81df1c9a857d1aae0dc0a1ad08bf0fcdaa966c43d6c7e3581eef8a09e109',
     'kit/confinement/feedback_failure.py': 'ace31213a57e9647c14f4895f3dd887a54a831b719969c02c84cdb655125b3d8',
     '.github/workflows/development-feedback-smoke.yml': '09e058574372baa40016327e8a0da12d130a262a8bd70baba3a38ed10acc3d7a',

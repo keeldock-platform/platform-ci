@@ -448,22 +448,40 @@ posixHostedTest('the pinned npm honors one immutable cutoff against a synthetic 
   const root = mkdtempSync(resolve(tmpdir(), 'fixture-npm-age-'));
   context.after(() => rmSync(root, { recursive: true, force: true }));
   const registry = `http://127.0.0.1:${server.address().port}/`;
+  const configRoot = resolve(root, 'npm-config');
+  mkdirSync(configRoot, { mode: 0o700 });
+  const userConfig = resolve(configRoot, 'npm-user-empty.npmrc');
+  const globalConfig = resolve(configRoot, 'npm-global-empty.npmrc');
+  for (const configPath of [userConfig, globalConfig]) {
+    const descriptor = openSync(configPath, 'wx', 0o600);
+    try {
+      writeFileSync(descriptor, '\n', 'utf8');
+      fsyncSync(descriptor);
+      chmodSync(configPath, 0o600);
+    } finally {
+      closeSync(descriptor);
+    }
+  }
+  assert.notEqual(userConfig, globalConfig);
+  assert.equal(readFileSync(userConfig, 'utf8'), '\n');
+  assert.equal(readFileSync(globalConfig, 'utf8'), '\n');
   const environmentFor = (directory) => ({
     HOME: root,
     PATH: `${dirname(process.execPath)}:/usr/bin:/bin:/usr/sbin:/sbin`,
     npm_config_cache: resolve(directory, 'npm-cache'),
     npm_config_update_notifier: 'false',
     npm_config_registry: registry,
-    npm_config_userconfig: '/dev/null',
-    npm_config_globalconfig: '/dev/null',
+    npm_config_userconfig: userConfig,
+    npm_config_globalconfig: globalConfig,
     npm_config_audit: 'false',
     npm_config_fund: 'false',
     npm_config_fetch_retries: '0',
     npm_config_fetch_timeout: '10000',
   });
   const commonArgs = [
-    cli, 'install', '--package-lock-only', '--ignore-scripts', '--audit=false', '--fund=false',
-    `--registry=${registry}`, '--min-release-age=7', `--before=${cutoff}`,
+    cli, `--registry=${registry}`, `--userconfig=${userConfig}`, `--globalconfig=${globalConfig}`,
+    'install', '--package-lock-only', '--ignore-scripts', '--audit=false', '--fund=false',
+    '--min-release-age=7', `--before=${cutoff}`,
     '--fetch-retries=0', '--fetch-timeout=10000',
   ];
   const cutoffArgs = commonArgs.filter((argument) => argument.startsWith('--before='));

@@ -120,8 +120,8 @@ def _node_environment(storage, node, contract):
         "LC_ALL": "C",
         "npm_config_cache": str(storage / "node-cache"),
         "npm_config_registry": contract.REGISTRY_URL,
-        "npm_config_userconfig": "/dev/null",
-        "npm_config_globalconfig": "/dev/null",
+        "npm_config_userconfig": str(storage / contract.USER_CONFIG_NAME),
+        "npm_config_globalconfig": str(storage / contract.GLOBAL_CONFIG_NAME),
         "npm_config_ignore_scripts": "true",
         "npm_config_audit": "false",
         "npm_config_fund": "false",
@@ -145,8 +145,9 @@ def _expected_command(mode, argv, stage, substage, contract, node, npm_cli, stor
         if type(request_epoch := policy_epoch_ms) is not int:
             return False
         cutoff_ms = request_epoch - contract.RELEASE_AGE_DAYS * contract.DAY_MS
+        environment = _node_environment(storage, node, contract)
         suffix = ("install", "--package-lock-only", "--workspaces=true", "--include-workspace-root")
-        return argv == tuple(contract._command_prefix(node, npm_cli, cutoff_ms)) + suffix
+        return argv == tuple(contract._command_prefix(node, npm_cli, cutoff_ms, environment)) + suffix
     if stage == "node_dependency_audit" and substage == "bulk_audit":
         helper = Path(contract.__file__).resolve().with_name("node_contract_validation.mjs")
         return argv == (str(node), str(helper), "--request", str(storage / "node-contract-request.json"))
@@ -156,8 +157,9 @@ def _expected_command(mode, argv, stage, substage, contract, node, npm_cli, stor
         cutoff_ms = accepted_provenance.get("cutoff_epoch_ms")
         if type(cutoff_ms) is not int:
             return False
+        environment = _node_environment(storage, node, contract)
         suffix = ("ci", "--workspaces=true", "--include-workspace-root")
-        return argv == tuple(contract._command_prefix(node, npm_cli, cutoff_ms)) + suffix
+        return argv == tuple(contract._command_prefix(node, npm_cli, cutoff_ms, environment)) + suffix
     if stage == "typescript_typecheck" and substage == "typecheck" and mode == "verify":
         return argv == (str(node), str(npm_cli), "run", "typecheck", "--workspaces", "--ignore-scripts")
     if stage == "typescript_tests" and substage == "tests" and mode == "verify":

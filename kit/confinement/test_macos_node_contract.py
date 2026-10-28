@@ -97,11 +97,13 @@ def _provenance(lock_bytes, policy_epoch_ms, accepted_identity, generation_ident
 
 
 class WorkerHarness:
-    def __init__(self, project, *, lock_bytes=None, failure=None, audit_reason=None):
+    def __init__(self, project, *, lock_bytes=None, failure=None, audit_reason=None,
+                 mutate_config_after=None):
         self.project = Path(project)
         self.lock_bytes = lock_bytes or _lock_bytes()
         self.failure = failure
         self.audit_reason = audit_reason
+        self.mutate_config_after = mutate_config_after
         self.calls = []
         self.requests = []
 
@@ -156,6 +158,8 @@ class WorkerHarness:
             return self._result(stdout=(json.dumps(output, separators=(",", ":")) + "\n").encode("ascii"))
         if substage == self.failure:
             return self._result(1, b"fixture stage failure")
+        if substage == self.mutate_config_after:
+            Path(env["npm_config_globalconfig"]).write_bytes(b"changed\n")
         return self._result()
 
     def _result(self, returncode=0, stdout=b"", stderr=b""):
@@ -230,11 +234,25 @@ class MacOSNodeContractTests(unittest.TestCase):
         self.assertEqual(output["stages"], ("node_dependency_prepare", "node_dependency_audit"))
         self.assertEqual(output["provenance_candidate"]["policy_epoch_ms"], policy_epoch_ms)
         self.assertEqual(output["provenance_candidate"]["generation_attempts"], 1)
+        environment = runner.calls[0]["env"]
+        user_config = Path(environment["npm_config_userconfig"])
+        global_config = Path(environment["npm_config_globalconfig"])
+        self.assertNotEqual(user_config, global_config)
+        self.assertEqual(user_config.parent, self.storage)
+        self.assertEqual(global_config.parent, self.storage)
+        for config_path in (user_config, global_config):
+            info = config_path.stat()
+            self.assertEqual(config_path.read_bytes(), b"\n")
+            self.assertEqual(info.st_uid, self.uid)
+            self.assertEqual(info.st_gid, self.gid)
+            self.assertEqual(info.st_mode & 0o777, 0o600)
         commands = [entry["argv"] for entry in runner.calls]
         generation = [command for command in commands if "--package-lock-only" in command]
         self.assertEqual(len(generation), 1)
         self.assertIn("--min-release-age=7", generation[0])
         self.assertTrue(any(item.startswith("--before=") for item in generation[0]))
+        self.assertIn("--userconfig=" + str(user_config), generation[0])
+        self.assertIn("--globalconfig=" + str(global_config), generation[0])
         self.assertFalse(any("ci" in command for command in commands))
         self.assertFalse(any("typecheck" in command or "test" == command[-1] for command in commands))
         self.assertTrue(any("--request" in command for command in commands))
@@ -295,6 +313,10 @@ class MacOSNodeContractTests(unittest.TestCase):
         self.assertLess(typecheck_index, tests_index)
         self.assertFalse(any("--package-lock-only" in command for command in commands))
         self.assertTrue(any("--ignore-scripts" in command for command in commands if "ci" in command))
+        ci_command = commands[ci_index]
+        ci_environment = runner.calls[ci_index]["env"]
+        self.assertIn("--userconfig=" + ci_environment["npm_config_userconfig"], ci_command)
+        self.assertIn("--globalconfig=" + ci_environment["npm_config_globalconfig"], ci_command)
 
     def test_verify_failure_reports_completed_prefix_and_does_not_claim_later_stages(self):
         lock_bytes = _lock_bytes()
@@ -315,6 +337,24 @@ class MacOSNodeContractTests(unittest.TestCase):
         self.assertEqual(caught.exception.stage, "typescript_typecheck")
         self.assertEqual(caught.exception.completed_stages,
                          ("node_dependency_prepare", "node_dependency_audit"))
+
+    def test_changed_empty_config_stops_before_the_next_project_command(self):
+        lock_bytes = _lock_bytes()
+        now_ms = int(time.time() * 1000)
+        policy_epoch_ms = now_ms - (30 * subject.DAY_MS)
+        current_identity = _identity("5")
+        provenance = _provenance(lock_bytes, policy_epoch_ms, current_identity, _identity("a"))
+        self.install_committed_lock(lock_bytes)
+        runner = WorkerHarness(self.project, lock_bytes=lock_bytes, mutate_config_after="typecheck")
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self.call("verify", runner, accepted_lock=lock_bytes, accepted_provenance=provenance)
+        self.assertEqual(caught.exception.reason, "tool_unavailable")
+        self.assertEqual(caught.exception.stage, "typescript_tests")
+        self.assertEqual(caught.exception.substage, "tests")
+        self.assertEqual(caught.exception.completed_stages, (
+            "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck",
+        ))
+        self.assertEqual(runner.calls[-1]["substage"], "typecheck")
 
     def test_rejects_provenance_drift_before_running_the_worker(self):
         lock_bytes = _lock_bytes()

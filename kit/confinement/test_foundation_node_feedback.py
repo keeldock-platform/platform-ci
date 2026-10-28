@@ -96,6 +96,8 @@ class FakeContract:
     NODE_VERSION = "24.22.1"
     NPM_VERSION = "11.19.1"
     AUDIT_ENDPOINT = "npm-bulk-advisory-v1"
+    USER_CONFIG_NAME = "npm-user-empty.npmrc"
+    GLOBAL_CONFIG_NAME = "npm-global-empty.npmrc"
     RELEASE_AGE_DAYS = 7
     DAY_MS = 86_400_000
     STAGES = frozenset(subject.NODE_GATE_NAMES)
@@ -108,9 +110,10 @@ class FakeContract:
         self.call = None
         self.callback_mutation = None
 
-    def _command_prefix(self, node, npm_cli, cutoff_ms):
+    def _command_prefix(self, node, npm_cli, cutoff_ms, environment):
         return (str(node), str(npm_cli), "--registry=" + self.REGISTRY_URL,
-                "--userconfig=/dev/null", "--globalconfig=/dev/null", "--ignore-scripts",
+                "--userconfig=" + environment["npm_config_userconfig"],
+                "--globalconfig=" + environment["npm_config_globalconfig"], "--ignore-scripts",
                 "--audit=false", "--fund=false", "--fetch-retries=0", "--fetch-timeout=30000",
                 "--no-update-notifier", "--min-release-age=7", "--before=" + str(cutoff_ms))
 
@@ -198,6 +201,20 @@ def _verify_result(lock_bytes, provenance):
 
 
 class FoundationNodeFeedbackTests(unittest.TestCase):
+    def test_npm_arguments_use_distinct_empty_config_paths_from_clean_environment(self):
+        contract = FakeContract("bootstrap")
+        storage = Path("/fixed/worker-storage")
+        node = Path("/fixed/node/bin/node")
+        environment = subject._node_environment(storage, node, contract)
+        command = contract._command_prefix(node, Path("/fixed/npm-cli.js"), 1234, environment)
+        user_config = environment["npm_config_userconfig"]
+        global_config = environment["npm_config_globalconfig"]
+        self.assertNotEqual(user_config, global_config)
+        self.assertEqual(user_config, str(storage / contract.USER_CONFIG_NAME))
+        self.assertEqual(global_config, str(storage / contract.GLOBAL_CONFIG_NAME))
+        self.assertIn("--userconfig=" + user_config, command)
+        self.assertIn("--globalconfig=" + global_config, command)
+
     def _run(self, mode, kind, *, validated_tree, accepted_provenance=None, lock_bytes=None,
              callback_mutation=None, fail_census=False, fail_restore=False):
         producer = FakeProducer()

@@ -16,10 +16,14 @@ NPM_VERSION = "11.19.1"
 RELEASE_AGE_DAYS = 7
 REGISTRY_URL = "https://registry.npmjs.org/"
 AUDIT_ENDPOINT = "npm-bulk-advisory-v1"
+USER_CONFIG_NAME = "npm-user-empty.npmrc"
+GLOBAL_CONFIG_NAME = "npm-global-empty.npmrc"
+EMPTY_CONFIG_BYTES = b"\n"
 MAX_LOCK_BYTES = 4 * 1024 * 1024 - 64 * 1024
 MAX_REQUEST_BYTES = 6 * 1024 * 1024
 MAX_CAPTURE_BYTES = 32 * 1024
 MAX_EXPECTATION_BYTES = 256 * 1024
+MAX_NPM_CONFIG_BYTES = 16
 MAX_STAGE_SECONDS = 120
 MAX_AUDIT_SECONDS = 90
 DAY_MS = 24 * 60 * 60 * 1000
@@ -372,6 +376,10 @@ def _node_environment(node, worker_storage, worker_uid, worker_gid):
     home = _owned_directory(root / "node-home", worker_uid, worker_gid, create=True)
     temporary = _owned_directory(root / "node-tmp", worker_uid, worker_gid, create=True)
     cache = _owned_directory(root / "node-cache", worker_uid, worker_gid, create=True)
+    user_config = root / USER_CONFIG_NAME
+    global_config = root / GLOBAL_CONFIG_NAME
+    _write_worker_file(user_config, EMPTY_CONFIG_BYTES, worker_uid, worker_gid)
+    _write_worker_file(global_config, EMPTY_CONFIG_BYTES, worker_uid, worker_gid)
     return {
         "PATH": str(Path(node).parent) + ":/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(home),
@@ -380,8 +388,8 @@ def _node_environment(node, worker_storage, worker_uid, worker_gid):
         "LC_ALL": "C",
         "npm_config_cache": str(cache),
         "npm_config_registry": REGISTRY_URL,
-        "npm_config_userconfig": "/dev/null",
-        "npm_config_globalconfig": "/dev/null",
+        "npm_config_userconfig": str(user_config),
+        "npm_config_globalconfig": str(global_config),
         "npm_config_ignore_scripts": "true",
         "npm_config_audit": "false",
         "npm_config_fund": "false",
@@ -389,6 +397,34 @@ def _node_environment(node, worker_storage, worker_uid, worker_gid):
         "npm_config_fetch_timeout": "30000",
         "npm_config_update_notifier": "false",
     }
+
+
+def _validate_npm_config_files(environment, worker_storage, worker_uid, worker_gid, *, stage, substage):
+    if type(environment) is not dict:
+        _refuse("tool_unavailable", stage=stage, substage=substage)
+    root = Path(worker_storage)
+    for key, name in (("npm_config_userconfig", USER_CONFIG_NAME),
+                      ("npm_config_globalconfig", GLOBAL_CONFIG_NAME)):
+        target = root / name
+        if environment.get(key) != str(target):
+            _refuse("tool_unavailable", stage=stage, substage=substage)
+        try:
+            before = target.lstat()
+            if (not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode)
+                    or before.st_uid != worker_uid or before.st_gid != worker_gid
+                    or before.st_nlink != 1 or before.st_size != len(EMPTY_CONFIG_BYTES)
+                    or stat.S_IMODE(before.st_mode) != 0o600):
+                raise ValueError
+            payload = _read_worker_file(target, worker_uid, MAX_NPM_CONFIG_BYTES)
+            after = target.lstat()
+            if ((before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                    or not stat.S_ISREG(after.st_mode) or stat.S_ISLNK(after.st_mode)
+                    or after.st_uid != worker_uid or after.st_gid != worker_gid
+                    or after.st_nlink != 1 or after.st_size != len(EMPTY_CONFIG_BYTES)
+                    or stat.S_IMODE(after.st_mode) != 0o600 or payload != EMPTY_CONFIG_BYTES):
+                raise ValueError
+        except BaseException:
+            _refuse("tool_unavailable", stage=stage, substage=substage)
 
 
 def _cutoff_iso(cutoff_ms):
@@ -400,10 +436,19 @@ def _cutoff_iso(cutoff_ms):
         _refuse("invalid_input")
 
 
-def _command_prefix(node, npm_cli, cutoff_ms):
+def _command_prefix(node, npm_cli, cutoff_ms, environment):
+    if type(environment) is not dict:
+        _refuse("invalid_input")
+    user_config = environment.get("npm_config_userconfig")
+    global_config = environment.get("npm_config_globalconfig")
+    if (type(user_config) is not str or type(global_config) is not str
+            or not Path(user_config).is_absolute() or not Path(global_config).is_absolute()
+            or user_config == global_config or any("\x00" in value or "\n" in value for value in (
+                user_config, global_config))):
+        _refuse("invalid_input")
     return (
         str(node), str(npm_cli), "--registry=" + REGISTRY_URL,
-        "--userconfig=/dev/null", "--globalconfig=/dev/null", "--ignore-scripts",
+        "--userconfig=" + user_config, "--globalconfig=" + global_config, "--ignore-scripts",
         "--audit=false", "--fund=false", "--fetch-retries=0", "--fetch-timeout=30000",
         "--no-update-notifier", "--min-release-age=7", "--before=" + _cutoff_iso(cutoff_ms),
     )
@@ -553,14 +598,23 @@ def _run_node_contract(
             _refuse("accepted_provenance_invalid", stage="node_dependency_prepare",
                     substage="lock_validation")
     environment = _node_environment(node, storage_path, worker_uid, worker_gid)
-    _tool_versions(run_worker, node, npm, project_path, environment, deadline)
+
+    def checked_worker(argv, *, stage, substage, cwd, env, deadline, timeout,
+                       allow_nonzero_capture=True):
+        _validate_npm_config_files(environment, storage_path, worker_uid, worker_gid,
+                                   stage=stage, substage=substage)
+        return run_worker(argv, stage=stage, substage=substage, cwd=cwd, env=env,
+                          deadline=deadline, timeout=timeout,
+                          allow_nonzero_capture=allow_nonzero_capture)
+
+    _tool_versions(checked_worker, node, npm, project_path, environment, deadline)
 
     if mode == "bootstrap":
         _ensure_absent(_lock_path(project_path), reason="lock_already_present")
-        command = _command_prefix(node, npm, cutoff_ms) + (
+        command = _command_prefix(node, npm, cutoff_ms, environment) + (
             "install", "--package-lock-only", "--workspaces=true", "--include-workspace-root",
         )
-        prepared = _worker_result(run_worker, command, stage="node_dependency_prepare",
+        prepared = _worker_result(checked_worker, command, stage="node_dependency_prepare",
                                   substage="lock_generation", project=project_path,
                                   environment=environment, deadline=deadline, timeout=MAX_STAGE_SECONDS)
         _validate_stage_result(prepared, "node_dependency_prepare", "lock_generation")
@@ -599,7 +653,7 @@ def _run_node_contract(
     _write_worker_file(request_path, request, worker_uid, worker_gid)
     try:
         audited = _worker_result(
-            run_worker, (str(node), str(helper), "--request", str(request_path)),
+            checked_worker, (str(node), str(helper), "--request", str(request_path)),
             stage="node_dependency_audit", substage="bulk_audit", project=project_path,
             environment=environment, deadline=deadline, timeout=MAX_AUDIT_SECONDS,
         )
@@ -659,8 +713,9 @@ def _run_node_contract(
         }
 
     ci = _worker_result(
-        run_worker,
-        _command_prefix(node, npm, cutoff_ms) + ("ci", "--workspaces=true", "--include-workspace-root"),
+        checked_worker,
+        _command_prefix(node, npm, cutoff_ms, environment)
+        + ("ci", "--workspaces=true", "--include-workspace-root"),
         stage="node_dependency_audit", substage="npm_ci", project=project_path,
         environment=environment, deadline=deadline, timeout=MAX_STAGE_SECONDS,
     )
@@ -668,14 +723,14 @@ def _run_node_contract(
     _completed.append("node_dependency_audit")
 
     typecheck = _worker_result(
-        run_worker, (str(node), str(npm), "run", "typecheck", "--workspaces", "--ignore-scripts"),
+        checked_worker, (str(node), str(npm), "run", "typecheck", "--workspaces", "--ignore-scripts"),
         stage="typescript_typecheck", substage="typecheck", project=project_path,
         environment=environment, deadline=deadline, timeout=MAX_STAGE_SECONDS,
     )
     _validate_stage_result(typecheck, "typescript_typecheck", "typecheck")
     _completed.append("typescript_typecheck")
     tests = _worker_result(
-        run_worker, (str(node), str(npm), "run", "test", "--workspaces", "--ignore-scripts"),
+        checked_worker, (str(node), str(npm), "run", "test", "--workspaces", "--ignore-scripts"),
         stage="typescript_tests", substage="tests", project=project_path,
         environment=environment, deadline=deadline, timeout=MAX_STAGE_SECONDS,
     )
