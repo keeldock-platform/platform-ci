@@ -18,6 +18,7 @@ from pathlib import Path
 
 import linux_harness
 import linux_channels
+import linux_probes
 import linux_session
 
 
@@ -78,8 +79,9 @@ SOURCE_STEP_NAMES = (
     "Run all thirteen offline project gates",
     "Merge confinement phase records",
     "Forced faults must fail closed",
-    "Publish confinement verdict",
+    "Collect confinement verdict record",
 )
+VERDICT_STEP_NAMES = ("Fetch exact public control", "Publish confinement verdict")
 SETTINGS_STEP_NAMES = (
     "Fetch exact public control",
     "Prepare audit identity",
@@ -307,6 +309,7 @@ def _expected_run(environ, cache_digest):
         ci_ref = "main"
     all_steps = list(SOURCE_STEP_NAMES)
     if mode == "source":
+        all_steps.append("Post Mint scoped source-reader token")
         optional = ("Forced faults must fail closed",)
     else:
         optional = tuple(sorted(OPTIONAL_SOURCE_STEPS - {"Forced faults must fail closed"}))
@@ -324,8 +327,9 @@ def _expected_run(environ, cache_digest):
             "linux-source-admission-settings": {"steps": SETTINGS_STEP_NAMES, "optional_steps": ()},
             "linux-source-admission-unit": {"steps": UNIT_STEP_NAMES, "optional_steps": ()},
             "linux-source-admission-source-read": {"steps": tuple(all_steps), "optional_steps": tuple(optional)},
+            "linux-source-admission-verdict": {"steps": VERDICT_STEP_NAMES, "optional_steps": ()},
         },
-        "verdict_job": "linux-source-admission-source-read",
+        "verdict_job": "linux-source-admission-verdict",
         "verdict_step": "Publish confinement verdict",
         "auditor_job": "linux-source-admission-audit",
         "artifact_names": (),
@@ -808,8 +812,8 @@ def checkout_source(environ=None):
             or repository_info.get("private") is not True
             or repository_info.get("full_name") != repository):
         raise SourceBuildRefusal("source")
-    eligible = environ.get("CI_REF") == "refs/heads/untrusted"
-    if environ.get("CI_REF") == "refs/heads/main":
+    eligible = env.get("CI_REF") == "refs/heads/untrusted"
+    if env.get("CI_REF") == "refs/heads/main":
         for branch in ("develop", "uat", "main"):
             tip = _reference_sha(token, repository, branch)
             if tip is not None and _comparison(token, repository, identity["source_sha"], tip) in ("ahead", "identical"):
@@ -1112,8 +1116,78 @@ def _download_integrity(url, expected, destination):
     os.chmod(destination, 0o400)
 
 
+def _open_project_root():
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        parent = os.open("/tmp", flags)
+    except OSError:
+        raise SourceBuildRefusal("gate") from None
+    parent_details = os.fstat(parent)
+    if parent_details.st_uid != 0 or parent_details.st_mode & 0o022 and not parent_details.st_mode & stat.S_ISVTX:
+        os.close(parent)
+        raise SourceBuildRefusal("gate")
+    try:
+        try:
+            os.mkdir(PROJECT_ROOT.name, 0o755, dir_fd=parent)
+        except FileExistsError:
+            pass
+        root = os.open(PROJECT_ROOT.name, flags, dir_fd=parent)
+    except OSError:
+        raise SourceBuildRefusal("gate") from None
+    finally:
+        os.close(parent)
+    try:
+        details = os.fstat(root)
+    except OSError:
+        os.close(root)
+        raise SourceBuildRefusal("gate") from None
+    if details.st_uid != 0 or details.st_mode & 0o022:
+        os.close(root)
+        raise SourceBuildRefusal("gate")
+    return root
+
+
+def _project_gate_directories(worker, create=False):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    root = _open_project_root()
+    try:
+        if Path(worker) != PROJECT_ROOT / "source":
+            raise SourceBuildRefusal("gate")
+        project = os.open("source", flags, dir_fd=root)
+        try:
+            details = os.fstat(project)
+            if details.st_uid != linux_harness.CHILD_UID or details.st_gid != linux_harness.CHILD_GID:
+                raise SourceBuildRefusal("gate")
+            for name in (".home", ".tmp", "target", ".npm-cache", ".kd-cargo-home"):
+                made = False
+                if create and name != ".kd-cargo-home":
+                    try:
+                        os.mkdir(name, 0o700, dir_fd=project)
+                        made = True
+                    except FileExistsError:
+                        pass
+                child = os.open(name, flags, dir_fd=project)
+                try:
+                    if made:
+                        os.fchown(child, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
+                        os.fchmod(child, 0o700)
+                    details = os.fstat(child)
+                    if details.st_uid != linux_harness.CHILD_UID or details.st_gid != linux_harness.CHILD_GID:
+                        raise SourceBuildRefusal("gate")
+                finally:
+                    os.close(child)
+        finally:
+            os.close(project)
+    except OSError:
+        raise SourceBuildRefusal("gate") from None
+    finally:
+        os.close(root)
+
+
 def _prepare_worker_tree(source, tarball_index, environ):
-    worker = PROJECT_ROOT
+    root = _open_project_root()
+    os.close(root)
+    worker = PROJECT_ROOT / "source"
     if worker.is_symlink():
         raise SourceBuildRefusal("gate")
     shutil.rmtree(worker, ignore_errors=True)
@@ -1144,7 +1218,10 @@ def _prepare_worker_tree(source, tarball_index, environ):
     if type(mapping) is not dict or any(type(key) is not str or type(value) is not str for key, value in mapping.items()):
         raise SourceBuildRefusal("lock")
     tarball_root = worker / ".kd-npm-tarballs"
-    tarball_root.mkdir(mode=0o755, exist_ok=True)
+    try:
+        tarball_root.mkdir(mode=0o755)
+    except OSError:
+        raise SourceBuildRefusal("gate") from None
     copied = {}
     package_integrities = {}
     for entry in lock.get("packages", {}).values():
@@ -1231,13 +1308,17 @@ def prepare_project(environ=None):
     _validate_cargo_lock_sources(source)
     worker = _prepare_worker_tree(source, tarball_index, env)
     cargo_home = worker / ".kd-cargo-home"
-    cargo_home.mkdir(mode=0o755)
+    try:
+        cargo_home.mkdir(mode=0o755)
+    except OSError:
+        raise SourceBuildRefusal("gate") from None
     config = cargo_home / "config.toml"
     config.write_text("\n", encoding="ascii")
     os.chown(config, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
     os.chmod(config, 0o444)
     os.chown(cargo_home, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
     os.chmod(cargo_home, 0o755)
+    _project_gate_directories(worker, create=True)
     output = env.get("GITHUB_OUTPUT")
     if output:
         with open(output, "at", encoding="ascii") as sink:
@@ -1304,7 +1385,7 @@ def run_project_gates(environ=None):
     cargo_home = Path(env.get("CARGO_HOME", ""))
     rust_root = env.get("RUST_ROOT", "")
     node_bin = env.get("NODE_BIN", "")
-    if not worker.is_dir() or not cargo_home.is_dir() or not rust_root or not node_bin:
+    if not rust_root or not node_bin or cargo_home != worker / ".kd-cargo-home":
         raise SourceBuildRefusal("gate")
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     records.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1325,14 +1406,12 @@ def run_project_gates(environ=None):
             "npm_config_globalconfig": "/dev/null",
             "PYTHONDONTWRITEBYTECODE": "1", "CI": "true",
         }
-        for path in (project_env["HOME"], project_env["TMPDIR"],
-                     project_env["CARGO_TARGET_DIR"], project_env["NPM_CONFIG_CACHE"]):
-            Path(path).mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chown(path, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
         nonce = os.urandom(12).hex()
         try:
+            _project_gate_directories(worker)
+            launch = ("/usr/bin/python3", "-B", "-c", linux_probes.LAUNCHER_SOURCE, *argv)
             result = linux_session.run_host(
-                str(env.get("RUNNER_TEMP", "/tmp")), nonce, argv, project_env, {},
+                str(env.get("RUNNER_TEMP", "/tmp")), nonce, launch, project_env, {},
                 limits="fixture", timeout=600, cwd=str(worker),
             )
         except BaseException:
@@ -1363,8 +1442,8 @@ def _load_json(path):
     return value if type(value) is dict else None
 
 
-def emit_verdict(environ=None):
-    env = os.environ if environ is None else environ
+def _verdict_record(environ):
+    env = environ
     audit, verdict, unused_canary = _audit_modules()
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     merged = _load_json(records / "merged.json")
@@ -1411,7 +1490,6 @@ def emit_verdict(environ=None):
             "failed": failed,
             "token_revocation": token_state,
         }
-        line = verdict.encode_line(record)
     except BaseException:
         record = {
             "os": "linux", "boundary": "linux-ns-seccomp-uid",
@@ -1423,6 +1501,25 @@ def emit_verdict(environ=None):
             "handoff": "not-applicable", "project_execution": "not_started",
             "gates": 0, "failed": 0, "token_revocation": "unconfirmed",
         }
+    return record
+
+
+def write_verdict_record(environ=None):
+    env = os.environ if environ is None else environ
+    unused_audit, verdict, unused_canary = _audit_modules()
+    record = _verdict_record(env)
+    _write_output(env, {"record": json.dumps(record, sort_keys=True, separators=(",", ":"))})
+    return 0 if verdict.run_accepted(record) or env.get("CI_MODE") == "synthetic" and verdict.confinement_accepted(record) else 1
+
+
+def emit_verdict(environ=None):
+    env = os.environ if environ is None else environ
+    unused_audit, verdict, unused_canary = _audit_modules()
+    try:
+        record = json.loads(env.get("VERDICT_RECORD", ""))
+        line = verdict.encode_line(record)
+    except BaseException:
+        record = _verdict_record({"CI_SHA": env.get("CI_SHA", "0" * 40), "GITHUB_RUN_ID": env.get("GITHUB_RUN_ID", "1"), "GITHUB_RUN_ATTEMPT": env.get("GITHUB_RUN_ATTEMPT", "1")})
         line = verdict.encode_line(record)
     sys.stdout.write(line + "\n")
     return 0 if verdict.run_accepted(record) or env.get("CI_MODE") == "synthetic" and verdict.confinement_accepted(record) else 1
@@ -1437,7 +1534,7 @@ def run_audit(environ=None):
             value = SYNTHETIC_LOG_CANARY
         config = log_canary.compute_config(value)
         log_canary.PINNED_CONFIG = config
-        code = audit.main(environ=env)
+        code = audit.main(arguments=[], environ=env)
         return code
     except BaseException:
         sys.stdout.write("KD-CONFINEMENT-AUDIT schema=1 status=refused phase=log_canary reason=confinement_audit_invalid\n")
@@ -1456,6 +1553,7 @@ def _dispatch(command):
         "trusted-audit": run_trusted_audit,
         "prepare-project": prepare_project,
         "gates": run_project_gates,
+        "verdict-record": write_verdict_record,
         "verdict": emit_verdict,
         "audit": run_audit,
     }

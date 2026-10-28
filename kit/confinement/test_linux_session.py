@@ -89,6 +89,27 @@ class LinuxSessionPureTests(unittest.TestCase):
                 session.harden_usr_submounts("/tmp/root")
         self.assertEqual(raised.exception.reason, 95)
 
+    def test_host_view_remounts_usr_read_only_before_project_launch(self):
+        before = [
+            {"mount_point": "/usr", "options": ["rw", "relatime"]},
+            {"mount_point": "/usr/local", "options": ["rw", "noexec"]},
+        ]
+        after = [{"mount_point": item["mount_point"], "options": ["ro"]} for item in before]
+        with patch("linux_session.read_mountinfo", side_effect=[before, after]), patch(
+            "linux_session.harness._mount"
+        ) as mount:
+            session.harden_host_usr()
+        self.assertEqual(mount.call_count, 3)
+        self.assertEqual(mount.call_args_list[0].args[:2], ("/usr", "/usr"))
+        self.assertEqual([call.args[1] for call in mount.call_args_list[1:]], ["/usr", "/usr/local"])
+        for call in mount.call_args_list[1:]:
+            self.assertTrue(call.args[3] & harness.MS_RDONLY)
+        with patch("linux_session.read_mountinfo", side_effect=[before, before]), patch(
+            "linux_session.harness._mount"
+        ):
+            with self.assertRaises(harness.ProofFailure):
+                session.harden_host_usr()
+
     def test_usr_readback_inside_the_chroot_requires_a_present_read_only_mount(self):
         ro = [{"mount_point": "/usr", "options": ["ro"]}]
         rw = [{"mount_point": "/usr", "options": ["rw"]}]

@@ -196,7 +196,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertNotIn("pull_request:", self.text)
         self.assertNotIn("workflow_call:", self.text)
 
-    def test_four_jobs_with_least_privilege_and_cache_mode_none_everywhere(self):
+    def test_five_jobs_with_least_privilege_and_cache_mode_none_everywhere(self):
         jobs = self.jobs()
         self.assertEqual(
             list(jobs),
@@ -204,17 +204,19 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "linux-source-admission-settings",
                 "linux-source-admission-unit",
                 "linux-source-admission-source-read",
+                "linux-source-admission-verdict",
                 "linux-source-admission-audit",
             ],
         )
-        self.assertEqual(self.text.count("cache-mode: none"), 5)
+        self.assertEqual(self.text.count("cache-mode: none"), 6)
         for name in ("settings", "source-read"):
             body = jobs["linux-source-admission-" + name]
             self.assertIn("      actions: read\n      contents: read\n", body)
         self.assertIn("    permissions: {}\n", jobs["linux-source-admission-unit"])
+        self.assertIn("      contents: read\n", jobs["linux-source-admission-verdict"])
         self.assertIn("      actions: read\n      checks: read\n", jobs["linux-source-admission-audit"])
-        self.assertEqual(self.text.count("contents: read"), 2)
-        self.assertEqual(self.text.count("runs-on: ubuntu-24.04"), 4)
+        self.assertEqual(self.text.count("\n      contents: read\n"), 3)
+        self.assertEqual(self.text.count("runs-on: ubuntu-24.04"), 5)
         self.assertNotIn("latest", self.text)
 
     def test_source_reader_secret_is_scoped_to_mint_and_canary_stays_out_of_arguments(self):
@@ -226,7 +228,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertIn("actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510", mint)
         self.assertIn("SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}", source)
         self.assertIn("if: ${{ always() && steps.source-reader-token.outputs.token != '' }}", source)
-        self.assertIn("linux-source-build.py revoke", source)
+        self.assertIn("linux_source_build.py revoke", source)
         self.assertIn("steps.source-reader-token.outputs.installation-id", source)
         for name, body in self.jobs().items():
             if name != "linux-source-admission-source-read":
@@ -262,12 +264,12 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "Run all thirteen offline project gates",
                 "Merge confinement phase records",
                 "Forced faults must fail closed",
-                "Publish confinement verdict",
+                "Collect confinement verdict record",
             ],
         )
         self.assertLess(source.index("linux_boundary.py selftest"), source.index("Mint scoped source-reader token"))
-        self.assertLess(source.index("Fetch exact source"), source.index("linux-source-build.py revoke"))
-        self.assertLess(source.index("linux-source-build.py revoke"), source.index("Fetch npm tarballs"))
+        self.assertLess(source.index("Fetch exact source"), source.index("linux_source_build.py revoke"))
+        self.assertLess(source.index("linux_source_build.py revoke"), source.index("Fetch npm tarballs"))
         self.assertLess(source.index("Prepare offline project inputs"), source.index("linux_boundary.py recheck"))
         self.assertLess(source.index("linux_boundary.py recheck"), source.index("Run all thirteen offline project gates"))
         self.assertIn("sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP", source)
@@ -276,8 +278,8 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
     def test_audit_job_runs_always_with_expected_identity_and_no_artifacts(self):
         audit = self.jobs()["linux-source-admission-audit"]
         self.assertIn("if: ${{ always() &&", audit)
-        for name in ("settings", "unit", "source-read"):
-            self.assertIn("needs.linux-source-admission-" + name + ".result", audit)
+        for name in ("settings", "unit", "source-read", "verdict"):
+            self.assertIn("      - linux-source-admission-" + name + "\n", audit)
         self.assertIn("CONFINEMENT_AUDIT_EXPECTED: ${{ needs.linux-source-admission-settings.outputs.expected }}", audit)
         self.assertIn("linux_source_build.py audit", audit)
         self.assertNotIn("sudo", audit)
@@ -288,10 +290,12 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
 
     def test_verdict_step_is_plain_run_and_the_verdict_job_has_no_composite_step(self):
         source = self.jobs()["linux-source-admission-source-read"]
-        verdict = source.split("      - name: Publish confinement verdict\n", 1)[1].split("  linux-source-admission-audit:", 1)[0]
-        self.assertIn("if: ${{ always() }}", verdict)
+        verdict = self.jobs()["linux-source-admission-verdict"]
+        self.assertIn("      - name: Collect confinement verdict record\n", source)
+        self.assertIn("verdict_record: ${{ steps.verdict-record.outputs.record }}", source)
         self.assertIn("run: python3 -B kit/confinement/linux_source_build.py verdict", verdict)
         self.assertNotIn("uses:", verdict)
+        self.assertEqual(verdict.count("      - name:"), 2)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", self.text)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", verdict)
 

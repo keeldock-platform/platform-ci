@@ -292,6 +292,14 @@ def harden_usr_submounts(rootfs):
         raise harness.ProofFailure(95)
 
 
+def harden_host_usr():
+    harness._mount("/usr", "/usr", None, harness.MS_BIND | harness.MS_REC)
+    for entry in sorted(mounts_under(read_mountinfo(), "/usr"), key=lambda item: len(item["mount_point"])):
+        if "ro" not in entry["options"]:
+            harness._mount(None, entry["mount_point"], None, remount_flags(entry["options"]))
+    require_usr_readonly("/usr")
+
+
 def require_usr_readonly(prefix):
     entries = mounts_under(read_mountinfo(), prefix)
     if not entries or writable_mounts(entries, prefix):
@@ -491,6 +499,7 @@ def inside_host(spec):
     os.makedirs(os.path.join(base, "capture"), mode=0o700, exist_ok=True)
     harness._mount("proc", "/proc", "proc", harness.MS_NOSUID | harness.MS_NODEV | harness.MS_NOEXEC)
     minimal_dev("/dev")
+    harden_host_usr()
     nonce = spec["nonce"]
     out_path, out_writer, out_reader = harness._write_capture(base, "out-" + nonce)
     err_path, err_writer, err_reader = harness._write_capture(base, "err-" + nonce)
@@ -502,9 +511,10 @@ def inside_host(spec):
         stdout = read_capture(out_reader)
         stderr = read_capture(err_reader)
     harness._verify_netns()
+    require_usr_readonly("/usr")
     readback = {
         "netns": True,
-        "usr_ro": False,
+        "usr_ro": True,
         "ptrace_scope": harness._read_sysctl("/proc/sys/kernel/yama/ptrace_scope"),
     }
     return code, timed_out, stdout, stderr, readback

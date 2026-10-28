@@ -1,6 +1,12 @@
+import hashlib
+import json
+import os
+import subprocess
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 import foundation_node_feedback
 import linux_source_build
@@ -37,9 +43,10 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Run all thirteen offline project gates",
                 "Merge confinement phase records",
                 "Forced faults must fail closed",
-                "Publish confinement verdict",
+                "Collect confinement verdict record",
             ),
         )
+        self.assertEqual(linux_source_build.VERDICT_STEP_NAMES, ("Fetch exact public control", "Publish confinement verdict"))
         self.assertEqual(
             linux_source_build.OPTIONAL_SOURCE_STEPS,
             frozenset((
@@ -54,6 +61,15 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Forced faults must fail closed",
             )),
         )
+
+    def test_expected_run_assigns_the_plain_verdict_job_and_action_post(self):
+        base = {"CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1"}
+        source = linux_source_build._expected_run({**base, "CI_MODE": "source"}, "b" * 64)
+        synthetic = linux_source_build._expected_run({**base, "CI_MODE": "synthetic"}, "b" * 64)
+        self.assertEqual(source["verdict_job"], "linux-source-admission-verdict")
+        self.assertEqual(source["jobs"][source["verdict_job"]]["steps"], linux_source_build.VERDICT_STEP_NAMES)
+        self.assertEqual(source["jobs"]["linux-source-admission-source-read"]["steps"][-1], "Post Mint scoped source-reader token")
+        self.assertNotIn("Post Mint scoped source-reader token", synthetic["jobs"]["linux-source-admission-source-read"]["steps"])
 
     def test_toolchain_versions_are_pinned_and_node_digest_is_a_coordinator_constant(self):
         self.assertEqual(linux_source_build.NODE_VERSION, "24.22.1")
@@ -131,6 +147,202 @@ class LinuxSourceBuildTests(unittest.TestCase):
         for name in ("node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests"):
             with self.subTest(gate=name):
                 self.assertTrue(any(item.startswith("--workspaces") or item == "--workspaces" for item in by_name[name]))
+
+    def test_project_root_refuses_a_hostile_symlink(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
+            root = Path(temporary)
+            link = root.parent / (root.name + "-link")
+            link.symlink_to(root, target_is_directory=True)
+            try:
+                with patch.object(linux_source_build, "PROJECT_ROOT", link):
+                    with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                        linux_source_build._open_project_root()
+            finally:
+                link.unlink()
+
+    def test_gate_directories_refuse_hostile_symlinks_without_ownership_changes(self):
+        for create in (False, True):
+            with self.subTest(create=create), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "root"
+                worker = root / "source"
+                outside = Path(temporary) / "outside"
+                worker.mkdir(parents=True)
+                outside.mkdir()
+                for name in (".tmp", "target", ".npm-cache", ".kd-cargo-home"):
+                    (worker / name).mkdir()
+                (worker / ".home").symlink_to(outside, target_is_directory=True)
+                before = outside.stat()
+                flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                with patch.object(linux_source_build, "PROJECT_ROOT", root), patch.object(
+                    linux_source_build, "_open_project_root", side_effect=lambda: os.open(root, flags)
+                ), patch.object(linux_source_build.linux_harness, "CHILD_UID", os.getuid()), patch.object(
+                    linux_source_build.linux_harness, "CHILD_GID", os.getgid()
+                ), patch.object(linux_source_build.os, "fchown", side_effect=AssertionError("unexpected chown")):
+                    with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                        linux_source_build._project_gate_directories(worker, create=create)
+                after = outside.stat()
+                self.assertEqual((before.st_uid, before.st_gid, before.st_mode), (after.st_uid, after.st_gid, after.st_mode))
+
+    def test_repeated_preflight_refuses_missing_binding_before_duplicate_check(self):
+        sha = "a" * 40
+        env = {
+            "CI_EVENT_NAME": "workflow_dispatch", "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "CI_SERVER_URL": "https://github.com", "CACHE_MODE": "none",
+            "CI_SHA": sha, "GITHUB_SHA": sha, "CI_REF": "refs/heads/untrusted", "CI_MODE": "source",
+        }
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(linux_source_build, "_source_inputs", side_effect=linux_source_build.SourceBuildRefusal("binding")) as binding, patch.object(
+            linux_source_build, "_require_no_duplicate"
+        ) as duplicate:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build.validate_dispatch(env, "token")
+            binding.assert_called_once_with(env)
+            duplicate.assert_not_called()
+
+    def test_protected_source_binding_refuses_one_changed_fingerprint(self):
+        sha = "a" * 40
+        base = "b" * 40
+        fingerprint = "c" * 64
+        env = {
+            "REQUESTED_SOURCE_SHA": sha, "REQUESTED_BASE_SHA": base,
+            "REQUESTED_BASE_BRANCH": "main", "REQUESTED_FINGERPRINT": fingerprint,
+            "CI_SHA": "d" * 40, "LINUX_SOURCE_ALLOWED_SHA": sha,
+            "LINUX_SOURCE_ALLOWED_BASE_SHA": base, "LINUX_SOURCE_ALLOWED_BASE_BRANCH": "main",
+            "LINUX_SOURCE_ALLOWED_FINGERPRINT": "e" * 64,
+            "LINUX_SOURCE_ALLOWED_CONTROL_SHA": "d" * 40,
+            "SOURCE_REPOSITORY_ID": "7", "SOURCE_REPOSITORY_OWNER": "owner",
+            "SOURCE_REPOSITORY_NAME": "source", "SOURCE_READER_INSTALLATION_ID": "8",
+            "SOURCE_READER_CLIENT_ID": "client", "LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256": "f" * 64,
+            "LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256": "1" * 64,
+            "LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": "{}",
+            "LINUX_SOURCE_ENVIRONMENT_NAME": "source-read", "REQUESTED_ENVIRONMENT_NAME": "source-read",
+        }
+        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build._source_inputs(env)
+            provenance.assert_not_called()
+            env["LINUX_SOURCE_ALLOWED_FINGERPRINT"] = fingerprint
+            self.assertEqual(linux_source_build._source_inputs(env)["reviewed_diff_sha256"], fingerprint)
+            provenance.assert_called_once()
+
+    def test_default_checkout_environment_reaches_the_source_fetch(self):
+        identity = {"owner": "owner", "name": "source", "repository_id": "7", "source_sha": "a" * 40}
+        repository = {"id": 7, "private": True, "full_name": "owner/source"}
+        marker = RuntimeError("source fetch reached")
+
+        def git_call(unused_repo, *arguments, **unused_keywords):
+            if arguments[:2] == ("remote", "add"):
+                raise marker
+            return subprocess.CompletedProcess(arguments, 0, b"", b"")
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ, {"RUNNER_TEMP": temporary, "CI_REF": "refs/heads/untrusted", "SOURCE_READER_TOKEN": "token"}, clear=True
+        ), patch.object(linux_source_build, "_source_inputs", return_value=identity), patch.object(
+            linux_source_build, "_api_request", return_value=(200, repository)
+        ), patch.object(linux_source_build, "_git", side_effect=git_call):
+            with self.assertRaisesRegex(RuntimeError, "source fetch reached"):
+                linux_source_build.checkout_source()
+
+    def test_checkout_rejects_a_bad_signature_before_lock_or_project_work(self):
+        source_sha = "a" * 40
+        base_sha = "b" * 40
+        identity = {
+            "owner": "owner", "name": "source", "repository_id": "7", "source_sha": source_sha,
+            "base_sha": base_sha, "base_branch": "main", "reviewed_diff_sha256": hashlib.sha256(b"").hexdigest(),
+        }
+
+        def git_call(unused_repo, *arguments, **unused_keywords):
+            output = b""
+            if arguments[:2] == ("rev-parse", "--verify"):
+                reference = arguments[2]
+                output = ((base_sha if reference.startswith("refs/remotes/") else "c" * 40 if reference == "HEAD^{tree}" else source_sha) + "\n").encode("ascii")
+            return subprocess.CompletedProcess(arguments, 0, output, b"")
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            linux_source_build, "_source_inputs", return_value=identity
+        ), patch.object(linux_source_build, "_api_request", return_value=(200, {
+            "id": 7, "private": True, "full_name": "owner/source",
+        })), patch.object(linux_source_build, "_git", side_effect=git_call), patch.object(
+            linux_source_build, "_verify_signatures", side_effect=linux_source_build.SourceBuildRefusal("signature")
+        ) as signatures:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "signature"):
+                linux_source_build.checkout_source({
+                    "RUNNER_TEMP": temporary, "CI_REF": "refs/heads/untrusted", "SOURCE_READER_TOKEN": "token",
+                    "CI_WORKSPACE": temporary,
+                })
+            signatures.assert_called_once()
+
+    def test_revoke_requires_the_unauthorized_response_and_writes_a_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            env = {"SOURCE_READER_TOKEN": "token", "RUNNER_TEMP": temporary}
+            with patch.object(linux_source_build, "_api_request", side_effect=[(204, {}), (401, {})]) as api:
+                self.assertEqual(linux_source_build.revoke_token(env), 0)
+                self.assertEqual(api.call_count, 2)
+                self.assertEqual(api.call_args.args[0], "/installation/repositories?per_page=1")
+            receipt = json.loads((Path(temporary) / "kd-records" / "revocation.json").read_text(encoding="ascii"))
+            self.assertTrue(receipt["rejected_after_revoke"])
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            linux_source_build, "_api_request", side_effect=[(204, {}), (200, {})]
+        ):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "revocation"):
+                linux_source_build.revoke_token({"SOURCE_READER_TOKEN": "token", "RUNNER_TEMP": temporary})
+            self.assertFalse((Path(temporary) / "kd-records" / "revocation.json").exists())
+
+    def test_real_gates_use_the_shared_stopping_launcher(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            linux_source_build, "_project_gate_directories"
+        ) as directories, patch.object(linux_source_build, "_gate_commands", return_value=tuple(
+            (name, ("/usr/bin/true",)) for name in linux_source_build.GATES
+        )), patch.object(linux_source_build.linux_session, "run_host", return_value=types.SimpleNamespace(
+            exit_code=0, timed_out=False, stdout=b"", stderr=b""
+        )) as session:
+            worker = linux_source_build.PROJECT_ROOT / "source"
+            self.assertEqual(linux_source_build.run_project_gates({
+                "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
+                "CARGO_HOME": str(worker / ".kd-cargo-home"), "RUST_ROOT": "/rust", "NODE_BIN": "/node",
+            }), 0)
+            self.assertEqual(directories.call_count, 13)
+            self.assertEqual(session.call_count, 13)
+            for invocation in session.call_args_list:
+                launch = invocation.args[2]
+                self.assertEqual(launch[:3], ("/usr/bin/python3", "-B", "-c"))
+                self.assertEqual(launch[3], linux_source_build.linux_probes.LAUNCHER_SOURCE)
+                self.assertEqual(launch[4:], ("/usr/bin/true",))
+
+    def test_audit_command_passes_empty_arguments_to_the_shared_cli(self):
+        audit = types.SimpleNamespace(main=Mock(return_value=0))
+        canary = types.SimpleNamespace(compute_config=Mock(return_value="config"), PINNED_CONFIG=None)
+        with patch.object(linux_source_build, "_audit_modules", return_value=(audit, None, canary)):
+            self.assertEqual(linux_source_build.main(["audit"]), 0)
+        self.assertEqual(audit.main.call_args.kwargs["arguments"], [])
+        self.assertIs(audit.main.call_args.kwargs["environ"], os.environ)
+
+    def test_synthetic_production_entry_points_pass_the_verdict_record_between_jobs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            records = Path(temporary) / "kd-records"
+            records.mkdir()
+            merged = {
+                "channels": {name: {"status": "blocked", "before": True, "after": True}
+                             for name in linux_source_build.linux_channels.CHANNELS},
+                "memory_canary": "absent", "readable_file_canary": "absent",
+            }
+            (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
+            output = Path(temporary) / "output"
+            sha = "a" * 40
+            env = {
+                "RUNNER_TEMP": temporary, "GITHUB_OUTPUT": str(output), "CI_SHA": sha,
+                "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1", "CI_MODE": "synthetic",
+            }
+            with patch.dict(os.environ, env, clear=True), patch.object(
+                linux_source_build, "validate_dispatch", return_value="synthetic"
+            ) as dispatch:
+                self.assertEqual(linux_source_build.main(["preflight"]), 0)
+                dispatch.assert_called_once()
+                self.assertEqual(linux_source_build.main(["verdict-record"]), 0)
+                encoded = output.read_text(encoding="ascii").split("record=", 1)[1].strip()
+                with patch.dict(os.environ, {**env, "VERDICT_RECORD": encoded}, clear=True):
+                    self.assertEqual(linux_source_build.main(["verdict"]), 0)
 
 
 if __name__ == "__main__":

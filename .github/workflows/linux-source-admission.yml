@@ -159,6 +159,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+    outputs:
+      verdict_record: ${{ steps.verdict-record.outputs.record }}
     defaults:
       run:
         shell: bash
@@ -251,6 +253,7 @@ jobs:
           owner: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
           repositories: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
           permission-contents: read
+          skip-token-revoke: true
       - name: Verify selected installation identity
         if: ${{ inputs.mode == 'source' }}
         env:
@@ -330,14 +333,46 @@ jobs:
           set -euo pipefail
           arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT" --synthetic-standin)
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py faults "${arguments[@]}"
-      - name: Publish confinement verdict
+      - name: Collect confinement verdict record
+        id: verdict-record
         if: ${{ always() }}
+        run: python3 -B kit/confinement/linux_source_build.py verdict-record
+  linux-source-admission-verdict:
+    needs:
+      - linux-source-admission-settings
+      - linux-source-admission-unit
+      - linux-source-admission-source-read
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    cache-mode: none
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_SHA: ${{ github.sha }}
+      CI_MODE: ${{ inputs.mode }}
+      VERDICT_RECORD: ${{ needs.linux-source-admission-source-read.outputs.verdict_record }}
+    steps:
+      - name: Fetch exact public control
+        run: |
+          set -euo pipefail
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${GITHUB_SERVER_URL%/}/${GITHUB_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$GITHUB_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$GITHUB_SHA" ]]
+      - name: Publish confinement verdict
         run: python3 -B kit/confinement/linux_source_build.py verdict
   linux-source-admission-audit:
     needs:
       - linux-source-admission-settings
       - linux-source-admission-unit
       - linux-source-admission-source-read
+      - linux-source-admission-verdict
     if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
     runs-on: ubuntu-24.04
     environment:
