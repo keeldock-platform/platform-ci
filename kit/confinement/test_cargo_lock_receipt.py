@@ -712,10 +712,22 @@ class CargoLockReceiptTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX directory descriptors")
     def test_macos_extended_acl_on_ancestor_is_refused(self):
         library = Mock()
-        library.acl_get_fd_np.return_value = 1
         library.acl_get_entry.return_value = 0
         library.acl_free.return_value = 0
         with tempfile.TemporaryDirectory() as temporary:
+            ancestor_identity = subject._file_identity(Path(temporary).parent.stat())
+            target_identity = subject._file_identity(Path(temporary).stat())
+            inspected = []
+
+            def get_acl(descriptor, acl_type):
+                identity = subject._file_identity(os.fstat(descriptor))
+                inspected.append(identity)
+                if identity == ancestor_identity:
+                    return 1
+                subject.ctypes.set_errno(subject.errno.ENOENT)
+                return None
+
+            library.acl_get_fd_np.side_effect = get_acl
             with patch.object(subject.sys, "platform", "darwin"), patch.object(
                 subject.ctypes, "CDLL", return_value=library,
             ):
@@ -724,9 +736,10 @@ class CargoLockReceiptTests(unittest.TestCase):
                     lambda: subject._open_target_directory(temporary),
                     "cargo_archive_invalid",
                 )
-        library.acl_get_fd_np.assert_called()
-        library.acl_get_entry.assert_called()
-        library.acl_free.assert_called()
+            self.assertEqual(inspected[-1], ancestor_identity)
+            self.assertNotIn(target_identity, inspected)
+        library.acl_get_entry.assert_called_once()
+        library.acl_free.assert_called_once()
 
     @unittest.skipIf(os.name == "nt", "POSIX directory descriptors")
     def test_macos_extended_acl_on_private_target_is_refused(self):
