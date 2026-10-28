@@ -489,6 +489,7 @@ class CoreContractTreeTests(unittest.TestCase):
         with patch.object(
             subject, "_contract_tree_entries", side_effect=(dict(entries), entries),
         ), patch.object(subject, "_contract_blob", side_effect=blob) as blob, \
+                patch.object(subject, "_contract_blob_size", return_value=1), \
                 patch.object(subject, "_feedback_corpus_shape", return_value=True), \
                 patch.object(subject, "_feedback_manifest_shape", return_value=True), \
                 patch.object(subject, "_feedback_fuzz_manifest_shape", return_value=True), \
@@ -526,7 +527,7 @@ class CoreContractTreeTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIsNone(subject._core_contract_expected_mode(path))
 
-    def test_feedback_tree_allows_only_the_exact_reviewed_typescript_files(self):
+    def test_feedback_tree_allows_reviewed_typescript_patterns_and_fixed_configs(self):
         for path in subject.CORE_CONTRACT_FEEDBACK_FILES:
             with self.subTest(path=path):
                 self.assertIsNone(subject._core_contract_expected_mode(path))
@@ -535,8 +536,32 @@ class CoreContractTreeTests(unittest.TestCase):
                         subject._core_contract_expected_mode(path, concern=concern), "100644",
                     )
         for path in (
-            "packages/host-api/src/extra.ts",
-            "packages/host-api/tests/extra.test.ts",
+            "packages/host-api/src/new-module.ts",
+            "packages/host-api/tests/new-test.test.ts",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(subject._core_contract_expected_mode(path))
+                for concern in subject.FEEDBACK_PROFILE_CONCERNS:
+                    self.assertEqual(
+                        subject._core_contract_expected_mode(path, concern=concern), "100644",
+                    )
+        for path in (
+            "packages/host-api/src/New-module.ts",
+            "packages/host-api/src/nested/new-module.ts",
+            "packages/host-api/src/new-module.js",
+            "packages/host-api/src/new-module.mjs",
+            "packages/host-api/src/new-module.cjs",
+            "packages/host-api/src/.hidden.ts",
+            "packages/host-api/src/" + "a" * (subject.MAX_CORE_CONTRACT_NAME_LENGTH + 1) + ".ts",
+            "packages/host-api/src/vite.config.ts",
+            "packages/host-api/src/vitest.config.ts",
+            "packages/host-api/src/tsconfig.json",
+            "packages/host-api/src/eslint.config.js",
+            "packages/host-api/src/package.json",
+            "packages/host-api/tests/New-test.test.ts",
+            "packages/host-api/tests/nested/new-test.test.ts",
+            "packages/host-api/tests/" + "a" * (subject.MAX_CORE_CONTRACT_NAME_LENGTH + 1) + ".test.ts",
+            "packages/host-api/tests/new-test.test.js",
             "packages/host-api/build.rs",
             "packages/other/package.json",
         ):
@@ -639,9 +664,11 @@ class CoreContractTreeTests(unittest.TestCase):
                 call.args[4] == root_lock for call in blob.call_args_list
             ))
 
-    def test_feedback_foundation_allows_only_fixed_fuzz_and_adr_paths(self):
+    def test_feedback_foundation_allows_numbered_adrs_and_snake_fuzz_targets(self):
         fixed_paths = set(subject.CORE_CONTRACT_FOUNDATION_FILES)
         fixed_paths.update((
+            "docs/adr/0004-reviewed-decisions.md",
+            "fuzz/fuzz_targets/new_target.rs",
             "fuzz/corpus/identifiers/valid-seed",
             "fuzz/corpus/tool_error_codes/valid-seed",
             "fuzz/corpus/versions/valid-seed",
@@ -653,15 +680,133 @@ class CoreContractTreeTests(unittest.TestCase):
                         subject._core_contract_expected_mode(path, concern=concern), "100644",
                     )
         for path in (
-            "docs/adr/0004-unreviewed.md",
-            "fuzz/fuzz_targets/extra.rs",
-            "fuzz/corpus/other/seed",
+            "docs/adr/004-reviewed-decisions.md",
+            "docs/adr/00004-reviewed-decisions.md",
+            "docs/adr/0004-Reviewed-decisions.md",
+            "docs/adr/nested/0004-reviewed-decisions.md",
+            "docs/adr/0004-reviewed-decisions.txt",
+            "docs/adr/0004-" + "a" * (subject.MAX_CORE_CONTRACT_NAME_LENGTH + 1) + ".md",
+            "fuzz/fuzz_targets/New_target.rs",
+            "fuzz/fuzz_targets/nested/new_target.rs",
+            "fuzz/fuzz_targets/new-target.rs",
+            "fuzz/fuzz_targets/new_target.js",
+            "fuzz/fuzz_targets/" + "a" * (subject.MAX_CORE_CONTRACT_NAME_LENGTH + 1) + ".rs",
             "fuzz/corpus/versions/nested/seed",
             "fuzz/corpus/versions/seed.txt",
         ):
             with self.subTest(path=path):
                 for concern in subject.FEEDBACK_PROFILE_CONCERNS:
                     self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_feedback_tree_accepts_new_files_in_each_reviewed_pattern(self):
+        concern = "core-rust-format-return"
+        entries = self._required_core_contract_entries(concern)
+        for path in (
+            "packages/host-api/src/new-module.ts",
+            "packages/host-api/tests/new-test.test.ts",
+            "docs/adr/0004-reviewed-decisions.md",
+            "fuzz/fuzz_targets/new_target.rs",
+            "fuzz/corpus/new_target/seed",
+        ):
+            entries[path] = ("100644", "b" * 40)
+        marker, unused_blob = self._validate_feedback_tree(entries, concern)
+        self.assertEqual(marker, subject.CORE_CONTRACT_TREE_BY_CONCERN[concern])
+
+    def test_feedback_tree_refuses_a_corpus_for_an_undeclared_target(self):
+        concern = "core-rust-format-return"
+        entries = self._required_core_contract_entries(concern)
+        entries["fuzz/corpus/unreviewed/seed"] = ("100644", "b" * 40)
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(dict(entries), entries),
+        ), patch.object(subject, "_contract_blob") as blob, \
+                self.assertRaises(subject.Refusal) as refusal:
+            subject._safe_core_contract_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+                concern=concern,
+            )
+        blob.assert_not_called()
+        self.assertEqual(
+            (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
+        )
+
+    def test_feedback_pattern_count_limits_refuse_before_blob_reads(self):
+        cases = (
+            ("ts_sources", subject.MAX_CORE_CONTRACT_TS_SOURCES,
+             lambda index: "packages/host-api/src/extra-" + str(index) + ".ts"),
+            ("ts_tests", subject.MAX_CORE_CONTRACT_TS_TESTS,
+             lambda index: "packages/host-api/tests/extra-" + str(index) + ".test.ts"),
+            ("adrs", subject.MAX_CORE_CONTRACT_ADRS,
+             lambda index: "docs/adr/" + str(1000 + index) + "-extra.md"),
+            ("fuzz_targets", subject.MAX_CORE_CONTRACT_FUZZ_TARGETS,
+             lambda index: "fuzz/fuzz_targets/extra_" + str(index) + ".rs"),
+        )
+        for name, maximum, path_for in cases:
+            entries = self._required_core_contract_entries("core-rust-format-return")
+            existing = len(subject._core_contract_pattern_paths(entries)[name])
+            for index in range(maximum - existing + 1):
+                entries[path_for(index)] = ("100644", "b" * 40)
+            with self.subTest(name=name), patch.object(
+                subject, "_contract_tree_entries", side_effect=(dict(entries), entries),
+            ), patch.object(subject, "_contract_blob") as blob, \
+                    patch.object(subject, "_contract_blob_size") as blob_size, \
+                    self.assertRaises(subject.Refusal) as refusal:
+                subject._safe_core_contract_tree(
+                    "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+                    concern="core-rust-format-return",
+                )
+            blob.assert_not_called()
+            blob_size.assert_not_called()
+            self.assertEqual(
+                (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+                ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
+            )
+
+    def test_oversized_new_source_module_refuses_under_the_file_limit(self):
+        concern = "core-rust-format-return"
+        entries = self._required_core_contract_entries(concern)
+        path = "packages/host-api/src/new-module.ts"
+        entries[path] = ("100644", "b" * 40)
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(dict(entries), entries),
+        ), patch.object(
+            subject, "_contract_blob_size",
+            return_value=subject.MAX_CORE_CONTRACT_FILE_BYTES + 1,
+        ) as blob_size, patch.object(subject, "_contract_blob") as blob, \
+                self.assertRaises(subject.Refusal) as refusal:
+            subject._safe_core_contract_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+                concern=concern,
+            )
+        blob_size.assert_called_once()
+        blob.assert_not_called()
+        self.assertEqual(
+            (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
+        )
+
+    def test_added_pattern_files_share_a_bounded_total_size(self):
+        concern = "core-rust-format-return"
+        entries = self._required_core_contract_entries(concern)
+        entries["packages/host-api/src/new-module.ts"] = ("100644", "b" * 40)
+        entries["packages/host-api/tests/new-test.test.ts"] = ("100644", "c" * 40)
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(dict(entries), entries),
+        ), patch.object(
+            subject, "_contract_blob_size",
+            return_value=subject.MAX_CORE_CONTRACT_PATTERN_TOTAL_BYTES // 2 + 1,
+        ) as blob_size, patch.object(subject, "_contract_blob") as blob, \
+                self.assertRaises(subject.Refusal) as refusal:
+            subject._safe_core_contract_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+                concern=concern,
+            )
+        self.assertEqual(blob_size.call_count, 2)
+        blob.assert_not_called()
+        self.assertEqual(
+            (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
+        )
 
     def test_feedback_corpus_accepts_empty_utf8_seeds_with_bounded_closed_paths(self):
         paths = [
@@ -677,6 +822,18 @@ class CoreContractTreeTests(unittest.TestCase):
         unknown = paths[:-1] + ["fuzz/corpus/unreviewed/empty"]
         unknown_payloads = {path: b"" for path in unknown}
         self.assertFalse(subject._feedback_corpus_shape(unknown, unknown_payloads))
+        self.assertFalse(subject._feedback_corpus_paths_shape(
+            paths + ["fuzz/corpus/other/seed"],
+        ))
+        new_target_path = "fuzz/corpus/new_target/seed"
+        extended_paths = paths + [new_target_path]
+        extended_payloads = dict(payloads)
+        extended_payloads[new_target_path] = b""
+        declared_targets = subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS | {"new_target"}
+        self.assertTrue(subject._feedback_corpus_shape(
+            extended_paths, extended_payloads, declared_targets,
+        ))
+        self.assertFalse(subject._feedback_corpus_shape(extended_paths, extended_payloads))
         bad_utf8 = dict(payloads)
         bad_utf8[paths[1]] = b"\xff"
         self.assertFalse(subject._feedback_corpus_shape(paths, bad_utf8))
@@ -732,6 +889,25 @@ class CoreContractTreeTests(unittest.TestCase):
                     path, core_check="tree_entries", max_bytes=subject.MAX_FUZZ_CORPUS_FILE_BYTES,
                 )
         self.assertEqual(run_process.call_args.kwargs["max_output"], subject.MAX_FUZZ_CORPUS_FILE_BYTES)
+        self.assertEqual(
+            (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+            ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
+        )
+
+    def test_feedback_pattern_blob_size_read_refuses_an_oversized_file(self):
+        path = "packages/host-api/src/new-module.ts"
+        result = subject.subprocess.CompletedProcess(
+            ("git",), 0,
+            str(subject.MAX_CORE_CONTRACT_FILE_BYTES + 1).encode("ascii") + b"\n",
+            b"",
+        )
+        with patch.object(subject, "_run_process", return_value=result) as run_process:
+            with self.assertRaises(subject.Refusal) as refusal:
+                subject._contract_blob_size(
+                    "repository", "/usr/bin/git", {}, {path: ("100644", "a" * 40)},
+                    path, core_check="tree_entries",
+                )
+        self.assertEqual(run_process.call_args.kwargs["max_output"], 32)
         self.assertEqual(
             (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
             ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
@@ -809,6 +985,25 @@ class CoreContractTreeTests(unittest.TestCase):
             b'\n[[package]]\nname = "api-fixture"\nversion = "0.1.0"\n'
         )
         self.assertTrue(subject._feedback_fuzz_manifest_shape(fuzz_manifest, api_manifest, fuzz_lock))
+        extended_targets = subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS | {"new_target"}
+        self.assertFalse(subject._feedback_fuzz_manifest_shape(
+            fuzz_manifest, api_manifest, fuzz_lock, extended_targets,
+        ))
+        bin_sections = "".join(
+            '\n[[bin]]\nname = "' + name + '"\npath = "fuzz_targets/' + name + '.rs"\n'
+            'test = false\ndoc = false\nbench = false\n'
+            for name in sorted(extended_targets)
+        ).encode("ascii")
+        manifest_with_bins = fuzz_manifest + bin_sections
+        self.assertTrue(subject._feedback_fuzz_manifest_shape(
+            manifest_with_bins, api_manifest, fuzz_lock, extended_targets,
+        ))
+        self.assertFalse(subject._feedback_fuzz_manifest_shape(
+            manifest_with_bins.replace(
+                b'path = "fuzz_targets/new_target.rs"',
+                b'path = "fuzz_targets/mismatched.rs"',
+            ), api_manifest, fuzz_lock, extended_targets,
+        ))
         self.assertFalse(subject._feedback_fuzz_manifest_shape(
             fuzz_manifest.replace(
                 b'api-fixture = { path = "../crates/host/api" }', b'api-fixture = "1.0"',
@@ -860,6 +1055,25 @@ class CoreContractTreeTests(unittest.TestCase):
             (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
             ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
         )
+
+    def test_contract_tree_parser_refuses_traversal_and_unicode_lookalikes(self):
+        unicode_slug = chr(0x0430) + "dr"
+        for path in (
+            "fuzz/fuzz_targets/../outside.rs",
+            "docs/adr/0004-" + unicode_slug + ".md",
+        ):
+            payload = (
+                b"100644 blob " + b"a" * 40 + b"\t" + path.encode("utf-8") + b"\x00"
+            )
+            result = subject.subprocess.CompletedProcess(("git",), 0, payload, b"")
+            with self.subTest(path=path), patch.object(
+                subject, "_run_process", return_value=result,
+            ), self.assertRaises(subject.Refusal) as refusal:
+                subject._contract_tree_entries("repository", "/usr/bin/git", {}, "a" * 40)
+            self.assertEqual(
+                (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
+                ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
+            )
 
     @staticmethod
     def _required_core_contract_entries(concern="core-contract"):
