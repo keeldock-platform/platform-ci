@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import urllib.error
 from unittest.mock import MagicMock, Mock, patch
 
+import linux_harness as harness
 from linux_harness import DENIED_SYSCALLS, AUDIT_ARCH_NATIVE, CHILD_SOURCE, MAX_PROBE_SECONDS, PROBES, SECCOMP_ALLOW, SECCOMP_DENY, SOCKET_FILTER, UNSHARE_ARGUMENTS, COMPAT_SYSCALL_BIT, ProofFailure, SockFprog, _drop_child, _enter_rootfs_and_launch, _expected_denial, _inside, _install_socket_filter, _run_probe, _supervise_child_process, _verify_child, _verify_netns, _verify_proc_routes, _require_empty_route_dump, ROUTE_CHANGE_GROUPS, advance_supervision, outcome, valid_sha
 
 

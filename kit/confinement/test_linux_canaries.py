@@ -24,7 +24,8 @@ class LinuxCanaryTests(unittest.TestCase):
         self.assertTrue(canaries.valid_canary(canaries.STANDIN_VALUE))
         self.assertIn("NOT-A-SECRET", canaries.STANDIN_VALUE)
         workflow = (ROOT / ".github/workflows/linux-source-admission.yml").read_text(encoding="utf-8")
-        self.assertEqual(workflow.count(canaries.STANDIN_VALUE), 3)
+        self.assertEqual(workflow.count(canaries.STANDIN_VALUE), 5)
+        self.assertEqual(workflow.count("KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic'"), 4)
         self.assertIn("inputs.mode == 'synthetic'", workflow)
         self.assertIn("secrets.KD_LINUX_LOG_CANARY", workflow)
 
