@@ -1350,6 +1350,7 @@ class LaneRegistryTests(unittest.TestCase):
             {
                 "linux-confinement": policy_linux,
                 "windows-native-preflight": policy_windows,
+                "windows-handoff-synthetic": policy_handoff,
             },
         )
         self.assertEqual(
@@ -1382,6 +1383,11 @@ class LaneRegistryTests(unittest.TestCase):
                     ".github/workflows/windows-native-preflight.yml",
                     "windows-native-preflight",
                     "windows-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/windows-handoff-synthetic.yml",
+                    "windows-handoff-synthetic",
+                    "handoff-workflow-too-large",
                 ),
             ),
         )
