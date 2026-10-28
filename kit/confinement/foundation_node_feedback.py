@@ -47,8 +47,81 @@ SHA40_RE = re.compile(r"[a-f0-9]{40}\Z")
 SHA64_RE = re.compile(r"[a-f0-9]{64}\Z")
 
 
+SURVIVOR_CLASSES = frozenset((
+    "python", "ps", "developer_shim", "helper_preferences", "helper_notifications",
+    "helper_launch_services", "helper_security", "helper_trust", "helper_containers",
+    "apple_system_path", "other", "unknown", "additional",
+))
+CLEANUP_UNCLASSIFIED_DIAGNOSTIC = "source_gates_cleanup_unclassified"
+SURVIVOR_UNKNOWN_DIAGNOSTIC = "source_gates_survivor_unknown"
+COMMAND_CLEANUP_CHECK_DIAGNOSTICS = {
+    "probe_process_census": "source_gates_census",
+    "probe_process_group_cleanup": "source_gates_group_cleanup",
+    "probe_process_capture_cleanup": "source_gates_capture_cleanup",
+}
+
+
 def _refuse(producer, reason):
     producer._refuse(reason)
+
+
+def _survivor_diagnostic(classes):
+    """The survivor_unknown value is used only when the census itself reported the unknown class
+    (or reported survivors it could not classify). With no usable class information the fixed
+    cleanup_unclassified fallback is used instead."""
+    if (type(classes) is tuple and classes
+            and all(type(item) is str and item in SURVIVOR_CLASSES for item in classes)):
+        if len(classes) == 1:
+            return "source_gates_survivor_" + classes[0]
+        return "source_gates_survivor_multiple"
+    return CLEANUP_UNCLASSIFIED_DIAGNOSTIC
+
+
+def _command_cleanup_diagnostic(error):
+    check = getattr(error, "probe_check", None)
+    command_check = getattr(error, "command_check", None)
+    if type(check) is str:
+        if check == "probe_process_timeout":
+            if type(command_check) is str and command_check == "timeout":
+                return "source_gates_timeout"
+            if type(command_check) is str and command_check == "helper_failure":
+                return "source_gates_wait_uncertain"
+            return CLEANUP_UNCLASSIFIED_DIAGNOSTIC
+        if check in COMMAND_CLEANUP_CHECK_DIAGNOSTICS:
+            return COMMAND_CLEANUP_CHECK_DIAGNOSTICS[check]
+        if check == "probe_process_survivor":
+            return _survivor_diagnostic(getattr(error, "survivor_classes", None))
+    if type(command_check) is str and command_check == "timeout":
+        return "source_gates_timeout"
+    return CLEANUP_UNCLASSIFIED_DIAGNOSTIC
+
+
+def _census_diagnostic(error):
+    classes = getattr(error, "survivor_classes", None)
+    if type(classes) is tuple:
+        return _survivor_diagnostic(classes)
+    if type(classes) is str and classes == "unclassified":
+        return SURVIVOR_UNKNOWN_DIAGNOSTIC
+    return "source_gates_census"
+
+
+def _diagnostic_or_fallback(classify, error):
+    try:
+        diagnostic = classify(error)
+    except BaseException:
+        return CLEANUP_UNCLASSIFIED_DIAGNOSTIC
+    if type(diagnostic) is not str:
+        return CLEANUP_UNCLASSIFIED_DIAGNOSTIC
+    return diagnostic
+
+
+def _attach_cleanup_diagnostic(error, record):
+    diagnostic = record.get("diagnostic")
+    if (type(diagnostic) is str and getattr(error, "reason", None) == "cleanup_incomplete"):
+        try:
+            error.cleanup_diagnostic = diagnostic
+        except BaseException:
+            pass
 
 
 def _profile_context(mode, dispatch, producer, source_runtime, validated_tree, accepted_provenance):
@@ -171,6 +244,7 @@ def run_node_profile(mode, *, dispatch, source, worker_storage, worker_uid, envi
                      host_toolchain, capability, rust, deadline, node, npm_cli, contract,
                      producer, source_runtime, tool_cache_root, accepted_provenance=None,
                      validated_tree=None):
+    cleanup_record = {"diagnostic": None}
     try:
         profile, request, identity, policy_epoch_ms = _profile_context(
             mode, dispatch, producer, source_runtime, validated_tree, accepted_provenance,
@@ -242,15 +316,25 @@ def run_node_profile(mode, *, dispatch, source, worker_storage, worker_uid, envi
                 )
             except BaseException as error:
                 worker_error = error
+                if getattr(error, "reason", None) == "cleanup_incomplete":
+                    cleanup_record["diagnostic"] = _diagnostic_or_fallback(
+                        _command_cleanup_diagnostic, error,
+                    )
             finally:
                 try:
                     worker_census(worker_uid, python_executable, "feedback-node")
-                except BaseException:
+                except BaseException as census_error:
                     cleanup_failed = True
+                    if cleanup_record["diagnostic"] in (None, CLEANUP_UNCLASSIFIED_DIAGNOSTIC):
+                        cleanup_record["diagnostic"] = _diagnostic_or_fallback(
+                            _census_diagnostic, census_error,
+                        )
                 try:
                     os.chdir(original_cwd)
                 except BaseException:
                     cleanup_failed = True
+                    if cleanup_record["diagnostic"] in (None, CLEANUP_UNCLASSIFIED_DIAGNOSTIC):
+                        cleanup_record["diagnostic"] = "source_gates_restore"
             if cleanup_failed:
                 _refuse(producer, "cleanup_incomplete")
             if worker_error is not None:
@@ -278,6 +362,7 @@ def run_node_profile(mode, *, dispatch, source, worker_storage, worker_uid, envi
                          policy_epoch_ms, accepted_provenance, producer)
         return result
     except Exception as error:
+        _attach_cleanup_diagnostic(error, cleanup_record)
         node_refusal = getattr(contract, "NodeContractRefusal", None)
         if isinstance(node_refusal, type) and isinstance(error, node_refusal):
             raise

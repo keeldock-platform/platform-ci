@@ -39,6 +39,39 @@ class FeedbackFailureTests(unittest.TestCase):
         raw = _line(_record())
         self.assertEqual(subject.normalize_refusal(raw), raw)
 
+    def test_source_gates_cleanup_diagnostics_are_accepted_and_unlisted_values_are_not(self):
+        for diagnostic in sorted(core_contract.SOURCE_GATES_CLEANUP_DIAGNOSTICS):
+            raw = _line(_record(
+                diagnostic=diagnostic, reason="cleanup_incomplete", stage="cleanup",
+            ))
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(subject.normalize_refusal(raw), raw)
+            for wrong in ({"stage": "worker_setup"}, {"reason": "runner_unavailable"}):
+                bad = _line(_record(
+                    diagnostic=diagnostic, **{"reason": "cleanup_incomplete", "stage": "cleanup", **wrong},
+                ))
+                with self.subTest(diagnostic=diagnostic, wrong=wrong):
+                    self.assertEqual(
+                        subject.normalize_refusal(bad), subject._format_record(subject.UNAVAILABLE_RECORD),
+                    )
+        for diagnostic in sorted(core_contract.PRIVILEGE_PROBE_CHECK_DIAGNOSTICS.values()):
+            accepted = _line(_record(
+                diagnostic=diagnostic, reason="cleanup_incomplete", stage="cleanup",
+            ))
+            rejected = _line(_record(diagnostic=diagnostic))
+            with self.subTest(privilege_probe=diagnostic):
+                self.assertEqual(subject.normalize_refusal(accepted), accepted)
+                self.assertEqual(
+                    subject.normalize_refusal(rejected), subject._format_record(subject.UNAVAILABLE_RECORD),
+                )
+        for unlisted in ("source_gates_survivor_" + CANARY, "source_gates_survivor_"):
+            output = subject.normalize_refusal(_line(_record(
+                diagnostic=unlisted, reason="cleanup_incomplete", stage="cleanup",
+            )))
+            with self.subTest(unlisted=unlisted):
+                self.assertEqual(output, subject._format_record(subject.UNAVAILABLE_RECORD))
+                self.assertNotIn(CANARY.encode("ascii"), output)
+
     def test_known_no_operation_diagnostic_is_accepted_only_at_no_operation_stage(self):
         valid = _line(_record(
             diagnostic="none", reason="invalid_input", stage="arguments",

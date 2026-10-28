@@ -187,11 +187,26 @@ SYNTHETIC_LIB_RS = (
 )
 
 
+PROBE_CLEANUP_CHECKS = frozenset((
+    "probe_process_group_cleanup", "probe_process_capture_cleanup", "probe_process_census",
+    "probe_process_survivor", "probe_process_timeout",
+))
+
+
 class Refusal(Exception):
-    def __init__(self, reason, command_check=None):
+    def __init__(self, reason, command_check=None, probe_check=None, survivor_classes=()):
         self.reason = reason if reason in REASONS else "internal_error"
         self.command_check = (
             command_check if type(command_check) is str and command_check in COMMAND_CHECKS else None
+        )
+        self.probe_check = (
+            probe_check if type(probe_check) is str and probe_check in PROBE_CLEANUP_CHECKS else None
+        )
+        self.survivor_classes = (
+            survivor_classes
+            if type(survivor_classes) is tuple and len(survivor_classes) <= 16
+            and all(type(item) is str and len(item) <= 32 for item in survivor_classes)
+            else ()
         )
         super().__init__(self.reason)
 
@@ -1009,7 +1024,11 @@ def _run_worker_command(
         elif type(command_check) is not str or command_check not in COMMAND_CHECKS:
             command_check = "helper_failure"
         if not error.cleanup_complete:
-            raise Refusal("cleanup_incomplete", command_check=command_check) from None
+            raise Refusal(
+                "cleanup_incomplete", command_check=command_check,
+                probe_check=getattr(error, "check", None),
+                survivor_classes=getattr(error, "survivor_classes", ()),
+            ) from None
         raise Refusal(
             "smoke_failed" if stage == "smoke" else "version_mismatch",
             command_check=command_check,

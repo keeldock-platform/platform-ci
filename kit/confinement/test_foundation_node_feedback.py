@@ -41,6 +41,14 @@ class NodeContractRefusal(Exception):
         super().__init__(reason)
 
 
+class CleanupRefusal(Exception):
+    def __init__(self, **attributes):
+        self.reason = "cleanup_incomplete"
+        for name, value in attributes.items():
+            setattr(self, name, value)
+        super().__init__(self.reason)
+
+
 class FakeProducer:
     def __init__(self):
         self.PROFILE_BY_KIND = {
@@ -216,7 +224,8 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         self.assertIn("--globalconfig=" + global_config, command)
 
     def _run(self, mode, kind, *, validated_tree, accepted_provenance=None, lock_bytes=None,
-             callback_mutation=None, fail_census=False, fail_restore=False):
+             callback_mutation=None, fail_census=False, fail_restore=False,
+             census_error=None, command_error=None):
         producer = FakeProducer()
         profile = producer.PROFILE_BY_KIND[kind]
         dispatch = _dispatch(kind)
@@ -235,13 +244,20 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                                       stdout_truncated=False, stderr_truncated=False)
         def worker_census(*args):
             events.append(("census", args[-1]))
+            if census_error is not None:
+                raise census_error
             if fail_census:
                 raise OSError
 
+        def run_worker_command(argv, uid, env, python, capability, **kwargs):
+            events.append(("worker", tuple(argv), uid, dict(env), kwargs))
+            if command_error is not None:
+                raise command_error
+            return rust_result
+
         reviewed = SimpleNamespace(_worker_census=worker_census)
         rust = SimpleNamespace(
-            _run_worker_command=lambda argv, uid, env, python, capability, **kwargs:
-                events.append(("worker", tuple(argv), uid, dict(env), kwargs)) or rust_result,
+            _run_worker_command=run_worker_command,
             _load_control_sibling=lambda name: reviewed if name == "macos_reviewed_build" else None,
         )
         capability = SimpleNamespace(PROBE_PRIMARY_GID=20)
@@ -275,7 +291,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                         tool_cache_root=root / "node", accepted_provenance=accepted_provenance,
                         validated_tree=validated_tree,
                     )
-            except FeedbackRefusal as error:
+            except Exception as error:
                 error.worker_events = tuple(events)
                 raise
             self.assertEqual(cwd_changes[0], storage_root / "foundation-node-contract/project")
@@ -362,6 +378,135 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                 self.assertEqual(caught.exception.reason, "cleanup_incomplete")
                 self.assertEqual(caught.exception.worker_events[0][0], "worker")
                 self.assertEqual(caught.exception.worker_events[-1][0], "census")
+
+    def _cleanup_diagnostic(self, **options):
+        with self.assertRaises(Exception) as caught:
+            self._run("bootstrap", "lock", validated_tree="core_node_lock_return", **options)
+        self.assertEqual(caught.exception.reason, "cleanup_incomplete")
+        return caught.exception.cleanup_diagnostic
+
+    def test_census_survivor_class_selects_the_matching_fixed_diagnostic(self):
+        for survivor in sorted(subject.SURVIVOR_CLASSES):
+            with self.subTest(survivor=survivor):
+                diagnostic = self._cleanup_diagnostic(
+                    census_error=CleanupRefusal(survivor_classes=(survivor,)),
+                )
+                self.assertEqual(diagnostic, "source_gates_survivor_" + survivor)
+        self.assertEqual(
+            self._cleanup_diagnostic(
+                census_error=CleanupRefusal(survivor_classes=("python", "ps")),
+            ),
+            "source_gates_survivor_multiple",
+        )
+
+    def test_unclassified_survivors_and_missing_class_data_use_distinct_values(self):
+        self.assertEqual(
+            self._cleanup_diagnostic(census_error=CleanupRefusal(survivor_classes="unclassified")),
+            "source_gates_survivor_unknown",
+        )
+        for classes in (("private-process-name",), (), ("python", 7)):
+            with self.subTest(classes=classes):
+                self.assertEqual(
+                    self._cleanup_diagnostic(census_error=CleanupRefusal(survivor_classes=classes)),
+                    "source_gates_cleanup_unclassified",
+                )
+
+    def test_unreadable_census_selects_the_census_diagnostic(self):
+        for census_error in (
+            CleanupRefusal(survivor_classes="unavailable"), OSError(), CleanupRefusal(),
+        ):
+            with self.subTest(census_error=type(census_error).__name__):
+                self.assertEqual(
+                    self._cleanup_diagnostic(census_error=census_error), "source_gates_census",
+                )
+
+    def test_command_timeout_selects_the_timeout_diagnostic(self):
+        for attributes in (
+            {"probe_check": "probe_process_timeout", "command_check": "timeout"},
+            {"command_check": "timeout"},
+        ):
+            with self.subTest(attributes=attributes):
+                self.assertEqual(
+                    self._cleanup_diagnostic(command_error=CleanupRefusal(**attributes)),
+                    "source_gates_timeout",
+                )
+
+    def test_command_cleanup_failure_classifies_survivor_census_and_group_checks(self):
+        cases = (
+            ({"probe_check": "probe_process_survivor", "survivor_classes": ("helper_security",)},
+             "source_gates_survivor_helper_security"),
+            ({"probe_check": "probe_process_survivor", "survivor_classes": ()},
+             "source_gates_cleanup_unclassified"),
+            ({"probe_check": "probe_process_census"}, "source_gates_census"),
+            ({"probe_check": "probe_process_group_cleanup"}, "source_gates_group_cleanup"),
+            ({"probe_check": "probe_process_capture_cleanup"}, "source_gates_capture_cleanup"),
+            ({"probe_check": "untrusted-private-check"}, "source_gates_cleanup_unclassified"),
+            ({}, "source_gates_cleanup_unclassified"),
+            ({"probe_check": "probe_process_timeout", "command_check": "helper_failure"},
+             "source_gates_wait_uncertain"),
+            ({"probe_check": "probe_process_timeout"}, "source_gates_cleanup_unclassified"),
+        )
+        for attributes, expected in cases:
+            with self.subTest(attributes=attributes):
+                self.assertEqual(
+                    self._cleanup_diagnostic(command_error=CleanupRefusal(**attributes)), expected,
+                )
+
+    def test_command_cleanup_failure_keeps_the_first_cause_over_a_later_census_failure(self):
+        diagnostic = self._cleanup_diagnostic(
+            command_error=CleanupRefusal(
+                probe_check="probe_process_timeout", command_check="timeout",
+            ),
+            census_error=CleanupRefusal(survivor_classes=("python",)),
+        )
+        self.assertEqual(diagnostic, "source_gates_timeout")
+
+    def test_census_refines_a_fallback_command_diagnostic_but_not_a_specific_one(self):
+        census_error = CleanupRefusal(survivor_classes=("python",))
+        self.assertEqual(
+            self._cleanup_diagnostic(command_error=CleanupRefusal(), census_error=census_error),
+            "source_gates_survivor_python",
+        )
+        self.assertEqual(
+            self._cleanup_diagnostic(
+                command_error=CleanupRefusal(
+                    probe_check="probe_process_timeout", command_check="helper_failure",
+                ),
+                census_error=census_error,
+            ),
+            "source_gates_wait_uncertain",
+        )
+
+    def test_diagnostic_classifier_failure_keeps_cleanup_control_flow(self):
+        with patch.object(subject, "_census_diagnostic", side_effect=RuntimeError):
+            self.assertEqual(
+                self._cleanup_diagnostic(census_error=CleanupRefusal(survivor_classes=("ps",))),
+                "source_gates_cleanup_unclassified",
+            )
+        with patch.object(subject, "_command_cleanup_diagnostic", side_effect=RuntimeError):
+            self.assertEqual(
+                self._cleanup_diagnostic(command_error=CleanupRefusal(probe_check="probe_process_census")),
+                "source_gates_cleanup_unclassified",
+            )
+
+    def test_survivor_class_list_matches_the_census_class_order(self):
+        path = Path(__file__).resolve().parent / "macos_capability.py"
+        spec = importlib.util.spec_from_file_location("macos_capability_drift_check", path)
+        capability = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(capability)
+        self.assertEqual(subject.SURVIVOR_CLASSES, frozenset(capability.SURVIVOR_CLASS_ORDER))
+
+    def test_cwd_restore_failure_selects_the_restore_diagnostic(self):
+        self.assertEqual(self._cleanup_diagnostic(fail_restore=True), "source_gates_restore")
+
+    def test_non_cleanup_command_failure_carries_no_cleanup_diagnostic(self):
+        with self.assertRaises(Exception) as caught:
+            self._run(
+                "bootstrap", "lock", validated_tree="core_node_lock_return",
+                command_error=FeedbackRefusal("command_failed"),
+            )
+        self.assertEqual(caught.exception.reason, "command_failed")
+        self.assertFalse(hasattr(caught.exception, "cleanup_diagnostic"))
 
     def test_rust_failure_selects_thirteen_stages_without_running_node(self):
         failed = "parser_clippy"
