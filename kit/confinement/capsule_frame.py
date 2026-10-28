@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import os
 import struct
 import threading
 import unicodedata
@@ -112,6 +113,7 @@ REASON_CODES = (
 PROVISIONAL_CHOICES = (
     "Windows destination aliases use NFC and casefold; the exact Windows equivalence algorithm is unspecified.",
 )
+INDEPENDENT_PROTOCOL_VECTORS_REQUIRED = True
 
 _P256_FIELD = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
 _P256_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
@@ -1046,7 +1048,9 @@ def derive_capsule_aes_key(shared_x, header_bytes):
 
 
 class AEADProvider(Protocol):
-    def seal(self, key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> Tuple[bytes, bytes]:
+    """Seal must consume the mutable key synchronously without retaining it."""
+
+    def seal(self, key: bytearray, nonce: bytes, plaintext: bytes, aad: bytes) -> Tuple[bytes, bytes]:
         ...
 
     def open(self, key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aad: bytes) -> bytes:
@@ -1058,7 +1062,26 @@ class ECDHProvider(Protocol):
         ...
 
 
+class EphemeralSenderECDHProvider(Protocol):
+    """One fresh in-process sender private key per attempt.
+
+    The provider must not restore or share private state. Destroy must
+    irreversibly invalidate that state, including when derivation fails.
+    """
+
+    def sender_public_point(self) -> bytes:
+        ...
+
+    def derive_shared_x(self, peer_public_point: bytes) -> bytes:
+        ...
+
+    def destroy(self) -> None:
+        ...
+
+
 class PersistentKeyUseLedger(Protocol):
+    """Optional defence when the sender also has durable shared state."""
+
     def claim(self, key_sha256: bytes) -> bool:
         """Atomically and durably insert the 32-byte SHA-256 of the AES key.
 
@@ -1081,37 +1104,162 @@ def derive_shared_x(provider, peer_public_point):
     return shared_x
 
 
-class EncryptionSession:
-    """One single-use attempt for one derived AES key.
+_EPHEMERAL_KEY_TOKEN = object()
 
-    A trusted persistent ledger must claim SHA-256(key) before the first seal.
-    The claim is permanent, including after an error or interruption. The
-    caller must supply the same durable ledger after process and host restart;
-    fresh attempts require a fresh receiver key, sender key, salt, nonce
-    prefix, and transfer ID as specified by the capsule design.
+
+class EphemeralCapsuleKey:
+    """Process-bound AES key derived from a live ephemeral sender ECDH key.
+
+    Only derive_ephemeral_capsule_key constructs this object. The ECDH provider
+    must keep its sender private key in this job only and must not restore it
+    from serialized state. The mutable key buffer is erased after the attempt.
     """
 
-    def __init__(self, provider, key, header, use_ledger):
-        _check_bytes(key, 32)
-        _validate_header(header)
-        if not callable(getattr(provider, "seal", None)):
+    __slots__ = ("_material", "_header_sha256", "_pid", "_used", "_destroyed", "_lock")
+
+    def __init__(self, material, header_sha256, token):
+        if token is not _EPHEMERAL_KEY_TOKEN:
             _refuse(REASON_CRYPTO)
-        if not callable(getattr(use_ledger, "claim", None)):
-            _refuse(REASON_CRYPTO)
-        header_sha256 = header_digest(encode_capsule_header(header))
-        fingerprint = hashlib.sha256(key).digest()
-        with _ENCRYPTION_KEYS_LOCK:
-            if fingerprint in _ENCRYPTION_KEYS_USED or len(_ENCRYPTION_KEYS_USED) >= MAX_ENCRYPTION_SESSIONS:
-                _refuse(REASON_CRYPTO)
-            _ENCRYPTION_KEYS_USED.add(fingerprint)
+        _check_bytes(material, 32, REASON_CRYPTO)
+        _check_bytes(header_sha256, 32, REASON_CRYPTO)
+        self._material = bytearray(material)
+        self._header_sha256 = header_sha256
+        self._pid = os.getpid()
+        self._used = False
+        self._destroyed = False
+        self._lock = threading.Lock()
+
+    def _wipe(self):
+        for offset in range(len(self._material)):
+            self._material[offset] = 0
+        self._destroyed = True
+
+    def __del__(self):
         try:
-            claimed = use_ledger.claim(fingerprint)
+            self._wipe()
+        except Exception:
+            pass
+
+    def destroy(self):
+        if os.getpid() != self._pid:
+            self._wipe()
+            _refuse(REASON_CRYPTO)
+        with self._lock:
+            self._wipe()
+
+    def _discard_if_unconsumed(self):
+        if os.getpid() != self._pid:
+            self._wipe()
+            _refuse(REASON_CRYPTO)
+        with self._lock:
+            if not self._used:
+                self._wipe()
+
+    def _consume(self, header_sha256):
+        if os.getpid() != self._pid:
+            self._wipe()
+            _refuse(REASON_CRYPTO)
+        with self._lock:
+            if self._used or self._destroyed:
+                _refuse(REASON_CRYPTO)
+            self._used = True
+            if self._header_sha256 != header_sha256:
+                self._wipe()
+                _refuse(REASON_CRYPTO)
+
+    def __bytes__(self):
+        _refuse(REASON_CRYPTO)
+
+    def __copy__(self):
+        _refuse(REASON_CRYPTO)
+
+    def __deepcopy__(self, unused_memo):
+        _refuse(REASON_CRYPTO)
+
+    def __getstate__(self):
+        _refuse(REASON_CRYPTO)
+
+    def __reduce__(self):
+        _refuse(REASON_CRYPTO)
+
+    def __reduce_ex__(self, unused_protocol):
+        _refuse(REASON_CRYPTO)
+
+
+def derive_ephemeral_capsule_key(ecdh_provider, receiver_public_point, header_bytes):
+    if not callable(getattr(ecdh_provider, "destroy", None)):
+        _refuse(REASON_CRYPTO)
+    try:
+        header = decode_capsule_header(header_bytes)
+        validate_public_point(receiver_public_point)
+        try:
+            sender_point = ecdh_provider.sender_public_point()
         except Exception:
             _refuse(REASON_CRYPTO)
-        if claimed is not True:
+        validate_public_point(sender_point)
+        if sender_point != header.sender_public_point:
             _refuse(REASON_CRYPTO)
+        shared_x = derive_shared_x(ecdh_provider, receiver_public_point)
+    finally:
+        try:
+            ecdh_provider.destroy()
+        except Exception:
+            _refuse(REASON_CRYPTO)
+    digest = header_digest(header_bytes)
+    material = derive_aes_key(shared_x, header.hkdf_salt, digest)
+    return EphemeralCapsuleKey(material, digest, _EPHEMERAL_KEY_TOKEN)
+
+
+class EncryptionSession:
+    """Single-use attempt owning a process-bound ephemeral AES key.
+
+    Persist no session, key, sender private key, or shared secret. After a
+    crash, discard partial capsule output. A new job must issue a new receiver
+    key record and use a new sender key, salt, nonce prefix, and transfer ID.
+    No key-use state needs persistence for this ephemeral path. A persistent
+    ledger is optional extra defence, never a way to resume an attempt.
+    """
+
+    __slots__ = (
+        "_provider", "_key", "_fingerprint", "_pid", "_header_sha256",
+        "_nonce_prefix", "_next_index", "_failed", "_lock",
+        "_manifest_hasher", "_manifest_sha256",
+    )
+
+    def __init__(self, provider, key, header, use_ledger=None):
+        if type(key) is not EphemeralCapsuleKey:
+            _refuse(REASON_CRYPTO)
+        try:
+            _validate_header(header)
+            header_sha256 = header_digest(encode_capsule_header(header))
+        except BaseException:
+            key._discard_if_unconsumed()
+            raise
+        key._consume(header_sha256)
+        try:
+            if not callable(getattr(provider, "seal", None)):
+                _refuse(REASON_CRYPTO)
+            fingerprint = hashlib.sha256(key._material).digest()
+            with _ENCRYPTION_KEYS_LOCK:
+                if fingerprint in _ENCRYPTION_KEYS_USED or len(_ENCRYPTION_KEYS_USED) >= MAX_ENCRYPTION_SESSIONS:
+                    _refuse(REASON_CRYPTO)
+                _ENCRYPTION_KEYS_USED.add(fingerprint)
+            if use_ledger is not None:
+                if not callable(getattr(use_ledger, "claim", None)):
+                    _refuse(REASON_CRYPTO)
+                try:
+                    claimed = use_ledger.claim(fingerprint)
+                except Exception:
+                    _refuse(REASON_CRYPTO)
+                if claimed is not True:
+                    _refuse(REASON_CRYPTO)
+        except BaseException:
+            key.destroy()
+            raise
         self._provider = provider
         self._key = key
+        self._fingerprint = fingerprint
+        self._pid = os.getpid()
         self._header_sha256 = header_sha256
         self._nonce_prefix = header.nonce_prefix
         self._next_index = 0
@@ -1126,35 +1274,68 @@ class EncryptionSession:
     def __exit__(self, unused_type, unused_value, unused_traceback):
         self.abort()
 
+    def _require_origin_process(self):
+        if os.getpid() != self._pid:
+            self._failed = True
+            self._key._wipe()
+            _refuse(REASON_CRYPTO)
+
     def abort(self):
+        self._require_origin_process()
         with self._lock:
             self._failed = True
+            self._key.destroy()
 
     def seal_chunk(self, index, plaintext):
+        self._require_origin_process()
         with self._lock:
             if self._failed or self._next_index == CHUNK_COUNT:
                 _refuse(REASON_CRYPTO)
             self._failed = True
-            if type(index) is not int or index != self._next_index:
-                _refuse(REASON_CHUNK_INDEX)
-            _check_bytes(plaintext, CHUNK_PLAINTEXT_BYTES, REASON_LENGTH)
-            kind = chunk_kind_for_index(index)
-            aad = _aad_with_digest(self._header_sha256, index, kind, self._manifest_sha256)
-            nonce = make_nonce(self._nonce_prefix, index)
             try:
-                ciphertext, tag = self._provider.seal(self._key, nonce, plaintext, aad)
-            except Exception:
-                _refuse(REASON_CRYPTO)
-            _check_bytes(ciphertext, CHUNK_PLAINTEXT_BYTES, REASON_CRYPTO)
-            _check_bytes(tag, CHUNK_TAG_BYTES, REASON_CRYPTO)
-            if kind == 0:
-                self._manifest_hasher.update(ciphertext)
-                self._manifest_hasher.update(tag)
-                if index == LAST_MANIFEST_INDEX:
-                    self._manifest_sha256 = self._manifest_hasher.digest()
-            self._next_index += 1
-            self._failed = False
-            return ChunkRecord(index, kind, ciphertext, tag)
+                if self._key._destroyed:
+                    _refuse(REASON_CRYPTO)
+                if type(index) is not int or index != self._next_index:
+                    _refuse(REASON_CHUNK_INDEX)
+                _check_bytes(plaintext, CHUNK_PLAINTEXT_BYTES, REASON_LENGTH)
+                kind = chunk_kind_for_index(index)
+                aad = _aad_with_digest(self._header_sha256, index, kind, self._manifest_sha256)
+                nonce = make_nonce(self._nonce_prefix, index)
+                try:
+                    ciphertext, tag = self._provider.seal(self._key._material, nonce, plaintext, aad)
+                except Exception:
+                    _refuse(REASON_CRYPTO)
+                self._require_origin_process()
+                if hashlib.sha256(self._key._material).digest() != self._fingerprint:
+                    _refuse(REASON_CRYPTO)
+                _check_bytes(ciphertext, CHUNK_PLAINTEXT_BYTES, REASON_CRYPTO)
+                _check_bytes(tag, CHUNK_TAG_BYTES, REASON_CRYPTO)
+                if kind == 0:
+                    self._manifest_hasher.update(ciphertext)
+                    self._manifest_hasher.update(tag)
+                    if index == LAST_MANIFEST_INDEX:
+                        self._manifest_sha256 = self._manifest_hasher.digest()
+                self._next_index += 1
+                self._failed = self._next_index == CHUNK_COUNT
+                return ChunkRecord(index, kind, ciphertext, tag)
+            finally:
+                if self._failed:
+                    self._key.destroy()
+
+    def __copy__(self):
+        _refuse(REASON_CRYPTO)
+
+    def __deepcopy__(self, unused_memo):
+        _refuse(REASON_CRYPTO)
+
+    def __getstate__(self):
+        _refuse(REASON_CRYPTO)
+
+    def __reduce__(self):
+        _refuse(REASON_CRYPTO)
+
+    def __reduce_ex__(self, unused_protocol):
+        _refuse(REASON_CRYPTO)
 
 
 def open_chunk(provider, key, header, chunk, manifest_ciphertext_region=None):

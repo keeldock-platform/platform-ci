@@ -1,6 +1,9 @@
+import copy
 import hashlib
 import hmac
 import inspect
+import os
+import pickle
 import random
 import struct
 import threading
@@ -18,10 +21,16 @@ P256_BASE_POINT = bytes.fromhex(
 )
 _TEST_CONTEXT_ACTIVE = False
 INDEPENDENT_PRIMITIVE_KAT_SOURCES = {
-    "hkdf_prk_okm": "RFC 5869, Appendix A.1, SHA-256 test case",
-    "sha256_abc": "NIST FIPS 180-4, SHA-256 example for message abc",
+    "hkdf_prk_okm": "RFC 5869 Appendix A.1, https://www.rfc-editor.org/rfc/rfc5869.txt",
+    "sha256_abc": (
+        "NIST SHA-256 worked example, message abc, "
+        "https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/"
+        "documents/examples/SHA256.pdf"
+    ),
 }
-PUBLISHED_POINT_FIXTURE_SOURCE = "SEC 2, P-256 base point coordinates"
+PUBLISHED_POINT_FIXTURE_SOURCE = (
+    "SEC 2 version 2.0 section 2.4.2, https://www.secg.org/sec2-v2.pdf"
+)
 DESIGN_REGRESSION_VECTOR_SOURCES = {
     "layout": "Approved capsule design, format tables at lines 61 through 95",
     "nonce_aad_key": "Approved capsule design, formulas at lines 84 through 86",
@@ -68,6 +77,14 @@ class TestOnlyDeterministicFake:
         _require_unittest_context()
         frame.validate_public_point(peer_public_point)
         return bytes.fromhex("0123456789abcdef" * 4)
+
+    def sender_public_point(self):
+        _require_unittest_context()
+        return P256_BASE_POINT
+
+    def destroy(self):
+        _require_unittest_context()
+        self.sender_key_destroyed = True
 
 
 class RefusingFake:
@@ -134,6 +151,20 @@ def make_header():
         bytes.fromhex("66" * 32),
         hashlib.sha256(b"windows-receiver").digest(),
     )
+
+
+def make_ephemeral_key(header):
+    provider = TestOnlyDeterministicFake()
+    return frame.derive_ephemeral_capsule_key(
+        provider, P256_BASE_POINT, frame.encode_capsule_header(header)
+    )
+
+
+def make_encryption_session(provider, salt_byte, use_ledger=None):
+    header = replace(make_header(), hkdf_salt=bytes((salt_byte,)) * 32)
+    key = make_ephemeral_key(header)
+    session = frame.EncryptionSession(provider, key, header, use_ledger)
+    return session, key, header
 
 
 def make_manifest(entries=()):
@@ -337,6 +368,13 @@ class CapsuleFrameTests(unittest.TestCase):
         info = b"KDWH-v1/HKDF-AES256GCM\x00" + header_sha256
         expected = hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
         self.assertEqual(frame.derive_capsule_aes_key(shared_x, header_bytes), expected)
+
+    @unittest.skipIf(
+        frame.INDEPENDENT_PROTOCOL_VECTORS_REQUIRED,
+        "Future cross-language interop lane owns independently reviewed capsule H, shared X, PRK, AES key, GCM pairs, and whole-capsule digest",
+    )
+    def test_independent_protocol_vectors_from_interop_lane(self):
+        self.fail("Interop lane must supply fixed independent protocol vectors before closing this gate")
 
     def test_downgrade_refusal_code(self):
         encoded = bytearray(frame.encode_key_record(make_key_record()))
@@ -597,22 +635,19 @@ class CapsuleFrameTests(unittest.TestCase):
 
     def test_fake_chunk_seal_open_round_trip(self):
         provider = TestOnlyDeterministicFake()
-        use_ledger = TestOnlyUseLedger()
-        key = bytes.fromhex("33" * 32)
-        header = make_header()
         plaintext = bytes.fromhex("7c") * frame.CHUNK_PLAINTEXT_BYTES
-        session = frame.EncryptionSession(provider, key, header, use_ledger)
+        session, unused_key, header = make_encryption_session(provider, 0x33)
         chunk = session.seal_chunk(0, plaintext)
         self.assertEqual(chunk.kind, 0)
-        self.assertEqual(frame.open_chunk(provider, key, header, chunk), plaintext)
+        shared_x = bytes.fromhex("0123456789abcdef" * 4)
+        open_key = frame.derive_capsule_aes_key(shared_x, frame.encode_capsule_header(header))
+        self.assertEqual(frame.open_chunk(provider, open_key, header, chunk), plaintext)
 
     def test_encryption_session_single_use_and_order(self):
         self.assertFalse(hasattr(frame, "seal_chunk"))
         provider = TestOnlyDeterministicFake()
-        use_ledger = TestOnlyUseLedger()
-        key = bytes.fromhex("34" * 32)
         plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
-        session = frame.EncryptionSession(provider, key, make_header(), use_ledger)
+        session, key, header = make_encryption_session(provider, 0x34)
         session.seal_chunk(0, plaintext)
         self.assert_refusal(frame.REASON_CHUNK_INDEX, session.seal_chunk, 0, plaintext)
         self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 1, plaintext)
@@ -622,103 +657,237 @@ class CapsuleFrameTests(unittest.TestCase):
             frame.EncryptionSession,
             provider,
             key,
-            make_header(),
-            use_ledger,
+            header,
         )
 
     def test_encryption_session_failure_consumes_key(self):
         provider = mock.Mock()
         provider.seal.side_effect = ValueError("provider failure")
-        use_ledger = TestOnlyUseLedger()
-        key = bytes.fromhex("35" * 32)
         plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
-        session = frame.EncryptionSession(provider, key, make_header(), use_ledger)
+        session, key, header = make_encryption_session(provider, 0x35)
         self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 0, plaintext)
         self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 0, plaintext)
+        self.assertTrue(key._destroyed)
+        self.assertTrue(all(value == 0 for value in key._material))
         self.assertEqual(provider.seal.call_count, 1)
         self.assert_refusal(
             frame.REASON_CRYPTO,
             frame.EncryptionSession,
             provider,
             key,
-            make_header(),
-            use_ledger,
+            header,
         )
 
-    def test_persistent_claim_rejects_reuse_after_process_state_reset(self):
+    def test_duplicate_constructor_does_not_erase_active_session(self):
+        provider = TestOnlyDeterministicFake()
+        session, key, header = make_encryption_session(provider, 0x44)
+        self.assert_refusal(
+            frame.REASON_CRYPTO, frame.EncryptionSession, provider, key, header
+        )
+        invalid_header = replace(header, intended_job_sha256=bytes(32))
+        self.assert_refusal(
+            frame.REASON_STRUCTURE,
+            frame.EncryptionSession,
+            provider,
+            key,
+            invalid_header,
+        )
+        self.assertFalse(key._destroyed)
+        session.seal_chunk(0, bytes(frame.CHUNK_PLAINTEXT_BYTES))
+        self.assertEqual(len(provider.calls), 1)
+        session.abort()
+
+    def test_ephemeral_key_and_session_refuse_copy_and_pickle(self):
+        provider = mock.Mock()
+        header = replace(make_header(), hkdf_salt=bytes.fromhex("3c" * 32))
+        key = make_ephemeral_key(header)
+        self.assert_refusal(frame.REASON_CRYPTO, frame.EncryptionSession, provider, bytes(32), header)
+        self.assert_refusal(
+            frame.REASON_CRYPTO,
+            frame.EphemeralCapsuleKey,
+            bytes(32),
+            bytes(32),
+            None,
+        )
+        for operation in (bytes, copy.copy, copy.deepcopy, pickle.dumps):
+            self.assert_refusal(frame.REASON_CRYPTO, operation, key)
+        session = frame.EncryptionSession(provider, key, header)
+        for operation in (copy.copy, copy.deepcopy, pickle.dumps):
+            self.assert_refusal(frame.REASON_CRYPTO, operation, session)
+        with self.assertRaises(TypeError):
+            vars(session)
+        session.abort()
+        self.assertTrue(key._destroyed)
+        self.assertTrue(all(value == 0 for value in key._material))
+
+    def test_ephemeral_factory_destroys_sender_provider(self):
+        sender = TestOnlyDeterministicFake()
+        header = replace(make_header(), hkdf_salt=bytes.fromhex("42" * 32))
+        key = frame.derive_ephemeral_capsule_key(
+            sender, P256_BASE_POINT, frame.encode_capsule_header(header)
+        )
+        self.assertTrue(sender.sender_key_destroyed)
+        key.destroy()
+        failed_sender = mock.Mock()
+        failed_sender.sender_public_point.return_value = P256_BASE_POINT
+        failed_sender.derive_shared_x.return_value = bytes.fromhex("01" * 32)
+        failed_sender.destroy.side_effect = OSError("destroy failed")
+        self.assert_refusal(
+            frame.REASON_CRYPTO,
+            frame.derive_ephemeral_capsule_key,
+            failed_sender,
+            P256_BASE_POINT,
+            frame.encode_capsule_header(header),
+        )
+        invalid_sender = mock.Mock()
+        self.assert_refusal(
+            frame.REASON_DOWNGRADE,
+            frame.derive_ephemeral_capsule_key,
+            invalid_sender,
+            P256_BASE_POINT,
+            bytes(frame.CAPSULE_HEADER_LENGTH),
+        )
+        invalid_sender.destroy.assert_called_once_with()
+
+    def test_session_refuses_a_different_process_before_provider_use(self):
+        provider = mock.Mock()
+        session, key, unused_header = make_encryption_session(provider, 0x3d)
+        with mock.patch.object(frame.os, "getpid", return_value=os.getpid() + 1):
+            self.assert_refusal(
+                frame.REASON_CRYPTO,
+                session.seal_chunk,
+                0,
+                bytes(frame.CHUNK_PLAINTEXT_BYTES),
+            )
+        self.assertTrue(key._destroyed)
+        self.assertTrue(all(value == 0 for value in key._material))
+        provider.seal.assert_not_called()
+
+    @unittest.skipUnless(hasattr(os, "fork"), "fork unavailable on this platform")
+    def test_inherited_session_refuses_after_fork(self):
+        provider = mock.Mock()
+        session, key, unused_header = make_encryption_session(provider, 0x40)
+        reader, writer = os.pipe()
+        child = os.fork()
+        if child == 0:
+            os.close(reader)
+            try:
+                session.seal_chunk(0, bytes(frame.CHUNK_PLAINTEXT_BYTES))
+            except frame.CapsuleRefusal as error:
+                result = error.reason.encode("ascii")
+            except BaseException:
+                result = b"unexpected_exception"
+            else:
+                result = b"accepted"
+            os.write(writer, result)
+            os.close(writer)
+            os._exit(0)
+        os.close(writer)
+        result = os.read(reader, 64)
+        os.close(reader)
+        os.waitpid(child, 0)
+        self.assertEqual(result, frame.REASON_CRYPTO.encode("ascii"))
+        self.assertFalse(key._destroyed)
+        session.abort()
+
+    def test_ephemeral_key_is_bound_to_its_header(self):
+        provider = mock.Mock()
+        header = replace(make_header(), hkdf_salt=bytes.fromhex("3e" * 32))
+        key = make_ephemeral_key(header)
+        changed_header = replace(header, hkdf_salt=bytes.fromhex("3f" * 32))
+        self.assert_refusal(
+            frame.REASON_CRYPTO, frame.EncryptionSession, provider, key, changed_header
+        )
+        self.assertTrue(key._destroyed)
+        provider.seal.assert_not_called()
+        valid_header = replace(make_header(), hkdf_salt=bytes.fromhex("43" * 32))
+        second_key = make_ephemeral_key(valid_header)
+        invalid_header = replace(valid_header, intended_job_sha256=bytes(32))
+        self.assert_refusal(
+            frame.REASON_STRUCTURE,
+            frame.EncryptionSession,
+            provider,
+            second_key,
+            invalid_header,
+        )
+        self.assertTrue(second_key._destroyed)
+
+    def test_optional_persistent_claim_precedes_provider_use(self):
         provider = mock.Mock()
         use_ledger = TestOnlyUseLedger()
-        key = bytes.fromhex("38" * 32)
-        header = make_header()
-        frame.EncryptionSession(provider, key, header, use_ledger)
-        self.assertEqual(use_ledger.calls, [hashlib.sha256(key).digest()])
+        session, key, header = make_encryption_session(provider, 0x38, use_ledger)
+        self.assertEqual(len(use_ledger.calls), 1)
+        self.assertEqual(len(use_ledger.calls[0]), 32)
         provider.seal.assert_not_called()
         with mock.patch.object(frame, "_ENCRYPTION_KEYS_USED", set()):
+            repeated_key = make_ephemeral_key(header)
             self.assert_refusal(
                 frame.REASON_CRYPTO,
                 frame.EncryptionSession,
                 provider,
-                key,
+                repeated_key,
                 header,
                 use_ledger,
             )
+        self.assertTrue(repeated_key._destroyed)
         self.assertEqual(len(use_ledger.calls), 2)
+        self.assertEqual(use_ledger.calls[0], use_ledger.calls[1])
         provider.seal.assert_not_called()
+        session.abort()
 
-    def test_persistent_claim_is_required_and_fails_closed(self):
+    def test_optional_persistent_claim_fails_closed(self):
         provider = mock.Mock()
-        self.assert_refusal(
-            frame.REASON_CRYPTO,
-            frame.EncryptionSession,
-            provider,
-            bytes.fromhex("39" * 32),
-            make_header(),
-            None,
-        )
+        session, key, unused_header = make_encryption_session(provider, 0x39)
+        self.assertFalse(key._destroyed)
+        session.abort()
+        self.assertTrue(key._destroyed)
         refused_ledger = mock.Mock()
         refused_ledger.claim.return_value = False
+        refused_header = replace(make_header(), hkdf_salt=bytes.fromhex("3a" * 32))
+        refused_key = make_ephemeral_key(refused_header)
         self.assert_refusal(
             frame.REASON_CRYPTO,
             frame.EncryptionSession,
             provider,
-            bytes.fromhex("3a" * 32),
-            make_header(),
+            refused_key,
+            refused_header,
             refused_ledger,
         )
+        self.assertTrue(refused_key._destroyed)
         uncertain_ledger = mock.Mock()
         uncertain_ledger.claim.side_effect = OSError("storage uncertain")
+        uncertain_header = replace(make_header(), hkdf_salt=bytes.fromhex("3b" * 32))
+        uncertain_key = make_ephemeral_key(uncertain_header)
         self.assert_refusal(
             frame.REASON_CRYPTO,
             frame.EncryptionSession,
             provider,
-            bytes.fromhex("3b" * 32),
-            make_header(),
+            uncertain_key,
+            uncertain_header,
             uncertain_ledger,
         )
+        self.assertTrue(uncertain_key._destroyed)
         provider.seal.assert_not_called()
 
     def test_encryption_session_context_exit_aborts_partial_attempt(self):
         provider = TestOnlyDeterministicFake()
-        use_ledger = TestOnlyUseLedger()
-        key = bytes.fromhex("37" * 32)
         plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
-        with frame.EncryptionSession(provider, key, make_header(), use_ledger) as session:
+        session, key, header = make_encryption_session(provider, 0x37)
+        with session:
             session.seal_chunk(0, plaintext)
+        self.assertTrue(key._destroyed)
         self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 1, plaintext)
         self.assert_refusal(
             frame.REASON_CRYPTO,
             frame.EncryptionSession,
             provider,
             key,
-            make_header(),
-            use_ledger,
+            header,
         )
 
     def test_encryption_session_bundle_aad_uses_all_manifest_records(self):
         provider = TestOnlyDeterministicFake()
-        session = frame.EncryptionSession(
-            provider, bytes.fromhex("36" * 32), make_header(), TestOnlyUseLedger()
-        )
+        session, unused_key, unused_header = make_encryption_session(provider, 0x36)
         plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
         manifest_hasher = hashlib.sha256()
         for index in range(frame.MANIFEST_CHUNK_COUNT):
@@ -727,6 +896,17 @@ class CapsuleFrameTests(unittest.TestCase):
             manifest_hasher.update(chunk.tag)
         session.seal_chunk(frame.FIRST_BUNDLE_INDEX, plaintext)
         self.assertTrue(provider.calls[-1][1].endswith(manifest_hasher.digest()))
+
+    def test_completed_session_erases_key_material(self):
+        provider = TestOnlyDeterministicFake()
+        session, key, unused_header = make_encryption_session(provider, 0x41)
+        plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
+        for index in range(frame.CHUNK_COUNT):
+            session.seal_chunk(index, plaintext)
+        self.assertEqual(len(provider.calls), frame.CHUNK_COUNT)
+        self.assertTrue(key._destroyed)
+        self.assertTrue(all(value == 0 for value in key._material))
+        self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 0, plaintext)
 
     def test_seeded_round_trip_loops(self):
         generator = random.Random(731941)
