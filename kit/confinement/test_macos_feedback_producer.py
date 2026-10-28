@@ -238,6 +238,22 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             with self.subTest(outcome=outcome), self.assertRaises(producer.FeedbackRefusal):
                 producer.build_diagnostic_payload(outcome)
 
+    def test_build_diagnostic_payload_records_reviewed_typescript_paths_digest(self):
+        selected = producer.DIAGNOSTIC_GATE_SELECTIONS[-1]
+        outcome = {
+            "failed_stage": None, "selected_gates": selected, "completed": selected,
+            "returncode": 0, "stdout": b"", "stderr": b"",
+            "stdout_truncated": False, "stderr_truncated": False,
+            "node_reviewed_file_count": 24, "node_reviewed_paths_sha256": "a" * 64,
+        }
+        payload = producer.build_diagnostic_payload(outcome)
+        self.assertIn(b"node_reviewed_file_count=24 node_reviewed_paths_sha256=" + b"a" * 64, payload)
+        with self.assertRaises(producer.FeedbackRefusal):
+            producer.build_diagnostic_payload({
+                key: value for key, value in outcome.items()
+                if key not in ("node_reviewed_file_count", "node_reviewed_paths_sha256")
+            })
+
     def test_worker_refuses_invalid_capture_framing_without_publishing_output(self):
         error = RuntimeError("synthetic malformed frame")
         error.reason = "capture_invalid"
@@ -263,7 +279,10 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             "stdout_truncated": False, "stderr_truncated": False,
         }
         outcome = adapter.extend_diagnostic_outcome(
-            rust_result, lambda: {"mode": "verify", "status": "passed", "stages": adapter.NODE_GATE_NAMES},
+            rust_result, lambda: {
+                "mode": "verify", "status": "passed", "stages": adapter.NODE_GATE_NAMES,
+                "node_reviewed_file_count": 24, "node_reviewed_paths_sha256": "a" * 64,
+            },
             contract,
         )
         payload = producer.build_diagnostic_payload(outcome)
@@ -293,6 +312,18 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         copy_files.assert_not_called()
         run_worker.assert_not_called()
 
+    def test_reviewed_typescript_copy_uses_validator_file_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(producer, "_make_worker_directory"), \
+                    patch.object(producer, "_read_file", return_value=b"source") as read_file, \
+                    patch.object(producer, "_write_worker_file"):
+                producer._copy_reviewed_files(
+                    root / "source", root / "worker",
+                    ("packages/host-api/tests/new-test.test.ts",), 501, 20,
+                )
+        self.assertEqual(read_file.call_args.kwargs["maximum"], producer.MAX_RUST_FILE_BYTES)
+
     def test_source_profile_failure_restores_source_cwd_and_never_returns_payload(self):
         dispatch = _validated_dispatch("rust_patch")
         calls = []
@@ -319,7 +350,9 @@ class MacosFeedbackProducerTests(unittest.TestCase):
 
     def test_full_foundation_rust_formatter_copies_fuzz_workspace_and_returns_only_rust_paths(self):
         dispatch = _validated_dispatch("rust_patch")
-        fuzz_paths = producer.FOUNDATION_FUZZ_RUST_PATHS
+        fuzz_paths = ("fuzz/src/main.rs",) + tuple(
+            "fuzz/fuzz_targets/" + name + ".rs" for name in sorted(producer.FOUNDATION_FUZZ_TARGETS)
+        ) + ("fuzz/fuzz_targets/new_target.rs",)
         reviewed_paths = tuple(sorted(("crates/host/api/src/lib.rs",) + fuzz_paths))
         calls = []
         command_result = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
@@ -377,7 +410,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertNotIn("fuzz/Cargo.toml", result["reviewed_rust_paths"])
         self.assertNotIn("fuzz/Cargo.lock", result["reviewed_rust_paths"])
 
-    def test_reviewed_fuzz_rust_paths_are_fixed_and_reject_unsafe_entries(self):
+    def test_reviewed_fuzz_rust_paths_include_new_targets_and_reject_unsafe_entries(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary)
             crate_source = source / "crates/host/api/src"
@@ -386,7 +419,15 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             for package_root in producer.PACKAGE_ROOTS[1:]:
                 (source / package_root / "src").mkdir(parents=True)
 
-            expected_files = {source / path for path in producer.FOUNDATION_FUZZ_RUST_PATHS}
+            fuzz_directory = source / "fuzz/fuzz_targets"
+            fuzz_directory.mkdir(parents=True)
+            names = set(producer.FOUNDATION_FUZZ_TARGETS) | {"new_target"}
+            for name in names:
+                (fuzz_directory / (name + ".rs")).touch()
+            fuzz_paths = ("fuzz/src/main.rs",) + tuple(
+                "fuzz/fuzz_targets/" + name + ".rs" for name in sorted(names)
+            )
+            expected_files = {source / path for path in fuzz_paths}
             crate_file = crate_source / "lib.rs"
             source_directories = {
                 source / package_root / "src" for package_root in producer.PACKAGE_ROOTS
@@ -398,7 +439,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             def fixture_lstat(path, *args, **kwargs):
                 if path in expected_files or path == crate_file:
                     return file_info
-                if path in source_directories:
+                if path in source_directories or path == fuzz_directory:
                     return directory_info
                 return original_lstat(path, *args, **kwargs)
 
@@ -409,11 +450,11 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             self.assertEqual(legacy, ("crates/host/api/src/lib.rs",))
             self.assertEqual(
                 complete,
-                tuple(sorted(("crates/host/api/src/lib.rs",) + producer.FOUNDATION_FUZZ_RUST_PATHS)),
+                tuple(sorted(("crates/host/api/src/lib.rs",) + fuzz_paths)),
             )
 
             unsafe_info = SimpleNamespace(st_mode=stat.S_IFREG | 0o400, st_uid=0, st_nlink=2)
-            unsafe_path = source / producer.FOUNDATION_FUZZ_RUST_PATHS[0]
+            unsafe_path = source / "fuzz/fuzz_targets/new_target.rs"
 
             def unsafe_lstat(path, *args, **kwargs):
                 if path == unsafe_path:

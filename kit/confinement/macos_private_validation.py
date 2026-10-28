@@ -1553,18 +1553,9 @@ def _feedback_manifest_shape(root_payload, package_payload):
     )
 
 
-def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload, target_names=None):
+def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
     if any(type(payload) is not bytes or len(payload) > MAX_CORE_CONTRACT_FILE_BYTES
            for payload in (fuzz_payload, api_payload, lock_payload)):
-        return False
-    if target_names is None:
-        target_names = CORE_CONTRACT_FUZZ_CORPUS_TARGETS
-    if (type(target_names) not in (set, frozenset)
-            or not target_names
-            or not CORE_CONTRACT_FUZZ_CORPUS_TARGETS.issubset(target_names)
-            or any(type(name) is not str or len(name) > MAX_CORE_CONTRACT_NAME_LENGTH
-                   or CORE_CONTRACT_SNAKE_NAME_PATTERN.fullmatch(name) is None
-                   for name in target_names)):
         return False
     try:
         fuzz_text = fuzz_payload.decode("utf-8", "strict")
@@ -1575,20 +1566,15 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload, targe
     if any("\r" in text for text in (fuzz_text, api_text, lock_text)):
         return False
 
-    def parse_sections(text, *, allow_bins=False):
+    def parse_sections(text):
         sections = {}
-        bins = []
         current = None
         for line in text.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith(chr(35)):
                 continue
             if stripped.startswith("[["):
-                if not allow_bins or stripped != "[[bin]]":
-                    return None
-                current = {}
-                bins.append(current)
-                continue
+                return None
             section = re.fullmatch(r"\[([A-Za-z0-9_.-]{1,128})\]", stripped)
             if section is not None:
                 current = section.group(1)
@@ -1600,19 +1586,15 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload, targe
             if current is None or assignment is None:
                 return None
             key, value = assignment.groups()
-            selected = current if type(current) is dict else sections[current]
+            selected = sections[current]
             if key in selected:
                 return None
             selected[key] = value.strip()
-        return sections, bins
+        return sections
 
-    fuzz_parsed = parse_sections(fuzz_text, allow_bins=True)
-    api_parsed = parse_sections(api_text)
-    if fuzz_parsed is None or api_parsed is None:
-        return False
-    fuzz_sections, bin_sections = fuzz_parsed
-    api_sections, unused_bins = api_parsed
-    if unused_bins:
+    fuzz_sections = parse_sections(fuzz_text)
+    api_sections = parse_sections(api_text)
+    if fuzz_sections is None or api_sections is None:
         return False
     package = fuzz_sections.get("package")
     dependencies = fuzz_sections.get("dependencies")
@@ -1654,29 +1636,6 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload, targe
             or dependencies[api_name] != '{ path = "../crates/host/api" }'):
         return False
 
-    if bin_sections:
-        bin_names = set()
-        for section in bin_sections:
-            if type(section) is not dict or set(section) != {"name", "path", "test", "doc", "bench"}:
-                return False
-            name_match = re.fullmatch(r'"([a-z][a-z0-9]*(?:_[a-z0-9]+)*)"', section.get("name", ""))
-            if name_match is None:
-                return False
-            name = name_match.group(1)
-            if (len(name) > MAX_CORE_CONTRACT_NAME_LENGTH
-                    or name in bin_names
-                    or name not in target_names
-                    or section.get("path") != '"fuzz_targets/' + name + '.rs"'
-                    or section.get("test") != "false"
-                    or section.get("doc") != "false"
-                    or section.get("bench") != "false"):
-                return False
-            bin_names.add(name)
-        if bin_names != set(target_names):
-            return False
-    elif set(target_names) != set(CORE_CONTRACT_FUZZ_CORPUS_TARGETS):
-        return False
-
     prefix_and_packages = re.split(r"(?m)^\[\[package\]\]\s*$", lock_text)
     if len(prefix_and_packages) != 3 or re.search(r"(?m)^\s*(?:source|checksum)\s*=", lock_text):
         return False
@@ -1706,6 +1665,51 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload, targe
             return False
         parsed_lock[name] = dependencies_in_lock
     return parsed_lock == {fuzz_name: [api_name], api_name: []}
+
+
+def _feedback_fuzz_modules_shape(main_payload, target_names):
+    if (type(main_payload) is not bytes or len(main_payload) > MAX_CORE_CONTRACT_FILE_BYTES
+            or type(target_names) not in (set, frozenset)
+            or not CORE_CONTRACT_FUZZ_CORPUS_TARGETS.issubset(target_names)
+            or len(target_names) > MAX_CORE_CONTRACT_FUZZ_TARGETS
+            or any(type(name) is not str or len(name) > MAX_CORE_CONTRACT_NAME_LENGTH
+                   or CORE_CONTRACT_SNAKE_NAME_PATTERN.fullmatch(name) is None
+                   for name in target_names)):
+        return False
+    try:
+        text = main_payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return False
+    if "\r" in text or re.search(r"\binclude(?:_str)?\s*!\s*\([^)]*fuzz_targets", text, re.S):
+        return False
+    attribute = re.compile(r"^\s*" + re.escape(chr(35)) + r"\s*\[")
+    direct_path = re.compile(r"^\s*" + re.escape(chr(35)) + r"\s*\[\s*path\b")
+    module = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\b")
+    declared = set()
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if attribute.match(line) and (direct_path.match(line) or re.search(r"\bpath\s*=", line)):
+            if index + 1 >= len(lines):
+                return False
+            match = re.fullmatch(
+                re.escape(chr(35)) + r'\[path = "\.\./fuzz_targets/([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\.rs"\]',
+                line,
+            )
+            if match is None:
+                return False
+            name = match.group(1)
+            if (name not in target_names or name in declared
+                    or lines[index + 1] != "mod " + name + ";"):
+                return False
+            declared.add(name)
+            index += 2
+            continue
+        if module.match(line):
+            return False
+        index += 1
+    return declared == set(target_names)
 
 
 def _feedback_corpus_paths_shape(corpus_paths, target_names=None):
@@ -2036,7 +2040,13 @@ def _safe_core_contract_tree(
             repository, git_executable, repo_env, entries,
             "/".join(CORE_CONTRACT_CRATE_ROOTS[0]) + "/Cargo.toml", core_check="package_decode",
         )
-        if not _feedback_fuzz_manifest_shape(fuzz_manifest, api_cargo, fuzz_lock, target_names):
+        if not _feedback_fuzz_manifest_shape(fuzz_manifest, api_cargo, fuzz_lock):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+        fuzz_main = _contract_blob(
+            repository, git_executable, repo_env, entries, "fuzz/src/main.rs",
+            core_check="package_decode",
+        )
+        if not _feedback_fuzz_modules_shape(fuzz_main, target_names):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
         if concern == "core-build-diagnostic-return" and package_lock_present:
             if entries[CORE_CONTRACT_PACKAGE_LOCK_PATH][0] != "100644":

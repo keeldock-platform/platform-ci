@@ -121,8 +121,8 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    'kit/confinement/foundation_node_feedback.py': 'b01ad561961f47d9c04d59f5282c82330eb3b005f93fbe302a95cc6d24ed7726',
-    'kit/confinement/test_foundation_node_feedback.py': '1b1eaa33a26723d6ba51a998c7eeb8db6e536440ae2c360613929d2c69198a2f',
+    'kit/confinement/foundation_node_feedback.py': '37b0c620d8c4d53ac623cbe176fe0783cf9e2ab395bc3527db1f6999dfe33c4d',
+    'kit/confinement/test_foundation_node_feedback.py': '5c16a4c6d57d99ca9d5e68853ce84ae517c8cff50dc0a28b5bebd377897a93be',
     'kit/confinement/macos_node_contract.py': '890cd2891954d4abf7db85ec4295e7aa01c4e2ca3a083ef7537904e3c3c1aeb6',
     'kit/confinement/test_macos_node_contract.py': 'e82debccbaeaba990256babe32dd9ff36dcc8d4542a411b56e67034aff4a293c',
     'kit/confinement/node_contract_validation.mjs': '5d5c06ef75a7194858b707685b40ab39155f2f0ea0dde1633b286bc2709f5920',
@@ -159,8 +159,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_macos_core_bootstrap.py': 'f8e56bde25e64fc691adc25c3288924179797b83c8d6da66ef21c5fad256c38e',
     'kit/confinement/macos_network_observer.py': 'a7cf6cb16e68f00513e9f8ee08d52511619b18bb8edd37205faf907dcf0a98d9',
     'kit/confinement/test_macos_network_observer.py': '0187ffbe5a7b7395b2edc2025a4dd3e4c0adf5a48c881f8878578010d76307a3',
-    'kit/confinement/macos_private_validation.py': '392ae6e44e37357e225c058a1e249a1fe6f4a1c48df8babc5255f86b3f43ebee',
-    'kit/confinement/test_macos_private_validation.py': 'fd76f0bf5ac2e00d67e727941ff1beedcf72a41e5df63ef89cc20848ae9517f0',
+    'kit/confinement/macos_private_validation.py': '1bfebff6fa98158cc7e92b11cb0c6326877c5c74e01031986f842e8ac4dc342c',
+    'kit/confinement/test_macos_private_validation.py': '4bdae1572612131a014e9ca97f9512e0c5aab483add56ba826f2b4d15bc09443',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     '.github/workflows/windows-native-preflight.yml': 'da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb',
     'kit/confinement/windows_native_preflight.cs': 'ba0f8859db9d8bcc1e4c8274520bcb67a3292cb311f553127e1f29fe13838543',
@@ -171,8 +171,8 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/node-lock-return.yml': '6e9c157462984967427fc33961fcd2f7ca3b9755ff180d4561c981846d0b6cc0',
     '.github/workflows/core-rust-format-return.yml': '5ac5147ad14a7948320b7cdf90be19ccfca8ac57045139ee38558ecd4c5863ca',
     '.github/workflows/core-build-diagnostic-return.yml': 'a667f3ca1bf73458eb39585d694eb443f5971cbe856a0b7ff49f9d7c24ed6ab4',
-    'kit/confinement/macos_feedback_producer.py': '476ef2318d5fc048fe70459989ed42a1303318aa8328e586e938c8d553e5fb33',
-    'kit/confinement/test_macos_feedback_producer.py': '7214979094c8c1b21db2c3692a765e04f0dc2148ea1676163ee6a6b5061412da',
+    'kit/confinement/macos_feedback_producer.py': 'e3e4751a87df461f74114530e9e51591e9d1aae6dd904140c3361f763a83d6db',
+    'kit/confinement/test_macos_feedback_producer.py': 'd240693d16bd8ec04cd473ab2f08f2ec0e482263886887b2f0ebe6c020e098d6',
     'kit/confinement/feedback_producer_crypto.mjs': 'e621131afec27d78b170e207843e76e20d4f9682cf2323c3a787ac53b6db60da',
     'kit/confinement/test_feedback_producer_crypto.mjs': '1f70ec5fd25a02257f9bf857afcd244383aec71906e45fd4ed67809c279a9c10',
     'kit/confinement/feedback_admin.py': '4f39933cf4985926c141240644d783121bbb161e5386ceab842f592d41ca2e9a',

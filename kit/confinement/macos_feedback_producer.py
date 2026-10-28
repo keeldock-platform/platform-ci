@@ -51,12 +51,9 @@ VERSION_SPEC_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
 PACKAGE_ROOTS = (
     Path("crates/host/api"), Path("crates/host/mock"), Path("crates/host/conformance"),
 )
-FOUNDATION_FUZZ_RUST_PATHS = (
-    "fuzz/src/main.rs",
-    "fuzz/fuzz_targets/identifiers.rs",
-    "fuzz/fuzz_targets/tool_error_codes.rs",
-    "fuzz/fuzz_targets/versions.rs",
-)
+FOUNDATION_FUZZ_TARGETS = frozenset(("identifiers", "tool_error_codes", "versions"))
+FOUNDATION_FUZZ_TARGET_RE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\.rs\Z")
+MAX_FOUNDATION_FUZZ_TARGETS = 16
 FOUNDATION_FUZZ_MANIFESTS = ("fuzz/Cargo.toml", "fuzz/Cargo.lock")
 RUST_ROOT_FILES = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml")
 DIAGNOSTIC_BASE_GATES = (
@@ -239,8 +236,24 @@ def _validate_dependency_sources(root, workspaces):
 
 
 def _validated_fuzz_rust_paths(source):
+    directory = source / "fuzz/fuzz_targets"
+    try:
+        directory_info = directory.lstat()
+        if (not stat.S_ISDIR(directory_info.st_mode) or stat.S_ISLNK(directory_info.st_mode)
+                or directory_info.st_uid != 0
+                or directory_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            _refuse("manifest_invalid")
+        with os.scandir(directory) as iterator:
+            names = sorted(entry.name for entry in iterator)
+    except OSError:
+        _refuse("manifest_invalid")
+    if (not 1 <= len(names) <= MAX_FOUNDATION_FUZZ_TARGETS
+            or not FOUNDATION_FUZZ_TARGETS.issubset({name[:-3] for name in names})
+            or any(len(name[:-3]) > 64 or FOUNDATION_FUZZ_TARGET_RE.fullmatch(name) is None
+                   for name in names)):
+        _refuse("manifest_invalid")
     paths = []
-    for relative in FOUNDATION_FUZZ_RUST_PATHS:
+    for relative in ("fuzz/src/main.rs",) + tuple("fuzz/fuzz_targets/" + name for name in names):
         target = source / relative
         try:
             info = target.lstat()
@@ -586,7 +599,7 @@ def _copy_reviewed_files(source, destination, relative_paths, worker_uid, primar
                 _make_worker_directory(current, worker_uid, primary_gid)
             except OSError:
                 _refuse("output_unavailable")
-        payload = _read_file(source / rel, maximum=MAX_RUST_FILE_BYTES if rel.suffix == ".rs"
+        payload = _read_file(source / rel, maximum=MAX_RUST_FILE_BYTES if rel.suffix in (".rs", ".ts")
                              else MAX_PACKAGE_JSON_BYTES)
         _write_worker_file(current / rel.name, payload, worker_uid, primary_gid)
 
@@ -784,10 +797,23 @@ def build_diagnostic_payload(outcome):
                 or outcome.get("stdout_truncated") is not False
                 or outcome.get("stderr_truncated") is not False):
             _refuse("capture_invalid")
+        reviewed_count = outcome.get("node_reviewed_file_count")
+        reviewed_digest = outcome.get("node_reviewed_paths_sha256")
+        if selected == DIAGNOSTIC_GATE_SELECTIONS[-1]:
+            if (type(reviewed_count) is not int or not 5 <= reviewed_count <= 133
+                    or type(reviewed_digest) is not str
+                    or SHA256_RE.fullmatch(reviewed_digest) is None):
+                _refuse("capture_invalid")
+            reviewed_evidence = (" node_reviewed_file_count=" + str(reviewed_count)
+                                 + " node_reviewed_paths_sha256=" + reviewed_digest)
+        elif reviewed_count is not None or reviewed_digest is not None:
+            _refuse("capture_invalid")
+        else:
+            reviewed_evidence = ""
         return (
             "KD-BUILD-DIAGNOSTICS schema=1 selected_gates=" + ",".join(selected)
             + " completed_gates=" + ",".join(completed)
-            + " result=all-gates-completed\n"
+            + " result=all-gates-completed" + reviewed_evidence + "\n"
         ).encode("ascii")
     if (type(failed) is not str or failed not in selected
             or completed != selected[:selected.index(failed)]):

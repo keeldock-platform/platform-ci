@@ -472,7 +472,14 @@ class SourceRefTests(unittest.TestCase):
 
 class CoreContractTreeTests(unittest.TestCase):
     @staticmethod
-    def _validate_feedback_tree(entries, concern):
+    def _module_lines(names):
+        return "".join(
+            chr(35) + '[path = "../fuzz_targets/' + name + '.rs"]\nmod ' + name + ';\n'
+            for name in sorted(names)
+        ).encode("ascii")
+
+    @staticmethod
+    def _validate_feedback_tree(entries, concern, main_payload=None):
         digest = hashlib.sha256(b"x").hexdigest()
 
         def blob(unused_repository, unused_git, unused_environment, unused_entries, path, **unused):
@@ -484,6 +491,10 @@ class CoreContractTreeTests(unittest.TestCase):
                 return ("version = 4\n" + "[[package]]\n" * len(subject.CORE_CONTRACT_CRATE_ROOTS)).encode("ascii")
             if path == "rust-toolchain.toml":
                 return subject.CORE_CONTRACT_TOOLCHAIN
+            if path == "fuzz/src/main.rs":
+                return main_payload if main_payload is not None else CoreContractTreeTests._module_lines(
+                    subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS,
+                )
             return b"x"
 
         with patch.object(
@@ -709,8 +720,17 @@ class CoreContractTreeTests(unittest.TestCase):
             "fuzz/corpus/new_target/seed",
         ):
             entries[path] = ("100644", "b" * 40)
-        marker, unused_blob = self._validate_feedback_tree(entries, concern)
+        main_payload = self._module_lines(subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS | {"new_target"})
+        marker, unused_blob = self._validate_feedback_tree(entries, concern, main_payload)
         self.assertEqual(marker, subject.CORE_CONTRACT_TREE_BY_CONCERN[concern])
+
+    def test_feedback_tree_refuses_new_fuzz_target_without_module_declaration(self):
+        concern = "core-rust-format-return"
+        entries = self._required_core_contract_entries(concern)
+        entries["fuzz/fuzz_targets/new_target.rs"] = ("100644", "b" * 40)
+        with self.assertRaises(subject.Refusal) as refusal:
+            self._validate_feedback_tree(entries, concern)
+        self.assertEqual(refusal.exception.core_check, "package_decode")
 
     def test_feedback_tree_refuses_a_corpus_for_an_undeclared_target(self):
         concern = "core-rust-format-return"
@@ -985,24 +1005,8 @@ class CoreContractTreeTests(unittest.TestCase):
             b'\n[[package]]\nname = "api-fixture"\nversion = "0.1.0"\n'
         )
         self.assertTrue(subject._feedback_fuzz_manifest_shape(fuzz_manifest, api_manifest, fuzz_lock))
-        extended_targets = subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS | {"new_target"}
         self.assertFalse(subject._feedback_fuzz_manifest_shape(
-            fuzz_manifest, api_manifest, fuzz_lock, extended_targets,
-        ))
-        bin_sections = "".join(
-            '\n[[bin]]\nname = "' + name + '"\npath = "fuzz_targets/' + name + '.rs"\n'
-            'test = false\ndoc = false\nbench = false\n'
-            for name in sorted(extended_targets)
-        ).encode("ascii")
-        manifest_with_bins = fuzz_manifest + bin_sections
-        self.assertTrue(subject._feedback_fuzz_manifest_shape(
-            manifest_with_bins, api_manifest, fuzz_lock, extended_targets,
-        ))
-        self.assertFalse(subject._feedback_fuzz_manifest_shape(
-            manifest_with_bins.replace(
-                b'path = "fuzz_targets/new_target.rs"',
-                b'path = "fuzz_targets/mismatched.rs"',
-            ), api_manifest, fuzz_lock, extended_targets,
+            fuzz_manifest + b'\n[[bin]]\nname = "new_target"\n', api_manifest, fuzz_lock,
         ))
         self.assertFalse(subject._feedback_fuzz_manifest_shape(
             fuzz_manifest.replace(
@@ -1018,6 +1022,27 @@ class CoreContractTreeTests(unittest.TestCase):
             fuzz_manifest, api_manifest,
             external_lock,
         ))
+
+    def test_feedback_fuzz_modules_require_one_exact_pair_per_target(self):
+        targets = subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS | {"new_target"}
+        valid = self._module_lines(targets)
+        baseline = self._module_lines(subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS)
+        new_pair = self._module_lines({"new_target"})
+        self.assertTrue(subject._feedback_fuzz_modules_shape(valid, targets))
+        invalid = (
+            baseline,
+            valid + new_pair,
+            valid + self._module_lines({"missing_target"}),
+            valid.replace(b"../fuzz_targets/new_target.rs", b"../../fuzz_targets/new_target.rs"),
+            valid.replace(b"mod new_target;", b"mod mismatched;"),
+            valid + b"mod stray;\n",
+            valid + b'include!("../fuzz_targets/new_target.rs");\n',
+            valid + b'include_str!("../fuzz_targets/new_target.rs");\n',
+            valid + b'include_str !("../fuzz_targets/new_target.rs");\n',
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                self.assertFalse(subject._feedback_fuzz_modules_shape(payload, targets))
 
     def test_rules_lock_requires_v2_and_only_manifested_installed_files(self):
         rules_file = subject.RULES_DIRECTORY + "/rules/shared/rust.md"

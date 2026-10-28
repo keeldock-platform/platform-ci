@@ -7,6 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import macos_private_validation as validation
+
 
 MODULE_PATH = Path(__file__).resolve().parent / "foundation_node_feedback.py"
 SPEC = importlib.util.spec_from_file_location("foundation_node_feedback", MODULE_PATH)
@@ -191,9 +193,10 @@ def _dispatch(kind):
 
 def _runtime():
     return SimpleNamespace(
-        CORE_CONTRACT_FEEDBACK_FILES=frozenset(
-            set(subject.NODE_REVIEWED_FILES) | {".npmrc", "README.md", "packages/host-api/README.md"}
-        ),
+        CORE_CONTRACT_FEEDBACK_FILES=validation.CORE_CONTRACT_FEEDBACK_FILES,
+        _core_contract_pattern_paths=validation._core_contract_pattern_paths,
+        MAX_CORE_CONTRACT_TS_SOURCES=validation.MAX_CORE_CONTRACT_TS_SOURCES,
+        MAX_CORE_CONTRACT_TS_TESTS=validation.MAX_CORE_CONTRACT_TS_TESTS,
         CORE_CONTRACT_TREE_BY_CONCERN={"core-node-lock-return": "core_node_lock_return"},
         CORE_CONTRACT_PACKAGE_LOCK_TREE=subject.PACKAGE_LOCK_TREE,
     )
@@ -262,7 +265,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
     def _run(self, mode, kind, *, validated_tree, accepted_provenance=None, lock_bytes=None,
              callback_mutation=None, fail_census=False, fail_restore=False,
              census_error=None, command_error=None, contract_error=None,
-             real_node_contract=None):
+             real_node_contract=None, new_ts_paths=()):
         producer = FakeProducer()
         profile = producer.PROFILE_BY_KIND[kind]
         dispatch = _dispatch(kind)
@@ -307,6 +310,11 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
             root = Path(temporary)
             source = root / "source"
             source.mkdir()
+            baseline = validation._core_contract_pattern_paths(validation.CORE_CONTRACT_FEEDBACK_FILES)
+            for relative in sorted(baseline["ts_sources"] | baseline["ts_tests"] | set(new_ts_paths)):
+                target = source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.touch()
             storage_root = root / "worker"
             storage_root.mkdir()
             if lock_bytes is not None:
@@ -370,13 +378,33 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
             accepted_provenance=provenance, lock_bytes=lock_bytes,
         )
         copied = producer.copies[0][2]
-        self.assertEqual(copied, tuple(sorted(subject.NODE_REVIEWED_FILES)))
+        baseline = validation._core_contract_pattern_paths(validation.CORE_CONTRACT_FEEDBACK_FILES)
+        expected = subject.NODE_FIXED_FILES | baseline["ts_sources"] | baseline["ts_tests"]
+        self.assertEqual(copied, tuple(sorted(expected)))
         self.assertNotIn(".npmrc", copied)
         self.assertFalse(any("README" in path or "CONTRACT" in path or "CHANGELOG" in path for path in copied))
         self.assertEqual(producer.writes[0][1], lock_bytes)
         self.assertEqual(contract.call[1]["accepted_lock"], lock_bytes)
         self.assertIs(contract.call[1]["accepted_provenance"], provenance)
         self.assertEqual(result["stages"], subject.NODE_GATE_NAMES)
+        self.assertEqual(result["node_reviewed_file_count"], len(copied))
+        self.assertEqual(result["node_reviewed_paths_sha256"], hashlib.sha256(
+            "".join(path + "\n" for path in copied).encode("ascii")
+        ).hexdigest())
+
+    def test_verify_copies_new_source_and_test_files_into_worker(self):
+        additions = (
+            "packages/host-api/src/new-module.ts",
+            "packages/host-api/tests/new-module.test.ts",
+        )
+        result, producer, unused_contract = self._run(
+            "verify", "build_diagnostics", validated_tree=subject.PACKAGE_LOCK_TREE,
+            accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+            new_ts_paths=additions,
+        )
+        copied = producer.copies[0][2]
+        self.assertTrue(set(additions).issubset(copied))
+        self.assertEqual(result["node_reviewed_file_count"], len(copied))
 
     def test_verify_refuses_wrong_profile_or_unadmitted_tree_before_copy(self):
         producer = FakeProducer()
@@ -591,11 +619,16 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
             "returncode": 0, "stdout": b"", "stderr": b"",
             "stdout_truncated": False, "stderr_truncated": False,
         }
-        node_result = {"mode": "verify", "status": "passed", "stages": subject.NODE_GATE_NAMES}
+        node_result = {
+            "mode": "verify", "status": "passed", "stages": subject.NODE_GATE_NAMES,
+            "node_reviewed_file_count": 24, "node_reviewed_paths_sha256": "a" * 64,
+        }
         outcome = subject.extend_diagnostic_outcome(rust_outcome, lambda: node_result, FakeContract("verify"))
         self.assertEqual(outcome["selected_gates"], subject.FULL_FOUNDATION_GATES)
         self.assertEqual(outcome["completed"], subject.FULL_FOUNDATION_GATES)
         self.assertIsNone(outcome["failed_stage"])
+        self.assertEqual(outcome["node_reviewed_file_count"], 24)
+        self.assertEqual(outcome["node_reviewed_paths_sha256"], "a" * 64)
 
     def test_node_cleanup_refusal_propagates_without_diagnostic_payload(self):
         rust_outcome = {
