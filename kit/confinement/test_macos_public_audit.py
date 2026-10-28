@@ -1937,6 +1937,60 @@ class CoreContractReceiptTests(unittest.TestCase):
             with self.subTest(unlisted=unlisted), self.assertRaises(audit.AuditRefusal):
                 audit.publish_core_contract_receipt(env, io.BytesIO(rejected), io.BytesIO())
 
+    def test_publisher_accepts_node_substage_diagnostics_only_with_their_bound_stage_and_reason(self):
+        import macos_core_contract as core_contract
+
+        self.assertEqual(
+            audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS,
+            core_contract.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS,
+        )
+        self.assertEqual(
+            audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS,
+            core_contract.SOURCE_GATES_NODE_DIAGNOSTICS,
+        )
+        self.assertEqual(len(audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS), 90)
+        self.assertTrue(
+            audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS <= audit.CORE_CONTRACT_REFUSAL_DIAGNOSTICS
+        )
+        env = core_contract_publish_environment("1")
+        base = {
+            "schema_version": 1, "status": "refused", "stage": "worker_setup",
+            "reason": "runner_unavailable", "diagnostic": "source_gates",
+        }
+        for diagnostic, reason in sorted(audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.items()):
+            accepted = core_contract_line(
+                {**base, "reason": reason, "diagnostic": diagnostic}, b"KD-CORE-CONTRACT-REFUSAL ",
+            )
+            with self.subTest(diagnostic=diagnostic):
+                output = io.BytesIO()
+                self.assertEqual(
+                    audit.publish_core_contract_receipt(env, io.BytesIO(accepted), output), 0,
+                )
+                self.assertEqual(output.getvalue(), accepted)
+            other_reason = "capture_invalid" if reason == "runner_unavailable" else "runner_unavailable"
+            for wrong in (
+                {"reason": other_reason}, {"stage": "cleanup"}, {"stage": "toolchain_install"},
+                {"stage": "cleanup", "reason": "cleanup_incomplete"}, {"reason": "internal_error"},
+            ):
+                rejected = core_contract_line(
+                    {**base, "reason": reason, "diagnostic": diagnostic, **wrong},
+                    b"KD-CORE-CONTRACT-REFUSAL ",
+                )
+                with self.subTest(diagnostic=diagnostic, wrong=wrong):
+                    with self.assertRaises(audit.AuditRefusal):
+                        audit.publish_core_contract_receipt(env, io.BytesIO(rejected), io.BytesIO())
+        for unlisted in (
+            "source_gates_node_private_command_timeout", "source_gates_node_", "source_gates_node",
+            "source_gates_node_lock_validation_command_timeout",
+            "source_gates_node_lock_validation_contract_refused",
+            "source_gates_node_none_command_timeout",
+        ):
+            rejected = core_contract_line(
+                {**base, "diagnostic": unlisted}, b"KD-CORE-CONTRACT-REFUSAL ",
+            )
+            with self.subTest(unlisted=unlisted), self.assertRaises(audit.AuditRefusal):
+                audit.publish_core_contract_receipt(env, io.BytesIO(rejected), io.BytesIO())
+
     def test_private_source_diagnostics_match_the_closed_runtime_contract(self):
         self.assertEqual(audit.CORE_CONTRACT_RUNTIME_REASONS, source_runtime.REASONS)
         self.assertEqual(audit.CORE_CONTRACT_RUNTIME_STAGES, source_runtime.STAGES)

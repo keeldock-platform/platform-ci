@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -707,6 +708,238 @@ class CoreContractTests(unittest.TestCase):
             error.cleanup_diagnostic = unlisted
             with self.subTest(unlisted=unlisted):
                 self._follow_refusal_to_the_published_line(error, "source_gates")
+
+    def test_node_diagnostic_vocabulary_is_a_closed_generated_set(self):
+        generated = set()
+        for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
+            self.assertEqual(len(reasons), len(set(reasons)))
+            self.assertNotIn("cleanup_incomplete", reasons)
+            for reason in reasons:
+                generated.add("source_gates_node_" + substage + "_" + reason)
+        for substage in subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES:
+            for check in subject.SOURCE_GATES_NODE_COMMAND_CHECKS:
+                generated.add("source_gates_node_" + substage + "_command_" + check)
+        self.assertEqual(subject.SOURCE_GATES_NODE_DIAGNOSTICS, frozenset(generated))
+        self.assertEqual(len(subject.SOURCE_GATES_NODE_DIAGNOSTICS), 90)
+        self.assertEqual(set(subject.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS), generated)
+        self.assertTrue(subject.SOURCE_GATES_NODE_DIAGNOSTICS <= subject.DIAGNOSTICS)
+        self.assertTrue(subject.SOURCE_GATES_NODE_DIAGNOSTICS <= subject.DETAILED_DIAGNOSTICS)
+        self.assertTrue(subject.SOURCE_GATES_NODE_DIAGNOSTICS <= subject.PRESERVED_SOURCE_DIAGNOSTICS)
+        self.assertFalse(subject.SOURCE_GATES_NODE_DIAGNOSTICS & subject.CLEANUP_DIAGNOSTICS)
+        self.assertEqual(
+            set(subject.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.values()),
+            {"capture_invalid", "runner_unavailable"},
+        )
+        for value in subject.SOURCE_GATES_NODE_DIAGNOSTICS:
+            self.assertRegex(value, r"\Asource_gates_node_[a-z_]+\Z")
+        self.assertEqual(
+            subject.SOURCE_GATES_NODE_COMMAND_CHECKS,
+            ("spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow",
+             "helper_failure"),
+        )
+        self.assertEqual(frozenset(subject.SOURCE_GATES_NODE_COMMAND_CHECKS), real_node_contract.COMMAND_CHECKS)
+        self.assertEqual(frozenset(subject.SOURCE_GATES_NODE_COMMAND_CHECKS), real_rust.COMMAND_CHECKS)
+        node_substages = {"none"} | set(foundation_tests.subject.NODE_SUBSTAGES)
+        self.assertEqual(
+            {name for name, unused in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE}, node_substages,
+        )
+        node_reasons = set(foundation_tests.subject.NODE_REASONS) - {"cleanup_incomplete"}
+        for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
+            self.assertTrue(set(reasons) <= node_reasons)
+        self.assertTrue(
+            set(subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES) <= set(foundation_tests.subject.NODE_SUBSTAGES)
+        )
+        self.assertNotIn("lock_validation", subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES)
+
+    def _published_node_refusal(self, error, stage="worker_setup"):
+        diagnostics = subject._FailureDiagnostics()
+        cleanup_state = {"first": None}
+
+        @contextmanager
+        def lease():
+            yield object()
+
+        with self.assertRaises(type(error)) as raised:
+            with subject._lease_with_diagnostic_capture(
+                lease(), diagnostics, lambda: "source_gates", cleanup_state,
+            ):
+                raise error
+        self.assertIsNone(cleanup_state["first"])
+        attached = diagnostics.attach(
+            subject._toolchain_refusal(raised.exception, stage), "source_gates",
+            cleanup_state["first"],
+        )
+        reattached = subject._FailureDiagnostics().attach(attached, "source_gates")
+        self.assertEqual((reattached.reason, reattached.stage, reattached.diagnostic),
+                         (attached.reason, attached.stage, attached.diagnostic))
+        final = subject._FailureDiagnostics().attach(
+            reattached, getattr(reattached, "diagnostic", "unavailable"),
+        )
+        self.assertEqual((final.reason, final.stage, final.diagnostic),
+                         (attached.reason, attached.stage, attached.diagnostic))
+        payload = subject._format_refusal(final)
+        record = json.loads(payload)
+        self.assertEqual(record["diagnostic"], attached.diagnostic)
+        line = feedback_failure.REFUSAL_PREFIX + payload + b"\n"
+        return attached, record, feedback_failure.normalize_refusal(line) == line
+
+    def _expect_node_diagnostic(self, error, expected, public_reason="runner_unavailable"):
+        attached, record, normalized = self._published_node_refusal(error)
+        self.assertEqual(attached.diagnostic, expected)
+        self.assertEqual((attached.reason, attached.stage), (public_reason, "worker_setup"))
+        self.assertEqual(
+            (record["reason"], record["stage"], record["diagnostic"]),
+            (public_reason, "worker_setup", expected),
+        )
+        self.assertTrue(normalized)
+
+    def _real_tool_version_refusal(self, npm_stdout):
+        def run_worker(argv, *, stage, substage, cwd, env, deadline, timeout, allow_nonzero_capture):
+            stdout = (("v" + real_node_contract.NODE_VERSION + "\n").encode("ascii")
+                      if substage == "runtime_version" else npm_stdout)
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr=b"",
+                                   stdout_truncated=False, stderr_truncated=False)
+
+        with self.assertRaises(real_node_contract.NodeContractRefusal) as caught:
+            real_node_contract._tool_versions(
+                run_worker, Path("node"), Path("npm-cli"), Path("project"), {}, time.monotonic() + 60,
+            )
+        return caught.exception
+
+    def _real_worker_refusal(self, substage, command_error):
+        def run_worker(*arguments, **options):
+            raise command_error
+
+        with self.assertRaises(real_node_contract.NodeContractRefusal) as caught:
+            real_node_contract._worker_result(
+                run_worker, ("fixed",), stage="node_dependency_prepare", substage=substage,
+                project=Path("project"), environment={}, deadline=time.monotonic() + 60, timeout=10,
+            )
+        return caught.exception
+
+    @unittest.skipUnless(os.name == "posix", "Node worker harness requires POSIX paths")
+    def test_real_npm_version_mismatch_publishes_its_substage_through_run_node_profile(self):
+        refusal = self._real_tool_version_refusal(b"0.0.0\n")
+        self.assertEqual((refusal.reason, refusal.substage), ("toolchain_mismatch", "npm_version"))
+        raised = self._real_node_refusal(contract_error=refusal)
+        self.assertIs(raised, refusal)
+        self._expect_node_diagnostic(raised, "source_gates_node_npm_version_toolchain_mismatch")
+
+    @unittest.skipUnless(os.name == "posix", "Node worker harness requires POSIX paths")
+    def test_real_runtime_command_check_survives_run_node_profile_to_the_published_line(self):
+        for check in sorted(real_rust.COMMAND_CHECKS):
+            command_error = real_rust.Refusal("version_mismatch", command_check=check)
+            with self.subTest(check=check):
+                refusal = self._real_node_refusal(command_error=command_error)
+                self.assertEqual(
+                    (refusal.reason, refusal.substage, refusal.command_check),
+                    ("command_failed", "runtime_version", check),
+                )
+                self._expect_node_diagnostic(
+                    refusal, "source_gates_node_runtime_version_command_" + check,
+                )
+
+    @unittest.skipUnless(os.name == "posix", "Node worker harness requires POSIX paths")
+    def test_real_lock_generation_failures_publish_command_check_or_plain_command_failed(self):
+        command_error = real_rust.Refusal("version_mismatch", command_check="helper_failure")
+        refusal = self._real_worker_refusal("lock_generation", command_error)
+        self.assertEqual(refusal.command_check, "helper_failure")
+        raised = self._real_node_refusal(contract_error=refusal)
+        self._expect_node_diagnostic(raised, "source_gates_node_lock_generation_command_helper_failure")
+        no_check = self._real_worker_refusal("lock_generation", RuntimeError("private"))
+        self.assertIsNone(no_check.command_check)
+        self._expect_node_diagnostic(
+            self._real_node_refusal(contract_error=no_check),
+            "source_gates_node_lock_generation_command_failed",
+        )
+        with self.assertRaises(real_node_contract.NodeContractRefusal) as caught:
+            real_node_contract._validate_stage_result(
+                SimpleNamespace(returncode=1, stdout=b"", stderr=b"", stdout_truncated=False,
+                                stderr_truncated=False),
+                "node_dependency_prepare", "lock_generation",
+            )
+        self._expect_node_diagnostic(
+            self._real_node_refusal(contract_error=caught.exception),
+            "source_gates_node_lock_generation_command_failed",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "Node worker harness requires POSIX paths")
+    def test_real_capture_invalid_keeps_its_public_reason_and_gains_the_substage(self):
+        refusal = real_node_contract.NodeContractRefusal(
+            "capture_invalid", stage="node_dependency_audit", substage="bulk_audit",
+        )
+        self._expect_node_diagnostic(
+            self._real_node_refusal(contract_error=refusal),
+            "source_gates_node_bulk_audit_capture_invalid", public_reason="capture_invalid",
+        )
+
+    def test_every_listed_node_combination_publishes_its_bound_value(self):
+        for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
+            for reason in reasons:
+                error = real_node_contract.NodeContractRefusal(
+                    reason, substage=None if substage == "none" else substage,
+                )
+                expected = "source_gates_node_" + substage + "_" + reason
+                with self.subTest(diagnostic=expected):
+                    self._expect_node_diagnostic(
+                        error, expected,
+                        public_reason="capture_invalid" if reason == "capture_invalid"
+                        else "runner_unavailable",
+                    )
+        for substage in subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES:
+            for check in subject.SOURCE_GATES_NODE_COMMAND_CHECKS:
+                error = real_node_contract.NodeContractRefusal(
+                    "command_failed", substage=substage, command_check=check,
+                )
+                expected = "source_gates_node_" + substage + "_command_" + check
+                with self.subTest(diagnostic=expected):
+                    self._expect_node_diagnostic(error, expected)
+
+    def test_unlisted_node_combinations_keep_the_generic_source_gates_value(self):
+        refusal = real_node_contract.NodeContractRefusal
+        tampered_substage = refusal("command_failed", substage="lock_generation")
+        tampered_substage.substage = "private_substage"
+        tampered_check = refusal("command_failed", substage="lock_generation", command_check="timeout")
+        tampered_check.command_check = "private_check"
+        tampered_reason = refusal("command_failed", substage="lock_generation")
+        tampered_reason.reason = 7
+        for error in (
+            refusal("contract_refused", substage="lock_validation"),
+            refusal("toolchain_mismatch", substage="bulk_audit"),
+            refusal("vulnerable_dependency", substage="npm_ci"),
+            refusal("command_failed", substage="lock_validation", command_check="timeout"),
+            tampered_substage, tampered_check, tampered_reason,
+        ):
+            with self.subTest(reason=error.reason, substage=error.substage):
+                self._expect_node_diagnostic(error, "source_gates")
+        generic = SimpleNamespace(reason="command_failed", substage="lock_generation",
+                                  command_check="spawn_failure")
+        refused = subject._toolchain_refusal(generic, "worker_setup")
+        self.assertEqual((refused.reason, refused.stage, refused.diagnostic),
+                         ("runner_unavailable", "worker_setup", "unavailable"))
+        self.assertEqual(
+            subject._FailureDiagnostics().attach(refused, "source_gates").diagnostic, "source_gates",
+        )
+        other_stage = subject._toolchain_refusal(
+            refusal("command_failed", substage="lock_generation", command_check="timeout"),
+            "toolchain_install",
+        )
+        self.assertEqual((other_stage.reason, other_stage.stage), ("toolchain_install_failed", "toolchain_install"))
+        self.assertEqual(other_stage.diagnostic, "unavailable")
+        for unlisted in ("source_gates_node_private_command_timeout", "source_gates_node_", "source_gates_node"):
+            forced = subject.Refusal("runner_unavailable", "worker_setup", diagnostic=unlisted)
+            self.assertEqual(forced.diagnostic, "unavailable")
+            self.assertEqual(
+                subject._FailureDiagnostics().attach(forced, "source_gates").diagnostic, "source_gates",
+            )
+
+    def test_node_cleanup_refusal_still_wins_over_the_node_substage_value(self):
+        error = real_node_contract.NodeContractRefusal(
+            "cleanup_incomplete", stage="node_dependency_audit", substage="bulk_audit",
+        )
+        refusal = subject._toolchain_refusal(error, "worker_setup")
+        self.assertEqual((refusal.reason, refusal.stage), ("cleanup_incomplete", "cleanup"))
+        self.assertNotIn(refusal.diagnostic, subject.SOURCE_GATES_NODE_DIAGNOSTICS)
 
     def test_review_binding_requires_every_protected_value(self):
         request = _request()

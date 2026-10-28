@@ -49,10 +49,16 @@ STAGES = frozenset({
 })
 
 
+COMMAND_CHECKS = frozenset({
+    "spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow",
+    "helper_failure",
+})
+
+
 class NodeContractRefusal(Exception):
     def __init__(self, reason="contract_refused", *, stage="node_dependency_prepare", substage=None,
                  returncode=None, stdout=b"", stderr=b"", stdout_truncated=False,
-                 stderr_truncated=False):
+                 stderr_truncated=False, command_check=None):
         self.reason = reason if reason in {
             "invalid_input", "tool_unavailable", "toolchain_mismatch", "accepted_provenance_invalid",
             "lock_missing", "lock_already_present", "manifest_invalid", "limit_exceeded",
@@ -64,6 +70,9 @@ class NodeContractRefusal(Exception):
             "runtime_version", "npm_version", "lock_generation", "lock_validation", "bulk_audit",
             "npm_ci", "typecheck", "tests",
         } else None
+        self.command_check = (
+            command_check if type(command_check) is str and command_check in COMMAND_CHECKS else None
+        )
         self.returncode = returncode if type(returncode) is int and 0 <= returncode <= 255 else None
         self.stdout = stdout if type(stdout) is bytes and len(stdout) <= MAX_CAPTURE_BYTES else b""
         self.stderr = stderr if type(stderr) is bytes and len(stderr) <= MAX_CAPTURE_BYTES else b""
@@ -341,7 +350,8 @@ def _worker_result(run_worker, argv, *, stage, substage, project, environment, d
             _refuse("cleanup_incomplete", stage=stage, substage=substage)
         if getattr(error, "reason", None) == "deadline_exceeded":
             _refuse("deadline_exceeded", stage=stage, substage=substage)
-        _refuse("command_failed", stage=stage, substage=substage)
+        _refuse("command_failed", stage=stage, substage=substage,
+                command_check=getattr(error, "command_check", None))
     stdout = getattr(result, "stdout", None)
     stderr = getattr(result, "stderr", None)
     returncode = getattr(result, "returncode", None)

@@ -142,6 +142,55 @@ SOURCE_GATE_COMMAND_DIAGNOSTICS = {
     "capture_overflow": "source_gate_capture_overflow",
 }
 SOURCE_GATE_DIAGNOSTICS = frozenset(SOURCE_GATE_COMMAND_DIAGNOSTICS.values())
+SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE = (
+    ("none", (
+        "invalid_input", "tool_unavailable", "accepted_provenance_invalid", "lock_missing",
+        "lock_already_present", "manifest_invalid", "limit_exceeded", "deadline_exceeded",
+        "capture_invalid", "contract_refused",
+    )),
+    ("runtime_version", (
+        "toolchain_mismatch", "command_failed", "capture_invalid", "tool_unavailable",
+        "deadline_exceeded",
+    )),
+    ("npm_version", (
+        "toolchain_mismatch", "command_failed", "capture_invalid", "tool_unavailable",
+        "deadline_exceeded",
+    )),
+    ("lock_generation", (
+        "command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded",
+    )),
+    ("lock_validation", ("accepted_provenance_invalid",)),
+    ("bulk_audit", (
+        "limit_exceeded", "manifest_invalid", "lock_missing", "accepted_provenance_invalid",
+        "audit_unavailable", "audit_response_invalid", "vulnerable_dependency",
+        "deadline_exceeded", "capture_invalid", "command_failed", "tool_unavailable",
+    )),
+    ("npm_ci", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
+    ("typecheck", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
+    ("tests", ("command_failed", "capture_invalid", "tool_unavailable", "deadline_exceeded")),
+)
+SOURCE_GATES_NODE_COMMAND_SUBSTAGES = (
+    "runtime_version", "npm_version", "lock_generation", "bulk_audit", "npm_ci", "typecheck",
+    "tests",
+)
+SOURCE_GATES_NODE_COMMAND_CHECKS = (
+    "spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow",
+    "helper_failure",
+)
+SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
+    **{
+        "source_gates_node_" + substage + "_" + reason:
+            "capture_invalid" if reason == "capture_invalid" else "runner_unavailable"
+        for substage, reasons in SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
+        for reason in reasons
+    },
+    **{
+        "source_gates_node_" + substage + "_command_" + check: "runner_unavailable"
+        for substage in SOURCE_GATES_NODE_COMMAND_SUBSTAGES
+        for check in SOURCE_GATES_NODE_COMMAND_CHECKS
+    },
+}
+SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(SOURCE_GATES_NODE_DIAGNOSTIC_REASONS)
 SUMMARY_GUARD_CHECKS = frozenset((
     "input", "protect_controls", "runner_identity", "prepare_summary", "real_probe",
     "verify_controls", "make_scratch", "write_denial_probe", "standin_check", "remove_scratch",
@@ -156,7 +205,7 @@ SUMMARY_GUARD_DIAGNOSTICS = frozenset(SUMMARY_GUARD_DIAGNOSTIC_MAP.values())
 PRESERVED_SOURCE_DIAGNOSTICS = (
     SOURCE_RUNTIME_DIAGNOSTICS | SOURCE_FETCH_DIAGNOSTICS
     | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
-    | SOURCE_GATE_DIAGNOSTICS
+    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS
 )
 PRESERVED_SUMMARY_GUARD_DIAGNOSTICS = SUMMARY_GUARD_DIAGNOSTICS
 PRIVILEGE_PROBE_CHECK_DIAGNOSTICS = {
@@ -193,7 +242,7 @@ CLEANUP_DIAGNOSTICS = frozenset((
 DIAGNOSTICS = (
     OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | SOURCE_RUNTIME_DIAGNOSTICS
     | SOURCE_FETCH_DIAGNOSTICS | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
-    | SOURCE_GATE_DIAGNOSTICS | SUMMARY_GUARD_DIAGNOSTICS
+    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS | SUMMARY_GUARD_DIAGNOSTICS
     | frozenset(("none", "unavailable"))
 )
 DETAILED_DIAGNOSTICS = DIAGNOSTICS - frozenset(("none", "unavailable"))
@@ -1030,6 +1079,27 @@ def _make_directory(prefix, mode):
         raise Refusal("runner_unavailable", "worker_setup") from None
 
 
+def _node_refusal_diagnostic(error):
+    try:
+        if type(error).__name__ != "NodeContractRefusal":
+            return None
+        reason = getattr(error, "reason", None)
+        substage = getattr(error, "substage", None)
+        command_check = getattr(error, "command_check", None)
+        if type(reason) is not str or (substage is not None and type(substage) is not str):
+            return None
+        label = "none" if substage is None else substage
+        if reason == "command_failed" and type(command_check) is str:
+            candidate = "source_gates_node_" + label + "_command_" + command_check
+        else:
+            candidate = "source_gates_node_" + label + "_" + reason
+        if candidate in SOURCE_GATES_NODE_DIAGNOSTICS:
+            return candidate
+    except BaseException:
+        pass
+    return None
+
+
 def _toolchain_refusal(error, stage):
     reason = getattr(error, "reason", None)
     if reason == "cleanup_incomplete":
@@ -1037,8 +1107,15 @@ def _toolchain_refusal(error, stage):
         if type(diagnostic) is str and diagnostic in SOURCE_GATES_CLEANUP_DIAGNOSTICS:
             return Refusal("cleanup_incomplete", "cleanup", diagnostic=diagnostic)
         return Refusal("cleanup_incomplete", "cleanup")
+    node_diagnostic = _node_refusal_diagnostic(error) if stage == "worker_setup" else None
+    expected_reason = (
+        SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.get(node_diagnostic) if node_diagnostic is not None else None
+    )
     if reason == "capture_invalid":
-        return Refusal("capture_invalid", stage)
+        return Refusal(
+            "capture_invalid", stage,
+            diagnostic=node_diagnostic if expected_reason == "capture_invalid" else None,
+        )
     if reason == "version_mismatch":
         return Refusal("toolchain_version_mismatch", "toolchain_install")
     if stage == "observer":
@@ -1049,7 +1126,10 @@ def _toolchain_refusal(error, stage):
         return Refusal("source_diff_mismatch", "source_diff")
     if stage == "toolchain_install":
         return Refusal("toolchain_install_failed", "toolchain_install")
-    return Refusal("runner_unavailable", "worker_setup")
+    return Refusal(
+        "runner_unavailable", "worker_setup",
+        diagnostic=node_diagnostic if expected_reason == "runner_unavailable" else None,
+    )
 
 
 def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha256, deadline, lifecycle,

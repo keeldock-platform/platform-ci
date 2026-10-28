@@ -72,6 +72,34 @@ class FeedbackFailureTests(unittest.TestCase):
                 self.assertEqual(output, subject._format_record(subject.UNAVAILABLE_RECORD))
                 self.assertNotIn(CANARY.encode("ascii"), output)
 
+    def test_node_substage_diagnostics_are_accepted_only_with_their_bound_stage_and_reason(self):
+        bound = core_contract.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS
+        self.assertEqual(subject.NODE_BOUND_DIAGNOSTIC_REASONS, bound)
+        self.assertEqual(len(bound), 90)
+        unavailable = subject._format_record(subject.UNAVAILABLE_RECORD)
+        for diagnostic, reason in sorted(bound.items()):
+            raw = _line(_record(diagnostic=diagnostic, reason=reason, stage="worker_setup"))
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(subject.normalize_refusal(raw), raw)
+            other_reason = "capture_invalid" if reason == "runner_unavailable" else "runner_unavailable"
+            for wrong in ({"reason": other_reason}, {"stage": "cleanup"}, {"stage": "toolchain_install"},
+                          {"reason": "cleanup_incomplete", "stage": "cleanup"},
+                          {"reason": "internal_error"}):
+                bad = _line(_record(diagnostic=diagnostic, **{"reason": reason, "stage": "worker_setup", **wrong}))
+                with self.subTest(diagnostic=diagnostic, wrong=wrong):
+                    self.assertEqual(subject.normalize_refusal(bad), unavailable)
+        for unlisted in (
+            "source_gates_node_" + CANARY, "source_gates_node_", "source_gates_node_none_command_failed_extra",
+            "source_gates_node_lock_validation_command_timeout",
+            "source_gates_node_lock_validation_contract_refused",
+        ):
+            output = subject.normalize_refusal(_line(_record(
+                diagnostic=unlisted, reason="runner_unavailable", stage="worker_setup",
+            )))
+            with self.subTest(unlisted=unlisted):
+                self.assertEqual(output, unavailable)
+                self.assertNotIn(CANARY.encode("ascii"), output)
+
     def test_known_no_operation_diagnostic_is_accepted_only_at_no_operation_stage(self):
         valid = _line(_record(
             diagnostic="none", reason="invalid_input", stage="arguments",

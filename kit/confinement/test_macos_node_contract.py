@@ -398,6 +398,76 @@ class MacOSNodeContractTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason, "accepted_provenance_invalid")
         self.assertEqual(runner.calls, [])
 
+    def _bootstrap_with_worker_error(self, error, at):
+        runner = RaisingWorkerHarness(self.project, error, at)
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        return caught.exception
+
+    def test_worker_exception_carries_only_a_closed_command_check_onto_the_refusal(self):
+        for check in sorted(subject.COMMAND_CHECKS):
+            for at in ("runtime_version", "npm_version", "lock_generation"):
+                with self.subTest(check=check, substage=at):
+                    refusal = self._bootstrap_with_worker_error(WorkerError(command_check=check), at)
+                    self.assertEqual(refusal.reason, "command_failed")
+                    self.assertEqual(refusal.substage, at)
+                    self.assertEqual(refusal.command_check, check)
+        for unlisted in ("private-" + "value", "", 7, None, b"timeout"):
+            with self.subTest(unlisted=unlisted):
+                refusal = self._bootstrap_with_worker_error(
+                    WorkerError(command_check=unlisted), "lock_generation",
+                )
+                self.assertEqual(
+                    (refusal.reason, refusal.substage, refusal.command_check),
+                    ("command_failed", "lock_generation", None),
+                )
+
+    def test_cleanup_and_deadline_worker_exceptions_keep_their_reason_without_a_check(self):
+        for reason in ("cleanup_incomplete", "deadline_exceeded"):
+            with self.subTest(reason=reason):
+                refusal = self._bootstrap_with_worker_error(
+                    WorkerError(reason=reason, command_check="timeout"), "lock_generation",
+                )
+                self.assertEqual(refusal.reason, reason)
+                self.assertIsNone(refusal.command_check)
+
+    def test_nonzero_stage_exit_is_command_failed_without_a_command_check(self):
+        runner = WorkerHarness(self.project, failure="lock_generation")
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        self.assertEqual(caught.exception.reason, "command_failed")
+        self.assertIsNone(caught.exception.command_check)
+
+    def test_refusal_constructor_drops_an_unlisted_command_check(self):
+        self.assertEqual(
+            subject.NodeContractRefusal("command_failed", command_check="spawn_failure").command_check,
+            "spawn_failure",
+        )
+        for unlisted in ("other", 3, None, ("timeout",)):
+            with self.subTest(unlisted=unlisted):
+                self.assertIsNone(
+                    subject.NodeContractRefusal("command_failed", command_check=unlisted).command_check,
+                )
+
+
+class WorkerError(Exception):
+    def __init__(self, reason="version_mismatch", command_check=None):
+        self.reason = reason
+        self.command_check = command_check
+        super().__init__(reason)
+
+
+class RaisingWorkerHarness(WorkerHarness):
+    def __init__(self, project, error, at):
+        super().__init__(project)
+        self.error = error
+        self.at = at
+
+    def __call__(self, argv, *, stage, substage, **options):
+        if substage == self.at:
+            raise self.error
+        return super().__call__(argv, stage=stage, substage=substage, **options)
+
 
 if __name__ == "__main__":
     unittest.main()
