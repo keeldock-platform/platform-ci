@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -9,6 +10,8 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import foundation_node_feedback
+import confinement_public_audit
+import confinement_verdict
 import linux_source_build
 import macos_core_contract
 
@@ -43,10 +46,14 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Run all thirteen offline project gates",
                 "Merge confinement phase records",
                 "Forced faults must fail closed",
-                "Collect confinement verdict record",
             ),
         )
-        self.assertEqual(linux_source_build.VERDICT_STEP_NAMES, ("Fetch exact public control", "Publish confinement verdict"))
+        self.assertEqual(linux_source_build.VERDICT_STEP_NAMES, (
+            "Fetch exact public control", "Record verifier image and Rust sysroot",
+            "Harden verifier runner paths", "Run independent boundary self-test",
+            "Re-run independent positive controls", "Merge independent confinement records",
+            "Publish confinement verdict",
+        ))
         self.assertEqual(
             linux_source_build.OPTIONAL_SOURCE_STEPS,
             frozenset((
@@ -310,6 +317,24 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 self.assertEqual(launch[3], linux_source_build.linux_probes.LAUNCHER_SOURCE)
                 self.assertEqual(launch[4:], ("/usr/bin/true",))
 
+    def test_shared_launcher_really_stops_before_the_command_runs(self):
+        stdout_reader, stdout_writer = os.pipe()
+        stderr_reader, stderr_writer = os.pipe()
+        launch = ("/usr/bin/python3", "-B", "-c", linux_source_build.linux_probes.LAUNCHER_SOURCE, "/usr/bin/true")
+        spec = {"mode": "open", "keep_root": True, "limits": "probe", "env": {"PATH": "/usr/bin"}, "timeout": 5}
+        try:
+            code, timed_out = linux_source_build.linux_session.launch_and_collect(
+                spec, launch, "/", (None, stdout_writer), (None, stderr_writer), False,
+            )
+            self.assertEqual(code, 0)
+            self.assertFalse(timed_out)
+        finally:
+            for descriptor in (stdout_reader, stdout_writer, stderr_reader, stderr_writer):
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
     def test_audit_command_passes_empty_arguments_to_the_shared_cli(self):
         audit = types.SimpleNamespace(main=Mock(return_value=0))
         canary = types.SimpleNamespace(compute_config=Mock(return_value="config"), PINNED_CONFIG=None)
@@ -318,7 +343,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertEqual(audit.main.call_args.kwargs["arguments"], [])
         self.assertIs(audit.main.call_args.kwargs["environ"], os.environ)
 
-    def test_synthetic_production_entry_points_pass_the_verdict_record_between_jobs(self):
+    def test_synthetic_entry_points_use_only_independent_proof_and_job_result(self):
         with tempfile.TemporaryDirectory() as temporary:
             records = Path(temporary) / "kd-records"
             records.mkdir()
@@ -328,21 +353,85 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "memory_canary": "absent", "readable_file_canary": "absent",
             }
             (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
-            output = Path(temporary) / "output"
             sha = "a" * 40
             env = {
-                "RUNNER_TEMP": temporary, "GITHUB_OUTPUT": str(output), "CI_SHA": sha,
+                "RUNNER_TEMP": temporary, "CI_SHA": sha,
                 "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1", "CI_MODE": "synthetic",
+                "PRODUCER_RESULT": "success", "VERDICT_RECORD": "forged producer value",
+                "CI_EVENT_NAME": "workflow_dispatch", "CI_REPOSITORY": linux_source_build.REPOSITORY,
+                "CI_SERVER_URL": "https://github.com", "CACHE_MODE": "none",
+                "GITHUB_SHA": sha, "CI_REF": "refs/heads/main", "GITHUB_TOKEN": "read-token",
             }
             with patch.dict(os.environ, env, clear=True), patch.object(
-                linux_source_build, "validate_dispatch", return_value="synthetic"
-            ) as dispatch:
+                linux_source_build, "_reference_sha", side_effect=[sha, "b" * 40]
+            ) as references, patch.object(linux_source_build, "_comparison", return_value="ahead") as comparison:
                 self.assertEqual(linux_source_build.main(["preflight"]), 0)
-                dispatch.assert_called_once()
-                self.assertEqual(linux_source_build.main(["verdict-record"]), 0)
-                encoded = output.read_text(encoding="ascii").split("record=", 1)[1].strip()
-                with patch.dict(os.environ, {**env, "VERDICT_RECORD": encoded}, clear=True):
+                self.assertEqual(references.call_count, 2)
+                comparison.assert_called_once()
+                output = io.StringIO()
+                with patch.object(linux_source_build.sys, "stdout", output):
                     self.assertEqual(linux_source_build.main(["verdict"]), 0)
+                record = confinement_verdict.decode_line(output.getvalue().strip())
+                self.assertTrue(confinement_verdict.confinement_accepted(record))
+                self.assertEqual(record["project_execution"], "not_started")
+                self.assertEqual(record["token_revocation"], "not-applicable")
+
+    def test_forged_producer_record_cannot_turn_a_failed_source_job_into_acceptance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            records = Path(temporary) / "kd-records"
+            records.mkdir()
+            merged = {
+                "channels": {name: {"status": "blocked", "before": True, "after": True}
+                             for name in confinement_verdict.CHANNELS},
+                "memory_canary": "absent", "readable_file_canary": "absent",
+            }
+            (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
+            forged = {
+                "os": "linux", "boundary": "linux-ns-seccomp-uid", "control_sha": "a" * 40,
+                "run_id": 7, "run_attempt": 1, "channels": merged["channels"],
+                "memory_canary": "absent", "readable_file_canary": "absent",
+                "handoff": "not-applicable", "project_execution": "completed",
+                "gates": 13, "failed": 0, "token_revocation": "confirmed",
+            }
+            self.assertTrue(confinement_verdict.run_accepted(forged))
+            env = {
+                "RUNNER_TEMP": temporary, "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7",
+                "GITHUB_RUN_ATTEMPT": "1", "CI_MODE": "source", "PRODUCER_RESULT": "failure",
+                "VERDICT_RECORD": json.dumps(forged),
+            }
+            output = io.StringIO()
+            with patch.object(linux_source_build.sys, "stdout", output):
+                self.assertEqual(linux_source_build.emit_verdict(env), 1)
+            record = confinement_verdict.decode_line(output.getvalue().strip())
+            self.assertEqual(record["project_execution"], "not_started")
+            self.assertEqual(record["gates"], 0)
+            self.assertEqual(record["token_revocation"], "unconfirmed")
+            env["PRODUCER_RESULT"] = "success"
+            self.assertEqual(linux_source_build._verdict_record(env)["project_execution"], "completed")
+            env["PRODUCER_RESULT"] = "forged"
+            self.assertEqual(linux_source_build._verdict_record(env)["project_execution"], "not_started")
+
+    def test_shared_auditor_rejects_verdict_outside_the_plain_run_step(self):
+        expected = linux_source_build._expected_run({
+            "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1", "CI_MODE": "synthetic",
+        }, "b" * 64)
+        steps = [{"name": name, "conclusion": "success"} for name in linux_source_build.VERDICT_STEP_NAMES]
+        job = {"steps": steps}
+        line = confinement_verdict.encode_line({
+            "os": "linux", "boundary": "linux-ns-seccomp-uid", "control_sha": "a" * 40,
+            "run_id": 7, "run_attempt": 1,
+            "channels": {name: {"status": "blocked", "before": True, "after": True}
+                         for name in confinement_verdict.CHANNELS},
+            "memory_canary": "absent", "readable_file_canary": "absent",
+            "handoff": "not-applicable", "project_execution": "not_started",
+            "gates": 0, "failed": 0, "token_revocation": "not-applicable",
+        }).encode("ascii")
+        headers = [bytes((35, 35)) + b"[group]Run verified command\n" for unused in steps]
+        good = b"".join(headers) + line + b"\n"
+        confinement_public_audit._check_section(good, job, expected)
+        bad = b"".join(headers[:-1]) + line + b"\n" + headers[-1]
+        with self.assertRaises(confinement_public_audit.AuditRefusal):
+            confinement_public_audit._check_section(bad, job, expected)
 
 
 if __name__ == "__main__":

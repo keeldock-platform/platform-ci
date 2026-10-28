@@ -286,8 +286,6 @@ jobs:
     permissions:
       actions: read
       contents: read
-    outputs:
-      verdict_record: ${{ steps.verdict-record.outputs.record }}
     defaults:
       run:
         shell: bash
@@ -460,10 +458,6 @@ jobs:
           set -euo pipefail
           arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT" --synthetic-standin)
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py faults "${arguments[@]}"
-      - name: Collect confinement verdict record
-        id: verdict-record
-        if: ${{ always() }}
-        run: python3 -B kit/confinement/linux_source_build.py verdict-record
   linux-source-admission-verdict:
     needs:
       - linux-source-admission-settings
@@ -471,6 +465,8 @@ jobs:
       - linux-source-admission-source-read
     if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
     runs-on: ubuntu-24.04
+    environment:
+      name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}
     timeout-minutes: 15
     cache-mode: none
     permissions:
@@ -481,7 +477,7 @@ jobs:
     env:
       CI_SHA: ${{ github.sha }}
       CI_MODE: ${{ inputs.mode }}
-      VERDICT_RECORD: ${{ needs.linux-source-admission-source-read.outputs.verdict_record }}
+      PRODUCER_RESULT: ${{ needs.linux-source-admission-source-read.result }}
     steps:
       - name: Fetch exact public control
         run: |
@@ -492,7 +488,48 @@ jobs:
           git fetch --quiet --no-tags --depth=1 origin "$GITHUB_REF" 2>/dev/null
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
           [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$GITHUB_SHA" ]]
+      - name: Record verifier image and Rust sysroot
+        id: verifier-toolchain
+        run: |
+          set -euo pipefail
+          [[ "${ImageOS:-}" =~ ^[A-Za-z0-9._-]{1,64}$ && "${ImageVersion:-}" =~ ^[A-Za-z0-9._-]{1,64}$ ]]
+          sysroot="$(rustc --print sysroot)"
+          [[ "$sysroot" =~ ^/[A-Za-z0-9._/@+=-]{1,300}$ && -x "$sysroot/bin/rustc" ]]
+          mkdir -p "$RUNNER_TEMP/kd-records"
+          printf '%s\n' "rust_sysroot=$sysroot" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "linux-verifier-image schema=1 image-os=$ImageOS image-version=$ImageVersion"
+      - name: Harden verifier runner paths
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B kit/confinement/linux_boundary.py harden --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP"
+      - name: Run independent boundary self-test
+        env:
+          KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic' && 'kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd' || secrets.KD_LINUX_LOG_CANARY }}
+          KD_RUST_SYSROOT: ${{ steps.verifier-toolchain.outputs.rust_sysroot }}
+        run: |
+          set -euo pipefail
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          if [[ "$CI_MODE" == "synthetic" ]]; then
+            arguments+=(--synthetic-standin)
+          fi
+          sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py selftest "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/selftest.json"
+      - name: Re-run independent positive controls
+        env:
+          KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic' && 'kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd' || secrets.KD_LINUX_LOG_CANARY }}
+          KD_RUST_SYSROOT: ${{ steps.verifier-toolchain.outputs.rust_sysroot }}
+        run: |
+          set -euo pipefail
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          if [[ "$CI_MODE" == "synthetic" ]]; then
+            arguments+=(--synthetic-standin)
+          fi
+          sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
+      - name: Merge independent confinement records
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B kit/confinement/linux_boundary.py merge --selftest "$RUNNER_TEMP/kd-records/selftest.json" --recheck "$RUNNER_TEMP/kd-records/recheck.json" --out "$RUNNER_TEMP/kd-records/merged.json"
       - name: Publish confinement verdict
+        if: ${{ always() }}
         run: python3 -B kit/confinement/linux_source_build.py verdict
   linux-source-admission-audit:
     needs:

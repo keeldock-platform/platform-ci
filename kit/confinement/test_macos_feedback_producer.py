@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import stat
@@ -71,6 +72,52 @@ def _dispatch(kind="build_diagnostics"):
 def _validated_dispatch(kind):
     _request, environment = _dispatch(kind)
     return producer.validate_dispatch(kind, environment, now=NOW)
+
+
+def _main_with_fake_core_execute(execute):
+    arguments = [
+        "run", "--profile", "lock", "--token-stdin", "--source-sha", SOURCE_SHA,
+        "--base-sha", BASE_SHA, "--base-branch", "develop",
+    ]
+    _request, environment = _dispatch("lock")
+    output = io.StringIO()
+    original_spec = importlib.util.spec_from_file_location
+
+    def core_spec(name, path, *args, **kwargs):
+        spec = original_spec(name, path, *args, **kwargs)
+        if name == "macos_core_contract":
+            original_loader = spec.loader
+
+            class Loader:
+                def create_module(self, spec):
+                    return None
+
+                def exec_module(self, module):
+                    original_loader.exec_module(module)
+                    module._execute = lambda actual, environ, token, lifecycle, feedback_kind=None: execute(
+                        module, actual, environ, token, lifecycle, feedback_kind,
+                    )
+
+            spec.loader = Loader()
+        return spec
+
+    with patch.dict(sys.modules):
+        with patch.object(importlib.util, "spec_from_file_location", side_effect=core_spec):
+            status = producer.main(
+                arguments=arguments, environ=environment, stdin=io.BytesIO(b"fixture-token\n"),
+                stdout=output,
+            )
+    return status, output.getvalue()
+
+
+def _foundation_bootstrap_with_fakes(**options):
+    path = MODULE_PATH.with_name("test_foundation_node_feedback.py")
+    spec = importlib.util.spec_from_file_location("foundation_node_feedback_main_fixtures", path)
+    fixtures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixtures)
+    return fixtures.FoundationNodeFeedbackTests()._run(
+        "bootstrap", "lock", validated_tree="core_node_lock_return", **options,
+    )
 
 
 class MacosFeedbackProducerTests(unittest.TestCase):
@@ -433,6 +480,84 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertEqual(kind, "lock")
         self.assertEqual(core_args[0:2], ["run", "--token-stdin"])
         self.assertEqual(producer._parse_cli(["run", "--profile", "invalid"]), ("invalid", []))
+
+    @unittest.skipUnless(sys.platform != "win32", "the macOS producer path is POSIX only")
+    def test_main_lock_profile_publishes_the_public_result_line(self):
+        receipt = None
+
+        def execute(core, arguments, environment, token, lifecycle, feedback_kind):
+            nonlocal receipt
+            self.assertEqual(arguments, [
+                "run", "--token-stdin", "--source-sha", SOURCE_SHA,
+                "--base-sha", BASE_SHA, "--base-branch", "develop",
+            ])
+            self.assertEqual(token, "fixture-token")
+            self.assertEqual(feedback_kind, "lock")
+            dispatch = producer.validate_dispatch(feedback_kind, environment, now=NOW)
+            self.assertEqual(dispatch["profile"], producer.PROFILE_BY_KIND["lock"])
+            lock_result, _adapter_producer, contract = _foundation_bootstrap_with_fakes()
+            self.assertEqual(lock_result["mode"], "bootstrap")
+            self.assertEqual(lock_result["stages"], ("node_dependency_prepare", "node_dependency_audit"))
+            self.assertEqual(lock_result["provenance_candidate"]["generation_attempts"], 1)
+            self.assertEqual(contract.call[0], "bootstrap")
+            self.assertIsNone(contract.call[1]["accepted_lock"])
+            self.assertIsNone(contract.call[1]["accepted_provenance"])
+            ciphertext = hashlib.sha256(lock_result["lock_bytes"]).digest()
+            receipt = producer.producer_receipt(dispatch, {
+                "member_name": "lock-return-v1.enc",
+                "ciphertext_digest": hashlib.sha256(ciphertext).hexdigest(),
+                "member_size": len(ciphertext),
+            })
+            return receipt.encode("ascii")
+
+        status, output = _main_with_fake_core_execute(execute)
+        self.assertEqual(status, 0)
+        self.assertEqual(output, "KD-FEEDBACK-PRODUCER " + receipt + "\n")
+
+    @unittest.skipUnless(sys.platform != "win32", "the macOS producer path is POSIX only")
+    def test_main_publishes_real_node_toolchain_refusal_mapping(self):
+        worker_calls = []
+
+        def execute(core, arguments, environment, token, lifecycle, feedback_kind):
+            self.assertEqual(feedback_kind, "lock")
+            self.assertEqual(lifecycle["token_revocation"], "unconfirmed")
+            lifecycle["token_revocation"] = "confirmed_before_execution"
+            path = MODULE_PATH.with_name("macos_node_contract.py")
+            spec = importlib.util.spec_from_file_location("macos_node_contract_main_test", path)
+            contract = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(contract)
+
+            def run_worker(argv, **unused):
+                self.assertEqual(lifecycle["token_revocation"], "confirmed_before_execution")
+                worker_calls.append(tuple(argv))
+                return SimpleNamespace(
+                    returncode=0, stdout=b"v0.0.0\n", stderr=b"",
+                    stdout_truncated=False, stderr_truncated=False,
+                )
+
+            with self.assertRaises(contract.NodeContractRefusal) as caught:
+                contract._tool_versions(
+                    run_worker, Path("node"), Path("npm-cli"), Path("project"), {},
+                    producer.time.monotonic() + 60,
+                )
+            try:
+                _foundation_bootstrap_with_fakes(
+                    contract_error=caught.exception, real_node_contract=contract,
+                )
+            except contract.NodeContractRefusal as refusal:
+                raise core._toolchain_refusal(refusal, "worker_setup")
+            self.fail("bootstrap accepted a real Node contract refusal")
+
+        status, output = _main_with_fake_core_execute(execute)
+        self.assertEqual(worker_calls, [("node", "--version")])
+        self.assertEqual(status, 1)
+        self.assertEqual(
+            output,
+            'KD-FEEDBACK-PRODUCER-REFUSAL '
+            '{"diagnostic":"source_gates_node_runtime_version_toolchain_mismatch",'
+            '"reason":"runner_unavailable","schema_version":1,"stage":"worker_setup",'
+            '"status":"refused"}\n',
+        )
 
 
 if __name__ == "__main__":

@@ -79,9 +79,16 @@ SOURCE_STEP_NAMES = (
     "Run all thirteen offline project gates",
     "Merge confinement phase records",
     "Forced faults must fail closed",
-    "Collect confinement verdict record",
 )
-VERDICT_STEP_NAMES = ("Fetch exact public control", "Publish confinement verdict")
+VERDICT_STEP_NAMES = (
+    "Fetch exact public control",
+    "Record verifier image and Rust sysroot",
+    "Harden verifier runner paths",
+    "Run independent boundary self-test",
+    "Re-run independent positive controls",
+    "Merge independent confinement records",
+    "Publish confinement verdict",
+)
 SETTINGS_STEP_NAMES = (
     "Fetch exact public control",
     "Prepare audit identity",
@@ -1444,12 +1451,14 @@ def _load_json(path):
 
 def _verdict_record(environ):
     env = environ
-    audit, verdict, unused_canary = _audit_modules()
+    unused_audit, verdict, unused_canary = _audit_modules()
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     merged = _load_json(records / "merged.json")
-    gates = _load_json(records / "gates.json")
-    revoke = _load_json(records / "revocation.json")
     try:
+        mode = env.get("CI_MODE")
+        producer_result = env.get("PRODUCER_RESULT")
+        if mode not in ("source", "synthetic") or producer_result not in ("success", "failure", "cancelled", "skipped"):
+            raise ValueError
         if merged is None or type(merged.get("channels")) is not dict:
             raise ValueError
         channels = {
@@ -1462,20 +1471,11 @@ def _verdict_record(environ):
         }
         memory = merged.get("memory_canary", "not-run")
         readable = merged.get("readable_file_canary", "not-run")
-        gate_count = gates.get("gate_count", 0) if gates else 0
-        failed = gates.get("failed", 0) if gates else 0
-        if gate_count == 13 and failed == 0:
-            project = "completed"
-        elif gate_count > 0:
-            project = "failed"
-            failed = max(1, failed)
-        else:
-            project = "not_started"
-            gate_count = 0
-            failed = 0
-        token_state = "confirmed" if revoke and revoke.get("status") == "confirmed" else "unconfirmed"
-        if env.get("CI_MODE") == "synthetic":
-            token_state = "not-applicable"
+        accepted_source = mode == "source" and producer_result == "success"
+        project = "completed" if accepted_source else "not_started"
+        gate_count = 13 if accepted_source else 0
+        failed = 0
+        token_state = "confirmed" if accepted_source else "not-applicable" if mode == "synthetic" else "unconfirmed"
         record = {
             "os": "linux", "boundary": "linux-ns-seccomp-uid",
             "control_sha": env.get("CI_SHA", ""),
@@ -1499,28 +1499,16 @@ def _verdict_record(environ):
             "channels": {name: {"status": "not-run", "before": False, "after": False} for name in verdict.CHANNELS},
             "memory_canary": "not-run", "readable_file_canary": "not-run",
             "handoff": "not-applicable", "project_execution": "not_started",
-            "gates": 0, "failed": 0, "token_revocation": "unconfirmed",
+            "gates": 0, "failed": 0, "token_revocation": "not-applicable" if env.get("CI_MODE") == "synthetic" else "unconfirmed",
         }
     return record
-
-
-def write_verdict_record(environ=None):
-    env = os.environ if environ is None else environ
-    unused_audit, verdict, unused_canary = _audit_modules()
-    record = _verdict_record(env)
-    _write_output(env, {"record": json.dumps(record, sort_keys=True, separators=(",", ":"))})
-    return 0 if verdict.run_accepted(record) or env.get("CI_MODE") == "synthetic" and verdict.confinement_accepted(record) else 1
 
 
 def emit_verdict(environ=None):
     env = os.environ if environ is None else environ
     unused_audit, verdict, unused_canary = _audit_modules()
-    try:
-        record = json.loads(env.get("VERDICT_RECORD", ""))
-        line = verdict.encode_line(record)
-    except BaseException:
-        record = _verdict_record({"CI_SHA": env.get("CI_SHA", "0" * 40), "GITHUB_RUN_ID": env.get("GITHUB_RUN_ID", "1"), "GITHUB_RUN_ATTEMPT": env.get("GITHUB_RUN_ATTEMPT", "1")})
-        line = verdict.encode_line(record)
+    record = _verdict_record(env)
+    line = verdict.encode_line(record)
     sys.stdout.write(line + "\n")
     return 0 if verdict.run_accepted(record) or env.get("CI_MODE") == "synthetic" and verdict.confinement_accepted(record) else 1
 
@@ -1553,7 +1541,6 @@ def _dispatch(command):
         "trusted-audit": run_trusted_audit,
         "prepare-project": prepare_project,
         "gates": run_project_gates,
-        "verdict-record": write_verdict_record,
         "verdict": emit_verdict,
         "audit": run_audit,
     }

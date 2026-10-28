@@ -233,7 +233,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         for name, body in self.jobs().items():
             if name != "linux-source-admission-source-read":
                 self.assertNotIn("SOURCE_READER_PRIVATE_KEY", body)
-        self.assertEqual(self.text.count("KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic'"), 2)
+        self.assertEqual(self.text.count("KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic'"), 4)
         source = self.jobs()["linux-source-admission-source-read"]
         self.assertEqual(source.count("--preserve-env=KD_CANARY_SECRET"), 3)
         for line in source.splitlines():
@@ -264,7 +264,6 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "Run all thirteen offline project gates",
                 "Merge confinement phase records",
                 "Forced faults must fail closed",
-                "Collect confinement verdict record",
             ],
         )
         self.assertLess(source.index("linux_boundary.py selftest"), source.index("Mint scoped source-reader token"))
@@ -291,11 +290,17 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
     def test_verdict_step_is_plain_run_and_the_verdict_job_has_no_composite_step(self):
         source = self.jobs()["linux-source-admission-source-read"]
         verdict = self.jobs()["linux-source-admission-verdict"]
-        self.assertIn("      - name: Collect confinement verdict record\n", source)
-        self.assertIn("verdict_record: ${{ steps.verdict-record.outputs.record }}", source)
+        self.assertNotIn("    outputs:\n", source)
+        self.assertNotIn("verdict_record", verdict)
+        self.assertIn("PRODUCER_RESULT: ${{ needs.linux-source-admission-source-read.result }}", verdict)
+        self.assertIn("name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}", verdict)
+        self.assertIn("linux_boundary.py selftest", verdict)
+        self.assertIn("linux_boundary.py recheck", verdict)
+        self.assertIn("linux_boundary.py merge", verdict)
         self.assertIn("run: python3 -B kit/confinement/linux_source_build.py verdict", verdict)
         self.assertNotIn("uses:", verdict)
-        self.assertEqual(verdict.count("      - name:"), 2)
+        self.assertEqual(verdict.count("      - name:"), 7)
+        self.assertEqual(verdict.count("--preserve-env=KD_CANARY_SECRET"), 2)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", self.text)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", verdict)
 

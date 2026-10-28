@@ -1345,14 +1345,23 @@ class LaneRegistryTests(unittest.TestCase):
         self.assertIs(type(policy.LANE_MODULES), tuple)
 
     def test_registry_maps_each_lane_kind_to_exactly_one_lane(self):
+        self.assertEqual(policy.LANE_MODULES, (policy_linux, policy_windows, policy_handoff))
         self.assertEqual(
             {kind: module for kind, module in policy.WORKFLOW_KIND_LANES.items()},
             {
-                "linux-confinement": policy_linux,
-                "linux-source-admission": policy_linux,
-                "windows-native-preflight": policy_windows,
+                kind: module
+                for module in policy.LANE_MODULES
+                for kind in tuple(module.WORKFLOW_TEMPLATES) + tuple(module.WORKFLOW_SHA256)
             },
         )
+        self.assertEqual(
+            set(policy.WORKFLOW_KIND_LANES),
+            {"linux-confinement", "linux-source-admission", "windows-native-preflight", "windows-confinement"},
+        )
+        self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["linux-source-admission"], policy_linux)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["windows-confinement"], policy_windows)
         self.assertEqual(
             set(policy.LANE_WORKFLOW_TEMPLATES) | set(policy.LANE_WORKFLOW_SHA256),
             set(policy.WORKFLOW_KIND_LANES),
@@ -1377,19 +1386,27 @@ class LaneRegistryTests(unittest.TestCase):
     def test_candidate_workflows_follow_lane_order(self):
         self.assertEqual(
             policy.LANE_CANDIDATE_WORKFLOWS,
+            tuple(entry for module in policy.LANE_MODULES for entry in module.CANDIDATE_WORKFLOWS),
+        )
+        self.assertIn(
+            (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
+            policy.LANE_CANDIDATE_WORKFLOWS,
+        )
+        self.assertIn(
             (
-                (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
-                (
-                    ".github/workflows/linux-source-admission.yml",
-                    "linux-source-admission",
-                    "linux-source-admission-workflow-too-large",
-                ),
-                (
-                    ".github/workflows/windows-native-preflight.yml",
-                    "windows-native-preflight",
-                    "windows-workflow-too-large",
-                ),
+                ".github/workflows/linux-source-admission.yml",
+                "linux-source-admission",
+                "linux-source-admission-workflow-too-large",
             ),
+            policy.LANE_CANDIDATE_WORKFLOWS,
+        )
+        self.assertIn(
+            (
+                ".github/workflows/windows-native-preflight.yml",
+                "windows-native-preflight",
+                "windows-workflow-too-large",
+            ),
+            policy.LANE_CANDIDATE_WORKFLOWS,
         )
 
     def test_every_lane_module_exposes_the_same_interface(self):
