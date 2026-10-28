@@ -75,6 +75,8 @@ PLATFORM_FILES = frozenset(
         "kit/bootstrap/test_policy_linux.py",
         "kit/bootstrap/test_policy_windows.py",
         "kit/bootstrap/test_public_tree.py",
+        "kit/selector/suite_selector.py",
+        "kit/selector/test_suite_selector.py",
         "kit/confinement/macos_boundary_guard.py",
         "kit/confinement/test_macos_boundary_guard.py",
         "kit/confinement/macos_canary_scan.py",
