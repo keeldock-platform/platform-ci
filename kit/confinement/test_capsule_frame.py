@@ -1,8 +1,11 @@
 import hashlib
 import hmac
+import inspect
 import random
 import struct
+import threading
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import capsule_frame as frame
@@ -14,30 +17,57 @@ P256_BASE_POINT = bytes.fromhex(
     "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
 )
 _TEST_CONTEXT_ACTIVE = False
+VECTOR_SOURCES = {
+    "key_header_chunk_trailer_manifest": "Approved capsule design, format tables at lines 61 through 95; layout checks only",
+    "nonce_aad_and_protocol_key": "Approved capsule design, formulas at lines 84 through 86; separate formula checks only",
+    "hkdf_prk_okm": "RFC 5869, Appendix A.1, SHA-256 test case; published primitive KAT",
+    "p256_base_point": "SEC 2, P-256 base point coordinates; published point fixture",
+    "sha256_abc": "NIST FIPS 180-4, SHA-256 message abc; published primitive KAT",
+}
+
+
+def _require_unittest_context():
+    current = inspect.currentframe()
+    try:
+        active_run = False
+        while current is not None:
+            if current.f_code is unittest.TestCase.run.__code__:
+                active_run = True
+                break
+            current = current.f_back
+        if not _TEST_CONTEXT_ACTIVE or not active_run:
+            raise RuntimeError("test_only_fake_refused")
+    finally:
+        del current
 
 
 class TestOnlyDeterministicFake:
     def __init__(self):
-        if not _TEST_CONTEXT_ACTIVE:
-            raise RuntimeError("test_only_fake_refused")
+        _require_unittest_context()
+        self.calls = []
 
     def seal(self, key, nonce, plaintext, aad):
+        _require_unittest_context()
+        self.calls.append((nonce, aad))
         tag = hmac.new(key, nonce + aad + plaintext, hashlib.sha256).digest()[:16]
         return plaintext, tag
 
     def open(self, key, nonce, ciphertext, tag, aad):
+        _require_unittest_context()
         expected = hmac.new(key, nonce + aad + ciphertext, hashlib.sha256).digest()[:16]
         if not hmac.compare_digest(tag, expected):
             raise ValueError("fake_tag_invalid")
         return ciphertext
 
     def derive_shared_x(self, peer_public_point):
+        _require_unittest_context()
         frame.validate_public_point(peer_public_point)
         return bytes.fromhex("0123456789abcdef" * 4)
 
 
 class RefusingFake:
     def open(self, key, nonce, ciphertext, tag, aad):
+        _require_unittest_context()
         raise ValueError("refused")
 
 
@@ -80,7 +110,7 @@ def make_header():
         4,
         5,
         bytes.fromhex("66" * 32),
-        bytes.fromhex("77" * 32),
+        hashlib.sha256(b"windows-receiver").digest(),
     )
 
 
@@ -113,7 +143,7 @@ class CapsuleFrameTests(unittest.TestCase):
             callback(*args)
         self.assertEqual(raised.exception.reason, reason)
 
-    def test_key_record_known_answer_vector(self):
+    def test_key_record_design_layout_vector(self):
         record = make_key_record()
         encoded = frame.encode_key_record(record)
         expected_hex = (
@@ -143,7 +173,7 @@ class CapsuleFrameTests(unittest.TestCase):
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         )
 
-    def test_header_known_answer_vector(self):
+    def test_header_design_layout_vector(self):
         header = make_header()
         encoded = frame.encode_capsule_header(header)
         prefix_hex = (
@@ -164,7 +194,7 @@ class CapsuleFrameTests(unittest.TestCase):
             + "0000000000000004"
             + "0000000000000005"
             + "66" * 32
-            + "77" * 32
+            + hashlib.sha256(b"windows-receiver").hexdigest()
             + "00000010"
             + "00000100"
             + "00100000"
@@ -175,32 +205,34 @@ class CapsuleFrameTests(unittest.TestCase):
         self.assertEqual(frame.decode_capsule_header(bytes.fromhex(encoded.hex())), header)
 
     def test_chunk_offsets_match_fixed_global_layout(self):
+        self.assertEqual(frame.CAPSULE_LENGTH, 286261248)
         self.assertEqual(frame.chunk_offset(0), 65536)
         self.assertEqual(frame.chunk_offset(15), 15794416)
         self.assertEqual(frame.chunk_offset(16), 16843008)
         self.assertEqual(frame.chunk_offset(271), 284233968)
+        self.assertEqual(frame.TRAILER_START, 285282560)
 
-    def test_chunk_known_answer_vector(self):
+    def test_chunk_design_layout_vector(self):
         ciphertext = bytes.fromhex("5a") * frame.CHUNK_PLAINTEXT_BYTES
         tag = bytes.fromhex("a5") * frame.CHUNK_TAG_BYTES
         encoded = frame.encode_chunk(16, ciphertext, tag, 1)
         self.assertEqual(encoded.hex(), "5a" * frame.CHUNK_PLAINTEXT_BYTES + "a5" * 16)
         self.assertEqual(frame.decode_chunk(bytes.fromhex(encoded.hex()), 16), frame.ChunkRecord(16, 1, ciphertext, tag))
 
-    def test_trailer_known_answer_vector(self):
+    def test_trailer_design_layout_vector(self):
         trailer = bytes.fromhex("ab") * frame.TRAILER_LENGTH
         encoded = frame.encode_trailer(trailer)
         self.assertEqual(encoded.hex(), "ab" * frame.TRAILER_LENGTH)
         self.assertEqual(frame.decode_trailer(bytes.fromhex(encoded.hex())), trailer)
 
-    def test_manifest_known_answer_vector(self):
+    def test_manifest_design_layout_vector(self):
         manifest = make_manifest()
         encoded = frame.encode_manifest(manifest)
         expected_hex = (
             "a8"
             "01"
             "70"
-            + frame.MANIFEST_DOMAIN.hex()
+            + b"KDWH-v1/manifest".hex()
             + "02"
             + "01"
             + "03"
@@ -240,20 +272,14 @@ class CapsuleFrameTests(unittest.TestCase):
             + "00000110",
         )
         manifest_region = bytes.fromhex("11") * frame.MANIFEST_REGION_LENGTH
-        fixed_manifest_digest = bytes.fromhex("12") * 32
-        with mock.patch.object(
-            frame,
-            "manifest_ciphertext_digest",
-            return_value=fixed_manifest_digest,
-        ):
-            bundle_aad = frame.make_aad(bytes.fromhex("ff") * 32, 16, 1, manifest_region)
+        bundle_aad = frame.make_aad(bytes.fromhex("ff") * 32, 16, 1, manifest_region)
         expected_bundle_aad = (
             "4b4457482d76312f47434d2d4348554e4b00"
             + "ff" * 32
             + "0000000000000010"
             + "01"
             + "00000110"
-            + "12" * 32
+            + hashlib.sha256(manifest_region).hexdigest()
         )
         self.assertEqual(bundle_aad.hex(), expected_bundle_aad)
         self.assertEqual(
@@ -265,6 +291,11 @@ class CapsuleFrameTests(unittest.TestCase):
         ikm = bytes.fromhex("0b" * 22)
         salt = bytes.fromhex("000102030405060708090a0b0c")
         info = bytes.fromhex("f0f1f2f3f4f5f6f7f8f9")
+        self.assertEqual(
+            hmac.new(salt, ikm, hashlib.sha256).hexdigest(),
+            "077709362c2e32df0ddc3f0dc47bba6"
+            "390b6c73bb50f9c3122ec844ad7c2b3e5",
+        )
         output = frame._hkdf_sha256(ikm, salt, info, 42)
         self.assertEqual(
             output.hex(),
@@ -273,15 +304,14 @@ class CapsuleFrameTests(unittest.TestCase):
             "34007208d5b887185865",
         )
 
-    def test_capsule_key_uses_header_salt_and_digest(self):
+    def test_capsule_key_matches_independent_design_formula(self):
         header_bytes = frame.encode_capsule_header(make_header())
-        header = frame.decode_capsule_header(header_bytes)
         shared_x = bytes.fromhex("01" * 32)
-        expected = frame.derive_aes_key(
-            shared_x,
-            header.hkdf_salt,
-            frame.header_digest(header_bytes),
-        )
+        header_sha256 = hashlib.sha256(header_bytes).digest()
+        salt = header_bytes[201:233]
+        prk = hmac.new(salt, shared_x, hashlib.sha256).digest()
+        info = b"KDWH-v1/HKDF-AES256GCM\x00" + header_sha256
+        expected = hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
         self.assertEqual(frame.derive_capsule_aes_key(shared_x, header_bytes), expected)
 
     def test_downgrade_refusal_code(self):
@@ -294,13 +324,34 @@ class CapsuleFrameTests(unittest.TestCase):
         header = bytearray(frame.encode_capsule_header(make_header()))
         header[frame.HEADER_VERSION_START:frame.HEADER_SUITE_START] = b"\x00\x02"
         self.assert_refusal(frame.REASON_DOWNGRADE, frame.decode_capsule_header, bytes(header))
+        encoded = bytearray(frame.encode_key_record(make_key_record()))
+        encoded[frame.KEY_SUITE_START:frame.KEY_CONTROL_REPOSITORY_ID_START] = b"\x00\x02"
+        self.assert_refusal(frame.REASON_DOWNGRADE, frame.decode_key_record, bytes(encoded))
+        header = bytearray(frame.encode_capsule_header(make_header()))
+        header[frame.HEADER_SUITE_START:frame.HEADER_FLAGS_START] = b"\x00\x02"
+        self.assert_refusal(frame.REASON_DOWNGRADE, frame.decode_capsule_header, bytes(header))
 
     def test_length_refusal_code(self):
         self.assert_refusal(frame.REASON_LENGTH, frame.decode_capsule_header, b"short")
+        self.assert_refusal(frame.REASON_LENGTH, frame.decode_capsule, b"short", make_key_record())
         self.assert_refusal(
             frame.REASON_LENGTH,
             frame.decode_length_prefixed_region,
-            struct.pack(">Q", 5),
+            struct.pack(">Q", 5) + bytes(8),
+            16,
+            4,
+        )
+        self.assert_refusal(
+            frame.REASON_LENGTH,
+            frame.decode_length_prefixed_region,
+            struct.pack(">Q", 5) + bytes(4),
+            12,
+            10,
+        )
+        self.assert_refusal(
+            frame.REASON_LENGTH,
+            frame.decode_length_prefixed_region,
+            struct.pack(">Q", 3) + bytes(3),
             12,
             4,
         )
@@ -309,6 +360,11 @@ class CapsuleFrameTests(unittest.TestCase):
         encoded = frame.encode_manifest(make_manifest())
         noncanonical = b"\xb8\x08" + encoded[1:]
         self.assert_refusal(frame.REASON_NONCANONICAL, frame.decode_manifest, noncanonical)
+        key_two_offset = 3 + len(b"KDWH-v1/manifest")
+        for replacement in (0, 1):
+            malformed = bytearray(encoded)
+            malformed[key_two_offset] = replacement
+            self.assert_refusal(frame.REASON_NONCANONICAL, frame.decode_manifest, bytes(malformed))
 
     def test_global_index_refusal_code(self):
         indices = list(range(frame.CHUNK_COUNT))
@@ -347,6 +403,19 @@ class CapsuleFrameTests(unittest.TestCase):
             frame.decode_capsule_header,
             frame.encode_capsule_header(make_header()) + b"\x00",
         )
+        with mock.patch.object(frame, "CAPSULE_LENGTH", 4):
+            self.assert_refusal(frame.REASON_TRAILING, frame.decode_capsule, bytes(5), make_key_record())
+
+    def test_full_capsule_view_keeps_one_immutable_owner(self):
+        raw = bytes(frame.CAPSULE_LENGTH)
+        self.assert_refusal(frame.REASON_DOWNGRADE, frame.decode_capsule, raw, make_key_record())
+        view = frame.CapsuleView(raw, make_header())
+        self.assertIs(view.chunk(0).ciphertext.obj, raw)
+        self.assertIs(view.chunk(271).tag.obj, raw)
+        self.assertIs(view.manifest_ciphertext_region.obj, raw)
+        self.assertIs(view.trailer.obj, raw)
+        self.assertTrue(view.chunk(0).ciphertext.readonly)
+        self.assertEqual(len(view.trailer), 978688)
 
     def test_manifest_limit_refusal_code(self):
         bad_path = frame.ManifestEntry("../escape", 0o100644, bytes(20), 0, bytes(32))
@@ -363,12 +432,28 @@ class CapsuleFrameTests(unittest.TestCase):
             frame.encode_manifest,
             make_manifest((too_large,)),
         )
+        def entry(path):
+            return frame.ManifestEntry(path, 0o100644, bytes(20), 0, bytes(32))
+        for paths in (("a", "a/b"), ("A", "a/b"), ("A/b", "a")):
+            self.assert_refusal(
+                frame.REASON_MANIFEST_LIMIT,
+                frame.encode_manifest,
+                make_manifest(tuple(entry(path) for path in paths)),
+            )
 
     def test_invalid_point_refusal_code(self):
         self.assert_refusal(
             frame.REASON_POINT,
             frame.validate_public_point,
             b"\x04" + bytes(64),
+        )
+        self.assertEqual(frame.validate_public_point(P256_BASE_POINT), P256_BASE_POINT)
+        self.assert_refusal(frame.REASON_POINT, frame.validate_public_point, b"\x02" + P256_BASE_POINT[1:])
+        field = int("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff", 16)
+        self.assert_refusal(
+            frame.REASON_POINT,
+            frame.validate_public_point,
+            b"\x04" + field.to_bytes(32, "big") + P256_BASE_POINT[33:],
         )
 
     def test_structure_refusal_code_and_exception_conversion(self):
@@ -390,30 +475,16 @@ class CapsuleFrameTests(unittest.TestCase):
             chunk,
         )
 
-    def test_every_reason_code_has_a_negative_case(self):
-        covered = {
-            frame.REASON_DOWNGRADE,
-            frame.REASON_LENGTH,
-            frame.REASON_NONCANONICAL,
-            frame.REASON_CHUNK_INDEX,
-            frame.REASON_TRAILING,
-            frame.REASON_MANIFEST_LIMIT,
-            frame.REASON_POINT,
-            frame.REASON_STRUCTURE,
-            frame.REASON_CRYPTO,
-        }
-        self.assertEqual(covered, set(frame.REASON_CODES))
-
     def test_length_prefix_round_trip_and_cap(self):
         encoded = frame.encode_length_prefixed_region(b"abc", b"z", 12, 4)
         self.assertEqual(encoded, bytes.fromhex("00000000000000036162637a"))
         self.assertEqual(frame.decode_length_prefixed_region(encoded, 12, 4), (b"abc", b"z"))
-        over_cap = struct.pack(">Q", 5)
+        over_cap = struct.pack(">Q", 5) + bytes(8)
         self.assert_refusal(
             frame.REASON_LENGTH,
             frame.decode_length_prefixed_region,
             over_cap,
-            12,
+            16,
             4,
         )
 
@@ -434,7 +505,7 @@ class CapsuleFrameTests(unittest.TestCase):
             record.created_at,
             record.expires_at,
             record.workflow_ref_sha256,
-            bytes.fromhex("77" * 32),
+            hashlib.sha256(b"windows-receiver").digest(),
         )
         self.assertTrue(frame.validate_header_key_binding(header, record_bytes))
         mismatched = frame.CapsuleHeader(
@@ -459,23 +530,118 @@ class CapsuleFrameTests(unittest.TestCase):
             mismatched,
             record,
         )
+        self.assert_refusal(
+            frame.REASON_STRUCTURE,
+            frame.validate_header_key_binding,
+            replace(header, intended_job_sha256=bytes.fromhex("77" * 32)),
+            record,
+        )
+        encoded_header = bytearray(frame.encode_capsule_header(header))
+        encoded_header[frame.HEADER_INTENDED_JOB_SHA256_START] ^= 1
+        self.assert_refusal(
+            frame.REASON_STRUCTURE,
+            frame.decode_capsule_header,
+            bytes(encoded_header),
+        )
 
     def test_test_only_fake_refuses_outside_test_context(self):
         global _TEST_CONTEXT_ACTIVE
+        retained = TestOnlyDeterministicFake()
         _TEST_CONTEXT_ACTIVE = False
         with self.assertRaisesRegex(RuntimeError, "test_only_fake_refused"):
             TestOnlyDeterministicFake()
+        with self.assertRaisesRegex(RuntimeError, "test_only_fake_refused"):
+            retained.seal(bytes(32), bytes(12), b"", b"")
+        with self.assertRaisesRegex(RuntimeError, "test_only_fake_refused"):
+            retained.open(bytes(32), bytes(12), b"", bytes(16), b"")
+        with self.assertRaisesRegex(RuntimeError, "test_only_fake_refused"):
+            retained.derive_shared_x(P256_BASE_POINT)
         _TEST_CONTEXT_ACTIVE = True
         self.assertIsInstance(TestOnlyDeterministicFake(), TestOnlyDeterministicFake)
+        refusals = []
+
+        def outside_unittest_stack():
+            try:
+                TestOnlyDeterministicFake()
+            except RuntimeError as error:
+                refusals.append(str(error))
+
+        worker = threading.Thread(target=outside_unittest_stack)
+        worker.start()
+        worker.join()
+        self.assertEqual(refusals, ["test_only_fake_refused"])
 
     def test_fake_chunk_seal_open_round_trip(self):
         provider = TestOnlyDeterministicFake()
         key = bytes.fromhex("33" * 32)
         header = make_header()
         plaintext = bytes.fromhex("7c") * frame.CHUNK_PLAINTEXT_BYTES
-        chunk = frame.seal_chunk(provider, key, header, 0, plaintext)
+        session = frame.EncryptionSession(provider, key, header)
+        chunk = session.seal_chunk(0, plaintext)
         self.assertEqual(chunk.kind, 0)
         self.assertEqual(frame.open_chunk(provider, key, header, chunk), plaintext)
+
+    def test_encryption_session_single_use_and_order(self):
+        self.assertFalse(hasattr(frame, "seal_chunk"))
+        provider = TestOnlyDeterministicFake()
+        key = bytes.fromhex("34" * 32)
+        plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
+        session = frame.EncryptionSession(provider, key, make_header())
+        session.seal_chunk(0, plaintext)
+        self.assert_refusal(frame.REASON_CHUNK_INDEX, session.seal_chunk, 0, plaintext)
+        self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 1, plaintext)
+        self.assertEqual(len(provider.calls), 1)
+        self.assert_refusal(
+            frame.REASON_CRYPTO,
+            frame.EncryptionSession,
+            provider,
+            key,
+            make_header(),
+        )
+
+    def test_encryption_session_failure_consumes_key(self):
+        provider = mock.Mock()
+        provider.seal.side_effect = ValueError("provider failure")
+        key = bytes.fromhex("35" * 32)
+        plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
+        session = frame.EncryptionSession(provider, key, make_header())
+        self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 0, plaintext)
+        self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 0, plaintext)
+        self.assertEqual(provider.seal.call_count, 1)
+        self.assert_refusal(
+            frame.REASON_CRYPTO,
+            frame.EncryptionSession,
+            provider,
+            key,
+            make_header(),
+        )
+
+    def test_encryption_session_context_exit_aborts_partial_attempt(self):
+        provider = TestOnlyDeterministicFake()
+        key = bytes.fromhex("37" * 32)
+        plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
+        with frame.EncryptionSession(provider, key, make_header()) as session:
+            session.seal_chunk(0, plaintext)
+        self.assert_refusal(frame.REASON_CRYPTO, session.seal_chunk, 1, plaintext)
+        self.assert_refusal(
+            frame.REASON_CRYPTO,
+            frame.EncryptionSession,
+            provider,
+            key,
+            make_header(),
+        )
+
+    def test_encryption_session_bundle_aad_uses_all_manifest_records(self):
+        provider = TestOnlyDeterministicFake()
+        session = frame.EncryptionSession(provider, bytes.fromhex("36" * 32), make_header())
+        plaintext = bytes(frame.CHUNK_PLAINTEXT_BYTES)
+        manifest_hasher = hashlib.sha256()
+        for index in range(frame.MANIFEST_CHUNK_COUNT):
+            chunk = session.seal_chunk(index, plaintext)
+            manifest_hasher.update(chunk.ciphertext)
+            manifest_hasher.update(chunk.tag)
+        session.seal_chunk(frame.FIRST_BUNDLE_INDEX, plaintext)
+        self.assertTrue(provider.calls[-1][1].endswith(manifest_hasher.digest()))
 
     def test_seeded_round_trip_loops(self):
         generator = random.Random(731941)

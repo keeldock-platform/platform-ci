@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import struct
+import threading
 import unicodedata
 from dataclasses import dataclass
 from typing import Protocol, Sequence, Tuple
@@ -108,11 +109,7 @@ REASON_CODES = (
 )
 
 PROVISIONAL_CHOICES = (
-    "The candidate v1 proposal is implemented as written and remains provisional.",
-    "Chunk indices are implicit in fixed capsule position because no index bytes are specified.",
-    "Windows path aliases use NFC, Windows-safe component rules, and case-fold collision rejection.",
-    "Padding and trailer bytes are caller-supplied; framing checks lengths but cannot prove randomness.",
-    "The frame layer validates P-256 points arithmetically; provider lifecycle and interoperability remain external.",
+    "Windows destination aliases use NFC and casefold; the exact Windows equivalence algorithm is unspecified.",
 )
 
 _P256_FIELD = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
@@ -148,6 +145,22 @@ def _is_bytes(value):
 def _check_bytes(value, length, reason=REASON_STRUCTURE):
     if not _is_bytes(value) or len(value) != length:
         _refuse(reason)
+
+
+def _check_readonly_region(value, length, reason=REASON_STRUCTURE):
+    if _is_bytes(value) and len(value) == length:
+        return
+    if (
+        type(value) is memoryview
+        and value.readonly
+        and value.format == "B"
+        and value.ndim == 1
+        and value.c_contiguous
+        and len(value) == length
+        and type(value.obj) is bytes
+    ):
+        return
+    _refuse(reason)
 
 
 def _check_uint(value, maximum=_MAX_U64):
@@ -271,6 +284,49 @@ class Capsule:
     trailer: bytes
 
 
+class CapsuleView:
+    """A bounded, read-only view retaining one immutable capsule bytes owner.
+
+    Chunk and trailer views keep the original bytes alive. Consumers should
+    authenticate and process one chunk at a time; no ciphertext is copied by
+    decoding the complete capsule.
+    """
+
+    def __init__(self, data, header):
+        _check_capsule_length(data)
+        _validate_header(header)
+        self._data = memoryview(data)
+        self.header = header
+
+    def chunk(self, index):
+        kind = chunk_kind_for_index(index)
+        start = chunk_offset(index)
+        ciphertext = self._data[start:start + CHUNK_PLAINTEXT_BYTES]
+        tag = self._data[start + CHUNK_PLAINTEXT_BYTES:start + CHUNK_RECORD_LENGTH]
+        return ChunkRecord(index, kind, ciphertext, tag)
+
+    @property
+    def manifest_chunks(self):
+        return tuple(self.chunk(index) for index in range(MANIFEST_CHUNK_COUNT))
+
+    @property
+    def bundle_chunks(self):
+        return tuple(self.chunk(index) for index in range(FIRST_BUNDLE_INDEX, CHUNK_COUNT))
+
+    @property
+    def manifest_ciphertext_region(self):
+        return self._data[MANIFEST_REGION_START:BUNDLE_REGION_START]
+
+    @property
+    def trailer(self):
+        return self._data[TRAILER_START:CAPSULE_LENGTH]
+
+
+_ENCRYPTION_KEYS_USED = set()
+_ENCRYPTION_KEYS_LOCK = threading.Lock()
+MAX_ENCRYPTION_SESSIONS = 10000
+
+
 def _validate_key_record(record):
     if type(record) is not KeyRecord:
         _refuse(REASON_STRUCTURE)
@@ -370,6 +426,8 @@ def _validate_header(header):
         _refuse(REASON_STRUCTURE)
     _check_bytes(header.workflow_ref_sha256, 32)
     _check_bytes(header.intended_job_sha256, 32)
+    if header.intended_job_sha256 != RECEIVER_JOB_SHA256:
+        _refuse(REASON_STRUCTURE)
 
 
 def encode_capsule_header(header):
@@ -478,6 +536,7 @@ def validate_header_key_binding(header, key_record):
         or header.created_at != record.created_at
         or header.expires_at != record.expires_at
         or header.workflow_ref_sha256 != record.workflow_ref_sha256
+        or header.intended_job_sha256 != RECEIVER_JOB_SHA256
     ):
         _refuse(REASON_STRUCTURE)
     return True
@@ -645,6 +704,7 @@ def _validate_manifest(manifest):
         _refuse(REASON_MANIFEST_LIMIT)
     previous_path = None
     aliases = set()
+    ancestor_aliases = set()
     total_size = 0
     for entry in manifest.entries:
         if type(entry) is not ManifestEntry:
@@ -656,9 +716,14 @@ def _validate_manifest(manifest):
             _refuse(REASON_MANIFEST_LIMIT)
         previous_path = path_bytes
         alias = unicodedata.normalize("NFC", entry.path).casefold()
-        if alias in aliases:
+        components = alias.split("/")
+        ancestors = tuple("/".join(components[:end]) for end in range(1, len(components)))
+        if alias in aliases or alias in ancestor_aliases or any(
+            ancestor in aliases for ancestor in ancestors
+        ):
             _refuse(REASON_MANIFEST_LIMIT)
         aliases.add(alias)
+        ancestor_aliases.update(ancestors)
         if entry.mode not in (0o100644, 0o100755):
             _refuse(REASON_MANIFEST_LIMIT)
         _check_bytes(entry.blob_id, 20)
@@ -901,7 +966,7 @@ def header_digest(header_bytes):
 
 
 def manifest_ciphertext_digest(manifest_region):
-    _check_bytes(manifest_region, MANIFEST_REGION_LENGTH, REASON_LENGTH)
+    _check_readonly_region(manifest_region, MANIFEST_REGION_LENGTH, REASON_LENGTH)
     return hashlib.sha256(manifest_region).digest()
 
 
@@ -916,6 +981,17 @@ def make_aad(header_sha256, index, kind, manifest_ciphertext_region=None):
     expected_kind = chunk_kind_for_index(index)
     if type(kind) is not int or kind != expected_kind:
         _refuse(REASON_CHUNK_INDEX)
+    if kind == 1:
+        _check_readonly_region(manifest_ciphertext_region, MANIFEST_REGION_LENGTH, REASON_LENGTH)
+        manifest_sha256 = manifest_ciphertext_digest(manifest_ciphertext_region)
+    elif manifest_ciphertext_region is not None:
+        _refuse(REASON_STRUCTURE)
+    else:
+        manifest_sha256 = None
+    return _aad_with_digest(header_sha256, index, kind, manifest_sha256)
+
+
+def _aad_with_digest(header_sha256, index, kind, manifest_sha256):
     aad = (
         AAD_DOMAIN
         + b"\x00"
@@ -925,10 +1001,8 @@ def make_aad(header_sha256, index, kind, manifest_ciphertext_region=None):
         + _u32(CHUNK_COUNT)
     )
     if kind == 1:
-        _check_bytes(manifest_ciphertext_region, MANIFEST_REGION_LENGTH, REASON_LENGTH)
-        aad += manifest_ciphertext_digest(manifest_ciphertext_region)
-    elif manifest_ciphertext_region is not None:
-        _refuse(REASON_STRUCTURE)
+        _check_bytes(manifest_sha256, 32, REASON_LENGTH)
+        aad += manifest_sha256
     return aad
 
 
@@ -986,20 +1060,68 @@ def derive_shared_x(provider, peer_public_point):
     return shared_x
 
 
-def seal_chunk(provider, key, header, index, plaintext, manifest_ciphertext_region=None):
-    _check_bytes(key, 32)
-    _validate_header(header)
-    _check_bytes(plaintext, CHUNK_PLAINTEXT_BYTES, REASON_LENGTH)
-    kind = chunk_kind_for_index(index)
-    aad = make_aad(header_digest(encode_capsule_header(header)), index, kind, manifest_ciphertext_region)
-    nonce = make_nonce(header.nonce_prefix, index)
-    try:
-        ciphertext, tag = provider.seal(key, nonce, plaintext, aad)
-    except Exception:
-        _refuse(REASON_CRYPTO)
-    _check_bytes(ciphertext, CHUNK_PLAINTEXT_BYTES, REASON_CRYPTO)
-    _check_bytes(tag, CHUNK_TAG_BYTES, REASON_CRYPTO)
-    return ChunkRecord(index, kind, ciphertext, tag)
+class EncryptionSession:
+    """One process-local, single-use attempt for one derived AES key.
+
+    The sender must provision a fresh key tuple for every new process attempt.
+    A session cannot be resumed after an error or interruption.
+    """
+
+    def __init__(self, provider, key, header):
+        _check_bytes(key, 32)
+        _validate_header(header)
+        if not callable(getattr(provider, "seal", None)):
+            _refuse(REASON_CRYPTO)
+        fingerprint = hashlib.sha256(key).digest()
+        with _ENCRYPTION_KEYS_LOCK:
+            if fingerprint in _ENCRYPTION_KEYS_USED or len(_ENCRYPTION_KEYS_USED) >= MAX_ENCRYPTION_SESSIONS:
+                _refuse(REASON_CRYPTO)
+            _ENCRYPTION_KEYS_USED.add(fingerprint)
+        self._provider = provider
+        self._key = key
+        self._header_sha256 = header_digest(encode_capsule_header(header))
+        self._nonce_prefix = header.nonce_prefix
+        self._next_index = 0
+        self._failed = False
+        self._lock = threading.Lock()
+        self._manifest_hasher = hashlib.sha256()
+        self._manifest_sha256 = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, unused_type, unused_value, unused_traceback):
+        self.abort()
+
+    def abort(self):
+        with self._lock:
+            self._failed = True
+
+    def seal_chunk(self, index, plaintext):
+        with self._lock:
+            if self._failed or self._next_index == CHUNK_COUNT:
+                _refuse(REASON_CRYPTO)
+            self._failed = True
+            if type(index) is not int or index != self._next_index:
+                _refuse(REASON_CHUNK_INDEX)
+            _check_bytes(plaintext, CHUNK_PLAINTEXT_BYTES, REASON_LENGTH)
+            kind = chunk_kind_for_index(index)
+            aad = _aad_with_digest(self._header_sha256, index, kind, self._manifest_sha256)
+            nonce = make_nonce(self._nonce_prefix, index)
+            try:
+                ciphertext, tag = self._provider.seal(self._key, nonce, plaintext, aad)
+            except Exception:
+                _refuse(REASON_CRYPTO)
+            _check_bytes(ciphertext, CHUNK_PLAINTEXT_BYTES, REASON_CRYPTO)
+            _check_bytes(tag, CHUNK_TAG_BYTES, REASON_CRYPTO)
+            if kind == 0:
+                self._manifest_hasher.update(ciphertext)
+                self._manifest_hasher.update(tag)
+                if index == LAST_MANIFEST_INDEX:
+                    self._manifest_sha256 = self._manifest_hasher.digest()
+            self._next_index += 1
+            self._failed = False
+            return ChunkRecord(index, kind, ciphertext, tag)
 
 
 def open_chunk(provider, key, header, chunk, manifest_ciphertext_region=None):
@@ -1010,8 +1132,8 @@ def open_chunk(provider, key, header, chunk, manifest_ciphertext_region=None):
     expected_kind = chunk_kind_for_index(chunk.index)
     if chunk.kind != expected_kind:
         _refuse(REASON_CHUNK_INDEX)
-    _check_bytes(chunk.ciphertext, CHUNK_PLAINTEXT_BYTES, REASON_LENGTH)
-    _check_bytes(chunk.tag, CHUNK_TAG_BYTES, REASON_LENGTH)
+    _check_readonly_region(chunk.ciphertext, CHUNK_PLAINTEXT_BYTES, REASON_LENGTH)
+    _check_readonly_region(chunk.tag, CHUNK_TAG_BYTES, REASON_LENGTH)
     aad = make_aad(
         header_digest(encode_capsule_header(header)),
         chunk.index,
@@ -1020,7 +1142,7 @@ def open_chunk(provider, key, header, chunk, manifest_ciphertext_region=None):
     )
     nonce = make_nonce(header.nonce_prefix, chunk.index)
     try:
-        plaintext = provider.open(key, nonce, chunk.ciphertext, chunk.tag, aad)
+        plaintext = provider.open(key, nonce, bytes(chunk.ciphertext), bytes(chunk.tag), aad)
     except Exception:
         _refuse(REASON_CRYPTO)
     _check_bytes(plaintext, CHUNK_PLAINTEXT_BYTES, REASON_CRYPTO)
@@ -1037,6 +1159,7 @@ def _check_capsule_length(data):
 
 
 def encode_capsule(capsule, key_record):
+    """Yield a complete capsule as bounded pieces in wire order."""
     if type(capsule) is not Capsule:
         _refuse(REASON_STRUCTURE)
     _validate_header(capsule.header)
@@ -1048,34 +1171,22 @@ def encode_capsule(capsule, key_record):
     if len(capsule.bundle_chunks) != BUNDLE_CHUNK_COUNT:
         _refuse(REASON_CHUNK_INDEX)
     trailer = encode_trailer(capsule.trailer)
-    output = (
-        encode_capsule_header(capsule.header)
-        + b"".join(encode_chunk(chunk.index, chunk.ciphertext, chunk.tag, chunk.kind) for chunk in chunks)
-        + trailer
-    )
-    if len(output) != CAPSULE_LENGTH:
-        _refuse(REASON_LENGTH)
-    return output
+    header_bytes = encode_capsule_header(capsule.header)
+
+    def parts():
+        yield header_bytes
+        for chunk in chunks:
+            yield encode_chunk(chunk.index, chunk.ciphertext, chunk.tag, chunk.kind)
+        yield trailer
+
+    return parts()
 
 
 def _decode_capsule(data, key_record):
     _check_capsule_length(data)
     header = decode_capsule_header(data[:CAPSULE_HEADER_LENGTH])
     validate_header_key_binding(header, key_record)
-    chunks = []
-    offset = MANIFEST_REGION_START
-    for index in range(CHUNK_COUNT):
-        record = data[offset:offset + CHUNK_RECORD_LENGTH]
-        chunks.append(decode_chunk(record, index))
-        offset += CHUNK_RECORD_LENGTH
-    validate_global_indices(tuple(chunk.index for chunk in chunks))
-    trailer = decode_trailer(data[TRAILER_START:])
-    return Capsule(
-        header,
-        tuple(chunks[:MANIFEST_CHUNK_COUNT]),
-        tuple(chunks[MANIFEST_CHUNK_COUNT:]),
-        trailer,
-    )
+    return CapsuleView(data, header)
 
 
 def decode_capsule(data, key_record):
