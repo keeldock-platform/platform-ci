@@ -329,6 +329,26 @@ class NpmAdmissionTests(unittest.TestCase):
             lambda: subject.parse_lock(json.dumps(lock).encode("ascii")), "npm_lock_invalid",
         )
 
+    def test_lock_refuses_bundled_package_metadata(self):
+        for field, value in (
+                ("inBundle", True),
+                ("bundledDependencies", ["sample-package-01"]),
+                ("bundleDependencies", ["sample-package-01"])):
+            with self.subTest(field=field):
+                lock, unused_bytes, unused_archives, unused_material = _fixture()
+                lock["packages"]["node_modules/sample-package-00"][field] = value
+                raw = json.dumps(lock).encode("ascii")
+                self.assert_refused(lambda: subject.parse_lock(raw), "npm_lock_invalid")
+
+        lock, unused_bytes, unused_archives, unused_material = _fixture()
+        lock["packages"]["node_modules/sample-package-00"].update({
+            "inBundle": False, "bundledDependencies": [],
+        })
+        parsed = subject.parse_lock(json.dumps(lock).encode("ascii"))
+        self.assertEqual(
+            parsed["packages"]["node_modules/sample-package-00"]["inBundle"], False,
+        )
+
     def test_lock_parser_rejects_duplicate_keys_depth_and_oversized_input(self):
         self.assert_refused(
             lambda: subject.parse_lock(b'{"name":"a","name":"b"}'), "npm_lock_invalid",
@@ -355,18 +375,20 @@ class NpmAdmissionTests(unittest.TestCase):
         self.assert_refused(lambda: subject.compute_material_digest(extra), "npm_material_invalid")
 
     def test_tarball_integrity_and_classification_cover_scripts_and_native_bindings(self):
-        lock, lock_bytes, archives, unused_material = _fixture()
+        unused_lock, lock_bytes, archives, unused_material = _fixture()
         identities = subject.verify_archive_set(lock_bytes, archives)
         self.assertEqual(len(identities), 61)
         by_path = {identity["path"]: identity for identity in identities}
+        entries_by_path = dict(subject.registry_entries(lock_bytes))
         fsevents_path = "node_modules/fsevents"
         script_report = subject.verify_tarball(
-            lock["packages"][fsevents_path], archives[fsevents_path],
+            entries_by_path[fsevents_path], archives[fsevents_path],
         )
         self.assertEqual(script_report["install_scripts"], ("install",))
+        self.assertEqual(script_report["implicit_install_scripts"], ())
         rolldown_path = "node_modules/" + ROLLODOWN_BINDINGS[0]
         binding_report = subject.verify_tarball(
-            lock["packages"][rolldown_path], archives[rolldown_path],
+            entries_by_path[rolldown_path], archives[rolldown_path],
         )
         self.assertIn("package/binding.node", binding_report["native_binaries"])
         self.assertEqual(by_path[fsevents_path]["version"], "2.3.3")
@@ -382,6 +404,45 @@ class NpmAdmissionTests(unittest.TestCase):
         }
         lifecycle_report = subject.verify_tarball(lifecycle_entry, lifecycle_data)
         self.assertEqual(lifecycle_report["install_scripts"], lifecycle_names)
+
+    def test_binding_gyp_classifies_implicit_install_only_at_archive_root(self):
+        data = _tarball("sample", "1.0.0", extra=(("package/binding.gyp", b"{}"),))
+        entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+        report = subject.verify_tarball(entry, data)
+        self.assertEqual(report["install_scripts"], ("install",))
+        self.assertEqual(report["implicit_install_scripts"], ("install",))
+
+        preinstall_data = _tarball(
+            "sample", "1.0.0", scripts={"preinstall": "synthetic"},
+            extra=(("package/binding.gyp", b"{}"),),
+        )
+        preinstall_entry = dict(entry, integrity=_sri(preinstall_data))
+        preinstall_report = subject.verify_tarball(preinstall_entry, preinstall_data)
+        self.assertEqual(preinstall_report["install_scripts"], ("preinstall",))
+        self.assertEqual(preinstall_report["implicit_install_scripts"], ())
+
+        nested_data = _tarball("sample", "1.0.0", extra=(("package/assets/binding.gyp", b"{}"),))
+        nested_entry = dict(entry, integrity=_sri(nested_data))
+        nested_report = subject.verify_tarball(nested_entry, nested_data)
+        self.assertEqual(nested_report["install_scripts"], ())
+        self.assertEqual(nested_report["implicit_install_scripts"], ())
+
+    def test_tarball_refuses_bundled_package_tree(self):
+        private_name = "keeldock" + "-" + "private"
+        nested_manifest = json.dumps({
+            "name": private_name,
+            "version": "1.0.0",
+            "scripts": {"install": "synthetic"},
+        }, sort_keys=True, separators=(",", ":")).encode("ascii")
+        data = _tarball(
+            "sample", "1.0.0",
+            extra=(("package/node_modules/" + private_name + "/package.json", nested_manifest),),
+        )
+        entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+        self.assert_refused(lambda: subject.verify_tarball(entry, data), "npm_archive_invalid")
+        ordinary_data = _tarball("sample", "1.0.0", extra=(("package/assets/data", b"safe"),))
+        ordinary_entry = dict(entry, integrity=_sri(ordinary_data))
+        self.assertEqual(subject.verify_tarball(ordinary_entry, ordinary_data)["install_scripts"], ())
 
     def test_tarball_refuses_bad_integrity_and_package_manifest_identity(self):
         data = _tarball("sample", "1.0.0")
@@ -447,11 +508,43 @@ class NpmAdmissionTests(unittest.TestCase):
             lambda: subject.verify_tarball(oversized_entry, oversized_data), "npm_archive_invalid",
         )
 
+    def test_tar_preflight_refuses_windows_path_aliases(self):
+        for path in (
+                "package/package.json.",
+                "package/package.json ",
+                "package/file:stream",
+                "package/CON",
+                "package/NUL.txt",
+                "package/CLOCK$.txt",
+                "package/dir/LPT1.cfg",
+                "package/PROGRA~1.TXT",
+                "package/file?name"):
+            with self.subTest(path=path):
+                data = _tarball("sample", "1.0.0", extra=((path, b"synthetic"),))
+                entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+                self.assert_refused(
+                    lambda: subject.verify_tarball(entry, data), "npm_archive_invalid",
+                )
+        data = _tarball("sample", "1.0.0", extra=(("package/file-name", b"synthetic"),))
+        entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+        self.assertEqual(subject.verify_tarball(entry, data)["file_count"], 2)
+
     def test_native_magic_is_classified_without_filename_extension(self):
         data = _tarball("sample", "1.0.0", extra=(("package/content.bin", b"MZsynthetic"),))
         entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
         report = subject.verify_tarball(entry, data)
         self.assertIn("package/content.bin", report["native_binaries"])
+
+    def test_fat64_native_magic_is_classified_without_filename_extension(self):
+        data = _tarball("sample", "1.0.0", extra=(
+            ("package/fat64-big", b"\xca\xfe\xba\xbfsynthetic"),
+            ("package/fat64-little", b"\xbf\xba\xfe\xcasynthetic"),
+        ))
+        entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+        report = subject.verify_tarball(entry, data)
+        self.assertEqual(report["native_binaries"], (
+            "package/fat64-big", "package/fat64-little",
+        ))
 
     def test_bounded_descriptor_read_refuses_links_and_returns_verified_bytes(self):
         with tempfile.TemporaryDirectory() as temporary:

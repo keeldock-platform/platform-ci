@@ -31,6 +31,9 @@ MAX_ARCHIVE_PATH_BYTES = 512
 MAX_PACKAGE_JSON_BYTES = 256 * 1024
 MAX_RECEIPT_TTL_SECONDS = 24 * 60 * 60
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
+WINDOWS_RESERVED_BASENAMES = frozenset((
+    "con", "prn", "aux", "nul", "conin$", "conout$", "clock$",
+))
 HEX40_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
@@ -345,6 +348,8 @@ def _validate_entry_shape(entry, workspace_names, extra_internal_names):
     for key in BOOLEAN_ENTRY_FIELDS:
         if key in entry and type(entry[key]) is not bool:
             _refuse("npm_lock_invalid")
+    if entry.get("inBundle") is True:
+        _refuse("npm_lock_invalid")
     for key in DEPENDENCY_FIELDS:
         if key in entry:
             _validate_dependency_map(entry[key], workspace_names, extra_internal_names)
@@ -374,9 +379,7 @@ def _validate_entry_shape(entry, workspace_names, extra_internal_names):
                     or any(type(item) is not str or len(item) > 128 for item in values)):
                 _refuse("npm_lock_invalid")
             if key in ("bundledDependencies", "bundleDependencies"):
-                if any(not _valid_package_name(item)
-                       or (_internal_name(item, extra_internal_names) and item not in workspace_names)
-                       for item in values):
+                if values:
                     _refuse("npm_lock_invalid")
     if "engines" in entry:
         engines = entry["engines"]
@@ -543,8 +546,15 @@ def _safe_relative_archive_path(value):
     parts = value.split("/")
     if not parts or any(part in ("", ".", "..") for part in parts):
         return False
-    if ":" in parts[0] or parts[0].startswith("~"):
-        return False
+    for part in parts:
+        if (part[-1] in (".", " ")
+                or any(char in '<>:"|?*~' for char in part)):
+            return False
+        basename = part.split(".", 1)[0].strip(" ").casefold()
+        if (basename in WINDOWS_RESERVED_BASENAMES
+                or (len(basename) == 4 and basename[:3] in ("com", "lpt")
+                    and basename[3] in "123456789\u00b9\u00b2\u00b3")):
+            return False
     return True
 
 
@@ -625,6 +635,7 @@ def _native_magic(data):
         or data.startswith((b"\xfe\xed\xfa\xce", b"\xce\xfa\xed\xfe"))
         or data.startswith((b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe"))
         or data.startswith((b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"))
+        or data.startswith((b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"))
     )
 
 
@@ -662,6 +673,7 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
     package_json_member = None
     manifest_bytes = None
     native_paths = []
+    root_binding_gyp = False
     try:
         archive = tarfile.open(
             fileobj=io.BytesIO(tar_bytes), mode="r:", encoding="utf-8", errors="strict",
@@ -691,6 +703,8 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
                     _refuse("npm_archive_invalid")
                 folded.add(relative.casefold())
                 parts = relative.split("/")
+                if any(part.casefold() == "node_modules" for part in parts[1:]):
+                    _refuse("npm_archive_invalid")
                 for index in range(1, len(parts) + 1):
                     spelling = "/".join(parts[:index])
                     key = spelling.casefold()
@@ -711,6 +725,8 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
                 entries[relative] = (is_directory, member)
                 if relative == "package/package.json" and not is_directory:
                     package_json_member = member
+                if relative.casefold() == "package/binding.gyp" and not is_directory:
+                    root_binding_gyp = True
                 if not is_directory and _native_path(relative):
                     native_paths.append(relative)
             for path, (is_directory, member) in entries.items():
@@ -744,6 +760,11 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
     if manifest_bytes is None:
         _refuse("npm_archive_invalid")
     install_scripts = _manifest_scripts(manifest_bytes, name, version)
+    implicit_install = root_binding_gyp and not any(
+        script in install_scripts for script in ("preinstall", "install")
+    )
+    if implicit_install:
+        install_scripts = ("install",) + install_scripts
     return {
         "name": name,
         "version": version,
@@ -752,6 +773,7 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
         "unpacked_bytes": total,
         "file_count": sum(1 for is_directory, unused in entries.values() if not is_directory),
         "install_scripts": install_scripts,
+        "implicit_install_scripts": ("install",) if implicit_install else (),
         "native_binaries": tuple(sorted(native_paths)),
     }
 
