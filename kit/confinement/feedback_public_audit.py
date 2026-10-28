@@ -35,16 +35,70 @@ SETTINGS_PREFIX = b"KD-FEEDBACK-SETTINGS "
 PREPARE_PREFIX = b"KD-FEEDBACK-PREPARE "
 PRODUCER_SUMMARY_PREFIX = b"KD-FEEDBACK-PRODUCER-SUMMARY "
 AUDIT_SUMMARY_PREFIX = b"KD-FEEDBACK-AUDIT-SUMMARY "
+AUDIT_FAILURE_PHASES = frozenset((
+    "request", "identity", "run", "workflow", "history", "jobs",
+    "job_surfaces", "check_surfaces", "job_steps", "job_logs",
+    "artifact_inventory", "artifact_download", "cache_snapshot",
+    "summary_markers", "producer_evidence", "receipt", "unavailable",
+))
 
 
 class FeedbackAuditRefusal(Exception):
-    def __init__(self):
+    def __init__(self, phase="unavailable"):
         self.reason = "feedback_audit_invalid"
+        self.phase = phase if type(phase) is str and phase in AUDIT_FAILURE_PHASES else "unavailable"
         super().__init__(self.reason)
 
 
-def _refuse():
-    raise FeedbackAuditRefusal()
+def _refuse(phase="unavailable"):
+    raise FeedbackAuditRefusal(phase)
+
+
+def _failure_record(phase):
+    safe_phase = phase if type(phase) is str and phase in AUDIT_FAILURE_PHASES else "unavailable"
+    record = {"phase": safe_phase, "reason": "feedback_audit_invalid", "schema_version": 1}
+    encoded = json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return "KD-FEEDBACK-AUDIT-REFUSAL " + encoded
+
+
+def normalize_refusal(raw):
+    """Return one canonical, fixed-enum refusal record without reflecting input data."""
+    unavailable = _failure_record("unavailable")
+    if type(raw) is not bytes or not raw or len(raw) > MAX_RECORD_BYTES:
+        return unavailable
+    if raw.endswith(b"\n"):
+        raw = raw[:-1]
+    if not raw or b"\n" in raw or b"\r" in raw:
+        return unavailable
+    prefix = b"KD-FEEDBACK-AUDIT-REFUSAL "
+    if not raw.startswith(prefix):
+        return unavailable
+
+    def no_duplicate_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate key")
+            result[key] = value
+        return result
+
+    try:
+        encoded = raw[len(prefix):].decode("ascii", "strict")
+        record = json.loads(encoded, object_pairs_hook=no_duplicate_pairs)
+    except Exception:
+        return unavailable
+    if (type(record) is not dict
+            or set(record) != {"phase", "reason", "schema_version"}
+            or type(record.get("phase")) is not str
+            or record["phase"] not in AUDIT_FAILURE_PHASES
+            or record.get("reason") != "feedback_audit_invalid"
+            or type(record.get("schema_version")) is not int
+            or record["schema_version"] != 1):
+        return unavailable
+    canonical = json.dumps(record, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
+    if canonical != raw[len(prefix):]:
+        return unavailable
+    return _failure_record(record["phase"])
 
 
 def _safe_int(value, minimum=0):
@@ -323,14 +377,20 @@ def _read_cache_snapshot(log, control_sha, run_id):
 def audit_live(environ=None, api_factory=None, *, now=None):
     env = os.environ if environ is None else environ
     current = int(time.time()) if now is None else now
-    request, profile = _request_from_environment(env, now=current)
-    control_sha, run_id, actor = _validate_identity(
-        env, request, profile, job_name=profile["auditor_job"],
-    )
+    try:
+        request, profile = _request_from_environment(env, now=current)
+    except BaseException:
+        _refuse("request")
+    try:
+        control_sha, run_id, actor = _validate_identity(
+            env, request, profile, job_name=profile["auditor_job"],
+        )
+    except BaseException:
+        _refuse("identity")
     run_path = "/repos/" + public_audit.REPOSITORY + "/actions/runs/" + run_id
     factory = public_audit.GitHubAPI if api_factory is None else api_factory
-    api = factory(env.get("GITHUB_TOKEN", ""))
     try:
+        api = factory(env.get("GITHUB_TOKEN", ""))
         run, unused_headers = api.json(run_path)
         if (type(run) is not dict or run.get("id") != int(run_id)
                 or run.get("run_attempt") != 1 or run.get("head_sha") != control_sha
@@ -343,23 +403,38 @@ def audit_live(environ=None, api_factory=None, *, now=None):
                 or str(run["repository"].get("id")) != request["ci_repository_id"]
                 or run["repository"].get("full_name") != public_audit.REPOSITORY
                 or not _safe_int(run.get("workflow_id"), 1)):
-            _refuse()
+            _refuse("run")
+    except FeedbackAuditRefusal:
+        _refuse("run")
+    except BaseException:
+        _refuse("run")
+    try:
         workflow, unused_headers = api.json(
             "/repos/" + public_audit.REPOSITORY + "/actions/workflows/" + str(run["workflow_id"]),
         )
         if (type(workflow) is not dict or workflow.get("id") != run["workflow_id"]
                 or workflow.get("path") != profile["workflow_path"] or workflow.get("state") != "active"):
-            _refuse()
+            _refuse("workflow")
+    except FeedbackAuditRefusal:
+        _refuse("workflow")
+    except BaseException:
+        _refuse("workflow")
+    try:
         _history_for_live_run(api, request, profile, run, actor, current)
+    except FeedbackAuditRefusal:
+        _refuse("history")
+    except BaseException:
+        _refuse("history")
+    try:
         jobs_path = ("/repos/" + public_audit.REPOSITORY + "/actions/runs/" + run_id
                      + "/attempts/1/jobs")
         jobs = public_audit._read_counted_collection(
             api, jobs_path, "jobs", feedback_api.MAX_JOBS, public_audit._validate_job_record,
         )
     except FeedbackAuditRefusal:
-        raise
+        _refuse("jobs")
     except BaseException:
-        _refuse()
+        _refuse("jobs")
 
     expected_names = {
         profile["producer_job"] + feedback_api.SETTINGS_SUFFIX,
@@ -368,18 +443,28 @@ def audit_live(environ=None, api_factory=None, *, now=None):
         profile["auditor_job"],
     }
     by_name = {}
-    surfaces_ok = len(jobs) == len(expected_names)
+    first_failure = None
+    surfaces_ok = True
+
+    def fail(phase):
+        nonlocal surfaces_ok, first_failure
+        surfaces_ok = False
+        if first_failure is None:
+            first_failure = phase
+
+    if len(jobs) != len(expected_names):
+        fail("jobs")
     for job in jobs:
         name = job.get("name") if type(job) is dict else None
         if type(name) is not str or name in by_name:
-            surfaces_ok = False
+            fail("jobs")
             continue
         by_name[name] = job
         if (job.get("run_id") != int(run_id) or job.get("run_attempt") != 1
                 or job.get("head_sha") != control_sha):
-            surfaces_ok = False
+            fail("job_surfaces")
     if set(by_name) != expected_names:
-        surfaces_ok = False
+        fail("jobs")
 
     logs = {}
     details = {}
@@ -387,12 +472,13 @@ def audit_live(environ=None, api_factory=None, *, now=None):
         own_auditor = name == profile["auditor_job"]
         if own_auditor:
             if job.get("status") != "in_progress" or job.get("conclusion") is not None:
-                surfaces_ok = False
+                fail("job_surfaces")
             check_ok, unused_id = _check_surface(api, job, run, live_auditor=True)
-            surfaces_ok = surfaces_ok and check_ok
+            if not check_ok:
+                fail("check_surfaces")
             continue
         if job.get("status") != "completed":
-            surfaces_ok = False
+            fail("job_surfaces")
         detail = None
         check_id = None
         try:
@@ -400,7 +486,7 @@ def audit_live(environ=None, api_factory=None, *, now=None):
                 api, job, run_id, "1", control_sha, name,
             )
         except Exception:
-            surfaces_ok = False
+            fail("job_steps")
         check_ok, checked_id = _check_surface(
             api, job, run,
             allow_capacity=(name == profile["producer_job"]
@@ -408,23 +494,23 @@ def audit_live(environ=None, api_factory=None, *, now=None):
         )
         check_id = checked_id if checked_id is not None else check_id
         if not check_ok:
-            surfaces_ok = False
+            fail("check_surfaces")
         if detail is not None:
             if detail.get("conclusion") != "success":
-                surfaces_ok = False
+                fail("job_surfaces")
             details[name] = detail
         try:
             log = api.log_text(job["id"])
             public_audit.inspect_public_bytes(log, control_sha)
             logs[name] = log
         except Exception:
-            surfaces_ok = False
+            fail("job_logs")
             logs[name] = b""
         if (detail is not None
                 and not feedback_api._feedback_job_steps_success(
                     detail, name, profile, request, logs[name],
                 )):
-            surfaces_ok = False
+            fail("job_steps")
 
     expected_artifact_name = "feedback-" + profile["kind"] + "-" + request["request_id"]
     artifact_records = []
@@ -439,7 +525,7 @@ def audit_live(environ=None, api_factory=None, *, now=None):
         for item in artifact_records:
             raw = json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
             if len(raw) > 65536:
-                surfaces_ok = False
+                fail("artifact_inventory")
             public_audit.inspect_public_bytes(raw, control_sha)
         if len(artifact_records) == 1:
             artifact_record = artifact_records[0]
@@ -447,33 +533,36 @@ def audit_live(environ=None, api_factory=None, *, now=None):
                     and artifact_record.get("name") == expected_artifact_name
                     and artifact_record.get("expired") is False
                     and 0 < artifact_record.get("size_in_bytes", 0) <= node_lock_receipt.MAX_ARCHIVE_BYTES):
-                scanned_archive = feedback_api._download_archive(api, artifact_record["id"])
-                digest = feedback_api._artifact_digest(artifact_record.get("digest"))
-                if (len(scanned_archive) != artifact_record["size_in_bytes"]
-                        or hashlib.sha256(scanned_archive).hexdigest() != digest):
-                    surfaces_ok = False
-                scanned_member = node_lock_receipt.validate_ciphertext_archive(
-                    scanned_archive, member_name=profile["member_name"],
-                )
+                try:
+                    scanned_archive = feedback_api._download_archive(api, artifact_record["id"])
+                    digest = feedback_api._artifact_digest(artifact_record.get("digest"))
+                    if (len(scanned_archive) != artifact_record["size_in_bytes"]
+                            or hashlib.sha256(scanned_archive).hexdigest() != digest):
+                        fail("artifact_download")
+                    scanned_member = node_lock_receipt.validate_ciphertext_archive(
+                        scanned_archive, member_name=profile["member_name"],
+                    )
+                except BaseException:
+                    fail("artifact_download")
             else:
-                surfaces_ok = False
+                fail("artifact_inventory")
         else:
-            surfaces_ok = False
+            fail("artifact_inventory")
     except Exception:
-        surfaces_ok = False
+        fail("artifact_inventory")
 
     cache_digest = None
     try:
         cache_digest = _snapshot_cache(api, control_sha)
     except Exception:
-        surfaces_ok = False
+        fail("cache_snapshot")
     settings_name = profile["producer_job"] + feedback_api.SETTINGS_SUFFIX
     prepare_name = profile["producer_job"] + feedback_api.PREPARE_SUFFIX
     producer_name = profile["producer_job"]
     try:
         baseline = _read_cache_snapshot(logs[settings_name], control_sha, run_id)
         if cache_digest != baseline:
-            surfaces_ok = False
+            fail("summary_markers")
         expected_settings = (SETTINGS_PREFIX + b"schema=1 request-id="
                              + request["request_id"].encode("ascii") + b" profile="
                              + profile["kind"].encode("ascii") + b" status=verified")
@@ -484,13 +573,13 @@ def audit_live(environ=None, api_factory=None, *, now=None):
                              + request["request_id"].encode("ascii") + b" profile="
                              + profile["kind"].encode("ascii") + b" status=encrypted")
         if not _summary_line(logs[settings_name], expected_settings):
-            surfaces_ok = False
+            fail("summary_markers")
         if not _summary_line(logs[prepare_name], expected_prepare):
-            surfaces_ok = False
+            fail("summary_markers")
         if not _summary_line(logs[producer_name], expected_producer):
-            surfaces_ok = False
+            fail("summary_markers")
     except (KeyError, Exception):
-        surfaces_ok = False
+        fail("summary_markers")
 
     producer_record = None
     producer_output = None
@@ -509,12 +598,12 @@ def audit_live(environ=None, api_factory=None, *, now=None):
             api, request, profile, run, producer_output, producer_record, current,
         )
     except Exception:
-        surfaces_ok = False
+        fail("producer_evidence")
 
     if scanned_archive is None or scanned_member is None:
-        surfaces_ok = False
+        fail("artifact_download")
     if not surfaces_ok:
-        _refuse()
+        _refuse(first_failure or "unavailable")
     context_fields = (
         node_lock_receipt.CONTEXT_FIELDS
         if profile["profile_id"] == 1 else node_lock_receipt.FEEDBACK_CONTEXT_FIELDS
@@ -538,16 +627,24 @@ def audit_live(environ=None, api_factory=None, *, now=None):
     })
     encoded = json.dumps(receipt, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
     if len(encoded) > MAX_RECORD_BYTES:
-        _refuse()
+        _refuse("receipt")
     return "KD-FEEDBACK-AUDIT " + encoded.decode("ascii")
 
 
 def main(arguments=None, environ=None):
     args = sys.argv[1:] if arguments is None else arguments
     env = os.environ if environ is None else environ
-    if type(args) not in (tuple, list) or len(args) != 1 or args[0] not in {"settings", "preflight", "prepare", "audit"}:
+    if (type(args) not in (tuple, list) or len(args) != 1
+            or args[0] not in {"settings", "preflight", "prepare", "audit", "normalize-refusal"}):
         print("KD-FEEDBACK-AUDIT-REFUSAL {\"reason\":\"invalid_input\",\"schema_version\":1}")
         return 2
+    if args[0] == "normalize-refusal":
+        try:
+            raw = sys.stdin.buffer.read(MAX_RECORD_BYTES + 1)
+        except BaseException:
+            raw = None
+        print(normalize_refusal(raw))
+        return 0
     try:
         if args[0] == "settings":
             line = settings(env)
@@ -558,14 +655,20 @@ def main(arguments=None, environ=None):
         else:
             line = audit_live(env)
         if not line.startswith("KD-FEEDBACK-") or len(line.encode("ascii")) > MAX_RECORD_BYTES:
-            _refuse()
+            _refuse("receipt" if args[0] == "audit" else "unavailable")
         print(line)
         return 0
-    except FeedbackAuditRefusal:
-        print("KD-FEEDBACK-AUDIT-REFUSAL {\"reason\":\"feedback_audit_invalid\",\"schema_version\":1}")
+    except FeedbackAuditRefusal as refusal:
+        if args[0] == "audit":
+            print(_failure_record(refusal.phase))
+        else:
+            print("KD-FEEDBACK-AUDIT-REFUSAL {\"reason\":\"feedback_audit_invalid\",\"schema_version\":1}")
         return 2
     except BaseException:
-        print("KD-FEEDBACK-AUDIT-REFUSAL {\"reason\":\"feedback_audit_invalid\",\"schema_version\":1}")
+        if args[0] == "audit":
+            print("KD-FEEDBACK-AUDIT-REFUSAL {\"phase\":\"unavailable\",\"reason\":\"feedback_audit_invalid\",\"schema_version\":1}")
+        else:
+            print("KD-FEEDBACK-AUDIT-REFUSAL {\"reason\":\"feedback_audit_invalid\",\"schema_version\":1}")
         return 2
 
 

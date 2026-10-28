@@ -1,10 +1,15 @@
 import base64
 import copy
+import contextlib
 import datetime
 import hashlib
 from email.message import Message
 import io
 import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
 import urllib.parse
 import unittest
 import zipfile
@@ -550,10 +555,11 @@ class LiveProviderPipelineTests(unittest.TestCase):
         environment = _environment(request, key, profile["auditor_job"])
         environment["GITHUB_TOKEN"] = "A" * 24
         api = LiveAuditProvider(request, failed_producer=True)
-        with self.assertRaises(subject.FeedbackAuditRefusal):
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
             subject.audit_live(
                 environment, api_factory=lambda unused_token: api, now=NOW,
             )
+        self.assertEqual(caught.exception.phase, "job_surfaces")
         combined_calls = " ".join(api.calls)
         self.assertIn("/actions/runs/" + str(api.run_id) + "/artifacts?per_page=", combined_calls)
         self.assertIn("/repos/" + macos_public_audit.REPOSITORY + "/actions/caches?per_page=", combined_calls)
@@ -584,10 +590,15 @@ class LiveProviderPipelineTests(unittest.TestCase):
         fallback = next(step for step in api.details[103]["steps"]
                         if step["name"] == feedback_api.PRODUCER_TOKEN_FALLBACK_STEP)
         fallback["name"] = "Unexpected skipped cleanup"
-        with self.assertRaises(subject.FeedbackAuditRefusal):
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
             subject.audit_live(
                 environment, api_factory=lambda unused_token: api, now=NOW,
             )
+        self.assertEqual(caught.exception.phase, "job_steps")
+        self.assertEqual(set(api.log_calls), {101, 102, 103})
+        self.assertTrue(any("/actions/runs/" + str(api.run_id) + "/artifacts?per_page=" in call
+                            for call in api.calls))
+        self.assertTrue(any("/actions/caches?per_page=" in call for call in api.calls))
 
     def test_live_audit_requires_producer_success_summary_for_skipped_fallback(self):
         request, key = _request()
@@ -610,6 +621,265 @@ class LiveProviderPipelineTests(unittest.TestCase):
             + CONTROL_SHA + " run-id=8123 run-attempt=1 digest=" + digest + "\n"
         ).encode("ascii")
         self.assertEqual(subject._read_cache_snapshot(log, CONTROL_SHA, "8123"), digest)
+
+    def test_early_audit_refusals_identify_fixed_validation_phase(self):
+        request, key = _request()
+        profile = feedback_request.PROFILES[request["concern"]]
+        environment = _environment(request, key, profile["auditor_job"])
+        environment["GITHUB_TOKEN"] = "A" * 24
+        invalid_request = dict(environment, **{feedback_api.REQUEST_ENV: "not-canonical"})
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            subject.audit_live(invalid_request, api_factory=lambda unused_token: self.fail(), now=NOW)
+        self.assertEqual(caught.exception.phase, "request")
+
+        invalid_identity = dict(environment, GITHUB_ACTOR="canary_private_value")
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            subject.audit_live(invalid_identity, api_factory=lambda unused_token: self.fail(), now=NOW)
+        self.assertEqual(caught.exception.phase, "identity")
+        self.assertNotIn("canary_private_value", str(caught.exception))
+
+        api = LiveAuditProvider(request)
+        original_json = api.json
+
+        def wrong_run(path):
+            result, headers = original_json(path)
+            if path == "/repos/" + macos_public_audit.REPOSITORY + "/actions/runs/" + str(api.run_id):
+                result = dict(result, head_sha="e" * 40)
+            return result, headers
+
+        api.json = wrong_run
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            subject.audit_live(environment, api_factory=lambda unused_token: api, now=NOW)
+        self.assertEqual(caught.exception.phase, "run")
+
+        api = LiveAuditProvider(request)
+        original_json = api.json
+
+        def inactive_workflow(path):
+            result, headers = original_json(path)
+            if path.endswith("/actions/workflows/" + str(api.workflow_id)):
+                result = dict(result, state="disabled")
+            return result, headers
+
+        api.json = inactive_workflow
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            subject.audit_live(environment, api_factory=lambda unused_token: api, now=NOW)
+        self.assertEqual(caught.exception.phase, "workflow")
+
+        api = LiveAuditProvider(request)
+        with patch.object(subject, "_history_for_live_run", side_effect=RuntimeError("canary")):
+            with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+                subject.audit_live(environment, api_factory=lambda unused_token: api, now=NOW)
+        self.assertEqual(caught.exception.phase, "history")
+        self.assertNotIn("canary", str(caught.exception))
+
+    def test_job_collection_failure_has_fixed_phase_and_no_dynamic_details(self):
+        request, key = _request()
+        profile = feedback_request.PROFILES[request["concern"]]
+        environment = _environment(request, key, profile["auditor_job"])
+        environment["GITHUB_TOKEN"] = "A" * 24
+        api = LiveAuditProvider(request)
+        original_reader = subject.public_audit._read_counted_collection
+
+        def fail_jobs(api_client, path, *args, **kwargs):
+            if path.endswith("/attempts/1/jobs"):
+                raise RuntimeError("canary-private-value")
+            return original_reader(api_client, path, *args, **kwargs)
+
+        with patch.object(subject.public_audit, "_read_counted_collection", side_effect=fail_jobs):
+            with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+                subject.audit_live(environment, api_factory=lambda unused_token: api, now=NOW)
+        self.assertEqual(caught.exception.phase, "jobs")
+        self.assertNotIn("canary-private-value", str(caught.exception))
+
+    def test_late_failures_keep_first_phase_while_audit_scans_remaining_surfaces(self):
+        for expected_phase in (
+            "check_surfaces", "job_logs", "artifact_inventory", "artifact_download",
+            "cache_snapshot", "summary_markers", "producer_evidence",
+        ):
+            with self.subTest(phase=expected_phase):
+                request, key = _request()
+                profile = feedback_request.PROFILES[request["concern"]]
+                environment = _environment(request, key, profile["auditor_job"])
+                environment["GITHUB_TOKEN"] = "A" * 24
+                api = LiveAuditProvider(request)
+                stack = contextlib.ExitStack()
+
+                if expected_phase == "check_surfaces":
+                    original_check = subject._check_surface
+
+                    def failed_check(client, job, run, **kwargs):
+                        valid, check_id = original_check(client, job, run, **kwargs)
+                        if check_id == 201:
+                            return False, check_id
+                        return valid, check_id
+
+                    stack.enter_context(patch.object(subject, "_check_surface", side_effect=failed_check))
+                elif expected_phase == "job_logs":
+                    original_log = api.log_text
+
+                    def failed_log(job_id):
+                        if job_id == 103:
+                            api.log_calls.append(job_id)
+                            raise RuntimeError("canary-private-value")
+                        return original_log(job_id)
+
+                    api.log_text = failed_log
+                elif expected_phase == "artifact_inventory":
+                    original_reader = subject.public_audit._read_counted_collection
+
+                    def failed_inventory(client, path, *args, **kwargs):
+                        if path.endswith("/actions/runs/" + str(api.run_id) + "/artifacts"):
+                            api.calls.append(path + "?per_page=100&page=1")
+                            raise RuntimeError("canary-private-value")
+                        return original_reader(client, path, *args, **kwargs)
+
+                    stack.enter_context(patch.object(
+                        subject.public_audit, "_read_counted_collection", side_effect=failed_inventory,
+                    ))
+                elif expected_phase == "artifact_download":
+                    stack.enter_context(patch.object(
+                        feedback_api, "_download_archive", side_effect=RuntimeError("canary-private-value"),
+                    ))
+                elif expected_phase == "cache_snapshot":
+                    def failed_cache_snapshot(client, control_sha):
+                        api.calls.append(
+                            "/repos/" + macos_public_audit.REPOSITORY
+                            + "/actions/caches?per_page=100&page=1",
+                        )
+                        raise RuntimeError("canary-private-value")
+
+                    stack.enter_context(patch.object(
+                        subject, "_snapshot_cache", side_effect=failed_cache_snapshot,
+                    ))
+                elif expected_phase == "summary_markers":
+                    api.logs[101] = api.logs[101].replace(
+                        b"KD-FEEDBACK-SETTINGS ", b"KD-FEEDBACK-OTHER-SETTINGS ",
+                    )
+                elif expected_phase == "producer_evidence":
+                    api.logs[103] = api.logs[103].replace(b"KD-FEEDBACK-UPLOAD ", b"KD-FEEDBACK-OTHER-UPLOAD ")
+
+                with stack:
+                    with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+                        subject.audit_live(environment, api_factory=lambda unused_token: api, now=NOW)
+                self.assertEqual(caught.exception.phase, expected_phase)
+                combined_calls = " ".join(api.calls)
+                self.assertIn("/actions/runs/" + str(api.run_id) + "/artifacts?per_page=", combined_calls)
+                self.assertIn("/actions/caches?per_page=", combined_calls)
+                self.assertEqual(set(api.log_calls), {101, 102, 103})
+                self.assertTrue(any("/check-runs/" + str(check_id) + "/annotations?" in call
+                                    for check_id in range(201, 205) for call in api.calls))
+
+    def test_audit_refusal_command_emits_only_fixed_phase_record(self):
+        with patch.object(subject, "audit_live", side_effect=subject.FeedbackAuditRefusal("history")):
+            with patch("builtins.print") as printer:
+                status = subject.main(["audit"], {})
+        self.assertEqual(status, 2)
+        printer.assert_called_once_with(subject._failure_record("history"))
+
+        with patch.object(subject, "audit_live", side_effect=subject.FeedbackAuditRefusal("private-value")):
+            with patch("builtins.print") as printer:
+                status = subject.main(["audit"], {})
+        self.assertEqual(status, 2)
+        printer.assert_called_once_with(subject._failure_record("unavailable"))
+
+    def test_refusal_normalizer_accepts_only_canonical_closed_phase_records(self):
+        prefix = b"KD-FEEDBACK-AUDIT-REFUSAL "
+        valid = prefix + b'{"phase":"history","reason":"feedback_audit_invalid","schema_version":1}\n'
+        expected = prefix + b'{"phase":"history","reason":"feedback_audit_invalid","schema_version":1}'
+        self.assertEqual(subject.normalize_refusal(valid), expected.decode("ascii"))
+        unavailable = subject._failure_record("unavailable")
+        invalid_records = (
+            prefix + b'{"phase":"canary-private-value","reason":"feedback_audit_invalid","schema_version":1}',
+            prefix + b'{"phase":"history","reason":"canary-private-value","schema_version":1}',
+            prefix + b'{"phase":"history","reason":"feedback_audit_invalid","schema_version":1,"extra":"canary-private-value"}',
+            prefix + b'{"phase":"history","phase":"run","reason":"feedback_audit_invalid","schema_version":1}',
+            valid + b"unexpected trailing record\n",
+            b"canary-private-value",
+            b"KD-FEEDBACK-AUDIT-REFUSAL " + b"x" * subject.MAX_RECORD_BYTES,
+        )
+        for raw in invalid_records:
+            with self.subTest(raw_length=len(raw)):
+                normalized = subject.normalize_refusal(raw)
+                self.assertEqual(normalized, unavailable)
+                self.assertNotIn("canary-private-value", normalized)
+
+    def test_normalize_refusal_cli_reads_bounded_stdin_and_emits_only_safe_record(self):
+        raw = (
+            b'KD-FEEDBACK-AUDIT-REFUSAL {"phase":"artifact_download",'
+            b'"reason":"feedback_audit_invalid","schema_version":1}\n'
+        )
+
+        class BoundedInput:
+            def __init__(self, value):
+                self.value = value
+                self.requested_size = None
+
+            def read(self, size):
+                self.requested_size = size
+                return self.value[:size]
+
+        buffer = BoundedInput(raw)
+        stream = type("InputStream", (), {"buffer": buffer})()
+        with patch.object(subject.sys, "stdin", stream):
+            with patch("builtins.print") as printer:
+                status = subject.main(["normalize-refusal"], {})
+        self.assertEqual(status, 0)
+        self.assertEqual(buffer.requested_size, subject.MAX_RECORD_BYTES + 1)
+        printer.assert_called_once_with(subject._failure_record("artifact_download"))
+
+
+class AuditWorkflowShellSyntaxTests(unittest.TestCase):
+    @staticmethod
+    def _audit_script(workflow_path):
+        lines = Path(workflow_path).read_text(encoding="utf-8").splitlines()
+        step_line = "      - name: Audit completed producer and public surfaces"
+        matches = [index for index, line in enumerate(lines) if line == step_line]
+        if len(matches) != 1:
+            raise AssertionError("expected one audit workflow step")
+        run_index = None
+        for index in range(matches[0] + 1, len(lines)):
+            if lines[index].startswith("      - name:"):
+                break
+            if lines[index] == "        run: |":
+                run_index = index
+                break
+        if run_index is None:
+            raise AssertionError("audit workflow step has no literal run block")
+        body_indent = len(lines[run_index]) - len(lines[run_index].lstrip(" ")) + 2
+        body = []
+        for line in lines[run_index + 1:]:
+            if not line.strip():
+                body.append("")
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            if indent < body_indent:
+                break
+            body.append(line[body_indent:])
+        script = "\n".join(body).rstrip() + "\n"
+        if not script.strip():
+            raise AssertionError("audit workflow run block is empty")
+        return script
+
+    def test_all_return_workflow_audit_blocks_parse_with_bash(self):
+        bash = shutil.which("bash")
+        if os.name == "nt" and bash is None:
+            self.skipTest("Windows runner has no Bash executable available")
+        self.assertIsNotNone(bash, "Bash is required on POSIX workflow test runners")
+        repository_root = Path(__file__).resolve().parents[2]
+        workflow_paths = (
+            repository_root / ".github/workflows/node-lock-return.yml",
+            repository_root / ".github/workflows/core-rust-format-return.yml",
+            repository_root / ".github/workflows/core-build-diagnostic-return.yml",
+        )
+        scripts = [self._audit_script(path) for path in workflow_paths]
+        self.assertEqual(len(scripts), 3)
+        for script in scripts:
+            result = subprocess.run(
+                [bash, "-n"], input=script, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=10, check=False,
+            )
+            self.assertEqual(result.returncode, 0, "audit workflow shell must parse")
 
 
 if __name__ == "__main__":
