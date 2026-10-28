@@ -120,6 +120,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/test_confinement_public_audit.py",
         "kit/confinement/log_canary.py",
         "kit/confinement/test_log_canary.py",
+        "kit/confinement/capsule_frame.py",
+        "kit/confinement/test_capsule_frame.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
