@@ -174,10 +174,10 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/feedback_admin_crypto.mjs': '181e1b986916de1bd146368254589b5d69e34f50e3e8e7111f0f8ea5ca7b4e8e',
     'kit/confinement/test_feedback_admin_crypto.mjs': 'f327b2b12055909db88e1ce2ad65a27bfd9835b83234da81357ef6b7411344a8',
     'kit/confinement/test_feedback_admin_integration.py': 'a668a1d799fe7eb10fa174a4a5141e914724968196be055f6a3f7e6b67fc5ae8',
-    'kit/confinement/feedback_api.py': '531b982e8b5fdeb2a0c74b54216f4ebe5581f9cc3486023ea384b751f81a7e33',
-    'kit/confinement/test_feedback_api.py': 'bd6cf145d1fa9d735cae47006488d6c33c9d027c8a82e0112d5a8dd1c9160169',
+    'kit/confinement/feedback_api.py': 'd1f13582e53ee178f53e66be06fb9ce8c1a8cee6db3762aafaf8f96f64faf377',
+    'kit/confinement/test_feedback_api.py': 'a748ca0ad084de64bbec47f4d2413f4ae35d6b932d8010847f59cec700f27fae',
     'kit/confinement/feedback_public_audit.py': 'beef023a68e01343c5e8f3e883ba99be75f79924eeaca8fdcaabe9d7401960cb',
-    'kit/confinement/test_feedback_public_audit.py': 'a75701338410932e777d9da8894afb98a8c5ff1b3288d964124015728d23c0d9',
+    'kit/confinement/test_feedback_public_audit.py': '4a7b822645c7051a4f1999e5961482000a0c58c7c31d9a6ec106a88b8426b5e7',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(

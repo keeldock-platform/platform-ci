@@ -296,7 +296,6 @@ class LiveAuditProvider(macos_public_audit.GitHubAPI):
         self.calls.append(path)
         parsed = urllib.parse.urlsplit(path)
         route = parsed.path
-        query = urllib.parse.parse_qs(parsed.query)
         headers = Message()
         run_path = "/repos/" + macos_public_audit.REPOSITORY + "/actions/runs/" + str(self.run_id)
         if route == run_path:
@@ -317,20 +316,17 @@ class LiveAuditProvider(macos_public_audit.GitHubAPI):
         if route.endswith("/actions/workflows/" + str(self.workflow_id)):
             return {"id": self.workflow_id, "path": self.request["workflow_path"], "state": "active"}, headers
         if route.endswith("/actions/workflows/" + str(self.workflow_id) + "/runs"):
-            status = query["status"][0]
-            runs = []
-            if status == "in_progress":
-                runs = [{
-                    "id": self.run_id,
-                    "run_attempt": 1,
-                    "display_title": feedback_api.RUN_TITLE_PREFIX + self.request["request_id"],
-                    "head_sha": self.request["control_sha"],
-                    "path": self.request["workflow_path"],
-                    "event": "workflow_dispatch",
-                    "head_branch": "main",
-                    "status": "in_progress",
-                    "conclusion": None,
-                }]
+            runs = [{
+                "id": self.run_id,
+                "run_attempt": 1,
+                "display_title": feedback_api.RUN_TITLE_PREFIX + self.request["request_id"],
+                "head_sha": self.request["control_sha"],
+                "path": self.request["workflow_path"],
+                "event": "workflow_dispatch",
+                "head_branch": "main",
+                "status": "in_progress",
+                "conclusion": None,
+            }]
             return {"total_count": len(runs), "workflow_runs": runs}, headers
         if route.endswith("/actions/runs/" + str(self.run_id) + "/attempts/1/jobs"):
             return {"total_count": len(self.jobs), "jobs": self.jobs}, headers
@@ -542,12 +538,18 @@ class LiveProviderPipelineTests(unittest.TestCase):
                     for call in api.calls
                     if "/actions/workflows/" + str(api.workflow_id) + "/runs?" in call
                 ]
-                self.assertEqual(len(history_queries), 6)
+                self.assertEqual(len(history_queries), 1)
+                self.assertTrue(all("status" not in query and "filter" not in query
+                                    for query in history_queries))
                 self.assertEqual(
-                    {query["status"][0] for query in history_queries},
-                    {"completed", "queued", "in_progress", "waiting", "pending", "requested"},
+                    set(history_queries[0]) - {"per_page", "page"},
+                    {"branch", "created", "event", "head_sha"},
                 )
-                self.assertTrue(all(query.get("filter") == ["all"] for query in history_queries))
+                self.assertEqual(history_queries[0]["branch"], ["main"])
+                self.assertEqual(history_queries[0]["event"], ["workflow_dispatch"])
+                self.assertEqual(history_queries[0]["head_sha"], [CONTROL_SHA])
+                self.assertEqual(history_queries[0]["created"], ["2026-10-27..2026-10-28"])
+                self.assertEqual(history_queries[0]["page"], ["1"])
 
     def test_failed_producer_still_scans_jobs_checks_annotations_artifact_and_cache(self):
         request, key = _request()
@@ -574,12 +576,18 @@ class LiveProviderPipelineTests(unittest.TestCase):
             for call in api.calls
             if "/actions/workflows/" + str(api.workflow_id) + "/runs?" in call
         ]
-        self.assertEqual(len(history_queries), 6)
+        self.assertEqual(len(history_queries), 1)
+        self.assertTrue(all("status" not in query and "filter" not in query
+                            for query in history_queries))
         self.assertEqual(
-            {query["status"][0] for query in history_queries},
-            {"completed", "queued", "in_progress", "waiting", "pending", "requested"},
+            set(history_queries[0]) - {"per_page", "page"},
+            {"branch", "created", "event", "head_sha"},
         )
-        self.assertTrue(all(query.get("filter") == ["all"] for query in history_queries))
+        self.assertEqual(history_queries[0]["branch"], ["main"])
+        self.assertEqual(history_queries[0]["event"], ["workflow_dispatch"])
+        self.assertEqual(history_queries[0]["head_sha"], [CONTROL_SHA])
+        self.assertEqual(history_queries[0]["created"], ["2026-10-27..2026-10-28"])
+        self.assertEqual(history_queries[0]["page"], ["1"])
 
     def test_live_audit_rejects_unknown_producer_skip_even_with_success_summary(self):
         request, key = _request()
@@ -694,10 +702,10 @@ class LiveProviderPipelineTests(unittest.TestCase):
 
     def test_history_collection_diagnostics_stay_closed_through_live_audit(self):
         for api_reason, expected_phase in (
-            ("api_status", "history_completed_api_status"),
-            ("api_schema", "history_completed_api_schema"),
-            ("pagination_incomplete", "history_completed_api_pagination"),
-            ("api_unavailable", "history_completed_api_unavailable"),
+            ("api_status", "history_all_api_status"),
+            ("api_schema", "history_all_api_schema"),
+            ("pagination_incomplete", "history_all_api_pagination"),
+            ("api_unavailable", "history_all_api_unavailable"),
         ):
             with self.subTest(reason=api_reason):
                 request, key = _request()
@@ -734,7 +742,7 @@ class LiveProviderPipelineTests(unittest.TestCase):
         ):
             with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
                 subject.audit_live(environment, api_factory=lambda unused_token: api, now=NOW)
-        self.assertEqual(caught.exception.phase, "history_completed_api_unavailable")
+        self.assertEqual(caught.exception.phase, "history_all_api_unavailable")
         self.assertNotIn("private provider response", str(caught.exception))
 
     def test_late_failures_keep_first_phase_while_audit_scans_remaining_surfaces(self):

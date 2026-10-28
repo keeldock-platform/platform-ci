@@ -28,11 +28,9 @@ MAX_JOBS = 16
 MAX_ARTIFACT_AGE_SECONDS = 24 * 60 * 60
 MAX_CAPACITY_NOTICES = 64
 MAX_MARKER_BYTES = 16 * 1024
-HISTORY_COLLECTION_STATUSES = ("completed", "queued", "in_progress", "waiting", "pending", "requested")
 HISTORY_API_REASONS = ("status", "schema", "pagination", "unavailable")
 HISTORY_FAILURE_PHASES = frozenset(
-    "history_" + status + "_api_" + reason
-    for status in HISTORY_COLLECTION_STATUSES for reason in HISTORY_API_REASONS
+    "history_all_api_" + reason for reason in HISTORY_API_REASONS
 ) | frozenset((
     "history_duplicate_ids", "history_match_zero", "history_match_multiple",
     "history_identity_mismatch", "history_status_mismatch",
@@ -263,47 +261,35 @@ def _history(api, request, profile, run, expected_actor_login, now, *, live=Fals
         "/repos/" + API_REPOSITORY + "/actions/workflows/"
         + str(run["workflow_id"]) + "/runs"
     )
-    items = []
-    seen_ids = set()
-    for status in HISTORY_COLLECTION_STATUSES:
-        query = {
-            "branch": "main",
-            "created": lower_date + ".." + upper_date,
-            "event": "workflow_dispatch",
-            "filter": "all",
-            "head_sha": request["control_sha"],
-            "status": status,
-        }
-        schema_phase = "history_" + status + "_api_schema"
+    query = {
+        "branch": "main",
+        "created": lower_date + ".." + upper_date,
+        "event": "workflow_dispatch",
+        "head_sha": request["control_sha"],
+    }
 
-        def validate_history_item(item):
-            _validate_history_run(item, schema_phase)
+    def validate_history_item(item):
+        _validate_history_run(item, "history_all_api_schema")
 
-        try:
-            page_items = public_audit._read_counted_collection(
-                _HistoryCollectionAPI(api), path, "workflow_runs", MAX_HISTORY_RUNS, validate_history_item,
-                fixed_query=query,
-            )
-        except HistoryRefusal:
-            raise
-        except public_audit.AuditRefusal as error:
-            diagnostic = {
-                "api_status": "status",
-                "api_schema": "schema",
-                "pagination_incomplete": "pagination",
-                "api_unavailable": "unavailable",
-            }.get(getattr(error, "reason", None), "unavailable")
-            diagnostic = "history_" + status + "_api_" + diagnostic
-            raise HistoryRefusal(diagnostic) from None
-        except Exception:
-            raise HistoryRefusal("history_" + status + "_api_unavailable") from None
-        if len(items) + len(page_items) > MAX_HISTORY_RUNS:
-            raise HistoryRefusal("history_" + status + "_api_pagination")
-        for item in page_items:
-            if item["id"] in seen_ids:
-                raise HistoryRefusal("history_duplicate_ids")
-            seen_ids.add(item["id"])
-        items.extend(page_items)
+    try:
+        items = public_audit._read_counted_collection(
+            _HistoryCollectionAPI(api), path, "workflow_runs", MAX_HISTORY_RUNS, validate_history_item,
+            fixed_query=query,
+        )
+    except HistoryRefusal:
+        raise
+    except public_audit.AuditRefusal as error:
+        diagnostic = {
+            "api_status": "status",
+            "api_schema": "schema",
+            "pagination_incomplete": "pagination",
+            "api_unavailable": "unavailable",
+        }.get(getattr(error, "reason", None), "unavailable")
+        raise HistoryRefusal("history_all_api_" + diagnostic) from None
+    except Exception:
+        raise HistoryRefusal("history_all_api_unavailable") from None
+    if len(items) >= MAX_HISTORY_RUNS:
+        raise HistoryRefusal("history_all_api_pagination")
     matches = [
         item for item in items
         if item.get("display_title") == RUN_TITLE_PREFIX + request["request_id"]
