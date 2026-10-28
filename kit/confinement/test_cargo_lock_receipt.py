@@ -8,7 +8,7 @@ from pathlib import Path
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import cargo_lock_receipt as subject
 
@@ -228,6 +228,31 @@ class CargoLockReceiptTests(unittest.TestCase):
         )
         with patch.object(subject, "MAX_LOCK_PACKAGES", 1):
             _assert_refused(self, lambda: subject.parse_cargo_lock(LOCK_BYTES + second), "cargo_lock_invalid")
+
+    def test_multiline_array_counts_raw_whitespace_and_comment_bytes(self):
+        marker = chr(35).encode("ascii")
+        for continuation in (b" " * 80, marker + b" " * 80):
+            lock = LOCK_BYTES.replace(
+                b"dependencies = []", b"dependencies = [\n" + continuation + b"\n]",
+            )
+            with patch.object(subject, "MAX_DEPENDENCY_ARRAY_BYTES", 64):
+                _assert_refused(self, lambda: subject.parse_cargo_lock(lock), "cargo_lock_invalid")
+
+    def test_multiline_array_scans_each_nonempty_fragment_once(self):
+        dependency = b'"serde 1.0.1",'
+        lock = LOCK_BYTES.replace(
+            b"dependencies = []", b"dependencies = [\n " + dependency + b"\n]",
+        )
+        original = subject._scan_array_fragment
+        lengths = []
+
+        def observe(fragment, *state):
+            lengths.append(len(fragment))
+            return original(fragment, *state)
+
+        with patch.object(subject, "_scan_array_fragment", side_effect=observe):
+            self.assertEqual(subject.parse_cargo_lock(lock)["version"], 4)
+        self.assertEqual(lengths, [1, len(dependency), 1])
 
     def test_numeric_prerelease_leading_zero_refused_in_urls_lock_and_edges(self):
         _assert_refused(
@@ -478,6 +503,32 @@ class CargoLockReceiptTests(unittest.TestCase):
                     "cargo_archive_invalid",
                 )
 
+    def test_archive_preflight_refuses_chained_extension_headers(self):
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as archive:
+            member = tarfile.TarInfo("serde-1.0.1/Cargo.toml")
+            member.pax_headers = {"comment": "value"}
+            content = b"[package]\n"
+            member.size = len(content)
+            archive.addfile(member, io.BytesIO(content))
+        archive_bytes = raw.getvalue()
+        self.assertEqual(archive_bytes[156:157], b"x")
+        extension_size = int(archive_bytes[124:136].strip(b"\x00 "), 8)
+        extension_end = 512 + ((extension_size + 511) // 512) * 512
+        chained = archive_bytes[:extension_end] + archive_bytes
+        _assert_refused(
+            self, lambda: subject._preflight_tar_headers(chained), "cargo_archive_invalid",
+        )
+
+    def test_archive_inspector_converts_tar_recursion_to_fixed_refusal(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        with patch.object(subject.tarfile, "open", side_effect=RecursionError):
+            _assert_refused(
+                self, lambda: subject.verify_archive("serde", "1.0.1", data, digest),
+                "cargo_archive_invalid",
+            )
+
     def test_archive_verifier_rejects_paths_links_devices_collisions_and_roots(self):
         cases = (
             _archive((("serde-1.0.1/../outside", b"bad"),)),
@@ -610,7 +661,10 @@ class CargoLockReceiptTests(unittest.TestCase):
             vendor = real / "vendor"
             vendor.mkdir(parents=True)
             link = parent / "link"
-            link.symlink_to(real, target_is_directory=True)
+            try:
+                link.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest("symbolic links are unavailable")
             _assert_refused(
                 self,
                 lambda: subject.extract_archive("serde", "1.0.1", data, digest, link / "vendor"),
@@ -630,6 +684,99 @@ class CargoLockReceiptTests(unittest.TestCase):
                 )
             self.assertEqual(list(Path(temporary).iterdir()), [])
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode boundary")
+    def test_extractor_requires_private_owned_target(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "shared"
+            target.mkdir(mode=0o755)
+            target.chmod(0o755)
+            _assert_refused(
+                self,
+                lambda: subject.extract_archive("serde", "1.0.1", data, digest, target),
+                "cargo_archive_invalid",
+            )
+            self.assertEqual(list(target.iterdir()), [])
+
+    def test_extractor_refuses_staging_source_replacement_and_preserves_replacement(self):
+        data = _archive()
+        digest = hashlib.sha256(data).hexdigest()
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary)
+            swapped = []
+            if os.name == "nt":
+                publish = subject._publish_windows_stage
+
+                def replace_source(stage, destination, identity):
+                    moved = target / "moved"
+                    os.rename(stage, moved)
+                    stage.mkdir(mode=0o700)
+                    swapped.append((stage, moved, identity))
+                    publish(stage, destination, identity)
+
+                publisher = "_publish_windows_stage"
+            else:
+                publish = subject._publish_stage
+
+                def replace_source(parent_fd, stage_name, final_name, identity):
+                    os.rename(stage_name, "moved", src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                    os.mkdir(stage_name, mode=0o700, dir_fd=parent_fd)
+                    swapped.append((stage_name, identity))
+                    publish(parent_fd, stage_name, final_name, identity)
+
+                publisher = "_publish_stage"
+            with patch.object(subject, publisher, side_effect=replace_source):
+                _assert_refused(
+                    self,
+                    lambda: subject.extract_archive("serde", "1.0.1", data, digest, target),
+                    "cargo_archive_invalid",
+                )
+            self.assertEqual(len(swapped), 1)
+            self.assertFalse((target / "serde-1.0.1").exists())
+            if os.name == "nt":
+                stage, moved, identity = swapped[0]
+                self.assertEqual(list(stage.iterdir()), [])
+                stage.rmdir()
+                subject._remove_windows_stage(moved, identity)
+            else:
+                stage_name, identity = swapped[0]
+                self.assertEqual(list((target / stage_name).iterdir()), [])
+                parent_fd, unused_target = subject._open_target_directory(target)
+                try:
+                    os.rmdir(stage_name, dir_fd=parent_fd)
+                    subject._remove_stage(parent_fd, "moved", identity)
+                finally:
+                    os.close(parent_fd)
+            self.assertEqual(list(target.iterdir()), [])
+
+    @unittest.skipIf(os.name == "nt", "POSIX publication API")
+    def test_macos_no_replace_publication_uses_darwin_symbol(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary)
+            parent_fd, unused_target = subject._open_target_directory(target)
+            try:
+                os.mkdir("stage", mode=0o700, dir_fd=parent_fd)
+                identity = subject._entry_identity(parent_fd, "stage")
+                flags = []
+
+                def rename_call(old_fd, old_name, new_fd, new_name, flag):
+                    flags.append(flag)
+                    os.rename(old_name, new_name, src_dir_fd=old_fd, dst_dir_fd=new_fd)
+                    return 0
+
+                function = Mock(side_effect=rename_call)
+                library = Mock(renameatx_np=function)
+                with patch.object(subject.sys, "platform", "darwin"):
+                    with patch.object(subject.ctypes, "CDLL", return_value=library):
+                        subject._publish_stage(parent_fd, "stage", "published", identity)
+                self.assertEqual(flags, [4])
+                self.assertEqual(subject._entry_identity(parent_fd, "published"), identity)
+                os.rmdir("published", dir_fd=parent_fd)
+            finally:
+                os.close(parent_fd)
+
+    @unittest.skipIf(os.name == "nt", "POSIX descriptor race")
     def test_extractor_refuses_child_directory_replaced_during_write(self):
         data = _archive()
         digest = hashlib.sha256(data).hexdigest()
@@ -638,7 +785,7 @@ class CargoLockReceiptTests(unittest.TestCase):
             parent = Path(temporary)
             vendor = parent / "vendor"
             outside = parent / "outside"
-            vendor.mkdir()
+            vendor.mkdir(mode=0o700)
             outside.mkdir()
             replaced = [False]
 
@@ -662,13 +809,24 @@ class CargoLockReceiptTests(unittest.TestCase):
     def test_extractor_atomic_publish_never_replaces_existing_package(self):
         data = _archive()
         digest = hashlib.sha256(data).hexdigest()
-        publish = subject._publish_stage
         with tempfile.TemporaryDirectory() as temporary:
-            def competing_writer(parent_fd, stage_name, final_name):
-                os.mkdir(final_name, dir_fd=parent_fd)
-                publish(parent_fd, stage_name, final_name)
+            if os.name == "nt":
+                publish = subject._publish_windows_stage
 
-            with patch.object(subject, "_publish_stage", side_effect=competing_writer):
+                def competing_writer(stage, destination, identity):
+                    destination.mkdir()
+                    publish(stage, destination, identity)
+
+                publisher = "_publish_windows_stage"
+            else:
+                publish = subject._publish_stage
+
+                def competing_writer(parent_fd, stage_name, final_name, identity):
+                    os.mkdir(final_name, dir_fd=parent_fd)
+                    publish(parent_fd, stage_name, final_name, identity)
+
+                publisher = "_publish_stage"
+            with patch.object(subject, publisher, side_effect=competing_writer):
                 _assert_refused(
                     self,
                     lambda: subject.extract_archive("serde", "1.0.1", data, digest, temporary),
@@ -707,6 +865,8 @@ class CargoLockReceiptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             with patch.dict(os.environ, {
                 "CARGO_HOME": "untrusted", "CARGO_NET_OFFLINE": "false",
+                "HOME": "untrusted", "RUSTUP_HOME": "untrusted",
+                "RUSTUP_TOOLCHAIN": "attacker", "LANG": "C",
                 "CARGO_ENCODED_RUSTFLAGS": "untrusted", "RUSTC_WRAPPER": "untrusted",
                 "RUSTFLAGS": "untrusted", "RUSTDOC": "untrusted",
                 "RUSTDOCFLAGS": "untrusted", "SSL_CERT_FILE": "untrusted",
@@ -717,7 +877,8 @@ class CargoLockReceiptTests(unittest.TestCase):
                 "TMPDIR": "/attacker/tmp",
             }, clear=True):
                 arguments, environment = subject.cargo_config_for_vendor(temporary)
-            self.addCleanup(os.rmdir, environment["CARGO_HOME"])
+            for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
+                self.addCleanup(os.rmdir, environment[key])
             rendered = " ".join(arguments)
             self.assertIn("net.offline=true", rendered)
             self.assertIn("registry.global-credential-providers=[]", rendered)
@@ -729,13 +890,25 @@ class CargoLockReceiptTests(unittest.TestCase):
                 "RUSTFLAGS", "RUSTDOC", "RUSTDOCFLAGS", "SSL_CERT_FILE",
                 "SSL_CERT_DIR", "NIX_SSL_CERT_FILE", "REQUESTS_CA_BUNDLE",
                 "CURL_CA_BUNDLE", "HTTP_PROXY", "ftp_proxy", "KEELDOCK_TEST",
+                "RUSTUP_TOOLCHAIN",
             ):
                 with self.subTest(key=key):
                     self.assertNotIn(key, environment)
-            self.assertEqual(environment["PATH"], "/usr/bin:/bin")
-            self.assertEqual(environment["TMPDIR"], "/tmp")
-            self.assertEqual(set(environment), {"PATH", "TMPDIR", "CARGO_HOME"})
-            self.assertTrue(Path(environment["CARGO_HOME"]).is_dir())
+            if os.name != "nt":
+                self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+                self.assertEqual(environment["TMPDIR"], "/tmp")
+            self.assertEqual(environment["LANG"], "C")
+            self.assertEqual(
+                set(environment), {"PATH", "TMPDIR", "HOME", "CARGO_HOME", "RUSTUP_HOME", "LANG"},
+            )
+            self.assertEqual(len({environment[key] for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME")}), 3)
+            self.assertNotEqual(environment["HOME"], "untrusted")
+            self.assertNotEqual(environment["RUSTUP_HOME"], "untrusted")
+            for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
+                with self.subTest(key=key):
+                    self.assertTrue(Path(environment[key]).is_dir())
+                    if os.name != "nt":
+                        self.assertEqual(Path(environment[key]).stat().st_mode & 0o777, 0o700)
 
     def test_cargo_configuration_refuses_unavailable_vendor_path(self):
         with tempfile.TemporaryDirectory() as temporary:

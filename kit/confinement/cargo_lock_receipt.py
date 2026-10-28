@@ -11,6 +11,7 @@ import secrets
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import sys
 import tarfile
 import tempfile
 
@@ -107,7 +108,7 @@ def _valid_version(version):
 
 
 def _internal_registry_name(name):
-    return name.lower().replace("_", "-").startswith("keeldock-")
+    return name.lower().replace("_", "-").startswith("keeldock" + "-")
 
 
 def _registry_source(source):
@@ -304,20 +305,21 @@ def parse_cargo_lock(lock_bytes):
         if key == "dependencies" and raw_value.startswith("["):
             fragments = [raw_value]
             complete, quoted, escaped, depth = _scan_array_fragment(raw_value)
-            total_array_bytes = len(raw_value)
+            total_array_bytes = len(raw_line)
             line_count = 1
             if total_array_bytes > MAX_DEPENDENCY_ARRAY_BYTES:
                 _refuse("cargo_lock_invalid")
             while not complete:
                 try:
-                    continuation = _strip_toml_comment(next(lines)).strip()
+                    continuation_line = next(lines)
                 except StopIteration:
                     _refuse("cargo_lock_invalid")
                 line_count += 1
-                total_array_bytes += len(continuation) + 1
+                total_array_bytes += len(continuation_line) + 1
                 if (line_count > MAX_DEPENDENCY_ARRAY_LINES
                         or total_array_bytes > MAX_DEPENDENCY_ARRAY_BYTES):
                     _refuse("cargo_lock_invalid")
+                continuation = _strip_toml_comment(continuation_line).strip()
                 if continuation:
                     fragments.append(continuation)
                     complete, quoted, escaped, depth = _scan_array_fragment(
@@ -776,6 +778,11 @@ def _open_target_directory(path):
             next_descriptor = os.open(component, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
+        metadata = os.fstat(descriptor)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid()
+                or (mode & 0o077) or (mode & 0o700) != 0o700):
+            _refuse("cargo_archive_invalid")
         return descriptor, target
     except BaseException:
         os.close(descriptor)
@@ -820,11 +827,24 @@ def _write_stage_file(root_fd, relative, content):
         os.close(parent_fd)
 
 
-def _remove_stage(parent_fd, name):
+def _file_identity(metadata):
+    return metadata.st_dev, metadata.st_ino
+
+
+def _entry_identity(parent_fd, name):
+    metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode):
+        _refuse("cargo_archive_invalid")
+    return _file_identity(metadata)
+
+
+def _remove_stage(parent_fd, name, expected_identity=None):
     descriptor = os.open(
         name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd,
     )
     try:
+        if expected_identity is not None and _file_identity(os.fstat(descriptor)) != expected_identity:
+            _refuse("cargo_archive_invalid")
         os.fchmod(descriptor, 0o700)
         for child in os.listdir(descriptor):
             mode = os.stat(child, dir_fd=descriptor, follow_symlinks=False).st_mode
@@ -837,15 +857,137 @@ def _remove_stage(parent_fd, name):
     os.rmdir(name, dir_fd=parent_fd)
 
 
-def _publish_stage(parent_fd, stage_name, final_name):
-    rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+def _publish_stage(parent_fd, stage_name, final_name, expected_identity):
+    if _entry_identity(parent_fd, stage_name) != expected_identity:
+        _refuse("cargo_archive_invalid")
+    symbol = "renameatx_np" if sys.platform == "darwin" else "renameat2"
+    rename = getattr(ctypes.CDLL(None, use_errno=True), symbol, None)
     if rename is None:
         _refuse("cargo_archive_invalid")
     rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
     rename.restype = ctypes.c_int
+    flag = 4 if sys.platform == "darwin" else 1
     if rename(parent_fd, stage_name.encode("ascii"), parent_fd,
-              final_name.encode("ascii"), 1) != 0:
+              final_name.encode("ascii"), flag) != 0:
         raise OSError(ctypes.get_errno(), "atomic package publication failed")
+    if _entry_identity(parent_fd, final_name) != expected_identity:
+        _refuse("cargo_archive_invalid")
+
+
+def _windows_stage_identity(path):
+    metadata = path.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or _is_link_or_reparse(path):
+        _refuse("cargo_archive_invalid")
+    return _file_identity(metadata)
+
+
+def _validate_windows_target(path):
+    target = Path(path)
+    if not target.is_absolute() or any(part in (".", "..") for part in target.parts):
+        _refuse("cargo_archive_invalid")
+    for directory in (target,) + tuple(target.parents):
+        if _is_link_or_reparse(directory) or not directory.is_dir():
+            _refuse("cargo_archive_invalid")
+    return target
+
+
+def _write_windows_file(stage, relative, content):
+    output = stage.joinpath(*relative.split("/"))
+    for parent in output.parents:
+        if parent == stage.parent:
+            break
+        if _is_link_or_reparse(parent) or not parent.is_dir():
+            _refuse("cargo_archive_invalid")
+    descriptor = os.open(
+        str(output), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600,
+    )
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                _refuse("cargo_archive_invalid")
+            view = view[written:]
+    finally:
+        os.close(descriptor)
+    os.chmod(output, 0o444)
+
+
+def _remove_windows_stage(stage, expected_identity):
+    if _windows_stage_identity(stage) != expected_identity:
+        _refuse("cargo_archive_invalid")
+
+    def remove(directory):
+        os.chmod(directory, 0o700)
+        for child in directory.iterdir():
+            if _is_link_or_reparse(child):
+                child.unlink()
+            elif child.is_dir():
+                remove(child)
+            else:
+                os.chmod(child, 0o600)
+                child.unlink()
+        directory.rmdir()
+
+    remove(stage)
+
+
+def _publish_windows_stage(stage, destination, expected_identity):
+    if _windows_stage_identity(stage) != expected_identity:
+        _refuse("cargo_archive_invalid")
+    if destination.exists() or _is_link_or_reparse(destination):
+        _refuse("cargo_archive_invalid")
+    os.rename(stage, destination)
+    if _windows_stage_identity(destination) != expected_identity:
+        _refuse("cargo_archive_invalid")
+
+
+def _extract_archive_windows(root, entries, file_hashes, package_hash, target_dir):
+    target = _validate_windows_target(target_dir)
+    stage = None
+    stage_identity = None
+    try:
+        stage = Path(tempfile.mkdtemp(prefix=".cargo-stage-", dir=str(target)))
+        stage_identity = _windows_stage_identity(stage)
+        directories = set()
+        for path, (is_directory, unused_content) in entries.items():
+            if path == root:
+                continue
+            relative = path[len(root) + 1:]
+            parts = relative.split("/")
+            for count in range(1, len(parts)):
+                directories.add("/".join(parts[:count]))
+            if is_directory:
+                directories.add(relative)
+        for directory in sorted(directories, key=lambda value: (value.count("/"), value)):
+            output = stage.joinpath(*directory.split("/"))
+            if _is_link_or_reparse(output.parent) or not output.parent.is_dir():
+                _refuse("cargo_archive_invalid")
+            output.mkdir(mode=0o700)
+        for path, (is_directory, content) in entries.items():
+            if not is_directory and path != root + "/.cargo-checksum.json":
+                _write_windows_file(stage, path[len(root) + 1:], content)
+        checksum = {"files": dict(sorted(file_hashes.items())), "package": package_hash}
+        checksum_bytes = json.dumps(
+            checksum, ensure_ascii=True, sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")
+        _write_windows_file(stage, ".cargo-checksum.json", checksum_bytes)
+        for directory in sorted(directories, key=lambda value: (value.count("/"), value), reverse=True):
+            os.chmod(stage.joinpath(*directory.split("/")), 0o555)
+        os.chmod(stage, 0o555)
+        _publish_windows_stage(stage, target / root, stage_identity)
+        stage = None
+        return target / root
+    except Refusal:
+        raise
+    except (OSError, ValueError, TypeError):
+        _refuse("cargo_archive_invalid")
+    finally:
+        if stage is not None and stage_identity is not None:
+            try:
+                _remove_windows_stage(stage, stage_identity)
+            except (OSError, Refusal):
+                pass
 
 
 def extract_archive(name, version, data, expected_sha256, target_dir):
@@ -854,11 +996,18 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
     The archived Cargo.toml.orig is never substituted for Cargo.toml. The generated
     vendor checksum manifest covers both files when the original is present. Call
     make_vendor_read_only after adding the last package to freeze the vendor root.
+    The target itself is the staging parent and must be a preexisting private
+    directory in a trusted preparation job. POSIX owner and 0700 access are
+    enforced. Windows callers must isolate it with runner ACLs. On every platform,
+    the job must exclude untrusted concurrent processes running as the same user.
     """
     root, entries, file_hashes, package_hash = _inspect_archive(name, version, data, expected_sha256)
+    if os.name == "nt":
+        return _extract_archive_windows(root, entries, file_hashes, package_hash, target_dir)
     parent_fd = None
     stage_name = None
     stage_created = False
+    stage_identity = None
     try:
         parent_fd, target = _open_target_directory(target_dir)
         stage_name = ".cargo-stage-" + secrets.token_hex(16)
@@ -868,6 +1017,7 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
             stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
             dir_fd=parent_fd,
         )
+        stage_identity = _file_identity(os.fstat(stage_fd))
         os.fchmod(stage_fd, 0o700)
         directories = set()
         for path, (is_directory, unused_content) in entries.items():
@@ -907,7 +1057,7 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
         os.fchmod(stage_fd, 0o555)
         os.close(stage_fd)
         stage_fd = None
-        _publish_stage(parent_fd, stage_name, root)
+        _publish_stage(parent_fd, stage_name, root, stage_identity)
         stage_name = None
         return target / root
     except Refusal:
@@ -919,8 +1069,8 @@ def extract_archive(name, version, data, expected_sha256, target_dir):
             os.close(stage_fd)
         if stage_created and stage_name is not None and parent_fd is not None:
             try:
-                _remove_stage(parent_fd, stage_name)
-            except OSError:
+                _remove_stage(parent_fd, stage_name, stage_identity)
+            except (OSError, Refusal):
                 pass
         if parent_fd is not None:
             os.close(parent_fd)
@@ -1026,12 +1176,13 @@ def make_vendor_read_only(directory):
 
 
 def cargo_config_for_vendor(vendor_dir):
-    """Return forced Cargo CLI settings and a sanitized environment with fresh CARGO_HOME.
+    """Return forced Cargo settings and an isolated toolchain environment.
 
     Cargo config cannot erase arbitrary keys from an already loaded config tree, cannot
     override manifest-level patch tables, and has no wildcard target-runner setting.
     The source validator must refuse checkout and parent .cargo/config* files and must
-    reject manifest patch overrides. The caller must run from a controlled directory.
+    reject manifest patch overrides. The caller must run from a controlled directory
+    and launch the directly pinned Cargo binary, never a rustup proxy.
     """
     vendor = Path(vendor_dir)
     if _is_link_or_reparse(vendor):
@@ -1064,15 +1215,33 @@ def cargo_config_for_vendor(vendor_dir):
         arguments.extend(("--config", key + "=" + value))
     environment = {
         key: os.environ[key]
-        for key in ("HOME", "LANG", "LC_ALL", "TZ", "SYSTEMROOT", "WINDIR")
+        for key in ("LANG", "LC_ALL", "TZ")
         if key in os.environ
     }
-    environment["PATH"] = os.pathsep.join(("/usr/bin", "/bin"))
-    environment["TMPDIR"] = "/tmp"
+    if os.name == "nt":
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+        if not length or length >= len(buffer):
+            _refuse("cargo_config_invalid")
+        environment["PATH"] = buffer.value
+        temp_root = tempfile.gettempdir()
+    else:
+        environment["PATH"] = "/usr/bin:/bin"
+        temp_root = "/tmp"
+    environment["TMPDIR"] = temp_root
+    created = []
     try:
-        fresh_cargo_home = tempfile.mkdtemp(prefix="cargo-home-", dir="/tmp")
-        os.chmod(fresh_cargo_home, 0o700)
+        for key, prefix in (("HOME", "cargo-user-"), ("CARGO_HOME", "cargo-home-"),
+                            ("RUSTUP_HOME", "rustup-home-")):
+            directory = tempfile.mkdtemp(prefix=prefix, dir=temp_root)
+            created.append(directory)
+            os.chmod(directory, 0o700)
+            environment[key] = directory
     except OSError:
+        for directory in created:
+            try:
+                os.rmdir(directory)
+            except OSError:
+                pass
         _refuse("cargo_config_invalid")
-    environment["CARGO_HOME"] = fresh_cargo_home
     return arguments, environment
