@@ -271,7 +271,6 @@ def _private_dir(path, *, create):
                 if info.st_uid != os.getuid():
                     os.close(next_fd)
                     _refuse()
-                os.close(parent_fd)
                 return next_fd
             os.close(parent_fd)
             parent_fd = next_fd

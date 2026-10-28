@@ -495,26 +495,135 @@ class FeedbackAdminTests(unittest.TestCase):
             with other._locked_directory(create=False):
                 pass
 
+    def test_private_directory_closes_each_owned_descriptor_once(self):
+        os.mkdir(self.directory, 0o700)
+        real_open = subject.os.open
+        real_close = subject.os.close
+        active = {}
+        opened = []
+        closed = []
+        generation = [0]
+
+        def tracked_open(path, flags, mode=0o777, *, dir_fd=None):
+            descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+            generation[0] += 1
+            ownership = (generation[0], threading.get_ident())
+            active[descriptor] = ownership
+            opened.append((descriptor, ownership))
+            return descriptor
+
+        def tracked_close(descriptor):
+            ownership = active.get(descriptor)
+            if ownership is None or ownership[1] != threading.get_ident():
+                raise AssertionError("descriptor close had no matching open in this thread")
+            del active[descriptor]
+            closed.append((descriptor, ownership))
+            real_close(descriptor)
+
+        try:
+            with mock.patch.object(subject.os, "open", side_effect=tracked_open), \
+                    mock.patch.object(subject.os, "close", side_effect=tracked_close):
+                returned = subject._private_dir(self.directory, create=False)
+                self.assertEqual(set(active), {returned})
+                self.assertTrue(stat.S_ISDIR(os.fstat(returned).st_mode))
+                tracked_close(returned)
+            self.assertEqual(active, {})
+            self.assertEqual(len(opened), len(closed))
+            self.assertEqual(sorted(opened), sorted(closed))
+        finally:
+            for descriptor in list(active):
+                try:
+                    real_close(descriptor)
+                except OSError:
+                    pass
+
     def test_concurrent_consumers_release_at_most_one_output(self):
         result = self.create()
         request = result["request"]
         evidence, trusted = self.evidence_for(request)
         gate = self.summary_gate(request)
-        outcomes = []
+        second_lock_attempt = threading.Event()
+        attempt_lock = threading.Lock()
+        lock_attempts = [0]
+        stage_trace = []
+        trace_lock = threading.Lock()
+        original_lock = self.admin._locked_directory
+
+        @contextlib.contextmanager
+        def observed_lock(*, create):
+            with attempt_lock:
+                lock_attempts[0] += 1
+                if lock_attempts[0] == 2:
+                    second_lock_attempt.set()
+            with original_lock(create=create) as dir_fd:
+                yield dir_fd
+
+        module = types.ModuleType("feedback_api")
+
+        def collect(api, collector_request, **kwargs):
+            with trace_lock:
+                stage_trace.append("collector")
+            if not second_lock_attempt.wait(timeout=5):
+                with trace_lock:
+                    stage_trace.append("collector_wait_timeout")
+            return evidence
+
+        module.collect_feedback_evidence = collect
+
+        def validate(*args, **kwargs):
+            with trace_lock:
+                stage_trace.append("receipt")
+            return trusted
+
+        def helper(message, *, plaintext_pipe=False):
+            with trace_lock:
+                stage_trace.append("decrypt")
+            return _fake_helper(message, plaintext_pipe=plaintext_pipe)
+
+        original_summary = self.admin._write_summary_gate
+        original_release = self.admin._release_private_output
+
+        def write_summary(*args, **kwargs):
+            with trace_lock:
+                stage_trace.append("summary")
+            return original_summary(*args, **kwargs)
+
+        def release_output(*args, **kwargs):
+            with trace_lock:
+                stage_trace.append("release")
+            return original_release(*args, **kwargs)
 
         def consume():
             try:
                 return self.admin.consume_return(request["request_id"], object(),
                                                  manual_summary_review=gate)
             except subject.FeedbackAdminRefusal:
-                return None
+                return "refused"
 
-        with self.install_collector(evidence), \
-                mock.patch.object(subject.node_lock_receipt, "validate_receipt", return_value=trusted):
+        with mock.patch.dict(sys.modules, {"feedback_api": module}), \
+                mock.patch.object(subject.node_lock_receipt, "validate_receipt", side_effect=validate), \
+                mock.patch.object(self.admin, "_run_helper", side_effect=helper), \
+                mock.patch.object(self.admin, "_write_summary_gate", side_effect=write_summary), \
+                mock.patch.object(self.admin, "_release_private_output", side_effect=release_output), \
+                mock.patch.object(self.admin, "_locked_directory", side_effect=observed_lock):
             with ThreadPoolExecutor(max_workers=2) as executor:
-                outcomes = list(executor.map(lambda unused: consume(), range(2)))
-        successes = [item for item in outcomes if item is not None]
-        self.assertEqual(len(successes), 1)
+                futures = [executor.submit(consume) for unused in range(2)]
+                outcomes = [future.result(timeout=10) for future in futures]
+        successes = [item for item in outcomes if isinstance(item, dict)]
+        refusals = [item for item in outcomes if item == "refused"]
+        self.assertEqual(len(successes), 1, f"outcomes={outcomes!r}; stages={stage_trace!r}")
+        self.assertEqual(len(refusals), 1, f"outcomes={outcomes!r}; stages={stage_trace!r}")
+        self.assertEqual(lock_attempts[0], 2)
+        self.assertNotIn("collector_wait_timeout", stage_trace)
+        self.assertEqual(stage_trace.count("collector"), 1, f"stages={stage_trace!r}")
+        self.assertEqual(stage_trace.count("decrypt"), 1, f"stages={stage_trace!r}")
+        self.assertEqual(stage_trace.count("summary"), 1, f"stages={stage_trace!r}")
+        self.assertEqual(stage_trace.count("release"), 1, f"stages={stage_trace!r}")
+        self.assertTrue(os.path.isfile(successes[0]["private_output_path"]))
+        self.assertEqual(self._state()["requests"][0]["status"], "consumed")
+        self.assertFalse(os.path.exists(os.path.join(
+            self.directory, "key-" + request["nonce"] + ".der",
+        )))
 
     def test_lock_wait_expiry_retires_key_before_collector_or_decrypt(self):
         result = self.create(expiry=NOW + 60)
