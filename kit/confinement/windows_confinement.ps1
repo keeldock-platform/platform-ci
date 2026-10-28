@@ -532,7 +532,7 @@ try {
             foreach ($component in (Get-Content -LiteralPath (Join-Path $componentRoot 'components'))) {
                 $name = $component.Trim()
                 if ($name.Length -eq 0) { continue }
-                if ($name -cne $expectedComponent) {
+                if (-not [string]::Equals($name, $expectedComponent, [StringComparison]::Ordinal)) {
                     $componentNameExpected = $expectedComponent
                     $componentNameObserved = $name
                     throw 'component_name'
