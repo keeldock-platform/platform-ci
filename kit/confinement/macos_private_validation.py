@@ -1681,8 +1681,11 @@ def _feedback_fuzz_modules_shape(main_payload, target_names):
     except UnicodeDecodeError:
         return False
     raw_string = re.compile(r"\b(?:b|c)?r" + re.escape(chr(35)) + r'*"')
-    if ("\r" in text or "/*" in text or "include" in text
-            or raw_string.search(text)):
+    char_quote = "'"
+    if ("\r" in text or "/*" in text or "include" in text or "macro_rules" in text
+            or raw_string.search(text)
+            or char_quote + '"' + char_quote in text
+            or char_quote + "\\" + '"' + char_quote in text):
         return False
     quoted = False
     escaped = False
@@ -1700,7 +1703,6 @@ def _feedback_fuzz_modules_shape(main_payload, target_names):
             quoted = True
     if quoted:
         return False
-    attribute = re.compile(r"^\s*" + re.escape(chr(35)) + r"\s*!?\s*\[")
     module = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\b")
     declared = set()
     references = set()
@@ -1712,7 +1714,8 @@ def _feedback_fuzz_modules_shape(main_payload, target_names):
     index = 0
     while index < len(lines):
         line = lines[index]
-        if attribute.match(line):
+        code = re.sub(r'"(?:\\.|[^"\\])*"', '""', line).split("//", 1)[0]
+        if chr(35) in code:
             if index + 1 >= len(lines):
                 return False
             match = re.fullmatch(
@@ -1730,7 +1733,6 @@ def _feedback_fuzz_modules_shape(main_payload, target_names):
             continue
         if module.match(line):
             return False
-        code = re.sub(r'"(?:\\.|[^"\\])*"', '""', line).split("//", 1)[0]
         for name in target_names - references:
             if reference_patterns[name].search(code):
                 references.add(name)

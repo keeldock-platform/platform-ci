@@ -1040,6 +1040,10 @@ class CoreContractTreeTests(unittest.TestCase):
         baseline = self._module_lines(subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS)
         new_pair = self._module_lines({"new_target"})
         self.assertTrue(subject._feedback_fuzz_modules_shape(valid, targets))
+        self.assertTrue(subject._feedback_fuzz_modules_shape(
+            valid + b'const MARKER: &str = "' + bytes((35,)) + b'";\n'
+            + b"// " + bytes((35,)) + b" comment\n", targets,
+        ))
         invalid = (
             baseline,
             valid + new_pair,
@@ -1054,6 +1058,11 @@ class CoreContractTreeTests(unittest.TestCase):
             valid + b"// include anywhere is refused\n",
             (chr(35) + "[cfg(any())]\n").encode("ascii") + valid,
             (chr(35) + "[allow(dead_code)]\n").encode("ascii") + valid,
+            ("use std::io; " + chr(35) + "[cfg(any())]\n").encode("ascii") + valid,
+            ("use std::io; " + chr(35) + "[allow(dead_code)]\n").encode("ascii") + valid,
+            valid + b"macro_rules! helper { () => {} }\n",
+            valid + ("let quote = '" + '"' + "';\n").encode("ascii"),
+            valid + ("let quote = '" + "\\" + '"' + "';\n").encode("ascii"),
             b"/*\n" + valid + b"\n*/",
             b'let hidden = r"' + valid + b'";\n',
             b'let hidden = r' + bytes((35,)) + b'"' + valid + b'"' + bytes((35,)) + b';\n',
