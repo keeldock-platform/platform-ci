@@ -2,7 +2,9 @@ import base64
 import hashlib
 import json
 import unittest
+import zlib
 from dataclasses import replace
+from unittest.mock import patch
 
 import policy
 
@@ -49,24 +51,24 @@ def _lock_fixtures():
         ("cargo", "sample-crate"): cargo_bytes,
         ("npm", "sample-npm"): npm_bytes,
     }
-    archives = tuple(_archive(record, payloads[(record.manager, record.package)])
+    stager = policy.BoundedArchiveStager()
+    archives = tuple(_archive(record, payloads[(record.manager, record.package)], stager=stager)
                      for record in projection.records)
     return cargo_lock, npm_lock, projection, archives
 
 
-def _archive(record, payload, **changes):
-    result = policy.CacheArchive(
-        record.archive_path,
-        payload,
-        record.manager,
-        record.package,
-        record.version,
-        record.registry,
-        record.archive_origin,
-        record.digest_algorithm,
-        record.digest_value,
-    )
+def _archive(record, payload, stager=None, **changes):
+    result = (stager or policy.BoundedArchiveStager()).stage(_claim(record), (payload,))
     return replace(result, **changes) if changes else result
+
+
+def _claim(record, **changes):
+    claim = policy.CacheArchiveClaim(
+        record.archive_path, record.manager, record.package, record.version,
+        record.registry, record.archive_origin, record.digest_algorithm,
+        record.digest_value, "file", "public-archive",
+    )
+    return replace(claim, **changes) if changes else claim
 
 
 def _expectation(projection, source_slot=SLOT_A, visible=(MAIN, UNTRUSTED), trusted=(MAIN,),
@@ -219,6 +221,70 @@ class PublicLockProjectionTests(unittest.TestCase):
         with self.assertRaisesRegex(policy.CachePolicyError, "registry-origin"):
             policy.project_public_locks(changed, npm_lock)
 
+    def test_cargo_registry_alias_rejects_unapproved_port(self):
+        cargo_lock, npm_lock, _, _ = _lock_fixtures()
+        changed = cargo_lock.replace("github.com/", "github.com:444/")
+        with self.assertRaisesRegex(policy.CachePolicyError, "origin-port"):
+            policy.project_public_locks(changed, npm_lock)
+        for suffix in (":", ":0443"):
+            with self.subTest(suffix=suffix):
+                malformed = cargo_lock.replace("github.com/", "github.com" + suffix + "/")
+                with self.assertRaisesRegex(policy.CachePolicyError, "registry-origin"):
+                    policy.project_public_locks(malformed, npm_lock)
+        approved = cargo_lock.replace("github.com/", "github.com:443/")
+        self.assertEqual(policy.project_public_locks(approved, npm_lock).digest,
+                         policy.project_public_locks(cargo_lock, npm_lock).digest)
+
+    def test_npm_integrity_algorithms_use_matching_digest_representations(self):
+        _, npm_lock, _, _ = _lock_fixtures()
+        payload = b"public npm archive"
+        for algorithm in ("sha256", "sha384", "sha512"):
+            with self.subTest(algorithm=algorithm):
+                document = json.loads(npm_lock)
+                integrity = algorithm + "-" + base64.b64encode(
+                    hashlib.new(algorithm, payload).digest()
+                ).decode("ascii")
+                document["packages"]["node_modules/sample-npm"]["integrity"] = integrity
+                projection = policy.project_public_locks(None, json.dumps(document))
+                record = projection.records[0]
+                self.assertEqual(record.digest_algorithm, algorithm)
+                if algorithm == "sha256":
+                    self.assertEqual(record.digest_value, hashlib.sha256(payload).hexdigest())
+                archives = (_archive(record, payload),)
+                self.assertEqual(set(policy._verify_archives(archives, projection)[0]),
+                                 {record.archive_path})
+                wrong_algorithm = "sha384" if algorithm == "sha256" else "sha256"
+                with self.assertRaisesRegex(policy.CachePolicyError, "archive-digest-algorithm"):
+                    policy._verify_archives((replace(archives[0], digest_algorithm=wrong_algorithm),),
+                                            projection)
+        document = json.loads(npm_lock)
+        document["packages"]["node_modules/sample-npm"]["integrity"] = (
+            "sha384-" + base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
+        )
+        with self.assertRaisesRegex(policy.CachePolicyError, "npm-integrity"):
+            policy.project_public_locks(None, json.dumps(document))
+
+    def test_projection_record_and_output_limits_choose_cold_without_seed(self):
+        cargo_lock, _, _, _ = _lock_fixtures()
+        within_bound = policy.decide_public_projection(cargo_lock)
+        self.assertTrue(within_bound.seed_allowed)
+        self.assertTrue(within_bound.cache_read_allowed)
+        self.assertFalse(within_bound.cold_required)
+        self.assertIsNotNone(within_bound.projection)
+        base = cargo_lock[cargo_lock.index("[[package]]"):]
+        records = "".join(base.replace("sample-crate", "p" + str(index).zfill(4) + "x" * 180)
+                          for index in range(policy.MAX_PROJECTION_RECORDS))
+        decision = policy.decide_public_projection(records)
+        self.assertEqual(decision.reason, "projection-output-limit")
+        self.assertIsNone(decision.projection)
+        self.assertFalse(decision.seed_allowed)
+        self.assertFalse(decision.cache_read_allowed)
+        self.assertTrue(decision.cold_required)
+        overflow = "".join(base.replace("sample-crate", "p" + str(index))
+                           for index in range(policy.MAX_PROJECTION_RECORDS + 1))
+        self.assertEqual(policy.decide_public_projection(overflow).reason,
+                         "projection-record-limit")
+
 
 class CacheKeyTests(unittest.TestCase):
     def test_key_is_exact_and_binds_every_public_dimension(self):
@@ -251,14 +317,15 @@ class CacheKeyTests(unittest.TestCase):
             with self.subTest(slot=slot):
                 with self.assertRaisesRegex(policy.CachePolicyError, "source-slot"):
                     policy.build_cache_key(slot, "linux", "x86_64", TOOLS, projection)
-        for operating_system, architecture, schema in (
-            ("linux.main", "x86_64", policy.SCHEMA),
-            ("linux", "x86.64", policy.SCHEMA),
-            ("linux", "x86_64", "public.v1"),
+        for operating_system, architecture, schema, code in (
+            ("linux.main", "x86_64", policy.SCHEMA, "operating-system"),
+            ("linux", "x86.64", policy.SCHEMA, "architecture"),
+            ("linux", "x86_64", "public.v1", "cache-schema"),
         ):
             with self.subTest(os=operating_system, architecture=architecture, schema=schema):
-                with self.assertRaises(policy.CachePolicyError):
+                with self.assertRaises(policy.CachePolicyError) as raised:
                     policy.build_cache_key(SLOT_A, operating_system, architecture, TOOLS, projection, schema)
+                self.assertEqual(raised.exception.code, code)
 
 
 class RestoreVerifierTests(unittest.TestCase):
@@ -338,13 +405,19 @@ class RestoreVerifierTests(unittest.TestCase):
 
     def test_absolute_traversal_duplicate_link_reparse_and_special_paths_fail(self):
         first = self.archives[0]
-        paths = ("/absolute", "../escape", "archives\\escape", "archives/cargo/CON.archive")
-        for path in paths:
+        paths = (
+            ("/absolute", "archive-path-absolute"),
+            ("../escape", "archive-path-traversal"),
+            ("archives\\escape", "archive-path-backslash"),
+            ("archives/cargo/CON.archive", "archive-path-reserved"),
+        )
+        for path, expected_code in paths:
             with self.subTest(path=path):
                 member = replace(first, path=path)
                 entry = _entry(self.projection, (member,) + self.archives[1:], self.expectation)
-                with self.assertRaises(policy.CachePolicyError):
+                with self.assertRaises(policy.CachePolicyError) as raised:
                     policy.verify_restore(entry, self.expectation)
+                self.assertEqual(raised.exception.code, expected_code)
         for kind in ("symlink", "hardlink", "reparse", "special"):
             with self.subTest(kind=kind):
                 member = replace(first, kind=kind)
@@ -369,10 +442,64 @@ class RestoreVerifierTests(unittest.TestCase):
     def test_entry_and_manifest_size_and_file_count_limits_fail(self):
         with self.assertRaisesRegex(policy.CachePolicyError, "entry-size-limit"):
             policy.verify_restore(replace(self.entry, reported_size=policy.ENTRY_LIMIT + 1), self.expectation)
-        with self.assertRaisesRegex(policy.CachePolicyError, "entry-file-count"):
-            policy.verify_restore(replace(self.entry, file_count=policy.MAX_FILES + 1), self.expectation)
+        with self.assertRaises(policy.CachePolicyError) as mismatched:
+            policy.verify_restore(replace(self.entry, file_count=len(self.archives) + 1),
+                                  self.expectation)
+        self.assertEqual(mismatched.exception.code, "entry-file-count")
+        too_many = (self.archives[0],) * (policy.MAX_FILES + 1)
+        oversized_manifest = replace(
+            self.entry, archives=too_many, file_count=len(too_many),
+            reported_size=len(too_many) * len(self.archives[0].data),
+        )
+        with patch.object(policy, "_verify_archives", side_effect=AssertionError("archive fallback reached")):
+            with self.assertRaises(policy.CachePolicyError) as declared_limit:
+                policy.verify_restore(oversized_manifest, self.expectation)
+        self.assertEqual(declared_limit.exception.code, "entry-file-count")
+        with self.assertRaises(policy.CachePolicyError) as manifest_limit:
+            policy._verify_archives(too_many, self.projection)
+        self.assertEqual(manifest_limit.exception.code, "archive-file-count")
         with self.assertRaisesRegex(policy.CachePolicyError, "archive-size-limit"):
             policy._verify_archives(self.archives, self.projection, max_bytes=1)
+
+    def test_staging_bounds_payload_before_hash_and_rejects_compressed_bomb(self):
+        first = self.projection.records[0]
+        with self.assertRaisesRegex(policy.CachePolicyError, "archive-size-limit"):
+            policy.BoundedArchiveStager(max_bytes=1).stage(_claim(first), (b"too large",))
+        bomb = zlib.compress(b"x" * 8192)
+        with self.assertRaisesRegex(policy.CachePolicyError, "archive-size-limit"):
+            policy.BoundedArchiveStager(max_bytes=1024).stage(_claim(first), (bomb,), compression="zlib")
+        valid = policy.BoundedArchiveStager().stage(
+            _claim(first), (zlib.compress(self.archives[0].data),), compression="zlib"
+        )
+        self.assertEqual(valid.data, self.archives[0].data)
+        limited = policy.BoundedArchiveStager(max_files=1)
+        limited.stage(_claim(first), (self.archives[0].data,))
+        with self.assertRaisesRegex(policy.CachePolicyError, "staging-file-limit"):
+            limited.stage(_claim(first), (self.archives[0].data,))
+        with self.assertRaisesRegex(policy.CachePolicyError, "archive-path"):
+            policy.BoundedArchiveStager().stage(_claim(first, path="../escape"), (b"payload",))
+        with self.assertRaisesRegex(policy.CachePolicyError, "archive-entry-kind"):
+            policy.BoundedArchiveStager().stage(_claim(first, kind="symlink"), (b"payload",))
+        with self.assertRaisesRegex(policy.CachePolicyError, "resolver-metadata-cached"):
+            policy.BoundedArchiveStager().stage(
+                _claim(first, payload_class="resolver-metadata"), (b"payload",)
+            )
+        wrong_origin = policy.BoundedArchiveStager().stage(
+            _claim(first, origin="https://packages.invalid"), (self.archives[0].data,)
+        )
+        with self.assertRaisesRegex(policy.CachePolicyError, "archive-origin"):
+            policy.verify_restore(_entry(self.projection, (wrong_origin,) + self.archives[1:]),
+                                  self.expectation)
+        with self.assertRaisesRegex(policy.CachePolicyError, "archive-not-staged"):
+            policy._verify_archives((replace(self.archives[0], staging_token=None),),
+                                    self.projection)
+        oversized = replace(self.archives[0], data=b"too large")
+        with patch.object(policy, "_digest_matches", side_effect=AssertionError("hashed before limit")):
+            with self.assertRaisesRegex(policy.CachePolicyError, "archive-size-limit"):
+                policy._verify_archives((oversized,), self.projection, max_bytes=1)
+            protected = {archive.path: archive.data for archive in self.archives}
+            with self.assertRaisesRegex(policy.CachePolicyError, "protected-copy-size-limit"):
+                policy._recheck_copy(self.projection, protected, max_bytes=1)
 
     def test_any_cached_resolver_metadata_is_rejected(self):
         with self.assertRaisesRegex(policy.CachePolicyError, "resolver-metadata-cached"):
@@ -415,6 +542,51 @@ class ColdFallbackTests(unittest.TestCase):
             )
         )
         self.cold = policy.ColdPreparation(self.archives, metadata, True, True)
+
+    def test_verified_hit_requires_fresh_allowlisted_resolver_preparation(self):
+        entry = _entry(self.projection, self.archives, self.expectation)
+        missing = policy.decide_restore(entry, self.expectation)
+        self.assertEqual((missing.status, missing.reason),
+                         ("cold-required", "resolver-preparation-missing"))
+        self.assertFalse(missing.verified)
+        fresh = policy.FreshResolverPreparation(self.cold.resolver_metadata, True, True)
+        hit = policy.decide_restore(entry, self.expectation, resolver_preparation=fresh)
+        self.assertEqual((hit.status, hit.reason), ("cache", "verified-hit"))
+        self.assertTrue(hit.verified)
+        self.assertEqual(hit.resolver_metadata, fresh.resolver_metadata)
+        supplied_cold = policy.decide_restore(entry, self.expectation, self.cold)
+        self.assertEqual(supplied_cold.status, "cache")
+        self.assertEqual(supplied_cold.resolver_metadata, self.cold.resolver_metadata)
+        without_metadata = replace(fresh, resolver_metadata=())
+        rejected = policy.decide_restore(entry, self.expectation,
+                                         resolver_preparation=without_metadata)
+        self.assertEqual((rejected.status, rejected.reason),
+                         ("cold-required", "resolver-metadata-missing"))
+        cached = replace(fresh.resolver_metadata[0], from_cache=True)
+        with_cached = replace(fresh, resolver_metadata=(cached, fresh.resolver_metadata[1]))
+        rejected = policy.decide_restore(entry, self.expectation, resolver_preparation=with_cached)
+        self.assertEqual((rejected.status, rejected.reason),
+                         ("cold-required", "resolver-metadata-cached"))
+        wrong_origin = replace(fresh.resolver_metadata[0], origin="https://packages.invalid")
+        with_wrong_origin = replace(fresh, resolver_metadata=(wrong_origin, fresh.resolver_metadata[1]))
+        rejected = policy.decide_restore(entry, self.expectation,
+                                         resolver_preparation=with_wrong_origin)
+        self.assertEqual((rejected.status, rejected.reason),
+                         ("cold-required", "resolver-origin"))
+        crossed = replace(fresh.resolver_metadata[0], origin="https://registry.npmjs.org")
+        with_crossed_origin = replace(fresh, resolver_metadata=(crossed, fresh.resolver_metadata[1]))
+        rejected = policy.decide_restore(entry, self.expectation,
+                                         resolver_preparation=with_crossed_origin)
+        self.assertEqual((rejected.status, rejected.reason),
+                         ("cold-required", "resolver-origin"))
+        not_ready = replace(fresh, offline_ready=False)
+        rejected = policy.decide_restore(entry, self.expectation, resolver_preparation=not_ready)
+        self.assertEqual((rejected.status, rejected.reason),
+                         ("cold-required", "resolver-setup-incomplete"))
+        fallback = policy.decide_restore(entry, self.expectation, self.cold,
+                                         resolver_preparation=with_cached)
+        self.assertEqual(fallback.status, "cold")
+        self.assertTrue(fallback.verified)
 
     def test_shadowed_or_missing_cache_uses_verified_cold_archives_and_fresh_metadata(self):
         _, _, projection, _ = _lock_fixtures()
@@ -822,6 +994,12 @@ class CapacityAdmissionTests(unittest.TestCase):
         self.assertEqual(exceeded.reason, "reservation-exceeded")
         oversize = policy.reconcile_save(policy.ENTRY_LIMIT + 5, policy.ENTRY_LIMIT + 5)
         self.assertTrue(oversize.freeze_saves)
+        existing = _cache_record("oversized", size=policy.ENTRY_LIMIT + 1)
+        admission = policy.admit_save(
+            _inventory((existing,)), (SLOT_A, SLOT_B), SLOT_B, "linux", "x86_64",
+            "new-key", 1, True, True,
+        )
+        self.assertEqual(admission.reason, "entry-over-limit-inventory")
 
 
 class CleanupPlannerTests(unittest.TestCase):
@@ -891,9 +1069,11 @@ class CleanupPlannerTests(unittest.TestCase):
     def test_repository_source_and_partition_budgets_select_cleanup_victims(self):
         now = 80_000_000
         slots = (SLOT_A, SLOT_B)
-        duplicate_payload_entries = (
-            _cache_record("source-a", SLOT_A, key="same-archive", size=1100 * 1024 * 1024),
-            _cache_record("source-b", SLOT_B, key="same-archive", size=1100 * 1024 * 1024),
+        duplicate_payload_entries = tuple(
+            _cache_record("source-" + slot_name + "-" + str(index), slot,
+                          key="same-archive-" + str(index), size=400 * 1024 * 1024,
+                          last_access=now - 1)
+            for slot_name, slot in (("a", SLOT_A), ("b", SLOT_B)) for index in range(3)
         )
         plan = policy.plan_cleanup(
             _inventory(duplicate_payload_entries), now, slots, {},
@@ -910,8 +1090,15 @@ class CleanupPlannerTests(unittest.TestCase):
         )
         self.assertIn(("key-0", "partition-over-limit"), partition_plan.deletions)
 
+    def test_entry_above_ceiling_is_retired_even_when_recent_and_under_source_budget(self):
+        now = 81_000_000
+        oversized = _cache_record("oversized", size=policy.ENTRY_LIMIT + 1,
+                                  last_access=now - 1)
+        plan = policy.plan_cleanup(_inventory((oversized,)), now, (SLOT_A,), {})
+        self.assertEqual(plan.deletions, (("oversized", "entry-over-limit"),))
+
     def test_cleaner_is_source_free_serialized_and_endpoint_limited(self):
-        plan = policy.plan_cleanup(_inventory(), 1, (SLOT_A,))
+        plan = policy.plan_cleanup(_inventory(), 1, (SLOT_A,), {})
         self.assertEqual(plan.concurrency_group, policy.CONCURRENCY_GROUP)
         self.assertFalse(plan.cancel_in_progress)
         self.assertEqual(plan.cache_mode, "none")

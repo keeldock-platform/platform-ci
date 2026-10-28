@@ -3,11 +3,12 @@ import hashlib
 import json
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Mapping, Optional, Tuple
 from urllib.parse import urlsplit
+import zlib
 
 
 SCHEMA = "public-archive-v1"
@@ -16,6 +17,8 @@ ENTRY_LIMIT = 512 * 1024 * 1024
 SOURCE_LIMIT = 1024 * 1024 * 1024
 IDLE_RETIREMENT_SECONDS = 14 * 24 * 60 * 60
 MAX_FILES = 4096
+MAX_PROJECTION_RECORDS = 4096
+MAX_PROJECTION_BYTES = 1024 * 1024
 MAX_CLEANUP_REQUESTS = 25
 GITHUB_TOKEN_HOURLY_LIMIT = 1000
 MAX_KEYS_PER_PARTITION = 2
@@ -144,6 +147,7 @@ class PublicLockProjection:
 
     def __post_init__(self):
         _require(type(self.records) is tuple, "projection-records")
+        _require(len(self.records) <= MAX_PROJECTION_RECORDS, "projection-record-limit")
         cargo_origins = tuple(sorted(_registry_origin_set(self.allowed_cargo_origins)))
         npm_origins = tuple(sorted(_registry_origin_set(self.allowed_npm_origins)))
         archive_origins = tuple(sorted(_registry_origin_set(self.allowed_archive_origins)))
@@ -174,6 +178,7 @@ class PublicLockProjection:
             logical_identities[logical] = (record.archive_digest, record.archive_origin)
         ordered = tuple(record for _, record in sorted(expected, key=lambda pair: pair[0]))
         _require(ordered == self.records, "projection-not-canonical")
+        _ = self.canonical_bytes
 
     def validate(self):
         self.__post_init__()
@@ -182,7 +187,10 @@ class PublicLockProjection:
     def from_records(cls, records, allowed_cargo_origins=DEFAULT_CARGO_ORIGINS,
                      allowed_npm_origins=DEFAULT_NPM_ORIGINS,
                      allowed_archive_origins=DEFAULT_ARCHIVE_ORIGINS):
-        selected = tuple(records)
+        selected = []
+        for record in records:
+            _require(len(selected) < MAX_PROJECTION_RECORDS, "projection-record-limit")
+            selected.append(record)
         cargo_origins = _registry_origin_set(allowed_cargo_origins)
         npm_origins = _registry_origin_set(allowed_npm_origins)
         archive_origins = _registry_origin_set(allowed_archive_origins)
@@ -211,7 +219,14 @@ class PublicLockProjection:
 
     @property
     def canonical_bytes(self):
-        return _canonical_json([item.public_value() for item in self.records])
+        chunks = []
+        size = 2
+        for item in self.records:
+            chunk = _canonical_json(item.public_value())
+            size += len(chunk) + bool(chunks)
+            _require(size <= MAX_PROJECTION_BYTES, "projection-output-limit")
+            chunks.append(chunk)
+        return b"[" + b",".join(chunks) + b"]"
 
     @property
     def digest(self):
@@ -263,13 +278,16 @@ def _cargo_registry(source, allowed_origins):
     _require(parsed.scheme.lower() == "https" and parsed.hostname is not None, "registry-origin")
     _require(parsed.username is None and parsed.password is None and not parsed.query and not parsed.fragment,
              "registry-origin")
+    origin = _normalize_origin(value)
     host = parsed.hostname.lower()
     if host == "github.com":
+        _require(origin == "https://github.com", "registry-origin")
+        _require(parsed.netloc.lower() in ("github.com", "github.com:443"), "registry-origin")
         _require(parsed.path.rstrip("/") == "/rust-lang/crates.io-index", "registry-origin")
         registry = "https://index.crates.io"
     else:
         _require(parsed.path in ("", "/"), "registry-origin")
-        registry = _normalize_origin(value)
+        registry = origin
         _require(registry in allowed_origins, "registry-not-allowed")
     return registry
 
@@ -303,6 +321,7 @@ def _parse_cargo_lock(payload, cargo_archive_origins, allowed_cargo_origins):
             "cargo", name, version, registry, archive_origin, "sha256", checksum, "crate"
         )
         _validate_record(record)
+        _require(len(records) < MAX_PROJECTION_RECORDS, "projection-record-limit")
         records.append(record)
 
     for raw_line in payload.splitlines():
@@ -342,7 +361,8 @@ def _npm_integrity(value):
             continue
         expected_length = {"sha256": 32, "sha384": 48, "sha512": 64}[algorithm]
         if len(decoded) == expected_length:
-            candidates.append((algorithm, base64.b64encode(decoded).decode("ascii")))
+            digest = decoded.hex() if algorithm == "sha256" else base64.b64encode(decoded).decode("ascii")
+            candidates.append((algorithm, digest))
     _require(bool(candidates), "npm-integrity")
     strengths = {"sha256": 1, "sha384": 2, "sha512": 3}
     return sorted(candidates, key=lambda item: strengths[item[0]], reverse=True)[0]
@@ -390,6 +410,7 @@ def _parse_legacy_npm_dependencies(dependencies, allowed_origins, records):
     _require(type(dependencies) is dict, "npm-lock-dependencies")
     for name, value in dependencies.items():
         _require(type(name) is str and type(value) is dict, "npm-lock-package")
+        _require(len(records) < MAX_PROJECTION_RECORDS, "projection-record-limit")
         records.append(_npm_record(name, value, allowed_origins))
         nested = value.get("dependencies", {})
         if nested:
@@ -422,6 +443,7 @@ def _parse_npm_lock(payload, allowed_npm_origins):
             if value.get("link") is True:
                 continue
             name = value.get("name") or _npm_name_from_path(path)
+            _require(len(records) < MAX_PROJECTION_RECORDS, "projection-record-limit")
             records.append(_npm_record(name, value, allowed_npm_origins))
     else:
         _parse_legacy_npm_dependencies(document.get("dependencies", {}), allowed_npm_origins, records)
@@ -443,6 +465,25 @@ def project_public_locks(
     records.extend(_parse_npm_lock(npm_lock, npm_allowed))
     archive_origins = tuple(cargo_map.values()) + tuple(npm_allowed)
     return PublicLockProjection.from_records(records, tuple(cargo_allowed), tuple(npm_allowed), archive_origins)
+
+
+@dataclass(frozen=True)
+class ProjectionDecision:
+    projection: Optional[PublicLockProjection]
+    seed_allowed: bool
+    cache_read_allowed: bool
+    cold_required: bool
+    reason: str
+
+
+def decide_public_projection(*args, **kwargs):
+    try:
+        projection = project_public_locks(*args, **kwargs)
+    except CachePolicyError as error:
+        if error.code not in ("projection-record-limit", "projection-output-limit"):
+            raise
+        return ProjectionDecision(None, False, False, True, error.code)
+    return ProjectionDecision(projection, True, True, False, "within-bound")
 
 
 def toolchain_identity_digest(toolchains):
@@ -469,9 +510,8 @@ def build_cache_key(source_slot, operating_system, architecture, toolchains, pro
 
 
 @dataclass(frozen=True)
-class CacheArchive:
+class CacheArchiveClaim:
     path: str
-    data: bytes
     manager: str
     package: str
     version: str
@@ -479,8 +519,76 @@ class CacheArchive:
     origin: str
     digest_algorithm: str
     digest_value: str
-    kind: str = "file"
-    payload_class: str = "public-archive"
+    kind: str
+    payload_class: str
+
+
+@dataclass(frozen=True)
+class CacheArchive(CacheArchiveClaim):
+    data: bytes = b""
+    staging_token: object = field(default=None, repr=False, compare=False)
+
+
+_STAGED_ARCHIVE = object()
+
+
+class BoundedArchiveStager:
+    def __init__(self, max_bytes=ENTRY_LIMIT, max_files=MAX_FILES):
+        _require(type(max_bytes) is int and 0 < max_bytes <= ENTRY_LIMIT, "staging-size-limit")
+        _require(type(max_files) is int and 0 < max_files <= MAX_FILES, "staging-file-limit")
+        self.max_bytes = max_bytes
+        self.max_files = max_files
+        self.total_bytes = 0
+        self.transport_bytes = 0
+        self.file_count = 0
+
+    def stage(self, claim, chunks, compression="none"):
+        _require(isinstance(claim, CacheArchiveClaim), "staging-claim")
+        _require(self.file_count < self.max_files, "staging-file-limit")
+        _require(compression in ("none", "zlib"), "staging-compression")
+        _path_equivalence(claim.path)
+        _require(claim.kind == "file", "archive-entry-kind")
+        _require(claim.payload_class == "public-archive", "resolver-metadata-cached")
+        try:
+            iterator = iter(chunks)
+        except TypeError:
+            raise CachePolicyError("staging-chunks")
+        decompressor = zlib.decompressobj() if compression == "zlib" else None
+        output = bytearray()
+        transport_size = 0
+        for chunk in iterator:
+            _require(type(chunk) is bytes, "staging-chunks")
+            transport_size += len(chunk)
+            _require(self.transport_bytes + transport_size <= ENTRY_LIMIT, "staging-transport-limit")
+            remaining = self.max_bytes - self.total_bytes - len(output)
+            if decompressor is None:
+                extracted = chunk
+            else:
+                try:
+                    extracted = decompressor.decompress(chunk, remaining + 1)
+                except zlib.error:
+                    raise CachePolicyError("staging-compression")
+            _require(len(extracted) <= remaining, "archive-size-limit")
+            output.extend(extracted)
+            if decompressor is not None:
+                _require(not decompressor.unconsumed_tail, "archive-size-limit")
+        if decompressor is not None:
+            remaining = self.max_bytes - self.total_bytes - len(output)
+            try:
+                trailing = decompressor.flush(remaining + 1)
+            except zlib.error:
+                raise CachePolicyError("staging-compression")
+            _require(len(trailing) <= remaining, "archive-size-limit")
+            output.extend(trailing)
+            _require(decompressor.eof and not decompressor.unused_data, "staging-compression")
+        self.total_bytes += len(output)
+        self.transport_bytes += transport_size
+        self.file_count += 1
+        return CacheArchive(
+            claim.path, claim.manager, claim.package, claim.version, claim.registry,
+            claim.origin, claim.digest_algorithm, claim.digest_value, claim.kind,
+            claim.payload_class, bytes(output), _STAGED_ARCHIVE,
+        )
 
 
 @dataclass(frozen=True)
@@ -529,14 +637,17 @@ class RestoreExpectation:
 
 def _path_equivalence(path):
     _require(type(path) is str and path and path.isascii(), "archive-path")
-    _require("\\" not in path and not path.startswith("/"), "archive-path")
-    _require(":" not in path and not any(ord(char) < 32 for char in path), "archive-path")
+    _require("\\" not in path, "archive-path-backslash")
+    _require(not path.startswith("/"), "archive-path-absolute")
+    _require(":" not in path, "archive-path-colon")
+    _require(not any(ord(char) < 32 for char in path), "archive-path-control")
     parts = path.split("/")
-    _require(all(part not in ("", ".", "..") for part in parts), "archive-path")
+    _require(all(part not in ("", ".") for part in parts), "archive-path-component")
+    _require(all(part != ".." for part in parts), "archive-path-traversal")
     for part in parts:
-        _require(part == part.rstrip(" ."), "archive-path")
+        _require(part == part.rstrip(" ."), "archive-path-trailing")
         base = part.split(".", 1)[0].casefold()
-        _require(base not in RESERVED_WINDOWS_NAMES, "archive-path")
+        _require(base not in RESERVED_WINDOWS_NAMES, "archive-path-reserved")
     canonical = unicodedata.normalize("NFC", path)
     return canonical.casefold()
 
@@ -579,6 +690,10 @@ def _verify_archives(archives, projection, max_bytes=ENTRY_LIMIT):
     verified = {}
     for member in archives:
         _require(isinstance(member, CacheArchive), "archive-entry-type")
+        _require(member.staging_token is _STAGED_ARCHIVE, "archive-not-staged")
+        _require(type(member.data) is bytes, "archive-bytes")
+        total += len(member.data)
+        _require(total <= max_bytes, "archive-size-limit")
         equivalent = _path_equivalence(member.path)
         _require(equivalent not in seen_equivalent, "archive-path-collision")
         seen_equivalent.add(equivalent)
@@ -587,19 +702,21 @@ def _verify_archives(archives, projection, max_bytes=ENTRY_LIMIT):
         record = expected.get(member.path)
         _require(record is not None, "archive-not-in-lock")
         _verify_member(member, record)
-        total += len(member.data)
-        _require(total <= max_bytes, "archive-size-limit")
         verified[member.path] = bytes(bytearray(member.data))
     _require(seen_paths == set(expected), "archive-manifest-mismatch")
     return verified, total
 
 
-def _recheck_copy(projection, copied):
+def _recheck_copy(projection, copied, max_bytes=ENTRY_LIMIT):
     expected = {record.archive_path: record for record in projection.records}
     _require(set(copied) == set(expected), "protected-copy-manifest")
+    total = 0
     for path, payload in copied.items():
         record = expected[path]
-        _require(type(payload) is bytes and _digest_matches(payload, record.digest_algorithm, record.digest_value),
+        _require(type(payload) is bytes, "protected-copy-digest")
+        total += len(payload)
+        _require(total <= max_bytes, "protected-copy-size-limit")
+        _require(_digest_matches(payload, record.digest_algorithm, record.digest_value),
                  "protected-copy-digest")
 
 
@@ -673,6 +790,13 @@ class ColdPreparation:
 
 
 @dataclass(frozen=True)
+class FreshResolverPreparation:
+    resolver_metadata: Tuple[ResolverMetadata, ...]
+    trusted_setup_complete: bool
+    offline_ready: bool
+
+
+@dataclass(frozen=True)
 class RestoreDecision:
     status: str
     reason: str
@@ -682,15 +806,14 @@ class RestoreDecision:
     resolver_metadata: Tuple[ResolverMetadata, ...] = ()
 
 
-def _verify_cold_preparation(preparation, projection):
-    _require(isinstance(preparation, ColdPreparation), "cold-preparation-missing")
-    _require(preparation.trusted_setup_complete and preparation.offline_ready, "cold-setup-incomplete")
-    copied, _ = _verify_archives(preparation.archives, projection)
-    metadata_by_manager = {}
-    allowed_origins = {
-        manager: frozenset(record.registry for record in projection.records if record.manager == manager)
-        for manager in ("cargo", "npm")
-    }
+def _verify_resolver_preparation(preparation, projection):
+    _require(isinstance(preparation, (ColdPreparation, FreshResolverPreparation)),
+             "resolver-preparation-missing")
+    _require(preparation.trusted_setup_complete is True and preparation.offline_ready is True,
+             "resolver-setup-incomplete")
+    _require(type(preparation.resolver_metadata) is tuple, "resolver-metadata-type")
+    required_sources = frozenset((record.manager, record.registry) for record in projection.records)
+    seen_sources = set()
     for metadata in preparation.resolver_metadata:
         _require(isinstance(metadata, ResolverMetadata), "resolver-metadata-type")
         _require(metadata.manager in ("cargo", "npm"), "resolver-manager")
@@ -698,18 +821,35 @@ def _verify_cold_preparation(preparation, projection):
         _require(type(metadata.data) is bytes and 0 < len(metadata.data) <= ENTRY_LIMIT,
                  "resolver-metadata-size")
         origin = _normalize_origin(metadata.origin)
-        _require(origin in allowed_origins[metadata.manager], "resolver-origin")
-        metadata_by_manager[metadata.manager] = metadata_by_manager.get(metadata.manager, 0) + 1
-    _require(projection.managers.issubset(set(metadata_by_manager)), "resolver-metadata-missing")
+        source = (metadata.manager, origin)
+        _require(source in required_sources, "resolver-origin")
+        seen_sources.add(source)
+    _require(required_sources.issubset(seen_sources), "resolver-metadata-missing")
+    return preparation.resolver_metadata
+
+
+def _verify_cold_preparation(preparation, projection):
+    _require(isinstance(preparation, ColdPreparation), "cold-preparation-missing")
+    _verify_resolver_preparation(preparation, projection)
+    copied, _ = _verify_archives(preparation.archives, projection)
     return MappingProxyType(copied)
 
 
-def decide_restore(entry, expectation, cold_preparation=None):
+def decide_restore(entry, expectation, cold_preparation=None, resolver_preparation=None):
     try:
         restored = verify_restore(entry, expectation)
-        return RestoreDecision("cache", "verified-hit", True, True, restored)
     except CachePolicyError as error:
         cache_reason = error.code
+    else:
+        try:
+            fresh_metadata = _verify_resolver_preparation(
+                resolver_preparation if resolver_preparation is not None else cold_preparation,
+                expectation.projection,
+            )
+        except CachePolicyError as error:
+            cache_reason = error.code
+        else:
+            return RestoreDecision("cache", "verified-hit", True, True, restored, fresh_metadata)
     if cold_preparation is None:
         return RestoreDecision("cold-required", cache_reason, False, False, None)
     try:
@@ -1122,12 +1262,15 @@ def plan_cleanup(inventory, now_seconds, active_source_slots, current_projection
             reasons[item.cache_id] = "orphaned-source"
         elif item.scope != "refs/heads/main":
             reasons[item.cache_id] = "non-main-scope"
+        elif item.reported_size > ENTRY_LIMIT:
+            reasons[item.cache_id] = "entry-over-limit"
         elif current_digest is not None and item.projection_digest != current_digest:
             reasons[item.cache_id] = "superseded"
         elif age >= IDLE_RETIREMENT_SECONDS:
             reasons[item.cache_id] = "idle"
     selected = {}
-    precedence = {"orphaned-source": 0, "non-main-scope": 1, "superseded": 2, "idle": 3}
+    precedence = {"orphaned-source": 0, "non-main-scope": 1, "entry-over-limit": 2,
+                  "superseded": 3, "idle": 4}
     for cache_id in sorted(reasons, key=lambda value: (precedence[reasons[value]],
                                                         by_id[value].last_access_seconds, value)):
         selected[cache_id] = reasons[cache_id]
@@ -1171,7 +1314,7 @@ def plan_cleanup(inventory, now_seconds, active_source_slots, current_projection
         selected[victim.cache_id] = budget_reason
 
     delete_slots = max(0, request_limit - inventory.list_requests)
-    ordered = sorted(selected, key=lambda value: (precedence.get(selected[value], 4),
+    ordered = sorted(selected, key=lambda value: (precedence.get(selected[value], 5),
                                                    by_id[value].last_access_seconds, value))
     chosen = ordered[:delete_slots]
     left = [value for value in ordered if value not in chosen]
@@ -1241,6 +1384,8 @@ def admit_save(inventory, source_slots, source_slot, operating_system, architect
             or type(key) is not str or not key):
         return reject("admission-identity-invalid", staged_upper_bound)
     entries = tuple(inventory.entries)
+    if any(item.reported_size > ENTRY_LIMIT for item in entries):
+        return reject("entry-over-limit-inventory", staged_upper_bound)
     if any(item.cache_id == key or item.key == key for item in entries):
         return reject("already-present", staged_upper_bound)
     partition = (source_slot, operating_system, architecture)
