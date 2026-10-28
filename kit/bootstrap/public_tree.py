@@ -110,6 +110,12 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/windows_native_preflight.cs",
         "kit/confinement/windows_native_preflight.ps1",
         "kit/confinement/test_windows_native_preflight.py",
+        "kit/confinement/confinement_verdict.py",
+        "kit/confinement/test_confinement_verdict.py",
+        "kit/confinement/confinement_public_audit.py",
+        "kit/confinement/test_confinement_public_audit.py",
+        "kit/confinement/log_canary.py",
+        "kit/confinement/test_log_canary.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
