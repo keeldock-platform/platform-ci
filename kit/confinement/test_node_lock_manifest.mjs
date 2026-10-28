@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 
 import {
@@ -290,35 +292,45 @@ function contractConstant(name, quote) {
   return matches[0][1];
 }
 
-test('the fixed Node title option decodes to its module source and keeps process.title assignable', () => {
+const titleProbeSource = [
+  'const descriptor = Object.getOwnPropertyDescriptor(process, "title");',
+  'const kind = "value" in descriptor ? "data" : "accessor";',
+  'process.title = "kd-title-probe";',
+  'const short = String(process.title);',
+  'process.title = "k".repeat(4096);',
+  'process.stdout.write(JSON.stringify({ kind, short, length: String(process.title).length }));',
+].join('\n');
+
+test('the fixed Node title option makes process.title a plain data property before the main script runs', () => {
   const option = contractConstant('NODE_OPTIONS_VALUE', '"');
   const source = contractConstant('NODE_TITLE_MODULE_SOURCE', "'");
   const prefix = '--import=data:text/javascript;base64,';
   assert.ok(option.startsWith(prefix));
   assert.match(option, /^[A-Za-z0-9+/=,:;.\-]+$/);
   assert.equal(Buffer.from(option.slice(prefix.length), 'base64').toString('ascii'), source);
-  const environment = { NODE_OPTIONS: option };
+  const baseEnvironment = {};
   for (const name of ['PATH', 'SystemRoot']) {
     if (process.env[name] !== undefined) {
-      environment[name] = process.env[name];
+      baseEnvironment[name] = process.env[name];
     }
   }
-  const result = spawnSync(
-    process.execPath,
-    ['-e', 'process.title="kd-title-probe";process.stdout.write(String(process.title))'],
-    { env: environment, encoding: 'utf8', timeout: 30000, windowsHide: true },
-  );
-  assert.equal(result.error, undefined);
-  assert.equal(result.status, 0);
-  assert.equal(result.stdout, 'kd-title-probe');
-  assert.equal(result.stderr, '');
-  const longTitle = spawnSync(
-    process.execPath,
-    ['-e', 'const t="k".repeat(4096);process.title=t;process.stdout.write(String(process.title.length))'],
-    { env: environment, encoding: 'utf8', timeout: 30000, windowsHide: true },
-  );
-  assert.equal(longTitle.error, undefined);
-  assert.equal(longTitle.status, 0);
-  assert.equal(longTitle.stdout, '4096');
-  assert.equal(longTitle.stderr, '');
+  const directory = mkdtempSync(join(tmpdir(), 'kd-title-probe-'));
+  try {
+    const probeFile = join(directory, 'probe.cjs');
+    writeFileSync(probeFile, titleProbeSource);
+    const run = (environment) => spawnSync(process.execPath, [probeFile], {
+      env: environment, encoding: 'utf8', timeout: 30000, windowsHide: true, cwd: directory,
+    });
+    const fixed = run({ ...baseEnvironment, NODE_OPTIONS: option });
+    assert.equal(fixed.error, undefined);
+    assert.equal(fixed.status, 0);
+    assert.equal(fixed.stderr, '');
+    assert.deepEqual(JSON.parse(fixed.stdout), { kind: 'data', short: 'kd-title-probe', length: 4096 });
+    const control = run(baseEnvironment);
+    assert.equal(control.error, undefined);
+    assert.equal(control.status, 0);
+    assert.equal(JSON.parse(control.stdout).kind, 'accessor');
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });

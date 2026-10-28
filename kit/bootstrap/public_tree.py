@@ -136,7 +136,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/node_lock_envelope.mjs': '17b636e798669b740ae54630082d55c21b0584305cb556770dfc9c9ba593642f',
     'kit/confinement/test_node_lock_envelope.mjs': '255b00fb4e47dff6e825ce52919af04f7f08e21ea49af336f1f52cca23a6f381',
     'kit/confinement/node_lock_manifest.mjs': 'b498f9846103d09937f1a370da6a37509e32afe941648b0d854d038aea2548d5',
-    'kit/confinement/test_node_lock_manifest.mjs': '7fb31fbdaccab8f75c7a80f0dd30ab37f155b3e993b2719633b2455a239088d2',
+    'kit/confinement/test_node_lock_manifest.mjs': '24d56e460a8c47193a349f155df51dbceb6bb1fc77db1717cb4a2255e1170946',
     'kit/confinement/node_lock_receipt.py': 'ade987d617a6cfe8a8b9f937ea6c17510a639a9ea671437625afeecd0c7e1a63',
     'kit/confinement/test_node_lock_receipt.py': '76163ace7dc4e239c16c993de84da44deaf402e42ba4fccb1a28fd8c28fae6b6',
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
