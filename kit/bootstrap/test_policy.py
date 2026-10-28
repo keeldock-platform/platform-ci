@@ -175,16 +175,28 @@ class WorkflowPolicyTests(unittest.TestCase):
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow + "\npermissions: write-all\n", "platform", "development-feedback-smoke")
 
-    def test_attestation_probe_requires_manual_main_and_minimal_permission_checks(self):
+    def test_attestation_probe_requires_exact_reviewed_workflow(self):
         path = Path(__file__).resolve().parents[2] / ".github/workflows/attestation-probe.yml"
         workflow = path.read_text(encoding="utf-8")
         self.assertTrue(validate_workflow_text(workflow, "platform", "attestation-probe"))
-        self.assertIn("attestations:write,id-token:write", workflow)
-        self.assertIn("verifier_permissions=actions:read,attestations:read", workflow)
+        self.assertIn("minimal_permissions[windows-2025]=$windowsPermissions", workflow)
+        self.assertIn("$ubuntuPermissions = 'unavailable'", workflow)
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "attestation-probe")
         mutations = (
             workflow.replace("  workflow_dispatch:\n", "  push:\n", 1),
             workflow.replace("          - windows-2025\n", "          - windows-latest\n", 1),
             workflow.replace("--deny-self-hosted-runners", ""),
+            workflow.replace("if ($env:EVENT_NAME -ne 'workflow_dispatch' -or $env:EVENT_REF -ne 'refs/heads/main') {", "if ($false) {", 1),
+            workflow.replace("      - name: Check the source-free verifier helper\n", "      - name: Extra shell step\n        run: echo extra\n      - name: Check the source-free verifier helper\n", 1),
+            workflow.replace("  verify:\n", "  extra-job:\n    runs-on: ubuntu-24.04\n    steps:\n      - run: echo extra\n\n  verify:\n", 1),
+            workflow.replace("--cert-oidc-issuer 'https://token.actions.githubusercontent.com'", "--cert-oidc-issuer 'https://other.invalid'", 1),
+            workflow.replace("      actions: read\n      attestations: read\n", "      actions: read\n      attestations: read\n      contents: write\n", 1),
+            workflow.replace("[int]$response.StatusCode -eq 403", "[int]$response.StatusCode -ge 400", 1),
+            workflow.replace("if ($result -eq 'ambiguous') { throw 'permission-ambiguous' }", "if ($false) { throw 'permission-ambiguous' }", 1),
+            workflow.replace("            $ubuntuPermissions = 'unavailable'\n            $windowsPermissions = 'unavailable'\n          }", "          }", 1),
+            workflow.replace("if ($reductions[\"$runner/$missing\"] -eq 'succeeded')", "if ($false)", 1),
+            workflow.replace("          ref: ${{ github.sha }}\n", "          ref: main\n", 1),
             workflow.replace(
                 "uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 " + chr(35) + " v4.2.2",
                 "uses: actions/attest@v4",
@@ -192,10 +204,18 @@ class WorkflowPolicyTests(unittest.TestCase):
             ),
             workflow + "\n",
         )
-        for changed in mutations:
-            with self.subTest(length=len(changed)):
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation=index):
+                self.assertNotEqual(changed, workflow)
                 with self.assertRaises(PolicyError):
                     validate_workflow_text(changed, "platform", "attestation-probe")
+
+    def test_existing_attestation_permission_probe_reports_observations_only(self):
+        path = Path(__file__).resolve().parents[2] / ".github/workflows/windows-attestation-permission-probe.yml"
+        workflow = path.read_text(encoding="utf-8")
+        self.assertNotIn("probe=profile-selection", workflow)
+        for profile in ("common-intersection", "github-guide", "actions-readme"):
+            self.assertIn("probe=profile-comparison result=observed profile=" + profile, workflow)
 
     def test_actual_platform_workflow_matches_closed_supported_shape(self):
         self.assertTrue(validate_workflow_text(self._platform_workflow(), "platform"))

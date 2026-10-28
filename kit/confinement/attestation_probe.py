@@ -4,14 +4,13 @@ from pathlib import Path
 
 
 MAX_JSON_BYTES = 1048576
-CLAIM_ALIASES = {
-    "audience": frozenset(("aud", "audience", "audiences")),
-    "issuer": frozenset(("iss", "issuer")),
-    "job_id": frozenset(("jobid", "checkrunid")),
-    "run_attempt": frozenset(("runattempt",)),
-    "run_id": frozenset(("runid",)),
-}
-CLAIM_ORDER = ("audience", "issuer", "job_id", "run_attempt", "run_id")
+LEAF_SUMMARY_FIELDS = (
+    "identity",
+    "issuer",
+    "sourceRepositoryURI",
+    "buildConfigURI",
+    "runInvocationURI",
+)
 
 
 def _pairs_without_duplicates(pairs):
@@ -33,82 +32,31 @@ def load_json(path):
     )
 
 
-def _normalise_key(value):
-    return "".join(character.lower() for character in value if character.isalnum())
-
-
-def _certificate_documents(document):
-    certificates = []
-    pending = [document]
-    certificate_names = frozenset(("certificate", "certificates", "signingcertificate"))
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if _normalise_key(key) in certificate_names:
-                    if isinstance(item, dict):
-                        certificates.append(item)
-                    elif isinstance(item, list):
-                        certificates.extend(entry for entry in item if isinstance(entry, dict))
-                elif isinstance(item, (dict, list)):
-                    pending.append(item)
-        elif isinstance(value, list):
-            pending.extend(value)
-    return certificates
-
-
-def _scalar_values(document, aliases):
-    found = []
-    pending = [document]
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if _normalise_key(key) in aliases:
-                    if isinstance(item, list):
-                        found.extend(entry for entry in item if isinstance(entry, (str, int)) and not isinstance(entry, bool))
-                    elif isinstance(item, (str, int)) and not isinstance(item, bool):
-                        found.append(item)
-                if isinstance(item, (dict, list)):
-                    pending.append(item)
-        elif isinstance(value, list):
-            pending.extend(value)
-    return found
-
-
-def _expected_values(expected):
-    return {
-        "audience": frozenset((expected["audience"],)),
-        "issuer": frozenset((expected["issuer"],)),
-        "job_id": frozenset((expected["job_id"],)),
-        "run_attempt": frozenset((str(expected["run_attempt"]),)),
-        "run_id": frozenset((str(expected["run_id"]),)),
-    }
+def verified_leaf_summary(document):
+    if isinstance(document, list):
+        if len(document) != 1:
+            return None
+        document = document[0]
+    if not isinstance(document, dict):
+        return None
+    result = document.get("verificationResult")
+    if not isinstance(result, dict):
+        return None
+    signature = result.get("signature")
+    if not isinstance(signature, dict):
+        return None
+    certificate = signature.get("certificate")
+    if not isinstance(certificate, dict):
+        return None
+    return certificate
 
 
 def evaluate_mapping(document, expected):
-    present = []
-    missing = []
-    mismatched = []
-    accepted = _expected_values(expected)
-    certificates = _certificate_documents(document)
-    for claim in CLAIM_ORDER:
-        values = [
-            item
-            for certificate in certificates
-            for item in _scalar_values(certificate, CLAIM_ALIASES[claim])
-        ]
-        if not values:
-            missing.append(claim)
-            continue
-        present.append(claim)
-        if any(str(value) not in accepted[claim] for value in values):
-            mismatched.append(claim)
-    if missing:
-        return "unavailable", tuple(present)
-    if mismatched:
-        return "mismatch", tuple(present)
-    return "available", tuple(present)
+    certificate = verified_leaf_summary(document)
+    if certificate is None:
+        return "unavailable", ()
+    present = tuple(field for field in LEAF_SUMMARY_FIELDS if field in certificate)
+    return "unavailable", present
 
 
 def job_identifier(document, name):
@@ -130,10 +78,9 @@ def job_identifier(document, name):
 
 
 def _print_mapping(document, expected):
-    result, claims = evaluate_mapping(document, expected)
-    claim_text = ",".join(claims) if claims else "none"
-    print("mapping=" + result + " claims=" + claim_text)
-    return result
+    result, fields = evaluate_mapping(document, expected)
+    field_text = ",".join(fields) if fields else "none"
+    print("mapping=" + result + " leaf_fields=" + field_text)
 
 
 def main():
@@ -152,10 +99,8 @@ def main():
     arguments = parser.parse_args()
     try:
         if arguments.command == "job-id":
-            document = load_json(arguments.jobs_file)
-            print(job_identifier(document, arguments.name))
+            print(job_identifier(load_json(arguments.jobs_file), arguments.name))
             return 0
-        document = load_json(arguments.verified_file)
         expected = {
             "audience": arguments.audience,
             "issuer": arguments.issuer,
@@ -163,10 +108,10 @@ def main():
             "run_attempt": arguments.run_attempt,
             "run_id": arguments.run_id,
         }
-        _print_mapping(document, expected)
+        _print_mapping(load_json(arguments.verified_file), expected)
         return 0
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
-        print("mapping=unavailable claims=none")
+        print("mapping=unavailable leaf_fields=none")
         return 0
 
 
