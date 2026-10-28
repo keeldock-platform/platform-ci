@@ -48,6 +48,8 @@ PLATFORM_FILES = frozenset(
         'kit/confinement/test_node_lock_manifest.mjs',
         'kit/confinement/node_lock_receipt.py',
         'kit/confinement/test_node_lock_receipt.py',
+        'kit/confinement/cargo_lock_receipt.py',
+        'kit/confinement/test_cargo_lock_receipt.py',
         ".github/workflows/linux-confinement.yml",
         ".github/workflows/windows-attestation-permission-probe.yml",
         ".github/workflows/attestation-probe.yml",
@@ -75,6 +77,9 @@ PLATFORM_FILES = frozenset(
         "kit/bootstrap/test_policy_linux.py",
         "kit/bootstrap/test_policy_windows.py",
         "kit/bootstrap/test_public_tree.py",
+        ".github/workflows/windows-handoff-synthetic.yml",
+        "kit/handoff/source_free.py",
+        "kit/handoff/test_source_free.py",
         "kit/confinement/macos_boundary_guard.py",
         "kit/confinement/test_macos_boundary_guard.py",
         "kit/confinement/macos_canary_scan.py",
@@ -125,6 +130,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/test_log_canary.py",
         "kit/confinement/capsule_frame.py",
         "kit/confinement/test_capsule_frame.py",
+        "kit/confinement/source_bundle_preflight.py",
+        "kit/confinement/test_source_bundle_preflight.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
