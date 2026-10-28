@@ -71,6 +71,7 @@ class Refusal(Exception):
         if reason not in (
             "cargo_lock_receipt_invalid", "cargo_lock_invalid", "cargo_receipt_invalid",
             "cargo_lock_mismatch", "cargo_archive_invalid", "cargo_config_invalid",
+            "cargo_vendor_invalid",
         ):
             reason = "cargo_lock_receipt_invalid"
         self.reason = reason
