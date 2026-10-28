@@ -11,11 +11,18 @@ $refusal = $null
 $cleanup = 'verified'
 $box = $null
 $baseDirectory = $null
+$componentNameExpected = $null
+$componentNameObserved = $null
 
 $RustVersion = '1.99.1'
 $RustTarget = 'x86_64-pc-windows-msvc'
 $RustDate = '2026-10-15'
 $NodeVersion = '24.22.1'
+$ExpectedRustComponents = @{
+    rustc = 'rustc'
+    cargo = 'cargo'
+    rust_std = ('rust-std-' + $RustTarget)
+}
 $Downloads = @(
     @{ Name = 'rustc'; File = 'rustc.tar.gz'; Url = ('https://static.rust-lang.org/dist/' + $RustDate + '/rustc-' + $RustVersion + '-' + $RustTarget + '.tar.gz'); Sha256 = '4e211ed2047e7890a8aea79fc8a88922d4c0e87a325349323d56c958d8da5d3a'; Root = ('rustc-' + $RustVersion + '-' + $RustTarget) },
     @{ Name = 'cargo'; File = 'cargo.tar.gz'; Url = ('https://static.rust-lang.org/dist/' + $RustDate + '/cargo-' + $RustVersion + '-' + $RustTarget + '.tar.gz'); Sha256 = 'bbf6e9295b69c9de8f2610e3e5bb90217d23826b7f2adac698262663a58ad899'; Root = ('cargo-' + $RustVersion + '-' + $RustTarget) },
@@ -146,6 +153,13 @@ function Get-CleanText([string]$text, [int]$limit) {
     $value = $value.Replace("`r", '')
     $value = [regex]::Replace($value, '[^A-Za-z0-9 ._=/,\n-]', '?')
     if ($value.Length -gt $limit) { $value = $value.Substring(0, $limit) }
+    return $value
+}
+
+function Get-SafeComponentName([string]$text) {
+    $value = [regex]::Replace([string]$text, '[^A-Za-z0-9._-]', '_')
+    if ($value.Length -gt 64) { $value = $value.Substring(0, 64) }
+    if ($value.Length -eq 0) { return 'empty' }
     return $value
 }
 
@@ -514,10 +528,15 @@ try {
             $extract = Join-Path $layout.Downloads ('x-' + $item.Name)
             Invoke-Tar (Join-Path $layout.Downloads $item.File) $extract
             $componentRoot = Join-Path $extract $item.Root
+            $expectedComponent = $ExpectedRustComponents[$item.Name]
             foreach ($component in (Get-Content -LiteralPath (Join-Path $componentRoot 'components'))) {
                 $name = $component.Trim()
                 if ($name.Length -eq 0) { continue }
-                if ($name -notmatch '^[a-z0-9-]{1,64}$') { throw 'component_name' }
+                if (-not [string]::Equals($name, $expectedComponent, [StringComparison]::Ordinal)) {
+                    $componentNameExpected = $expectedComponent
+                    $componentNameObserved = $name
+                    throw 'component_name'
+                }
                 $componentSource = Join-Path $componentRoot $name
                 if (-not (Test-Path -LiteralPath $componentSource -PathType Container)) { throw 'component_missing' }
                 Copy-Item -Path (Join-Path $componentSource '*') -Destination $layout.RustPrefix -Recurse -Force
@@ -599,7 +618,11 @@ try {
     $reason = [regex]::Replace($reason, '[^A-Za-z0-9._ -]', '_').Trim().Replace(' ', '_')
     if ($reason.Length -eq 0) { $reason = 'unspecified' }
     $safePhase = [regex]::Replace([string]$phase, '[^A-Za-z0-9_]', '_')
-    $refusal = 'windows-confinement-spike=refused phase=' + $safePhase + ' reason=' + $reason
+    $componentDiagnostic = ''
+    if ($null -ne $componentNameExpected) {
+        $componentDiagnostic = ' expected_component=' + (Get-SafeComponentName $componentNameExpected) + ' observed_component=' + (Get-SafeComponentName $componentNameObserved)
+    }
+    $refusal = 'windows-confinement-spike=refused phase=' + $safePhase + ' reason=' + $reason + $componentDiagnostic
 }
 
 try {
