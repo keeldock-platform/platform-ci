@@ -1349,6 +1349,7 @@ class LaneRegistryTests(unittest.TestCase):
             {kind: module for kind, module in policy.WORKFLOW_KIND_LANES.items()},
             {
                 "linux-confinement": policy_linux,
+                "linux-source-admission": policy_linux,
                 "windows-native-preflight": policy_windows,
             },
         )
@@ -1378,6 +1379,11 @@ class LaneRegistryTests(unittest.TestCase):
             policy.LANE_CANDIDATE_WORKFLOWS,
             (
                 (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
+                (
+                    ".github/workflows/linux-source-admission.yml",
+                    "linux-source-admission",
+                    "linux-source-admission-workflow-too-large",
+                ),
                 (
                     ".github/workflows/windows-native-preflight.yml",
                     "windows-native-preflight",

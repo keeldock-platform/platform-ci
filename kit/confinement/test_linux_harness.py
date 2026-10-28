@@ -680,5 +680,13 @@ class HarnessPolicyTests(unittest.TestCase):
                     self.assertEqual(raised.exception.reason, reason)
 
 
+from test_linux_boundary import *
+from test_linux_canaries import *
+from test_linux_channels import *
+from test_linux_fixtures import *
+from test_linux_session import *
+from test_linux_settings import *
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

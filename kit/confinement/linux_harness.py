@@ -284,27 +284,32 @@ def _wait_for_process_state(pid, expected):
     raise ProofFailure(74)
 
 
-def _drop_child():
+CHILD_LIMITS = (
+    (resource.RLIMIT_CPU, (3, 3)),
+    (resource.RLIMIT_FSIZE, (MAX_CAPTURE // 2, MAX_CAPTURE // 2)),
+    (resource.RLIMIT_AS, (268435456, 268435456)),
+    (resource.RLIMIT_NPROC, (16, 16)),
+    (resource.RLIMIT_NOFILE, (16, 16)),
+    (resource.RLIMIT_CORE, (0, 0)),
+)
+
+
+def _drop_child(limits=None, socket_filter=True, drop_privileges=True):
     libc = ctypes.CDLL(None, use_errno=True)
-    for capability in range(64):
-        if libc.prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) != 0:
-            error = ctypes.get_errno()
-            if error not in (errno.EINVAL, errno.EPERM):
-                os._exit(91)
-    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-        os._exit(92)
-    os.setgroups([])
-    os.setresgid(CHILD_GID, CHILD_GID, CHILD_GID)
-    os.setresuid(CHILD_UID, CHILD_UID, CHILD_UID)
-    _install_socket_filter()
-    for key, limit in (
-        (resource.RLIMIT_CPU, (3, 3)),
-        (resource.RLIMIT_FSIZE, (MAX_CAPTURE // 2, MAX_CAPTURE // 2)),
-        (resource.RLIMIT_AS, (268435456, 268435456)),
-        (resource.RLIMIT_NPROC, (16, 16)),
-        (resource.RLIMIT_NOFILE, (16, 16)),
-        (resource.RLIMIT_CORE, (0, 0)),
-    ):
+    if drop_privileges:
+        for capability in range(64):
+            if libc.prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) != 0:
+                error = ctypes.get_errno()
+                if error not in (errno.EINVAL, errno.EPERM):
+                    os._exit(91)
+        if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            os._exit(92)
+        os.setgroups([])
+        os.setresgid(CHILD_GID, CHILD_GID, CHILD_GID)
+        os.setresuid(CHILD_UID, CHILD_UID, CHILD_UID)
+    if socket_filter:
+        _install_socket_filter()
+    for key, limit in (CHILD_LIMITS if limits is None else limits):
         resource.setrlimit(key, limit)
     os.close(0)
 
