@@ -399,6 +399,7 @@ class MacOSNodeContractTests(unittest.TestCase):
         self.assertEqual(runner.calls, [])
 
     def _bootstrap_with_worker_error(self, error, at):
+        self.storage = Path(tempfile.mkdtemp(dir=self.root)).resolve(strict=True)
         runner = RaisingWorkerHarness(self.project, error, at)
         with self.assertRaises(subject.NodeContractRefusal) as caught:
             self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
