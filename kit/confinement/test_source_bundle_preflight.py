@@ -121,6 +121,29 @@ class SourceBundlePreflightTests(unittest.TestCase):
         self.assertIn(result.reason, subject.REFUSAL_REASONS)
         self.assertEqual(result.reason, reason)
 
+    def assert_copy_target_boundary(self, base_data, command):
+        base = subject._Entry(0, 3, len(base_data), 0, 0,
+                              result_size=len(base_data))
+        deadline = subject._Deadline(subject.BundleLimits())
+        at_limit = io.BytesIO(base_data)
+        subject._apply_delta(io.BytesIO(command), at_limit, base, len(base_data),
+                             hashlib.sha1(), deadline)
+        self.assertEqual(at_limit.getvalue(), base_data + base_data)
+
+        one_past = io.BytesIO(base_data)
+        with self.assertRaises(subject._Refusal) as refused:
+            subject._apply_delta(io.BytesIO(command), one_past, base, len(base_data) - 1,
+                                 hashlib.sha1(), deadline)
+        self.assertEqual(refused.exception.reason, "object-invalid")
+        self.assertEqual(one_past.getvalue(), base_data)
+
+        incomplete = io.BytesIO(base_data)
+        with self.assertRaises(subject._Refusal) as refused:
+            subject._apply_delta(io.BytesIO(command), incomplete, base, len(base_data) + 1,
+                                 hashlib.sha1(), deadline)
+        self.assertEqual(refused.exception.reason, "object-invalid")
+        self.assertEqual(incomplete.getvalue(), base_data + base_data)
+
     def test_small_bundle_from_bytes_and_binary_stream(self):
         raw = _one_blob()
         for source in (raw, io.BytesIO(raw)):
@@ -337,6 +360,7 @@ class SourceBundlePreflightTests(unittest.TestCase):
                              b"\x02\x01\x90"):
             with self.subTest(instructions=instructions):
                 self.assert_refusal(_offset_delta(b"ab", instructions), "object-invalid")
+        self.assert_copy_target_boundary(b"ab", b"\x90\x02")
 
     def test_implicit_copy_size_is_exactly_65536(self):
         data = b"a" * 65536
@@ -346,6 +370,7 @@ class SourceBundlePreflightTests(unittest.TestCase):
         self.assertEqual(result.total_expanded_bytes, 2 * len(data) + 1)
         oversized_copy = _varint(len(data)) + _varint(len(data) - 1) + b"\x80"
         self.assert_refusal(_offset_delta(data, oversized_copy), "object-invalid")
+        self.assert_copy_target_boundary(data, b"\x80")
 
     def test_bundle_and_pack_header_errors_have_exact_reasons(self):
         bad_magic = bytes((35,)) + b" v4 git bundle\n"
