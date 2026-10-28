@@ -440,6 +440,10 @@ class JobTests(AuditCase):
         renamed = FakeApi()
         renamed.jobs[0]["name"] = "other"
         cases["renamed"] = renamed
+        for api in (extra, duplicate):
+            api.logs[104] = noise_log(b"extra")
+            api.checks[204] = make_check(204)
+            api.annotations[204] = []
         for name, api in cases.items():
             with self.subTest(case=name):
                 self.assert_refused(api, "jobs")
