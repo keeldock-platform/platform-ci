@@ -518,12 +518,15 @@ class MacosFeedbackProducerTests(unittest.TestCase):
 
         def execute(core, arguments, environment, token, lifecycle, feedback_kind):
             self.assertEqual(feedback_kind, "lock")
+            self.assertEqual(lifecycle["token_revocation"], "unconfirmed")
+            lifecycle["token_revocation"] = "confirmed_before_execution"
             path = MODULE_PATH.with_name("macos_node_contract.py")
             spec = importlib.util.spec_from_file_location("macos_node_contract_main_test", path)
             contract = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(contract)
 
             def run_worker(argv, **unused):
+                self.assertEqual(lifecycle["token_revocation"], "confirmed_before_execution")
                 worker_calls.append(tuple(argv))
                 return SimpleNamespace(
                     returncode=0, stdout=b"v0.0.0\n", stderr=b"",
