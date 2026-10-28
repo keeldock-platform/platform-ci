@@ -18,6 +18,7 @@ __all__ = [
 ROOT = Path(__file__).resolve().parents[2]
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = ROOT / ".github/workflows/windows-native-preflight.yml"
 WINDOWS_CONFINEMENT_WORKFLOW = ROOT / ".github/workflows/windows-confinement.yml"
+CAPSULE_VECTORS_WORKFLOW = ROOT / ".github/workflows/capsule-vectors.yml"
 WINDOWS_WORKFLOW_SHA256_BEFORE_SPLIT = "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb"
 WINDOWS_LANE_FILES = (
     ".github/workflows/windows-native-preflight.yml",
@@ -30,6 +31,8 @@ WINDOWS_LANE_FILES = (
     "kit/confinement/windows_confinement.cs",
     "kit/confinement/windows_confinement.ps1",
     "kit/confinement/test_windows_confinement.py",
+    ".github/workflows/capsule-vectors.yml",
+    "kit/confinement/capsule_frame_vector_gate.py",
 )
 
 
@@ -153,6 +156,33 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
 
 
 class WindowsLaneRegistryTests(unittest.TestCase):
+    def test_capsule_vectors_exact_template_and_refusals(self):
+        workflow = CAPSULE_VECTORS_WORKFLOW.read_text(encoding="ascii")
+        self.assertEqual(workflow, policy_windows.CAPSULE_VECTORS_WORKFLOW_TEMPLATE)
+        self.assertTrue(validate_workflow_text(workflow, "platform", "capsule-vectors"))
+        self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("permissions: {}", workflow)
+        self.assertIn("runs-on: windows-2025", workflow)
+        self.assertIn("capsule_frame.ps1 -Mode vectors", workflow)
+        self.assertIn("capsule_frame_vector_gate.py", workflow)
+        self.assertIn("capsule-vectors=refused reason=gate", workflow)
+        self.assertNotIn("secrets.", workflow)
+        for mutation in (
+            workflow.replace("workflow_dispatch:", "push:"),
+            workflow.replace("refs/heads/main", "refs/heads/feature"),
+            workflow.replace("permissions: {}", "permissions:\n  contents: read", 1),
+            workflow.replace("capsule_frame_vector_gate.py", "test_capsule_frame.py"),
+            workflow.replace("capsule_frame.ps1 -Mode vectors", "capsule_frame.ps1 -Mode compile"),
+            workflow.replace("capsule-vectors=refused reason=gate", "capsule-vectors=observed result=matched"),
+            workflow + "\n",
+        ):
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(mutation, workflow)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(mutation, "platform", "capsule-vectors")
+        with self.assertRaisesRegex(PolicyError, "workflow-kind-pool"):
+            validate_workflow_text(workflow, "connect", "capsule-vectors")
+
     def test_moved_template_is_byte_for_byte_the_pre_split_template(self):
         template = policy_windows.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE
         self.assertEqual(
@@ -171,12 +201,13 @@ class WindowsLaneRegistryTests(unittest.TestCase):
             policy_windows.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE,
         )
 
-    def test_lane_declares_only_the_windows_workflow_and_no_digest_pins(self):
+    def test_lane_declares_only_reviewed_windows_workflows_and_no_digest_pins(self):
         self.assertEqual(
             dict(policy_windows.WORKFLOW_TEMPLATES),
             {
                 "windows-native-preflight": policy_windows.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE,
                 "windows-confinement": policy_windows.WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE,
+                "capsule-vectors": policy_windows.CAPSULE_VECTORS_WORKFLOW_TEMPLATE,
             },
         )
         self.assertEqual(dict(policy_windows.WORKFLOW_SHA256), {})
@@ -193,12 +224,18 @@ class WindowsLaneRegistryTests(unittest.TestCase):
                     "windows-confinement",
                     "windows-confinement-workflow-too-large",
                 ),
+                (
+                    ".github/workflows/capsule-vectors.yml",
+                    "capsule-vectors",
+                    "capsule-vectors-workflow-too-large",
+                ),
             ),
         )
 
     def test_registry_routes_the_windows_kind_to_the_windows_lane(self):
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-confinement"], policy_windows)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["capsule-vectors"], policy_windows)
         self.assertEqual(
             policy.LANE_WORKFLOW_TEMPLATES["windows-confinement"],
             policy_windows.WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE,
@@ -206,6 +243,10 @@ class WindowsLaneRegistryTests(unittest.TestCase):
         self.assertEqual(
             policy.LANE_WORKFLOW_TEMPLATES["windows-native-preflight"],
             policy_windows.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE,
+        )
+        self.assertEqual(
+            policy.LANE_WORKFLOW_TEMPLATES["capsule-vectors"],
+            policy_windows.CAPSULE_VECTORS_WORKFLOW_TEMPLATE,
         )
         for entry in policy_windows.CANDIDATE_WORKFLOWS:
             self.assertIn(entry, policy.LANE_CANDIDATE_WORKFLOWS)
