@@ -481,6 +481,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertEqual(core_args[0:2], ["run", "--token-stdin"])
         self.assertEqual(producer._parse_cli(["run", "--profile", "invalid"]), ("invalid", []))
 
+    @unittest.skipUnless(sys.platform != "win32", "the macOS producer path is POSIX only")
     def test_main_lock_profile_publishes_the_public_result_line(self):
         receipt = None
 
@@ -513,6 +514,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(output, "KD-FEEDBACK-PRODUCER " + receipt + "\n")
 
+    @unittest.skipUnless(sys.platform != "win32", "the macOS producer path is POSIX only")
     def test_main_publishes_real_node_toolchain_refusal_mapping(self):
         worker_calls = []
 
