@@ -1,8 +1,12 @@
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
-from attestation_probe import evaluate_mapping, job_identifier, load_json, verified_leaf_summary
+from attestation_probe import evaluate_mapping, job_identifier, load_json, main, verified_leaf_summary
 
 
 EXPECTED = {
@@ -69,9 +73,35 @@ class AttestationProbeTests(unittest.TestCase):
         )
         result, fields = evaluate_mapping(value, EXPECTED)
         self.assertEqual(result, "unavailable")
-        self.assertEqual(fields, ("identity", "issuer", "runInvocationURI"))
+        self.assertEqual(fields, ("aud", "check_run_id", "identity", "issuer", "runInvocationURI", "run_attempt", "run_id"))
         self.assertEqual(evaluate_mapping(value, dict(EXPECTED, job_id="932"))[0], "unavailable")
         self.assertEqual(evaluate_mapping(value, dict(EXPECTED, run_attempt="3"))[0], "unavailable")
+
+    def test_unexpected_safe_leaf_field_name_is_reported_without_its_value(self):
+        value = verified_summary(zNewField="secret-value")
+        result, fields = evaluate_mapping(value, EXPECTED)
+        self.assertEqual(result, "unavailable")
+        self.assertEqual(fields, ("identity", "issuer", "zNewField"))
+        self.assertNotIn("secret-value", ",".join(fields))
+
+    def test_invalid_or_excessive_leaf_field_names_suppress_diagnostics(self):
+        invalid = verified_summary()
+        invalid["verificationResult"]["signature"]["certificate"]["token.value"] = "secret-value"
+        self.assertEqual(evaluate_mapping(invalid, EXPECTED), ("unavailable", ()))
+        excessive = verified_summary()
+        certificate = excessive["verificationResult"]["signature"]["certificate"]
+        certificate.update({"field" + str(index): index for index in range(31)})
+        self.assertEqual(evaluate_mapping(excessive, EXPECTED), ("unavailable", ()))
+
+    def test_discover_command_prints_only_validated_field_names(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "verified.json"
+            path.write_text(json.dumps(verified_summary(zNewField="secret-value")), encoding="utf-8")
+            output = StringIO()
+            with patch("sys.argv", ["attestation_probe.py", "discover", "--verified-file", str(path)]):
+                with redirect_stdout(output):
+                    self.assertEqual(main(), 0)
+            self.assertEqual(output.getvalue(), "leaf_fields=identity,issuer,zNewField\n")
 
     def test_duplicate_json_fields_and_oversized_input_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

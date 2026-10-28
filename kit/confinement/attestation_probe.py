@@ -1,16 +1,12 @@
 import argparse
 import json
+import re
 from pathlib import Path
 
 
 MAX_JSON_BYTES = 1048576
-LEAF_SUMMARY_FIELDS = (
-    "identity",
-    "issuer",
-    "sourceRepositoryURI",
-    "buildConfigURI",
-    "runInvocationURI",
-)
+MAX_LEAF_FIELDS = 32
+LEAF_FIELD_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,47}\Z")
 
 
 def _pairs_without_duplicates(pairs):
@@ -55,8 +51,11 @@ def evaluate_mapping(document, expected):
     certificate = verified_leaf_summary(document)
     if certificate is None:
         return "unavailable", ()
-    present = tuple(field for field in LEAF_SUMMARY_FIELDS if field in certificate)
-    return "unavailable", present
+    if len(certificate) > MAX_LEAF_FIELDS:
+        return "unavailable", ()
+    if any(type(field) is not str or LEAF_FIELD_NAME.fullmatch(field) is None for field in certificate):
+        return "unavailable", ()
+    return "unavailable", tuple(sorted(certificate))
 
 
 def job_identifier(document, name):
@@ -96,10 +95,16 @@ def main():
     evaluate_parser.add_argument("--job-id", required=True)
     evaluate_parser.add_argument("--run-attempt", required=True)
     evaluate_parser.add_argument("--run-id", required=True)
+    discover_parser = commands.add_parser("discover")
+    discover_parser.add_argument("--verified-file", required=True)
     arguments = parser.parse_args()
     try:
         if arguments.command == "job-id":
             print(job_identifier(load_json(arguments.jobs_file), arguments.name))
+            return 0
+        if arguments.command == "discover":
+            _, fields = evaluate_mapping(load_json(arguments.verified_file), {})
+            print("leaf_fields=" + (",".join(fields) if fields else "none"))
             return 0
         expected = {
             "audience": arguments.audience,
@@ -111,7 +116,10 @@ def main():
         _print_mapping(load_json(arguments.verified_file), expected)
         return 0
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
-        print("mapping=unavailable leaf_fields=none")
+        if arguments.command == "discover":
+            print("leaf_fields=unavailable")
+        else:
+            print("mapping=unavailable leaf_fields=none")
         return 0
 
 

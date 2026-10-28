@@ -181,6 +181,12 @@ class WorkflowPolicyTests(unittest.TestCase):
         self.assertTrue(validate_workflow_text(workflow, "platform", "attestation-probe"))
         self.assertIn("minimal_permissions[windows-2025]=$windowsPermissions", workflow)
         self.assertIn("$ubuntuPermissions = 'unavailable'", workflow)
+        self.assertNotIn("$result = 'denied'", workflow)
+        self.assertIn("permission-observation action=$result capability=$capability", workflow)
+        self.assertLess(
+            workflow.index("      - name: Discover verified certificate field names"),
+            workflow.index("      - name: Verify signed statements and negative cases"),
+        )
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow, "connect", "attestation-probe")
         mutations = (
@@ -193,7 +199,9 @@ class WorkflowPolicyTests(unittest.TestCase):
             workflow.replace("--cert-oidc-issuer 'https://token.actions.githubusercontent.com'", "--cert-oidc-issuer 'https://other.invalid'", 1),
             workflow.replace("      actions: read\n      attestations: read\n", "      actions: read\n      attestations: read\n      contents: write\n", 1),
             workflow.replace("[int]$response.StatusCode -eq 403", "[int]$response.StatusCode -ge 400", 1),
-            workflow.replace("if ($result -eq 'ambiguous') { throw 'permission-ambiguous' }", "if ($false) { throw 'permission-ambiguous' }", 1),
+            workflow.replace("if ($result -notin @('failed', 'succeeded', 'ambiguous')) { throw 'classification-value' }", "if ($false) { throw 'classification-value' }", 1),
+            workflow.replace("$result = 'failed'", "$result = 'denied'", 1),
+            workflow.replace("Write-Output \"probe=leaf-summary runner=$runner $fieldText\"", "Write-Output 'probe=leaf-summary suppressed'", 1),
             workflow.replace("            $ubuntuPermissions = 'unavailable'\n            $windowsPermissions = 'unavailable'\n          }", "          }", 1),
             workflow.replace("if ($reductions[\"$runner/$missing\"] -eq 'succeeded')", "if ($false)", 1),
             workflow.replace("          ref: ${{ github.sha }}\n", "          ref: main\n", 1),

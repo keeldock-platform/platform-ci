@@ -225,14 +225,20 @@ jobs:
           $result = 'ambiguous'
           if ($env:ATTEST_OUTCOME -eq 'success') {
             $result = 'succeeded'
-          } elseif ($env:ATTEST_OUTCOME -eq 'failure' -and [string]::IsNullOrWhiteSpace($env:ACTIONS_ID_TOKEN_REQUEST_URL) -and [string]::IsNullOrWhiteSpace($env:ACTIONS_ID_TOKEN_REQUEST_TOKEN)) {
-            $result = 'denied'
+          } elseif ($env:ATTEST_OUTCOME -eq 'failure') {
+            $result = 'failed'
+          }
+          $capability = 'oidc-ambiguous'
+          if ([string]::IsNullOrWhiteSpace($env:ACTIONS_ID_TOKEN_REQUEST_URL) -and [string]::IsNullOrWhiteSpace($env:ACTIONS_ID_TOKEN_REQUEST_TOKEN)) {
+            $capability = 'oidc-unavailable'
+          } elseif (-not [string]::IsNullOrWhiteSpace($env:ACTIONS_ID_TOKEN_REQUEST_URL) -and -not [string]::IsNullOrWhiteSpace($env:ACTIONS_ID_TOKEN_REQUEST_TOKEN)) {
+            $capability = 'oidc-present'
           }
           "result=$result" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
           $directory = Join-Path $env:RUNNER_TEMP 'attestation-probe-result'
           New-Item -ItemType Directory -Path $directory -Force | Out-Null
           [System.IO.File]::WriteAllText((Join-Path $directory 'result.txt'), "$result`n", [System.Text.Encoding]::ASCII)
-          Write-Output "permission-observation=$result missing=id-token:write"
+          Write-Output "permission-observation action=$result capability=$capability missing=id-token:write"
       - name: Upload identity token classification
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -310,7 +316,11 @@ jobs:
           $result = 'ambiguous'
           if ($env:ATTEST_OUTCOME -eq 'success') {
             $result = 'succeeded'
-          } elseif ($env:ATTEST_OUTCOME -eq 'failure' -and $env:PROBE_REPOSITORY -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+          } elseif ($env:ATTEST_OUTCOME -eq 'failure') {
+            $result = 'failed'
+          }
+          $capability = 'api-ambiguous'
+          if ($env:PROBE_REPOSITORY -match '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
             $headers = @{ Authorization = "Bearer $env:PROBE_TOKEN"; Accept = 'application/vnd.github+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
             try {
               Invoke-RestMethod -Uri "https://api.github.com/repos/$env:PROBE_REPOSITORY/attestations" -Method Post -Headers $headers -ContentType 'application/json' -Body '{"attestations":[]}' -ErrorAction Stop | Out-Null
@@ -322,7 +332,7 @@ jobs:
               }
               $message = $_.ErrorDetails.Message
               if ($null -ne $response -and [int]$response.StatusCode -eq 403 -and $accepted -match '(^|,)\s*attestations=write\s*(,|$)' -and $message -match '"message"\s*:\s*"Resource not accessible by integration"') {
-                $result = 'denied'
+                $capability = 'api-write-denied'
               }
             }
           }
@@ -330,7 +340,7 @@ jobs:
           $directory = Join-Path $env:RUNNER_TEMP 'attestation-probe-result'
           New-Item -ItemType Directory -Path $directory -Force | Out-Null
           [System.IO.File]::WriteAllText((Join-Path $directory 'result.txt'), "$result`n", [System.Text.Encoding]::ASCII)
-          Write-Output "permission-observation=$result missing=attestations:write"
+          Write-Output "permission-observation action=$result capability=$capability missing=attestations:write"
       - name: Upload attestation write classification
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -366,6 +376,54 @@ jobs:
       run:
         shell: pwsh
     steps:
+      - name: Discover verified certificate field names
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Output "::add-mask::$env:GH_TOKEN"
+          $root = Join-Path $env:RUNNER_TEMP 'attestation-probe-discovery'
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+          try {
+            if ($env:EVENT_NAME -ne 'workflow_dispatch' -or $env:EVENT_REF -ne 'refs/heads/main') { throw 'trigger' }
+            if ($env:GH_SERVER_URL -ne 'https://github.com') { throw 'server' }
+            if ($env:GH_REPOSITORY -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'repository' }
+            $helperDirectory = Join-Path $root 'helper'
+            New-Item -ItemType Directory -Path $helperDirectory -Force | Out-Null
+            & gh run download $env:GH_RUN_ID --repo $env:GH_REPOSITORY --name "attestation-probe-helper-$env:GH_RUN_ATTEMPT" --dir $helperDirectory 1>$null 2>$null
+            if ($LASTEXITCODE -ne 0) { throw 'helper' }
+            $helper = Join-Path $helperDirectory 'attestation_probe.py'
+          } catch {
+            foreach ($runner in @('ubuntu-24.04', 'windows-2025')) {
+              Write-Output "probe=leaf-summary runner=$runner leaf_fields=unavailable"
+            }
+            exit 0
+          }
+          foreach ($runner in @('ubuntu-24.04', 'windows-2025')) {
+            try {
+              $artifactName = "probe-minimal-$runner-$env:GH_RUN_ATTEMPT"
+              $directory = Join-Path $root $artifactName
+              New-Item -ItemType Directory -Path $directory -Force | Out-Null
+              & gh run download $env:GH_RUN_ID --repo $env:GH_REPOSITORY --name $artifactName --dir $directory 1>$null 2>$null
+              if ($LASTEXITCODE -ne 0) { throw 'artifact' }
+              $subject = Join-Path $directory 'subject.bin'
+              $bundle = Join-Path $directory 'bundle.json'
+              $verified = Join-Path $directory 'verified.json'
+              $subjectInfo = Get-Item -LiteralPath $subject
+              $bundleInfo = Get-Item -LiteralPath $bundle
+              if ($subjectInfo.Length -gt 256 -or $bundleInfo.Length -le 0 -or $bundleInfo.Length -gt 1048576) { throw 'size' }
+              $expectedText = "attestation probe subject v1`nrun=$env:GH_RUN_ID`nrun_attempt=$env:GH_RUN_ATTEMPT`njob=attest-minimal`nrunner=$runner`n"
+              $expectedBytes = [System.Text.Encoding]::ASCII.GetBytes($expectedText)
+              if ([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($subject)) -cne [Convert]::ToBase64String($expectedBytes)) { throw 'subject' }
+              & gh attestation verify $subject --bundle $bundle --repo $env:GH_REPOSITORY --signer-workflow "$env:GH_REPOSITORY/.github/workflows/attestation-probe.yml" --predicate-type 'https://example.invalid/attestation-probe/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json 1> $verified 2>$null
+              if ($LASTEXITCODE -ne 0) { throw 'signature' }
+              $fields = & python3 $helper discover --verified-file $verified
+              if ($LASTEXITCODE -ne 0) { throw 'fields' }
+              $fieldText = ($fields | Out-String).Trim()
+              if ($fieldText -notmatch '^leaf_fields=(none|[A-Za-z][A-Za-z0-9_]{0,47}(,[A-Za-z][A-Za-z0-9_]{0,47}){0,31})$') { throw 'field-shape' }
+              Write-Output "probe=leaf-summary runner=$runner $fieldText"
+            } catch {
+              Write-Output "probe=leaf-summary runner=$runner leaf_fields=unavailable"
+            }
+          }
       - name: Verify signed statements and negative cases
         env:
           PROPOSED_RESULT: ${{ needs.attest-proposed.result }}
@@ -397,8 +455,7 @@ jobs:
                 $resultPath = Join-Path $classificationDirectory 'result.txt'
                 if ((Get-Item -LiteralPath $resultPath).Length -gt 16) { throw 'classification-size' }
                 $result = (Get-Content -LiteralPath $resultPath -Raw).Trim()
-                if ($result -notin @('denied', 'succeeded', 'ambiguous')) { throw 'classification-value' }
-                if ($result -eq 'ambiguous') { throw 'permission-ambiguous' }
+                if ($result -notin @('failed', 'succeeded', 'ambiguous')) { throw 'classification-value' }
                 $reductions["$runner/$missing"] = $result
               }
             }
@@ -484,24 +541,11 @@ jobs:
             $otherAttempt = if ($env:GH_RUN_ATTEMPT -eq '1') { '2' } else { [string]([int]$env:GH_RUN_ATTEMPT + 1) }
             $attemptCheck = & python3 $helper evaluate --verified-file $verifiedFiles['minimal-ubuntu'] --audience 'sigstore' --issuer 'https://token.actions.githubusercontent.com' --run-id $env:GH_RUN_ID --run-attempt $otherAttempt --job-id $jobIds['attest-minimal-ubuntu-24.04']
             if ($LASTEXITCODE -ne 0 -or ($attemptCheck | Out-String).Trim() -notmatch '^mapping=mismatch leaf_fields=') { throw 'attempt-not-distinguished' }
-            foreach ($runner in @('ubuntu-24.04', 'windows-2025')) {
-              $noId = $reductions["$runner/id-token"]
-              $noAttestations = $reductions["$runner/attestations"]
-              if ($noId -eq 'denied' -and $noAttestations -eq 'denied') {
-                $selected = 'attestations:write,id-token:write'
-              } elseif ($noId -eq 'denied' -and $noAttestations -eq 'succeeded') {
-                $selected = 'id-token:write'
-              } elseif ($noId -eq 'succeeded' -and $noAttestations -eq 'denied') {
-                $selected = 'attestations:write'
-              } else {
-                throw 'smaller-profile-unmeasured'
-              }
-              if ($runner -eq 'ubuntu-24.04') { $ubuntuPermissions = $selected } else { $windowsPermissions = $selected }
-            }
-            $mapping = 'available'
+            if (@($reductions.Values | Where-Object { $_ -ne 'succeeded' }).Count -gt 0) { throw 'permission-unattributed' }
+            throw 'permission-selection-unavailable'
           } catch {
             $mapping = 'unavailable'
-            if ($_.Exception.Message -in @('claims-unavailable', 'permission-ambiguous')) {
+            if ($_.Exception.Message -in @('claims-unavailable', 'permission-unattributed', 'permission-selection-unavailable')) {
               $reason = $_.Exception.Message
             } else {
               $reason = 'operational'
