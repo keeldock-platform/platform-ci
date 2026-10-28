@@ -67,7 +67,25 @@ MCP_HOST_REVERSE_EDGES = tuple(
 )
 
 
-SUITE_EDGES = MCP_HOST_REVERSE_EDGES
+MCP_HOST_SHARED_EDGES = tuple(
+    edge
+    for feature, _ in MCP_HOST_FEATURE_OWNERS
+    for edge in (
+        SuiteEdge(
+            "crates/host/mcp-host/" + feature,
+            "core.static",
+            "source-static",
+        ),
+        SuiteEdge(
+            "crates/host/mcp-host/" + feature,
+            "core.feature-states",
+            "host-feature-states",
+        ),
+    )
+)
+
+
+SUITE_EDGES = MCP_HOST_REVERSE_EDGES + MCP_HOST_SHARED_EDGES
 FULL_SET_PREFIXES = (
     ".github",
     "kit/selector",

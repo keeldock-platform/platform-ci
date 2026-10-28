@@ -3,6 +3,7 @@ import unittest
 
 from suite_selector import (
     MCP_HOST_REVERSE_EDGES,
+    MCP_HOST_SHARED_EDGES,
     PathChange,
     SHADOW_MODE,
     SUITE_EDGES,
@@ -27,6 +28,7 @@ EXPECTED_MCP_REVERSE_EDGES = (
 FULL_SUITES = frozenset(
     (
         "core.mcp-host",
+        "core.feature-states",
         "core.settings-schema",
         "core.shell-ui",
         "core.workspace",
@@ -53,7 +55,9 @@ class SuiteSelectorTests(unittest.TestCase):
                 self.assertFalse(report.escalated)
                 self.assertEqual(
                     report.would_select,
-                    tuple(sorted(("core.mcp-host", owner_suite))),
+                    tuple(
+                        sorted(("core.mcp-host", owner_suite, "core.static", "core.feature-states"))
+                    ),
                 )
 
     def test_required_reverse_edges_select_both_suites_from_one_changed_path(self):
@@ -72,7 +76,7 @@ class SuiteSelectorTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     set(report.would_select),
-                    {"core.mcp-host", owner_suite},
+                    {"core.mcp-host", owner_suite, "core.static", "core.feature-states"},
                 )
 
     def test_removing_any_required_reverse_edge_fails_its_fixture(self):
@@ -90,8 +94,13 @@ class SuiteSelectorTests(unittest.TestCase):
                 )
                 feature = edge.path_prefix.rsplit("/", 1)[1]
                 owner_suite = dict(EXPECTED_MCP_REVERSE_EDGES)[feature]
-                expected = tuple(sorted(("core.mcp-host", owner_suite)))
-                self.assertNotEqual(report.would_select, expected)
+                expected = {
+                    "core.mcp-host",
+                    owner_suite,
+                    "core.static",
+                    "core.feature-states",
+                }
+                self.assertEqual(set(report.would_select), expected - {edge.suite_id})
 
     def test_base_sha_must_be_resolved_and_canonical(self):
         for base_sha in (None, "a" * 39, "A" * 40):
@@ -154,7 +163,10 @@ class SuiteSelectorTests(unittest.TestCase):
         payload = json.loads(format_shadow_report(report))
         self.assertEqual(payload["effective_suites"], list(sorted(FULL_SUITES)))
         self.assertEqual(payload["skipped_suites"], [])
-        self.assertEqual(payload["would_select"], ["core.ai", "core.mcp-host"])
+        self.assertEqual(
+            payload["would_select"],
+            ["core.ai", "core.feature-states", "core.mcp-host", "core.static"],
+        )
         self.assertFalse(payload["escalated"])
 
     def test_duplicate_paths_do_not_duplicate_suite_ids(self):
@@ -167,7 +179,10 @@ class SuiteSelectorTests(unittest.TestCase):
             GOOD_BASE_SHA,
             base_resolved=True,
         )
-        self.assertEqual(report.would_select, ("core.mcp-host", "core.windows"))
+        self.assertEqual(
+            report.would_select,
+            ("core.feature-states", "core.mcp-host", "core.static", "core.windows"),
+        )
 
     def test_catalogue_contains_each_documented_owner_edge(self):
         for feature, owner_suite in EXPECTED_MCP_REVERSE_EDGES:
@@ -179,6 +194,14 @@ class SuiteSelectorTests(unittest.TestCase):
             self.assertIn(
                 SuiteEdge(expected_prefix, owner_suite, "mcp-host-owner"),
                 MCP_HOST_REVERSE_EDGES,
+            )
+            self.assertIn(
+                SuiteEdge(expected_prefix, "core.static", "source-static"),
+                MCP_HOST_SHARED_EDGES,
+            )
+            self.assertIn(
+                SuiteEdge(expected_prefix, "core.feature-states", "host-feature-states"),
+                MCP_HOST_SHARED_EDGES,
             )
 
 
