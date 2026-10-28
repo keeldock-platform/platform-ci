@@ -550,15 +550,7 @@ namespace KeelDock.Platform.CapsuleFrame
 
         private static string CaseFoldAlias(string value)
         {
-            string folded = value.Normalize(NormalizationForm.FormC);
-            folded = folded.Replace("\u0130", "i\u0307");
-            folded = folded.ToLowerInvariant();
-            folded = folded.Replace("\u00df", "ss").Replace("\u1e9e", "ss");
-            folded = folded.Replace("\u03c2", "\u03c3").Replace("\u017f", "s");
-            folded = folded.Replace("\u212a", "k").Replace("\u212b", "\u00e5");
-            folded = folded.Replace("\ufb00", "ff").Replace("\ufb01", "fi").Replace("\ufb02", "fl");
-            folded = folded.Replace("\ufb03", "ffi").Replace("\ufb04", "ffl").Replace("\ufb05", "st").Replace("\ufb06", "st");
-            return folded;
+            return value.ToLowerInvariant();
         }
 
         private static bool IsPathSafe(string path)
@@ -573,7 +565,7 @@ namespace KeelDock.Platform.CapsuleFrame
             catch { return false; }
             foreach (char item in path)
             {
-                if (item < 32 || (item >= 127 && item <= 159) || "<>:\"|?*".IndexOf(item) >= 0) return false;
+                if (item < 32 || item > 126 || "<>:\"|?*".IndexOf(item) >= 0) return false;
             }
             string[] components = path.Split('/');
             foreach (string component in components)
@@ -1160,6 +1152,7 @@ namespace KeelDock.Platform.CapsuleFrame
 
         public static string GenerateJson()
         {
+            VerifyPrimitiveFixtures();
             byte[] basePoint = HexBasePoint();
             KeyRecord record = new KeyRecord
             {
@@ -1218,6 +1211,7 @@ namespace KeelDock.Platform.CapsuleFrame
                     }
                 }
             };
+            VerifyPathRefusals(manifest);
             byte[] manifestCbor = CapsuleCodec.EncodeManifest(manifest);
             if (!CapsuleCodec.EncodeManifest(CapsuleCodec.DecodeManifest(manifestCbor)).SequenceEqual(manifestCbor))
                 throw new CapsuleRefusal(RefusalCode.Structure);
@@ -1261,7 +1255,7 @@ namespace KeelDock.Platform.CapsuleFrame
                 {
                     byte[] plain = new byte[CapsuleCodec.ChunkPlaintextBytes];
                     byte[] nonce = CapsuleCodec.MakeNonce(header.NoncePrefix, index);
-                    byte[] aad = MakeBundleAad(headerSha, index, manifestSha);
+                    byte[] aad = CapsuleCodec.MakeAad(headerSha, index, 1, manifestRegion);
                     Tuple<byte[], byte[]> pair = CapsuleCodec.SealAesGcm(aesKey, nonce, plain, aad);
                     if (index == 16 || index == 271)
                     {
@@ -1269,6 +1263,14 @@ namespace KeelDock.Platform.CapsuleFrame
                         ChunkRecord decodedChunk = CapsuleCodec.DecodeChunk(encodedChunk, index, 1);
                         if (!CapsuleCodec.EncodeChunk(decodedChunk.Index, decodedChunk.Ciphertext, decodedChunk.Tag, decodedChunk.Kind).SequenceEqual(encodedChunk))
                             throw new CapsuleRefusal(RefusalCode.Structure);
+                    }
+                    if (index == 16)
+                    {
+                        byte[] corruptTag = (byte[])pair.Item2.Clone();
+                        corruptTag[0] ^= 1;
+                        RequireCryptoRefusal(aesKey, nonce, pair.Item1, corruptTag, aad);
+                        RequireCryptoRefusal(aesKey, CapsuleCodec.MakeNonce(header.NoncePrefix, 0),
+                            pair.Item1, pair.Item2, CapsuleCodec.MakeAad(headerSha, 0, 0, null));
                     }
                     WriteDigest(capsuleHash, pair.Item1);
                     WriteDigest(capsuleHash, pair.Item2);
@@ -1285,8 +1287,8 @@ namespace KeelDock.Platform.CapsuleFrame
                     ",\"271\":" + JsonString(CapsuleCodec.ToHex(CapsuleCodec.MakeNonce(header.NoncePrefix, 271))) + "}";
                 string aad0 = CapsuleCodec.ToHex(CapsuleCodec.MakeAad(headerSha, 0, 0, null));
                 string aad15 = CapsuleCodec.ToHex(CapsuleCodec.MakeAad(headerSha, 15, 0, null));
-                string aad16 = CapsuleCodec.ToHex(MakeBundleAad(headerSha, 16, manifestSha));
-                string aad271 = CapsuleCodec.ToHex(MakeBundleAad(headerSha, 271, manifestSha));
+                string aad16 = CapsuleCodec.ToHex(CapsuleCodec.MakeAad(headerSha, 16, 1, manifestRegion));
+                string aad271 = CapsuleCodec.ToHex(CapsuleCodec.MakeAad(headerSha, 271, 1, manifestRegion));
                 byte[] hkdfInfo = HkdfInfo(headerSha);
                 byte[] prk;
                 using (HMACSHA256 extract = new HMACSHA256(header.HkdfSalt)) prk = extract.ComputeHash(sharedX);
@@ -1325,6 +1327,98 @@ namespace KeelDock.Platform.CapsuleFrame
             return FromHex("046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5");
         }
 
+        private static void VerifyPrimitiveFixtures()
+        {
+            byte[] point = HexBasePoint();
+            if (!CapsuleCodec.ValidatePublicPoint(point).SequenceEqual(point) ||
+                !point.Skip(1).Take(32).SequenceEqual(FromHex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")))
+                throw new CapsuleRefusal(RefusalCode.Point);
+            byte[] privateOne = new byte[32];
+            privateOne[31] = 1;
+            ECParameters parameters = new ECParameters
+            {
+                Curve = ECCurve.NamedCurves.nistP256,
+                D = privateOne,
+                Q = new ECPoint
+                {
+                    X = point.Skip(1).Take(32).ToArray(),
+                    Y = point.Skip(33).Take(32).ToArray()
+                }
+            };
+            using (ECDiffieHellman local = ECDiffieHellman.Create(parameters))
+            using (ECDiffieHellman peer = ECDiffieHellman.Create(parameters))
+            {
+                byte[] derivedHash = local.DeriveKeyFromHash(peer.PublicKey, HashAlgorithmName.SHA256);
+                if (!derivedHash.SequenceEqual(CapsuleCodec.Sha256(parameters.Q.X)))
+                    throw new CapsuleRefusal(RefusalCode.Crypto);
+            }
+            byte[] ikm = Repeat(0x0b, 22);
+            byte[] salt = FromHex("000102030405060708090a0b0c");
+            byte[] info = FromHex("f0f1f2f3f4f5f6f7f8f9");
+            byte[] expectedPrk = FromHex("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+            byte[] expectedOkm = FromHex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865");
+            using (HMACSHA256 extract = new HMACSHA256(salt))
+            {
+                if (!extract.ComputeHash(ikm).SequenceEqual(expectedPrk))
+                    throw new CapsuleRefusal(RefusalCode.Crypto);
+            }
+            if (!CapsuleCodec.HkdfSha256(ikm, salt, info, 42).SequenceEqual(expectedOkm))
+                throw new CapsuleRefusal(RefusalCode.Crypto);
+            byte[] emptyCiphertext = new byte[0];
+            byte[] emptyTag = new byte[16];
+            using (AesGcm aes = new AesGcm(new byte[32], 16))
+                aes.Encrypt(new byte[12], new byte[0], emptyCiphertext, emptyTag, new byte[0]);
+            if (!emptyTag.SequenceEqual(FromHex("530f8afbc74536b9a963b4f1c4cb738b")))
+                throw new CapsuleRefusal(RefusalCode.Crypto);
+        }
+
+        private static void RequireCryptoRefusal(byte[] key, byte[] nonce, byte[] ciphertext, byte[] tag, byte[] aad)
+        {
+            try { CapsuleCodec.OpenAesGcm(key, nonce, ciphertext, tag, aad); }
+            catch (CapsuleRefusal error)
+            {
+                if (error.Reason == RefusalCode.Crypto) return;
+                throw;
+            }
+            throw new CapsuleRefusal(RefusalCode.Structure);
+        }
+
+        private static void VerifyPathRefusals(Manifest template)
+        {
+            foreach (string[] paths in new string[][]
+            {
+                new string[] { "A", "a" },
+                new string[] { "A", "a/b" },
+                new string[] { "\u00b5.txt" },
+                new string[] { "\u03bc.txt" }
+            })
+            {
+                Manifest mutated = new Manifest
+                {
+                    SourceRepositoryId = template.SourceRepositoryId,
+                    SourceSha = template.SourceSha,
+                    TreeId = template.TreeId,
+                    BundleSha256 = template.BundleSha256,
+                    BundleLength = template.BundleLength,
+                    Entries = paths.Select(path => new ManifestEntry
+                    {
+                        Path = path,
+                        Mode = 33188,
+                        BlobId = Repeat(0x33, 20),
+                        Size = 4,
+                        Sha256 = Repeat(0x44, 32)
+                    }).ToList()
+                };
+                try { CapsuleCodec.EncodeManifest(mutated); }
+                catch (CapsuleRefusal error)
+                {
+                    if (error.Reason == RefusalCode.ManifestLimit) continue;
+                    throw;
+                }
+                throw new CapsuleRefusal(RefusalCode.Structure);
+            }
+        }
+
         private static byte[] FromHex(string value)
         {
             byte[] output = new byte[value.Length / 2];
@@ -1341,27 +1435,5 @@ namespace KeelDock.Platform.CapsuleFrame
             return info;
         }
 
-        private static byte[] MakeBundleAad(byte[] headerSha, uint index, byte[] manifestSha)
-        {
-            byte[] domain = Encoding.ASCII.GetBytes("KDWH-v1/GCM-CHUNK");
-            ulong wideIndex = index;
-            using (MemoryStream stream = new MemoryStream())
-            {
-                stream.Write(domain, 0, domain.Length);
-                stream.WriteByte(0);
-                stream.Write(headerSha, 0, headerSha.Length);
-                byte[] raw = new byte[]
-                {
-                    (byte)(wideIndex >> 56), (byte)(wideIndex >> 48), (byte)(wideIndex >> 40), (byte)(wideIndex >> 32),
-                    (byte)(wideIndex >> 24), (byte)(wideIndex >> 16), (byte)(wideIndex >> 8), (byte)wideIndex
-                };
-                stream.Write(raw, 0, raw.Length);
-                stream.WriteByte(1);
-                raw = new byte[] { 0, 0, 1, 16 };
-                stream.Write(raw, 0, raw.Length);
-                stream.Write(manifestSha, 0, manifestSha.Length);
-                return stream.ToArray();
-            }
-        }
     }
 }

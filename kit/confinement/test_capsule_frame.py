@@ -496,11 +496,17 @@ class CapsuleFrameTests(unittest.TestCase):
         )
         def entry(path):
             return frame.ManifestEntry(path, 0o100644, bytes(20), 0, bytes(32))
-        for paths in (("a", "a/b"), ("A", "a/b"), ("A/b", "a")):
+        for paths in (("A", "a"), ("a", "a/b"), ("A", "a/b"), ("A/b", "a")):
             self.assert_refusal(
                 frame.REASON_MANIFEST_LIMIT,
                 frame.encode_manifest,
                 make_manifest(tuple(entry(path) for path in paths)),
+            )
+        for path in ("\u00b5.txt", "\u03bc.txt", "\u00df.txt", "\u212a.txt"):
+            self.assert_refusal(
+                frame.REASON_MANIFEST_LIMIT,
+                frame.encode_manifest,
+                make_manifest((entry(path),)),
             )
 
     def test_invalid_point_refusal_code(self):
