@@ -257,6 +257,23 @@ class MacOSNodeContractTests(unittest.TestCase):
         self.assertFalse(any("typecheck" in command or "test" == command[-1] for command in commands))
         self.assertTrue(any("--request" in command for command in commands))
 
+    def test_worker_environment_carries_the_fixed_title_option_on_every_command(self):
+        runner = WorkerHarness(self.project)
+        self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        self.assertTrue(runner.calls)
+        for entry in runner.calls:
+            self.assertEqual(entry["env"]["NODE_OPTIONS"], subject.NODE_OPTIONS_VALUE)
+
+    def test_fixed_title_option_decodes_to_the_exact_module_source(self):
+        source = 'Object.defineProperty(process,"title",{value:process.title,writable:true,configurable:true,enumerable:true});'
+        self.assertEqual(subject.NODE_TITLE_MODULE_SOURCE, source)
+        prefix = "--import=data:text/javascript;base64,"
+        self.assertTrue(subject.NODE_OPTIONS_VALUE.startswith(prefix))
+        encoded = subject.NODE_OPTIONS_VALUE[len(prefix):]
+        self.assertEqual(base64.b64decode(encoded, validate=True), source.encode("ascii"))
+        self.assertEqual(base64.b64encode(source.encode("ascii")).decode("ascii"), encoded)
+        self.assertFalse(any(character in subject.NODE_OPTIONS_VALUE for character in " \t\"'\\"))
+
     def test_bootstrap_refuses_generation_failure_without_retry_or_audit(self):
         runner = WorkerHarness(self.project, failure="lock_generation")
         with self.assertRaises(subject.NodeContractRefusal) as caught:

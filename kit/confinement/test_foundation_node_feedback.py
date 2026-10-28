@@ -18,6 +18,10 @@ SOURCE_SHA = "a" * 40
 BASE_SHA = "b" * 40
 CONTROL_SHA = "c" * 40
 DIFF_SHA = "d" * 64
+NODE_OPTIONS_EXPECTED = (
+    "--import=data:text/javascript;base64,"
+    "T2JqZWN0LmRlZmluZVByb3BlcnR5KHByb2Nlc3MsInRpdGxlIix7dmFsdWU6cHJvY2Vzcy50aXRsZSx3cml0YWJsZTp0cnVlLGNvbmZpZ3VyYWJsZTp0cnVlLGVudW1lcmFibGU6dHJ1ZX0pOw=="
+)
 
 
 class FeedbackRefusal(Exception):
@@ -106,6 +110,7 @@ class FakeContract:
     AUDIT_ENDPOINT = "npm-bulk-advisory-v1"
     USER_CONFIG_NAME = "npm-user-empty.npmrc"
     GLOBAL_CONFIG_NAME = "npm-global-empty.npmrc"
+    NODE_OPTIONS_VALUE = NODE_OPTIONS_EXPECTED
     RELEASE_AGE_DAYS = 7
     DAY_MS = 86_400_000
     STAGES = frozenset(subject.NODE_GATE_NAMES)
@@ -144,6 +149,15 @@ class FakeContract:
         elif self.callback_mutation == "env":
             env = dict(env)
             env["LANG"] = "C.UTF-8"
+        elif self.callback_mutation == "node_options_changed":
+            env = dict(env)
+            env["NODE_OPTIONS"] = env["NODE_OPTIONS"] + " --no-warnings"
+        elif self.callback_mutation == "node_options_removed":
+            env = dict(env)
+            del env["NODE_OPTIONS"]
+        elif self.callback_mutation == "extra_key":
+            env = dict(env)
+            env["NODE_PATH"] = "/unexpected"
         if self.contract_error is not None:
             raise self.contract_error
         if self.real_worker_result is not None:
@@ -232,6 +246,18 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         self.assertEqual(global_config, str(storage / contract.GLOBAL_CONFIG_NAME))
         self.assertIn("--userconfig=" + user_config, command)
         self.assertIn("--globalconfig=" + global_config, command)
+
+    def test_node_environment_carries_exactly_the_fixed_title_option_and_no_other_keys(self):
+        environment = subject._node_environment(
+            Path("/fixed/worker-storage"), Path("/fixed/node/bin/node"), FakeContract("bootstrap"),
+        )
+        self.assertEqual(environment["NODE_OPTIONS"], NODE_OPTIONS_EXPECTED)
+        self.assertEqual(set(environment), {
+            "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "NODE_OPTIONS", "npm_config_cache",
+            "npm_config_registry", "npm_config_userconfig", "npm_config_globalconfig",
+            "npm_config_ignore_scripts", "npm_config_audit", "npm_config_fund",
+            "npm_config_fetch_retries", "npm_config_fetch_timeout", "npm_config_update_notifier",
+        })
 
     def _run(self, mode, kind, *, validated_tree, accepted_provenance=None, lock_bytes=None,
              callback_mutation=None, fail_census=False, fail_restore=False,
@@ -372,7 +398,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         self.assertEqual(producer.copies, [])
 
     def test_worker_rejects_changed_callback_command_environment_and_cwd_before_spawn(self):
-        for mutation in ("argv", "env", "cwd"):
+        for mutation in ("argv", "env", "cwd", "node_options_changed", "node_options_removed", "extra_key"):
             with self.subTest(mutation=mutation):
                 with self.assertRaises(FeedbackRefusal) as caught:
                     self._run(

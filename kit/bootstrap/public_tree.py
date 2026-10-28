@@ -115,10 +115,10 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    'kit/confinement/foundation_node_feedback.py': 'ba7d2352da3f74c12d96328277b03e71bf3cee9a4e03119dcbb18c01231f8f38',
-    'kit/confinement/test_foundation_node_feedback.py': '3beeb3c7a98a771610818c4720e81d7519f3e9db870c97dea6f53178ce6c38e4',
-    'kit/confinement/macos_node_contract.py': 'cc5b3dcbc05283323ca27b626378b901c2d7db49e2c499e221fdd49f9632cfe8',
-    'kit/confinement/test_macos_node_contract.py': 'e2afb54b418fad64890a35fd23e3a1cfee0ab5d66c68711484b2efab1e5bf790',
+    'kit/confinement/foundation_node_feedback.py': 'b01ad561961f47d9c04d59f5282c82330eb3b005f93fbe302a95cc6d24ed7726',
+    'kit/confinement/test_foundation_node_feedback.py': '477747fa526abfadc8cf95ca1ace8945f53357db554dacc753d7033ea42f097a',
+    'kit/confinement/macos_node_contract.py': '89af79db856fa8a8a1721797f098203e6c1177991722ceb65e85593d0d1ceedf',
+    'kit/confinement/test_macos_node_contract.py': 'eb926963bc81e376143b029297c16e8a212b02924b5d4f6ef30eecb10f2361d2',
     'kit/confinement/node_contract_validation.mjs': '3784560a51e188adc8516e4bfbf8293d1f6fb01300643cf7c7edf7725d156ec3',
     'kit/confinement/test_node_contract_validation.mjs': 'e43a96ff604eab3c9a4c752ac7547fd3a70ab7027b5fa887e8eda04e7e028fab',
     'kit/confinement/test_feedback_failure.py': '8432cbbb9dc41c7c9c938376f09770f75e47b5b35c79910f6f51343b836783af',
@@ -136,7 +136,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/node_lock_envelope.mjs': '17b636e798669b740ae54630082d55c21b0584305cb556770dfc9c9ba593642f',
     'kit/confinement/test_node_lock_envelope.mjs': '255b00fb4e47dff6e825ce52919af04f7f08e21ea49af336f1f52cca23a6f381',
     'kit/confinement/node_lock_manifest.mjs': 'b498f9846103d09937f1a370da6a37509e32afe941648b0d854d038aea2548d5',
-    'kit/confinement/test_node_lock_manifest.mjs': '86c7d3a90e4a11ea5eba560d7989cb56b056fd284d14410bcb55e530c503ede9',
+    'kit/confinement/test_node_lock_manifest.mjs': '7fb31fbdaccab8f75c7a80f0dd30ab37f155b3e993b2719633b2455a239088d2',
     'kit/confinement/node_lock_receipt.py': 'ade987d617a6cfe8a8b9f937ea6c17510a639a9ea671437625afeecd0c7e1a63',
     'kit/confinement/test_node_lock_receipt.py': '76163ace7dc4e239c16c993de84da44deaf402e42ba4fccb1a28fd8c28fae6b6',
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',

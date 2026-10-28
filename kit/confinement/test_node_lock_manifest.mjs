@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 import {
@@ -278,4 +280,45 @@ test('accepts funding URLs that carry a query string', () => {
     type: 'github', url: 'https://example.invalid/owner/project?sponsor=1',
   };
   assert.doesNotThrow(() => validateLockManifest(bytes(objectForm), expected));
+});
+
+const contractText = readFileSync(new URL('./macos_node_contract.py', import.meta.url), 'utf8');
+
+function contractConstant(name, quote) {
+  const matches = [...contractText.matchAll(new RegExp(`^${name} = ${quote}([^${quote}\\r\\n]+)${quote}\\r?$`, 'gm'))];
+  assert.equal(matches.length, 1);
+  return matches[0][1];
+}
+
+test('the fixed Node title option decodes to its module source and keeps process.title assignable', () => {
+  const option = contractConstant('NODE_OPTIONS_VALUE', '"');
+  const source = contractConstant('NODE_TITLE_MODULE_SOURCE', "'");
+  const prefix = '--import=data:text/javascript;base64,';
+  assert.ok(option.startsWith(prefix));
+  assert.match(option, /^[A-Za-z0-9+/=,:;.\-]+$/);
+  assert.equal(Buffer.from(option.slice(prefix.length), 'base64').toString('ascii'), source);
+  const environment = { NODE_OPTIONS: option };
+  for (const name of ['PATH', 'SystemRoot']) {
+    if (process.env[name] !== undefined) {
+      environment[name] = process.env[name];
+    }
+  }
+  const result = spawnSync(
+    process.execPath,
+    ['-e', 'process.title="kd-title-probe";process.stdout.write(String(process.title))'],
+    { env: environment, encoding: 'utf8', timeout: 30000, windowsHide: true },
+  );
+  assert.equal(result.error, undefined);
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, 'kd-title-probe');
+  assert.equal(result.stderr, '');
+  const longTitle = spawnSync(
+    process.execPath,
+    ['-e', 'const t="k".repeat(4096);process.title=t;process.stdout.write(String(process.title.length))'],
+    { env: environment, encoding: 'utf8', timeout: 30000, windowsHide: true },
+  );
+  assert.equal(longTitle.error, undefined);
+  assert.equal(longTitle.status, 0);
+  assert.equal(longTitle.stdout, '4096');
+  assert.equal(longTitle.stderr, '');
 });

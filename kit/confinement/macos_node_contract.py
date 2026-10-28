@@ -18,6 +18,8 @@ REGISTRY_URL = "https://registry.npmjs.org/"
 AUDIT_ENDPOINT = "npm-bulk-advisory-v1"
 USER_CONFIG_NAME = "npm-user-empty.npmrc"
 GLOBAL_CONFIG_NAME = "npm-global-empty.npmrc"
+NODE_TITLE_MODULE_SOURCE = 'Object.defineProperty(process,"title",{value:process.title,writable:true,configurable:true,enumerable:true});'
+NODE_OPTIONS_VALUE = "--import=data:text/javascript;base64,T2JqZWN0LmRlZmluZVByb3BlcnR5KHByb2Nlc3MsInRpdGxlIix7dmFsdWU6cHJvY2Vzcy50aXRsZSx3cml0YWJsZTp0cnVlLGNvbmZpZ3VyYWJsZTp0cnVlLGVudW1lcmFibGU6dHJ1ZX0pOw=="
 EMPTY_CONFIG_BYTES = b"\n"
 MAX_LOCK_BYTES = 4 * 1024 * 1024 - 64 * 1024
 MAX_REQUEST_BYTES = 6 * 1024 * 1024
@@ -386,6 +388,7 @@ def _node_environment(node, worker_storage, worker_uid, worker_gid):
         "TMPDIR": str(temporary),
         "LANG": "C",
         "LC_ALL": "C",
+        "NODE_OPTIONS": NODE_OPTIONS_VALUE,
         "npm_config_cache": str(cache),
         "npm_config_registry": REGISTRY_URL,
         "npm_config_userconfig": str(user_config),
