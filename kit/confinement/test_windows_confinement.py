@@ -113,6 +113,27 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
         self.assertIn("$AllowedHosts -notcontains $uri.Host", self.wrapper)
         self.assertIn("hash_mismatch", self.wrapper)
 
+    def test_rust_component_names_are_exact_and_refusals_report_bounded_names(self):
+        self.assertIn("rustc = 'rustc'", self.wrapper)
+        self.assertIn("cargo = 'cargo'", self.wrapper)
+        self.assertIn("rust_std = ('rust-std-' + $RustTarget)", self.wrapper)
+        for root in (
+            "Root = ('rustc-' + $RustVersion + '-' + $RustTarget)",
+            "Root = ('cargo-' + $RustVersion + '-' + $RustTarget)",
+            "Root = ('rust-std-' + $RustVersion + '-' + $RustTarget)",
+        ):
+            with self.subTest(root=root):
+                self.assertIn(root, self.wrapper)
+        self.assertIn("$expectedComponent = $ExpectedRustComponents[$item.Name]", self.wrapper)
+        self.assertIn("if ($name -cne $expectedComponent)", self.wrapper)
+        self.assertIn("$componentNameExpected = $expectedComponent", self.wrapper)
+        self.assertIn("$componentNameObserved = $name", self.wrapper)
+        self.assertIn("expected_component=", self.wrapper)
+        self.assertIn("observed_component=", self.wrapper)
+        safe_name = self.function_body("Get-SafeComponentName")
+        self.assertIn("'[^A-Za-z0-9._-]'", safe_name)
+        self.assertIn("$value.Substring(0, 64)", safe_name)
+
     def function_body(self, name):
         match = re.search(r"^function " + re.escape(name) + r"\b.*?^\}$", self.wrapper, re.S | re.M)
         self.assertIsNotNone(match, name)
