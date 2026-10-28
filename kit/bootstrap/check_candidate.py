@@ -1,7 +1,13 @@
 import argparse
 from pathlib import Path
 
-from policy import PolicyError, load_policy_document, validate_workflow_text, verify_git_head
+from policy import (
+    LANE_CANDIDATE_WORKFLOWS,
+    PolicyError,
+    load_policy_document,
+    validate_workflow_text,
+    verify_git_head,
+)
 from public_tree import PublicTreeError, scan_tree
 
 
@@ -23,12 +29,6 @@ def main():
         workflow_text = workflow_payload.decode("utf-8")
         validate_workflow_text(workflow_text, pool)
         if pool == "platform":
-            linux_workflow_path = root / ".github/workflows/linux-confinement.yml"
-            with linux_workflow_path.open("rb") as source:
-                linux_payload = source.read(262145)
-            if len(linux_payload) > 262144:
-                raise PolicyError("linux-workflow-too-large")
-            validate_workflow_text(linux_payload.decode("utf-8"), pool, "linux-confinement")
             macos_workflow_path = root / ".github/workflows/macos-capability.yml"
             with macos_workflow_path.open("rb") as source:
                 macos_payload = source.read(262145)
@@ -68,12 +68,13 @@ def main():
                 validate_workflow_text(
                     source_reader_payload.decode("utf-8"), pool, workflow_kind
                 )
-            windows_workflow_path = root / ".github/workflows/windows-native-preflight.yml"
-            with windows_workflow_path.open("rb") as source:
-                windows_payload = source.read(262145)
-            if len(windows_payload) > 262144:
-                raise PolicyError("windows-workflow-too-large")
-            validate_workflow_text(windows_payload.decode("utf-8"), pool, "windows-native-preflight")
+            for path, workflow_kind, too_large_code in LANE_CANDIDATE_WORKFLOWS:
+                lane_workflow_path = root / path
+                with lane_workflow_path.open("rb") as source:
+                    lane_payload = source.read(262145)
+                if len(lane_payload) > 262144:
+                    raise PolicyError(too_large_code)
+                validate_workflow_text(lane_payload.decode("utf-8"), pool, workflow_kind)
         scan_tree(root, pool)
         print("candidate-policy=accepted control-sha=" + actual_sha)
     except (OSError, UnicodeDecodeError, ValueError, PolicyError, PublicTreeError):

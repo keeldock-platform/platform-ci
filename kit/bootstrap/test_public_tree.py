@@ -129,7 +129,6 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn(".github/workflows/macos-cache-proof.yml", result)
         self.assertIn(".github/workflows/macos-source-reader-preflight.yml", result)
         self.assertIn(".github/workflows/macos-rules-reader-preflight.yml", result)
-        self.assertIn(".github/workflows/windows-native-preflight.yml", result)
         self.assertIn("kit/confinement/macos_boundary_guard.py", result)
         self.assertIn("kit/confinement/test_macos_boundary_guard.py", result)
         self.assertIn("kit/confinement/macos_canary_scan.py", result)
@@ -150,9 +149,6 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("kit/confinement/macos_capability.swift", result)
         self.assertIn("kit/confinement/test_macos_capability.py", result)
         self.assertIn("kit/confinement/test_macos_descriptors.py", result)
-        self.assertIn("kit/confinement/windows_native_preflight.cs", result)
-        self.assertIn("kit/confinement/windows_native_preflight.ps1", result)
-        self.assertIn("kit/confinement/test_windows_native_preflight.py", result)
 
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
