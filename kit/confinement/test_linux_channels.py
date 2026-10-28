@@ -130,11 +130,11 @@ class LinuxChannelModelTests(unittest.TestCase):
                 bad()
         readback = channels.readback_line(
             "selftest",
-            (("ptrace-scope", "3"), ("project-uid", "65534"), ("usr-submounts", "ro"), ("runner-uid-distinct", "1")),
+            (("ptrace-scope", "3"), ("project-uid", "62000"), ("usr-submounts", "ro"), ("runner-uid-distinct", "1")),
         )
         self.assertEqual(
             readback,
-            "KD-LINUX-READBACK schema=1 phase=selftest ptrace-scope=3 project-uid=65534 usr-submounts=ro runner-uid-distinct=1",
+            "KD-LINUX-READBACK schema=1 phase=selftest ptrace-scope=3 project-uid=62000 usr-submounts=ro runner-uid-distinct=1",
         )
 
 

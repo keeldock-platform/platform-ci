@@ -32,8 +32,8 @@ SUPERVISION_TRANSITIONS = {
     ("parent-running", "parent-exited"): "parent-dead",
     ("parent-dead", "descendant-reaped"): "complete",
 }
-CHILD_UID = 65534
-CHILD_GID = 65534
+CHILD_UID = 62000
+CHILD_GID = 62000
 MAX_CAPTURE = 8192
 MAX_PROBE_SECONDS = 10
 INNER_REFUSAL_REASONS = (
@@ -690,13 +690,20 @@ def _set_sysctl(path, value):
 def _make_rootfs(rootfs):
     os.makedirs(rootfs, mode=0o700, exist_ok=True)
     _mount("tmpfs", rootfs, "tmpfs", MS_NOSUID | MS_NODEV, "size=128m")
-    for relative in ("usr", "etc", "proc", "tmp", "capture"):
+    for relative in ("usr", "etc", "proc", "tmp", "dev", "capture"):
         os.makedirs(os.path.join(rootfs, relative), mode=0o755, exist_ok=True)
     os.chmod(rootfs, 0o555)
     _mount("/usr", os.path.join(rootfs, "usr"), None, MS_BIND | MS_REC)
     _mount(None, os.path.join(rootfs, "usr"), None, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV)
     _mount("proc", os.path.join(rootfs, "proc"), "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC)
     _mount("tmpfs", os.path.join(rootfs, "tmp"), "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=8m")
+    _mount("tmpfs", os.path.join(rootfs, "dev"), "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755,size=1m")
+    for name, major, minor in (("null", 1, 3), ("zero", 1, 5), ("random", 1, 8), ("urandom", 1, 9)):
+        os.mknod(
+            os.path.join(rootfs, "dev", name),
+            stat.S_IFCHR | 0o666,
+            os.makedev(major, minor),
+        )
     os.chmod(os.path.join(rootfs, "tmp"), 0o1777)
     os.chmod(os.path.join(rootfs, "capture"), 0o700)
     for name, value in (

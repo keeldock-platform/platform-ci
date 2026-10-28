@@ -41,6 +41,8 @@ LINUX_LANE_FILES = (
     "kit/confinement/test_linux_session.py",
     "kit/confinement/linux_settings.py",
     "kit/confinement/test_linux_settings.py",
+    "kit/confinement/linux_source_build.py",
+    "kit/confinement/test_linux_source_build.py",
 )
 
 
@@ -168,7 +170,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.text = ADMISSION_WORKFLOW.read_text(encoding="utf-8")
 
     def jobs(self):
-        parts = re.split(r"(?m)^  (linux-source-admission-[a-z]+):\n", self.text)
+        parts = re.split(r"(?m)^  (linux-source-admission-[a-z-]+):\n", self.text)
         return {parts[index]: parts[index + 1] for index in range(1, len(parts), 2)}
 
     def test_template_is_byte_for_byte_the_workflow_and_validates_only_for_the_platform_pool(self):
@@ -181,20 +183,18 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
             validate_workflow_text(self.text, "platform")
 
-    def test_synthetic_mode_has_no_source_environment_secret_app_token_or_checkout_action(self):
-        for forbidden in (
-            "secrets.", "environment:", "create-github-app-token", "actions/checkout", "id-token", "pull_request",
-            "inputs.", "source-read", "SOURCE_READER", "workflow_call",
-        ):
-            self.assertNotIn(forbidden, self.text)
-        self.assertEqual(re.findall(r"(?m)^on:\n((?:  .*\n)+)", self.text), ["  workflow_dispatch:\n"])
-        self.assertIn("\npermissions: {}\n", self.text)
-
-    def test_no_step_uses_any_action_so_no_composite_markers_can_reach_the_verdict_log(self):
-        self.assertIsNone(re.search(r"(?m)^\s*-?\s*uses:", self.text))
-        self.assertNotIn("uses: ./", self.text)
-        for job, body in self.jobs().items():
-            self.assertNotIn("uses:", body, job)
+    def test_synthetic_and_source_dispatch_conditions_and_environment_binding(self):
+        self.assertIn("          - synthetic\n          - source", self.text)
+        self.assertIn("github.ref == 'refs/heads/main'", self.jobs()["linux-source-admission-settings"])
+        source = self.jobs()["linux-source-admission-source-read"]
+        self.assertIn("github.ref == 'refs/heads/untrusted'", source)
+        self.assertIn("inputs.mode == 'source'", source)
+        self.assertIn("inputs.mode == 'synthetic' && github.ref == 'refs/heads/main'", source)
+        self.assertIn("name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}", source)
+        self.assertIn("REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}", source)
+        self.assertIn("LINUX_SOURCE_ENVIRONMENT_NAME: ${{ vars.LINUX_SOURCE_ENVIRONMENT_NAME }}", source)
+        self.assertNotIn("pull_request:", self.text)
+        self.assertNotIn("workflow_call:", self.text)
 
     def test_four_jobs_with_least_privilege_and_cache_mode_none_everywhere(self):
         jobs = self.jobs()
@@ -203,63 +203,97 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
             [
                 "linux-source-admission-settings",
                 "linux-source-admission-unit",
-                "linux-source-admission-boundary",
+                "linux-source-admission-source-read",
                 "linux-source-admission-audit",
             ],
         )
         self.assertEqual(self.text.count("cache-mode: none"), 5)
-        self.assertIn("    permissions:\n      contents: read\n", jobs["linux-source-admission-settings"])
-        for name in ("unit", "boundary", "audit"):
-            self.assertIn("    permissions: {}\n", jobs["linux-source-admission-" + name])
-        self.assertEqual(self.text.count("contents: read"), 1)
+        for name in ("settings", "source-read"):
+            body = jobs["linux-source-admission-" + name]
+            self.assertIn("      actions: read\n      contents: read\n", body)
+        self.assertIn("    permissions: {}\n", jobs["linux-source-admission-unit"])
+        self.assertIn("      actions: read\n      checks: read\n", jobs["linux-source-admission-audit"])
+        self.assertEqual(self.text.count("contents: read"), 2)
         self.assertEqual(self.text.count("runs-on: ubuntu-24.04"), 4)
         self.assertNotIn("latest", self.text)
 
-    def test_only_the_boundary_job_uses_sudo_and_the_canary_stays_out_of_arguments(self):
-        jobs = self.jobs()
-        for name, body in jobs.items():
-            self.assertEqual("sudo" in body, name.endswith("boundary"), name)
-        boundary = jobs["linux-source-admission-boundary"]
-        self.assertEqual(boundary.count("--preserve-env=KD_CANARY_SECRET"), 3)
-        for line in boundary.splitlines():
+    def test_source_reader_secret_is_scoped_to_mint_and_canary_stays_out_of_arguments(self):
+        source = self.jobs()["linux-source-admission-source-read"]
+        mint = source.split("      - name: Mint scoped source-reader token\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("if: ${{ inputs.mode == 'source' }}", mint)
+        self.assertIn("SOURCE_READER_PRIVATE_KEY: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}", mint)
+        self.assertEqual(self.text.count("secrets.SOURCE_READER_PRIVATE_KEY"), 1)
+        self.assertIn("actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510", mint)
+        self.assertIn("SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}", source)
+        self.assertIn("if: ${{ always() && steps.source-reader-token.outputs.token != '' }}", source)
+        self.assertIn("linux-source-build.py revoke", source)
+        self.assertIn("steps.source-reader-token.outputs.installation-id", source)
+        for name, body in self.jobs().items():
+            if name != "linux-source-admission-source-read":
+                self.assertNotIn("SOURCE_READER_PRIVATE_KEY", body)
+        self.assertEqual(self.text.count("KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic'"), 2)
+        source = self.jobs()["linux-source-admission-source-read"]
+        self.assertEqual(source.count("--preserve-env=KD_CANARY_SECRET"), 3)
+        for line in source.splitlines():
             if "sudo" in line:
                 self.assertNotIn("$KD_CANARY_SECRET", line)
-                self.assertNotIn(STANDIN, line)
-        self.assertEqual(self.text.count("KD_CANARY_SECRET: " + STANDIN), 3)
-        self.assertNotIn("KD_CANARY_SECRET", jobs["linux-source-admission-settings"])
-        self.assertNotIn("KD_CANARY_SECRET", jobs["linux-source-admission-unit"])
-        self.assertNotIn("KD_CANARY_SECRET", jobs["linux-source-admission-audit"])
+        self.assertNotIn("KD_CANARY_SECRET", self.jobs()["linux-source-admission-settings"])
+        self.assertNotIn("KD_CANARY_SECRET", self.jobs()["linux-source-admission-unit"])
 
-    def test_boundary_steps_run_in_the_required_order_with_controls_rerun_before_the_project_phase(self):
-        boundary = self.jobs()["linux-source-admission-boundary"]
-        names = re.findall(r"(?m)^      - name: (.*)$", boundary)
+    def test_source_read_steps_follow_the_required_order(self):
+        source = self.jobs()["linux-source-admission-source-read"]
+        names = re.findall(r"(?m)^      - name: (.*)$", source)
         self.assertEqual(
             names,
             [
                 "Fetch exact public control",
-                "Record runner image and resolve the preinstalled toolchain",
+                "Repeat preflight in source-read",
+                "Record image and fetch pinned Rust and Node toolchains",
                 "Harden runner paths before the proof",
-                "Boundary self-test with generated hostile fixtures and secret canaries",
-                "Synthetic project phase marker",
+                "Boundary self-test before source-reader mint",
+                "Mint scoped source-reader token",
+                "Verify selected installation identity",
+                "Fetch exact source and verify binding, tree, signatures and lock provenance",
+                "Revoke source-reader token and verify rejection",
+                "Fetch npm tarballs by committed lock integrity",
+                "Run trusted dependency audit",
+                "Prepare offline project inputs",
                 "Re-run positive controls immediately before the first project command",
-                "Merge phase records",
+                "Run all thirteen offline project gates",
+                "Merge confinement phase records",
                 "Forced faults must fail closed",
+                "Publish confinement verdict",
             ],
         )
-        self.assertLess(boundary.index("linux_boundary.py harden"), boundary.index("linux_boundary.py selftest"))
-        self.assertLess(boundary.index("linux_boundary.py selftest"), boundary.index("linux_boundary.py recheck"))
-        self.assertLess(boundary.index("linux_boundary.py recheck"), boundary.index("linux_boundary.py merge"))
-        self.assertIn("--synthetic-standin", boundary)
-        self.assertIn("project-execution=none", boundary)
+        self.assertLess(source.index("linux_boundary.py selftest"), source.index("Mint scoped source-reader token"))
+        self.assertLess(source.index("Fetch exact source"), source.index("linux-source-build.py revoke"))
+        self.assertLess(source.index("linux-source-build.py revoke"), source.index("Fetch npm tarballs"))
+        self.assertLess(source.index("Prepare offline project inputs"), source.index("linux_boundary.py recheck"))
+        self.assertLess(source.index("linux_boundary.py recheck"), source.index("Run all thirteen offline project gates"))
+        self.assertIn("sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP", source)
+        self.assertIn("--synthetic-standin", source)
 
-    def test_audit_job_runs_always_and_only_reports_upstream_results(self):
+    def test_audit_job_runs_always_with_expected_identity_and_no_artifacts(self):
         audit = self.jobs()["linux-source-admission-audit"]
         self.assertIn("if: ${{ always() &&", audit)
-        for name in ("settings", "unit", "boundary"):
+        for name in ("settings", "unit", "source-read"):
             self.assertIn("needs.linux-source-admission-" + name + ".result", audit)
-        self.assertIn("status=placeholder", audit)
+        self.assertIn("CONFINEMENT_AUDIT_EXPECTED: ${{ needs.linux-source-admission-settings.outputs.expected }}", audit)
+        self.assertIn("linux_source_build.py audit", audit)
         self.assertNotIn("sudo", audit)
-        self.assertNotIn("git ", audit)
+        self.assertIn('"artifact_names": ()', (ROOT / "kit/confinement/linux_source_build.py").read_text(encoding="utf-8"))
+        self.assertIn('"cache_digest": cache_digest', (ROOT / "kit/confinement/linux_source_build.py").read_text(encoding="utf-8"))
+        self.assertNotIn("upload-artifact", self.text)
+        self.assertNotIn("download-artifact", self.text)
+
+    def test_verdict_step_is_plain_run_and_the_verdict_job_has_no_composite_step(self):
+        source = self.jobs()["linux-source-admission-source-read"]
+        verdict = source.split("      - name: Publish confinement verdict\n", 1)[1].split("  linux-source-admission-audit:", 1)[0]
+        self.assertIn("if: ${{ always() }}", verdict)
+        self.assertIn("run: python3 -B kit/confinement/linux_source_build.py verdict", verdict)
+        self.assertNotIn("uses:", verdict)
+        self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", self.text)
+        self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", verdict)
 
     def test_verdict_prefix_is_never_printed_by_the_workflow_or_any_linux_module(self):
         prefix = "KD-CONFINEMENT" + "-VERDICT"
@@ -278,9 +312,9 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
             self.text.replace("cache-mode: none\njobs:", "jobs:"),
             self.text.replace("runs-on: ubuntu-24.04", "runs-on: ubuntu-latest", 1),
             self.text.replace("permissions: {}\ncache-mode", "permissions: write-all\ncache-mode", 1),
-            self.text.replace("      - name: Synthetic project phase marker\n", "      - name: Synthetic project phase marker\n        uses: ./kit/bootstrap\n", 1),
+            self.text.replace("      - name: Publish confinement verdict\n", "      - name: Publish confinement verdict\n        uses: ./kit/bootstrap\n", 1),
             self.text.replace("      - name: Fetch exact public control\n", "      - name: Fetch exact public control\n        if: ${{ false }}\n", 1),
-            self.text.replace("--synthetic-standin", "", 1),
+            self.text.replace("cache-mode: none\n", "", 1),
             self.text.replace("workflow_dispatch:\n", "workflow_dispatch:\n  push:\n", 1),
             self.text + "  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",
         )
@@ -292,8 +326,8 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
 
     def test_composite_step_in_the_verdict_job_is_refused_at_policy_time(self):
         changed = self.text.replace(
-            "      - name: Merge phase records\n",
-            "      - name: Merge phase records\n        uses: ./kit/bootstrap\n",
+            "      - name: Publish confinement verdict\n",
+            "      - name: Publish confinement verdict\n        uses: ./kit/bootstrap\n",
             1,
         )
         self.assertIn("uses: ./", changed)

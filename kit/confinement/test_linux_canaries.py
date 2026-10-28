@@ -19,13 +19,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class LinuxCanaryTests(unittest.TestCase):
-    def test_standin_is_a_fixed_sixty_four_character_non_secret_matching_the_workflow(self):
+    def test_standin_is_a_fixed_sixty_four_character_non_secret_scoped_to_synthetic_mode(self):
         self.assertEqual(len(canaries.STANDIN_VALUE), 64)
         self.assertTrue(canaries.valid_canary(canaries.STANDIN_VALUE))
         self.assertIn("NOT-A-SECRET", canaries.STANDIN_VALUE)
         workflow = (ROOT / ".github/workflows/linux-source-admission.yml").read_text(encoding="utf-8")
-        self.assertEqual(workflow.count("KD_CANARY_SECRET: " + canaries.STANDIN_VALUE), 3)
-        self.assertNotIn("secrets.", workflow)
+        self.assertEqual(workflow.count(canaries.STANDIN_VALUE), 3)
+        self.assertIn("inputs.mode == 'synthetic'", workflow)
+        self.assertIn("secrets.KD_LINUX_LOG_CANARY", workflow)
 
     def test_canary_validation_bounds_and_environment_loading(self):
         for bad in (None, "", "a" * 15, "a" * 257, "has space in it 12345", "caf" + chr(233) + "x" * 20):

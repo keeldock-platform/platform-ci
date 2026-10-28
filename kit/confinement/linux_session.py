@@ -40,7 +40,7 @@ FIXTURE_LIMITS = (
 LIMIT_PROFILES = {"probe": PROBE_LIMITS, "fixture": FIXTURE_LIMITS}
 CONFINED_UNSHARE = tuple(harness.UNSHARE_ARGUMENTS)
 OPEN_UNSHARE = ("--mount", "--pid", "--fork", "--ipc", "--propagation", "private", "--kill-child=KILL")
-HOST_UNSHARE = ("--mount", "--ipc", "--net", "--propagation", "private")
+HOST_UNSHARE = ("--mount", "--pid", "--fork", "--ipc", "--net", "--propagation", "private", "--kill-child=KILL")
 MODES = ("confined", "open")
 VIEWS = ("chroot", "host")
 FAULTS = ("usr-writable", "uid-root")
@@ -53,10 +53,19 @@ MOUNT_FLAG_NAMES = {
     "relatime": 2097152,
 }
 HOSTS_TEXT = "127.0.0.1 localhost tripwire.invalid\n::1 localhost\n"
-PASSWD_TEXT = "root:x:0:0:root:/root:/usr/sbin/nologin\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
-GROUP_TEXT = "root:x:0:\nnogroup:x:65534:\n"
+PASSWD_TEXT = "root:x:0:0:root:/root:/usr/sbin/nologin\nkdproject:x:62000:62000:project:/work:/usr/sbin/nologin\n"
+GROUP_TEXT = "root:x:0:\nkdproject:x:62000:\n"
 CRLF = bytes((13, 10))
 SAFE_PATH = re.compile(r"/[A-Za-z0-9._/@+=-]{0,400}")
+PROJECT_ENV_NAMES = frozenset((
+    "PATH", "LANG", "LC_ALL", "HOME", "TMP", "TMPDIR", "CI",
+    "PYTHONDONTWRITEBYTECODE", "PYTHONNOUSERSITE", "CARGO_HOME", "RUSTUP_HOME",
+    "CARGO_TARGET_DIR", "CARGO_NET_OFFLINE", "CARGO_INCREMENTAL", "RUSTC", "RUSTDOC",
+    "RUSTFMT", "NODE", "NPM_CONFIG_OFFLINE", "NPM_CONFIG_CACHE", "NPM_CONFIG_USERCONFIG",
+    "NPM_CONFIG_GLOBALCONFIG", "npm_config_offline", "npm_config_cache", "npm_config_userconfig",
+    "npm_config_globalconfig",
+))
+PROJECT_ENV_SECRET_PARTS = ("TOKEN", "SECRET", "PASSWORD", "PRIVATE_KEY", "CREDENTIAL")
 
 
 class EventStore:
@@ -305,6 +314,13 @@ def validate_spec(spec):
     env = spec.get("env")
     if type(env) is not dict or not all(type(key) is str and type(value) is str for key, value in env.items()):
         raise harness.ProofFailure(96)
+    if any(
+        key.startswith(("GITHUB_", "ACTIONS_", "RUNNER_", "SOURCE_READER_"))
+        or any(part in key.upper() for part in PROJECT_ENV_SECRET_PARTS)
+        or (key not in PROJECT_ENV_NAMES and not key.startswith("KD_"))
+        for key in env
+    ):
+        raise harness.ProofFailure(96)
     files = spec.get("files")
     if type(files) is not dict:
         raise harness.ProofFailure(96)
@@ -351,7 +367,10 @@ def extend_rootfs(rootfs, spec):
     if spec.get("work"):
         work = os.path.join(rootfs, "work")
         os.makedirs(work, mode=0o700, exist_ok=True)
-        harness._mount("tmpfs", work, "tmpfs", harness.MS_NOSUID | harness.MS_NODEV, "size=96m,mode=0700,uid=65534,gid=65534")
+        harness._mount(
+            "tmpfs", work, "tmpfs", harness.MS_NOSUID | harness.MS_NODEV,
+            "size=96m,mode=0700,uid=" + str(harness.CHILD_UID) + ",gid=" + str(harness.CHILD_GID),
+        )
     for bind in spec.get("binds", []):
         target = rootfs + bind["target"]
         os.makedirs(target, mode=0o755, exist_ok=True)
@@ -470,6 +489,8 @@ def inside_host(spec):
     base = spec["rootfs"]
     write_files("", spec["files"])
     os.makedirs(os.path.join(base, "capture"), mode=0o700, exist_ok=True)
+    harness._mount("proc", "/proc", "proc", harness.MS_NOSUID | harness.MS_NODEV | harness.MS_NOEXEC)
+    minimal_dev("/dev")
     nonce = spec["nonce"]
     out_path, out_writer, out_reader = harness._write_capture(base, "out-" + nonce)
     err_path, err_writer, err_reader = harness._write_capture(base, "err-" + nonce)
@@ -487,6 +508,14 @@ def inside_host(spec):
         "ptrace_scope": harness._read_sysctl("/proc/sys/kernel/yama/ptrace_scope"),
     }
     return code, timed_out, stdout, stderr, readback
+
+
+def minimal_dev(path):
+    os.makedirs(path, mode=0o755, exist_ok=True)
+    harness._mount("tmpfs", path, "tmpfs", harness.MS_NOSUID | harness.MS_NOEXEC, "mode=0755,size=1m")
+    for name, major, minor in (("null", 1, 3), ("zero", 1, 5), ("random", 1, 8), ("urandom", 1, 9)):
+        target = os.path.join(path, name)
+        os.mknod(target, stat.S_IFCHR | 0o666, os.makedev(major, minor))
 
 
 def inside(spec):
@@ -638,7 +667,7 @@ def run_chroot(workdir, nonce, argv, env, mode, files, binds=(), work=False, lim
     return _spawn(workdir, spec, arguments)
 
 
-def run_host(workdir, nonce, argv, env, files, limits="probe", timeout=30):
+def run_host(workdir, nonce, argv, env, files, limits="probe", timeout=30, cwd="/"):
     spec = {
         "mode": "confined",
         "view": "host",
@@ -653,7 +682,7 @@ def run_host(workdir, nonce, argv, env, files, limits="probe", timeout=30):
         "extra_fd": False,
         "keep_root": False,
         "fault": None,
-        "cwd": "/",
+        "cwd": cwd,
     }
     return _spawn(workdir, spec, HOST_UNSHARE)
 

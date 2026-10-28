@@ -651,7 +651,7 @@ class HarnessPolicyTests(unittest.TestCase):
 
     def test_capture_verification_requires_exact_identity_and_write_only_regular_files(self):
         nonce = "c" * 24
-        child = {"Uid": ["65534"] * 4, "Gid": ["65534"] * 4, "Groups": [], "NoNewPrivs": ["1"], "Seccomp": ["2"], "Seccomp_filters": ["1"]}
+        child = {"Uid": [str(harness.CHILD_UID)] * 4, "Gid": [str(harness.CHILD_GID)] * 4, "Groups": [], "NoNewPrivs": ["1"], "Seccomp": ["2"], "Seccomp_filters": ["1"]}
         child.update({key: ["0000000000000000"] for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")})
         root = {"Seccomp_filters": ["0"]}
         regular = SimpleNamespace(st_dev=1, st_ino=20, st_uid=0, st_mode=stat.S_IFREG | 0o200)
@@ -659,7 +659,7 @@ class HarnessPolicyTests(unittest.TestCase):
             (regular, "flags:\t0100001\n", None),
             (SimpleNamespace(st_dev=1, st_ino=21, st_uid=0, st_mode=stat.S_IFREG | 0o200), "flags:\t1\n", 90),
             (SimpleNamespace(st_dev=1, st_ino=20, st_uid=0, st_mode=stat.S_IFSOCK | 0o200), "flags:\t1\n", 90),
-            (SimpleNamespace(st_dev=1, st_ino=20, st_uid=65534, st_mode=stat.S_IFREG | 0o200), "flags:\t1\n", 90),
+            (SimpleNamespace(st_dev=1, st_ino=20, st_uid=harness.CHILD_UID, st_mode=stat.S_IFREG | 0o200), "flags:\t1\n", 90),
             (regular, "flags:\t2\n", 90),
             (regular, "flags:\t1\nflags:\t1\n", 90),
         )

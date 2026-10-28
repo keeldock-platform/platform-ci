@@ -121,6 +121,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/test_linux_session.py",
         "kit/confinement/linux_settings.py",
         "kit/confinement/test_linux_settings.py",
+        "kit/confinement/linux_source_build.py",
+        "kit/confinement/test_linux_source_build.py",
         "kit/confinement/windows_native_preflight.cs",
         "kit/confinement/windows_native_preflight.ps1",
         "kit/confinement/test_windows_native_preflight.py",

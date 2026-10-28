@@ -1,7 +1,9 @@
 import base64
 import json
 import socket
+import stat
 import subprocess
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -146,13 +148,37 @@ class LinuxSessionPureTests(unittest.TestCase):
         self.assertIn("--pid", session.OPEN_UNSHARE)
         self.assertIn("--kill-child=KILL", session.OPEN_UNSHARE)
         self.assertIn("--net", session.HOST_UNSHARE)
-        self.assertNotIn("--pid", session.HOST_UNSHARE)
+        self.assertIn("--pid", session.HOST_UNSHARE)
+        self.assertIn("--fork", session.HOST_UNSHARE)
+        self.assertIn("--kill-child=KILL", session.HOST_UNSHARE)
         self.assertNotIn("--user", session.CONFINED_UNSHARE + session.OPEN_UNSHARE + session.HOST_UNSHARE)
 
 
 class LinuxSessionSpecTests(unittest.TestCase):
     def test_a_well_formed_spec_validates(self):
         self.assertEqual(session.validate_spec(good_spec())["view"], "chroot")
+
+    def test_project_environment_is_scrubbed_and_the_uid_is_dedicated(self):
+        self.assertEqual(session.validate_spec(good_spec())["env"], {"PATH": "/usr/bin"})
+        self.assertNotEqual(harness.CHILD_UID, 65534)
+        self.assertNotEqual(harness.CHILD_GID, 65534)
+        for key in ("GITHUB_TOKEN", "SOURCE_READER_TOKEN", "PASSWORD", "UNLISTED_ENV"):
+            spec = good_spec(env={key: "value"})
+            with self.subTest(key=key), self.assertRaises(harness.ProofFailure):
+                session.validate_spec(spec)
+
+    def test_host_view_uses_only_minimal_device_nodes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = temporary + "/dev"
+            with patch("linux_session.harness._mount") as mount, patch("linux_session.os.mknod") as mknod:
+                session.minimal_dev(path)
+            mount.assert_called_once_with(
+                "tmpfs", path, "tmpfs", harness.MS_NOSUID | harness.MS_NOEXEC, "mode=0755,size=1m",
+            )
+            self.assertEqual(mknod.call_count, 4)
+            names = tuple(call.args[0].rsplit("/", 1)[1] for call in mknod.call_args_list)
+            self.assertEqual(names, ("null", "zero", "random", "urandom"))
+            self.assertTrue(all(stat.S_IFMT(call.args[1]) == stat.S_IFCHR for call in mknod.call_args_list))
 
     def test_malformed_specs_are_refused_with_a_fixed_reason(self):
         bad = (
@@ -280,10 +306,12 @@ class LinuxSessionLaunchTests(unittest.TestCase):
         self.assertTrue(captured["cleaned"])
         self.assertEqual(captured["result"].exit_code, 0)
 
-    def test_host_view_has_no_pid_namespace_and_never_runs_open(self):
+    def test_host_view_has_pid_namespace_and_never_runs_open(self):
         captured = self.run_spawn(view_runner="host")
         command = captured["command"]
-        self.assertNotIn("--pid", command)
+        self.assertIn("--pid", command)
+        self.assertIn("--fork", command)
+        self.assertIn("--kill-child=KILL", command)
         self.assertIn("--net", command)
         self.assertEqual(captured["spec"]["view"], "host")
         self.assertEqual(captured["spec"]["mode"], "confined")
@@ -360,7 +388,10 @@ class LinuxSessionLaunchTests(unittest.TestCase):
         with patch("linux_session.subprocess.Popen") as popen:
             session.start_peer("token", {"A": "b"})
         kwargs = popen.call_args.kwargs
-        self.assertEqual((kwargs["user"], kwargs["group"], kwargs["extra_groups"]), (65534, 65534, []))
+        self.assertEqual(
+            (kwargs["user"], kwargs["group"], kwargs["extra_groups"]),
+            (harness.CHILD_UID, harness.CHILD_GID, []),
+        )
         self.assertEqual(kwargs["env"], {"KD_CONTROL": "token", "A": "b"})
         self.assertNotIn("preexec_fn", kwargs)
 
