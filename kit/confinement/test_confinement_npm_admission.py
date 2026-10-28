@@ -51,9 +51,12 @@ def _node_modules_path(name):
     return "node_modules/" + name
 
 
-def _tarball(name, version, scripts=None, binary=False, extra=()):
+def _tarball(name, version, scripts=None, binary=False, extra=(), gypfile=None):
+    manifest_fields = {"name": name, "version": version, "scripts": scripts or {}}
+    if gypfile is not None:
+        manifest_fields["gypfile"] = gypfile
     manifest = json.dumps(
-        {"name": name, "version": version, "scripts": scripts or {}},
+        manifest_fields,
         sort_keys=True, separators=(",", ":"),
     ).encode("ascii")
     output = io.BytesIO()
@@ -427,6 +430,27 @@ class NpmAdmissionTests(unittest.TestCase):
         self.assertEqual(nested_report["install_scripts"], ())
         self.assertEqual(nested_report["implicit_install_scripts"], ())
 
+    def test_binding_gyp_uses_command_truthiness_and_gypfile_flag(self):
+        for script in ("preinstall", "install"):
+            with self.subTest(script=script):
+                data = _tarball(
+                    "sample", "1.0.0", scripts={script: ""},
+                    extra=(("package/binding.gyp", b"{}"),),
+                )
+                entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+                report = subject.verify_tarball(entry, data)
+                self.assertEqual(report["install_scripts"], ("install",))
+                self.assertEqual(report["implicit_install_scripts"], ("install",))
+
+        disabled_data = _tarball(
+            "sample", "1.0.0", extra=(("package/binding.gyp", b"{}"),),
+            gypfile=False,
+        )
+        disabled_entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(disabled_data)}
+        disabled_report = subject.verify_tarball(disabled_entry, disabled_data)
+        self.assertEqual(disabled_report["install_scripts"], ())
+        self.assertEqual(disabled_report["implicit_install_scripts"], ())
+
     def test_tarball_refuses_bundled_package_tree(self):
         private_name = "keeldock" + "-" + "private"
         nested_manifest = json.dumps({
@@ -526,6 +550,23 @@ class NpmAdmissionTests(unittest.TestCase):
                     lambda: subject.verify_tarball(entry, data), "npm_archive_invalid",
                 )
         data = _tarball("sample", "1.0.0", extra=(("package/file-name", b"synthetic"),))
+        entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+        self.assertEqual(subject.verify_tarball(entry, data)["file_count"], 2)
+
+    def test_tar_preflight_refuses_non_ascii_aliases_in_every_component(self):
+        for paths in (
+                ("package/file.js", "package/f\u0131le.js"),
+                ("package/b\u0131nding.gyp",),
+                ("package/f\u0131les/data",)):
+            with self.subTest(paths=paths):
+                data = _tarball("sample", "1.0.0", extra=tuple(
+                    (path, b"synthetic") for path in paths
+                ))
+                entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+                self.assert_refused(
+                    lambda: subject.verify_tarball(entry, data), "npm_archive_invalid",
+                )
+        data = _tarball("sample", "1.0.0", extra=(("package/files/data", b"synthetic"),))
         entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
         self.assertEqual(subject.verify_tarball(entry, data)["file_count"], 2)
 

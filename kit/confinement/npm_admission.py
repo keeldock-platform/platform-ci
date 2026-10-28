@@ -541,7 +541,7 @@ def _safe_relative_archive_path(value):
         encoded = value.encode("utf-8", "strict")
     except UnicodeError:
         return False
-    if len(encoded) > MAX_ARCHIVE_PATH_BYTES or any(ord(char) < 32 or ord(char) == 127 for char in value):
+    if len(encoded) > MAX_ARCHIVE_PATH_BYTES or any(ord(char) < 32 or ord(char) > 126 for char in value):
         return False
     parts = value.split("/")
     if not parts or any(part in ("", ".", "..") for part in parts):
@@ -550,7 +550,7 @@ def _safe_relative_archive_path(value):
         if (part[-1] in (".", " ")
                 or any(char in '<>:"|?*~' for char in part)):
             return False
-        basename = part.split(".", 1)[0].strip(" ").casefold()
+        basename = part.split(".", 1)[0].strip(" ").lower()
         if (basename in WINDOWS_RESERVED_BASENAMES
                 or (len(basename) == 4 and basename[:3] in ("com", "lpt")
                     and basename[3] in "123456789\u00b9\u00b2\u00b3")):
@@ -649,8 +649,7 @@ def _manifest_scripts(data, name, version):
     for key, value in scripts.items():
         if type(key) is not str or type(value) is not str or len(key) > 128:
             _refuse("npm_archive_invalid")
-    lifecycle = ("preinstall", "install", "postinstall", "prepare")
-    return tuple(name for name in lifecycle if name in scripts)
+    return scripts, manifest.get("gypfile", True)
 
 
 def _inspect_tarball(name, version, integrity, data, internal_names=()):
@@ -699,15 +698,16 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
                     _refuse("npm_archive_invalid")
                 if raw_name.endswith("//") or (not is_directory and raw_name.endswith("/")):
                     _refuse("npm_archive_invalid")
-                if relative in entries or relative.casefold() in folded:
+                folded_relative = relative.lower()
+                if relative in entries or folded_relative in folded:
                     _refuse("npm_archive_invalid")
-                folded.add(relative.casefold())
+                folded.add(folded_relative)
                 parts = relative.split("/")
-                if any(part.casefold() == "node_modules" for part in parts[1:]):
+                if any(part.lower() == "node_modules" for part in parts[1:]):
                     _refuse("npm_archive_invalid")
                 for index in range(1, len(parts) + 1):
                     spelling = "/".join(parts[:index])
-                    key = spelling.casefold()
+                    key = spelling.lower()
                     previous = spellings.get(key)
                     if previous is not None and previous != spelling:
                         _refuse("npm_archive_invalid")
@@ -725,7 +725,7 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
                 entries[relative] = (is_directory, member)
                 if relative == "package/package.json" and not is_directory:
                     package_json_member = member
-                if relative.casefold() == "package/binding.gyp" and not is_directory:
+                if folded_relative == "package/binding.gyp" and not is_directory:
                     root_binding_gyp = True
                 if not is_directory and _native_path(relative):
                     native_paths.append(relative)
@@ -759,12 +759,16 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
         _refuse("npm_archive_invalid")
     if manifest_bytes is None:
         _refuse("npm_archive_invalid")
-    install_scripts = _manifest_scripts(manifest_bytes, name, version)
-    implicit_install = root_binding_gyp and not any(
-        script in install_scripts for script in ("preinstall", "install")
+    scripts, gypfile = _manifest_scripts(manifest_bytes, name, version)
+    implicit_install = (
+        root_binding_gyp and gypfile is not False
+        and not scripts.get("preinstall") and not scripts.get("install")
     )
-    if implicit_install:
-        install_scripts = ("install",) + install_scripts
+    lifecycle = ("preinstall", "install", "postinstall", "prepare")
+    install_scripts = tuple(
+        script for script in lifecycle
+        if scripts.get(script) or (implicit_install and script == "install")
+    )
     return {
         "name": name,
         "version": version,
