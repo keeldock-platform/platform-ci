@@ -1448,6 +1448,11 @@ class LaneRegistryTests(unittest.TestCase):
             (
                 (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
                 (
+                    ".github/workflows/linux-source-admission.yml",
+                    "linux-source-admission",
+                    "linux-source-admission-workflow-too-large",
+                ),
+                (
                     ".github/workflows/windows-native-preflight.yml",
                     "windows-native-preflight",
                     "windows-workflow-too-large",
