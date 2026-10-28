@@ -1,6 +1,8 @@
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -380,6 +382,57 @@ class LinuxBoundaryCommandTests(unittest.TestCase):
             with patch("linux_boundary.sys.stdout", out):
                 self.assertEqual(boundary.main(["merge", "--selftest", first, "--recheck", os.path.join(base, "absent.json")]), 1)
             self.assertIn("project-execution=not_started", out.getvalue())
+
+    def test_merge_hands_root_written_record_to_runner_through_its_open_descriptor(self):
+        selftest = channels.empty_record("selftest")
+        recheck = channels.empty_record("recheck")
+        for record in (selftest, recheck):
+            for name in channels.CHANNELS:
+                record["channels"][name] = {"status": "blocked", "control": True}
+            record["memory_canary"] = "absent"
+            record["readable_file_canary"] = "absent"
+            record["result"] = "accepted"
+            record["reason"] = "none"
+        selftest["fixtures"] = "complete"
+        with tempfile.TemporaryDirectory() as base:
+            first = os.path.join(base, "a.json")
+            second = os.path.join(base, "b.json")
+            output = os.path.join(base, "merged.json")
+            boundary.write_record(first, selftest)
+            boundary.write_record(second, recheck)
+            command = ["merge", "--selftest", first, "--recheck", second,
+                       "--out", output, "--reader-uid", str(os.getuid()),
+                       "--reader-gid", str(os.getgid())]
+            original = os.fchown
+            with patch.object(boundary.os, "fchown", wraps=original) as chown:
+                self.assertEqual(boundary.main(command), 0)
+            chown.assert_called_once()
+            self.assertIsInstance(chown.call_args.args[0], int)
+            self.assertEqual(chown.call_args.args[1:], (os.getuid(), os.getgid()))
+            self.assertEqual(os.stat(output).st_mode & 0o777, 0o600)
+            with open(output, encoding="ascii") as source:
+                self.assertTrue(json.load(source)["accepted"])
+            command[command.index(output)] = os.path.join(base, "failed.json")
+            with patch.object(boundary.os, "fchown", side_effect=PermissionError):
+                self.assertEqual(boundary.main(command), 1)
+            linked = os.path.join(base, "linked")
+            os.symlink(base, linked)
+            command[command.index(os.path.join(base, "failed.json"))] = os.path.join(linked, "escape.json")
+            self.assertEqual(boundary.main(command), 1)
+            self.assertFalse(os.path.exists(os.path.join(base, "escape.json")))
+            if sys.platform == "linux":
+                root_output = os.path.join(base, "root-merged.json")
+                command[command.index(os.path.join(linked, "escape.json"))] = root_output
+                result = subprocess.run(
+                    ["sudo", "-n", sys.executable, "-B", boundary.__file__, *command],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    timeout=30, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout.decode("ascii", errors="replace"))
+                self.assertEqual(os.stat(root_output).st_uid, os.getuid())
+                self.assertEqual(os.stat(root_output).st_mode & 0o777, 0o600)
+                with open(root_output, encoding="ascii") as source:
+                    self.assertTrue(json.load(source)["accepted"])
 
     def test_command_line_requires_a_record_path_and_a_runner_uid_and_validates_paths(self):
         out = io.StringIO()

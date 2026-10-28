@@ -82,12 +82,30 @@ SOURCE_STEP_NAMES = (
 )
 VERDICT_STEP_NAMES = (
     "Fetch exact public control",
-    "Record verifier image and Rust sysroot",
+    "Repeat independent preflight",
+    "Record verifier image and fetch pinned toolchains",
     "Harden verifier runner paths",
     "Run independent boundary self-test",
-    "Re-run independent positive controls",
+    "Mint verifier scoped source-reader token",
+    "Verify source independently against binding, tree, signatures and lock",
+    "Revoke verifier token and verify rejection",
+    "Fetch independent npm tarballs by lock integrity",
+    "Run independent trusted dependency audit",
+    "Prepare independent offline project inputs",
+    "Re-run independent positive controls before project execution",
+    "Run independent thirteen offline project gates",
     "Merge independent confinement records",
+    "Verify unprivileged proof handoff",
     "Publish confinement verdict",
+)
+OPTIONAL_VERDICT_SYNTHETIC_STEPS = (
+    "Mint verifier scoped source-reader token",
+    "Verify source independently against binding, tree, signatures and lock",
+    "Revoke verifier token and verify rejection",
+    "Fetch independent npm tarballs by lock integrity",
+    "Run independent trusted dependency audit",
+    "Prepare independent offline project inputs",
+    "Run independent thirteen offline project gates",
 )
 SETTINGS_STEP_NAMES = (
     "Fetch exact public control",
@@ -136,6 +154,8 @@ def _api_request(path, token, method="GET", payload=None, expected=(200,)):
         "X-GitHub-Api-Version": API_VERSION,
     }
     data = None if payload is None else json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    if data is not None:
+        headers["Content-Type"] = "application/json"
     request = urllib.request.Request(API_ROOT + path, data=data, headers=headers, method=method)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
@@ -334,7 +354,10 @@ def _expected_run(environ, cache_digest):
             "linux-source-admission-settings": {"steps": SETTINGS_STEP_NAMES, "optional_steps": ()},
             "linux-source-admission-unit": {"steps": UNIT_STEP_NAMES, "optional_steps": ()},
             "linux-source-admission-source-read": {"steps": tuple(all_steps), "optional_steps": tuple(optional)},
-            "linux-source-admission-verdict": {"steps": VERDICT_STEP_NAMES, "optional_steps": ()},
+            "linux-source-admission-verdict": {
+                "steps": VERDICT_STEP_NAMES,
+                "optional_steps": OPTIONAL_VERDICT_SYNTHETIC_STEPS if mode == "synthetic" else (),
+            },
         },
         "verdict_job": "linux-source-admission-verdict",
         "verdict_step": "Publish confinement verdict",
@@ -353,6 +376,74 @@ def _write_output(environ, values):
     with open(path, "at", encoding="ascii") as sink:
         for key, value in values.items():
             sink.write(key + "=" + value + "\n")
+
+
+def mint_verifier_token(environ=None):
+    env = os.environ if environ is None else environ
+    identity = _source_inputs(env)
+    client_id = env.get("SOURCE_READER_CLIENT_ID", "")
+    installation_id = env.get("SOURCE_READER_INSTALLATION_ID", "")
+    private_key = env.get("SOURCE_READER_PRIVATE_KEY", "")
+    if (re.fullmatch(r"[A-Za-z0-9_.-]{3,100}", client_id) is None
+            or DECIMAL_RE.fullmatch(installation_id) is None
+            or not private_key.startswith("-----BEGIN ")
+            or len(private_key) > 16384):
+        raise SourceBuildRefusal("token")
+    now = int(time.time())
+    header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=")
+    claims = json.dumps({"iat": now - 60, "exp": now + 540, "iss": client_id}, separators=(",", ":")).encode("ascii")
+    payload = base64.urlsafe_b64encode(claims).rstrip(b"=")
+    signing_input = header + b"." + payload
+    descriptor = -1
+    try:
+        descriptor = os.memfd_create("kd-app-key", os.MFD_CLOEXEC)
+        key_bytes = private_key.encode("ascii")
+        if os.write(descriptor, key_bytes) != len(key_bytes):
+            raise SourceBuildRefusal("token")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        signed = subprocess.run(
+            ["/usr/bin/openssl", "dgst", "-sha256", "-sign", "/proc/self/fd/" + str(descriptor)],
+            input=signing_input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=15, check=False, pass_fds=(descriptor,),
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        )
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise SourceBuildRefusal("token") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if signed.returncode != 0 or len(signed.stdout) < 64 or len(signed.stdout) > 1024:
+        raise SourceBuildRefusal("token")
+    jwt = signing_input.decode("ascii") + "." + base64.urlsafe_b64encode(signed.stdout).rstrip(b"=").decode("ascii")
+    unused, installation = _api_request("/app/installations/" + installation_id, jwt)
+    account = installation.get("account") if type(installation) is dict else None
+    if (type(installation) is not dict or installation.get("id") != int(installation_id)
+            or type(account) is not dict or type(account.get("login")) is not str
+            or account["login"].lower() != identity["owner"].lower()):
+        raise SourceBuildRefusal("token")
+    unused, issued = _api_request(
+        "/app/installations/" + installation_id + "/access_tokens", jwt, method="POST",
+        payload={"repositories": [identity["name"]], "permissions": {"contents": "read"}}, expected=(201,),
+    )
+    token = issued.get("token") if type(issued) is dict else None
+    if type(token) is not str or re.fullmatch(r"[A-Za-z0-9_]{20,1024}", token) is None:
+        raise SourceBuildRefusal("token")
+    permissions = issued.get("permissions")
+    if (type(permissions) is not dict or permissions.get("contents") != "read"
+            or set(permissions) - {"contents", "metadata"}
+            or any(value != "read" for value in permissions.values())):
+        raise SourceBuildRefusal("token")
+    unused, repositories = _api_request("/installation/repositories?per_page=100", token)
+    entries = repositories.get("repositories") if type(repositories) is dict else None
+    if (type(entries) is not list or len(entries) != 1 or repositories.get("total_count") != 1
+            or type(entries[0]) is not dict or entries[0].get("id") != int(identity["repository_id"])
+            or entries[0].get("name") != identity["name"]):
+        raise SourceBuildRefusal("token")
+    sys.stdout.write("::add-mask::" + token + "\n")
+    sys.stdout.flush()
+    _write_output(env, {"token": token, "installation_id": installation_id})
+    sys.stdout.write("linux-verifier-token=issued installation=verified scope=one-repository\n")
+    return 0
 
 
 def snapshot_and_preflight(environ=None):
@@ -1442,22 +1533,71 @@ def run_project_gates(environ=None):
 
 
 def _load_json(path):
+    descriptor = -1
     try:
-        value = json.loads(Path(path).read_text(encoding="ascii"))
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+            return None
+        with os.fdopen(descriptor, "rt", encoding="ascii") as source:
+            descriptor = -1
+            value = json.loads(source.read(65537))
     except (OSError, UnicodeError, ValueError):
         return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     return value if type(value) is dict else None
+
+
+def _handoff_record(records):
+    path = records / "merged.json"
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        return None
+    return _load_json(path)
+
+
+def verify_proof_handoff(environ=None):
+    env = os.environ if environ is None else environ
+    records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
+    record = _handoff_record(records)
+    if record is None or type(record.get("channels")) is not dict:
+        raise SourceBuildRefusal("boundary")
+    sys.stdout.write("linux-verifier-proof-handoff=readable owner=runner mode=0600\n")
+    return 0
+
+
+def _verified_source_receipts(records, env):
+    gates = _load_json(records / "gates.json")
+    revoke = _load_json(records / "revocation.json")
+    if (gates is None or revoke is None or gates.get("schema_version") != 1
+            or type(gates.get("gates")) is not dict
+            or set(gates["gates"]) != set(GATES)
+            or any(gates["gates"][name] != "passed" for name in GATES)
+            or gates.get("gate_count") != len(GATES) or gates.get("failed") != 0
+            or revoke.get("schema_version") != 1 or revoke.get("status") != "confirmed"
+            or revoke.get("control_sha") != env.get("CI_SHA")
+            or revoke.get("run_id") != env.get("GITHUB_RUN_ID")
+            or revoke.get("run_attempt") != env.get("GITHUB_RUN_ATTEMPT")
+            or revoke.get("installation_id") != env.get("SOURCE_READER_INSTALLATION_ID")
+            or revoke.get("rejected_after_revoke") is not True):
+        return False
+    return True
 
 
 def _verdict_record(environ):
     env = environ
     unused_audit, verdict, unused_canary = _audit_modules()
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
-    merged = _load_json(records / "merged.json")
+    merged = _handoff_record(records)
     try:
         mode = env.get("CI_MODE")
-        producer_result = env.get("PRODUCER_RESULT")
-        if mode not in ("source", "synthetic") or producer_result not in ("success", "failure", "cancelled", "skipped"):
+        if mode not in ("source", "synthetic"):
             raise ValueError
         if merged is None or type(merged.get("channels")) is not dict:
             raise ValueError
@@ -1471,7 +1611,7 @@ def _verdict_record(environ):
         }
         memory = merged.get("memory_canary", "not-run")
         readable = merged.get("readable_file_canary", "not-run")
-        accepted_source = mode == "source" and producer_result == "success"
+        accepted_source = mode == "source" and _verified_source_receipts(records, env)
         project = "completed" if accepted_source else "not_started"
         gate_count = 13 if accepted_source else 0
         failed = 0
@@ -1510,7 +1650,8 @@ def emit_verdict(environ=None):
     record = _verdict_record(env)
     line = verdict.encode_line(record)
     sys.stdout.write(line + "\n")
-    return 0 if verdict.run_accepted(record) or env.get("CI_MODE") == "synthetic" and verdict.confinement_accepted(record) else 1
+    accepted = verdict.run_accepted(record) if env.get("CI_MODE") == "source" else verdict.confinement_accepted(record)
+    return 0 if accepted and env.get("PRODUCER_RESULT") == "success" else 1
 
 
 def run_audit(environ=None):
@@ -1535,12 +1676,14 @@ def _dispatch(command):
         "audit-expected": write_audit_identity,
         "preflight": repeat_preflight,
         "toolchains": prepare_toolchains,
+        "mint-verifier-token": mint_verifier_token,
         "checkout": checkout_source,
         "revoke": revoke_token,
         "npm-tarballs": fetch_npm_tarballs,
         "trusted-audit": run_trusted_audit,
         "prepare-project": prepare_project,
         "gates": run_project_gates,
+        "verify-handoff": verify_proof_handoff,
         "verdict": emit_verdict,
         "audit": run_audit,
     }

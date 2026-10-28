@@ -675,11 +675,30 @@ def run_merge(arguments):
         + " fixtures=" + merged["fixtures"]
     )
     if arguments.out:
-        descriptor = os.open(arguments.out, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        handoff = arguments.reader_uid is not None or arguments.reader_gid is not None
+        if handoff and (arguments.reader_uid is None or arguments.reader_gid is None
+                        or arguments.reader_uid <= 0 or arguments.reader_gid <= 0):
+            raise BoundaryRefusal("environment")
+        if not os.path.isabs(arguments.out):
+            raise BoundaryRefusal("environment")
+        parent = os.open(os.path.dirname(arguments.out), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            os.write(descriptor, (json.dumps(merged, sort_keys=True, separators=(",", ":")) + chr(10)).encode("ascii"))
+            descriptor = os.open(
+                os.path.basename(arguments.out),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600, dir_fd=parent,
+            )
+            try:
+                body = (json.dumps(merged, sort_keys=True, separators=(",", ":")) + chr(10)).encode("ascii")
+                if os.write(descriptor, body) != len(body):
+                    raise BoundaryRefusal("environment")
+                if handoff:
+                    os.fchown(descriptor, arguments.reader_uid, arguments.reader_gid)
+                    os.fchmod(descriptor, 0o600)
+            finally:
+                os.close(descriptor)
         finally:
-            os.close(descriptor)
+            os.close(parent)
     return 0 if merged["accepted"] else 1
 
 
@@ -704,6 +723,8 @@ def build_parser():
     parser.add_argument("--selftest")
     parser.add_argument("--recheck")
     parser.add_argument("--out")
+    parser.add_argument("--reader-uid", type=int)
+    parser.add_argument("--reader-gid", type=int)
     return parser
 
 

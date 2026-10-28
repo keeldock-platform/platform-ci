@@ -209,7 +209,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
             ],
         )
         self.assertEqual(self.text.count("cache-mode: none"), 6)
-        for name in ("settings", "source-read"):
+        for name in ("settings", "source-read", "verdict"):
             body = jobs["linux-source-admission-" + name]
             self.assertIn("      actions: read\n      contents: read\n", body)
         self.assertIn("    permissions: {}\n", jobs["linux-source-admission-unit"])
@@ -224,14 +224,18 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         mint = source.split("      - name: Mint scoped source-reader token\n", 1)[1].split("      - name:", 1)[0]
         self.assertIn("if: ${{ inputs.mode == 'source' }}", mint)
         self.assertIn("SOURCE_READER_PRIVATE_KEY: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}", mint)
-        self.assertEqual(self.text.count("secrets.SOURCE_READER_PRIVATE_KEY"), 1)
+        self.assertEqual(self.text.count("secrets.SOURCE_READER_PRIVATE_KEY"), 2)
         self.assertIn("actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510", mint)
         self.assertIn("SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}", source)
         self.assertIn("if: ${{ always() && steps.source-reader-token.outputs.token != '' }}", source)
         self.assertIn("linux_source_build.py revoke", source)
         self.assertIn("steps.source-reader-token.outputs.installation-id", source)
+        verdict = self.jobs()["linux-source-admission-verdict"]
+        verifier_mint = verdict.split("      - name: Mint verifier scoped source-reader token\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("SOURCE_READER_PRIVATE_KEY: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}", verifier_mint)
+        self.assertIn("linux_source_build.py mint-verifier-token", verifier_mint)
         for name, body in self.jobs().items():
-            if name != "linux-source-admission-source-read":
+            if name not in ("linux-source-admission-source-read", "linux-source-admission-verdict"):
                 self.assertNotIn("SOURCE_READER_PRIVATE_KEY", body)
         self.assertEqual(self.text.count("KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic'"), 4)
         source = self.jobs()["linux-source-admission-source-read"]
@@ -290,16 +294,22 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
     def test_verdict_step_is_plain_run_and_the_verdict_job_has_no_composite_step(self):
         source = self.jobs()["linux-source-admission-source-read"]
         verdict = self.jobs()["linux-source-admission-verdict"]
+        unit = self.jobs()["linux-source-admission-unit"]
+        self.assertIn("python3 -B kit/confinement/test_linux_boundary.py", unit)
         self.assertNotIn("    outputs:\n", source)
         self.assertNotIn("verdict_record", verdict)
+        self.assertNotIn("needs.linux-source-admission-source-read.outputs", verdict)
         self.assertIn("PRODUCER_RESULT: ${{ needs.linux-source-admission-source-read.result }}", verdict)
         self.assertIn("name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}", verdict)
         self.assertIn("linux_boundary.py selftest", verdict)
         self.assertIn("linux_boundary.py recheck", verdict)
         self.assertIn("linux_boundary.py merge", verdict)
+        self.assertIn("--reader-uid \"$(id -u)\" --reader-gid \"$(id -g)\"", verdict)
+        self.assertIn("linux_source_build.py verify-handoff", verdict)
+        self.assertIn("linux_source_build.py gates", verdict)
         self.assertIn("run: python3 -B kit/confinement/linux_source_build.py verdict", verdict)
         self.assertNotIn("uses:", verdict)
-        self.assertEqual(verdict.count("      - name:"), 7)
+        self.assertEqual(verdict.count("      - name:"), 16)
         self.assertEqual(verdict.count("--preserve-env=KD_CANARY_SECRET"), 2)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", self.text)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", verdict)

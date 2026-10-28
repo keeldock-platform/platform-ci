@@ -141,6 +141,7 @@ jobs:
           python3 -B kit/bootstrap/test_policy_linux.py
           python3 -B kit/bootstrap/test_public_tree.py
           python3 -B kit/confinement/test_linux_harness.py
+          python3 -B kit/confinement/test_linux_boundary.py
           python3 -B kit/confinement/test_linux_session.py
           python3 -B kit/confinement/test_linux_canaries.py
           python3 -B kit/confinement/test_linux_channels.py
@@ -340,17 +341,43 @@ jobs:
     runs-on: ubuntu-24.04
     environment:
       name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}
-    timeout-minutes: 15
+    timeout-minutes: 120
     cache-mode: none
     permissions:
+      actions: read
       contents: read
     defaults:
       run:
         shell: bash
     env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
       CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
       CI_MODE: ${{ inputs.mode }}
+      CI_WORKSPACE: ${{ github.workspace }}
+      CACHE_MODE: none
       PRODUCER_RESULT: ${{ needs.linux-source-admission-source-read.result }}
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_BASE_SHA: ${{ inputs.base_sha }}
+      REQUESTED_BASE_BRANCH: ${{ inputs.base_branch }}
+      REQUESTED_FINGERPRINT: ${{ inputs.fingerprint }}
+      REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}
+      SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+      SOURCE_REPOSITORY_OWNER: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
+      SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+      SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
+      LINUX_SOURCE_ALLOWED_SHA: ${{ vars.LINUX_SOURCE_ALLOWED_SHA }}
+      LINUX_SOURCE_ALLOWED_BASE_SHA: ${{ vars.LINUX_SOURCE_ALLOWED_BASE_SHA }}
+      LINUX_SOURCE_ALLOWED_BASE_BRANCH: ${{ vars.LINUX_SOURCE_ALLOWED_BASE_BRANCH }}
+      LINUX_SOURCE_ALLOWED_FINGERPRINT: ${{ vars.LINUX_SOURCE_ALLOWED_FINGERPRINT }}
+      LINUX_SOURCE_ALLOWED_CONTROL_SHA: ${{ vars.LINUX_SOURCE_ALLOWED_CONTROL_SHA }}
+      LINUX_SOURCE_ENVIRONMENT_NAME: ${{ vars.LINUX_SOURCE_ENVIRONMENT_NAME }}
+      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256 }}
+      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256 }}
+      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON }}
     steps:
       - name: Fetch exact public control
         run: |
@@ -361,21 +388,30 @@ jobs:
           git fetch --quiet --no-tags --depth=1 origin "$GITHUB_REF" 2>/dev/null
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
           [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$GITHUB_SHA" ]]
-      - name: Record verifier image and Rust sysroot
+      - name: Repeat independent preflight
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B kit/confinement/linux_source_build.py preflight
+      - name: Record verifier image and fetch pinned toolchains
         id: verifier-toolchain
         run: |
           set -euo pipefail
-          [[ "${ImageOS:-}" =~ ^[A-Za-z0-9._-]{1,64}$ && "${ImageVersion:-}" =~ ^[A-Za-z0-9._-]{1,64}$ ]]
-          sysroot="$(rustc --print sysroot)"
-          [[ "$sysroot" =~ ^/[A-Za-z0-9._/@+=-]{1,300}$ && -x "$sysroot/bin/rustc" ]]
-          mkdir -p "$RUNNER_TEMP/kd-records"
-          printf '%s\n' "rust_sysroot=$sysroot" >> "$GITHUB_OUTPUT"
-          printf '%s\n' "linux-verifier-image schema=1 image-os=$ImageOS image-version=$ImageVersion"
+          if [[ "$CI_MODE" == "source" ]]; then
+            python3 -B kit/confinement/linux_source_build.py toolchains
+          else
+            [[ "${ImageOS:-}" =~ ^[A-Za-z0-9._-]{1,64}$ && "${ImageVersion:-}" =~ ^[A-Za-z0-9._-]{1,64}$ ]]
+            sysroot="$(rustc --print sysroot)"
+            [[ "$sysroot" =~ ^/[A-Za-z0-9._/@+=-]{1,300}$ && -x "$sysroot/bin/rustc" ]]
+            mkdir -p "$RUNNER_TEMP/kd-records"
+            printf '%s\n' "rust_sysroot=$sysroot" >> "$GITHUB_OUTPUT"
+            printf '%s\n' "linux-verifier-image schema=1 image-os=$ImageOS image-version=$ImageVersion mode=synthetic"
+          fi
       - name: Harden verifier runner paths
         run: |
           set -euo pipefail
           sudo -n python3 -B kit/confinement/linux_boundary.py harden --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP"
       - name: Run independent boundary self-test
+        id: verifier-selftest
         env:
           KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic' && 'kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd' || secrets.KD_LINUX_LOG_CANARY }}
           KD_RUST_SYSROOT: ${{ steps.verifier-toolchain.outputs.rust_sysroot }}
@@ -386,7 +422,47 @@ jobs:
             arguments+=(--synthetic-standin)
           fi
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py selftest "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/selftest.json"
-      - name: Re-run independent positive controls
+      - name: Mint verifier scoped source-reader token
+        id: verifier-token
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          SOURCE_READER_PRIVATE_KEY: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+        run: python3 -B kit/confinement/linux_source_build.py mint-verifier-token
+      - name: Verify source independently against binding, tree, signatures and lock
+        id: verifier-checkout
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          SOURCE_READER_TOKEN: ${{ steps.verifier-token.outputs.token }}
+        run: python3 -B kit/confinement/linux_source_build.py checkout
+      - name: Revoke verifier token and verify rejection
+        if: ${{ always() && steps.verifier-token.outputs.token != '' }}
+        env:
+          SOURCE_READER_TOKEN: ${{ steps.verifier-token.outputs.token }}
+        run: python3 -B kit/confinement/linux_source_build.py revoke
+      - name: Fetch independent npm tarballs by lock integrity
+        id: verifier-npm
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
+        run: python3 -B kit/confinement/linux_source_build.py npm-tarballs
+      - name: Run independent trusted dependency audit
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
+          NODE_BIN: ${{ steps.verifier-toolchain.outputs.node_bin }}
+        run: python3 -B kit/confinement/linux_source_build.py trusted-audit
+      - name: Prepare independent offline project inputs
+        id: verifier-project
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
+          NPM_TARBALL_INDEX: ${{ steps.verifier-npm.outputs.tarball_index }}
+          RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
+          EXPECTED_NODE_LOCK_SHA256: ${{ steps.verifier-checkout.outputs.lock_sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.verifier-checkout.outputs.manifest_sha256 }}
+        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
+      - name: Re-run independent positive controls before project execution
+        id: verifier-recheck
         env:
           KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic' && 'kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd' || secrets.KD_LINUX_LOG_CANARY }}
           KD_RUST_SYSROOT: ${{ steps.verifier-toolchain.outputs.rust_sysroot }}
@@ -397,10 +473,22 @@ jobs:
             arguments+=(--synthetic-standin)
           fi
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
+      - name: Run independent thirteen offline project gates
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          WORKER_PATH: ${{ steps.verifier-project.outputs.worker_path }}
+          CARGO_HOME: ${{ steps.verifier-project.outputs.cargo_home }}
+          RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
+          NODE_BIN: ${{ steps.verifier-toolchain.outputs.node_bin }}
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge independent confinement records
+        if: ${{ always() && steps.verifier-selftest.outcome != 'skipped' && steps.verifier-recheck.outcome != 'skipped' }}
         run: |
           set -euo pipefail
-          sudo -n python3 -B kit/confinement/linux_boundary.py merge --selftest "$RUNNER_TEMP/kd-records/selftest.json" --recheck "$RUNNER_TEMP/kd-records/recheck.json" --out "$RUNNER_TEMP/kd-records/merged.json"
+          sudo -n python3 -B kit/confinement/linux_boundary.py merge --selftest "$RUNNER_TEMP/kd-records/selftest.json" --recheck "$RUNNER_TEMP/kd-records/recheck.json" --out "$RUNNER_TEMP/kd-records/merged.json" --reader-uid "$(id -u)" --reader-gid "$(id -g)"
+      - name: Verify unprivileged proof handoff
+        if: ${{ always() && steps.verifier-selftest.outcome != 'skipped' && steps.verifier-recheck.outcome != 'skipped' }}
+        run: python3 -B kit/confinement/linux_source_build.py verify-handoff
       - name: Publish confinement verdict
         if: ${{ always() }}
         run: python3 -B kit/confinement/linux_source_build.py verdict

@@ -49,9 +49,18 @@ class LinuxSourceBuildTests(unittest.TestCase):
             ),
         )
         self.assertEqual(linux_source_build.VERDICT_STEP_NAMES, (
-            "Fetch exact public control", "Record verifier image and Rust sysroot",
+            "Fetch exact public control", "Repeat independent preflight",
+            "Record verifier image and fetch pinned toolchains",
             "Harden verifier runner paths", "Run independent boundary self-test",
-            "Re-run independent positive controls", "Merge independent confinement records",
+            "Mint verifier scoped source-reader token",
+            "Verify source independently against binding, tree, signatures and lock",
+            "Revoke verifier token and verify rejection",
+            "Fetch independent npm tarballs by lock integrity",
+            "Run independent trusted dependency audit",
+            "Prepare independent offline project inputs",
+            "Re-run independent positive controls before project execution",
+            "Run independent thirteen offline project gates",
+            "Merge independent confinement records", "Verify unprivileged proof handoff",
             "Publish confinement verdict",
         ))
         self.assertEqual(
@@ -75,6 +84,11 @@ class LinuxSourceBuildTests(unittest.TestCase):
         synthetic = linux_source_build._expected_run({**base, "CI_MODE": "synthetic"}, "b" * 64)
         self.assertEqual(source["verdict_job"], "linux-source-admission-verdict")
         self.assertEqual(source["jobs"][source["verdict_job"]]["steps"], linux_source_build.VERDICT_STEP_NAMES)
+        self.assertEqual(source["jobs"][source["verdict_job"]]["optional_steps"], ())
+        self.assertEqual(
+            synthetic["jobs"][synthetic["verdict_job"]]["optional_steps"],
+            linux_source_build.OPTIONAL_VERDICT_SYNTHETIC_STEPS,
+        )
         self.assertEqual(source["jobs"]["linux-source-admission-source-read"]["steps"][-1], "Post Mint scoped source-reader token")
         self.assertNotIn("Post Mint scoped source-reader token", synthetic["jobs"]["linux-source-admission-source-read"]["steps"])
 
@@ -110,7 +124,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             linux_source_build._validate_cargo_lock_sources(temporary)
             lock.write_text(
                 'version = 3\n\n[[package]]\nname = "example"\nversion = "1.0.0"\n'
-                'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
+                'source = "registry+https://' + 'github.com/rust-lang/crates.io-index"\n',
                 encoding="utf-8",
             )
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
@@ -353,6 +367,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "memory_canary": "absent", "readable_file_canary": "absent",
             }
             (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
+            (records / "merged.json").chmod(0o600)
             sha = "a" * 40
             env = {
                 "RUNNER_TEMP": temporary, "CI_SHA": sha,
@@ -386,6 +401,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "memory_canary": "absent", "readable_file_canary": "absent",
             }
             (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
+            (records / "merged.json").chmod(0o600)
             forged = {
                 "os": "linux", "boundary": "linux-ns-seccomp-uid", "control_sha": "a" * 40,
                 "run_id": 7, "run_attempt": 1, "channels": merged["channels"],
@@ -407,9 +423,107 @@ class LinuxSourceBuildTests(unittest.TestCase):
             self.assertEqual(record["gates"], 0)
             self.assertEqual(record["token_revocation"], "unconfirmed")
             env["PRODUCER_RESULT"] = "success"
-            self.assertEqual(linux_source_build._verdict_record(env)["project_execution"], "completed")
+            self.assertEqual(linux_source_build._verdict_record(env)["project_execution"], "not_started")
+            with patch.object(linux_source_build.sys, "stdout", io.StringIO()):
+                self.assertEqual(linux_source_build.emit_verdict(env), 1)
             env["PRODUCER_RESULT"] = "forged"
             self.assertEqual(linux_source_build._verdict_record(env)["project_execution"], "not_started")
+
+    def test_verifier_receipts_alone_establish_source_claims_and_producer_only_vetoes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            records = Path(temporary) / "kd-records"
+            records.mkdir()
+            merged = {
+                "channels": {name: {"status": "blocked", "before": True, "after": True}
+                             for name in confinement_verdict.CHANNELS},
+                "memory_canary": "absent", "readable_file_canary": "absent",
+            }
+            (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
+            (records / "merged.json").chmod(0o600)
+            gates = {"schema_version": 1, "gates": {name: "passed" for name in linux_source_build.GATES},
+                     "gate_count": 13, "failed": 0}
+            receipt = {
+                "schema_version": 1, "status": "confirmed", "control_sha": "a" * 40,
+                "run_id": "7", "run_attempt": "1", "installation_id": "19",
+                "rejected_after_revoke": True,
+            }
+            (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
+            (records / "revocation.json").write_text(json.dumps(receipt), encoding="ascii")
+            env = {
+                "RUNNER_TEMP": temporary, "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7",
+                "GITHUB_RUN_ATTEMPT": "1", "SOURCE_READER_INSTALLATION_ID": "19",
+                "CI_MODE": "source", "PRODUCER_RESULT": "success",
+            }
+            trusted = linux_source_build._verdict_record(env)
+            self.assertTrue(confinement_verdict.run_accepted(trusted))
+            with patch.object(linux_source_build.sys, "stdout", io.StringIO()):
+                self.assertEqual(linux_source_build.emit_verdict(env), 0)
+            env["PRODUCER_RESULT"] = "failure"
+            self.assertEqual(linux_source_build._verdict_record(env), trusted)
+            with patch.object(linux_source_build.sys, "stdout", io.StringIO()):
+                self.assertEqual(linux_source_build.emit_verdict(env), 1)
+            env["PRODUCER_RESULT"] = "success"
+            gates["gates"]["format"] = "not-run"
+            (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
+            self.assertEqual(linux_source_build._verdict_record(env)["project_execution"], "not_started")
+            gates["gates"]["format"] = "passed"
+            (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
+            receipt["rejected_after_revoke"] = False
+            (records / "revocation.json").write_text(json.dumps(receipt), encoding="ascii")
+            self.assertEqual(linux_source_build._verdict_record(env)["token_revocation"], "unconfirmed")
+
+    def test_unprivileged_handoff_refuses_wrong_owner_mode_and_symlink(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            records = Path(temporary) / "kd-records"
+            records.mkdir()
+            path = records / "merged.json"
+            path.write_text('{"channels":{}}', encoding="ascii")
+            path.chmod(0o600)
+            reader = os.getuid()
+            with patch.object(linux_source_build.os, "getuid", return_value=reader + 1):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build.verify_proof_handoff({"RUNNER_TEMP": temporary})
+            self.assertEqual(linux_source_build.verify_proof_handoff({"RUNNER_TEMP": temporary}), 0)
+            path.chmod(0o644)
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build.verify_proof_handoff({"RUNNER_TEMP": temporary})
+            path.unlink()
+            path.symlink_to(records / "missing.json")
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build.verify_proof_handoff({"RUNNER_TEMP": temporary})
+
+    def test_verifier_mints_only_for_the_bound_installation_and_repository(self):
+        token = "g" * 40
+        identity = {"owner": "KeelDock", "name": "private-source", "repository_id": "41"}
+        env = {
+            "SOURCE_READER_CLIENT_ID": "Iv1.abc123", "SOURCE_READER_INSTALLATION_ID": "19",
+            "SOURCE_READER_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n",
+        }
+        installation = {"id": 19, "account": {"login": "keeldock"}}
+        issued = {"token": token, "permissions": {"contents": "read", "metadata": "read"}}
+        repositories = {"total_count": 1, "repositories": [{"id": 41, "name": "private-source"}]}
+        with patch.object(linux_source_build, "_source_inputs", return_value=identity), patch.object(
+            linux_source_build.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=b"s" * 256)
+        ), patch.object(linux_source_build, "_api_request", side_effect=[
+            (200, installation), (201, issued), (200, repositories),
+        ]) as api, patch.object(linux_source_build, "_write_output") as output:
+            transcript = io.StringIO()
+            with patch.object(linux_source_build.sys, "stdout", transcript):
+                self.assertEqual(linux_source_build.mint_verifier_token(env), 0)
+            self.assertIn("::add-mask::" + token, transcript.getvalue())
+            self.assertNotIn("fixture", transcript.getvalue())
+            output.assert_called_once_with(env, {"token": token, "installation_id": "19"})
+            self.assertEqual(api.call_args_list[1].args[0], "/app/installations/19/access_tokens")
+            self.assertEqual(api.call_args_list[1].kwargs["payload"], {
+                "repositories": ["private-source"], "permissions": {"contents": "read"},
+            })
+        with patch.object(linux_source_build, "_source_inputs", return_value=identity), patch.object(
+            linux_source_build.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=b"s" * 256)
+        ), patch.object(linux_source_build, "_api_request", side_effect=[
+            (200, installation), (201, issued), (200, {"total_count": 2, "repositories": repositories["repositories"]}),
+        ]):
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build.mint_verifier_token(env)
 
     def test_shared_auditor_rejects_verdict_outside_the_plain_run_step(self):
         expected = linux_source_build._expected_run({
