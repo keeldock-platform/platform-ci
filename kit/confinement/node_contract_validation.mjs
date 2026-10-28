@@ -454,7 +454,7 @@ function validateAdvisories(advisories, inventory, semver) {
     for (const item of items) {
       if (item === null || typeof item !== 'object' || Array.isArray(item)
           || Object.getPrototypeOf(item) !== null
-          || typeof item.name !== 'string' || item.name !== name
+          || (item.name !== undefined && item.name !== name)
           || typeof item.vulnerable_versions !== 'string' || item.vulnerable_versions.length < 1
           || item.vulnerable_versions.length > 1024) reject('audit_response_invalid');
       let range;

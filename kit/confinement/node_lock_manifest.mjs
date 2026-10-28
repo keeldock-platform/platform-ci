@@ -276,7 +276,7 @@ function validateEntryMetadata(entry) {
       if (typeof funding.url !== 'string' || funding.url.length > 2048) reject('invalid_package');
       let url;
       try { url = new URL(funding.url); } catch { reject('invalid_package'); }
-      if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash
+      if (url.protocol !== 'https:' || url.username || url.password || url.hash
           || url.href !== funding.url) reject('invalid_package');
       if (funding.type !== undefined && (typeof funding.type !== 'string'
           || !/^[A-Za-z0-9._-]{1,64}$/u.test(funding.type))) reject('invalid_package');
