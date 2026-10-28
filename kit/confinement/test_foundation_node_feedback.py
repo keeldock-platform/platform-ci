@@ -342,6 +342,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                     )
             except Exception as error:
                 error.worker_events = tuple(events)
+                error.cwd_changes = tuple(cwd_changes)
                 raise
             self.assertEqual(cwd_changes[0], storage_root / "foundation-node-contract/project")
             self.assertEqual(cwd_changes[-1], Path.cwd())
@@ -381,6 +382,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         baseline = validation._core_contract_pattern_paths(validation.CORE_CONTRACT_FEEDBACK_FILES)
         expected = subject.NODE_FIXED_FILES | baseline["ts_sources"] | baseline["ts_tests"]
         self.assertEqual(copied, tuple(sorted(expected)))
+        self.assertEqual(set(copied), subject.NODE_REVIEWED_FILES)
         self.assertNotIn(".npmrc", copied)
         self.assertFalse(any("README" in path or "CONTRACT" in path or "CHANGELOG" in path for path in copied))
         self.assertEqual(producer.writes[0][1], lock_bytes)
@@ -547,11 +549,15 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         )
 
     def test_diagnostic_classifier_failure_keeps_cleanup_control_flow(self):
+        original_cwd = Path.cwd()
         with patch.object(subject, "_census_diagnostic", side_effect=RuntimeError):
-            self.assertEqual(
-                self._cleanup_diagnostic(census_error=CleanupRefusal(survivor_classes=("ps",))),
-                "source_gates_cleanup_unclassified",
-            )
+            with self.assertRaises(Exception) as caught:
+                self._run(
+                    "bootstrap", "lock", validated_tree="core_node_lock_return",
+                    census_error=CleanupRefusal(survivor_classes=("ps",)),
+                )
+        self.assertEqual(caught.exception.cleanup_diagnostic, "source_gates_cleanup_unclassified")
+        self.assertEqual(caught.exception.cwd_changes[-1], original_cwd)
         with patch.object(subject, "_command_cleanup_diagnostic", side_effect=RuntimeError):
             self.assertEqual(
                 self._cleanup_diagnostic(command_error=CleanupRefusal(probe_check="probe_process_census")),

@@ -51,7 +51,15 @@ VERSION_SPEC_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
 PACKAGE_ROOTS = (
     Path("crates/host/api"), Path("crates/host/mock"), Path("crates/host/conformance"),
 )
-FOUNDATION_FUZZ_TARGETS = frozenset(("identifiers", "tool_error_codes", "versions"))
+FOUNDATION_FUZZ_RUST_PATHS = (
+    "fuzz/src/main.rs",
+    "fuzz/fuzz_targets/identifiers.rs",
+    "fuzz/fuzz_targets/tool_error_codes.rs",
+    "fuzz/fuzz_targets/versions.rs",
+)
+FOUNDATION_FUZZ_TARGETS = frozenset(
+    Path(path).stem for path in FOUNDATION_FUZZ_RUST_PATHS[1:]
+)
 FOUNDATION_FUZZ_TARGET_RE = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\.rs\Z")
 MAX_FOUNDATION_FUZZ_TARGETS = 16
 FOUNDATION_FUZZ_MANIFESTS = ("fuzz/Cargo.toml", "fuzz/Cargo.lock")
@@ -247,13 +255,16 @@ def _validated_fuzz_rust_paths(source):
             names = sorted(entry.name for entry in iterator)
     except OSError:
         _refuse("manifest_invalid")
+    fixed_targets = {Path(path).name for path in FOUNDATION_FUZZ_RUST_PATHS[1:]}
     if (not 1 <= len(names) <= MAX_FOUNDATION_FUZZ_TARGETS
+            or not fixed_targets.issubset(set(names))
             or not FOUNDATION_FUZZ_TARGETS.issubset({name[:-3] for name in names})
             or any(len(name[:-3]) > 64 or FOUNDATION_FUZZ_TARGET_RE.fullmatch(name) is None
                    for name in names)):
         _refuse("manifest_invalid")
     paths = []
-    for relative in ("fuzz/src/main.rs",) + tuple("fuzz/fuzz_targets/" + name for name in names):
+    for relative in FOUNDATION_FUZZ_RUST_PATHS[:1] + tuple(
+            "fuzz/fuzz_targets/" + name for name in names):
         target = source / relative
         try:
             info = target.lstat()

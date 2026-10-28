@@ -21,6 +21,18 @@ NODE_FIXED_FILES = frozenset((
     ".node-version", "package.json", "tsconfig.base.json",
     "packages/host-api/package.json", "packages/host-api/tsconfig.json",
 ))
+NODE_REVIEWED_FILES = NODE_FIXED_FILES | frozenset((
+    "packages/host-api/src/budget.ts", "packages/host-api/src/effects.ts",
+    "packages/host-api/src/entitlements.ts", "packages/host-api/src/errors.ts",
+    "packages/host-api/src/ids.ts", "packages/host-api/src/index.ts",
+    "packages/host-api/src/manifest.ts", "packages/host-api/src/metadata.ts",
+    "packages/host-api/src/module.ts", "packages/host-api/src/plugin.ts",
+    "packages/host-api/src/result.ts", "packages/host-api/src/streams.ts",
+    "packages/host-api/src/version.ts", "packages/host-api/tests/budget-streams.test.ts",
+    "packages/host-api/tests/entitlements-errors.test.ts",
+    "packages/host-api/tests/ids-version.test.ts",
+    "packages/host-api/tests/manifest-metadata.test.ts",
+))
 PACKAGE_LOCK_PATH = "package-lock.json"
 PACKAGE_LOCK_TREE = "core_build_diagnostic_return_with_package_lock"
 SOURCE_IDENTITY_KEYS = ("source_sha", "base_sha", "control_sha", "reviewed_diff_sha256")
@@ -178,7 +190,7 @@ def _reviewed_files(source_runtime, mode, producer, source):
         _refuse(producer, "manifest_invalid")
     required = set(BOOTSTRAP_MANIFESTS)
     if mode == "verify":
-        required.update(NODE_FIXED_FILES)
+        required.update(NODE_REVIEWED_FILES)
     if not required.issubset(source_files):
         _refuse(producer, "manifest_invalid")
     if mode == "bootstrap":
@@ -207,7 +219,7 @@ def _reviewed_files(source_runtime, mode, producer, source):
             or len(matched["ts_tests"]) > source_runtime.MAX_CORE_CONTRACT_TS_TESTS
             or not required_ts.issubset(selected)):
         _refuse(producer, "manifest_invalid")
-    return tuple(sorted(NODE_FIXED_FILES | selected))
+    return tuple(sorted(NODE_REVIEWED_FILES | selected))
 
 
 def _node_environment(storage, node, contract):

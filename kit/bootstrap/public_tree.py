@@ -50,6 +50,7 @@ PLATFORM_FILES = frozenset(
         'kit/confinement/test_node_lock_receipt.py',
         ".github/workflows/linux-confinement.yml",
         ".github/workflows/windows-attestation-permission-probe.yml",
+        ".github/workflows/attestation-probe.yml",
         ".github/workflows/macos-capability.yml",
         ".github/workflows/macos-reviewed-build.yml",
         ".github/workflows/macos-rust-toolchain-smoke.yml",
@@ -110,6 +111,18 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/windows_native_preflight.cs",
         "kit/confinement/windows_native_preflight.ps1",
         "kit/confinement/test_windows_native_preflight.py",
+        ".github/workflows/windows-confinement.yml",
+        "kit/confinement/windows_confinement.cs",
+        "kit/confinement/windows_confinement.ps1",
+        "kit/confinement/test_windows_confinement.py",
+        "kit/confinement/confinement_verdict.py",
+        "kit/confinement/test_confinement_verdict.py",
+        "kit/confinement/attestation_probe.py",
+        "kit/confinement/test_attestation_probe.py",
+        "kit/confinement/confinement_public_audit.py",
+        "kit/confinement/test_confinement_public_audit.py",
+        "kit/confinement/log_canary.py",
+        "kit/confinement/test_log_canary.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
@@ -121,8 +134,8 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    'kit/confinement/foundation_node_feedback.py': '37b0c620d8c4d53ac623cbe176fe0783cf9e2ab395bc3527db1f6999dfe33c4d',
-    'kit/confinement/test_foundation_node_feedback.py': '5c16a4c6d57d99ca9d5e68853ce84ae517c8cff50dc0a28b5bebd377897a93be',
+    'kit/confinement/foundation_node_feedback.py': '9bdbbccd22bbe66461d7310852de98688c39da05088cedf25e2eabcc43f24f29',
+    'kit/confinement/test_foundation_node_feedback.py': 'cd58fa451fce51a95aa647446ebf6efce881fe8297e6370e16a81ff06b560cab',
     'kit/confinement/macos_node_contract.py': '890cd2891954d4abf7db85ec4295e7aa01c4e2ca3a083ef7537904e3c3c1aeb6',
     'kit/confinement/test_macos_node_contract.py': 'e82debccbaeaba990256babe32dd9ff36dcc8d4542a411b56e67034aff4a293c',
     'kit/confinement/node_contract_validation.mjs': '5d5c06ef75a7194858b707685b40ab39155f2f0ea0dde1633b286bc2709f5920',
@@ -171,8 +184,8 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/node-lock-return.yml': '6e9c157462984967427fc33961fcd2f7ca3b9755ff180d4561c981846d0b6cc0',
     '.github/workflows/core-rust-format-return.yml': '5ac5147ad14a7948320b7cdf90be19ccfca8ac57045139ee38558ecd4c5863ca',
     '.github/workflows/core-build-diagnostic-return.yml': 'a667f3ca1bf73458eb39585d694eb443f5971cbe856a0b7ff49f9d7c24ed6ab4',
-    'kit/confinement/macos_feedback_producer.py': 'e3e4751a87df461f74114530e9e51591e9d1aae6dd904140c3361f763a83d6db',
-    'kit/confinement/test_macos_feedback_producer.py': 'd240693d16bd8ec04cd473ab2f08f2ec0e482263886887b2f0ebe6c020e098d6',
+    'kit/confinement/macos_feedback_producer.py': 'e8e8fa65e807a9c4db78dfbc157d73cd4c1f62686aa8ca69fc9343ef0fd97fbc',
+    'kit/confinement/test_macos_feedback_producer.py': 'cf46e5ae0a160f158dc4ab35928bcab55bffe89ce682867f6815cd78b0c54d4c',
     'kit/confinement/feedback_producer_crypto.mjs': 'e621131afec27d78b170e207843e76e20d4f9682cf2323c3a787ac53b6db60da',
     'kit/confinement/test_feedback_producer_crypto.mjs': '1f70ec5fd25a02257f9bf857afcd244383aec71906e45fd4ed67809c279a9c10',
     'kit/confinement/feedback_admin.py': '4f39933cf4985926c141240644d783121bbb161e5386ceab842f592d41ca2e9a',

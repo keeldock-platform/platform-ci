@@ -8,10 +8,16 @@ from policy import PolicyError, validate_workflow_text
 from public_tree import PINNED_FILE_SHA256, PLATFORM_FILES, scan_tree
 
 
-__all__ = ["WindowsWorkflowPolicyTests", "WindowsLaneRegistryTests", "WindowsLanePublicTreeTests"]
+__all__ = [
+    "WindowsWorkflowPolicyTests",
+    "WindowsConfinementWorkflowTests",
+    "WindowsLaneRegistryTests",
+    "WindowsLanePublicTreeTests",
+]
 
 ROOT = Path(__file__).resolve().parents[2]
 WINDOWS_NATIVE_PREFLIGHT_WORKFLOW = ROOT / ".github/workflows/windows-native-preflight.yml"
+WINDOWS_CONFINEMENT_WORKFLOW = ROOT / ".github/workflows/windows-confinement.yml"
 WINDOWS_WORKFLOW_SHA256_BEFORE_SPLIT = "da294aadfc0e99cbe109aba90f9fb86df65867cd32d3325d26a9e9a5b035e5bb"
 WINDOWS_LANE_FILES = (
     ".github/workflows/windows-native-preflight.yml",
@@ -20,6 +26,10 @@ WINDOWS_LANE_FILES = (
     "kit/confinement/windows_native_preflight.cs",
     "kit/confinement/windows_native_preflight.ps1",
     "kit/confinement/test_windows_native_preflight.py",
+    ".github/workflows/windows-confinement.yml",
+    "kit/confinement/windows_confinement.cs",
+    "kit/confinement/windows_confinement.ps1",
+    "kit/confinement/test_windows_confinement.py",
 )
 
 
@@ -75,6 +85,73 @@ class WindowsWorkflowPolicyTests(unittest.TestCase):
                     validate_workflow_text(changed, "platform", "windows-native-preflight")
 
 
+class WindowsConfinementWorkflowTests(unittest.TestCase):
+    def test_actual_confinement_workflow_matches_the_reviewed_template(self):
+        workflow = WINDOWS_CONFINEMENT_WORKFLOW.read_text(encoding="utf-8")
+        self.assertTrue(validate_workflow_text(workflow, "platform", "windows-confinement"))
+        self.assertEqual(
+            workflow.encode("utf-8"),
+            policy_windows.WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE.encode("utf-8"),
+        )
+        self.assertEqual(workflow.count("runs-on: windows-2025\n"), 2)
+        self.assertIn("permissions: {}\n", workflow)
+        self.assertIn("  workflow_dispatch:\n", workflow)
+        self.assertIn("  push:\n", workflow)
+        self.assertIn("  pull_request:\n", workflow)
+        self.assertIn(
+            "if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}",
+            workflow,
+        )
+        self.assertIn("windows_confinement.ps1 -Mode compile", workflow)
+        self.assertIn("windows_confinement.ps1 -Mode spike", workflow)
+        self.assertIn("test_windows_confinement.py", workflow)
+        for forbidden in (
+            "inputs:",
+            "secrets.",
+            "uses:",
+            "upload-artifact",
+            "download-artifact",
+            "attest",
+            "cache:",
+            "outputs:",
+            "contents:",
+            "id-token",
+            "environment:",
+            "continue-on-error",
+            "pull_request_target",
+            chr(35),
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, workflow)
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "connect", "windows-confinement")
+        with self.assertRaises(PolicyError):
+            validate_workflow_text(workflow, "platform")
+
+    def test_confinement_workflow_rejects_trigger_runner_and_execution_changes(self):
+        base = WINDOWS_CONFINEMENT_WORKFLOW.read_text(encoding="utf-8")
+        mutations = (
+            base.replace("  pull_request:\n", "  pull_request_target:\n"),
+            base.replace("  workflow_dispatch:\n", ""),
+            base.replace("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", "true"),
+            base.replace("github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/feature'"),
+            base.replace("runs-on: windows-2025", "runs-on: windows-latest", 1),
+            base.replace("permissions: {}\n", "permissions:\n  contents: read\n"),
+            base.replace("-Mode spike", "-Mode compile"),
+            base.replace("      - name: Compile native confinement module\n", ""),
+            base.replace("python -B kit/confinement/test_windows_confinement.py\n", ""),
+            base.replace("    needs: windows-policy\n", ""),
+            base.replace("        run: |\n", "        continue-on-error: true\n        run: |\n", 1),
+            base.replace("    steps:\n", "    environment: source-read\n    steps:\n", 1),
+            base + "  extra:\n    runs-on: windows-2025\n    steps: []\n",
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(mutation_index=index):
+                self.assertNotEqual(changed, base)
+                with self.assertRaises(PolicyError):
+                    validate_workflow_text(changed, "platform", "windows-confinement")
+
+
 class WindowsLaneRegistryTests(unittest.TestCase):
     def test_moved_template_is_byte_for_byte_the_pre_split_template(self):
         template = policy_windows.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE
@@ -97,7 +174,10 @@ class WindowsLaneRegistryTests(unittest.TestCase):
     def test_lane_declares_only_the_windows_workflow_and_no_digest_pins(self):
         self.assertEqual(
             dict(policy_windows.WORKFLOW_TEMPLATES),
-            {"windows-native-preflight": policy_windows.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE},
+            {
+                "windows-native-preflight": policy_windows.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE,
+                "windows-confinement": policy_windows.WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE,
+            },
         )
         self.assertEqual(dict(policy_windows.WORKFLOW_SHA256), {})
         self.assertEqual(
@@ -108,11 +188,21 @@ class WindowsLaneRegistryTests(unittest.TestCase):
                     "windows-native-preflight",
                     "windows-workflow-too-large",
                 ),
+                (
+                    ".github/workflows/windows-confinement.yml",
+                    "windows-confinement",
+                    "windows-confinement-workflow-too-large",
+                ),
             ),
         )
 
     def test_registry_routes_the_windows_kind_to_the_windows_lane(self):
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["windows-confinement"], policy_windows)
+        self.assertEqual(
+            policy.LANE_WORKFLOW_TEMPLATES["windows-confinement"],
+            policy_windows.WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE,
+        )
         self.assertEqual(
             policy.LANE_WORKFLOW_TEMPLATES["windows-native-preflight"],
             policy_windows.WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE,
