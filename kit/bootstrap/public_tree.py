@@ -126,6 +126,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/test_confinement_public_audit.py",
         "kit/confinement/log_canary.py",
         "kit/confinement/test_log_canary.py",
+        "kit/confinement/release_evidence.py",
+        "kit/confinement/test_release_evidence.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
@@ -200,6 +202,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_feedback_api.py': 'a748ca0ad084de64bbec47f4d2413f4ae35d6b932d8010847f59cec700f27fae',
     'kit/confinement/feedback_public_audit.py': 'beef023a68e01343c5e8f3e883ba99be75f79924eeaca8fdcaabe9d7401960cb',
     'kit/confinement/test_feedback_public_audit.py': '4a7b822645c7051a4f1999e5961482000a0c58c7c31d9a6ec106a88b8426b5e7',
+    'kit/confinement/release_evidence.py': '98c4363e170572dc94415391e0d8590682f6cbdd7e1561ff93f55a4eb44ce062',
+    'kit/confinement/test_release_evidence.py': 'bfde296555a20125faf1f9697eff55368e2f931443c56ef4c0ff8a768406d18b',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(
