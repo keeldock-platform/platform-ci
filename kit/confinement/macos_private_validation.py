@@ -235,16 +235,57 @@ CORE_CONTRACT_MANIFEST_ASSIGNMENT_PATTERN = re.compile(r"([A-Za-z0-9_.-]{1,64})\
 CORE_CONTRACT_MANIFEST_NAME_PATTERN = re.compile(r'"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"\Z')
 CORE_CONTRACT_MANIFEST_TEXT_PATTERN = re.compile(r'"[A-Za-z0-9 ,.:()-]{1,256}"\Z')
 CORE_CONTRACT_MANIFEST_WORKSPACE_VALUE_PATTERN = re.compile(r"\{\s*workspace\s*=\s*true\s*\}\Z")
-CORE_CONTRACT_ROOT_SECTIONS = frozenset((
-    "[workspace]", "[workspace.package]", "[workspace.dependencies]",
-    "[workspace.lints.rust]", "[workspace.lints.clippy]",
-))
-CORE_CONTRACT_ROOT_PATH_LINE_PATTERN = re.compile(
-    r'(keeldock' r'-host-(?:api|mock))\s*=\s*\{\s*path\s*=\s*"(crates/host/(?:api|mock))"\s*\}\Z'
-)
 CORE_CONTRACT_ROOT_PATH_DEPENDENCIES = {
     "keeldock" "-host-api": "crates/host/api",
     "keeldock" "-host-mock": "crates/host/mock",
+}
+CORE_CONTRACT_ROOT_ASSIGNMENT_PATTERN = re.compile(r"([a-z][a-z0-9_-]{0,63}) = (.{1,512})\Z")
+CORE_CONTRACT_ROOT_ARRAY_ITEM = r'"[A-Za-z0-9/_-]{1,128}"'
+CORE_CONTRACT_ROOT_ARRAY_PATTERN = re.compile(
+    r"\[(?:\s*" + CORE_CONTRACT_ROOT_ARRAY_ITEM + r"(?:\s*,\s*" + CORE_CONTRACT_ROOT_ARRAY_ITEM
+    + r")*\s*,?)?\s*\]\Z"
+)
+CORE_CONTRACT_ROOT_ARRAY_LINE_PATTERN = re.compile(CORE_CONTRACT_ROOT_ARRAY_ITEM + r",?\Z")
+CORE_CONTRACT_ROOT_RESOLVER_PATTERN = re.compile(r'"[0-9]{1,2}"\Z')
+CORE_CONTRACT_ROOT_VERSION_PATTERN = re.compile(r'"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"\Z')
+CORE_CONTRACT_ROOT_EDITION_PATTERN = re.compile(r'"[0-9]{4}"\Z')
+CORE_CONTRACT_ROOT_BOOLEAN_PATTERN = re.compile(r"(?:true|false)\Z")
+CORE_CONTRACT_ROOT_LEVEL_PATTERN = re.compile(r'"(?:forbid|deny|warn)"\Z')
+CORE_CONTRACT_ROOT_LEVEL_TABLE_PATTERN = re.compile(
+    r'\{\s*level\s*=\s*"(?:forbid|deny|warn)"\s*,\s*priority\s*=\s*-?[0-9]{1,3}\s*\}\Z'
+)
+CORE_CONTRACT_ROOT_KEYS = {
+    "[workspace]": {
+        "resolver": CORE_CONTRACT_ROOT_RESOLVER_PATTERN,
+        "members": CORE_CONTRACT_ROOT_ARRAY_PATTERN,
+        "exclude": CORE_CONTRACT_ROOT_ARRAY_PATTERN,
+    },
+    "[workspace.package]": {
+        "version": CORE_CONTRACT_ROOT_VERSION_PATTERN,
+        "edition": CORE_CONTRACT_ROOT_EDITION_PATTERN,
+        "rust-version": CORE_CONTRACT_ROOT_VERSION_PATTERN,
+        "publish": CORE_CONTRACT_ROOT_BOOLEAN_PATTERN,
+    },
+    "[workspace.dependencies]": {
+        name: re.compile(r"\{\s*path\s*=\s*" + '"' + re.escape(path) + '"' + r"\s*\}\Z")
+        for name, path in CORE_CONTRACT_ROOT_PATH_DEPENDENCIES.items()
+    },
+    "[workspace.lints.rust]": {
+        "unsafe_code": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "unsafe_op_in_unsafe_fn": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "missing_docs": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "unreachable_pub": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "warnings": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+    },
+    "[workspace.lints.clippy]": {
+        "all": CORE_CONTRACT_ROOT_LEVEL_TABLE_PATTERN,
+        "unwrap_used": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "expect_used": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "panic": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "indexing_slicing": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "cast_possible_truncation": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "undocumented_unsafe_blocks": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+    },
 }
 CORE_CONTRACT_SNAKE_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z")
 CORE_CONTRACT_TS_SOURCE_PATH_PATTERN = re.compile(
@@ -1917,26 +1958,40 @@ def _core_contract_crate_manifest_shape(text):
 
 
 def _core_contract_workspace_paths_shape(workspace_text):
-    if type(workspace_text) is not str or "\r" in workspace_text:
+    if type(workspace_text) is not str or "\r" in workspace_text or "\x00" in workspace_text:
         return False
-    found = {}
+    section = None
+    seen = {}
+    open_array = False
     for line in workspace_text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith(chr(35)):
             continue
-        if stripped.startswith("["):
-            if stripped not in CORE_CONTRACT_ROOT_SECTIONS:
+        if open_array:
+            if stripped == "]":
+                open_array = False
+            elif CORE_CONTRACT_ROOT_ARRAY_LINE_PATTERN.fullmatch(stripped) is None:
                 return False
             continue
-        if re.search(r"\bpath\b", stripped) is None:
+        if stripped.startswith("["):
+            if stripped not in CORE_CONTRACT_ROOT_KEYS or stripped in seen:
+                return False
+            section = stripped
+            seen[section] = set()
             continue
-        match = CORE_CONTRACT_ROOT_PATH_LINE_PATTERN.fullmatch(stripped)
-        if match is None or match.group(1) in found:
+        assignment = CORE_CONTRACT_ROOT_ASSIGNMENT_PATTERN.fullmatch(stripped)
+        if section is None or assignment is None:
             return False
-        found[match.group(1)] = match.group(2)
-    return all(
-        CORE_CONTRACT_ROOT_PATH_DEPENDENCIES.get(name) == path for name, path in found.items()
-    )
+        key, value = assignment.group(1), assignment.group(2)
+        shape = CORE_CONTRACT_ROOT_KEYS[section].get(key)
+        if shape is None or key in seen[section]:
+            return False
+        seen[section].add(key)
+        if shape is CORE_CONTRACT_ROOT_ARRAY_PATTERN and value == "[":
+            open_array = True
+        elif shape.fullmatch(value) is None:
+            return False
+    return not open_array and "members" in seen.get("[workspace]", ())
 
 
 def _core_contract_path_name(path, pattern):

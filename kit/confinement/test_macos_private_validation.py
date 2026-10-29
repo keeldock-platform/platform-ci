@@ -977,6 +977,133 @@ class CoreContractTreeTests(unittest.TestCase):
                     "workspace_members",
                 )
 
+    @staticmethod
+    def _real_root_manifest():
+        hash_mark = chr(35)
+        lines = (
+            hash_mark + " Contract workspace root.",
+            hash_mark + " The runtime workspace is separate and is not listed here.",
+            "[workspace]",
+            'resolver = "3"',
+            "members = [",
+            '    "crates/host/api",',
+            '    "crates/host/mock",',
+            '    "crates/host/conformance",',
+            '    "crates/kernel/i18n",',
+            "]",
+            hash_mark + " Guard for the runtime crates (see section \u00a7 3 of the layout notes).",
+            "exclude = [",
+            '    "crates/host/core",',
+            '    "crates/host/registry",',
+            '    "crates/host/extensions",',
+            '    "crates/host/links",',
+            '    "crates/host/mcp",',
+            '    "crates/host/mcp-host",',
+            '    "crates/host/mcp-shim",',
+            '    "crates/host/settings-schema",',
+            '    "crates/services",',
+            '    "crates/apps",',
+            '    "apps",',
+            "]",
+            "",
+            "[workspace.package]",
+            'version = "0.1.0"',
+            'edition = "2024"',
+            'rust-version = "1.99.1"',
+            "publish = false",
+            "",
+            "[workspace.dependencies]",
+            'keeldock' '-host-api = { path = "crates/host/api" }',
+            'keeldock' '-host-mock = { path = "crates/host/mock" }',
+            "",
+            hash_mark + " On from the first commit.",
+            "[workspace.lints.rust]",
+            'unsafe_code = "forbid"',
+            'unsafe_op_in_unsafe_fn = "deny"',
+            'missing_docs = "warn"',
+            'unreachable_pub = "warn"',
+            'warnings = "deny"',
+            "",
+            "[workspace.lints.clippy]",
+            'all = { level = "warn", priority = -1 }',
+            'unwrap_used = "deny"',
+            'expect_used = "deny"',
+            'panic = "deny"',
+            'indexing_slicing = "deny"',
+            'cast_possible_truncation = "deny"',
+            'undocumented_unsafe_blocks = "deny"',
+            "",
+        )
+        return "\n".join(lines)
+
+    def test_workspace_paths_shape_accepts_the_real_contract_root(self):
+        text = self._real_root_manifest()
+        self.assertTrue(text.isascii() is False)
+        self.assertTrue(subject._core_contract_workspace_paths_shape(text))
+        self.assertEqual(
+            subject._core_contract_workspace_members(text),
+            ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS],
+        )
+        self.assertEqual(
+            self._validate_feedback_tree(
+                self._required_core_contract_entries("core-rust-format-return"),
+                "core-rust-format-return", workspace_text=text,
+            )[0],
+            subject.CORE_CONTRACT_TREE_BY_CONCERN["core-rust-format-return"],
+        )
+
+    def test_workspace_paths_shape_is_a_full_allowlist(self):
+        real = self._real_root_manifest()
+        hash_mark = chr(35)
+        dependency = 'keeldock' '-host-api = { path = "crates/host/api" }\n'
+        forms = (
+            ("dotted key before workspace", 'patch.crates-io.evil = { path = "../evil" }\n' + real),
+            ("dotted key in workspace", real.replace('resolver = "3"\n', 'resolver = "3"\npatch.evil.path = "../evil"\n')),
+            ("dotted key in dependencies", real.replace(dependency, dependency + 'evil.path = "../evil"\n')),
+            ("key before any section", 'name = "evil"\n' + real),
+            ("quoted path key", real.replace(dependency, 'keeldock' '-host-api = { "path" = "crates/host/api" }\n')),
+            ("quoted dependency key", real.replace(dependency, '"keeldock' '-host-api" = { path = "crates/host/api" }\n')),
+            ("escaped key", real.replace('resolver', '"resolv\\u0065r"')),
+            ("single quoted key", real.replace('resolver', "'resolver'")),
+            ("uppercase key", real.replace('resolver', "Resolver")),
+            ("unknown key in workspace", real.replace('resolver = "3"\n', 'resolver = "3"\ndefault-members = ["crates/host/api"]\n')),
+            ("unknown key in package", real.replace('publish = false\n', 'publish = false\nlicense = "MIT"\n')),
+            ("unknown lint key", real.replace('warnings = "deny"\n', 'warnings = "deny"\nevil = "deny"\n')),
+            ("allow level", real.replace('warnings = "deny"', 'warnings = "allow"')),
+            ("inline table where string expected", real.replace('resolver = "3"', 'resolver = { path = "../evil" }')),
+            ("inline table in package", real.replace('publish = false', 'publish = { path = "../evil" }')),
+            ("extra inline key", real.replace('{ path = "crates/host/api" }', '{ path = "crates/host/api", package = "evil" }')),
+            ("trailing comment on value", real.replace('publish = false', 'publish = false ' + hash_mark + ' note')),
+            ("trailing content after array", real.replace('    "crates/kernel/i18n",\n]\n', '    "crates/kernel/i18n",\n] extra\n')),
+            ("unterminated array", real.replace('    "apps",\n]\n', '    "apps",\n')),
+            ("bad array item", real.replace('    "apps",\n', '    evil,\n')),
+            ("duplicate key", real.replace('resolver = "3"\n', 'resolver = "3"\nresolver = "3"\n')),
+            ("duplicate section", real + '[workspace.package]\nversion = "0.1.0"\n'),
+            ("unknown section", real + '[package]\nname = "evil"\n'),
+            ("profile section", real + '[profile.release]\nopt-level = 3\n'),
+            ("patch section", real + '[patch.crates-io]\nevil = { path = "../evil" }\n'),
+            ("replace section", real + '[replace]\n"evil:1.0.0" = { path = "../evil" }\n'),
+            ("source section", real + '[source.crates-io]\nreplace-with = "evil"\n'),
+            ("array section", real + '[[bin]]\nname = "tool"\n'),
+            ("quoted section", real.replace('[workspace.package]', '["workspace".package]')),
+            ("section with trailing comment", real.replace('[workspace.package]', '[workspace.package] ' + hash_mark + ' note')),
+            ("carriage return", real.replace("\n", "\r\n")),
+            ("nul byte", real + "\x00"),
+            ("non-ascii key", real.replace('resolver', 'resolv\u00e9r')),
+        )
+        for name, text in forms:
+            with self.subTest(form=name):
+                self.assertFalse(subject._core_contract_workspace_paths_shape(text))
+                self.assertEqual(
+                    self._refused_check(
+                        self._required_core_contract_entries("core-rust-format-return"),
+                        "core-rust-format-return", workspace_text=text,
+                    ),
+                    "workspace_members",
+                )
+        self.assertFalse(subject._core_contract_workspace_paths_shape(None))
+        self.assertFalse(subject._core_contract_workspace_paths_shape(real.encode("utf-8")))
+
     def test_build_diagnostic_tree_marker_distinguishes_optional_root_lock(self):
         concern = "core-build-diagnostic-return"
         entries = self._required_core_contract_entries(concern)
