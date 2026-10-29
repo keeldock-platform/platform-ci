@@ -10,6 +10,11 @@ import urllib.request
 
 
 REPOSITORY = "keeldock-platform/platform-ci"
+APPROVED_HOST_RELEASES = (
+    ("15.7.9", "20260907.0337.1"),
+    ("15.8.2", "20261028.0489.1"),
+)
+APPROVED_HOST_RELEASE_FIRST_RUNS = {("15.8.2", "20261028.0489.1"): "40941660825"}
 WORKFLOW_PATH = ".github/workflows/macos-capability.yml"
 NATIVE_JOB_NAME = "macos-capability"
 REVIEWED_WORKFLOW_PATH = ".github/workflows/macos-reviewed-build.yml"
@@ -475,6 +480,13 @@ CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
 CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(
     CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS
 )
+CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS = frozenset((
+    "context_guard_platform_unapproved", "context_guard_preflight_unavailable",
+    "context_guard_pf_unavailable", "context_guard_pf_rules_unexpected",
+    "context_guard_cleanup_incomplete", "context_rust_invalid_input",
+    "context_rust_runner_unavailable", "context_rules_control_identity_invalid",
+    "context_rules_context_unavailable",
+))
 CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "none", "unavailable", "load_controls", "review_binding", "host_preflight",
     "temp_root_check", "smoke_receipt", "token_input", "token_revocation",
@@ -504,7 +516,7 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     CORE_CONTRACT_RUNTIME_DIAGNOSTICS | CORE_CONTRACT_FETCH_DIAGNOSTICS
     | CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS | CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS
     | CORE_CONTRACT_GATE_DIAGNOSTICS | CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS
-    | CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS
+    | CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS | CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS
 )
 CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS = frozenset((
     "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",
@@ -809,9 +821,7 @@ def validate_receipt(encoded, control_sha, run_id, run_attempt):
         _fail("receipt_invalid")
     fixed_values = {
         "boundary": "seatbelt-deny-default",
-        "macos_product_version": "15.7.9",
         "runner_image_os": "macos-15-arm64",
-        "runner_image_version": "20260907.0337.1",
         "developer_mode": "disabled",
         "pf": "enforced",
         "sandbox_selftest": "enforced",
@@ -821,6 +831,9 @@ def validate_receipt(encoded, control_sha, run_id, run_attempt):
     for key, expected in fixed_values.items():
         if type(value[key]) is not type(expected) or value[key] != expected:
             _fail("receipt_invalid")
+    if (type(value["macos_product_version"]) is not str or type(value["runner_image_version"]) is not str
+            or (value["macos_product_version"], value["runner_image_version"]) not in APPROVED_HOST_RELEASES):
+        _fail("receipt_invalid")
     channels = value["channels"]
     if type(channels) is not dict or channels != EXPECTED_CHANNELS:
         _fail("receipt_invalid")

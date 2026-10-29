@@ -132,6 +132,11 @@ SUMMARY_GUARD_CHECKS = frozenset((
     "protect_controls_directory_permissions", "protect_controls_file_reference",
     "protect_controls_file_type_owner", "protect_controls_file_permissions",
 ))
+CONTEXT_GUARD_REASONS = (
+    "platform_unapproved", "preflight_unavailable", "pf_unavailable", "pf_rules_unexpected",
+    "cleanup_incomplete",
+)
+CONTEXT_GUARD_DIAGNOSTICS = frozenset("context_guard_" + reason for reason in CONTEXT_GUARD_REASONS)
 SUMMARY_GUARD_PROTECT_CHECKS = frozenset((
     "workspace_owner", "directory_type_owner", "directory_permissions",
     "file_reference", "file_type_owner", "file_permissions",
@@ -253,10 +258,14 @@ os.write(1, b"plan-id-snapshot=read-only\n")
 
 class Refusal(Exception):
     def __init__(self, reason, stage, *, embedded_formula_sha256=None, verified_bottle_sha256=None,
-                 diagnostic=None):
+                 diagnostic=None, context_diagnostic=None):
         self.reason = reason if type(reason) is str and reason in REASONS else "internal_error"
         self.stage = stage if type(stage) is str and stage in STAGES else "context"
         self.diagnostic = diagnostic if type(diagnostic) is str and diagnostic in SUMMARY_GUARD_CHECKS else None
+        self.context_diagnostic = (
+            context_diagnostic
+            if type(context_diagnostic) is str and context_diagnostic in CONTEXT_GUARD_DIAGNOSTICS else None
+        )
         self.embedded_formula_sha256 = (
             embedded_formula_sha256
             if type(embedded_formula_sha256) is str and SHA256_RE.fullmatch(embedded_formula_sha256)
@@ -418,6 +427,19 @@ def _parse_request(argv):
     return {"source_sha": source_sha, "base_sha": base_sha, "base_branch": branch, "concern": concern}
 
 
+def _guard_context_diagnostic(error, boundary):
+    try:
+        guard_error = getattr(boundary, "GuardError", None)
+        reason = getattr(error, "reason", None)
+        if type(guard_error) is type and isinstance(error, guard_error) and type(reason) is str:
+            token = "context_guard_" + reason
+            if token in CONTEXT_GUARD_DIAGNOSTICS:
+                return token
+    except BaseException:
+        pass
+    return None
+
+
 def _public_context(environ, reviewed, capability, boundary):
     control = environ.get("CI_SHA", "")
     if (not _valid_sha(control) or environ.get("CI_EVENT_NAME") != "workflow_dispatch"
@@ -429,8 +451,10 @@ def _public_context(environ, reviewed, capability, boundary):
         binding = reviewed._binding(control, environ)
         root = capability._check_context(control, environ.get("CI_WORKSPACE", ""))
         identity = boundary.check_platform()
-    except BaseException:
-        raise Refusal("context_unavailable", "context") from None
+    except BaseException as error:
+        raise Refusal(
+            "context_unavailable", "context", context_diagnostic=_guard_context_diagnostic(error, boundary),
+        ) from None
     if (not _safe_id(binding.get("run_id")) or not _safe_id(binding.get("run_attempt"))
             or identity.architecture != "arm64"):
         raise Refusal("control_identity_invalid", "context")

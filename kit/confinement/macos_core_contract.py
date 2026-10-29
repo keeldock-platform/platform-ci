@@ -240,11 +240,25 @@ CLEANUP_DIAGNOSTICS = frozenset((
     "cleanup_summary_probe", "cleanup_summary_restore", "cleanup_summary_close", "cleanup_dash",
     "cleanup_unknown",
 )) | SOURCE_GATES_CLEANUP_DIAGNOSTICS
+FOREIGN_CONTEXT_REASONS = (
+    ("guard", "macos_boundary_guard", (
+        "platform_unapproved", "preflight_unavailable", "pf_unavailable", "pf_rules_unexpected",
+        "cleanup_incomplete",
+    )),
+    ("rust", "macos_rust_toolchain", ("invalid_input", "runner_unavailable")),
+    ("rules", "macos_rules_bootstrap", ("control_identity_invalid", "context_unavailable")),
+)
+FOREIGN_CONTEXT_DIAGNOSTICS = frozenset(
+    "context_" + tag + "_" + reason
+    for tag, unused_module, reasons in FOREIGN_CONTEXT_REASONS
+    for reason in reasons
+)
+FOREIGN_CONTEXT_MODULE_TAGS = {module: tag for tag, module, unused_reasons in FOREIGN_CONTEXT_REASONS}
 DIAGNOSTICS = (
     OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | SOURCE_RUNTIME_DIAGNOSTICS
     | SOURCE_FETCH_DIAGNOSTICS | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
     | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS | SUMMARY_GUARD_DIAGNOSTICS
-    | frozenset(("none", "unavailable"))
+    | FOREIGN_CONTEXT_DIAGNOSTICS | frozenset(("none", "unavailable"))
 )
 DETAILED_DIAGNOSTICS = DIAGNOSTICS - frozenset(("none", "unavailable"))
 NO_OPERATION_STAGES = frozenset(("arguments", "context", "host"))
@@ -316,6 +330,9 @@ class _FailureDiagnostics:
         diagnostic = getattr(error, "diagnostic", None)
         if (type(diagnostic) is str
                 and diagnostic in (OPERATION_DIAGNOSTICS | PRESERVED_SOURCE_DIAGNOSTICS)):
+            return Refusal(reason, stage, diagnostic=diagnostic)
+        if (type(error) is Refusal and stage == "context" and type(diagnostic) is str
+                and diagnostic in FOREIGN_CONTEXT_DIAGNOSTICS):
             return Refusal(reason, stage, diagnostic=diagnostic)
         if (type(error) is Refusal and reason == "summary_guard_failed" and stage == "summary_guard"
                 and type(diagnostic) is str
@@ -461,6 +478,22 @@ def _load_controls():
     return reviewed, capability, boundary, runtime, rust, rules
 
 
+def _foreign_context_diagnostic(error):
+    try:
+        carried = getattr(error, "context_diagnostic", None)
+        if type(carried) is str and carried in FOREIGN_CONTEXT_DIAGNOSTICS:
+            return carried
+        tag = FOREIGN_CONTEXT_MODULE_TAGS.get(getattr(type(error), "__module__", None))
+        reason = getattr(error, "reason", None)
+        if tag is not None and type(reason) is str:
+            token = "context_" + tag + "_" + reason
+            if token in FOREIGN_CONTEXT_DIAGNOSTICS:
+                return token
+    except BaseException:
+        pass
+    return None
+
+
 def _validate_context(environ, reviewed, capability, boundary, rust):
     control_sha = environ.get("CI_SHA", "")
     if not _valid_sha(control_sha):
@@ -472,8 +505,10 @@ def _validate_context(environ, reviewed, capability, boundary, rust):
         run_id, run_attempt, runner_temp = rust._strict_context(environ, control_sha)
     except Refusal:
         raise
-    except BaseException:
-        raise Refusal("runner_unavailable", "context") from None
+    except BaseException as error:
+        raise Refusal(
+            "runner_unavailable", "context", diagnostic=_foreign_context_diagnostic(error),
+        ) from None
     if (binding.get("control_sha") != control_sha or binding.get("run_id") != run_id
             or binding.get("run_attempt") != run_attempt or not _safe_id(run_id)
             or not _safe_id(run_attempt) or not isinstance(root, Path)):

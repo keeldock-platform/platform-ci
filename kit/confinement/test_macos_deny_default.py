@@ -408,6 +408,23 @@ class DenyDefaultPolicyTests(unittest.TestCase):
                 with self.assertRaises(deny.Refusal):
                     deny._native_receipt(CONTROL_SHA, "12345", "2", identity)
 
+    def test_receipt_accepts_each_approved_host_release_and_refuses_a_mixed_pair(self):
+        self.assertEqual(
+            deny.APPROVED_HOST_RELEASES,
+            (("15.7.9", "20260907.0337.1"), ("15.8.2", "20261028.0489.1")),
+        )
+        for product, image_version in deny.APPROVED_HOST_RELEASES:
+            with self.subTest(product=product):
+                identity = dict(IDENTITY, product_version=product, image_version=image_version)
+                receipt = deny._native_receipt(CONTROL_SHA, "12345", "2", identity)
+                self.assertEqual(receipt["macos_product_version"], product)
+                self.assertEqual(receipt["runner_image_version"], image_version)
+        for product, image_version in (("15.8.2", "20260907.0337.1"), ("15.7.9", "20261028.0489.1")):
+            with self.subTest(mixed=(product, image_version)):
+                identity = dict(IDENTITY, product_version=product, image_version=image_version)
+                with self.assertRaises(deny.Refusal):
+                    deny._native_receipt(CONTROL_SHA, "12345", "2", identity)
+
     def test_receipt_rejects_caller_forged_control_and_run_identity(self):
         for control_sha in ("a" * 12, CONTROL_SHA.upper(), "g" * 40, CONTROL_SHA + "0", None):
             with self.subTest(identity_type=type(control_sha).__name__):

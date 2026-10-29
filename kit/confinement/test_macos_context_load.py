@@ -28,6 +28,14 @@ PRODUCER_MODULES = (
 NOT_ROOT = hasattr(os, "geteuid") and os.geteuid() != 0
 
 
+def load_module(name):
+    path = CONTROL_DIRECTORY / (name + ".py")
+    spec = importlib.util.spec_from_file_location(name + "_under_test", str(path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_core():
     path = CONTROL_DIRECTORY / "macos_core_contract.py"
     spec = importlib.util.spec_from_file_location("macos_core_contract_under_test", str(path))
@@ -142,6 +150,31 @@ class ProducerContextTests(unittest.TestCase):
                 self.rules._public_context(
                     self.environment, self.reviewed, self.capability, self.boundary)
         self.assertEqual(raised.exception.reason, "context_unavailable")
+        self.assertEqual(raised.exception.context_diagnostic, "context_guard_platform_unapproved")
+        self.assertIsNone(raised.exception.diagnostic)
+
+    def test_public_context_keeps_unknown_failures_opaque(self):
+        binding_patch, capability_patch, platform_patch = self.patched(
+            platform_error=RuntimeError("raw host text must not travel"))
+        with binding_patch, capability_patch, platform_patch:
+            with self.assertRaises(self.rules.Refusal) as raised:
+                self.rules._public_context(
+                    self.environment, self.reviewed, self.capability, self.boundary)
+        self.assertEqual(raised.exception.reason, "context_unavailable")
+        self.assertIsNone(raised.exception.context_diagnostic)
+
+    def test_guard_reasons_outside_the_allowlist_carry_no_token(self):
+        error = self.boundary.GuardError("platform_unapproved")
+        error.reason = "free text with a path"
+        self.assertIsNone(self.rules._guard_context_diagnostic(error, self.boundary))
+        self.assertIsNone(self.rules._guard_context_diagnostic(ValueError("x"), self.boundary))
+        for reason in self.boundary.GuardError._REASONS:
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    self.rules._guard_context_diagnostic(
+                        self.boundary.GuardError(reason), self.boundary),
+                    "context_guard_" + reason,
+                )
 
     @unittest.skipUnless(NOT_ROOT, "the runner temporary directory must not be owned by root")
     def test_validate_context_returns_binding_root_and_runner_temp(self):
@@ -165,9 +198,84 @@ class ProducerContextTests(unittest.TestCase):
             (raised.exception.reason, raised.exception.stage),
             ("runner_unavailable", "context"),
         )
+        self.assertEqual(raised.exception.diagnostic, "context_guard_platform_unapproved")
+
+    @unittest.skipUnless(NOT_ROOT, "the runner temporary directory must not be owned by root")
+    def test_validate_context_maps_unknown_exception_types_to_the_opaque_diagnostic(self):
+        binding_patch, capability_patch, platform_patch = self.patched()
+        with binding_patch, capability_patch, platform_patch, \
+                mock.patch.object(self.rust, "_strict_context", side_effect=ValueError("raw text")):
+            with self.assertRaises(self.core.Refusal) as raised:
+                self.core._validate_context(
+                    self.environment, self.reviewed, self.capability, self.boundary, self.rust)
+        self.assertEqual(
+            (raised.exception.reason, raised.exception.stage, raised.exception.diagnostic),
+            ("runner_unavailable", "context", "none"),
+        )
+
+    @unittest.skipUnless(NOT_ROOT, "the runner temporary directory must not be owned by root")
+    def test_validate_context_tags_known_foreign_refusals_by_module_and_reason(self):
+        binding_patch, capability_patch, platform_patch = self.patched()
+        for reason, token in (
+            ("invalid_input", "context_rust_invalid_input"),
+            ("runner_unavailable", "context_rust_runner_unavailable"),
+        ):
+            with self.subTest(reason=reason):
+                with binding_patch, capability_patch, platform_patch, \
+                        mock.patch.object(self.rust, "_strict_context", side_effect=self.rust.Refusal(reason)):
+                    with self.assertRaises(self.core.Refusal) as raised:
+                        self.core._validate_context(
+                            self.environment, self.reviewed, self.capability, self.boundary, self.rust)
+                self.assertEqual(raised.exception.diagnostic, token)
+                binding_patch, capability_patch, platform_patch = self.patched()
+
+    def test_foreign_context_diagnostics_survive_attach_formatting_and_normalisation(self):
+        failure = self.core.Refusal(
+            "runner_unavailable", "context", diagnostic="context_guard_platform_unapproved")
+        attached = self.core._FailureDiagnostics().attach(failure, failure.diagnostic)
+        self.assertEqual(attached.diagnostic, "context_guard_platform_unapproved")
+        payload = self.core._format_refusal(attached)
+        self.assertIn(b'"diagnostic":"context_guard_platform_unapproved"', payload)
+        failure_module = load_module("feedback_failure")
+        raw = b"KD-FEEDBACK-PRODUCER-REFUSAL " + payload + b"\n"
+        self.assertEqual(failure_module.normalize_refusal(raw), raw)
+        other_stage = self.core.Refusal(
+            "runner_unavailable", "host", diagnostic="context_guard_platform_unapproved")
+        reattached = self.core._FailureDiagnostics().attach(other_stage, other_stage.diagnostic)
+        self.assertNotEqual(reattached.diagnostic, "context_guard_platform_unapproved")
+
+    def test_foreign_context_tokens_match_the_public_audit_allowlist(self):
+        audit = load_module("macos_public_audit")
+        self.assertEqual(
+            self.core.FOREIGN_CONTEXT_DIAGNOSTICS, audit.CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS)
+        self.assertLessEqual(
+            audit.CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS, audit.CORE_CONTRACT_REFUSAL_DIAGNOSTICS)
+        self.assertLessEqual(self.core.FOREIGN_CONTEXT_DIAGNOSTICS, self.core.DIAGNOSTICS)
+        self.assertEqual(len(self.core.FOREIGN_CONTEXT_DIAGNOSTICS), 9)
+        for token in self.core.FOREIGN_CONTEXT_DIAGNOSTICS:
+            self.assertRegex(token, r"\Acontext_(guard|rust|rules)_[a-z_]+\Z")
 
     def test_interpreter_is_recorded_for_the_hosted_run(self):
         self.assertGreaterEqual(sys.version_info[:2], (3, 9))
+
+
+class ApprovedHostReleaseTableTests(unittest.TestCase):
+    def test_the_three_approved_host_release_tables_are_identical_and_bounded(self):
+        boundary = load_module("macos_boundary_guard")
+        deny = load_module("macos_deny_default")
+        audit = load_module("macos_public_audit")
+        expected = (("15.7.9", "20260907.0337.1"), ("15.8.2", "20261028.0489.1"))
+        self.assertEqual(boundary.APPROVED_HOST_RELEASES, expected)
+        self.assertEqual(deny.APPROVED_HOST_RELEASES, expected)
+        self.assertEqual(audit.APPROVED_HOST_RELEASES, expected)
+        self.assertLessEqual(len(expected), 2)
+        observed = {("15.8.2", "20261028.0489.1"): "40941660825"}
+        self.assertEqual(boundary.APPROVED_HOST_RELEASE_FIRST_RUNS, observed)
+        self.assertEqual(deny.APPROVED_HOST_RELEASE_FIRST_RUNS, observed)
+        self.assertEqual(audit.APPROVED_HOST_RELEASE_FIRST_RUNS, observed)
+        self.assertEqual(boundary.APPROVED_IMAGE_OS, deny.APPROVED_IMAGE_OS_VALUE)
+        self.assertEqual(boundary.APPROVED_RUNNER_IMAGE_OS, deny.APPROVED_RUNNER_IMAGE_OS)
+        self.assertEqual(boundary.APPROVED_ARCHITECTURE, deny.APPROVED_ARCH)
 
 
 if __name__ == "__main__":
