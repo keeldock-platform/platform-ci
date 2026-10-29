@@ -38,13 +38,14 @@ ALLOWED_CONTROL_SIBLINGS = frozenset((
     "macos_capability", "macos_reviewed_build", "macos_boundary_guard",
     "macos_private_validation", "macos_source_reader", "macos_network_observer",
     "macos_rust_toolchain", "macos_rules_bootstrap", "macos_feedback_producer",
-    "macos_node_contract", "foundation_node_feedback",
+    "macos_node_contract", "foundation_node_feedback", "cargo_lock_bootstrap",
 ))
 FEEDBACK_TREE_LABELS = {
     "core-contract": "core_contract",
     "core-node-lock-return": "core_node_lock_return",
     "core-rust-format-return": "core_rust_format_return",
     "core-build-diagnostic-return": "core_build_diagnostic_return",
+    "core-rust-lock-return": "core_rust_lock_return",
 }
 LOCKED_FOUNDATION_TREE = "core_build_diagnostic_return_with_package_lock"
 GATE_NAMES = (
@@ -1379,6 +1380,16 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                             "expected_manifest": producer._expected_manifest(source),
                             "reviewed_rust_paths": None, "source_result": "command_completed",
                         }
+                    elif feedback["profile"]["kind"] == "cargo_lock":
+                        feedback_result = _run_inside_source(
+                            source,
+                            original_cwd,
+                            lambda: producer.run_cargo_lock_profile(
+                                feedback["dispatch"], source, worker_storage, worker_uid, environment,
+                                toolchain_paths.command_paths(), host_toolchain, capability, rust,
+                                deadline, _load_control_sibling("cargo_lock_bootstrap"), environ,
+                            ),
+                        )
                     else:
                         feedback_result = _run_inside_source(
                             source,

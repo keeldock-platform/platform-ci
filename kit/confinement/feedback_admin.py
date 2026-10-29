@@ -997,7 +997,13 @@ class FeedbackAdmin:
         return self._retire_entry(dir_fd, state, entry)
 
     def _release_private_output(self, dir_fd, request, profile, plaintext):
-        suffix = "lock" if profile["kind"] == "lock" else "patch" if profile["kind"] == "rust_patch" else "diagnostics"
+        if (type(profile.get("max_payload_bytes")) is not int
+                or len(plaintext) > profile["max_payload_bytes"]):
+            _refuse()
+        suffix = (
+            "lock" if profile["kind"] == "lock" else "patch" if profile["kind"] == "rust_patch"
+            else "cargo-lock" if profile["kind"] == feedback_request.CARGO_LOCK_KIND else "diagnostics"
+        )
         name = "return-" + request["request_id"] + "-" + suffix + ".payload"
         _create_named(dir_fd, name, plaintext, mode=0o600, limit=MAX_PLAINTEXT_BYTES)
         return os.path.join(self.state_directory, name)

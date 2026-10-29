@@ -87,6 +87,7 @@ FEEDBACK_PROFILE_CONCERNS = frozenset((
     "core-node-lock-return",
     "core-rust-format-return",
     "core-build-diagnostic-return",
+    "core-rust-lock-return",
 ))
 CORE_CONTRACT_CONCERNS = frozenset(("core-contract",)) | FEEDBACK_PROFILE_CONCERNS
 SOURCE_DESCENDANT_CONCERNS = frozenset(("rules-bootstrap",)) | CORE_CONTRACT_CONCERNS
@@ -266,6 +267,7 @@ CORE_CONTRACT_TREE_BY_CONCERN = {
     "core-node-lock-return": "core_node_lock_return",
     "core-rust-format-return": "core_rust_format_return",
     "core-build-diagnostic-return": "core_build_diagnostic_return",
+    "core-rust-lock-return": "core_rust_lock_return",
 }
 CORE_CONTRACT_RULES_TAG_PATTERN = re.compile(r"tag v2\.[0-9]+\.[0-9]+\Z")
 CORE_CONTRACT_TOOLCHAIN = b'[toolchain]\nchannel = "1.99.1"\ncomponents = ["rustfmt", "clippy"]\nprofile = "minimal"\n'

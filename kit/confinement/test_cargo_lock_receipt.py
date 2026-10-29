@@ -1163,5 +1163,32 @@ class CargoLockReceiptTests(unittest.TestCase):
             )
 
 
+class ToolchainHashTests(unittest.TestCase):
+    def test_hash_binds_target_and_sorted_component_hashes(self):
+        components = (("rustc", "b" * 64), ("cargo", "a" * 64))
+        expected = hashlib.sha256((
+            "toolchain-target=aarch64-apple-darwin\ncargo=" + "a" * 64 + "\nrustc=" + "b" * 64 + "\n"
+        ).encode("ascii")).hexdigest()
+        self.assertEqual(subject.toolchain_hash("aarch64-apple-darwin", components), expected)
+        self.assertEqual(subject.toolchain_hash("aarch64-apple-darwin", components[::-1]), expected)
+        self.assertNotEqual(subject.toolchain_hash("x86_64-unknown-linux-gnu", components), expected)
+        self.assertNotEqual(
+            subject.toolchain_hash("aarch64-apple-darwin", (("cargo", "c" * 64), components[0])), expected,
+        )
+
+    def test_invalid_targets_and_components_are_refused(self):
+        good = (("cargo", "a" * 64),)
+        for target, components in (
+            ("", good), ("darwin", good), ("AArch64-apple-darwin", good), (1, good),
+            ("aarch64-apple-darwin", ()), ("aarch64-apple-darwin", (("cargo", "short"),)),
+            ("aarch64-apple-darwin", (("cargo", "a" * 64), ("cargo", "b" * 64))),
+            ("aarch64-apple-darwin", (("bad name", "a" * 64),)), ("aarch64-apple-darwin", None),
+            ("aarch64-apple-darwin", ((1, "a" * 64),)),
+        ):
+            with self.subTest(target=target, components=repr(components)):
+                with self.assertRaises(subject.Refusal):
+                    subject.toolchain_hash(target, components)
+
+
 if __name__ == "__main__":
     unittest.main()
