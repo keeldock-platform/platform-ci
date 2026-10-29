@@ -235,6 +235,7 @@ class PublicTreeTests(unittest.TestCase):
             '.github/workflows/capsule-vectors.yml',
             'kit/confinement/capsule_frame.cs',
             'kit/confinement/capsule_frame.ps1',
+            'kit/confinement/capsule_frame_vectors.json',
             ".github/workflows/windows-native-preflight.yml",
             "kit/confinement/windows_native_preflight.cs",
             "kit/confinement/windows_native_preflight.ps1",
