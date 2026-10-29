@@ -475,7 +475,7 @@ foreach ($case in $cases) {
         self.assertIn("$script:AncestorPaths = @()", self.wrapper)
         self.assertIn("$script:AncestorPaths += $ancestorPath", self.wrapper)
         self.assertIn("$ancestorCount = $script:AncestorPaths.Count", self.wrapper)
-        self.assertIn("' ancestors_read_attributes=' + $ancestorCount", self.wrapper)
+        self.assertIn("scratch=modify ancestors_read_attributes=' + $ancestorCount", self.wrapper)
         self.assertNotRegex(
             self.wrapper,
             r"(?im)^\s*\$ancestors\s*=\s*\$script:Ancestors\.Count\b",
