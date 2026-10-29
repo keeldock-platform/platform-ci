@@ -11,7 +11,6 @@ from pathlib import Path
 import shutil
 import stat
 import tempfile
-import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -1450,50 +1449,73 @@ class CoreContractTests(unittest.TestCase):
                 self.assertNotIn(str(error).encode("utf-8"), payload)
 
 
-class DiffCapTests(unittest.TestCase):
-    def _stream(self, total):
-        out_read, out_write = os.pipe()
-        err_read, err_write = os.pipe()
-        os.close(err_write)
+class _FakeSelector:
+    def __init__(self):
+        self.registered = {}
 
-        def feed():
-            block = b"x" * 65536
-            remaining = total
-            try:
-                with os.fdopen(out_write, "wb", buffering=0) as stream:
-                    while remaining:
-                        size = min(remaining, len(block))
-                        stream.write(block[:size])
-                        remaining -= size
-            except OSError:
-                return
+    def register(self, fileobj, events, data=None):
+        self.registered[fileobj] = SimpleNamespace(fileobj=fileobj, events=events, data=data)
+
+    def unregister(self, fileobj):
+        del self.registered[fileobj]
+
+    def get_map(self):
+        return self.registered
+
+    def select(self, timeout=None):
+        return [(key, key.events) for key in list(self.registered.values())]
+
+    def close(self):
+        self.registered = {}
+
+
+class _FakeStream:
+    def __init__(self, descriptor):
+        self.descriptor = descriptor
+        self.closed = False
+
+    def fileno(self):
+        return self.descriptor
+
+    def close(self):
+        self.closed = True
+
+
+class DiffCapTests(unittest.TestCase):
+    CAP = 4096
+
+    def _stream(self, total):
+        remaining = {101: total, 102: 0}
+
+        def fake_read(descriptor, size):
+            count = min(size, 1000, remaining[descriptor])
+            remaining[descriptor] -= count
+            return b"x" * count
 
         process = SimpleNamespace(
-            stdout=os.fdopen(out_read, "rb", buffering=0),
-            stderr=os.fdopen(err_read, "rb", buffering=0),
+            stdout=_FakeStream(101), stderr=_FakeStream(102),
             pid=1, returncode=0, poll=lambda: 0, wait=lambda timeout=None: 0,
         )
-        thread = threading.Thread(target=feed)
-        thread.start()
-        try:
-            with patch.object(subject.subprocess, "Popen", return_value=process):
-                return subject._stream_git_diff_hash(
-                    Path("/synthetic-source"), BASE_SHA, SOURCE_SHA,
-                    hashlib.sha256(b"x" * total).hexdigest(), "/usr/bin/git",
-                    time.monotonic() + 120,
-                )
-        finally:
-            thread.join(timeout=30)
+        with patch.object(subject, "MAX_DIFF_BYTES", self.CAP), \
+                patch.object(subject.selectors, "DefaultSelector", _FakeSelector), \
+                patch.object(subject.os, "read", side_effect=fake_read), \
+                patch.object(subject.subprocess, "Popen", return_value=process):
+            return subject._stream_git_diff_hash(
+                Path("/synthetic-source"), BASE_SHA, SOURCE_SHA,
+                hashlib.sha256(b"x" * total).hexdigest(), "/usr/bin/git",
+                time.monotonic() + 120,
+            )
 
-    def test_diff_cap_admits_the_batch_four_size_and_stops_exactly_at_the_cap(self):
+    def test_diff_cap_constant_admits_the_batch_four_size(self):
         self.assertEqual(subject.MAX_DIFF_BYTES, 6 * 1024 * 1024)
         self.assertGreater(subject.MAX_DIFF_BYTES, 3_723_563)
+
+    def test_diff_cap_is_enforced_exactly_at_the_boundary(self):
         self.assertEqual(
-            self._stream(subject.MAX_DIFF_BYTES),
-            hashlib.sha256(b"x" * subject.MAX_DIFF_BYTES).hexdigest(),
+            self._stream(self.CAP), hashlib.sha256(b"x" * self.CAP).hexdigest(),
         )
         with self.assertRaises(subject.Refusal) as refusal:
-            self._stream(subject.MAX_DIFF_BYTES + 1)
+            self._stream(self.CAP + 1)
         self.assertEqual(refusal.exception.reason, "source_diff_mismatch")
 
 
