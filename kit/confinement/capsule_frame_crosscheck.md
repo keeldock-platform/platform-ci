@@ -22,10 +22,11 @@ kit/confinement/capsule_frame_vector_gate.py is an explicit CI entry point. Its
 name deliberately avoids unittest's ordinary test_ discovery pattern. It
 requires both a checked-in generated fixture and fresh CI output. A missing or
 pending fixture fails the gate, as does any difference between reviewed and
-fresh C sharp JSON. The checked-in pending JSON permits the first CI run to
-produce a review artifact; that run is expected to refuse the gate. The
-coordinator reviews the artifact, replaces the pending fixture, and dispatches
-again after review. No pending run counts as protocol coverage.
+fresh C sharp JSON. The first capsule-vectors run on main, run 40866237493,
+refused only because the checked-in fixture was pending; all other comparisons
+matched. The reviewed artifact from that run is now checked in. Its SHA-256 is
+fb0660998011eec479ee01e919510dcd8f88ae5266114d9f82a899b4fa72fb94. The next
+dispatch is the first capsule-vectors run that counts as protocol coverage.
 
 The gate compares the complete key record, header, canonical manifest CBOR,
 header digest, HKDF inputs and outputs, nonces, AAD fields, ciphertext manifest
