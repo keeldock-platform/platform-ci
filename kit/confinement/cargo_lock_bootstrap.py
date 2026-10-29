@@ -81,10 +81,8 @@ CONTRACT_WORKSPACE = "contract"
 RUNTIME_WORKSPACE = "runtime"
 RUNTIME_WORKSPACE_DIRECTORY = "runtime"
 WORKSPACE_DIRECTORIES = {CONTRACT_WORKSPACE: ".", RUNTIME_WORKSPACE: RUNTIME_WORKSPACE_DIRECTORY}
-RUNTIME_ADMITTED_PREFIXES = (
-    "crates/host/core", "crates/host/registry", "crates/host/extensions", "crates/host/links",
-    "crates/host/mcp", "crates/host/mcp-host", "crates/host/mcp-shim",
-    "crates/host/settings-schema", "crates/services", "crates/apps", "apps",
+RUNTIME_MEMBER_PATH_RE = re.compile(
+    RUNTIME_WORKSPACE_DIRECTORY + r"/crates/[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z"
 )
 EXCLUDE_PATH_RE = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\Z")
 BARE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+")
@@ -606,7 +604,10 @@ def _check_workspace_members(workspace, members, root_directory="."):
     resolved = _resolved_listing(listed, root_directory)
     if len(set(listed)) != len(listed) or set(resolved) != set(members) or len(set(resolved)) != len(resolved):
         _manifest_refuse()
-    if root_directory != "." and ("exclude" in workspace or "default-members" in workspace):
+    if root_directory != "." and (
+        "exclude" in workspace or "default-members" in workspace
+        or any(".." in item or item.startswith("/") for item in listed)
+    ):
         _manifest_refuse()
     if "exclude" in workspace:
         _check_workspace_exclude(workspace["exclude"], members)
@@ -615,13 +616,6 @@ def _check_workspace_members(workspace, members, root_directory="."):
         if (type(default) is not list or any(type(item) is not str for item in default)
                 or len(set(default)) != len(default) or set(default) != set(members)):
             _manifest_refuse()
-
-
-def _package_workspace_link_ok(package, directory, is_root, root_directory):
-    if root_directory == ".":
-        return "workspace" not in package
-    return (not is_root and type(package.get("workspace")) is str
-            and package["workspace"] == posixpath.relpath(root_directory, directory))
 
 
 def _check_document(document, directory, members, is_root, root_directory="."):
@@ -653,9 +647,10 @@ def _check_document(document, directory, members, is_root, root_directory="."):
     package = document.get("package")
     if package is None:
         return None, None
+    if root_directory != "." and is_root:
+        _manifest_refuse()
     if (type(package) is not dict or type(package.get("name")) is not str
-            or not _package_workspace_link_ok(package, directory, is_root, root_directory)
-            or "edition" not in package):
+            or "workspace" in package or "edition" not in package):
         _manifest_refuse()
     return package["name"], package["edition"]
 
@@ -684,9 +679,10 @@ def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE):
 
     The workspace selector names one fixed root manifest. The contract root is the
     repository root manifest. The runtime root is a virtual manifest in its own directory
-    whose members must sit under the fixed runtime paths, are listed relative to that
-    directory, and each declare the exact relative link back to the runtime root. A
-    manifest of one workspace never satisfies the other, because the root path differs.
+    whose members sit inside that directory as plain relative paths, never use a parent
+    segment and never declare a package workspace key; any parent segment anywhere in a
+    runtime manifest is refused. A manifest of one workspace never satisfies the other,
+    because the root path differs.
     """
     root_directory = workspace_directory(workspace)
     root_path = workspace_root_manifest(workspace)
@@ -694,13 +690,12 @@ def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE):
             or not 1 <= len(manifests) <= MAX_MANIFESTS or root_path not in manifests):
         _manifest_refuse()
     member_set = frozenset(members)
-    if root_directory != "." and any(
-        type(member) is not str or not any(
-            member == prefix or member.startswith(prefix + "/")
-            for prefix in RUNTIME_ADMITTED_PREFIXES
-        ) or EXCLUDE_PATH_RE.fullmatch(member) is None
-        or any(part in (".", "..") for part in member.split("/"))
-        for member in member_set
+    if root_directory != "." and (
+        any(
+            type(member) is not str or RUNTIME_MEMBER_PATH_RE.fullmatch(member) is None
+            for member in member_set
+        )
+        or any(type(data) is not bytes or b".." in data for data in manifests.values())
     ):
         _manifest_refuse()
     allowed = {root_path} | {member + "/Cargo.toml" for member in member_set}

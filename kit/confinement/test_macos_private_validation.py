@@ -2735,7 +2735,7 @@ BATCH4_ROOT_TEXT = (
 def _runtime_root_text(roots=None, extra=""):
     roots = subject.RUNTIME_CRATE_ROOTS if roots is None else roots
     listing = "".join(
-        '    "../' + "/".join(root) + '",\n' for root in roots
+        '    "' + "/".join(root[1:]) + '",\n' for root in roots
     )
     return (
         '[workspace]\nresolver = "3"\nmembers = [\n' + listing + "]\n\n"
@@ -2747,9 +2747,8 @@ def _runtime_root_text(roots=None, extra=""):
 
 
 def _runtime_member_text(root, extra_package="", tail=""):
-    link = "../" * len(root) + "runtime"
     return (
-        '[package]\nname = "' + root[-1] + '"\nworkspace = "' + link + '"\n'
+        '[package]\nname = "' + root[-1] + '"\n'
         "version.workspace = true\nedition.workspace = true\n"
         "rust-version.workspace = true\npublish.workspace = true\n"
         + extra_package + "\n[lints]\nworkspace = true\n" + tail
@@ -2840,10 +2839,8 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             ["host-router", "fixture-data", "tool-a", "tool-b", "tool-bad-no-handler", "tool-bad-no-manifest"],
         )
         for root in subject.RUNTIME_CRATE_ROOTS:
-            prefix = "/".join(root)
-            self.assertTrue(any(
-                prefix == item or prefix.startswith(item + "/") for item in subject.RUNTIME_ADMITTED_PREFIXES
-            ))
+            self.assertTrue(subject._runtime_root_admitted(root))
+            self.assertEqual(root[:3], ("runtime", "crates", "test-fixtures"))
         self.assertEqual(subject.RUNTIME_WORKSPACE_DIRECTORY, "runtime")
         marker, reads = self._validate()
         self.assertEqual(marker, "core_contract")
@@ -2893,7 +2890,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         )))
         for path in (
             "runtime/Cargo.toml", "runtime/Cargo.lock", "apps/x/src/main.rs",
-            "crates/apps/test-fixtures/tool-a/src/lib.rs", "crates/services/store/src/lib.rs",
+            "runtime/crates/test-fixtures/tool-a/src/lib.rs", "crates/services/store/src/lib.rs",
         ):
             with self.subTest(path=path):
                 self.assertIsNone(subject._core_contract_expected_mode(path))
@@ -2901,7 +2898,8 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
     def test_runtime_paths_without_root_files_are_still_refused_as_before(self):
         for path in (
             "apps/test-shell-desktop/src/main.rs", "crates/services/store/src/lib.rs",
-            "runtime/rustfmt.toml", "crates/apps/test-fixtures/tool-a/Cargo.toml",
+            "runtime/rustfmt.toml", "runtime/crates/test-fixtures/tool-a/Cargo.toml",
+            "runtime/package.json", "runtime/package-lock.json",
         ):
             entries = CoreContractTreeTests._required_core_contract_entries()
             entries[path] = ("100644", "a" * 40)
@@ -2926,8 +2924,9 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         for path in (
             prefix + "/build.rs", prefix + "/src/build.rs", prefix + "/package.json",
             prefix + "/src/data.json", "apps/test-shell-desktop/package.json",
-            "crates/apps/test-fixtures/unlisted/src/lib.rs", "runtime/extra.toml",
-            "runtime/.cargo/config.toml", "crates/services/store/src/lib.rs",
+            "runtime/crates/test-fixtures/unlisted/src/lib.rs", "runtime/extra.toml",
+            "runtime/package.json", "runtime/package-lock.json", "runtime/apps/shell/src/main.rs",
+            "runtime/.cargo/config.toml", "runtime/crates/services/store/src/lib.rs",
         ):
             entries = self._runtime_entries()
             entries[path] = ("100644", "a" * 40)
@@ -2946,12 +2945,14 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             _runtime_root_text().replace('resolver = "3"', 'resolver = "2"'),
             _runtime_root_text().replace('resolver = "3"\n', ""),
             _runtime_root_text().replace(']\n\n[workspace.package]', ']\nexclude = ["x"]\n\n[workspace.package]'),
-            _runtime_root_text().replace('"../crates', '"crates', 1),
+            _runtime_root_text().replace('"crates/', '"runtime/crates/', 1),
+            _runtime_root_text().replace('"crates/', '"../runtime/crates/', 1),
             _runtime_root_text(roots=subject.RUNTIME_CRATE_ROOTS[:-1]),
             _runtime_root_text(roots=tuple(reversed(subject.RUNTIME_CRATE_ROOTS))),
             _runtime_root_text(extra='\n[workspace.dependencies]\nserde = "=1.0.0"\n'),
             _runtime_root_text(extra='\n[workspace.dependencies]\nx = { git = "u" }\n'),
-            _runtime_root_text(extra='\n[workspace.dependencies]\nx = { path = "../crates/services/store" }\n'),
+            _runtime_root_text(extra='\n[workspace.dependencies]\nx = { path = "crates/services/store" }\n'),
+            _runtime_root_text(extra='\n[workspace.dependencies]\nx = { path = "../crates/test-fixtures/tool-a" }\n'),
             _runtime_root_text() + "\n[package]\nname = \"x\"\n",
             _runtime_root_text().replace("publish = false", 'publish = true'),
             _runtime_root_text() + 'unsafe_code = "forbid"\n',
@@ -2966,7 +2967,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         self.assertEqual(self._refused(blobs=blobs), "workspace_decode")
 
     def test_runtime_root_path_dependencies_may_name_configured_members_only(self):
-        member = "../" + "/".join(subject.RUNTIME_CRATE_ROOTS[0])
+        member = "/".join(subject.RUNTIME_CRATE_ROOTS[0][1:])
         good = _runtime_root_text(extra='\n[workspace.dependencies]\nrouter = { path = "' + member + '" }\n')
         blobs = self._runtime_blobs()
         blobs[subject.RUNTIME_ROOT_MANIFEST_PATH] = good.encode("utf-8")
@@ -2983,8 +2984,10 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         path = "/".join(root) + "/Cargo.toml"
         good = _runtime_member_text(root)
         cases = (
-            (good.replace('workspace = "../../../../runtime"', 'workspace = "../../../runtime"'), "package_decode"),
-            (good.replace('workspace = "../../../../runtime"\n', ""), "package_decode"),
+            (good.replace("[package]\n", '[package]\nworkspace = "../../../.."\n'), "package_decode"),
+            (good.replace("[package]\n", '[package]\nworkspace = "."\n'), "package_decode"),
+            (good.replace("[lints]", '[dependencies]\nx = { path = "../tool-b" }\n\n[lints]'), "package_decode"),
+            (good.replace("[package]\n", '[package]\ndescription = "a..b"\n'), "package_decode"),
             (good.replace("edition.workspace = true\n", ""), "package_decode"),
             (good.replace("[lints]", '[features]\nx = []\n\n[lints]'), "package_decode"),
             (good.replace("[lints]", "[dependencies]\nunknown = { workspace = true }\n\n[lints]"), "package_decode"),
@@ -3067,13 +3070,18 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(self._refused(blobs=blobs), "package_decode")
 
-    def test_runtime_members_outside_the_admitted_prefixes_are_not_approved(self):
+    def test_runtime_members_outside_the_fixed_grammar_are_not_approved(self):
         for roots in (
             (("crates", "host", "api"),),
             (("packages", "x"),),
             (("runtime", "x"),),
             (),
             (("apps", "a"), ("apps", "a")),
+            (("runtime", "crates", "a", "b", "c"),),
+            (("runtime", "apps", "a", "b"),),
+            (("runtime", "crates", "A", "b"),),
+            (("runtime", "crates", "..", "b"),),
+            (("runtime", "crates", "a", "b"), ("runtime", "crates", "a", "b")),
             ["apps"],
         ):
             with self.subTest(roots=roots), patch.object(subject, "RUNTIME_CRATE_ROOTS", roots):
@@ -3103,7 +3111,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         with patch.object(subject, "RUNTIME_CRATE_ROOTS", ()):
             marker, unused_reads = self._validate(entries=entries, blobs=blobs)
             self.assertEqual(marker, "core_contract")
-            entries["crates/apps/test-fixtures/tool-a/Cargo.toml"] = ("100644", "a" * 40)
+            entries["runtime/crates/test-fixtures/tool-a/Cargo.toml"] = ("100644", "a" * 40)
             self.assertEqual(self._refused(entries=entries, blobs=blobs), "path_mode")
 
 

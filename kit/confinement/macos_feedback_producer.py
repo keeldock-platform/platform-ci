@@ -54,7 +54,7 @@ PACKAGE_ROOTS = (
     Path("crates/kernel/i18n"),
 )
 RUNTIME_PACKAGE_ROOTS = tuple(
-    Path("crates/apps/test-fixtures") / name
+    Path("runtime/crates/test-fixtures") / name
     for name in (
         "host-router", "fixture-data", "tool-a", "tool-b",
         "tool-bad-no-handler", "tool-bad-no-manifest",

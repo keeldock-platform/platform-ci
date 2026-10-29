@@ -275,12 +275,9 @@ RUNTIME_WORKSPACE_DIRECTORY = "runtime"
 RUNTIME_ROOT_MANIFEST_PATH = RUNTIME_WORKSPACE_DIRECTORY + "/Cargo.toml"
 RUNTIME_ROOT_LOCK_PATH = RUNTIME_WORKSPACE_DIRECTORY + "/Cargo.lock"
 RUNTIME_ROOT_FILES = frozenset((RUNTIME_ROOT_MANIFEST_PATH, RUNTIME_ROOT_LOCK_PATH))
-RUNTIME_ADMITTED_PREFIXES = (
-    "crates/host/core", "crates/host/registry", "crates/host/extensions", "crates/host/links",
-    "crates/host/mcp", "crates/host/mcp-host", "crates/host/mcp-shim",
-    "crates/host/settings-schema", "crates/services", "crates/apps", "apps",
-)
-RUNTIME_FIXTURE_DIRECTORY = ("crates", "apps", "test-fixtures")
+RUNTIME_PART_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
+RUNTIME_CRATES_DIRECTORY = (RUNTIME_WORKSPACE_DIRECTORY, "crates")
+RUNTIME_FIXTURE_DIRECTORY = RUNTIME_CRATES_DIRECTORY + ("test-fixtures",)
 RUNTIME_CRATE_ROOTS = tuple(
     RUNTIME_FIXTURE_DIRECTORY + (name,)
     for name in (
@@ -291,7 +288,7 @@ RUNTIME_CRATE_ROOTS = tuple(
 RUNTIME_CONFIG_FILES = ("rust-toolchain.toml", "rustfmt.toml", "clippy.toml")
 MAX_RUNTIME_MEMBERS = 32
 RUNTIME_MEMBERS_PATTERN = re.compile(r"(?m)^members\s*=\s*\[([^\]]*)\]\s*$")
-RUNTIME_MEMBER_PATTERN = re.compile(r'\s*"((?:\.\./)*[A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*(?:,|\Z)')
+RUNTIME_MEMBER_PATTERN = re.compile(r'\s*"([A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*(?:,|\Z)')
 RUNTIME_SECTION_PATTERN = re.compile(r"\[([a-z-]{1,32})\]\Z")
 RUNTIME_ASSIGNMENT_PATTERN = re.compile(r"([A-Za-z0-9_.-]{1,64})\s*=\s*(.{1,512})\Z")
 RUNTIME_DEPENDENCY_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*\Z")
@@ -302,7 +299,7 @@ RUNTIME_LINT_VALUE_PATTERN = re.compile(
     r'"(?:allow|warn|deny|forbid)"\Z'
     r'|\{\s*level\s*=\s*"(?:allow|warn|deny|forbid)"\s*,\s*priority\s*=\s*-?[0-9]{1,3}\s*\}\Z'
 )
-RUNTIME_ROOT_PATH_PATTERN = re.compile(r'\{\s*path\s*=\s*"((?:\.\./)*[A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*\}\Z')
+RUNTIME_ROOT_PATH_PATTERN = re.compile(r'\{\s*path\s*=\s*"([A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*\}\Z')
 RUNTIME_ROOT_SECTIONS = frozenset((
     "[workspace]", "[workspace.package]", "[workspace.dependencies]",
     "[workspace.lints.rust]", "[workspace.lints.clippy]",
@@ -2078,17 +2075,20 @@ def _runtime_member_listing(crate_roots):
     ]
 
 
-def _runtime_member_link(root):
-    return posixpath.relpath(RUNTIME_WORKSPACE_DIRECTORY, "/".join(root))
+def _runtime_root_admitted(root):
+    return (
+        type(root) is tuple and len(root) == len(RUNTIME_CRATES_DIRECTORY) + 2
+        and root[:len(RUNTIME_CRATES_DIRECTORY)] == RUNTIME_CRATES_DIRECTORY
+        and all(
+            type(part) is str and RUNTIME_PART_PATTERN.fullmatch(part) is not None
+            for part in root[len(RUNTIME_CRATES_DIRECTORY):]
+        )
+    )
 
 
 def _runtime_workspace_path(path):
-    if type(path) is not str:
-        return False
-    if path.startswith(RUNTIME_WORKSPACE_DIRECTORY + "/"):
-        return True
-    return any(
-        path == prefix or path.startswith(prefix + "/") for prefix in RUNTIME_ADMITTED_PREFIXES
+    return type(path) is str and (
+        path == RUNTIME_WORKSPACE_DIRECTORY or path.startswith(RUNTIME_WORKSPACE_DIRECTORY + "/")
     )
 
 
@@ -2135,7 +2135,7 @@ def _runtime_workspace_members(workspace_text):
 
 
 def _runtime_root_manifest_shape(text, crate_roots):
-    if type(text) is not str or "\r" in text or "\x00" in text:
+    if type(text) is not str or "\r" in text or "\x00" in text or ".." in text:
         return False
     expected = _runtime_member_listing(crate_roots)
     if _runtime_workspace_members(text) != expected:
@@ -2204,8 +2204,8 @@ def _runtime_declared_dependencies(text):
     return names
 
 
-def _runtime_crate_manifest_name(text, root, declared):
-    if type(text) is not str or "\r" in text or "\x00" in text:
+def _runtime_crate_manifest_name(text, declared):
+    if type(text) is not str or "\r" in text or "\x00" in text or ".." in text:
         return None
     section = None
     keys = {}
@@ -2235,8 +2235,6 @@ def _runtime_crate_manifest_name(text, root, declared):
                 name = match.group(1) if match is not None else None
             elif key == "description":
                 valid = RUNTIME_TEXT_PATTERN.fullmatch(value) is not None
-            elif key == "workspace":
-                valid = value == '"' + _runtime_member_link(root) + '"'
             elif key in RUNTIME_MANIFEST_INHERITED_KEYS:
                 valid = value == "true"
             else:
@@ -2253,7 +2251,7 @@ def _runtime_crate_manifest_name(text, root, declared):
     package = keys.get("package")
     if (
         name is None or package is None
-        or not (RUNTIME_MANIFEST_INHERITED_KEYS | {"name", "workspace"}).issubset(package)
+        or not (RUNTIME_MANIFEST_INHERITED_KEYS | {"name"}).issubset(package)
     ):
         return None
     return name
@@ -2313,14 +2311,7 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries):
     if (
         type(crate_roots) is not tuple or len(crate_roots) > MAX_RUNTIME_MEMBERS
         or len(set(crate_roots)) != len(crate_roots)
-        or any(
-            type(root) is not tuple or not root
-            or not any(
-                "/".join(root) == prefix or "/".join(root).startswith(prefix + "/")
-                for prefix in RUNTIME_ADMITTED_PREFIXES
-            )
-            for root in crate_roots
-        )
+        or any(not _runtime_root_admitted(root) for root in crate_roots)
     ):
         raise Refusal("bootstrap_not_approved", "configuration")
     required = set(RUNTIME_ROOT_FILES)
@@ -2371,7 +2362,7 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries):
             manifest_text = payload.decode("utf-8", "strict")
         except UnicodeDecodeError:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
-        name = _runtime_crate_manifest_name(manifest_text, root, declared)
+        name = _runtime_crate_manifest_name(manifest_text, declared)
         if name is None:
             raise Refusal(
                 "bootstrap_snapshot_invalid", "bootstrap",
