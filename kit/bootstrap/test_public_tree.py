@@ -166,6 +166,12 @@ class PublicTreeTests(unittest.TestCase):
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertEqual(action.count('"test_baselines_prepare.py"'), 2)
 
+    def test_role_signer_suite_is_registered_and_discovered(self):
+        self.assertIn("kit/confinement/role_signer.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/test_role_signer.py", PLATFORM_FILES)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertEqual(action.count('"test_role_signer.py"'), 2)
+
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
