@@ -922,7 +922,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             ("-1", False),
             ("+1", False),
             (" 1", False),
-            ("١", False),
+            ("\u0661", False),
             ("1 extra", False),
         ):
             with self.subTest(text=text):
@@ -953,7 +953,7 @@ if ([int][System.Runtime.InteropServices.Marshal]::OffsetOf([type]$descriptor, '
             ("4294967296", "", "windows-native-preflight=refused check=child_process_create_other reason=native_preflight_unavailable cleanup=verified"),
             ("00", "", "windows-native-preflight=refused check=child_process_create_other reason=native_preflight_unavailable cleanup=verified"),
             ("-1", "", fallback_incomplete),
-            ("١", "", fallback_incomplete),
+            ("\u0661", "", fallback_incomplete),
             ("9" * 300, "", fallback_incomplete),
             ("7", "\n", fallback_incomplete),
             ("7", "\r\n", fallback_incomplete),

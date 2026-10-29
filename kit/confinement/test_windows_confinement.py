@@ -383,7 +383,7 @@ foreach ($case in $cases) {
         self.assertNotIn("preserve-symlinks", self.wrapper)
         acl = self.function_body("Test-Acl")
         for required in (
-            "foreach ($path in $script:Ancestors)",
+            "foreach ($path in $script:AncestorPaths)",
             "$entries.Count -ne 1",
             "$entries[0].FileSystemRights -ne $attributeMask",
             "[System.Security.AccessControl.FileSystemRights]'ReadAttributes, Synchronize'",
@@ -470,6 +470,18 @@ foreach ($case in $cases) {
         for forbidden in ("Invoke-Expression", "iex ", "RunAs", "Set-ExecutionPolicy", "Start-Process", "SetEnvironmentVariable"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.wrapper)
+
+    def test_ancestor_count_does_not_replace_acl_readback_paths(self):
+        self.assertIn("$script:AncestorPaths = @()", self.wrapper)
+        self.assertIn("$script:AncestorPaths += $ancestorPath", self.wrapper)
+        self.assertIn("$ancestorCount = $script:AncestorPaths.Count", self.wrapper)
+        self.assertIn("scratch=modify ancestors_read_attributes=' + $ancestorCount", self.wrapper)
+        self.assertNotRegex(
+            self.wrapper,
+            r"(?im)^\s*\$ancestors\s*=\s*\$script:Ancestors\.Count\b",
+        )
+        self.assertIn("foreach ($path in $script:AncestorPaths)", self.function_body("Test-Acl"))
+        self.assertIn("if ($aclState -ne 'verified') { throw 'acl_readback' }", self.wrapper)
 
     def test_workflow_runs_only_source_free_checks(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
