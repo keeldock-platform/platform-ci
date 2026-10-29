@@ -411,9 +411,10 @@ function Grant-WinsockCatalogRead([string]$sid, [string]$path = 'SYSTEM\CurrentC
         }
         if ($script:WinsockCatalogLease) {
             try {
-                Remove-CatalogScratchKeys @($script:WinsockCatalogLease.ScratchList)
                 if ($script:WinsockCatalogLease.ArmedFile -and (Test-Path -LiteralPath ([string]$script:WinsockCatalogLease.ArmedFile))) {
                     Restore-WinsockCatalogAcl $script:WinsockCatalogLease
+                } else {
+                    Remove-CatalogScratchKeys @($script:WinsockCatalogLease.ScratchList)
                 }
                 Stop-CatalogRecovery $script:WinsockCatalogLease
                 $script:WinsockCatalogLease = $null
@@ -427,9 +428,19 @@ function Grant-WinsockCatalogRead([string]$sid, [string]$path = 'SYSTEM\CurrentC
 }
 
 function Restore-WinsockCatalogAcl($lease) {
-    if ($null -ne $lease -and $lease.ScratchList) { Remove-CatalogScratchKeys @($lease.ScratchList) }
-    if ($null -ne $lease -and $lease.ArmedFile -and -not (Test-Path -LiteralPath ([string]$lease.ArmedFile))) { return }
-    Restore-CatalogAcl $lease
+    $failure = ''
+    try {
+        $skip = $null -ne $lease -and $lease.ArmedFile -and -not (Test-Path -LiteralPath ([string]$lease.ArmedFile))
+        if (-not $skip) { Restore-CatalogAcl $lease }
+    } catch {
+        $failure = [string]$_.Exception.Message
+    }
+    try {
+        if ($null -ne $lease -and $lease.ScratchList) { Remove-CatalogScratchKeys @($lease.ScratchList) }
+    } catch {
+        if (-not $failure) { $failure = [string]$_.Exception.Message }
+    }
+    if ($failure) { throw $failure }
 }
 
 function Remove-CatalogRecoveryFolder([string]$record) {
@@ -470,35 +481,31 @@ function Invoke-CatalogWatch([string]$record, [string]$ready, [string]$done, [st
             if ($parent.WaitForExit(250)) { break }
         }
     }
+    $skipRestore = (Test-Path -LiteralPath $done) -or -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $record) 'armed'))
+    $restored = $skipRestore
+    for ($attempt = 0; -not $restored -and $attempt -lt 30; $attempt++) {
+        try {
+            Restore-CatalogAcl $data
+            $restored = $true
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
     $scratchGone = $false
-    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+    for ($attempt = 0; -not $scratchGone -and $attempt -lt 30; $attempt++) {
         try {
             Remove-CatalogScratchKeys @($data.ScratchPaths)
             $scratchGone = $true
-            break
         } catch {
             Start-Sleep -Seconds 1
         }
     }
-    if (-not $scratchGone) {
+    if (-not $restored -or -not $scratchGone) {
         [IO.File]::WriteAllText($ack, 'failed')
         throw 'winsock_recovery_failed'
     }
-    if ((Test-Path -LiteralPath $done) -or -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $record) 'armed'))) {
-        Remove-CatalogRecoveryFolder $record
-        return
-    }
-    for ($attempt = 0; $attempt -lt 30; $attempt++) {
-        try {
-            Restore-CatalogAcl $data
-            Remove-CatalogRecoveryFolder $record
-            return
-        } catch {
-            Start-Sleep -Seconds 1
-        }
-    }
-    [IO.File]::WriteAllText($ack, 'failed')
-    throw 'winsock_recovery_failed'
+    Remove-CatalogRecoveryFolder $record
+    return
 }
 
 if ($RecoveryMode -eq 'watch') {

@@ -549,9 +549,9 @@ foreach ($case in $cases) {
         grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
         self.assertLess(grant.index("Start-CatalogRecovery"), grant.index("Add-CatalogScratchKeys"))
         self.assertLess(grant.index("Add-CatalogScratchKeys"), grant.index("Add-CatalogRead"))
-        self.assertLess(grant.index("Remove-CatalogScratchKeys"), grant.index("Restore-WinsockCatalogAcl"))
+        self.assertLess(grant.index("Restore-WinsockCatalogAcl"), grant.index("Remove-CatalogScratchKeys"))
         restore = self.function_body("Restore-WinsockCatalogAcl", self.recovery)
-        self.assertLess(restore.index("Remove-CatalogScratchKeys"), restore.index("ArmedFile"))
+        self.assertLess(restore.index("Restore-CatalogAcl $lease"), restore.index("Remove-CatalogScratchKeys"))
         remove = self.function_body("Remove-CatalogScratchKeys", self.recovery)
         self.assertIn("$index -ge 0; $index--", remove)
         self.assertIn("DeleteSubKeyTree($path, $false)", remove)
@@ -562,7 +562,7 @@ foreach ($case in $cases) {
         watch = self.function_body("Invoke-CatalogWatch", self.recovery)
         self.assertIn("Remove-CatalogScratchKeys @($data.ScratchPaths)", watch)
         self.assertIn("Assert-ScratchPath ([string]$item)", watch)
-        self.assertLess(watch.index("Remove-CatalogScratchKeys"), watch.index("Restore-CatalogAcl $data"))
+        self.assertLess(watch.index("Restore-CatalogAcl $data"), watch.index("Remove-CatalogScratchKeys"))
         self.assertIn("-cmatch '^SOFTWARE\\\\KeelDock\\\\ConfinementRecoveryTest\\\\[a-f0-9]{32}\\z'", self.function_body("Assert-ScratchPath", self.recovery))
         for reason in ("'winsock_scratch_create'", "'winsock_scratch_cleanup'"):
             self.assertIn(reason, grant)
@@ -596,6 +596,32 @@ foreach ($case in $cases) {
                 else:
                     with self.subTest(path=path.name, name=name):
                         self.assertNotIn(name, text)
+
+    def test_catalog_restore_is_attempted_even_when_scratch_deletion_fails(self):
+        restore = self.function_body("Restore-WinsockCatalogAcl", self.recovery)
+        first = restore.index("Restore-CatalogAcl $lease")
+        second = restore.index("Remove-CatalogScratchKeys")
+        self.assertLess(first, second)
+        head = restore[:second]
+        self.assertEqual(head.count("} catch {"), 1)
+        self.assertLess(first, head.index("} catch {"))
+        tail = restore[second:]
+        self.assertIn("} catch {", tail)
+        self.assertIn("if (-not $failure) { $failure = [string]$_.Exception.Message }", tail)
+        self.assertIn("if ($failure) { throw $failure }", tail)
+        self.assertEqual(restore.count("throw "), 1)
+        watch = self.function_body("Invoke-CatalogWatch", self.recovery)
+        restore_loop = watch.index("Restore-CatalogAcl $data")
+        scratch_loop = watch.index("Remove-CatalogScratchKeys")
+        self.assertLess(restore_loop, scratch_loop)
+        between = watch[restore_loop:scratch_loop]
+        self.assertNotIn("throw ", between)
+        self.assertNotIn("return", between)
+        self.assertIn("if (-not $restored -or -not $scratchGone) {", watch)
+        self.assertLess(scratch_loop, watch.index("if (-not $restored -or -not $scratchGone) {"))
+        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
+        armed_branch = grant[grant.index("Restore-WinsockCatalogAcl"):grant.index("Remove-CatalogScratchKeys")]
+        self.assertIn("} else {", armed_branch)
 
     def test_winsock_recovery_survives_forced_parent_exit(self):
         start = self.function_body("Start-CatalogRecovery", self.recovery)
@@ -686,7 +712,8 @@ foreach ($case in $cases) {
 
     def test_unarmed_lease_never_restores_the_live_key(self):
         restore = self.function_body("Restore-WinsockCatalogAcl", self.recovery)
-        self.assertIn("-not (Test-Path -LiteralPath ([string]$lease.ArmedFile))) { return }", restore)
+        self.assertIn("-not (Test-Path -LiteralPath ([string]$lease.ArmedFile))", restore)
+        self.assertNotIn("return", restore)
         self.assertLess(restore.index("ArmedFile"), restore.index("Restore-CatalogAcl $lease"))
         confined = self.function_body("Invoke-ConfinedLadder")
         self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", confined)
