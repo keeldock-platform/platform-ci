@@ -228,8 +228,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_feedback_api.py': 'a748ca0ad084de64bbec47f4d2413f4ae35d6b932d8010847f59cec700f27fae',
     'kit/confinement/feedback_public_audit.py': 'beef023a68e01343c5e8f3e883ba99be75f79924eeaca8fdcaabe9d7401960cb',
     'kit/confinement/test_feedback_public_audit.py': '4a7b822645c7051a4f1999e5961482000a0c58c7c31d9a6ec106a88b8426b5e7',
-    'kit/confinement/role_signer.py': '37d4a2f174e02d5c3ed9b00535e4a3caaa84d90c6e25ba236f24d8194de4e4a9',
-    'kit/confinement/test_role_signer.py': 'd3ff93284775e53acd5f6328b25b6f0c4058878ac9a817fe06aa0e69e855f864',
+    'kit/confinement/role_signer.py': '3edbc0b73ea642158bac30c4da1c5d8f7c5b44905a5c77ae8caea832ef5e9aeb',
+    'kit/confinement/test_role_signer.py': 'a0ebd90aaf7dd5b625d212f48171807e70bce0038d3ad3a1226e87c053d6fd0a',
     'kit/bootstrap/policy_handoff.py': 'a219e9cb880cea6bc6444ad6c8c4d7209e83bb9c7be5c7dbef15630a20e5269d',
     'kit/bootstrap/test_policy_handoff.py': '0544070f4012476a03fed541aab9c8ba0c60ab9d2ef94c9882e15e43b4f085ec',
 }
