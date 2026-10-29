@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_MANIFEST_BYTES = 131072
 MAX_JSON_DEPTH = 16
 MAX_JSON_STRUCTURAL_TOKENS = 4096
@@ -39,6 +39,7 @@ MANIFEST_FIELDS = frozenset(
 )
 INPUT_FIELDS = frozenset(
     (
+        "input_manifest_sha256",
         "source_sha",
         "lock_receipts",
         "toolchain_identities",
@@ -111,6 +112,7 @@ class EnvironmentValue:
 class BuildInputs:
     """Hold the reproducible identities shared by both builds."""
 
+    input_manifest_sha256: str
     source_sha: str
     lock_receipts: tuple
     toolchain_identities: tuple
@@ -156,14 +158,28 @@ class DifferenceAllowlist:
 
 
 @dataclass(frozen=True)
+class BuildComparisonContext:
+    """Carry host-verified sealed inputs, trusted time and consumed build IDs."""
+
+    input_manifest_sha256: str
+    expected_output_paths: tuple
+    now: datetime
+    seen_build_ids: tuple = ()
+
+
+@dataclass(frozen=True)
 class BuildComparisonResult:
     """Expose the digests that bind an accepted shadow comparison."""
 
     accepted: bool
     mode: str
+    input_manifest_sha256: str
     input_identity_sha256: str
+    expected_output_paths_sha256: str
     build_a_id: str
     build_b_id: str
+    build_a_manifest_sha256: str
+    build_b_manifest_sha256: str
     build_a_output_set_sha256: str
     build_b_output_set_sha256: str
     allowlist_version: int
@@ -233,7 +249,7 @@ def _record_list(value, maximum, minimum=0):
 
 
 def manifest_from_mapping(value):
-    """Build a closed manifest model from already decoded JSON data."""
+    """Build a bounded manifest model from already decoded JSON data."""
 
     _object_fields(value, MANIFEST_FIELDS)
     if type(value["schema_version"]) is not int or value["schema_version"] != SCHEMA_VERSION:
@@ -243,6 +259,7 @@ def manifest_from_mapping(value):
 
     raw_inputs = value["inputs"]
     _object_fields(raw_inputs, INPUT_FIELDS)
+    input_manifest_sha256 = _digest(raw_inputs["input_manifest_sha256"])
     source_sha = _bounded_string(raw_inputs["source_sha"], SOURCE_SHA_RE, 64)
 
     lock_receipts = []
@@ -292,6 +309,7 @@ def manifest_from_mapping(value):
         environment_allowlist.append(EnvironmentValue(name, environment_value))
 
     inputs = BuildInputs(
+        input_manifest_sha256,
         source_sha,
         tuple(lock_receipts),
         tuple(toolchain_identities),
@@ -329,6 +347,7 @@ def manifest_from_mapping(value):
             _refuse("manifest_malformed")
         observations.append((name, observation_value))
 
+    _check_json_bounds(encode_canonical_json(value))
     return BuildEvidenceManifest(
         SCHEMA_VERSION,
         build_id,
@@ -499,6 +518,7 @@ def _allowlist_mapping(allowlist):
 
 def _inputs_mapping(inputs):
     return {
+        "input_manifest_sha256": inputs.input_manifest_sha256,
         "source_sha": inputs.source_sha,
         "lock_receipts": [
             {
@@ -542,14 +562,28 @@ def _validated_manifest(value):
         return parse_manifest(value)
     if type(value) is BuildEvidenceManifest:
         try:
-            if type(value.observations) is not tuple:
+            if (
+                type(value.inputs) is not BuildInputs
+                or type(value.artifacts) is not tuple
+                or len(value.artifacts) > MAX_ARTIFACTS
+                or type(value.observations) is not tuple
+                or len(value.observations) > MAX_OBSERVATIONS
+                or type(value.inputs.lock_receipts) is not tuple
+                or len(value.inputs.lock_receipts) > MAX_LOCK_RECEIPTS
+                or type(value.inputs.toolchain_identities) is not tuple
+                or len(value.inputs.toolchain_identities) > MAX_TOOLCHAINS
+                or type(value.inputs.image_identities) is not tuple
+                or len(value.inputs.image_identities) > MAX_IMAGES
+                or type(value.inputs.environment_allowlist) is not tuple
+                or len(value.inputs.environment_allowlist) > MAX_ENVIRONMENT_ITEMS
+            ):
                 _refuse("manifest_malformed")
             if len(dict(value.observations)) != len(value.observations):
                 _refuse("manifest_malformed")
             return manifest_from_mapping(_manifest_mapping(value))
         except BuildVerificationRefusal:
             raise
-        except (AttributeError, TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError, RecursionError):
             _refuse("manifest_malformed")
     _refuse("manifest_malformed")
 
@@ -562,6 +596,30 @@ def _validate_now(value):
     if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         _refuse("manifest_malformed")
     return value.astimezone(timezone.utc)
+
+
+def _validated_context(value):
+    if type(value) is not BuildComparisonContext:
+        _refuse("manifest_malformed")
+    input_manifest_sha256 = _digest(value.input_manifest_sha256)
+    paths = value.expected_output_paths
+    if type(paths) is not tuple or len(paths) < 1 or len(paths) > MAX_ARTIFACTS:
+        _refuse("manifest_malformed")
+    previous_path = None
+    for path in paths:
+        _artifact_path(path)
+        if previous_path is not None and path <= previous_path:
+            _refuse("manifest_malformed")
+        previous_path = path
+    now = _validate_now(value.now)
+    seen_build_ids = value.seen_build_ids
+    if type(seen_build_ids) is not tuple or len(seen_build_ids) > 4096:
+        _refuse("manifest_malformed")
+    validated_seen = set()
+    for build_id in seen_build_ids:
+        _bounded_string(build_id, BUILD_ID_RE, 128)
+        validated_seen.add(build_id)
+    return input_manifest_sha256, paths, now, validated_seen
 
 
 def _check_freshness(manifest, now):
@@ -592,26 +650,36 @@ def _artifact_mapping(manifest):
     ]
 
 
-def compare_builds(build_a, build_b, now, allowlist=EMPTY_ALLOWLIST, seen_build_ids=()):
-    """Compare two fresh manifests without reading files or changing state."""
+def _compare_artifacts(left, right, expected_paths):
+    left_paths = set(item.path for item in left.artifacts)
+    right_paths = set(item.path for item in right.artifacts)
+    expected_path_set = set(expected_paths)
+    if expected_path_set - left_paths or expected_path_set - right_paths:
+        _refuse("artifact_missing")
+    if left_paths - expected_path_set or right_paths - expected_path_set:
+        _refuse("artifact_extra")
+    left_artifacts = dict((item.path, item) for item in left.artifacts)
+    right_artifacts = dict((item.path, item) for item in right.artifacts)
+    for path in expected_paths:
+        if left_artifacts[path].sha256 != right_artifacts[path].sha256:
+            _refuse("artifact_digest_mismatch")
+        if left_artifacts[path].size != right_artifacts[path].size:
+            _refuse("artifact_size_mismatch")
+
+
+def compare_builds(build_a, build_b, context, allowlist=EMPTY_ALLOWLIST):
+    """Compare builds using digest and paths derived from one sealed input manifest."""
 
     left = _validated_manifest(build_a)
     right = _validated_manifest(build_b)
     policy = _allowlist_mapping(allowlist)
-    current_time = _validate_now(now)
+    expected_digest, expected_paths, current_time, validated_seen = _validated_context(
+        context
+    )
 
     _check_freshness(left, current_time)
     _check_freshness(right, current_time)
 
-    if type(seen_build_ids) not in (tuple, list, set, frozenset):
-        _refuse("manifest_malformed")
-    if len(seen_build_ids) > 4096:
-        _refuse("manifest_malformed")
-    validated_seen = set()
-    for build_id in seen_build_ids:
-        if type(build_id) is not str or BUILD_ID_RE.fullmatch(build_id) is None:
-            _refuse("manifest_malformed")
-        validated_seen.add(build_id)
     if (
         left.build_id == right.build_id
         or left.build_id in validated_seen
@@ -619,22 +687,14 @@ def compare_builds(build_a, build_b, now, allowlist=EMPTY_ALLOWLIST, seen_build_
     ):
         _refuse("build_identity_reused")
 
-    if left.inputs != right.inputs:
+    if (
+        left.inputs != right.inputs
+        or left.inputs.input_manifest_sha256 != expected_digest
+        or right.inputs.input_manifest_sha256 != expected_digest
+    ):
         _refuse("input_mismatch")
 
-    left_paths = set(item.path for item in left.artifacts)
-    right_paths = set(item.path for item in right.artifacts)
-    if left_paths - right_paths:
-        _refuse("artifact_missing")
-    if right_paths - left_paths:
-        _refuse("artifact_extra")
-    left_artifacts = dict((item.path, item) for item in left.artifacts)
-    right_artifacts = dict((item.path, item) for item in right.artifacts)
-    for path in sorted(left_paths):
-        if left_artifacts[path].sha256 != right_artifacts[path].sha256:
-            _refuse("artifact_digest_mismatch")
-        if left_artifacts[path].size != right_artifacts[path].size:
-            _refuse("artifact_size_mismatch")
+    _compare_artifacts(left, right, expected_paths)
 
     differences = _observation_differences(left, right)
     allowed_fields = set(item["field"] for item in policy["entries"])
@@ -642,20 +702,27 @@ def compare_builds(build_a, build_b, now, allowlist=EMPTY_ALLOWLIST, seen_build_
         _refuse("unallowlisted_difference")
 
     input_identity_sha256 = _manifest_digest(_inputs_mapping(left.inputs))
+    expected_output_paths_sha256 = _manifest_digest(list(expected_paths))
+    build_a_manifest_sha256 = _manifest_digest(_manifest_mapping(left))
+    build_b_manifest_sha256 = _manifest_digest(_manifest_mapping(right))
     output_a_sha256 = _manifest_digest(_artifact_mapping(left))
     output_b_sha256 = _manifest_digest(_artifact_mapping(right))
     allowlist_sha256 = _manifest_digest(policy)
     comparison_identity = {
         "schema_version": SCHEMA_VERSION,
+        "input_manifest_sha256": expected_digest,
         "input_identity_sha256": input_identity_sha256,
+        "expected_output_paths_sha256": expected_output_paths_sha256,
         "build_a": {
             "build_id": left.build_id,
             "created_at": left.created_at,
+            "manifest_sha256": build_a_manifest_sha256,
             "output_set_sha256": output_a_sha256,
         },
         "build_b": {
             "build_id": right.build_id,
             "created_at": right.created_at,
+            "manifest_sha256": build_b_manifest_sha256,
             "output_set_sha256": output_b_sha256,
         },
         "allowlist_version": allowlist.version,
@@ -666,9 +733,13 @@ def compare_builds(build_a, build_b, now, allowlist=EMPTY_ALLOWLIST, seen_build_
     return BuildComparisonResult(
         True,
         MODE,
+        expected_digest,
         input_identity_sha256,
+        expected_output_paths_sha256,
         left.build_id,
         right.build_id,
+        build_a_manifest_sha256,
+        build_b_manifest_sha256,
         output_a_sha256,
         output_b_sha256,
         allowlist.version,
