@@ -105,6 +105,30 @@ test('projects the validated lock into exact package identities and dependency e
   assert.equal(byName.get('typescript').integrity, `sha512-${'A'.repeat(86)}==`);
 });
 
+test('the established validator keeps inventory-only restrictions out of existing callers', () => {
+  const absentDevelopmentDependency = lockFixture();
+  absentDevelopmentDependency.packages['node_modules/typescript'].devDependencies = {
+    uninstalled: '1.0.0',
+  };
+  assert.deepEqual(validateLockManifest(bytes(absentDevelopmentDependency), expected), {
+    packageCount: 6, lockfileVersion: 3,
+  });
+  assert.throws(
+    () => validateLockManifestInventory(bytes(absentDevelopmentDependency), expected),
+    LockManifestError,
+  );
+
+  const nonStringLicense = lockFixture();
+  nonStringLicense.packages['node_modules/typescript'].license = { id: 'MIT' };
+  assert.deepEqual(validateLockManifest(bytes(nonStringLicense), expected), {
+    packageCount: 6, lockfileVersion: 3,
+  });
+  assert.throws(
+    () => validateLockManifestInventory(bytes(nonStringLicense), expected),
+    LockManifestError,
+  );
+});
+
 test('fails closed on root/workspace metadata and direct pin drift', () => {
   const wrongRoot = lockFixture();
   wrongRoot.name = 'other-root';

@@ -496,7 +496,7 @@ function buildLockInventory(packages, expected, workspaceByPath, workspaceDirect
 }
 
 /** Validate an npm v3 lock against caller-supplied, pre-reviewed manifest metadata. */
-function validateLockManifestUnchecked(lockBytes, expectedInput) {
+function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventory) {
   const expected = normalizeExpectation(expectedInput);
   const lock = decodeLock(lockBytes);
   if (lock === null || typeof lock !== 'object' || Array.isArray(lock)) reject('invalid_lock');
@@ -562,16 +562,19 @@ function validateLockManifestUnchecked(lockBytes, expectedInput) {
     if (entry.name !== undefined && entry.name !== moduleName) reject('invalid_package');
   }
 
-  return Object.freeze({
+  const result = {
     packageCount: packageKeys.length,
     lockfileVersion: 3,
-    packages: buildLockInventory(packages, expected, workspaceByPath, workspaceDirectories),
-  });
+  };
+  if (includeInventory) {
+    result.packages = buildLockInventory(packages, expected, workspaceByPath, workspaceDirectories);
+  }
+  return Object.freeze(result);
 }
 
-function checkedLockManifest(lockBytes, expectedInput) {
+function checkedLockManifest(lockBytes, expectedInput, includeInventory) {
   try {
-    return validateLockManifestUnchecked(lockBytes, expectedInput);
+    return validateLockManifestUnchecked(lockBytes, expectedInput, includeInventory);
   } catch (error) {
     if (error instanceof LockManifestError) throw error;
     reject('invalid_manifest');
@@ -579,12 +582,12 @@ function checkedLockManifest(lockBytes, expectedInput) {
 }
 
 export function validateLockManifest(lockBytes, expectedInput) {
-  const result = checkedLockManifest(lockBytes, expectedInput);
+  const result = checkedLockManifest(lockBytes, expectedInput, false);
   return Object.freeze({ packageCount: result.packageCount, lockfileVersion: result.lockfileVersion });
 }
 
 export function validateLockManifestInventory(lockBytes, expectedInput) {
-  const result = checkedLockManifest(lockBytes, expectedInput);
+  const result = checkedLockManifest(lockBytes, expectedInput, true);
   if (!(lockBytes instanceof Uint8Array)) reject('invalid_manifest');
   return Object.freeze({
     inventoryVersion: 1,

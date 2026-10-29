@@ -4,8 +4,11 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 import re
+import subprocess
 import uuid
+from pathlib import Path
 from urllib.parse import quote, unquote
 
 try:
@@ -19,8 +22,10 @@ CYCLONEDX_SPEC_VERSION = "1.5"
 CYCLONEDX_SPEC_VERSION_PRIMARY_SOURCE_RECHECK_REQUIRED = True
 MAX_SBOM_BYTES = 16 * 1024 * 1024
 MAX_PACKAGE_LOCK_BYTES = (4 * 1024 * 1024) - (64 * 1024)
+MAX_INVENTORY_BYTES = 16 * 1024 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 100_000
+MAX_INVENTORY_NODES = 1_000_000
 MAX_JSON_STRING = 32_768
 MAX_COMPONENTS = 50_000
 MAX_TOOLS = 64
@@ -58,7 +63,7 @@ COMPONENT_FIELDS = frozenset((
     "type", "bom-ref", "name", "version", "purl", "hashes", "licenses",
     "scope", "description",
 ))
-TOOL_FIELDS = frozenset(("vendor", "name", "version", "purl", "hashes"))
+TOOL_FIELDS = frozenset(("vendor", "name", "version", "hashes"))
 METADATA_FIELDS = frozenset(("timestamp", "tools", "component"))
 IGNORED_VOLATILE_METADATA_FIELDS = frozenset(("timestamp",))
 
@@ -86,6 +91,16 @@ def _safe_text(value, maximum=4096, allow_empty=False):
     if type(value) is not str or len(value) > maximum or (not allow_empty and not value):
         return False
     return all(ord(character) >= 32 and not 55296 <= ord(character) <= 57343 for character in value)
+
+
+def _valid_serial_number(value):
+    if not _safe_text(value, 45) or not value.startswith("urn:uuid:"):
+        return False
+    try:
+        identifier = uuid.UUID(value[len("urn:uuid:"):])
+    except (ValueError, AttributeError):
+        return False
+    return value == "urn:uuid:" + str(identifier)
 
 
 def _json_object(pairs):
@@ -117,13 +132,13 @@ def _json_constant(value):
     _refuse("sbom_json_invalid")
 
 
-def _check_json_tree(value):
+def _check_json_tree(value, max_nodes=MAX_JSON_NODES):
     pending = [(value, 0)]
     nodes = 0
     while pending:
         current, depth = pending.pop()
         nodes += 1
-        if nodes > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
+        if nodes > max_nodes or depth > MAX_JSON_DEPTH:
             _refuse("sbom_json_invalid")
         if type(current) is str:
             if not _safe_text(current, MAX_JSON_STRING, allow_empty=True):
@@ -180,7 +195,7 @@ def parse_generator_output(data):
     if type(document.get("version")) is not int or document["version"] < 1:
         _refuse("sbom_document_invalid")
     serial_number = document.get("serialNumber")
-    if serial_number is not None and not _safe_text(serial_number, 128):
+    if serial_number is not None and not _valid_serial_number(serial_number):
         _refuse("sbom_document_invalid")
     return document
 
@@ -265,6 +280,8 @@ def _normalise_licenses(value, locked_license=None):
     if value is not None:
         if type(value) is not list or len(value) > MAX_LICENSES:
             _refuse("sbom_license_invalid")
+        if len(value) > 1:
+            _refuse("sbom_unsupported_field")
         for choice in value:
             if type(choice) is not dict or len(choice) != 1:
                 _refuse("sbom_license_invalid")
@@ -280,7 +297,6 @@ def _normalise_licenses(value, locked_license=None):
             if not _safe_text(expression, 4096):
                 _refuse("sbom_license_invalid")
             expressions.append(expression)
-    expressions = sorted(set(expressions))
     if locked_license is not None:
         if not _safe_text(locked_license, 4096):
             _refuse("sbom_license_invalid")
@@ -303,7 +319,7 @@ def _normalise_tools(value):
         if not _safe_text(item.get("name"), 256):
             _refuse("sbom_document_invalid")
         tool = {"name": item["name"]}
-        for field in ("vendor", "version", "purl"):
+        for field in ("vendor", "version"):
             if field in item:
                 if not _safe_text(item[field], 4096):
                     _refuse("sbom_document_invalid")
@@ -385,6 +401,44 @@ def _npm_source_hash(integrity):
     return digest.hex()
 
 
+def _derive_npm_inventory(package_lock_bytes, expected_manifest, node_executable):
+    if type(package_lock_bytes) is not bytes or len(package_lock_bytes) > MAX_PACKAGE_LOCK_BYTES:
+        _refuse("sbom_lock_invalid")
+    if (type(node_executable) is not str or not os.path.isabs(node_executable)
+            or not _safe_text(node_executable, 4096)):
+        _refuse("sbom_inventory_invalid")
+    expectation_bytes = _canonical_bytes(expected_manifest)
+    if len(expectation_bytes) > 262_144:
+        _refuse("sbom_inventory_invalid")
+    envelope = _canonical_bytes({
+        "expected": expected_manifest,
+        "lockBase64": base64.b64encode(package_lock_bytes).decode("ascii"),
+    })
+    helper = Path(__file__).with_name("node_lock_inventory.mjs")
+    environment = {key: os.environ[key] for key in ("SystemRoot", "WINDIR") if key in os.environ}
+    environment["NODE_OPTIONS"] = ""
+    try:
+        result = subprocess.run(
+            [node_executable, str(helper)], input=envelope, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, env=environment, timeout=60, check=False,
+        )
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        _refuse("sbom_inventory_invalid")
+    if result.returncode != 0:
+        _refuse("sbom_lock_invalid")
+    if len(result.stdout) > MAX_INVENTORY_BYTES:
+        _refuse("sbom_inventory_invalid")
+    try:
+        inventory = json.loads(
+            result.stdout.decode("utf-8", "strict"), object_pairs_hook=_json_object,
+            parse_int=_json_integer, parse_float=_json_float, parse_constant=_json_constant,
+        )
+        _check_json_tree(inventory, MAX_INVENTORY_NODES)
+    except (UnicodeError, ValueError, TypeError, RecursionError, SbomRefusal):
+        _refuse("sbom_inventory_invalid")
+    return inventory
+
+
 def _npm_inventory(package_lock_bytes, inventory):
     if type(package_lock_bytes) is not bytes or len(package_lock_bytes) > MAX_PACKAGE_LOCK_BYTES:
         _refuse("sbom_lock_invalid")
@@ -407,7 +461,6 @@ def _npm_inventory(package_lock_bytes, inventory):
             or len(packages) > inventory["packageCount"]):
         _refuse("sbom_inventory_invalid")
     records = {}
-    pending_edges = []
     for package in packages:
         if type(package) is not dict or set(package) != {
                 "name", "version", "kind", "integrity", "license", "dependencies"}:
@@ -434,6 +487,18 @@ def _npm_inventory(package_lock_bytes, inventory):
         if type(dependencies) is not list or len(dependencies) > MAX_DEPENDENCIES:
             _refuse("sbom_inventory_invalid")
         purl = _purl_for("npm", name, version)
+        dependency_purls = set()
+        for dependency in dependencies:
+            if type(dependency) is not dict or set(dependency) != {"name", "version"}:
+                _refuse("sbom_inventory_invalid")
+            dependency_name = dependency["name"]
+            dependency_version = dependency["version"]
+            if not _valid_name("npm", dependency_name) or not _valid_version(dependency_version):
+                _refuse("sbom_inventory_invalid")
+            dependency_purl = _purl_for("npm", dependency_name, dependency_version)
+            if dependency_purl in dependency_purls:
+                _refuse("sbom_inventory_invalid")
+            dependency_purls.add(dependency_purl)
         record = records.get(purl)
         if record is None:
             record = {
@@ -444,29 +509,28 @@ def _npm_inventory(package_lock_bytes, inventory):
                 "kind": kind,
                 "hashes": hashes,
                 "license": locked_license,
-                "dependencies": set(),
+                "dependencies": dependency_purls,
             }
             records[purl] = record
         elif (record["hashes"] != hashes
-              or (record["license"] is not None and locked_license is not None
-                  and record["license"] != locked_license)
-              or record["kind"] != kind):
+              or record["license"] != locked_license
+              or record["kind"] != kind
+              or record["dependencies"] != dependency_purls):
             _refuse("sbom_identity_conflict")
-        elif record["license"] is None:
-            record["license"] = locked_license
-        for dependency in dependencies:
-            if type(dependency) is not dict or set(dependency) != {"name", "version"}:
-                _refuse("sbom_inventory_invalid")
-            dependency_name = dependency["name"]
-            dependency_version = dependency["version"]
-            if not _valid_name("npm", dependency_name) or not _valid_version(dependency_version):
-                _refuse("sbom_inventory_invalid")
-            pending_edges.append((purl, _purl_for("npm", dependency_name, dependency_version)))
-    for source, target in pending_edges:
-        if target not in records:
+    record_keys = set(records)
+    for record in records.values():
+        if record["dependencies"] - record_keys:
             _refuse("sbom_inventory_invalid")
-        records[source]["dependencies"].add(target)
     return records
+
+
+def _register_alias(aliases, reference, purl):
+    if not _safe_text(reference, 4096):
+        _refuse("sbom_component_invalid")
+    prior = aliases.get(reference)
+    if prior is not None and prior != purl:
+        _refuse("sbom_identity_conflict")
+    aliases[reference] = purl
 
 
 def _normalise_component(component, ecosystem, expected, aliases, observed, is_root=False):
@@ -520,20 +584,11 @@ def _normalise_component(component, ecosystem, expected, aliases, observed, is_r
             _refuse("sbom_duplicate_identity")
         _refuse("sbom_identity_conflict")
     observed[purl] = output
-    aliases[purl] = purl
+    _register_alias(aliases, purl, purl)
     if "bom-ref" in component:
-        reference = component["bom-ref"]
-        if not _safe_text(reference, 4096):
-            _refuse("sbom_component_invalid")
-        prior = aliases.get(reference)
-        if prior is not None and prior != purl:
-            _refuse("sbom_identity_conflict")
-        aliases[reference] = purl
+        _register_alias(aliases, component["bom-ref"], purl)
     if raw_purl is not None:
-        prior = aliases.get(raw_purl)
-        if prior is not None and prior != purl:
-            _refuse("sbom_identity_conflict")
-        aliases[raw_purl] = purl
+        _register_alias(aliases, raw_purl, purl)
     return purl
 
 
@@ -617,7 +672,7 @@ def validate_pinned_schema_subset(document):
     if (document["bomFormat"] != "CycloneDX"
             or document["specVersion"] != CYCLONEDX_SPEC_VERSION
             or type(document["version"]) is not int or document["version"] != 1
-            or not _safe_text(document["serialNumber"], 64)):
+            or not _valid_serial_number(document["serialNumber"])):
         _refuse("sbom_schema_invalid")
     metadata = document["metadata"]
     if type(metadata) is not dict or set(metadata) - {"component", "tools"}:
@@ -668,7 +723,7 @@ def validate_pinned_schema_subset(document):
         if "description" in component and not _safe_text(component["description"], 16_384, allow_empty=True):
             _refuse("sbom_schema_invalid")
         if "licenses" in component:
-            if type(component["licenses"]) is not list or not component["licenses"]:
+            if type(component["licenses"]) is not list or len(component["licenses"]) != 1:
                 _refuse("sbom_schema_invalid")
             for license_choice in component["licenses"]:
                 if (type(license_choice) is not dict or set(license_choice) != {"expression"}
@@ -688,7 +743,7 @@ def validate_pinned_schema_subset(document):
     for tool in tools:
         if type(tool) is not dict or set(tool) - TOOL_FIELDS or not _safe_text(tool.get("name"), 256):
             _refuse("sbom_schema_invalid")
-        for field in ("vendor", "version", "purl"):
+        for field in ("vendor", "version"):
             if field in tool and not _safe_text(tool[field], 4096):
                 _refuse("sbom_schema_invalid")
         if "hashes" in tool:
@@ -793,11 +848,17 @@ def _attach_edges(normalized, expected):
 
 
 def normalize_and_merge(
-        cargo_sbom_bytes, npm_sbom_bytes, cargo_lock_bytes, package_lock_bytes, npm_lock_inventory):
-    """Run the pipeline using npm_lock_inventory from validateLockManifestInventory."""
+        cargo_sbom_bytes, npm_sbom_bytes, cargo_lock_bytes, package_lock_bytes,
+        npm_lock_context):
+    """Derive npm inventory from exact lock bytes and return the merged document."""
+    if type(npm_lock_context) is not dict or set(npm_lock_context) != {"expected", "nodeExecutable"}:
+        _refuse("sbom_inventory_invalid")
     cargo_document = parse_generator_output(cargo_sbom_bytes)
     npm_document = parse_generator_output(npm_sbom_bytes)
     cargo_expected = _cargo_inventory(cargo_lock_bytes)
+    npm_lock_inventory = _derive_npm_inventory(
+        package_lock_bytes, npm_lock_context["expected"], npm_lock_context["nodeExecutable"],
+    )
     npm_expected = _npm_inventory(package_lock_bytes, npm_lock_inventory)
     cargo_normalized = _normalise_generator(cargo_document, "cargo", cargo_expected)
     npm_normalized = _normalise_generator(npm_document, "npm", npm_expected)

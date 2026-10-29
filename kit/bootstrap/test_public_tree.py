@@ -203,6 +203,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_feedback_smoke_audit.py',
             'kit/confinement/node_lock_envelope.mjs',
             'kit/confinement/test_node_lock_envelope.mjs',
+            'kit/confinement/node_lock_inventory.mjs',
             'kit/confinement/node_lock_manifest.mjs',
             'kit/confinement/test_node_lock_manifest.mjs',
             'kit/confinement/sbom_normalizer.py',

@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import json
+import shutil
 import unittest
 
 import cargo_lock_receipt
@@ -31,7 +32,16 @@ PACKAGE_LOCK_VALUE = {
         "": {
             "name": "fixture-root",
             "version": "1.0.0",
+            "workspaces": ["packages/*"],
             "dependencies": {"left-pad": "1.3.0"},
+        },
+        "packages/shared": {
+            "name": "fixture-shared",
+            "version": "1.0.0",
+        },
+        "node_modules/fixture-shared": {
+            "resolved": "packages/shared",
+            "link": True,
         },
         "node_modules/left-pad": {
             "version": "1.3.0",
@@ -42,29 +52,21 @@ PACKAGE_LOCK_VALUE = {
     },
 }
 PACKAGE_LOCK_BYTES = (json.dumps(PACKAGE_LOCK_VALUE, separators=(",", ":")) + "\n").encode("ascii")
-NPM_LOCK_INVENTORY = {
-    "inventoryVersion": 1,
-    "packageCount": 2,
-    "lockfileVersion": 3,
-    "lockSha256": hashlib.sha256(PACKAGE_LOCK_BYTES).hexdigest(),
-    "packages": [
-        {
+NPM_LOCK_CONTEXT = {
+    "nodeExecutable": shutil.which("node"),
+    "expected": {
+        "root": {
             "name": "fixture-root",
             "version": "1.0.0",
-            "kind": "root",
-            "integrity": None,
-            "license": None,
-            "dependencies": [{"name": "left-pad", "version": "1.3.0"}],
+            "workspaces": ["packages/*"],
+            "dependencies": {"left-pad": "1.3.0"},
         },
-        {
-            "name": "left-pad",
-            "version": "1.3.0",
-            "kind": "registry",
-            "integrity": NPM_INTEGRITY,
-            "license": "MIT",
-            "dependencies": [],
-        },
-    ],
+        "workspaces": [{
+            "path": "packages/shared",
+            "name": "fixture-shared",
+            "version": "1.0.0",
+        }],
+    },
 }
 
 
@@ -122,6 +124,13 @@ def npm_document():
         "components": [
             {
                 "type": "library",
+                "bom-ref": "shared-ref",
+                "name": "fixture-shared",
+                "version": "1.0.0",
+                "purl": "pkg:npm/fixture-shared@1.0.0",
+            },
+            {
+                "type": "library",
                 "bom-ref": "left-pad-ref",
                 "name": "left-pad",
                 "version": "1.3.0",
@@ -132,6 +141,7 @@ def npm_document():
         ],
         "dependencies": [
             {"ref": "npm-root", "dependsOn": ["left-pad-ref"]},
+            {"ref": "shared-ref", "dependsOn": []},
             {"ref": "left-pad-ref", "dependsOn": []},
         ],
     }
@@ -142,13 +152,13 @@ def encode_document(document):
 
 
 def merge(cargo=None, npm=None, cargo_lock=CARGO_LOCK_BYTES,
-          package_lock=PACKAGE_LOCK_BYTES, npm_inventory=NPM_LOCK_INVENTORY):
+          package_lock=PACKAGE_LOCK_BYTES, npm_context=NPM_LOCK_CONTEXT):
     return subject.normalize_and_merge(
         encode_document(cargo if cargo is not None else cargo_document()),
         encode_document(npm if npm is not None else npm_document()),
         cargo_lock,
         package_lock,
-        npm_inventory,
+        npm_context,
     )
 
 
@@ -230,8 +240,22 @@ class SbomNormalizerTests(unittest.TestCase):
         document["components"][0]["licenses"] = [{"expression": 4}]
         self.assert_refusal("sbom_license_invalid", lambda: merge(cargo=document))
         document = npm_document()
-        document["components"][0]["licenses"] = [{"expression": "Apache-2.0"}]
+        document["components"][1]["licenses"] = [{"expression": "Apache-2.0"}]
         self.assert_refusal("sbom_license_conflict", lambda: merge(npm=document))
+
+        document = cargo_document()
+        document["components"][0]["licenses"] = [
+            {"license": {"id": "MIT"}}, {"license": {"id": "Apache-2.0"}},
+        ]
+        self.assert_refusal("sbom_unsupported_field", lambda: merge(cargo=document))
+
+    def test_rejects_unsupported_legacy_tool_data_and_bad_serial(self):
+        document = cargo_document()
+        document["metadata"]["tools"][0]["purl"] = "pkg:generic/tool@1"
+        self.assert_refusal("sbom_unsupported_field", lambda: merge(cargo=document))
+        document = cargo_document()
+        document["serialNumber"] = "arbitrary-text"
+        self.assert_refusal("sbom_document_invalid", lambda: merge(cargo=document))
 
     def test_rejects_duplicate_and_conflicting_component_identities(self):
         document = cargo_document()
@@ -243,6 +267,15 @@ class SbomNormalizerTests(unittest.TestCase):
         document["components"].append(conflicting)
         self.assert_refusal("sbom_identity_conflict", lambda: merge(cargo=document))
 
+    def test_refuses_reference_collisions_with_later_purls_and_raw_references(self):
+        document = cargo_document()
+        document["metadata"]["component"]["bom-ref"] = "pkg:cargo/serde@1.0.0"
+        self.assert_refusal("sbom_identity_conflict", lambda: merge(cargo=document))
+        document = cargo_document()
+        document["metadata"]["component"]["bom-ref"] = "same-ref"
+        document["components"][0]["bom-ref"] = "same-ref"
+        self.assert_refusal("sbom_identity_conflict", lambda: merge(cargo=document))
+
     def test_proves_exact_component_coverage(self):
         document = cargo_document()
         document["components"] = []
@@ -252,6 +285,48 @@ class SbomNormalizerTests(unittest.TestCase):
         extra.update({"name": "other", "purl": "pkg:cargo/other@1.0.0"})
         document["components"].append(extra)
         self.assert_refusal("sbom_coverage_extra", lambda: merge(cargo=document))
+
+    def test_npm_coverage_comes_from_exact_lock_bytes(self):
+        document = npm_document()
+        document["components"] = [document["components"][0]]
+        document["dependencies"] = [
+            {"ref": "npm-root", "dependsOn": []},
+            {"ref": "shared-ref", "dependsOn": []},
+        ]
+        self.assert_refusal("sbom_coverage_missing", lambda: merge(npm=document))
+
+        document = npm_document()
+        document["components"][1]["name"] = "substituted"
+        document["components"][1]["purl"] = "pkg:npm/substituted@1.3.0"
+        self.assert_refusal("sbom_coverage_extra", lambda: merge(npm=document))
+
+        lock = json.loads(PACKAGE_LOCK_BYTES)
+        lock["packages"]["node_modules/left-pad"]["integrity"] = "sha512-" + ("A" * 85) + "Q=="
+        self.assert_refusal("sbom_hash_conflict", lambda: merge(package_lock=encode_document(lock)))
+
+    def test_repeated_npm_installations_with_different_resolutions_refuse(self):
+        lock = json.loads(PACKAGE_LOCK_BYTES)
+        packages = lock["packages"]
+        for version, path in (
+                ("1.0.0", "node_modules/peer"),
+                ("2.0.0", "packages/shared/node_modules/peer")):
+            packages[path] = {
+                "version": version,
+                "resolved": "https://registry.npmjs.org/peer/-/peer-" + version + ".tgz",
+                "integrity": NPM_INTEGRITY,
+            }
+        for path, version in (
+                ("node_modules/peer-owner", "1.0.0"),
+                ("packages/shared/node_modules/peer-owner", "2.0.0")):
+            packages[path] = {
+                "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/peer-owner/-/peer-owner-1.0.0.tgz",
+                "integrity": NPM_INTEGRITY,
+                "peerDependencies": {"peer": version},
+            }
+        self.assert_refusal(
+            "sbom_identity_conflict", lambda: merge(package_lock=encode_document(lock)),
+        )
 
     def test_rejects_dependency_edges_that_do_not_match_locks(self):
         document = cargo_document()
@@ -267,16 +342,40 @@ class SbomNormalizerTests(unittest.TestCase):
             lambda: merge(cargo_lock=b"version = 2\n"),
         )
         self.assert_refusal(
-            "sbom_lock_hash_mismatch",
-            lambda: merge(package_lock=PACKAGE_LOCK_BYTES + b" "),
+            "sbom_lock_invalid",
+            lambda: merge(package_lock=b"not json"),
         )
         self.assert_refusal(
             "sbom_inventory_invalid",
-            lambda: merge(npm_inventory={}),
+            lambda: merge(npm_context={}),
+        )
+        forged = {
+            "inventoryVersion": 1,
+            "packageCount": 1,
+            "lockfileVersion": 3,
+            "lockSha256": hashlib.sha256(PACKAGE_LOCK_BYTES + b" ").hexdigest(),
+            "packages": [],
+        }
+        self.assert_refusal(
+            "sbom_lock_hash_mismatch",
+            lambda: subject._npm_inventory(PACKAGE_LOCK_BYTES, forged),
         )
 
     def test_rejects_malformed_pinned_schema_output(self):
         self.assert_refusal("sbom_schema_invalid", lambda: subject.validate_pinned_schema_subset({}))
+
+    def test_schema_rejects_multiple_expressions_tool_purl_and_bad_serial(self):
+        document = json.loads(merge())
+        document["components"][0]["licenses"] = [
+            {"expression": "MIT"}, {"expression": "Apache-2.0"},
+        ]
+        self.assert_refusal("sbom_schema_invalid", lambda: subject.validate_pinned_schema_subset(document))
+        document = json.loads(merge())
+        document["metadata"]["tools"][0]["purl"] = "pkg:generic/tool@1"
+        self.assert_refusal("sbom_schema_invalid", lambda: subject.validate_pinned_schema_subset(document))
+        document = json.loads(merge())
+        document["serialNumber"] = "not-a-uuid"
+        self.assert_refusal("sbom_schema_invalid", lambda: subject.validate_pinned_schema_subset(document))
 
 
 if __name__ == "__main__":
