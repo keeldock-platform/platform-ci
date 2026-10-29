@@ -12,6 +12,13 @@ export const LOCK_MANIFEST_LIMITS = Object.freeze({
 const DEPENDENCY_GROUPS = Object.freeze([
   'dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies',
 ]);
+const PERMITTED_OVERRIDES = Object.freeze({ lightningcss: '1.33.0' });
+const OVERRIDE_PLATFORM_BINARIES = Object.freeze({
+  lightningcss: new Set([
+    'darwin-arm64', 'darwin-x64', 'freebsd-x64', 'linux-arm-gnueabihf', 'linux-arm64-gnu', 'linux-arm64-musl',
+    'linux-x64-gnu', 'linux-x64-musl', 'win32-arm64-msvc', 'win32-x64-msvc', 'android-arm64',
+  ].map((suffix) => `lightningcss-${suffix}`)),
+});
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/u;
 const NUMERIC_IDENTIFIER = '(?:0|[1-9][0-9]*)';
 const PRE_RELEASE_IDENTIFIER = '(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)';
@@ -83,11 +90,19 @@ function packageName(value) {
     && !value.includes('..') && !['__proto__', 'constructor', 'prototype'].includes(value);
 }
 
+function normalizeOverrides(value) {
+  const overrides = dataObject(value, Object.keys(PERMITTED_OVERRIDES), Object.keys(PERMITTED_OVERRIDES));
+  for (const [name, spec] of Object.entries(PERMITTED_OVERRIDES)) {
+    if (overrides[name] !== spec) reject('invalid_expectation');
+  }
+  return overrides;
+}
+
 function normalizeExpectation(input) {
   const expected = dataObject(input, ['root', 'workspaces'], ['root', 'workspaces']);
   if (!Array.isArray(expected.workspaces) || expected.workspaces.length > 256) reject('invalid_expectation');
   const root = dataObject(expected.root,
-    ['name', 'version', 'workspaces', ...DEPENDENCY_GROUPS], ['name', 'version', 'workspaces']);
+    ['name', 'version', 'workspaces', 'overrides', ...DEPENDENCY_GROUPS], ['name', 'version', 'workspaces']);
   const workspaces = expected.workspaces.map((value) => dataObject(value,
     ['path', 'name', 'version', ...DEPENDENCY_GROUPS], ['path', 'name', 'version']));
   if (!packageName(root.name) || !exactVersion(root.version)
@@ -95,6 +110,7 @@ function normalizeExpectation(input) {
       || new Set(root.workspaces).size !== root.workspaces.length
       || root.workspaces.some((path) => typeof path !== 'string'
         || !(path === 'packages/*' || validWorkspacePath(path)))) reject('invalid_expectation');
+  if (Object.hasOwn(root, 'overrides')) root.overrides = normalizeOverrides(root.overrides);
   const names = new Set();
   const paths = new Set();
   for (const item of workspaces) {
@@ -120,6 +136,15 @@ function normalizeExpectation(input) {
         if (!packageName(name) || (!workspaceSpec && !safeDependencySpec(spec, !names.has(name)))
             || (!names.has(name) && typeof spec === 'string' && spec.startsWith('workspace:'))) {
           reject('invalid_expectation');
+        }
+      }
+    }
+  }
+  if (root.overrides !== undefined) {
+    for (const item of [root, ...workspaces]) {
+      for (const group of DEPENDENCY_GROUPS) {
+        for (const [name, spec] of Object.entries(PERMITTED_OVERRIDES)) {
+          if (Object.hasOwn(item[group], name) && item[group][name] !== spec) reject('invalid_expectation');
         }
       }
     }
@@ -237,9 +262,9 @@ function validateDependencyMap(map, workspaceNames) {
   }
 }
 
-function validateEntryMetadata(entry) {
+function validateEntryMetadata(entry, isRoot = false) {
   const keys = Object.keys(entry);
-  if (keys.some((key) => !LOCK_ENTRY_FIELDS.has(key))) reject('invalid_package');
+  if (keys.some((key) => !LOCK_ENTRY_FIELDS.has(key) && !(isRoot && key === 'overrides'))) reject('invalid_package');
   if (entry.link === true && keys.some((key) => key !== 'link' && key !== 'resolved')) reject('workspace_link_invalid');
   for (const flag of ['link', 'inBundle', 'hasInstallScript', 'hasShrinkwrap', 'dev', 'devOptional', 'optional', 'peer']) {
     if (entry[flag] !== undefined && typeof entry[flag] !== 'boolean') reject('invalid_package');
@@ -517,6 +542,10 @@ function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventor
       || rootEntry.workspaces.some((path, index) => path !== expected.root.workspaces[index])) {
     reject('root_mismatch');
   }
+  if (Object.hasOwn(rootEntry, 'overrides')
+      && (expected.root.overrides === undefined || !exactMap(rootEntry.overrides, expected.root.overrides))) {
+    reject('root_mismatch');
+  }
   compareDirectPins(rootEntry, expected.root);
 
   const workspaceByPath = new Map();
@@ -538,7 +567,7 @@ function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventor
   for (const key of packageKeys) {
     const entry = packages[key];
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) reject('invalid_package');
-    validateEntryMetadata(entry);
+    validateEntryMetadata(entry, key === '');
     for (const group of DEPENDENCY_GROUPS) validateDependencyMap(entry[group], workspaceByName);
     if (key === '' || workspaceByPath.has(key)) {
       if (entry.resolved !== undefined || entry.integrity !== undefined || entry.link === true) {
@@ -560,6 +589,13 @@ function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventor
       reject('package_source_invalid');
     }
     if (entry.name !== undefined && entry.name !== moduleName) reject('invalid_package');
+    if (expected.root.overrides !== undefined) {
+      for (const [name, pinned] of Object.entries(expected.root.overrides)) {
+        if ((moduleName === name || OVERRIDE_PLATFORM_BINARIES[name]?.has(moduleName)) && entry.version !== pinned) {
+          reject('override_mismatch');
+        }
+      }
+    }
   }
 
   const result = {
