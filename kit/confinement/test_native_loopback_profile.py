@@ -17,8 +17,6 @@ from native_loopback_profile import (
 
 
 ROOT = Path(__file__).resolve().parent
-# linux_harness.py digest re-pinned (1283f3c1...) for the approved linux-source-read lane change;
-# the Appium loopback lane itself must not alter either profile.
 SOURCE_PROFILE_DIGESTS = {
     "linux_harness.py": "066e461ad229d70cd2a270fc95ddcc29e60951da5c7ec5cfdd68e45c4445a8c0",
     "macos_deny_default.py": "ab15114cddef7f94732bfd8497a08fde41f75b49e6c42721a447b4f895ce628f",

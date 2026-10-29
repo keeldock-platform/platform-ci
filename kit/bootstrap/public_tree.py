@@ -198,7 +198,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/foundation_node_feedback.py': '9bdbbccd22bbe66461d7310852de98688c39da05088cedf25e2eabcc43f24f29',
     'kit/confinement/test_foundation_node_feedback.py': 'cd58fa451fce51a95aa647446ebf6efce881fe8297e6370e16a81ff06b560cab',
     'kit/confinement/native_loopback_profile.py': '5dee8e3f29e1d9178099eeefdec9f7520efe3939ab9b8cae71406b8da48a4ab7',
-    'kit/confinement/test_native_loopback_profile.py': '6f0e05d60d500dc15bd8cb6c4d6bc0279a34bcdee7f3da85f44ca4dddc3f852e',
+    'kit/confinement/test_native_loopback_profile.py': 'a3c7f3efa713ca5a1d3379694c3e25ff71c47ce7072bf0e2139c459d777bf695',
     'kit/confinement/macos_node_contract.py': '890cd2891954d4abf7db85ec4295e7aa01c4e2ca3a083ef7537904e3c3c1aeb6',
     'kit/confinement/test_macos_node_contract.py': 'e82debccbaeaba990256babe32dd9ff36dcc8d4542a411b56e67034aff4a293c',
     'kit/confinement/node_contract_validation.mjs': '5d5c06ef75a7194858b707685b40ab39155f2f0ea0dde1633b286bc2709f5920',
