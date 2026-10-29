@@ -261,6 +261,8 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_cargo_vendor_verify.py',
             "kit/confinement/release_evidence.py",
             "kit/confinement/test_release_evidence.py",
+            "kit/confinement/native_loopback_profile.py",
+            "kit/confinement/test_native_loopback_profile.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))
@@ -271,6 +273,17 @@ class PublicTreeTests(unittest.TestCase):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, destination)
             scan_tree(root, "platform")
+            for name in (
+                "kit/confinement/native_loopback_profile.py",
+                "kit/confinement/test_native_loopback_profile.py",
+            ):
+                with self.subTest(file=name):
+                    edited = root / name
+                    original = edited.read_bytes()
+                    edited.write_bytes(original + b"\n")
+                    with self.assertRaisesRegex(PublicTreeError, "file-hash-mismatch"):
+                        scan_tree(root, "platform")
+                    edited.write_bytes(original)
             edited = root / "kit/confinement/windows_native_preflight.cs"
             edited.write_text(edited.read_text(encoding="utf-8") + "\n", encoding="utf-8")
             with self.assertRaisesRegex(PublicTreeError, "file-hash-mismatch"):
