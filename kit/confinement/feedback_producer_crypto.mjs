@@ -86,7 +86,7 @@ function validateInput(input) {
   }
   if (profile.kind !== input.kind) reject('invalid_context');
   const limit = input.kind === 'lock' ? 4 * 1024 * 1024 - 64 * 1024
-    : input.kind === 'rust_patch' ? 1024 * 1024
+    : input.kind === 'rust_patch' ? 4 * 1024 * 1024 - 64 * 1024
       : input.kind === 'cargo_lock' ? 1024 * 1024 : 512 * 1024;
   const payloadBytes = strictBytes(input.payload_b64, limit);
   const publicKey = publicKeyFromSpki(input.recipient_spki_b64, input.context);

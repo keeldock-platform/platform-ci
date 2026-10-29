@@ -845,6 +845,15 @@ class ProfilePayloadLimitTests(unittest.TestCase):
                             stub, -1, {"request_id": "a" * 64}, profile, oversize,
                         )
                 create.assert_not_called()
+        patch_profile = feedback_request.PROFILE_BY_KIND["rust_patch"]
+        self.assertEqual(patch_profile["max_payload_bytes"], 4 * 1024 * 1024 - 64 * 1024)
+        self.assertEqual(patch_profile["max_payload_bytes"], subject.MAX_PLAINTEXT_BYTES)
+        with mock.patch.object(subject, "_create_named") as create:
+            path = subject.FeedbackAdmin._release_private_output(
+                stub, -1, {"request_id": "a" * 64}, patch_profile, b"x" * patch_profile["max_payload_bytes"],
+            )
+        create.assert_called_once()
+        self.assertTrue(path.endswith("-patch.payload"))
         cargo = feedback_request.PROFILE_BY_KIND["cargo_lock"]
         with mock.patch.object(subject, "_create_named") as create:
             path = subject.FeedbackAdmin._release_private_output(

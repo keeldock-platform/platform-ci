@@ -704,6 +704,36 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             )
         self.assertTrue(payload.startswith(b"diff --git a/crates/kernel/i18n/src/lib.rs "))
 
+    def test_format_patch_limit_matches_the_profile_and_is_enforced_at_the_boundary(self):
+        self.assertEqual(producer.MAX_PATCH_BYTES, 4 * 1024 * 1024 - 64 * 1024)
+        self.assertEqual(producer.MAX_PATCH_BYTES, producer.MAX_LOCK_BYTES)
+        self.assertEqual(producer.MAX_PATCH_BYTES, producer.PROFILE_BY_KIND["rust_patch"]["max_payload_bytes"])
+        self.assertLessEqual(producer.MAX_PATCH_BYTES, producer.MAX_CIPHERTEXT_BYTES - 64 * 1024)
+        self.assertLessEqual(
+            4 * ((producer.MAX_PATCH_BYTES + 2) // 3) + 128 * 1024, producer.MAX_NODE_INPUT_BYTES,
+        )
+        relative = "crates/kernel/i18n/src/lib.rs"
+        header = len(("diff --git a/" + relative + " b/" + relative + "\n").encode("ascii"))
+        for extra, accepted in ((0, True), (1, False)):
+            body = "x" * (producer.MAX_PATCH_BYTES - header - 1 + extra) + "\n"
+            with self.subTest(extra=extra), \
+                    patch.object(producer, "_read_file", return_value=b"fn a(){}\n"), \
+                    patch.object(producer, "_read_worker_file", return_value=b"fn a() {}\n"), \
+                    patch.object(producer.difflib, "unified_diff", return_value=[body]):
+                if accepted:
+                    payload = producer._rust_format_patch(
+                        Path("/synthetic-source"), Path("/synthetic-formatted"),
+                        (relative,), 501, time.monotonic() + 600,
+                    )
+                    self.assertEqual(len(payload), producer.MAX_PATCH_BYTES)
+                else:
+                    with self.assertRaises(producer.FeedbackRefusal) as raised:
+                        producer._rust_format_patch(
+                            Path("/synthetic-source"), Path("/synthetic-formatted"),
+                            (relative,), 501, time.monotonic() + 600,
+                        )
+                    self.assertEqual(raised.exception.reason, "payload_invalid")
+
     def test_cli_accepts_only_fixed_run_and_publisher_shapes(self):
         kind, core_args = producer._parse_cli([
             "run", "--profile", "lock", "--token-stdin", "--source-sha", SOURCE_SHA,

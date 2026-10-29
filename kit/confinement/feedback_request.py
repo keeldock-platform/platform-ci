@@ -34,7 +34,7 @@ _PROFILE_ROWS = (
      4 * 1024 * 1024 - 64 * 1024, ()),
     (2, "rust_patch", "core-rust-format-return", ".github/workflows/core-rust-format-return.yml",
      "core-rust-format-return", "core-rust-format-return-audit", "rust-format-return-v1.enc",
-     1024 * 1024, ()),
+     4 * 1024 * 1024 - 64 * 1024, ()),
     (3, "build_diagnostics", "core-build-diagnostic-return",
      ".github/workflows/core-build-diagnostic-return.yml", "core-build-diagnostic-return",
      "core-build-diagnostic-return-audit", "build-diagnostic-return-v1.enc",

@@ -234,6 +234,14 @@ class CargoLockProfileTests(unittest.TestCase):
         )
         self.assertLessEqual(total, profile["max_payload_bytes"])
 
+    def test_rust_patch_profile_limit_matches_the_envelope_plaintext_bound(self):
+        profile = subject.PROFILE_BY_KIND["rust_patch"]
+        node_profile = subject.PROFILE_BY_KIND["lock"]
+        self.assertEqual(profile["max_payload_bytes"], 4 * 1024 * 1024 - 64 * 1024)
+        self.assertEqual(profile["max_payload_bytes"], node_profile["max_payload_bytes"])
+        self.assertGreater(profile["max_payload_bytes"], subject.CARGO_LOCK_MAX_PAYLOAD_BYTES)
+        self.assertGreater(profile["max_payload_bytes"], subject.PROFILE_BY_KIND["build_diagnostics"]["max_payload_bytes"])
+
     def test_requests_bind_the_cargo_lock_kind_concern_and_workflow_exactly(self):
         request = subject.create_request(_cargo_fields(0), now=NOW)
         record = subject.encode_request(request, now=NOW)
