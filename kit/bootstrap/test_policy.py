@@ -230,6 +230,11 @@ class WorkflowPolicyTests(unittest.TestCase):
 
     def test_node_lock_smoke_workflow_is_closed_source_free_and_cross_platform(self):
         workflow = NODE_LOCK_SMOKE_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(workflow, NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE)
+        self.assertIn("  pull_request:\n", workflow)
+        self.assertEqual(workflow.count('test_sbom_normalizer.py"'), 2)
+        self.assertLess(workflow.index("uses: actions/setup-node@"), workflow.index('test_sbom_normalizer.py"'))
+        self.assertIn("Versions/3.9/bin/python3.9 -I -S -B -m unittest discover", workflow)
         self.assertTrue(validate_workflow_text(workflow, "platform", "node-lock-smoke"))
         with self.assertRaises(PolicyError):
             validate_workflow_text(workflow, "connect", "node-lock-smoke")
@@ -240,6 +245,7 @@ class WorkflowPolicyTests(unittest.TestCase):
         base = NODE_LOCK_SMOKE_WORKFLOW.read_text(encoding="utf-8")
         mutations = (
             base.replace("  workflow_dispatch:\n", "  pull_request:\n", 1),
+            base.replace("  pull_request:\n", "", 1),
             base.replace("      - \"**\"\n", "      - main\n", 1),
             base.replace("permissions: {}\n", "permissions:\n  contents: read\n", 1),
             base.replace("          - macos-15\n", "          - macos-latest\n", 1),
@@ -252,6 +258,8 @@ class WorkflowPolicyTests(unittest.TestCase):
             base.replace('== "11.19.1"', '== "11.19.0"', 1),
             base.replace("test_node_lock_manifest.mjs", "unreviewed.mjs", 1),
             base.replace('test_node_lock_receipt.py"', 'test_policy.py"', 1),
+            base.replace('          "$python_command" -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"\n', "", 1),
+            base.replace('            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"\n', "", 1),
             base.replace("      - name: Run source-free helper tests\n", "      - name: Extra step\n        run: echo extra\n      - name: Run source-free helper tests\n", 1),
             base.replace("  workflow_dispatch:\n", "  workflow_dispatch:\n    inputs: {}\n", 1),
         )
