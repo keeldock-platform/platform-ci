@@ -1249,6 +1249,47 @@ class ArtifactAndStageTests(unittest.TestCase):
             subject._validate_snapshot(snapshot, "attestations", RUN_ID,
                                        RUN_ATTEMPT, CONTROL_SHA)
 
+    def test_provider_deprecation_link_with_type_parameter_is_ignored(self):
+        digest = "a" * 64
+        docs_host = ".".join(("docs", "github", "com"))
+        docs_path = "/".join(("", "en", "rest", "about-the-rest-api", "api-versions"))
+        docs_uri = "https:" + chr(47) * 2 + docs_host + docs_path
+        response = (
+            "HTTP/2 200 OK\r\n"
+            "Link: <%s>; rel=\"deprecation\"; type=\"text/html\"\r\n"
+            "\r\n"
+            "{\"attestations\":[]}"
+        ) % docs_uri
+        snapshot = subject.parse_provider_http(response.encode("ascii"), digest,
+                                               RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
+        self.assertEqual(snapshot["observed_count"], 0)
+        self.assertIsNone(snapshot["pages"][0]["next_uri"])
+
+    def test_provider_link_relations_are_unique_and_pagination_targets_are_strict(self):
+        digest = "a" * 64
+        docs_host = ".".join(("docs", "github", "com"))
+        docs_path = "/".join(("", "en", "rest", "about-the-rest-api", "api-versions"))
+        docs_uri = "https:" + chr(47) * 2 + docs_host + docs_path
+        cursor = subject.provider_start_uri(digest) + "&after=opaque-cursor"
+        link_value = (
+            '<%s>; rel="next"; type="application/json", '
+            '<%s>; rel="deprecation"; type="text/html"'
+        ) % (cursor, docs_uri)
+        self.assertEqual(subject.provider_next_link([("Link", link_value)], digest), cursor)
+        for malformed in (
+            '<%s>; rel="next", <%s>; rel="next"' % (cursor, cursor),
+            '<%s>; rel="next next"' % cursor,
+            '<%s>; rel="deprecation"; type=' % docs_uri,
+            '<%s>; rel="canonical"' % docs_uri,
+        ):
+            with self.subTest(link=malformed):
+                with self.assertRaisesRegex(subject.Refusal, "provider-link-shape"):
+                    subject.provider_next_link([("Link", malformed)], digest)
+        for relation in ("last", "prev", "first"):
+            with self.subTest(relation=relation):
+                with self.assertRaisesRegex(subject.Refusal, "provider-cursor-uri"):
+                    subject.provider_next_link([("Link", '<%s>; rel="%s"' % (docs_uri, relation))], digest)
+
     def test_archive_bytes_size_digest_expiry_and_members_are_bound(self):
         with tempfile.TemporaryDirectory() as temporary:
             evidence = fixture_successful_evidence(temporary)
