@@ -1692,6 +1692,16 @@ class BareJobLogTests(unittest.TestCase):
         raw = [line.replace("^[[", "\x1b[") for line in messages]
         self.assertEqual(self.parse(bare_linux_log(raw)), self.parse(bare_linux_log(messages)))
 
+    def test_control_bytes_are_stored_in_caret_form_and_tabs_are_kept(self):
+        messages = unlabeled_linux_messages()
+        messages[2] = "bell\x07 del\x7f esc\x1b[0m tab\tend"
+        parsed = self.parse(bare_linux_log(messages))
+        other = parsed["other"][0]
+        self.assertIn("bell^G del^? esc^[[0m tab\tend", other)
+        for text in [other] + list(parsed["sections"].values()):
+            self.assertEqual([c for c in text if ord(c) < 32 and c not in "\n\t"], [])
+            self.assertNotIn("\x7f", text)
+
     def test_a_run_group_started_inside_a_matched_header_is_refused(self):
         messages = unlabeled_linux_messages()
         script = "^[[36;1mprintf '%s\\n' '" + REVOKE_OUTPUT + "'^[[0m"

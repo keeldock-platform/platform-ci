@@ -78,6 +78,7 @@ LINUX_STEP_LOG_MARKERS = {
     "verify-token-rejection": "printf '%s\\n' 'probe=source-free-revocation-simulation result=synthetic'",
 }
 ANSI_ESCAPE = re.compile(r"(?:\x1b|\^\[)\[[0-9;]*m")
+CONTROL_BYTES = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 GUARD_LABELS = (
     "api-fetch-failed",
     "run-view-failed",
@@ -2309,6 +2310,10 @@ def _cmd_find_job(arguments):
     print(job["id"])
 
 
+def _caret_form(match):
+    return "^" + chr((ord(match.group(0)) + 64) % 128)
+
+
 def _without_mark(text):
     return text[1:] if text.startswith(BYTE_ORDER_MARK) else text
 
@@ -2335,7 +2340,7 @@ def parse_linux_log_sections(log_text, job_name, step_names):
         except ValueError:
             raise Refusal("linux-log-timestamp")
         labels.append(fields[1])
-        messages.append(match.group(2))
+        messages.append(CONTROL_BYTES.sub(_caret_form, match.group(2)))
     if messages and all(label == UNLABELED_LOG_STEP for label in labels):
         return _marker_log_sections(messages, step_names)
     for label, message in zip(labels, messages):
