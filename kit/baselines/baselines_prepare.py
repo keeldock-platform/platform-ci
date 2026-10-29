@@ -187,7 +187,7 @@ TOOLCHAIN_NAMES = frozenset(
 PERCENTILES = {"p95": 95, "p05": 5}
 STATISTICS = frozenset(("p95", "p05", "median_x2", "min", "max"))
 SYNTHETIC_VARIANT_ORDER = ("default", "cold", "warm", "numeric", "mixed")
-COLD_PROFILE_MODES =frozenset(("empty-cold", "prepared-cold"))
+COLD_PROFILE_MODES = frozenset(("empty-cold", "prepared-cold"))
 WARM_PROFILE_MODES = frozenset(("empty-warm", "prepared-warm"))
 
 METRICS = {
@@ -379,6 +379,13 @@ def load_policy():
     finally:
         if inserted and bootstrap in sys.path:
             sys.path.remove(bootstrap)
+    expected = os.path.realpath(os.path.join(bootstrap, "policy.py"))
+    try:
+        loaded = os.path.realpath(str(getattr(module, "__file__", "")))
+    except (OSError, ValueError):
+        raise BaselinesRefusal("pin_unreviewed")
+    if loaded != expected:
+        raise BaselinesRefusal("pin_unreviewed")
     if not hasattr(module, "MACOS_CACHE_PROOF_ACTION_SHA"):
         raise BaselinesRefusal("pin_unreviewed")
     return module

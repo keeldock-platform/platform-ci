@@ -196,6 +196,20 @@ class ActionPinTests(unittest.TestCase):
         for name in ("actions/checkout", "actions/setup-node", "actions/upload-artifact"):
             self.assertIn(name, names)
 
+    def test_load_policy_refuses_a_module_from_another_path(self):
+        class Substitute:
+            __file__ = os.path.join(tempfile.gettempdir(), "policy.py")
+            MACOS_CACHE_PROOF_ACTION_SHA = "a" * 40
+
+        with mock.patch.object(baselines_prepare.importlib, "import_module", return_value=Substitute):
+            with self.assertRaisesRegex(BaselinesRefusal, "pin_unreviewed"):
+                baselines_prepare.load_policy()
+
+    def test_load_policy_accepts_the_bootstrap_policy_module(self):
+        policy = baselines_prepare.load_policy()
+        expected = Path(ROOT, "kit", "bootstrap", "policy.py").resolve()
+        self.assertEqual(Path(policy.__file__).resolve(), expected)
+
     def test_extracts_block_flow_and_quoted_key_references(self):
         sha = "a" * 40
         text = "\n".join(

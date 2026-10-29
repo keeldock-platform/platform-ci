@@ -160,9 +160,11 @@ class ReleaseEvidenceTests(unittest.TestCase):
             root = Path(temporary)
             payload = b"safe log\n"
             target = _write(root, "build.log", payload)
+            original_ctime = os.lstat(target).st_ctime_ns
             target.unlink()
             time.sleep(0.1)
             _write(root, "build.log", payload)
+            self.assertEqual(os.lstat(target).st_ctime_ns, original_ctime)
             manifest = _manifest((_entry("build.log", "log", payload),))
             verdict = _scan(root, manifest)
             self.assertTrue(verdict.accepted)
