@@ -356,7 +356,7 @@ foreach ($case in $cases) {
 
     def test_winsock_catalog_access_is_package_scoped_read_only_and_restored(self):
         grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
-        self.assertIn("WinSock2\\Parameters\\Protocol_Catalog9", grant)
+        self.assertIn("WinSock2\\Parameters'", grant)
         self.assertLess(grant.index("New-CatalogLease"), grant.index("Start-CatalogRecovery"))
         self.assertLess(grant.index("Start-CatalogRecovery"), grant.index("Add-CatalogRead"))
         self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", grant)
@@ -373,10 +373,13 @@ foreach ($case in $cases) {
         self.assertLess(add.index("WriteAllText([string]$lease.ArmedFile"), add.index("$key.SetAccessControl($security)"))
         self.assertIn("Restore-CatalogAcl $lease", self.function_body("Restore-WinsockCatalogAcl", self.recovery))
         restore = self.function_body("Restore-CatalogAcl", self.recovery)
-        self.assertIn("$lease.OriginalSddl", restore)
-        self.assertIn("$key.SetAccessControl($restore)", restore)
-        self.assertIn("GetSecurityDescriptorSddlForm", restore)
-        self.assertIn("winsock_restore_readback", restore)
+        self.assertIn("Restore-CatalogKey", restore)
+        self.assertIn("$index -ge 0; $index--", restore)
+        key_restore = self.function_body("Restore-CatalogKey", self.recovery)
+        self.assertIn("$sddl", key_restore)
+        self.assertIn("$key.SetAccessControl($restore)", key_restore)
+        self.assertIn("GetSecurityDescriptorSddlForm", key_restore)
+        self.assertIn("winsock_restore_readback", key_restore)
         confined = self.function_body("Invoke-ConfinedLadder")
         self.assertIn("Grant-WinsockCatalogRead $script:Sid", confined)
         self.assertIn("finally", confined)
@@ -388,6 +391,48 @@ foreach ($case in $cases) {
         self.assertNotIn("internetClient", self.recovery)
         self.assertNotIn("privateNetworkClientServer", self.wrapper)
         self.assertIn("capabilities.CapabilityCount = 0", self.native)
+
+    def test_winsock_grants_are_explicit_per_key_over_a_closed_key_set(self):
+        asserted = self.function_body("Assert-CatalogPath", self.recovery)
+        for part in ("Protocol_Catalog9|NameSpace_Catalog5", "Catalog_Entries|Catalog_Entries64", "[0-9]{12}", "-cmatch"):
+            self.assertIn(part, asserted)
+        paths = self.function_body("Get-CatalogKeyPaths", self.recovery)
+        for part in ("'Protocol_Catalog9'", "'NameSpace_Catalog5'", "'Catalog_Entries'", "'Catalog_Entries64'", "Get-CatalogNumberedChildren"):
+            self.assertIn(part, paths)
+        children = self.function_body("Get-CatalogNumberedChildren", self.recovery)
+        self.assertIn("'^[0-9]{12}\\z'", children)
+        lease = self.function_body("New-CatalogLease", self.recovery)
+        self.assertIn("KeyList", lease)
+        self.assertIn("OriginalSddl = (Get-CatalogAclSddl $item)", lease)
+        add = self.function_body("Add-CatalogRead", self.recovery)
+        self.assertIn("foreach ($item in @($lease.KeyList))", add)
+        self.assertIn("InheritanceFlags]::None, [System.Security.AccessControl.PropagationFlags]::None", add)
+        self.assertIn("-ne [string]$item.OriginalSddl", add)
+        self.assertIn("$entry.PropagationFlags -eq", add)
+        self.assertLess(add.index("-ne [string]$item.OriginalSddl"), add.index("$key.SetAccessControl($security)"))
+        watch = self.function_body("Invoke-CatalogWatch", self.recovery)
+        self.assertIn("@($data.KeyList)", watch)
+        self.assertIn("Assert-CatalogPath ([string]$item.Path)", watch)
+
+    def test_confined_ladder_probes_each_granted_catalog_key_before_other_stages(self):
+        probe = self.function_body("Get-WinsockProbeSpecs")
+        for part in ("reg.exe", "'winsock_key_'", "query HKLM", "$script:WinsockCatalogLease", "$r.ExitCode -eq 0"):
+            self.assertIn(part, probe)
+        for name in ("parameters", "protocol_catalog", "namespace_catalog", "protocol_entries64", "namespace_entries64", "protocol_entry", "namespace_entry64"):
+            self.assertIn("Name = '" + name + "'", probe)
+        specs = self.function_body("Get-StageSpecs")
+        self.assertLess(specs.index("Get-WinsockProbeSpecs"), specs.index("Name = 'cmd_exec'"))
+
+    def test_package_sid_and_path_shapes_are_checked_in_the_unprivileged_job(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        step = text.index("      - name: Check package SID and catalog path shapes without registry access\n")
+        self.assertLess(text.index("      - name: Compile native confinement module\n"), step)
+        self.assertLess(step, text.index("  windows-confinement-spike:\n"))
+        block = text[step:text.index("      - name: Exercise registry recovery after forced cancellation\n")]
+        self.assertIn("test_windows_confinement_recovery.ps1 -Mode sid", block)
+        self.assertNotIn("if:", block)
+        self.assertIn("if ($Mode -eq 'sid') {", self.recovery_test)
+        self.assertNotIn("OpenBaseKey", self.recovery_test.split("if ($Mode -eq 'sid') {", 1)[1].split("exit 0", 1)[0])
 
     def test_winsock_recovery_survives_forced_parent_exit(self):
         start = self.function_body("Start-CatalogRecovery", self.recovery)
@@ -422,8 +467,11 @@ foreach ($case in $cases) {
         self.assertIn("Remove-CatalogRecoveryFolder $record", watch)
         self.assertIn("-ne $recordHash", watch)
         self.assertIn("'recovery_test_leak'", self.recovery_test)
-        self.assertIn("Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1-1' $Path -ForceReadbackFailure", self.recovery_test)
+        self.assertIn("Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1' $Path -ForceReadbackFailure", self.recovery_test)
         self.assertIn("-not (Get-ScheduledTask -TaskName $taskName", self.recovery_test)
+        self.assertIn("'^S-1-15-2-(?:[0-9]{1,10}-){6}[0-9]{1,10}\\z'", self.recovery)
+        self.assertIn("$badSids = @('S-1-15-2-1-1-1-1-1-1-1-1', 'S-1-15-2-1-1-1-1-1-1', 'S-1-15-2-1-1-1-1-1-1-12345678901'", self.recovery_test)
+        self.assertIn("'recovery_test_sid'", self.recovery_test)
         self.assertIn("test_windows_confinement_recovery.ps1 -Mode parent", WORKFLOW.read_text(encoding="utf-8"))
 
     def test_winsock_errors_use_fixed_reasons_and_verified_rollback(self):
