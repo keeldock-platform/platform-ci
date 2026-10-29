@@ -575,3 +575,24 @@ test('requires the platform binaries of the overridden package to match its exac
   unconstrained.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.32.0');
   assert.equal(codeOf(unconstrained.lock, unconstrained.expectation), 'accepted');
 });
+
+test('limits the platform binary version check to the official lightningcss binary names', () => {
+  const official = [
+    'darwin-arm64', 'darwin-x64', 'freebsd-x64', 'linux-arm-gnueabihf', 'linux-arm64-gnu', 'linux-arm64-musl',
+    'linux-x64-gnu', 'linux-x64-musl', 'win32-arm64-msvc', 'win32-x64-msvc', 'android-arm64',
+  ];
+  for (const suffix of official) {
+    const name = `lightningcss-${suffix}`;
+    const stale = overrideFixture();
+    stale.lock.packages[`node_modules/${name}`] = registryEntry(name, '1.32.0');
+    assert.equal(codeOf(stale.lock, stale.expectation), 'override_mismatch', name);
+    const current = overrideFixture();
+    current.lock.packages[`node_modules/${name}`] = registryEntry(name, '1.33.0');
+    assert.equal(codeOf(current.lock, current.expectation), 'accepted', name);
+  }
+  for (const name of ['lightningcss-loader', 'lightningcss-cli', 'lightningcss-linux-x64', 'lightningcss-wasm']) {
+    const other = overrideFixture();
+    other.lock.packages[`node_modules/${name}`] = registryEntry(name, '2.4.6');
+    assert.equal(codeOf(other.lock, other.expectation), 'accepted', name);
+  }
+});

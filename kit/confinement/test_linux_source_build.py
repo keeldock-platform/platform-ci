@@ -3,6 +3,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -331,6 +332,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 self.assertEqual(launch[3], linux_source_build.linux_probes.LAUNCHER_SOURCE)
                 self.assertEqual(launch[4:], ("/usr/bin/true",))
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the shared launcher stop uses Linux process facilities")
     def test_shared_launcher_really_stops_before_the_command_runs(self):
         stdout_reader, stdout_writer = os.pipe()
         stderr_reader, stderr_writer = os.pipe()
@@ -492,6 +494,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
                 linux_source_build.verify_proof_handoff({"RUNNER_TEMP": temporary})
 
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "the verifier key descriptor uses memfd_create, which only Linux provides")
     def test_verifier_mints_only_for_the_bound_installation_and_repository(self):
         token = "g" * 40
         identity = {"owner": "KeelDock", "name": "private-source", "repository_id": "41"}

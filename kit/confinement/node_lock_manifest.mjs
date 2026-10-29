@@ -13,6 +13,12 @@ const DEPENDENCY_GROUPS = Object.freeze([
   'dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies',
 ]);
 const PERMITTED_OVERRIDES = Object.freeze({ lightningcss: '1.33.0' });
+const OVERRIDE_PLATFORM_BINARIES = Object.freeze({
+  lightningcss: new Set([
+    'darwin-arm64', 'darwin-x64', 'freebsd-x64', 'linux-arm-gnueabihf', 'linux-arm64-gnu', 'linux-arm64-musl',
+    'linux-x64-gnu', 'linux-x64-musl', 'win32-arm64-msvc', 'win32-x64-msvc', 'android-arm64',
+  ].map((suffix) => `lightningcss-${suffix}`)),
+});
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/u;
 const NUMERIC_IDENTIFIER = '(?:0|[1-9][0-9]*)';
 const PRE_RELEASE_IDENTIFIER = '(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)';
@@ -585,7 +591,7 @@ function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventor
     if (entry.name !== undefined && entry.name !== moduleName) reject('invalid_package');
     if (expected.root.overrides !== undefined) {
       for (const [name, pinned] of Object.entries(expected.root.overrides)) {
-        if ((moduleName === name || moduleName.startsWith(`${name}-`)) && entry.version !== pinned) {
+        if ((moduleName === name || OVERRIDE_PLATFORM_BINARIES[name]?.has(moduleName)) && entry.version !== pinned) {
           reject('override_mismatch');
         }
       }

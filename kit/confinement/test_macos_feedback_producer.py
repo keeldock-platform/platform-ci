@@ -5,6 +5,7 @@ import io
 import shutil
 import subprocess
 import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -272,8 +273,11 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                 with self.assertRaises(producer.FeedbackRefusal):
                     self._override_manifest(extra)
 
-    @unittest.skipUnless(shutil.which("node"), "node is required for the validator round trip")
     def test_override_expectation_round_trips_through_the_lock_validator(self):
+        if not shutil.which("node"):
+            if os.environ.get("CI") == "true":
+                self.fail("node is required in CI for the validator round trip")
+            self.skipTest("node is required for the validator round trip")
         expected = self._override_manifest({"overrides": {"lightningcss": "1.33.0"}})
         integrity = "sha512-" + "A" * 86 + "=="
 
