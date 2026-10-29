@@ -453,6 +453,150 @@ foreach ($case in $cases) {
         self.assertIn("lpac_default_key_control", probe)
         self.assertIn("Control\\Nls\\CodePage", probe)
 
+    def test_discriminator_stages_follow_the_key_probes_and_precede_the_other_confined_stages(self):
+        specs = self.function_body("Get-StageSpecs")
+        probes = specs.index("Get-WinsockProbeSpecs")
+        discriminator = specs.index("Get-LpacDiscriminatorSpecs")
+        self.assertLess(probes, discriminator)
+        self.assertLess(discriminator, specs.index("Name = 'cmd_exec'"))
+        body = self.function_body("Get-LpacDiscriminatorSpecs")
+        self.assertLess(body.index("lpac_discriminator_arap"), body.index("lpac_discriminator_aap"))
+        lines = [line for line in body.splitlines() if "$specs += @{" in line]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("ScratchPaths.Arap", lines[0])
+        self.assertIn("$r.ExitCode -eq 0", lines[0])
+        self.assertIn("ScratchPaths.Aap", lines[1])
+        self.assertIn("$r.ExitCode -ne 0", lines[1])
+        self.assertIn("-match 'Access is denied'", lines[1])
+        for line in lines:
+            self.assertIn("query HKLM", line)
+            self.assertIn("Exe = $reg", line)
+
+    @staticmethod
+    def behaviour_model(arap, aap):
+        if arap is None or aap is None or not arap["ran"] or not aap["ran"]:
+            return "inconclusive"
+        if arap["exit"] != 0:
+            return "inconclusive"
+        if aap["exit"] == 0:
+            return "not_lpac"
+        if "Access is denied" in aap["output"]:
+            return "behavioural"
+        return "inconclusive"
+
+    def test_behaviour_verdict_maps_the_three_outcomes(self):
+        body = self.function_body("Get-LpacBehaviour")
+        returns = re.findall(r"return '([a-z_]+)'", body)
+        self.assertEqual(returns, ["inconclusive", "inconclusive", "not_lpac", "behavioural", "inconclusive"])
+        for required in (
+            "-not $arap.Ran -or -not $aap.Ran",
+            "$arap.ExitCode -ne 0",
+            "$aap.ExitCode -eq 0",
+            "$aap.Output -match 'Access is denied'",
+        ):
+            self.assertIn(required, body)
+        readable = {"ran": True, "exit": 0, "output": ""}
+        denied = {"ran": True, "exit": 1, "output": "ERROR: Access is denied."}
+        other = {"ran": True, "exit": 1, "output": "ERROR: not found"}
+        not_run = {"ran": False, "exit": 0, "output": ""}
+        self.assertEqual(self.behaviour_model(readable, denied), "behavioural")
+        self.assertEqual(self.behaviour_model(readable, readable), "not_lpac")
+        self.assertEqual(self.behaviour_model(denied, denied), "inconclusive")
+        self.assertEqual(self.behaviour_model(readable, other), "inconclusive")
+        self.assertEqual(self.behaviour_model(readable, not_run), "inconclusive")
+        self.assertEqual(self.behaviour_model(None, denied), "inconclusive")
+
+    def test_token_state_uses_the_behaviour_verdict_without_loosening_the_exit_rule(self):
+        self.assertIn("$lpacBehaviour = Get-LpacBehaviour $confinedOutcomes", self.wrapper)
+        for required in (
+            "if ($lpacBehaviour -eq 'not_lpac') {",
+            "$tokenState = 'not_lpac'",
+            "} elseif ($lpacBehaviour -eq 'behavioural') {",
+            "if ($containerConsistent) {",
+            "$lpacBasis = 'behavioural'",
+            "$tokenState = 'inconclusive'",
+            "' lpac=' + $lpacText + ' lpac_behaviour=' + $lpacBehaviour",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.wrapper)
+        consistent = "$confinedOutcomes[$key].Token -or $confinedOutcomes[$key].AapOnly"
+        self.assertIn(consistent, self.wrapper)
+        self.assertLess(self.wrapper.index("$lpacBehaviour = Get-LpacBehaviour"), self.wrapper.index("windows-confinement-spike=observed"))
+        self.assertIn("-and $tokenState -eq 'verified'", self.wrapper)
+        self.assertIn("Ran = ($result.Failure -eq '' -and $result.Exited -and -not $result.TimedOut)", self.wrapper)
+
+    def test_scratch_discriminator_keys_are_created_restored_and_deleted_through_the_lease(self):
+        lease = self.function_body("New-CatalogLease", self.recovery)
+        self.assertIn("ScratchPaths", lease)
+        self.assertIn("ScratchList", lease)
+        self.assertIn("ConfinementRecoveryTest", lease)
+        create = self.function_body("New-CatalogScratchKey", self.recovery)
+        for required in (
+            "SetAccessRuleProtection($true, $false)",
+            "'S-1-5-18'",
+            "'S-1-5-32-544'",
+            "$readSid",
+            "InheritanceFlags]::None, [System.Security.AccessControl.PropagationFlags]::None",
+            "AreAccessRulesProtected",
+            "-ne ($actual -join ',')",
+            "-cne 'S-1-15-2-1' -and $readSid -cne 'S-1-15-2-2'",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, create)
+        add = self.function_body("Add-CatalogScratchKeys", self.recovery)
+        self.assertLess(add.index("'S-1-15-2-1'"), add.index("'S-1-15-2-2'"))
+        self.assertLess(add.index("ScratchPaths.Aap"), add.index("ScratchPaths.Arap"))
+        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
+        self.assertLess(grant.index("Start-CatalogRecovery"), grant.index("Add-CatalogScratchKeys"))
+        self.assertLess(grant.index("Add-CatalogScratchKeys"), grant.index("Add-CatalogRead"))
+        self.assertLess(grant.index("Remove-CatalogScratchKeys"), grant.index("Restore-WinsockCatalogAcl"))
+        restore = self.function_body("Restore-WinsockCatalogAcl", self.recovery)
+        self.assertLess(restore.index("Remove-CatalogScratchKeys"), restore.index("ArmedFile"))
+        remove = self.function_body("Remove-CatalogScratchKeys", self.recovery)
+        self.assertIn("$index -ge 0; $index--", remove)
+        self.assertIn("DeleteSubKeyTree($path, $false)", remove)
+        self.assertIn("'winsock_scratch_cleanup'", remove)
+        self.assertIn("Assert-ScratchPath $path", remove)
+        start = self.function_body("Start-CatalogRecovery", self.recovery)
+        self.assertIn("ScratchPaths = @($lease.ScratchList)", start)
+        watch = self.function_body("Invoke-CatalogWatch", self.recovery)
+        self.assertIn("Remove-CatalogScratchKeys @($data.ScratchPaths)", watch)
+        self.assertIn("Assert-ScratchPath ([string]$item)", watch)
+        self.assertLess(watch.index("Remove-CatalogScratchKeys"), watch.index("Restore-CatalogAcl $data"))
+        self.assertIn("-cmatch '^SOFTWARE\\\\KeelDock\\\\ConfinementRecoveryTest\\\\[a-f0-9]{32}\\z'", self.function_body("Assert-ScratchPath", self.recovery))
+        for reason in ("'winsock_scratch_create'", "'winsock_scratch_cleanup'"):
+            self.assertIn(reason, grant)
+            self.assertIn(reason, self.wrapper)
+        self.assertIn("Add-CatalogScratchKeys $lease", self.recovery_test)
+        self.assertIn("recovery_test_scratch", self.recovery_test)
+        self.assertIn("-Mode sid", WORKFLOW.read_text(encoding="utf-8"))
+
+    def test_only_the_confinement_workflow_loads_the_spike_native_and_wrapper_files(self):
+        names = ("windows_confinement.cs", "windows_confinement.ps1", "windows_confinement_recovery.ps1")
+        allowed = {WORKFLOW.resolve()}
+        candidates = list((ROOT / ".github").rglob("*.yml")) + list((ROOT / "kit").rglob("action.yml"))
+        self.assertGreater(len(candidates), 1)
+        for path in candidates:
+            if path.resolve() in allowed:
+                continue
+            text = path.read_text(encoding="utf-8")
+            for name in names:
+                with self.subTest(path=path.name, name=name):
+                    self.assertNotIn(name, text)
+        template = (ROOT / "kit/bootstrap/policy_windows.py").read_text(encoding="utf-8")
+        start = template.index('WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE = """')
+        end = template.index('"""', start + 60)
+        for path in sorted((ROOT / "kit/bootstrap").glob("policy_*.py")):
+            text = path.read_text(encoding="utf-8")
+            for name in names:
+                if path.name == "policy_windows.py":
+                    for match in re.finditer(re.escape(name), text):
+                        with self.subTest(path=path.name, name=name, offset=match.start()):
+                            self.assertTrue(start <= match.start() < end)
+                else:
+                    with self.subTest(path=path.name, name=name):
+                        self.assertNotIn(name, text)
+
     def test_winsock_recovery_survives_forced_parent_exit(self):
         start = self.function_body("Start-CatalogRecovery", self.recovery)
         watch = self.function_body("Invoke-CatalogWatch", self.recovery)

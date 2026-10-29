@@ -22,6 +22,16 @@ if ($Mode -eq 'sid') {
         if (Test-PackageSid $item) { throw 'recovery_test_sid' }
     }
     foreach ($item in $goodPaths) { Assert-CatalogPath $item }
+    $scratchPrefix = 'SOFTWARE\KeelDock\ConfinementRecoveryTest\'
+    Assert-ScratchPath ($scratchPrefix + ('a1' * 16))
+    foreach ($item in @(($scratchPrefix + ('a1' * 15)), ($scratchPrefix + ('A1' * 16)), ($scratchPrefix + ('a1' * 16) + '\000000000001'), ($scratchPrefix + ('a1' * 16) + "`n"), $prefix, ($prefix + '\Protocol_Catalog9'), 'SOFTWARE\KeelDock\ConfinementRecoveryTest')) {
+        $refused = $false
+        try { Assert-ScratchPath $item } catch {
+            if ($_.Exception.Message -ne 'winsock_catalog_path') { throw }
+            $refused = $true
+        }
+        if (-not $refused) { throw 'recovery_test_path' }
+    }
     foreach ($item in $badPaths) {
         $refused = $false
         try { Assert-CatalogPath $item } catch {
@@ -37,8 +47,9 @@ if ($Mode -eq 'child') {
     $lease = New-CatalogLease $Path 'S-1-15-2-1-1-1-1-1-1-1'
     try {
         Start-CatalogRecovery $lease (Join-Path $PSScriptRoot 'windows_confinement_recovery.ps1')
+        Add-CatalogScratchKeys $lease
         Add-CatalogRead $lease
-        [IO.File]::WriteAllText($Marker, [string]$lease.RecoveryDirectory)
+        [IO.File]::WriteAllText($Marker, ([string]$lease.RecoveryDirectory + "`n" + [string]$lease.ScratchList[0] + "`n" + [string]$lease.ScratchList[1]))
         while ($true) { Start-Sleep -Seconds 1 }
     } finally {
         Restore-CatalogAcl $lease
@@ -55,6 +66,7 @@ $original = $null
 $originalChild = $null
 $childPath = $null
 $directory = $null
+$scratchList = $null
 try {
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
     $key = $base.CreateSubKey($Path)
@@ -73,7 +85,12 @@ try {
         if ($child.HasExited -or [DateTime]::UtcNow -ge $deadline) { throw 'recovery_test_child' }
         Start-Sleep -Milliseconds 100
     }
-    $directory = [IO.File]::ReadAllText($Marker)
+    $markerLines = [IO.File]::ReadAllText($Marker) -split "`n"
+    $directory = $markerLines[0]
+    $scratchList = @($markerLines[1], $markerLines[2])
+    foreach ($scratch in $scratchList) {
+        if ($null -eq (Get-CatalogSubKeyNames $scratch)) { throw 'recovery_test_scratch' }
+    }
     if ((Get-CatalogAclSddl $Path) -eq $original -or (Get-CatalogAclSddl $childPath) -eq $originalChild) { throw 'recovery_test_not_mutated' }
     $child.Kill()
     if (-not $child.WaitForExit(5000)) { throw 'recovery_test_kill' }
@@ -81,7 +98,7 @@ try {
     $deadline = [DateTime]::UtcNow.AddSeconds(60)
     $restored = $false
     while ([DateTime]::UtcNow -lt $deadline) {
-        if ((Get-CatalogAclSddl $Path) -eq $original -and (Get-CatalogAclSddl $childPath) -eq $originalChild -and -not (Test-Path -LiteralPath $directory) -and
+        if ((Get-CatalogAclSddl $Path) -eq $original -and (Get-CatalogAclSddl $childPath) -eq $originalChild -and $null -eq (Get-CatalogSubKeyNames $scratchList[0]) -and $null -eq (Get-CatalogSubKeyNames $scratchList[1]) -and -not (Test-Path -LiteralPath $directory) -and
             -not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) {
             $restored = $true
             break
@@ -92,9 +109,17 @@ try {
     $common = [Environment]::GetFolderPath('CommonApplicationData')
     $before = @(Get-ChildItem -LiteralPath $common -Directory -Force -Filter 'KDWindowsConfinementRecovery_*').Count
     $reason = ''
+    $testParent = 'SOFTWARE\KeelDock\ConfinementRecoveryTest'
+    $parentKey = $base.OpenSubKey($testParent, $false)
+    $keysBefore = @($parentKey.GetSubKeyNames()).Count
+    $parentKey.Dispose()
     try { Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1' $Path -ForceReadbackFailure } catch { $reason = [string]$_.Exception.Message }
     if ($reason -ne 'winsock_catalog_readback') { throw 'recovery_test_injection' }
     if ($script:WinsockCatalogLease) { throw 'recovery_test_lease' }
+    $parentKey = $base.OpenSubKey($testParent, $false)
+    $keysAfter = @($parentKey.GetSubKeyNames()).Count
+    $parentKey.Dispose()
+    if ($keysAfter -ne $keysBefore) { throw 'recovery_test_scratch' }
     if ((Get-CatalogAclSddl $Path) -ne $original -or (Get-CatalogAclSddl $childPath) -ne $originalChild) { throw 'recovery_test_rollback' }
     $after = @(Get-ChildItem -LiteralPath $common -Directory -Force -Filter 'KDWindowsConfinementRecovery_*').Count
     if ($after -ne $before) { throw 'recovery_test_leak' }
@@ -120,6 +145,9 @@ try {
     }
     if ($original) {
         try { Restore-CatalogAcl @{ Path = $Path; KeyList = @(@{ Path = $Path; OriginalSddl = $original }, @{ Path = $childPath; OriginalSddl = $originalChild }) } } catch { }
+    }
+    if ($scratchList -and $scratchList[0] -and $scratchList[1]) {
+        try { Remove-CatalogScratchKeys $scratchList } catch { }
     }
     if ($directory) {
         $taskName = Split-Path -Leaf $directory
