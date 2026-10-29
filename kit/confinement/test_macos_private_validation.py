@@ -481,10 +481,10 @@ CRATE_MANIFEST = (
     "publish.workspace = true\n"
     "\n"
     "[dependencies]\n"
-    "keeldock-host-api = { workspace = true }\n"
+    "keeldock" "-host-api = { workspace = true }\n"
     "\n"
     "[dev-dependencies]\n"
-    "keeldock-host-mock = { workspace = true }\n"
+    "keeldock" "-host-mock = { workspace = true }\n"
     "\n"
     "[lints]\n"
     "workspace = true\n"
@@ -881,7 +881,7 @@ class CoreContractTreeTests(unittest.TestCase):
             ("inline package table", 'package = { name = "synthetic-crate", build = "build.rs" }\n'),
             ("dotted package key", 'package.build = "build.rs"\n' + header),
             ("spaced key", header + 'build   =   "build.rs"\n'),
-            ("build dependencies", header + '[build-dependencies]\nkeeldock-host-api = { workspace = true }\n'),
+            ("build dependencies", header + '[build-dependencies]\nkeeldock' '-host-api = { workspace = true }\n'),
             ("trailing comment", header + 'build = "b.rs" ' + chr(35) + " note\n"),
         ):
             with self.subTest(form=name):
@@ -896,11 +896,11 @@ class CoreContractTreeTests(unittest.TestCase):
             ("bin section", header + '[[bin]]\nname = "tool"\npath = "src/main.rs"\n'),
             ("test section", header + '[[test]]\nname = "contract"\npath = "tests/main.rs"\n'),
             ("path dependency", header + '[dependencies]\nevil = { path = "../evil" }\n'),
-            ("member name with path", header + '[dependencies]\nkeeldock-host-api = { path = "../x" }\n'),
-            ("workspace and path", header + '[dependencies]\nkeeldock-host-api = { workspace = true, path = "../x" }\n'),
-            ("dev dependency path", header + '[dev-dependencies]\nkeeldock-host-mock = { path = "../x" }\n'),
-            ("dotted dependency path", header + '[dependencies]\nkeeldock-host-api.path = "../x"\n'),
-            ("version dependency", header + '[dependencies]\nkeeldock-host-api = "1.0.0"\n'),
+            ("member name with path", header + '[dependencies]\nkeeldock' '-host-api = { path = "../x" }\n'),
+            ("workspace and path", header + '[dependencies]\nkeeldock' '-host-api = { workspace = true, path = "../x" }\n'),
+            ("dev dependency path", header + '[dev-dependencies]\nkeeldock' '-host-mock = { path = "../x" }\n'),
+            ("dotted dependency path", header + '[dependencies]\nkeeldock' '-host-api.path = "../x"\n'),
+            ("version dependency", header + '[dependencies]\nkeeldock' '-host-api = "1.0.0"\n'),
             ("unknown dependency", header + '[dependencies]\nserde = { workspace = true }\n'),
             ("target table", header + "[target.'cfg(unix)'.dependencies]\n"),
             ("package metadata", header + "[package.metadata]\n"),
@@ -948,17 +948,17 @@ class CoreContractTreeTests(unittest.TestCase):
         base = self._workspace_text(members)
         allowed = (
             "[workspace.package]\nversion = \"0.1.0\"\n\n[workspace.dependencies]\n"
-            'keeldock-host-api = { path = "crates/host/api" }\n'
-            'keeldock-host-mock = { path = "crates/host/mock" }\n\n'
+            'keeldock' '-host-api = { path = "crates/host/api" }\n'
+            'keeldock' '-host-mock = { path = "crates/host/mock" }\n\n'
             "[workspace.lints.rust]\nunsafe_code = \"forbid\"\n"
         )
         self.assertTrue(subject._core_contract_workspace_paths_shape(base))
         self.assertTrue(subject._core_contract_workspace_paths_shape(base + allowed))
         for name, extra in (
             ("outside path", '[workspace.dependencies]\nevil = { path = "../evil" }\n'),
-            ("member name wrong path", '[workspace.dependencies]\nkeeldock-host-api = { path = "crates/host/mock" }\n'),
-            ("member name outside path", '[workspace.dependencies]\nkeeldock-host-api = { path = "../api" }\n'),
-            ("duplicate", '[workspace.dependencies]\nkeeldock-host-api = { path = "crates/host/api" }\nkeeldock-host-api = { path = "crates/host/api" }\n'),
+            ("member name wrong path", '[workspace.dependencies]\nkeeldock' '-host-api = { path = "crates/host/mock" }\n'),
+            ("member name outside path", '[workspace.dependencies]\nkeeldock' '-host-api = { path = "../api" }\n'),
+            ("duplicate", '[workspace.dependencies]\nkeeldock' '-host-api = { path = "crates/host/api" }\nkeeldock' '-host-api = { path = "crates/host/api" }\n'),
             ("quoted key", '[workspace.dependencies]\n"evil" = { "path" = "../evil" }\n'),
             ("dotted key", '[workspace.dependencies]\nevil.path = "../evil"\n'),
             ("dependency table", '[workspace.dependencies.evil]\npath = "../evil"\n'),

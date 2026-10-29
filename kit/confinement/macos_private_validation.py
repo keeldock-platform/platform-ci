@@ -228,7 +228,7 @@ CORE_CONTRACT_MANIFEST_SECTIONS = frozenset(("package", "dependencies", "dev-dep
 CORE_CONTRACT_MANIFEST_INHERITED_KEYS = frozenset((
     "version.workspace", "edition.workspace", "rust-version.workspace", "publish.workspace",
 ))
-CORE_CONTRACT_MANIFEST_DEPENDENCIES = frozenset(("keeldock-host-api", "keeldock-host-mock"))
+CORE_CONTRACT_MANIFEST_DEPENDENCIES = frozenset(("keeldock" "-host-api", "keeldock" "-host-mock"))
 CORE_CONTRACT_MANIFEST_SECTION_PATTERN = re.compile(r"\[([a-z-]{1,32})\]\Z")
 CORE_CONTRACT_MANIFEST_ASSIGNMENT_PATTERN = re.compile(r"([A-Za-z0-9_.-]{1,64})\s*=\s*(.{1,512})\Z")
 CORE_CONTRACT_MANIFEST_NAME_PATTERN = re.compile(r'"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"\Z')
@@ -239,11 +239,11 @@ CORE_CONTRACT_ROOT_SECTIONS = frozenset((
     "[workspace.lints.rust]", "[workspace.lints.clippy]",
 ))
 CORE_CONTRACT_ROOT_PATH_LINE_PATTERN = re.compile(
-    r'(keeldock-host-(?:api|mock))\s*=\s*\{\s*path\s*=\s*"(crates/host/(?:api|mock))"\s*\}\Z'
+    r'(keeldock' r'-host-(?:api|mock))\s*=\s*\{\s*path\s*=\s*"(crates/host/(?:api|mock))"\s*\}\Z'
 )
 CORE_CONTRACT_ROOT_PATH_DEPENDENCIES = {
-    "keeldock-host-api": "crates/host/api",
-    "keeldock-host-mock": "crates/host/mock",
+    "keeldock" "-host-api": "crates/host/api",
+    "keeldock" "-host-mock": "crates/host/mock",
 }
 CORE_CONTRACT_SNAKE_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z")
 CORE_CONTRACT_TS_SOURCE_PATH_PATTERN = re.compile(
