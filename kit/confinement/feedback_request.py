@@ -15,19 +15,33 @@ MAX_TRACKED_REQUESTS = 4096
 HEX40_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
+CARGO_LOCK_KIND = "cargo_lock"
+CARGO_LOCK_MAX_PAYLOAD_BYTES = 1024 * 1024
+CARGO_LOCK_MAX_LOCK_BYTES = 256 * 1024
+CARGO_LOCK_MAX_RECEIPT_BYTES = 128 * 1024
+CARGO_LOCK_MAX_EVIDENCE_BYTES = 192 * 1024
+CARGO_LOCK_MAX_PACKAGES = 512
+CARGO_LOCK_MAX_CONSUMED = 8
+CARGO_LOCK_BUILD_INPUTS = ()
 
 PROFILE_FIELDS = (
     "profile_id", "kind", "concern", "workflow_path", "producer_job", "auditor_job",
-    "member_name",
+    "member_name", "max_payload_bytes", "build_inputs",
 )
 _PROFILE_ROWS = (
     (1, "lock", "core-node-lock-return", ".github/workflows/node-lock-return.yml",
-     "node-lock-return", "node-lock-return-audit", "lock-return-v1.enc"),
+     "node-lock-return", "node-lock-return-audit", "lock-return-v1.enc",
+     4 * 1024 * 1024 - 64 * 1024, ()),
     (2, "rust_patch", "core-rust-format-return", ".github/workflows/core-rust-format-return.yml",
-     "core-rust-format-return", "core-rust-format-return-audit", "rust-format-return-v1.enc"),
+     "core-rust-format-return", "core-rust-format-return-audit", "rust-format-return-v1.enc",
+     1024 * 1024, ()),
     (3, "build_diagnostics", "core-build-diagnostic-return",
      ".github/workflows/core-build-diagnostic-return.yml", "core-build-diagnostic-return",
-     "core-build-diagnostic-return-audit", "build-diagnostic-return-v1.enc"),
+     "core-build-diagnostic-return-audit", "build-diagnostic-return-v1.enc",
+     512 * 1024, ()),
+    (4, CARGO_LOCK_KIND, "core-rust-lock-return", ".github/workflows/core-rust-lock-return.yml",
+     "core-rust-lock-return", "core-rust-lock-return-audit", "rust-lock-return-v1.enc",
+     CARGO_LOCK_MAX_PAYLOAD_BYTES, CARGO_LOCK_BUILD_INPUTS),
 )
 PROFILES = {
     row[2]: dict(zip(PROFILE_FIELDS, row))
@@ -262,6 +276,28 @@ def _validate_state(state):
         _refuse()
 
 
+def cargo_lock_consumed_count(state):
+    """Count consumed Cargo lock returns; this state is separate from the single-use lock kind."""
+    _validate_state(state)
+    return sum(
+        1 for entry in state["requests"]
+        if entry["kind"] == CARGO_LOCK_KIND and entry["status"] == "consumed"
+    )
+
+
+def validate_build_inputs(kind, inputs):
+    """Accept only build inputs that the registered profile explicitly allowlists."""
+    profile = PROFILE_BY_KIND.get(kind) if type(kind) is str else None
+    if profile is None or type(inputs) is not dict or len(inputs) > len(profile["build_inputs"]):
+        _refuse()
+    for name, value in inputs.items():
+        if (type(name) is not str or name not in profile["build_inputs"]
+                or type(value) is not str or not 0 < len(value) <= 256
+                or not value.isascii() or not value.isprintable()):
+            _refuse()
+    return dict(inputs)
+
+
 def _transition_state(state, request_id, *, status, now=None):
     _validate_state(state)
     if not _valid_hex(request_id, 64):
@@ -272,7 +308,9 @@ def _transition_state(state, request_id, *, status, now=None):
                 _refuse()
             if status == "consumed":
                 if (not _safe_int(now, minimum=1) or now >= entry["expiry"]
-                        or entry["kind"] == "lock" and state["bootstrap_lock_consumed"]):
+                        or entry["kind"] == "lock" and state["bootstrap_lock_consumed"]
+                        or entry["kind"] == CARGO_LOCK_KIND
+                        and cargo_lock_consumed_count(state) >= CARGO_LOCK_MAX_CONSUMED):
                     _refuse()
             elif status == "expired":
                 if not _safe_int(now, minimum=1) or now < entry["expiry"]:
@@ -305,6 +343,14 @@ def register_request(state, request, *, now):
     ):
         _refuse()
     if state["bootstrap_lock_consumed"] and profile["kind"] == "lock":
+        _refuse()
+    if profile["kind"] == CARGO_LOCK_KIND and (
+        cargo_lock_consumed_count(state) >= CARGO_LOCK_MAX_CONSUMED
+        or any(
+            entry["kind"] == CARGO_LOCK_KIND and entry["status"] == ACTIVE_STATUS
+            for entry in state["requests"]
+        )
+    ):
         _refuse()
     if any(
         entry["request_id"] == request["request_id"]

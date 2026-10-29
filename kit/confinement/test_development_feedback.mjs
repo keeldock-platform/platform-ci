@@ -109,7 +109,8 @@ function rustPatch(
 
 function validate(kind, payloadBytes, extra = {}) {
   const profileName = kind === 'lock' ? 'core-node-lock-return'
-    : kind === 'rust_patch' ? 'core-rust-format-return' : 'core-build-diagnostic-return';
+    : kind === 'rust_patch' ? 'core-rust-format-return'
+      : kind === 'cargo_lock' ? 'core-rust-lock-return' : 'core-build-diagnostic-return';
   return validateDevelopmentFeedback({ payloadBytes, context: contextFor(profileName), now: NOW, ...extra });
 }
 
@@ -287,4 +288,69 @@ test('lock and diagnostics profiles validate on both encryption and decryption',
     recipientPrivateKey: recipient.privateKey,
     now: NOW,
   }), diagnosticPayload);
+});
+
+function cargoLockBundle(overrides = {}) {
+  return Buffer.from(JSON.stringify({
+    evidence_b64: Buffer.from('{"schema_version":1}', 'ascii').toString('base64'),
+    lock_b64: Buffer.from('version = 4\n', 'ascii').toString('base64'),
+    receipt_b64: Buffer.from('{"schema_version":1}', 'ascii').toString('base64'),
+    schema_version: 1,
+    ...overrides,
+  }), 'utf8');
+}
+
+test('accepts one bounded canonical cargo lock bundle and refuses everything else', () => {
+  const payload = cargoLockBundle();
+  assert.deepEqual(validate('cargo_lock', payload), payload);
+  for (const rejected of [
+    Buffer.from('{}', 'utf8'),
+    Buffer.from(`${payload.toString('utf8')}\n`, 'utf8'),
+    cargoLockBundle({ extra: 'AAAA' }),
+    cargoLockBundle({ schema_version: 2 }),
+    cargoLockBundle({ lock_b64: Buffer.from('version = 4', 'ascii').toString('base64') }),
+    cargoLockBundle({ lock_b64: Buffer.from(`version = 4\n${String.fromCharCode(233)}`, 'utf8').toString('base64') }),
+    cargoLockBundle({ receipt_b64: Buffer.from('{"a":1}\n', 'ascii').toString('base64') }),
+    cargoLockBundle({ evidence_b64: '' }),
+    cargoLockBundle({ evidence_b64: 'AAA' }),
+    cargoLockBundle({
+      lock_b64: Buffer.alloc(DEVELOPMENT_FEEDBACK_LIMITS.cargoLockLockBytes + 1, 0x61).toString('base64'),
+    }),
+    Buffer.alloc(DEVELOPMENT_FEEDBACK_LIMITS.cargoLockBytes + 1, 0x20),
+  ]) {
+    assert.throws(() => validate('cargo_lock', rejected), DevelopmentFeedbackError);
+  }
+  assert.throws(() => validate('cargo_lock', payload, { expectedManifest: lockExpectation }),
+    DevelopmentFeedbackError);
+  assert.throws(() => validate('cargo_lock', payload, { reviewedRustPaths: ['src/lib.rs'] }),
+    DevelopmentFeedbackError);
+});
+
+test('cargo lock bundles stay under their own limit and never reuse the node lock limit', () => {
+  assert.ok(DEVELOPMENT_FEEDBACK_LIMITS.cargoLockBytes <= 1024 * 1024);
+  assert.ok(DEVELOPMENT_FEEDBACK_LIMITS.cargoLockBytes < 4 * 1024 * 1024 - 64 * 1024);
+});
+
+test('cargo lock bundles encrypt and decrypt only under their own profile', () => {
+  const payload = cargoLockBundle();
+  const context = contextFor('core-rust-lock-return');
+  const envelope = encryptDevelopmentFeedback({
+    payloadBytes: payload,
+    context,
+    recipientPublicKey: recipient.publicKey,
+    now: NOW,
+  });
+  assert.equal(envelope[5], RETURN_PROFILES['core-rust-lock-return'].id);
+  assert.deepEqual(decryptDevelopmentFeedback({
+    envelope,
+    context,
+    recipientPrivateKey: recipient.privateKey,
+    now: NOW,
+  }), payload);
+  assert.throws(() => decryptDevelopmentFeedback({
+    envelope,
+    context: contextFor('core-build-diagnostic-return'),
+    recipientPrivateKey: recipient.privateKey,
+    now: NOW,
+  }), DevelopmentFeedbackError);
 });

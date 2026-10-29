@@ -166,6 +166,12 @@ class PublicTreeTests(unittest.TestCase):
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertEqual(action.count('"test_baselines_prepare.py"'), 2)
 
+    def test_role_signer_suite_is_registered_and_discovered(self):
+        self.assertIn("kit/confinement/role_signer.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/test_role_signer.py", PLATFORM_FILES)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertEqual(action.count('"test_role_signer.py"'), 2)
+
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -285,6 +291,11 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_release_build_verify.py",
             'kit/confinement/cargo_vendor_verify.py',
             'kit/confinement/test_cargo_vendor_verify.py',
+            '.github/workflows/core-rust-lock-return.yml',
+            'kit/bootstrap/policy_rust.py',
+            'kit/bootstrap/test_policy_rust.py',
+            'kit/confinement/cargo_lock_bootstrap.py',
+            'kit/confinement/test_confinement_cargo_lock_bootstrap.py',
             "kit/confinement/release_evidence.py",
             "kit/confinement/test_release_evidence.py",
             "kit/confinement/native_loopback_profile.py",
@@ -309,6 +320,8 @@ class PublicTreeTests(unittest.TestCase):
             for name in (
                 "kit/confinement/native_loopback_profile.py",
                 "kit/confinement/test_native_loopback_profile.py",
+                "kit/confinement/linux_harness.py",
+                "kit/confinement/macos_deny_default.py",
             ):
                 with self.subTest(file=name):
                     edited = root / name

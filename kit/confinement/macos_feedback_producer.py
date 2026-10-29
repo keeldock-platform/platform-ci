@@ -796,6 +796,105 @@ def run_source_profile(dispatch, source, worker_storage, worker_uid, environment
     _refuse("request_invalid")
 
 
+def _cargo_toolchain_hash(rust, bootstrap):
+    components = getattr(rust, "COMPONENTS", None)
+    target = getattr(rust, "TARGET", None)
+    if type(components) is not tuple or not components or type(target) is not str:
+        _refuse("tool_unavailable")
+    pairs = []
+    for component in components:
+        pairs.append((getattr(component, "name", None), getattr(component, "sha256", None)))
+    try:
+        return target, bootstrap.cargo.toolchain_hash(target, pairs)
+    except bootstrap.cargo.Refusal:
+        _refuse("tool_unavailable")
+
+
+def _cargo_bootstrap_refusal(bootstrap, error):
+    reason = getattr(error, "reason", None)
+    if reason == "bootstrap_network_refused":
+        _refuse("command_failed")
+    if reason in ("bootstrap_config_refused", "bootstrap_source_refused", "bootstrap_manifest_refused"):
+        _refuse("manifest_invalid")
+    if reason in ("bootstrap_environment_refused", "bootstrap_input_invalid"):
+        _refuse("tool_unavailable")
+    _refuse("payload_invalid")
+
+
+def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environment, tools,
+                           host_toolchain, capability, rust, deadline, bootstrap, source_environ):
+    profile = dispatch["profile"]
+    if (profile["kind"] != feedback_request.CARGO_LOCK_KIND or type(source_environ) is not dict
+            or type(environment) is not dict or type(tools) is not dict):
+        _refuse("request_invalid")
+    request = dispatch["request"]
+    worker_gid = capability.PROBE_PRIMARY_GID
+    refusal_type = bootstrap.BootstrapRefusal
+    project = worker_storage / "feedback-cargo-lock"
+    cargo_home = worker_storage / "cargo-lock-home"
+    try:
+        bootstrap.refuse_cargo_config(source)
+        reviewed_paths = _reviewed_rust_paths(source)
+        manifests = ("Cargo.toml",) + tuple((root / "Cargo.toml").as_posix() for root in PACKAGE_ROOTS)
+        manifest_bytes = {path: _read_file(source / path, maximum=MAX_PACKAGE_JSON_BYTES) for path in manifests}
+        package_names = bootstrap.check_manifests(
+            manifest_bytes, frozenset(root.as_posix() for root in PACKAGE_ROOTS),
+        )
+        _copy_reviewed_files(source, project, manifests + reviewed_paths, worker_uid, worker_gid)
+        _make_worker_directory(cargo_home, worker_uid, worker_gid)
+        bootstrap.refuse_cargo_config(project)
+        bootstrap.require_fresh_directory(cargo_home)
+        cargo_environment = bootstrap.build_cargo_environment(
+            environment, cargo_home=str(cargo_home), home=environment.get("HOME"),
+            tmpdir=str(worker_storage / "tmp"), path=environment.get("PATH"),
+        )
+        command = bootstrap.generate_lockfile_command(str(tools["cargo"]), str(project / "Cargo.toml"))
+    except refusal_type as error:
+        _cargo_bootstrap_refusal(bootstrap, error)
+    try:
+        os.chdir(project)
+        result = _run_worker(
+            rust, command, worker_uid, cargo_environment, host_toolchain["python"], capability,
+            "feedback_lock", deadline, allow_nonzero_capture=True,
+        )
+        if result.returncode != 0:
+            _refuse("command_failed")
+    finally:
+        try:
+            os.chdir(source)
+        except OSError:
+            _refuse("cleanup_incomplete")
+    lock_bytes = _read_worker_file(project / "Cargo.lock", worker_uid, bootstrap.MAX_LOCK_BYTES)
+    toolchain_target, toolchain_hash = _cargo_toolchain_hash(rust, bootstrap)
+    try:
+        bootstrap.check_lock_members(lock_bytes, package_names)
+    except refusal_type as error:
+        _cargo_bootstrap_refusal(bootstrap, error)
+    owner = source_environ.get("SOURCE_REPOSITORY_OWNER", "")
+    name = source_environ.get("SOURCE_REPOSITORY_NAME", "")
+    trusted_context = {
+        "repository": owner + "/" + name,
+        "workspace_path": ".",
+        "source_sha": request["source_sha"],
+        "base_sha": request["base_sha"],
+        "base_branch": request["base_branch"],
+        "reviewed_diff_fingerprint": request["reviewed_diff_sha256"],
+        "dependency_policy_revision": bootstrap.DEPENDENCY_POLICY_REVISION,
+        "control_sha": request["control_sha"],
+        "toolchain_hash": toolchain_hash,
+    }
+    try:
+        bundle = bootstrap.produce_bundle(
+            lock_bytes, trusted_context, run_id=dispatch["context"]["run_id"], run_attempt=1,
+            now=int(time.time()), expiry=request["expiry"], build_inputs={},
+            fetcher=bootstrap.RegistryFetcher(), toolchain_target=toolchain_target,
+        )
+    except refusal_type as error:
+        _cargo_bootstrap_refusal(bootstrap, error)
+    return {"payload_bytes": bundle, "expected_manifest": None, "reviewed_rust_paths": None,
+            "source_result": "command_completed"}
+
+
 def build_diagnostic_payload(outcome):
     if type(outcome) is not dict:
         _refuse("capture_invalid")
