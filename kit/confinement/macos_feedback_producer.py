@@ -91,18 +91,44 @@ PROFILE_BY_KIND = feedback_request.PROFILE_BY_KIND
 PROFILE_BY_CONCERN = feedback_request.PROFILES
 
 
+ENCRYPT_DETAILS = frozenset((
+    "payload_missing", "tool_path", "input_size", "spawn", "node_exit", "output_size",
+    "output_shape", "output_directory", "output_write", "output_member",
+))
+NODE_REFUSAL_CODES = frozenset((
+    "credential_like_content", "envelope_rejected", "exception_expired", "invalid_cargo_lock",
+    "invalid_context", "invalid_expectation", "invalid_input", "invalid_lock_manifest",
+    "invalid_payload", "invalid_recipient", "invalid_rust_patch", "limit_exceeded",
+    "payload_too_large", "unreviewed_rust_path", "unsupported_kind", "input_too_large",
+    "encryption_failed",
+))
+NODE_DETAILS = frozenset("node_" + code for code in NODE_REFUSAL_CODES)
+NODE_STDERR_RE = re.compile(r"KD-FEEDBACK-ENCRYPTION-REFUSAL(?: ([a-z_]{1,40}))?\n\Z")
+
+
 class FeedbackRefusal(Exception):
-    def __init__(self, reason="feedback_invalid"):
+    def __init__(self, reason="feedback_invalid", detail=None):
         self.reason = reason if reason in {
             "feedback_invalid", "request_invalid", "recipient_invalid", "manifest_invalid",
             "tool_unavailable", "command_failed", "capture_invalid", "payload_invalid",
             "output_unavailable", "cleanup_incomplete",
         } else "feedback_invalid"
+        self.detail = detail if type(detail) is str and (detail in ENCRYPT_DETAILS or detail in NODE_DETAILS) else None
         super().__init__(self.reason)
 
 
-def _refuse(reason="feedback_invalid"):
-    raise FeedbackRefusal(reason)
+def _refuse(reason="feedback_invalid", detail=None):
+    raise FeedbackRefusal(reason, detail)
+
+
+def _node_detail(stderr):
+    try:
+        match = NODE_STDERR_RE.fullmatch(bytes(stderr[:256]).decode("ascii", "strict"))
+    except BaseException:
+        return "node_exit"
+    if match is not None and match.group(1) in NODE_REFUSAL_CODES:
+        return "node_" + match.group(1)
+    return "node_exit"
 
 
 def _valid_decimal(value):
@@ -472,28 +498,31 @@ def resolve_node(environ, *, require_npm=False):
 def _encrypt_payload(encryptor, input_record, node):
     raw = json.dumps(input_record, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
     if len(raw) > MAX_NODE_INPUT_BYTES:
-        _refuse("payload_invalid")
+        _refuse("payload_invalid", "input_size")
     try:
         result = subprocess.run((str(node), str(encryptor)), input=raw, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                                 env={"PATH": str(node.parent), "HOME": "/var/empty", "LANG": "C", "LC_ALL": "C"},
                                 timeout=60, close_fds=True, check=False)
     except BaseException:
-        _refuse("payload_invalid")
-    if (result.returncode != 0 or result.stderr or not result.stdout
-            or len(result.stdout) > MAX_CIPHERTEXT_BYTES or result.stdout[:4] != b"KDLE"):
-        _refuse("payload_invalid")
+        _refuse("payload_invalid", "spawn")
+    if result.returncode != 0 or result.stderr:
+        _refuse("payload_invalid", _node_detail(result.stderr))
+    if not result.stdout or result.stdout[:4] != b"KDLE":
+        _refuse("payload_invalid", "output_shape")
+    if len(result.stdout) > MAX_CIPHERTEXT_BYTES:
+        _refuse("payload_invalid", "output_size")
     return bytes(result.stdout)
 
 
 def _write_ciphertext(runner_temp, member_name, payload):
     if (member_name not in {profile["member_name"] for profile in PROFILE_BY_KIND.values()}
             or type(payload) is not bytes or not 1 <= len(payload) <= MAX_CIPHERTEXT_BYTES):
-        _refuse("output_unavailable")
+        _refuse("output_unavailable", "output_member")
     nofollow = getattr(os, "O_NOFOLLOW", None)
     directory_flag = getattr(os, "O_DIRECTORY", None)
     if nofollow is None or directory_flag is None:
-        _refuse("output_unavailable")
+        _refuse("output_unavailable", "output_directory")
     parent_fd = directory_fd = file_fd = None
     directory_created = False
     file_created = False
@@ -545,7 +574,7 @@ def _write_ciphertext(runner_temp, member_name, payload):
                 os.rmdir(OUTPUT_DIRECTORY, dir_fd=parent_fd)
             except OSError:
                 pass
-        _refuse("output_unavailable")
+        _refuse("output_unavailable", "output_write")
     finally:
         for descriptor in (file_fd, directory_fd, parent_fd):
             if descriptor is not None:
@@ -999,7 +1028,7 @@ def encrypt_after_cleanup(dispatch, result, node):
     profile = dispatch["profile"]
     payload = result.get("payload_bytes")
     if type(payload) is not bytes or not payload:
-        _refuse("payload_invalid")
+        _refuse("payload_invalid", "payload_missing")
     record = {
         "schema_version": 1,
         "kind": profile["kind"],
@@ -1028,7 +1057,7 @@ def encrypt_after_cleanup(dispatch, result, node):
     if (resolved_encryptor.parent != control_directory or not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1 or stat.S_ISLNK(info.st_mode)
             or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
-        _refuse("tool_unavailable")
+        _refuse("tool_unavailable", "tool_path")
     return _encrypt_payload(encryptor, record, node)
 
 

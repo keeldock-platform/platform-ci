@@ -186,7 +186,7 @@ test('CLI asynchronously reads bounded stdin and emits only ciphertext or a gene
   assert.equal(oversized.error, undefined);
   assert.equal(oversized.status, 1);
   assert.equal(oversized.stdout.length, 0);
-  assert.deepEqual(oversized.stderr, Buffer.from('KD-FEEDBACK-ENCRYPTION-REFUSAL\n'));
+  assert.deepEqual(oversized.stderr, Buffer.from('KD-FEEDBACK-ENCRYPTION-REFUSAL input_too_large\n'));
 });
 
 test('producer encrypts a cargo lock bundle under its own profile and refuses expectations', () => {

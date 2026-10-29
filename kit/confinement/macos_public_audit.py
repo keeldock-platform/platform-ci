@@ -487,6 +487,18 @@ CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS = frozenset((
     "context_rust_runner_unavailable", "context_rules_control_identity_invalid",
     "context_rules_context_unavailable",
 ))
+CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS = frozenset(
+    "success_receipt_" + detail for detail in (
+        "payload_missing", "tool_path", "input_size", "spawn", "node_exit", "output_size",
+        "output_shape", "output_directory", "output_write", "output_member",
+        "node_credential_like_content", "node_envelope_rejected", "node_exception_expired",
+        "node_invalid_cargo_lock", "node_invalid_context", "node_invalid_expectation",
+        "node_invalid_input", "node_invalid_lock_manifest", "node_invalid_payload",
+        "node_invalid_recipient", "node_invalid_rust_patch", "node_limit_exceeded",
+        "node_payload_too_large", "node_unreviewed_rust_path", "node_unsupported_kind",
+        "node_input_too_large", "node_encryption_failed",
+    )
+)
 CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     "none", "unavailable", "load_controls", "review_binding", "host_preflight",
     "temp_root_check", "smoke_receipt", "token_input", "token_revocation",
@@ -517,6 +529,7 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     | CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS | CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS
     | CORE_CONTRACT_GATE_DIAGNOSTICS | CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS
     | CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS | CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS
+    | CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS
 )
 CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS = frozenset((
     "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",

@@ -254,11 +254,22 @@ FOREIGN_CONTEXT_DIAGNOSTICS = frozenset(
     for reason in reasons
 )
 FOREIGN_CONTEXT_MODULE_TAGS = {module: tag for tag, module, unused_reasons in FOREIGN_CONTEXT_REASONS}
+SUCCESS_RECEIPT_DETAILS = (
+    "payload_missing", "tool_path", "input_size", "spawn", "node_exit", "output_size",
+    "output_shape", "output_directory", "output_write", "output_member",
+) + tuple("node_" + code for code in (
+    "credential_like_content", "envelope_rejected", "exception_expired", "invalid_cargo_lock",
+    "invalid_context", "invalid_expectation", "invalid_input", "invalid_lock_manifest",
+    "invalid_payload", "invalid_recipient", "invalid_rust_patch", "limit_exceeded",
+    "payload_too_large", "unreviewed_rust_path", "unsupported_kind", "input_too_large",
+    "encryption_failed",
+))
+SUCCESS_RECEIPT_DIAGNOSTICS = frozenset("success_receipt_" + detail for detail in SUCCESS_RECEIPT_DETAILS)
 DIAGNOSTICS = (
     OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | SOURCE_RUNTIME_DIAGNOSTICS
     | SOURCE_FETCH_DIAGNOSTICS | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
     | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS | SUMMARY_GUARD_DIAGNOSTICS
-    | FOREIGN_CONTEXT_DIAGNOSTICS | frozenset(("none", "unavailable"))
+    | FOREIGN_CONTEXT_DIAGNOSTICS | SUCCESS_RECEIPT_DIAGNOSTICS | frozenset(("none", "unavailable"))
 )
 DETAILED_DIAGNOSTICS = DIAGNOSTICS - frozenset(("none", "unavailable"))
 NO_OPERATION_STAGES = frozenset(("arguments", "context", "host"))
@@ -333,6 +344,9 @@ class _FailureDiagnostics:
             return Refusal(reason, stage, diagnostic=diagnostic)
         if (type(error) is Refusal and stage == "context" and type(diagnostic) is str
                 and diagnostic in FOREIGN_CONTEXT_DIAGNOSTICS):
+            return Refusal(reason, stage, diagnostic=diagnostic)
+        if (type(error) is Refusal and reason == "internal_error" and stage == "internal"
+                and type(diagnostic) is str and diagnostic in SUCCESS_RECEIPT_DIAGNOSTICS):
             return Refusal(reason, stage, diagnostic=diagnostic)
         if (type(error) is Refusal and reason == "summary_guard_failed" and stage == "summary_guard"
                 and type(diagnostic) is str
@@ -1739,8 +1753,12 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
         return payload[:-1]
     except Refusal as error:
         raise _FailureDiagnostics().attach(error, operation) from None
-    except BaseException:
+    except BaseException as error:
         diagnostic = operation if operation in OPERATION_DIAGNOSTICS else "unavailable"
+        if operation == "success_receipt":
+            detail = getattr(error, "detail", None)
+            if type(detail) is str and "success_receipt_" + detail in SUCCESS_RECEIPT_DIAGNOSTICS:
+                diagnostic = "success_receipt_" + detail
         raise Refusal("internal_error", "internal", diagnostic=diagnostic) from None
 
 

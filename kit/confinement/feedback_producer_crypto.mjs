@@ -7,6 +7,13 @@ import { encryptDevelopmentFeedback } from './development_feedback.mjs';
 import { returnProfileForContext } from './node_lock_envelope.mjs';
 
 const MAX_INPUT_BYTES = 6 * 1024 * 1024;
+const REFUSAL_CODES = new Set([
+  'credential_like_content', 'envelope_rejected', 'exception_expired', 'invalid_cargo_lock',
+  'invalid_context', 'invalid_expectation', 'invalid_input', 'invalid_lock_manifest',
+  'invalid_payload', 'invalid_recipient', 'invalid_rust_patch', 'limit_exceeded',
+  'payload_too_large', 'unreviewed_rust_path', 'unsupported_kind', 'input_too_large',
+  'encryption_failed',
+]);
 const BASE64_SHAPE = /^[A-Za-z0-9+/]*={0,2}$/u;
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
 
@@ -20,6 +27,19 @@ export class FeedbackCryptoError extends Error {
 
 function reject(code = 'invalid_input') {
   throw new FeedbackCryptoError(code);
+}
+
+function innerRefusalCode(error) {
+  const code = error !== null && typeof error === 'object' && error.name === 'DevelopmentFeedbackError'
+    ? error.code : undefined;
+  return typeof code === 'string' && REFUSAL_CODES.has(code) ? code : 'encryption_failed';
+}
+
+function refusalLine(error) {
+  const code = error instanceof FeedbackCryptoError ? error.code : undefined;
+  return typeof code === 'string' && REFUSAL_CODES.has(code)
+    ? `KD-FEEDBACK-ENCRYPTION-REFUSAL ${code}\n`
+    : 'KD-FEEDBACK-ENCRYPTION-REFUSAL\n';
 }
 
 function exactObject(value, allowed, required) {
@@ -119,7 +139,7 @@ export function encryptFeedbackPayload(input) {
     return Buffer.from(encryptDevelopmentFeedback(options));
   } catch (error) {
     if (error instanceof FeedbackCryptoError) throw error;
-    reject('encryption_failed');
+    reject(innerRefusalCode(error));
   }
 }
 
@@ -148,8 +168,8 @@ if (process.argv.length === 2) {
   if (typeof process.argv[1] === 'string'
       && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
     try {
-      void main().catch(() => {
-        process.stderr.write('KD-FEEDBACK-ENCRYPTION-REFUSAL\n');
+      void main().catch((error) => {
+        process.stderr.write(refusalLine(error));
         process.exitCode = 1;
       });
     } catch {

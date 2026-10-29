@@ -396,7 +396,7 @@ jobs:
             fi
             IFS= read -r refusal_line < "$failure_file"
             [[ "$refusal_line" == KD-FEEDBACK-PRODUCER-REFUSAL\ * ]] || exit 1
-            if [[ "$refusal_line" != *'"reason":"cleanup_incomplete"'* && "$refusal_line" != *'"reason":"internal_error"'* && "$refusal_line" != *'"diagnostic":"unavailable","reason":"runner_unavailable","schema_version":1,"stage":"context"'* ]]; then printf 'producer_revocation=confirmed\n' >> "$GITHUB_OUTPUT"; fi
+            if [[ "$refusal_line" != *'"reason":"cleanup_incomplete"'* && "$refusal_line" != *'"diagnostic":"unavailable"'* ]]; then printf 'producer_revocation=confirmed\n' >> "$GITHUB_OUTPUT"; fi
             printf '%s\n' "$refusal_line"
             exit 1
           fi
