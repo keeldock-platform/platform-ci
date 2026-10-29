@@ -1,5 +1,20 @@
+"""Source-free baselines preparation slice.
+
+This lane covers only the slice named SLICE_NAME: action pin validation, job
+permission and cache-mode validation, runner identity, native tool presence and
+the closed record schema with its summary channel. It is not the full
+preparation gate. The proofs listed in OUTSTANDING_PROOFS are not performed, so
+a later source-bearing check must never read this output as the complete gate.
+
+The summary audit is a self-consistency check of the block this job wrote: it
+re-reads the same file and compares the canonical bytes, digest and binding
+fields. The independent proof is the coordinator extraction of the complete
+rendered summary from the public run page.
+"""
+
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -21,7 +36,22 @@ MAX_TOOLCHAIN_ITEMS = 16
 
 BEGIN_MARKER = "baseline-evidence-v1-begin"
 END_MARKER = "baseline-evidence-v1-end"
-VERDICT_PREFIX = "baselines-prepare="
+SLICE_NAME = "pins-permissions-identity-record-channel"
+VERDICT_PREFIX = "baselines-prepare-slice=" + SLICE_NAME + " "
+OUTSTANDING_PREFIX = "baselines-prepare-outstanding item="
+OUTSTANDING_PROOFS = (
+    "account-lifecycle-and-two-account-webview-isolation",
+    "package-tool-switches",
+    "locked-input-acquisition",
+    "fixed-capture-path",
+    "synthetic-canaries",
+    "runtime-cache-denial-proof",
+    "cargo-fixed-volume",
+    "host-reserve-2gib",
+    "cleanup-and-safe-failure",
+    "failure-lifecycle-drill",
+)
+REQUIRED_REPOSITORY = "keeldock-platform/platform-ci"
 REQUIRED_EVENT = "workflow_dispatch"
 REQUIRED_REF = "refs/heads/main"
 REQUIRED_RUNNER_ENVIRONMENT = "github-hosted"
@@ -34,7 +64,16 @@ DECIMAL_RE = re.compile(r"[1-9][0-9]{0,15}\Z")
 LABEL_RE = re.compile(r"[a-z0-9]{1,16}\Z")
 IMAGE_VERSION_RE = re.compile(r"[0-9]{1,8}(?:\.[0-9]{1,8}){0,3}\Z")
 VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}\Z")
-USES_RE = re.compile(r"^\s*(?:-\s+)?uses:\s+(\S+)")
+USES_RE = re.compile(
+    r"(?:^|[\s{,\[-])[\"']?uses[\"']?\s*:\s*[\"']?([^\s\"',}\]]+)"
+)
+TEMPLATE_USES_RE = re.compile(r"uses:\s+([A-Za-z0-9_./-]+)@([0-9a-f]{40})")
+POLICY_SHA_CONSTANTS = (
+    ("actions/create-github-app-token", "MACOS_SOURCE_READER_ACTION_SHA"),
+    ("actions/cache/restore", "MACOS_CACHE_PROOF_ACTION_SHA"),
+    ("actions/cache/save", "MACOS_CACHE_PROOF_ACTION_SHA"),
+)
+POLICY_MODULE_NAMES = ("policy", "policy_linux", "policy_windows")
 REMOTE_REF_RE = re.compile(
     r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_-]+)*)@([0-9a-f]{40})\Z"
 )
@@ -98,15 +137,10 @@ PLATFORMS = {
     },
 }
 
-REVIEWED_PINS = frozenset(
+RESIDUAL_REVIEWED_PINS = frozenset(
     (
         ("actions/attest", "1e69f48acb82d1966a394da916b4c1698aa569d6"),
-        ("actions/cache/restore", "3edfce9056124e459a23f683a21433670d47daca"),
-        ("actions/cache/save", "3edfce9056124e459a23f683a21433670d47daca"),
         ("actions/checkout", "11bd71901bbe5b1630ceea73d27597364c9af683"),
-        ("actions/create-github-app-token", "64ab729a6294000f5aa4a4bc0b73d1f32bc45510"),
-        ("actions/setup-node", "949feb2413d6458794dcd2491c4babbbce0c15c1"),
-        ("actions/upload-artifact", "cf430e030ddbb5b0abf93d22962f4752f3646cd9"),
     )
 )
 
@@ -150,8 +184,11 @@ PROFILE_MODES = frozenset(("empty-cold", "prepared-cold", "empty-warm", "prepare
 TOOLCHAIN_NAMES = frozenset(
     ("rust", "node", "npm", "tauri", "webkit", "webview2", "xcode", "python", "git")
 )
-PERCENTILES = {"p95": 95, "p05": 5, "median": 50}
-STATISTICS = frozenset(("p95", "p05", "median", "min", "max"))
+PERCENTILES = {"p95": 95, "p05": 5}
+STATISTICS = frozenset(("p95", "p05", "median_x2", "min", "max"))
+SYNTHETIC_VARIANT_ORDER = ("default", "cold", "warm", "numeric", "mixed")
+COLD_PROFILE_MODES =frozenset(("empty-cold", "prepared-cold"))
+WARM_PROFILE_MODES = frozenset(("empty-warm", "prepared-warm"))
 
 METRICS = {
     "native.startup.splash": ("startup", "us", 20, True),
@@ -276,6 +313,8 @@ def validate_run_context(environ, control_sha):
         raise BaselinesRefusal("control_sha_invalid")
     if environ.get("GITHUB_SHA") != control_sha:
         raise BaselinesRefusal("run_context_invalid")
+    if environ.get("GITHUB_REPOSITORY") != REQUIRED_REPOSITORY:
+        raise BaselinesRefusal("run_context_invalid")
     if environ.get("GITHUB_EVENT_NAME") != REQUIRED_EVENT:
         raise BaselinesRefusal("run_context_invalid")
     if environ.get("GITHUB_REF") != REQUIRED_REF:
@@ -305,7 +344,7 @@ def check_runner_identity(platform, environ):
     if type(architecture) is not str or architecture.lower() != spec["architecture"]:
         raise BaselinesRefusal("runner_architecture")
     image_os = environ.get("ImageOS")
-    if type(image_os) is not str or image_os.lower() != spec["image_os"]:
+    if image_os != spec["image_os"]:
         raise BaselinesRefusal("runner_image")
     image_version = environ.get("ImageVersion")
     if not _is_match(image_version, IMAGE_VERSION_RE):
@@ -321,24 +360,71 @@ def check_runner_identity(platform, environ):
 def inspect_workflow_uses(text):
     references = []
     for line in text.split("\n"):
-        match = USES_RE.match(line)
-        if match is not None:
+        for match in USES_RE.finditer(line):
             references.append(match.group(1))
     return references
 
 
-def validate_action_pins(root):
-    directory = os.path.join(str(root), *WORKFLOWS_DIRECTORY.split("/"))
+def load_policy():
+    bootstrap = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bootstrap")
+    )
+    inserted = bootstrap not in sys.path
+    if inserted:
+        sys.path.insert(0, bootstrap)
     try:
-        names = sorted(name for name in os.listdir(directory) if name.endswith(".yml"))
-    except OSError:
+        module = importlib.import_module("policy")
+    except ImportError:
+        raise BaselinesRefusal("pin_unreviewed")
+    finally:
+        if inserted and bootstrap in sys.path:
+            sys.path.remove(bootstrap)
+    if not hasattr(module, "MACOS_CACHE_PROOF_ACTION_SHA"):
+        raise BaselinesRefusal("pin_unreviewed")
+    return module
+
+
+def reviewed_pins():
+    policy = load_policy()
+    pins = set(RESIDUAL_REVIEWED_PINS)
+    for action, constant in POLICY_SHA_CONSTANTS:
+        value = getattr(policy, constant, None)
+        if not _is_match(value, SHA1_RE):
+            raise BaselinesRefusal("pin_unreviewed")
+        pins.add((action, value))
+    for module_name in POLICY_MODULE_NAMES:
+        module = policy if module_name == "policy" else getattr(policy, module_name, None)
+        if module is None:
+            raise BaselinesRefusal("pin_unreviewed")
+        for value in vars(module).values():
+            if type(value) is str:
+                for match in TEMPLATE_USES_RE.finditer(value):
+                    pins.add((match.group(1), match.group(2)))
+    return frozenset(pins)
+
+
+def list_yaml_files(root):
+    found = []
+    for current, directories, files in os.walk(str(root), followlinks=False):
+        directories[:] = [name for name in directories if name != ".git"]
+        for name in files:
+            if name.endswith(".yml") or name.endswith(".yaml"):
+                found.append(os.path.join(current, name))
+    return sorted(found)
+
+
+def validate_action_pins(root, pins=None):
+    paths = list_yaml_files(root)
+    workflow_root = os.path.join(str(root), *WORKFLOWS_DIRECTORY.split("/"))
+    if not any(path.startswith(workflow_root + os.sep) for path in paths):
         raise BaselinesRefusal("workflow_unavailable")
-    if not names:
-        raise BaselinesRefusal("workflow_unavailable")
+    reviewed = reviewed_pins() if pins is None else pins
     remote_count = 0
     local_count = 0
-    for name in names:
-        text = read_text_file(os.path.join(directory, name), "workflow_unavailable")
+    for path in paths:
+        if os.path.islink(path):
+            raise BaselinesRefusal("file_unreadable")
+        text = read_text_file(path, "workflow_unavailable")
         for reference in inspect_workflow_uses(text):
             if LOCAL_REF_RE.match(reference) is not None:
                 if ".." in reference.split("/"):
@@ -348,10 +434,10 @@ def validate_action_pins(root):
             match = REMOTE_REF_RE.match(reference)
             if match is None:
                 raise BaselinesRefusal("pin_malformed")
-            if (match.group(1), match.group(2)) not in REVIEWED_PINS:
+            if (match.group(1), match.group(2)) not in reviewed:
                 raise BaselinesRefusal("pin_unreviewed")
             remote_count += 1
-    return {"workflows": len(names), "remote_pins": remote_count, "local_references": local_count}
+    return {"workflows": len(paths), "remote_pins": remote_count, "local_references": local_count}
 
 
 def validate_top_level_permissions(text):
@@ -447,6 +533,11 @@ def compute_statistic(name, values):
         return ordered[0]
     if name == "max":
         return ordered[-1]
+    if name == "median_x2":
+        middle = len(ordered) // 2
+        if len(ordered) % 2 == 1:
+            return 2 * ordered[middle]
+        return ordered[middle - 1] + ordered[middle]
     rank = (PERCENTILES[name] * len(ordered) + 99) // 100
     if rank < 1:
         rank = 1
@@ -547,6 +638,10 @@ def validate_row(row):
         )
         if not all(native_checks):
             raise BaselinesRefusal("record_row")
+        if row["variant_id"] == "warm" and row["profile_mode"] not in WARM_PROFILE_MODES:
+            raise BaselinesRefusal("record_row")
+        if row["variant_id"] == "cold" and row["profile_mode"] not in COLD_PROFILE_MODES:
+            raise BaselinesRefusal("record_row")
     return True
 
 
@@ -576,7 +671,12 @@ def validate_block(block):
     seen = set()
     for row in rows:
         validate_row(row)
-        key = (row["metric_id"], row["variant_id"], row["batch_index"])
+        key = (
+            row["metric_id"],
+            row["variant_id"],
+            row.get("profile_mode"),
+            row["batch_index"],
+        )
         if key in seen:
             raise BaselinesRefusal("record_row")
         seen.add(key)
@@ -645,24 +745,49 @@ def build_synthetic_block(runner, control_sha, run_id, run_attempt):
         "method_version": 1,
     }
     values = [MAX_SAFE_INTEGER - offset for offset in range(MAX_VECTOR_LENGTH)]
+
+    def echo_row(variant, index, count):
+        selected = values[:count]
+        return {
+            "suite_id": "ipc",
+            "metric_id": "ipc.echo-64",
+            "variant_id": variant,
+            "batch_index": index,
+            "batch_kind": "primary" if index < MAX_PRIMARY_BATCHES else "confirmation",
+            "observation_count": len(selected),
+            "unit": "us",
+            "status": "ok",
+            "values": list(selected),
+            "statistic_name": "p95",
+            "statistic_value": compute_statistic("p95", selected),
+        }
+
     rows = []
-    for index in range(MAX_BATCHES):
-        rows.append(
-            {
-                "suite_id": "ipc",
-                "metric_id": "ipc.echo-64",
-                "variant_id": "default",
-                "batch_index": index,
-                "batch_kind": "primary" if index < MAX_PRIMARY_BATCHES else "confirmation",
-                "observation_count": len(values),
-                "unit": "us",
-                "status": "ok",
-                "values": list(values),
-                "statistic_name": "p95",
-                "statistic_value": compute_statistic("p95", values),
-            }
-        )
     block = {"schema": SCHEMA, "identity": identity, "rows": rows}
+    pending = None
+    for variant in SYNTHETIC_VARIANT_ORDER:
+        for index in range(MAX_BATCHES):
+            rows.append(echo_row(variant, index, MAX_VECTOR_LENGTH))
+            if len(rows) > MAX_ROWS or len(canonical_bytes(block)) > MAX_BLOCK_BYTES:
+                rows.pop()
+                pending = (variant, index)
+                break
+        if pending is not None:
+            break
+    if pending is not None:
+        low = 0
+        high = MAX_VECTOR_LENGTH
+        while low < high:
+            middle = (low + high + 1) // 2
+            rows.append(echo_row(pending[0], pending[1], middle))
+            fits = len(rows) <= MAX_ROWS and len(canonical_bytes(block)) <= MAX_BLOCK_BYTES
+            rows.pop()
+            if fits:
+                low = middle
+            else:
+                high = middle - 1
+        if low > 0:
+            rows.append(echo_row(pending[0], pending[1], low))
     validate_block(block)
     return block
 
@@ -702,7 +827,7 @@ def _parse_fields(line, marker):
     return fields
 
 
-def audit_summary(text, control_sha, run_id, run_attempt, platform):
+def audit_summary_with_digest(text, control_sha, run_id, run_attempt, platform):
     if type(text) is not str:
         raise BaselinesRefusal("summary_shape")
     lines = text.split("\n")
@@ -725,6 +850,8 @@ def audit_summary(text, control_sha, run_id, run_attempt, platform):
     except UnicodeEncodeError:
         raise BaselinesRefusal("summary_shape")
     block = load_block(payload)
+    if payload != canonical_bytes(block):
+        raise BaselinesRefusal("audit_mismatch")
     identity = block["identity"]
     digest = hashlib.sha256(payload).hexdigest()
     expected = {
@@ -746,15 +873,36 @@ def audit_summary(text, control_sha, run_id, run_attempt, platform):
         or identity["platform"] != platform
     ):
         raise BaselinesRefusal("audit_mismatch")
-    return block
+    return block, header["digest"]
+
+
+def audit_summary(text, control_sha, run_id, run_attempt, platform):
+    return audit_summary_with_digest(text, control_sha, run_id, run_attempt, platform)[0]
+
+
+def check_lane_block(block, runner):
+    identity = block["identity"]
+    if identity["evidence_class"] != "synthetic":
+        raise BaselinesRefusal("audit_mismatch")
+    for field in ("platform", "architecture", "image_os", "image_version"):
+        if identity[field] != runner[field]:
+            raise BaselinesRefusal("audit_mismatch")
+    return True
 
 
 def append_summary(path, text):
     if type(path) is not str or not path or not os.path.isabs(path):
         raise BaselinesRefusal("summary_unavailable")
+    encoded = text.encode("utf-8")
     try:
-        with open(path, "a", encoding="utf-8", newline="\n") as target:
-            target.write(text)
+        existing = os.path.getsize(path) if os.path.exists(path) else 0
+    except OSError:
+        raise BaselinesRefusal("summary_unavailable")
+    if existing + len(encoded) > MAX_SUMMARY_BYTES:
+        raise BaselinesRefusal("summary_oversize")
+    try:
+        with open(path, "ab") as target:
+            target.write(encoded)
     except OSError:
         raise BaselinesRefusal("summary_unavailable")
 
@@ -794,8 +942,15 @@ def run_preparation(root, platform, control_sha, environ, emit=print):
     block = build_synthetic_block(runner, control_sha, run_id, run_attempt)
     summary_path = environ.get("GITHUB_STEP_SUMMARY")
     append_summary(summary_path, "\n" + render_summary(block))
-    audited = audit_summary(read_summary(summary_path), control_sha, run_id, run_attempt, platform)
+    audited, header_digest = audit_summary_with_digest(
+        read_summary(summary_path), control_sha, run_id, run_attempt, platform
+    )
     payload = canonical_bytes(audited)
+    if payload != canonical_bytes(block):
+        raise BaselinesRefusal("audit_mismatch")
+    check_lane_block(audited, runner)
+    if hashlib.sha256(payload).hexdigest() != header_digest:
+        raise BaselinesRefusal("audit_mismatch")
     return {
         "platform": platform,
         "control_sha": control_sha,
@@ -808,8 +963,13 @@ def run_preparation(root, platform, control_sha, environ, emit=print):
         "tools_total": len(tools),
         "rows": len(audited["rows"]),
         "bytes": len(payload),
-        "digest": hashlib.sha256(payload).hexdigest(),
+        "digest": header_digest,
     }
+
+
+def emit_outstanding(emit=print):
+    for item in OUTSTANDING_PROOFS:
+        emit(OUTSTANDING_PREFIX + item)
 
 
 def main(argv=None, environ=None):
@@ -824,16 +984,21 @@ def main(argv=None, environ=None):
             arguments.root, arguments.platform, arguments.control_sha, environment
         )
     except BaselinesRefusal as refusal:
-        print(VERDICT_PREFIX + "refused code=" + refusal.code)
+        emit_outstanding()
+        print(VERDICT_PREFIX + "result=refused code=" + refusal.code)
         return 1
     except OSError:
-        print(VERDICT_PREFIX + "refused code=runner_unavailable")
+        emit_outstanding()
+        print(VERDICT_PREFIX + "result=refused code=runner_unavailable")
         return 1
+    emit_outstanding()
     print(
         VERDICT_PREFIX
-        + "ok platform=%s control-sha=%s run-id=%d run-attempt=%d workflows=%d pins=%d jobs=%d "
-        "native-tools=%d/%d rows=%d bytes=%d digest=%s"
+        + "result=ok step1-complete=no outstanding=%d platform=%s control-sha=%s run-id=%d "
+        "run-attempt=%d workflows=%d pins=%d jobs=%d native-tools=%d/%d rows=%d bytes=%d "
+        "digest=%s"
         % (
+            len(OUTSTANDING_PROOFS),
             result["platform"],
             result["control_sha"],
             result["run_id"],

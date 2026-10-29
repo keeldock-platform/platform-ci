@@ -291,8 +291,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/release_evidence.py': '2609b125bf2d3cbde256e2e4229c576fc0de1c5da898faf206807205dee49ae2',
     'kit/confinement/test_release_evidence.py': '0b781f9b1a72919b6d43230f9831f7320aa44a9d4f39949b9408bae53b06b143',
     '.github/workflows/baselines-prepare.yml': '970eec0b3be196ab2c0e02f7652a06e186b9ab2f76df704daba53a935af0388d',
-    'kit/baselines/baselines_prepare.py': 'b40f069d3e8e315c10cb4f2761534c3c740d27befd8ea73100afce23080c5acf',
-    'kit/baselines/test_baselines_prepare.py': '9a16097bde74e741a088925507d63418b51dfd8e4fbe59444136848b7f6e01b4',
+    'kit/baselines/baselines_prepare.py': 'bc38bb2709c8b454555d9c9cb1fd362d09c40a954d09a8a3746595f754e92238',
+    'kit/baselines/test_baselines_prepare.py': 'd4ab663c38f5ffcac9982f03151f4129c6d4e56687c805157addcad6959564a2',
     'kit/bootstrap/policy_baselines.py': '62878db53091a36a743d10e6e3355f7b9bb8227ae763337082608e9935edd8b8',
     'kit/bootstrap/test_policy_baselines.py': '3e9041e973239aaf75c57ada33356b94f422c9941747a45b13f608de65f939aa',
 }
