@@ -1,5 +1,3 @@
-import hashlib
-from pathlib import Path
 import unittest
 
 from native_loopback_profile import (
@@ -14,13 +12,6 @@ from native_loopback_profile import (
     ProfileError,
     validate_profile,
 )
-
-
-ROOT = Path(__file__).resolve().parent
-SOURCE_PROFILE_DIGESTS = {
-    "linux_harness.py": "066e461ad229d70cd2a270fc95ddcc29e60951da5c7ec5cfdd68e45c4445a8c0",
-    "macos_deny_default.py": "ab15114cddef7f94732bfd8497a08fde41f75b49e6c42721a447b4f895ce628f",
-}
 
 
 def valid_profile():
@@ -179,11 +170,3 @@ class ProofPlanTests(unittest.TestCase):
         self.assertTrue(
             all(check.subjects == ("test_worker", "automation_processes") for check in NEGATIVE_EGRESS_PROOFS)
         )
-
-
-class SourceJobProfileTests(unittest.TestCase):
-    def test_existing_linux_and_macos_source_job_profiles_remain_byte_identical(self):
-        for filename, expected_digest in SOURCE_PROFILE_DIGESTS.items():
-            with self.subTest(profile=filename):
-                actual = hashlib.sha256((ROOT / filename).read_bytes()).hexdigest()
-                self.assertEqual(actual, expected_digest)

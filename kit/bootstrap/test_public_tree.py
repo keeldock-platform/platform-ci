@@ -253,12 +253,16 @@ class PublicTreeTests(unittest.TestCase):
             '.github/workflows/capsule-vectors.yml',
             'kit/confinement/capsule_frame.cs',
             'kit/confinement/capsule_frame.ps1',
+            'kit/confinement/capsule_frame_vectors.json',
             ".github/workflows/windows-native-preflight.yml",
             "kit/confinement/windows_native_preflight.cs",
             "kit/confinement/windows_native_preflight.ps1",
             "kit/confinement/test_windows_native_preflight.py",
+            "kit/confinement/windows_confinement.cs",
             "kit/confinement/windows_confinement.ps1",
+            "kit/confinement/windows_confinement_recovery.ps1",
             "kit/confinement/test_windows_confinement.py",
+            "kit/confinement/test_windows_confinement_recovery.ps1",
             "kit/confinement/macos_source_reader.py",
             "kit/confinement/test_macos_source_reader.py",
             "kit/confinement/release_provenance.py",
@@ -275,6 +279,8 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_release_evidence.py",
             "kit/confinement/native_loopback_profile.py",
             "kit/confinement/test_native_loopback_profile.py",
+            "kit/confinement/linux_harness.py",
+            "kit/confinement/macos_deny_default.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))

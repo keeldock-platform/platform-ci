@@ -1,6 +1,7 @@
 import hashlib
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -152,6 +153,20 @@ class ReleaseEvidenceTests(unittest.TestCase):
                 subject._file_identity(files["build.log"]),
                 subject._file_identity(os.lstat(target)),
             )
+
+    @unittest.skipUnless(os.name == "nt", "Windows tunnelled creation time only")
+    def test_windows_recreated_log_with_a_tunnelled_change_time_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = b"safe log\n"
+            target = _write(root, "build.log", payload)
+            target.unlink()
+            time.sleep(0.1)
+            _write(root, "build.log", payload)
+            manifest = _manifest((_entry("build.log", "log", payload),))
+            verdict = _scan(root, manifest)
+            self.assertTrue(verdict.accepted)
+            self.assertEqual(verdict.reason, "none")
 
     def test_pinned_canary_in_any_listed_file_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:

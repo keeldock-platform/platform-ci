@@ -13,6 +13,8 @@ $box = $null
 $baseDirectory = $null
 $componentNameExpected = $null
 $componentNameObserved = $null
+$script:WinsockCatalogLease = $null
+. (Join-Path $PSScriptRoot 'windows_confinement_recovery.ps1')
 
 $RustVersion = '1.99.1'
 $RustTarget = 'x86_64-pc-windows-msvc'
@@ -273,6 +275,22 @@ function Grant-Access([string]$path, [string]$sid, [string]$rights, [bool]$inher
     [System.IO.FileSystemAclExtensions]::SetAccessControl($info, $security)
 }
 
+function Set-LowIntegrityLabel([string]$path) {
+    $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    & $icacls $path '/setintegritylevel' '(OI)(CI)L' | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'integrity_set' }
+    $global:LASTEXITCODE = 0
+}
+
+function Test-LowIntegrityLabel([string]$path) {
+    $icacls = Join-Path $env:SystemRoot 'System32\icacls.exe'
+    $output = & $icacls $path 2>$null
+    $code = $LASTEXITCODE
+    $global:LASTEXITCODE = 0
+    if ($code -ne 0) { return $false }
+    return [bool]($output -match 'Mandatory Label\\Low Mandatory Level:(?:\(I\))?\(OI\)\(CI\)\(NW\)')
+}
+
 function Grant-NonPropagating([string]$path, [string]$sid) {
     $bytes = [KeelDock.Platform.WindowsConfinement.NonPropagatingDacl]::Read($path)
     $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($bytes, 0)
@@ -323,7 +341,12 @@ function Test-Acl {
     foreach ($path in @(($script:Layout.RustBin + '\rustc.exe'), ($script:Layout.MsvcBin + '\link.exe'), ($script:Layout.NodeDir + '\node.exe'), $script:Layout.LightningcssBinding, $script:Layout.RolldownBinding, $script:Layout.NodeTest)) {
         if (@(Get-SidRules $path $sid).Count -lt 1) { return 'not_inherited' }
     }
-    if (@(Get-SidRules $script:Lpac.Tmp $sid).Count -lt 1) { return 'scratch_not_inherited' }
+    foreach ($path in @($script:Lpac.Tmp, $script:Lpac.Profile, $script:Lpac.CargoHome, $script:Lpac.Crate, (Join-Path $script:Lpac.Crate 'src'))) {
+        $entries = @(Get-SidRules $path $sid)
+        if ($entries.Count -ne 1 -or -not $entries[0].IsInherited -or $entries[0].AccessControlType -ne 'Allow' -or ($entries[0].FileSystemRights -band $modifyMask) -ne $modifyMask) { return 'scratch_not_inherited' }
+        if (-not (Test-LowIntegrityLabel $path)) { return 'scratch_integrity' }
+    }
+    if (-not (Test-LowIntegrityLabel $script:Lpac.Root)) { return 'scratch_integrity' }
     return 'verified'
 }
 
@@ -366,7 +389,7 @@ function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
         $specs += @{ Name = 'acl_ro_read'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.RustBin); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'rustc\.exe' } }
         $specs += @{ Name = 'acl_scratch_write'; Exe = $cmd; Arguments = ('/d /c copy /y nul ' + $scratch.Tmp + '\kd_write.txt'); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and (Test-Path -LiteralPath ($script:Lpac.Tmp + '\kd_write.txt')) } }
         $specs += @{ Name = 'acl_ro_write_denied'; Exe = $cmd; Arguments = ('/d /c copy /y nul ' + $layout.ReadOnly + '\kd_write_probe.txt'); Timeout = 30; Check = { param($r) $r.ExitCode -ne 0 -and (($r.Stdout + $r.Stderr) -match 'Access is denied') -and -not (Test-Path -LiteralPath ($script:Layout.ReadOnly + '\kd_write_probe.txt')) } }
-        $specs += @{ Name = 'acl_downloads_denied'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.Downloads); Timeout = 30; Check = { param($r) $r.ExitCode -ne 0 -and (($r.Stdout + $r.Stderr) -match 'Access is denied') } }
+        $specs += @{ Name = 'acl_downloads_denied'; Exe = $cmd; Arguments = ('/d /c type "' + $layout.Downloads + '\acl_probe.txt"'); Timeout = 30; Check = { param($r) $r.ExitCode -ne 0 -and (($r.Stdout + $r.Stderr) -match 'Access is denied') } }
     } else {
         $specs += @{ Name = 'acl_downloads_listable'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.Downloads); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'rustc\.tar\.gz' } }
     }
@@ -407,10 +430,29 @@ function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
             $firstLine = ($result.Stdout -split "`n" | Where-Object { $_.Trim().Length -gt 0 } | Select-Object -First 1)
             if ($firstLine) { Write-Line ('kd-diag stage=' + $spec.Name + ' stream=first line=' + (Get-CleanText $firstLine.Trim() 160)) }
         }
-        $lpacProven = ($tokenText -like 'appcontainer=1,*') -and ($tokenText -like '*,lpac=1,*') -and ($tokenText -like '*,sid=match,*') -and ($tokenText -like '*,aap=absent')
+        $lpacProven = ($tokenText -like 'appcontainer=1,*') -and ($tokenText -like '*,lpac=1,*') -and ($tokenText -like '*,sid=match,*') -and ($tokenText -like '*,arap=present,*') -and ($tokenText -like '*,aap=absent')
         $outcomes[$spec.Name] = @{ Passed = $passed; Job = ($jobText -like 'assigned,*'); Token = $lpacProven; AapOnly = ($tokenText -like '*,lpac=aap_only,*'); Stdout = [string]$result.Stdout }
     }
     return $outcomes
+}
+
+function Invoke-ConfinedLadder($sandbox, [hashtable]$scratch) {
+    try {
+        $script:WinsockCatalogLease = Grant-WinsockCatalogRead $script:Sid
+        $script:phase = 'ladder'
+        return Invoke-Ladder $sandbox $true $scratch
+    } finally {
+        if ($script:WinsockCatalogLease) {
+            try {
+                Restore-WinsockCatalogAcl $script:WinsockCatalogLease
+                Stop-CatalogRecovery $script:WinsockCatalogLease
+            } catch {
+                $script:phase = 'winsock_acl'
+                throw
+            }
+            $script:WinsockCatalogLease = $null
+        }
+    }
 }
 
 
@@ -481,6 +523,7 @@ try {
         foreach ($directory in @($layout.Base, $layout.Downloads, $layout.ReadOnly, $script:Lpac.Root, $script:Control.Root)) {
             New-Item -ItemType Directory -Path $directory | Out-Null
         }
+        New-Item -ItemType File -Path (Join-Path $layout.Downloads 'acl_probe.txt') | Out-Null
 
         $phase = 'lpac_profile'
         $box = [KeelDock.Platform.WindowsConfinement.Sandbox]::Create()
@@ -489,6 +532,7 @@ try {
         $phase = 'acl_grant'
         Grant-Access $layout.ReadOnly $script:Sid 'ReadAndExecute, Synchronize' $true
         Grant-Access $script:Lpac.Root $script:Sid 'Modify, Synchronize' $true
+        Set-LowIntegrityLabel $script:Lpac.Root
         $phase = 'acl_ancestors'
         $script:AncestorPaths = @()
         $ancestorPath = $layout.Base
@@ -583,7 +627,9 @@ try {
 
         $phase = 'ladder'
         $controlOutcomes = Invoke-Ladder $box $false $script:Control
-        $confinedOutcomes = Invoke-Ladder $box $true $script:Lpac
+        $phase = 'winsock_acl'
+        $confinedOutcomes = Invoke-ConfinedLadder $box $script:Lpac
+        $phase = 'ladder'
 
         $firstFailure = 'none'
         foreach ($key in $confinedOutcomes.Keys) {
@@ -614,15 +660,36 @@ try {
         if ($rust -eq 'compiled' -and $node -eq 'ran' -and $firstFailure -eq 'none' -and $jobState -eq 'verified' -and $tokenState -eq 'verified' -and $aclNegative -eq 'denied') { $exitCode = 0 }
     }
 } catch {
-    $reason = Get-CleanText ([string]$_.Exception.Message) 120
-    $reason = [regex]::Replace($reason, '[^A-Za-z0-9._ -]', '_').Trim().Replace(' ', '_')
-    if ($reason.Length -eq 0) { $reason = 'unspecified' }
+    $reason = [string]$_.Exception.Message
+    if ($phase -eq 'winsock_acl') {
+        if ($reason -notin @('winsock_catalog_path', 'winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_recovery_stop', 'winsock_registry_read', 'winsock_package_sid', 'winsock_grant_failed', 'winsock_restore_failed', 'winsock_restore_readback', 'winsock_restore_state')) {
+            $reason = 'winsock_registry_error'
+        }
+    } else {
+        $reason = Get-CleanText $reason 120
+        $reason = [regex]::Replace($reason, '[^A-Za-z0-9._ -]', '_').Trim().Replace(' ', '_')
+        if ($reason.Length -eq 0) { $reason = 'unspecified' }
+    }
     $safePhase = [regex]::Replace([string]$phase, '[^A-Za-z0-9_]', '_')
     $componentDiagnostic = ''
     if ($null -ne $componentNameExpected) {
         $componentDiagnostic = ' expected_component=' + (Get-SafeComponentName $componentNameExpected) + ' observed_component=' + (Get-SafeComponentName $componentNameObserved)
     }
     $refusal = 'windows-confinement-spike=refused phase=' + $safePhase + ' reason=' + $reason + $componentDiagnostic
+}
+
+try {
+    if ($script:WinsockCatalogLease) {
+        try {
+            Restore-WinsockCatalogAcl $script:WinsockCatalogLease
+            Stop-CatalogRecovery $script:WinsockCatalogLease
+            $script:WinsockCatalogLease = $null
+        } catch {
+            $cleanup = 'incomplete'
+        }
+    }
+} catch {
+    $cleanup = 'incomplete'
 }
 
 try {
