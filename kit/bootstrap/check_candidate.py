@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 
+from api_budget import load_budget_document
 from policy import (
     LANE_CANDIDATE_WORKFLOWS,
     PolicyError,
@@ -77,6 +78,8 @@ def main():
                     raise PolicyError(too_large_code)
                 validate_workflow_text(lane_payload.decode("utf-8"), pool, workflow_kind)
         scan_tree(root, pool)
+        if pool == "platform":
+            load_budget_document(root / "ci/api-budgets.json")
         print("candidate-policy=accepted control-sha=" + actual_sha)
     except (OSError, UnicodeDecodeError, ValueError, PolicyError, PublicTreeError):
         print("candidate-policy=refused")

@@ -150,6 +150,12 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("kit/confinement/test_macos_capability.py", result)
         self.assertIn("kit/confinement/test_macos_descriptors.py", result)
 
+    def test_release_evidence_scanner_is_registered_and_discovered(self):
+        self.assertIn("kit/confinement/release_evidence.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/test_release_evidence.py", PLATFORM_FILES)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertEqual(action.count('"test_release_evidence.py"'), 2)
+
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -164,6 +170,18 @@ class PublicTreeTests(unittest.TestCase):
             (root / "kit/confinement/unreviewed.py").write_text("safe\n", encoding="utf-8")
             with self.assertRaisesRegex(PublicTreeError, "tree-shape"):
                 scan_tree(root, "platform")
+
+    def test_cache_policy_files_are_registered_and_test_discovery_is_active(self):
+        result = scan_tree(ROOT, "platform")
+        for name in ("kit/cache/policy.py", "kit/cache/test_policy.py"):
+            with self.subTest(name=name):
+                self.assertIn(name, PLATFORM_FILES)
+                self.assertIn(name, result)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            'unittest discover -s "$CI_ACTION_PATH/../cache" -p "test_*.py"',
+            action,
+        )
 
     def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
@@ -249,6 +267,14 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_role_signer.py",
             "kit/bootstrap/policy_handoff.py",
             "kit/bootstrap/test_policy_handoff.py",
+            "kit/confinement/release_build_verify.py",
+            "kit/confinement/test_release_build_verify.py",
+            'kit/confinement/cargo_vendor_verify.py',
+            'kit/confinement/test_cargo_vendor_verify.py',
+            "kit/confinement/release_evidence.py",
+            "kit/confinement/test_release_evidence.py",
+            "kit/confinement/native_loopback_profile.py",
+            "kit/confinement/test_native_loopback_profile.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))
@@ -259,6 +285,17 @@ class PublicTreeTests(unittest.TestCase):
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, destination)
             scan_tree(root, "platform")
+            for name in (
+                "kit/confinement/native_loopback_profile.py",
+                "kit/confinement/test_native_loopback_profile.py",
+            ):
+                with self.subTest(file=name):
+                    edited = root / name
+                    original = edited.read_bytes()
+                    edited.write_bytes(original + b"\n")
+                    with self.assertRaisesRegex(PublicTreeError, "file-hash-mismatch"):
+                        scan_tree(root, "platform")
+                    edited.write_bytes(original)
             edited = root / "kit/confinement/windows_native_preflight.cs"
             edited.write_text(edited.read_text(encoding="utf-8") + "\n", encoding="utf-8")
             with self.assertRaisesRegex(PublicTreeError, "file-hash-mismatch"):

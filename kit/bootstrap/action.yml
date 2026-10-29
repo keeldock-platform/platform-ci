@@ -4,6 +4,10 @@ inputs:
   pool:
     description: Public pool label
     required: true
+  ledger_path:
+    description: Coordinator request ledger path for the shadow API report
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
@@ -77,18 +81,50 @@ runs:
         "$python_bin" -B "$CI_ACTION_PATH/test_public_tree.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../selector" -p "test_*.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_capsule_frame.py"
+        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_native_loopback_profile.py"
+        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../cache" -p "test_*.py"
+        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH" -p "test_api_controls.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_macos*.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement*.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_source_bundle_preflight.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_log_canary.py"
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_lock_receipt.py"
+        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_build_verify.py"
+        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_vendor_verify.py"
+        "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_evidence.py"
         if [[ "${RUNNER_OS:-}" == "macOS" ]]; then
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_capsule_frame.py"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../cache" -p "test_*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_macos*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../selector" -p "test_*.py"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_native_loopback_profile.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_confinement*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_source_bundle_preflight.py"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH" -p "test_api_controls.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_log_canary.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_lock_receipt.py"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_build_verify.py"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_cargo_vendor_verify.py"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_release_evidence.py"
         fi
         "$python_bin" -B "$CI_ACTION_PATH/check_candidate.py" --root "$CI_WORKSPACE" --pool "$CI_POOL" --sha "$CI_SHA"
+    - name: ci.rate-budget shadow report
+      if: ${{ inputs.ledger_path != '' }}
+      shell: bash
+      env:
+        CI_ACTION_PATH: ${{ github.action_path }}
+        CI_WORKSPACE: ${{ github.workspace }}
+        CI_RATE_LEDGER_PATH: ${{ inputs.ledger_path }}
+        PYTHONDONTWRITEBYTECODE: "1"
+      run: |
+        set -euo pipefail
+        if command -v python3 >/dev/null 2>&1; then
+          python_bin="$(command -v python3)"
+        elif command -v python >/dev/null 2>&1; then
+          python_bin="$(command -v python)"
+        else
+          exit 1
+        fi
+        if ! "$python_bin" -B "$CI_ACTION_PATH/api_budget.py" --shadow --ledger "$CI_RATE_LEDGER_PATH" --budgets "$CI_WORKSPACE/ci/api-budgets.json"; then
+          printf '%s\n' 'ci.rate-budget=unavailable code=reporter-failed'
+        fi

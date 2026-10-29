@@ -32,8 +32,8 @@ SUPERVISION_TRANSITIONS = {
     ("parent-running", "parent-exited"): "parent-dead",
     ("parent-dead", "descendant-reaped"): "complete",
 }
-CHILD_UID = 65534
-CHILD_GID = 65534
+CHILD_UID = 62000
+CHILD_GID = 62000
 MAX_CAPTURE = 8192
 MAX_PROBE_SECONDS = 10
 INNER_REFUSAL_REASONS = (
@@ -76,6 +76,8 @@ COMPAT_SYSCALL_BIT = 0x40000000
 SECCOMP_DENY = 0x00050000 | errno.EPERM
 SECCOMP_ALLOW = 0x7FFF0000
 SOCKET_SYSCALLS = (41, 53, 425, 426, 427)
+EXTRA_DENIED_SYSCALLS = (101, 155, 161, 165, 166, 248, 249, 250, 272, 298, 308, 310, 311, 321, 323, 428, 429, 430, 431, 432, 433, 438, 442)
+DENIED_SYSCALLS = SOCKET_SYSCALLS + EXTRA_DENIED_SYSCALLS
 SOCKET_FILTER = (
     (0x20, 0, 0, 4),
     (0x15, 1, 0, AUDIT_ARCH_NATIVE),
@@ -83,7 +85,7 @@ SOCKET_FILTER = (
     (0x20, 0, 0, 0),
     (0x45, 0, 1, COMPAT_SYSCALL_BIT),
     (0x06, 0, 0, SECCOMP_DENY),
-) + tuple(instruction for number in SOCKET_SYSCALLS for instruction in (
+) + tuple(instruction for number in DENIED_SYSCALLS for instruction in (
     (0x15, 0, 1, number),
     (0x06, 0, 0, SECCOMP_DENY),
 )) + ((0x06, 0, 0, SECCOMP_ALLOW),)
@@ -284,27 +286,32 @@ def _wait_for_process_state(pid, expected):
     raise ProofFailure(74)
 
 
-def _drop_child():
+CHILD_LIMITS = (
+    (resource.RLIMIT_CPU, (3, 3)),
+    (resource.RLIMIT_FSIZE, (MAX_CAPTURE // 2, MAX_CAPTURE // 2)),
+    (resource.RLIMIT_AS, (268435456, 268435456)),
+    (resource.RLIMIT_NPROC, (16, 16)),
+    (resource.RLIMIT_NOFILE, (16, 16)),
+    (resource.RLIMIT_CORE, (0, 0)),
+)
+
+
+def _drop_child(limits=None, socket_filter=True, drop_privileges=True):
     libc = ctypes.CDLL(None, use_errno=True)
-    for capability in range(64):
-        if libc.prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) != 0:
-            error = ctypes.get_errno()
-            if error not in (errno.EINVAL, errno.EPERM):
-                os._exit(91)
-    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-        os._exit(92)
-    os.setgroups([])
-    os.setresgid(CHILD_GID, CHILD_GID, CHILD_GID)
-    os.setresuid(CHILD_UID, CHILD_UID, CHILD_UID)
-    _install_socket_filter()
-    for key, limit in (
-        (resource.RLIMIT_CPU, (3, 3)),
-        (resource.RLIMIT_FSIZE, (MAX_CAPTURE // 2, MAX_CAPTURE // 2)),
-        (resource.RLIMIT_AS, (268435456, 268435456)),
-        (resource.RLIMIT_NPROC, (16, 16)),
-        (resource.RLIMIT_NOFILE, (16, 16)),
-        (resource.RLIMIT_CORE, (0, 0)),
-    ):
+    if drop_privileges:
+        for capability in range(64):
+            if libc.prctl(PR_CAPBSET_DROP, capability, 0, 0, 0) != 0:
+                error = ctypes.get_errno()
+                if error not in (errno.EINVAL, errno.EPERM):
+                    os._exit(91)
+        if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+            os._exit(92)
+        os.setgroups([])
+        os.setresgid(CHILD_GID, CHILD_GID, CHILD_GID)
+        os.setresuid(CHILD_UID, CHILD_UID, CHILD_UID)
+    if socket_filter:
+        _install_socket_filter()
+    for key, limit in (CHILD_LIMITS if limits is None else limits):
         resource.setrlimit(key, limit)
     os.close(0)
 
@@ -683,13 +690,20 @@ def _set_sysctl(path, value):
 def _make_rootfs(rootfs):
     os.makedirs(rootfs, mode=0o700, exist_ok=True)
     _mount("tmpfs", rootfs, "tmpfs", MS_NOSUID | MS_NODEV, "size=128m")
-    for relative in ("usr", "etc", "proc", "tmp", "capture"):
+    for relative in ("usr", "etc", "proc", "tmp", "dev", "capture"):
         os.makedirs(os.path.join(rootfs, relative), mode=0o755, exist_ok=True)
     os.chmod(rootfs, 0o555)
     _mount("/usr", os.path.join(rootfs, "usr"), None, MS_BIND | MS_REC)
     _mount(None, os.path.join(rootfs, "usr"), None, MS_BIND | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV)
     _mount("proc", os.path.join(rootfs, "proc"), "proc", MS_NOSUID | MS_NODEV | MS_NOEXEC)
     _mount("tmpfs", os.path.join(rootfs, "tmp"), "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=8m")
+    _mount("tmpfs", os.path.join(rootfs, "dev"), "tmpfs", MS_NOSUID | MS_NOEXEC, "mode=0755,size=1m")
+    for name, major, minor in (("null", 1, 3), ("zero", 1, 5), ("random", 1, 8), ("urandom", 1, 9)):
+        os.mknod(
+            os.path.join(rootfs, "dev", name),
+            stat.S_IFCHR | 0o666,
+            os.makedev(major, minor),
+        )
     os.chmod(os.path.join(rootfs, "tmp"), 0o1777)
     os.chmod(os.path.join(rootfs, "capture"), 0o700)
     for name, value in (

@@ -11,7 +11,7 @@ import sys
 import time
 import zipfile
 from pathlib import Path
-from urllib.parse import parse_qsl, unquote, urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 
 MAX_JSON_BYTES = 8388608
@@ -871,11 +871,16 @@ def validate_provider_uri(uri, subject_digest, initial=False):
     if (type(uri) is not str or len(uri) > 2048 or
             any(ord(character) < 33 or ord(character) > 126 for character in uri)):
         raise Refusal("provider-cursor-uri")
-    parts = urlsplit(uri)
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        raise Refusal("provider-cursor-uri")
     expected_path = "/repos/" + CONTROL_REPOSITORY + "/attestations/sha256:" + subject_digest
     if (parts.scheme != "https" or parts.netloc != "api.github.com" or
-            unquote(parts.path) != expected_path or parts.fragment):
+            parts.path != expected_path or parts.fragment):
         raise Refusal("provider-cursor-uri")
+    if re.search(r"%(?![a-fA-F0-9]{2})", parts.query) is not None:
+        raise Refusal("provider-cursor-query")
     try:
         pairs = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True)
     except ValueError:
@@ -894,22 +899,130 @@ def validate_provider_uri(uri, subject_digest, initial=False):
     return uri
 
 
+def _split_provider_link_parts(value, separator, angle_brackets=False):
+    parts = []
+    start = 0
+    quoted = False
+    escaped = False
+    in_angle = False
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if quoted:
+            if character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            continue
+        if character == '"':
+            quoted = True
+            continue
+        if angle_brackets:
+            if character == "<":
+                if in_angle:
+                    raise Refusal("provider-link-shape")
+                in_angle = True
+            elif character == ">":
+                if not in_angle:
+                    raise Refusal("provider-link-shape")
+                in_angle = False
+        if character == separator and not in_angle:
+            parts.append(value[start:index])
+            start = index + 1
+    if quoted or escaped or in_angle:
+        raise Refusal("provider-link-shape")
+    parts.append(value[start:])
+    return parts
+
+
+def _provider_link_parameter(raw):
+    match = re.fullmatch(
+        r'([A-Za-z0-9!$%&\'*+.^_`|~-]+)[ \t]*=[ \t]*(?:"((?:[^"\\]|\\.)*)"|([A-Za-z0-9!$%&\'*+.^_`|~:/?@-]+))',
+        raw,
+    )
+    if match is None:
+        raise Refusal("provider-link-shape")
+    name = match.group(1).lower()
+    value = match.group(2) if match.group(2) is not None else match.group(3)
+    if match.group(2) is not None:
+        unescaped = []
+        position = 0
+        while position < len(value):
+            character = value[position]
+            if character == "\\":
+                position += 1
+                if position == len(value) or value[position] not in ('"', "\\"):
+                    raise Refusal("provider-link-shape")
+                character = value[position]
+            unescaped.append(character)
+            position += 1
+        value = "".join(unescaped)
+    if name == "" or value is None:
+        raise Refusal("provider-link-shape")
+    return name, value
+
+
+def _provider_link_entry(raw, subject_digest, relations):
+    entry = raw.strip(" \t")
+    if not entry.startswith("<"):
+        raise Refusal("provider-link-shape")
+    closing = entry.find(">")
+    if closing <= 1 or "<" in entry[1:closing]:
+        raise Refusal("provider-link-shape")
+    uri = entry[1:closing]
+    if (not uri.isascii() or any(ord(character) < 33 or ord(character) > 126 for character in uri)
+            or any(character in uri for character in '<>"\\{}|^`')
+            or re.search(r"%(?![a-fA-F0-9]{2})", uri) is not None):
+        raise Refusal("provider-link-shape")
+    try:
+        urlsplit(uri)
+    except ValueError:
+        raise Refusal("provider-link-shape")
+    suffix = entry[closing + 1:]
+    parameters = _split_provider_link_parts(suffix, ";")
+    if parameters[0].strip(" \t"):
+        raise Refusal("provider-link-shape")
+    values = {}
+    for raw_parameter in parameters[1:]:
+        parameter = raw_parameter.strip(" \t")
+        if not parameter:
+            raise Refusal("provider-link-shape")
+        name, value = _provider_link_parameter(parameter)
+        if name in values:
+            raise Refusal("provider-link-shape")
+        values[name] = value
+    relation_value = values.get("rel")
+    if relation_value is None:
+        raise Refusal("provider-link-shape")
+    entry_relations = re.split(r"[ \t]+", relation_value.strip(" \t"))
+    if not entry_relations or any(re.fullmatch(r"[a-z]+", relation) is None for relation in entry_relations):
+        raise Refusal("provider-link-shape")
+    next_uri = None
+    for relation in entry_relations:
+        if relation not in ("next", "last", "prev", "first", "deprecation") or relation in relations:
+            raise Refusal("provider-link-shape")
+        relations.add(relation)
+        if relation != "deprecation":
+            checked_uri = validate_provider_uri(uri, subject_digest)
+            if relation == "next":
+                next_uri = checked_uri
+    return next_uri
+
+
 def provider_next_link(headers, subject_digest):
     links = [value for name, value in headers if name.lower() == "link"]
-    if len(links) > 1:
-        raise Refusal("provider-link-duplicate")
     if not links:
         return None
-    next_uri = None
+    entries = []
+    for value in links:
+        entries.extend(_split_provider_link_parts(value, ",", angle_brackets=True))
     relations = set()
-    for entry in links[0].split(","):
-        match = re.fullmatch(r'\s*<([^<>]+)>;\s*rel="([a-z]+)"\s*', entry)
-        if match is None or match.group(2) in relations:
-            raise Refusal("provider-link-shape")
-        relation = match.group(2)
-        relations.add(relation)
-        if relation == "next":
-            next_uri = validate_provider_uri(match.group(1), subject_digest)
+    next_uri = None
+    for entry in entries:
+        entry_next_uri = _provider_link_entry(entry, subject_digest, relations)
+        if entry_next_uri is not None:
+            next_uri = entry_next_uri
     return next_uri
 
 
