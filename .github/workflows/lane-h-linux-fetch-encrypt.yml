@@ -1,0 +1,139 @@
+name: lane-h-linux-fetch-encrypt
+on:
+  workflow_call:
+    inputs:
+      profile:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  linux-fetch-encrypt:
+    name: role-linux-fetch-encrypt-v1
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.profile == 'probe' || inputs.profile == 'production-synthetic') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KD_PROFILE: ${{ inputs.profile }}
+      KD_REPOSITORY: ${{ github.repository }}
+      KD_SHA: ${{ github.sha }}
+      KD_REF: ${{ github.ref }}
+      KD_WORKFLOW_REF: ${{ github.workflow_ref }}
+      KD_RUNNER: ubuntu-24.04
+      KD_RUN_ID: ${{ github.run_id }}
+      KD_RUN_ATTEMPT: ${{ github.run_attempt }}
+    steps:
+      - name: Checkout reviewed control files
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Refuse non-source-free invocation
+        run: |
+          set -euo pipefail
+          [[ "$KD_REPOSITORY" == "keeldock-platform/platform-ci" && "$KD_REF" == "refs/heads/main" && "$KD_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$KD_WORKFLOW_REF" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/(windows-source-admission|attestation-role-signer-probe)\.yml@refs/heads/main$ ]]
+          [[ "$KD_PROFILE" == "probe" || "$KD_PROFILE" == "production-synthetic" ]]
+          if [[ "$KD_PROFILE" == "probe" ]]; then [[ "$KD_WORKFLOW_REF" == *attestation-role-signer-probe.yml@* ]]; else [[ "$KD_WORKFLOW_REF" == *windows-source-admission.yml@* ]]; fi
+      - name: Read numeric control repository identifier
+        run: |
+          set -euo pipefail
+          gh api "repos/$KD_REPOSITORY" --jq '.id' > "$RUNNER_TEMP/control-repository-id.txt" 2>/dev/null
+          [[ "$(cat "$RUNNER_TEMP/control-repository-id.txt")" =~ ^[1-9][0-9]{0,19}$ ]]
+      - name: Wait for the exact current-attempt receiver artifact
+        run: |
+          set -euo pipefail
+          api_path="repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/artifacts?per_page=100"
+          evidence="$RUNNER_TEMP/role-evidence"
+          mkdir -p "$evidence/artifacts"
+          selected=''
+          for retry in $(seq 1 60); do
+            gh api --paginate --slurp "$api_path" > "$evidence/artifact-pages.json" 2>/dev/null
+            if selected="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$evidence/artifact-pages.json" --role windows-receiver --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --field name 2>/dev/null)"; then break; fi
+            selected=''
+            sleep 5
+          done
+          [[ -n "$selected" ]]
+          printf '%s\n' "$selected" > "$evidence/receiver-name.txt"
+          identifier="$(python -B kit/confinement/role_signer.py find-artifact --artifacts-file "$evidence/artifact-pages.json" --role windows-receiver --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --field id)"
+          gh api "repos/$KD_REPOSITORY/actions/artifacts/$identifier/zip" > "$evidence/artifacts/$selected.zip" 2>/dev/null
+          python -B kit/confinement/role_signer.py extract-artifact --artifacts-file "$evidence/artifact-pages.json" --role windows-receiver --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA" --archive-file "$evidence/artifacts/$selected.zip" --output-directory "$evidence/artifacts/$selected"
+      - name: Verify receiver bundle before binding the synthetic capsule
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/role-evidence"
+          selected="$(cat "$evidence/receiver-name.txt")"
+          directory="$evidence/artifacts/$selected"
+          gh attestation verify "$directory/subject.bin" --bundle "$directory/bundle.json" --repo "$KD_REPOSITORY" --signer-workflow "$KD_REPOSITORY/.github/workflows/lane-h-windows-receiver.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$directory/verified.json" 2>/dev/null
+      - name: Apply evidence-backed Gate A before creating the Linux subject
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/role-evidence"
+          gh api "repos/$KD_REPOSITORY" --jq '{id:.id,full_name:.full_name,owner_id:.owner.id,visibility:.visibility}' > "$evidence/repository.json" 2>/dev/null
+          gh api "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID" > "$evidence/run.json" 2>/dev/null
+          gh api --paginate --slurp "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/attempts/$KD_RUN_ATTEMPT/jobs?per_page=100" > "$evidence/jobs-pages.json" 2>/dev/null
+          gh api --paginate --slurp "repos/$KD_REPOSITORY/actions/runs/$KD_RUN_ID/artifacts?per_page=100" > "$evidence/artifact-pages.json" 2>/dev/null
+          python -B kit/confinement/role_signer.py wrap-pages --kind jobs --input "$evidence/jobs-pages.json" --output "$evidence/jobs.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          python -B kit/confinement/role_signer.py wrap-pages --kind artifacts --input "$evidence/artifact-pages.json" --output "$evidence/artifacts.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          selected="$(cat "$evidence/receiver-name.txt")"
+          directory="$evidence/artifacts/$selected"
+          subject_sha="$(sha256sum "$directory/subject.bin" | awk '{print $1}')"
+          provider_path="repos/$KD_REPOSITORY/attestations/sha256:$subject_sha"
+          gh api --include --paginate "$provider_path?per_page=100" > "$evidence/provider-$subject_sha-http.txt" 2>/dev/null
+          python -B kit/confinement/role_signer.py wrap-provider-http --input "$evidence/provider-$subject_sha-http.txt" --subject-digest "$subject_sha" --output "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA"
+          python -B kit/confinement/role_signer.py export-provider --snapshot "$evidence/provider-$subject_sha.json" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --head-sha "$KD_SHA" --output-directory "$evidence/provider-$subject_sha"
+          while read -r index provider_role; do
+            gh attestation verify "$directory/subject.bin" --bundle "$evidence/provider-$subject_sha/bundle-$index.json" --repo "$KD_REPOSITORY" --signer-workflow "$KD_REPOSITORY/.github/workflows/lane-h-$provider_role.yml" --predicate-type 'https://example.invalid/role-statement/v1' --cert-oidc-issuer 'https://token.actions.githubusercontent.com' --deny-self-hosted-runners --format json > "$evidence/provider-$subject_sha/verified-$index.json" 2>/dev/null
+          done < "$evidence/provider-$subject_sha/manifest.txt"
+          gate_args=(--observe --observation-output "$evidence/gate-A-observation.json")
+          python -B kit/confinement/role_signer.py gate-transition --gate A --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --jobs-file "$evidence/jobs.json" --artifacts-file "$evidence/artifacts.json" --repository-metadata "$evidence/repository.json" --run-metadata "$evidence/run.json" --artifact-directory "$evidence/artifacts" --provider-directory "$evidence" "${gate_args[@]}"
+      - name: Create the fixed synthetic capsule bound to receiver bytes
+        id: subject
+        run: |
+          set -euo pipefail
+          repository_id="$(cat "$RUNNER_TEMP/control-repository-id.txt")"
+          selected="$(cat "$RUNNER_TEMP/role-evidence/receiver-name.txt")"
+          python -B kit/confinement/role_signer.py prepare --profile "$KD_PROFILE" --role linux-fetch-encrypt --repository "$KD_REPOSITORY" --repository-id "$repository_id" --control-sha "$KD_SHA" --ref "$KD_REF" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --workflow-ref "$KD_WORKFLOW_REF" --runner "$KD_RUNNER" --receiver-record "$RUNNER_TEMP/role-evidence/artifacts/$selected/subject.bin" --output-directory "$RUNNER_TEMP/role-statement"
+      - name: handoff-revoke-source-token-v1
+        id: revoke-source-token
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'probe=source-free-revocation-simulation status=passed'
+      - name: handoff-verify-token-rejection-v1
+        id: verify-token-rejection
+        run: |
+          set -euo pipefail
+          printf '%s\n' 'probe=source-free-revocation-simulation result=synthetic'
+          printf '%s\n' 'handoff-revocation=confirmed'
+      - name: Sign only the linux-fetch-encrypt role statement
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/role-statement/subject.bin
+          predicate-type: https://example.invalid/role-statement/v1
+          predicate-path: ${{ runner.temp }}/role-statement/predicate.json
+          push-to-registry: false
+          create-storage-record: true
+          show-summary: false
+      - name: Package exact signed statement
+        env:
+          ROLE_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          test -n "$ROLE_BUNDLE"
+          cp "$ROLE_BUNDLE" "$RUNNER_TEMP/role-statement/bundle.json"
+      - name: Upload exact Linux subject, predicate, and bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: role-statement-linux-fetch-encrypt-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.subject.outputs.transfer_id }}
+          path: ${{ runner.temp }}/role-statement
+          if-no-files-found: error
+          retention-days: 1

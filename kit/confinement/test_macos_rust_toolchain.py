@@ -63,7 +63,7 @@ class RustToolchainContractTests(unittest.TestCase):
         )
         for name in (
             "../outside", "/absolute/path", "root/../../outside", "root\\outside",
-            "root//duplicate-separator", "root/./dot", "root/naïve",
+            "root//duplicate-separator", "root/./dot", "root/na\u00efve",
         ):
             with self.subTest(name=name):
                 self.assertIsNone(rust._safe_archive_name(name))

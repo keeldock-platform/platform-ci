@@ -1,0 +1,83 @@
+name: lane-h-windows-receiver
+on:
+  workflow_call:
+    inputs:
+      profile:
+        required: true
+        type: string
+permissions: {}
+jobs:
+  windows-receiver:
+    name: role-windows-receiver-v1
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && (inputs.profile == 'probe' || inputs.profile == 'production-synthetic') }}
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KD_PROFILE: ${{ inputs.profile }}
+      KD_REPOSITORY: ${{ github.repository }}
+      KD_SHA: ${{ github.sha }}
+      KD_REF: ${{ github.ref }}
+      KD_WORKFLOW_REF: ${{ github.workflow_ref }}
+      KD_RUNNER: windows-2025
+      KD_RUN_ID: ${{ github.run_id }}
+      KD_RUN_ATTEMPT: ${{ github.run_attempt }}
+    steps:
+      - name: Checkout reviewed control files
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Refuse non-source-free invocation
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:KD_REPOSITORY -ne 'keeldock-platform/platform-ci' -or $env:KD_REF -ne 'refs/heads/main' -or $env:KD_SHA -notmatch '^[a-f0-9]{40}$') { throw 'context' }
+          if ($env:KD_WORKFLOW_REF -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/\.github/workflows/(windows-source-admission|attestation-role-signer-probe)\.yml@refs/heads/main$') { throw 'caller' }
+          if ($env:KD_PROFILE -notin @('probe', 'production-synthetic')) { throw 'profile' }
+          if (($env:KD_PROFILE -eq 'probe') -ne ($env:KD_WORKFLOW_REF -match 'attestation-role-signer-probe\.yml@')) { throw 'profile-caller' }
+      - name: Read numeric control repository identifier
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identifierPath = Join-Path $env:RUNNER_TEMP 'control-repository-id.txt'
+          & gh api "repos/$env:KD_REPOSITORY" --jq '.id' 1> $identifierPath 2>$null
+          if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath $identifierPath -Raw).Trim() -notmatch '^[1-9][0-9]{0,19}$') { throw 'repository-id' }
+      - name: Create exact synthetic receiver key record and role predicate
+        id: subject
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identifierPath = Join-Path $env:RUNNER_TEMP 'control-repository-id.txt'
+          $identifier = (Get-Content -LiteralPath $identifierPath -Raw).Trim()
+          $target = Join-Path $env:RUNNER_TEMP 'role-statement'
+          & python -B kit/confinement/role_signer.py prepare --profile $env:KD_PROFILE --role windows-receiver --repository $env:KD_REPOSITORY --repository-id $identifier --control-sha $env:KD_SHA --ref $env:KD_REF --run-id $env:KD_RUN_ID --run-attempt $env:KD_RUN_ATTEMPT --workflow-ref $env:KD_WORKFLOW_REF --runner $env:KD_RUNNER --output-directory $target
+          if ($LASTEXITCODE -ne 0) { throw 'subject' }
+      - name: Sign only the windows-receiver role statement
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/role-statement/subject.bin
+          predicate-type: https://example.invalid/role-statement/v1
+          predicate-path: ${{ runner.temp }}/role-statement/predicate.json
+          push-to-registry: false
+          create-storage-record: true
+          show-summary: false
+      - name: Package exact signed receiver statement
+        env:
+          ROLE_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:ROLE_BUNDLE)) { throw 'bundle' }
+          Copy-Item -LiteralPath $env:ROLE_BUNDLE -Destination (Join-Path $env:RUNNER_TEMP 'role-statement/bundle.json')
+      - name: Upload exact receiver subject, predicate, and bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: role-statement-windows-receiver-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.subject.outputs.transfer_id }}
+          path: ${{ runner.temp }}/role-statement
+          if-no-files-found: error
+          retention-days: 1
