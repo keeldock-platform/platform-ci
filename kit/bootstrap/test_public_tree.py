@@ -150,6 +150,12 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("kit/confinement/test_macos_capability.py", result)
         self.assertIn("kit/confinement/test_macos_descriptors.py", result)
 
+    def test_release_evidence_scanner_is_registered_and_discovered(self):
+        self.assertIn("kit/confinement/release_evidence.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/test_release_evidence.py", PLATFORM_FILES)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertEqual(action.count('"test_release_evidence.py"'), 2)
+
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -253,6 +259,8 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_release_build_verify.py",
             'kit/confinement/cargo_vendor_verify.py',
             'kit/confinement/test_cargo_vendor_verify.py',
+            "kit/confinement/release_evidence.py",
+            "kit/confinement/test_release_evidence.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))
