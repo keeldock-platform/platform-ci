@@ -156,6 +156,16 @@ class PublicTreeTests(unittest.TestCase):
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertEqual(action.count('"test_release_evidence.py"'), 2)
 
+    def test_baselines_preparation_lane_is_registered_and_discovered(self):
+        for name in (
+            ".github/workflows/baselines-prepare.yml",
+            "kit/baselines/baselines_prepare.py",
+            "kit/baselines/test_baselines_prepare.py",
+        ):
+            self.assertIn(name, PLATFORM_FILES)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertEqual(action.count('"test_baselines_prepare.py"'), 2)
+
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -281,6 +291,11 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_native_loopback_profile.py",
             "kit/confinement/linux_harness.py",
             "kit/confinement/macos_deny_default.py",
+            ".github/workflows/baselines-prepare.yml",
+            "kit/baselines/baselines_prepare.py",
+            "kit/baselines/test_baselines_prepare.py",
+            "kit/bootstrap/policy_baselines.py",
+            "kit/bootstrap/test_policy_baselines.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))

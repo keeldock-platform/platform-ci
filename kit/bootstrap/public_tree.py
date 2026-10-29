@@ -186,6 +186,11 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/test_release_build_verify.py",
         "kit/confinement/release_evidence.py",
         "kit/confinement/test_release_evidence.py",
+        ".github/workflows/baselines-prepare.yml",
+        "kit/baselines/baselines_prepare.py",
+        "kit/baselines/test_baselines_prepare.py",
+        "kit/bootstrap/policy_baselines.py",
+        "kit/bootstrap/test_policy_baselines.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
@@ -293,6 +298,11 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_cargo_vendor_verify.py': '69bec4106ed3c4ac41624ddcb4719b18902d4f2556ba140257ee9e513c3bcf32',
     'kit/confinement/release_evidence.py': '2609b125bf2d3cbde256e2e4229c576fc0de1c5da898faf206807205dee49ae2',
     'kit/confinement/test_release_evidence.py': '05947463ca7228ca890376347bc08f77de6403d09b34e59596c4433e101c2014',
+    '.github/workflows/baselines-prepare.yml': '970eec0b3be196ab2c0e02f7652a06e186b9ab2f76df704daba53a935af0388d',
+    'kit/baselines/baselines_prepare.py': 'bc38bb2709c8b454555d9c9cb1fd362d09c40a954d09a8a3746595f754e92238',
+    'kit/baselines/test_baselines_prepare.py': 'b0ddfe086197c5cff284bf3cc0f7c1e9a658df871b383f2393af177823389617',
+    'kit/bootstrap/policy_baselines.py': '62878db53091a36a743d10e6e3355f7b9bb8227ae763337082608e9935edd8b8',
+    'kit/bootstrap/test_policy_baselines.py': '3e9041e973239aaf75c57ada33356b94f422c9941747a45b13f608de65f939aa',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(

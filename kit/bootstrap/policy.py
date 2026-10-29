@@ -4,6 +4,7 @@ import re
 import subprocess
 from types import MappingProxyType
 
+import policy_baselines
 import policy_handoff
 import policy_linux
 import policy_windows
@@ -1345,7 +1346,7 @@ SHARED_WORKFLOW_KINDS = frozenset(
         "macos-rules-source-reader",
     )
 ) | frozenset(FEEDBACK_RETURN_WORKFLOW_SHA256)
-LANE_MODULES = (policy_linux, policy_windows, policy_handoff)
+LANE_MODULES = (policy_linux, policy_windows, policy_handoff, policy_baselines)
 LANE_DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
 
 
