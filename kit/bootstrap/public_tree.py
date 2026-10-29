@@ -264,7 +264,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/windows_native_preflight.cs': 'ba0f8859db9d8bcc1e4c8274520bcb67a3292cb311f553127e1f29fe13838543',
     'kit/confinement/windows_native_preflight.ps1': '8dbaaaad105c2fe0439dedb1b7c9572b8e7ec74a8db29f8edcab91169b06c58b',
     'kit/confinement/test_windows_native_preflight.py': '07defbc65611505f9107e5cb9186f4e15bbb9616797ff07032b3f314480eea7d',
-    'kit/confinement/windows_confinement.cs': 'd94a5e9cf557571d9908fb69c601364182bad933f0f3a87b6120614a609bb2fb',
+    'kit/confinement/windows_confinement.cs': '52fde26bbbb6a67a4d68c47e8142fc9302581917414bc959ceee871be597c337',
     'kit/confinement/windows_confinement.ps1': '4f0086237e187f0180bdfa04324e93d0b684bfd6c006e223431528cceeca6d99',
     'kit/confinement/windows_confinement_recovery.ps1': 'c433b3e6956a5c948410f409ff4072ee0bd1d1860cdc7d02eb3a840ac1bd1dcc',
     'kit/confinement/test_windows_confinement.py': 'a56c611da00449fec41a550845d4e4f5af37b7a8e6d8b6729dbf048fc7524687',

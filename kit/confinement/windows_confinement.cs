@@ -77,7 +77,7 @@ namespace KeelDock.Platform.WindowsConfinement
                     }
                     return "native-registry-probe id=" + probeId + " status=ok";
                 }
-                return "native-registry-probe id=" + probeId + " status=" + StatusName(status) + " ntstatus=0x" + status.ToString("X8");
+                return "native-registry-probe id=" + probeId + " status=" + StatusName(status) + " ntstatus=0x" + status.ToString("X" + "8");
             }
             finally
             {
