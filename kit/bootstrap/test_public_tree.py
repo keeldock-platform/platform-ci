@@ -236,6 +236,8 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/windows_native_preflight.cs",
             "kit/confinement/windows_native_preflight.ps1",
             "kit/confinement/test_windows_native_preflight.py",
+            "kit/confinement/windows_confinement.ps1",
+            "kit/confinement/test_windows_confinement.py",
             "kit/confinement/macos_source_reader.py",
             "kit/confinement/test_macos_source_reader.py",
             "kit/confinement/release_provenance.py",

@@ -314,7 +314,7 @@ function Test-Acl {
         if (@(Get-SidRules $path $sid).Count -ne 0) { return 'unexpected_rule' }
     }
     $attributeMask = [System.Security.AccessControl.FileSystemRights]'ReadAttributes, Synchronize'
-    foreach ($path in $script:Ancestors) {
+    foreach ($path in $script:AncestorPaths) {
         $entries = @(Get-SidRules $path $sid)
         if ($entries.Count -ne 1) { return 'ancestor_rule' }
         if ($entries[0].FileSystemRights -ne $attributeMask -or $entries[0].AccessControlType -ne 'Allow' -or $entries[0].IsInherited) { return 'ancestor_rule' }
@@ -490,16 +490,16 @@ try {
         Grant-Access $layout.ReadOnly $script:Sid 'ReadAndExecute, Synchronize' $true
         Grant-Access $script:Lpac.Root $script:Sid 'Modify, Synchronize' $true
         $phase = 'acl_ancestors'
-        $script:Ancestors = @()
+        $script:AncestorPaths = @()
         $ancestorPath = $layout.Base
         while ($ancestorPath) {
-            $script:Ancestors += $ancestorPath
+            $script:AncestorPaths += $ancestorPath
             $ancestorPath = Split-Path -Parent $ancestorPath
         }
-        foreach ($ancestorPath in $script:Ancestors) {
+        foreach ($ancestorPath in $script:AncestorPaths) {
             Grant-NonPropagating $ancestorPath $script:Sid
         }
-        $ancestors = $script:Ancestors.Count
+        $ancestorCount = $script:AncestorPaths.Count
         $ancestorFailures = 0
         $phase = 'acl_grant'
         foreach ($set in @($script:Lpac, $script:Control)) {
@@ -510,7 +510,7 @@ try {
         foreach ($directory in @($layout.RustPrefix, $layout.NodeDir, $layout.NpmDir, $layout.TestDir)) {
             New-Item -ItemType Directory -Force -Path $directory | Out-Null
         }
-        Write-Line ('windows-confinement-acl=granted ro=read_execute scratch=modify ancestors_read_attributes=' + $ancestors + ' ancestors_failed=' + $ancestorFailures)
+        Write-Line ('windows-confinement-acl=granted ro=read_execute scratch=modify ancestors_read_attributes=' + $ancestorCount + ' ancestors_failed=' + $ancestorFailures)
 
         $phase = 'fetch'
         foreach ($item in ($Downloads + @($NodeDownload))) {
