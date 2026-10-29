@@ -106,7 +106,7 @@ GUARD_HTTP_CLASSES = {
     "429": "rate-limit",
 }
 GUARD_TIMEOUT_SECONDS = 300
-GUARD_FALLBACK_ROUTE = re.compile(r"repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/jobs/[0-9]+/logs")
+GUARD_FALLBACK_ROUTE = re.compile(r"repos/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/actions/jobs/([0-9]+)/logs")
 GUARD_STDERR_BYTES = 65536
 CERTIFICATE_ISSUER_PIN = "CN=sigstore-intermediate,O=sigstore.dev"
 CERTIFICATE_DIGEST_FIELDS = ("sourceRepositoryDigest", "buildSignerDigest", "buildConfigDigest")
@@ -2427,6 +2427,22 @@ def _guard_attempts(command, output, label, attempts, pause):
     return code, error_class
 
 
+def _guard_option(command, name):
+    values = [command[index + 1] for index, item in enumerate(command[:-1]) if item == name]
+    return values[0] if len(values) == 1 else None
+
+
+def _guard_route_matches(route, command):
+    match = GUARD_FALLBACK_ROUTE.fullmatch(route)
+    if match is None:
+        return False
+    owner, repository, job = match.groups()
+    if owner in (".", "..") or repository in (".", ".."):
+        return False
+    return (_guard_option(command, "--repo") == owner + "/" + repository
+            and _guard_option(command, "--job") == job)
+
+
 def _cmd_guard(arguments):
     command = list(arguments.guard_command)
     if command and command[0] == "--":
@@ -2436,7 +2452,7 @@ def _cmd_guard(arguments):
     if not 1 <= arguments.attempts <= 10 or not 0 <= arguments.pause <= 30:
         raise Refusal("guard-bounds")
     route = arguments.fallback_route
-    if route is not None and GUARD_FALLBACK_ROUTE.fullmatch(route) is None:
+    if route is not None and not _guard_route_matches(route, command):
         raise Refusal("guard-command")
     label = arguments.label
     code, error_class = _guard_attempts(

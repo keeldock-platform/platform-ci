@@ -1167,7 +1167,7 @@ class ArtifactAndStageTests(unittest.TestCase):
                 role = subject.ROLE_ORDER[0]
                 artifacts = subject.validate_artifact_inventory(
                     evidence["artifacts_snapshot"], RUN_ID, RUN_ATTEMPT,
-                    CONTROL_SHA, (role,))
+                    CONTROL_SHA, subject.ROLE_ORDER)
                 verified_path = (Path(temporary) / "artifacts" /
                                  artifacts[role][0]["name"] / "verified.json")
                 verified = json.loads(verified_path.read_text(encoding="ascii"))
@@ -1683,41 +1683,76 @@ class BareJobLogTests(unittest.TestCase):
             self.parse(unlabeled_linux_log(messages))
 
 
-class JobLogFallbackTests(GuardedCommandTests):
+class JobLogFallbackTests(unittest.TestCase):
     ROUTE = "repos/keeldock-platform/platform-ci/actions/jobs/42/logs"
+    VIEW = ("gh", "run", "view", "1", "--repo", "keeldock-platform/platform-ci",
+            "--job", "42", "--log")
+    PENDING = types.SimpleNamespace(
+        returncode=1, stderr=b"run 1 is still in progress; logs will be available")
+
+    def run_view(self, outcomes, route=None, command=None):
+        results = list(outcomes)
+        calls = []
+
+        def fake_run(call, **options):
+            calls.append(call)
+            return results.pop(0)
+
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary:
+            target = str(Path(temporary) / "out.log")
+            with mock.patch.object(subject.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(subject.time, "sleep"), \
+                    contextlib.redirect_stdout(buffer):
+                code = subject.main(["guard", "--label", "run-view-failed", "--output", target,
+                                     "--fallback-route", route or self.ROUTE, "--",
+                                     *(command or self.VIEW)])
+        return code, buffer.getvalue(), calls
 
     def test_in_progress_run_view_falls_back_to_the_job_log_route(self):
-        pending = types.SimpleNamespace(
-            returncode=1, stderr=b"run 1 is still in progress; logs will be available")
         done = types.SimpleNamespace(returncode=0, stderr=b"")
-        code, printed, calls, unused_sleeps, unused_created = self.run_guard(
-            [pending, done], ("--fallback-route", self.ROUTE))
+        code, printed, calls = self.run_view([self.PENDING, done])
         self.assertEqual(code, 0)
-        self.assertEqual(calls, [["gh", "api", "route"], ["gh", "api", self.ROUTE]])
+        self.assertEqual(calls, [list(self.VIEW), ["gh", "api", self.ROUTE]])
         self.assertEqual(printed, "probe=role-signer fallback=job-log-api\n")
 
     def test_fallback_failure_has_its_own_fixed_reason(self):
-        pending = types.SimpleNamespace(
-            returncode=1, stderr=b"run 1 is still in progress; logs will be available")
         missing = types.SimpleNamespace(returncode=1, stderr=b"gh: Not Found (HTTP 404)")
-        code, printed, unused_calls, unused_sleeps, unused_created = self.run_guard(
-            [pending, missing], ("--fallback-route", self.ROUTE))
+        code, printed, unused_calls = self.run_view([self.PENDING, missing])
         self.assertEqual(code, 1)
         self.assertTrue(printed.endswith(
             "reason=job-log-fetch-failed exit=1 class=http-404\n"))
 
-    def test_other_failures_do_not_fall_back_and_routes_are_fixed_shape(self):
+    def test_other_failures_do_not_fall_back(self):
         missing = types.SimpleNamespace(returncode=1, stderr=b"gh: Not Found (HTTP 404)")
-        code, printed, calls, unused_sleeps, unused_created = self.run_guard(
-            [missing], ("--fallback-route", self.ROUTE))
+        code, printed, calls = self.run_view([missing])
         self.assertEqual(code, 1)
         self.assertEqual(len(calls), 1)
-        self.assertTrue(printed.endswith("reason=api-fetch-failed exit=1 class=http-404\n"))
-        code, printed, calls, unused_sleeps, unused_created = self.run_guard(
-            [], ("--fallback-route", "repos/x/y/issues"))
-        self.assertEqual(code, 1)
-        self.assertEqual(calls, [])
-        self.assertEqual(printed, "probe=role-signer result=unavailable reason=guard-command\n")
+        self.assertTrue(printed.endswith("reason=run-view-failed exit=1 class=http-404\n"))
+
+    def test_route_must_name_the_same_repository_and_job_without_dot_segments(self):
+        routes = (
+            "repos/keeldock-platform/platform-ci/actions/jobs/43/logs",
+            "repos/keeldock-platform/other/actions/jobs/42/logs",
+            "repos/other/platform-ci/actions/jobs/42/logs",
+            "repos/../platform-ci/actions/jobs/42/logs",
+            "repos/keeldock-platform/../actions/jobs/42/logs",
+            "repos/keeldock-platform/platform-ci/actions/jobs/42/logs/extra",
+            "repos/x/y/issues",
+        )
+        for route in routes:
+            with self.subTest(route=route):
+                code, printed, calls = self.run_view([], route=route)
+                self.assertEqual(code, 1)
+                self.assertEqual(calls, [])
+                self.assertEqual(printed, "probe=role-signer result=unavailable "
+                                          "reason=guard-command\n")
+        dotted = ("gh", "run", "view", "1", "--repo", "../platform-ci", "--job", "42", "--log")
+        code, printed, calls = self.run_view(
+            [], route="repos/../platform-ci/actions/jobs/42/logs", command=dotted)
+        self.assertEqual((code, calls), (1, []))
+        code, printed, calls = self.run_view([], command=("gh", "run", "view", "1", "--log"))
+        self.assertEqual((code, calls), (1, []))
 
 
 class CertificatePinTests(unittest.TestCase):
