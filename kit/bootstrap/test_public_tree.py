@@ -309,6 +309,8 @@ class PublicTreeTests(unittest.TestCase):
             for name in (
                 "kit/confinement/native_loopback_profile.py",
                 "kit/confinement/test_native_loopback_profile.py",
+                "kit/confinement/linux_harness.py",
+                "kit/confinement/macos_deny_default.py",
             ):
                 with self.subTest(file=name):
                     edited = root / name
