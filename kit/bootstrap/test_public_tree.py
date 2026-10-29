@@ -279,6 +279,8 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_release_evidence.py",
             "kit/confinement/native_loopback_profile.py",
             "kit/confinement/test_native_loopback_profile.py",
+            "kit/confinement/linux_harness.py",
+            "kit/confinement/macos_deny_default.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))

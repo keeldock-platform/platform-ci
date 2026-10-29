@@ -456,15 +456,21 @@ foreach ($case in $cases) {
         stop = self.function_body("Stop-CatalogRecovery", self.recovery)
         unregister = stop[stop.index("Unregister-ScheduledTask"):]
         self.assertIn("-ErrorAction Stop", unregister.splitlines()[0])
-        absent = "if (Get-ScheduledTask -TaskName ([string]$lease.TaskName) -ErrorAction SilentlyContinue) { throw 'winsock_recovery_stop' }"
+        absent = "if (Test-CatalogTaskPresent ([string]$lease.TaskName)) { throw 'winsock_recovery_stop' }"
         self.assertIn(absent, stop)
         self.assertLess(stop.index(absent), stop.index("$lease.TaskRegistered = $false"))
         self.assertLess(stop.index(absent), stop.index("Remove-Item"))
         self.assertNotIn("Unregister-ScheduledTask -TaskName ([string]$lease.TaskName) -Confirm:$false -ErrorAction SilentlyContinue", stop)
         remove = self.function_body("Remove-CatalogRecoveryFolder", self.recovery)
-        gone = "if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { return }"
+        gone = "if ($present) { return }"
         self.assertIn(gone, remove)
         self.assertLess(remove.index("Unregister-ScheduledTask"), remove.index(gone))
+        helper = self.function_body("Test-CatalogTaskPresent", self.recovery)
+        self.assertIn("Get-ScheduledTask -TaskName $taskName -ErrorAction Stop", helper)
+        self.assertIn("CategoryInfo.Category -eq 'ObjectNotFound'", helper)
+        self.assertNotIn("SilentlyContinue", helper)
+        self.assertIn("if ($lease.TaskName -and $lease.RecoveryDirectory) {", stop)
+        self.assertNotIn("Get-ScheduledTask", stop)
         self.assertLess(remove.index(gone), remove.index("Remove-Item"))
 
     def test_unarmed_lease_never_restores_the_live_key(self):

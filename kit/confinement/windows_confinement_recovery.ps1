@@ -190,10 +190,20 @@ function Start-CatalogRecovery($lease, [string]$source) {
     }
 }
 
+function Test-CatalogTaskPresent([string]$taskName) {
+    try {
+        $found = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        return ($null -ne $found)
+    } catch {
+        if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { return $false }
+        throw 'winsock_recovery_stop'
+    }
+}
+
 function Stop-CatalogRecovery($lease) {
     try {
-        if ($lease.TaskRegistered) {
-            if ($lease.ReadyFile -and (Test-Path -LiteralPath ([string]$lease.ReadyFile))) {
+        if ($lease.TaskName) {
+            if ($lease.TaskRegistered -and $lease.ReadyFile -and (Test-Path -LiteralPath ([string]$lease.ReadyFile))) {
                 [IO.File]::WriteAllText([string]$lease.DoneFile, 'done')
                 $deadline = [DateTime]::UtcNow.AddSeconds(30)
                 while (-not (Test-Path -LiteralPath ([string]$lease.AckFile))) {
@@ -202,13 +212,13 @@ function Stop-CatalogRecovery($lease) {
                 }
                 if ([IO.File]::ReadAllText([string]$lease.AckFile) -ne 'done') { throw 'winsock_recovery_stop' }
             }
-            if (Get-ScheduledTask -TaskName ([string]$lease.TaskName) -ErrorAction SilentlyContinue) {
+            if (Test-CatalogTaskPresent ([string]$lease.TaskName)) {
                 Unregister-ScheduledTask -TaskName ([string]$lease.TaskName) -Confirm:$false -ErrorAction Stop
             }
-            if (Get-ScheduledTask -TaskName ([string]$lease.TaskName) -ErrorAction SilentlyContinue) { throw 'winsock_recovery_stop' }
+            if (Test-CatalogTaskPresent ([string]$lease.TaskName)) { throw 'winsock_recovery_stop' }
             $lease.TaskRegistered = $false
         }
-        if ($lease.RecoveryDirectory) {
+        if ($lease.TaskName -and $lease.RecoveryDirectory) {
             $deadline = [DateTime]::UtcNow.AddSeconds(30)
             while (Test-Path -LiteralPath ([string]$lease.RecoveryDirectory)) {
                 Remove-Item -LiteralPath ([string]$lease.RecoveryDirectory) -Recurse -Force -ErrorAction SilentlyContinue
@@ -259,11 +269,13 @@ function Remove-CatalogRecoveryFolder([string]$record) {
     $directory = Split-Path -Parent $record
     $taskName = Split-Path -Leaf $directory
     try {
-        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        if (Test-CatalogTaskPresent $taskName) {
             Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
         }
     } catch { }
-    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { return }
+    $present = $true
+    try { $present = Test-CatalogTaskPresent $taskName } catch { }
+    if ($present) { return }
     Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
 }
 

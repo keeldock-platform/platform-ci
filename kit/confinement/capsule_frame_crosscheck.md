@@ -24,9 +24,12 @@ requires both a checked-in generated fixture and fresh CI output. A missing or
 pending fixture fails the gate, as does any difference between reviewed and
 fresh C sharp JSON. The first capsule-vectors run on main, run 40866237493,
 refused only because the checked-in fixture was pending; all other comparisons
-matched. The reviewed artifact from that run is now checked in. Its SHA-256 is
-fb0660998011eec479ee01e919510dcd8f88ae5266114d9f82a899b4fa72fb94. The next
-dispatch is the first capsule-vectors run that counts as protocol coverage.
+matched. The reviewed artifact from that run is now checked in. The SHA-256 of
+the checked-in file, including its trailing newline, is
+fb0660998011eec479ee01e919510dcd8f88ae5266114d9f82a899b4fa72fb94. The gate
+strips that one trailing newline before comparing, so the reviewed digest it
+logs is 913e7ad6695f170b387462a7594d757d9f8da7c2fca068a1c266f7e3ae3805b7. The
+next dispatch is the first capsule-vectors run that counts as protocol coverage.
 
 The gate compares the complete key record, header, canonical manifest CBOR,
 header digest, HKDF inputs and outputs, nonces, AAD fields, ciphertext manifest
