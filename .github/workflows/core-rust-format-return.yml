@@ -120,7 +120,9 @@ jobs:
           [[ "$(npm --version)" == "11.19.1" ]]
           node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs kit/confinement/test_node_contract_validation.mjs
           python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_policy_handoff.py
           python3 -B kit/bootstrap/test_public_tree.py
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_role_signer.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_macos*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"

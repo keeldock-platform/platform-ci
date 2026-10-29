@@ -186,9 +186,137 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
 """
 
+CAPSULE_VECTORS_WORKFLOW_TEMPLATE = """name: capsule-vectors
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  windows-generate:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    permissions: {}
+    outputs:
+      vector_b64: ${{ steps.generate.outputs.vector_b64 }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Refuse any dispatch outside reviewed main
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:CI_EVENT_NAME -ne 'workflow_dispatch' -or $env:CI_REF -ne 'refs/heads/main') { exit 1 }
+          if ($env:CI_REPOSITORY -ne 'keeldock-platform/platform-ci' -or $env:CI_SERVER_URL -ne 'https://github.com') { exit 1 }
+          if ($env:CI_SHA -notmatch '^[a-f0-9]{40}$') { exit 1 }
+      - name: Fetch reviewed public control
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          git init --quiet . 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git config core.autocrlf false 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git remote add origin "$($env:CI_SERVER_URL)/$($env:CI_REPOSITORY).git" 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git fetch --quiet --no-tags --depth=1 origin $env:CI_REF 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          git checkout --quiet --detach FETCH_HEAD 2>$null
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $actualSha = git rev-parse --verify HEAD 2>$null
+          if ($LASTEXITCODE -ne 0 -or $actualSha.Trim() -ne $env:CI_SHA) { exit 1 }
+      - name: Validate public control
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -B kit/bootstrap/test_policy_windows.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -B kit/bootstrap/test_public_tree.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          python -B kit/bootstrap/check_candidate.py --root $env:CI_WORKSPACE --pool platform --sha $env:CI_SHA
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Compile and generate independent vectors
+        id: generate
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File kit/confinement/capsule_frame.ps1 -Mode compile
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $vectorText = pwsh -NoProfile -File kit/confinement/capsule_frame.ps1 -Mode vectors
+          if ($LASTEXITCODE -ne 0 -or $vectorText.Count -ne 1) { exit 1 }
+          $vectorPath = Join-Path $env:RUNNER_TEMP 'capsule_frame_vectors.json'
+          [System.IO.File]::WriteAllText($vectorPath, $vectorText + "`n", [System.Text.Encoding]::ASCII)
+          $bytes = [System.Text.Encoding]::ASCII.GetBytes($vectorText)
+          $memory = [System.IO.MemoryStream]::new()
+          $zip = [System.IO.Compression.GZipStream]::new($memory, [System.IO.Compression.CompressionMode]::Compress, $true)
+          $zip.Write($bytes, 0, $bytes.Length)
+          $zip.Dispose()
+          $encoded = [Convert]::ToBase64String($memory.ToArray())
+          "vector_b64=$encoded" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+      - name: Preserve generated vectors for review
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: capsule-frame-vectors
+          path: ${{ runner.temp }}/capsule_frame_vectors.json
+          if-no-files-found: error
+          retention-days: 1
+  ubuntu-compare:
+    needs: windows-generate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions: {}
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      KD_CAPSULE_VECTOR_B64: ${{ needs.windows-generate.outputs.vector_b64 }}
+    steps:
+      - name: Fetch same reviewed public control
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$CI_REPOSITORY" = 'keeldock-platform/platform-ci'
+          test "$CI_REF" = 'refs/heads/main'
+          git init --quiet .
+          git config core.autocrlf false
+          git remote add origin "$CI_SERVER_URL/$CI_REPOSITORY.git"
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF"
+          git checkout --quiet --detach FETCH_HEAD
+          test "$(git rev-parse --verify HEAD)" = "$CI_SHA"
+      - name: Compare with reviewed vectors and platform AES-GCM
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -B kit/confinement/capsule_frame_vector_gate.py
+  verdict:
+    needs: [windows-generate, ubuntu-compare]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      GENERATE_RESULT: ${{ needs.windows-generate.result }}
+      COMPARE_RESULT: ${{ needs.ubuntu-compare.result }}
+    steps:
+      - name: Emit one capsule vector verdict
+        shell: bash
+        run: |
+          if [[ "$GENERATE_RESULT" = 'success' && "$COMPARE_RESULT" = 'success' ]]; then
+            echo 'capsule-vectors=observed result=matched'
+          else
+            echo 'capsule-vectors=refused reason=gate'
+            exit 1
+          fi
+"""
+
 WORKFLOW_TEMPLATES = {
     "windows-native-preflight": WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE,
     "windows-confinement": WINDOWS_CONFINEMENT_WORKFLOW_TEMPLATE,
+    "capsule-vectors": CAPSULE_VECTORS_WORKFLOW_TEMPLATE,
 }
 WORKFLOW_SHA256 = {}
 CANDIDATE_WORKFLOWS = (
@@ -201,5 +329,10 @@ CANDIDATE_WORKFLOWS = (
         ".github/workflows/windows-confinement.yml",
         "windows-confinement",
         "windows-confinement-workflow-too-large",
+    ),
+    (
+        ".github/workflows/capsule-vectors.yml",
+        "capsule-vectors",
+        "capsule-vectors-workflow-too-large",
     ),
 )
