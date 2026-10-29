@@ -416,12 +416,44 @@ foreach ($case in $cases) {
 
     def test_confined_ladder_probes_each_granted_catalog_key_before_other_stages(self):
         probe = self.function_body("Get-WinsockProbeSpecs")
-        for part in ("reg.exe", "'winsock_key_'", "query HKLM", "$script:WinsockCatalogLease", "$r.ExitCode -eq 0"):
+        for part in ("'winsock_key_'", "Get-NativeProbeArguments", "$script:WinsockCatalogLease", "$r.ExitCode -eq 0", "status=ok"):
             self.assertIn(part, probe)
+        self.assertNotIn("reg.exe", probe)
+        self.assertNotIn("query HKLM", probe)
         for name in ("parameters", "protocol_catalog", "namespace_catalog", "protocol_entries64", "namespace_entries64", "protocol_entry", "namespace_entry64"):
             self.assertIn("Name = '" + name + "'", probe)
         specs = self.function_body("Get-StageSpecs")
         self.assertLess(specs.index("Get-WinsockProbeSpecs"), specs.index("Name = 'cmd_exec'"))
+
+    def test_native_registry_probe_uses_full_nt_names_and_a_closed_identifier_set(self):
+        for required in (
+            "NtOpenKey",
+            "ObjectCaseInsensitive",
+            "KeyQueryValue",
+            "\\\\REGISTRY\\\\MACHINE\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\WinSock2\\\\Parameters",
+            "\\\\REGISTRY\\\\MACHINE\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Nls\\\\CodePage",
+            "HasNumericSuffix(probeId, \"winsock_protocol_entry_\", 12)",
+            "HasHexSuffix(probeId, \"lpac_discriminator_arap_\", 32)",
+            "status=",
+            "access_denied",
+            "object_name_not_found",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.native)
+        self.assertIn("IsKnownProbeId($probeId)", self.wrapper)
+        self.assertIn("NativeRegistryProbe]::Probe($ProbeId)", self.wrapper)
+        self.assertIn("ValidateSet('spike', 'compile', 'native-probe')", self.wrapper)
+        self.assertIn("Copy-Item -LiteralPath $PSCommandPath -Destination $layout.NativeProbeScript", self.wrapper)
+        self.assertIn("$script:Layout.NativeProbeScript", self.wrapper)
+        self.assertIn("$script:Layout.NativeProbeSource", self.wrapper)
+        self.assertIn("$script:Layout.NativeProbeRecovery", self.function_body("Test-Acl"))
+        arguments = self.function_body("Get-NativeProbeArguments")
+        self.assertIn("IsKnownProbeId($probeId)", arguments)
+        self.assertIn("-ProbeId ' + $probeId", arguments)
+        self.assertNotIn("ScratchPaths", arguments)
+        self.assertIn('throw new InvalidOperationException("registry_probe_id")', self.native)
+        self.assertNotIn("reg.exe", self.wrapper)
+        self.assertNotIn("query HKLM", self.wrapper)
 
     def test_package_sid_and_path_shapes_are_checked_in_the_unprivileged_job(self):
         text = WORKFLOW.read_text(encoding="utf-8")
@@ -451,7 +483,7 @@ foreach ($case in $cases) {
         ladder = self.function_body("Invoke-Ladder")
         self.assertEqual(ladder.count("$sandbox.Run($confined,"), 1)
         self.assertIn("lpac_default_key_control", probe)
-        self.assertIn("Control\\Nls\\CodePage", probe)
+        self.assertIn("Get-NativeProbeArguments 'lpac_default_key_control'", probe)
 
     def test_discriminator_stages_follow_the_key_probes_and_precede_the_other_confined_stages(self):
         specs = self.function_body("Get-StageSpecs")
@@ -464,23 +496,24 @@ foreach ($case in $cases) {
         lines = [line for line in body.splitlines() if "$specs += @{" in line]
         self.assertEqual(len(lines), 2)
         self.assertIn("ScratchPaths.Arap", lines[0])
-        self.assertIn("$r.ExitCode -eq 0", lines[0])
+        self.assertIn("$arapArguments", lines[0])
+        self.assertIn("status=ok", lines[0])
         self.assertIn("ScratchPaths.Aap", lines[1])
-        self.assertIn("$r.ExitCode -ne 0", lines[1])
-        self.assertIn("-match 'Access is denied'", lines[1])
+        self.assertIn("$aapArguments", lines[1])
+        self.assertIn("status=access_denied ntstatus=0xC0000022", lines[1])
         for line in lines:
-            self.assertIn("query HKLM", line)
-            self.assertIn("Exe = $reg", line)
+            self.assertIn("Exe = $probeExe", line)
+            self.assertNotIn("query HKLM", line)
 
     @staticmethod
     def behaviour_model(arap, aap):
         if arap is None or aap is None or not arap["ran"] or not aap["ran"]:
             return "inconclusive"
-        if arap["exit"] != 0:
+        if "status=ok" not in arap["output"]:
             return "inconclusive"
-        if aap["exit"] == 0:
+        if "status=ok" in aap["output"]:
             return "not_lpac"
-        if "Access is denied" in aap["output"]:
+        if "status=access_denied ntstatus=0xC0000022" in aap["output"]:
             return "behavioural"
         return "inconclusive"
 
@@ -490,14 +523,14 @@ foreach ($case in $cases) {
         self.assertEqual(returns, ["inconclusive", "inconclusive", "not_lpac", "behavioural", "inconclusive"])
         for required in (
             "-not $arap.Ran -or -not $aap.Ran",
-            "$arap.ExitCode -ne 0",
-            "$aap.ExitCode -eq 0",
-            "$aap.Output -match 'Access is denied'",
+            "$arap.Stdout -notmatch 'status=ok'",
+            "$aap.Stdout -match 'status=ok'",
+            "$aap.Stdout -match 'status=access_denied ntstatus=0xC0000022'",
         ):
             self.assertIn(required, body)
-        readable = {"ran": True, "exit": 0, "output": ""}
-        denied = {"ran": True, "exit": 1, "output": "ERROR: Access is denied."}
-        other = {"ran": True, "exit": 1, "output": "ERROR: not found"}
+        readable = {"ran": True, "exit": 0, "output": "native-registry-probe status=ok"}
+        denied = {"ran": True, "exit": 0, "output": "native-registry-probe status=access_denied ntstatus=0xC0000022"}
+        other = {"ran": True, "exit": 0, "output": "native-registry-probe status=object_name_not_found ntstatus=0xC0000034"}
         not_run = {"ran": False, "exit": 0, "output": ""}
         self.assertEqual(self.behaviour_model(readable, denied), "behavioural")
         self.assertEqual(self.behaviour_model(readable, readable), "not_lpac")
@@ -888,7 +921,7 @@ foreach ($case in $cases) {
             "control_rust=",
             "control_node=",
             "acl_negative=",
-            "ValidateSet('spike', 'compile')",
+            "ValidateSet('spike', 'compile', 'native-probe')",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, self.wrapper)

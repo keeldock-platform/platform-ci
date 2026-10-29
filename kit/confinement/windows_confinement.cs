@@ -8,6 +8,161 @@ using Microsoft.Win32.SafeHandles;
 
 namespace KeelDock.Platform.WindowsConfinement
 {
+    public static class NativeRegistryProbe
+    {
+        private const uint KeyQueryValue = 0x0001;
+        private const uint ObjectCaseInsensitive = 0x00000040;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct UnicodeString
+        {
+            internal ushort Length;
+            internal ushort MaximumLength;
+            internal IntPtr Buffer;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ObjectAttributes
+        {
+            internal uint Length;
+            internal IntPtr RootDirectory;
+            internal IntPtr ObjectName;
+            internal uint Attributes;
+            internal IntPtr SecurityDescriptor;
+            internal IntPtr SecurityQualityOfService;
+        }
+
+        public static bool IsKnownProbeId(string probeId)
+        {
+            try
+            {
+                ResolvePath(probeId);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        public static string Probe(string probeId)
+        {
+            string path = ResolvePath(probeId);
+            IntPtr pathBuffer = IntPtr.Zero;
+            IntPtr nameBuffer = IntPtr.Zero;
+            IntPtr attributesBuffer = IntPtr.Zero;
+            IntPtr key = IntPtr.Zero;
+            try
+            {
+                pathBuffer = Marshal.StringToHGlobalUni(path);
+                UnicodeString name = new UnicodeString();
+                name.Length = checked((ushort)(path.Length * 2));
+                name.MaximumLength = checked((ushort)(name.Length + 2));
+                name.Buffer = pathBuffer;
+                nameBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+                Marshal.StructureToPtr(name, nameBuffer, false);
+                ObjectAttributes attributes = new ObjectAttributes();
+                attributes.Length = (uint)Marshal.SizeOf(typeof(ObjectAttributes));
+                attributes.ObjectName = nameBuffer;
+                attributes.Attributes = ObjectCaseInsensitive;
+                attributesBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(ObjectAttributes)));
+                Marshal.StructureToPtr(attributes, attributesBuffer, false);
+                uint status = Native.NtOpenKey(out key, KeyQueryValue, attributesBuffer);
+                if (status == 0)
+                {
+                    if (key != IntPtr.Zero)
+                    {
+                        Native.NtClose(key);
+                        key = IntPtr.Zero;
+                    }
+                    return "native-registry-probe id=" + probeId + " status=ok";
+                }
+                return "native-registry-probe id=" + probeId + " status=" + StatusName(status) + " ntstatus=0x" + status.ToString("X8");
+            }
+            finally
+            {
+                if (key != IntPtr.Zero)
+                {
+                    Native.NtClose(key);
+                }
+                if (attributesBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(attributesBuffer);
+                }
+                if (nameBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(nameBuffer);
+                }
+                if (pathBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(pathBuffer);
+                }
+            }
+        }
+
+        private static string ResolvePath(string probeId)
+        {
+            if (string.Equals(probeId, "winsock_parameters", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters"; }
+            if (string.Equals(probeId, "winsock_protocol_catalog", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9"; }
+            if (string.Equals(probeId, "winsock_namespace_catalog", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5"; }
+            if (string.Equals(probeId, "winsock_protocol_entries", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries"; }
+            if (string.Equals(probeId, "winsock_protocol_entries64", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64"; }
+            if (string.Equals(probeId, "winsock_namespace_entries", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries"; }
+            if (string.Equals(probeId, "winsock_namespace_entries64", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries64"; }
+            if (HasNumericSuffix(probeId, "winsock_protocol_entry_", 12)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries\\" + probeId.Substring("winsock_protocol_entry_".Length); }
+            if (HasNumericSuffix(probeId, "winsock_protocol_entry64_", 12)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64\\" + probeId.Substring("winsock_protocol_entry64_".Length); }
+            if (HasNumericSuffix(probeId, "winsock_namespace_entry_", 12)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries\\" + probeId.Substring("winsock_namespace_entry_".Length); }
+            if (HasNumericSuffix(probeId, "winsock_namespace_entry64_", 12)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries64\\" + probeId.Substring("winsock_namespace_entry64_".Length); }
+            if (HasHexSuffix(probeId, "lpac_discriminator_arap_", 32)) { return "\\REGISTRY\\MACHINE\\SOFTWARE\\KeelDock\\ConfinementRecoveryTest\\" + probeId.Substring("lpac_discriminator_arap_".Length); }
+            if (HasHexSuffix(probeId, "lpac_discriminator_aap_", 32)) { return "\\REGISTRY\\MACHINE\\SOFTWARE\\KeelDock\\ConfinementRecoveryTest\\" + probeId.Substring("lpac_discriminator_aap_".Length); }
+            if (string.Equals(probeId, "lpac_default_key_control", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage"; }
+            throw new InvalidOperationException("registry_probe_id");
+        }
+
+        private static bool HasNumericSuffix(string value, string prefix, int length)
+        {
+            if (string.IsNullOrEmpty(value) || !value.StartsWith(prefix, StringComparison.Ordinal) || value.Length != prefix.Length + length) { return false; }
+            for (int index = prefix.Length; index < value.Length; ++index)
+            {
+                if (value[index] < '0' || value[index] > '9') { return false; }
+            }
+            return true;
+        }
+
+        private static bool HasHexSuffix(string value, string prefix, int length)
+        {
+            if (string.IsNullOrEmpty(value) || !value.StartsWith(prefix, StringComparison.Ordinal) || value.Length != prefix.Length + length) { return false; }
+            for (int index = prefix.Length; index < value.Length; ++index)
+            {
+                char item = value[index];
+                if (!((item >= '0' && item <= '9') || (item >= 'a' && item <= 'f'))) { return false; }
+            }
+            return true;
+        }
+
+        private static string StatusName(uint status)
+        {
+            switch (status)
+            {
+                case 0xC000000D: return "invalid_parameter";
+                case 0xC0000022: return "access_denied";
+                case 0xC0000034: return "object_name_not_found";
+                case 0xC000003A: return "object_path_not_found";
+                case 0xC000003B: return "object_path_syntax_bad";
+                default: return "ntstatus";
+            }
+        }
+
+        private static class Native
+        {
+            [DllImport("ntdll.dll", ExactSpelling = true)]
+            internal static extern uint NtOpenKey(out IntPtr keyHandle, uint desiredAccess, IntPtr objectAttributes);
+
+            [DllImport("ntdll.dll", ExactSpelling = true)]
+            internal static extern uint NtClose(IntPtr handle);
+        }
+    }
+
     public sealed class RunResult
     {
         public string Failure = "";
