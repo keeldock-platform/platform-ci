@@ -228,6 +228,25 @@ class WorkflowPolicyTests(unittest.TestCase):
     def test_actual_platform_workflow_matches_closed_supported_shape(self):
         self.assertTrue(validate_workflow_text(self._platform_workflow(), "platform"))
 
+    def test_shared_action_runs_release_build_verify_on_current_and_pinned_python(self):
+        self.assertIn("uses: ./kit/bootstrap\n", self._platform_workflow())
+        action = PLATFORM_ACTION.read_text(encoding="utf-8")
+        current = (
+            '        "$python_bin" -B -m unittest discover -s '
+            '"$CI_ACTION_PATH/../confinement" -p "test_release_build_verify.py"\n'
+        )
+        pinned = (
+            "          /Library/Developer/CommandLineTools/Library/Frameworks/"
+            "Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest "
+            'discover -s "$CI_ACTION_PATH/../confinement" '
+            '-p "test_release_build_verify.py"\n'
+        )
+        macos_branch = '        if [[ "${RUNNER_OS:-}" == "macOS" ]]; then\n'
+        self.assertEqual(action.count(current), 1)
+        self.assertEqual(action.count(pinned), 1)
+        self.assertLess(action.index(current), action.index(macos_branch))
+        self.assertLess(action.index(macos_branch), action.index(pinned))
+
     def test_node_lock_smoke_workflow_is_closed_source_free_and_cross_platform(self):
         workflow = NODE_LOCK_SMOKE_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(workflow, NODE_LOCK_SMOKE_WORKFLOW_TEMPLATE)

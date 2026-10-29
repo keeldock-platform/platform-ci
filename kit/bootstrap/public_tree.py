@@ -154,6 +154,8 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/capsule_frame_crosscheck.md",
         "kit/confinement/capsule_frame_vector_gate.py",
         ".github/workflows/capsule-vectors.yml",
+        "kit/confinement/release_build_verify.py",
+        "kit/confinement/test_release_build_verify.py",
     )
 )
 CONSUMER_FILES = frozenset((".github/workflows/public-policy.yml", "ci/policy.json"))
@@ -247,6 +249,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_role_signer.py': 'd3ff93284775e53acd5f6328b25b6f0c4058878ac9a817fe06aa0e69e855f864',
     'kit/bootstrap/policy_handoff.py': 'a219e9cb880cea6bc6444ad6c8c4d7209e83bb9c7be5c7dbef15630a20e5269d',
     'kit/bootstrap/test_policy_handoff.py': '0544070f4012476a03fed541aab9c8ba0c60ab9d2ef94c9882e15e43b4f085ec',
+    'kit/confinement/release_build_verify.py': 'ad9b18d2faaa6e7f408ea854f8483d9d97ebca0a7a2711e57d521203a882d91e',
+    'kit/confinement/test_release_build_verify.py': '08c8b7dcb28307d8470cab9675202bcc206492261d20dec70064232c197f2579',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(
