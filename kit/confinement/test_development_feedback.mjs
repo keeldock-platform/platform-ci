@@ -242,10 +242,9 @@ test('accepts a subset patch with originals for its changed reviewed file', () =
 });
 
 test('rejects consumer originals outside the reviewed Rust path set', () => {
-  const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
-    'let token = CancellationToken::new();');
+  const payload = rustPatch('src/lib.rs', 'let value = alpha;', 'let value = beta;');
   assert.throws(() => encryptRustPatchWithSources(payload, {
-    'src/lib.rs': 'let token=CancellationToken::new();\n',
+    'src/lib.rs': 'let value = alpha;\n',
     'src/unchanged.rs': 'fn unchanged() {}\n',
   }, ['src/lib.rs']), { code: 'invalid_expectation' });
 });
@@ -268,12 +267,12 @@ test('rejects rust patches that add a credential-shaped literal', () => {
 test('continues scanning credential-shaped text for non-rust payloads', () => {
   const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
     'let token = CancellationToken::new();');
-  assert.throws(() => encryptDevelopmentFeedbackWithRustSources({
+  assert.throws(() => encryptDevelopmentFeedback({
     payloadBytes: payload,
     context: contextFor('core-build-diagnostic-return'),
     recipientPublicKey: recipient.publicKey,
     now: NOW,
-  }, new Map([['src/lib.rs', Buffer.from('let token=CancellationToken::new();\n', 'utf8')]])), {
+  }), {
     code: 'credential_like_content',
   });
 });

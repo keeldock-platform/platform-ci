@@ -223,7 +223,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/feedback_failure.py': '749d0a6dd81b4f41ea6cf339072e02848c5280c22b366fd65d13fbf6fc8bf763',
     '.github/workflows/development-feedback-smoke.yml': '09e058574372baa40016327e8a0da12d130a262a8bd70baba3a38ed10acc3d7a',
     'kit/confinement/development_feedback.mjs': 'e1f995758330db80466dff70928c1525aebecfd12daa3d2da911d4050e1f3731',
-    'kit/confinement/test_development_feedback.mjs': '94dbe067f71ceec5f1112b23a0df00382b12030dfbda7f1567694bcfa61a5af3',
+    'kit/confinement/test_development_feedback.mjs': 'ab00b61ecce8e49895ad2c312d0e16a08b2cc67941b91da8418a5b8c05451087',
     'kit/confinement/feedback_request.py': '9c829edde3b289ef33ac738edb0aefdd2689ab8f293d3a099c9dec980f13796a',
     'kit/confinement/test_feedback_request.py': '3098946b5cf52fddf9280ab80effff4a4f641570f561e6b91d7b1f79e33bec77',
     'kit/confinement/feedback_smoke.mjs': 'de814d03e2202d91312879b1a3ef1e280026d8d8dc53836f35c7f4d1bae59bf6',
