@@ -7,6 +7,7 @@ import { encryptDevelopmentFeedback } from './development_feedback.mjs';
 import { returnProfileForContext } from './node_lock_envelope.mjs';
 
 const MAX_INPUT_BYTES = 6 * 1024 * 1024;
+const BASE64_SHAPE = /^[A-Za-z0-9+/]*={0,2}$/u;
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
 
 export class FeedbackCryptoError extends Error {
@@ -41,7 +42,7 @@ function exactObject(value, allowed, required) {
 
 function strictBytes(encoded, limit) {
   if (typeof encoded !== 'string' || encoded.length > Math.ceil(limit / 3) * 4 + 4
-      || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(encoded)) {
+      || encoded.length % 4 !== 0 || !BASE64_SHAPE.test(encoded)) {
     reject('invalid_payload');
   }
   const bytes = Buffer.from(encoded, 'base64');

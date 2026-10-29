@@ -140,6 +140,14 @@ test('producer encrypts a Rust patch of exactly the byte limit and refuses one b
   assert.throws(() => encryptFeedbackPayload(over.input));
 });
 
+test('producer base64 shape check refuses malformed padding, length, alphabet, and whitespace', () => {
+  for (const bad of ['eA=', 'eA=A', '=eA=', 'e===', 'eA==\n', 'eA== ', 'e_==', 'eB==', 'eA']) {
+    const input = fixture('rust_patch').input;
+    input.payload_b64 = bad;
+    assert.throws(() => encryptFeedbackPayload(input), { code: 'invalid_payload' }, bad);
+  }
+});
+
 test('producer refuses a mismatched key, profile, and unclosed input shape', () => {
   const wrongKey = fixture();
   wrongKey.input.context.recipient_fingerprint = '0'.repeat(64);
