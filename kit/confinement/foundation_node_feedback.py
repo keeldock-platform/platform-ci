@@ -2,6 +2,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import stat
 import time
 
 
@@ -16,9 +17,11 @@ NODE_GATE_NAMES = (
 NODE_BOOTSTRAP_GATES = ("node_dependency_prepare", "node_dependency_audit")
 FULL_FOUNDATION_GATES = RUST_FOUNDATION_GATES + NODE_GATE_NAMES
 BOOTSTRAP_MANIFESTS = ("package.json", "packages/host-api/package.json")
-NODE_REVIEWED_FILES = frozenset((
+NODE_FIXED_FILES = frozenset((
     ".node-version", "package.json", "tsconfig.base.json",
     "packages/host-api/package.json", "packages/host-api/tsconfig.json",
+))
+NODE_REVIEWED_FILES = NODE_FIXED_FILES | frozenset((
     "packages/host-api/src/budget.ts", "packages/host-api/src/effects.ts",
     "packages/host-api/src/entitlements.ts", "packages/host-api/src/errors.ts",
     "packages/host-api/src/ids.ts", "packages/host-api/src/index.ts",
@@ -181,7 +184,7 @@ def _profile_context(mode, dispatch, producer, source_runtime, validated_tree, a
     return profile, request, identity, policy_epoch_ms
 
 
-def _reviewed_files(source_runtime, mode, producer):
+def _reviewed_files(source_runtime, mode, producer, source):
     source_files = getattr(source_runtime, "CORE_CONTRACT_FEEDBACK_FILES", None)
     if type(source_files) is not frozenset:
         _refuse(producer, "manifest_invalid")
@@ -192,7 +195,31 @@ def _reviewed_files(source_runtime, mode, producer):
         _refuse(producer, "manifest_invalid")
     if mode == "bootstrap":
         return BOOTSTRAP_MANIFESTS
-    return tuple(sorted(NODE_REVIEWED_FILES))
+    pattern_paths = getattr(source_runtime, "_core_contract_pattern_paths", None)
+    if not callable(pattern_paths):
+        _refuse(producer, "manifest_invalid")
+    discovered = set()
+    for folder in ("src", "tests"):
+        directory = source / "packages" / "host-api" / folder
+        try:
+            info = directory.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                _refuse(producer, "manifest_invalid")
+            with os.scandir(directory) as iterator:
+                names = [entry.name for entry in iterator]
+        except OSError:
+            _refuse(producer, "manifest_invalid")
+        discovered.update("packages/host-api/" + folder + "/" + name for name in names)
+    matched = pattern_paths(discovered)
+    selected = matched["ts_sources"] | matched["ts_tests"]
+    baseline = pattern_paths(source_files)
+    required_ts = baseline["ts_sources"] | baseline["ts_tests"]
+    if (selected != discovered
+            or len(matched["ts_sources"]) > source_runtime.MAX_CORE_CONTRACT_TS_SOURCES
+            or len(matched["ts_tests"]) > source_runtime.MAX_CORE_CONTRACT_TS_TESTS
+            or not required_ts.issubset(selected)):
+        _refuse(producer, "manifest_invalid")
+    return tuple(sorted(NODE_REVIEWED_FILES | selected))
 
 
 def _node_environment(storage, node, contract):
@@ -285,7 +312,7 @@ def run_node_profile(mode, *, dispatch, source, worker_storage, worker_uid, envi
             )
         else:
             lock_bytes = None
-        files = _reviewed_files(source_runtime, mode, producer)
+        files = _reviewed_files(source_runtime, mode, producer, source_path)
         storage = root_storage / "foundation-node-contract"
         producer._make_worker_directory(storage, worker_uid, worker_gid)
         project = storage / "project"
@@ -372,6 +399,11 @@ def run_node_profile(mode, *, dispatch, source, worker_storage, worker_uid, envi
         )
         _validate_result(mode, result, contract, identity, expected_manifest, lock_bytes,
                          policy_epoch_ms, accepted_provenance, producer)
+        if mode == "verify":
+            result["node_reviewed_file_count"] = len(files)
+            result["node_reviewed_paths_sha256"] = hashlib.sha256(
+                "".join(path + "\n" for path in files).encode("ascii")
+            ).hexdigest()
         return result
     except Exception as error:
         if cleanup_record["diagnostic"] is None and getattr(error, "reason", None) == "cleanup_incomplete":
@@ -532,7 +564,7 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
     if (type(result) is not dict or result.get("mode") != "verify"
             or result.get("status") != "passed" or result.get("stages") != NODE_GATE_NAMES):
         raise ValueError("node verification incomplete")
-    return {
+    outcome = {
         "selected_gates": selected,
         "completed": selected,
         "failed_stage": None,
@@ -542,3 +574,11 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
         "stdout_truncated": False,
         "stderr_truncated": False,
     }
+    count = result.get("node_reviewed_file_count")
+    digest = result.get("node_reviewed_paths_sha256")
+    if (type(count) is not int or not 5 <= count <= 133
+            or type(digest) is not str or SHA64_RE.fullmatch(digest) is None):
+        raise ValueError("node reviewed files invalid")
+    outcome["node_reviewed_file_count"] = count
+    outcome["node_reviewed_paths_sha256"] = digest
+    return outcome
