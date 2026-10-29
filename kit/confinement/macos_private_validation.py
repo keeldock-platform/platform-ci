@@ -206,8 +206,21 @@ CORE_CONTRACT_FOUNDATION_FILES = frozenset((
 CORE_CONTRACT_FUZZ_CORPUS_TARGETS = frozenset((
     "identifiers", "tool_error_codes", "versions",
 ))
+CORE_CONTRACT_SNAKE_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z")
+CORE_CONTRACT_TS_SOURCE_PATH_PATTERN = re.compile(
+    r"packages/host-api/src/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.ts\Z"
+)
+CORE_CONTRACT_TS_TEST_PATH_PATTERN = re.compile(
+    r"packages/host-api/tests/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.test\.ts\Z"
+)
+CORE_CONTRACT_ADR_PATH_PATTERN = re.compile(
+    r"docs/adr/([0-9]{4})-([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.md\Z"
+)
+CORE_CONTRACT_FUZZ_TARGET_PATH_PATTERN = re.compile(
+    r"fuzz/fuzz_targets/([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\.rs\Z"
+)
 CORE_CONTRACT_FUZZ_CORPUS_PATH = re.compile(
-    r"fuzz/corpus/(identifiers|tool_error_codes|versions)/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z"
+    r"fuzz/corpus/([a-z][a-z0-9]*(?:_[a-z0-9]+)*)/[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z"
 )
 CORE_CONTRACT_TREE_BY_CONCERN = {
     "core-contract": "core_contract",
@@ -221,6 +234,12 @@ MAX_SIGNER_BYTES = 65536
 MAX_INVENTORY_BYTES = 16384
 MAX_TREE_BYTES = 1024 * 1024
 MAX_CORE_CONTRACT_FILE_BYTES = 1024 * 1024
+MAX_CORE_CONTRACT_PATTERN_TOTAL_BYTES = MAX_TREE_BYTES
+MAX_CORE_CONTRACT_NAME_LENGTH = 64
+MAX_CORE_CONTRACT_TS_SOURCES = 64
+MAX_CORE_CONTRACT_TS_TESTS = 64
+MAX_CORE_CONTRACT_ADRS = 64
+MAX_CORE_CONTRACT_FUZZ_TARGETS = 16
 MAX_FUZZ_CORPUS_FILES = 256
 MAX_FUZZ_CORPUS_FILE_BYTES = 4096
 MAX_FUZZ_CORPUS_TOTAL_BYTES = 128 * 1024
@@ -1466,6 +1485,31 @@ def _contract_blob(
     return result.stdout
 
 
+def _contract_blob_size(repository, git_executable, repo_env, entries, path, *, core_check):
+    entry = entries.get(path)
+    if entry is None or entry[0] not in ("100644", "100755"):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check)
+    try:
+        result = _run_process(
+            (git_executable, "cat-file", "-s", entry[1]),
+            cwd=repository,
+            environ=repo_env,
+            max_output=32,
+            stage="bootstrap",
+        )
+    except Refusal as error:
+        if error.reason == "cleanup_incomplete":
+            raise
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check) from None
+    if (result.returncode != 0 or result.stderr
+            or re.fullmatch(rb"(?:0|[1-9][0-9]{0,19})\n", result.stdout) is None):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check)
+    size = int(result.stdout[:-1])
+    if size > MAX_CORE_CONTRACT_FILE_BYTES:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check=core_check)
+    return size
+
+
 def _unique_json_object(pairs):
     result = {}
     for key, value in pairs:
@@ -1542,9 +1586,10 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
             if current is None or assignment is None:
                 return None
             key, value = assignment.groups()
-            if key in sections[current]:
+            selected = sections[current]
+            if key in selected:
                 return None
-            sections[current][key] = value.strip()
+            selected[key] = value.strip()
         return sections
 
     fuzz_sections = parse_sections(fuzz_text)
@@ -1622,7 +1667,88 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
     return parsed_lock == {fuzz_name: [api_name], api_name: []}
 
 
-def _feedback_corpus_paths_shape(corpus_paths):
+def _feedback_fuzz_modules_shape(main_payload, target_names):
+    if (type(main_payload) is not bytes or len(main_payload) > MAX_CORE_CONTRACT_FILE_BYTES
+            or type(target_names) not in (set, frozenset)
+            or not CORE_CONTRACT_FUZZ_CORPUS_TARGETS.issubset(target_names)
+            or len(target_names) > MAX_CORE_CONTRACT_FUZZ_TARGETS
+            or any(type(name) is not str or len(name) > MAX_CORE_CONTRACT_NAME_LENGTH
+                   or CORE_CONTRACT_SNAKE_NAME_PATTERN.fullmatch(name) is None
+                   for name in target_names)):
+        return False
+    try:
+        text = main_payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return False
+    raw_string = re.compile(r"\b(?:b|c)?r" + re.escape(chr(35)) + r'*"')
+    char_quote = "'"
+    if ("\r" in text or "/*" in text or "include" in text or "macro_rules" in text
+            or raw_string.search(text)
+            or char_quote + '"' + char_quote in text
+            or char_quote + "\\" + '"' + char_quote in text):
+        return False
+    quoted = False
+    escaped = False
+    for character in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+            elif character == "\n":
+                return False
+        elif character == '"':
+            quoted = True
+    if quoted:
+        return False
+    module = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\b")
+    declared = set()
+    references = set()
+    reference_patterns = {
+        name: re.compile(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"::fuzz(?![A-Za-z0-9_])")
+        for name in target_names
+    }
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        code = re.sub(r'"(?:\\.|[^"\\])*"', '""', line).split("//", 1)[0]
+        if chr(35) in code:
+            if index + 1 >= len(lines):
+                return False
+            match = re.fullmatch(
+                re.escape(chr(35)) + r'\[path = "\.\./fuzz_targets/([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\.rs"\]',
+                line,
+            )
+            if match is None:
+                return False
+            name = match.group(1)
+            if (name not in target_names or name in declared
+                    or lines[index + 1] != "mod " + name + ";"):
+                return False
+            declared.add(name)
+            index += 2
+            continue
+        if module.match(line):
+            return False
+        for name in target_names - references:
+            if reference_patterns[name].search(code):
+                references.add(name)
+        index += 1
+    return declared == references == set(target_names)
+
+
+def _feedback_corpus_paths_shape(corpus_paths, target_names=None):
+    if target_names is None:
+        target_names = CORE_CONTRACT_FUZZ_CORPUS_TARGETS
+    if (type(target_names) not in (set, frozenset)
+            or not CORE_CONTRACT_FUZZ_CORPUS_TARGETS.issubset(target_names)
+            or any(type(name) is not str or len(name) > MAX_CORE_CONTRACT_NAME_LENGTH
+                   or CORE_CONTRACT_SNAKE_NAME_PATTERN.fullmatch(name) is None
+                   for name in target_names)):
+        return False
     if (type(corpus_paths) is not list or not 1 <= len(corpus_paths) <= MAX_FUZZ_CORPUS_FILES
             or any(type(path) is not str for path in corpus_paths)
             or len(set(corpus_paths)) != len(corpus_paths)):
@@ -1633,11 +1759,11 @@ def _feedback_corpus_paths_shape(corpus_paths):
         if match is None:
             return False
         targets.add(match.group(1))
-    return targets == CORE_CONTRACT_FUZZ_CORPUS_TARGETS
+    return CORE_CONTRACT_FUZZ_CORPUS_TARGETS.issubset(targets) and targets.issubset(target_names)
 
 
-def _feedback_corpus_shape(corpus_paths, payloads):
-    if (not _feedback_corpus_paths_shape(corpus_paths)
+def _feedback_corpus_shape(corpus_paths, payloads, target_names=None):
+    if (not _feedback_corpus_paths_shape(corpus_paths, target_names)
             or type(payloads) is not dict or set(payloads) != set(corpus_paths)):
         return False
     total_bytes = 0
@@ -1677,9 +1803,61 @@ def _core_contract_foundation_path(path):
         and (
             path in CORE_CONTRACT_FEEDBACK_FILES
             or path in CORE_CONTRACT_FOUNDATION_FILES
+            or _core_contract_ts_source_name(path) is not None
+            or _core_contract_ts_test_name(path) is not None
+            or _core_contract_adr_parts(path) is not None
+            or _core_contract_fuzz_target_name(path) is not None
             or CORE_CONTRACT_FUZZ_CORPUS_PATH.fullmatch(path) is not None
         )
     )
+
+
+def _core_contract_path_name(path, pattern):
+    if type(path) is not str:
+        return None
+    match = pattern.fullmatch(path)
+    if match is None:
+        return None
+    name = match.group(1)
+    return name if len(name) <= MAX_CORE_CONTRACT_NAME_LENGTH else None
+
+
+def _core_contract_ts_source_name(path):
+    return _core_contract_path_name(path, CORE_CONTRACT_TS_SOURCE_PATH_PATTERN)
+
+
+def _core_contract_ts_test_name(path):
+    return _core_contract_path_name(path, CORE_CONTRACT_TS_TEST_PATH_PATTERN)
+
+
+def _core_contract_adr_parts(path):
+    if type(path) is not str:
+        return None
+    match = CORE_CONTRACT_ADR_PATH_PATTERN.fullmatch(path)
+    if match is None or len(match.group(2)) > MAX_CORE_CONTRACT_NAME_LENGTH:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _core_contract_fuzz_target_name(path):
+    return _core_contract_path_name(path, CORE_CONTRACT_FUZZ_TARGET_PATH_PATTERN)
+
+
+def _core_contract_pattern_paths(entries):
+    return {
+        "ts_sources": {
+            path for path in entries if _core_contract_ts_source_name(path) is not None
+        },
+        "ts_tests": {
+            path for path in entries if _core_contract_ts_test_name(path) is not None
+        },
+        "adrs": {
+            path for path in entries if _core_contract_adr_parts(path) is not None
+        },
+        "fuzz_targets": {
+            path for path in entries if _core_contract_fuzz_target_name(path) is not None
+        },
+    }
 
 
 def _core_contract_package_mode(path, *, feedback_profile=False):
@@ -1819,6 +1997,32 @@ def _safe_core_contract_tree(
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
         if not CORE_CONTRACT_FEEDBACK_FILES.issubset(entries) or not CORE_CONTRACT_FOUNDATION_FILES.issubset(entries):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+        pattern_paths = _core_contract_pattern_paths(entries)
+        pattern_limits = (
+            ("ts_sources", MAX_CORE_CONTRACT_TS_SOURCES),
+            ("ts_tests", MAX_CORE_CONTRACT_TS_TESTS),
+            ("adrs", MAX_CORE_CONTRACT_ADRS),
+            ("fuzz_targets", MAX_CORE_CONTRACT_FUZZ_TARGETS),
+        )
+        if any(len(pattern_paths[name]) > maximum for name, maximum in pattern_limits):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
+        adr_numbers = [
+            _core_contract_adr_parts(path)[0] for path in pattern_paths["adrs"]
+        ]
+        if len(adr_numbers) != len(set(adr_numbers)):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
+        baseline_pattern_paths = set(CORE_CONTRACT_FEEDBACK_FILES) | set(CORE_CONTRACT_FOUNDATION_FILES)
+        pattern_total_bytes = 0
+        for path in sorted(set().union(*pattern_paths.values()) - baseline_pattern_paths):
+            pattern_total_bytes += _contract_blob_size(
+                repository, git_executable, repo_env, entries, path,
+                core_check="tree_entries",
+            )
+            if pattern_total_bytes > MAX_CORE_CONTRACT_PATTERN_TOTAL_BYTES:
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
+        target_names = {
+            _core_contract_fuzz_target_name(path) for path in pattern_paths["fuzz_targets"]
+        }
         corpus_paths = []
         for path in entries:
             if path.startswith("fuzz/corpus/"):
@@ -1826,7 +2030,7 @@ def _safe_core_contract_tree(
                         or len(corpus_paths) >= MAX_FUZZ_CORPUS_FILES):
                     raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
                 corpus_paths.append(path)
-        if not _feedback_corpus_paths_shape(corpus_paths):
+        if not _feedback_corpus_paths_shape(corpus_paths, target_names):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
         corpus_payloads = {}
         corpus_total_bytes = 0
@@ -1843,7 +2047,7 @@ def _safe_core_contract_tree(
             except UnicodeDecodeError:
                 raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries") from None
             corpus_payloads[path] = payload
-        if not _feedback_corpus_shape(corpus_paths, corpus_payloads):
+        if not _feedback_corpus_shape(corpus_paths, corpus_payloads, target_names):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
         root_package = _contract_blob(
             repository, git_executable, repo_env, entries, "package.json", core_check="package_decode",
@@ -1865,6 +2069,12 @@ def _safe_core_contract_tree(
             "/".join(CORE_CONTRACT_CRATE_ROOTS[0]) + "/Cargo.toml", core_check="package_decode",
         )
         if not _feedback_fuzz_manifest_shape(fuzz_manifest, api_cargo, fuzz_lock):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+        fuzz_main = _contract_blob(
+            repository, git_executable, repo_env, entries, "fuzz/src/main.rs",
+            core_check="package_decode",
+        )
+        if not _feedback_fuzz_modules_shape(fuzz_main, target_names):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
         if concern == "core-build-diagnostic-return" and package_lock_present:
             if entries[CORE_CONTRACT_PACKAGE_LOCK_PATH][0] != "100644":
