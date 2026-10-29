@@ -177,6 +177,16 @@ class FeedbackAdminTests(unittest.TestCase):
         module.collect_feedback_evidence = lambda api, request, **kwargs: evidence
         return mock.patch.dict(sys.modules, {"feedback_api": module})
 
+    def test_reviewed_rust_path_list_is_bounded_at_the_batch_four_headroom(self):
+        def paths(count):
+            return ["crates/kernel/i18n/src/module_" + str(index) + ".rs" for index in range(count)]
+
+        self.assertTrue(subject._valid_reviewed_rust_paths(paths(1)))
+        self.assertTrue(subject._valid_reviewed_rust_paths(paths(512)))
+        self.assertFalse(subject._valid_reviewed_rust_paths(paths(513)))
+        self.assertFalse(subject._valid_reviewed_rust_paths([]))
+        self.assertFalse(subject._valid_reviewed_rust_paths(paths(1) * 2))
+
     def test_request_creation_persists_private_key_and_only_returns_public_material(self):
         result = self.create()
         self.assertEqual(set(result), {"request", "canonical_record", "public_spki_base64", "recipient_fingerprint"})

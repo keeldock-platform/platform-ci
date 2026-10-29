@@ -155,6 +155,7 @@ CORE_CONTRACT_CRATE_ROOTS = (
     ("crates", "host", "api"),
     ("crates", "host", "mock"),
     ("crates", "host", "conformance"),
+    ("crates", "kernel", "i18n"),
 )
 CORE_CONTRACT_ROOT_FILES = frozenset((
     "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml",
@@ -206,12 +207,26 @@ CORE_CONTRACT_FOUNDATION_FILES = frozenset((
 CORE_CONTRACT_FUZZ_CORPUS_TARGETS = frozenset((
     "identifiers", "tool_error_codes", "versions",
 ))
+CORE_CONTRACT_KERNEL_FEEDBACK_FILES = frozenset((
+    "crates/host/api/tests/fixtures/i18n-regression-v1.jsonl",
+    "crates/host/api/tests/fixtures/i18n-v1.jsonl",
+    "crates/kernel/i18n/src/cldr46_cardinal_rules.md",
+    "packages/kernel-i18n/CHANGELOG.md",
+    "packages/kernel-i18n/CONTRACT.md",
+    "packages/kernel-i18n/README.md",
+    "packages/kernel-i18n/data/cldr46_cardinal_rules.md",
+    "packages/kernel-i18n/package.json",
+    "packages/kernel-i18n/tests/support.ts",
+    "packages/kernel-i18n/tsconfig.json",
+))
+CORE_CONTRACT_WORKSPACE_MEMBERS_PATTERN = re.compile(r"(?m)^members\s*=\s*\[([^\]]*)\]\s*$")
+CORE_CONTRACT_WORKSPACE_MEMBER_PATTERN = re.compile(r'\s*"([A-Za-z0-9/_-]{1,128})"\s*(?:,|\Z)')
 CORE_CONTRACT_SNAKE_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z")
 CORE_CONTRACT_TS_SOURCE_PATH_PATTERN = re.compile(
-    r"packages/host-api/src/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.ts\Z"
+    r"packages/(?:host-api|kernel-i18n)/src/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.ts\Z"
 )
 CORE_CONTRACT_TS_TEST_PATH_PATTERN = re.compile(
-    r"packages/host-api/tests/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.test\.ts\Z"
+    r"packages/(?:host-api|kernel-i18n)/tests/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.test\.ts\Z"
 )
 CORE_CONTRACT_ADR_PATH_PATTERN = re.compile(
     r"docs/adr/([0-9]{4})-([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.md\Z"
@@ -1803,6 +1818,7 @@ def _core_contract_foundation_path(path):
         and (
             path in CORE_CONTRACT_FEEDBACK_FILES
             or path in CORE_CONTRACT_FOUNDATION_FILES
+            or path in CORE_CONTRACT_KERNEL_FEEDBACK_FILES
             or _core_contract_ts_source_name(path) is not None
             or _core_contract_ts_test_name(path) is not None
             or _core_contract_adr_parts(path) is not None
@@ -1810,6 +1826,24 @@ def _core_contract_foundation_path(path):
             or CORE_CONTRACT_FUZZ_CORPUS_PATH.fullmatch(path) is not None
         )
     )
+
+
+def _core_contract_workspace_members(workspace_text):
+    arrays = CORE_CONTRACT_WORKSPACE_MEMBERS_PATTERN.findall(workspace_text)
+    if len(arrays) != 1:
+        return None
+    body = arrays[0]
+    members = []
+    position = 0
+    while True:
+        match = CORE_CONTRACT_WORKSPACE_MEMBER_PATTERN.match(body, position)
+        if match is None:
+            break
+        members.append(match.group(1))
+        position = match.end()
+    if body[position:].strip():
+        return None
+    return members
 
 
 def _core_contract_path_name(path, pattern):
@@ -2122,9 +2156,9 @@ def _safe_core_contract_tree(
         workspace_text = workspace.decode("utf-8", "strict")
     except UnicodeDecodeError:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_decode") from None
-    members = re.findall(r"(?m)^members\s*=\s*\[([^\]\r\n]*)\]\s*$", workspace_text)
-    expected_members = ", ".join('"' + "/".join(root) + '"' for root in CORE_CONTRACT_CRATE_ROOTS)
-    if members != [expected_members]:
+    if _core_contract_workspace_members(workspace_text) != [
+        "/".join(root) for root in CORE_CONTRACT_CRATE_ROOTS
+    ]:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
 
     lock_text = _contract_blob(

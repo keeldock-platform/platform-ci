@@ -25,7 +25,7 @@ RUN_PREFIX = "macos-core-contract-"
 WORKER_PREFIX = "macos-core-contract-worker-"
 MAX_TOTAL_SECONDS = 15 * 60
 MAX_COMMAND_SECONDS = 120
-MAX_DIFF_BYTES = 2 * 1024 * 1024
+MAX_DIFF_BYTES = 6 * 1024 * 1024
 MAX_CAPTURE_BYTES = 65_536
 MAX_RECEIPT_BYTES = 8192
 MAX_REFUSAL_BYTES = 512
@@ -629,7 +629,7 @@ def _validate_source_path(source_path, storage_root):
         for relative in (
             "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml",
             "crates/host/api/Cargo.toml", "crates/host/mock/Cargo.toml",
-            "crates/host/conformance/Cargo.toml",
+            "crates/host/conformance/Cargo.toml", "crates/kernel/i18n/Cargo.toml",
         ):
             target = source / relative
             target_info = target.lstat()

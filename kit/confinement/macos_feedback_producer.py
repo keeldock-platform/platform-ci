@@ -39,7 +39,7 @@ MAX_JSON_BYTES = 128 * 1024
 MAX_PACKAGE_JSON_BYTES = 256 * 1024
 MAX_LOCK_BYTES = 4 * 1024 * 1024 - 64 * 1024
 MAX_RUST_FILE_BYTES = 1024 * 1024
-MAX_RUST_PATHS = 256
+MAX_RUST_PATHS = 512
 MAX_PATCH_BYTES = 1024 * 1024
 MAX_NODE_INPUT_BYTES = 6 * 1024 * 1024
 MAX_CIPHERTEXT_BYTES = 4 * 1024 * 1024
@@ -50,6 +50,7 @@ PACKAGE_NAME_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-
 VERSION_SPEC_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
 PACKAGE_ROOTS = (
     Path("crates/host/api"), Path("crates/host/mock"), Path("crates/host/conformance"),
+    Path("crates/kernel/i18n"),
 )
 FOUNDATION_FUZZ_RUST_PATHS = (
     "fuzz/src/main.rs",
@@ -75,7 +76,7 @@ DIAGNOSTIC_GATE_SELECTIONS = (
     DIAGNOSTIC_BASE_GATES, DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES,
     DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES + DIAGNOSTIC_NODE_GATES,
 )
-WORKSPACE_PACKAGE_PATHS = ("packages/host-api",)
+WORKSPACE_PACKAGE_PATHS = ("packages/host-api", "packages/kernel-i18n")
 DEPENDENCY_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 PROFILE_BY_KIND = feedback_request.PROFILE_BY_KIND
 PROFILE_BY_CONCERN = feedback_request.PROFILES
@@ -188,7 +189,7 @@ def _expected_manifest(source):
             _refuse("manifest_invalid")
         workspaces = workspaces.get("packages")
     if (type(workspaces) is not list or len(workspaces) != 1
-            or workspaces[0] not in ("packages/*", "packages/host-api")):
+            or workspaces[0] != "packages/*"):
         _refuse("manifest_invalid")
     expected_paths = []
     for path in WORKSPACE_PACKAGE_PATHS:

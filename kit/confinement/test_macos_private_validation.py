@@ -483,15 +483,19 @@ class CoreContractTreeTests(unittest.TestCase):
         return (declarations + references).encode("ascii")
 
     @staticmethod
-    def _validate_feedback_tree(entries, concern, main_payload=None):
+    def _validate_feedback_tree(entries, concern, main_payload=None, workspace_text=None, lock_text=None):
         digest = hashlib.sha256(b"x").hexdigest()
 
         def blob(unused_repository, unused_git, unused_environment, unused_entries, path, **unused):
             if path == "Cargo.toml":
+                if workspace_text is not None:
+                    return workspace_text.encode("utf-8")
                 members = ", ".join('"' + "/".join(root) + '"'
                                      for root in subject.CORE_CONTRACT_CRATE_ROOTS)
                 return ("[workspace]\nmembers = [" + members + "]\n").encode("utf-8")
             if path == "Cargo.lock":
+                if lock_text is not None:
+                    return lock_text.encode("ascii")
                 return ("version = 4\n" + "[[package]]\n" * len(subject.CORE_CONTRACT_CRATE_ROOTS)).encode("ascii")
             if path == "rust-toolchain.toml":
                 return subject.CORE_CONTRACT_TOOLCHAIN
@@ -516,7 +520,7 @@ class CoreContractTreeTests(unittest.TestCase):
             )
         return marker, blob
 
-    def test_core_contract_path_scope_is_limited_to_workspace_and_three_crates(self):
+    def test_core_contract_path_scope_is_limited_to_workspace_and_four_crates(self):
         for path in subject.CORE_CONTRACT_ROOT_FILES:
             self.assertEqual(subject._core_contract_expected_mode(path), "100644")
         for root in subject.CORE_CONTRACT_CRATE_ROOTS:
@@ -583,6 +587,173 @@ class CoreContractTreeTests(unittest.TestCase):
             with self.subTest(path=path):
                 for concern in subject.FEEDBACK_PROFILE_CONCERNS:
                     self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    @staticmethod
+    def _workspace_text(members, trailing_comma=True):
+        lines = ",\n".join('    "' + member + '"' for member in members)
+        return (
+            '[workspace]\nresolver = "3"\nmembers = [\n' + lines
+            + (",\n" if trailing_comma else "\n") + ']\nexclude = [\n    "apps",\n]\n'
+        )
+
+    def _refused_check(self, entries, concern, **overrides):
+        with self.assertRaises(subject.Refusal) as refusal:
+            self._validate_feedback_tree(entries, concern, **overrides)
+        self.assertEqual(refusal.exception.reason, "bootstrap_snapshot_invalid")
+        return refusal.exception.core_check
+
+    def test_workspace_members_are_the_four_exact_paths(self):
+        members = [
+            "crates/host/api", "crates/host/mock", "crates/host/conformance", "crates/kernel/i18n",
+        ]
+        self.assertEqual(
+            ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS], members,
+        )
+        for trailing_comma in (True, False):
+            with self.subTest(trailing_comma=trailing_comma):
+                self.assertEqual(
+                    subject._core_contract_workspace_members(
+                        self._workspace_text(members, trailing_comma=trailing_comma),
+                    ),
+                    members,
+                )
+        self.assertEqual(
+            subject._core_contract_workspace_members(
+                "[workspace]\nmembers = [" + ", ".join('"' + item + '"' for item in members) + "]\n",
+            ),
+            members,
+        )
+        for rejected in (
+            "[workspace]\n",
+            "[workspace]\nmembers = []\n",
+            "[workspace]\nmembers = [\n    \"crates/host/api\" \"crates/host/mock\",\n]\n",
+            "[workspace]\nmembers = [\n    \"crates/host/api\",,\n]\n",
+            "[workspace]\nmembers = [\n    crates/host/api,\n]\n",
+            "[workspace]\nmembers = [\n    \"crates/host/api\", " + chr(35) + " note\n]\n",
+            self._workspace_text(members) + 'members = [\n    "crates/host/api",\n]\n',
+        ):
+            with self.subTest(rejected=rejected):
+                self.assertNotEqual(subject._core_contract_workspace_members(rejected), members)
+
+    def test_four_member_multiline_workspace_is_admitted(self):
+        concern = "core-rust-format-return"
+        entries = self._required_core_contract_entries(concern)
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        marker, unused_blob = self._validate_feedback_tree(
+            entries, concern, workspace_text=self._workspace_text(members),
+        )
+        self.assertEqual(marker, subject.CORE_CONTRACT_TREE_BY_CONCERN[concern])
+
+    def test_workspace_with_a_fifth_missing_reordered_or_glob_member_is_refused(self):
+        concern = "core-rust-format-return"
+        entries = self._required_core_contract_entries(concern)
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        for changed in (
+            members + ["crates/kernel/extra"],
+            members[:-1],
+            list(reversed(members)),
+            members + [members[0]],
+            members[:-1] + ["crates/kernel/*"],
+            members[:-1] + ["crates/kernel/i18n/../i18n"],
+        ):
+            with self.subTest(members=changed):
+                self.assertEqual(
+                    self._refused_check(
+                        entries, concern, workspace_text=self._workspace_text(changed),
+                    ),
+                    "workspace_members",
+                )
+
+    def test_lock_with_a_fifth_package_or_a_registry_source_is_refused(self):
+        concern = "core-rust-format-return"
+        entries = self._required_core_contract_entries(concern)
+        count = len(subject.CORE_CONTRACT_CRATE_ROOTS)
+        registry = 'source = "registry+crates"\n'
+        for lock_text in (
+            "version = 4\n" + "[[package]]\n" * (count + 1),
+            "version = 4\n" + "[[package]]\n" * (count - 1),
+            "version = 4\n" + "[[package]]\n" * count + registry,
+            "version = 4\n" + "[[package]]\n" * (count - 1) + "[[package]]\n" + registry,
+            "version = 3\n" + "[[package]]\n" * count,
+        ):
+            with self.subTest(lock=lock_text):
+                self.assertEqual(
+                    self._refused_check(entries, concern, lock_text=lock_text),
+                    "cargo_lock_shape",
+                )
+        marker, unused_blob = self._validate_feedback_tree(
+            entries, concern, lock_text="version = 4\n" + "[[package]]\n" * count,
+        )
+        self.assertEqual(marker, subject.CORE_CONTRACT_TREE_BY_CONCERN[concern])
+
+    def test_kernel_paths_are_admitted_only_for_feedback_concerns_by_exact_rule(self):
+        for path in (
+            "crates/kernel/i18n/Cargo.toml",
+            "crates/kernel/i18n/src/lib.rs",
+            "crates/kernel/i18n/src/pattern/parser.rs",
+            "crates/kernel/i18n/tests/i18n_conformance/faults.rs",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(subject._core_contract_expected_mode(path), "100644")
+        for path in (
+            "crates/kernel/i18n/src/cldr46_cardinal_rules.md",
+            "crates/host/api/tests/fixtures/i18n-v1.jsonl",
+            "crates/host/api/tests/fixtures/i18n-regression-v1.jsonl",
+            "packages/kernel-i18n/CHANGELOG.md",
+            "packages/kernel-i18n/CONTRACT.md",
+            "packages/kernel-i18n/README.md",
+            "packages/kernel-i18n/package.json",
+            "packages/kernel-i18n/tsconfig.json",
+            "packages/kernel-i18n/data/cldr46_cardinal_rules.md",
+            "packages/kernel-i18n/tests/support.ts",
+            "packages/kernel-i18n/src/catalogue.ts",
+            "packages/kernel-i18n/tests/catalogue-vectors.test.ts",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(subject._core_contract_foundation_path(path))
+                self.assertIsNone(subject._core_contract_expected_mode(path))
+                for concern in subject.FEEDBACK_PROFILE_CONCERNS:
+                    self.assertEqual(
+                        subject._core_contract_expected_mode(path, concern=concern), "100644",
+                    )
+
+    def test_paths_outside_the_kernel_allowlist_are_refused(self):
+        for path in (
+            "crates/kernel/Cargo.toml",
+            "crates/kernel/core/src/lib.rs",
+            "crates/kernel/i18n/build.rs",
+            "crates/kernel/i18n/src/build.rs",
+            "crates/kernel/i18n/src/other.md",
+            "crates/kernel/i18n/src/nested/data.json",
+            "crates/kernel/i18n/data/cldr46_cardinal_rules.md",
+            "crates/host/api/tests/fixtures/other.jsonl",
+            "crates/host/api/tests/fixtures/i18n-v1.json",
+            "crates/host/api/tests/fixtures/nested/i18n-v1.jsonl",
+            "crates/host/mock/tests/fixtures/i18n-v1.jsonl",
+            "packages/kernel-i18n/package-lock.json",
+            "packages/kernel-i18n/vite.config.ts",
+            "packages/kernel-i18n/data/other.md",
+            "packages/kernel-i18n/src/Key.ts",
+            "packages/kernel-i18n/src/key.js",
+            "packages/kernel-i18n/src/nested/key.ts",
+            "packages/kernel-i18n/tests/other.ts",
+            "packages/kernel-i18n/tests/nested/key.test.ts",
+            "packages/kernel-other/package.json",
+            "packages/kernel-i18n-extra/src/key.ts",
+        ):
+            with self.subTest(path=path):
+                self.assertFalse(subject._core_contract_foundation_path(path))
+                for concern in subject.CORE_CONTRACT_CONCERNS:
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_kernel_package_lock_follows_the_existing_root_lock_rule(self):
+        path = subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
+        for concern in subject.CORE_CONTRACT_CONCERNS:
+            with self.subTest(concern=concern):
+                expected = "100644" if concern == "core-build-diagnostic-return" else None
+                self.assertEqual(
+                    subject._core_contract_expected_mode(path, concern=concern), expected,
+                )
 
     def test_root_package_lock_is_admitted_only_for_build_diagnostic_verification(self):
         path = subject.CORE_CONTRACT_PACKAGE_LOCK_PATH

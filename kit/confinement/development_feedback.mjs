@@ -21,7 +21,7 @@ export const DEVELOPMENT_FEEDBACK_LIMITS = Object.freeze({
   rustPatchLines: 32_768,
   rustPatchLineCodeUnits: 16_384,
   rustPatchFiles: 128,
-  reviewedRustPaths: 256,
+  reviewedRustPaths: 512,
   hunkLines: 16_384,
   hunkCount: 1_000_000,
 });

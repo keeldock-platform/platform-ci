@@ -163,10 +163,12 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             "devDependencies": {"typescript": "6.0.3"},
         }
         workspace = {"name": "@synthetic/host-api", "version": "1.0.0"}
+        kernel_workspace = {"name": "@synthetic/kernel-i18n", "version": "1.0.0"}
         source = Path("/synthetic-source")
         files = {
             source / "package.json": json.dumps(root).encode("utf-8"),
             source / "packages/host-api/package.json": json.dumps(workspace).encode("utf-8"),
+            source / "packages/kernel-i18n/package.json": json.dumps(kernel_workspace).encode("utf-8"),
         }
         with patch.object(producer, "_read_file", side_effect=lambda path, **unused: files[path]):
             expected = producer._expected_manifest(source)
@@ -174,9 +176,48 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             "name": "synthetic-root", "version": "1.0.0", "workspaces": ["packages/*"],
             "devDependencies": {"typescript": "6.0.3"},
         })
-        self.assertEqual(expected["workspaces"], [{
-            "path": "packages/host-api", "name": "@synthetic/host-api", "version": "1.0.0",
-        }])
+        self.assertEqual(expected["workspaces"], [
+            {"path": "packages/host-api", "name": "@synthetic/host-api", "version": "1.0.0"},
+            {"path": "packages/kernel-i18n", "name": "@synthetic/kernel-i18n", "version": "1.0.0"},
+        ])
+        self.assertEqual(
+            producer.WORKSPACE_PACKAGE_PATHS, ("packages/host-api", "packages/kernel-i18n"),
+        )
+
+    def test_source_manifest_requires_both_workspaces_and_only_the_package_glob(self):
+        source = Path("/synthetic-source")
+
+        def expected_for(workspaces, present):
+            root = {"name": "synthetic-root", "version": "1.0.0", "workspaces": workspaces}
+            files = {source / "package.json": json.dumps(root).encode("utf-8")}
+            for name in present:
+                files[source / "packages" / name / "package.json"] = json.dumps(
+                    {"name": "@synthetic/" + name, "version": "1.0.0"}
+                ).encode("utf-8")
+
+            def read(path, **unused):
+                if path not in files:
+                    producer._refuse("manifest_invalid")
+                return files[path]
+
+            with patch.object(producer, "_read_file", side_effect=read):
+                return producer._expected_manifest(source)
+
+        self.assertEqual(
+            len(expected_for(["packages/*"], ("host-api", "kernel-i18n"))["workspaces"]), 2,
+        )
+        for workspaces, present in (
+            (["packages/*"], ("kernel-i18n",)),
+            (["packages/*"], ("host-api",)),
+            (["packages/host-api"], ("host-api", "kernel-i18n")),
+            (["packages/host-api", "packages/kernel-i18n"], ("host-api", "kernel-i18n")),
+            (["packages/kernel-i18n"], ("host-api", "kernel-i18n")),
+            (["apps/*"], ("host-api", "kernel-i18n")),
+        ):
+            with self.subTest(workspaces=workspaces, present=present):
+                with self.assertRaises(producer.FeedbackRefusal) as raised:
+                    expected_for(workspaces, present)
+                self.assertEqual(raised.exception.reason, "manifest_invalid")
 
     def test_producer_receipt_is_canonical_context_only_and_profile_closed(self):
         _, environment = _dispatch("rust_patch")
@@ -525,6 +566,89 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                     with self.assertRaises(producer.FeedbackRefusal) as raised:
                         producer._reviewed_rust_paths(source, include_fuzz=True)
                 self.assertEqual(raised.exception.reason, "manifest_invalid")
+
+    @staticmethod
+    def _regular_lstat():
+        file_info = SimpleNamespace(st_mode=stat.S_IFREG | 0o400, st_uid=0, st_nlink=1)
+        directory_info = SimpleNamespace(st_mode=stat.S_IFDIR | 0o500, st_uid=0, st_nlink=1)
+        original_lstat = Path.lstat
+
+        def fixture_lstat(path, *args, **kwargs):
+            if path.is_dir():
+                return directory_info
+            if path.is_file():
+                return file_info
+            return original_lstat(path, *args, **kwargs)
+
+        return fixture_lstat
+
+    def test_reviewed_rust_paths_include_every_admitted_crate_and_only_rust_files(self):
+        self.assertEqual(len(producer.PACKAGE_ROOTS), 4)
+        self.assertEqual(producer.PACKAGE_ROOTS[-1], Path("crates/kernel/i18n"))
+        self.assertIn("crates/kernel/i18n/Cargo.toml", producer._source_root_files())
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            for package_root in producer.PACKAGE_ROOTS:
+                (source / package_root / "src").mkdir(parents=True)
+            kernel = source / "crates/kernel/i18n"
+            (kernel / "src/pattern").mkdir()
+            (kernel / "tests").mkdir()
+            (kernel / "src/lib.rs").touch()
+            (kernel / "src/pattern/parser.rs").touch()
+            (kernel / "src/cldr46_cardinal_rules.md").touch()
+            (kernel / "tests/message_keys.rs").touch()
+            (kernel / "build.rs").touch()
+            with patch.object(Path, "lstat", self._regular_lstat()):
+                paths = producer._reviewed_rust_paths(source)
+        self.assertEqual(paths, (
+            "crates/kernel/i18n/src/lib.rs",
+            "crates/kernel/i18n/src/pattern/parser.rs",
+            "crates/kernel/i18n/tests/message_keys.rs",
+        ))
+
+    def test_source_profile_copies_and_formats_the_kernel_crate(self):
+        dispatch = _validated_dispatch("rust_patch")
+        kernel_paths = ("crates/kernel/i18n/src/lib.rs",)
+        copied = []
+        with patch.object(producer, "_reviewed_rust_paths", return_value=kernel_paths), \
+                patch.object(producer, "_copy_reviewed_files",
+                             side_effect=lambda *args: copied.append(args)), \
+                patch.object(producer, "_run_worker",
+                             return_value=SimpleNamespace(returncode=0, stdout=b"", stderr=b"")), \
+                patch.object(producer, "_rust_format_patch",
+                             return_value=b"synthetic-format-patch") as format_patch, \
+                patch.object(producer.os, "chdir"):
+            result = producer.run_source_profile(
+                dispatch, Path("/synthetic-source"), Path("/synthetic-worker"), 501, {},
+                {"cargo": Path("/trusted/cargo")}, {"python": "/trusted/python"},
+                SimpleNamespace(PROBE_PRIMARY_GID=20), object(), object(),
+                10**12, Path("/trusted/node"), None,
+            )
+        self.assertEqual(len(copied), 1)
+        self.assertIn("crates/kernel/i18n/Cargo.toml", copied[0][2])
+        self.assertIn(kernel_paths[0], copied[0][2])
+        self.assertEqual(format_patch.call_args.args[2], kernel_paths)
+        self.assertEqual(result["reviewed_rust_paths"], list(kernel_paths))
+        self.assertEqual(result["payload_bytes"], b"synthetic-format-patch")
+
+    def test_reviewed_rust_path_cap_admits_batch_four_and_is_enforced_at_the_boundary(self):
+        self.assertGreater(producer.MAX_RUST_PATHS, 368)
+        self.assertEqual(producer.MAX_RUST_PATHS, 512)
+        for count, accepted in ((producer.MAX_RUST_PATHS, True), (producer.MAX_RUST_PATHS + 1, False)):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary)
+                for package_root in producer.PACKAGE_ROOTS:
+                    (source / package_root / "src").mkdir(parents=True)
+                kernel_source = source / "crates/kernel/i18n/src"
+                for index in range(count):
+                    (kernel_source / ("module_" + str(index) + ".rs")).touch()
+                with patch.object(Path, "lstat", self._regular_lstat()):
+                    if accepted:
+                        self.assertEqual(len(producer._reviewed_rust_paths(source)), count)
+                    else:
+                        with self.assertRaises(producer.FeedbackRefusal) as raised:
+                            producer._reviewed_rust_paths(source)
+                        self.assertEqual(raised.exception.reason, "manifest_invalid")
 
     def test_cli_accepts_only_fixed_run_and_publisher_shapes(self):
         kind, core_args = producer._parse_cli([
