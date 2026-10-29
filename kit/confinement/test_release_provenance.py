@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import unittest
 
@@ -6,6 +7,7 @@ from release_provenance import (
     MAX_STATEMENT_BYTES,
     PREDICATE_TYPE_URI,
     PROFILE_VERSION,
+    PROVENANCE_DOCUMENT_ROLE,
     STATEMENT_TYPE_URI,
     VerificationRefusal,
     encode_canonical_json,
@@ -83,34 +85,41 @@ class ReleaseProvenanceTests(unittest.TestCase):
             },
         }
         self.release = {"product": "keeldock", "channel": "uat", "version": "4.7.0"}
-        self.expected_context = {
+        self.expected_context = copy.deepcopy({
             "release": self.release,
             "buildInputManifestSha256": digest("build-input-manifest"),
             "buildEvidence": self.build_evidence,
             "signer": self.signer,
             "pins": self.pins,
-        }
+        })
         self.allowed_signers = {"release-role": ["release-key-test"]}
         self.statement = self.make_statement()
         self.statement_bytes = encode_canonical_json(self.statement)
+        self.expected_message = (
+            b"KeelDock/release/v1/provenance\x00"
+            + b'{"key_id":"release-key-test","payload":'
+            + self.statement_bytes
+            + b',"role":"provenance","schema":1}'
+        )
         self.signature = hashlib.sha256(
-            b"fixture-key"
-            + signature_message(self.statement_bytes, "release-role", "release-key-test")
+            b"fixture-key" + self.expected_message
         ).digest()
         self.verifier = DeterministicFakeVerifier()
 
     def make_statement(self, predicate=None, subjects=None):
-        edges = self.release_manifest
         if predicate is None:
             predicate = {
                 "profileVersion": PROFILE_VERSION,
-                "release": self.release,
+                "release": copy.deepcopy(self.release),
                 "buildInputManifestSha256": digest("build-input-manifest"),
-                "buildEvidence": self.build_evidence,
-                "signer": self.signer,
-                "pins": self.pins,
-                "edges": edges,
+                "buildEvidence": copy.deepcopy(self.build_evidence),
+                "signer": copy.deepcopy(self.signer),
+                "pins": copy.deepcopy(self.pins),
+                "edges": copy.deepcopy(self.release_manifest),
             }
+        else:
+            predicate = copy.deepcopy(predicate)
+        edges = predicate["edges"]
         if subjects is None:
             entries = []
             for artifact in edges["artifacts"]:
@@ -125,6 +134,8 @@ class ReleaseProvenanceTests(unittest.TestCase):
                     {"name": signature["name"], "digest": {"sha256": signature["sha256"]}}
                 )
             subjects = sorted(entries, key=lambda item: item["name"])
+        else:
+            subjects = copy.deepcopy(subjects)
         return {
             "_type": STATEMENT_TYPE_URI,
             "subject": subjects,
@@ -141,7 +152,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
             self.allowed_signers if signers is None else signers,
             self.signature if signature is None else signature,
             self.verifier,
-            "release-role",
+            PROVENANCE_DOCUMENT_ROLE,
             "release-key-test",
         )
 
@@ -156,6 +167,22 @@ class ReleaseProvenanceTests(unittest.TestCase):
         self.assertEqual(result.signer_role, "release-role")
         self.assertEqual(result.signer_key_id, "release-key-test")
         self.assertEqual(len(result.subject_names), 4)
+
+    def test_provenance_signing_bytes_match_fixed_vector(self):
+        self.assertEqual(
+            signature_message(self.statement_bytes, "release-key-test"),
+            self.expected_message,
+        )
+
+    def test_refuses_signature_from_manifest_domain(self):
+        manifest_message = (
+            b"KeelDock/release/v1/manifest\x00"
+            + b'{"key_id":"release-key-test","payload":'
+            + self.statement_bytes
+            + b',"role":"manifest","schema":1}'
+        )
+        manifest_signature = hashlib.sha256(b"fixture-key" + manifest_message).digest()
+        self.assert_refusal("invalid-signature", signature=manifest_signature)
 
     def test_refuses_changed_subject_digest(self):
         changed = self.make_statement()
@@ -181,7 +208,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 self.allowed_signers,
                 self.signature,
                 self.verifier,
-                "build-role",
+                "release-role",
                 "release-key-test",
             )
         self.assertEqual(refusal.exception.code, "wrong-signer")
@@ -195,7 +222,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 self.allowed_signers,
                 self.signature,
                 self.verifier,
-                "release-role",
+                PROVENANCE_DOCUMENT_ROLE,
                 "other-key",
             )
         self.assertEqual(refusal.exception.code, "wrong-signer")
@@ -203,6 +230,18 @@ class ReleaseProvenanceTests(unittest.TestCase):
     def test_refuses_stale_build_run(self):
         changed = self.make_statement()
         changed["predicate"]["buildEvidence"]["runId"] = "run-old"
+        self.assertEqual(
+            self.expected_context["buildEvidence"]["runId"], "run-2026-10-29-01"
+        )
+        self.assert_refusal("stale-build", statement=changed)
+
+    def test_refuses_stale_nested_lock_pin(self):
+        changed = self.make_statement()
+        changed["predicate"]["pins"]["lockDigests"]["cargo-lock"] = digest("older-lock")
+        self.assertEqual(
+            self.expected_context["pins"]["lockDigests"]["cargo-lock"],
+            digest("cargo-lock"),
+        )
         self.assert_refusal("stale-build", statement=changed)
 
     def test_refuses_missing_build_a_evidence(self):
@@ -258,7 +297,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 self.allowed_signers,
                 self.signature,
                 self.verifier,
-                "release-role",
+                PROVENANCE_DOCUMENT_ROLE,
                 "release-key-test",
             )
         self.assertEqual(refusal.exception.code, "duplicate-key")
@@ -273,7 +312,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 self.allowed_signers,
                 self.signature,
                 self.verifier,
-                "release-role",
+                PROVENANCE_DOCUMENT_ROLE,
                 "release-key-test",
             )
         self.assertEqual(refusal.exception.code, "non-canonical-json")
@@ -288,7 +327,7 @@ class ReleaseProvenanceTests(unittest.TestCase):
                 self.allowed_signers,
                 self.signature,
                 self.verifier,
-                "release-role",
+                PROVENANCE_DOCUMENT_ROLE,
                 "release-key-test",
             )
         self.assertEqual(refusal.exception.code, "statement-too-large")

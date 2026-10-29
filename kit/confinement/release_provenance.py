@@ -21,6 +21,7 @@ MAX_IDENTIFIER_LENGTH = 128
 MAX_VERSION_LENGTH = 64
 SAFE_INTEGER_MAX = 9007199254740991
 SIGNATURE_DOMAIN_PREFIX = "KeelDock/release/v1/"
+PROVENANCE_DOCUMENT_ROLE = "provenance"
 
 IDENTIFIER_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._:/+-]*"
 SHA256_PATTERN = r"[0-9a-f]{64}"
@@ -647,26 +648,21 @@ def _validate_allowed_signers(allowed_signers, signer):
         _refuse("wrong-signer")
 
 
-def signature_message(statement_bytes, role, key_id):
-    """Build the role-bound message passed to the injected signature verifier."""
+def signature_message(statement_bytes, key_id):
+    """Build provenance signing bytes for the authorized release-role key."""
 
     statement = parse_canonical_statement(statement_bytes)
-    if type(role) is not str or type(key_id) is not str:
-        _refuse("wrong-signer")
-    if len(role) > MAX_IDENTIFIER_LENGTH or re.fullmatch(IDENTIFIER_PATTERN, role) is None:
+    if type(key_id) is not str:
         _refuse("wrong-signer")
     if len(key_id) > MAX_IDENTIFIER_LENGTH or re.fullmatch(IDENTIFIER_PATTERN, key_id) is None:
         _refuse("wrong-signer")
     signed_payload = {
         "schema": 1,
-        "role": role,
+        "role": PROVENANCE_DOCUMENT_ROLE,
         "key_id": key_id,
         "payload": statement,
     }
-    try:
-        domain = (SIGNATURE_DOMAIN_PREFIX + role).encode("ascii", "strict") + bytes((0,))
-    except UnicodeEncodeError:
-        _refuse("wrong-signer")
+    domain = (SIGNATURE_DOMAIN_PREFIX + PROVENANCE_DOCUMENT_ROLE).encode("ascii") + bytes((0,))
     return domain + encode_canonical_json(signed_payload)
 
 
@@ -683,7 +679,7 @@ def verify_statement(
     """Verify a Statement against an authenticated manifest projection and run context.
 
     The caller authenticates and projects the release-set manifest before passing it here.
-    The injected verifier checks the exact role-bound message and signature bytes.
+    The injected verifier checks the provenance-domain message and signature bytes.
     """
 
     statement = parse_canonical_statement(statement_bytes)
@@ -691,7 +687,7 @@ def verify_statement(
     _validate_expected_context(expected_context)
     _validate_profile_relations(statement, release_manifest)
     signer = predicate["signer"]
-    if envelope_role != signer["role"] or envelope_key_id != signer["keyId"]:
+    if envelope_role != PROVENANCE_DOCUMENT_ROLE or envelope_key_id != signer["keyId"]:
         _refuse("wrong-signer")
     _validate_allowed_signers(allowed_signers, signer)
     if signer != expected_context["signer"]:
@@ -712,7 +708,7 @@ def verify_statement(
         _refuse("invalid-signature")
     if not callable(getattr(signature_verifier, "verify", None)):
         _refuse("invalid-signature")
-    message = signature_message(statement_bytes, envelope_role, envelope_key_id)
+    message = signature_message(statement_bytes, envelope_key_id)
     try:
         verified = signature_verifier.verify(message, signature)
     except Exception:
