@@ -1198,6 +1198,7 @@ on:
   push:
     branches:
       - "**"
+  pull_request:
   workflow_dispatch:
 permissions: {}
 jobs:
@@ -1225,7 +1226,7 @@ jobs:
       - name: Fetch public candidate
         run: |
           set -euo pipefail
-          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "workflow_dispatch" ]]; then
+          if [[ "$CI_EVENT_NAME" != "push" && "$CI_EVENT_NAME" != "workflow_dispatch" && "$CI_EVENT_NAME" != "pull_request" ]]; then
             exit 1
           fi
           if [[ ! "$CI_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
@@ -1237,8 +1238,14 @@ jobs:
           if [[ ! "$CI_SERVER_URL" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
             exit 1
           fi
-          if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
-            exit 1
+          if [[ "$CI_EVENT_NAME" == "pull_request" ]]; then
+            if [[ ! "$CI_REF" =~ ^refs/pull/[1-9][0-9]*/merge$ ]]; then
+              exit 1
+            fi
+          else
+            if [[ ! "$CI_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]]; then
+              exit 1
+            fi
           fi
           requested_ref="$CI_REF"
           git init -q . 2>/dev/null
@@ -1251,7 +1258,7 @@ jobs:
             exit 1
           fi
       - name: Set up the pinned Node runtime
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "24.22.1"
           check-latest: false
@@ -1268,6 +1275,10 @@ jobs:
             python_command=python
           fi
           "$python_command" -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
+          "$python_command" -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_sbom_normalizer.py"
+          fi
 """
 
 

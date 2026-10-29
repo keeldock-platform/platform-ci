@@ -9,6 +9,7 @@ import {
   LOCK_MANIFEST_LIMITS,
   LockManifestError,
   validateLockManifest,
+  validateLockManifestInventory,
 } from './node_lock_manifest.mjs';
 
 const expected = {
@@ -86,6 +87,46 @@ function workspaceTypescriptFixture(version) {
 
 test('accepts only the reviewed root, workspace, exact pins, and public registry package entries', () => {
   assert.deepEqual(validateLockManifest(bytes(), expected), { packageCount: 6, lockfileVersion: 3 });
+});
+
+test('projects the validated lock into exact package identities and dependency edges', () => {
+  const inventory = validateLockManifestInventory(bytes(), expected);
+  assert.equal(inventory.inventoryVersion, 1);
+  assert.equal(inventory.lockfileVersion, 3);
+  assert.match(inventory.lockSha256, /^[a-f0-9]{64}$/u);
+  assert.equal(inventory.packages.length, 4);
+  const byName = new Map(inventory.packages.map((item) => [item.name, item]));
+  assert.deepEqual(byName.get('fixture-root').dependencies, [
+    { name: 'typescript', version: '6.0.3' },
+  ]);
+  assert.deepEqual(byName.get('@fixture/client-api').dependencies, [
+    { name: '@fixture/shared', version: '1.0.0' },
+  ]);
+  assert.equal(byName.get('typescript').integrity, `sha512-${'A'.repeat(86)}==`);
+});
+
+test('the established validator keeps inventory-only restrictions out of existing callers', () => {
+  const absentDevelopmentDependency = lockFixture();
+  absentDevelopmentDependency.packages['node_modules/typescript'].devDependencies = {
+    uninstalled: '1.0.0',
+  };
+  assert.deepEqual(validateLockManifest(bytes(absentDevelopmentDependency), expected), {
+    packageCount: 6, lockfileVersion: 3,
+  });
+  assert.throws(
+    () => validateLockManifestInventory(bytes(absentDevelopmentDependency), expected),
+    LockManifestError,
+  );
+
+  const nonStringLicense = lockFixture();
+  nonStringLicense.packages['node_modules/typescript'].license = { id: 'MIT' };
+  assert.deepEqual(validateLockManifest(bytes(nonStringLicense), expected), {
+    packageCount: 6, lockfileVersion: 3,
+  });
+  assert.throws(
+    () => validateLockManifestInventory(bytes(nonStringLicense), expected),
+    LockManifestError,
+  );
 });
 
 test('fails closed on root/workspace metadata and direct pin drift', () => {
