@@ -107,6 +107,7 @@ PLATFORM_FILES = frozenset(
         "kit/bootstrap/test_api_controls.py",
         "kit/confinement/macos_boundary_guard.py",
         "kit/confinement/test_macos_boundary_guard.py",
+        "kit/confinement/test_macos_context_load.py",
         "kit/confinement/macos_canary_scan.py",
         "kit/confinement/macos_deny_default.py",
         "kit/confinement/test_macos_deny_default.py",
