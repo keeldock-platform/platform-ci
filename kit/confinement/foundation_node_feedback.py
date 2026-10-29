@@ -44,6 +44,7 @@ NODE_REVIEWED_FILES = NODE_FIXED_FILES | frozenset((
     "packages/host-api/tests/ids-version.test.ts",
     "packages/host-api/tests/manifest-metadata.test.ts",
 ))
+MAX_NODE_REVIEWED_FILES = 10 + 2 * (64 + 64)
 PACKAGE_LOCK_PATH = "package-lock.json"
 PACKAGE_LOCK_TREE = "core_build_diagnostic_return_with_package_lock"
 SOURCE_IDENTITY_KEYS = ("source_sha", "base_sha", "control_sha", "reviewed_diff_sha256")
@@ -599,7 +600,7 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
     }
     count = result.get("node_reviewed_file_count")
     digest = result.get("node_reviewed_paths_sha256")
-    if (type(count) is not int or not 5 <= count <= 133
+    if (type(count) is not int or not 5 <= count <= MAX_NODE_REVIEWED_FILES
             or type(digest) is not str or SHA64_RE.fullmatch(digest) is None):
         raise ValueError("node reviewed files invalid")
     outcome["node_reviewed_file_count"] = count

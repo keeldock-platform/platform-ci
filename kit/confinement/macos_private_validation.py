@@ -221,6 +221,30 @@ CORE_CONTRACT_KERNEL_FEEDBACK_FILES = frozenset((
 ))
 CORE_CONTRACT_WORKSPACE_MEMBERS_PATTERN = re.compile(r"(?m)^members\s*=\s*\[([^\]]*)\]\s*$")
 CORE_CONTRACT_WORKSPACE_MEMBER_PATTERN = re.compile(r'\s*"([A-Za-z0-9/_-]{1,128})"\s*(?:,|\Z)')
+CORE_CONTRACT_PACKAGE_LOCK_CONCERNS = frozenset((
+    "core-build-diagnostic-return", "core-rust-format-return",
+))
+CORE_CONTRACT_MANIFEST_SECTIONS = frozenset(("package", "dependencies", "dev-dependencies", "lints"))
+CORE_CONTRACT_MANIFEST_INHERITED_KEYS = frozenset((
+    "version.workspace", "edition.workspace", "rust-version.workspace", "publish.workspace",
+))
+CORE_CONTRACT_MANIFEST_DEPENDENCIES = frozenset(("keeldock-host-api", "keeldock-host-mock"))
+CORE_CONTRACT_MANIFEST_SECTION_PATTERN = re.compile(r"\[([a-z-]{1,32})\]\Z")
+CORE_CONTRACT_MANIFEST_ASSIGNMENT_PATTERN = re.compile(r"([A-Za-z0-9_.-]{1,64})\s*=\s*(.{1,512})\Z")
+CORE_CONTRACT_MANIFEST_NAME_PATTERN = re.compile(r'"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"\Z')
+CORE_CONTRACT_MANIFEST_TEXT_PATTERN = re.compile(r'"[A-Za-z0-9 ,.:()-]{1,256}"\Z')
+CORE_CONTRACT_MANIFEST_WORKSPACE_VALUE_PATTERN = re.compile(r"\{\s*workspace\s*=\s*true\s*\}\Z")
+CORE_CONTRACT_ROOT_SECTIONS = frozenset((
+    "[workspace]", "[workspace.package]", "[workspace.dependencies]",
+    "[workspace.lints.rust]", "[workspace.lints.clippy]",
+))
+CORE_CONTRACT_ROOT_PATH_LINE_PATTERN = re.compile(
+    r'(keeldock-host-(?:api|mock))\s*=\s*\{\s*path\s*=\s*"(crates/host/(?:api|mock))"\s*\}\Z'
+)
+CORE_CONTRACT_ROOT_PATH_DEPENDENCIES = {
+    "keeldock-host-api": "crates/host/api",
+    "keeldock-host-mock": "crates/host/mock",
+}
 CORE_CONTRACT_SNAKE_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z")
 CORE_CONTRACT_TS_SOURCE_PATH_PATTERN = re.compile(
     r"packages/(?:host-api|kernel-i18n)/src/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.ts\Z"
@@ -1846,6 +1870,73 @@ def _core_contract_workspace_members(workspace_text):
     return members
 
 
+def _core_contract_crate_manifest_shape(text):
+    if type(text) is not str or "\r" in text or "\x00" in text:
+        return False
+    section = None
+    keys = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(chr(35)):
+            continue
+        header = CORE_CONTRACT_MANIFEST_SECTION_PATTERN.fullmatch(stripped)
+        if header is not None:
+            section = header.group(1)
+            if section not in CORE_CONTRACT_MANIFEST_SECTIONS or section in keys:
+                return False
+            keys[section] = set()
+            continue
+        assignment = CORE_CONTRACT_MANIFEST_ASSIGNMENT_PATTERN.fullmatch(stripped)
+        if section is None or assignment is None:
+            return False
+        key, value = assignment.group(1), assignment.group(2).strip()
+        if key in keys[section]:
+            return False
+        keys[section].add(key)
+        if section == "package":
+            if key == "name":
+                valid = CORE_CONTRACT_MANIFEST_NAME_PATTERN.fullmatch(value) is not None
+            elif key == "description":
+                valid = CORE_CONTRACT_MANIFEST_TEXT_PATTERN.fullmatch(value) is not None
+            elif key in CORE_CONTRACT_MANIFEST_INHERITED_KEYS:
+                valid = value == "true"
+            else:
+                valid = False
+        elif section in ("dependencies", "dev-dependencies"):
+            valid = (
+                key in CORE_CONTRACT_MANIFEST_DEPENDENCIES
+                and CORE_CONTRACT_MANIFEST_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
+            )
+        else:
+            valid = key == "workspace" and value == "true"
+        if not valid:
+            return False
+    return "package" in keys and "name" in keys["package"]
+
+
+def _core_contract_workspace_paths_shape(workspace_text):
+    if type(workspace_text) is not str or "\r" in workspace_text:
+        return False
+    found = {}
+    for line in workspace_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(chr(35)):
+            continue
+        if stripped.startswith("["):
+            if stripped not in CORE_CONTRACT_ROOT_SECTIONS:
+                return False
+            continue
+        if re.search(r"\bpath\b", stripped) is None:
+            continue
+        match = CORE_CONTRACT_ROOT_PATH_LINE_PATTERN.fullmatch(stripped)
+        if match is None or match.group(1) in found:
+            return False
+        found[match.group(1)] = match.group(2)
+    return all(
+        CORE_CONTRACT_ROOT_PATH_DEPENDENCIES.get(name) == path for name, path in found.items()
+    )
+
+
 def _core_contract_path_name(path, pattern):
     if type(path) is not str:
         return None
@@ -1917,7 +2008,7 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
     if type(concern) is not str or concern not in CORE_CONTRACT_CONCERNS:
         return None
     if path == CORE_CONTRACT_PACKAGE_LOCK_PATH:
-        return "100644" if concern == "core-build-diagnostic-return" else None
+        return "100644" if concern in CORE_CONTRACT_PACKAGE_LOCK_CONCERNS else None
     if path in CORE_CONTRACT_ROOT_FILES:
         return "100644"
     admin_mode = _core_contract_admin_mode(path)
@@ -2021,7 +2112,7 @@ def _safe_core_contract_tree(
         if path not in CORE_CONTRACT_ROOT_FILES
     )
     package_lock_present = CORE_CONTRACT_PACKAGE_LOCK_PATH in entries
-    if (concern == "core-build-diagnostic-return" and package_lock_present
+    if (concern in CORE_CONTRACT_PACKAGE_LOCK_CONCERNS and package_lock_present
             and not foundation_present):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     if concern == "core-node-lock-return" and not foundation_present:
@@ -2110,7 +2201,7 @@ def _safe_core_contract_tree(
         )
         if not _feedback_fuzz_modules_shape(fuzz_main, target_names):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
-        if concern == "core-build-diagnostic-return" and package_lock_present:
+        if concern in CORE_CONTRACT_PACKAGE_LOCK_CONCERNS and package_lock_present:
             if entries[CORE_CONTRACT_PACKAGE_LOCK_PATH][0] != "100644":
                 raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
             package_lock = _contract_blob(
@@ -2160,6 +2251,8 @@ def _safe_core_contract_tree(
         "/".join(root) for root in CORE_CONTRACT_CRATE_ROOTS
     ]:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
+    if not _core_contract_workspace_paths_shape(workspace_text):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
 
     lock_text = _contract_blob(
         repository, git_executable, repo_env, entries, "Cargo.lock",
@@ -2189,8 +2282,11 @@ def _safe_core_contract_tree(
             manifest_text = payload.decode("utf-8", "strict")
         except UnicodeDecodeError:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
-        if re.search(r"(?m)^\s*build\s*=", manifest_text) is not None:
-            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_build")
+        if not _core_contract_crate_manifest_shape(manifest_text):
+            raise Refusal(
+                "bootstrap_snapshot_invalid", "bootstrap",
+                core_check="package_build" if "build" in manifest_text else "package_decode",
+            )
     tree_kind = CORE_CONTRACT_TREE_BY_CONCERN[concern]
     if concern == "core-build-diagnostic-return" and package_lock_present:
         tree_kind = CORE_CONTRACT_PACKAGE_LOCK_TREE

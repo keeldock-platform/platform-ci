@@ -150,7 +150,7 @@ test('accepts a one-file patch only for an exact reviewed Rust path', () => {
   }), DevelopmentFeedbackError);
 });
 
-test('bounds the reviewed Rust path list at the batch four headroom', () => {
+test('bounds the reviewed Rust path list at the four crate headroom', () => {
   assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.reviewedRustPaths, 512);
   const payload = rustPatch();
   const reviewed = (count) => ['src/lib.rs', ...Array.from({ length: count - 1 }, (_, index) => `src/module_${index}.rs`)];

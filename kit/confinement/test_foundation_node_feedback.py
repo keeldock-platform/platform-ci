@@ -454,13 +454,22 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         def add_stray_file(source):
             (source / "packages/stray.txt").touch()
 
+        def add_hidden_file(source):
+            (source / "packages/.hidden").touch()
+
+        def add_case_variant(source):
+            (source / "packages/Kernel-I18n.json").touch()
+
         def remove_host_api(source):
             shutil.rmtree(source / "packages/host-api")
 
         def remove_kernel(source):
             shutil.rmtree(source / "packages/kernel-i18n")
 
-        for mutate in (add_third, add_stray_file, remove_host_api, remove_kernel):
+        for mutate in (
+            add_third, add_stray_file, add_hidden_file, add_case_variant, remove_host_api,
+            remove_kernel,
+        ):
             with self.subTest(mutation=mutate.__name__, mode="bootstrap"):
                 self._refused(
                     "bootstrap", "lock", "core_node_lock_return", mutate,
@@ -729,6 +738,35 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         self.assertIsNone(outcome["failed_stage"])
         self.assertEqual(outcome["node_reviewed_file_count"], 24)
         self.assertEqual(outcome["node_reviewed_paths_sha256"], "a" * 64)
+
+    def test_reviewed_file_count_bound_covers_two_packages(self):
+        self.assertEqual(subject.MAX_NODE_REVIEWED_FILES, 10 + 2 * (64 + 64))
+        self.assertEqual(len(subject.NODE_FIXED_FILES), 10)
+        rust_outcome = {
+            "selected_gates": subject.RUST_FOUNDATION_GATES,
+            "completed": subject.RUST_FOUNDATION_GATES, "failed_stage": None,
+            "returncode": 0, "stdout": b"", "stderr": b"",
+            "stdout_truncated": False, "stderr_truncated": False,
+        }
+        for count, accepted in (
+            (4, False), (5, True), (subject.MAX_NODE_REVIEWED_FILES, True),
+            (subject.MAX_NODE_REVIEWED_FILES + 1, False),
+        ):
+            node_result = {
+                "mode": "verify", "status": "passed", "stages": subject.NODE_GATE_NAMES,
+                "node_reviewed_file_count": count, "node_reviewed_paths_sha256": "a" * 64,
+            }
+            with self.subTest(count=count):
+                if accepted:
+                    outcome = subject.extend_diagnostic_outcome(
+                        dict(rust_outcome), lambda: node_result, FakeContract("verify"),
+                    )
+                    self.assertEqual(outcome["node_reviewed_file_count"], count)
+                else:
+                    with self.assertRaises(ValueError):
+                        subject.extend_diagnostic_outcome(
+                            dict(rust_outcome), lambda: node_result, FakeContract("verify"),
+                        )
 
     def test_node_cleanup_refusal_propagates_without_diagnostic_payload(self):
         rust_outcome = {

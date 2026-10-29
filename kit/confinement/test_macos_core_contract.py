@@ -1506,7 +1506,7 @@ class DiffCapTests(unittest.TestCase):
                 time.monotonic() + 120,
             )
 
-    def test_diff_cap_constant_admits_the_batch_four_size(self):
+    def test_diff_cap_constant_admits_the_four_crate_contract_size(self):
         self.assertEqual(subject.MAX_DIFF_BYTES, 6 * 1024 * 1024)
         self.assertGreater(subject.MAX_DIFF_BYTES, 3_723_563)
 

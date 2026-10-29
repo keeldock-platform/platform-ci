@@ -40,6 +40,7 @@ MAX_PACKAGE_JSON_BYTES = 256 * 1024
 MAX_LOCK_BYTES = 4 * 1024 * 1024 - 64 * 1024
 MAX_RUST_FILE_BYTES = 1024 * 1024
 MAX_RUST_PATHS = 512
+MAX_NODE_REVIEWED_FILES = 10 + 2 * (64 + 64)
 MAX_PATCH_BYTES = 1024 * 1024
 MAX_NODE_INPUT_BYTES = 6 * 1024 * 1024
 MAX_CIPHERTEXT_BYTES = 4 * 1024 * 1024
@@ -719,10 +720,12 @@ def _source_root_files(*, include_fuzz=False):
     return tuple(paths)
 
 
-def _rust_format_patch(source, formatted, reviewed_paths, worker_uid):
+def _rust_format_patch(source, formatted, reviewed_paths, worker_uid, deadline):
     chunks = []
     total = 0
     for relative in reviewed_paths:
+        if type(deadline) not in (int, float) or deadline <= time.monotonic():
+            _refuse("command_failed")
         before = _read_file(source / relative, maximum=MAX_RUST_FILE_BYTES)
         after = _read_worker_file(formatted / relative, worker_uid, MAX_RUST_FILE_BYTES)
         if before == after:
@@ -765,7 +768,7 @@ def run_source_profile(dispatch, source, worker_storage, worker_uid, environment
         formatted = worker_storage / "feedback-rust-format"
         _copy_reviewed_files(source, formatted, copy_paths, worker_uid, capability.PROBE_PRIMARY_GID)
         commands = [("feedback_format", (
-            tools["cargo"], "fmt", "--manifest-path", str(formatted / "Cargo.toml"), "--all",
+            tools["cargo"], "--offline", "fmt", "--manifest-path", str(formatted / "Cargo.toml"), "--all",
         ))]
         if validated_fuzz_workspace:
             commands.append(("feedback_parser_format", (
@@ -786,7 +789,7 @@ def run_source_profile(dispatch, source, worker_storage, worker_uid, environment
                 os.chdir(source)
             except OSError:
                 _refuse("cleanup_incomplete")
-        patch = _rust_format_patch(source, formatted, reviewed_paths, worker_uid)
+        patch = _rust_format_patch(source, formatted, reviewed_paths, worker_uid, deadline)
         return {"payload_bytes": patch, "expected_manifest": None,
                 "reviewed_rust_paths": list(reviewed_paths), "source_result": "command_completed"}
 
@@ -812,7 +815,7 @@ def build_diagnostic_payload(outcome):
         reviewed_count = outcome.get("node_reviewed_file_count")
         reviewed_digest = outcome.get("node_reviewed_paths_sha256")
         if selected == DIAGNOSTIC_GATE_SELECTIONS[-1]:
-            if (type(reviewed_count) is not int or not 5 <= reviewed_count <= 133
+            if (type(reviewed_count) is not int or not 5 <= reviewed_count <= MAX_NODE_REVIEWED_FILES
                     or type(reviewed_digest) is not str
                     or SHA256_RE.fullmatch(reviewed_digest) is None):
                 _refuse("capture_invalid")

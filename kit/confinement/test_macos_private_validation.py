@@ -470,6 +470,27 @@ class SourceRefTests(unittest.TestCase):
         )
 
 
+CRATE_MANIFEST = (
+    chr(35) + " Synthetic crate manifest.\n"
+    "[package]\n"
+    "name = \"synthetic-crate\"\n"
+    "description = \"Synthetic crate: used only by the tree tests.\"\n"
+    "version.workspace = true\n"
+    "edition.workspace = true\n"
+    "rust-version.workspace = true\n"
+    "publish.workspace = true\n"
+    "\n"
+    "[dependencies]\n"
+    "keeldock-host-api = { workspace = true }\n"
+    "\n"
+    "[dev-dependencies]\n"
+    "keeldock-host-mock = { workspace = true }\n"
+    "\n"
+    "[lints]\n"
+    "workspace = true\n"
+)
+
+
 class CoreContractTreeTests(unittest.TestCase):
     @staticmethod
     def _module_lines(names):
@@ -483,10 +504,14 @@ class CoreContractTreeTests(unittest.TestCase):
         return (declarations + references).encode("ascii")
 
     @staticmethod
-    def _validate_feedback_tree(entries, concern, main_payload=None, workspace_text=None, lock_text=None):
+    def _validate_feedback_tree(
+        entries, concern, main_payload=None, workspace_text=None, lock_text=None, manifest_text=None,
+    ):
         digest = hashlib.sha256(b"x").hexdigest()
 
         def blob(unused_repository, unused_git, unused_environment, unused_entries, path, **unused):
+            if path.startswith("crates/") and path.endswith("/Cargo.toml"):
+                return (manifest_text or CRATE_MANIFEST).encode("utf-8")
             if path == "Cargo.toml":
                 if workspace_text is not None:
                     return workspace_text.encode("utf-8")
@@ -740,6 +765,15 @@ class CoreContractTreeTests(unittest.TestCase):
             "packages/kernel-i18n/tests/nested/key.test.ts",
             "packages/kernel-other/package.json",
             "packages/kernel-i18n-extra/src/key.ts",
+            "packages/.hidden/package.json",
+            "packages/kernel-i18n/.hidden.ts",
+            "packages/kernel-i18n/src/.hidden.ts",
+            "packages/kernel-i18n/tests/.hidden.test.ts",
+            "packages/Kernel-I18n/src/key.ts",
+            "packages/KERNEL-I18N/package.json",
+            "packages/Host-Api/src/ids.ts",
+            "packages/kernel-i18n/src/Key.ts",
+            "packages/kernel-i18n/Package.json",
         ):
             with self.subTest(path=path):
                 self.assertFalse(subject._core_contract_foundation_path(path))
@@ -750,26 +784,198 @@ class CoreContractTreeTests(unittest.TestCase):
         path = subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
         for concern in subject.CORE_CONTRACT_CONCERNS:
             with self.subTest(concern=concern):
-                expected = "100644" if concern == "core-build-diagnostic-return" else None
+                expected = "100644" if concern in (
+                    "core-build-diagnostic-return", "core-rust-format-return",
+                ) else None
                 self.assertEqual(
                     subject._core_contract_expected_mode(path, concern=concern), expected,
                 )
 
-    def test_root_package_lock_is_admitted_only_for_build_diagnostic_verification(self):
+    def test_root_package_lock_is_admitted_for_build_diagnostic_and_format_return_only(self):
         path = subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
         self.assertIsNone(subject._core_contract_expected_mode(path))
         self.assertIsNone(subject._core_contract_expected_mode(
             path, concern="core-node-lock-return",
         ))
-        self.assertIsNone(subject._core_contract_expected_mode(
-            path, concern="core-rust-format-return",
-        ))
-        self.assertEqual(subject._core_contract_expected_mode(
-            path, concern="core-build-diagnostic-return",
-        ), "100644")
-        self.assertIsNone(subject._core_contract_expected_mode(
-            "Package-lock.json", concern="core-build-diagnostic-return",
-        ))
+        for concern in ("core-rust-format-return", "core-build-diagnostic-return"):
+            with self.subTest(concern=concern):
+                self.assertEqual(
+                    subject._core_contract_expected_mode(path, concern=concern), "100644",
+                )
+                self.assertIsNone(subject._core_contract_expected_mode(
+                    "Package-lock.json", concern=concern,
+                ))
+
+    @staticmethod
+    def _four_crate_entries(concern):
+        entries = CoreContractTreeTests._required_core_contract_entries(concern)
+        extra = set(subject.CORE_CONTRACT_KERNEL_FEEDBACK_FILES) | {
+            "crates/kernel/i18n/src/pattern/parser.rs",
+            "crates/kernel/i18n/tests/message_keys.rs",
+            "packages/kernel-i18n/src/index.ts",
+            "packages/kernel-i18n/src/key.ts",
+            "packages/kernel-i18n/tests/key.test.ts",
+            subject.CORE_CONTRACT_PACKAGE_LOCK_PATH,
+        }
+        entries.update({path: ("100644", "a" * 40) for path in extra})
+        return entries
+
+    def test_four_crate_two_package_tree_is_admitted_by_format_return_and_diagnostics(self):
+        for concern, tree in (
+            ("core-rust-format-return", "core_rust_format_return"),
+            ("core-build-diagnostic-return", subject.CORE_CONTRACT_PACKAGE_LOCK_TREE),
+        ):
+            with self.subTest(concern=concern):
+                entries = self._four_crate_entries(concern)
+                members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+                marker, blob = self._validate_feedback_tree(
+                    entries, concern, workspace_text=self._workspace_text(members),
+                )
+                self.assertEqual(marker, tree)
+                lock_calls = [
+                    call for call in blob.call_args_list
+                    if call.args[4] == subject.CORE_CONTRACT_PACKAGE_LOCK_PATH
+                ]
+                self.assertEqual(len(lock_calls), 1)
+                self.assertEqual(lock_calls[0].kwargs["max_bytes"], subject.MAX_FEEDBACK_LOCK_BYTES)
+
+    def test_package_lock_is_refused_for_node_lock_return_and_non_regular_modes(self):
+        entries = self._four_crate_entries("core-node-lock-return")
+        self.assertEqual(self._refused_check(entries, "core-node-lock-return"), "path_mode")
+        for concern in ("core-rust-format-return", "core-build-diagnostic-return"):
+            changed = self._four_crate_entries(concern)
+            changed[subject.CORE_CONTRACT_PACKAGE_LOCK_PATH] = ("100755", "a" * 40)
+            with self.subTest(concern=concern):
+                self.assertEqual(self._refused_check(changed, concern), "path_mode")
+
+    def test_format_return_refuses_a_package_lock_without_the_foundation_files(self):
+        concern = "core-rust-format-return"
+        entries = {
+            path: entry for path, entry in self._required_core_contract_entries(concern).items()
+            if not subject._core_contract_foundation_path(path)
+        }
+        entries[subject.CORE_CONTRACT_PACKAGE_LOCK_PATH] = ("100644", "a" * 40)
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(dict(entries), entries),
+        ), self.assertRaises(subject.Refusal) as refusal:
+            subject._safe_core_contract_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40, concern=concern,
+            )
+        self.assertEqual(refusal.exception.core_check, "required_files")
+
+    def test_crate_manifest_shape_admits_only_the_sections_and_keys_in_use(self):
+        self.assertTrue(subject._core_contract_crate_manifest_shape(CRATE_MANIFEST))
+        minimal = (
+            '[package]\nname = "synthetic-crate"\n\n[dependencies]\n\n[lints]\nworkspace = true\n'
+        )
+        self.assertTrue(subject._core_contract_crate_manifest_shape(minimal))
+
+    def test_crate_manifest_shape_refuses_every_build_bypass_form(self):
+        header = '[package]\nname = "synthetic-crate"\n'
+        for name, text in (
+            ("plain", header + 'build = "build.rs"\n'),
+            ("quoted key", header + '"build" = "build.rs"\n'),
+            ("quoted dotted key", header + '"package"."build" = "build.rs"\n'),
+            ("single quoted key", header + "'build' = 'build.rs'\n"),
+            ("disabled", header + "build = false\n"),
+            ("inline package table", 'package = { name = "synthetic-crate", build = "build.rs" }\n'),
+            ("dotted package key", 'package.build = "build.rs"\n' + header),
+            ("spaced key", header + 'build   =   "build.rs"\n'),
+            ("build dependencies", header + '[build-dependencies]\nkeeldock-host-api = { workspace = true }\n'),
+            ("trailing comment", header + 'build = "b.rs" ' + chr(35) + " note\n"),
+        ):
+            with self.subTest(form=name):
+                self.assertFalse(subject._core_contract_crate_manifest_shape(text))
+
+    def test_crate_manifest_shape_refuses_proc_macro_lib_paths_and_path_dependencies(self):
+        header = '[package]\nname = "synthetic-crate"\n'
+        for name, text in (
+            ("proc macro", header + "[lib]\nproc-macro = true\n"),
+            ("lib path outside", header + '[lib]\npath = "../outside/lib.rs"\n'),
+            ("lib path inside", header + '[lib]\npath = "src/lib.rs"\n'),
+            ("bin section", header + '[[bin]]\nname = "tool"\npath = "src/main.rs"\n'),
+            ("test section", header + '[[test]]\nname = "contract"\npath = "tests/main.rs"\n'),
+            ("path dependency", header + '[dependencies]\nevil = { path = "../evil" }\n'),
+            ("member name with path", header + '[dependencies]\nkeeldock-host-api = { path = "../x" }\n'),
+            ("workspace and path", header + '[dependencies]\nkeeldock-host-api = { workspace = true, path = "../x" }\n'),
+            ("dev dependency path", header + '[dev-dependencies]\nkeeldock-host-mock = { path = "../x" }\n'),
+            ("dotted dependency path", header + '[dependencies]\nkeeldock-host-api.path = "../x"\n'),
+            ("version dependency", header + '[dependencies]\nkeeldock-host-api = "1.0.0"\n'),
+            ("unknown dependency", header + '[dependencies]\nserde = { workspace = true }\n'),
+            ("target table", header + "[target.'cfg(unix)'.dependencies]\n"),
+            ("package metadata", header + "[package.metadata]\n"),
+            ("workspace section", header + "[workspace]\n"),
+            ("patch section", header + '[patch.crates-io]\nserde = { path = "../x" }\n'),
+            ("features", header + "[features]\n"),
+            ("links key", header + 'links = "native"\n'),
+            ("autobins key", header + "autobins = true\n"),
+            ("literal version", header + 'version = "1.0.0"\n'),
+            ("inherited false", header + "version.workspace = false\n"),
+            ("duplicate section", header + header),
+            ("duplicate key", header + 'name = "other"\n'),
+            ("key before section", 'name = "synthetic-crate"\n' + header),
+            ("continuation line", header + 'description = "first\n  second"\n'),
+            ("array value", header + 'name = ["synthetic-crate"]\n'),
+            ("description escape", header + 'description = "a\\"b"\n'),
+            ("carriage return", header.replace("\n", "\r\n")),
+            ("missing package", "[dependencies]\n"),
+            ("missing name", "[package]\nversion.workspace = true\n"),
+            ("empty", ""),
+        ):
+            with self.subTest(form=name):
+                self.assertFalse(subject._core_contract_crate_manifest_shape(text))
+
+    def test_tree_refuses_each_crate_manifest_bypass_with_a_tagged_check(self):
+        concern = "core-rust-format-return"
+        entries = self._required_core_contract_entries(concern)
+        header = '[package]\nname = "synthetic-crate"\n'
+        for text, check in (
+            (header + 'build = "build.rs"\n', "package_build"),
+            (header + '"build" = "build.rs"\n', "package_build"),
+            ('package = { name = "x", build = "build.rs" }\n', "package_build"),
+            (header + "[lib]\nproc-macro = true\n", "package_decode"),
+            (header + '[lib]\npath = "../outside/lib.rs"\n', "package_decode"),
+            (header + '[dependencies]\nevil = { path = "../evil" }\n', "package_decode"),
+            (header + '[[test]]\nname = "contract"\n', "package_decode"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self._refused_check(entries, concern, manifest_text=text), check,
+                )
+
+    def test_workspace_paths_shape_admits_only_the_two_member_path_dependencies(self):
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        base = self._workspace_text(members)
+        allowed = (
+            "[workspace.package]\nversion = \"0.1.0\"\n\n[workspace.dependencies]\n"
+            'keeldock-host-api = { path = "crates/host/api" }\n'
+            'keeldock-host-mock = { path = "crates/host/mock" }\n\n'
+            "[workspace.lints.rust]\nunsafe_code = \"forbid\"\n"
+        )
+        self.assertTrue(subject._core_contract_workspace_paths_shape(base))
+        self.assertTrue(subject._core_contract_workspace_paths_shape(base + allowed))
+        for name, extra in (
+            ("outside path", '[workspace.dependencies]\nevil = { path = "../evil" }\n'),
+            ("member name wrong path", '[workspace.dependencies]\nkeeldock-host-api = { path = "crates/host/mock" }\n'),
+            ("member name outside path", '[workspace.dependencies]\nkeeldock-host-api = { path = "../api" }\n'),
+            ("duplicate", '[workspace.dependencies]\nkeeldock-host-api = { path = "crates/host/api" }\nkeeldock-host-api = { path = "crates/host/api" }\n'),
+            ("quoted key", '[workspace.dependencies]\n"evil" = { "path" = "../evil" }\n'),
+            ("dotted key", '[workspace.dependencies]\nevil.path = "../evil"\n'),
+            ("dependency table", '[workspace.dependencies.evil]\npath = "../evil"\n'),
+            ("patch", '[patch.crates-io]\nevil = { path = "../evil" }\n'),
+            ("replace", '[replace]\n"evil:1.0.0" = { path = "../evil" }\n'),
+            ("dependencies", '[dependencies]\nevil = { path = "../evil" }\n'),
+            ("array section", '[[bin]]\nname = "tool"\n'),
+        ):
+            with self.subTest(form=name):
+                self.assertFalse(subject._core_contract_workspace_paths_shape(base + extra))
+                self.assertEqual(
+                    self._refused_check(
+                        self._required_core_contract_entries("core-rust-format-return"),
+                        "core-rust-format-return", workspace_text=base + extra,
+                    ),
+                    "workspace_members",
+                )
 
     def test_build_diagnostic_tree_marker_distinguishes_optional_root_lock(self):
         concern = "core-build-diagnostic-return"
@@ -1301,6 +1507,23 @@ class CoreContractTreeTests(unittest.TestCase):
                 (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
                 ("bootstrap_snapshot_invalid", "bootstrap", "tree_entries"),
             )
+
+    def test_contract_tree_parser_refuses_case_variants_and_hidden_traversal(self):
+        for first, second in (
+            ("packages/kernel-i18n/package.json", "packages/Kernel-I18n/package.json"),
+            ("packages/host-api/src/ids.ts", "packages/host-api/src/IDS.ts"),
+            ("packages/kernel-i18n/src/key.ts", "packages/kernel-i18n/src/./key.ts"),
+        ):
+            payload = b"".join(
+                b"100644 blob " + b"a" * 40 + b"\t" + path.encode("utf-8") + b"\x00"
+                for path in (first, second)
+            )
+            result = subject.subprocess.CompletedProcess(("git",), 0, payload, b"")
+            with self.subTest(first=first, second=second), patch.object(
+                subject, "_run_process", return_value=result,
+            ), self.assertRaises(subject.Refusal) as refusal:
+                subject._contract_tree_entries("repository", "/usr/bin/git", {}, "a" * 40)
+            self.assertEqual(refusal.exception.core_check, "tree_entries")
 
     @staticmethod
     def _required_core_contract_entries(concern="core-contract"):

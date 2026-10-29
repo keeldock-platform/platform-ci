@@ -7,6 +7,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -459,7 +460,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                 calls.append(("command", args[1], args[6], kwargs))
                 return command_result
 
-            def record_patch(source_path, formatted, paths, worker_uid):
+            def record_patch(source_path, formatted, paths, worker_uid, deadline):
                 calls.append(("patch", source_path, formatted, tuple(paths), worker_uid))
                 return b"synthetic-format-patch"
 
@@ -485,7 +486,8 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertNotIn("fuzz/corpus/seed", copied_paths)
         format_calls = [call for call in calls if call[0] == "command"]
         self.assertEqual([call[2] for call in format_calls], ["feedback_format", "feedback_parser_format"])
-        self.assertEqual(format_calls[0][1][3], str(worker_storage / "feedback-rust-format/Cargo.toml"))
+        self.assertEqual(format_calls[0][1][1:3], ("--offline", "fmt"))
+        self.assertEqual(format_calls[0][1][4], str(worker_storage / "feedback-rust-format/Cargo.toml"))
         self.assertEqual(format_calls[1][1][5], str(worker_storage / "feedback-rust-format/fuzz/Cargo.toml"))
         self.assertEqual(format_calls[1][1][1:3], ("--locked", "--offline"))
         self.assertTrue(all(call[3]["allow_nonzero_capture"] for call in format_calls))
@@ -631,7 +633,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertEqual(result["reviewed_rust_paths"], list(kernel_paths))
         self.assertEqual(result["payload_bytes"], b"synthetic-format-patch")
 
-    def test_reviewed_rust_path_cap_admits_batch_four_and_is_enforced_at_the_boundary(self):
+    def test_reviewed_rust_path_cap_admits_the_four_crate_contract_and_is_enforced_at_the_boundary(self):
         self.assertGreater(producer.MAX_RUST_PATHS, 368)
         self.assertEqual(producer.MAX_RUST_PATHS, 512)
         for count, accepted in ((producer.MAX_RUST_PATHS, True), (producer.MAX_RUST_PATHS + 1, False)):
@@ -649,6 +651,58 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                         with self.assertRaises(producer.FeedbackRefusal) as raised:
                             producer._reviewed_rust_paths(source)
                         self.assertEqual(raised.exception.reason, "manifest_invalid")
+
+    def test_node_reviewed_file_bound_matches_the_foundation_adapter_and_two_packages(self):
+        spec = importlib.util.spec_from_file_location(
+            "foundation_node_feedback_bound",
+            Path(__file__).resolve().parent / "foundation_node_feedback.py",
+        )
+        foundation = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(foundation)
+        self.assertEqual(producer.MAX_NODE_REVIEWED_FILES, 10 + 2 * (64 + 64))
+        self.assertEqual(producer.MAX_NODE_REVIEWED_FILES, foundation.MAX_NODE_REVIEWED_FILES)
+        selected = producer.DIAGNOSTIC_GATE_SELECTIONS[-1]
+        for count, accepted in (
+            (4, False), (5, True), (producer.MAX_NODE_REVIEWED_FILES, True),
+            (producer.MAX_NODE_REVIEWED_FILES + 1, False),
+        ):
+            outcome = {
+                "failed_stage": None, "selected_gates": selected, "completed": selected,
+                "returncode": 0, "stdout": b"", "stderr": b"",
+                "stdout_truncated": False, "stderr_truncated": False,
+                "node_reviewed_file_count": count, "node_reviewed_paths_sha256": "a" * 64,
+            }
+            with self.subTest(count=count):
+                if accepted:
+                    self.assertIn(
+                        b"node_reviewed_file_count=" + str(count).encode("ascii"),
+                        producer.build_diagnostic_payload(outcome),
+                    )
+                else:
+                    with self.assertRaises(producer.FeedbackRefusal):
+                        producer.build_diagnostic_payload(outcome)
+
+    def test_format_patch_loop_refuses_an_expired_deadline_before_reading_files(self):
+        with patch.object(producer, "_read_file") as read_file, \
+                patch.object(producer, "_read_worker_file") as read_worker:
+            for deadline in (time.monotonic() - 1, 0, None, "later"):
+                with self.subTest(deadline=deadline), self.assertRaises(producer.FeedbackRefusal) as raised:
+                    producer._rust_format_patch(
+                        Path("/synthetic-source"), Path("/synthetic-formatted"),
+                        ("crates/kernel/i18n/src/lib.rs",), 501, deadline,
+                    )
+                self.assertEqual(raised.exception.reason, "command_failed")
+        read_file.assert_not_called()
+        read_worker.assert_not_called()
+
+    def test_format_patch_loop_runs_while_the_deadline_is_open(self):
+        with patch.object(producer, "_read_file", return_value=b"fn a(){}\n"), \
+                patch.object(producer, "_read_worker_file", return_value=b"fn a() {}\n"):
+            payload = producer._rust_format_patch(
+                Path("/synthetic-source"), Path("/synthetic-formatted"),
+                ("crates/kernel/i18n/src/lib.rs",), 501, time.monotonic() + 600,
+            )
+        self.assertTrue(payload.startswith(b"diff --git a/crates/kernel/i18n/src/lib.rs "))
 
     def test_cli_accepts_only_fixed_run_and_publisher_shapes(self):
         kind, core_args = producer._parse_cli([

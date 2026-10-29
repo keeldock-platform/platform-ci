@@ -177,7 +177,7 @@ class FeedbackAdminTests(unittest.TestCase):
         module.collect_feedback_evidence = lambda api, request, **kwargs: evidence
         return mock.patch.dict(sys.modules, {"feedback_api": module})
 
-    def test_reviewed_rust_path_list_is_bounded_at_the_batch_four_headroom(self):
+    def test_reviewed_rust_path_list_is_bounded_at_the_four_crate_headroom(self):
         def paths(count):
             return ["crates/kernel/i18n/src/module_" + str(index) + ".rs" for index in range(count)]
 
