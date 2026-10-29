@@ -721,7 +721,7 @@ class CargoLockProducerTests(unittest.TestCase):
         self.assertEqual(worker_uid, 501)
         self.assertEqual(args[4:8], ("/trusted/python", args[5], "feedback_lock", 10**12))
         self.assertTrue(kwargs["allow_nonzero_capture"])
-        self.assertEqual(command[0], "/trusted/cargo")
+        self.assertEqual(command[0], str(Path("/trusted/cargo")))
         self.assertEqual(command[1:-3], self.bootstrap.bootstrap_config_arguments())
         self.assertEqual(command[-3:], ("generate-lockfile", "--manifest-path", str(project / "Cargo.toml")))
         self.assertEqual(

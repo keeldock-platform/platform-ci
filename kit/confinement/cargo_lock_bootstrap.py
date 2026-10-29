@@ -83,7 +83,16 @@ MANIFEST_PIN_RE = re.compile(
     r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z"
 )
 DEPENDENCY_TABLE_NAMES = ("dependencies", "dev-dependencies", "build-dependencies")
-FORBIDDEN_MANIFEST_TABLES = frozenset(("patch", "replace", "source"))
+REQUIRED_EDITION = "2024"
+ALLOWED_TOP_TABLES = frozenset((
+    "package", "lib", "bin", "example", "test", "bench", "dependencies", "dev-dependencies",
+    "build-dependencies", "target", "features", "workspace", "profile", "lints",
+))
+ALLOWED_TARGET_KEYS = frozenset(("dependencies", "dev-dependencies", "build-dependencies"))
+ALLOWED_WORKSPACE_KEYS = frozenset((
+    "members", "exclude", "default-members", "resolver", "package", "dependencies", "metadata",
+    "lints",
+))
 ARRAY_TABLE_NAMES = frozenset(("bin", "example", "test", "bench"))
 DEPENDENCY_SPEC_KEYS = frozenset((
     "version", "path", "features", "default-features", "default_features", "optional",
@@ -197,13 +206,17 @@ def bootstrap_config_arguments():
     return tuple(arguments)
 
 
+def _absolute(value):
+    return os.path.isabs(value) or posixpath.isabs(value)
+
+
 def generate_lockfile_command(cargo_executable, manifest_path):
     """Return the one Cargo command that resolves a lock without building or running code."""
     for value in (cargo_executable, manifest_path):
-        if (type(value) is not str or not value.startswith("/") or len(value) > 4096
+        if (type(value) is not str or not _absolute(value) or len(value) > 4096
                 or "\x00" in value or "\n" in value or "\r" in value):
             _refuse("bootstrap_input_invalid")
-    if not manifest_path.endswith("/Cargo.toml"):
+    if os.path.basename(manifest_path) != "Cargo.toml":
         _refuse("bootstrap_input_invalid")
     return (cargo_executable,) + bootstrap_config_arguments() + (
         "generate-lockfile", "--manifest-path", manifest_path,
@@ -227,7 +240,7 @@ def injected_environment_names(parent):
 
 def _environment_text(value, absolute):
     if (type(value) is not str or not value or len(value) > 4096 or "\x00" in value
-            or "\n" in value or "\r" in value or (absolute and not value.startswith("/"))):
+            or "\n" in value or "\r" in value or (absolute and not _absolute(value))):
         _refuse("bootstrap_environment_refused")
     return value
 
@@ -542,12 +555,29 @@ def _check_dependency(name, spec, directory, members):
     _check_pin(spec["version"])
 
 
-def _check_document(document, directory, members):
-    if set(document) & FORBIDDEN_MANIFEST_TABLES:
+def _check_workspace_members(workspace, members):
+    listed = workspace.get("members")
+    if (type(listed) is not list or any(type(item) is not str for item in listed)
+            or len(set(listed)) != len(listed) or set(listed) != set(members)):
+        _manifest_refuse()
+    if "exclude" in workspace and workspace["exclude"] != []:
+        _manifest_refuse()
+    if "default-members" in workspace:
+        default = workspace["default-members"]
+        if (type(default) is not list or any(type(item) is not str for item in default)
+                or len(set(default)) != len(default) or set(default) != set(members)):
+            _manifest_refuse()
+
+
+def _check_document(document, directory, members, is_root):
+    if set(document) - ALLOWED_TOP_TABLES:
         _manifest_refuse()
     workspace = document.get("workspace")
-    if workspace is not None and (
-            type(workspace) is not dict or set(workspace) & FORBIDDEN_MANIFEST_TABLES):
+    if workspace is not None:
+        if not is_root or type(workspace) is not dict or set(workspace) - ALLOWED_WORKSPACE_KEYS:
+            _manifest_refuse()
+        _check_workspace_members(workspace, members)
+    elif is_root:
         _manifest_refuse()
     tables = [document[name] for name in DEPENDENCY_TABLE_NAMES if name in document]
     target = document.get("target")
@@ -555,7 +585,7 @@ def _check_document(document, directory, members):
         if type(target) is not dict:
             _manifest_refuse()
         for entry in target.values():
-            if type(entry) is not dict or set(entry) & FORBIDDEN_MANIFEST_TABLES:
+            if type(entry) is not dict or set(entry) - ALLOWED_TARGET_KEYS:
                 _manifest_refuse()
             tables.extend(entry[name] for name in DEPENDENCY_TABLE_NAMES if name in entry)
     if workspace is not None and "dependencies" in workspace:
@@ -567,10 +597,23 @@ def _check_document(document, directory, members):
             _check_dependency(name, spec, directory, members)
     package = document.get("package")
     if package is None:
-        return None
-    if type(package) is not dict or type(package.get("name")) is not str:
+        return None, None
+    if (type(package) is not dict or type(package.get("name")) is not str
+            or "workspace" in package or "edition" not in package):
         _manifest_refuse()
-    return package["name"]
+    return package["name"], package["edition"]
+
+
+def _check_edition(edition, root_document):
+    if edition == REQUIRED_EDITION and type(edition) is str:
+        return
+    if type(edition) is dict and edition == {"workspace": True}:
+        workspace = root_document.get("workspace")
+        shared = workspace.get("package") if type(workspace) is dict else None
+        if type(shared) is dict and type(shared.get("edition")) is str \
+                and shared["edition"] == REQUIRED_EDITION:
+            return
+    _manifest_refuse()
 
 
 def check_manifests(manifests, members):
@@ -578,21 +621,26 @@ def check_manifests(manifests, members):
 
     Only exact version pins from the default registry and path dependencies that name a
     fixed workspace member are accepted. Git, registry, registry-index, any other path and
-    any patch, replace or source table are refused, and so is anything that cannot be parsed.
-    Returns the package names the manifests declare.
+    every table outside the allowlist are refused, so are the underscore spellings of the
+    dependency tables, a project table, a package workspace key, a workspace member list
+    that differs from the fixed members, and any package without edition 2024. Anything
+    that cannot be parsed is refused. Returns the package names the manifests declare.
     """
     if (type(manifests) is not dict or type(members) not in (set, frozenset, tuple)
             or not 1 <= len(manifests) <= MAX_MANIFESTS or "Cargo.toml" not in manifests):
         _manifest_refuse()
     member_set = frozenset(members)
     allowed = {"Cargo.toml"} | {member + "/Cargo.toml" for member in member_set}
-    names = set()
-    for path, data in manifests.items():
+    for path in manifests:
         if type(path) is not str or path not in allowed:
             _manifest_refuse()
+    documents = {path: _parse_manifest(manifests[path]) for path in sorted(manifests)}
+    names = set()
+    for path, document in documents.items():
         directory = posixpath.dirname(path) or "."
-        name = _check_document(_parse_manifest(data), directory, member_set)
+        name, edition = _check_document(document, directory, member_set, path == "Cargo.toml")
         if name is not None:
+            _check_edition(edition, documents["Cargo.toml"])
             if name in names:
                 _manifest_refuse()
             names.add(name)
@@ -710,8 +758,9 @@ class RegistryFetcher:
     """Fetch index entries and version metadata from the two fixed crates.io origins only."""
 
     def __init__(self, opener=None):
+        self._proxy_handler = urllib.request.ProxyHandler({})
         self._opener = opener if opener is not None else urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), _NoRedirect(),
+            self._proxy_handler, _NoRedirect(),
         )
 
     def _get(self, host, path, limit, accept):

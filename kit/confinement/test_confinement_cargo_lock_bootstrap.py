@@ -507,11 +507,17 @@ class RegistryFetcherTests(BootstrapTestCase):
             self.assertEqual(timeout, subject.FETCH_TIMEOUT_SECONDS)
             self.assertEqual(headers.get("User-agent"), subject.USER_AGENT)
         default = subject.RegistryFetcher()
-        proxies = [
-            handler for handler in default._opener.handlers
-            if isinstance(handler, urllib.request.ProxyHandler)
-        ]
-        self.assertEqual([handler.proxies for handler in proxies], [{}])
+        self.assertIsInstance(default._proxy_handler, urllib.request.ProxyHandler)
+        self.assertEqual(default._proxy_handler.proxies, {})
+        self.assertEqual(
+            [handler for handler in default._opener.handlers
+             if isinstance(handler, urllib.request.ProxyHandler) and handler.proxies],
+            [],
+        )
+        self.assertFalse(any(
+            hasattr(handler, "https_open") and isinstance(handler, urllib.request.ProxyHandler)
+            for handler in default._opener.handlers
+        ))
         self.assertTrue(any(isinstance(handler, subject._NoRedirect) for handler in default._opener.handlers))
 
     def test_redirects_errors_bad_status_and_oversize_bodies_are_refused(self):
@@ -715,20 +721,20 @@ ROOT_MANIFEST = (
 )
 API_MANIFEST = (
     HASH + " a comment\n"
-    '[package]\nname = "host-api"\nversion = "0.1.0"\nedition = "2021"\n\n'
+    '[package]\nname = "host-api"\nversion = "0.1.0"\nedition = "2024"\n\n'
     "[dependencies]\n"
     'serde = { version = "=1.0.200", features = [\n  "derive",\n], default-features = false }\n'
     'shared = { workspace = true }\n'
 )
 MOCK_MANIFEST = (
-    '[package]\nname = "host-mock"\nversion = "0.1.0"\n\n'
+    '[package]\nname = "host-mock"\nversion = "0.1.0"\nedition = "2024"\n\n'
     '[dependencies]\nhost-api = { path = "../api", version = "=0.1.0" }\n\n'
     '[dev-dependencies]\nserde_json = "=1.0.100"\n\n'
     '[build-dependencies]\ncc = "=1.0.83"\n\n'
     "[target.'cfg(unix)'.dependencies]\nlibc = \"=0.2.150\"\n"
 )
 CONFORMANCE_MANIFEST = (
-    '[package]\nname = "host-conformance"\nversion = "0.1.0"\n\n'
+    '[package]\nname = "host-conformance"\nversion = "0.1.0"\nedition = "2024"\n\n'
     '[dependencies.host-mock]\npath = "../mock"\n'
 )
 
@@ -777,7 +783,7 @@ class ManifestCheckTests(BootstrapTestCase):
             with self.subTest(dependency=line):
                 with self.assertRaises(subject.BootstrapRefusal) as raised:
                     subject.check_manifests(
-                        _manifests(api='[package]\nname = "host-api"\n\n[dependencies]\n' + line + "\n"),
+                        _manifests(api='[package]\nname = "host-api"\nedition = "2024"\n\n[dependencies]\n' + line + "\n"),
                         MEMBERS,
                     )
                 self.assertEqual(raised.exception.reason, "bootstrap_manifest_refused")
@@ -799,7 +805,7 @@ class ManifestCheckTests(BootstrapTestCase):
             with self.subTest(section=section):
                 with self.assertRaises(subject.BootstrapRefusal):
                     subject.check_manifests(
-                        _manifests(api='[package]\nname = "host-api"\n\n' + section), MEMBERS,
+                        _manifests(api='[package]\nname = "host-api"\nedition = "2024"\n\n' + section), MEMBERS,
                     )
         with self.assertRaises(subject.BootstrapRefusal):
             subject.check_manifests(_manifests(root=ROOT_MANIFEST + bad), MEMBERS)
@@ -887,6 +893,134 @@ class ManifestCheckTests(BootstrapTestCase):
         duplicate["crates/host/mock/Cargo.toml"] = API_MANIFEST.encode("utf-8")
         with self.assertRaises(subject.BootstrapRefusal):
             subject.check_manifests(duplicate, MEMBERS)
+
+    def assert_manifest_refused(self, manifests):
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            subject.check_manifests(manifests, MEMBERS)
+        self.assertEqual(raised.exception.reason, "bootstrap_manifest_refused")
+
+    def test_underscore_dependency_tables_are_refused_at_top_level(self):
+        git = "https:" + chr(47) * 2 + "example.invalid/crate"
+        for table in ("dev_dependencies", "build_dependencies"):
+            for body in ('a = { git = "' + git + '" }\n', 'a = "=1.0.0"\n'):
+                with self.subTest(table=table, body=body):
+                    self.assert_manifest_refused(_manifests(api=API_MANIFEST + "\n[" + table + "]\n" + body))
+
+    def test_underscore_dependency_tables_are_refused_under_target_tables(self):
+        git = "https:" + chr(47) * 2 + "example.invalid/crate"
+        for header in (
+            "[target.'cfg(unix)'.dev_dependencies]",
+            "[target.'cfg(unix)'.build_dependencies]",
+            "[target.x86_64-pc-windows-msvc.dev_dependencies]",
+            "[target.x86_64-pc-windows-msvc.build_dependencies]",
+            "[target.'cfg(unix)'.unknown]",
+        ):
+            with self.subTest(header=header):
+                self.assert_manifest_refused(
+                    _manifests(api=API_MANIFEST + "\n" + header + '\na = { git = "' + git + '" }\n')
+                )
+
+    def test_project_and_other_unknown_tables_are_refused(self):
+        for section in (
+            '[project]\nname = "host-api"\nedition = "2024"\n',
+            '[badges]\nmaintenance = "x"\n',
+            "[unknown]\na = 1\n",
+            "[cargo-features]\n",
+            "unknown_key = 1\n",
+        ):
+            with self.subTest(section=section):
+                self.assert_manifest_refused(_manifests(api=API_MANIFEST + "\n" + section))
+        self.assert_manifest_refused(
+            _manifests(api='[project]\nname = "host-api"\nedition = "2024"\n')
+        )
+
+    def test_every_package_must_declare_edition_2024(self):
+        base = '[package]\nname = "host-api"\nversion = "0.1.0"\n'
+        for api in (
+            base,
+            base + 'edition = "2021"\n',
+            base + 'edition = "2018"\n',
+            base + "edition = 2024\n",
+            base + 'edition = "2025"\n',
+            base + 'edition = { workspace = false }\n',
+            base + "edition.workspace = true\n",
+        ):
+            with self.subTest(api=api):
+                self.assert_manifest_refused(_manifests(api=api))
+        mock = dict(_manifests())
+        mock["crates/host/mock/Cargo.toml"] = MOCK_MANIFEST.replace('edition = "2024"\n', "").encode("utf-8")
+        self.assert_manifest_refused(mock)
+
+    def test_edition_may_be_inherited_only_from_a_workspace_edition_2024(self):
+        inherited = '[package]\nname = "host-api"\nversion = "0.1.0"\nedition.workspace = true\n'
+        shared = ROOT_MANIFEST + '\n[workspace.package]\nedition = "2024"\n'
+        self.assertEqual(
+            subject.check_manifests(_manifests(api=inherited, root=shared), MEMBERS),
+            frozenset(("host-api", "host-mock", "host-conformance")),
+        )
+        for root in (
+            ROOT_MANIFEST,
+            ROOT_MANIFEST + '\n[workspace.package]\nedition = "2021"\n',
+            ROOT_MANIFEST + "\n[workspace.package]\nversion = \"0.1.0\"\n",
+        ):
+            with self.subTest(root=root):
+                self.assert_manifest_refused(_manifests(api=inherited, root=root))
+
+    def test_package_workspace_key_is_refused(self):
+        for key in ('workspace = "../.."', 'workspace = "."', "workspace = true"):
+            with self.subTest(key=key):
+                self.assert_manifest_refused(_manifests(api=API_MANIFEST.replace(
+                    'edition = "2024"\n', 'edition = "2024"\n' + key + "\n", 1,
+                )))
+
+    def test_workspace_members_must_be_exactly_the_fixed_members(self):
+        def root_with(members):
+            return ROOT_MANIFEST.replace(
+                '  "crates/host/conformance",\n', "".join('  "' + item + '",\n' for item in members[2:]),
+            ).replace('  "crates/host/mock",\n', '  "' + members[1] + '",\n').replace(
+                '  "crates/host/api",\n', '  "' + members[0] + '",\n',
+            )
+
+        for members in (
+            ("crates/host/api", "crates/host/mock"),
+            ("crates/host/api", "crates/host/mock", "crates/host/conformance", "crates/host/extra"),
+            ("crates/host/api", "crates/host/api", "crates/host/mock"),
+            ("crates/host/*", "crates/host/mock", "crates/host/conformance"),
+            ("crates/host/api", "crates/host/mock", "crates/other"),
+        ):
+            with self.subTest(members=members):
+                self.assert_manifest_refused(_manifests(root=root_with(members)))
+        for root in (
+            ROOT_MANIFEST.replace("members =", "unlisted ="),
+            ROOT_MANIFEST.replace(ROOT_MANIFEST.split("\n\n", 1)[0], '[workspace]\nmembers = "crates/host/api"'),
+            '[package]\nname = "host-root"\nedition = "2024"\n',
+        ):
+            with self.subTest(root=root):
+                self.assert_manifest_refused(_manifests(root=root))
+        member_workspace = _manifests(api=API_MANIFEST + "\n[workspace]\nmembers = []\n")
+        self.assert_manifest_refused(member_workspace)
+
+    def test_exclude_and_default_members_are_refused_unless_they_match_the_fixed_expectation(self):
+        listing = '[\n  "crates/host/api",\n  "crates/host/mock",\n  "crates/host/conformance",\n]'
+        accepted = (
+            ROOT_MANIFEST.replace('resolver = "2"', 'resolver = "2"\nexclude = []'),
+            ROOT_MANIFEST.replace('resolver = "2"', 'resolver = "2"\ndefault-members = ' + listing),
+        )
+        for root in accepted:
+            with self.subTest(root=root):
+                self.assertTrue(subject.check_manifests(_manifests(root=root), MEMBERS))
+        refused = (
+            ROOT_MANIFEST.replace('resolver = "2"', 'resolver = "2"\nexclude = ["crates/host/api"]'),
+            ROOT_MANIFEST.replace('resolver = "2"', 'resolver = "2"\nexclude = "x"'),
+            ROOT_MANIFEST.replace('resolver = "2"', 'resolver = "2"\ndefault-members = ["crates/host/api"]'),
+            ROOT_MANIFEST.replace('resolver = "2"', 'resolver = "2"\ndefault-members = []'),
+            ROOT_MANIFEST.replace('resolver = "2"', 'resolver = "2"\ndefault-members = ["../x"]'),
+            ROOT_MANIFEST.replace('resolver = "2"', 'resolver = "2"\ndefault-members = "crates/host/api"'),
+            ROOT_MANIFEST.replace('resolver = "2"', 'resolver = "2"\npatch = 1'),
+        )
+        for root in refused:
+            with self.subTest(root=root):
+                self.assert_manifest_refused(_manifests(root=root))
 
     def test_sourceless_lock_packages_must_be_exactly_the_workspace_packages(self):
         self.assertTrue(subject.check_lock_members(LOCK_BYTES, frozenset(("contract-root",))))
