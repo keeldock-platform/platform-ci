@@ -76,6 +76,8 @@ MAX_MANIFEST_BYTES = 256 * 1024
 MAX_MANIFEST_LINES = 8192
 MAX_MANIFEST_VALUE_DEPTH = 8
 MAX_MANIFESTS = 16
+MAX_WORKSPACE_EXCLUDE = 64
+EXCLUDE_PATH_RE = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\Z")
 BARE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+")
 NUMBER_RE = re.compile(r"[+-]?[0-9][0-9_]*(?:\.[0-9_]+)?(?:[eE][+-]?[0-9]+)?")
 MANIFEST_PIN_RE = re.compile(
@@ -555,13 +557,27 @@ def _check_dependency(name, spec, directory, members):
     _check_pin(spec["version"])
 
 
+def _check_workspace_exclude(excluded, members):
+    if (type(excluded) is not list or len(excluded) > MAX_WORKSPACE_EXCLUDE
+            or any(type(item) is not str for item in excluded)
+            or len(set(excluded)) != len(excluded)):
+        _manifest_refuse()
+    for item in excluded:
+        if (EXCLUDE_PATH_RE.fullmatch(item) is None
+                or any(part in (".", "..") for part in item.split("/"))):
+            _manifest_refuse()
+        for member in members:
+            if member == item or member.startswith(item + "/"):
+                _manifest_refuse()
+
+
 def _check_workspace_members(workspace, members):
     listed = workspace.get("members")
     if (type(listed) is not list or any(type(item) is not str for item in listed)
             or len(set(listed)) != len(listed) or set(listed) != set(members)):
         _manifest_refuse()
-    if "exclude" in workspace and workspace["exclude"] != []:
-        _manifest_refuse()
+    if "exclude" in workspace:
+        _check_workspace_exclude(workspace["exclude"], members)
     if "default-members" in workspace:
         default = workspace["default-members"]
         if (type(default) is not list or any(type(item) is not str for item in default)

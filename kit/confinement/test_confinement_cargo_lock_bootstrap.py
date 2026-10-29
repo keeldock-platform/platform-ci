@@ -781,6 +781,74 @@ CONFORMANCE_MANIFEST = (
 )
 
 
+CONTRACT_MEMBERS = ("crates/host/api", "crates/host/mock", "crates/host/conformance", "crates/kernel/i18n")
+CONTRACT_EXCLUDE = (
+    "crates/host/core", "crates/host/registry", "crates/host/extensions", "crates/host/links",
+    "crates/host/mcp", "crates/host/mcp-host", "crates/host/mcp-shim", "crates/host/settings-schema",
+    "crates/services", "crates/apps", "apps",
+)
+PRIVATE_PREFIX = "keeldock" + "-"
+
+
+def _contract_root(exclude=CONTRACT_EXCLUDE):
+    listing = "".join('    "' + item + '",\n' for item in exclude)
+    return (
+        "[workspace]\n"
+        'resolver = "3"\n'
+        "members = [\n"
+        '    "crates/host/api",\n    "crates/host/mock",\n    "crates/host/conformance",\n'
+        '    "crates/kernel/i18n",\n'
+        "]\n"
+        "exclude = [\n" + listing + "]\n\n"
+        "[workspace.package]\n"
+        'version = "0.1.0"\nedition = "2024"\nrust-version = "1.99.1"\npublish = false\n\n'
+        "[workspace.dependencies]\n"
+        + PRIVATE_PREFIX + 'host-api = { path = "crates/host/api" }\n'
+        + PRIVATE_PREFIX + 'host-mock = { path = "crates/host/mock" }\n\n'
+        "[workspace.lints.rust]\n"
+        'unsafe_code = "forbid"\nunsafe_op_in_unsafe_fn = "deny"\nmissing_docs = "warn"\n'
+        'unreachable_pub = "warn"\nwarnings = "deny"\n\n'
+        "[workspace.lints.clippy]\n"
+        'all = { level = "warn", priority = -1 }\nunwrap_used = "deny"\nexpect_used = "deny"\n'
+        'panic = "deny"\nindexing_slicing = "deny"\ncast_possible_truncation = "deny"\n'
+        'undocumented_unsafe_blocks = "deny"\n'
+    )
+
+
+def _contract_member(name, description, dependencies="", dev_dependencies=""):
+    return (
+        '[package]\nname = "' + PRIVATE_PREFIX + name + '"\n'
+        'description = "' + description + '"\n'
+        "version.workspace = true\nedition.workspace = true\n"
+        "rust-version.workspace = true\npublish.workspace = true\n\n"
+        "[dependencies]\n" + dependencies + "\n"
+        + ("[dev-dependencies]\n" + dev_dependencies + "\n" if dev_dependencies else "")
+        + "[lints]\nworkspace = true\n"
+    )
+
+
+def _contract_manifests(root=None):
+    host_api = PRIVATE_PREFIX + "host-api = { workspace = true }\n"
+    host_mock = PRIVATE_PREFIX + "host-mock = { workspace = true }\n"
+    return {
+        "Cargo.toml": (_contract_root() if root is None else root).encode("utf-8"),
+        "crates/host/api/Cargo.toml": _contract_member(
+            "host-api", "KeelDock L1 host API: the stable contract between the host and its tools.",
+        ).encode("utf-8"),
+        "crates/host/mock/Cargo.toml": _contract_member(
+            "host-mock", "KeelDock mock host: an honest in-memory host for tool contract tests.", host_api,
+        ).encode("utf-8"),
+        "crates/host/conformance/Cargo.toml": _contract_member(
+            "host-conformance", "KeelDock conformance suite written against the host API traits.",
+            host_api, host_mock,
+        ).encode("utf-8"),
+        "crates/kernel/i18n/Cargo.toml": _contract_member(
+            "kernel-i18n",
+            "KeelDock shared kernel contract for localized message keys, patterns and catalogues.",
+        ).encode("utf-8"),
+    }
+
+
 def _manifests(api=API_MANIFEST, root=ROOT_MANIFEST):
     return {
         "Cargo.toml": root.encode("utf-8"),
@@ -1063,6 +1131,56 @@ class ManifestCheckTests(BootstrapTestCase):
         for root in refused:
             with self.subTest(root=root):
                 self.assert_manifest_refused(_manifests(root=root))
+
+    def test_contract_workspace_exclude_list_is_accepted_with_the_four_members(self):
+        names = subject.check_manifests(_contract_manifests(), CONTRACT_MEMBERS)
+        self.assertEqual(names, frozenset(
+            (PRIVATE_PREFIX + "host-api", PRIVATE_PREFIX + "host-mock",
+             PRIVATE_PREFIX + "host-conformance", PRIVATE_PREFIX + "kernel-i18n"),
+        ))
+        for exclude in ((), ("apps",), CONTRACT_EXCLUDE[:3], tuple("dir" + str(index) for index in range(64))):
+            with self.subTest(exclude=exclude):
+                root = _contract_root(exclude)
+                self.assertTrue(subject.check_manifests(_contract_manifests(root), CONTRACT_MEMBERS))
+
+    def test_workspace_exclude_entries_must_be_normalized_paths_outside_the_members(self):
+        base = _contract_root()
+        start = base.index("exclude = [")
+        end = base.index("]\n", start) + 1
+        refused = (
+            '["/crates/host/core"]',
+            '["crates/host\\\\core"]',
+            '["crates/./host/core"]',
+            '["crates/host/./core"]',
+            '["."]',
+            '["crates/../host/core"]',
+            '[".."]',
+            '["../crates/host/core"]',
+            '["crates/host/api"]',
+            '["crates/kernel/i18n"]',
+            '["crates/host"]',
+            '["crates"]',
+            '["crates/kernel"]',
+            '["crates/host/core", "crates/host/core"]',
+            '[""]',
+            '["crates//host/core"]',
+            '["crates/host/core/"]',
+            '["crates/host/co re"]',
+            "[\"crates/host/c" + chr(246) + "re\"]",
+            "[1]",
+            "[true]",
+            '[["crates/host/core"]]',
+            '[{ path = "crates/host/core" }]',
+            '"crates/host/core"',
+            "1",
+            "[" + ", ".join('"dir' + str(index) + '"' for index in range(65)) + "]",
+        )
+        for text in refused:
+            with self.subTest(exclude=text):
+                root = base[:start] + "exclude = " + text + base[end:]
+                with self.assertRaises(subject.BootstrapRefusal) as raised:
+                    subject.check_manifests(_contract_manifests(root), CONTRACT_MEMBERS)
+                self.assertEqual(raised.exception.reason, "bootstrap_manifest_refused")
 
     def test_sourceless_lock_packages_must_be_exactly_the_workspace_packages(self):
         self.assertTrue(subject.check_lock_members(LOCK_BYTES, frozenset(("contract-root",))))
