@@ -203,8 +203,9 @@ function Stop-CatalogRecovery($lease) {
                 if ([IO.File]::ReadAllText([string]$lease.AckFile) -ne 'done') { throw 'winsock_recovery_stop' }
             }
             if (Get-ScheduledTask -TaskName ([string]$lease.TaskName) -ErrorAction SilentlyContinue) {
-                Unregister-ScheduledTask -TaskName ([string]$lease.TaskName) -Confirm:$false -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName ([string]$lease.TaskName) -Confirm:$false -ErrorAction Stop
             }
+            if (Get-ScheduledTask -TaskName ([string]$lease.TaskName) -ErrorAction SilentlyContinue) { throw 'winsock_recovery_stop' }
             $lease.TaskRegistered = $false
         }
         if ($lease.RecoveryDirectory) {
@@ -250,12 +251,19 @@ function Grant-WinsockCatalogRead([string]$sid, [string]$path = 'SYSTEM\CurrentC
 }
 
 function Restore-WinsockCatalogAcl($lease) {
+    if ($null -ne $lease -and $lease.ArmedFile -and -not (Test-Path -LiteralPath ([string]$lease.ArmedFile))) { return }
     Restore-CatalogAcl $lease
 }
 
 function Remove-CatalogRecoveryFolder([string]$record) {
     $directory = Split-Path -Parent $record
-    try { Unregister-ScheduledTask -TaskName (Split-Path -Leaf $directory) -Confirm:$false -ErrorAction Stop } catch { }
+    $taskName = Split-Path -Leaf $directory
+    try {
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+        }
+    } catch { }
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { return }
     Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
 }
 

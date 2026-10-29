@@ -452,6 +452,49 @@ foreach ($case in $cases) {
         self.assertIn("Restore-CatalogAcl $lease", self.recovery_test)
         self.assertIn("$_.Exception.Message -ne 'winsock_restore_failed'", self.recovery_test)
 
+    def test_task_removal_is_confirmed_before_the_recovery_folder_is_deleted(self):
+        stop = self.function_body("Stop-CatalogRecovery", self.recovery)
+        unregister = stop[stop.index("Unregister-ScheduledTask"):]
+        self.assertIn("-ErrorAction Stop", unregister.splitlines()[0])
+        absent = "if (Get-ScheduledTask -TaskName ([string]$lease.TaskName) -ErrorAction SilentlyContinue) { throw 'winsock_recovery_stop' }"
+        self.assertIn(absent, stop)
+        self.assertLess(stop.index(absent), stop.index("$lease.TaskRegistered = $false"))
+        self.assertLess(stop.index(absent), stop.index("Remove-Item"))
+        self.assertNotIn("Unregister-ScheduledTask -TaskName ([string]$lease.TaskName) -Confirm:$false -ErrorAction SilentlyContinue", stop)
+        remove = self.function_body("Remove-CatalogRecoveryFolder", self.recovery)
+        gone = "if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) { return }"
+        self.assertIn(gone, remove)
+        self.assertLess(remove.index("Unregister-ScheduledTask"), remove.index(gone))
+        self.assertLess(remove.index(gone), remove.index("Remove-Item"))
+
+    def test_unarmed_lease_never_restores_the_live_key(self):
+        restore = self.function_body("Restore-WinsockCatalogAcl", self.recovery)
+        self.assertIn("-not (Test-Path -LiteralPath ([string]$lease.ArmedFile))) { return }", restore)
+        self.assertLess(restore.index("ArmedFile"), restore.index("Restore-CatalogAcl $lease"))
+        confined = self.function_body("Invoke-ConfinedLadder")
+        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", confined)
+
+    def test_scripts_have_no_line_starting_with_an_operator(self):
+        starts = re.compile(r"^\s*-(and|or|band|bor|eq|ne|not)\b")
+        ends = re.compile(r"(?:-(?:and|or|band|bor|eq|ne)|,|\|)\s*$")
+        for path in (WRAPPER, RECOVERY, RECOVERY_TEST):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for number, line in enumerate(lines[1:], 2):
+                if starts.match(line):
+                    with self.subTest(path=path.name, line=number):
+                        self.assertRegex(lines[number - 2], ends)
+
+    def test_syntax_check_step_runs_before_the_compile_step(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        check = text.index("      - name: Check PowerShell script syntax\n")
+        self.assertLess(check, text.index("      - name: Compile native confinement module\n"))
+        block = text[check:text.index("      - name: Compile native confinement module\n")]
+        self.assertIn("[System.Management.Automation.Language.Parser]::ParseFile", block)
+        for name in ("windows_confinement.ps1", "windows_confinement_recovery.ps1", "test_windows_confinement_recovery.ps1"):
+            self.assertIn("'" + name + "'", block)
+        self.assertIn("if ($bad -ne 0) { exit 1 }", block)
+        self.assertNotIn("if:", block)
+
     def test_negative_acl_stages_require_the_specific_denial_and_a_listing_control(self):
         specs = self.function_body("Get-StageSpecs")
         confined_branch = specs.split("} else {", 1)[0]
