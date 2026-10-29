@@ -1,5 +1,6 @@
 import fnmatch
 import re
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -112,6 +113,86 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
                 ))
         self.assertIn("$AllowedHosts -notcontains $uri.Host", self.wrapper)
         self.assertIn("hash_mismatch", self.wrapper)
+
+    def test_rust_component_names_are_exact_and_refusals_report_bounded_names(self):
+        self.assertIn("rustc = 'rustc'", self.wrapper)
+        self.assertIn("cargo = 'cargo'", self.wrapper)
+        self.assertIn("rust_std = ('rust-std-' + $RustTarget)", self.wrapper)
+        for root in (
+            "Root = ('rustc-' + $RustVersion + '-' + $RustTarget)",
+            "Root = ('cargo-' + $RustVersion + '-' + $RustTarget)",
+            "Root = ('rust-std-' + $RustVersion + '-' + $RustTarget)",
+        ):
+            with self.subTest(root=root):
+                self.assertIn(root, self.wrapper)
+        self.assertIn("$expectedComponent = $ExpectedRustComponents[$item.Name]", self.wrapper)
+        self.rust_component_guard()
+        self.assertIn("expected_component=", self.wrapper)
+        self.assertIn("observed_component=", self.wrapper)
+        safe_name = self.function_body("Get-SafeComponentName")
+        self.assertIn("'[^A-Za-z0-9._-]'", safe_name)
+        self.assertIn("$value.Substring(0, 64)", safe_name)
+
+    def rust_component_guard(self):
+        stage = self.wrapper.split("$phase = 'stage_rust'", 1)[1].split("$phase = 'stage_node'", 1)[0]
+        branch = re.search(
+            r"(?m)^[ \t]*if \(-not \[string\]::Equals\(\$name, \$expectedComponent, "
+            r"\[StringComparison\]::Ordinal\)\) \{\n"
+            r"[ \t]*\$componentNameExpected = \$expectedComponent\n"
+            r"[ \t]*\$componentNameObserved = \$name\n"
+            r"[ \t]*throw 'component_name'\n"
+            r"[ \t]*\}$",
+            stage,
+        )
+        self.assertIsNotNone(branch)
+        self.assertLess(stage.index("$expectedComponent = $ExpectedRustComponents[$item.Name]"), branch.start())
+        self.assertLess(branch.end(), stage.index("$componentSource = Join-Path $componentRoot $name"))
+        return branch.group(0)
+
+    def test_rust_component_guard_rejects_unexpected_names_in_windows_ci(self):
+        if sys.platform != "win32":
+            self.skipTest("PowerShell component guard runs in Windows CI")
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "function Test-Component([string]$name, [string]$expectedComponent) {\n"
+            + self.rust_component_guard()
+            + "\n}\n"
+            + """
+Test-Component 'rustc' 'rustc'
+Test-Component 'cargo' 'cargo'
+Test-Component 'rust-std-x86_64-pc-windows-msvc' 'rust-std-x86_64-pc-windows-msvc'
+$cases = @(
+    @{ Expected = 'rustc'; Observed = 'wrong' }
+    @{ Expected = 'rustc'; Observed = 'RUSTC' }
+    @{ Expected = 'rustc'; Observed = 'rustc/cargo' }
+    @{ Expected = 'rustc'; Observed = ('rustc' + [char]92 + 'cargo') }
+    @{ Expected = 'rustc'; Observed = '../rustc' }
+    @{ Expected = 'rustc'; Observed = 'rustc/../cargo' }
+    @{ Expected = 'rustc'; Observed = ('rust' + [char]0 + 'c') }
+    @{ Expected = 'rustc'; Observed = ('rust' + [char]0x00AD + 'c') }
+    @{ Expected = 'rustc'; Observed = ('rust' + [char]0x200B + 'c') }
+    @{ Expected = 'rust-std-x86_64-pc-windows-msvc'; Observed = 'rust-std-x86-64-pc-windows-msvc' }
+)
+foreach ($case in $cases) {
+    $rejected = $false
+    try {
+        Test-Component $case.Observed $case.Expected
+    } catch {
+        if ($_.Exception.Message -ne 'component_name') { throw }
+        $rejected = $true
+    }
+    if (-not $rejected) { throw 'accepted_bad_component' }
+}
+"""
+        )
+        result = subprocess.run(
+            ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def function_body(self, name):
         match = re.search(r"^function " + re.escape(name) + r"\b.*?^\}$", self.wrapper, re.S | re.M)
