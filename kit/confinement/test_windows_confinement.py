@@ -203,7 +203,7 @@ foreach ($case in $cases) {
         names = re.findall(r"Name = '([a-z_]+)'; Exe", self.wrapper)
         self.assertEqual(tuple(names), CONFINED_STAGES)
         control = "$controlOutcomes = Invoke-Ladder $box $false $script:Control"
-        confined = "$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac"
+        confined = "$confinedOutcomes = Invoke-ConfinedLadder $box $script:Lpac"
         self.assertIn(control, self.wrapper)
         self.assertIn(confined, self.wrapper)
         self.assertLess(self.wrapper.index(control), self.wrapper.index(confined))
@@ -263,17 +263,18 @@ foreach ($case in $cases) {
         proof = re.search(r"^ *\$lpacProven = (.+)$", self.function_body("Invoke-Ladder"), re.M)
         self.assertIsNotNone(proof)
         patterns = re.findall(r"\$tokenText -like '([^']+)'", proof.group(1))
-        self.assertEqual(len(patterns), 4)
+        self.assertEqual(len(patterns), 5)
         return all(fnmatch.fnmatchcase(text, pattern) for pattern in patterns)
 
     def test_container_proof_requires_every_token_fact_explicitly(self):
-        good = "appcontainer=1,capabilities=0,integrity=0x1000,lpac=1,sid=match,aap=absent"
+        good = "appcontainer=1,capabilities=0,integrity=0x1000,lpac=1,sid=match,arap=present,aap=absent"
         self.assertTrue(self.token_accepted(good))
         for bad in (
             good.replace("lpac=1", "lpac=unreadable"),
             good.replace("lpac=1", "lpac=aap_only"),
             good.replace("lpac=1", "lpac=0"),
             good.replace("sid=match", "sid=mismatch"),
+            good.replace("arap=present", "arap=absent"),
             good.replace("aap=absent", "aap=present"),
             good.replace("appcontainer=1", "appcontainer=0"),
             "appcontainer=0,integrity=0x3000",
@@ -288,7 +289,11 @@ foreach ($case in $cases) {
             'applicationPackages != "absent"',
             "TokenAppContainerSid",
             "TokenGroups",
+            "TokenRestrictedSids",
             'AllApplicationPackagesSid = "S-1-15-2-1"',
+            'AllRestrictedApplicationPackagesSid = "S-1-15-2-2"',
+            "ReadAllRestrictedApplicationPackagesState",
+            "GroupEnabled = 0x00000004",
             "Native.EqualSid(actual, expectedSid)",
         ):
             with self.subTest(required=required):
@@ -316,10 +321,58 @@ foreach ($case in $cases) {
                 self.assertEqual(len(line), 1)
                 self.assertIn("$scratch.", line[0])
         specs = self.function_body("Get-StageSpecs")
+        scratch_write = re.search(r"Name = 'acl_scratch_write'.*", specs).group(0)
+        self.assertIn("$scratch.Tmp + '\\kd_write.txt'", scratch_write)
+        self.assertIn("$script:Lpac.Tmp + '\\kd_write.txt'", scratch_write)
         control_branch = specs.split("} else {", 1)[1].split("    }\n    $specs +=", 1)[0]
         self.assertNotIn("$script:Lpac", control_branch)
         self.assertNotIn("ReadOnly", control_branch)
         self.assertIn("$cargoManifest = Join-Path $scratch.Crate", specs)
+
+    def test_scratch_grants_match_low_integrity_inherited_write_paths(self):
+        self.assertIn("Grant-Access $script:Lpac.Root $script:Sid 'Modify, Synchronize' $true", self.wrapper)
+        self.assertIn("Set-LowIntegrityLabel $script:Lpac.Root", self.wrapper)
+        low_label = self.function_body("Set-LowIntegrityLabel")
+        self.assertIn("'/setintegritylevel' '(OI)(CI)L'", low_label)
+        self.assertIn("if ($LASTEXITCODE -ne 0) { throw 'integrity_set' }", low_label)
+        check_label = self.function_body("Test-LowIntegrityLabel")
+        self.assertIn("Mandatory Label\\\\Low Mandatory Level", check_label)
+        self.assertIn("Test-LowIntegrityLabel $script:Lpac.Root", self.function_body("Test-Acl"))
+        acl = self.function_body("Test-Acl")
+        for path in ("$script:Lpac.Tmp", "$script:Lpac.Profile", "$script:Lpac.CargoHome", "$script:Lpac.Crate"):
+            with self.subTest(path=path):
+                self.assertIn(path, acl)
+        self.assertIn("-not $entries[0].IsInherited", acl)
+        self.assertIn("$entries[0].AccessControlType -ne 'Allow'", acl)
+        self.assertIn("$entries[0].FileSystemRights -band $modifyMask", acl)
+        environment = self.function_body("New-StageEnvironment")
+        for name in ("TEMP", "TMP"):
+            line = next(item for item in environment.splitlines() if "('" + name + "=" in item)
+            self.assertIn("$scratch.Tmp", line)
+
+    def test_winsock_catalog_access_is_package_scoped_read_only_and_restored(self):
+        body = self.function_body("Grant-WinsockCatalogRead")
+        self.assertIn("WinSock2\\Parameters\\Protocol_Catalog9", body)
+        self.assertIn("RegistryRights]::ReadKey", body)
+        self.assertIn("RegistryRights]::ChangePermissions", body)
+        self.assertIn("RegistryAccessRule($identity", body)
+        self.assertIn("$security.AddAccessRule($rule)", body)
+        self.assertIn("$original = $security.GetSecurityDescriptorSddlForm", body)
+        self.assertLess(body.index("$script:WinsockCatalogLease = @{"), body.index("$key.SetAccessControl($security)"))
+        self.assertIn("$writeMask =", body)
+        self.assertIn("$key.SetAccessControl($restore)", body)
+        restore = self.function_body("Restore-WinsockCatalogAcl")
+        self.assertIn("$lease.OriginalSddl", restore)
+        self.assertIn("winsock_restore_readback", restore)
+        confined = self.function_body("Invoke-ConfinedLadder")
+        self.assertIn("Grant-WinsockCatalogRead $script:Sid", confined)
+        self.assertIn("finally", confined)
+        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", confined)
+        self.assertIn("$script:WinsockCatalogLease = $null", confined)
+        self.assertIn("$phase = 'winsock_acl'", self.wrapper)
+        self.assertNotIn("internetClient", self.wrapper)
+        self.assertNotIn("privateNetworkClientServer", self.wrapper)
+        self.assertIn("capabilities.CapabilityCount = 0", self.native)
 
     def test_negative_acl_stages_require_the_specific_denial_and_a_listing_control(self):
         specs = self.function_body("Get-StageSpecs")
@@ -328,6 +381,11 @@ foreach ($case in $cases) {
         denied = re.search(r"Name = 'acl_downloads_denied'.*", confined_branch).group(0)
         self.assertIn("-match 'Access is denied'", denied)
         self.assertIn("$r.ExitCode -ne 0", denied)
+        self.assertIn("type ", denied)
+        self.assertIn("$layout.Downloads", denied)
+        self.assertIn("acl_probe.txt", denied)
+        self.assertNotIn("> nul", denied)
+        self.assertIn("New-Item -ItemType File -Path (Join-Path $layout.Downloads 'acl_probe.txt')", self.wrapper)
         write_denied = re.search(r"Name = 'acl_ro_write_denied'.*", confined_branch).group(0)
         self.assertIn("-match 'Access is denied'", write_denied)
         self.assertIn("copy /y nul ' + $layout.ReadOnly", write_denied)
@@ -399,7 +457,8 @@ foreach ($case in $cases) {
     def test_unreadable_container_flag_hedge_is_spike_only_and_never_verifies(self):
         self.assertEqual(self.native.count("private const bool SpikeAllowUnreadableLpac = true;"), 1)
         for required in (
-            'lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match" && applicationPackages == "absent"',
+            'lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match"',
+            'restrictedApplicationPackages == "present" && applicationPackages == "absent"',
             'reported = "aap_only";',
             '(lpac != "1" && reported != "aap_only")',
         ):
