@@ -290,7 +290,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_cargo_vendor_verify.py': '69bec4106ed3c4ac41624ddcb4719b18902d4f2556ba140257ee9e513c3bcf32',
     'kit/confinement/release_evidence.py': '2609b125bf2d3cbde256e2e4229c576fc0de1c5da898faf206807205dee49ae2',
     'kit/confinement/test_release_evidence.py': '0b781f9b1a72919b6d43230f9831f7320aa44a9d4f39949b9408bae53b06b143',
-    'kit/confinement/test_confinement_cargo_lock_bootstrap.py': '3310a07b6fb344f583661946847b186025ff8dc9438a0ebdde7f5282b965dad7',
+    'kit/confinement/test_confinement_cargo_lock_bootstrap.py': '71dc6f352f8445123e40ebd8d6214dff5c048ff53344999b95c7eea19e707355',
     'kit/confinement/cargo_lock_bootstrap.py': 'b8dc409a80615b7399bbfbc291289729e383acd34724d86fa876e914a6fcb18c',
     'kit/bootstrap/test_policy_rust.py': 'eaaea07d1f0cd284198deca4d6fc6661653cd4b50e5c3929ff63decde595699b',
     'kit/bootstrap/policy_rust.py': '7751a54cd079a02f54f068de4931f851d13fe5654d5f0e42879e39c49912a2e6',

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -247,9 +248,32 @@ class CargoConfigRefusalTests(BootstrapTestCase):
         (root / "crates" / "api" / "src" / "lib.rs").write_bytes(b"x")
         return root
 
-    def test_clean_tree_is_accepted(self):
+    def ambient_cargo(self, temporary):
+        base = Path(temporary)
+        return any(os.path.lexists(parent / ".cargo") for parent in (base,) + tuple(base.parents))
+
+    def without_ambient_cargo(self, temporary):
+        base = Path(temporary)
+        ambient = (base,) + tuple(base.parents)
+        real = os.path.lexists
+
+        def lexists(path):
+            candidate = Path(path)
+            if candidate.name == ".cargo" and candidate.parent in ambient:
+                return False
+            return real(path)
+
+        return mock.patch.object(os.path, "lexists", side_effect=lexists)
+
+    def test_clean_tree_is_accepted_when_no_ancestor_has_cargo_configuration(self):
         with tempfile.TemporaryDirectory() as temporary:
-            self.assertTrue(subject.refuse_cargo_config(self.tree(temporary)))
+            root = self.tree(temporary)
+            if self.ambient_cargo(temporary):
+                self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, root)
+            else:
+                self.assertTrue(subject.refuse_cargo_config(root))
+            with self.without_ambient_cargo(temporary):
+                self.assertTrue(subject.refuse_cargo_config(root))
 
     def test_any_cargo_configuration_in_the_tree_is_refused(self):
         for relative, directory in (
@@ -265,24 +289,42 @@ class CargoConfigRefusalTests(BootstrapTestCase):
                     else:
                         target.parent.mkdir(parents=True, exist_ok=True)
                         target.write_bytes(b"[http]\nproxy = \"x\"\n")
-                    self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, root)
+                    with self.without_ambient_cargo(temporary):
+                        self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, root)
 
     def test_cargo_configuration_in_a_parent_directory_is_refused(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.tree(temporary)
+            with self.without_ambient_cargo(temporary):
+                self.assertTrue(subject.refuse_cargo_config(root))
             (Path(temporary) / "work" / ".cargo").mkdir()
             (Path(temporary) / "work" / ".cargo" / "config.toml").write_bytes(b"x")
+            with self.without_ambient_cargo(temporary):
+                self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, root)
             self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, root)
+
+    def test_an_ambient_ancestor_cargo_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.tree(temporary)
+            ambient = Path(temporary)
+            real = os.path.lexists
+
+            def lexists(path):
+                return Path(path) == ambient / ".cargo" or real(path)
+
+            with mock.patch.object(os.path, "lexists", side_effect=lexists):
+                self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, root)
 
     def test_links_and_bad_roots_are_refused(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.tree(temporary)
-            os.symlink(str(root / "Cargo.toml"), str(root / "linked.toml"))
-            self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, root)
-            self.assert_refused(
-                "bootstrap_config_refused", subject.refuse_cargo_config, Path(temporary) / "absent",
-            )
-            self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, "relative/path")
+            with self.without_ambient_cargo(temporary):
+                os.symlink(str(root / "Cargo.toml"), str(root / "linked.toml"))
+                self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, root)
+                self.assert_refused(
+                    "bootstrap_config_refused", subject.refuse_cargo_config, Path(temporary) / "absent",
+                )
+                self.assert_refused("bootstrap_config_refused", subject.refuse_cargo_config, "relative/path")
 
 
 class LockAndReceiptTests(BootstrapTestCase):
