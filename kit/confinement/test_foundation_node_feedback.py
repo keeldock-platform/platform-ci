@@ -2,6 +2,8 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shutil
+import sys
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -20,6 +22,12 @@ SOURCE_SHA = "a" * 40
 BASE_SHA = "b" * 40
 CONTROL_SHA = "c" * 40
 DIFF_SHA = "d" * 64
+KERNEL_TS_PATHS = (
+    "packages/kernel-i18n/src/index.ts",
+    "packages/kernel-i18n/src/key.ts",
+    "packages/kernel-i18n/tests/key.test.ts",
+    "packages/kernel-i18n/tests/support.ts",
+)
 NODE_OPTIONS_EXPECTED = (
     "--import=data:text/javascript;base64,"
     "bGV0IGtkVGl0bGUgPSBTdHJpbmcocHJvY2Vzcy50aXRsZSk7T2JqZWN0LmRlZmluZVByb3BlcnR5KHByb2Nlc3MsInRpdGxlIix7Z2V0KCl7cmV0dXJuIGtkVGl0bGU7fSxzZXQodmFsdWUpe2tkVGl0bGUgPSBTdHJpbmcodmFsdWUpO30sY29uZmlndXJhYmxlOnRydWUsZW51bWVyYWJsZTp0cnVlfSk7"
@@ -77,7 +85,10 @@ class FakeProducer:
     def _expected_manifest(self, source):
         return {
             "root": {"name": "fixture-root", "version": "1.0.0", "workspaces": ["packages/*"]},
-            "workspaces": [{"path": "packages/host-api", "name": "@fixture/host-api", "version": "1.0.0"}],
+            "workspaces": [
+                {"path": "packages/host-api", "name": "@fixture/host-api", "version": "1.0.0"},
+                {"path": "packages/kernel-i18n", "name": "@fixture/kernel-i18n", "version": "1.0.0"},
+            ],
         }
 
     def _read_file(self, path, *, maximum, owner=0):
@@ -194,6 +205,7 @@ def _dispatch(kind):
 def _runtime():
     return SimpleNamespace(
         CORE_CONTRACT_FEEDBACK_FILES=validation.CORE_CONTRACT_FEEDBACK_FILES,
+        CORE_CONTRACT_KERNEL_FEEDBACK_FILES=validation.CORE_CONTRACT_KERNEL_FEEDBACK_FILES,
         _core_contract_pattern_paths=validation._core_contract_pattern_paths,
         MAX_CORE_CONTRACT_TS_SOURCES=validation.MAX_CORE_CONTRACT_TS_SOURCES,
         MAX_CORE_CONTRACT_TS_TESTS=validation.MAX_CORE_CONTRACT_TS_TESTS,
@@ -265,7 +277,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
     def _run(self, mode, kind, *, validated_tree, accepted_provenance=None, lock_bytes=None,
              callback_mutation=None, fail_census=False, fail_restore=False,
              census_error=None, command_error=None, contract_error=None,
-             real_node_contract=None, new_ts_paths=()):
+             real_node_contract=None, new_ts_paths=(), mutate_source=None):
         producer = FakeProducer()
         profile = producer.PROFILE_BY_KIND[kind]
         dispatch = _dispatch(kind)
@@ -311,10 +323,14 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
             source = root / "source"
             source.mkdir()
             baseline = validation._core_contract_pattern_paths(validation.CORE_CONTRACT_FEEDBACK_FILES)
-            for relative in sorted(baseline["ts_sources"] | baseline["ts_tests"] | set(new_ts_paths)):
+            for relative in sorted(
+                baseline["ts_sources"] | baseline["ts_tests"] | set(new_ts_paths) | set(KERNEL_TS_PATHS)
+            ):
                 target = source / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.touch()
+            if mutate_source is not None:
+                mutate_source(source)
             storage_root = root / "worker"
             storage_root.mkdir()
             if lock_bytes is not None:
@@ -360,7 +376,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                 self.assertEqual((source / subject.PACKAGE_LOCK_PATH).read_bytes(), lock_bytes)
             return result, producer, contract
 
-    def test_bootstrap_copies_only_two_manifests_and_derives_epoch_from_request(self):
+    def test_bootstrap_copies_only_three_manifests_and_derives_epoch_from_request(self):
         result, producer, contract = self._run(
             "bootstrap", "lock", validated_tree="core_node_lock_return",
         )
@@ -380,9 +396,15 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         )
         copied = producer.copies[0][2]
         baseline = validation._core_contract_pattern_paths(validation.CORE_CONTRACT_FEEDBACK_FILES)
-        expected = subject.NODE_FIXED_FILES | baseline["ts_sources"] | baseline["ts_tests"]
+        expected = (
+            subject.NODE_FIXED_FILES | baseline["ts_sources"] | baseline["ts_tests"]
+            | set(KERNEL_TS_PATHS)
+        )
         self.assertEqual(copied, tuple(sorted(expected)))
-        self.assertEqual(set(copied), subject.NODE_REVIEWED_FILES)
+        self.assertEqual(set(copied), subject.NODE_REVIEWED_FILES | set(KERNEL_TS_PATHS))
+        self.assertTrue(subject.NODE_FIXTURE_FILES.issubset(copied))
+        self.assertIn("packages/kernel-i18n/package.json", copied)
+        self.assertIn("packages/kernel-i18n/tsconfig.json", copied)
         self.assertNotIn(".npmrc", copied)
         self.assertFalse(any("README" in path or "CONTRACT" in path or "CHANGELOG" in path for path in copied))
         self.assertEqual(producer.writes[0][1], lock_bytes)
@@ -407,6 +429,87 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         copied = producer.copies[0][2]
         self.assertTrue(set(additions).issubset(copied))
         self.assertEqual(result["node_reviewed_file_count"], len(copied))
+
+    def test_workspace_set_is_exactly_host_api_then_kernel_i18n(self):
+        self.assertEqual(
+            subject.NODE_WORKSPACE_PACKAGES, ("packages/host-api", "packages/kernel-i18n"),
+        )
+        self.assertEqual(subject.BOOTSTRAP_MANIFESTS, (
+            "package.json", "packages/host-api/package.json", "packages/kernel-i18n/package.json",
+        ))
+        self.assertEqual(
+            [item["path"] for item in FakeProducer()._expected_manifest(Path("/source"))["workspaces"]],
+            list(subject.NODE_WORKSPACE_PACKAGES),
+        )
+
+    def _refused(self, mode, kind, tree, mutate_source, **options):
+        with self.assertRaises(FeedbackRefusal) as caught:
+            self._run(mode, kind, validated_tree=tree, mutate_source=mutate_source, **options)
+        self.assertEqual(caught.exception.reason, "manifest_invalid")
+
+    def test_gates_refuse_a_third_workspace_or_a_missing_workspace(self):
+        def add_third(source):
+            (source / "packages/third-package/src").mkdir(parents=True)
+
+        def add_stray_file(source):
+            (source / "packages/stray.txt").touch()
+
+        def add_hidden_file(source):
+            (source / "packages/.hidden").touch()
+
+        def add_case_variant(source):
+            (source / "packages/Kernel-I18n.json").touch()
+
+        def remove_host_api(source):
+            shutil.rmtree(source / "packages/host-api")
+
+        def remove_kernel(source):
+            shutil.rmtree(source / "packages/kernel-i18n")
+
+        for mutate in (
+            add_third, add_stray_file, add_hidden_file, add_case_variant, remove_host_api,
+            remove_kernel,
+        ):
+            with self.subTest(mutation=mutate.__name__, mode="bootstrap"):
+                self._refused(
+                    "bootstrap", "lock", "core_node_lock_return", mutate,
+                )
+            with self.subTest(mutation=mutate.__name__, mode="verify"):
+                self._refused(
+                    "verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE, mutate,
+                    accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+                )
+
+    def test_verify_refuses_kernel_sources_outside_the_reviewed_patterns(self):
+        def remove_support(source):
+            (source / "packages/kernel-i18n/tests/support.ts").unlink()
+
+        def add_script(source):
+            (source / "packages/kernel-i18n/src/other.js").touch()
+
+        def add_nested_directory(source):
+            (source / "packages/kernel-i18n/tests/nested").mkdir()
+
+        def remove_kernel_tests(source):
+            shutil.rmtree(source / "packages/kernel-i18n/tests")
+
+        for mutate in (remove_support, add_script, add_nested_directory, remove_kernel_tests):
+            with self.subTest(mutation=mutate.__name__):
+                self._refused(
+                    "verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE, mutate,
+                    accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+                )
+
+    def test_verify_refuses_when_the_validator_does_not_supply_the_kernel_file_set(self):
+        runtime = _runtime()
+        del runtime.CORE_CONTRACT_KERNEL_FEEDBACK_FILES
+        with patch.object(sys.modules[__name__], "_runtime", return_value=runtime):
+            with self.assertRaises(FeedbackRefusal) as caught:
+                self._run(
+                    "verify", "build_diagnostics", validated_tree=subject.PACKAGE_LOCK_TREE,
+                    accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+                )
+        self.assertEqual(caught.exception.reason, "manifest_invalid")
 
     def test_verify_refuses_wrong_profile_or_unadmitted_tree_before_copy(self):
         producer = FakeProducer()
@@ -635,6 +738,35 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         self.assertIsNone(outcome["failed_stage"])
         self.assertEqual(outcome["node_reviewed_file_count"], 24)
         self.assertEqual(outcome["node_reviewed_paths_sha256"], "a" * 64)
+
+    def test_reviewed_file_count_bound_covers_two_packages(self):
+        self.assertEqual(subject.MAX_NODE_REVIEWED_FILES, 10 + 2 * (64 + 64))
+        self.assertEqual(len(subject.NODE_FIXED_FILES), 10)
+        rust_outcome = {
+            "selected_gates": subject.RUST_FOUNDATION_GATES,
+            "completed": subject.RUST_FOUNDATION_GATES, "failed_stage": None,
+            "returncode": 0, "stdout": b"", "stderr": b"",
+            "stdout_truncated": False, "stderr_truncated": False,
+        }
+        for count, accepted in (
+            (4, False), (5, True), (subject.MAX_NODE_REVIEWED_FILES, True),
+            (subject.MAX_NODE_REVIEWED_FILES + 1, False),
+        ):
+            node_result = {
+                "mode": "verify", "status": "passed", "stages": subject.NODE_GATE_NAMES,
+                "node_reviewed_file_count": count, "node_reviewed_paths_sha256": "a" * 64,
+            }
+            with self.subTest(count=count):
+                if accepted:
+                    outcome = subject.extend_diagnostic_outcome(
+                        dict(rust_outcome), lambda: node_result, FakeContract("verify"),
+                    )
+                    self.assertEqual(outcome["node_reviewed_file_count"], count)
+                else:
+                    with self.assertRaises(ValueError):
+                        subject.extend_diagnostic_outcome(
+                            dict(rust_outcome), lambda: node_result, FakeContract("verify"),
+                        )
 
     def test_node_cleanup_refusal_propagates_without_diagnostic_payload(self):
         rust_outcome = {

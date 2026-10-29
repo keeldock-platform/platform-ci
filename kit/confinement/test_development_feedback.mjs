@@ -150,6 +150,15 @@ test('accepts a one-file patch only for an exact reviewed Rust path', () => {
   }), DevelopmentFeedbackError);
 });
 
+test('bounds the reviewed Rust path list at the four crate headroom', () => {
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.reviewedRustPaths, 512);
+  const payload = rustPatch();
+  const reviewed = (count) => ['src/lib.rs', ...Array.from({ length: count - 1 }, (_, index) => `src/module_${index}.rs`)];
+  assert.deepEqual(validate('rust_patch', payload, { reviewedRustPaths: reviewed(512) }), payload);
+  assert.throws(() => validate('rust_patch', payload, { reviewedRustPaths: reviewed(513) }), DevelopmentFeedbackError);
+  assert.throws(() => validate('rust_patch', payload, { reviewedRustPaths: [] }), DevelopmentFeedbackError);
+});
+
 test('accepts bounded diagnostics and rejects malformed or credential-shaped text', () => {
   const payload = Buffer.from('compiler completed with zero warnings\n', 'utf8');
   assert.deepEqual(validate('build_diagnostics', payload), payload);
