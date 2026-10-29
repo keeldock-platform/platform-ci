@@ -340,6 +340,16 @@ def _file_identity(metadata):
     )
 
 
+def _same_open_file(opened, expected):
+    if os.name == "posix":
+        return _file_identity(opened) == _file_identity(expected)
+    if opened.st_size != expected.st_size or opened.st_mtime_ns != expected.st_mtime_ns:
+        return False
+    if opened.st_ino and expected.st_ino:
+        return (opened.st_dev, opened.st_ino) == (expected.st_dev, expected.st_ino)
+    return True
+
+
 def _open_evidence_file(root, root_descriptor, item):
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     if os.name == "posix":
@@ -377,7 +387,7 @@ def _scan_file(root, root_descriptor, item, expected_metadata, config):
             before = os.fstat(descriptor)
             if not stat.S_ISREG(before.st_mode):
                 raise EvidenceRefusal("file_not_regular")
-            if _file_identity(before) != _file_identity(expected_metadata):
+            if not _same_open_file(before, expected_metadata):
                 raise EvidenceRefusal("file_changed")
             digest = hashlib.sha256()
             total = 0
@@ -438,7 +448,7 @@ def _verify_snapshot_source(root, root_descriptor, item, expected_metadata, dige
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise EvidenceRefusal("file_not_regular")
-        if _file_identity(before) != _file_identity(expected_metadata):
+        if not _same_open_file(before, expected_metadata):
             raise EvidenceRefusal("tree_changed")
         check = hashlib.sha256()
         total = 0

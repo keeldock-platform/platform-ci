@@ -283,8 +283,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_release_build_verify.py': '08c8b7dcb28307d8470cab9675202bcc206492261d20dec70064232c197f2579',
     'kit/confinement/cargo_vendor_verify.py': 'b5964d2b36909abe7ba56af424e7d58248763038e2ee20ea74eb89033602a4f6',
     'kit/confinement/test_cargo_vendor_verify.py': '69bec4106ed3c4ac41624ddcb4719b18902d4f2556ba140257ee9e513c3bcf32',
-    'kit/confinement/release_evidence.py': '5dc54b4106979713bda03ea2882cfe755b2e119c0b82c1ee7e3c3515ebf72294',
-    'kit/confinement/test_release_evidence.py': '3545a2e85c22592cf1fe36e23253b00a38a6d0a2f718a1a83e1d2031e9982c25',
+    'kit/confinement/release_evidence.py': '931673a81ef5aaf34b36fa3161d226e1cea0b7a46fbab6ca4abe0d83f9db40a9',
+    'kit/confinement/test_release_evidence.py': '45ed1ad958d99d419fff7c24518585857afcb06295aff2de3c1f63f36bcb1a00',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(
