@@ -1418,13 +1418,28 @@ class LaneRegistryTests(unittest.TestCase):
                 "linux-confinement",
                 "windows-native-preflight",
                 "windows-confinement",
+                "capsule-vectors",
                 "windows-handoff-synthetic",
+                "windows-source-admission",
+                "lane-h-windows-receiver",
+                "lane-h-linux-fetch-encrypt",
+                "lane-h-capsule-attester",
+                "attestation-role-signer-probe",
             },
         )
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-confinement"], policy_windows)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["capsule-vectors"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-handoff-synthetic"], policy_handoff)
+        for kind in (
+            "windows-source-admission",
+            "lane-h-windows-receiver",
+            "lane-h-linux-fetch-encrypt",
+            "lane-h-capsule-attester",
+            "attestation-role-signer-probe",
+        ):
+            self.assertIs(policy.WORKFLOW_KIND_LANES[kind], policy_handoff)
         self.assertEqual(
             set(policy.LANE_WORKFLOW_TEMPLATES) | set(policy.LANE_WORKFLOW_SHA256),
             set(policy.WORKFLOW_KIND_LANES),
@@ -1462,6 +1477,11 @@ class LaneRegistryTests(unittest.TestCase):
                     "windows-confinement-workflow-too-large",
                 ),
                 (
+                    ".github/workflows/capsule-vectors.yml",
+                    "capsule-vectors",
+                    "capsule-vectors-workflow-too-large",
+                ),
+                (
                     ".github/workflows/windows-handoff-synthetic.yml",
                     "windows-handoff-synthetic",
                     "handoff-workflow-too-large",
@@ -1489,6 +1509,14 @@ class LaneRegistryTests(unittest.TestCase):
                 ".github/workflows/windows-confinement.yml",
                 "windows-confinement",
                 "windows-confinement-workflow-too-large",
+            ),
+            policy.LANE_CANDIDATE_WORKFLOWS,
+        )
+        self.assertIn(
+            (
+                ".github/workflows/capsule-vectors.yml",
+                "capsule-vectors",
+                "capsule-vectors-workflow-too-large",
             ),
             policy.LANE_CANDIDATE_WORKFLOWS,
         )

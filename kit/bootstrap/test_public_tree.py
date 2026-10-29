@@ -170,6 +170,11 @@ class PublicTreeTests(unittest.TestCase):
             '.github/workflows/node-lock-return.yml',
             '.github/workflows/core-rust-format-return.yml',
             '.github/workflows/core-build-diagnostic-return.yml',
+            '.github/workflows/attestation-role-signer-probe.yml',
+            '.github/workflows/windows-source-admission.yml',
+            '.github/workflows/lane-h-windows-receiver.yml',
+            '.github/workflows/lane-h-linux-fetch-encrypt.yml',
+            '.github/workflows/lane-h-capsule-attester.yml',
             'kit/confinement/foundation_node_feedback.py',
             'kit/confinement/test_foundation_node_feedback.py',
             'kit/confinement/macos_node_contract.py',
@@ -233,6 +238,12 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_windows_native_preflight.py",
             "kit/confinement/macos_source_reader.py",
             "kit/confinement/test_macos_source_reader.py",
+            "kit/confinement/release_provenance.py",
+            "kit/confinement/test_confinement_release_provenance.py",
+            "kit/confinement/role_signer.py",
+            "kit/confinement/test_role_signer.py",
+            "kit/bootstrap/policy_handoff.py",
+            "kit/bootstrap/test_policy_handoff.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))
@@ -247,6 +258,10 @@ class PublicTreeTests(unittest.TestCase):
             edited.write_text(edited.read_text(encoding="utf-8") + "\n", encoding="utf-8")
             with self.assertRaisesRegex(PublicTreeError, "file-hash-mismatch"):
                 scan_tree(root, "platform")
+
+    def test_role_signer_suite_is_registered_in_source_free_ci(self):
+        workflow = (ROOT / ".github/workflows/core-rust-format-return.yml").read_text(encoding="utf-8")
+        self.assertIn('unittest discover -s kit/confinement -p "test_role_signer.py"', workflow)
 
     def test_pinned_action_version_comment_is_the_only_permitted_comment(self):
         version_pin = "uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " v4.2.2"
