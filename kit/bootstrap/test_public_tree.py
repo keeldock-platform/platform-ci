@@ -230,6 +230,8 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_windows_native_preflight.py",
             "kit/confinement/macos_source_reader.py",
             "kit/confinement/test_macos_source_reader.py",
+            'kit/confinement/cargo_vendor_verify.py',
+            'kit/confinement/test_cargo_vendor_verify.py',
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))
