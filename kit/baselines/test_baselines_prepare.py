@@ -578,8 +578,27 @@ class SyntheticRecordTests(unittest.TestCase):
         self.assertNotIn(b" ", first)
         self.assertNotIn(b"\n", first)
 
-    def test_load_block_round_trips_and_refuses_malformed_payloads(self):
+    def small_block(self):
         block = self.block()
+        block["rows"] = [dict(row, values=row["values"][:10]) for row in block["rows"][:2]]
+        for row in block["rows"]:
+            row["observation_count"] = 10
+            row["statistic_value"] = compute_statistic("p95", row["values"])
+        self.assertTrue(validate_block(block))
+        self.assertLess(len(canonical_bytes(block)), MAX_BLOCK_BYTES // 4)
+        return block
+
+    def test_load_block_round_trips_the_full_size_block_and_refuses_oversize_first(self):
+        block = self.block()
+        payload = canonical_bytes(block)
+        self.assertEqual(load_block(payload), block)
+        with self.assertRaisesRegex(BaselinesRefusal, "record_oversize"):
+            load_block(payload + b" " * MAX_BLOCK_BYTES)
+        with self.assertRaisesRegex(BaselinesRefusal, "record_oversize"):
+            load_block(payload.replace(b'{"batch_index":0,', b'{"batch_index":0,"batch_index":0,', 1))
+
+    def test_load_block_refuses_malformed_payloads(self):
+        block = self.small_block()
         payload = canonical_bytes(block)
         self.assertEqual(load_block(payload), block)
         duplicate = payload.replace(b'{"batch_index":0,', b'{"batch_index":0,"batch_index":0,', 1)
@@ -590,7 +609,6 @@ class SyntheticRecordTests(unittest.TestCase):
             (b"[]", "record_fields"),
             (b"NaN", "record_malformed"),
             (b"\xff", "record_malformed"),
-            (payload + b" " * MAX_BLOCK_BYTES, "record_oversize"),
             ("text", "record_malformed"),
         ):
             with self.subTest(code=code):
@@ -599,7 +617,7 @@ class SyntheticRecordTests(unittest.TestCase):
 
     def test_block_validation_refuses_identity_and_row_defects(self):
         def mutate(change):
-            block = copy.deepcopy(self.block())
+            block = copy.deepcopy(self.small_block())
             change(block)
             return block
 
