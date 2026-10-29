@@ -1410,6 +1410,7 @@ class LaneRegistryTests(unittest.TestCase):
                 "linux-confinement",
                 "windows-native-preflight",
                 "windows-confinement",
+                "capsule-vectors",
                 "windows-handoff-synthetic",
                 "windows-source-admission",
                 "lane-h-windows-receiver",
@@ -1421,6 +1422,7 @@ class LaneRegistryTests(unittest.TestCase):
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-confinement"], policy_windows)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["capsule-vectors"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-handoff-synthetic"], policy_handoff)
         for kind in (
             "windows-source-admission",
@@ -1467,6 +1469,11 @@ class LaneRegistryTests(unittest.TestCase):
                     "windows-confinement-workflow-too-large",
                 ),
                 (
+                    ".github/workflows/capsule-vectors.yml",
+                    "capsule-vectors",
+                    "capsule-vectors-workflow-too-large",
+                ),
+                (
                     ".github/workflows/windows-handoff-synthetic.yml",
                     "windows-handoff-synthetic",
                     "handoff-workflow-too-large",
@@ -1494,6 +1501,14 @@ class LaneRegistryTests(unittest.TestCase):
                 ".github/workflows/windows-confinement.yml",
                 "windows-confinement",
                 "windows-confinement-workflow-too-large",
+            ),
+            policy.LANE_CANDIDATE_WORKFLOWS,
+        )
+        self.assertIn(
+            (
+                ".github/workflows/capsule-vectors.yml",
+                "capsule-vectors",
+                "capsule-vectors-workflow-too-large",
             ),
             policy.LANE_CANDIDATE_WORKFLOWS,
         )
