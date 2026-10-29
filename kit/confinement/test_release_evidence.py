@@ -118,6 +118,18 @@ class ReleaseEvidenceTests(unittest.TestCase):
         after = SimpleNamespace(**dict(fields, st_ctime_ns=6))
         self.assertNotEqual(subject._file_identity(before), subject._file_identity(after))
 
+    @unittest.skipUnless(os.name == "nt", "Windows directory metadata only")
+    def test_windows_inventory_keeps_full_file_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = _write(root, "build.log", b"safe log\n")
+            files, directories = subject._inventory(root, None)
+            self.assertEqual(directories, {})
+            self.assertEqual(
+                subject._file_identity(files["build.log"]),
+                subject._file_identity(os.lstat(target)),
+            )
+
     def test_pinned_canary_in_any_listed_file_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

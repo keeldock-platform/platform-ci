@@ -224,7 +224,10 @@ def _inventory(root, root_descriptor):
                     if nodes[0] > MAX_TREE_NODES:
                         raise EvidenceRefusal("tree_invalid")
                     try:
-                        metadata = entry.stat(follow_symlinks=False)
+                        metadata = (
+                            entry.stat(follow_symlinks=False)
+                            if root_descriptor is not None else os.lstat(entry.path)
+                        )
                         if _is_link(metadata):
                             raise EvidenceRefusal("tree_invalid")
                     except EvidenceRefusal:
