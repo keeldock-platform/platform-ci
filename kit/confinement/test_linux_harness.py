@@ -14,7 +14,8 @@ from types import SimpleNamespace
 import urllib.error
 from unittest.mock import MagicMock, Mock, patch
 
-from linux_harness import AUDIT_ARCH_NATIVE, CHILD_SOURCE, MAX_PROBE_SECONDS, PROBES, SECCOMP_ALLOW, SECCOMP_DENY, SOCKET_FILTER, UNSHARE_ARGUMENTS, COMPAT_SYSCALL_BIT, ProofFailure, SockFprog, _drop_child, _enter_rootfs_and_launch, _expected_denial, _inside, _install_socket_filter, _run_probe, _supervise_child_process, _verify_child, _verify_netns, _verify_proc_routes, _require_empty_route_dump, ROUTE_CHANGE_GROUPS, advance_supervision, outcome, valid_sha
+import linux_harness as harness
+from linux_harness import DENIED_SYSCALLS, AUDIT_ARCH_NATIVE, CHILD_SOURCE, MAX_PROBE_SECONDS, PROBES, SECCOMP_ALLOW, SECCOMP_DENY, SOCKET_FILTER, UNSHARE_ARGUMENTS, COMPAT_SYSCALL_BIT, ProofFailure, SockFprog, _drop_child, _enter_rootfs_and_launch, _expected_denial, _inside, _install_socket_filter, _run_probe, _supervise_child_process, _verify_child, _verify_netns, _verify_proc_routes, _require_empty_route_dump, ROUTE_CHANGE_GROUPS, advance_supervision, outcome, valid_sha
 
 
 class HarnessPolicyTests(unittest.TestCase):
@@ -507,7 +508,7 @@ class HarnessPolicyTests(unittest.TestCase):
             data = struct.pack("<IIQ6Q", number, architecture, 0, *([0] * 6))
             accumulator = 0
             pc = 0
-            for _ in range(64):
+            for _ in range(128):
                 code, yes, no, value = SOCKET_FILTER[pc]
                 if code == 0x20:
                     accumulator = struct.unpack_from("<I", data, value)[0]
@@ -523,7 +524,7 @@ class HarnessPolicyTests(unittest.TestCase):
             self.fail("filter-did-not-return")
 
         for number in range(512):
-            expected = SECCOMP_DENY if number in (41, 53, 425, 426, 427) else SECCOMP_ALLOW
+            expected = SECCOMP_DENY if number in DENIED_SYSCALLS else SECCOMP_ALLOW
             self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, number), expected)
             self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, COMPAT_SYSCALL_BIT | number), SECCOMP_DENY)
             for architecture in (0x40000003, 0xC00000B7, 0, 0xFFFFFFFF):
@@ -651,7 +652,7 @@ class HarnessPolicyTests(unittest.TestCase):
 
     def test_capture_verification_requires_exact_identity_and_write_only_regular_files(self):
         nonce = "c" * 24
-        child = {"Uid": ["65534"] * 4, "Gid": ["65534"] * 4, "Groups": [], "NoNewPrivs": ["1"], "Seccomp": ["2"], "Seccomp_filters": ["1"]}
+        child = {"Uid": [str(harness.CHILD_UID)] * 4, "Gid": [str(harness.CHILD_GID)] * 4, "Groups": [], "NoNewPrivs": ["1"], "Seccomp": ["2"], "Seccomp_filters": ["1"]}
         child.update({key: ["0000000000000000"] for key in ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")})
         root = {"Seccomp_filters": ["0"]}
         regular = SimpleNamespace(st_dev=1, st_ino=20, st_uid=0, st_mode=stat.S_IFREG | 0o200)
@@ -659,7 +660,7 @@ class HarnessPolicyTests(unittest.TestCase):
             (regular, "flags:\t0100001\n", None),
             (SimpleNamespace(st_dev=1, st_ino=21, st_uid=0, st_mode=stat.S_IFREG | 0o200), "flags:\t1\n", 90),
             (SimpleNamespace(st_dev=1, st_ino=20, st_uid=0, st_mode=stat.S_IFSOCK | 0o200), "flags:\t1\n", 90),
-            (SimpleNamespace(st_dev=1, st_ino=20, st_uid=65534, st_mode=stat.S_IFREG | 0o200), "flags:\t1\n", 90),
+            (SimpleNamespace(st_dev=1, st_ino=20, st_uid=harness.CHILD_UID, st_mode=stat.S_IFREG | 0o200), "flags:\t1\n", 90),
             (regular, "flags:\t2\n", 90),
             (regular, "flags:\t1\nflags:\t1\n", 90),
         )
@@ -678,6 +679,14 @@ class HarnessPolicyTests(unittest.TestCase):
                     with self.assertRaises(ProofFailure) as raised:
                         _verify_child(2, nonce)
                     self.assertEqual(raised.exception.reason, reason)
+
+
+from test_linux_boundary import *
+from test_linux_canaries import *
+from test_linux_channels import *
+from test_linux_fixtures import *
+from test_linux_session import *
+from test_linux_settings import *
 
 
 if __name__ == "__main__":

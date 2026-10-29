@@ -1444,9 +1444,11 @@ class LaneRegistryTests(unittest.TestCase):
                 "lane-h-linux-fetch-encrypt",
                 "lane-h-capsule-attester",
                 "attestation-role-signer-probe",
+                "linux-source-admission",
             },
         )
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["linux-source-admission"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-confinement"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["capsule-vectors"], policy_windows)
@@ -1486,6 +1488,11 @@ class LaneRegistryTests(unittest.TestCase):
             (
                 (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
                 (
+                    ".github/workflows/linux-source-admission.yml",
+                    "linux-source-admission",
+                    "linux-source-admission-workflow-too-large",
+                ),
+                (
                     ".github/workflows/windows-native-preflight.yml",
                     "windows-native-preflight",
                     "windows-workflow-too-large",
@@ -1513,6 +1520,14 @@ class LaneRegistryTests(unittest.TestCase):
         )
         self.assertIn(
             (".github/workflows/linux-confinement.yml", "linux-confinement", "linux-workflow-too-large"),
+            policy.LANE_CANDIDATE_WORKFLOWS,
+        )
+        self.assertIn(
+            (
+                ".github/workflows/linux-source-admission.yml",
+                "linux-source-admission",
+                "linux-source-admission-workflow-too-large",
+            ),
             policy.LANE_CANDIDATE_WORKFLOWS,
         )
         self.assertIn(
