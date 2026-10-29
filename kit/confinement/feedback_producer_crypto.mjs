@@ -3,7 +3,10 @@ import { TextDecoder } from 'node:util';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
-import { encryptDevelopmentFeedback } from './development_feedback.mjs';
+import {
+  encryptDevelopmentFeedback,
+  encryptDevelopmentFeedbackWithRustSources,
+} from './development_feedback.mjs';
 import { returnProfileForContext } from './node_lock_envelope.mjs';
 
 const MAX_INPUT_BYTES = 6 * 1024 * 1024;
@@ -16,6 +19,7 @@ const REFUSAL_CODES = new Set([
 ]);
 const BASE64_SHAPE = /^[A-Za-z0-9+/]*={0,2}$/u;
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
+const MAX_RUST_SOURCE_BYTES = 1024 * 1024;
 
 export class FeedbackCryptoError extends Error {
   constructor(code = 'invalid_input') {
@@ -87,10 +91,27 @@ function publicKeyFromSpki(encoded, context) {
   return key;
 }
 
+function originalRustFiles(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 512) reject('invalid_expectation');
+  const files = new Map();
+  for (const entry of value) {
+    if (!exactObject(entry, ['path', 'content_b64'], ['path', 'content_b64'])
+        || typeof entry.path !== 'string' || files.has(entry.path)) reject('invalid_expectation');
+    const bytes = strictBytes(entry.content_b64, MAX_RUST_SOURCE_BYTES);
+    try {
+      UTF8.decode(bytes);
+    } catch {
+      reject('invalid_payload');
+    }
+    files.set(entry.path, bytes);
+  }
+  return files;
+}
+
 function validateInput(input) {
   const keys = [
     'schema_version', 'kind', 'payload_b64', 'context', 'recipient_spki_b64', 'now',
-    'expected_manifest', 'reviewed_rust_paths',
+    'expected_manifest', 'reviewed_rust_paths', 'original_rust_files_b64',
   ];
   if (!exactObject(input, keys,
     ['schema_version', 'kind', 'payload_b64', 'context', 'recipient_spki_b64', 'now'])
@@ -117,8 +138,10 @@ function validateInput(input) {
     recipientPublicKey: publicKey,
     now: input.now,
   };
+  let trustedOriginalRustFiles;
   if (input.kind === 'lock') {
-    if (!Object.hasOwn(input, 'expected_manifest') || Object.hasOwn(input, 'reviewed_rust_paths')) {
+    if (!Object.hasOwn(input, 'expected_manifest') || Object.hasOwn(input, 'reviewed_rust_paths')
+        || Object.hasOwn(input, 'original_rust_files_b64')) {
       reject('invalid_expectation');
     }
     options.expectedManifest = input.expected_manifest;
@@ -127,16 +150,24 @@ function validateInput(input) {
       reject('invalid_expectation');
     }
     options.reviewedRustPaths = input.reviewed_rust_paths;
+    if (Object.hasOwn(input, 'original_rust_files_b64')) {
+      trustedOriginalRustFiles = originalRustFiles(input.original_rust_files_b64);
+    }
   } else if (Object.hasOwn(input, 'expected_manifest') || Object.hasOwn(input, 'reviewed_rust_paths')) {
     reject('invalid_expectation');
+  } else if (Object.hasOwn(input, 'original_rust_files_b64')) {
+    reject('invalid_expectation');
   }
-  return { options, payloadBytes };
+  return { options, payloadBytes, trustedOriginalRustFiles };
 }
 
 export function encryptFeedbackPayload(input) {
   try {
-    const { options } = validateInput(input);
-    return Buffer.from(encryptDevelopmentFeedback(options));
+    const { options, trustedOriginalRustFiles } = validateInput(input);
+    const ciphertext = trustedOriginalRustFiles === undefined
+      ? encryptDevelopmentFeedback(options)
+      : encryptDevelopmentFeedbackWithRustSources(options, trustedOriginalRustFiles);
+    return Buffer.from(ciphertext);
   } catch (error) {
     if (error instanceof FeedbackCryptoError) throw error;
     reject(innerRefusalCode(error));

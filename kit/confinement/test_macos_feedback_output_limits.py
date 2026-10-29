@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -64,11 +65,11 @@ class Helpers(object):
         except Exception as error:
             self.fail("plain exception %s escaped %s: %s" % (type(error).__name__, name, error))
 
-    def dispatch(self, spki=None):
+    def dispatch(self, spki=None, kind="rust_patch"):
         context = mock.patch.object(base, "SPKI", base.SPKI if spki is None else spki)
         with context:
-            unused_request, environment = base._dispatch("rust_patch")
-            return producer.validate_dispatch("rust_patch", environment, now=base.NOW)
+            unused_request, environment = base._dispatch(kind)
+            return producer.validate_dispatch(kind, environment, now=base.NOW)
 
     def refusal_for(self, payload, paths, run_result=None, input_error=None):
         dispatch = self.dispatch()
@@ -81,6 +82,20 @@ class Helpers(object):
             return self.call_without_plain_exceptions(
                 "encrypt_after_cleanup",
                 lambda: producer.encrypt_after_cleanup(dispatch, result, node))
+
+    def write_output_as_current_user(self, runner_temp, dispatch, ciphertext):
+        with mock.patch.object(producer, "OUTPUT_OWNER_UID", os.getuid()), \
+                mock.patch.object(producer, "OUTPUT_OWNER_GID", os.getgid()), \
+                mock.patch.object(producer.os, "fchown", return_value=None):
+            return producer.write_output(Path(runner_temp), dispatch, ciphertext)
+
+    def assert_written_ciphertext(self, raw_receipt, runner_temp, dispatch, ciphertext):
+        receipt = json.loads(raw_receipt)
+        member_path = Path(runner_temp) / producer.OUTPUT_DIRECTORY / dispatch["profile"]["member_name"]
+        self.assertEqual(receipt["member_name"], dispatch["profile"]["member_name"])
+        self.assertEqual(receipt["member_size"], len(ciphertext))
+        self.assertEqual(member_path.stat().st_size, len(ciphertext))
+        self.assertEqual(member_path.read_bytes(), ciphertext)
 
 
 
@@ -119,16 +134,14 @@ class OutputPathRefusals(Helpers, unittest.TestCase):
         outcome = self.refusal_for(b"", paths, SimpleNamespace(returncode=0, stdout=b"", stderr=b""))
         self.assertEqual(outcome.detail, "payload_missing")
 
-    def test_output_write_refusals_carry_details_and_never_plain_exceptions(self):
+    def test_output_write_succeeds_for_a_non_root_owner_and_checks_member_bytes(self):
         dispatch = self.dispatch()
         member = dispatch["profile"]["member_name"]
+        ciphertext = b"KDLE" + b"x" * 64
         with tempfile.TemporaryDirectory() as temporary:
-            outcome = self.call_without_plain_exceptions(
-                "write_output",
-                lambda: producer.write_output(Path(temporary), dispatch, b"KDLE" + b"x" * 64))
-            if isinstance(outcome, producer.FeedbackRefusal):
-                self.assertEqual(outcome.reason, "output_unavailable")
-                self.assertIn(outcome.detail, ("output_write", "output_directory"))
+            outcome = self.write_output_as_current_user(temporary, dispatch, ciphertext)
+            self.assertIsInstance(outcome, str)
+            self.assert_written_ciphertext(outcome, temporary, dispatch, ciphertext)
         outcome = self.call_without_plain_exceptions(
             "write_output", lambda: producer.write_output(Path("/nonexistent"), dispatch, b""))
         self.assertIsInstance(outcome, producer.FeedbackRefusal)
@@ -139,12 +152,9 @@ class OutputPathRefusals(Helpers, unittest.TestCase):
         dispatch = self.dispatch()
         ciphertext = b"KDLE" + b"x" * (producer.MAX_CIPHERTEXT_BYTES - 4)
         with tempfile.TemporaryDirectory() as temporary:
-            outcome = self.call_without_plain_exceptions(
-                "write_output", lambda: producer.write_output(Path(temporary), dispatch, ciphertext))
-        if isinstance(outcome, producer.FeedbackRefusal):
-            self.assertIn(outcome.detail, ("output_write", "output_directory"))
-        else:
-            self.assertEqual(outcome["member_size"], producer.MAX_CIPHERTEXT_BYTES)
+            outcome = self.write_output_as_current_user(temporary, dispatch, ciphertext)
+            self.assertIsInstance(outcome, str)
+            self.assert_written_ciphertext(outcome, temporary, dispatch, ciphertext)
         too_large = self.call_without_plain_exceptions(
             "write_output", lambda: producer.write_output(Path("/nonexistent"), dispatch, ciphertext + b"x"))
         self.assertEqual(too_large.detail, "output_member")
@@ -158,6 +168,8 @@ class NearLimitPatchThroughRealEncryption(Helpers, unittest.TestCase):
             [NODE, "-e", KEY_SCRIPT], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=120, check=False)
         if result.returncode != 0 or not result.stdout:
+            if os.environ.get("CI") == "true":
+                raise AssertionError("the CI node runtime could not generate a recipient key")
             raise unittest.SkipTest("the node runtime could not generate a recipient key")
         cls.spki = result.stdout
 
@@ -177,6 +189,9 @@ class NearLimitPatchThroughRealEncryption(Helpers, unittest.TestCase):
             "near-limit patch was refused with detail %r" % getattr(outcome, "detail", None))
         self.assertEqual(outcome[:4], b"KDLE")
         self.assertLessEqual(len(outcome), producer.MAX_CIPHERTEXT_BYTES)
+        with tempfile.TemporaryDirectory() as temporary:
+            receipt = self.write_output_as_current_user(temporary, dispatch, outcome)
+            self.assert_written_ciphertext(receipt, temporary, dispatch, outcome)
 
     def test_credential_like_patch_text_is_reported_by_its_node_reason(self):
         patch, paths = synthetic_rust_patch(200_000)
@@ -193,7 +208,7 @@ class NearLimitPatchThroughRealEncryption(Helpers, unittest.TestCase):
         self.assertEqual(outcome.detail, "node_credential_like_content")
 
 
-class SuccessReceiptDiagnosticTests(unittest.TestCase):
+class SuccessReceiptDiagnosticTests(Helpers, unittest.TestCase):
     def test_producer_core_and_audit_detail_tables_are_identical(self):
         core = load_module("macos_core_contract")
         audit = load_module("macos_public_audit")
@@ -206,6 +221,48 @@ class SuccessReceiptDiagnosticTests(unittest.TestCase):
         self.assertLessEqual(core.SUCCESS_RECEIPT_DIAGNOSTICS, core.DIAGNOSTICS)
         self.assertLessEqual(
             audit.CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS, audit.CORE_CONTRACT_REFUSAL_DIAGNOSTICS)
+
+    def test_missing_manifest_reviewed_paths_and_encryptor_failures_have_fixed_details(self):
+        core = load_module("macos_core_contract")
+        expected_details = (
+            "expected_manifest_invalid", "reviewed_paths_invalid", "encryptor_unavailable",
+        )
+        dispatch = self.dispatch()
+        with self.assertRaises(producer.FeedbackRefusal) as missing_paths:
+            producer.encrypt_after_cleanup(
+                dispatch, {"payload_bytes": b"diff"}, Path(NODE or "/usr/bin/node"))
+        self.assertEqual(missing_paths.exception.detail, "reviewed_paths_invalid")
+        with self.assertRaises(producer.FeedbackRefusal) as missing_manifest:
+            producer.encrypt_after_cleanup(
+                self.dispatch(kind="lock"), {"payload_bytes": b"lock"},
+                Path(NODE or "/usr/bin/node"))
+        self.assertEqual(missing_manifest.exception.detail, "expected_manifest_invalid")
+
+        original_resolve = Path.resolve
+
+        def refuse_encryptor_resolution(path, *args, **kwargs):
+            if path.name == "feedback_producer_crypto.mjs":
+                raise OSError("unavailable")
+            return original_resolve(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", new=refuse_encryptor_resolution):
+            with self.assertRaises(producer.FeedbackRefusal) as missing_encryptor:
+                producer.encrypt_after_cleanup(
+                    dispatch,
+                    {"payload_bytes": b"diff", "reviewed_rust_paths": ["crates/host/api/src/lib.rs"]},
+                    Path(NODE or "/usr/bin/node"),
+                )
+        self.assertEqual(missing_encryptor.exception.detail, "encryptor_unavailable")
+
+        diagnostics = frozenset("success_receipt_" + detail for detail in expected_details)
+        self.assertTrue(diagnostics <= core.DIAGNOSTICS)
+        failure_module = load_module("feedback_failure")
+        for diagnostic in diagnostics:
+            refusal = core.Refusal("internal_error", "internal", diagnostic=diagnostic)
+            attached = core._FailureDiagnostics().attach(refusal, diagnostic)
+            self.assertEqual(attached.diagnostic, diagnostic)
+            raw = b"KD-FEEDBACK-PRODUCER-REFUSAL " + core._format_refusal(attached) + b"\n"
+            self.assertEqual(failure_module.normalize_refusal(raw), raw)
 
     def test_success_receipt_diagnostics_survive_attach_formatting_and_normalisation(self):
         core = load_module("macos_core_contract")

@@ -564,6 +564,84 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn('"diagnostic":"summary_guard_input"', output.getvalue())
 
+    def test_producer_revocation_marker_follows_successful_cleanup_on_late_refusal(self):
+        arguments = [
+            "run", "--token-stdin", "--source-sha", SOURCE_SHA,
+            "--base-sha", BASE_SHA, "--base-branch", "develop",
+        ]
+        events = []
+        output = io.StringIO()
+        error_output = io.StringIO()
+
+        def revoke(unused_environment, unused_token):
+            events.append("revoke")
+            return True
+
+        rules = SimpleNamespace(_revoke_pending_token=revoke)
+        with patch.object(subject, "_execute", side_effect=subject.Refusal("runner_unavailable", "receipt")):
+            with patch.object(subject, "_load_control_sibling", return_value=rules):
+                status = subject.main(
+                    arguments=arguments, environ={}, stdin=io.BytesIO(b"fixture-token\n"),
+                    stdout=output, stderr=error_output,
+                )
+        self.assertEqual(status, 1)
+        self.assertEqual(events, ["revoke"])
+        self.assertEqual(error_output.getvalue(), "KD-PRODUCER-TOKEN-REVOCATION confirmed\n")
+        self.assertTrue(output.getvalue().startswith("KD-CORE-CONTRACT-REFUSAL "))
+
+    def test_producer_revocation_marker_is_absent_when_token_stdin_read_fails(self):
+        arguments = [
+            "run", "--token-stdin", "--source-sha", SOURCE_SHA,
+            "--base-sha", BASE_SHA, "--base-branch", "develop",
+        ]
+        output = io.StringIO()
+        error_output = io.StringIO()
+        with patch.object(subject, "_execute") as execute:
+            status = subject.main(
+                arguments=arguments, environ={}, stdin=io.BytesIO(),
+                stdout=output, stderr=error_output,
+            )
+        self.assertEqual(status, 1)
+        execute.assert_not_called()
+        self.assertEqual(error_output.getvalue(), "")
+
+    def test_producer_revocation_marker_is_absent_when_revoke_fails(self):
+        arguments = [
+            "run", "--token-stdin", "--source-sha", SOURCE_SHA,
+            "--base-sha", BASE_SHA, "--base-branch", "develop",
+        ]
+        output = io.StringIO()
+        error_output = io.StringIO()
+        rules = SimpleNamespace(_revoke_pending_token=lambda unused_environment, unused_token: False)
+        with patch.object(subject, "_execute", side_effect=subject.Refusal("runner_unavailable", "receipt")):
+            with patch.object(subject, "_load_control_sibling", return_value=rules):
+                status = subject.main(
+                    arguments=arguments, environ={}, stdin=io.BytesIO(b"fixture-token\n"),
+                    stdout=output, stderr=error_output,
+                )
+        self.assertEqual(status, 1)
+        self.assertEqual(error_output.getvalue(), "")
+
+    def test_producer_revocation_marker_is_printed_on_a_confirmed_normal_path(self):
+        arguments = [
+            "run", "--token-stdin", "--source-sha", SOURCE_SHA,
+            "--base-sha", BASE_SHA, "--base-branch", "develop",
+        ]
+        output = io.StringIO()
+        error_output = io.StringIO()
+
+        def successful_execute(unused_arguments, unused_environment, unused_token, lifecycle, **unused_kwargs):
+            lifecycle["token_revocation"] = "confirmed_before_execution"
+            return b'{"status":"passed"}'
+
+        with patch.object(subject, "_execute", side_effect=successful_execute):
+            status = subject.main(
+                arguments=arguments, environ={}, stdin=io.BytesIO(b"fixture-token\n"),
+                stdout=output, stderr=error_output,
+            )
+        self.assertEqual(status, 0)
+        self.assertEqual(error_output.getvalue(), "KD-PRODUCER-TOKEN-REVOCATION confirmed\n")
+
     def test_source_failure_details_survive_outer_reattach_and_cleanup_keeps_first_cause(self):
         source_failures = (
             ("invalid_input", "source_validation", "source_runtime_input_invalid_input"),

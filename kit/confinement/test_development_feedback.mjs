@@ -7,6 +7,7 @@ import {
   DevelopmentFeedbackError,
   decryptDevelopmentFeedback,
   encryptDevelopmentFeedback,
+  encryptDevelopmentFeedbackWithRustSources,
   validateDevelopmentFeedback,
 } from './development_feedback.mjs';
 import { encryptReturnEnvelope, LOCK_ENVELOPE_LIMITS, RETURN_PROFILES } from './node_lock_envelope.mjs';
@@ -164,6 +165,15 @@ function validate(kind, payloadBytes, extra = {}) {
   return validateDevelopmentFeedback({ payloadBytes, context: contextFor(profileName), now: NOW, ...extra });
 }
 
+function encryptRustPatchWithSources(payloadBytes, originals) {
+  return encryptDevelopmentFeedbackWithRustSources({
+    payloadBytes,
+    context: contextFor('core-rust-format-return'),
+    recipientPublicKey: recipient.publicKey,
+    now: NOW,
+  }, new Map(Object.entries(originals).map(([path, contents]) => [path, Buffer.from(contents, 'utf8')])));
+}
+
 before(() => {
   recipient = generateKeyPairSync('rsa', { modulusLength: 3072, publicExponent: 65537 });
 });
@@ -199,6 +209,52 @@ test('accepts a one-file patch only for an exact reviewed Rust path', () => {
   assert.throws(() => validate('rust_patch', Buffer.alloc(DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes + 1), {
     reviewedRustPaths: ['src/lib.rs'],
   }), DevelopmentFeedbackError);
+});
+
+test('accepts whitespace-equivalent rust patches with credential-shaped context', () => {
+  const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
+    'let token = CancellationToken::new();');
+  const envelope = encryptRustPatchWithSources(payload, {
+    'src/lib.rs': 'let token=CancellationToken::new();\n',
+  });
+  assert.ok(envelope instanceof Uint8Array);
+});
+
+test('rejects rust patches that add a credential-shaped literal', () => {
+  const payload = Buffer.from([
+    'diff --git a/src/lib.rs b/src/lib.rs',
+    '--- a/src/lib.rs',
+    '+++ b/src/lib.rs',
+    '@@ -1,1 +1,2 @@',
+    ' fn run() {}',
+    '+let token = "synthetic-secret-value";',
+    '',
+  ].join('\n'), 'utf8');
+  assert.throws(() => encryptRustPatchWithSources(payload, {
+    'src/lib.rs': 'fn run() {}\n',
+  }), { code: 'credential_like_content' });
+});
+
+test('continues scanning credential-shaped text for non-rust payloads', () => {
+  const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
+    'let token = CancellationToken::new();');
+  assert.throws(() => validate('build_diagnostics', payload), { code: 'credential_like_content' });
+});
+
+test('scans credential-shaped context when a rust patch changes a non-whitespace token', () => {
+  const payload = Buffer.from([
+    'diff --git a/src/lib.rs b/src/lib.rs',
+    '--- a/src/lib.rs',
+    '+++ b/src/lib.rs',
+    '@@ -1,2 +1,2 @@',
+    ' let token = CancellationToken::new();',
+    '-let value = alpha;',
+    '+let value = beta;',
+    '',
+  ].join('\n'), 'utf8');
+  assert.throws(() => encryptRustPatchWithSources(payload, {
+    'src/lib.rs': 'let token = CancellationToken::new();\nlet value = alpha;\n',
+  }), { code: 'credential_like_content' });
 });
 
 test('bounds the reviewed Rust path list at the four crate headroom', () => {

@@ -563,7 +563,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                 calls.append(("command", args[1], args[6], kwargs))
                 return command_result
 
-            def record_patch(source_path, formatted, paths, worker_uid, deadline):
+            def record_patch(source_path, formatted, paths, worker_uid, deadline, original_sources=None):
                 calls.append(("patch", source_path, formatted, tuple(paths), worker_uid))
                 return b"synthetic-format-patch"
 
@@ -736,6 +736,31 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertEqual(result["reviewed_rust_paths"], list(kernel_paths))
         self.assertEqual(result["payload_bytes"], b"synthetic-format-patch")
 
+    def test_encrypt_after_cleanup_retries_credential_text_with_captured_source_bytes(self):
+        dispatch = _validated_dispatch("rust_patch")
+        result = {
+            "payload_bytes": b"synthetic-format-patch",
+            "reviewed_rust_paths": ["src/lib.rs", "src/unchanged.rs"],
+            "original_rust_sources": {"src/lib.rs": b"let token=CancellationToken::new();\n"},
+        }
+        calls = []
+
+        def encrypt_payload(encryptor, record, node):
+            calls.append(dict(record))
+            if len(calls) == 1:
+                raise producer.FeedbackRefusal("payload_invalid", "node_credential_like_content")
+            return b"synthetic-ciphertext"
+
+        with patch.object(producer, "_encrypt_payload", side_effect=encrypt_payload):
+            ciphertext = producer.encrypt_after_cleanup(dispatch, result, Path("/trusted/node"))
+        self.assertEqual(ciphertext, b"synthetic-ciphertext")
+        self.assertNotIn("original_rust_files_b64", calls[0])
+        self.assertEqual(calls[1]["original_rust_files_b64"], [{
+            "path": "src/lib.rs",
+            "content_b64": base64.b64encode(b"let token=CancellationToken::new();\n").decode("ascii"),
+        }])
+        self.assertNotIn("original_rust_files_b64", dispatch["request"])
+
     def test_reviewed_rust_path_cap_admits_the_four_crate_contract_and_is_enforced_at_the_boundary(self):
         self.assertGreater(producer.MAX_RUST_PATHS, 368)
         self.assertEqual(producer.MAX_RUST_PATHS, 512)
@@ -799,13 +824,16 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         read_worker.assert_not_called()
 
     def test_format_patch_loop_runs_while_the_deadline_is_open(self):
+        original_sources = {}
         with patch.object(producer, "_read_file", return_value=b"fn a(){}\n"), \
                 patch.object(producer, "_read_worker_file", return_value=b"fn a() {}\n"):
             payload = producer._rust_format_patch(
                 Path("/synthetic-source"), Path("/synthetic-formatted"),
                 ("crates/kernel/i18n/src/lib.rs",), 501, time.monotonic() + 600,
+                original_sources=original_sources,
             )
         self.assertTrue(payload.startswith(b"diff --git a/crates/kernel/i18n/src/lib.rs "))
+        self.assertEqual(original_sources, {"crates/kernel/i18n/src/lib.rs": b"fn a(){}\n"})
 
     def test_format_patch_limit_matches_the_profile_and_is_enforced_at_the_boundary(self):
         self.assertEqual(producer.MAX_PATCH_BYTES, 4 * 1024 * 1024 - 64 * 1024)

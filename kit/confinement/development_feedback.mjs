@@ -188,6 +188,7 @@ function parseRustPatch(text, reviewedPaths) {
   const lines = text.slice(0, -1).split('\n');
   if (lines.length > DEVELOPMENT_FEEDBACK_LIMITS.rustPatchLines) reject('limit_exceeded');
   const changedPaths = new Set();
+  const files = [];
   let index = 0;
   while (index < lines.length) {
     const fileHeader = /^diff --git a\/([^ ]+) b\/([^ ]+)$/u.exec(lines[index]);
@@ -197,6 +198,8 @@ function parseRustPatch(text, reviewedPaths) {
     if (oldPath !== newPath || !RUST_PATH.test(oldPath) || !reviewedPaths.has(oldPath)
         || changedPaths.has(oldPath)) reject('unreviewed_rust_path');
     changedPaths.add(oldPath);
+    const file = { path: oldPath, hunks: [] };
+    files.push(file);
     index += 1;
     if (index < lines.length && lines[index].startsWith('index ')) {
       if (!/^index [a-f0-9]{7,64}\.{2}[a-f0-9]{7,64}(?: 100644)?$/u.test(lines[index])) {
@@ -224,11 +227,13 @@ function parseRustPatch(text, reviewedPaths) {
       let newSeen = 0;
       let bodyLines = 0;
       let canMarkNoNewline = false;
+      const hunkLines = [];
       while (index < lines.length && !lines[index].startsWith('@@ ')
           && !lines[index].startsWith('diff --git ')) {
         const line = lines[index];
         if (line === '\\ No newline at end of file') {
           if (!canMarkNoNewline) reject('invalid_rust_patch');
+          hunkLines[hunkLines.length - 1].newline = false;
           canMarkNoNewline = false;
           index += 1;
           continue;
@@ -240,18 +245,85 @@ function parseRustPatch(text, reviewedPaths) {
         bodyLines += 1;
         if (oldSeen > hunk.oldCount || newSeen > hunk.newCount
             || bodyLines > DEVELOPMENT_FEEDBACK_LIMITS.hunkLines) reject('invalid_rust_patch');
+        hunkLines.push({ kind: line[0], text: line.slice(1), newline: true });
         canMarkNoNewline = true;
         index += 1;
       }
       if (oldSeen !== hunk.oldCount || newSeen !== hunk.newCount || bodyLines === 0) {
         reject('invalid_rust_patch');
       }
+      file.hunks.push({ ...hunk, lines: hunkLines });
       hunkCount += 1;
     }
     if (hunkCount === 0 || !hasEdit) reject('invalid_rust_patch');
     if (changedPaths.size > DEVELOPMENT_FEEDBACK_LIMITS.rustPatchFiles) reject('limit_exceeded');
   }
   if (changedPaths.size === 0) reject('invalid_rust_patch');
+  return files;
+}
+
+function sourceLines(text) {
+  if (text.length === 0) return [];
+  const trailingNewline = text.endsWith('\n');
+  const values = text.split('\n');
+  if (trailingNewline) values.pop();
+  return values.map((value, index) => ({
+    text: value,
+    newline: index < values.length - 1 || trailingNewline,
+  }));
+}
+
+function applyRustFilePatch(originalBytes, file) {
+  let originalText;
+  try {
+    originalText = UTF8.decode(originalBytes);
+  } catch {
+    reject('invalid_rust_patch');
+  }
+  if (originalText.includes('\0') || originalText.includes('\r')) reject('invalid_rust_patch');
+  const original = sourceLines(originalText);
+  const result = [];
+  let originalCursor = 0;
+  for (const hunk of file.hunks) {
+    const oldPosition = hunk.oldCount === 0 ? hunk.oldStart : hunk.oldStart - 1;
+    const newPosition = hunk.newCount === 0 ? hunk.newStart : hunk.newStart - 1;
+    if (oldPosition < originalCursor || oldPosition > original.length) reject('invalid_rust_patch');
+    while (originalCursor < oldPosition) {
+      result.push(original[originalCursor]);
+      originalCursor += 1;
+    }
+    if (newPosition !== result.length) reject('invalid_rust_patch');
+    for (const line of hunk.lines) {
+      if (line.kind === ' ' || line.kind === '-') {
+        const sourceLine = original[originalCursor];
+        if (!sourceLine || sourceLine.text !== line.text || sourceLine.newline !== line.newline) {
+          reject('invalid_rust_patch');
+        }
+        originalCursor += 1;
+        if (line.kind === ' ') result.push(sourceLine);
+      } else {
+        result.push({ text: line.text, newline: line.newline });
+      }
+    }
+  }
+  while (originalCursor < original.length) {
+    result.push(original[originalCursor]);
+    originalCursor += 1;
+  }
+  const patchedText = result.map((line) => line.text + (line.newline ? '\n' : '')).join('');
+  // Whitespace equivalence removes every character matched by JavaScript \s.
+  return originalText.replace(/\s/gu, '') === patchedText.replace(/\s/gu, '');
+}
+
+function rustPatchWhitespaceEquivalent(text, reviewedPaths, originalRustFiles) {
+  const files = parseRustPatch(text, reviewedPaths);
+  if (!(originalRustFiles instanceof Map) || originalRustFiles.size !== files.length) reject('invalid_expectation');
+  for (const file of files) {
+    const originalBytes = originalRustFiles.get(file.path);
+    if (!(originalBytes instanceof Uint8Array)) reject('invalid_expectation');
+    if (!applyRustFilePatch(originalBytes, file)) return false;
+  }
+  return true;
 }
 
 function validateDiagnosticText(text) {
@@ -321,7 +393,7 @@ function validateCargoLockBundle(bytes) {
   if (canonical !== text) reject('invalid_cargo_lock');
 }
 
-function validatePayload(bytes, profile, options) {
+function validatePayload(bytes, profile, options, originalRustFiles) {
   if (!PROFILE_KINDS.has(profile.kind)) reject('unsupported_kind');
   if (profile.kind === 'cargo_lock') {
     if (Object.hasOwn(options, 'expectedManifest') || Object.hasOwn(options, 'reviewedRustPaths')) {
@@ -344,7 +416,19 @@ function validatePayload(bytes, profile, options) {
     if (bytes.byteLength > DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes) reject('payload_too_large');
     const text = decodeText(bytes, DEVELOPMENT_FEEDBACK_LIMITS.rustPatchLines,
       DEVELOPMENT_FEEDBACK_LIMITS.rustPatchLineCodeUnits);
-    validateDiagnosticText(text);
+    let equivalent = false;
+    if (originalRustFiles !== undefined) {
+      try {
+        equivalent = rustPatchWhitespaceEquivalent(text, reviewedPaths, originalRustFiles);
+      } catch (error) {
+        if (error instanceof DevelopmentFeedbackError) {
+          validateDiagnosticText(text);
+          throw error;
+        }
+        reject('invalid_rust_patch');
+      }
+    }
+    if (!equivalent) validateDiagnosticText(text);
     parseRustPatch(text, reviewedPaths);
     return;
   }
@@ -361,13 +445,14 @@ function payloadLimit(kind) {
   return LOCK_MANIFEST_LIMITS.inputBytes;
 }
 
-function prepare(options) {
+function prepare(options, originalRustFiles) {
   const input = dataOptions(options);
   const { profile, context } = validatedContext(input.context);
   validateExceptionWindow(context, input.now);
+  if (originalRustFiles !== undefined && profile.kind !== 'rust_patch') reject('invalid_expectation');
   input.context = context;
   const payloadBytes = copyPayload(input.payloadBytes, payloadLimit(profile.kind));
-  validatePayload(payloadBytes, profile, input);
+  validatePayload(payloadBytes, profile, input, originalRustFiles);
   return { input, profile, payloadBytes };
 }
 
@@ -385,6 +470,23 @@ export function validateDevelopmentFeedback(options) {
 export function encryptDevelopmentFeedback(options) {
   try {
     const prepared = prepare(options);
+    return encryptReturnEnvelope({
+      payloadBytes: prepared.payloadBytes,
+      recipientPublicKey: prepared.input.recipientPublicKey,
+      context: prepared.input.context,
+      now: prepared.input.now,
+    });
+  } catch (error) {
+    if (error instanceof DevelopmentFeedbackError) throw error;
+    if (error instanceof LockEnvelopeError) reject('envelope_rejected');
+    reject('invalid_input');
+  }
+}
+
+/** Validate a producer-built patch against its original Rust bytes before encrypting it. */
+export function encryptDevelopmentFeedbackWithRustSources(options, originalRustFiles) {
+  try {
+    const prepared = prepare(options, originalRustFiles);
     return encryptReturnEnvelope({
       payloadBytes: prepared.payloadBytes,
       recipientPublicKey: prepared.input.recipientPublicKey,

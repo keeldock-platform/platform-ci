@@ -491,6 +491,7 @@ CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS = frozenset(
     "success_receipt_" + detail for detail in (
         "payload_missing", "tool_path", "input_size", "spawn", "node_exit", "output_size",
         "output_shape", "output_directory", "output_write", "output_member",
+        "expected_manifest_invalid", "reviewed_paths_invalid", "encryptor_unavailable",
         "node_credential_like_content", "node_envelope_rejected", "node_exception_expired",
         "node_invalid_cargo_lock", "node_invalid_context", "node_invalid_expectation",
         "node_invalid_input", "node_invalid_lock_manifest", "node_invalid_payload",

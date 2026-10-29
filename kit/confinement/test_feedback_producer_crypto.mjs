@@ -108,6 +108,42 @@ test('producer validates lock and reviewed Rust patch profiles before encryption
   assert.equal(patchCiphertext.includes(Buffer.from('src/lib.rs')), false);
 });
 
+test('producer validates captured Rust source bytes before exempting credential-shaped context', () => {
+  const value = fixture('rust_patch');
+  const original = 'let token=CancellationToken::new();\n';
+  value.input.payload_b64 = Buffer.from([
+    'diff --git a/src/lib.rs b/src/lib.rs',
+    '--- a/src/lib.rs',
+    '+++ b/src/lib.rs',
+    '@@ -1,1 +1,1 @@',
+    '-let token=CancellationToken::new();',
+    '+let token = CancellationToken::new();',
+    '',
+  ].join('\n'), 'utf8').toString('base64');
+  value.input.original_rust_files_b64 = [{
+    path: 'src/lib.rs',
+    content_b64: Buffer.from(original, 'utf8').toString('base64'),
+  }];
+  const ciphertext = encryptFeedbackPayload(value.input);
+  assert.equal(ciphertext[5], 2);
+
+  const changed = fixture('rust_patch');
+  changed.input.payload_b64 = Buffer.from([
+    'diff --git a/src/lib.rs b/src/lib.rs',
+    '--- a/src/lib.rs',
+    '+++ b/src/lib.rs',
+    '@@ -1,1 +1,2 @@',
+    ' fn run() {}',
+    '+let token = "synthetic-secret-value";',
+    '',
+  ].join('\n'), 'utf8').toString('base64');
+  changed.input.original_rust_files_b64 = [{
+    path: 'src/lib.rs',
+    content_b64: Buffer.from('fn run() {}\n', 'utf8').toString('base64'),
+  }];
+  assert.throws(() => encryptFeedbackPayload(changed.input), { code: 'credential_like_content' });
+});
+
 function sizedRustPatch(totalBytes) {
   const width = 4000;
   const prefix = [

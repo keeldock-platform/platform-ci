@@ -33,6 +33,8 @@ NODE_ENV = "KD_NODE_EXECUTABLE"
 NODE_VERSION = "24.22.1"
 OUTPUT_DIRECTORY = "core-feedback"
 FEEDBACK_TEMP_DIRECTORY = "feedback-tmp"
+OUTPUT_OWNER_UID = 0
+OUTPUT_OWNER_GID = 0
 MAX_REQUEST_BYTES = 2048
 MAX_KEY_BYTES = 4096
 MAX_JSON_BYTES = 128 * 1024
@@ -94,6 +96,7 @@ PROFILE_BY_CONCERN = feedback_request.PROFILES
 ENCRYPT_DETAILS = frozenset((
     "payload_missing", "tool_path", "input_size", "spawn", "node_exit", "output_size",
     "output_shape", "output_directory", "output_write", "output_member",
+    "expected_manifest_invalid", "reviewed_paths_invalid", "encryptor_unavailable",
 ))
 NODE_REFUSAL_CODES = frozenset((
     "credential_like_content", "envelope_rejected", "exception_expired", "invalid_cargo_lock",
@@ -534,15 +537,16 @@ def _write_ciphertext(runner_temp, member_name, payload):
         os.mkdir(OUTPUT_DIRECTORY, 0o700, dir_fd=parent_fd)
         directory_created = True
         directory_fd = os.open(OUTPUT_DIRECTORY, os.O_RDONLY | directory_flag | nofollow, dir_fd=parent_fd)
-        os.fchown(directory_fd, 0, 0)
+        os.fchown(directory_fd, OUTPUT_OWNER_UID, OUTPUT_OWNER_GID)
         os.fchmod(directory_fd, 0o700)
         directory = os.fstat(directory_fd)
-        if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != 0 or stat.S_IMODE(directory.st_mode) != 0o700:
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != OUTPUT_OWNER_UID
+                or stat.S_IMODE(directory.st_mode) != 0o700):
             raise ValueError
         file_fd = os.open(member_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow,
                           0o600, dir_fd=directory_fd)
         file_created = True
-        os.fchown(file_fd, 0, 0)
+        os.fchown(file_fd, OUTPUT_OWNER_UID, OUTPUT_OWNER_GID)
         os.fchmod(file_fd, 0o400)
         offset = 0
         while offset < len(payload):
@@ -554,7 +558,7 @@ def _write_ciphertext(runner_temp, member_name, payload):
         opened = os.fstat(file_fd)
         named = os.stat(member_name, dir_fd=directory_fd, follow_symlinks=False)
         if ((opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
-                or not stat.S_ISREG(opened.st_mode) or opened.st_uid != 0 or opened.st_nlink != 1
+                or not stat.S_ISREG(opened.st_mode) or opened.st_uid != OUTPUT_OWNER_UID or opened.st_nlink != 1
                 or opened.st_size != len(payload) or stat.S_IMODE(opened.st_mode) != 0o400):
             raise ValueError
         os.fsync(directory_fd)
@@ -775,7 +779,7 @@ def _source_root_files(*, include_fuzz=False):
     return tuple(paths)
 
 
-def _rust_format_patch(source, formatted, reviewed_paths, worker_uid, deadline):
+def _rust_format_patch(source, formatted, reviewed_paths, worker_uid, deadline, original_sources=None):
     chunks = []
     total = 0
     for relative in reviewed_paths:
@@ -785,6 +789,10 @@ def _rust_format_patch(source, formatted, reviewed_paths, worker_uid, deadline):
         after = _read_worker_file(formatted / relative, worker_uid, MAX_RUST_FILE_BYTES)
         if before == after:
             continue
+        if original_sources is not None:
+            if type(original_sources) is not dict:
+                _refuse("manifest_invalid")
+            original_sources[relative] = before
         try:
             before_text = before.decode("utf-8", "strict").splitlines(keepends=True)
             after_text = after.decode("utf-8", "strict").splitlines(keepends=True)
@@ -844,9 +852,13 @@ def run_source_profile(dispatch, source, worker_storage, worker_uid, environment
                 os.chdir(source)
             except OSError:
                 _refuse("cleanup_incomplete")
-        patch = _rust_format_patch(source, formatted, reviewed_paths, worker_uid, deadline)
+        original_sources = {}
+        patch = _rust_format_patch(
+            source, formatted, reviewed_paths, worker_uid, deadline, original_sources=original_sources,
+        )
         return {"payload_bytes": patch, "expected_manifest": None,
-                "reviewed_rust_paths": list(reviewed_paths), "source_result": "command_completed"}
+                "reviewed_rust_paths": list(reviewed_paths), "original_rust_sources": original_sources,
+                "source_result": "command_completed"}
 
     _refuse("request_invalid")
 
@@ -1040,25 +1052,39 @@ def encrypt_after_cleanup(dispatch, result, node):
     if profile["kind"] == "lock":
         expected = result.get("expected_manifest")
         if type(expected) is not dict:
-            _refuse("manifest_invalid")
+            _refuse("manifest_invalid", "expected_manifest_invalid")
         record["expected_manifest"] = expected
     elif profile["kind"] == "rust_patch":
         paths = result.get("reviewed_rust_paths")
         if type(paths) is not list or not paths:
-            _refuse("manifest_invalid")
+            _refuse("manifest_invalid", "reviewed_paths_invalid")
         record["reviewed_rust_paths"] = paths
-    encryptor = Path(__file__).resolve(strict=True).parent / "feedback_producer_crypto.mjs"
     try:
+        control_directory = Path(__file__).resolve(strict=True).parent
+        encryptor = control_directory / "feedback_producer_crypto.mjs"
         info = encryptor.lstat()
         resolved_encryptor = encryptor.resolve(strict=True)
-    except OSError:
-        _refuse("tool_unavailable")
-    control_directory = Path(__file__).resolve(strict=True).parent
+    except (OSError, RuntimeError):
+        _refuse("tool_unavailable", "encryptor_unavailable")
     if (resolved_encryptor.parent != control_directory or not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1 or stat.S_ISLNK(info.st_mode)
             or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
         _refuse("tool_unavailable", "tool_path")
-    return _encrypt_payload(encryptor, record, node)
+    try:
+        return _encrypt_payload(encryptor, record, node)
+    except FeedbackRefusal as error:
+        if profile["kind"] != "rust_patch" or error.detail != "node_credential_like_content":
+            raise
+        original_sources = result.get("original_rust_sources")
+        if (type(original_sources) is not dict or not original_sources
+                or not set(original_sources).issubset(paths)
+                or any(type(original_sources[path]) is not bytes for path in original_sources)):
+            _refuse("manifest_invalid", "reviewed_paths_invalid")
+        record["original_rust_files_b64"] = [
+            {"path": path, "content_b64": base64.b64encode(original_sources[path]).decode("ascii")}
+            for path in sorted(original_sources)
+        ]
+        return _encrypt_payload(encryptor, record, node)
 
 
 def write_output(runner_temp, dispatch, ciphertext):

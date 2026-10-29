@@ -257,6 +257,7 @@ FOREIGN_CONTEXT_MODULE_TAGS = {module: tag for tag, module, unused_reasons in FO
 SUCCESS_RECEIPT_DETAILS = (
     "payload_missing", "tool_path", "input_size", "spawn", "node_exit", "output_size",
     "output_shape", "output_directory", "output_write", "output_member",
+    "expected_manifest_invalid", "reviewed_paths_invalid", "encryptor_unavailable",
 ) + tuple("node_" + code for code in (
     "credential_like_content", "envelope_rejected", "exception_expired", "invalid_cargo_lock",
     "invalid_context", "invalid_expectation", "invalid_input", "invalid_lock_manifest",
@@ -1779,11 +1780,12 @@ def _format_refusal(error):
     return payload[:-1]
 
 
-def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=None):
+def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=None, stderr=None):
     actual_arguments = sys.argv[1:] if arguments is None else arguments
     environment = dict(os.environ) if environ is None else dict(environ)
     input_stream = sys.stdin.buffer if stdin is None else stdin
     output_stream = sys.stdout if stdout is None else stdout
+    error_stream = sys.stderr if stderr is None else stderr
     token_reference = None
     lifecycle = {"token_revocation": "unconfirmed"}
     failure_diagnostics = _FailureDiagnostics()
@@ -1798,6 +1800,7 @@ def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=No
         pending_tokens.append(environment_token)
     elif environment_token is not None:
         failure = Refusal("invalid_input", "arguments")
+    token_stdin_failed = False
     token_requested = (
         type(actual_arguments) in (tuple, list) and len(actual_arguments) >= 2
         and actual_arguments[0] == "run" and actual_arguments[1] == "--token-stdin"
@@ -1806,6 +1809,7 @@ def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=No
         try:
             pending_tokens.append(_read_token_stdin(input_stream))
         except Refusal as error:
+            token_stdin_failed = True
             if failure is None:
                 failure = error
     pending_tokens = list(dict.fromkeys(pending_tokens))
@@ -1823,6 +1827,7 @@ def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=No
         failure = Refusal("internal_error", "internal", diagnostic="unavailable")
     if failure is not None:
         failure = failure_diagnostics.attach(failure, getattr(failure, "diagnostic", "unavailable"))
+        all_pending_tokens_revoked = bool(pending_tokens) and not token_stdin_failed
         for pending_token in pending_tokens:
             if (pending_token == token_reference
                     and lifecycle.get("token_revocation") == "confirmed_before_execution"):
@@ -1832,10 +1837,12 @@ def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=No
                 if rules._revoke_pending_token(environment, pending_token):
                     lifecycle["token_revocation"] = "confirmed_before_execution"
                 else:
+                    all_pending_tokens_revoked = False
                     failure = failure_diagnostics.attach(
                         Refusal("cleanup_incomplete", "cleanup"), "token_revocation",
                     )
             except BaseException:
+                all_pending_tokens_revoked = False
                 failure = failure_diagnostics.attach(
                     Refusal("cleanup_incomplete", "cleanup"), "token_revocation",
                 )
@@ -1843,9 +1850,14 @@ def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=No
     if failure is not None:
         prefix = "KD-FEEDBACK-PRODUCER-REFUSAL " if feedback_kind is not None else "KD-CORE-CONTRACT-REFUSAL "
         output_stream.write(prefix + _format_refusal(failure).decode("ascii") + "\n")
+        if all_pending_tokens_revoked:
+            error_stream.write("KD-PRODUCER-TOKEN-REVOCATION confirmed\n")
         return 1
     prefix = "KD-FEEDBACK-PRODUCER " if feedback_kind is not None else "KD-CORE-CONTRACT "
     output_stream.write(prefix + result.decode("ascii") + "\n")
+    if (pending_tokens
+            and lifecycle.get("token_revocation") == "confirmed_before_execution"):
+        error_stream.write("KD-PRODUCER-TOKEN-REVOCATION confirmed\n")
     return 0
 
 
