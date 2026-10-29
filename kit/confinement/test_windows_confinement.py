@@ -383,7 +383,7 @@ foreach ($case in $cases) {
         self.assertNotIn("preserve-symlinks", self.wrapper)
         acl = self.function_body("Test-Acl")
         for required in (
-            "foreach ($path in $script:Ancestors)",
+            "foreach ($path in $script:AncestorPaths)",
             "$entries.Count -ne 1",
             "$entries[0].FileSystemRights -ne $attributeMask",
             "[System.Security.AccessControl.FileSystemRights]'ReadAttributes, Synchronize'",
