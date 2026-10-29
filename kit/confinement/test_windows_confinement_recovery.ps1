@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'windows_confinement_recovery.ps1')
 
 if ($Mode -eq 'child') {
-    $lease = New-CatalogLease $Path 'S-1-15-2-1-1-1-1-1-1-1-1'
+    $lease = New-CatalogLease $Path 'S-1-15-2-1-1-1-1-1-1-1'
     try {
         Start-CatalogRecovery $lease (Join-Path $PSScriptRoot 'windows_confinement_recovery.ps1')
         Add-CatalogRead $lease
@@ -60,7 +60,7 @@ try {
     $common = [Environment]::GetFolderPath('CommonApplicationData')
     $before = @(Get-ChildItem -LiteralPath $common -Directory -Force -Filter 'KDWindowsConfinementRecovery_*').Count
     $reason = ''
-    try { Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1-1' $Path -ForceReadbackFailure } catch { $reason = [string]$_.Exception.Message }
+    try { Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1' $Path -ForceReadbackFailure } catch { $reason = [string]$_.Exception.Message }
     if ($reason -ne 'winsock_catalog_readback') { throw 'recovery_test_injection' }
     if ($script:WinsockCatalogLease) { throw 'recovery_test_lease' }
     if ((Get-CatalogAclSddl $Path) -ne $original) { throw 'recovery_test_rollback' }
@@ -73,6 +73,14 @@ try {
         $caught = $true
     }
     if (-not $caught -or (Get-CatalogAclSddl $Path) -ne $original) { throw 'recovery_test_reason' }
+    foreach ($badSid in @('S-1-15-2-1-1-1-1-1-1-1-1', 'S-1-15-2-1-1-1-1-1-1', 'S-1-15-2-1-1-1-1-1-1-12345678901')) {
+        $refused = $false
+        try { [void](New-CatalogLease $Path $badSid) } catch {
+            if ($_.Exception.Message -ne 'winsock_package_sid') { throw }
+            $refused = $true
+        }
+        if (-not $refused) { throw 'recovery_test_sid' }
+    }
 } finally {
     if ($child) {
         if (-not $child.HasExited) { $child.Kill(); [void]$child.WaitForExit(5000) }

@@ -39,7 +39,7 @@ function Get-CatalogAclSddl([string]$path) {
 
 function New-CatalogLease([string]$path, [string]$sid) {
     Assert-CatalogPath $path
-    if ($sid -notmatch '^S-1-15-2-(?:[0-9]+-){7}[0-9]+$') { throw 'winsock_package_sid' }
+    if ($sid -notmatch '^S-1-15-2-(?:[0-9]{1,10}-){6}[0-9]{1,10}$') { throw 'winsock_package_sid' }
     return @{ Path = $path; Sid = $sid; OriginalSddl = (Get-CatalogAclSddl $path) }
 }
 

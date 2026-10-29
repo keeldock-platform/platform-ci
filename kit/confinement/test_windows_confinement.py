@@ -422,8 +422,11 @@ foreach ($case in $cases) {
         self.assertIn("Remove-CatalogRecoveryFolder $record", watch)
         self.assertIn("-ne $recordHash", watch)
         self.assertIn("'recovery_test_leak'", self.recovery_test)
-        self.assertIn("Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1-1' $Path -ForceReadbackFailure", self.recovery_test)
+        self.assertIn("Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1' $Path -ForceReadbackFailure", self.recovery_test)
         self.assertIn("-not (Get-ScheduledTask -TaskName $taskName", self.recovery_test)
+        self.assertIn("'^S-1-15-2-(?:[0-9]{1,10}-){6}[0-9]{1,10}$'", self.recovery)
+        self.assertIn("'S-1-15-2-1-1-1-1-1-1-1-1', 'S-1-15-2-1-1-1-1-1-1', 'S-1-15-2-1-1-1-1-1-1-12345678901'", self.recovery_test)
+        self.assertIn("'recovery_test_sid'", self.recovery_test)
         self.assertIn("test_windows_confinement_recovery.ps1 -Mode parent", WORKFLOW.read_text(encoding="utf-8"))
 
     def test_winsock_errors_use_fixed_reasons_and_verified_rollback(self):
