@@ -36,7 +36,9 @@ WINDOWS_LANE_FILES = (
     ".github/workflows/windows-confinement.yml",
     "kit/confinement/windows_confinement.cs",
     "kit/confinement/windows_confinement.ps1",
+    "kit/confinement/windows_confinement_recovery.ps1",
     "kit/confinement/test_windows_confinement.py",
+    "kit/confinement/test_windows_confinement_recovery.ps1",
     ".github/workflows/capsule-vectors.yml",
     "kit/confinement/capsule_frame_vector_gate.py",
 )

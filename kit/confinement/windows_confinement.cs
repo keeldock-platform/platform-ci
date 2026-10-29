@@ -77,8 +77,11 @@ namespace KeelDock.Platform.WindowsConfinement
         private const uint TokenQuery = 0x0008;
         private const bool SpikeAllowUnreadableLpac = true;
         private const int TokenGroups = 2;
+        private const int TokenRestrictedSids = 11;
         private const int TokenAppContainerSid = 31;
         private const string AllApplicationPackagesSid = "S-1-15-2-1";
+        private const string AllRestrictedApplicationPackagesSid = "S-1-15-2-2";
+        private const uint GroupEnabled = 0x00000004;
         private const int TokenIntegrityLevel = 25;
         private const int TokenIsAppContainer = 29;
         private const int TokenCapabilities = 30;
@@ -508,16 +511,19 @@ namespace KeelDock.Platform.WindowsConfinement
                     lpac = "unreadable";
                 }
                 string sidState = ReadContainerSidMatches(token, expectedSid) ? "match" : "mismatch";
+                string restrictedApplicationPackages = ReadAllRestrictedApplicationPackagesState(token);
                 string applicationPackages = ReadAllApplicationPackagesState(token);
                 string reported = lpac;
-                if (lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match" && applicationPackages == "absent")
+                if (lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match"
+                    && restrictedApplicationPackages == "present" && applicationPackages == "absent")
                 {
                     reported = "aap_only";
                 }
                 string text = "appcontainer=" + isAppContainer.ToString() + " capabilities=" + capabilityCount.ToString()
-                    + " integrity=0x" + integrity.ToString("x4") + " lpac=" + reported + " sid=" + sidState + " aap=" + applicationPackages;
+                    + " integrity=0x" + integrity.ToString("x4") + " lpac=" + reported + " sid=" + sidState
+                    + " arap=" + restrictedApplicationPackages + " aap=" + applicationPackages;
                 if (isAppContainer != 1 || capabilityCount != 0 || integrity != LowIntegrityRid || (lpac != "1" && reported != "aap_only")
-                    || sidState != "match" || applicationPackages != "absent")
+                    || sidState != "match" || restrictedApplicationPackages != "present" || applicationPackages != "absent")
                 {
                     throw new InvalidOperationException(text);
                 }
@@ -550,8 +556,22 @@ namespace KeelDock.Platform.WindowsConfinement
 
         private static string ReadAllApplicationPackagesState(IntPtr token)
         {
+            bool inGroups = ReadSidInTokenSet(token, TokenGroups, AllApplicationPackagesSid, false);
+            bool inRestrictedSids = ReadSidInTokenSet(token, TokenRestrictedSids, AllApplicationPackagesSid, false);
+            return inGroups || inRestrictedSids ? "present" : "absent";
+        }
+
+        private static string ReadAllRestrictedApplicationPackagesState(IntPtr token)
+        {
+            bool inGroups = ReadSidInTokenSet(token, TokenGroups, AllRestrictedApplicationPackagesSid, true);
+            bool inRestrictedSids = ReadSidInTokenSet(token, TokenRestrictedSids, AllRestrictedApplicationPackagesSid, false);
+            return inGroups || inRestrictedSids ? "present" : "absent";
+        }
+
+        private static bool ReadSidInTokenSet(IntPtr token, int informationClass, string expectedSid, bool requireEnabled)
+        {
             uint length;
-            IntPtr buffer = QueryTokenInformation(token, TokenGroups, out length);
+            IntPtr buffer = QueryTokenInformation(token, informationClass, out length);
             try
             {
                 int groupOffset = IntPtr.Size;
@@ -567,9 +587,15 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 for (uint index = 0; index < count; ++index)
                 {
-                    IntPtr sid = Marshal.ReadIntPtr(buffer, groupOffset + (int)index * entrySize);
+                    int offset = groupOffset + (int)index * entrySize;
+                    IntPtr sid = Marshal.ReadIntPtr(buffer, offset);
+                    uint attributes = unchecked((uint)Marshal.ReadInt32(buffer, offset + IntPtr.Size));
+                    if (sid == IntPtr.Zero || (requireEnabled && (attributes & GroupEnabled) == 0))
+                    {
+                        continue;
+                    }
                     IntPtr text;
-                    if (sid == IntPtr.Zero || !Native.ConvertSidToStringSidW(sid, out text) || text == IntPtr.Zero)
+                    if (!Native.ConvertSidToStringSidW(sid, out text) || text == IntPtr.Zero)
                     {
                         throw new InvalidOperationException();
                     }
@@ -582,12 +608,12 @@ namespace KeelDock.Platform.WindowsConfinement
                     {
                         Native.LocalFree(text);
                     }
-                    if (string.Equals(value, AllApplicationPackagesSid, StringComparison.Ordinal))
+                    if (string.Equals(value, expectedSid, StringComparison.Ordinal))
                     {
-                        return "present";
+                        return true;
                     }
                 }
-                return "absent";
+                return false;
             }
             finally
             {
