@@ -379,12 +379,45 @@ function New-StageEnvironment([hashtable]$scratch, [string]$targetName) {
     )
 }
 
+function Get-WinsockProbeSpecs {
+    $lease = $script:WinsockCatalogLease
+    if ($null -eq $lease) { return @() }
+    $reg = Join-Path $env:SystemRoot 'System32\reg.exe'
+    $classes = @(
+        @{ Name = 'parameters'; Pattern = '^Parameters\z' },
+        @{ Name = 'protocol_catalog'; Pattern = '^Parameters\\Protocol_Catalog9\z' },
+        @{ Name = 'namespace_catalog'; Pattern = '^Parameters\\NameSpace_Catalog5\z' },
+        @{ Name = 'protocol_entries'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries\z' },
+        @{ Name = 'protocol_entries64'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries64\z' },
+        @{ Name = 'namespace_entries'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries\z' },
+        @{ Name = 'namespace_entries64'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries64\z' },
+        @{ Name = 'protocol_entry'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries\\[0-9]{12}\z' },
+        @{ Name = 'protocol_entry64'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries64\\[0-9]{12}\z' },
+        @{ Name = 'namespace_entry'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries\\[0-9]{12}\z' },
+        @{ Name = 'namespace_entry64'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries64\\[0-9]{12}\z' }
+    )
+    $prefix = 'SYSTEM\CurrentControlSet\Services\WinSock2\'
+    $specs = @()
+    foreach ($class in $classes) {
+        foreach ($item in @($lease.KeyList)) {
+            $path = [string]$item.Path
+            if (-not $path.StartsWith($prefix, [StringComparison]::Ordinal)) { continue }
+            if ($path.Substring($prefix.Length) -cmatch $class.Pattern) {
+                $specs += @{ Name = ('winsock_key_' + $class.Name); Exe = $reg; Arguments = ('query HKLM\' + $path); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 } }
+                break
+            }
+        }
+    }
+    return $specs
+}
+
 function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
     $layout = $script:Layout
     $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
     $cargoManifest = Join-Path $scratch.Crate 'Cargo.toml'
     $specs = @()
     if ($confined) {
+        $specs += @(Get-WinsockProbeSpecs)
         $specs += @{ Name = 'cmd_exec'; Exe = $cmd; Arguments = '/d /c echo kd-lpac-cmd'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'kd-lpac-cmd' } }
         $specs += @{ Name = 'acl_ro_read'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.RustBin); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'rustc\.exe' } }
         $specs += @{ Name = 'acl_scratch_write'; Exe = $cmd; Arguments = ('/d /c copy /y nul ' + $scratch.Tmp + '\kd_write.txt'); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and (Test-Path -LiteralPath ($script:Lpac.Tmp + '\kd_write.txt')) } }
