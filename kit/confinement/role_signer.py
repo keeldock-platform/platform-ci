@@ -48,14 +48,14 @@ CALLER_PROFILES = {
     },
 }
 PINNED_WORKFLOW_SHA256 = {
-    ".github/workflows/windows-source-admission.yml": "b1b0ec4bcc81906cf134cca091facd071b922feed29c372a4ed783d2e9846452",
+    ".github/workflows/windows-source-admission.yml": "9783b15773e7ac970aaf83eabe0a6ac333fca31d258553f2066e8aab7e79ca3a",
     ".github/workflows/lane-h-windows-receiver.yml": "5347fcfdf29c979f7af8c63cee48f77b856fd7cc38d34ad675da75a0b806b448",
     ".github/workflows/lane-h-linux-fetch-encrypt.yml": "fdd7355a0eabe45248fb497e49b5989645f5e2f31fd134fb6d80ac06cf52f0a7",
-    ".github/workflows/lane-h-capsule-attester.yml": "eed3ce701a4945cecebcc32ddaf9f18e41510ae86def376874f7daafbd0ff716",
-    ".github/workflows/attestation-role-signer-probe.yml": "ecaedf124a7a2961802c123bed543fbed22799dc6b4f2d835108d180095ff258",
+    ".github/workflows/lane-h-capsule-attester.yml": "bdde526a962d01374e2655c8e8c83b786bc004555cb24f411f46eb1f6840a243",
+    ".github/workflows/attestation-role-signer-probe.yml": "ba5154846c0ae90fa3dad7caecf5a0a715336247aae67e4ed1b3c35d1aeac2e3",
 }
 API_JOB_NAME_PINS = {
-    profile: {role: None for role in ROLE_ORDER}
+    profile: {role: "role-call-%s-v1 / role-%s-v1" % (role, role) for role in ROLE_ORDER}
     for profile in CALLER_PROFILES
 }
 API_LINUX_STEP_NAME_PINS = {
@@ -66,7 +66,7 @@ API_LINUX_STEP_NAME_PINS = {
     for profile in CALLER_PROFILES
 }
 API_LINUX_STEP_ORDINAL_PINS = {
-    profile: {"revoke-source-token": None, "verify-token-rejection": None}
+    profile: {"revoke-source-token": 9, "verify-token-rejection": 10}
     for profile in CALLER_PROFILES
 }
 UNLABELED_LOG_STEP = "UNKNOWN STEP"
@@ -84,6 +84,7 @@ GUARD_LABELS = (
     "attestation-verify-failed",
     "artifact-download-failed",
     "provider-fetch-failed",
+    "job-log-fetch-failed",
 )
 GUARD_RETRY_CLASSES = ("in-progress", "http-404", "http-5xx", "network", "timeout")
 GUARD_STDERR_CLASSES = (
@@ -105,11 +106,10 @@ GUARD_HTTP_CLASSES = {
     "429": "rate-limit",
 }
 GUARD_TIMEOUT_SECONDS = 300
+GUARD_FALLBACK_ROUTE = re.compile(r"repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/jobs/[0-9]+/logs")
 GUARD_STDERR_BYTES = 65536
-CERTIFICATE_DIGEST_PINS = {
-    profile: {role: None for role in ROLE_ORDER}
-    for profile in CALLER_PROFILES
-}
+CERTIFICATE_ISSUER_PIN = "CN=sigstore-intermediate,O=sigstore.dev"
+CERTIFICATE_DIGEST_FIELDS = ("sourceRepositoryDigest", "buildSignerDigest", "buildConfigDigest")
 HEX_20 = re.compile(r"[a-f0-9]{40}\Z")
 HEX_32 = re.compile(r"[a-f0-9]{64}\Z")
 HEX_16 = re.compile(r"[a-f0-9]{32}\Z")
@@ -549,6 +549,16 @@ def certificate_expectations(
     }
 
 
+def resolve_certificate_pins(profile, control_sha):
+    if profile not in CALLER_PROFILES:
+        raise Refusal("certificate-profile-unresolved")
+    if type(control_sha) is not str or HEX_20.fullmatch(control_sha) is None:
+        raise Refusal("certificate-control-sha-missing")
+    pins = {field: control_sha for field in CERTIFICATE_DIGEST_FIELDS}
+    pins["certificateIssuer"] = CERTIFICATE_ISSUER_PIN
+    return {role: dict(pins) for role in ROLE_ORDER}
+
+
 def validate_certificate(certificate, expected):
     if type(certificate) is not dict or len(certificate) > MAX_CERTIFICATE_FIELDS:
         raise Refusal("certificate-shape")
@@ -617,6 +627,8 @@ def validate_certificate(certificate, expected):
     )
     for field in exact_fields:
         if certificate[field] != expected[field]:
+            if field in CERTIFICATE_DIGEST_FIELDS:
+                raise Refusal("certificate-digest-mismatch")
             raise Refusal("certificate-claim-mismatch")
     validate_run_invocation(
         certificate["runInvocationURI"],
@@ -2286,6 +2298,10 @@ def _cmd_find_job(arguments):
     print(job["id"])
 
 
+def _without_mark(text):
+    return text[1:] if text.startswith(BYTE_ORDER_MARK) else text
+
+
 def parse_linux_log_sections(log_text, job_name, step_names):
     if type(log_text) is not str or type(job_name) is not str:
         raise Refusal("linux-log-shape")
@@ -2293,11 +2309,13 @@ def parse_linux_log_sections(log_text, job_name, step_names):
     other = []
     labels = []
     messages = []
-    for line in log_text.splitlines():
-        fields = line.split("\t", 2)
+    lines = log_text.splitlines()
+    bare = bool(lines) and re.match(r"\d{4}-\d{2}-\d{2}T", _without_mark(lines[0])) is not None
+    for line in lines:
+        fields = [job_name, UNLABELED_LOG_STEP, line] if bare else line.split("\t", 2)
         if len(fields) != 3 or fields[0] != job_name:
             raise Refusal("linux-log-format")
-        stamped = fields[2][1:] if fields[2].startswith(BYTE_ORDER_MARK) else fields[2]
+        stamped = _without_mark(fields[2])
         match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z)[ \t]+(.*)", stamped)
         if match is None:
             raise Refusal("linux-log-timestamp")
@@ -2327,7 +2345,9 @@ def _marker_log_sections(messages, step_names):
     for index, message in enumerate(messages):
         clean = ANSI_ESCAPE.sub("", message)
         if clean.startswith(LOG_GROUP_PREFIX):
-            blocks.append({"script": [], "output": []})
+            if header:
+                blocks[-1]["nested"] = True
+            blocks.append({"script": [], "output": [], "nested": False})
             header = True
         elif not blocks:
             continue
@@ -2346,6 +2366,8 @@ def _marker_log_sections(messages, step_names):
             raise Refusal("linux-log-section-missing")
         if len(found) != 1:
             raise Refusal("linux-log-section-ambiguous")
+        if blocks[found[0]]["nested"]:
+            raise Refusal("linux-log-section-nested")
         claimed[step_id] = found[0]
     if len(set(claimed.values())) != len(claimed):
         raise Refusal("linux-log-section-ambiguous")
@@ -2391,26 +2413,44 @@ def _guard_run_once(command, output):
     return min(abs(result.returncode), 255), _guard_error_class(result.stderr or b"")
 
 
+def _guard_attempts(command, output, label, attempts, pause):
+    for attempt in range(1, attempts + 1):
+        code, error_class = _guard_run_once(command, output)
+        if code == 0:
+            return 0, ""
+        if attempt < attempts and error_class in GUARD_RETRY_CLASSES:
+            print("probe=role-signer retry=%s attempt=%d class=%s" % (
+                label, attempt, error_class))
+            time.sleep(pause)
+            continue
+        break
+    return code, error_class
+
+
 def _cmd_guard(arguments):
-    command = list(arguments.command)
+    command = list(arguments.guard_command)
     if command and command[0] == "--":
         command = command[1:]
     if not command or command[0] != "gh":
         raise Refusal("guard-command")
     if not 1 <= arguments.attempts <= 10 or not 0 <= arguments.pause <= 30:
         raise Refusal("guard-bounds")
-    for attempt in range(1, arguments.attempts + 1):
-        code, error_class = _guard_run_once(command, arguments.output)
-        if code == 0:
-            return 0
-        if attempt < arguments.attempts and error_class in GUARD_RETRY_CLASSES:
-            print("probe=role-signer retry=%s attempt=%d class=%s" % (
-                arguments.label, attempt, error_class))
-            time.sleep(arguments.pause)
-            continue
-        break
+    route = arguments.fallback_route
+    if route is not None and GUARD_FALLBACK_ROUTE.fullmatch(route) is None:
+        raise Refusal("guard-command")
+    label = arguments.label
+    code, error_class = _guard_attempts(
+        command, arguments.output, label, arguments.attempts, arguments.pause)
+    if code != 0 and route is not None and error_class == "in-progress":
+        print("probe=role-signer fallback=job-log-api")
+        label = "job-log-fetch-failed"
+        code, error_class = _guard_attempts(
+            ["gh", "api", route], arguments.output, label, arguments.attempts,
+            arguments.pause)
+    if code == 0:
+        return 0
     print("probe=role-signer result=unavailable reason=%s exit=%d class=%s" % (
-        arguments.label, code, error_class))
+        label, code, error_class))
     return 1
 
 
@@ -2456,7 +2496,7 @@ def _cmd_gate_transition(arguments):
                                         arguments.control_sha)
     logs = load_json_file(arguments.linux_logs) if arguments.gate == "B" else None
     api_pins = API_JOB_NAME_PINS[profile]
-    digest_pins = CERTIFICATE_DIGEST_PINS[profile]
+    digest_pins = resolve_certificate_pins(profile, arguments.control_sha)
     ordinal_pins = API_LINUX_STEP_ORDINAL_PINS[profile]
     job_observations = {}
     if arguments.observe:
@@ -2600,7 +2640,7 @@ def _cmd_verify_snapshot(arguments):
         arguments.evidence_directory, arguments.run_id, arguments.run_attempt,
         arguments.control_sha)
     api_pins = API_JOB_NAME_PINS[profile]
-    digest_pins = CERTIFICATE_DIGEST_PINS[profile]
+    digest_pins = resolve_certificate_pins(profile, arguments.control_sha)
     ordinal_pins = API_LINUX_STEP_ORDINAL_PINS[profile]
     job_observations = {}
     if arguments.observe:
@@ -2703,7 +2743,8 @@ def build_parser():
     guard.add_argument("--output", required=True)
     guard.add_argument("--attempts", type=int, default=1)
     guard.add_argument("--pause", type=int, default=5)
-    guard.add_argument("command", nargs=argparse.REMAINDER)
+    guard.add_argument("--fallback-route")
+    guard.add_argument("guard_command", nargs=argparse.REMAINDER)
     find_job = commands.add_parser("find-job")
     find_job.add_argument("--profile", choices=tuple(CALLER_PROFILES), required=True)
     find_job.add_argument("--role", choices=ROLE_ORDER, required=True)

@@ -25,10 +25,10 @@ REF = "refs/heads/main"
 FIXTURE_NOW = int(time.time())
 WORKFLOW_REF = REPOSITORY + "/" + subject.CALLER_PROFILES["probe"]["path"] + "@" + REF
 DIGEST_PINS = {
-    "sourceRepositoryDigest": "sha256:" + "1" * 64,
-    "buildSignerDigest": "sha256:" + "2" * 64,
-    "buildConfigDigest": "sha256:" + "3" * 64,
-    "certificateIssuer": "https://fulcio.example.invalid",
+    "sourceRepositoryDigest": CONTROL_SHA,
+    "buildSignerDigest": CONTROL_SHA,
+    "buildConfigDigest": CONTROL_SHA,
+    "certificateIssuer": subject.CERTIFICATE_ISSUER_PIN,
 }
 ALTERNATE_DIGEST_VALUES = {
     "sourceRepositoryDigest": "sha256-base64:YWJjZA==",
@@ -728,7 +728,7 @@ class WorkflowAndJobMappingTests(unittest.TestCase):
         with self.assertRaisesRegex(subject.Refusal, "api-job-map-unresolved"):
             subject.validate_jobs_snapshot(snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, {role: None for role in subject.ROLE_ORDER})
 
-    def test_linux_step_names_are_fixed_and_hosted_ordinals_remain_unresolved(self):
+    def test_linux_step_names_and_observed_ordinals_are_pinned(self):
         for profile in subject.CALLER_PROFILES:
             self.assertEqual(
                 subject.API_LINUX_STEP_NAME_PINS[profile],
@@ -737,7 +737,13 @@ class WorkflowAndJobMappingTests(unittest.TestCase):
                     "verify-token-rejection": "handoff-verify-token-rejection-v1",
                 },
             )
-            self.assertTrue(all(value is None for value in subject.API_LINUX_STEP_ORDINAL_PINS[profile].values()))
+            self.assertEqual(subject.API_LINUX_STEP_ORDINAL_PINS[profile],
+                             {"revoke-source-token": 9, "verify-token-rejection": 10})
+            self.assertEqual(subject.API_JOB_NAME_PINS[profile], {
+                "windows-receiver": "role-call-windows-receiver-v1 / role-windows-receiver-v1",
+                "linux-fetch-encrypt": "role-call-linux-fetch-encrypt-v1 / role-linux-fetch-encrypt-v1",
+                "capsule-attester": "role-call-capsule-attester-v1 / role-capsule-attester-v1",
+            })
 
     def test_api_rejects_wrong_sha_run_attempt_status_runner_and_step_shapes(self):
         hosted = subject.validate_jobs_snapshot(fixture_job_snapshot(), RUN_ID,
@@ -1097,8 +1103,6 @@ class ArtifactAndStageTests(unittest.TestCase):
                                                       [str(bad_path)] + parse_command[parse_command.index("--output"):]), 1)
                         command.extend(("--linux-logs", str(log_path)))
                     with mock.patch.object(subject, "API_JOB_NAME_PINS", {"probe": fixture_api_names()}), \
-                            mock.patch.object(subject, "CERTIFICATE_DIGEST_PINS", {
-                                "probe": {role: dict(DIGEST_PINS) for role in subject.ROLE_ORDER}}), \
                             mock.patch.object(subject, "API_LINUX_STEP_ORDINAL_PINS", {
                                 "probe": {"revoke-source-token": 5, "verify-token-rejection": 6}}):
                         self.assertEqual(subject.main(command), 0)
@@ -1636,6 +1640,125 @@ class GuardedCommandTests(unittest.TestCase):
         self.assertEqual(buffer.getvalue().splitlines(), [
             "probe=role-signer result=unavailable reason=guard-command",
             "probe=role-signer result=unavailable reason=guard-bounds"])
+
+
+def bare_linux_log(messages):
+    rows = []
+    for number, message in enumerate(messages):
+        stamp = "2026-10-29T13:47:%02d.%07dZ" % (number % 60, number)
+        prefix = subject.BYTE_ORDER_MARK if number == 0 else ""
+        rows.append(prefix + stamp + " " + message)
+    return "\n".join(rows) + "\n"
+
+
+class BareJobLogTests(unittest.TestCase):
+    def parse(self, text):
+        return subject.parse_linux_log_sections(
+            text, UNLABELED_JOB, subject.API_LINUX_STEP_NAME_PINS["probe"])
+
+    def test_job_log_without_columns_uses_the_same_group_markers(self):
+        messages = unlabeled_linux_messages()
+        parsed = self.parse(bare_linux_log(messages))
+        self.assertEqual(parsed, self.parse(unlabeled_linux_log(messages)))
+        self.assertEqual(parsed["sections"]["revoke-source-token"], REVOKE_OUTPUT)
+        self.assertEqual(parsed["sections"]["verify-token-rejection"],
+                         REJECTION_OUTPUT + "\n" + CONFIRMED_LINE)
+
+    def test_job_log_lines_still_need_timestamps_and_sections(self):
+        messages = unlabeled_linux_messages()
+        text = bare_linux_log(messages)
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-timestamp"):
+            self.parse(text + "no timestamp here\n")
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-missing"):
+            self.parse(bare_linux_log([line for line in messages if line != REVOKE_OUTPUT]))
+
+    def test_a_run_group_started_inside_a_matched_header_is_refused(self):
+        messages = unlabeled_linux_messages()
+        script = "^[[36;1mprintf '%s\\n' '" + REVOKE_OUTPUT + "'^[[0m"
+        end = messages.index(LOG_MARK + "[endgroup]", messages.index(script))
+        del messages[end]
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-nested"):
+            self.parse(bare_linux_log(messages))
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-nested"):
+            self.parse(unlabeled_linux_log(messages))
+
+
+class JobLogFallbackTests(GuardedCommandTests):
+    ROUTE = "repos/keeldock-platform/platform-ci/actions/jobs/42/logs"
+
+    def test_in_progress_run_view_falls_back_to_the_job_log_route(self):
+        pending = types.SimpleNamespace(
+            returncode=1, stderr=b"run 1 is still in progress; logs will be available")
+        done = types.SimpleNamespace(returncode=0, stderr=b"")
+        code, printed, calls, unused_sleeps, unused_created = self.run_guard(
+            [pending, done], ("--fallback-route", self.ROUTE))
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [["gh", "api", "route"], ["gh", "api", self.ROUTE]])
+        self.assertEqual(printed, "probe=role-signer fallback=job-log-api\n")
+
+    def test_fallback_failure_has_its_own_fixed_reason(self):
+        pending = types.SimpleNamespace(
+            returncode=1, stderr=b"run 1 is still in progress; logs will be available")
+        missing = types.SimpleNamespace(returncode=1, stderr=b"gh: Not Found (HTTP 404)")
+        code, printed, unused_calls, unused_sleeps, unused_created = self.run_guard(
+            [pending, missing], ("--fallback-route", self.ROUTE))
+        self.assertEqual(code, 1)
+        self.assertTrue(printed.endswith(
+            "reason=job-log-fetch-failed exit=1 class=http-404\n"))
+
+    def test_other_failures_do_not_fall_back_and_routes_are_fixed_shape(self):
+        missing = types.SimpleNamespace(returncode=1, stderr=b"gh: Not Found (HTTP 404)")
+        code, printed, calls, unused_sleeps, unused_created = self.run_guard(
+            [missing], ("--fallback-route", self.ROUTE))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(printed.endswith("reason=api-fetch-failed exit=1 class=http-404\n"))
+        code, printed, calls, unused_sleeps, unused_created = self.run_guard(
+            [], ("--fallback-route", "repos/x/y/issues"))
+        self.assertEqual(code, 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(printed, "probe=role-signer result=unavailable reason=guard-command\n")
+
+
+class CertificatePinTests(unittest.TestCase):
+    def expected(self, pins):
+        return subject.certificate_expectations(
+            "probe", REPOSITORY, REF, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
+            "windows-receiver", subject.ROLE_RUNNERS["windows-receiver"], pins)
+
+    def test_digests_equal_the_control_commit_and_issuer_is_pinned(self):
+        pins = subject.resolve_certificate_pins("probe", CONTROL_SHA)
+        self.assertEqual(set(pins), set(subject.ROLE_ORDER))
+        for role in subject.ROLE_ORDER:
+            self.assertEqual(pins[role], {
+                "sourceRepositoryDigest": CONTROL_SHA, "buildSignerDigest": CONTROL_SHA,
+                "buildConfigDigest": CONTROL_SHA,
+                "certificateIssuer": "CN=sigstore-intermediate,O=sigstore.dev"})
+        unused_expected, certificate = fixture_certificate()
+        self.assertTrue(subject.validate_certificate(
+            certificate, self.expected(pins["windows-receiver"])))
+
+    def test_each_digest_field_must_equal_the_control_commit(self):
+        expected = self.expected(subject.resolve_certificate_pins("probe", CONTROL_SHA)["windows-receiver"])
+        unused_expected, certificate = fixture_certificate()
+        for field in subject.CERTIFICATE_DIGEST_FIELDS:
+            with self.subTest(field=field):
+                altered = dict(certificate, **{field: "b" * 40})
+                with self.assertRaisesRegex(subject.Refusal, "certificate-digest-mismatch"):
+                    subject.validate_certificate(altered, expected)
+
+    def test_wrong_issuer_and_bad_control_commit_fail_closed(self):
+        expected = self.expected(subject.resolve_certificate_pins("probe", CONTROL_SHA)["windows-receiver"])
+        unused_expected, certificate = fixture_certificate()
+        with self.assertRaisesRegex(subject.Refusal, "certificate-claim-mismatch"):
+            subject.validate_certificate(
+                dict(certificate, certificateIssuer="CN=other,O=example"), expected)
+        for value in (None, "", "short", "A" * 40, "a" * 41, 5):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(subject.Refusal, "certificate-control-sha-missing"):
+                    subject.resolve_certificate_pins("probe", value)
+        with self.assertRaisesRegex(subject.Refusal, "certificate-profile-unresolved"):
+            subject.resolve_certificate_pins("unknown", CONTROL_SHA)
 
 
 if __name__ == "__main__":
