@@ -14,6 +14,7 @@ $baseDirectory = $null
 $componentNameExpected = $null
 $componentNameObserved = $null
 $script:WinsockCatalogLease = $null
+. (Join-Path $PSScriptRoot 'windows_confinement_recovery.ps1')
 
 $RustVersion = '1.99.1'
 $RustTarget = 'x86_64-pc-windows-msvc'
@@ -292,76 +293,32 @@ function Test-LowIntegrityLabel([string]$path) {
 
 function Grant-WinsockCatalogRead([string]$sid) {
     $path = 'SYSTEM\CurrentControlSet\Services\WinSock2\Parameters\Protocol_Catalog9'
-    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
-    $key = $null
-    $original = $null
     try {
-        $rights = [System.Security.AccessControl.RegistryRights]::ReadKey -bor [System.Security.AccessControl.RegistryRights]::ChangePermissions
-        $key = $base.OpenSubKey($path, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $rights)
-        if ($null -eq $key) { throw 'winsock_catalog_missing' }
-        $security = $key.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
-        $original = $security.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
-        $script:WinsockCatalogLease = @{ Path = $path; OriginalSddl = $original; Sid = $sid }
-        $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
-        $rule = New-Object System.Security.AccessControl.RegistryAccessRule($identity, [System.Security.AccessControl.RegistryRights]::ReadKey, [System.Security.AccessControl.AccessControlType]::Allow)
-        $security.AddAccessRule($rule)
-        $key.SetAccessControl($security)
-        $readBack = $key.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
-        $rules = $readBack.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
-        $writeMask = [System.Security.AccessControl.RegistryRights]'SetValue, CreateSubKey, Delete, ChangePermissions, TakeOwnership'
-        $found = $false
-        foreach ($entry in $rules) {
-            if ($entry.IdentityReference.Value -eq $sid -and $entry.AccessControlType -eq 'Allow'
-                -and ($entry.RegistryRights -band [System.Security.AccessControl.RegistryRights]::ReadKey) -eq [System.Security.AccessControl.RegistryRights]::ReadKey
-                -and ($entry.RegistryRights -band $writeMask) -eq 0) {
-                $found = $true
-            }
-        }
-        if (-not $found) {
-            $restore = New-Object System.Security.AccessControl.RegistrySecurity
-            $restore.SetSecurityDescriptorSddlForm($original, [System.Security.AccessControl.AccessControlSections]::Access)
-            $key.SetAccessControl($restore)
-            $script:WinsockCatalogLease = $null
-            throw 'winsock_catalog_readback'
-        }
+        $script:WinsockCatalogLease = New-CatalogLease $path $sid
+        Start-CatalogRecovery $script:WinsockCatalogLease (Join-Path $PSScriptRoot 'windows_confinement_recovery.ps1')
+        Add-CatalogRead $script:WinsockCatalogLease
         return $script:WinsockCatalogLease
     } catch {
-        if ($key -and $null -ne $original) {
+        $reason = [string]$_.Exception.Message
+        if ($reason -notin @('winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_registry_read', 'winsock_package_sid')) {
+            $reason = 'winsock_grant_failed'
+        }
+        if ($script:WinsockCatalogLease) {
             try {
-                $restore = New-Object System.Security.AccessControl.RegistrySecurity
-                $restore.SetSecurityDescriptorSddlForm($original, [System.Security.AccessControl.AccessControlSections]::Access)
-                $key.SetAccessControl($restore)
+                Restore-WinsockCatalogAcl $script:WinsockCatalogLease
+                Stop-CatalogRecovery $script:WinsockCatalogLease
                 $script:WinsockCatalogLease = $null
             } catch {
                 $script:cleanup = 'incomplete'
+                throw 'winsock_restore_failed'
             }
         }
-        throw
-    } finally {
-        if ($key) { $key.Dispose() }
-        $base.Dispose()
+        throw $reason
     }
 }
 
 function Restore-WinsockCatalogAcl($lease) {
-    if ($null -eq $lease -or [string]::IsNullOrEmpty([string]$lease.OriginalSddl)) { throw 'winsock_restore_state' }
-    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
-    $key = $null
-    try {
-        $rights = [System.Security.AccessControl.RegistryRights]::ReadKey -bor [System.Security.AccessControl.RegistryRights]::ChangePermissions
-        $key = $base.OpenSubKey([string]$lease.Path, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $rights)
-        if ($null -eq $key) { throw 'winsock_catalog_missing' }
-        $restore = New-Object System.Security.AccessControl.RegistrySecurity
-        $restore.SetSecurityDescriptorSddlForm([string]$lease.OriginalSddl, [System.Security.AccessControl.AccessControlSections]::Access)
-        $key.SetAccessControl($restore)
-        $actual = $key.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
-        if ($actual.GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access) -ne [string]$lease.OriginalSddl) {
-            throw 'winsock_restore_readback'
-        }
-    } finally {
-        if ($key) { $key.Dispose() }
-        $base.Dispose()
-    }
+    Restore-CatalogAcl $lease
 }
 
 function Grant-NonPropagating([string]$path, [string]$sid) {
@@ -511,12 +468,13 @@ function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
 }
 
 function Invoke-ConfinedLadder($sandbox, [hashtable]$scratch) {
-    $script:WinsockCatalogLease = Grant-WinsockCatalogRead $script:Sid
     try {
+        $script:WinsockCatalogLease = Grant-WinsockCatalogRead $script:Sid
         return Invoke-Ladder $sandbox $true $scratch
     } finally {
         if ($script:WinsockCatalogLease) {
             Restore-WinsockCatalogAcl $script:WinsockCatalogLease
+            Stop-CatalogRecovery $script:WinsockCatalogLease
             $script:WinsockCatalogLease = $null
         }
     }
@@ -727,9 +685,16 @@ try {
         if ($rust -eq 'compiled' -and $node -eq 'ran' -and $firstFailure -eq 'none' -and $jobState -eq 'verified' -and $tokenState -eq 'verified' -and $aclNegative -eq 'denied') { $exitCode = 0 }
     }
 } catch {
-    $reason = Get-CleanText ([string]$_.Exception.Message) 120
-    $reason = [regex]::Replace($reason, '[^A-Za-z0-9._ -]', '_').Trim().Replace(' ', '_')
-    if ($reason.Length -eq 0) { $reason = 'unspecified' }
+    $reason = [string]$_.Exception.Message
+    if ($phase -eq 'winsock_acl') {
+        if ($reason -notin @('winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_recovery_stop', 'winsock_registry_read', 'winsock_package_sid', 'winsock_grant_failed', 'winsock_restore_failed', 'winsock_restore_readback', 'winsock_restore_state')) {
+            $reason = 'winsock_registry_error'
+        }
+    } else {
+        $reason = Get-CleanText $reason 120
+        $reason = [regex]::Replace($reason, '[^A-Za-z0-9._ -]', '_').Trim().Replace(' ', '_')
+        if ($reason.Length -eq 0) { $reason = 'unspecified' }
+    }
     $safePhase = [regex]::Replace([string]$phase, '[^A-Za-z0-9_]', '_')
     $componentDiagnostic = ''
     if ($null -ne $componentNameExpected) {
@@ -742,6 +707,7 @@ try {
     if ($script:WinsockCatalogLease) {
         try {
             Restore-WinsockCatalogAcl $script:WinsockCatalogLease
+            Stop-CatalogRecovery $script:WinsockCatalogLease
             $script:WinsockCatalogLease = $null
         } catch {
             $cleanup = 'incomplete'

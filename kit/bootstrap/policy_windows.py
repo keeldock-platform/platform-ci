@@ -133,6 +133,12 @@ jobs:
           $ErrorActionPreference = 'Stop'
           & kit/confinement/windows_confinement.ps1 -Mode compile
           if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Exercise registry recovery after forced cancellation
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & kit/confinement/test_windows_confinement_recovery.ps1 -Mode parent
+          if ($LASTEXITCODE -ne 0) { exit 1 }
   windows-confinement-spike:
     needs: windows-policy
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}

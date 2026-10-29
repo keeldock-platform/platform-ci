@@ -13,6 +13,8 @@ from public_tree import MAX_FILE_BYTES, inspect_text
 
 NATIVE = ROOT / "kit/confinement/windows_confinement.cs"
 WRAPPER = ROOT / "kit/confinement/windows_confinement.ps1"
+RECOVERY = ROOT / "kit/confinement/windows_confinement_recovery.ps1"
+RECOVERY_TEST = ROOT / "kit/confinement/test_windows_confinement_recovery.ps1"
 WORKFLOW = ROOT / ".github/workflows/windows-confinement.yml"
 CONFINED_STAGES = (
     "cmd_exec",
@@ -36,9 +38,11 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
     def setUpClass(cls):
         cls.native = NATIVE.read_text(encoding="utf-8")
         cls.wrapper = WRAPPER.read_text(encoding="utf-8")
+        cls.recovery = RECOVERY.read_text(encoding="utf-8")
+        cls.recovery_test = RECOVERY_TEST.read_text(encoding="utf-8")
 
     def test_files_pass_the_public_tree_rules(self):
-        for path in (NATIVE, WRAPPER, WORKFLOW):
+        for path in (NATIVE, WRAPPER, RECOVERY, RECOVERY_TEST, WORKFLOW):
             with self.subTest(path=path.name):
                 payload = path.read_bytes()
                 self.assertLessEqual(len(payload), MAX_FILE_BYTES)
@@ -194,8 +198,8 @@ foreach ($case in $cases) {
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def function_body(self, name):
-        match = re.search(r"^function " + re.escape(name) + r"\b.*?^\}$", self.wrapper, re.S | re.M)
+    def function_body(self, name, source=None):
+        match = re.search(r"^function " + re.escape(name) + r"\b.*?^\}$", self.wrapper if source is None else source, re.S | re.M)
         self.assertIsNotNone(match, name)
         return match.group(0)
 
@@ -351,28 +355,84 @@ foreach ($case in $cases) {
             self.assertIn("$scratch.Tmp", line)
 
     def test_winsock_catalog_access_is_package_scoped_read_only_and_restored(self):
-        body = self.function_body("Grant-WinsockCatalogRead")
-        self.assertIn("WinSock2\\Parameters\\Protocol_Catalog9", body)
-        self.assertIn("RegistryRights]::ReadKey", body)
-        self.assertIn("RegistryRights]::ChangePermissions", body)
-        self.assertIn("RegistryAccessRule($identity", body)
-        self.assertIn("$security.AddAccessRule($rule)", body)
-        self.assertIn("$original = $security.GetSecurityDescriptorSddlForm", body)
-        self.assertLess(body.index("$script:WinsockCatalogLease = @{"), body.index("$key.SetAccessControl($security)"))
-        self.assertIn("$writeMask =", body)
-        self.assertIn("$key.SetAccessControl($restore)", body)
-        restore = self.function_body("Restore-WinsockCatalogAcl")
+        grant = self.function_body("Grant-WinsockCatalogRead")
+        self.assertIn("WinSock2\\Parameters\\Protocol_Catalog9", grant)
+        self.assertLess(grant.index("New-CatalogLease"), grant.index("Start-CatalogRecovery"))
+        self.assertLess(grant.index("Start-CatalogRecovery"), grant.index("Add-CatalogRead"))
+        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", grant)
+        self.assertLess(grant.index("Restore-WinsockCatalogAcl"), grant.index("Stop-CatalogRecovery"))
+        self.assertLess(grant.index("Stop-CatalogRecovery"), grant.index("$script:WinsockCatalogLease = $null"))
+        self.assertNotIn("SetAccessControl", grant)
+        add = self.function_body("Add-CatalogRead", self.recovery)
+        self.assertIn("RegistryRights]::ReadKey", add)
+        self.assertIn("RegistryRights]::ChangePermissions", add)
+        self.assertIn("RegistryAccessRule($identity", add)
+        self.assertIn("$security.AddAccessRule($rule)", add)
+        self.assertIn("$writeMask =", add)
+        self.assertIn("-not $entry.IsInherited", add)
+        self.assertLess(add.index("WriteAllText([string]$lease.ArmedFile"), add.index("$key.SetAccessControl($security)"))
+        self.assertIn("Restore-CatalogAcl $lease", self.function_body("Restore-WinsockCatalogAcl"))
+        restore = self.function_body("Restore-CatalogAcl", self.recovery)
         self.assertIn("$lease.OriginalSddl", restore)
+        self.assertIn("$key.SetAccessControl($restore)", restore)
+        self.assertIn("GetSecurityDescriptorSddlForm", restore)
         self.assertIn("winsock_restore_readback", restore)
         confined = self.function_body("Invoke-ConfinedLadder")
         self.assertIn("Grant-WinsockCatalogRead $script:Sid", confined)
         self.assertIn("finally", confined)
         self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", confined)
+        self.assertIn("Stop-CatalogRecovery $script:WinsockCatalogLease", confined)
         self.assertIn("$script:WinsockCatalogLease = $null", confined)
         self.assertIn("$phase = 'winsock_acl'", self.wrapper)
         self.assertNotIn("internetClient", self.wrapper)
+        self.assertNotIn("internetClient", self.recovery)
         self.assertNotIn("privateNetworkClientServer", self.wrapper)
         self.assertIn("capabilities.CapabilityCount = 0", self.native)
+
+    def test_winsock_recovery_survives_forced_parent_exit(self):
+        start = self.function_body("Start-CatalogRecovery", self.recovery)
+        watch = self.function_body("Invoke-CatalogWatch", self.recovery)
+        for required in (
+            "New-ScheduledTaskPrincipal -UserId 'SYSTEM'",
+            "[IO.FileSystemAclExtensions]::SetAccessControl($info, $security)",
+            "Copy-Item -LiteralPath $source -Destination $copy",
+            "Register-ScheduledTask",
+            "Start-ScheduledTask",
+            "Test-Path -LiteralPath $ready",
+        ):
+            self.assertIn(required, start)
+        self.assertLess(start.index("Register-ScheduledTask"), start.index("Start-ScheduledTask"))
+        self.assertLess(start.index("Start-ScheduledTask"), start.index("Test-Path -LiteralPath $ready"))
+        self.assertIn("GetProcessById", watch)
+        self.assertIn("ParentStartTicks", watch)
+        self.assertIn("$parent.WaitForExit(250)", watch)
+        self.assertIn("Restore-CatalogAcl $data", watch)
+        self.assertIn("-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $record) 'armed'))", watch)
+        self.assertIn("$child.Kill()", self.recovery_test)
+        self.assertTrue(self.recovery_test.rstrip().endswith("exit 0"))
+        self.assertIn("Get-CatalogAclSddl $Path) -eq $original", self.recovery_test)
+        self.assertIn("[IO.File]::ReadAllText($ack) -eq 'restored'", self.recovery_test)
+        self.assertIn("-not (Get-ScheduledTask -TaskName $taskName", self.recovery_test)
+        self.assertIn("test_windows_confinement_recovery.ps1 -Mode parent", WORKFLOW.read_text(encoding="utf-8"))
+
+    def test_winsock_errors_use_fixed_reasons_and_verified_rollback(self):
+        grant = self.function_body("Grant-WinsockCatalogRead")
+        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", grant)
+        self.assertIn("throw 'winsock_restore_failed'", grant)
+        self.assertIn("throw $reason", grant)
+        for name in ("Get-CatalogAclSddl", "Add-CatalogRead", "Restore-CatalogAcl", "Start-CatalogRecovery", "Stop-CatalogRecovery"):
+            body = self.function_body(name, self.recovery)
+            self.assertNotRegex(body, r"(?m)^\s*throw\s*$")
+        self.assertIn("if ($phase -eq 'winsock_acl')", self.wrapper)
+        self.assertIn("$reason = 'winsock_registry_error'", self.wrapper)
+        self.assertIn("'winsock_grant_failed'", self.wrapper)
+        self.assertIn("'winsock_restore_failed'", self.wrapper)
+        add = self.function_body("Add-CatalogRead", self.recovery)
+        self.assertIn("if ($ForceReadbackFailure) { throw 'winsock_catalog_readback' }", add)
+        self.assertLess(add.index("$key.SetAccessControl($security)"), add.rindex("if ($ForceReadbackFailure)"))
+        self.assertIn("Add-CatalogRead $lease -ForceReadbackFailure", self.recovery_test)
+        self.assertIn("Restore-CatalogAcl $lease", self.recovery_test)
+        self.assertIn("$_.Exception.Message -ne 'winsock_restore_failed'", self.recovery_test)
 
     def test_negative_acl_stages_require_the_specific_denial_and_a_listing_control(self):
         specs = self.function_body("Get-StageSpecs")
