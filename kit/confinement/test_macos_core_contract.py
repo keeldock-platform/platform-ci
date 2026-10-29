@@ -54,9 +54,11 @@ def _lease_record():
     return {"repository_id": "67890", "candidate_class": "signed-descendant"}
 
 
-def _success_record():
+def _success_record(include_runtime=False):
     versions = {"rustc": "1.99.1", "cargo": "1.99.1", "rustfmt": "1.10.0", "clippy": "0.1.99"}
     gates = {name: "passed" for name in subject.GATE_NAMES}
+    if include_runtime:
+        gates.update({name: "passed" for name in subject.RUNTIME_GATE_NAMES})
     record = subject._build_success_record(
         _binding(), _request(), _lease_record(), DIFF_SHA256, versions, gates,
     )
@@ -992,6 +994,91 @@ class CoreContractTests(unittest.TestCase):
         self.assertIn(str(source / "crates/host/mock/Cargo.toml"), commands[4][1])
         self.assertIn(str(source / "crates/host/conformance/Cargo.toml"), commands[5][1])
 
+    def test_runtime_commands_are_fixed_locked_offline_and_cover_all_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            test_root = Path(temporary)
+            source = test_root / "source"
+            runtime_root = source / "runtime"
+            runtime_root.mkdir(parents=True)
+            (runtime_root / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
+            (runtime_root / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            tools = {"cargo": test_root / "toolchain" / "bin" / "cargo"}
+            legacy = subject._source_commands(source, tools)
+            enrolled = subject._source_commands(source, tools, include_runtime=True)
+        self.assertEqual(tuple(stage for stage, unused_argv in legacy), subject.GATE_NAMES)
+        self.assertEqual(
+            tuple(stage for stage, unused_argv in enrolled),
+            subject.GATE_NAMES + subject.RUNTIME_GATE_NAMES,
+        )
+        cargo = str(tools["cargo"])
+        manifest = str(source / "runtime/Cargo.toml")
+        self.assertEqual(enrolled[-3:], (
+            ("runtime_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path",
+                                 manifest, "--all", "--", "--check")),
+            ("runtime_clippy", (cargo, "clippy", "--offline", "--manifest-path", manifest,
+                                 "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
+            ("runtime_tests", (cargo, "test", "--offline", "--manifest-path", manifest,
+                                "--workspace", "--all-targets", "--locked")),
+        ))
+        with self.assertRaises(subject.Refusal):
+            subject._source_commands(source, tools, include_runtime=1)
+
+    def test_runtime_root_selection_requires_both_validated_root_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            self.assertFalse(subject._validated_runtime_workspace_present(source))
+            runtime_root = source / "runtime"
+            runtime_root.mkdir(parents=True)
+            (runtime_root / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            with self.assertRaises(subject.Refusal):
+                subject._validated_runtime_workspace_present(source)
+            (runtime_root / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
+            self.assertTrue(subject._validated_runtime_workspace_present(source))
+
+    def test_runtime_stages_run_in_order_and_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            runtime_root = source / "runtime"
+            runtime_root.mkdir(parents=True)
+            (runtime_root / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
+            (runtime_root / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            tools = {"cargo": Path("/toolchain/bin/cargo")}
+            calls = []
+            fail_runtime_clippy = [False]
+
+            def run_command(argv, *unused_args, **kwargs):
+                stage = kwargs["stage"]
+                calls.append(stage)
+                if fail_runtime_clippy[0] and stage == "runtime_clippy":
+                    error = RuntimeError("bounded helper failure")
+                    error.reason = "version_mismatch"
+                    error.command_check = "nonzero_exit"
+                    raise error
+                return SimpleNamespace(
+                    returncode=0, stdout=b"bounded", stderr=b"",
+                )
+
+            rust = SimpleNamespace(_run_worker_command=run_command)
+            with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
+                    _worker_census=lambda *args: None)):
+                gates = subject._run_gates(
+                    source, {}, 502, {"python": "/usr/bin/python3"}, object(), rust, tools,
+                    subject.time.monotonic() + 30, include_runtime=True,
+                )
+                self.assertEqual(tuple(gates), subject.GATE_NAMES + subject.RUNTIME_GATE_NAMES)
+                self.assertEqual(calls, list(subject.GATE_NAMES + subject.RUNTIME_GATE_NAMES))
+                calls.clear()
+                fail_runtime_clippy[0] = True
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject._run_gates(
+                        source, {}, 502, {"python": "/usr/bin/python3"}, object(), rust, tools,
+                        subject.time.monotonic() + 30, include_runtime=True,
+                    )
+            self.assertEqual(raised.exception.reason, "gate_failed")
+            self.assertEqual(raised.exception.stage, "runtime_clippy")
+            self.assertEqual(raised.exception.diagnostic, "source_gate_nonzero_exit")
+            self.assertEqual(calls, list(subject.GATE_NAMES + ("runtime_format", "runtime_clippy")))
+
     def test_foundation_parser_commands_are_fixed_offline_and_not_in_the_default_gate_set(self):
         with tempfile.TemporaryDirectory() as temporary:
             test_root = Path(temporary)
@@ -1271,7 +1358,7 @@ class CoreContractTests(unittest.TestCase):
             self.assertEqual(Path.cwd(), original_cwd)
             self.assertFalse(source.exists())
 
-    def test_success_receipt_uses_four_suites_and_exact_integer_counts(self):
+    def test_success_receipt_uses_dynamic_gate_counts_and_four_existing_suites(self):
         record, versions, gates = _success_record()
         validated = subject._validate_success_record(
             record, _binding(), _request(), _lease_record(), DIFF_SHA256,
@@ -1281,6 +1368,8 @@ class CoreContractTests(unittest.TestCase):
             "core.static", "core.host-api", "core.mock-host", "core.conformance",
         ])
         self.assertEqual(validated["gate_count"], 6)
+        self.assertEqual(validated["selected_gates"], list(subject.GATE_NAMES))
+        self.assertEqual(validated["completed_gates"], list(subject.GATE_NAMES))
         self.assertEqual(validated["suite_count"], 4)
         for field in ("gate_count", "gates_passed", "gates_failed", "suite_count", "suites_passed", "suites_failed"):
             invalid = copy.deepcopy(record)
@@ -1290,6 +1379,22 @@ class CoreContractTests(unittest.TestCase):
                     invalid, _binding(), _request(), _lease_record(), DIFF_SHA256,
                     versions, gates, True, True,
                 )
+        runtime_record, runtime_versions, runtime_gates = _success_record(include_runtime=True)
+        runtime_validated = subject._validate_success_record(
+            runtime_record, _binding(), _request(), _lease_record(), DIFF_SHA256,
+            runtime_versions, runtime_gates, True, True,
+        )
+        self.assertEqual(runtime_validated["gate_count"], 9)
+        self.assertEqual(runtime_validated["selected_gates"],
+                         list(subject.GATE_NAMES + subject.RUNTIME_GATE_NAMES))
+        self.assertEqual(runtime_validated["completed_gates"], runtime_validated["selected_gates"])
+        missing_runtime = copy.deepcopy(runtime_record)
+        missing_runtime["completed_gates"] = list(subject.GATE_NAMES + subject.RUNTIME_GATE_NAMES[:-1])
+        with self.assertRaises(subject.Refusal):
+            subject._validate_success_record(
+                missing_runtime, _binding(), _request(), _lease_record(), DIFF_SHA256,
+                runtime_versions, runtime_gates, True, True,
+            )
         extra = copy.deepcopy(record)
         extra["candidate_ref"] = CANDIDATE_REF
         with self.assertRaises(subject.Refusal):

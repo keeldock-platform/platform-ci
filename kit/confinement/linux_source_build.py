@@ -43,6 +43,8 @@ GATES = (
     "parser_format", "parser_clippy", "parser_replay", "node_dependency_prepare",
     "node_dependency_audit", "typescript_typecheck", "typescript_tests",
 )
+RUNTIME_GATE_NAMES = ("runtime_format", "runtime_clippy", "runtime_tests")
+RUNTIME_ROOT_FILES = ("runtime/Cargo.toml", "runtime/Cargo.lock")
 RUST_COMPONENTS = (
     ("rust-std", "https://static.rust-lang.org/dist/2026-10-15/rust-std-1.99.1-x86_64-unknown-linux-gnu.tar.gz", "d1290c05994a59c029e562cb75be1bddc6fb11a4c501e1b7b0f61d119c6cbb12"),
     ("rustc", "https://static.rust-lang.org/dist/2026-10-15/rustc-1.99.1-x86_64-unknown-linux-gnu.tar.gz", "85e7c0e6f21636f714e2a42966011364a6cc56b6548126d32144d6ba90904966"),
@@ -1473,10 +1475,36 @@ def run_trusted_audit(environ=None):
     return 0
 
 
+def _runtime_workspace_present(project):
+    try:
+        runtime_info = (project / "runtime").lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise SourceBuildRefusal("gate") from None
+    if not stat.S_ISDIR(runtime_info.st_mode):
+        raise SourceBuildRefusal("gate")
+    present = []
+    for relative_path in RUNTIME_ROOT_FILES:
+        try:
+            info = (project / relative_path).lstat()
+        except FileNotFoundError:
+            present.append(False)
+            continue
+        except OSError:
+            raise SourceBuildRefusal("gate") from None
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise SourceBuildRefusal("gate")
+        present.append(True)
+    if any(present) and not all(present):
+        raise SourceBuildRefusal("gate")
+    return all(present)
+
+
 def _gate_commands(project, rust_root, node_bin):
     cargo = str(Path(rust_root) / "bin" / "cargo")
     npm = str(Path(node_bin) / "npm")
-    return (
+    commands = (
         ("format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", str(project / "Cargo.toml"), "--all", "--", "--check")),
         ("clippy", (cargo, "clippy", "--offline", "--manifest-path", str(project / "Cargo.toml"), "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
         ("workspace_tests", (cargo, "test", "--offline", "--manifest-path", str(project / "Cargo.toml"), "--workspace", "--all-targets", "--locked")),
@@ -1491,6 +1519,14 @@ def _gate_commands(project, rust_root, node_bin):
         ("typescript_typecheck", (str(Path(node_bin) / "node"), npm, "--offline", "run", "typecheck", "--workspaces", "--ignore-scripts")),
         ("typescript_tests", (str(Path(node_bin) / "node"), npm, "--offline", "run", "test", "--workspaces", "--ignore-scripts")),
     )
+    if not _runtime_workspace_present(project):
+        return commands
+    runtime_manifest = str(project / "runtime/Cargo.toml")
+    return commands + (
+        ("runtime_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", runtime_manifest, "--all", "--", "--check")),
+        ("runtime_clippy", (cargo, "clippy", "--offline", "--manifest-path", runtime_manifest, "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
+        ("runtime_tests", (cargo, "test", "--offline", "--manifest-path", runtime_manifest, "--workspace", "--all-targets", "--locked")),
+    )
 
 
 def run_project_gates(environ=None):
@@ -1503,8 +1539,12 @@ def run_project_gates(environ=None):
         raise SourceBuildRefusal("gate")
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     records.mkdir(mode=0o700, parents=True, exist_ok=True)
-    outcomes = {name: "not-run" for name in GATES}
     commands = _gate_commands(worker, rust_root, node_bin)
+    selected_gates = tuple(name for name, unused_argv in commands)
+    expected_gates = GATES + (RUNTIME_GATE_NAMES if _runtime_workspace_present(worker) else ())
+    if selected_gates != expected_gates:
+        raise SourceBuildRefusal("gate")
+    outcomes = {name: "not-run" for name in selected_gates}
     for index, (name, argv) in enumerate(commands):
         project_env = {
             "PATH": str(Path(node_bin)) + ":" + str(Path(rust_root) / "bin") + ":/usr/bin:/bin",
@@ -1538,13 +1578,18 @@ def run_project_gates(environ=None):
         else:
             outcomes[name] = "failed"
             break
-    result = {"schema_version": 1, "gates": outcomes, "gate_count": sum(value != "not-run" for value in outcomes.values()),
-              "failed": sum(value == "failed" for value in outcomes.values())}
+    completed_gates = [name for name in selected_gates if outcomes[name] == "passed"]
+    result = {
+        "schema_version": 1, "selected_gates": list(selected_gates),
+        "completed_gates": completed_gates, "gates": outcomes,
+        "gate_count": sum(value != "not-run" for value in outcomes.values()),
+        "failed": sum(value == "failed" for value in outcomes.values()),
+    }
     (records / "gates.json").write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
-    if result["failed"] or result["gate_count"] != len(GATES):
+    if result["failed"] or result["gate_count"] != len(selected_gates):
         sys.stdout.write("linux-project-gates=refused completed=" + str(result["gate_count"]) + " failed=" + str(result["failed"]) + "\n")
         return 1
-    sys.stdout.write("linux-project-gates=passed gates=13 failed=0 offline=true\n")
+    sys.stdout.write("linux-project-gates=passed gates=" + str(len(selected_gates)) + " failed=0 offline=true\n")
     return 0
 
 
@@ -1591,11 +1636,22 @@ def verify_proof_handoff(environ=None):
 def _verified_source_receipts(records, env):
     gates = _load_json(records / "gates.json")
     revoke = _load_json(records / "revocation.json")
-    if (gates is None or revoke is None or gates.get("schema_version") != 1
+    if type(gates) is not dict or type(gates.get("selected_gates")) is not list:
+        return False
+    selected_gates = tuple(gates["selected_gates"])
+    expected_gate_sets = (GATES, GATES + RUNTIME_GATE_NAMES)
+    if (set(gates) != {
+                "schema_version", "selected_gates", "completed_gates", "gates", "gate_count", "failed",
+            }
+            or selected_gates not in expected_gate_sets
+            or gates.get("completed_gates") != list(selected_gates)
+            or revoke is None or gates.get("schema_version") != 1
             or type(gates.get("gates")) is not dict
-            or set(gates["gates"]) != set(GATES)
-            or any(gates["gates"][name] != "passed" for name in GATES)
-            or gates.get("gate_count") != len(GATES) or gates.get("failed") != 0
+            or set(gates["gates"]) != set(selected_gates)
+            or any(gates["gates"][name] != "passed" for name in selected_gates)
+            or type(gates.get("gate_count")) is not int
+            or gates.get("gate_count") != len(selected_gates)
+            or type(gates.get("failed")) is not int or gates.get("failed") != 0
             or revoke.get("schema_version") != 1 or revoke.get("status") != "confirmed"
             or revoke.get("control_sha") != env.get("CI_SHA")
             or revoke.get("run_id") != env.get("GITHUB_RUN_ID")

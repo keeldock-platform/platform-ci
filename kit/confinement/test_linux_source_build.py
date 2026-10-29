@@ -173,6 +173,32 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.subTest(gate=name):
                 self.assertTrue(any(item.startswith("--workspaces") or item == "--workspaces" for item in by_name[name]))
 
+    def test_runtime_gate_commands_are_selected_for_the_complete_workspace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            runtime = project / "runtime"
+            runtime.mkdir()
+            (runtime / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
+            (runtime / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            commands = linux_source_build._gate_commands(project, "/rust", "/node")
+            self.assertEqual(
+                tuple(name for name, argv in commands),
+                linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES,
+            )
+            cargo = "/rust/bin/cargo"
+            manifest = str(runtime / "Cargo.toml")
+            self.assertEqual(commands[-3:], (
+                ("runtime_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path",
+                                     manifest, "--all", "--", "--check")),
+                ("runtime_clippy", (cargo, "clippy", "--offline", "--manifest-path", manifest,
+                                     "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
+                ("runtime_tests", (cargo, "test", "--offline", "--manifest-path", manifest,
+                                    "--workspace", "--all-targets", "--locked")),
+            ))
+            (runtime / "Cargo.lock").unlink()
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._gate_commands(project, "/rust", "/node")
+
     def test_project_root_refuses_a_hostile_symlink(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
             root = Path(temporary)
@@ -319,7 +345,8 @@ class LinuxSourceBuildTests(unittest.TestCase):
             linux_source_build, "_project_gate_directories"
         ) as directories, patch.object(linux_source_build, "_gate_commands", return_value=tuple(
             (name, ("/usr/bin/true",)) for name in linux_source_build.GATES
-        )), patch.object(linux_source_build.linux_session, "run_host", return_value=types.SimpleNamespace(
+        )), patch.object(linux_source_build, "_runtime_workspace_present", return_value=False), patch.object(
+            linux_source_build.linux_session, "run_host", return_value=types.SimpleNamespace(
             exit_code=0, timed_out=False, stdout=b"", stderr=b""
         )) as session:
             worker = linux_source_build.PROJECT_ROOT / "source"
@@ -334,6 +361,32 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 self.assertEqual(launch[:3], ("/usr/bin/python3", "-B", "-c"))
                 self.assertEqual(launch[3], linux_source_build.linux_probes.LAUNCHER_SOURCE)
                 self.assertEqual(launch[4:], ("/usr/bin/true",))
+
+    def test_runtime_gate_receipt_requires_every_selected_stage_to_complete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Path(temporary) / "source"
+            runtime = worker / "runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
+            (runtime / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            commands = tuple(
+                (name, ("/usr/bin/true",))
+                for name in linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES
+            )
+            with patch.object(linux_source_build, "_project_gate_directories"), patch.object(
+                linux_source_build, "_gate_commands", return_value=commands
+            ), patch.object(linux_source_build.linux_session, "run_host", return_value=types.SimpleNamespace(
+                exit_code=0, timed_out=False, stdout=b"", stderr=b""
+            )):
+                result = linux_source_build.run_project_gates({
+                    "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
+                    "CARGO_HOME": str(worker / ".kd-cargo-home"), "RUST_ROOT": "/rust", "NODE_BIN": "/node",
+                })
+            self.assertEqual(result, 0)
+            receipt = json.loads((Path(temporary) / "kd-records" / "gates.json").read_text(encoding="ascii"))
+            self.assertEqual(receipt["selected_gates"], list(linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES))
+            self.assertEqual(receipt["completed_gates"], receipt["selected_gates"])
+            self.assertEqual(receipt["gate_count"], 16)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "the shared launcher stop uses Linux process facilities")
     def test_shared_launcher_really_stops_before_the_command_runs(self):
@@ -445,8 +498,14 @@ class LinuxSourceBuildTests(unittest.TestCase):
             }
             (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
             (records / "merged.json").chmod(0o600)
-            gates = {"schema_version": 1, "gates": {name: "passed" for name in linux_source_build.GATES},
-                     "gate_count": 13, "failed": 0}
+            gates = {
+                "schema_version": 1,
+                "selected_gates": list(linux_source_build.GATES),
+                "completed_gates": list(linux_source_build.GATES),
+                "gates": {name: "passed" for name in linux_source_build.GATES},
+                "gate_count": 13,
+                "failed": 0,
+            }
             receipt = {
                 "schema_version": 1, "status": "confirmed", "control_sha": "a" * 40,
                 "run_id": "7", "run_attempt": "1", "installation_id": "19",
@@ -476,6 +535,45 @@ class LinuxSourceBuildTests(unittest.TestCase):
             receipt["rejected_after_revoke"] = False
             (records / "revocation.json").write_text(json.dumps(receipt), encoding="ascii")
             self.assertEqual(linux_source_build._verdict_record(env)["token_revocation"], "unconfirmed")
+
+    def test_runtime_receipt_records_all_three_stages_without_changing_public_summary_shape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            records = Path(temporary) / "kd-records"
+            records.mkdir()
+            merged = {
+                "channels": {name: {"status": "blocked", "before": True, "after": True}
+                             for name in confinement_verdict.CHANNELS},
+                "memory_canary": "absent", "readable_file_canary": "absent",
+            }
+            (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
+            (records / "merged.json").chmod(0o600)
+            selected = linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES
+            gates = {
+                "schema_version": 1,
+                "selected_gates": list(selected),
+                "completed_gates": list(selected),
+                "gates": {name: "passed" for name in selected},
+                "gate_count": len(selected),
+                "failed": 0,
+            }
+            receipt = {
+                "schema_version": 1, "status": "confirmed", "control_sha": "a" * 40,
+                "run_id": "7", "run_attempt": "1", "installation_id": "19",
+                "rejected_after_revoke": True,
+            }
+            (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
+            (records / "revocation.json").write_text(json.dumps(receipt), encoding="ascii")
+            env = {
+                "RUNNER_TEMP": temporary, "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7",
+                "GITHUB_RUN_ATTEMPT": "1", "SOURCE_READER_INSTALLATION_ID": "19",
+                "CI_MODE": "source", "PRODUCER_RESULT": "success",
+            }
+            public_record = linux_source_build._verdict_record(env)
+            self.assertEqual(public_record["gates"], 13)
+            self.assertTrue(confinement_verdict.run_accepted(public_record))
+            gates["completed_gates"] = list(selected[:-1])
+            (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
+            self.assertEqual(linux_source_build._verdict_record(env)["project_execution"], "not_started")
 
     def test_unprivileged_handoff_refuses_wrong_owner_mode_and_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:
