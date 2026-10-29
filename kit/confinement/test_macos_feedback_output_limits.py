@@ -56,6 +56,20 @@ def synthetic_rust_patch(maximum):
     return b"".join(chunks), paths
 
 
+def synthetic_rust_sources(paths):
+    sources = {}
+    for file_index, path in enumerate(paths):
+        lines = []
+        for line_index in range(500):
+            if file_index == 0 and line_index == 1:
+                line = "    let token = CancellationToken::new();"
+            else:
+                line = "    let value_%06d = old_call_with_padding_%06d(1);" % (line_index, line_index)
+            lines.append(line)
+        sources[path] = ("\n".join(lines) + "\n").encode("ascii")
+    return sources
+
+
 class Helpers(object):
     def call_without_plain_exceptions(self, name, function):
         try:
@@ -71,9 +85,11 @@ class Helpers(object):
             unused_request, environment = base._dispatch(kind)
             return producer.validate_dispatch(kind, environment, now=base.NOW)
 
-    def refusal_for(self, payload, paths, run_result=None, input_error=None):
+    def refusal_for(self, payload, paths, run_result=None, input_error=None, original_sources=None):
         dispatch = self.dispatch()
         result = {"payload_bytes": payload, "reviewed_rust_paths": paths}
+        if original_sources is not None:
+            result["original_rust_sources"] = original_sources
         node = Path(NODE or "/usr/bin/node")
         runner = mock.patch.object(producer.subprocess, "run", return_value=run_result)
         if input_error is not None:
@@ -102,18 +118,30 @@ class Helpers(object):
 class OutputPathRefusals(Helpers, unittest.TestCase):
     def test_node_refusal_codes_map_to_fixed_details_and_unknown_text_stays_generic(self):
         paths = ["crates/host/api/src/lib.rs"]
+        credential_patch = b"\n".join((
+            b"diff --git a/crates/host/api/src/lib.rs b/crates/host/api/src/lib.rs",
+            b"--- a/crates/host/api/src/lib.rs",
+            b"+++ b/crates/host/api/src/lib.rs",
+            b"@@ -1,2 +1,2 @@",
+            b" let token = CancellationToken::new();",
+            b"-let value = alpha;",
+            b"+let value = beta;",
+            b"",
+        ))
         cases = (
-            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL credential_like_content\n", "node_credential_like_content"),
-            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL limit_exceeded\n", "node_limit_exceeded"),
-            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL invalid_rust_patch\n", "node_invalid_rust_patch"),
-            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL\n", "node_exit"),
-            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL free text with a path\n", "node_exit"),
-            (b"unexpected warning text\n", "node_exit"),
+            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL credential_like_content\n", "node_credential_like_content",
+             credential_patch, {paths[0]: b"let token = CancellationToken::new();\nlet value = alpha;\n"}),
+            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL limit_exceeded\n", "node_limit_exceeded", b"diff", None),
+            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL invalid_rust_patch\n", "node_invalid_rust_patch", b"diff", None),
+            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL\n", "node_exit", b"diff", None),
+            (b"KD-FEEDBACK-ENCRYPTION-REFUSAL free text with a path\n", "node_exit", b"diff", None),
+            (b"unexpected warning text\n", "node_exit", b"diff", None),
         )
-        for stderr, detail in cases:
+        for stderr, detail, payload, original_sources in cases:
             with self.subTest(detail=detail, stderr=stderr[:40]):
                 outcome = self.refusal_for(
-                    b"diff", paths, SimpleNamespace(returncode=1, stdout=b"", stderr=stderr))
+                    payload, paths, SimpleNamespace(returncode=1, stdout=b"", stderr=stderr),
+                    original_sources=original_sources)
                 self.assertIsInstance(outcome, producer.FeedbackRefusal)
                 self.assertEqual((outcome.reason, outcome.detail), ("payload_invalid", detail))
 
@@ -160,10 +188,13 @@ class OutputPathRefusals(Helpers, unittest.TestCase):
         self.assertEqual(too_large.detail, "output_member")
 
 
-@unittest.skipUnless(REAL_NODE, "a node executable is required for the real encryption path")
+@unittest.skipUnless(REAL_NODE or os.environ.get("CI") == "true",
+                     "a node executable is required for the real encryption path")
 class NearLimitPatchThroughRealEncryption(Helpers, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not REAL_NODE:
+            raise AssertionError("the CI environment requires a supported node runtime")
         result = subprocess.run(
             [NODE, "-e", KEY_SCRIPT], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             timeout=120, check=False)
@@ -199,7 +230,11 @@ class NearLimitPatchThroughRealEncryption(Helpers, unittest.TestCase):
             b"-    let value_000001 = old_call_with_padding_000001(1);\n",
             b"-    let token = CancellationToken::new();\n", 1)
         dispatch = self.dispatch(self.spki)
-        result = {"payload_bytes": patch, "reviewed_rust_paths": paths}
+        result = {
+            "payload_bytes": patch,
+            "reviewed_rust_paths": paths,
+            "original_rust_sources": synthetic_rust_sources(paths),
+        }
         with mock.patch.object(producer.time, "time", return_value=base.NOW):
             outcome = self.call_without_plain_exceptions(
                 "encrypt_after_cleanup",

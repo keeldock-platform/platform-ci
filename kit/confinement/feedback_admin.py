@@ -1016,7 +1016,8 @@ class FeedbackAdmin:
         _create_named(dir_fd, name, plaintext, mode=0o600, limit=MAX_PLAINTEXT_BYTES)
         return os.path.join(self.state_directory, name)
 
-    def consume_return(self, request_id, api_client, *, manual_summary_review):
+    def consume_return(self, request_id, api_client, *, manual_summary_review,
+                       rust_source_directory=None):
         """Collect authenticated run evidence, require the manual Summary ledger, then release once."""
         self._now()
         if type(request_id) is not str or len(request_id) != 64 or HEX64_RE.fullmatch(request_id) is None:
@@ -1076,6 +1077,11 @@ class FeedbackAdmin:
                     message["expected_manifest"] = packet["expected_manifest"]
                 if packet["reviewed_rust_paths"]:
                     message["reviewed_rust_paths"] = packet["reviewed_rust_paths"]
+                if rust_source_directory is not None:
+                    if (not packet["reviewed_rust_paths"] or type(rust_source_directory) is not str
+                            or not os.path.isabs(rust_source_directory) or "\x00" in rust_source_directory):
+                        _refuse()
+                    message["rust_source_directory"] = rust_source_directory
                 stdout, plaintext = self._run_helper(message, plaintext_pipe=True)
                 response = _parse_json(stdout, MAX_NODE_PUBLIC_OUTPUT_BYTES)
                 if not _exact_dict(response, {"schema_version", "ok"}) or response != {"schema_version": 1, "ok": True}:

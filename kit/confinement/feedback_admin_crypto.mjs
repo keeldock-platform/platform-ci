@@ -17,13 +17,17 @@ import {
 } from 'node:fs';
 import { dirname, isAbsolute, basename, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { returnProfileForContext } from './node_lock_envelope.mjs';
 
 const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const MAX_KEY_BYTES = 16 * 1024;
 const MAX_ENVELOPE_BYTES = 4 * 1024 * 1024;
 const MAX_PLAINTEXT_BYTES = 4 * 1024 * 1024 - 64 * 1024;
+const MAX_RUST_SOURCE_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_RUST_SOURCE_BYTES = 64 * 1024 * 1024;
 const BASE64_SHAPE = /^[A-Za-z0-9+/]*={0,2}$/u;
 const HEX_64 = /^[a-f0-9]{64}$/u;
+const RUST_SOURCE_PATH = /^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*\.rs$/u;
 
 function refuse() {
   throw new Error('operation refused');
@@ -62,6 +66,70 @@ function secureDirectory(directoryPath) {
   }
   if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid()
       || (info.mode & 0o777) !== 0o700) refuse();
+}
+
+function sourceDirectory(directoryPath) {
+  if (typeof directoryPath !== 'string' || !isAbsolute(directoryPath)
+      || directoryPath.split(sep).some((part) => part === '.' || part === '..')) refuse();
+  const parts = directoryPath.split(sep).filter(Boolean);
+  if (parts.length === 0) refuse();
+  let current = sep;
+  let info = lstatSync(current);
+  for (const part of parts) {
+    current = current === sep ? current + part : current + sep + part;
+    info = lstatSync(current);
+    if (info.isSymbolicLink() || !info.isDirectory() || ![0, process.getuid()].includes(info.uid)
+        || ((info.mode & 0o022) !== 0 && (info.mode & 0o1000) === 0)) refuse();
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) refuse();
+  return directoryPath;
+}
+
+function readReviewedRustSources(directoryInput, reviewedPaths) {
+  if (!Array.isArray(reviewedPaths) || reviewedPaths.length < 1 || reviewedPaths.length > 512) refuse();
+  const root = sourceDirectory(directoryInput);
+  const sources = new Map();
+  const seen = new Set();
+  let totalBytes = 0;
+  try {
+    for (const relativePath of reviewedPaths) {
+      if (typeof relativePath !== 'string' || relativePath.length > 256
+          || !RUST_SOURCE_PATH.test(relativePath) || seen.has(relativePath)) refuse();
+      seen.add(relativePath);
+      const parts = relativePath.split('/');
+      let path = root;
+      let leafInfo;
+      for (let index = 0; index < parts.length; index += 1) {
+        path = path === sep ? path + parts[index] : path + sep + parts[index];
+        leafInfo = lstatSync(path);
+        const isLeaf = index === parts.length - 1;
+        if (leafInfo.isSymbolicLink() || ![0, process.getuid()].includes(leafInfo.uid)
+            || (leafInfo.mode & 0o022) !== 0
+            || (isLeaf ? !leafInfo.isFile() : !leafInfo.isDirectory())) refuse();
+      }
+      if (!leafInfo || !Number.isSafeInteger(leafInfo.size) || leafInfo.size < 0
+          || leafInfo.size > MAX_RUST_SOURCE_FILE_BYTES
+          || totalBytes > MAX_RUST_SOURCE_BYTES - leafInfo.size) refuse();
+      const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      let bytes;
+      try {
+        const info = fstatSync(fd);
+        if (!info.isFile() || info.uid !== leafInfo.uid || info.dev !== leafInfo.dev
+            || info.ino !== leafInfo.ino || info.nlink !== 1 || info.size !== leafInfo.size
+            || (info.mode & 0o022) !== 0 || info.size > MAX_RUST_SOURCE_FILE_BYTES) refuse();
+        bytes = readFileSync(fd);
+        if (bytes.byteLength !== info.size) refuse();
+        totalBytes += bytes.byteLength;
+        sources.set(relativePath, bytes);
+      } finally {
+        closeSync(fd);
+      }
+    }
+    return sources;
+  } catch (error) {
+    for (const bytes of sources.values()) bytes.fill(0);
+    throw error;
+  }
 }
 
 function privateKeyPath(value) {
@@ -160,7 +228,7 @@ function strictEnvelope(value) {
 function decryptToDescriptor(input) {
   const values = exactObject(input, [
     'operation', 'private_key_path', 'context', 'now', 'envelope_base64', 'plaintext_fd',
-  ], ['expected_manifest', 'reviewed_rust_paths']);
+  ], ['expected_manifest', 'reviewed_rust_paths', 'rust_source_directory']);
   if (values.operation !== 'decrypt' || !Number.isSafeInteger(values.now) || values.now < 0
       || !Number.isSafeInteger(values.plaintext_fd) || values.plaintext_fd < 3) refuse();
   const envelope = strictEnvelope(values.envelope_base64);
@@ -168,7 +236,7 @@ function decryptToDescriptor(input) {
   let plaintext;
   try {
     const developmentFeedbackPath = new URL('./development_feedback.mjs', import.meta.url);
-    return import(developmentFeedbackPath.href).then(({ decryptDevelopmentFeedback }) => {
+    return import(developmentFeedbackPath.href).then((feedback) => {
       const options = {
         envelope,
         recipientPrivateKey: privateKey,
@@ -177,7 +245,18 @@ function decryptToDescriptor(input) {
       };
       if (Object.hasOwn(values, 'expected_manifest')) options.expectedManifest = values.expected_manifest;
       if (Object.hasOwn(values, 'reviewed_rust_paths')) options.reviewedRustPaths = values.reviewed_rust_paths;
-      plaintext = decryptDevelopmentFeedback(options);
+      if (Object.hasOwn(values, 'rust_source_directory')) {
+        if (!Object.hasOwn(values, 'reviewed_rust_paths')
+            || returnProfileForContext(values.context).kind !== 'rust_patch') refuse();
+        const originals = readReviewedRustSources(values.rust_source_directory, values.reviewed_rust_paths);
+        try {
+          plaintext = feedback.decryptDevelopmentFeedbackWithRustSources(options, originals);
+        } finally {
+          for (const bytes of originals.values()) bytes.fill(0);
+        }
+      } else {
+        plaintext = feedback.decryptDevelopmentFeedback(options);
+      }
       if (!(plaintext instanceof Uint8Array) || plaintext.byteLength > MAX_PLAINTEXT_BYTES) refuse();
       writeAll(values.plaintext_fd, plaintext);
       return Object.freeze({ schema_version: 1, ok: true });

@@ -449,7 +449,6 @@ function prepare(options, originalRustFiles) {
   const input = dataOptions(options);
   const { profile, context } = validatedContext(input.context);
   validateExceptionWindow(context, input.now);
-  if (originalRustFiles !== undefined && profile.kind !== 'rust_patch') reject('invalid_expectation');
   input.context = context;
   const payloadBytes = copyPayload(input.payloadBytes, payloadLimit(profile.kind));
   validatePayload(payloadBytes, profile, input, originalRustFiles);
@@ -513,6 +512,27 @@ export function decryptDevelopmentFeedback(options) {
       now: input.now,
     });
     validatePayload(copyPayload(payloadBytes, payloadLimit(profile.kind)), profile, input);
+    return Buffer.from(payloadBytes);
+  } catch (error) {
+    if (error instanceof DevelopmentFeedbackError) throw error;
+    if (error instanceof LockEnvelopeError) reject('envelope_rejected');
+    reject('invalid_input');
+  }
+}
+
+/** Authenticate and validate a return using original Rust bytes read by the consumer. */
+export function decryptDevelopmentFeedbackWithRustSources(options, originalRustFiles) {
+  try {
+    const input = dataOptions(options, ['context', 'envelope', 'recipientPrivateKey', 'now']);
+    const { profile, context } = validatedContext(input.context);
+    validateExceptionWindow(context, input.now);
+    const payloadBytes = decryptReturnEnvelope({
+      envelope: input.envelope,
+      recipientPrivateKey: input.recipientPrivateKey,
+      expectedContext: context,
+      now: input.now,
+    });
+    validatePayload(copyPayload(payloadBytes, payloadLimit(profile.kind)), profile, input, originalRustFiles);
     return Buffer.from(payloadBytes);
   } catch (error) {
     if (error instanceof DevelopmentFeedbackError) throw error;

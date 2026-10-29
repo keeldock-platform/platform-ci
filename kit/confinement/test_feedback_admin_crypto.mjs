@@ -3,18 +3,23 @@ import { createPublicKey } from 'node:crypto';
 import {
   closeSync,
   fstatSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   realpathSync,
   readFileSync,
   rmSync,
   symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { encryptDevelopmentFeedback } from './development_feedback.mjs';
+import {
+  encryptDevelopmentFeedback,
+  encryptDevelopmentFeedbackWithRustSources,
+} from './development_feedback.mjs';
 import { RETURN_PROFILES } from './node_lock_envelope.mjs';
 import { handleRequest } from './feedback_admin_crypto.mjs';
 
@@ -62,8 +67,8 @@ function lockBytes() {
   })}\n`, 'utf8');
 }
 
-function makeContext(fingerprint) {
-  const profile = RETURN_PROFILES['core-node-lock-return'];
+function makeContext(fingerprint, profileName = 'core-node-lock-return') {
+  const profile = RETURN_PROFILES[profileName];
   return {
     request_id: '1'.repeat(64),
     nonce: '2'.repeat(64),
@@ -80,6 +85,7 @@ function makeContext(fingerprint) {
     producer_job: profile.producerJob,
     run_attempt: 1,
     expiry: NOW + 3600,
+    ...(profile.id === 1 ? {} : { kind: profile.kind }),
   };
 }
 
@@ -122,6 +128,62 @@ async function decryptFixture(state, envelope, overrides = {}) {
   }
 }
 
+function rustPatch() {
+  return Buffer.from([
+    'diff --git a/src/lib.rs b/src/lib.rs',
+    'index 1111111..2222222 100644',
+    '--- a/src/lib.rs',
+    '+++ b/src/lib.rs',
+    '@@ -1,1 +1,1 @@',
+    '-let token=CancellationToken::new();',
+    '+let token = CancellationToken::new();',
+    '',
+  ].join('\n'), 'utf8');
+}
+
+function rustContext(state) {
+  return makeContext(state.keyInfo.recipient_fingerprint, 'core-rust-format-return');
+}
+
+function encryptRustFixture(state, context, original) {
+  return encryptDevelopmentFeedbackWithRustSources({
+    payloadBytes: rustPatch(),
+    context,
+    recipientPublicKey: state.publicKey,
+    now: NOW,
+    reviewedRustPaths: ['src/lib.rs'],
+  }, new Map([['src/lib.rs', original]]));
+}
+
+function writeRustSource(state, contents) {
+  const root = join(state.directory, 'rust-source');
+  mkdirSync(root, { mode: 0o700 });
+  mkdirSync(join(root, 'src'), { mode: 0o700 });
+  writeFileSync(join(root, 'src', 'lib.rs'), contents, { mode: 0o600 });
+  return root;
+}
+
+async function decryptRustFixture(state, envelope, context, sourceDirectory) {
+  const outputPath = join(state.directory, `rust-output-${Math.random().toString(16).slice(2)}.payload`);
+  const fd = openSync(outputPath, 'wx', 0o600);
+  const message = {
+    operation: 'decrypt',
+    private_key_path: state.keyPath,
+    context,
+    now: NOW,
+    envelope_base64: Buffer.from(envelope).toString('base64'),
+    plaintext_fd: fd,
+    reviewed_rust_paths: ['src/lib.rs'],
+  };
+  if (sourceDirectory !== undefined) message.rust_source_directory = sourceDirectory;
+  try {
+    const result = await handleRequest(message);
+    return { result, outputPath };
+  } finally {
+    closeSync(fd);
+  }
+}
+
 test('creates a private one-use key file and exposes only public metadata',
   { skip: !POSIX_OWNER_FILESYSTEM }, async (t) => {
   const state = await setup();
@@ -145,6 +207,41 @@ test('decrypts only an authenticated payload matching the exact context',
   const { result, outputPath } = await decryptFixture(state, envelope);
   assert.deepEqual(result, { schema_version: 1, ok: true });
   assert.deepEqual(readFileSync(outputPath), lockBytes());
+});
+
+test('decrypts a whitespace-equivalent rust patch using consumer-local originals',
+  { skip: !POSIX_OWNER_FILESYSTEM }, async (t) => {
+  const state = await setup();
+  t.after(() => rmSync(state.directory, { recursive: true, force: true }));
+  const context = rustContext(state);
+  const original = Buffer.from('let token=CancellationToken::new();\n', 'utf8');
+  const envelope = encryptRustFixture(state, context, original);
+  const sourceDirectory = writeRustSource(state, original);
+  const { result, outputPath } = await decryptRustFixture(state, envelope, context, sourceDirectory);
+  assert.deepEqual(result, { schema_version: 1, ok: true });
+  assert.deepEqual(readFileSync(outputPath), rustPatch());
+});
+
+test('rejects a credential-shaped rust patch when the consumer supplies no originals',
+  { skip: !POSIX_OWNER_FILESYSTEM }, async (t) => {
+  const state = await setup();
+  t.after(() => rmSync(state.directory, { recursive: true, force: true }));
+  const context = rustContext(state);
+  const original = Buffer.from('let token=CancellationToken::new();\n', 'utf8');
+  const envelope = encryptRustFixture(state, context, original);
+  await assert.rejects(() => decryptRustFixture(state, envelope, context));
+});
+
+test('rejects a rust patch when consumer-local originals differ from producer originals',
+  { skip: !POSIX_OWNER_FILESYSTEM }, async (t) => {
+  const state = await setup();
+  t.after(() => rmSync(state.directory, { recursive: true, force: true }));
+  const context = rustContext(state);
+  const original = Buffer.from('let token=CancellationToken::new();\n', 'utf8');
+  const envelope = encryptRustFixture(state, context, original);
+  const sourceDirectory = writeRustSource(
+    state, Buffer.from('let token=OtherCall::new();\nlet value = changed;\n', 'utf8'));
+  await assert.rejects(() => decryptRustFixture(state, envelope, context, sourceDirectory));
 });
 
 test('rejects truncated, modified, expired, or context-mismatched ciphertext',

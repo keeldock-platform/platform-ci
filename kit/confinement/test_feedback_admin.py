@@ -351,6 +351,30 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertEqual(calls[0][2]["now"], NOW)
         self.assertIs(type(calls[0][2]["now"]), int)
 
+    def test_consumer_source_directory_is_forwarded_only_for_reviewed_rust_paths(self):
+        result = self.create(kind="rust_patch")
+        request = result["request"]
+        evidence, trusted = self.evidence_for(request)
+        gate = self.summary_gate(request)
+        source_directory = os.path.join(self.temporary.name, "reviewed-source")
+        helper_messages = []
+
+        def helper(message, *, plaintext_pipe=False):
+            helper_messages.append(dict(message))
+            return _fake_helper(message, plaintext_pipe=plaintext_pipe)
+
+        with self.install_collector(evidence), \
+                mock.patch.object(subject.node_lock_receipt, "validate_receipt", return_value=trusted), \
+                mock.patch.object(self.admin, "_run_helper", side_effect=helper):
+            self.admin.consume_return(
+                request["request_id"], object(), manual_summary_review=gate,
+                rust_source_directory=source_directory,
+            )
+
+        self.assertEqual(len(helper_messages), 1)
+        self.assertEqual(helper_messages[0]["rust_source_directory"], source_directory)
+        self.assertEqual(helper_messages[0]["reviewed_rust_paths"], ["src/lib.rs"])
+
     def test_success_consumes_and_retires_key_before_private_output(self):
         result = self.create()
         request = result["request"]

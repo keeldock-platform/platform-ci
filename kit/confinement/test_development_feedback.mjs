@@ -6,6 +6,7 @@ import {
   DEVELOPMENT_FEEDBACK_LIMITS,
   DevelopmentFeedbackError,
   decryptDevelopmentFeedback,
+  decryptDevelopmentFeedbackWithRustSources,
   encryptDevelopmentFeedback,
   encryptDevelopmentFeedbackWithRustSources,
   validateDevelopmentFeedback,
@@ -171,6 +172,17 @@ function encryptRustPatchWithSources(payloadBytes, originals) {
     context: contextFor('core-rust-format-return'),
     recipientPublicKey: recipient.publicKey,
     now: NOW,
+    reviewedRustPaths: ['src/lib.rs'],
+  }, new Map(Object.entries(originals).map(([path, contents]) => [path, Buffer.from(contents, 'utf8')])));
+}
+
+function decryptRustPatchWithSources(envelope, originals) {
+  return decryptDevelopmentFeedbackWithRustSources({
+    envelope,
+    context: contextFor('core-rust-format-return'),
+    recipientPrivateKey: recipient.privateKey,
+    now: NOW,
+    reviewedRustPaths: ['src/lib.rs'],
   }, new Map(Object.entries(originals).map(([path, contents]) => [path, Buffer.from(contents, 'utf8')])));
 }
 
@@ -238,7 +250,14 @@ test('rejects rust patches that add a credential-shaped literal', () => {
 test('continues scanning credential-shaped text for non-rust payloads', () => {
   const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
     'let token = CancellationToken::new();');
-  assert.throws(() => validate('build_diagnostics', payload), { code: 'credential_like_content' });
+  assert.throws(() => encryptDevelopmentFeedbackWithRustSources({
+    payloadBytes: payload,
+    context: contextFor('core-build-diagnostic-return'),
+    recipientPublicKey: recipient.publicKey,
+    now: NOW,
+  }, new Map([['src/lib.rs', Buffer.from('let token=CancellationToken::new();\n', 'utf8')]])), {
+    code: 'credential_like_content',
+  });
 });
 
 test('scans credential-shaped context when a rust patch changes a non-whitespace token', () => {
@@ -254,6 +273,39 @@ test('scans credential-shaped context when a rust patch changes a non-whitespace
   ].join('\n'), 'utf8');
   assert.throws(() => encryptRustPatchWithSources(payload, {
     'src/lib.rs': 'let token = CancellationToken::new();\nlet value = alpha;\n',
+  }), { code: 'credential_like_content' });
+});
+
+test('decrypts whitespace-equivalent credential-shaped patches with consumer originals', () => {
+  const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
+    'let token = CancellationToken::new();');
+  const originals = { 'src/lib.rs': 'let token=CancellationToken::new();\n' };
+  const envelope = encryptRustPatchWithSources(payload, originals);
+  assert.deepEqual(decryptRustPatchWithSources(envelope, originals), payload);
+});
+
+test('scans equivalent credential-shaped patches when consumer originals are absent', () => {
+  const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
+    'let token = CancellationToken::new();');
+  const envelope = encryptRustPatchWithSources(payload, {
+    'src/lib.rs': 'let token=CancellationToken::new();\n',
+  });
+  assert.throws(() => decryptDevelopmentFeedback({
+    envelope,
+    context: contextFor('core-rust-format-return'),
+    recipientPrivateKey: recipient.privateKey,
+    now: NOW,
+    reviewedRustPaths: ['src/lib.rs'],
+  }), { code: 'credential_like_content' });
+});
+
+test('scans when consumer originals differ from the producer originals', () => {
+  const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
+    'let token = CancellationToken::new();');
+  const producerOriginal = 'let token=CancellationToken::new();\nlet value = alpha;\n';
+  const envelope = encryptRustPatchWithSources(payload, { 'src/lib.rs': producerOriginal });
+  assert.throws(() => decryptRustPatchWithSources(envelope, {
+    'src/lib.rs': 'let token=OtherCall::new();\nlet value = beta;\n',
   }), { code: 'credential_like_content' });
 });
 
