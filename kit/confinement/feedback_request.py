@@ -54,8 +54,13 @@ REQUEST_FIELDS = (
     "repository_id", "source_sha", "base_sha", "control_sha", "base_branch",
     "reviewed_diff_sha256", "recipient_fingerprint", "nonce", "expiry",
 )
+WORKSPACE_FIELD = "workspace"
+CARGO_WORKSPACE_SELECTORS = ("runtime",)
+REQUEST_FIELDS_WITH_WORKSPACE = REQUEST_FIELDS + (WORKSPACE_FIELD,)
 REQUEST_RECORD_FIELDS = frozenset(REQUEST_FIELDS)
+REQUEST_RECORD_FIELDS_WITH_WORKSPACE = frozenset(REQUEST_FIELDS_WITH_WORKSPACE)
 FULL_REQUEST_FIELDS = frozenset(("request_id",) + REQUEST_FIELDS)
+FULL_REQUEST_FIELDS_WITH_WORKSPACE = frozenset(("request_id",) + REQUEST_FIELDS_WITH_WORKSPACE)
 STATE_FIELDS = frozenset(("schema_version", "bootstrap_lock_consumed", "requests"))
 ENTRY_FIELDS = frozenset((
     "request_id", "nonce", "recipient_fingerprint", "kind", "expiry", "status",
@@ -97,6 +102,33 @@ def _valid_hex(value, size):
     return pattern.fullmatch(value) is not None
 
 
+def _request_fields_for(values):
+    if type(values) is dict and WORKSPACE_FIELD in values:
+        return REQUEST_FIELDS_WITH_WORKSPACE
+    return REQUEST_FIELDS
+
+
+def _record_fields_for(values):
+    if type(values) is dict and WORKSPACE_FIELD in values:
+        return REQUEST_RECORD_FIELDS_WITH_WORKSPACE
+    return REQUEST_RECORD_FIELDS
+
+
+def _full_fields_for(request):
+    if type(request) is dict and WORKSPACE_FIELD in request:
+        return FULL_REQUEST_FIELDS_WITH_WORKSPACE
+    return FULL_REQUEST_FIELDS
+
+
+def request_workspace(request):
+    """Return the Cargo workspace selector a request carries; an absent field means contract."""
+    if type(request) is not dict:
+        _refuse()
+    if WORKSPACE_FIELD not in request:
+        return "contract"
+    return request[WORKSPACE_FIELD]
+
+
 def _profile_for_values(values):
     if type(values) is not dict:
         _refuse()
@@ -110,9 +142,15 @@ def _profile_for_values(values):
 
 
 def _validate_values(values, now):
-    if not _exact_dict(values, REQUEST_RECORD_FIELDS) or not _safe_int(now, minimum=1):
+    if not _exact_dict(values, _record_fields_for(values)) or not _safe_int(now, minimum=1):
         _refuse()
     profile = _profile_for_values(values)
+    if WORKSPACE_FIELD in values and (
+        profile["kind"] != CARGO_LOCK_KIND
+        or type(values[WORKSPACE_FIELD]) is not str
+        or values[WORKSPACE_FIELD] not in CARGO_WORKSPACE_SELECTORS
+    ):
+        _refuse()
     if (not _valid_decimal(values["ci_repository_id"])
             or not _valid_decimal(values["repository_id"])
             or values["ci_repository_id"] == values["repository_id"]
@@ -142,7 +180,7 @@ def canonical_request(fields, *, now):
     """Return the bounded, ordered preimage used to calculate request_id."""
     _validate_values(fields, now)
     lines = [REQUEST_DOMAIN + "\n"]
-    for name in REQUEST_FIELDS:
+    for name in _request_fields_for(fields):
         value = fields[name]
         if type(value) is int:
             value = str(value)
@@ -168,9 +206,9 @@ def create_request(fields, *, now):
 
 def validate_request(request, *, now):
     """Check exact request fields and recompute the canonical request ID."""
-    if not _exact_dict(request, FULL_REQUEST_FIELDS):
+    if not _exact_dict(request, _full_fields_for(request)):
         _refuse()
-    values = {name: request[name] for name in REQUEST_FIELDS}
+    values = {name: request[name] for name in _request_fields_for(request)}
     preimage = canonical_request(values, now=now)
     if (not _valid_hex(request["request_id"], 64)
             or request["request_id"] != hashlib.sha256(preimage).hexdigest()):
@@ -181,7 +219,9 @@ def validate_request(request, *, now):
 def encode_request(request, *, now):
     """Encode a canonical record with its derived request ID as the final line."""
     validate_request(request, now=now)
-    preimage = canonical_request({name: request[name] for name in REQUEST_FIELDS}, now=now)
+    preimage = canonical_request(
+        {name: request[name] for name in _request_fields_for(request)}, now=now,
+    )
     try:
         return preimage + ("request_id=" + request["request_id"] + "\n").encode("ascii")
     except UnicodeError:
@@ -198,11 +238,13 @@ def parse_request(record, *, now):
         lines = record.decode("ascii", "strict").split("\n")
     except UnicodeError:
         _refuse()
+    with_workspace = len(lines) == len(REQUEST_FIELDS_WITH_WORKSPACE) + 3
+    fields = REQUEST_FIELDS_WITH_WORKSPACE if with_workspace else REQUEST_FIELDS
     if (lines[0] != REQUEST_DOMAIN or lines[-1] != ""
-            or len(lines) != len(REQUEST_FIELDS) + 3):
+            or len(lines) != len(fields) + 3):
         _refuse()
     values = {}
-    for line, name in zip(lines[1:-2], REQUEST_FIELDS):
+    for line, name in zip(lines[1:-2], fields):
         if line.count("=") != 1:
             _refuse()
         field, value = line.split("=", 1)

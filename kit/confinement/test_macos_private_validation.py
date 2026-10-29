@@ -2698,5 +2698,414 @@ class ControlGitCommandTests(unittest.TestCase):
             )
 
 
+BATCH4_ROOT_TEXT = (
+    chr(35) + " Platform contract workspace: the contract lane and its tag line.\n"
+    "[workspace]\n"
+    'resolver = "3"\n'
+    "members = [\n"
+    '    "crates/host/api",\n'
+    '    "crates/host/mock",\n'
+    '    "crates/host/conformance",\n'
+    '    "crates/kernel/i18n",\n'
+    "]\n"
+    + chr(35) + " Guard for the future runtime workspace.\n"
+    "exclude = [\n"
+    '    "crates/host/core",\n'
+    '    "crates/host/registry",\n'
+    '    "crates/host/extensions",\n'
+    '    "crates/host/links",\n'
+    '    "crates/host/mcp",\n'
+    '    "crates/host/mcp-host",\n'
+    '    "crates/host/mcp-shim",\n'
+    '    "crates/host/settings-schema",\n'
+    '    "crates/services",\n'
+    '    "crates/apps",\n'
+    '    "apps",\n'
+    "]\n\n"
+    "[workspace.package]\n"
+    'version = "0.1.0"\nedition = "2024"\nrust-version = "1.99.1"\npublish = false\n\n'
+    "[workspace.dependencies]\n"
+    "keeldock" '-host-api = { path = "crates/host/api" }\n'
+    "keeldock" '-host-mock = { path = "crates/host/mock" }\n\n'
+    "[workspace.lints.rust]\n"
+    'unsafe_code = "forbid"\nwarnings = "deny"\n'
+)
+
+
+def _runtime_root_text(roots=None, extra=""):
+    roots = subject.RUNTIME_CRATE_ROOTS if roots is None else roots
+    listing = "".join(
+        '    "../' + "/".join(root) + '",\n' for root in roots
+    )
+    return (
+        '[workspace]\nresolver = "3"\nmembers = [\n' + listing + "]\n\n"
+        "[workspace.package]\n"
+        'version = "0.1.0"\nedition = "2024"\nrust-version = "1.99.1"\npublish = false\n\n'
+        "[workspace.lints.rust]\n"
+        'unsafe_code = "forbid"\n' + extra
+    )
+
+
+def _runtime_member_text(root, extra_package="", tail=""):
+    link = "../" * len(root) + "runtime"
+    return (
+        '[package]\nname = "' + root[-1] + '"\nworkspace = "' + link + '"\n'
+        "version.workspace = true\nedition.workspace = true\n"
+        "rust-version.workspace = true\npublish.workspace = true\n"
+        + extra_package + "\n[lints]\nworkspace = true\n" + tail
+    )
+
+
+def _runtime_lock_text(names, extra=""):
+    return "version = 4\n" + "".join(
+        '\n[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n' + extra for name in names
+    )
+
+
+class RuntimeWorkspaceTreeTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_entries(roots=None):
+        roots = subject.RUNTIME_CRATE_ROOTS if roots is None else roots
+        paths = {
+            subject.RUNTIME_ROOT_MANIFEST_PATH, subject.RUNTIME_ROOT_LOCK_PATH,
+            "runtime/rust-toolchain.toml", "runtime/rustfmt.toml", "runtime/clippy.toml",
+        }
+        for root in roots:
+            prefix = "/".join(root)
+            paths.update((prefix + "/Cargo.toml", prefix + "/src/lib.rs", prefix + "/tests/unit.rs"))
+        return {path: ("100644", "a" * 40) for path in paths}
+
+    @staticmethod
+    def _runtime_blobs(roots=None):
+        roots = subject.RUNTIME_CRATE_ROOTS if roots is None else roots
+        blobs = {
+            subject.RUNTIME_ROOT_MANIFEST_PATH: _runtime_root_text(roots).encode("utf-8"),
+            subject.RUNTIME_ROOT_LOCK_PATH: _runtime_lock_text([root[-1] for root in roots]).encode("ascii"),
+            "runtime/rust-toolchain.toml": subject.CORE_CONTRACT_TOOLCHAIN,
+            "runtime/rustfmt.toml": b"x",
+            "runtime/clippy.toml": b"x",
+        }
+        for root in roots:
+            blobs["/".join(root) + "/Cargo.toml"] = _runtime_member_text(root).encode("utf-8")
+        return blobs
+
+    def _validate(self, entries=None, blobs=None, contract_overrides=None, base_entries=None):
+        entries = self._runtime_entries() if entries is None else entries
+        blobs = self._runtime_blobs() if blobs is None else blobs
+        contract_overrides = contract_overrides or {}
+        merged = CoreContractTreeTests._required_core_contract_entries()
+        merged.update(entries)
+        digest = hashlib.sha256(b"x").hexdigest()
+        reads = []
+
+        def blob(unused_repository, unused_git, unused_environment, unused_entries, path, **unused):
+            reads.append(path)
+            if path in blobs:
+                return blobs[path]
+            if path in contract_overrides:
+                return contract_overrides[path]
+            if path.startswith("crates/") and path.endswith("/Cargo.toml"):
+                return CRATE_MANIFEST.encode("utf-8")
+            if path == "Cargo.toml":
+                members = ", ".join('"' + "/".join(root) + '"' for root in subject.CORE_CONTRACT_CRATE_ROOTS)
+                return ("[workspace]\nmembers = [" + members + "]\n").encode("utf-8")
+            if path == "Cargo.lock":
+                return ("version = 4\n" + "[[package]]\n" * len(subject.CORE_CONTRACT_CRATE_ROOTS)).encode("ascii")
+            if path == "rust-toolchain.toml":
+                return subject.CORE_CONTRACT_TOOLCHAIN
+            return b"x"
+
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(dict(merged), merged),
+        ), patch.object(subject, "_contract_blob", side_effect=blob), \
+                patch.object(subject, "_core_contract_policy_matches_base", return_value=True), \
+                patch.object(subject, "_rules_v2_file_manifest", return_value={"AGENTS.md": digest}):
+            marker = subject._safe_core_contract_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40, concern="core-contract",
+            )
+        return marker, reads
+
+    def _refused(self, **kwargs):
+        with self.assertRaises(subject.Refusal) as refusal:
+            self._validate(**kwargs)
+        self.assertEqual(
+            (refusal.exception.reason, refusal.exception.stage),
+            ("bootstrap_snapshot_invalid", "bootstrap"),
+        )
+        return refusal.exception.core_check
+
+    def test_the_admitted_runtime_tree_is_exactly_the_std_only_fixture_workspace(self):
+        self.assertEqual(
+            [root[-1] for root in subject.RUNTIME_CRATE_ROOTS],
+            ["host-router", "fixture-data", "tool-a", "tool-b", "tool-bad-no-handler", "tool-bad-no-manifest"],
+        )
+        for root in subject.RUNTIME_CRATE_ROOTS:
+            prefix = "/".join(root)
+            self.assertTrue(any(
+                prefix == item or prefix.startswith(item + "/") for item in subject.RUNTIME_ADMITTED_PREFIXES
+            ))
+        self.assertEqual(subject.RUNTIME_WORKSPACE_DIRECTORY, "runtime")
+        marker, reads = self._validate()
+        self.assertEqual(marker, "core_contract")
+        self.assertIn(subject.RUNTIME_ROOT_MANIFEST_PATH, reads)
+        self.assertIn(subject.RUNTIME_ROOT_LOCK_PATH, reads)
+
+    def test_absent_runtime_workspace_leaves_the_contract_checks_unchanged(self):
+        entries = CoreContractTreeTests._required_core_contract_entries()
+        digest = hashlib.sha256(b"x").hexdigest()
+        reads = []
+
+        def blob(unused_repository, unused_git, unused_environment, unused_entries, path, **unused):
+            reads.append(path)
+            if path.startswith("crates/") and path.endswith("/Cargo.toml"):
+                return CRATE_MANIFEST.encode("utf-8")
+            if path == "Cargo.toml":
+                members = ", ".join('"' + "/".join(root) + '"' for root in subject.CORE_CONTRACT_CRATE_ROOTS)
+                return ("[workspace]\nmembers = [" + members + "]\n").encode("utf-8")
+            if path == "Cargo.lock":
+                return ("version = 4\n" + "[[package]]\n" * len(subject.CORE_CONTRACT_CRATE_ROOTS)).encode("ascii")
+            if path == "rust-toolchain.toml":
+                return subject.CORE_CONTRACT_TOOLCHAIN
+            return b"x"
+
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(dict(entries), entries),
+        ), patch.object(subject, "_contract_blob", side_effect=blob), \
+                patch.object(subject, "_core_contract_policy_matches_base", return_value=True), \
+                patch.object(subject, "_rules_v2_file_manifest", return_value={"AGENTS.md": digest}):
+            marker = subject._safe_core_contract_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40, concern="core-contract",
+            )
+        self.assertEqual(marker, "core_contract")
+        self.assertFalse(any(path.startswith("runtime/") for path in reads))
+
+    def test_batch4_root_manifest_still_passes_the_contract_parsers_unchanged(self):
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        self.assertEqual(subject._core_contract_workspace_members(BATCH4_ROOT_TEXT), members)
+        self.assertTrue(subject._core_contract_workspace_paths_shape(BATCH4_ROOT_TEXT))
+        self.assertEqual(
+            [root for root in subject.CORE_CONTRACT_CRATE_ROOTS],
+            [("crates", "host", "api"), ("crates", "host", "mock"),
+             ("crates", "host", "conformance"), ("crates", "kernel", "i18n")],
+        )
+        self.assertEqual(subject.CORE_CONTRACT_ROOT_FILES, frozenset((
+            "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml",
+        )))
+        for path in (
+            "runtime/Cargo.toml", "runtime/Cargo.lock", "apps/x/src/main.rs",
+            "crates/apps/test-fixtures/tool-a/src/lib.rs", "crates/services/store/src/lib.rs",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(subject._core_contract_expected_mode(path))
+
+    def test_runtime_paths_without_root_files_are_still_refused_as_before(self):
+        for path in (
+            "apps/test-shell-desktop/src/main.rs", "crates/services/store/src/lib.rs",
+            "runtime/rustfmt.toml", "crates/apps/test-fixtures/tool-a/Cargo.toml",
+        ):
+            entries = CoreContractTreeTests._required_core_contract_entries()
+            entries[path] = ("100644", "a" * 40)
+            with self.subTest(path=path):
+                self.assertEqual(self._refused(entries=entries, blobs={}), "path_mode")
+
+    def test_both_root_files_and_every_member_are_required(self):
+        for dropped in (subject.RUNTIME_ROOT_MANIFEST_PATH, subject.RUNTIME_ROOT_LOCK_PATH):
+            entries = self._runtime_entries()
+            del entries[dropped]
+            with self.subTest(dropped=dropped):
+                self.assertEqual(self._refused(entries=entries), "required_files")
+        root = subject.RUNTIME_CRATE_ROOTS[0]
+        for dropped in ("Cargo.toml", "src/lib.rs"):
+            entries = self._runtime_entries()
+            del entries["/".join(root) + "/" + dropped]
+            with self.subTest(dropped=dropped):
+                self.assertEqual(self._refused(entries=entries), "required_files")
+
+    def test_only_rust_package_files_at_configured_members_are_admitted(self):
+        prefix = "/".join(subject.RUNTIME_CRATE_ROOTS[0])
+        for path in (
+            prefix + "/build.rs", prefix + "/src/build.rs", prefix + "/package.json",
+            prefix + "/src/data.json", "apps/test-shell-desktop/package.json",
+            "crates/apps/test-fixtures/unlisted/src/lib.rs", "runtime/extra.toml",
+            "runtime/.cargo/config.toml", "crates/services/store/src/lib.rs",
+        ):
+            entries = self._runtime_entries()
+            entries[path] = ("100644", "a" * 40)
+            with self.subTest(path=path):
+                self.assertEqual(self._refused(entries=entries), "path_mode")
+        for mode in ("100755", "120000"):
+            entries = self._runtime_entries()
+            entries[subject.RUNTIME_ROOT_MANIFEST_PATH] = (mode, "a" * 40)
+            with self.subTest(mode=mode):
+                self.assertEqual(self._refused(entries=entries), "path_mode")
+
+    def test_runtime_root_manifest_is_a_strict_allowlist(self):
+        bad_roots = (
+            _runtime_root_text(extra='\n[workspace.metadata]\nx = "y"\n'),
+            _runtime_root_text(extra='\n[patch.crates-io]\n'),
+            _runtime_root_text().replace('resolver = "3"', 'resolver = "2"'),
+            _runtime_root_text().replace('resolver = "3"\n', ""),
+            _runtime_root_text().replace(']\n\n[workspace.package]', ']\nexclude = ["x"]\n\n[workspace.package]'),
+            _runtime_root_text().replace('"../crates', '"crates', 1),
+            _runtime_root_text(roots=subject.RUNTIME_CRATE_ROOTS[:-1]),
+            _runtime_root_text(roots=tuple(reversed(subject.RUNTIME_CRATE_ROOTS))),
+            _runtime_root_text(extra='\n[workspace.dependencies]\nserde = "=1.0.0"\n'),
+            _runtime_root_text(extra='\n[workspace.dependencies]\nx = { git = "u" }\n'),
+            _runtime_root_text(extra='\n[workspace.dependencies]\nx = { path = "../crates/services/store" }\n'),
+            _runtime_root_text() + "\n[package]\nname = \"x\"\n",
+            _runtime_root_text().replace("publish = false", 'publish = true'),
+            _runtime_root_text() + 'unsafe_code = "forbid"\n',
+        )
+        for text in bad_roots:
+            blobs = self._runtime_blobs()
+            blobs[subject.RUNTIME_ROOT_MANIFEST_PATH] = text.encode("utf-8")
+            with self.subTest(text=text):
+                self.assertEqual(self._refused(blobs=blobs), "workspace_members")
+        blobs = self._runtime_blobs()
+        blobs[subject.RUNTIME_ROOT_MANIFEST_PATH] = b"\xff\xfe"
+        self.assertEqual(self._refused(blobs=blobs), "workspace_decode")
+
+    def test_runtime_root_path_dependencies_may_name_configured_members_only(self):
+        member = "../" + "/".join(subject.RUNTIME_CRATE_ROOTS[0])
+        good = _runtime_root_text(extra='\n[workspace.dependencies]\nrouter = { path = "' + member + '" }\n')
+        blobs = self._runtime_blobs()
+        blobs[subject.RUNTIME_ROOT_MANIFEST_PATH] = good.encode("utf-8")
+        blobs["/".join(subject.RUNTIME_CRATE_ROOTS[1]) + "/Cargo.toml"] = (
+            _runtime_member_text(subject.RUNTIME_CRATE_ROOTS[1]).replace(
+                "\n[lints]", "\n[dependencies]\nrouter = { workspace = true }\n\n[lints]",
+            ).encode("utf-8")
+        )
+        marker, unused_reads = self._validate(blobs=blobs)
+        self.assertEqual(marker, "core_contract")
+
+    def test_runtime_member_manifests_are_a_strict_allowlist(self):
+        root = subject.RUNTIME_CRATE_ROOTS[2]
+        path = "/".join(root) + "/Cargo.toml"
+        good = _runtime_member_text(root)
+        cases = (
+            (good.replace('workspace = "../../../../runtime"', 'workspace = "../../../runtime"'), "package_decode"),
+            (good.replace('workspace = "../../../../runtime"\n', ""), "package_decode"),
+            (good.replace("edition.workspace = true\n", ""), "package_decode"),
+            (good.replace("[lints]", '[features]\nx = []\n\n[lints]'), "package_decode"),
+            (good.replace("[lints]", "[dependencies]\nunknown = { workspace = true }\n\n[lints]"), "package_decode"),
+            (good.replace("[lints]", '[dependencies]\nrouter = "=1.0.0"\n\n[lints]'), "package_decode"),
+            (good.replace("[lints]", '[build-dependencies]\nx = { workspace = true }\n\n[lints]'), "package_build"),
+            (good.replace("[package]\n", '[package]\nbuild = "build.rs"\n'), "package_build"),
+            (good.replace('name = "tool-a"', 'name = "Tool-A"'), "package_decode"),
+            (good.replace("[package]\n", "[package]\nlinks = \"x\"\n"), "package_decode"),
+        )
+        for text, check in cases:
+            blobs = self._runtime_blobs()
+            blobs[path] = text.encode("utf-8")
+            with self.subTest(text=text):
+                self.assertEqual(self._refused(blobs=blobs), check)
+        blobs = self._runtime_blobs()
+        blobs[path] = blobs["/".join(subject.RUNTIME_CRATE_ROOTS[3]) + "/Cargo.toml"]
+        self.assertEqual(self._refused(blobs=blobs), "package_decode")
+
+    def test_runtime_lock_requires_exactly_the_sourceless_members(self):
+        names = [root[-1] for root in subject.RUNTIME_CRATE_ROOTS]
+        source = 'source = "registry+' + "x" + '"\n'
+        cases = (
+            _runtime_lock_text(names[:-1]),
+            _runtime_lock_text(names + ["extra"]),
+            _runtime_lock_text(names, extra=source),
+            _runtime_lock_text(names, extra='checksum = "' + "a" * 64 + '"\n'),
+            _runtime_lock_text(names + [names[0]]),
+            _runtime_lock_text(names).replace("version = 4", "version = 3", 1),
+            _runtime_lock_text(names).replace("version = 4\n", ""),
+            _runtime_lock_text(names, extra='dependencies = [\n "missing",\n]\n'),
+            _runtime_lock_text(names, extra='dependencies = [\n "tool-a 0.1.0 (git+x)",\n]\n'),
+            _runtime_lock_text(names) + 'source = "git+x"\n',
+            _runtime_lock_text(names).replace('version = "0.1.0"\n', "", 1),
+        )
+        for text in cases:
+            blobs = self._runtime_blobs()
+            blobs[subject.RUNTIME_ROOT_LOCK_PATH] = text.encode("ascii")
+            with self.subTest(text=text):
+                self.assertEqual(self._refused(blobs=blobs), "cargo_lock_shape")
+        blobs = self._runtime_blobs()
+        blobs[subject.RUNTIME_ROOT_LOCK_PATH] = "version = 4\n\xe9".encode("utf-8")
+        self.assertEqual(self._refused(blobs=blobs), "cargo_lock_decode")
+        blobs[subject.RUNTIME_ROOT_LOCK_PATH] = _runtime_lock_text(
+            names, extra='dependencies = [\n "tool-b",\n]\n',
+        ).encode("ascii")
+        marker, unused_reads = self._validate(blobs=blobs)
+        self.assertEqual(marker, "core_contract")
+
+    def test_a_contract_file_never_satisfies_a_runtime_check_or_the_reverse(self):
+        contract_root = BATCH4_ROOT_TEXT.encode("utf-8")
+        contract_lock = (
+            "version = 4\n" + "[[package]]\n" * len(subject.CORE_CONTRACT_CRATE_ROOTS)
+        ).encode("ascii")
+        blobs = self._runtime_blobs()
+        blobs[subject.RUNTIME_ROOT_MANIFEST_PATH] = contract_root
+        self.assertEqual(self._refused(blobs=blobs), "workspace_members")
+        blobs = self._runtime_blobs()
+        blobs[subject.RUNTIME_ROOT_LOCK_PATH] = contract_lock
+        self.assertEqual(self._refused(blobs=blobs), "cargo_lock_shape")
+        blobs = self._runtime_blobs()
+        blobs[subject.RUNTIME_ROOT_MANIFEST_PATH] = CRATE_MANIFEST.encode("utf-8")
+        self.assertEqual(self._refused(blobs=blobs), "workspace_members")
+
+        runtime_root = _runtime_root_text().encode("utf-8")
+        runtime_lock = _runtime_lock_text([root[-1] for root in subject.RUNTIME_CRATE_ROOTS]).encode("ascii")
+        for override, check in (
+            ({"Cargo.toml": runtime_root}, "workspace_members"),
+            ({"Cargo.lock": runtime_lock}, "cargo_lock_shape"),
+        ):
+            with self.subTest(override=sorted(override)):
+                self.assertEqual(self._refused(contract_overrides=override), check)
+
+    def test_runtime_toolchain_and_format_configs_must_match_the_contract_files(self):
+        blobs = self._runtime_blobs()
+        blobs["runtime/rust-toolchain.toml"] = subject.CORE_CONTRACT_TOOLCHAIN + b"\n"
+        self.assertEqual(self._refused(blobs=blobs), "toolchain")
+        for name in ("rustfmt.toml", "clippy.toml"):
+            blobs = self._runtime_blobs()
+            blobs["runtime/" + name] = b"different"
+            with self.subTest(name=name):
+                self.assertEqual(self._refused(blobs=blobs), "package_decode")
+
+    def test_runtime_members_outside_the_admitted_prefixes_are_not_approved(self):
+        for roots in (
+            (("crates", "host", "api"),),
+            (("packages", "x"),),
+            (("runtime", "x"),),
+            (),
+            (("apps", "a"), ("apps", "a")),
+            ["apps"],
+        ):
+            with self.subTest(roots=roots), patch.object(subject, "RUNTIME_CRATE_ROOTS", roots):
+                entries = {
+                    subject.RUNTIME_ROOT_MANIFEST_PATH: ("100644", "a" * 40),
+                    subject.RUNTIME_ROOT_LOCK_PATH: ("100644", "a" * 40),
+                }
+                with self.assertRaises(subject.Refusal) as refusal:
+                    self._validate(entries=entries, blobs={})
+                if roots == ():
+                    self.assertEqual(refusal.exception.core_check, "workspace_members")
+                else:
+                    self.assertEqual(
+                        (refusal.exception.reason, refusal.exception.stage),
+                        ("bootstrap_not_approved", "configuration"),
+                    )
+
+    def test_an_empty_member_list_admits_only_the_two_root_files(self):
+        entries = {
+            subject.RUNTIME_ROOT_MANIFEST_PATH: ("100644", "a" * 40),
+            subject.RUNTIME_ROOT_LOCK_PATH: ("100644", "a" * 40),
+        }
+        blobs = {
+            subject.RUNTIME_ROOT_MANIFEST_PATH: _runtime_root_text(roots=()).encode("utf-8"),
+            subject.RUNTIME_ROOT_LOCK_PATH: b"version = 4\n",
+        }
+        with patch.object(subject, "RUNTIME_CRATE_ROOTS", ()):
+            marker, unused_reads = self._validate(entries=entries, blobs=blobs)
+            self.assertEqual(marker, "core_contract")
+            entries["crates/apps/test-fixtures/tool-a/Cargo.toml"] = ("100644", "a" * 40)
+            self.assertEqual(self._refused(entries=entries, blobs=blobs), "path_mode")
+
+
 if __name__ == "__main__":
     unittest.main()
