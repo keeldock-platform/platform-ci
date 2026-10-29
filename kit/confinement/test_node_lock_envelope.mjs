@@ -148,7 +148,7 @@ test('lock context keeps the original canonical AAD byte shape', () => {
 });
 
 test('closed feedback profiles bind kind, producer, canonical fields, and frame id', () => {
-  for (const name of ['core-rust-format-return', 'core-build-diagnostic-return']) {
+  for (const name of ['core-rust-format-return', 'core-build-diagnostic-return', 'core-rust-lock-return']) {
     const expected = feedbackContext(name);
     const profile = RETURN_PROFILES[name];
     const aad = canonicalContext(expected);

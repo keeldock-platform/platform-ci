@@ -6,6 +6,7 @@ from types import MappingProxyType
 
 import policy_handoff
 import policy_linux
+import policy_rust
 import policy_windows
 from policy_linux import LINUX_CONFINEMENT_WORKFLOW_TEMPLATE
 from policy_windows import WINDOWS_NATIVE_PREFLIGHT_WORKFLOW_TEMPLATE
@@ -1345,7 +1346,7 @@ SHARED_WORKFLOW_KINDS = frozenset(
         "macos-rules-source-reader",
     )
 ) | frozenset(FEEDBACK_RETURN_WORKFLOW_SHA256)
-LANE_MODULES = (policy_linux, policy_windows, policy_handoff)
+LANE_MODULES = (policy_linux, policy_windows, policy_handoff, policy_rust)
 LANE_DIGEST_PATTERN = re.compile(r"[a-f0-9]{64}\Z")
 
 

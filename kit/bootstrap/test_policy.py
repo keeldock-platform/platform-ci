@@ -34,9 +34,11 @@ from policy import (
 import policy
 import policy_handoff
 import policy_linux
+import policy_rust
 import policy_windows
 from test_policy_handoff import *
 from test_policy_linux import *
+from test_policy_rust import *
 from test_policy_windows import *
 
 
@@ -1417,12 +1419,12 @@ class WorkflowPolicyTests(unittest.TestCase):
 
 
 class LaneRegistryTests(unittest.TestCase):
-    def test_registry_is_a_fixed_static_set_of_the_three_lane_modules(self):
-        self.assertEqual(policy.LANE_MODULES, (policy_linux, policy_windows, policy_handoff))
+    def test_registry_is_a_fixed_static_set_of_the_four_lane_modules(self):
+        self.assertEqual(policy.LANE_MODULES, (policy_linux, policy_windows, policy_handoff, policy_rust))
         self.assertIs(type(policy.LANE_MODULES), tuple)
 
     def test_registry_maps_each_lane_kind_to_exactly_one_lane(self):
-        self.assertEqual(policy.LANE_MODULES, (policy_linux, policy_windows, policy_handoff))
+        self.assertEqual(policy.LANE_MODULES, (policy_linux, policy_windows, policy_handoff, policy_rust))
         self.assertEqual(
             {kind: module for kind, module in policy.WORKFLOW_KIND_LANES.items()},
             {
@@ -1445,8 +1447,10 @@ class LaneRegistryTests(unittest.TestCase):
                 "lane-h-capsule-attester",
                 "attestation-role-signer-probe",
                 "linux-source-admission",
+                "core-rust-lock-return",
             },
         )
+        self.assertIs(policy.WORKFLOW_KIND_LANES["core-rust-lock-return"], policy_rust)
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-source-admission"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
@@ -1511,6 +1515,11 @@ class LaneRegistryTests(unittest.TestCase):
                     ".github/workflows/windows-handoff-synthetic.yml",
                     "windows-handoff-synthetic",
                     "handoff-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/core-rust-lock-return.yml",
+                    "core-rust-lock-return",
+                    "rust-lock-return-workflow-too-large",
                 ),
             ),
         )

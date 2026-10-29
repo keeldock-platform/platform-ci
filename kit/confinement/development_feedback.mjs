@@ -24,9 +24,15 @@ export const DEVELOPMENT_FEEDBACK_LIMITS = Object.freeze({
   reviewedRustPaths: 256,
   hunkLines: 16_384,
   hunkCount: 1_000_000,
+  cargoLockBytes: 1024 * 1024,
+  cargoLockLockBytes: 256 * 1024,
+  cargoLockReceiptBytes: 128 * 1024,
+  cargoLockEvidenceBytes: 192 * 1024,
 });
 
-const PROFILE_KINDS = new Set(['lock', 'rust_patch', 'build_diagnostics']);
+const PROFILE_KINDS = new Set(['lock', 'rust_patch', 'build_diagnostics', 'cargo_lock']);
+const CARGO_LOCK_FIELDS = Object.freeze(['evidence_b64', 'lock_b64', 'receipt_b64', 'schema_version']);
+const BASE64_TEXT = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const RUST_PATH = /^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*\.rs$/u;
 const TOKEN_SHAPE = /(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{16,}|npm_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|ASIA[A-Z0-9]{16})(?:$|[^A-Za-z0-9])/u;
 const PRIVATE_KEY_HEADER = /-----BEGIN [A-Z0-9 ]{0,64}PRIVATE KEY-----/u;
@@ -273,8 +279,57 @@ function validateExceptionWindow(context, now) {
   }
 }
 
+function cargoLockMember(value, limit, multiline) {
+  if (typeof value !== 'string' || value.length === 0) reject('invalid_cargo_lock');
+  if (value.length > Math.ceil(limit / 3) * 4) reject('payload_too_large');
+  if (!BASE64_TEXT.test(value)) reject('invalid_cargo_lock');
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.byteLength === 0 || bytes.toString('base64') !== value) reject('invalid_cargo_lock');
+  if (bytes.byteLength > limit) reject('payload_too_large');
+  for (const byte of bytes) {
+    if (byte > 0x7e || (byte < 0x20 && !(multiline && byte === 0x0a))) reject('invalid_cargo_lock');
+  }
+  if (multiline && bytes[bytes.byteLength - 1] !== 0x0a) reject('invalid_cargo_lock');
+  return bytes;
+}
+
+function validateCargoLockBundle(bytes) {
+  if (bytes.byteLength > DEVELOPMENT_FEEDBACK_LIMITS.cargoLockBytes) reject('payload_too_large');
+  if (bytes.byteLength === 0) reject('invalid_cargo_lock');
+  let text;
+  let parsed;
+  try {
+    text = UTF8.decode(bytes);
+    parsed = JSON.parse(text);
+  } catch {
+    reject('invalid_cargo_lock');
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) reject('invalid_cargo_lock');
+  const keys = Object.keys(parsed).sort();
+  if (keys.length !== CARGO_LOCK_FIELDS.length
+      || keys.some((key, index) => key !== CARGO_LOCK_FIELDS[index])
+      || parsed.schema_version !== 1) reject('invalid_cargo_lock');
+  cargoLockMember(parsed.lock_b64, DEVELOPMENT_FEEDBACK_LIMITS.cargoLockLockBytes, true);
+  cargoLockMember(parsed.receipt_b64, DEVELOPMENT_FEEDBACK_LIMITS.cargoLockReceiptBytes, false);
+  cargoLockMember(parsed.evidence_b64, DEVELOPMENT_FEEDBACK_LIMITS.cargoLockEvidenceBytes, false);
+  const canonical = JSON.stringify({
+    evidence_b64: parsed.evidence_b64,
+    lock_b64: parsed.lock_b64,
+    receipt_b64: parsed.receipt_b64,
+    schema_version: 1,
+  });
+  if (canonical !== text) reject('invalid_cargo_lock');
+}
+
 function validatePayload(bytes, profile, options) {
   if (!PROFILE_KINDS.has(profile.kind)) reject('unsupported_kind');
+  if (profile.kind === 'cargo_lock') {
+    if (Object.hasOwn(options, 'expectedManifest') || Object.hasOwn(options, 'reviewedRustPaths')) {
+      reject('invalid_expectation');
+    }
+    validateCargoLockBundle(bytes);
+    return;
+  }
   if (profile.kind === 'lock') {
     if (!Object.hasOwn(options, 'expectedManifest')) reject('invalid_expectation');
     try {
@@ -299,15 +354,19 @@ function validatePayload(bytes, profile, options) {
   validateDiagnosticText(text);
 }
 
+function payloadLimit(kind) {
+  if (kind === 'rust_patch') return DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes;
+  if (kind === 'build_diagnostics') return DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes;
+  if (kind === 'cargo_lock') return DEVELOPMENT_FEEDBACK_LIMITS.cargoLockBytes;
+  return LOCK_MANIFEST_LIMITS.inputBytes;
+}
+
 function prepare(options) {
   const input = dataOptions(options);
   const { profile, context } = validatedContext(input.context);
   validateExceptionWindow(context, input.now);
   input.context = context;
-  const maxBytes = profile.kind === 'rust_patch' ? DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes
-    : profile.kind === 'build_diagnostics' ? DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes
-      : LOCK_MANIFEST_LIMITS.inputBytes;
-  const payloadBytes = copyPayload(input.payloadBytes, maxBytes);
+  const payloadBytes = copyPayload(input.payloadBytes, payloadLimit(profile.kind));
   validatePayload(payloadBytes, profile, input);
   return { input, profile, payloadBytes };
 }
@@ -351,10 +410,7 @@ export function decryptDevelopmentFeedback(options) {
       expectedContext: context,
       now: input.now,
     });
-    validatePayload(copyPayload(payloadBytes, profile.kind === 'rust_patch'
-      ? DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes
-      : profile.kind === 'build_diagnostics' ? DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes
-        : LOCK_MANIFEST_LIMITS.inputBytes), profile, input);
+    validatePayload(copyPayload(payloadBytes, payloadLimit(profile.kind)), profile, input);
     return Buffer.from(payloadBytes);
   } catch (error) {
     if (error instanceof DevelopmentFeedbackError) throw error;
