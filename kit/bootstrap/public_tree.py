@@ -55,6 +55,8 @@ PLATFORM_FILES = frozenset(
         'kit/confinement/test_sbom_normalizer.py',
         'kit/confinement/npm_admission.py',
         'kit/confinement/test_confinement_npm_admission.py',
+        'kit/confinement/cargo_vendor_verify.py',
+        'kit/confinement/test_cargo_vendor_verify.py',
         ".github/workflows/linux-confinement.yml",
         ".github/workflows/windows-attestation-permission-probe.yml",
         ".github/workflows/attestation-probe.yml",
@@ -251,6 +253,8 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/test_policy_handoff.py': '0544070f4012476a03fed541aab9c8ba0c60ab9d2ef94c9882e15e43b4f085ec',
     'kit/confinement/release_build_verify.py': 'ad9b18d2faaa6e7f408ea854f8483d9d97ebca0a7a2711e57d521203a882d91e',
     'kit/confinement/test_release_build_verify.py': '08c8b7dcb28307d8470cab9675202bcc206492261d20dec70064232c197f2579',
+    'kit/confinement/cargo_vendor_verify.py': 'b5964d2b36909abe7ba56af424e7d58248763038e2ee20ea74eb89033602a4f6',
+    'kit/confinement/test_cargo_vendor_verify.py': '69bec4106ed3c4ac41624ddcb4719b18902d4f2556ba140257ee9e513c3bcf32',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(

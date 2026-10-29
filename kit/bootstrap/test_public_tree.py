@@ -251,6 +251,8 @@ class PublicTreeTests(unittest.TestCase):
             "kit/bootstrap/test_policy_handoff.py",
             "kit/confinement/release_build_verify.py",
             "kit/confinement/test_release_build_verify.py",
+            'kit/confinement/cargo_vendor_verify.py',
+            'kit/confinement/test_cargo_vendor_verify.py',
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))
