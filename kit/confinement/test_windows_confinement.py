@@ -355,7 +355,7 @@ foreach ($case in $cases) {
             self.assertIn("$scratch.Tmp", line)
 
     def test_winsock_catalog_access_is_package_scoped_read_only_and_restored(self):
-        grant = self.function_body("Grant-WinsockCatalogRead")
+        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
         self.assertIn("WinSock2\\Parameters\\Protocol_Catalog9", grant)
         self.assertLess(grant.index("New-CatalogLease"), grant.index("Start-CatalogRecovery"))
         self.assertLess(grant.index("Start-CatalogRecovery"), grant.index("Add-CatalogRead"))
@@ -371,7 +371,7 @@ foreach ($case in $cases) {
         self.assertIn("$writeMask =", add)
         self.assertIn("-not $entry.IsInherited", add)
         self.assertLess(add.index("WriteAllText([string]$lease.ArmedFile"), add.index("$key.SetAccessControl($security)"))
-        self.assertIn("Restore-CatalogAcl $lease", self.function_body("Restore-WinsockCatalogAcl"))
+        self.assertIn("Restore-CatalogAcl $lease", self.function_body("Restore-WinsockCatalogAcl", self.recovery))
         restore = self.function_body("Restore-CatalogAcl", self.recovery)
         self.assertIn("$lease.OriginalSddl", restore)
         self.assertIn("$key.SetAccessControl($restore)", restore)
@@ -394,7 +394,14 @@ foreach ($case in $cases) {
         watch = self.function_body("Invoke-CatalogWatch", self.recovery)
         for required in (
             "New-ScheduledTaskPrincipal -UserId 'SYSTEM'",
-            "[IO.FileSystemAclExtensions]::SetAccessControl($info, $security)",
+            "[IO.FileSystemAclExtensions]::Create($info, $security)",
+            "S-1-5-32-544",
+            "Get-FileHash -LiteralPath $copy",
+            "-DeleteExpiredTaskAfter",
+            "$trigger.EndBoundary",
+            "GetFolderPath('CommonApplicationData')",
+            "$shellHome.StartsWith($programFiles",
+            "Contains('\"')",
             "Copy-Item -LiteralPath $source -Destination $copy",
             "Register-ScheduledTask",
             "Start-ScheduledTask",
@@ -411,12 +418,16 @@ foreach ($case in $cases) {
         self.assertIn("$child.Kill()", self.recovery_test)
         self.assertTrue(self.recovery_test.rstrip().endswith("exit 0"))
         self.assertIn("Get-CatalogAclSddl $Path) -eq $original", self.recovery_test)
-        self.assertIn("[IO.File]::ReadAllText($ack) -eq 'restored'", self.recovery_test)
+        self.assertIn("-not (Test-Path -LiteralPath $directory)", self.recovery_test)
+        self.assertIn("Remove-CatalogRecoveryFolder $record", watch)
+        self.assertIn("-ne $recordHash", watch)
+        self.assertIn("'recovery_test_leak'", self.recovery_test)
+        self.assertIn("Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1-1' $Path -ForceReadbackFailure", self.recovery_test)
         self.assertIn("-not (Get-ScheduledTask -TaskName $taskName", self.recovery_test)
         self.assertIn("test_windows_confinement_recovery.ps1 -Mode parent", WORKFLOW.read_text(encoding="utf-8"))
 
     def test_winsock_errors_use_fixed_reasons_and_verified_rollback(self):
-        grant = self.function_body("Grant-WinsockCatalogRead")
+        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
         self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", grant)
         self.assertIn("throw 'winsock_restore_failed'", grant)
         self.assertIn("throw $reason", grant)
@@ -430,7 +441,14 @@ foreach ($case in $cases) {
         add = self.function_body("Add-CatalogRead", self.recovery)
         self.assertIn("if ($ForceReadbackFailure) { throw 'winsock_catalog_readback' }", add)
         self.assertLess(add.index("$key.SetAccessControl($security)"), add.rindex("if ($ForceReadbackFailure)"))
-        self.assertIn("Add-CatalogRead $lease -ForceReadbackFailure", self.recovery_test)
+        self.assertIn("-ForceReadbackFailure:$ForceReadbackFailure", grant)
+        self.assertIn("Test-Path -LiteralPath ([string]$script:WinsockCatalogLease.ArmedFile)", grant)
+        self.assertLess(grant.index("ArmedFile"), grant.index("Restore-WinsockCatalogAcl"))
+        self.assertIn("Assert-CatalogPath $path", grant)
+        confined = self.function_body("Invoke-ConfinedLadder")
+        self.assertLess(confined.index("Grant-WinsockCatalogRead"), confined.index("$script:phase = 'ladder'"))
+        self.assertIn("-ForceReadbackFailure", self.recovery_test)
+        self.assertIn("recovery_test_lease", self.recovery_test)
         self.assertIn("Restore-CatalogAcl $lease", self.recovery_test)
         self.assertIn("$_.Exception.Message -ne 'winsock_restore_failed'", self.recovery_test)
 

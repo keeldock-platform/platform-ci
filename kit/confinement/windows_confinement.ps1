@@ -291,36 +291,6 @@ function Test-LowIntegrityLabel([string]$path) {
     return [bool]($output -match 'Mandatory Label\\Low Mandatory Level:(?:\(I\))?\(OI\)\(CI\)\(NW\)')
 }
 
-function Grant-WinsockCatalogRead([string]$sid) {
-    $path = 'SYSTEM\CurrentControlSet\Services\WinSock2\Parameters\Protocol_Catalog9'
-    try {
-        $script:WinsockCatalogLease = New-CatalogLease $path $sid
-        Start-CatalogRecovery $script:WinsockCatalogLease (Join-Path $PSScriptRoot 'windows_confinement_recovery.ps1')
-        Add-CatalogRead $script:WinsockCatalogLease
-        return $script:WinsockCatalogLease
-    } catch {
-        $reason = [string]$_.Exception.Message
-        if ($reason -notin @('winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_registry_read', 'winsock_package_sid')) {
-            $reason = 'winsock_grant_failed'
-        }
-        if ($script:WinsockCatalogLease) {
-            try {
-                Restore-WinsockCatalogAcl $script:WinsockCatalogLease
-                Stop-CatalogRecovery $script:WinsockCatalogLease
-                $script:WinsockCatalogLease = $null
-            } catch {
-                $script:cleanup = 'incomplete'
-                throw 'winsock_restore_failed'
-            }
-        }
-        throw $reason
-    }
-}
-
-function Restore-WinsockCatalogAcl($lease) {
-    Restore-CatalogAcl $lease
-}
-
 function Grant-NonPropagating([string]$path, [string]$sid) {
     $bytes = [KeelDock.Platform.WindowsConfinement.NonPropagatingDacl]::Read($path)
     $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($bytes, 0)
@@ -373,8 +343,7 @@ function Test-Acl {
     }
     foreach ($path in @($script:Lpac.Tmp, $script:Lpac.Profile, $script:Lpac.CargoHome, $script:Lpac.Crate, (Join-Path $script:Lpac.Crate 'src'))) {
         $entries = @(Get-SidRules $path $sid)
-        if ($entries.Count -ne 1 -or -not $entries[0].IsInherited -or $entries[0].AccessControlType -ne 'Allow'
-            -or ($entries[0].FileSystemRights -band $modifyMask) -ne $modifyMask) { return 'scratch_not_inherited' }
+        if ($entries.Count -ne 1 -or -not $entries[0].IsInherited -or $entries[0].AccessControlType -ne 'Allow' -or ($entries[0].FileSystemRights -band $modifyMask) -ne $modifyMask) { return 'scratch_not_inherited' }
         if (-not (Test-LowIntegrityLabel $path)) { return 'scratch_integrity' }
     }
     if (-not (Test-LowIntegrityLabel $script:Lpac.Root)) { return 'scratch_integrity' }
@@ -470,11 +439,17 @@ function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
 function Invoke-ConfinedLadder($sandbox, [hashtable]$scratch) {
     try {
         $script:WinsockCatalogLease = Grant-WinsockCatalogRead $script:Sid
+        $script:phase = 'ladder'
         return Invoke-Ladder $sandbox $true $scratch
     } finally {
         if ($script:WinsockCatalogLease) {
-            Restore-WinsockCatalogAcl $script:WinsockCatalogLease
-            Stop-CatalogRecovery $script:WinsockCatalogLease
+            try {
+                Restore-WinsockCatalogAcl $script:WinsockCatalogLease
+                Stop-CatalogRecovery $script:WinsockCatalogLease
+            } catch {
+                $script:phase = 'winsock_acl'
+                throw
+            }
             $script:WinsockCatalogLease = $null
         }
     }
@@ -687,7 +662,7 @@ try {
 } catch {
     $reason = [string]$_.Exception.Message
     if ($phase -eq 'winsock_acl') {
-        if ($reason -notin @('winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_recovery_stop', 'winsock_registry_read', 'winsock_package_sid', 'winsock_grant_failed', 'winsock_restore_failed', 'winsock_restore_readback', 'winsock_restore_state')) {
+        if ($reason -notin @('winsock_catalog_path', 'winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_recovery_stop', 'winsock_registry_read', 'winsock_package_sid', 'winsock_grant_failed', 'winsock_restore_failed', 'winsock_restore_readback', 'winsock_restore_state')) {
             $reason = 'winsock_registry_error'
         }
     } else {
