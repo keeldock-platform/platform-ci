@@ -10,6 +10,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+if not sys.platform.startswith("linux"):
+    raise unittest.SkipTest("the Linux source build suite runs only on Linux")
+
 import foundation_node_feedback
 import confinement_public_audit
 import confinement_verdict
