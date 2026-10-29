@@ -21,6 +21,7 @@ MAX_EVIDENCE_TOTAL_BYTES = log_canary.MAX_TOTAL_BYTES
 MAX_TREE_NODES = MAX_EVIDENCE_ITEMS * 4
 MAX_PATH_DEPTH = 16
 READ_CHUNK_BYTES = log_canary.SLICE_BYTES
+_WINDOWS_IDENTITY = os.name == "nt"
 ROLES = frozenset(("log", "artifact"))
 MANIFEST_FIELDS = frozenset(("schema_version", "items"))
 ITEM_FIELDS = frozenset(("path", "role", "size", "sha256"))
@@ -341,13 +342,13 @@ def _file_identity(metadata):
 
 
 def _same_open_file(opened, expected):
-    if os.name == "posix":
+    if not _WINDOWS_IDENTITY:
         return _file_identity(opened) == _file_identity(expected)
     if opened.st_size != expected.st_size or opened.st_mtime_ns != expected.st_mtime_ns:
         return False
-    if opened.st_ino and expected.st_ino:
-        return (opened.st_dev, opened.st_ino) == (expected.st_dev, expected.st_ino)
-    return True
+    if not opened.st_ino or not expected.st_ino:
+        return False
+    return (opened.st_dev, opened.st_ino) == (expected.st_dev, expected.st_ino)
 
 
 def _open_evidence_file(root, root_descriptor, item):

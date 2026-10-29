@@ -118,23 +118,26 @@ class ReleaseEvidenceTests(unittest.TestCase):
         after = SimpleNamespace(**dict(fields, st_ctime_ns=6))
         self.assertNotEqual(subject._file_identity(before), subject._file_identity(after))
 
-    def test_open_file_comparison_tolerates_windows_metadata_gaps_only(self):
+    def test_open_file_comparison_on_windows_ignores_only_change_time(self):
         fields = {
             "st_dev": 1, "st_ino": 2, "st_size": 3,
             "st_mtime_ns": 4, "st_ctime_ns": 5,
         }
         expected = SimpleNamespace(**fields)
-        with mock.patch.object(subject.os, "name", "nt"):
-            gaps = SimpleNamespace(**dict(fields, st_dev=0, st_ino=0, st_ctime_ns=9))
-            self.assertTrue(subject._same_open_file(gaps, expected))
-            self.assertTrue(subject._same_open_file(expected, gaps))
+        with mock.patch.object(subject, "_WINDOWS_IDENTITY", True):
+            later = SimpleNamespace(**dict(fields, st_ctime_ns=9))
+            self.assertTrue(subject._same_open_file(later, expected))
             self.assertTrue(subject._same_open_file(expected, expected))
             for name, value in (("st_size", 4), ("st_mtime_ns", 5),
-                                ("st_ino", 7), ("st_dev", 8)):
-                with self.subTest(field=name):
+                                ("st_ino", 7), ("st_dev", 8),
+                                ("st_ino", 0)):
+                with self.subTest(field=name, value=value):
                     changed = SimpleNamespace(**dict(fields, **{name: value}))
                     self.assertFalse(subject._same_open_file(changed, expected))
-        with mock.patch.object(subject.os, "name", "posix"):
+                    self.assertFalse(subject._same_open_file(expected, changed))
+            unset = SimpleNamespace(**dict(fields, st_ino=0))
+            self.assertFalse(subject._same_open_file(unset, unset))
+        with mock.patch.object(subject, "_WINDOWS_IDENTITY", False):
             changed = SimpleNamespace(**dict(fields, st_ctime_ns=6))
             self.assertFalse(subject._same_open_file(changed, expected))
 
