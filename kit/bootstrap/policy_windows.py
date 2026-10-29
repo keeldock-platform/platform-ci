@@ -243,19 +243,81 @@ jobs:
         id: generate
         run: |
           $ErrorActionPreference = 'Stop'
-          pwsh -NoProfile -File kit/confinement/capsule_frame.ps1 -Mode compile
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          $vectorText = pwsh -NoProfile -File kit/confinement/capsule_frame.ps1 -Mode vectors
-          if ($LASTEXITCODE -ne 0 -or $vectorText.Count -ne 1) { exit 1 }
-          $vectorPath = Join-Path $env:RUNNER_TEMP 'capsule_frame_vectors.json'
-          [System.IO.File]::WriteAllText($vectorPath, $vectorText + "`n", [System.Text.Encoding]::ASCII)
-          $bytes = [System.Text.Encoding]::ASCII.GetBytes($vectorText)
-          $memory = [System.IO.MemoryStream]::new()
-          $zip = [System.IO.Compression.GZipStream]::new($memory, [System.IO.Compression.CompressionMode]::Compress, $true)
-          $zip.Write($bytes, 0, $bytes.Length)
-          $zip.Dispose()
-          $encoded = [Convert]::ToBase64String($memory.ToArray())
-          "vector_b64=$encoded" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          function Write-CapsuleRefusal([string]$Reason) {
+            if (@('compiler_missing', 'compile_failed', 'vector_generation_failed', 'vector_mismatch', 'encoding') -notcontains $Reason) {
+              $Reason = 'vector_generation_failed'
+            }
+            [Console]::Out.WriteLine('capsule-frame=refused reason=' + $Reason)
+          }
+          function Forward-CapsuleRefusal($Lines, [string]$Fallback) {
+            if ($Lines.Count -eq 1) {
+              $match = [regex]::Match([string]$Lines[0], '^capsule-frame=refused reason=(compiler_missing|compile_failed|vector_generation_failed|vector_mismatch|encoding)$')
+              if ($match.Success) {
+                Write-CapsuleRefusal $match.Groups[1].Value
+                return
+              }
+            }
+            Write-CapsuleRefusal $Fallback
+          }
+          try {
+            $compileOutput = @(& pwsh -NoProfile -File kit/confinement/capsule_frame.ps1 -Mode compile 2>$null)
+            $compileExitCode = $LASTEXITCODE
+          } catch {
+            Write-CapsuleRefusal 'compiler_missing'
+            exit 1
+          }
+          if ($compileExitCode -ne 0) {
+            Forward-CapsuleRefusal $compileOutput 'compile_failed'
+            exit 1
+          }
+          if ($compileOutput.Count -ne 1 -or [string]$compileOutput[0] -ne 'capsule-frame-compile=observed result=compiled') {
+            Write-CapsuleRefusal 'compile_failed'
+            exit 1
+          }
+          try {
+            $vectorOutput = @(& pwsh -NoProfile -File kit/confinement/capsule_frame.ps1 -Mode vectors 2>$null)
+            $vectorExitCode = $LASTEXITCODE
+          } catch {
+            Write-CapsuleRefusal 'compiler_missing'
+            exit 1
+          }
+          if ($vectorExitCode -ne 0) {
+            Forward-CapsuleRefusal $vectorOutput 'vector_generation_failed'
+            exit 1
+          }
+          if ($vectorOutput.Count -ne 1 -or $vectorOutput[0] -isnot [string]) {
+            Write-CapsuleRefusal 'vector_mismatch'
+            exit 1
+          }
+          $vectorText = [string]$vectorOutput[0]
+          if ($vectorText -match '[^\\x00-\\x7F]') {
+            Write-CapsuleRefusal 'encoding'
+            exit 1
+          }
+          if ($vectorText.Contains("`r") -or $vectorText.Contains("`n")) {
+            Write-CapsuleRefusal 'vector_mismatch'
+            exit 1
+          }
+          if ($vectorText.Length -gt 262143 -or
+              -not $vectorText.StartsWith('{"format":"KDWH-v1-protocol-vectors","producer":"independent-csharp","status":"generated",', [StringComparison]::Ordinal) -or
+              -not $vectorText.EndsWith('}}}', [StringComparison]::Ordinal)) {
+            Write-CapsuleRefusal 'vector_mismatch'
+            exit 1
+          }
+          try {
+            $vectorPath = Join-Path $env:RUNNER_TEMP 'capsule_frame_vectors.json'
+            [System.IO.File]::WriteAllText($vectorPath, $vectorText + "`n", [System.Text.Encoding]::ASCII)
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes($vectorText)
+            $memory = [System.IO.MemoryStream]::new()
+            $zip = [System.IO.Compression.GZipStream]::new($memory, [System.IO.Compression.CompressionMode]::Compress, $true)
+            $zip.Write($bytes, 0, $bytes.Length)
+            $zip.Dispose()
+            $encoded = [Convert]::ToBase64String($memory.ToArray())
+            "vector_b64=$encoded" | Add-Content -LiteralPath $env:GITHUB_OUTPUT -Encoding utf8
+          } catch {
+            Write-CapsuleRefusal 'vector_generation_failed'
+            exit 1
+          }
       - name: Preserve generated vectors for review
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

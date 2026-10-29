@@ -10,6 +10,14 @@ the repository's pinned artifact uploader. No secret or private source enters
 either job. A final job emits one capsule-vectors verdict line and fails unless
 generation and comparison both succeeded.
 
+The Windows generation step emits only one fixed refusal line on failure.
+Its reasons are compiler_missing, compile_failed, vector_generation_failed,
+vector_mismatch, and encoding. The generation step does not forward compiler
+diagnostics, unexpected child output, or C sharp source text. A failed or
+malformed child result always exits nonzero. A bounded vector shape check
+precedes artifact and job-output writes. The workflow policy checks the exact
+workflow bytes.
+
 kit/confinement/capsule_frame_vector_gate.py is an explicit CI entry point. Its
 name deliberately avoids unittest's ordinary test_ discovery pattern. It
 requires both a checked-in generated fixture and fresh CI output. A missing or
