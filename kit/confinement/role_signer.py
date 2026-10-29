@@ -96,12 +96,23 @@ GUARD_STDERR_CLASSES = (
     ("timed out", "timeout"),
     ("could not resolve", "network"),
     ("connection", "network"),
+    ("no such host", "network"),
+    ("escape sequences", "escape-sequences"),
+    ("unknown flag", "gh-usage"),
+    ("redirect", "redirect"),
 )
 GUARD_HTTP_CLASSES = {
+    "301": "http-redirect",
+    "302": "http-redirect",
+    "307": "http-redirect",
+    "308": "http-redirect",
+    "400": "http-400",
     "401": "http-401",
     "403": "http-403",
     "404": "http-404",
+    "406": "http-406",
     "409": "http-409",
+    "410": "http-410",
     "422": "http-422",
     "429": "rate-limit",
 }
@@ -2461,7 +2472,7 @@ def _cmd_guard(arguments):
         print("probe=role-signer fallback=job-log-api")
         label = "job-log-fetch-failed"
         code, error_class = _guard_attempts(
-            ["gh", "api", route], arguments.output, label, arguments.attempts,
+            ["gh", "api", "--allow-escape-sequences", route], arguments.output, label, arguments.attempts,
             arguments.pause)
     if code == 0:
         return 0
