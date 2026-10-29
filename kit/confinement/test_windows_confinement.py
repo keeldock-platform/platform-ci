@@ -434,6 +434,25 @@ foreach ($case in $cases) {
         self.assertIn("if ($Mode -eq 'sid') {", self.recovery_test)
         self.assertNotIn("OpenBaseKey", self.recovery_test.split("if ($Mode -eq 'sid') {", 1)[1].split("exit 0", 1)[0])
 
+    def test_probe_specs_carry_the_same_confinement_fields_as_cmd_exec(self):
+        probe = self.function_body("Get-WinsockProbeSpecs")
+        specs = self.function_body("Get-StageSpecs")
+        cmd_line = re.search(r"Name = 'cmd_exec'.*", specs).group(0)
+        fields = ("Name", "Exe", "Arguments", "Timeout", "Check")
+        cmd_fields = re.findall(r"(\w+) = ", cmd_line.split("Check =", 1)[0] + "Check = ")
+        self.assertEqual(tuple(cmd_fields), fields)
+        spec_lines = [line for line in probe.splitlines() if "$specs += @{" in line]
+        self.assertEqual(len(spec_lines), 2)
+        for line in spec_lines:
+            with self.subTest(line=line):
+                found = re.findall(r"(\w+) = ", line.split("Check =", 1)[0] + "Check = ")
+                self.assertEqual(tuple(found), fields)
+                self.assertNotIn("confined", line.lower())
+        ladder = self.function_body("Invoke-Ladder")
+        self.assertEqual(ladder.count("$sandbox.Run($confined,"), 1)
+        self.assertIn("lpac_default_key_control", probe)
+        self.assertIn("Control\\Nls\\CodePage", probe)
+
     def test_winsock_recovery_survives_forced_parent_exit(self):
         start = self.function_body("Start-CatalogRecovery", self.recovery)
         watch = self.function_body("Invoke-CatalogWatch", self.recovery)
@@ -633,13 +652,16 @@ foreach ($case in $cases) {
         self.assertEqual(self.native.count("private const bool SpikeAllowUnreadableLpac = true;"), 1)
         for required in (
             'lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match"',
-            'restrictedApplicationPackages == "present" && applicationPackages == "absent"',
+            '&& applicationPackages == "absent")',
+            '(lpac == "1" && restrictedApplicationPackages != "present")',
             'reported = "aap_only";',
             '(lpac != "1" && reported != "aap_only")',
         ):
             with self.subTest(required=required):
                 self.assertIn(required, self.native)
         self.assertNotIn('lpac == "0" &&', self.native)
+        self.assertNotIn('restrictedApplicationPackages == "present" && applicationPackages', self.native)
+        self.assertIn("arap=present", self.wrapper)
         self.assertIn("lpac=aap_only", self.wrapper)
         self.assertIn("$tokenState = 'aap_only'", self.wrapper)
         self.assertIn("-and $tokenState -eq 'verified'", self.wrapper)

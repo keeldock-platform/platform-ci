@@ -408,6 +408,8 @@ function Get-WinsockProbeSpecs {
             }
         }
     }
+    $controlName = 'lpac_default_key_control'
+    $specs += @{ Name = $controlName; Exe = $reg; Arguments = 'query HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 } }
     return $specs
 }
 
