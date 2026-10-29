@@ -128,10 +128,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -B kit/bootstrap/check_candidate.py --root $env:CI_WORKSPACE --pool platform --sha $env:CI_SHA
           if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Check PowerShell script syntax
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Get-Location).Path
+          $bad = 0
+          foreach ($name in @('windows_confinement.ps1', 'windows_confinement_recovery.ps1', 'test_windows_confinement_recovery.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root ('kit/confinement/' + $name)), [ref]$tokens, [ref]$errors)
+            foreach ($item in $errors) { Write-Output ('parse-error file=' + $name + ' line=' + $item.Extent.StartLineNumber + ' id=' + $item.ErrorId); $bad = 1 }
+          }
+          if ($bad -ne 0) { exit 1 }
       - name: Compile native confinement module
         run: |
           $ErrorActionPreference = 'Stop'
           & kit/confinement/windows_confinement.ps1 -Mode compile
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Exercise registry recovery after forced cancellation
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & kit/confinement/test_windows_confinement_recovery.ps1 -Mode parent
           if ($LASTEXITCODE -ne 0) { exit 1 }
   windows-confinement-spike:
     needs: windows-policy

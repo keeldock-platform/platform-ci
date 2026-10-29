@@ -429,7 +429,7 @@ def _state_from_bytes(raw):
 
 
 def _valid_reviewed_rust_paths(paths):
-    if type(paths) is not list or not 1 <= len(paths) <= 256:
+    if type(paths) is not list or not 1 <= len(paths) <= 512:
         return False
     if any(type(path) is not str or len(path) > 256 or RUST_PATH_RE.fullmatch(path) is None
            or any(part in (".", "..") for part in path.split("/")) for path in paths):

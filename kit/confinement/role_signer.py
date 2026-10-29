@@ -482,7 +482,7 @@ def certificate_expectations(
         "buildSignerURI": _role_uri(repository, role, ref),
         "subjectAlternativeName": _role_uri(repository, role, ref),
         "buildConfigURI": _profile_uri(repository, profile_data["path"], ref),
-        "githubWorkflowRef": repository + "/" + profile_data["path"] + "@" + ref,
+        "githubWorkflowRef": ref,
         "githubWorkflowName": profile_data["name"],
         "githubWorkflowRepository": repository,
         "githubWorkflowSHA": control_sha,

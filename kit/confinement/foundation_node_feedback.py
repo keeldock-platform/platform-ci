@@ -16,11 +16,22 @@ NODE_GATE_NAMES = (
 )
 NODE_BOOTSTRAP_GATES = ("node_dependency_prepare", "node_dependency_audit")
 FULL_FOUNDATION_GATES = RUST_FOUNDATION_GATES + NODE_GATE_NAMES
-BOOTSTRAP_MANIFESTS = ("package.json", "packages/host-api/package.json")
+NODE_WORKSPACE_PACKAGES = ("packages/host-api", "packages/kernel-i18n")
+BOOTSTRAP_MANIFESTS = (
+    "package.json", "packages/host-api/package.json", "packages/kernel-i18n/package.json",
+)
+NODE_EXTRA_FILES = frozenset((
+    "packages/kernel-i18n/tests/support.ts",
+))
+NODE_FIXTURE_FILES = frozenset((
+    "crates/host/api/tests/fixtures/i18n-regression-v1.jsonl",
+    "crates/host/api/tests/fixtures/i18n-v1.jsonl",
+))
 NODE_FIXED_FILES = frozenset((
     ".node-version", "package.json", "tsconfig.base.json",
     "packages/host-api/package.json", "packages/host-api/tsconfig.json",
-))
+    "packages/kernel-i18n/package.json", "packages/kernel-i18n/tsconfig.json",
+)) | NODE_EXTRA_FILES | NODE_FIXTURE_FILES
 NODE_REVIEWED_FILES = NODE_FIXED_FILES | frozenset((
     "packages/host-api/src/budget.ts", "packages/host-api/src/effects.ts",
     "packages/host-api/src/entitlements.ts", "packages/host-api/src/errors.ts",
@@ -33,6 +44,7 @@ NODE_REVIEWED_FILES = NODE_FIXED_FILES | frozenset((
     "packages/host-api/tests/ids-version.test.ts",
     "packages/host-api/tests/manifest-metadata.test.ts",
 ))
+MAX_NODE_REVIEWED_FILES = 10 + 2 * (64 + 64)
 PACKAGE_LOCK_PATH = "package-lock.json"
 PACKAGE_LOCK_TREE = "core_build_diagnostic_return_with_package_lock"
 SOURCE_IDENTITY_KEYS = ("source_sha", "base_sha", "control_sha", "reviewed_diff_sha256")
@@ -186,12 +198,20 @@ def _profile_context(mode, dispatch, producer, source_runtime, validated_tree, a
 
 def _reviewed_files(source_runtime, mode, producer, source):
     source_files = getattr(source_runtime, "CORE_CONTRACT_FEEDBACK_FILES", None)
-    if type(source_files) is not frozenset:
+    kernel_files = getattr(source_runtime, "CORE_CONTRACT_KERNEL_FEEDBACK_FILES", None)
+    if type(source_files) is not frozenset or type(kernel_files) is not frozenset:
         _refuse(producer, "manifest_invalid")
     required = set(BOOTSTRAP_MANIFESTS)
     if mode == "verify":
         required.update(NODE_REVIEWED_FILES)
-    if not required.issubset(source_files):
+    if not required.issubset(source_files | kernel_files):
+        _refuse(producer, "manifest_invalid")
+    try:
+        with os.scandir(source / "packages") as iterator:
+            package_names = sorted(entry.name for entry in iterator)
+    except OSError:
+        _refuse(producer, "manifest_invalid")
+    if package_names != sorted(path.rsplit("/", 1)[-1] for path in NODE_WORKSPACE_PACKAGES):
         _refuse(producer, "manifest_invalid")
     if mode == "bootstrap":
         return BOOTSTRAP_MANIFESTS
@@ -199,22 +219,26 @@ def _reviewed_files(source_runtime, mode, producer, source):
     if not callable(pattern_paths):
         _refuse(producer, "manifest_invalid")
     discovered = set()
-    for folder in ("src", "tests"):
-        directory = source / "packages" / "host-api" / folder
-        try:
-            info = directory.lstat()
-            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+    for package_path in NODE_WORKSPACE_PACKAGES:
+        for folder in ("src", "tests"):
+            directory = source / package_path / folder
+            try:
+                info = directory.lstat()
+                if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                    _refuse(producer, "manifest_invalid")
+                with os.scandir(directory) as iterator:
+                    names = [entry.name for entry in iterator]
+            except OSError:
                 _refuse(producer, "manifest_invalid")
-            with os.scandir(directory) as iterator:
-                names = [entry.name for entry in iterator]
-        except OSError:
-            _refuse(producer, "manifest_invalid")
-        discovered.update("packages/host-api/" + folder + "/" + name for name in names)
-    matched = pattern_paths(discovered)
+            discovered.update(package_path + "/" + folder + "/" + name for name in names)
+    if not NODE_EXTRA_FILES.issubset(discovered):
+        _refuse(producer, "manifest_invalid")
+    patterned = discovered - NODE_EXTRA_FILES
+    matched = pattern_paths(patterned)
     selected = matched["ts_sources"] | matched["ts_tests"]
     baseline = pattern_paths(source_files)
     required_ts = baseline["ts_sources"] | baseline["ts_tests"]
-    if (selected != discovered
+    if (selected != patterned
             or len(matched["ts_sources"]) > source_runtime.MAX_CORE_CONTRACT_TS_SOURCES
             or len(matched["ts_tests"]) > source_runtime.MAX_CORE_CONTRACT_TS_TESTS
             or not required_ts.issubset(selected)):
@@ -576,7 +600,7 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
     }
     count = result.get("node_reviewed_file_count")
     digest = result.get("node_reviewed_paths_sha256")
-    if (type(count) is not int or not 5 <= count <= 133
+    if (type(count) is not int or not 5 <= count <= MAX_NODE_REVIEWED_FILES
             or type(digest) is not str or SHA64_RE.fullmatch(digest) is None):
         raise ValueError("node reviewed files invalid")
     outcome["node_reviewed_file_count"] = count

@@ -536,13 +536,44 @@ class KeyRecordAndPredicateTests(unittest.TestCase):
         probe, probe_certificate = fixture_certificate("linux-fetch-encrypt", "probe")
         production, production_certificate = fixture_certificate("linux-fetch-encrypt", "production-synthetic")
         self.assertNotEqual(probe["buildConfigURI"], production["buildConfigURI"])
-        self.assertNotEqual(probe["githubWorkflowRef"], production["githubWorkflowRef"])
+        self.assertEqual(probe["githubWorkflowRef"], REF)
+        self.assertEqual(production["githubWorkflowRef"], REF)
         self.assertNotEqual(probe["githubWorkflowName"], production["githubWorkflowName"])
         self.assertTrue(subject.validate_certificate(probe_certificate, probe))
         with self.assertRaises(subject.Refusal):
             subject.validate_certificate(probe_certificate, production)
         with self.assertRaises(subject.Refusal):
             subject.validate_certificate(production_certificate, probe)
+
+    def test_expectations_match_literal_claim_values_for_probe_profile(self):
+        expected = subject.certificate_expectations(
+            "probe",
+            REPOSITORY,
+            "refs/heads/main",
+            "a" * 40,
+            "701",
+            "2",
+            8150001,
+            99101,
+            "windows-receiver",
+            subject.ROLE_RUNNERS["windows-receiver"],
+            dict(DIGEST_PINS),
+        )
+        literal = {
+            "githubWorkflowRef": "refs/heads/main",
+            "githubWorkflowName": "attestation-role-signer-probe",
+            "githubWorkflowRepository": subject.CONTROL_REPOSITORY,
+            "githubWorkflowSHA": "a" * 40,
+            "githubWorkflowTrigger": "workflow_dispatch",
+            "sourceRepositoryRef": "refs/heads/main",
+            "sourceRepositoryVisibilityAtSigning": "public",
+            "buildTrigger": "workflow_dispatch",
+            "runnerEnvironment": "github-hosted",
+        }
+        for field, value in literal.items():
+            with self.subTest(field=field):
+                self.assertEqual(expected[field], value)
+        self.assertTrue(expected["buildConfigURI"].endswith("/.github/workflows/attestation-role-signer-probe.yml@refs/heads/main"))
 
     def test_certificate_requires_both_role_uri_and_san_and_every_identity_leaf(self):
         expected, certificate = fixture_certificate("capsule-attester")

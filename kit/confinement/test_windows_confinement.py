@@ -13,6 +13,8 @@ from public_tree import MAX_FILE_BYTES, inspect_text
 
 NATIVE = ROOT / "kit/confinement/windows_confinement.cs"
 WRAPPER = ROOT / "kit/confinement/windows_confinement.ps1"
+RECOVERY = ROOT / "kit/confinement/windows_confinement_recovery.ps1"
+RECOVERY_TEST = ROOT / "kit/confinement/test_windows_confinement_recovery.ps1"
 WORKFLOW = ROOT / ".github/workflows/windows-confinement.yml"
 CONFINED_STAGES = (
     "cmd_exec",
@@ -36,9 +38,11 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
     def setUpClass(cls):
         cls.native = NATIVE.read_text(encoding="utf-8")
         cls.wrapper = WRAPPER.read_text(encoding="utf-8")
+        cls.recovery = RECOVERY.read_text(encoding="utf-8")
+        cls.recovery_test = RECOVERY_TEST.read_text(encoding="utf-8")
 
     def test_files_pass_the_public_tree_rules(self):
-        for path in (NATIVE, WRAPPER, WORKFLOW):
+        for path in (NATIVE, WRAPPER, RECOVERY, RECOVERY_TEST, WORKFLOW):
             with self.subTest(path=path.name):
                 payload = path.read_bytes()
                 self.assertLessEqual(len(payload), MAX_FILE_BYTES)
@@ -194,8 +198,8 @@ foreach ($case in $cases) {
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def function_body(self, name):
-        match = re.search(r"^function " + re.escape(name) + r"\b.*?^\}$", self.wrapper, re.S | re.M)
+    def function_body(self, name, source=None):
+        match = re.search(r"^function " + re.escape(name) + r"\b.*?^\}$", self.wrapper if source is None else source, re.S | re.M)
         self.assertIsNotNone(match, name)
         return match.group(0)
 
@@ -203,7 +207,7 @@ foreach ($case in $cases) {
         names = re.findall(r"Name = '([a-z_]+)'; Exe", self.wrapper)
         self.assertEqual(tuple(names), CONFINED_STAGES)
         control = "$controlOutcomes = Invoke-Ladder $box $false $script:Control"
-        confined = "$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac"
+        confined = "$confinedOutcomes = Invoke-ConfinedLadder $box $script:Lpac"
         self.assertIn(control, self.wrapper)
         self.assertIn(confined, self.wrapper)
         self.assertLess(self.wrapper.index(control), self.wrapper.index(confined))
@@ -263,17 +267,18 @@ foreach ($case in $cases) {
         proof = re.search(r"^ *\$lpacProven = (.+)$", self.function_body("Invoke-Ladder"), re.M)
         self.assertIsNotNone(proof)
         patterns = re.findall(r"\$tokenText -like '([^']+)'", proof.group(1))
-        self.assertEqual(len(patterns), 4)
+        self.assertEqual(len(patterns), 5)
         return all(fnmatch.fnmatchcase(text, pattern) for pattern in patterns)
 
     def test_container_proof_requires_every_token_fact_explicitly(self):
-        good = "appcontainer=1,capabilities=0,integrity=0x1000,lpac=1,sid=match,aap=absent"
+        good = "appcontainer=1,capabilities=0,integrity=0x1000,lpac=1,sid=match,arap=present,aap=absent"
         self.assertTrue(self.token_accepted(good))
         for bad in (
             good.replace("lpac=1", "lpac=unreadable"),
             good.replace("lpac=1", "lpac=aap_only"),
             good.replace("lpac=1", "lpac=0"),
             good.replace("sid=match", "sid=mismatch"),
+            good.replace("arap=present", "arap=absent"),
             good.replace("aap=absent", "aap=present"),
             good.replace("appcontainer=1", "appcontainer=0"),
             "appcontainer=0,integrity=0x3000",
@@ -288,7 +293,11 @@ foreach ($case in $cases) {
             'applicationPackages != "absent"',
             "TokenAppContainerSid",
             "TokenGroups",
+            "TokenRestrictedSids",
             'AllApplicationPackagesSid = "S-1-15-2-1"',
+            'AllRestrictedApplicationPackagesSid = "S-1-15-2-2"',
+            "ReadAllRestrictedApplicationPackagesState",
+            "GroupEnabled = 0x00000004",
             "Native.EqualSid(actual, expectedSid)",
         ):
             with self.subTest(required=required):
@@ -316,10 +325,181 @@ foreach ($case in $cases) {
                 self.assertEqual(len(line), 1)
                 self.assertIn("$scratch.", line[0])
         specs = self.function_body("Get-StageSpecs")
+        scratch_write = re.search(r"Name = 'acl_scratch_write'.*", specs).group(0)
+        self.assertIn("$scratch.Tmp + '\\kd_write.txt'", scratch_write)
+        self.assertIn("$script:Lpac.Tmp + '\\kd_write.txt'", scratch_write)
         control_branch = specs.split("} else {", 1)[1].split("    }\n    $specs +=", 1)[0]
         self.assertNotIn("$script:Lpac", control_branch)
         self.assertNotIn("ReadOnly", control_branch)
         self.assertIn("$cargoManifest = Join-Path $scratch.Crate", specs)
+
+    def test_scratch_grants_match_low_integrity_inherited_write_paths(self):
+        self.assertIn("Grant-Access $script:Lpac.Root $script:Sid 'Modify, Synchronize' $true", self.wrapper)
+        self.assertIn("Set-LowIntegrityLabel $script:Lpac.Root", self.wrapper)
+        low_label = self.function_body("Set-LowIntegrityLabel")
+        self.assertIn("'/setintegritylevel' '(OI)(CI)L'", low_label)
+        self.assertIn("if ($LASTEXITCODE -ne 0) { throw 'integrity_set' }", low_label)
+        check_label = self.function_body("Test-LowIntegrityLabel")
+        self.assertIn("Mandatory Label\\\\Low Mandatory Level", check_label)
+        self.assertIn("Test-LowIntegrityLabel $script:Lpac.Root", self.function_body("Test-Acl"))
+        acl = self.function_body("Test-Acl")
+        for path in ("$script:Lpac.Tmp", "$script:Lpac.Profile", "$script:Lpac.CargoHome", "$script:Lpac.Crate"):
+            with self.subTest(path=path):
+                self.assertIn(path, acl)
+        self.assertIn("-not $entries[0].IsInherited", acl)
+        self.assertIn("$entries[0].AccessControlType -ne 'Allow'", acl)
+        self.assertIn("$entries[0].FileSystemRights -band $modifyMask", acl)
+        environment = self.function_body("New-StageEnvironment")
+        for name in ("TEMP", "TMP"):
+            line = next(item for item in environment.splitlines() if "('" + name + "=" in item)
+            self.assertIn("$scratch.Tmp", line)
+
+    def test_winsock_catalog_access_is_package_scoped_read_only_and_restored(self):
+        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
+        self.assertIn("WinSock2\\Parameters\\Protocol_Catalog9", grant)
+        self.assertLess(grant.index("New-CatalogLease"), grant.index("Start-CatalogRecovery"))
+        self.assertLess(grant.index("Start-CatalogRecovery"), grant.index("Add-CatalogRead"))
+        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", grant)
+        self.assertLess(grant.index("Restore-WinsockCatalogAcl"), grant.index("Stop-CatalogRecovery"))
+        self.assertLess(grant.index("Stop-CatalogRecovery"), grant.index("$script:WinsockCatalogLease = $null"))
+        self.assertNotIn("SetAccessControl", grant)
+        add = self.function_body("Add-CatalogRead", self.recovery)
+        self.assertIn("RegistryRights]::ReadKey", add)
+        self.assertIn("RegistryRights]::ChangePermissions", add)
+        self.assertIn("RegistryAccessRule($identity", add)
+        self.assertIn("$security.AddAccessRule($rule)", add)
+        self.assertIn("$writeMask =", add)
+        self.assertIn("-not $entry.IsInherited", add)
+        self.assertLess(add.index("WriteAllText([string]$lease.ArmedFile"), add.index("$key.SetAccessControl($security)"))
+        self.assertIn("Restore-CatalogAcl $lease", self.function_body("Restore-WinsockCatalogAcl", self.recovery))
+        restore = self.function_body("Restore-CatalogAcl", self.recovery)
+        self.assertIn("$lease.OriginalSddl", restore)
+        self.assertIn("$key.SetAccessControl($restore)", restore)
+        self.assertIn("GetSecurityDescriptorSddlForm", restore)
+        self.assertIn("winsock_restore_readback", restore)
+        confined = self.function_body("Invoke-ConfinedLadder")
+        self.assertIn("Grant-WinsockCatalogRead $script:Sid", confined)
+        self.assertIn("finally", confined)
+        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", confined)
+        self.assertIn("Stop-CatalogRecovery $script:WinsockCatalogLease", confined)
+        self.assertIn("$script:WinsockCatalogLease = $null", confined)
+        self.assertIn("$phase = 'winsock_acl'", self.wrapper)
+        self.assertNotIn("internetClient", self.wrapper)
+        self.assertNotIn("internetClient", self.recovery)
+        self.assertNotIn("privateNetworkClientServer", self.wrapper)
+        self.assertIn("capabilities.CapabilityCount = 0", self.native)
+
+    def test_winsock_recovery_survives_forced_parent_exit(self):
+        start = self.function_body("Start-CatalogRecovery", self.recovery)
+        watch = self.function_body("Invoke-CatalogWatch", self.recovery)
+        for required in (
+            "New-ScheduledTaskPrincipal -UserId 'SYSTEM'",
+            "[IO.FileSystemAclExtensions]::Create($info, $security)",
+            "S-1-5-32-544",
+            "Get-FileHash -LiteralPath $copy",
+            "-DeleteExpiredTaskAfter",
+            "$trigger.EndBoundary",
+            "GetFolderPath('CommonApplicationData')",
+            "$shellHome.StartsWith($programFiles",
+            "Contains('\"')",
+            "Copy-Item -LiteralPath $source -Destination $copy",
+            "Register-ScheduledTask",
+            "Start-ScheduledTask",
+            "Test-Path -LiteralPath $ready",
+        ):
+            self.assertIn(required, start)
+        self.assertLess(start.index("Register-ScheduledTask"), start.index("Start-ScheduledTask"))
+        self.assertLess(start.index("Start-ScheduledTask"), start.index("Test-Path -LiteralPath $ready"))
+        self.assertIn("GetProcessById", watch)
+        self.assertIn("ParentStartTicks", watch)
+        self.assertIn("$parent.WaitForExit(250)", watch)
+        self.assertIn("Restore-CatalogAcl $data", watch)
+        self.assertIn("-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $record) 'armed'))", watch)
+        self.assertIn("$child.Kill()", self.recovery_test)
+        self.assertTrue(self.recovery_test.rstrip().endswith("exit 0"))
+        self.assertIn("Get-CatalogAclSddl $Path) -eq $original", self.recovery_test)
+        self.assertIn("-not (Test-Path -LiteralPath $directory)", self.recovery_test)
+        self.assertIn("Remove-CatalogRecoveryFolder $record", watch)
+        self.assertIn("-ne $recordHash", watch)
+        self.assertIn("'recovery_test_leak'", self.recovery_test)
+        self.assertIn("Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1-1' $Path -ForceReadbackFailure", self.recovery_test)
+        self.assertIn("-not (Get-ScheduledTask -TaskName $taskName", self.recovery_test)
+        self.assertIn("test_windows_confinement_recovery.ps1 -Mode parent", WORKFLOW.read_text(encoding="utf-8"))
+
+    def test_winsock_errors_use_fixed_reasons_and_verified_rollback(self):
+        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
+        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", grant)
+        self.assertIn("throw 'winsock_restore_failed'", grant)
+        self.assertIn("throw $reason", grant)
+        for name in ("Get-CatalogAclSddl", "Add-CatalogRead", "Restore-CatalogAcl", "Start-CatalogRecovery", "Stop-CatalogRecovery"):
+            body = self.function_body(name, self.recovery)
+            self.assertNotRegex(body, r"(?m)^\s*throw\s*$")
+        self.assertIn("if ($phase -eq 'winsock_acl')", self.wrapper)
+        self.assertIn("$reason = 'winsock_registry_error'", self.wrapper)
+        self.assertIn("'winsock_grant_failed'", self.wrapper)
+        self.assertIn("'winsock_restore_failed'", self.wrapper)
+        add = self.function_body("Add-CatalogRead", self.recovery)
+        self.assertIn("if ($ForceReadbackFailure) { throw 'winsock_catalog_readback' }", add)
+        self.assertLess(add.index("$key.SetAccessControl($security)"), add.rindex("if ($ForceReadbackFailure)"))
+        self.assertIn("-ForceReadbackFailure:$ForceReadbackFailure", grant)
+        self.assertIn("Test-Path -LiteralPath ([string]$script:WinsockCatalogLease.ArmedFile)", grant)
+        self.assertLess(grant.index("ArmedFile"), grant.index("Restore-WinsockCatalogAcl"))
+        self.assertIn("Assert-CatalogPath $path", grant)
+        confined = self.function_body("Invoke-ConfinedLadder")
+        self.assertLess(confined.index("Grant-WinsockCatalogRead"), confined.index("$script:phase = 'ladder'"))
+        self.assertIn("-ForceReadbackFailure", self.recovery_test)
+        self.assertIn("recovery_test_lease", self.recovery_test)
+        self.assertIn("Restore-CatalogAcl $lease", self.recovery_test)
+        self.assertIn("$_.Exception.Message -ne 'winsock_restore_failed'", self.recovery_test)
+
+    def test_task_removal_is_confirmed_before_the_recovery_folder_is_deleted(self):
+        stop = self.function_body("Stop-CatalogRecovery", self.recovery)
+        unregister = stop[stop.index("Unregister-ScheduledTask"):]
+        self.assertIn("-ErrorAction Stop", unregister.splitlines()[0])
+        absent = "if (Test-CatalogTaskPresent ([string]$lease.TaskName)) { throw 'winsock_recovery_stop' }"
+        self.assertIn(absent, stop)
+        self.assertLess(stop.index(absent), stop.index("$lease.TaskRegistered = $false"))
+        self.assertLess(stop.index(absent), stop.index("Remove-Item"))
+        self.assertNotIn("Unregister-ScheduledTask -TaskName ([string]$lease.TaskName) -Confirm:$false -ErrorAction SilentlyContinue", stop)
+        remove = self.function_body("Remove-CatalogRecoveryFolder", self.recovery)
+        gone = "if ($present) { return }"
+        self.assertIn(gone, remove)
+        self.assertLess(remove.index("Unregister-ScheduledTask"), remove.index(gone))
+        helper = self.function_body("Test-CatalogTaskPresent", self.recovery)
+        self.assertIn("Get-ScheduledTask -TaskName $taskName -ErrorAction Stop", helper)
+        self.assertIn("CategoryInfo.Category -eq 'ObjectNotFound'", helper)
+        self.assertNotIn("SilentlyContinue", helper)
+        self.assertIn("if ($lease.TaskName -and $lease.RecoveryDirectory) {", stop)
+        self.assertNotIn("Get-ScheduledTask", stop)
+        self.assertLess(remove.index(gone), remove.index("Remove-Item"))
+
+    def test_unarmed_lease_never_restores_the_live_key(self):
+        restore = self.function_body("Restore-WinsockCatalogAcl", self.recovery)
+        self.assertIn("-not (Test-Path -LiteralPath ([string]$lease.ArmedFile))) { return }", restore)
+        self.assertLess(restore.index("ArmedFile"), restore.index("Restore-CatalogAcl $lease"))
+        confined = self.function_body("Invoke-ConfinedLadder")
+        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", confined)
+
+    def test_scripts_have_no_line_starting_with_an_operator(self):
+        starts = re.compile(r"^\s*-(and|or|band|bor|eq|ne|not)\b")
+        ends = re.compile(r"(?:-(?:and|or|band|bor|eq|ne)|,|\|)\s*$")
+        for path in (WRAPPER, RECOVERY, RECOVERY_TEST):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for number, line in enumerate(lines[1:], 2):
+                if starts.match(line):
+                    with self.subTest(path=path.name, line=number):
+                        self.assertRegex(lines[number - 2], ends)
+
+    def test_syntax_check_step_runs_before_the_compile_step(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        check = text.index("      - name: Check PowerShell script syntax\n")
+        self.assertLess(check, text.index("      - name: Compile native confinement module\n"))
+        block = text[check:text.index("      - name: Compile native confinement module\n")]
+        self.assertIn("[System.Management.Automation.Language.Parser]::ParseFile", block)
+        for name in ("windows_confinement.ps1", "windows_confinement_recovery.ps1", "test_windows_confinement_recovery.ps1"):
+            self.assertIn("'" + name + "'", block)
+        self.assertIn("if ($bad -ne 0) { exit 1 }", block)
+        self.assertNotIn("if:", block)
 
     def test_negative_acl_stages_require_the_specific_denial_and_a_listing_control(self):
         specs = self.function_body("Get-StageSpecs")
@@ -328,6 +508,11 @@ foreach ($case in $cases) {
         denied = re.search(r"Name = 'acl_downloads_denied'.*", confined_branch).group(0)
         self.assertIn("-match 'Access is denied'", denied)
         self.assertIn("$r.ExitCode -ne 0", denied)
+        self.assertIn("type ", denied)
+        self.assertIn("$layout.Downloads", denied)
+        self.assertIn("acl_probe.txt", denied)
+        self.assertNotIn("> nul", denied)
+        self.assertIn("New-Item -ItemType File -Path (Join-Path $layout.Downloads 'acl_probe.txt')", self.wrapper)
         write_denied = re.search(r"Name = 'acl_ro_write_denied'.*", confined_branch).group(0)
         self.assertIn("-match 'Access is denied'", write_denied)
         self.assertIn("copy /y nul ' + $layout.ReadOnly", write_denied)
@@ -399,7 +584,8 @@ foreach ($case in $cases) {
     def test_unreadable_container_flag_hedge_is_spike_only_and_never_verifies(self):
         self.assertEqual(self.native.count("private const bool SpikeAllowUnreadableLpac = true;"), 1)
         for required in (
-            'lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match" && applicationPackages == "absent"',
+            'lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match"',
+            'restrictedApplicationPackages == "present" && applicationPackages == "absent"',
             'reported = "aap_only";',
             '(lpac != "1" && reported != "aap_only")',
         ):
