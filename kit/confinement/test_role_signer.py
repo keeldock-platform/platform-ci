@@ -1,10 +1,12 @@
 import copy
 import base64
 import hashlib
+import contextlib
 import io
 import json
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 import zipfile
@@ -1448,6 +1450,192 @@ class ArtifactAndStageTests(unittest.TestCase):
                             arguments["other_log_sections"] = ["handoff-revocation=confirmed\n"]
                         with self.assertRaises(subject.Refusal):
                             subject.verify_transition_evidence(**arguments)
+
+
+LOG_MARK = chr(35) * 2
+UNLABELED_JOB = "role-call-linux-fetch-encrypt-v1 / role-linux-fetch-encrypt-v1"
+REVOKE_OUTPUT = "probe=source-free-revocation-simulation status=passed"
+REJECTION_OUTPUT = "probe=source-free-revocation-simulation result=synthetic"
+CONFIRMED_LINE = "handoff-revocation=confirmed"
+
+
+def unlabeled_run_block(script, output):
+    return (
+        [LOG_MARK + "[group]Run set -euo pipefail", "^[[36;1mset -euo pipefail^[[0m"]
+        + ["^[[36;1m" + line + "^[[0m" for line in script]
+        + ["shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}", "env:",
+           "  KD_PROFILE: probe", LOG_MARK + "[endgroup]"]
+        + list(output)
+    )
+
+
+def unlabeled_linux_messages():
+    messages = [
+        "Current runner version: '2.338.0'",
+        LOG_MARK + "[group]Runner Image Provisioner",
+        "Hosted Compute Agent",
+        LOG_MARK + "[endgroup]",
+        LOG_MARK + "[group]Run actions/checkout@" + "0" * 40,
+        "with:",
+        "  persist-credentials: false",
+        LOG_MARK + "[endgroup]",
+        LOG_MARK + "[group]Getting Git version info",
+        "Working directory is the workspace",
+        LOG_MARK + "[endgroup]",
+        "Checked out the reviewed control files",
+    ]
+    messages += unlabeled_run_block(
+        ["printf '%s\\n' 'unrelated=true'"], ["unrelated=true"])
+    messages += unlabeled_run_block(
+        ["printf '%s\\n' '" + REVOKE_OUTPUT + "'"], [REVOKE_OUTPUT])
+    messages += unlabeled_run_block(
+        ["printf '%s\\n' '" + REJECTION_OUTPUT + "'",
+         "printf '%s\\n' '" + CONFIRMED_LINE + "'"],
+        [REJECTION_OUTPUT, CONFIRMED_LINE])
+    messages += [
+        LOG_MARK + "[group]Run actions/attest@" + "0" * 40,
+        "with:",
+        "  push-to-registry: false",
+        LOG_MARK + "[endgroup]",
+        LOG_MARK + "[group]\x1b[36mAttestation signed using certificate\x1b[0m",
+        "Signed",
+        LOG_MARK + "[endgroup]",
+        "Post job cleanup.",
+    ]
+    return messages
+
+
+def unlabeled_linux_log(messages, job=UNLABELED_JOB):
+    rows = []
+    for number, message in enumerate(messages):
+        stamp = "2026-10-29T13:47:%02d.%07dZ" % (number % 60, number)
+        prefix = subject.BYTE_ORDER_MARK if number == 0 else ""
+        rows.append(job + "\tUNKNOWN STEP\t" + prefix + stamp + " " + message)
+    return "\n".join(rows) + "\n"
+
+
+class UnlabeledLinuxLogTests(unittest.TestCase):
+    def parse(self, messages):
+        return subject.parse_linux_log_sections(
+            unlabeled_linux_log(messages), UNLABELED_JOB,
+            subject.API_LINUX_STEP_NAME_PINS["probe"])
+
+    def test_sections_come_from_run_group_markers_when_every_line_is_unlabeled(self):
+        parsed = self.parse(unlabeled_linux_messages())
+        self.assertEqual(parsed["sections"]["revoke-source-token"], REVOKE_OUTPUT)
+        self.assertEqual(parsed["sections"]["verify-token-rejection"],
+                         REJECTION_OUTPUT + "\n" + CONFIRMED_LINE)
+        self.assertEqual(parsed["other"][0].splitlines().count(CONFIRMED_LINE), 0)
+        self.assertIn("Post job cleanup.", parsed["other"][0])
+        self.assertIn("unrelated=true", parsed["other"][0])
+
+    def test_required_sections_are_still_required(self):
+        messages = unlabeled_linux_messages()
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-missing"):
+            self.parse([line.replace("status=passed", "status=other") for line in messages])
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-missing"):
+            self.parse([line for line in messages if line != REVOKE_OUTPUT])
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-missing"):
+            self.parse([line for line in messages if line != REJECTION_OUTPUT
+                        and line != CONFIRMED_LINE])
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-missing"):
+            subject.parse_linux_log_sections(
+                "", UNLABELED_JOB, subject.API_LINUX_STEP_NAME_PINS["probe"])
+
+    def test_a_duplicated_step_block_is_ambiguous(self):
+        messages = unlabeled_linux_messages()
+        duplicate = unlabeled_run_block(
+            ["printf '%s\\n' '" + REVOKE_OUTPUT + "'"], [REVOKE_OUTPUT])
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-ambiguous"):
+            self.parse(messages + duplicate)
+
+    def test_job_column_and_timestamps_are_still_enforced(self):
+        text = unlabeled_linux_log(unlabeled_linux_messages())
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-format"):
+            subject.parse_linux_log_sections(
+                text, "other-job", subject.API_LINUX_STEP_NAME_PINS["probe"])
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-timestamp"):
+            subject.parse_linux_log_sections(
+                text.replace("2026-10-29T13:47:05", "bad-timestamp", 1), UNLABELED_JOB,
+                subject.API_LINUX_STEP_NAME_PINS["probe"])
+
+
+class GuardedCommandTests(unittest.TestCase):
+    def run_guard(self, outcomes, extra=()):
+        results = list(outcomes)
+        calls = []
+
+        def fake_run(command, **options):
+            calls.append(command)
+            outcome = results.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as temporary:
+            target = str(Path(temporary) / "out.json")
+            with mock.patch.object(subject.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(subject.time, "sleep") as sleeper, \
+                    contextlib.redirect_stdout(buffer):
+                code = subject.main(["guard", "--label", "api-fetch-failed", "--output", target,
+                                     *extra, "--", "gh", "api", "route"])
+            created = Path(target).exists()
+        return code, buffer.getvalue(), calls, sleeper.call_count, created
+
+    def test_failure_prints_one_fixed_reason_without_raw_error_text(self):
+        failure = types.SimpleNamespace(
+            returncode=1, stderr=b"gh: Not Found (HTTP 404) token=SECRETVALUE")
+        code, printed, calls, sleeps, created = self.run_guard([failure])
+        self.assertEqual(code, 1)
+        self.assertEqual(printed, "probe=role-signer result=unavailable "
+                                  "reason=api-fetch-failed exit=1 class=http-404\n")
+        self.assertNotIn("SECRETVALUE", printed)
+        self.assertEqual(calls, [["gh", "api", "route"]])
+        self.assertEqual(sleeps, 0)
+        self.assertTrue(created)
+
+    def test_unknown_errors_collapse_to_a_fixed_class(self):
+        failure = types.SimpleNamespace(returncode=4, stderr=b"free text with a secret")
+        code, printed, unused_calls, unused_sleeps, unused_created = self.run_guard([failure])
+        self.assertEqual(code, 1)
+        self.assertEqual(printed, "probe=role-signer result=unavailable "
+                                  "reason=api-fetch-failed exit=4 class=unclassified\n")
+
+    def test_retryable_class_is_retried_within_the_bound(self):
+        pending = types.SimpleNamespace(
+            returncode=1, stderr=b"job 1 is still in progress; logs will be available")
+        done = types.SimpleNamespace(returncode=0, stderr=b"")
+        code, printed, calls, sleeps, unused_created = self.run_guard(
+            [pending, done], ("--attempts", "3", "--pause", "1"))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sleeps, 1)
+        self.assertEqual(printed, "probe=role-signer retry=api-fetch-failed attempt=1 "
+                                  "class=in-progress\n")
+        code, printed, calls, sleeps, unused_created = self.run_guard(
+            [pending, pending], ("--attempts", "2", "--pause", "1"))
+        self.assertEqual(code, 1)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(printed.endswith("reason=api-fetch-failed exit=1 class=in-progress\n"))
+
+    def test_spawn_failure_and_bad_invocations_are_refused(self):
+        code, printed, unused_calls, unused_sleeps, unused_created = self.run_guard(
+            [OSError("missing")])
+        self.assertEqual(code, 1)
+        self.assertEqual(printed, "probe=role-signer result=unavailable "
+                                  "reason=api-fetch-failed exit=127 class=spawn-failed\n")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            self.assertEqual(subject.main(
+                ["guard", "--label", "api-fetch-failed", "--output", "unused", "--",
+                 "curl", "route"]), 1)
+            self.assertEqual(subject.main(
+                ["guard", "--label", "api-fetch-failed", "--output", "unused",
+                 "--attempts", "11", "--", "gh", "api"]), 1)
+        self.assertEqual(buffer.getvalue().splitlines(), [
+            "probe=role-signer result=unavailable reason=guard-command",
+            "probe=role-signer result=unavailable reason=guard-bounds"])
 
 
 if __name__ == "__main__":
