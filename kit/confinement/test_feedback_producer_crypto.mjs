@@ -108,6 +108,46 @@ test('producer validates lock and reviewed Rust patch profiles before encryption
   assert.equal(patchCiphertext.includes(Buffer.from('src/lib.rs')), false);
 });
 
+function sizedRustPatch(totalBytes) {
+  const width = 4000;
+  const prefix = [
+    'diff --git a/src/lib.rs b/src/lib.rs',
+    '--- a/src/lib.rs',
+    '+++ b/src/lib.rs',
+    '',
+  ].join('\n');
+  const pairs = Math.floor((totalBytes - 512) / (2 * (width + 2)));
+  const header = `@@ -1,${pairs} +1,${pairs} @@\n`;
+  const extra = totalBytes - prefix.length - header.length - pairs * 2 * (width + 2);
+  const removed = Array.from({ length: pairs }, () => `-${'x'.repeat(width)}\n`).join('');
+  const added = Array.from({ length: pairs },
+    (_, index) => `+${'y'.repeat(index === pairs - 1 ? width + extra : width)}\n`).join('');
+  const patch = Buffer.from(prefix + header + removed + added, 'ascii');
+  assert.equal(patch.length, totalBytes);
+  return patch;
+}
+
+test('producer encrypts a Rust patch of exactly the byte limit and refuses one byte more', () => {
+  const limit = 4 * 1024 * 1024 - 64 * 1024;
+  const atLimit = fixture('rust_patch');
+  atLimit.input.payload_b64 = sizedRustPatch(limit).toString('base64');
+  const ciphertext = encryptFeedbackPayload(atLimit.input);
+  assert.equal(ciphertext[5], 2);
+  assert.ok(ciphertext.length <= 4 * 1024 * 1024);
+
+  const over = fixture('rust_patch');
+  over.input.payload_b64 = sizedRustPatch(limit + 1).toString('base64');
+  assert.throws(() => encryptFeedbackPayload(over.input));
+});
+
+test('producer base64 shape check refuses malformed padding, length, alphabet, and whitespace', () => {
+  for (const bad of ['eA=', 'eA=A', '=eA=', 'e===', 'eA==\n', 'eA== ', 'e_==', 'eB==', 'eA']) {
+    const input = fixture('rust_patch').input;
+    input.payload_b64 = bad;
+    assert.throws(() => encryptFeedbackPayload(input), { code: 'invalid_payload' }, bad);
+  }
+});
+
 test('producer refuses a mismatched key, profile, and unclosed input shape', () => {
   const wrongKey = fixture();
   wrongKey.input.context.recipient_fingerprint = '0'.repeat(64);
