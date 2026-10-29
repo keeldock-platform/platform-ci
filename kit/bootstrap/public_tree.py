@@ -289,7 +289,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/feedback_admin_crypto.mjs': '205bd0c24c7c57675b4fae124a0bf10ae61d44bf00d53735d92a5b5490095b7a',
     'kit/confinement/test_feedback_admin_crypto.mjs': 'c958787435789993d6b6959e407ff531189700145fd4e706e71056a270087e17',
     'kit/confinement/test_feedback_admin_integration.py': 'a668a1d799fe7eb10fa174a4a5141e914724968196be055f6a3f7e6b67fc5ae8',
-    'kit/confinement/test_macos_feedback_output_limits.py': '72eda9e6ac6c8567e864becf4c9614fa53e06c8fe169a5bdb54cd9b5a5688d29',
+    'kit/confinement/test_macos_feedback_output_limits.py': 'd03c4e508b83c7a6ef7be7e9f402b2b3775d3878306fb1d010e27276625d9f99',
     'kit/confinement/feedback_api.py': 'd1f13582e53ee178f53e66be06fb9ce8c1a8cee6db3762aafaf8f96f64faf377',
     'kit/confinement/test_feedback_api.py': 'a748ca0ad084de64bbec47f4d2413f4ae35d6b932d8010847f59cec700f27fae',
     'kit/confinement/feedback_public_audit.py': 'beef023a68e01343c5e8f3e883ba99be75f79924eeaca8fdcaabe9d7401960cb',

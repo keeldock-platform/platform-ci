@@ -115,6 +115,7 @@ class Helpers(object):
 
 
 
+@unittest.skipUnless(sys.platform != "win32", "the macOS output path tests require POSIX behavior")
 class OutputPathRefusals(Helpers, unittest.TestCase):
     def test_node_refusal_codes_map_to_fixed_details_and_unknown_text_stays_generic(self):
         paths = ["crates/host/api/src/lib.rs"]
@@ -188,7 +189,7 @@ class OutputPathRefusals(Helpers, unittest.TestCase):
         self.assertEqual(too_large.detail, "output_member")
 
 
-@unittest.skipUnless(REAL_NODE or os.environ.get("CI") == "true",
+@unittest.skipUnless(sys.platform != "win32" and (REAL_NODE or os.environ.get("CI") == "true"),
                      "a node executable is required for the real encryption path")
 class NearLimitPatchThroughRealEncryption(Helpers, unittest.TestCase):
     @classmethod
