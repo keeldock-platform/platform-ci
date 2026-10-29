@@ -125,7 +125,7 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/attestation_probe.py",
         "kit/confinement/test_attestation_probe.py",
         "kit/confinement/release_provenance.py",
-        "kit/confinement/test_release_provenance.py",
+        "kit/confinement/test_confinement_release_provenance.py",
         "kit/confinement/confinement_public_audit.py",
         "kit/confinement/test_confinement_public_audit.py",
         "kit/confinement/log_canary.py",
@@ -207,7 +207,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/feedback_public_audit.py': 'beef023a68e01343c5e8f3e883ba99be75f79924eeaca8fdcaabe9d7401960cb',
     'kit/confinement/test_feedback_public_audit.py': '4a7b822645c7051a4f1999e5961482000a0c58c7c31d9a6ec106a88b8426b5e7',
     'kit/confinement/release_provenance.py': '6e9dbe1264623f68d95d01fe4b73c5c3e4d736a784c49c31fe0dea1b0fff8717',
-    'kit/confinement/test_release_provenance.py': '1e630a123396e28e23063842575f780a3a9aaaaf44a3264f431ccdcd4d68c6fa',
+    'kit/confinement/test_confinement_release_provenance.py': '1e630a123396e28e23063842575f780a3a9aaaaf44a3264f431ccdcd4d68c6fa',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(

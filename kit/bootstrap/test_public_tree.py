@@ -231,7 +231,7 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/macos_source_reader.py",
             "kit/confinement/test_macos_source_reader.py",
             "kit/confinement/release_provenance.py",
-            "kit/confinement/test_release_provenance.py",
+            "kit/confinement/test_confinement_release_provenance.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))
