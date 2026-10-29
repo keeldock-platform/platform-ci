@@ -1,4 +1,9 @@
 import hashlib
+import os
+import shutil
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -157,6 +162,61 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
 
 
 class WindowsLaneRegistryTests(unittest.TestCase):
+    def _run_capsule_generate(
+        self, compile_lines, compile_exit, vector_lines=(), vector_exit=0,
+        compile_throws=False, vector_throws=False,
+    ):
+        workflow = CAPSULE_VECTORS_WORKFLOW.read_text(encoding="ascii")
+        start = "      - name: Compile and generate independent vectors\n        id: generate\n        run: |\n"
+        end = "      - name: Preserve generated vectors for review\n"
+        run_block = textwrap.dedent(workflow.split(start, 1)[1].split(end, 1)[0])
+
+        def mock_branch(lines, exit_code, throws):
+            if throws:
+                return "    throw 'controlled failure'\n"
+            output = "    $global:LASTEXITCODE = " + str(exit_code) + "\n"
+            for line in lines:
+                output += "    Write-Output '" + line.replace("'", "''") + "'\n"
+            return output
+
+        mock = (
+            "$script:Invocation = 0\n"
+            "function pwsh {\n"
+            "  $script:Invocation += 1\n"
+            "  if ($script:Invocation -eq 1) {\n"
+            + mock_branch(compile_lines, compile_exit, compile_throws)
+            + "  } else {\n"
+            + mock_branch(vector_lines, vector_exit, vector_throws)
+            + "  }\n"
+            + "}\n"
+        )
+        powershell = shutil.which("pwsh")
+        self.assertIsNotNone(powershell)
+        with tempfile.TemporaryDirectory() as temporary:
+            script_path = Path(temporary) / "generate.ps1"
+            script_path.write_text(mock + run_block, encoding="utf-8")
+            environment = os.environ.copy()
+            environment["RUNNER_TEMP"] = temporary
+            environment["GITHUB_OUTPUT"] = str(Path(temporary) / "output")
+            result = subprocess.run(
+                [powershell, "-NoProfile", "-NonInteractive", "-File", str(script_path)],
+                cwd=ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=30,
+            )
+            self.assertFalse((Path(temporary) / "capsule_frame_vectors.json").exists())
+            self.assertFalse(Path(environment["GITHUB_OUTPUT"]).exists())
+            return result
+
+    def _assert_capsule_refusal(self, result, reason):
+        self.assertEqual(result.returncode, 1)
+        expected = "capsule-frame=refused reason=" + reason + "\n"
+        self.assertTrue(result.stdout == expected, "capsule refusal output differs")
+        self.assertFalse(result.stderr, "capsule refusal stderr was not empty")
+
     def test_capsule_frame_refusal_subreasons_are_fixed_and_routed(self):
         wrapper = CAPSULE_FRAME_WRAPPER.read_text(encoding="ascii")
         workflow = CAPSULE_VECTORS_WORKFLOW.read_text(encoding="ascii")
@@ -187,6 +247,62 @@ class WindowsLaneRegistryTests(unittest.TestCase):
         self.assertIn("Forward-CapsuleRefusal $compileOutput 'compile_failed'", workflow)
         self.assertIn("Forward-CapsuleRefusal $vectorOutput 'vector_generation_failed'", workflow)
         self.assertIn("2>$null", workflow)
+
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell routing")
+    def test_capsule_generate_forwards_only_allowlisted_refusals(self):
+        compiled = ("capsule-frame-compile=observed result=compiled",)
+        for reason in ("compiler_missing", "compile_failed"):
+            with self.subTest(stage="compile", reason=reason):
+                result = self._run_capsule_generate(
+                    ("capsule-frame=refused reason=" + reason,), 1,
+                )
+                self._assert_capsule_refusal(result, reason)
+        for reason in ("vector_generation_failed", "vector_mismatch", "encoding"):
+            with self.subTest(stage="vectors", reason=reason):
+                result = self._run_capsule_generate(
+                    compiled, 0, ("capsule-frame=refused reason=" + reason,), 1,
+                )
+                self._assert_capsule_refusal(result, reason)
+
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell routing")
+    def test_capsule_generate_suppresses_unexpected_child_output(self):
+        compiled = ("capsule-frame-compile=observed result=compiled",)
+        marker = "UNEXPECTED_OUTPUT_MARKER"
+        cases = (
+            ("compile_multiline", (marker, "capsule-frame=refused reason=compile_failed"),
+             1, (), 0, "compile_failed"),
+            ("compile_success", (marker,), 0, (), 0, "compile_failed"),
+            ("vector_multiline", compiled, 0,
+             (marker, "capsule-frame=refused reason=encoding"), 1, "vector_generation_failed"),
+            ("vector_unlisted", compiled, 0,
+             ("capsule-frame=refused reason=unlisted",), 1, "vector_generation_failed"),
+            ("vector_success_multiline", compiled, 0, (marker, marker), 0, "vector_mismatch"),
+            ("vector_success_singleline", compiled, 0, (marker,), 0, "vector_mismatch"),
+            ("vector_refusal_with_success_exit", compiled, 0,
+             ("capsule-frame=refused reason=encoding",), 0, "vector_mismatch"),
+            ("vector_non_ascii", compiled, 0, ("value" + chr(233),), 0, "encoding"),
+        )
+        for name, compile_lines, compile_exit, vector_lines, vector_exit, reason in cases:
+            with self.subTest(case=name):
+                result = self._run_capsule_generate(
+                    compile_lines, compile_exit, vector_lines, vector_exit,
+                )
+                self._assert_capsule_refusal(result, reason)
+                self.assertFalse(
+                    marker in result.stdout + result.stderr,
+                    "unexpected child output was forwarded",
+                )
+
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell routing")
+    def test_capsule_generate_catches_child_errors_without_echoing_them(self):
+        compiled = ("capsule-frame-compile=observed result=compiled",)
+        for stage in ("compile", "vectors"):
+            with self.subTest(stage=stage):
+                result = self._run_capsule_generate(
+                    compiled, 0, compile_throws=stage == "compile",
+                    vector_throws=stage == "vectors",
+                )
+                self._assert_capsule_refusal(result, "compiler_missing")
 
     def test_capsule_vectors_exact_template_and_refusals(self):
         workflow = CAPSULE_VECTORS_WORKFLOW.read_text(encoding="ascii")

@@ -225,6 +225,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_macos_private_validation.py',
             'ci/revoked-signer-fingerprints',
             '.github/workflows/capsule-vectors.yml',
+            'kit/confinement/capsule_frame.cs',
             'kit/confinement/capsule_frame.ps1',
             ".github/workflows/windows-native-preflight.yml",
             "kit/confinement/windows_native_preflight.cs",

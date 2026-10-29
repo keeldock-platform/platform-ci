@@ -290,11 +290,17 @@ jobs:
             exit 1
           }
           $vectorText = [string]$vectorOutput[0]
-          if ($vectorText -match '[^\x00-\x7F]') {
+          if ($vectorText -match '[^\\x00-\\x7F]') {
             Write-CapsuleRefusal 'encoding'
             exit 1
           }
           if ($vectorText.Contains("`r") -or $vectorText.Contains("`n")) {
+            Write-CapsuleRefusal 'vector_mismatch'
+            exit 1
+          }
+          if ($vectorText.Length -gt 262143 -or
+              -not $vectorText.StartsWith('{"format":"KDWH-v1-protocol-vectors","producer":"independent-csharp","status":"generated",', [StringComparison]::Ordinal) -or
+              -not $vectorText.EndsWith('}}}', [StringComparison]::Ordinal)) {
             Write-CapsuleRefusal 'vector_mismatch'
             exit 1
           }

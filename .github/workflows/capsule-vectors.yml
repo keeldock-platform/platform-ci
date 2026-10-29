@@ -110,6 +110,12 @@ jobs:
             Write-CapsuleRefusal 'vector_mismatch'
             exit 1
           }
+          if ($vectorText.Length -gt 262143 -or
+              -not $vectorText.StartsWith('{"format":"KDWH-v1-protocol-vectors","producer":"independent-csharp","status":"generated",', [StringComparison]::Ordinal) -or
+              -not $vectorText.EndsWith('}}}', [StringComparison]::Ordinal)) {
+            Write-CapsuleRefusal 'vector_mismatch'
+            exit 1
+          }
           try {
             $vectorPath = Join-Path $env:RUNNER_TEMP 'capsule_frame_vectors.json'
             [System.IO.File]::WriteAllText($vectorPath, $vectorText + "`n", [System.Text.Encoding]::ASCII)

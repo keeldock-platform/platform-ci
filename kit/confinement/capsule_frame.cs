@@ -624,7 +624,7 @@ namespace KeelDock.Platform.CapsuleFrame
                 CheckBytes(entry.BlobId, 20, RefusalCode.Structure);
                 CheckBytes(entry.Sha256, 32, RefusalCode.Structure);
                 Require(entry.Size <= MaximumEntryBytes, RefusalCode.ManifestLimit);
-                Require(UInt64.MaxValue - totalSize >= entry.Size, RefusalCode.ManifestLimit);
+                Require(ulong.MaxValue - totalSize >= entry.Size, RefusalCode.ManifestLimit);
                 totalSize += entry.Size;
                 Require(totalSize <= MaximumTreeBytes, RefusalCode.ManifestLimit);
             }
@@ -637,11 +637,11 @@ namespace KeelDock.Platform.CapsuleFrame
             {
                 output.Add((byte)((major << 5) | 24)); output.Add((byte)value);
             }
-            else if (value <= UInt16.MaxValue)
+            else if (value <= ushort.MaxValue)
             {
                 output.Add((byte)((major << 5) | 25)); output.Add((byte)(value >> 8)); output.Add((byte)value);
             }
-            else if (value <= UInt32.MaxValue)
+            else if (value <= uint.MaxValue)
             {
                 output.Add((byte)((major << 5) | 26));
                 output.AddRange(UInt32((uint)value));
@@ -728,14 +728,14 @@ namespace KeelDock.Platform.CapsuleFrame
                 {
                     byte[] raw = Take(4);
                     ulong value = ((ulong)raw[0] << 24) | ((ulong)raw[1] << 16) | ((ulong)raw[2] << 8) | raw[3];
-                    Require(value > UInt16.MaxValue, RefusalCode.Noncanonical);
+                    Require(value > ushort.MaxValue, RefusalCode.Noncanonical);
                     return value;
                 }
                 if (additional == 27)
                 {
                     byte[] raw = Take(8);
                     ulong value = ReadUInt64(raw, 0);
-                    Require(value > UInt32.MaxValue, RefusalCode.Noncanonical);
+                    Require(value > uint.MaxValue, RefusalCode.Noncanonical);
                     return value;
                 }
                 Refuse(RefusalCode.Noncanonical);
