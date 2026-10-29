@@ -375,3 +375,224 @@ test('the fixed Node title option keeps long process.title values intact in a sc
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+function lightningcssEntry(version) {
+  return {
+    version,
+    resolved: `https://registry.npmjs.org/lightningcss/-/lightningcss-${version}.tgz`,
+    integrity: `sha512-${'A'.repeat(86)}==`,
+  };
+}
+
+function overrideFixture(overrides = { lightningcss: '1.33.0' }, version = '1.33.0') {
+  const expectation = JSON.parse(JSON.stringify(expected));
+  expectation.root.overrides = overrides;
+  const lock = lockFixture();
+  lock.packages['node_modules/lightningcss'] = lightningcssEntry(version);
+  return { expectation, lock };
+}
+
+function codeOf(lock, expectation) {
+  try {
+    validateLockManifest(bytes(lock), expectation);
+  } catch (error) {
+    assert.ok(error instanceof LockManifestError);
+    return error.code;
+  }
+  return 'accepted';
+}
+
+test('accepts exactly one root override that pins lightningcss to the exact reviewed version', () => {
+  const { expectation, lock } = overrideFixture();
+  assert.deepEqual(validateLockManifest(bytes(lock), expectation), { packageCount: 7, lockfileVersion: 3 });
+  assert.equal(validateLockManifestInventory(bytes(lock), expectation).packages.length, 5);
+
+  const mirrored = overrideFixture();
+  mirrored.lock.packages[''].overrides = { lightningcss: '1.33.0' };
+  assert.deepEqual(validateLockManifest(bytes(mirrored.lock), mirrored.expectation), {
+    packageCount: 7, lockfileVersion: 3,
+  });
+
+  const absent = overrideFixture();
+  absent.lock.packages['node_modules/other'] = {
+    version: '2.0.0',
+    resolved: 'https://registry.npmjs.org/other/-/other-2.0.0.tgz',
+    integrity: `sha512-${'A'.repeat(86)}==`,
+  };
+  absent.lock.packages['node_modules/other/node_modules/lightningcss'] = lightningcssEntry('1.33.0');
+  assert.equal(codeOf(absent.lock, absent.expectation), 'accepted');
+
+  const second = JSON.parse(JSON.stringify(expected));
+  second.root.name = 'runtime-root';
+  second.root.overrides = { lightningcss: '1.33.0' };
+  const runtimeLock = lockFixture();
+  runtimeLock.name = 'runtime-root';
+  runtimeLock.packages[''].name = 'runtime-root';
+  runtimeLock.packages['node_modules/lightningcss'] = lightningcssEntry('1.33.0');
+  assert.equal(codeOf(runtimeLock, second), 'accepted');
+});
+
+test('refuses every override expectation except the single exact lightningcss pin', () => {
+  const refused = [
+    { typescript: '6.0.3' },
+    { lightningcss: '1.33.0', typescript: '6.0.3' },
+    {},
+    { lightningcss: '^1.33.0' },
+    { lightningcss: '~1.33.0' },
+    { lightningcss: '1.33' },
+    { lightningcss: '1.x' },
+    { lightningcss: '>=1.33.0' },
+    { lightningcss: '*' },
+    { lightningcss: 'latest' },
+    { lightningcss: '1.32.0' },
+    { lightningcss: '1.33.1' },
+    { lightningcss: '1.33.0-beta.1' },
+    { lightningcss: 'npm:lightningcss@1.33.0' },
+    { lightningcss: { '.': '1.33.0' } },
+    { lightningcss: { lightningcss: '1.33.0' } },
+    { lightningcss: ['1.33.0'] },
+    { lightningcss: 133 },
+    { lightningcss: null },
+    { lightningcss: undefined },
+    { 'lightningcss@1.33.0': '1.33.0' },
+    { '@scope/lightningcss': '1.33.0' },
+    { __proto__x: '1.33.0' },
+    ['lightningcss'],
+    '1.33.0',
+    null,
+    undefined,
+    7,
+  ];
+  for (const overrides of refused) {
+    const { expectation, lock } = overrideFixture();
+    expectation.root.overrides = overrides;
+    assert.equal(codeOf(lock, expectation), 'invalid_expectation', JSON.stringify(overrides));
+  }
+
+  const nested = overrideFixture();
+  nested.expectation.root.overrides = { foo: { lightningcss: '1.33.0' } };
+  assert.equal(codeOf(nested.lock, nested.expectation), 'invalid_expectation');
+
+  const onWorkspace = overrideFixture();
+  onWorkspace.expectation.workspaces[0].overrides = { lightningcss: '1.33.0' };
+  assert.equal(codeOf(onWorkspace.lock, onWorkspace.expectation), 'invalid_expectation');
+
+  const onWorkspaceOnly = overrideFixture();
+  delete onWorkspaceOnly.expectation.root.overrides;
+  onWorkspaceOnly.expectation.workspaces[1].overrides = { lightningcss: '1.33.0' };
+  assert.equal(codeOf(onWorkspaceOnly.lock, onWorkspaceOnly.expectation), 'invalid_expectation');
+
+  const conflictingPin = overrideFixture();
+  conflictingPin.expectation.root.devDependencies.lightningcss = '1.30.1';
+  conflictingPin.lock.packages[''].devDependencies.lightningcss = '1.30.1';
+  assert.equal(codeOf(conflictingPin.lock, conflictingPin.expectation), 'invalid_expectation');
+
+  const workspacePin = overrideFixture();
+  workspacePin.expectation.workspaces[1].dependencies = { lightningcss: '1.30.1' };
+  assert.equal(codeOf(workspacePin.lock, workspacePin.expectation), 'invalid_expectation');
+
+  const matchingPin = overrideFixture();
+  matchingPin.expectation.root.devDependencies.lightningcss = '1.33.0';
+  matchingPin.lock.packages[''].devDependencies.lightningcss = '1.33.0';
+  assert.equal(codeOf(matchingPin.lock, matchingPin.expectation), 'accepted');
+});
+
+test('keeps the lock root, other entries, and resolved versions consistent with the override', () => {
+  const withoutExpectation = overrideFixture();
+  delete withoutExpectation.expectation.root.overrides;
+  withoutExpectation.lock.packages[''].overrides = { lightningcss: '1.33.0' };
+  assert.equal(codeOf(withoutExpectation.lock, withoutExpectation.expectation), 'root_mismatch');
+
+  for (const overrides of [
+    { lightningcss: '1.32.0' },
+    { lightningcss: '1.33.0', typescript: '6.0.3' },
+    {},
+    '1.33.0',
+    ['lightningcss'],
+    null,
+  ]) {
+    const { expectation, lock } = overrideFixture();
+    lock.packages[''].overrides = overrides;
+    assert.equal(codeOf(lock, expectation), 'root_mismatch', JSON.stringify(overrides));
+  }
+
+  const onWorkspaceEntry = overrideFixture();
+  onWorkspaceEntry.lock.packages['packages/shared'].overrides = { lightningcss: '1.33.0' };
+  assert.equal(codeOf(onWorkspaceEntry.lock, onWorkspaceEntry.expectation), 'invalid_package');
+
+  const onPackageEntry = overrideFixture();
+  onPackageEntry.lock.packages['node_modules/typescript'].overrides = { lightningcss: '1.33.0' };
+  assert.equal(codeOf(onPackageEntry.lock, onPackageEntry.expectation), 'invalid_package');
+
+  const staleVersion = overrideFixture({ lightningcss: '1.33.0' }, '1.30.1');
+  assert.equal(codeOf(staleVersion.lock, staleVersion.expectation), 'override_mismatch');
+
+  const nestedStale = overrideFixture();
+  nestedStale.lock.packages['node_modules/other'] = {
+    version: '2.0.0',
+    resolved: 'https://registry.npmjs.org/other/-/other-2.0.0.tgz',
+    integrity: `sha512-${'A'.repeat(86)}==`,
+  };
+  nestedStale.lock.packages['node_modules/other/node_modules/lightningcss'] = lightningcssEntry('1.30.1');
+  assert.equal(codeOf(nestedStale.lock, nestedStale.expectation), 'override_mismatch');
+
+  const unconstrained = overrideFixture();
+  delete unconstrained.expectation.root.overrides;
+  unconstrained.lock.packages['node_modules/lightningcss'] = lightningcssEntry('1.30.1');
+  assert.equal(codeOf(unconstrained.lock, unconstrained.expectation), 'accepted');
+});
+
+function registryEntry(name, version) {
+  return {
+    version,
+    resolved: `https://registry.npmjs.org/${name}/-/${name}-${version}.tgz`,
+    integrity: `sha512-${'A'.repeat(86)}==`,
+  };
+}
+
+test('requires the platform binaries of the overridden package to match its exact version', () => {
+  const complete = overrideFixture();
+  complete.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.33.0');
+  complete.lock.packages['node_modules/lightningcss-win32-x64-msvc'] = registryEntry('lightningcss-win32-x64-msvc', '1.33.0');
+  assert.equal(codeOf(complete.lock, complete.expectation), 'accepted');
+
+  const halfOverridden = overrideFixture();
+  halfOverridden.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.32.0');
+  assert.equal(codeOf(halfOverridden.lock, halfOverridden.expectation), 'override_mismatch');
+
+  const nestedBinary = overrideFixture();
+  nestedBinary.lock.packages['node_modules/other'] = registryEntry('other', '2.0.0');
+  nestedBinary.lock.packages['node_modules/other/node_modules/lightningcss-darwin-arm64'] =
+    registryEntry('lightningcss-darwin-arm64', '1.30.1');
+  assert.equal(codeOf(nestedBinary.lock, nestedBinary.expectation), 'override_mismatch');
+
+  const unrelated = overrideFixture();
+  unrelated.lock.packages['node_modules/lightningcssx'] = registryEntry('lightningcssx', '9.9.9');
+  assert.equal(codeOf(unrelated.lock, unrelated.expectation), 'accepted');
+
+  const unconstrained = overrideFixture();
+  delete unconstrained.expectation.root.overrides;
+  unconstrained.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.32.0');
+  assert.equal(codeOf(unconstrained.lock, unconstrained.expectation), 'accepted');
+});
+
+test('limits the platform binary version check to the official lightningcss binary names', () => {
+  const official = [
+    'darwin-arm64', 'darwin-x64', 'freebsd-x64', 'linux-arm-gnueabihf', 'linux-arm64-gnu', 'linux-arm64-musl',
+    'linux-x64-gnu', 'linux-x64-musl', 'win32-arm64-msvc', 'win32-x64-msvc', 'android-arm64',
+  ];
+  for (const suffix of official) {
+    const name = `lightningcss-${suffix}`;
+    const stale = overrideFixture();
+    stale.lock.packages[`node_modules/${name}`] = registryEntry(name, '1.32.0');
+    assert.equal(codeOf(stale.lock, stale.expectation), 'override_mismatch', name);
+    const current = overrideFixture();
+    current.lock.packages[`node_modules/${name}`] = registryEntry(name, '1.33.0');
+    assert.equal(codeOf(current.lock, current.expectation), 'accepted', name);
+  }
+  for (const name of ['lightningcss-loader', 'lightningcss-cli', 'lightningcss-linux-x64', 'lightningcss-wasm']) {
+    const other = overrideFixture();
+    other.lock.packages[`node_modules/${name}`] = registryEntry(name, '2.4.6');
+    assert.equal(codeOf(other.lock, other.expectation), 'accepted', name);
+  }
+});

@@ -818,7 +818,7 @@ class ArtifactAndStageTests(unittest.TestCase):
         with self.assertRaises(subject.Refusal):
             subject.validate_artifact_inventory(fixture_artifact_snapshot(expired), RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
         wrong_transfer = fixture_artifacts()
-        wrong_transfer[2]["name"] = wrong_transfer[2]["name"][:-1] + "c"
+        wrong_transfer[2]["name"] = wrong_transfer[2]["name"][:-1] + ("d" if wrong_transfer[2]["name"].endswith("c") else "c")
         with self.assertRaises(subject.Refusal):
             subject.validate_artifact_inventory(fixture_artifact_snapshot(wrong_transfer), RUN_ID, RUN_ATTEMPT, CONTROL_SHA)
 
@@ -1428,7 +1428,7 @@ class ArtifactAndStageTests(unittest.TestCase):
                         elif case == "linux-job":
                             rows[1]["conclusion"] = "failure"
                         elif case == "receiver-binding":
-                            artifacts[1]["name"] = artifacts[1]["name"][:-1] + "c"
+                            artifacts[1]["name"] = artifacts[1]["name"][:-1] + ("d" if artifacts[1]["name"].endswith("c") else "c")
                         elif case == "linux-certificate":
                             path = Path(temporary) / "artifacts" / artifacts[1]["name"] / "verified.json"
                             document = json.loads(path.read_text(encoding="ascii"))
@@ -1606,6 +1606,21 @@ class GuardedCommandTests(unittest.TestCase):
         self.assertEqual(printed, "probe=role-signer result=unavailable "
                                   "reason=api-fetch-failed exit=4 class=unclassified\n")
 
+    def test_gh_refusals_map_to_fixed_classes_without_raw_text(self):
+        cases = (
+            (b"the response contains terminal escape sequences; pass the flag", "escape-sequences"),
+            (b"gh: Found (HTTP 302)", "http-redirect"),
+            (b"gh: Gone (HTTP 410)", "http-410"),
+            (b"gh: Bad Request (HTTP 400)", "http-400"),
+            (b"gh: Resource not accessible by integration (HTTP 403)", "http-403"),
+            (b"unknown flag: --allow-escape-sequences", "gh-usage"),
+            (b"stopped after 10 redirects", "redirect"),
+            (b"gh: Bad Gateway (HTTP 502)", "http-5xx"),
+        )
+        for stderr, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(subject._guard_error_class(stderr), expected)
+
     def test_retryable_class_is_retried_within_the_bound(self):
         pending = types.SimpleNamespace(
             returncode=1, stderr=b"job 1 is still in progress; logs will be available")
@@ -1672,6 +1687,21 @@ class BareJobLogTests(unittest.TestCase):
         with self.assertRaisesRegex(subject.Refusal, "linux-log-section-missing"):
             self.parse(bare_linux_log([line for line in messages if line != REVOKE_OUTPUT]))
 
+    def test_raw_escape_bytes_in_the_api_job_log_are_stripped_before_matching(self):
+        messages = unlabeled_linux_messages()
+        raw = [line.replace("^[[", "\x1b[") for line in messages]
+        self.assertEqual(self.parse(bare_linux_log(raw)), self.parse(bare_linux_log(messages)))
+
+    def test_control_bytes_are_stored_in_caret_form_and_tabs_are_kept(self):
+        messages = unlabeled_linux_messages()
+        messages[2] = "bell\x07 del\x7f esc\x1b[0m tab\tend"
+        parsed = self.parse(bare_linux_log(messages))
+        other = parsed["other"][0]
+        self.assertIn("bell^G del^? esc^[[0m tab\tend", other)
+        for text in [other] + list(parsed["sections"].values()):
+            self.assertEqual([c for c in text if ord(c) < 32 and c not in "\n\t"], [])
+            self.assertNotIn("\x7f", text)
+
     def test_a_run_group_started_inside_a_matched_header_is_refused(self):
         messages = unlabeled_linux_messages()
         script = "^[[36;1mprintf '%s\\n' '" + REVOKE_OUTPUT + "'^[[0m"
@@ -1713,7 +1743,7 @@ class JobLogFallbackTests(unittest.TestCase):
         done = types.SimpleNamespace(returncode=0, stderr=b"")
         code, printed, calls = self.run_view([self.PENDING, done])
         self.assertEqual(code, 0)
-        self.assertEqual(calls, [list(self.VIEW), ["gh", "api", self.ROUTE]])
+        self.assertEqual(calls, [list(self.VIEW), ["gh", "api", "--allow-escape-sequences", self.ROUTE]])
         self.assertEqual(printed, "probe=role-signer fallback=job-log-api\n")
 
     def test_fallback_failure_has_its_own_fixed_reason(self):

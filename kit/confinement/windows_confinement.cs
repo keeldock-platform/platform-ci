@@ -515,7 +515,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 string applicationPackages = ReadAllApplicationPackagesState(token);
                 string reported = lpac;
                 if (lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match"
-                    && restrictedApplicationPackages == "present" && applicationPackages == "absent")
+                    && applicationPackages == "absent")
                 {
                     reported = "aap_only";
                 }
@@ -523,7 +523,7 @@ namespace KeelDock.Platform.WindowsConfinement
                     + " integrity=0x" + integrity.ToString("x4") + " lpac=" + reported + " sid=" + sidState
                     + " arap=" + restrictedApplicationPackages + " aap=" + applicationPackages;
                 if (isAppContainer != 1 || capabilityCount != 0 || integrity != LowIntegrityRid || (lpac != "1" && reported != "aap_only")
-                    || sidState != "match" || restrictedApplicationPackages != "present" || applicationPackages != "absent")
+                    || sidState != "match" || (lpac == "1" && restrictedApplicationPackages != "present") || applicationPackages != "absent")
                 {
                     throw new InvalidOperationException(text);
                 }

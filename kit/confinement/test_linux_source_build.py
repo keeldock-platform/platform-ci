@@ -3,11 +3,15 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+if not sys.platform.startswith("linux"):
+    raise unittest.SkipTest("the Linux source build suite runs only on Linux")
 
 import foundation_node_feedback
 import confinement_public_audit
@@ -331,6 +335,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 self.assertEqual(launch[3], linux_source_build.linux_probes.LAUNCHER_SOURCE)
                 self.assertEqual(launch[4:], ("/usr/bin/true",))
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the shared launcher stop uses Linux process facilities")
     def test_shared_launcher_really_stops_before_the_command_runs(self):
         stdout_reader, stdout_writer = os.pipe()
         stderr_reader, stderr_writer = os.pipe()
@@ -492,6 +497,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
                 linux_source_build.verify_proof_handoff({"RUNNER_TEMP": temporary})
 
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "the verifier key descriptor uses memfd_create, which only Linux provides")
     def test_verifier_mints_only_for_the_bound_installation_and_repository(self):
         token = "g" * 40
         identity = {"owner": "KeelDock", "name": "private-source", "repository_id": "41"}
@@ -546,6 +552,48 @@ class LinuxSourceBuildTests(unittest.TestCase):
         bad = b"".join(headers[:-1]) + line + b"\n" + headers[-1]
         with self.assertRaises(confinement_public_audit.AuditRefusal):
             confinement_public_audit._check_section(bad, job, expected)
+
+    def _write_manifests(self, directory, root_extra=None, workspace_extra=None):
+        root = {
+            "name": "synthetic-root", "version": "1.0.0", "workspaces": ["packages/*"],
+            "devDependencies": {"typescript": "6.0.3"},
+        }
+        root.update(root_extra or {})
+        package = {"name": "@synthetic/host-api", "version": "1.0.0"}
+        package.update(workspace_extra or {})
+        base = Path(directory)
+        (base / "packages/host-api").mkdir(parents=True)
+        (base / "package.json").write_text(json.dumps(root), encoding="ascii")
+        (base / "packages/host-api/package.json").write_text(json.dumps(package), encoding="ascii")
+        return base
+
+    def test_manifest_digest_binds_the_exact_root_override_and_refuses_everything_else(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plain = linux_source_build._manifest_digest(self._write_manifests(Path(directory) / "plain"))
+        with tempfile.TemporaryDirectory() as directory:
+            allowed = linux_source_build._manifest_digest(self._write_manifests(
+                Path(directory) / "allowed", {"overrides": {"lightningcss": "1.33.0"}},
+            ))
+        self.assertNotEqual(plain, allowed)
+        for index, root_extra in enumerate((
+            {"overrides": {"lightningcss": "1.32.0"}}, {"overrides": {"lightningcss": "^1.33.0"}},
+            {"overrides": {"lightningcss": {"x": "1.33.0"}}}, {"overrides": {"other": "1.33.0"}},
+            {"overrides": {}}, {"overrides": ["lightningcss"]}, {"overrides": "1.33.0"}, {"overrides": None},
+            {"overrides": {"lightningcss": "1.33.0", "other": "1.0.0"}},
+            {"resolutions": {"a": "1.0.0"}}, {"bundleDependencies": ["a"]}, {"bundledDependencies": ["a"]},
+        )):
+            with self.subTest(root=root_extra), tempfile.TemporaryDirectory() as directory:
+                base = self._write_manifests(Path(directory) / ("r%d" % index), root_extra)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._manifest_digest(base)
+        for index, workspace_extra in enumerate((
+            {"overrides": {"lightningcss": "1.33.0"}}, {"overrides": {}}, {"resolutions": {"a": "1.0.0"}},
+        )):
+            with self.subTest(workspace=workspace_extra), tempfile.TemporaryDirectory() as directory:
+                base = self._write_manifests(Path(directory) / ("w%d" % index), None, workspace_extra)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._manifest_digest(base)
+
 
 
 if __name__ == "__main__":

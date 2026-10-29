@@ -185,12 +185,25 @@ def _read_file(path, *, maximum, owner=0):
                 pass
 
 
+ROOT_OVERRIDES = {"lightningcss": "1.33.0"}
+
+
+def _root_overrides(root):
+    if "overrides" not in root:
+        return None
+    value = root["overrides"]
+    if (type(value) is not dict or set(value) != set(ROOT_OVERRIDES)
+            or any(type(item) is not str or item != ROOT_OVERRIDES[name] for name, item in value.items())):
+        _refuse("manifest_invalid")
+    return dict(value)
+
+
 def _expected_manifest(source):
     root = _strict_json(_read_file(source / "package.json", maximum=MAX_PACKAGE_JSON_BYTES),
                         MAX_PACKAGE_JSON_BYTES)
     if type(root) is not dict or type(root.get("name")) is not str or type(root.get("version")) is not str:
         _refuse("manifest_invalid")
-    if any(key in root for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies")):
+    if any(key in root for key in ("resolutions", "bundleDependencies", "bundledDependencies")):
         _refuse("manifest_invalid")
     workspaces = root.get("workspaces")
     if type(workspaces) is dict:
@@ -214,6 +227,9 @@ def _expected_manifest(source):
     for group in DEPENDENCY_GROUPS:
         if group in root:
             root_expected[group] = root[group]
+    overrides = _root_overrides(root)
+    if overrides is not None:
+        root_expected["overrides"] = overrides
     workspace_expected = []
     for workspace_path in expected_paths:
         package = _strict_json(
@@ -249,7 +265,9 @@ def _validate_dependency_sources(root, workspaces):
                         _refuse("manifest_invalid")
                 elif not VERSION_SPEC_RE.fullmatch(spec):
                     _refuse("manifest_invalid")
-        if any(key in manifest for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies")):
+        if any(key in manifest for key in ("resolutions", "bundleDependencies", "bundledDependencies")):
+            _refuse("manifest_invalid")
+        if "overrides" in manifest and (manifest is not root or manifest["overrides"] != ROOT_OVERRIDES):
             _refuse("manifest_invalid")
 
 

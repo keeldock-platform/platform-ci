@@ -97,7 +97,9 @@ function New-CatalogLease([string]$path, [string]$sid) {
     foreach ($item in (Get-CatalogKeyPaths $path)) {
         $keyList += @{ Path = $item; OriginalSddl = (Get-CatalogAclSddl $item) }
     }
-    return @{ Path = $path; Sid = $sid; KeyList = $keyList }
+    $testRoot = 'SOFTWARE\KeelDock\ConfinementRecoveryTest\'
+    $scratchPaths = @{ Aap = ($testRoot + [Guid]::NewGuid().ToString('N')); Arap = ($testRoot + [Guid]::NewGuid().ToString('N')) }
+    return @{ Path = $path; Sid = $sid; KeyList = $keyList; ScratchPaths = $scratchPaths; ScratchList = @($scratchPaths.Aap, $scratchPaths.Arap) }
 }
 
 function Add-CatalogRead($lease, [switch]$ForceReadbackFailure) {
@@ -198,6 +200,86 @@ function Restore-CatalogAcl($lease) {
     if ($failure) { throw $failure }
 }
 
+function Assert-ScratchPath([string]$path) {
+    if (-not ($path -cmatch '^SOFTWARE\\KeelDock\\ConfinementRecoveryTest\\[a-f0-9]{32}\z')) { throw 'winsock_catalog_path' }
+}
+
+function New-CatalogScratchKey([string]$path, [string]$readSid) {
+    Assert-ScratchPath $path
+    if ($readSid -cne 'S-1-15-2-1' -and $readSid -cne 'S-1-15-2-2') { throw 'winsock_scratch_create' }
+    $base = $null
+    $key = $null
+    try {
+        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $created = $base.CreateSubKey($path)
+        if ($null -eq $created) { throw 'winsock_scratch_create' }
+        $created.Dispose()
+        $rights = [System.Security.AccessControl.RegistryRights]::ReadKey -bor [System.Security.AccessControl.RegistryRights]::ChangePermissions
+        $key = $base.OpenSubKey($path, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, $rights)
+        if ($null -eq $key) { throw 'winsock_scratch_create' }
+        $security = New-Object System.Security.AccessControl.RegistrySecurity
+        $security.SetAccessRuleProtection($true, $false)
+        $grants = @(
+            @{ Sid = 'S-1-5-18'; Rights = [System.Security.AccessControl.RegistryRights]::FullControl },
+            @{ Sid = 'S-1-5-32-544'; Rights = [System.Security.AccessControl.RegistryRights]::FullControl },
+            @{ Sid = $readSid; Rights = [System.Security.AccessControl.RegistryRights]::ReadKey }
+        )
+        foreach ($grant in $grants) {
+            $identity = New-Object System.Security.Principal.SecurityIdentifier([string]$grant.Sid)
+            $rule = New-Object System.Security.AccessControl.RegistryAccessRule($identity, $grant.Rights, [System.Security.AccessControl.InheritanceFlags]::None, [System.Security.AccessControl.PropagationFlags]::None, [System.Security.AccessControl.AccessControlType]::Allow)
+            $security.AddAccessRule($rule)
+        }
+        $key.SetAccessControl($security)
+        $readBack = $key.GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)
+        $entries = @($readBack.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        $expected = @('S-1-5-18', 'S-1-5-32-544', $readSid) | Sort-Object
+        $actual = @($entries | ForEach-Object { $_.IdentityReference.Value }) | Sort-Object
+        $writeMask = [System.Security.AccessControl.RegistryRights]'SetValue, CreateSubKey, Delete, ChangePermissions, TakeOwnership'
+        $readOnly = $true
+        foreach ($entry in $entries) {
+            if ($entry.AccessControlType -ne 'Allow' -or $entry.IsInherited -or $entry.InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None) { $readOnly = $false }
+            if ($entry.IdentityReference.Value -eq $readSid -and (($entry.RegistryRights -band $writeMask) -ne 0 -or ($entry.RegistryRights -band [System.Security.AccessControl.RegistryRights]::ReadKey) -ne [System.Security.AccessControl.RegistryRights]::ReadKey)) { $readOnly = $false }
+        }
+        if (-not $readBack.AreAccessRulesProtected -or -not $readOnly -or (($expected -join ',') -ne ($actual -join ','))) { throw 'winsock_scratch_create' }
+    } catch {
+        throw 'winsock_scratch_create'
+    } finally {
+        if ($key) { $key.Dispose() }
+        if ($base) { $base.Dispose() }
+    }
+}
+
+function Add-CatalogScratchKeys($lease) {
+    if (-not $lease.TaskRegistered -or -not $lease.ReadyFile -or -not (Test-Path -LiteralPath ([string]$lease.ReadyFile))) {
+        throw 'winsock_recovery_state'
+    }
+    New-CatalogScratchKey ([string]$lease.ScratchPaths.Aap) 'S-1-15-2-1'
+    New-CatalogScratchKey ([string]$lease.ScratchPaths.Arap) 'S-1-15-2-2'
+}
+
+function Remove-CatalogScratchKeys($paths) {
+    $failure = $false
+    $items = @($paths)
+    for ($index = $items.Count - 1; $index -ge 0; $index--) {
+        $path = [string]$items[$index]
+        Assert-ScratchPath $path
+        $base = $null
+        $probe = $null
+        try {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+            $base.DeleteSubKeyTree($path, $false)
+            $probe = $base.OpenSubKey($path, $false)
+            if ($null -ne $probe) { $failure = $true }
+        } catch {
+            $failure = $true
+        } finally {
+            if ($probe) { $probe.Dispose() }
+            if ($base) { $base.Dispose() }
+        }
+    }
+    if ($failure) { throw 'winsock_scratch_cleanup' }
+}
+
 function Start-CatalogRecovery($lease, [string]$source) {
     try {
         $common = [Environment]::GetFolderPath('CommonApplicationData')
@@ -246,7 +328,7 @@ function Start-CatalogRecovery($lease, [string]$source) {
             throw 'winsock_recovery_acl'
         }
         $parent = [Diagnostics.Process]::GetCurrentProcess()
-        $data = @{ Path = [string]$lease.Path; KeyList = @($lease.KeyList); ParentPid = $parent.Id; ParentStartTicks = $parent.StartTime.ToUniversalTime().Ticks }
+        $data = @{ Path = [string]$lease.Path; KeyList = @($lease.KeyList); ScratchPaths = @($lease.ScratchList); ParentPid = $parent.Id; ParentStartTicks = $parent.StartTime.ToUniversalTime().Ticks }
         [IO.File]::WriteAllText($record, ($data | ConvertTo-Json -Compress -Depth 5),(New-Object System.Text.UTF8Encoding($false)))
         $recordHash = (Get-FileHash -LiteralPath $record -Algorithm SHA256).Hash.ToLowerInvariant()
         foreach ($piece in @($shell, $copy, $record, $ready, $done, $ack, $recordHash)) {
@@ -319,17 +401,20 @@ function Grant-WinsockCatalogRead([string]$sid, [string]$path = 'SYSTEM\CurrentC
         Assert-CatalogPath $path
         $script:WinsockCatalogLease = New-CatalogLease $path $sid
         Start-CatalogRecovery $script:WinsockCatalogLease (Join-Path $PSScriptRoot 'windows_confinement_recovery.ps1')
+        Add-CatalogScratchKeys $script:WinsockCatalogLease
         Add-CatalogRead $script:WinsockCatalogLease -ForceReadbackFailure:$ForceReadbackFailure
         return $script:WinsockCatalogLease
     } catch {
         $reason = [string]$_.Exception.Message
-        if ($reason -notin @('winsock_catalog_path', 'winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_registry_read', 'winsock_package_sid')) {
+        if ($reason -notin @('winsock_catalog_path', 'winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_registry_read', 'winsock_package_sid', 'winsock_scratch_create', 'winsock_scratch_cleanup')) {
             $reason = 'winsock_grant_failed'
         }
         if ($script:WinsockCatalogLease) {
             try {
                 if ($script:WinsockCatalogLease.ArmedFile -and (Test-Path -LiteralPath ([string]$script:WinsockCatalogLease.ArmedFile))) {
                     Restore-WinsockCatalogAcl $script:WinsockCatalogLease
+                } else {
+                    Remove-CatalogScratchKeys @($script:WinsockCatalogLease.ScratchList)
                 }
                 Stop-CatalogRecovery $script:WinsockCatalogLease
                 $script:WinsockCatalogLease = $null
@@ -343,8 +428,19 @@ function Grant-WinsockCatalogRead([string]$sid, [string]$path = 'SYSTEM\CurrentC
 }
 
 function Restore-WinsockCatalogAcl($lease) {
-    if ($null -ne $lease -and $lease.ArmedFile -and -not (Test-Path -LiteralPath ([string]$lease.ArmedFile))) { return }
-    Restore-CatalogAcl $lease
+    $failure = ''
+    try {
+        $skip = $null -ne $lease -and $lease.ArmedFile -and -not (Test-Path -LiteralPath ([string]$lease.ArmedFile))
+        if (-not $skip) { Restore-CatalogAcl $lease }
+    } catch {
+        $failure = [string]$_.Exception.Message
+    }
+    try {
+        if ($null -ne $lease -and $lease.ScratchList) { Remove-CatalogScratchKeys @($lease.ScratchList) }
+    } catch {
+        if (-not $failure) { $failure = [string]$_.Exception.Message }
+    }
+    if ($failure) { throw $failure }
 }
 
 function Remove-CatalogRecoveryFolder([string]$record) {
@@ -366,7 +462,8 @@ function Invoke-CatalogWatch([string]$record, [string]$ready, [string]$done, [st
     if ((Get-FileHash -LiteralPath $record -Algorithm SHA256).Hash.ToLowerInvariant() -ne $recordHash) { throw 'winsock_recovery_record' }
     $data = Get-Content -LiteralPath $record -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     Assert-CatalogPath ([string]$data.Path)
-    if (@($data.KeyList).Count -eq 0) { throw 'winsock_recovery_record' }
+    if (@($data.KeyList).Count -eq 0 -or @($data.ScratchPaths).Count -ne 2) { throw 'winsock_recovery_record' }
+    foreach ($item in @($data.ScratchPaths)) { Assert-ScratchPath ([string]$item) }
     foreach ($item in @($data.KeyList)) {
         Assert-CatalogPath ([string]$item.Path)
         if ([string]::IsNullOrEmpty([string]$item.OriginalSddl)) { throw 'winsock_recovery_record' }
@@ -384,21 +481,31 @@ function Invoke-CatalogWatch([string]$record, [string]$ready, [string]$done, [st
             if ($parent.WaitForExit(250)) { break }
         }
     }
-    if ((Test-Path -LiteralPath $done) -or -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $record) 'armed'))) {
-        Remove-CatalogRecoveryFolder $record
-        return
-    }
-    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+    $skipRestore = (Test-Path -LiteralPath $done) -or -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $record) 'armed'))
+    $restored = $skipRestore
+    for ($attempt = 0; -not $restored -and $attempt -lt 30; $attempt++) {
         try {
             Restore-CatalogAcl $data
-            Remove-CatalogRecoveryFolder $record
-            return
+            $restored = $true
         } catch {
             Start-Sleep -Seconds 1
         }
     }
-    [IO.File]::WriteAllText($ack, 'failed')
-    throw 'winsock_recovery_failed'
+    $scratchGone = $false
+    for ($attempt = 0; -not $scratchGone -and $attempt -lt 30; $attempt++) {
+        try {
+            Remove-CatalogScratchKeys @($data.ScratchPaths)
+            $scratchGone = $true
+        } catch {
+            Start-Sleep -Seconds 1
+        }
+    }
+    if (-not $restored -or -not $scratchGone) {
+        [IO.File]::WriteAllText($ack, 'failed')
+        throw 'winsock_recovery_failed'
+    }
+    Remove-CatalogRecoveryFolder $record
+    return
 }
 
 if ($RecoveryMode -eq 'watch') {

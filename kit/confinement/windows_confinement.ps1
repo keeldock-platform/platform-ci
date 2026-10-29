@@ -408,7 +408,31 @@ function Get-WinsockProbeSpecs {
             }
         }
     }
+    $controlName = 'lpac_default_key_control'
+    $specs += @{ Name = $controlName; Exe = $reg; Arguments = 'query HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 } }
     return $specs
+}
+
+function Get-LpacDiscriminatorSpecs {
+    $lease = $script:WinsockCatalogLease
+    if ($null -eq $lease -or $null -eq $lease.ScratchPaths) { return @() }
+    $reg = Join-Path $env:SystemRoot 'System32\reg.exe'
+    $arapName = 'lpac_discriminator_arap'
+    $aapName = 'lpac_discriminator_aap'
+    $specs = @()
+    $specs += @{ Name = $arapName; Exe = $reg; Arguments = ('query HKLM\' + [string]$lease.ScratchPaths.Arap); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 } }
+    $specs += @{ Name = $aapName; Exe = $reg; Arguments = ('query HKLM\' + [string]$lease.ScratchPaths.Aap); Timeout = 30; Check = { param($r) $r.ExitCode -ne 0 -and (($r.Stdout + $r.Stderr) -match 'Access is denied') } }
+    return $specs
+}
+
+function Get-LpacBehaviour($outcomes) {
+    $arap = $outcomes['lpac_discriminator_arap']
+    $aap = $outcomes['lpac_discriminator_aap']
+    if ($null -eq $arap -or $null -eq $aap -or -not $arap.Ran -or -not $aap.Ran) { return 'inconclusive' }
+    if ($arap.ExitCode -ne 0) { return 'inconclusive' }
+    if ($aap.ExitCode -eq 0) { return 'not_lpac' }
+    if ($aap.Output -match 'Access is denied') { return 'behavioural' }
+    return 'inconclusive'
 }
 
 function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
@@ -418,6 +442,7 @@ function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
     $specs = @()
     if ($confined) {
         $specs += @(Get-WinsockProbeSpecs)
+        $specs += @(Get-LpacDiscriminatorSpecs)
         $specs += @{ Name = 'cmd_exec'; Exe = $cmd; Arguments = '/d /c echo kd-lpac-cmd'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'kd-lpac-cmd' } }
         $specs += @{ Name = 'acl_ro_read'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.RustBin); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'rustc\.exe' } }
         $specs += @{ Name = 'acl_scratch_write'; Exe = $cmd; Arguments = ('/d /c copy /y nul ' + $scratch.Tmp + '\kd_write.txt'); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and (Test-Path -LiteralPath ($script:Lpac.Tmp + '\kd_write.txt')) } }
@@ -464,7 +489,7 @@ function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
             if ($firstLine) { Write-Line ('kd-diag stage=' + $spec.Name + ' stream=first line=' + (Get-CleanText $firstLine.Trim() 160)) }
         }
         $lpacProven = ($tokenText -like 'appcontainer=1,*') -and ($tokenText -like '*,lpac=1,*') -and ($tokenText -like '*,sid=match,*') -and ($tokenText -like '*,arap=present,*') -and ($tokenText -like '*,aap=absent')
-        $outcomes[$spec.Name] = @{ Passed = $passed; Job = ($jobText -like 'assigned,*'); Token = $lpacProven; AapOnly = ($tokenText -like '*,lpac=aap_only,*'); Stdout = [string]$result.Stdout }
+        $outcomes[$spec.Name] = @{ Passed = $passed; Job = ($jobText -like 'assigned,*'); Token = $lpacProven; AapOnly = ($tokenText -like '*,lpac=aap_only,*'); Stdout = [string]$result.Stdout; Ran = ($result.Failure -eq '' -and $result.Exited -and -not $result.TimedOut); ExitCode = [uint32]$result.ExitCode; Output = ([string]$result.Stdout + [string]$result.Stderr) }
     }
     return $outcomes
 }
@@ -689,13 +714,31 @@ try {
         foreach ($key in $confinedOutcomes.Keys) {
             if ($tokenState -eq 'unverified' -and $confinedOutcomes[$key].AapOnly) { $tokenState = 'aap_only' }
         }
-        Write-Line ('windows-confinement-spike=observed rust=' + $rust + ' node=' + $node + ' first_failure=' + $firstFailure + ' lpac=' + $tokenState + ' job=' + $jobState + ' acl=' + $aclState + ' acl_negative=' + $aclNegative + ' control_rust=' + $controlRust + ' control_node=' + $controlNode + ' css_transform=' + $cssTransform + ' rolldown=load_only vitest=not_run rolldown_call=not_run')
+        $lpacBehaviour = Get-LpacBehaviour $confinedOutcomes
+        $lpacBasis = 'token'
+        $containerConsistent = $true
+        foreach ($key in $confinedOutcomes.Keys) {
+            if (-not ($confinedOutcomes[$key].Token -or $confinedOutcomes[$key].AapOnly)) { $containerConsistent = $false }
+        }
+        if ($lpacBehaviour -eq 'not_lpac') {
+            $tokenState = 'not_lpac'
+        } elseif ($lpacBehaviour -eq 'behavioural') {
+            if ($containerConsistent) {
+                if ($tokenState -ne 'verified') { $lpacBasis = 'behavioural' }
+                $tokenState = 'verified'
+            }
+        } elseif ($tokenState -ne 'verified') {
+            $tokenState = 'inconclusive'
+        }
+        $lpacText = $tokenState
+        if ($lpacBasis -eq 'behavioural') { $lpacText = 'behavioural' }
+        Write-Line ('windows-confinement-spike=observed rust=' + $rust + ' node=' + $node + ' first_failure=' + $firstFailure + ' lpac=' + $lpacText + ' lpac_behaviour=' + $lpacBehaviour + ' job=' + $jobState + ' acl=' + $aclState + ' acl_negative=' + $aclNegative + ' control_rust=' + $controlRust + ' control_node=' + $controlNode + ' css_transform=' + $cssTransform + ' rolldown=load_only vitest=not_run rolldown_call=not_run')
         if ($rust -eq 'compiled' -and $node -eq 'ran' -and $firstFailure -eq 'none' -and $jobState -eq 'verified' -and $tokenState -eq 'verified' -and $aclNegative -eq 'denied') { $exitCode = 0 }
     }
 } catch {
     $reason = [string]$_.Exception.Message
     if ($phase -eq 'winsock_acl') {
-        if ($reason -notin @('winsock_catalog_path', 'winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_recovery_stop', 'winsock_registry_read', 'winsock_package_sid', 'winsock_grant_failed', 'winsock_restore_failed', 'winsock_restore_readback', 'winsock_restore_state')) {
+        if ($reason -notin @('winsock_catalog_path', 'winsock_catalog_missing', 'winsock_catalog_changed', 'winsock_catalog_readback', 'winsock_recovery_acl', 'winsock_recovery_ready', 'winsock_recovery_start', 'winsock_recovery_stop', 'winsock_registry_read', 'winsock_package_sid', 'winsock_scratch_create', 'winsock_scratch_cleanup', 'winsock_grant_failed', 'winsock_restore_failed', 'winsock_restore_readback', 'winsock_restore_state')) {
             $reason = 'winsock_registry_error'
         }
     } else {

@@ -172,6 +172,24 @@ class PublicTreeTests(unittest.TestCase):
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertEqual(action.count('"test_role_signer.py"'), 2)
 
+    def test_linux_source_build_suite_is_registered_and_discovered_at_push_time(self):
+        self.assertIn("kit/confinement/linux_source_build.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/test_linux_source_build.py", PLATFORM_FILES)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertEqual(action.count('"test_linux_source_build.py"'), 1)
+        condition = 'if [[ "${RUNNER_OS:-}" == "Linux" ]]; then\n'
+        self.assertEqual(action.count(condition), 1)
+        start = action.index(condition)
+        end = action.index("\n        fi\n", start)
+        block = action[start:end]
+        self.assertEqual(block.count('"test_linux_source_build.py"'), 1)
+        self.assertIn('"$python_bin" -B -m unittest discover', block)
+        self.assertNotIn("python3.9", block)
+        self.assertLess(start, action.index('"${RUNNER_OS:-}" == "macOS"'))
+        self.assertGreater(start, action.index('"test_role_signer.py"'))
+        macos = action[action.index('"${RUNNER_OS:-}" == "macOS"'):]
+        self.assertNotIn("test_linux_source_build.py", macos)
+
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -385,6 +385,24 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(audit.AuditRefusal):
             audit.validate_receipt(encode_receipt(extra), CONTROL_SHA, RUN_ID, RUN_ATTEMPT)
 
+    def test_receipt_accepts_each_approved_host_release_and_refuses_a_mixed_pair(self):
+        for product, image_version in audit.APPROVED_HOST_RELEASES:
+            value = receipt_value()
+            value["macos_product_version"] = product
+            value["runner_image_version"] = image_version
+            with self.subTest(product=product):
+                self.assertEqual(
+                    audit.validate_receipt(encode_receipt(value), CONTROL_SHA, RUN_ID, RUN_ATTEMPT)["schema_version"],
+                    2,
+                )
+        for product, image_version in (("15.8.2", "20260907.0337.1"), ("15.7.9", "20261028.0489.1")):
+            value = receipt_value()
+            value["macos_product_version"] = product
+            value["runner_image_version"] = image_version
+            with self.subTest(mixed=(product, image_version)):
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.validate_receipt(encode_receipt(value), CONTROL_SHA, RUN_ID, RUN_ATTEMPT)
+
     def test_receipt_rejects_success_without_per_channel_proof(self):
         value = receipt_value()
         value["channels"]["https"] = "passed"
