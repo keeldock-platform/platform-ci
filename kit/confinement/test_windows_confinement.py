@@ -434,6 +434,7 @@ foreach ($case in $cases) {
             "\\\\REGISTRY\\\\MACHINE\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Nls\\\\CodePage",
             "HasNumericSuffix(probeId, \"winsock_protocol_entry_\", 12)",
             "HasHexSuffix(probeId, \"lpac_discriminator_arap_\", 32)",
+            "HasHexSuffix(probeId, \"lpac_discriminator_aap_\", 32)",
             "status=",
             "access_denied",
             "object_name_not_found",
@@ -495,10 +496,16 @@ foreach ($case in $cases) {
         self.assertLess(body.index("lpac_discriminator_arap"), body.index("lpac_discriminator_aap"))
         lines = [line for line in body.splitlines() if "$specs += @{" in line]
         self.assertEqual(len(lines), 2)
-        self.assertIn("ScratchPaths.Arap", lines[0])
+        self.assertIn("$arapPath = [string]$lease.ScratchPaths.Arap", body)
+        self.assertIn("$aapPath = [string]$lease.ScratchPaths.Aap", body)
+        self.assertIn("$arapId = 'lpac_discriminator_arap_' + $arapPath.Substring($arapPath.LastIndexOf('\\') + 1)", body)
+        self.assertIn("$aapId = 'lpac_discriminator_aap_' + $aapPath.Substring($aapPath.LastIndexOf('\\') + 1)", body)
+        self.assertIn("$arapArguments = Get-NativeProbeArguments $arapId", body)
+        self.assertIn("$aapArguments = Get-NativeProbeArguments $aapId", body)
+        self.assertIn("Name = $arapName", lines[0])
         self.assertIn("$arapArguments", lines[0])
         self.assertIn("status=ok", lines[0])
-        self.assertIn("ScratchPaths.Aap", lines[1])
+        self.assertIn("Name = $aapName", lines[1])
         self.assertIn("$aapArguments", lines[1])
         self.assertIn("status=access_denied ntstatus=0xC0000022", lines[1])
         for line in lines:
