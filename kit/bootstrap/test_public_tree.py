@@ -171,6 +171,18 @@ class PublicTreeTests(unittest.TestCase):
             with self.assertRaisesRegex(PublicTreeError, "tree-shape"):
                 scan_tree(root, "platform")
 
+    def test_cache_policy_files_are_registered_and_test_discovery_is_active(self):
+        result = scan_tree(ROOT, "platform")
+        for name in ("kit/cache/policy.py", "kit/cache/test_policy.py"):
+            with self.subTest(name=name):
+                self.assertIn(name, PLATFORM_FILES)
+                self.assertIn(name, result)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertIn(
+            'unittest discover -s "$CI_ACTION_PATH/../cache" -p "test_*.py"',
+            action,
+        )
+
     def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
             '.github/workflows/node-lock-return.yml',

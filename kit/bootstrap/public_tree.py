@@ -95,6 +95,8 @@ PLATFORM_FILES = frozenset(
         "kit/handoff/test_source_free.py",
         "kit/selector/suite_selector.py",
         "kit/selector/test_suite_selector.py",
+        "kit/cache/policy.py",
+        "kit/cache/test_policy.py",
         "kit/confinement/macos_boundary_guard.py",
         "kit/confinement/test_macos_boundary_guard.py",
         "kit/confinement/macos_canary_scan.py",
