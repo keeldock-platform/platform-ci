@@ -736,6 +736,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertEqual(result["reviewed_rust_paths"], list(kernel_paths))
         self.assertEqual(result["payload_bytes"], b"synthetic-format-patch")
 
+    @unittest.skipUnless(sys.platform != "win32", "the macOS producer path is POSIX only")
     def test_encrypt_after_cleanup_retries_credential_text_with_captured_source_bytes(self):
         dispatch = _validated_dispatch("rust_patch")
         result = {

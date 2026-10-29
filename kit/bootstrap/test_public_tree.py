@@ -235,6 +235,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_node_contract_validation.mjs',
             'kit/confinement/macos_feedback_producer.py',
             'kit/confinement/test_macos_feedback_producer.py',
+            'kit/confinement/test_macos_feedback_output_limits.py',
             'kit/confinement/feedback_producer_crypto.mjs',
             'kit/confinement/test_feedback_producer_crypto.mjs',
             'kit/confinement/feedback_admin.py',
