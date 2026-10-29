@@ -145,13 +145,13 @@ function rustContext(state) {
   return makeContext(state.keyInfo.recipient_fingerprint, 'core-rust-format-return');
 }
 
-function encryptRustFixture(state, context, original) {
+function encryptRustFixture(state, context, original, reviewedPaths = ['src/lib.rs']) {
   return encryptDevelopmentFeedbackWithRustSources({
     payloadBytes: rustPatch(),
     context,
     recipientPublicKey: state.publicKey,
     now: NOW,
-    reviewedRustPaths: ['src/lib.rs'],
+    reviewedRustPaths: reviewedPaths,
   }, new Map([['src/lib.rs', original]]));
 }
 
@@ -163,7 +163,8 @@ function writeRustSource(state, contents) {
   return root;
 }
 
-async function decryptRustFixture(state, envelope, context, sourceDirectory) {
+async function decryptRustFixture(state, envelope, context, sourceDirectory,
+  reviewedPaths = ['src/lib.rs']) {
   const outputPath = join(state.directory, `rust-output-${Math.random().toString(16).slice(2)}.payload`);
   const fd = openSync(outputPath, 'wx', 0o600);
   const message = {
@@ -173,7 +174,7 @@ async function decryptRustFixture(state, envelope, context, sourceDirectory) {
     now: NOW,
     envelope_base64: Buffer.from(envelope).toString('base64'),
     plaintext_fd: fd,
-    reviewed_rust_paths: ['src/lib.rs'],
+    reviewed_rust_paths: reviewedPaths,
   };
   if (sourceDirectory !== undefined) message.rust_source_directory = sourceDirectory;
   try {
@@ -218,6 +219,22 @@ test('decrypts a whitespace-equivalent rust patch using consumer-local originals
   const envelope = encryptRustFixture(state, context, original);
   const sourceDirectory = writeRustSource(state, original);
   const { result, outputPath } = await decryptRustFixture(state, envelope, context, sourceDirectory);
+  assert.deepEqual(result, { schema_version: 1, ok: true });
+  assert.deepEqual(readFileSync(outputPath), rustPatch());
+});
+
+test('decrypts a subset patch when the consumer reads every reviewed source path',
+  { skip: !POSIX_OWNER_FILESYSTEM }, async (t) => {
+  const state = await setup();
+  t.after(() => rmSync(state.directory, { recursive: true, force: true }));
+  const context = rustContext(state);
+  const reviewedPaths = ['src/lib.rs', 'src/unchanged.rs'];
+  const original = Buffer.from('let token=CancellationToken::new();\n', 'utf8');
+  const envelope = encryptRustFixture(state, context, original, reviewedPaths);
+  const sourceDirectory = writeRustSource(state, original);
+  writeFileSync(join(sourceDirectory, 'src', 'unchanged.rs'), 'fn unchanged() {}\n', { mode: 0o600 });
+  const { result, outputPath } = await decryptRustFixture(
+    state, envelope, context, sourceDirectory, reviewedPaths);
   assert.deepEqual(result, { schema_version: 1, ok: true });
   assert.deepEqual(readFileSync(outputPath), rustPatch());
 });

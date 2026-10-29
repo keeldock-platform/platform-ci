@@ -317,7 +317,11 @@ function applyRustFilePatch(originalBytes, file) {
 
 function rustPatchWhitespaceEquivalent(text, reviewedPaths, originalRustFiles) {
   const files = parseRustPatch(text, reviewedPaths);
-  if (!(originalRustFiles instanceof Map) || originalRustFiles.size !== files.length) reject('invalid_expectation');
+  if (!(originalRustFiles instanceof Map)) reject('invalid_expectation');
+  const reviewed = new Set(reviewedPaths);
+  for (const [path, bytes] of originalRustFiles) {
+    if (!reviewed.has(path) || !(bytes instanceof Uint8Array)) reject('invalid_expectation');
+  }
   for (const file of files) {
     const originalBytes = originalRustFiles.get(file.path);
     if (!(originalBytes instanceof Uint8Array)) reject('invalid_expectation');
@@ -449,6 +453,7 @@ function prepare(options, originalRustFiles) {
   const input = dataOptions(options);
   const { profile, context } = validatedContext(input.context);
   validateExceptionWindow(context, input.now);
+  if (originalRustFiles !== undefined && profile.kind !== 'rust_patch') reject('invalid_expectation');
   input.context = context;
   const payloadBytes = copyPayload(input.payloadBytes, payloadLimit(profile.kind));
   validatePayload(payloadBytes, profile, input, originalRustFiles);

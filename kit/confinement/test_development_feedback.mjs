@@ -166,13 +166,13 @@ function validate(kind, payloadBytes, extra = {}) {
   return validateDevelopmentFeedback({ payloadBytes, context: contextFor(profileName), now: NOW, ...extra });
 }
 
-function encryptRustPatchWithSources(payloadBytes, originals) {
+function encryptRustPatchWithSources(payloadBytes, originals, reviewedRustPaths = ['src/lib.rs']) {
   return encryptDevelopmentFeedbackWithRustSources({
     payloadBytes,
     context: contextFor('core-rust-format-return'),
     recipientPublicKey: recipient.publicKey,
     now: NOW,
-    reviewedRustPaths: ['src/lib.rs'],
+    reviewedRustPaths,
   }, new Map(Object.entries(originals).map(([path, contents]) => [path, Buffer.from(contents, 'utf8')])));
 }
 
@@ -230,6 +230,24 @@ test('accepts whitespace-equivalent rust patches with credential-shaped context'
     'src/lib.rs': 'let token=CancellationToken::new();\n',
   });
   assert.ok(envelope instanceof Uint8Array);
+});
+
+test('accepts a subset patch with originals for its changed reviewed file', () => {
+  const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
+    'let token = CancellationToken::new();');
+  const envelope = encryptRustPatchWithSources(payload, {
+    'src/lib.rs': 'let token=CancellationToken::new();\n',
+  }, ['src/lib.rs', 'src/unchanged.rs']);
+  assert.ok(envelope instanceof Uint8Array);
+});
+
+test('rejects consumer originals outside the reviewed Rust path set', () => {
+  const payload = rustPatch('src/lib.rs', 'let token=CancellationToken::new();',
+    'let token = CancellationToken::new();');
+  assert.throws(() => encryptRustPatchWithSources(payload, {
+    'src/lib.rs': 'let token=CancellationToken::new();\n',
+    'src/unchanged.rs': 'fn unchanged() {}\n',
+  }, ['src/lib.rs']), { code: 'invalid_expectation' });
 });
 
 test('rejects rust patches that add a credential-shaped literal', () => {
