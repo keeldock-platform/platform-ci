@@ -812,8 +812,10 @@ class CargoLockProducerTests(unittest.TestCase):
         )
 
     def _run(self, *, returncode=0, config_error=None, bundle_error=None, kind="cargo_lock",
-             manifest_error=None, members_error=None):
+             manifest_error=None, members_error=None, workspace=None):
         dispatch = _validated_dispatch(kind)
+        if workspace is not None:
+            dispatch["request"] = dict(dispatch["request"], workspace=workspace)
         state = {"commands": [], "bundles": [], "chdir": []}
 
         def record_command(*args, **kwargs):
@@ -864,6 +866,38 @@ class CargoLockProducerTests(unittest.TestCase):
                     state["refusal"] = error.reason
         state["dispatch"] = dispatch
         return state
+
+    def test_runtime_selector_maps_to_the_fixed_runtime_root_and_member_list(self):
+        state = self._run(workspace="runtime")
+        self.assertNotIn("refusal", state)
+        project = state["worker_storage"] / "feedback-cargo-lock"
+        runtime_members = tuple(root.as_posix() for root in producer.RUNTIME_PACKAGE_ROOTS)
+        copied = state["copy"].call_args.args[2]
+        self.assertEqual(copied[0], "runtime/Cargo.toml")
+        self.assertEqual(copied[1:1 + len(runtime_members)], tuple(path + "/Cargo.toml" for path in runtime_members))
+        self.assertNotIn("Cargo.toml", copied)
+        manifests, members, selector = state["check_manifests"].call_args.args
+        self.assertEqual(sorted(manifests), sorted(("runtime/Cargo.toml",) + tuple(path + "/Cargo.toml" for path in runtime_members)))
+        self.assertEqual(members, frozenset(runtime_members))
+        self.assertEqual(selector, "runtime")
+        command = state["commands"][0][0][1]
+        self.assertEqual(command[-3:], ("generate-lockfile", "--manifest-path", str(project / "runtime/Cargo.toml")))
+        self.assertEqual(state["read_lock"].call_args.args[0], project / "runtime" / "Cargo.lock")
+        lock_bytes, context, kwargs = state["bundles"][0]
+        self.assertEqual(context["workspace_path"], "runtime")
+
+    def test_contract_request_keeps_the_root_path_and_two_argument_manifest_check(self):
+        state = self._run()
+        self.assertEqual(len(state["check_manifests"].call_args.args), 2)
+        self.assertEqual(state["bundles"][0][1]["workspace_path"], ".")
+
+    def test_unknown_selector_refuses_before_copy_or_execution(self):
+        for value in ("other", "", "runtime/", "Runtime"):
+            state = self._run(workspace=value)
+            with self.subTest(value=value):
+                self.assertEqual(state["refusal"], "request_invalid")
+                state["copy"].assert_not_called()
+                self.assertEqual(state["commands"], [])
 
     def test_other_profile_kinds_and_bad_inputs_refuse_before_copy_or_execution(self):
         state = self._run(kind="rust_patch")

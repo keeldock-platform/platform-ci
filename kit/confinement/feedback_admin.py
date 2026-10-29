@@ -40,6 +40,7 @@ REQUEST_INPUT_FIELDS = frozenset((
     "kind", "repository_id", "source_sha", "base_sha", "control_sha",
     "base_branch", "reviewed_diff_sha256", "expiry",
 ))
+REQUEST_INPUT_FIELDS_WITH_WORKSPACE = REQUEST_INPUT_FIELDS | frozenset(("workspace",))
 PACKET_FIELDS = frozenset((
     "schema_version", "request", "expected_manifest", "reviewed_rust_paths",
     "review_confirmed", "review_confirmed_at",
@@ -793,7 +794,12 @@ class FeedbackAdmin:
                        reviewed_rust_paths=None, confirm_reviewed=False):
         """Persist a fresh reviewed request and return only its canonical record and public key."""
         now = self._now()
-        if not _exact_dict(reviewed_fields, REQUEST_INPUT_FIELDS) or confirm_reviewed is not True:
+        input_fields = (
+            REQUEST_INPUT_FIELDS_WITH_WORKSPACE
+            if type(reviewed_fields) is dict and "workspace" in reviewed_fields
+            else REQUEST_INPUT_FIELDS
+        )
+        if not _exact_dict(reviewed_fields, input_fields) or confirm_reviewed is not True:
             _refuse()
         packet_limit_value = {
             "schema_version": 1,
@@ -848,6 +854,8 @@ class FeedbackAdmin:
                     "nonce": nonce,
                     "expiry": reviewed_fields["expiry"],
                 }
+                if "workspace" in reviewed_fields:
+                    request_fields["workspace"] = reviewed_fields["workspace"]
                 request = feedback_request.create_request(request_fields, now=now)
                 request_id = request["request_id"]
                 canonical = feedback_request.encode_request(request, now=now)

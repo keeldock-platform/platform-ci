@@ -53,6 +53,14 @@ PACKAGE_ROOTS = (
     Path("crates/host/api"), Path("crates/host/mock"), Path("crates/host/conformance"),
     Path("crates/kernel/i18n"),
 )
+RUNTIME_PACKAGE_ROOTS = tuple(
+    Path("runtime/crates/test-fixtures") / name
+    for name in (
+        "host-router", "fixture-data", "tool-a", "tool-b",
+        "tool-bad-no-handler", "tool-bad-no-manifest",
+    )
+)
+CARGO_WORKSPACE_ROOTS = {"contract": PACKAGE_ROOTS, "runtime": RUNTIME_PACKAGE_ROOTS}
 FOUNDATION_FUZZ_RUST_PATHS = (
     "fuzz/src/main.rs",
     "fuzz/fuzz_targets/identifiers.rs",
@@ -280,11 +288,11 @@ def _validated_fuzz_rust_paths(source):
     return tuple(paths)
 
 
-def _reviewed_rust_paths(source, *, include_fuzz=False):
+def _reviewed_rust_paths(source, *, include_fuzz=False, roots=None):
     if type(include_fuzz) is not bool:
         _refuse("manifest_invalid")
     paths = []
-    for package_root in PACKAGE_ROOTS:
+    for package_root in (PACKAGE_ROOTS if roots is None else roots):
         source_directory = source / package_root / "src"
         try:
             source_info = source_directory.lstat()
@@ -828,17 +836,24 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
             or type(environment) is not dict or type(tools) is not dict):
         _refuse("request_invalid")
     request = dispatch["request"]
+    selector = feedback_request.request_workspace(request)
+    roots = CARGO_WORKSPACE_ROOTS.get(selector) if type(selector) is str else None
+    if roots is None:
+        _refuse("request_invalid")
     worker_gid = capability.PROBE_PRIMARY_GID
     refusal_type = bootstrap.BootstrapRefusal
     project = worker_storage / "feedback-cargo-lock"
     cargo_home = worker_storage / "cargo-lock-home"
     try:
         bootstrap.refuse_cargo_config(source)
-        reviewed_paths = _reviewed_rust_paths(source)
-        manifests = ("Cargo.toml",) + tuple((root / "Cargo.toml").as_posix() for root in PACKAGE_ROOTS)
+        reviewed_paths = _reviewed_rust_paths(source, roots=roots)
+        root_manifest = bootstrap.workspace_root_manifest(selector)
+        manifests = (root_manifest,) + tuple((root / "Cargo.toml").as_posix() for root in roots)
         manifest_bytes = {path: _read_file(source / path, maximum=MAX_PACKAGE_JSON_BYTES) for path in manifests}
-        package_names = bootstrap.check_manifests(
-            manifest_bytes, frozenset(root.as_posix() for root in PACKAGE_ROOTS),
+        member_paths = frozenset(root.as_posix() for root in roots)
+        package_names = (
+            bootstrap.check_manifests(manifest_bytes, member_paths) if selector == "contract"
+            else bootstrap.check_manifests(manifest_bytes, member_paths, selector)
         )
         _copy_reviewed_files(source, project, manifests + reviewed_paths, worker_uid, worker_gid)
         _make_worker_directory(cargo_home, worker_uid, worker_gid)
@@ -848,7 +863,9 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
             environment, cargo_home=str(cargo_home), home=environment.get("HOME"),
             tmpdir=str(worker_storage / "tmp"), path=environment.get("PATH"),
         )
-        command = bootstrap.generate_lockfile_command(str(tools["cargo"]), str(project / "Cargo.toml"))
+        command = bootstrap.generate_lockfile_command(
+            str(tools["cargo"]), str(project / root_manifest),
+        )
     except refusal_type as error:
         _cargo_bootstrap_refusal(bootstrap, error)
     try:
@@ -864,7 +881,9 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
             os.chdir(source)
         except OSError:
             _refuse("cleanup_incomplete")
-    lock_bytes = _read_worker_file(project / "Cargo.lock", worker_uid, bootstrap.MAX_LOCK_BYTES)
+    lock_bytes = _read_worker_file(
+        (project / root_manifest).parent / "Cargo.lock", worker_uid, bootstrap.MAX_LOCK_BYTES,
+    )
     toolchain_target, toolchain_hash = _cargo_toolchain_hash(rust, bootstrap)
     try:
         bootstrap.check_lock_members(lock_bytes, package_names)
@@ -874,7 +893,7 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
     name = source_environ.get("SOURCE_REPOSITORY_NAME", "")
     trusted_context = {
         "repository": owner + "/" + name,
-        "workspace_path": ".",
+        "workspace_path": bootstrap.workspace_directory(selector),
         "source_sha": request["source_sha"],
         "base_sha": request["base_sha"],
         "base_branch": request["base_branch"],

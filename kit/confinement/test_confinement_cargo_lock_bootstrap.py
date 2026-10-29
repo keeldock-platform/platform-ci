@@ -1204,5 +1204,160 @@ class ManifestCheckTests(BootstrapTestCase):
         self.assertEqual(json.loads(self.evidence(FakeFetcher()))["toolchain_target"], TARGET)
 
 
+RUNTIME_MEMBERS = ("runtime/crates/test-fixtures/tool-a", "runtime/crates/test-fixtures/tool-b")
+RUNTIME_ROOT = (
+    "[workspace]\n"
+    'resolver = "3"\n'
+    "members = [\n"
+    '    "crates/test-fixtures/tool-a",\n'
+    '    "crates/test-fixtures/tool-b",\n'
+    "]\n\n"
+    "[workspace.package]\n"
+    'version = "0.1.0"\nedition = "2024"\n'
+)
+
+
+def _runtime_member(name, extra="", package_extra=""):
+    return (
+        '[package]\nname = "' + name + '"\n'
+        "edition.workspace = true\n" + package_extra + extra
+    )
+
+
+def _runtime_manifests(root=RUNTIME_ROOT, package_extra=""):
+    return {
+        "runtime/Cargo.toml": root.encode("utf-8"),
+        "runtime/crates/test-fixtures/tool-a/Cargo.toml": _runtime_member(
+            "tool-a", package_extra=package_extra,
+        ).encode("utf-8"),
+        "runtime/crates/test-fixtures/tool-b/Cargo.toml": _runtime_member("tool-b").encode("utf-8"),
+    }
+
+
+class RuntimeWorkspaceTests(BootstrapTestCase):
+    def check(self, manifests, members=RUNTIME_MEMBERS, workspace="runtime"):
+        return subject.check_manifests(manifests, members, workspace)
+
+    def assert_refused(self, manifests, members=RUNTIME_MEMBERS, workspace="runtime"):
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            subject.check_manifests(manifests, members, workspace)
+        self.assertIn(raised.exception.reason, ("bootstrap_manifest_refused", "bootstrap_input_invalid"))
+
+    def test_selector_maps_only_to_the_two_fixed_roots(self):
+        self.assertEqual(subject.workspace_root_manifest("contract"), "Cargo.toml")
+        self.assertEqual(subject.workspace_root_manifest("runtime"), "runtime/Cargo.toml")
+        self.assertEqual(subject.workspace_directory("runtime"), "runtime")
+        for value in ("", "other", "runtime/..", "../runtime", "/runtime", "Runtime", None, 1, b"runtime"):
+            with self.subTest(value=value), self.assertRaises(subject.BootstrapRefusal):
+                subject.workspace_directory(value)
+
+    def test_runtime_manifests_with_plain_inside_members_are_accepted(self):
+        self.assertEqual(self.check(_runtime_manifests()), frozenset(("tool-a", "tool-b")))
+
+    def test_empty_runtime_workspace_is_accepted(self):
+        root = "[workspace]\nresolver = \"3\"\nmembers = []\n"
+        self.assertEqual(self.check({"runtime/Cargo.toml": root.encode("utf-8")}, ()), frozenset())
+
+    def test_runtime_and_contract_manifests_never_satisfy_each_other(self):
+        self.assert_refused(_runtime_manifests(), workspace="contract")
+        self.assert_refused(_contract_manifests(), members=CONTRACT_MEMBERS, workspace="runtime")
+        self.assert_refused({"Cargo.toml": RUNTIME_ROOT.encode("utf-8")}, workspace="runtime")
+
+    def test_runtime_members_must_be_fixed_paths_inside_the_runtime_crates_directory(self):
+        for member in (
+            "crates/host/api", "packages/x", "runtime/x", "runtime/crates/x", "runtime/apps/x",
+            "runtime/crates/a/b/c", "runtime/crates/A/b", "runtime/crates/../crates/a/b",
+            "crates/test-fixtures/tool-a", "/runtime/crates/a/b",
+        ):
+            with self.subTest(member=member):
+                self.assert_refused(_runtime_manifests(), members=(member,))
+
+    def test_runtime_member_list_must_match_exactly(self):
+        for root in (
+            RUNTIME_ROOT.replace('    "crates/test-fixtures/tool-b",\n', ""),
+            RUNTIME_ROOT.replace("tool-b", "tool-c"),
+            RUNTIME_ROOT.replace('"crates/', '"runtime/crates/'),
+            RUNTIME_ROOT.replace("]\n\n", ']\nexclude = ["x"]\n\n', 1),
+            RUNTIME_ROOT.replace("]\n\n", ']\ndefault-members = ["crates/test-fixtures/tool-a"]\n\n', 1),
+        ):
+            with self.subTest(root=root):
+                self.assert_refused(_runtime_manifests(root=root))
+
+    def test_any_parent_segment_or_package_workspace_key_is_refused_in_runtime_manifests(self):
+        for root in (
+            RUNTIME_ROOT.replace('"crates/test-fixtures/tool-a"', '"../runtime/crates/test-fixtures/tool-a"'),
+            RUNTIME_ROOT.replace('"crates/test-fixtures/tool-a"', '"crates/../crates/test-fixtures/tool-a"'),
+            RUNTIME_ROOT + '\n[workspace.dependencies]\nx = { path = "../runtime/crates/test-fixtures/tool-a" }\n',
+        ):
+            with self.subTest(root=root):
+                self.assert_refused(_runtime_manifests(root=root))
+        for package_extra in (
+            'workspace = "../../../../runtime"\n', 'workspace = "."\n', 'workspace = "../.."\n',
+        ):
+            with self.subTest(package_extra=package_extra):
+                self.assert_refused(_runtime_manifests(package_extra=package_extra))
+        manifests = _runtime_manifests()
+        manifests["runtime/crates/test-fixtures/tool-a/Cargo.toml"] = _runtime_member(
+            "tool-a", extra='\n[dependencies]\nb = { path = "../tool-b" }\n',
+        ).encode("utf-8")
+        self.assert_refused(manifests)
+        with_package = _runtime_manifests(root=RUNTIME_ROOT + '\n[package]\nname = "x"\nedition = "2024"\n')
+        self.assert_refused(with_package)
+
+    def test_runtime_foreign_dependency_forms_are_refused(self):
+        git = "https:" + chr(47) * 2 + "example.invalid/crate"
+        for dependency in (
+            'a = { git = "' + git + '" }',
+            'a = { path = "crates/test-fixtures/tool-b" }',
+            'a = "1.0.0"',
+        ):
+            manifests = _runtime_manifests()
+            manifests["runtime/crates/test-fixtures/tool-a/Cargo.toml"] = (
+                _runtime_member("tool-a", extra="[dependencies]\n" + dependency + "\n")
+            ).encode("utf-8")
+            with self.subTest(dependency=dependency):
+                self.assert_refused(manifests)
+
+    def test_runtime_root_path_dependencies_name_members_relative_to_the_root(self):
+        root = RUNTIME_ROOT + '\n[workspace.dependencies]\nb = { path = "crates/test-fixtures/tool-b" }\n'
+        manifests = _runtime_manifests(root=root)
+        manifests["runtime/crates/test-fixtures/tool-a/Cargo.toml"] = _runtime_member(
+            "tool-a", extra="[dependencies]\nb = { workspace = true }\n",
+        ).encode("utf-8")
+        self.assertEqual(self.check(manifests), frozenset(("tool-a", "tool-b")))
+
+    def test_runtime_lock_check_requires_exact_sourceless_members(self):
+        lock = (
+            "version = 4\n\n[[package]]\nname = \"tool-a\"\nversion = \"0.1.0\"\n\n"
+            "[[package]]\nname = \"tool-b\"\nversion = \"0.1.0\"\n"
+        ).encode("ascii")
+        self.assertTrue(subject.check_lock_members(lock, frozenset(("tool-a", "tool-b"))))
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_lock_members(lock, frozenset(("tool-a",)))
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_lock_members(lock, frozenset(("tool-a", "tool-b", "tool-c")))
+
+
+class ContractWorkspaceUnchangedTests(BootstrapTestCase):
+    def test_default_selector_is_the_contract_workspace(self):
+        self.assertEqual(
+            subject.check_manifests(_contract_manifests(), CONTRACT_MEMBERS),
+            subject.check_manifests(_contract_manifests(), CONTRACT_MEMBERS, "contract"),
+        )
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_manifests(_contract_manifests(), CONTRACT_MEMBERS, "other")
+
+    def test_contract_package_workspace_key_is_still_refused(self):
+        manifests = _contract_manifests()
+        manifests["crates/host/api/Cargo.toml"] = (
+
+            _contract_member("host-api", "Synthetic.").replace(
+                "[package]\n", '[package]\nworkspace = "../../.."\n', 1,
+            )
+        ).encode("utf-8")
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_manifests(manifests, CONTRACT_MEMBERS)
+
+
 if __name__ == "__main__":
     unittest.main()
