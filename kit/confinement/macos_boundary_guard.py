@@ -13,6 +13,10 @@ APPROVED_PRODUCT_VERSION = "15.7.9"
 APPROVED_IMAGE_OS = "macos15"
 APPROVED_RUNNER_IMAGE_OS = "macos-15-arm64"
 APPROVED_IMAGE_VERSION = "20260907.0337.1"
+APPROVED_HOST_RELEASES = (
+    (APPROVED_PRODUCT_VERSION, APPROVED_IMAGE_VERSION),
+    ("15.8.2", "20261028.0489.1"),
+)
 APPROVED_ARCHITECTURE = "arm64"
 SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec"
 SW_VERS_PATH = "/usr/bin/sw_vers"
@@ -182,12 +186,15 @@ def _identity_from_host():
         image_version=os.environ.get("ImageVersion", ""),
         architecture=platform.machine(),
     )
-    if identity != PlatformIdentity(
-        product_version=APPROVED_PRODUCT_VERSION,
-        image_os=APPROVED_IMAGE_OS,
-        runner_image_os=APPROVED_RUNNER_IMAGE_OS,
-        image_version=APPROVED_IMAGE_VERSION,
-        architecture=APPROVED_ARCHITECTURE,
+    if identity not in tuple(
+        PlatformIdentity(
+            product_version=release[0],
+            image_os=APPROVED_IMAGE_OS,
+            runner_image_os=APPROVED_RUNNER_IMAGE_OS,
+            image_version=release[1],
+            architecture=APPROVED_ARCHITECTURE,
+        )
+        for release in APPROVED_HOST_RELEASES
     ):
         raise GuardError("platform_unapproved")
     return identity
