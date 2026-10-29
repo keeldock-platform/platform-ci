@@ -9,7 +9,7 @@ import {
   encryptDevelopmentFeedback,
   validateDevelopmentFeedback,
 } from './development_feedback.mjs';
-import { encryptReturnEnvelope, RETURN_PROFILES } from './node_lock_envelope.mjs';
+import { encryptReturnEnvelope, LOCK_ENVELOPE_LIMITS, RETURN_PROFILES } from './node_lock_envelope.mjs';
 
 const NOW = 1_793_160_000;
 let recipient;
@@ -107,6 +107,56 @@ function rustPatch(
   ].join('\n'), 'utf8');
 }
 
+function sizedRustPatch(totalBytes) {
+  const width = 4000;
+  const prefix = [
+    'diff --git a/src/lib.rs b/src/lib.rs',
+    'index 1111111..2222222 100644',
+    '--- a/src/lib.rs',
+    '+++ b/src/lib.rs',
+    '',
+  ].join('\n');
+  const pairs = Math.floor((totalBytes - 512) / (2 * (width + 2)));
+  const header = `@@ -1,${pairs} +1,${pairs} @@\n`;
+  const extra = totalBytes - prefix.length - header.length - pairs * 2 * (width + 2);
+  const removed = Array.from({ length: pairs }, () => `-${'x'.repeat(width)}\n`).join('');
+  const added = Array.from({ length: pairs },
+    (_, index) => `+${'y'.repeat(index === pairs - 1 ? width + extra : width)}\n`).join('');
+  const patch = Buffer.from(prefix + header + removed + added, 'ascii');
+  assert.equal(patch.length, totalBytes);
+  return patch;
+}
+
+function linedRustPatch(totalLines) {
+  const hunks = Math.floor((totalLines - 4) / 3);
+  const spare = totalLines - 4 - hunks * 3;
+  const lines = [
+    'diff --git a/src/lib.rs b/src/lib.rs',
+    'index 1111111..2222222 100644',
+    '--- a/src/lib.rs',
+    '+++ b/src/lib.rs',
+  ];
+  for (let index = 0; index < hunks; index += 1) {
+    const extra = index === hunks - 1 ? spare : 0;
+    lines.push(`@@ -${index * 2 + 1},${1 + extra} +${index * 2 + 1},${1 + extra} @@`, '-a', '+b');
+    for (let count = 0; count < extra; count += 1) lines.push(' c');
+  }
+  lines.push('');
+  const patch = Buffer.from(lines.join('\n'), 'ascii');
+  assert.equal(lines.length - 1, totalLines);
+  return patch;
+}
+
+function manyFilePatch(count) {
+  const lines = [];
+  for (let index = 0; index < count; index += 1) {
+    const path = index === 0 ? 'src/lib.rs' : `src/module_${index}.rs`;
+    lines.push(`diff --git a/${path} b/${path}`, '--- a/' + path, '+++ b/' + path, '@@ -1,1 +1,1 @@', '-a', '+b');
+  }
+  lines.push('');
+  return Buffer.from(lines.join('\n'), 'ascii');
+}
+
 function validate(kind, payloadBytes, extra = {}) {
   const profileName = kind === 'lock' ? 'core-node-lock-return'
     : kind === 'rust_patch' ? 'core-rust-format-return'
@@ -158,6 +208,59 @@ test('bounds the reviewed Rust path list at the four crate headroom', () => {
   assert.deepEqual(validate('rust_patch', payload, { reviewedRustPaths: reviewed(512) }), payload);
   assert.throws(() => validate('rust_patch', payload, { reviewedRustPaths: reviewed(513) }), DevelopmentFeedbackError);
   assert.throws(() => validate('rust_patch', payload, { reviewedRustPaths: [] }), DevelopmentFeedbackError);
+});
+
+test('pins the Rust patch limits to the reviewed path cap and the envelope plaintext bound', () => {
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes, 4 * 1024 * 1024 - 64 * 1024);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes, LOCK_ENVELOPE_LIMITS.plaintextBytes);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.rustPatchFiles, 512);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.rustPatchFiles, DEVELOPMENT_FEEDBACK_LIMITS.reviewedRustPaths);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.rustPatchLines, 131_072);
+});
+
+test('accepts a Rust patch of exactly the byte limit and rejects one byte more', () => {
+  const limit = DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes;
+  const atLimit = sizedRustPatch(limit);
+  assert.deepEqual(validate('rust_patch', atLimit, { reviewedRustPaths: ['src/lib.rs'] }), atLimit);
+  assert.throws(() => validate('rust_patch', sizedRustPatch(limit + 1), { reviewedRustPaths: ['src/lib.rs'] }),
+    { code: 'payload_too_large' });
+});
+
+test('accepts a Rust patch at the file cap and rejects one file more', () => {
+  const reviewed = (count) => ['src/lib.rs', ...Array.from({ length: count - 1 }, (_, index) => `src/module_${index + 1}.rs`)];
+  const atCap = manyFilePatch(DEVELOPMENT_FEEDBACK_LIMITS.rustPatchFiles);
+  assert.deepEqual(validate('rust_patch', atCap, { reviewedRustPaths: reviewed(512) }), atCap);
+  assert.throws(() => validate('rust_patch', manyFilePatch(DEVELOPMENT_FEEDBACK_LIMITS.rustPatchFiles + 1), {
+    reviewedRustPaths: reviewed(512),
+  }), DevelopmentFeedbackError);
+});
+
+test('accepts a Rust patch below the line limit and rejects one at the limit', () => {
+  const limit = DEVELOPMENT_FEEDBACK_LIMITS.rustPatchLines;
+  const below = linedRustPatch(limit - 1);
+  assert.deepEqual(validate('rust_patch', below, { reviewedRustPaths: ['src/lib.rs'] }), below);
+  assert.throws(() => validate('rust_patch', linedRustPatch(limit), { reviewedRustPaths: ['src/lib.rs'] }),
+    { code: 'limit_exceeded' });
+});
+
+test('round trips a Rust patch of exactly the byte limit through the envelope', () => {
+  const context = contextFor('core-rust-format-return');
+  const payload = sizedRustPatch(DEVELOPMENT_FEEDBACK_LIMITS.rustPatchBytes);
+  const envelope = encryptDevelopmentFeedback({
+    payloadBytes: payload,
+    context,
+    recipientPublicKey: recipient.publicKey,
+    now: NOW,
+    reviewedRustPaths: ['src/lib.rs'],
+  });
+  assert.ok(envelope.byteLength <= LOCK_ENVELOPE_LIMITS.frameBytes);
+  assert.deepEqual(decryptDevelopmentFeedback({
+    envelope,
+    context,
+    recipientPrivateKey: recipient.privateKey,
+    now: NOW,
+    reviewedRustPaths: ['src/lib.rs'],
+  }), payload);
 });
 
 test('accepts bounded diagnostics and rejects malformed or credential-shaped text', () => {

@@ -234,6 +234,14 @@ class CargoLockProfileTests(unittest.TestCase):
         )
         self.assertLessEqual(total, profile["max_payload_bytes"])
 
+    def test_rust_patch_profile_limit_matches_the_envelope_plaintext_bound(self):
+        profile = subject.PROFILE_BY_KIND["rust_patch"]
+        node_profile = subject.PROFILE_BY_KIND["lock"]
+        self.assertEqual(profile["max_payload_bytes"], 4 * 1024 * 1024 - 64 * 1024)
+        self.assertEqual(profile["max_payload_bytes"], node_profile["max_payload_bytes"])
+        self.assertGreater(profile["max_payload_bytes"], subject.CARGO_LOCK_MAX_PAYLOAD_BYTES)
+        self.assertGreater(profile["max_payload_bytes"], subject.PROFILE_BY_KIND["build_diagnostics"]["max_payload_bytes"])
+
     def test_requests_bind_the_cargo_lock_kind_concern_and_workflow_exactly(self):
         request = subject.create_request(_cargo_fields(0), now=NOW)
         record = subject.encode_request(request, now=NOW)
@@ -337,6 +345,57 @@ class CargoLockProfileTests(unittest.TestCase):
         ):
             with self.subTest(kind=kind, inputs=repr(inputs)):
                 self.assert_refused(subject.validate_build_inputs, kind, inputs)
+
+
+class WorkspaceSelectorTests(unittest.TestCase):
+    def assert_refused(self, operation, *args, **kwargs):
+        with self.assertRaises(subject.RequestRefusal):
+            operation(*args, **kwargs)
+
+    def test_absent_selector_keeps_the_canonical_record_and_means_contract(self):
+        fields = _fields("cargo_lock")
+        request = subject.create_request(fields, now=NOW)
+        record = subject.encode_request(request, now=NOW)
+        self.assertNotIn(b"workspace=", record)
+        self.assertEqual(subject.request_workspace(request), "contract")
+        self.assertEqual(subject.parse_request(record, now=NOW), request)
+
+    def test_runtime_selector_is_a_bound_canonical_line_for_the_lock_profile_only(self):
+        fields = _fields("cargo_lock")
+        fields["workspace"] = "runtime"
+        request = subject.create_request(fields, now=NOW)
+        record = subject.encode_request(request, now=NOW)
+        preimage = record.rsplit(b"request_id=", 1)[0]
+        self.assertTrue(preimage.endswith(b"expiry=" + str(NOW + 3600).encode("ascii") + b"\nworkspace=runtime\n"))
+        self.assertEqual(subject.parse_request(record, now=NOW), request)
+        self.assertEqual(subject.request_workspace(request), "runtime")
+        plain = subject.create_request(_fields("cargo_lock"), now=NOW)
+        self.assertNotEqual(plain["request_id"], request["request_id"])
+        for kind in ("lock", "rust_patch", "build_diagnostics"):
+            other = _fields(kind)
+            other["workspace"] = "runtime"
+            with self.subTest(kind=kind):
+                self.assert_refused(subject.create_request, other, now=NOW)
+
+    def test_every_other_selector_value_is_refused(self):
+        for value in ("contract", "", "Runtime", "runtime/", "../runtime", "other", None, 1, b"runtime"):
+            fields = _fields("cargo_lock")
+            fields["workspace"] = value
+            with self.subTest(value=value):
+                self.assert_refused(subject.create_request, fields, now=NOW)
+
+    def test_selector_line_cannot_be_dropped_reordered_or_duplicated(self):
+        fields = _fields("cargo_lock")
+        fields["workspace"] = "runtime"
+        record = subject.encode_request(subject.create_request(fields, now=NOW), now=NOW)
+        for bad in (
+            record.replace(b"workspace=runtime\n", b"", 1),
+            record.replace(b"workspace=runtime\n", b"workspace=runtime\nworkspace=runtime\n", 1),
+            record.replace(b"workspace=runtime\n", b"workspace=contract\n", 1),
+            record.replace(b"workspace=runtime\n", b"unknown=runtime\n", 1),
+        ):
+            with self.subTest(bad=bad):
+                self.assert_refused(subject.parse_request, bad, now=NOW)
 
 
 if __name__ == "__main__":

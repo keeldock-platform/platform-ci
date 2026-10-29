@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import posixpath
 import re
 import selectors
 import shlex
@@ -235,16 +236,57 @@ CORE_CONTRACT_MANIFEST_ASSIGNMENT_PATTERN = re.compile(r"([A-Za-z0-9_.-]{1,64})\
 CORE_CONTRACT_MANIFEST_NAME_PATTERN = re.compile(r'"[a-z][a-z0-9]*(?:-[a-z0-9]+)*"\Z')
 CORE_CONTRACT_MANIFEST_TEXT_PATTERN = re.compile(r'"[A-Za-z0-9 ,.:()-]{1,256}"\Z')
 CORE_CONTRACT_MANIFEST_WORKSPACE_VALUE_PATTERN = re.compile(r"\{\s*workspace\s*=\s*true\s*\}\Z")
-CORE_CONTRACT_ROOT_SECTIONS = frozenset((
-    "[workspace]", "[workspace.package]", "[workspace.dependencies]",
-    "[workspace.lints.rust]", "[workspace.lints.clippy]",
-))
-CORE_CONTRACT_ROOT_PATH_LINE_PATTERN = re.compile(
-    r'(keeldock' r'-host-(?:api|mock))\s*=\s*\{\s*path\s*=\s*"(crates/host/(?:api|mock))"\s*\}\Z'
-)
 CORE_CONTRACT_ROOT_PATH_DEPENDENCIES = {
     "keeldock" "-host-api": "crates/host/api",
     "keeldock" "-host-mock": "crates/host/mock",
+}
+CORE_CONTRACT_ROOT_ASSIGNMENT_PATTERN = re.compile(r"([a-z][a-z0-9_-]{0,63}) = (.{1,512})\Z")
+CORE_CONTRACT_ROOT_ARRAY_ITEM = r'"[A-Za-z0-9/_-]{1,128}"'
+CORE_CONTRACT_ROOT_ARRAY_PATTERN = re.compile(
+    r"\[(?:\s*" + CORE_CONTRACT_ROOT_ARRAY_ITEM + r"(?:\s*,\s*" + CORE_CONTRACT_ROOT_ARRAY_ITEM
+    + r")*\s*,?)?\s*\]\Z"
+)
+CORE_CONTRACT_ROOT_ARRAY_LINE_PATTERN = re.compile(CORE_CONTRACT_ROOT_ARRAY_ITEM + r",?\Z")
+CORE_CONTRACT_ROOT_RESOLVER_PATTERN = re.compile(r'"[0-9]{1,2}"\Z')
+CORE_CONTRACT_ROOT_VERSION_PATTERN = re.compile(r'"[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"\Z')
+CORE_CONTRACT_ROOT_EDITION_PATTERN = re.compile(r'"[0-9]{4}"\Z')
+CORE_CONTRACT_ROOT_BOOLEAN_PATTERN = re.compile(r"(?:true|false)\Z")
+CORE_CONTRACT_ROOT_LEVEL_PATTERN = re.compile(r'"(?:forbid|deny|warn)"\Z')
+CORE_CONTRACT_ROOT_LEVEL_TABLE_PATTERN = re.compile(
+    r'\{\s*level\s*=\s*"(?:forbid|deny|warn)"\s*,\s*priority\s*=\s*-?[0-9]{1,3}\s*\}\Z'
+)
+CORE_CONTRACT_ROOT_KEYS = {
+    "[workspace]": {
+        "resolver": CORE_CONTRACT_ROOT_RESOLVER_PATTERN,
+        "members": CORE_CONTRACT_ROOT_ARRAY_PATTERN,
+        "exclude": CORE_CONTRACT_ROOT_ARRAY_PATTERN,
+    },
+    "[workspace.package]": {
+        "version": CORE_CONTRACT_ROOT_VERSION_PATTERN,
+        "edition": CORE_CONTRACT_ROOT_EDITION_PATTERN,
+        "rust-version": CORE_CONTRACT_ROOT_VERSION_PATTERN,
+        "publish": CORE_CONTRACT_ROOT_BOOLEAN_PATTERN,
+    },
+    "[workspace.dependencies]": {
+        name: re.compile(r"\{\s*path\s*=\s*" + '"' + re.escape(path) + '"' + r"\s*\}\Z")
+        for name, path in CORE_CONTRACT_ROOT_PATH_DEPENDENCIES.items()
+    },
+    "[workspace.lints.rust]": {
+        "unsafe_code": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "unsafe_op_in_unsafe_fn": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "missing_docs": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "unreachable_pub": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "warnings": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+    },
+    "[workspace.lints.clippy]": {
+        "all": CORE_CONTRACT_ROOT_LEVEL_TABLE_PATTERN,
+        "unwrap_used": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "expect_used": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "panic": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "indexing_slicing": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "cast_possible_truncation": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+        "undocumented_unsafe_blocks": CORE_CONTRACT_ROOT_LEVEL_PATTERN,
+    },
 }
 CORE_CONTRACT_SNAKE_NAME_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:_[a-z0-9]+)*\Z")
 CORE_CONTRACT_TS_SOURCE_PATH_PATTERN = re.compile(
@@ -270,6 +312,53 @@ CORE_CONTRACT_TREE_BY_CONCERN = {
     "core-rust-lock-return": "core_rust_lock_return",
 }
 CORE_CONTRACT_RULES_TAG_PATTERN = re.compile(r"tag v2\.[0-9]+\.[0-9]+\Z")
+RUNTIME_WORKSPACE_DIRECTORY = "runtime"
+RUNTIME_ROOT_MANIFEST_PATH = RUNTIME_WORKSPACE_DIRECTORY + "/Cargo.toml"
+RUNTIME_ROOT_LOCK_PATH = RUNTIME_WORKSPACE_DIRECTORY + "/Cargo.lock"
+RUNTIME_ROOT_FILES = frozenset((RUNTIME_ROOT_MANIFEST_PATH, RUNTIME_ROOT_LOCK_PATH))
+RUNTIME_PART_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
+RUNTIME_CRATES_DIRECTORY = (RUNTIME_WORKSPACE_DIRECTORY, "crates")
+RUNTIME_FIXTURE_DIRECTORY = RUNTIME_CRATES_DIRECTORY + ("test-fixtures",)
+RUNTIME_CRATE_ROOTS = tuple(
+    RUNTIME_FIXTURE_DIRECTORY + (name,)
+    for name in (
+        "host-router", "fixture-data", "tool-a", "tool-b",
+        "tool-bad-no-handler", "tool-bad-no-manifest",
+    )
+)
+RUNTIME_CONFIG_FILES = ("rust-toolchain.toml", "rustfmt.toml", "clippy.toml")
+MAX_RUNTIME_MEMBERS = 32
+RUNTIME_MEMBERS_PATTERN = re.compile(r"(?m)^members\s*=\s*\[([^\]]*)\]\s*$")
+RUNTIME_MEMBER_PATTERN = re.compile(r'\s*"([A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*(?:,|\Z)')
+RUNTIME_SECTION_PATTERN = re.compile(r"\[([a-z-]{1,32})\]\Z")
+RUNTIME_ASSIGNMENT_PATTERN = re.compile(r"([A-Za-z0-9_.-]{1,64})\s*=\s*(.{1,512})\Z")
+RUNTIME_DEPENDENCY_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*\Z")
+RUNTIME_PACKAGE_NAME_PATTERN = re.compile(r'"([a-z][a-z0-9]*(?:-[a-z0-9]+)*)"\Z')
+RUNTIME_TEXT_PATTERN = re.compile(r'"[A-Za-z0-9 ,.:()-]{1,256}"\Z')
+RUNTIME_LINT_KEY_PATTERN = re.compile(r"[a-z_][a-z0-9_:]{0,63}\Z")
+RUNTIME_LINT_VALUE_PATTERN = re.compile(
+    r'"(?:allow|warn|deny|forbid)"\Z'
+    r'|\{\s*level\s*=\s*"(?:allow|warn|deny|forbid)"\s*,\s*priority\s*=\s*-?[0-9]{1,3}\s*\}\Z'
+)
+RUNTIME_ROOT_PATH_PATTERN = re.compile(r'\{\s*path\s*=\s*"([A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*\}\Z')
+RUNTIME_ROOT_SECTIONS = frozenset((
+    "[workspace]", "[workspace.package]", "[workspace.dependencies]",
+    "[workspace.lints.rust]", "[workspace.lints.clippy]",
+))
+RUNTIME_ROOT_PACKAGE_VALUES = {
+    "version": re.compile(r'"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}"\Z'),
+    "edition": re.compile(r'"2024"\Z'),
+    "rust-version": re.compile(r'"1\.99\.1"\Z'),
+    "publish": re.compile(r"false\Z"),
+}
+RUNTIME_MANIFEST_SECTIONS = frozenset(("package", "dependencies", "dev-dependencies", "lints"))
+RUNTIME_MANIFEST_INHERITED_KEYS = frozenset((
+    "version.workspace", "edition.workspace", "rust-version.workspace", "publish.workspace",
+))
+RUNTIME_WORKSPACE_VALUE_PATTERN = re.compile(r"\{\s*workspace\s*=\s*true\s*\}\Z")
+RUNTIME_LOCK_NAME_PATTERN = re.compile(r'name = "([a-z][a-z0-9_]*(?:-[a-z0-9_]+)*)"\Z')
+RUNTIME_LOCK_VERSION_PATTERN = re.compile(r'version = "[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}"\Z')
+RUNTIME_LOCK_DEPENDENCY_PATTERN = re.compile(r'\s*"([a-z][a-z0-9_]*(?:-[a-z0-9_]+)*)",?\Z')
 CORE_CONTRACT_TOOLCHAIN = b'[toolchain]\nchannel = "1.99.1"\ncomponents = ["rustfmt", "clippy"]\nprofile = "minimal"\n'
 MAX_SIGNER_BYTES = 65536
 MAX_INVENTORY_BYTES = 16384
@@ -1917,26 +2006,40 @@ def _core_contract_crate_manifest_shape(text):
 
 
 def _core_contract_workspace_paths_shape(workspace_text):
-    if type(workspace_text) is not str or "\r" in workspace_text:
+    if type(workspace_text) is not str or "\r" in workspace_text or "\x00" in workspace_text:
         return False
-    found = {}
+    section = None
+    seen = {}
+    open_array = False
     for line in workspace_text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith(chr(35)):
             continue
-        if stripped.startswith("["):
-            if stripped not in CORE_CONTRACT_ROOT_SECTIONS:
+        if open_array:
+            if stripped == "]":
+                open_array = False
+            elif CORE_CONTRACT_ROOT_ARRAY_LINE_PATTERN.fullmatch(stripped) is None:
                 return False
             continue
-        if re.search(r"\bpath\b", stripped) is None:
+        if stripped.startswith("["):
+            if stripped not in CORE_CONTRACT_ROOT_KEYS or stripped in seen:
+                return False
+            section = stripped
+            seen[section] = set()
             continue
-        match = CORE_CONTRACT_ROOT_PATH_LINE_PATTERN.fullmatch(stripped)
-        if match is None or match.group(1) in found:
+        assignment = CORE_CONTRACT_ROOT_ASSIGNMENT_PATTERN.fullmatch(stripped)
+        if section is None or assignment is None:
             return False
-        found[match.group(1)] = match.group(2)
-    return all(
-        CORE_CONTRACT_ROOT_PATH_DEPENDENCIES.get(name) == path for name, path in found.items()
-    )
+        key, value = assignment.group(1), assignment.group(2)
+        shape = CORE_CONTRACT_ROOT_KEYS[section].get(key)
+        if shape is None or key in seen[section]:
+            return False
+        seen[section].add(key)
+        if shape is CORE_CONTRACT_ROOT_ARRAY_PATTERN and value == "[":
+            open_array = True
+        elif shape.fullmatch(value) is None:
+            return False
+    return not open_array and "members" in seen.get("[workspace]", ())
 
 
 def _core_contract_path_name(path, pattern):
@@ -2019,6 +2122,320 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
     return _core_contract_package_mode(
         path, feedback_profile=concern in FEEDBACK_PROFILE_CONCERNS,
     )
+
+
+def _runtime_member_listing(crate_roots):
+    return [
+        posixpath.relpath("/".join(root), RUNTIME_WORKSPACE_DIRECTORY) for root in crate_roots
+    ]
+
+
+def _runtime_root_admitted(root):
+    return (
+        type(root) is tuple and len(root) == len(RUNTIME_CRATES_DIRECTORY) + 2
+        and root[:len(RUNTIME_CRATES_DIRECTORY)] == RUNTIME_CRATES_DIRECTORY
+        and all(
+            type(part) is str and RUNTIME_PART_PATTERN.fullmatch(part) is not None
+            for part in root[len(RUNTIME_CRATES_DIRECTORY):]
+        )
+    )
+
+
+def _runtime_workspace_path(path):
+    return type(path) is str and (
+        path == RUNTIME_WORKSPACE_DIRECTORY or path.startswith(RUNTIME_WORKSPACE_DIRECTORY + "/")
+    )
+
+
+def _runtime_workspace_present(entries):
+    return any(path in entries for path in RUNTIME_ROOT_FILES)
+
+
+def _runtime_workspace_mode(path, crate_roots):
+    if path in RUNTIME_ROOT_FILES or path in (
+        RUNTIME_WORKSPACE_DIRECTORY + "/" + name for name in RUNTIME_CONFIG_FILES
+    ):
+        return "100644"
+    for root in crate_roots:
+        prefix = "/".join(root)
+        if path.startswith(prefix + "/"):
+            relative = path[len(prefix) + 1:]
+            if relative == "Cargo.toml":
+                return "100644"
+            if (
+                relative.startswith(("src/", "tests/"))
+                and relative.endswith(".rs")
+                and relative.rsplit("/", 1)[-1] != "build.rs"
+            ):
+                return "100644"
+    return None
+
+
+def _runtime_workspace_members(workspace_text):
+    arrays = RUNTIME_MEMBERS_PATTERN.findall(workspace_text)
+    if len(arrays) != 1:
+        return None
+    body = arrays[0]
+    members = []
+    position = 0
+    while True:
+        match = RUNTIME_MEMBER_PATTERN.match(body, position)
+        if match is None:
+            break
+        members.append(match.group(1))
+        position = match.end()
+    if body[position:].strip():
+        return None
+    return members
+
+
+def _runtime_root_manifest_shape(text, crate_roots):
+    if type(text) is not str or "\r" in text or "\x00" in text or ".." in text:
+        return False
+    expected = _runtime_member_listing(crate_roots)
+    if _runtime_workspace_members(text) != expected:
+        return False
+    section = None
+    seen = {}
+    in_members = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(chr(35)):
+            continue
+        if in_members:
+            if "]" in stripped:
+                in_members = False
+            continue
+        if stripped.startswith("["):
+            if stripped not in RUNTIME_ROOT_SECTIONS or stripped in seen:
+                return False
+            section = stripped
+            seen[section] = set()
+            continue
+        assignment = RUNTIME_ASSIGNMENT_PATTERN.fullmatch(stripped)
+        if section is None or assignment is None:
+            return False
+        key, value = assignment.group(1), assignment.group(2).strip()
+        if key in seen[section]:
+            return False
+        seen[section].add(key)
+        if section == "[workspace]":
+            if key == "resolver":
+                valid = value == '"3"'
+            elif key == "members":
+                valid = True
+                in_members = "]" not in value
+            else:
+                valid = False
+        elif section == "[workspace.package]":
+            pattern = RUNTIME_ROOT_PACKAGE_VALUES.get(key)
+            valid = pattern is not None and pattern.fullmatch(value) is not None
+        elif section == "[workspace.dependencies]":
+            match = RUNTIME_ROOT_PATH_PATTERN.fullmatch(value)
+            valid = (
+                RUNTIME_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
+                and match is not None and match.group(1) in expected
+            )
+        else:
+            valid = (
+                RUNTIME_LINT_KEY_PATTERN.fullmatch(key) is not None
+                and RUNTIME_LINT_VALUE_PATTERN.fullmatch(value) is not None
+            )
+        if not valid:
+            return False
+    return seen.get("[workspace]") == {"resolver", "members"}
+
+
+def _runtime_declared_dependencies(text):
+    names = set()
+    in_section = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = stripped == "[workspace.dependencies]"
+            continue
+        if in_section and stripped and not stripped.startswith(chr(35)):
+            names.add(stripped.split("=", 1)[0].strip())
+    return names
+
+
+def _runtime_crate_manifest_name(text, declared):
+    if type(text) is not str or "\r" in text or "\x00" in text or ".." in text:
+        return None
+    section = None
+    keys = {}
+    name = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(chr(35)):
+            continue
+        header = RUNTIME_SECTION_PATTERN.fullmatch(stripped)
+        if header is not None:
+            section = header.group(1)
+            if section not in RUNTIME_MANIFEST_SECTIONS or section in keys:
+                return None
+            keys[section] = set()
+            continue
+        assignment = RUNTIME_ASSIGNMENT_PATTERN.fullmatch(stripped)
+        if section is None or assignment is None:
+            return None
+        key, value = assignment.group(1), assignment.group(2).strip()
+        if key in keys[section]:
+            return None
+        keys[section].add(key)
+        if section == "package":
+            if key == "name":
+                match = RUNTIME_PACKAGE_NAME_PATTERN.fullmatch(value)
+                valid = match is not None
+                name = match.group(1) if match is not None else None
+            elif key == "description":
+                valid = RUNTIME_TEXT_PATTERN.fullmatch(value) is not None
+            elif key in RUNTIME_MANIFEST_INHERITED_KEYS:
+                valid = value == "true"
+            else:
+                valid = False
+        elif section in ("dependencies", "dev-dependencies"):
+            valid = (
+                key in declared
+                and RUNTIME_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
+            )
+        else:
+            valid = key == "workspace" and value == "true"
+        if not valid:
+            return None
+    package = keys.get("package")
+    if (
+        name is None or package is None
+        or not (RUNTIME_MANIFEST_INHERITED_KEYS | {"name"}).issubset(package)
+    ):
+        return None
+    return name
+
+
+def _runtime_lock_package_names(text):
+    if type(text) is not str or "\r" in text or "\x00" in text:
+        return None
+    packages = []
+    top_version = False
+    in_dependencies = False
+    for line in text.split("\n"):
+        if in_dependencies:
+            if line == "]":
+                in_dependencies = False
+                continue
+            match = RUNTIME_LOCK_DEPENDENCY_PATTERN.fullmatch(line)
+            if match is None:
+                return None
+            packages[-1]["dependencies"].append(match.group(1))
+            continue
+        if not line or line.startswith(chr(35)):
+            continue
+        if line == "[[package]]":
+            packages.append({"name": None, "version": None, "dependencies": [], "listed": False})
+            continue
+        if not packages:
+            if line == "version = 4" and not top_version:
+                top_version = True
+                continue
+            return None
+        current = packages[-1]
+        name_match = RUNTIME_LOCK_NAME_PATTERN.fullmatch(line)
+        if name_match is not None and current["name"] is None:
+            current["name"] = name_match.group(1)
+        elif RUNTIME_LOCK_VERSION_PATTERN.fullmatch(line) is not None and current["version"] is None:
+            current["version"] = line
+        elif line == "dependencies = [" and not current["listed"]:
+            current["listed"] = True
+            in_dependencies = True
+        else:
+            return None
+    if in_dependencies or not top_version or len(packages) > MAX_RUNTIME_MEMBERS:
+        return None
+    names = [package["name"] for package in packages]
+    if (
+        any(package["name"] is None or package["version"] is None for package in packages)
+        or len(set(names)) != len(names)
+        or any(dependency not in names for package in packages for dependency in package["dependencies"])
+    ):
+        return None
+    return set(names)
+
+
+def _check_runtime_workspace(repository, git_executable, repo_env, entries):
+    crate_roots = RUNTIME_CRATE_ROOTS
+    if (
+        type(crate_roots) is not tuple or len(crate_roots) > MAX_RUNTIME_MEMBERS
+        or len(set(crate_roots)) != len(crate_roots)
+        or any(not _runtime_root_admitted(root) for root in crate_roots)
+    ):
+        raise Refusal("bootstrap_not_approved", "configuration")
+    required = set(RUNTIME_ROOT_FILES)
+    for root in crate_roots:
+        prefix = "/".join(root)
+        required.add(prefix + "/Cargo.toml")
+        if prefix + "/src/lib.rs" not in entries and prefix + "/src/main.rs" not in entries:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+    if not required.issubset(entries):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+    for path, (mode, unused_object_id) in entries.items():
+        if _runtime_workspace_path(path) and (
+            mode != "100644" or _runtime_workspace_mode(path, crate_roots) != "100644"
+            or _core_contract_expected_mode(path, concern="core-contract") is not None
+        ):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
+    toolchain_path = RUNTIME_WORKSPACE_DIRECTORY + "/rust-toolchain.toml"
+    if toolchain_path in entries and _contract_blob(
+        repository, git_executable, repo_env, entries, toolchain_path, core_check="toolchain",
+    ) != CORE_CONTRACT_TOOLCHAIN:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="toolchain")
+    for name in RUNTIME_CONFIG_FILES[1:]:
+        path = RUNTIME_WORKSPACE_DIRECTORY + "/" + name
+        if path in entries and _contract_blob(
+            repository, git_executable, repo_env, entries, path, core_check="package_decode",
+        ) != _contract_blob(
+            repository, git_executable, repo_env, entries, name, core_check="package_decode",
+        ):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+    root_payload = _contract_blob(
+        repository, git_executable, repo_env, entries, RUNTIME_ROOT_MANIFEST_PATH,
+        core_check="workspace_decode",
+    )
+    try:
+        root_text = root_payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_decode") from None
+    if not _runtime_root_manifest_shape(root_text, crate_roots):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
+    declared = _runtime_declared_dependencies(root_text)
+    names = []
+    for root in crate_roots:
+        payload = _contract_blob(
+            repository, git_executable, repo_env, entries, "/".join(root) + "/Cargo.toml",
+            core_check="package_decode",
+        )
+        try:
+            manifest_text = payload.decode("utf-8", "strict")
+        except UnicodeDecodeError:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
+        name = _runtime_crate_manifest_name(manifest_text, declared)
+        if name is None:
+            raise Refusal(
+                "bootstrap_snapshot_invalid", "bootstrap",
+                core_check="package_build" if "build" in manifest_text else "package_decode",
+            )
+        names.append(name)
+    if len(set(names)) != len(names):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+    lock_payload = _contract_blob(
+        repository, git_executable, repo_env, entries, RUNTIME_ROOT_LOCK_PATH,
+        core_check="cargo_lock_decode",
+    )
+    try:
+        lock_text = lock_payload.decode("ascii", "strict")
+    except UnicodeDecodeError:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_decode") from None
+    if _runtime_lock_package_names(lock_text) != set(names):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
 
 
 def _parse_rules_v2_file_manifest(payload):
@@ -2212,7 +2629,10 @@ def _safe_core_contract_tree(
             )
             if not package_lock:
                 raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+    runtime_present = _runtime_workspace_present(entries)
     for path, (mode, unused_object_id) in entries.items():
+        if runtime_present and _runtime_workspace_path(path):
+            continue
         expected_mode = _core_contract_expected_mode(path, concern=concern)
         if mode != expected_mode or expected_mode is None:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
@@ -2289,6 +2709,8 @@ def _safe_core_contract_tree(
                 "bootstrap_snapshot_invalid", "bootstrap",
                 core_check="package_build" if "build" in manifest_text else "package_decode",
             )
+    if runtime_present:
+        _check_runtime_workspace(repository, git_executable, repo_env, entries)
     tree_kind = CORE_CONTRACT_TREE_BY_CONCERN[concern]
     if concern == "core-build-diagnostic-return" and package_lock_present:
         tree_kind = CORE_CONTRACT_PACKAGE_LOCK_TREE

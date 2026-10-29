@@ -704,6 +704,36 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             )
         self.assertTrue(payload.startswith(b"diff --git a/crates/kernel/i18n/src/lib.rs "))
 
+    def test_format_patch_limit_matches_the_profile_and_is_enforced_at_the_boundary(self):
+        self.assertEqual(producer.MAX_PATCH_BYTES, 4 * 1024 * 1024 - 64 * 1024)
+        self.assertEqual(producer.MAX_PATCH_BYTES, producer.MAX_LOCK_BYTES)
+        self.assertEqual(producer.MAX_PATCH_BYTES, producer.PROFILE_BY_KIND["rust_patch"]["max_payload_bytes"])
+        self.assertLessEqual(producer.MAX_PATCH_BYTES, producer.MAX_CIPHERTEXT_BYTES - 64 * 1024)
+        self.assertLessEqual(
+            4 * ((producer.MAX_PATCH_BYTES + 2) // 3) + 128 * 1024, producer.MAX_NODE_INPUT_BYTES,
+        )
+        relative = "crates/kernel/i18n/src/lib.rs"
+        header = len(("diff --git a/" + relative + " b/" + relative + "\n").encode("ascii"))
+        for extra, accepted in ((0, True), (1, False)):
+            body = "x" * (producer.MAX_PATCH_BYTES - header - 1 + extra) + "\n"
+            with self.subTest(extra=extra), \
+                    patch.object(producer, "_read_file", return_value=b"fn a(){}\n"), \
+                    patch.object(producer, "_read_worker_file", return_value=b"fn a() {}\n"), \
+                    patch.object(producer.difflib, "unified_diff", return_value=[body]):
+                if accepted:
+                    payload = producer._rust_format_patch(
+                        Path("/synthetic-source"), Path("/synthetic-formatted"),
+                        (relative,), 501, time.monotonic() + 600,
+                    )
+                    self.assertEqual(len(payload), producer.MAX_PATCH_BYTES)
+                else:
+                    with self.assertRaises(producer.FeedbackRefusal) as raised:
+                        producer._rust_format_patch(
+                            Path("/synthetic-source"), Path("/synthetic-formatted"),
+                            (relative,), 501, time.monotonic() + 600,
+                        )
+                    self.assertEqual(raised.exception.reason, "payload_invalid")
+
     def test_cli_accepts_only_fixed_run_and_publisher_shapes(self):
         kind, core_args = producer._parse_cli([
             "run", "--profile", "lock", "--token-stdin", "--source-sha", SOURCE_SHA,
@@ -812,8 +842,10 @@ class CargoLockProducerTests(unittest.TestCase):
         )
 
     def _run(self, *, returncode=0, config_error=None, bundle_error=None, kind="cargo_lock",
-             manifest_error=None, members_error=None):
+             manifest_error=None, members_error=None, workspace=None):
         dispatch = _validated_dispatch(kind)
+        if workspace is not None:
+            dispatch["request"] = dict(dispatch["request"], workspace=workspace)
         state = {"commands": [], "bundles": [], "chdir": []}
 
         def record_command(*args, **kwargs):
@@ -864,6 +896,38 @@ class CargoLockProducerTests(unittest.TestCase):
                     state["refusal"] = error.reason
         state["dispatch"] = dispatch
         return state
+
+    def test_runtime_selector_maps_to_the_fixed_runtime_root_and_member_list(self):
+        state = self._run(workspace="runtime")
+        self.assertNotIn("refusal", state)
+        project = state["worker_storage"] / "feedback-cargo-lock"
+        runtime_members = tuple(root.as_posix() for root in producer.RUNTIME_PACKAGE_ROOTS)
+        copied = state["copy"].call_args.args[2]
+        self.assertEqual(copied[0], "runtime/Cargo.toml")
+        self.assertEqual(copied[1:1 + len(runtime_members)], tuple(path + "/Cargo.toml" for path in runtime_members))
+        self.assertNotIn("Cargo.toml", copied)
+        manifests, members, selector = state["check_manifests"].call_args.args
+        self.assertEqual(sorted(manifests), sorted(("runtime/Cargo.toml",) + tuple(path + "/Cargo.toml" for path in runtime_members)))
+        self.assertEqual(members, frozenset(runtime_members))
+        self.assertEqual(selector, "runtime")
+        command = state["commands"][0][0][1]
+        self.assertEqual(command[-3:], ("generate-lockfile", "--manifest-path", str(project / "runtime/Cargo.toml")))
+        self.assertEqual(state["read_lock"].call_args.args[0], project / "runtime" / "Cargo.lock")
+        lock_bytes, context, kwargs = state["bundles"][0]
+        self.assertEqual(context["workspace_path"], "runtime")
+
+    def test_contract_request_keeps_the_root_path_and_two_argument_manifest_check(self):
+        state = self._run()
+        self.assertEqual(len(state["check_manifests"].call_args.args), 2)
+        self.assertEqual(state["bundles"][0][1]["workspace_path"], ".")
+
+    def test_unknown_selector_refuses_before_copy_or_execution(self):
+        for value in ("other", "", "runtime/", "Runtime"):
+            state = self._run(workspace=value)
+            with self.subTest(value=value):
+                self.assertEqual(state["refusal"], "request_invalid")
+                state["copy"].assert_not_called()
+                self.assertEqual(state["commands"], [])
 
     def test_other_profile_kinds_and_bad_inputs_refuse_before_copy_or_execution(self):
         state = self._run(kind="rust_patch")

@@ -22,6 +22,7 @@ const MAX_INPUT_BYTES = 8 * 1024 * 1024;
 const MAX_KEY_BYTES = 16 * 1024;
 const MAX_ENVELOPE_BYTES = 4 * 1024 * 1024;
 const MAX_PLAINTEXT_BYTES = 4 * 1024 * 1024 - 64 * 1024;
+const BASE64_SHAPE = /^[A-Za-z0-9+/]*={0,2}$/u;
 const HEX_64 = /^[a-f0-9]{64}$/u;
 
 function refuse() {
@@ -150,7 +151,7 @@ function readPrivateKey(keyPathInput) {
 function strictEnvelope(value) {
   if (typeof value !== 'string' || value.length === 0
       || value.length > Math.ceil(MAX_ENVELOPE_BYTES / 3) * 4 + 4
-      || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value)) refuse();
+      || value.length % 4 !== 0 || !BASE64_SHAPE.test(value)) refuse();
   const bytes = Buffer.from(value, 'base64');
   if (bytes.byteLength === 0 || bytes.byteLength > MAX_ENVELOPE_BYTES || bytes.toString('base64') !== value) refuse();
   return bytes;

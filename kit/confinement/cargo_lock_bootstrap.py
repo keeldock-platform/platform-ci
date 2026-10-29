@@ -77,6 +77,13 @@ MAX_MANIFEST_LINES = 8192
 MAX_MANIFEST_VALUE_DEPTH = 8
 MAX_MANIFESTS = 16
 MAX_WORKSPACE_EXCLUDE = 64
+CONTRACT_WORKSPACE = "contract"
+RUNTIME_WORKSPACE = "runtime"
+RUNTIME_WORKSPACE_DIRECTORY = "runtime"
+WORKSPACE_DIRECTORIES = {CONTRACT_WORKSPACE: ".", RUNTIME_WORKSPACE: RUNTIME_WORKSPACE_DIRECTORY}
+RUNTIME_MEMBER_PATH_RE = re.compile(
+    RUNTIME_WORKSPACE_DIRECTORY + r"/crates/[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z"
+)
 EXCLUDE_PATH_RE = re.compile(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*\Z")
 BARE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+")
 NUMBER_RE = re.compile(r"[+-]?[0-9][0-9_]*(?:\.[0-9_]+)?(?:[eE][+-]?[0-9]+)?")
@@ -571,10 +578,36 @@ def _check_workspace_exclude(excluded, members):
                 _manifest_refuse()
 
 
-def _check_workspace_members(workspace, members):
+def workspace_directory(workspace):
+    """Map a workspace selector to its fixed root directory; any other value is refused."""
+    if type(workspace) is not str or workspace not in WORKSPACE_DIRECTORIES:
+        _refuse("bootstrap_input_invalid")
+    return WORKSPACE_DIRECTORIES[workspace]
+
+
+def workspace_root_manifest(workspace):
+    """Return the fixed root manifest path of a workspace relative to the source root."""
+    directory = workspace_directory(workspace)
+    return "Cargo.toml" if directory == "." else directory + "/Cargo.toml"
+
+
+def _resolved_listing(listed, root_directory):
+    if root_directory == ".":
+        return listed
+    return [posixpath.normpath(posixpath.join(root_directory, item)) for item in listed]
+
+
+def _check_workspace_members(workspace, members, root_directory="."):
     listed = workspace.get("members")
-    if (type(listed) is not list or any(type(item) is not str for item in listed)
-            or len(set(listed)) != len(listed) or set(listed) != set(members)):
+    if type(listed) is not list or any(type(item) is not str for item in listed):
+        _manifest_refuse()
+    resolved = _resolved_listing(listed, root_directory)
+    if len(set(listed)) != len(listed) or set(resolved) != set(members) or len(set(resolved)) != len(resolved):
+        _manifest_refuse()
+    if root_directory != "." and (
+        "exclude" in workspace or "default-members" in workspace
+        or any(".." in item or item.startswith("/") for item in listed)
+    ):
         _manifest_refuse()
     if "exclude" in workspace:
         _check_workspace_exclude(workspace["exclude"], members)
@@ -585,14 +618,14 @@ def _check_workspace_members(workspace, members):
             _manifest_refuse()
 
 
-def _check_document(document, directory, members, is_root):
+def _check_document(document, directory, members, is_root, root_directory="."):
     if set(document) - ALLOWED_TOP_TABLES:
         _manifest_refuse()
     workspace = document.get("workspace")
     if workspace is not None:
         if not is_root or type(workspace) is not dict or set(workspace) - ALLOWED_WORKSPACE_KEYS:
             _manifest_refuse()
-        _check_workspace_members(workspace, members)
+        _check_workspace_members(workspace, members, root_directory)
     elif is_root:
         _manifest_refuse()
     tables = [document[name] for name in DEPENDENCY_TABLE_NAMES if name in document]
@@ -614,6 +647,8 @@ def _check_document(document, directory, members, is_root):
     package = document.get("package")
     if package is None:
         return None, None
+    if root_directory != "." and is_root:
+        _manifest_refuse()
     if (type(package) is not dict or type(package.get("name")) is not str
             or "workspace" in package or "edition" not in package):
         _manifest_refuse()
@@ -632,7 +667,7 @@ def _check_edition(edition, root_document):
     _manifest_refuse()
 
 
-def check_manifests(manifests, members):
+def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE):
     """Check the root and member manifests before any Cargo command runs.
 
     Only exact version pins from the default registry and path dependencies that name a
@@ -641,12 +676,29 @@ def check_manifests(manifests, members):
     dependency tables, a project table, a package workspace key, a workspace member list
     that differs from the fixed members, and any package without edition 2024. Anything
     that cannot be parsed is refused. Returns the package names the manifests declare.
+
+    The workspace selector names one fixed root manifest. The contract root is the
+    repository root manifest. The runtime root is a virtual manifest in its own directory
+    whose members sit inside that directory as plain relative paths, never use a parent
+    segment and never declare a package workspace key; any parent segment anywhere in a
+    runtime manifest is refused. A manifest of one workspace never satisfies the other,
+    because the root path differs.
     """
+    root_directory = workspace_directory(workspace)
+    root_path = workspace_root_manifest(workspace)
     if (type(manifests) is not dict or type(members) not in (set, frozenset, tuple)
-            or not 1 <= len(manifests) <= MAX_MANIFESTS or "Cargo.toml" not in manifests):
+            or not 1 <= len(manifests) <= MAX_MANIFESTS or root_path not in manifests):
         _manifest_refuse()
     member_set = frozenset(members)
-    allowed = {"Cargo.toml"} | {member + "/Cargo.toml" for member in member_set}
+    if root_directory != "." and (
+        any(
+            type(member) is not str or RUNTIME_MEMBER_PATH_RE.fullmatch(member) is None
+            for member in member_set
+        )
+        or any(type(data) is not bytes or b".." in data for data in manifests.values())
+    ):
+        _manifest_refuse()
+    allowed = {root_path} | {member + "/Cargo.toml" for member in member_set}
     for path in manifests:
         if type(path) is not str or path not in allowed:
             _manifest_refuse()
@@ -654,9 +706,11 @@ def check_manifests(manifests, members):
     names = set()
     for path, document in documents.items():
         directory = posixpath.dirname(path) or "."
-        name, edition = _check_document(document, directory, member_set, path == "Cargo.toml")
+        name, edition = _check_document(
+            document, directory, member_set, path == root_path, root_directory,
+        )
         if name is not None:
-            _check_edition(edition, documents["Cargo.toml"])
+            _check_edition(edition, documents[root_path])
             if name in names:
                 _manifest_refuse()
             names.add(name)
