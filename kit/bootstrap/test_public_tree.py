@@ -235,6 +235,8 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_windows_native_preflight.py",
             "kit/confinement/macos_source_reader.py",
             "kit/confinement/test_macos_source_reader.py",
+            "kit/confinement/release_provenance.py",
+            "kit/confinement/test_confinement_release_provenance.py",
             "kit/confinement/role_signer.py",
             "kit/confinement/test_role_signer.py",
             "kit/bootstrap/policy_handoff.py",
