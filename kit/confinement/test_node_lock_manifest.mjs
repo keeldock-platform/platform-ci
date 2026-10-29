@@ -541,3 +541,37 @@ test('keeps the lock root, other entries, and resolved versions consistent with 
   unconstrained.lock.packages['node_modules/lightningcss'] = lightningcssEntry('1.30.1');
   assert.equal(codeOf(unconstrained.lock, unconstrained.expectation), 'accepted');
 });
+
+function registryEntry(name, version) {
+  return {
+    version,
+    resolved: `https://registry.npmjs.org/${name}/-/${name}-${version}.tgz`,
+    integrity: `sha512-${'A'.repeat(86)}==`,
+  };
+}
+
+test('requires the platform binaries of the overridden package to match its exact version', () => {
+  const complete = overrideFixture();
+  complete.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.33.0');
+  complete.lock.packages['node_modules/lightningcss-win32-x64-msvc'] = registryEntry('lightningcss-win32-x64-msvc', '1.33.0');
+  assert.equal(codeOf(complete.lock, complete.expectation), 'accepted');
+
+  const halfOverridden = overrideFixture();
+  halfOverridden.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.32.0');
+  assert.equal(codeOf(halfOverridden.lock, halfOverridden.expectation), 'override_mismatch');
+
+  const nestedBinary = overrideFixture();
+  nestedBinary.lock.packages['node_modules/other'] = registryEntry('other', '2.0.0');
+  nestedBinary.lock.packages['node_modules/other/node_modules/lightningcss-darwin-arm64'] =
+    registryEntry('lightningcss-darwin-arm64', '1.30.1');
+  assert.equal(codeOf(nestedBinary.lock, nestedBinary.expectation), 'override_mismatch');
+
+  const unrelated = overrideFixture();
+  unrelated.lock.packages['node_modules/lightningcssx'] = registryEntry('lightningcssx', '9.9.9');
+  assert.equal(codeOf(unrelated.lock, unrelated.expectation), 'accepted');
+
+  const unconstrained = overrideFixture();
+  delete unconstrained.expectation.root.overrides;
+  unconstrained.lock.packages['node_modules/lightningcss-linux-x64-gnu'] = registryEntry('lightningcss-linux-x64-gnu', '1.32.0');
+  assert.equal(codeOf(unconstrained.lock, unconstrained.expectation), 'accepted');
+});

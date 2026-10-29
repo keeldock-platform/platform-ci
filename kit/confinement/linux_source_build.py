@@ -1061,11 +1061,24 @@ def _manifest_json(path):
         raise SourceBuildRefusal("lock") from None
 
 
+MANIFEST_ROOT_OVERRIDES = {"lightningcss": "1.33.0"}
+
+
+def _manifest_root_overrides(root):
+    if "overrides" not in root:
+        return None
+    value = root["overrides"]
+    if (type(value) is not dict or set(value) != set(MANIFEST_ROOT_OVERRIDES)
+            or any(type(item) is not str or item != MANIFEST_ROOT_OVERRIDES[name] for name, item in value.items())):
+        raise SourceBuildRefusal("lock")
+    return dict(value)
+
+
 def _manifest_digest(source_root):
     root = _manifest_json(Path(source_root) / "package.json")
     if (type(root) is not dict or type(root.get("name")) is not str
             or type(root.get("version")) is not str
-            or any(key in root for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies"))):
+            or any(key in root for key in ("resolutions", "bundleDependencies", "bundledDependencies"))):
         raise SourceBuildRefusal("lock")
     workspaces = root.get("workspaces")
     if type(workspaces) is dict:
@@ -1079,6 +1092,9 @@ def _manifest_digest(source_root):
     for group in MANIFEST_GROUPS:
         if group in root:
             root_expected[group] = root[group]
+    overrides = _manifest_root_overrides(root)
+    if overrides is not None:
+        root_expected["overrides"] = overrides
     workspace_path = "packages/host-api"
     if not any(pattern == workspace_path or pattern == "packages/*" and workspace_path.startswith("packages/")
                for pattern in workspaces):

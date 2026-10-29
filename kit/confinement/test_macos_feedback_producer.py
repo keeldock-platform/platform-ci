@@ -2,6 +2,8 @@ import base64
 import hashlib
 import importlib.util
 import io
+import shutil
+import subprocess
 import json
 from pathlib import Path
 import stat
@@ -219,6 +221,103 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                 with self.assertRaises(producer.FeedbackRefusal) as raised:
                     expected_for(workspaces, present)
                 self.assertEqual(raised.exception.reason, "manifest_invalid")
+
+    def _override_manifest(self, root_extra=None, workspace_extra=None):
+        root = {
+            "name": "synthetic-root",
+            "version": "1.0.0",
+            "workspaces": ["packages/*"],
+            "devDependencies": {"typescript": "6.0.3"},
+        }
+        root.update(root_extra or {})
+        host_api = {"name": "@synthetic/host-api", "version": "1.0.0"}
+        host_api.update(workspace_extra or {})
+        kernel = {"name": "@synthetic/kernel-i18n", "version": "1.0.0"}
+        source = Path("/synthetic-source")
+        files = {
+            source / "package.json": json.dumps(root).encode("utf-8"),
+            source / "packages/host-api/package.json": json.dumps(host_api).encode("utf-8"),
+            source / "packages/kernel-i18n/package.json": json.dumps(kernel).encode("utf-8"),
+        }
+        with patch.object(producer, "_read_file", side_effect=lambda path, **unused: files[path]):
+            return producer._expected_manifest(source)
+
+    def test_source_manifest_accepts_only_the_exact_root_override(self):
+        expected = self._override_manifest({"overrides": {"lightningcss": "1.33.0"}})
+        self.assertEqual(expected["root"]["overrides"], {"lightningcss": "1.33.0"})
+        self.assertNotIn("overrides", self._override_manifest()["root"])
+        for value in (
+            {"lightningcss": "1.32.0"}, {"lightningcss": "^1.33.0"}, {"lightningcss": "1.33"},
+            {"lightningcss": {"lightningcss": "1.33.0"}}, {"lightningcss": ["1.33.0"]},
+            {"lightningcss": 133}, {"lightningcss": None}, {"other": "1.33.0"}, {},
+            {"lightningcss": "1.33.0", "other": "1.0.0"}, ["lightningcss"], "1.33.0", None, 7,
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(producer.FeedbackRefusal) as raised:
+                    self._override_manifest({"overrides": value})
+                self.assertEqual(raised.exception.reason, "manifest_invalid")
+
+    def test_source_manifest_refuses_overrides_in_workspaces_and_other_closed_keys(self):
+        for extra in (
+            {"overrides": {"lightningcss": "1.33.0"}}, {"overrides": {}}, {"resolutions": {"a": "1.0.0"}},
+            {"bundleDependencies": ["a"]}, {"bundledDependencies": ["a"]},
+        ):
+            with self.subTest(workspace=extra):
+                with self.assertRaises(producer.FeedbackRefusal):
+                    self._override_manifest(workspace_extra=extra)
+        for extra in (
+            {"resolutions": {"a": "1.0.0"}}, {"bundleDependencies": ["a"]}, {"bundledDependencies": ["a"]},
+        ):
+            with self.subTest(root=extra):
+                with self.assertRaises(producer.FeedbackRefusal):
+                    self._override_manifest(extra)
+
+    @unittest.skipUnless(shutil.which("node"), "node is required for the validator round trip")
+    def test_override_expectation_round_trips_through_the_lock_validator(self):
+        expected = self._override_manifest({"overrides": {"lightningcss": "1.33.0"}})
+        integrity = "sha512-" + "A" * 86 + "=="
+
+        def registry(name, version):
+            return {
+                "version": version,
+                "resolved": "https://registry.npmjs.org/%s/-/%s-%s.tgz" % (name, name, version),
+                "integrity": integrity,
+            }
+
+        def lock_for(binary_version):
+            return {
+                "name": "synthetic-root", "version": "1.0.0", "lockfileVersion": 3, "requires": True,
+                "packages": {
+                    "": {"name": "synthetic-root", "version": "1.0.0", "workspaces": ["packages/*"],
+                         "devDependencies": {"typescript": "6.0.3"}},
+                    "packages/host-api": {"name": "@synthetic/host-api", "version": "1.0.0"},
+                    "packages/kernel-i18n": {"name": "@synthetic/kernel-i18n", "version": "1.0.0"},
+                    "node_modules/@synthetic/host-api": {"resolved": "packages/host-api", "link": True},
+                    "node_modules/@synthetic/kernel-i18n": {"resolved": "packages/kernel-i18n", "link": True},
+                    "node_modules/typescript": registry("typescript", "6.0.3"),
+                    "node_modules/lightningcss": registry("lightningcss", "1.33.0"),
+                    "node_modules/lightningcss-linux-x64-gnu": registry("lightningcss-linux-x64-gnu", binary_version),
+                },
+            }
+
+        script = (
+            "import { readFileSync } from 'node:fs';"
+            "import { validateLockManifest } from %s;"
+            "const input = JSON.parse(readFileSync(0, 'utf8'));"
+            "try { validateLockManifest(Buffer.from(input.lock), input.expected); console.log('accepted'); }"
+            "catch (error) { console.log(error.code); }"
+        ) % json.dumps((MODULE_PATH.parent / "node_lock_manifest.mjs").as_uri())
+
+        def run(binary_version):
+            payload = json.dumps({"lock": json.dumps(lock_for(binary_version)) + "\n", "expected": expected})
+            result = subprocess.run(
+                ["node", "--input-type=module", "-e", script], input=payload.encode("utf-8"),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False,
+            )
+            return result.stdout.decode("utf-8").strip()
+
+        self.assertEqual(run("1.33.0"), "accepted")
+        self.assertEqual(run("1.32.0"), "override_mismatch")
 
     def test_producer_receipt_is_canonical_context_only_and_profile_closed(self):
         _, environment = _dispatch("rust_patch")

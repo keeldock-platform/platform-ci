@@ -583,8 +583,13 @@ function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventor
       reject('package_source_invalid');
     }
     if (entry.name !== undefined && entry.name !== moduleName) reject('invalid_package');
-    if (expected.root.overrides !== undefined && Object.hasOwn(expected.root.overrides, moduleName)
-        && entry.version !== expected.root.overrides[moduleName]) reject('override_mismatch');
+    if (expected.root.overrides !== undefined) {
+      for (const [name, pinned] of Object.entries(expected.root.overrides)) {
+        if ((moduleName === name || moduleName.startsWith(`${name}-`)) && entry.version !== pinned) {
+          reject('override_mismatch');
+        }
+      }
+    }
   }
 
   const result = {

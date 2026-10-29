@@ -547,6 +547,48 @@ class LinuxSourceBuildTests(unittest.TestCase):
         with self.assertRaises(confinement_public_audit.AuditRefusal):
             confinement_public_audit._check_section(bad, job, expected)
 
+    def _write_manifests(self, directory, root_extra=None, workspace_extra=None):
+        root = {
+            "name": "synthetic-root", "version": "1.0.0", "workspaces": ["packages/*"],
+            "devDependencies": {"typescript": "6.0.3"},
+        }
+        root.update(root_extra or {})
+        package = {"name": "@synthetic/host-api", "version": "1.0.0"}
+        package.update(workspace_extra or {})
+        base = Path(directory)
+        (base / "packages/host-api").mkdir(parents=True)
+        (base / "package.json").write_text(json.dumps(root), encoding="ascii")
+        (base / "packages/host-api/package.json").write_text(json.dumps(package), encoding="ascii")
+        return base
+
+    def test_manifest_digest_binds_the_exact_root_override_and_refuses_everything_else(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plain = linux_source_build._manifest_digest(self._write_manifests(Path(directory) / "plain"))
+        with tempfile.TemporaryDirectory() as directory:
+            allowed = linux_source_build._manifest_digest(self._write_manifests(
+                Path(directory) / "allowed", {"overrides": {"lightningcss": "1.33.0"}},
+            ))
+        self.assertNotEqual(plain, allowed)
+        for index, root_extra in enumerate((
+            {"overrides": {"lightningcss": "1.32.0"}}, {"overrides": {"lightningcss": "^1.33.0"}},
+            {"overrides": {"lightningcss": {"x": "1.33.0"}}}, {"overrides": {"other": "1.33.0"}},
+            {"overrides": {}}, {"overrides": ["lightningcss"]}, {"overrides": "1.33.0"}, {"overrides": None},
+            {"overrides": {"lightningcss": "1.33.0", "other": "1.0.0"}},
+            {"resolutions": {"a": "1.0.0"}}, {"bundleDependencies": ["a"]}, {"bundledDependencies": ["a"]},
+        )):
+            with self.subTest(root=root_extra), tempfile.TemporaryDirectory() as directory:
+                base = self._write_manifests(Path(directory) / ("r%d" % index), root_extra)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._manifest_digest(base)
+        for index, workspace_extra in enumerate((
+            {"overrides": {"lightningcss": "1.33.0"}}, {"overrides": {}}, {"resolutions": {"a": "1.0.0"}},
+        )):
+            with self.subTest(workspace=workspace_extra), tempfile.TemporaryDirectory() as directory:
+                base = self._write_manifests(Path(directory) / ("w%d" % index), None, workspace_extra)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._manifest_digest(base)
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
