@@ -1,6 +1,7 @@
 param(
-    [ValidateSet('spike', 'compile')]
-    [string]$Mode = 'spike'
+    [ValidateSet('spike', 'compile', 'native-probe')]
+    [string]$Mode = 'spike',
+    [string]$ProbeId = ''
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -338,7 +339,7 @@ function Test-Acl {
         if ($entries[0].FileSystemRights -ne $attributeMask -or $entries[0].AccessControlType -ne 'Allow' -or $entries[0].IsInherited) { return 'ancestor_rule' }
         if ($entries[0].InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None -or $entries[0].PropagationFlags -ne [System.Security.AccessControl.PropagationFlags]::None) { return 'ancestor_rule' }
     }
-    foreach ($path in @(($script:Layout.RustBin + '\rustc.exe'), ($script:Layout.MsvcBin + '\link.exe'), ($script:Layout.NodeDir + '\node.exe'), $script:Layout.LightningcssBinding, $script:Layout.RolldownBinding, $script:Layout.NodeTest)) {
+    foreach ($path in @(($script:Layout.RustBin + '\rustc.exe'), ($script:Layout.MsvcBin + '\link.exe'), ($script:Layout.NodeDir + '\node.exe'), $script:Layout.LightningcssBinding, $script:Layout.RolldownBinding, $script:Layout.NodeTest, $script:Layout.NativeProbeScript, $script:Layout.NativeProbeSource, $script:Layout.NativeProbeRecovery)) {
         if (@(Get-SidRules $path $sid).Count -lt 1) { return 'not_inherited' }
     }
     foreach ($path in @($script:Lpac.Tmp, $script:Lpac.Profile, $script:Lpac.CargoHome, $script:Lpac.Crate, (Join-Path $script:Lpac.Crate 'src'))) {
@@ -379,22 +380,27 @@ function New-StageEnvironment([hashtable]$scratch, [string]$targetName) {
     )
 }
 
+function Get-NativeProbeArguments([string]$probeId) {
+    if (-not [KeelDock.Platform.WindowsConfinement.NativeRegistryProbe]::IsKnownProbeId($probeId)) { throw 'registry_probe_id' }
+    return ('-NoLogo -NoProfile -NonInteractive -File "' + $script:Layout.NativeProbeScript + '" -Mode native-probe -ProbeId ' + $probeId)
+}
+
 function Get-WinsockProbeSpecs {
     $lease = $script:WinsockCatalogLease
     if ($null -eq $lease) { return @() }
-    $reg = Join-Path $env:SystemRoot 'System32\reg.exe'
+    $probeExe = Join-Path $PSHOME 'pwsh.exe'
     $classes = @(
-        @{ Name = 'parameters'; Pattern = '^Parameters\z' },
-        @{ Name = 'protocol_catalog'; Pattern = '^Parameters\\Protocol_Catalog9\z' },
-        @{ Name = 'namespace_catalog'; Pattern = '^Parameters\\NameSpace_Catalog5\z' },
-        @{ Name = 'protocol_entries'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries\z' },
-        @{ Name = 'protocol_entries64'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries64\z' },
-        @{ Name = 'namespace_entries'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries\z' },
-        @{ Name = 'namespace_entries64'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries64\z' },
-        @{ Name = 'protocol_entry'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries\\[0-9]{12}\z' },
-        @{ Name = 'protocol_entry64'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries64\\[0-9]{12}\z' },
-        @{ Name = 'namespace_entry'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries\\[0-9]{12}\z' },
-        @{ Name = 'namespace_entry64'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries64\\[0-9]{12}\z' }
+        @{ Name = 'parameters'; Pattern = '^Parameters\z'; ProbeId = 'winsock_parameters' },
+        @{ Name = 'protocol_catalog'; Pattern = '^Parameters\\Protocol_Catalog9\z'; ProbeId = 'winsock_protocol_catalog' },
+        @{ Name = 'namespace_catalog'; Pattern = '^Parameters\\NameSpace_Catalog5\z'; ProbeId = 'winsock_namespace_catalog' },
+        @{ Name = 'protocol_entries'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries\z'; ProbeId = 'winsock_protocol_entries' },
+        @{ Name = 'protocol_entries64'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries64\z'; ProbeId = 'winsock_protocol_entries64' },
+        @{ Name = 'namespace_entries'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries\z'; ProbeId = 'winsock_namespace_entries' },
+        @{ Name = 'namespace_entries64'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries64\z'; ProbeId = 'winsock_namespace_entries64' },
+        @{ Name = 'protocol_entry'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries\\[0-9]{12}\z'; ProbePrefix = 'winsock_protocol_entry_' },
+        @{ Name = 'protocol_entry64'; Pattern = '^Parameters\\Protocol_Catalog9\\Catalog_Entries64\\[0-9]{12}\z'; ProbePrefix = 'winsock_protocol_entry64_' },
+        @{ Name = 'namespace_entry'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries\\[0-9]{12}\z'; ProbePrefix = 'winsock_namespace_entry_' },
+        @{ Name = 'namespace_entry64'; Pattern = '^Parameters\\NameSpace_Catalog5\\Catalog_Entries64\\[0-9]{12}\z'; ProbePrefix = 'winsock_namespace_entry64_' }
     )
     $prefix = 'SYSTEM\CurrentControlSet\Services\WinSock2\'
     $specs = @()
@@ -403,25 +409,37 @@ function Get-WinsockProbeSpecs {
             $path = [string]$item.Path
             if (-not $path.StartsWith($prefix, [StringComparison]::Ordinal)) { continue }
             if ($path.Substring($prefix.Length) -cmatch $class.Pattern) {
-                $specs += @{ Name = ('winsock_key_' + $class.Name); Exe = $reg; Arguments = ('query HKLM\' + $path); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 } }
+                $probeId = [string]$class.ProbeId
+                if ($class.ContainsKey('ProbePrefix')) { $probeId = [string]$class.ProbePrefix + [string]$path.Substring($path.LastIndexOf('\') + 1) }
+                $probeArguments = Get-NativeProbeArguments $probeId
+                $specs += @{ Name = ('winsock_key_' + $class.Name); Exe = $probeExe; Arguments = $probeArguments; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'status=ok' } }
                 break
             }
         }
     }
     $controlName = 'lpac_default_key_control'
-    $specs += @{ Name = $controlName; Exe = $reg; Arguments = 'query HKLM\SYSTEM\CurrentControlSet\Control\Nls\CodePage'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 } }
+    $controlArguments = Get-NativeProbeArguments 'lpac_default_key_control'
+    $specs += @{ Name = $controlName; Exe = $probeExe; Arguments = $controlArguments; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'status=ok' } }
     return $specs
 }
 
 function Get-LpacDiscriminatorSpecs {
     $lease = $script:WinsockCatalogLease
     if ($null -eq $lease -or $null -eq $lease.ScratchPaths) { return @() }
-    $reg = Join-Path $env:SystemRoot 'System32\reg.exe'
+    $probeExe = Join-Path $PSHOME 'pwsh.exe'
     $arapName = 'lpac_discriminator_arap'
     $aapName = 'lpac_discriminator_aap'
+    $arapPath = [string]$lease.ScratchPaths.Arap
+    $aapPath = [string]$lease.ScratchPaths.Aap
+    Assert-ScratchPath $arapPath
+    Assert-ScratchPath $aapPath
+    $arapId = 'lpac_discriminator_arap_' + $arapPath.Substring($arapPath.LastIndexOf('\') + 1)
+    $aapId = 'lpac_discriminator_aap_' + $aapPath.Substring($aapPath.LastIndexOf('\') + 1)
     $specs = @()
-    $specs += @{ Name = $arapName; Exe = $reg; Arguments = ('query HKLM\' + [string]$lease.ScratchPaths.Arap); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 } }
-    $specs += @{ Name = $aapName; Exe = $reg; Arguments = ('query HKLM\' + [string]$lease.ScratchPaths.Aap); Timeout = 30; Check = { param($r) $r.ExitCode -ne 0 -and (($r.Stdout + $r.Stderr) -match 'Access is denied') } }
+    $arapArguments = Get-NativeProbeArguments $arapId
+    $aapArguments = Get-NativeProbeArguments $aapId
+    $specs += @{ Name = $arapName; Exe = $probeExe; Arguments = $arapArguments; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'status=ok' } }
+    $specs += @{ Name = $aapName; Exe = $probeExe; Arguments = $aapArguments; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'status=access_denied ntstatus=0xC0000022' } }
     return $specs
 }
 
@@ -429,9 +447,9 @@ function Get-LpacBehaviour($outcomes) {
     $arap = $outcomes['lpac_discriminator_arap']
     $aap = $outcomes['lpac_discriminator_aap']
     if ($null -eq $arap -or $null -eq $aap -or -not $arap.Ran -or -not $aap.Ran) { return 'inconclusive' }
-    if ($arap.ExitCode -ne 0) { return 'inconclusive' }
-    if ($aap.ExitCode -eq 0) { return 'not_lpac' }
-    if ($aap.Output -match 'Access is denied') { return 'behavioural' }
+    if ($arap.Stdout -notmatch 'status=ok') { return 'inconclusive' }
+    if ($aap.Stdout -match 'status=ok') { return 'not_lpac' }
+    if ($aap.Stdout -match 'status=access_denied ntstatus=0xC0000022') { return 'behavioural' }
     return 'inconclusive'
 }
 
@@ -518,7 +536,11 @@ try {
     if (-not [Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([Runtime.InteropServices.OSPlatform]::Windows)) { throw 'platform' }
     $phase = 'runtime'
     [void](Add-Type -Path (Join-Path $PSScriptRoot 'windows_confinement.cs') -ErrorAction Stop)
-    if ($Mode -eq 'compile') {
+    if ($Mode -eq 'native-probe') {
+        $phase = 'native_probe'
+        Write-Line ([KeelDock.Platform.WindowsConfinement.NativeRegistryProbe]::Probe($ProbeId))
+        $exitCode = 0
+    } elseif ($Mode -eq 'compile') {
         Write-Line 'windows-confinement-compile=observed result=compiled'
         $exitCode = 0
     } else {
@@ -573,6 +595,10 @@ try {
         $layout.MsvcLib = Join-Path $layout.ReadOnly 'msvc\lib'
         $layout.SdkUcrt = Join-Path $layout.ReadOnly 'sdk\ucrt'
         $layout.SdkUm = Join-Path $layout.ReadOnly 'sdk\um'
+        $layout.NativeProbe = Join-Path $layout.ReadOnly 'native-probe'
+        $layout.NativeProbeScript = Join-Path $layout.NativeProbe 'windows_confinement.ps1'
+        $layout.NativeProbeSource = Join-Path $layout.NativeProbe 'windows_confinement.cs'
+        $layout.NativeProbeRecovery = Join-Path $layout.NativeProbe 'windows_confinement_recovery.ps1'
         $layout.NpmDir = Join-Path $layout.ReadOnly 'npm'
         $layout.TestDir = Join-Path $layout.ReadOnly 'tests'
         $layout.NodeTest = Join-Path $layout.TestDir 'kd_bindings.test.mjs'
@@ -609,9 +635,12 @@ try {
                 New-Item -ItemType Directory -Force -Path $directory | Out-Null
             }
         }
-        foreach ($directory in @($layout.RustPrefix, $layout.NodeDir, $layout.NpmDir, $layout.TestDir)) {
+        foreach ($directory in @($layout.RustPrefix, $layout.NodeDir, $layout.NativeProbe, $layout.NpmDir, $layout.TestDir)) {
             New-Item -ItemType Directory -Force -Path $directory | Out-Null
         }
+        Copy-Item -LiteralPath $PSCommandPath -Destination $layout.NativeProbeScript
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'windows_confinement.cs') -Destination $layout.NativeProbeSource
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'windows_confinement_recovery.ps1') -Destination $layout.NativeProbeRecovery
         Write-Line ('windows-confinement-acl=granted ro=read_execute scratch=modify ancestors_read_attributes=' + $ancestorCount + ' ancestors_failed=' + $ancestorFailures)
 
         $phase = 'fetch'
