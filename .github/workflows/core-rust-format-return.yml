@@ -98,15 +98,15 @@ jobs:
       - name: Fetch exact public control
         run: |
           set -euo pipefail
-          [[ "$CI_EVENT_NAME" == "workflow_dispatch" && "$CI_REF" == "refs/heads/main" ]]
-          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_SERVER_URL" == "https://github.com" ]]
-          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" && "$CI_REF" == "refs/heads/main" ]] || exit 1
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_SERVER_URL" == "https://github.com" ]] || exit 1
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]] || exit 1
           git init -q . 2>/dev/null
           git config core.autocrlf false 2>/dev/null
           git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
           git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
-          [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$CI_SHA" ]]
+          [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$CI_SHA" ]] || exit 1
       - name: Set up fixed Node runtime
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -116,8 +116,8 @@ jobs:
       - name: Run source-free helper suites
         run: |
           set -euo pipefail
-          [[ "$(node --version)" == "v24.22.1" ]]
-          [[ "$(npm --version)" == "11.19.1" ]]
+          [[ "$(node --version)" == "v24.22.1" ]] || exit 1
+          [[ "$(npm --version)" == "11.19.1" ]] || exit 1
           node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs kit/confinement/test_node_contract_validation.mjs
           python3 -B kit/bootstrap/test_policy.py
           python3 -B kit/bootstrap/test_policy_handoff.py
@@ -131,7 +131,8 @@ jobs:
         id: prepare
         run: |
           set -euo pipefail
-          [[ "${ImageOS:-}" =~ ^[A-Za-z0-9._-]{1,64}$ && "${ImageVersion:-}" =~ ^[A-Za-z0-9._-]{1,64}$ && -n "${RUNNER_TEMP:-}" ]]
+          [[ "${ImageOS:-}" =~ ^[A-Za-z0-9._-]{1,64}$ && "${ImageVersion:-}" =~ ^[A-Za-z0-9._-]{1,64}$ && -n "${RUNNER_TEMP:-}" ]] || exit 1
+          case "${ImageVersion:-}" in 20260907.0337.1|20261028.0489.1) ;; *) exit 1 ;; esac
           capture_dir="$(/usr/bin/mktemp -d "${RUNNER_TEMP%/}/feedback-rust-smoke.XXXXXX" 2>/dev/null)"
           trap '/bin/rm -rf "$capture_dir" 2>/dev/null' EXIT
           raw_file="$capture_dir/raw"
@@ -139,9 +140,9 @@ jobs:
           stderr_file="$capture_dir/stderr"
           validator_stderr="$capture_dir/validator-stderr"
           python3 -B kit/confinement/feedback_public_audit.py prepare >"$capture_dir/prepare" 2>"$capture_dir/prepare-stderr"
-          [[ "$(/usr/bin/wc -l < "$capture_dir/prepare")" -eq 1 && "$(/usr/bin/wc -c < "$capture_dir/prepare")" -le 1024 ]]
+          [[ "$(/usr/bin/wc -l < "$capture_dir/prepare")" -eq 1 && "$(/usr/bin/wc -c < "$capture_dir/prepare")" -le 1024 ]] || exit 1
           IFS= read -r prepare_line < "$capture_dir/prepare"
-          [[ "$prepare_line" == KD-FEEDBACK-PREPARE\ schema=1\ request-id=*\ profile=rust_patch\ status=passed ]]
+          [[ "$prepare_line" == KD-FEEDBACK-PREPARE\ schema=1\ request-id=*\ profile=rust_patch\ status=passed ]] || exit 1
           set +e
           sudo -n -- /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C LC_ALL=C \
             CI_SHA="$CI_SHA" GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
@@ -167,10 +168,10 @@ jobs:
             exit 1
           fi
           IFS= read -r rust_line < "$validated_file"
-          [[ "$rust_line" == KD-RUST-SMOKE\ * ]]
+          [[ "$rust_line" == KD-RUST-SMOKE\ * ]] || exit 1
           digest_line="$(/usr/bin/shasum -a 256 "$validated_file")"
           rust_smoke_digest="${digest_line%% *}"
-          [[ "$rust_smoke_digest" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$rust_smoke_digest" =~ ^[a-f0-9]{64}$ ]] || exit 1
           /bin/rm -rf "$capture_dir"
           trap - EXIT
           printf 'rust_smoke_digest=%s\nimage_os=%s\nimage_version=%s\n' \
@@ -209,15 +210,15 @@ jobs:
       - name: Fetch exact public control
         run: |
           set -euo pipefail
-          [[ "$CI_EVENT_NAME" == "workflow_dispatch" && "$CI_REF" == "refs/heads/main" ]]
-          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_SERVER_URL" == "https://github.com" ]]
-          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$CI_EVENT_NAME" == "workflow_dispatch" && "$CI_REF" == "refs/heads/main" ]] || exit 1
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_SERVER_URL" == "https://github.com" ]] || exit 1
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]] || exit 1
           git init -q . 2>/dev/null
           git config core.autocrlf false 2>/dev/null
           git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
           git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
-          [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$CI_SHA" ]]
+          [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$CI_SHA" ]] || exit 1
       - name: Set up fixed Node runtime
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
@@ -227,11 +228,14 @@ jobs:
       - name: Repeat source-free suites and prepare Rust smoke evidence
         run: |
           set -euo pipefail
-          [[ "$ImageOS" =~ ^[A-Za-z0-9._-]{1,64}$ && "$ImageVersion" =~ ^[A-Za-z0-9._-]{1,64}$ ]]
-          [[ "$ImageOS" == "$EXPECTED_PREPARE_IMAGE_OS" && "$ImageVersion" == "$EXPECTED_PREPARE_IMAGE_VERSION" ]]
-          [[ "$EXPECTED_PREPARE_RUST_SMOKE_DIGEST" =~ ^[a-f0-9]{64}$ ]]
-          [[ "$(node --version)" == "v24.22.1" ]]
-          [[ "$(npm --version)" == "11.19.1" ]]
+          [[ "$ImageOS" =~ ^[A-Za-z0-9._-]{1,64}$ && "$ImageVersion" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || exit 1
+          [[ "$ImageOS" == "$EXPECTED_PREPARE_IMAGE_OS" ]] || exit 1
+          printf 'KD-IMAGE-PAIR prepare=%s main=%s\n' "$EXPECTED_PREPARE_IMAGE_VERSION" "$ImageVersion"
+          case "$EXPECTED_PREPARE_IMAGE_VERSION" in 20260907.0337.1|20261028.0489.1) ;; *) exit 1 ;; esac
+          case "$ImageVersion" in 20260907.0337.1|20261028.0489.1) ;; *) exit 1 ;; esac
+          [[ "$EXPECTED_PREPARE_RUST_SMOKE_DIGEST" =~ ^[a-f0-9]{64}$ ]] || exit 1
+          [[ "$(node --version)" == "v24.22.1" ]] || exit 1
+          [[ "$(npm --version)" == "11.19.1" ]] || exit 1
           node --test kit/confinement/test_node_lock_envelope.mjs kit/confinement/test_node_lock_manifest.mjs kit/confinement/test_feedback_smoke.mjs kit/confinement/test_development_feedback.mjs kit/confinement/test_feedback_producer_crypto.mjs kit/confinement/test_feedback_admin_crypto.mjs kit/confinement/test_node_contract_validation.mjs
           python3 -B kit/bootstrap/test_policy.py
           python3 -B kit/bootstrap/test_public_tree.py
@@ -239,7 +243,7 @@ jobs:
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_feedback*.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_foundation_node_feedback.py"
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s kit/confinement -p "test_node_lock_receipt.py"
-          [[ -n "${ImageOS:-}" && -n "${ImageVersion:-}" ]]
+          [[ -n "${ImageOS:-}" && -n "${ImageVersion:-}" ]] || exit 1
           capture_dir="$(/usr/bin/mktemp -d "${RUNNER_TEMP%/}/feedback-rust-smoke.XXXXXX" 2>/dev/null)"
           trap '/bin/rm -rf "$capture_dir" 2>/dev/null' EXIT
           raw_file="$capture_dir/raw"
@@ -270,7 +274,7 @@ jobs:
           fi
           rust_digest_line="$(/usr/bin/shasum -a 256 "$validated_file")"
           rust_smoke_digest="${rust_digest_line%% *}"
-          [[ "$rust_smoke_digest" == "$EXPECTED_PREPARE_RUST_SMOKE_DIGEST" ]]
+          [[ "$rust_smoke_digest" == "$EXPECTED_PREPARE_RUST_SMOKE_DIGEST" ]] || exit 1
           /bin/rm -rf "$capture_dir"
           trap - EXIT
       - name: Verify protected bindings and reader scope
@@ -292,17 +296,17 @@ jobs:
           capture_dir="$(mktemp -d "${RUNNER_TEMP%/}/feedback-binding.XXXXXX")"
           trap 'rm -rf "$capture_dir"' EXIT
           python3 -B kit/confinement/feedback_public_audit.py preflight >"$capture_dir/result" 2>/dev/null
-          [[ "$(wc -l < "$capture_dir/result")" -eq 1 && "$(wc -c < "$capture_dir/result")" -le 1024 ]]
+          [[ "$(wc -l < "$capture_dir/result")" -eq 1 && "$(wc -c < "$capture_dir/result")" -le 1024 ]] || exit 1
           IFS= read -r binding_line < "$capture_dir/result"
-          [[ "$binding_line" == "KD-FEEDBACK-BINDING schema=1 request-id=$KD_FEEDBACK_REQUEST_ID profile=rust_patch status=verified" ]]
+          [[ "$binding_line" == "KD-FEEDBACK-BINDING schema=1 request-id=$KD_FEEDBACK_REQUEST_ID profile=rust_patch status=verified" ]] || exit 1
           rm -rf "$capture_dir"
           trap - EXIT
-          [[ "$CORE_CONTRACT_ALLOWED_SHA" == "$REQUESTED_SOURCE_SHA" && "$CORE_CONTRACT_ALLOWED_CONTROL_SHA" == "$CI_SHA" ]]
-          [[ "$CORE_CONTRACT_REVIEWED_SOURCE_SHA" == "$REQUESTED_SOURCE_SHA" && "$CORE_CONTRACT_REVIEWED_BASE_SHA" == "$REQUESTED_BASE_SHA" ]]
-          [[ "$CORE_CONTRACT_REVIEWED_BASE_BRANCH" == "$REQUESTED_BASE_BRANCH" && "$CORE_CONTRACT_REVIEWED_DIFF_SHA256" =~ ^[a-f0-9]{64}$ ]]
-          [[ "$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" == refs/heads/* && "$SOURCE_REPOSITORY_ID" =~ ^[1-9][0-9]{0,18}$ ]]
-          [[ "$SOURCE_READER_CLIENT_ID" =~ ^[A-Za-z0-9]{20,100}$ && "$SOURCE_READER_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ ]]
-          [[ "$SOURCE_REPOSITORY_OWNER" =~ ^[A-Za-z0-9_.-]{1,100}$ && "$SOURCE_REPOSITORY_NAME" =~ ^[A-Za-z0-9_.-]{1,100}$ ]]
+          [[ "$CORE_CONTRACT_ALLOWED_SHA" == "$REQUESTED_SOURCE_SHA" && "$CORE_CONTRACT_ALLOWED_CONTROL_SHA" == "$CI_SHA" ]] || exit 1
+          [[ "$CORE_CONTRACT_REVIEWED_SOURCE_SHA" == "$REQUESTED_SOURCE_SHA" && "$CORE_CONTRACT_REVIEWED_BASE_SHA" == "$REQUESTED_BASE_SHA" ]] || exit 1
+          [[ "$CORE_CONTRACT_REVIEWED_BASE_BRANCH" == "$REQUESTED_BASE_BRANCH" && "$CORE_CONTRACT_REVIEWED_DIFF_SHA256" =~ ^[a-f0-9]{64}$ ]] || exit 1
+          [[ "$CORE_CONTRACT_REVIEWED_CANDIDATE_REF" == refs/heads/* && "$SOURCE_REPOSITORY_ID" =~ ^[1-9][0-9]{0,18}$ ]] || exit 1
+          [[ "$SOURCE_READER_CLIENT_ID" =~ ^[A-Za-z0-9]{20,100}$ && "$SOURCE_READER_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ ]] || exit 1
+          [[ "$SOURCE_REPOSITORY_OWNER" =~ ^[A-Za-z0-9_.-]{1,100}$ && "$SOURCE_REPOSITORY_NAME" =~ ^[A-Za-z0-9_.-]{1,100}$ ]] || exit 1
       - name: Mint scoped source-reader token
         id: source-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -320,7 +324,7 @@ jobs:
           ACTUAL_INSTALLATION_ID: ${{ steps.source-token.outputs.installation-id }}
         run: |
           set -euo pipefail
-          [[ "$ACTUAL_INSTALLATION_ID" == "$EXPECTED_INSTALLATION_ID" ]]
+          [[ "$ACTUAL_INSTALLATION_ID" == "$EXPECTED_INSTALLATION_ID" ]] || exit 1
       - name: Run and publish encrypted feedback
         id: producer
         env:
@@ -339,7 +343,7 @@ jobs:
           CORE_CONTRACT_REVIEWED_DIFF_SHA256: ${{ vars.CORE_CONTRACT_REVIEWED_DIFF_SHA256 }}
         run: |
           set -euo pipefail
-          [[ -n "${ImageOS:-}" && -n "${ImageVersion:-}" && -n "${RUNNER_TEMP:-}" ]]
+          [[ -n "${ImageOS:-}" && -n "${ImageVersion:-}" && -n "${RUNNER_TEMP:-}" ]] || exit 1
           capture_dir="$(mktemp -d "${RUNNER_TEMP%/}/feedback-capture.XXXXXX")"
           trap 'rm -rf "$capture_dir"' EXIT
           stdout_file="$capture_dir/driver-stdout"
@@ -348,7 +352,7 @@ jobs:
           publish_stderr="$capture_dir/publisher-stderr"
           failure_file="$capture_dir/driver-refusal"
           node_path="$(command -v node)"
-          [[ "$node_path" == /* ]]
+          [[ "$node_path" == /* ]] || exit 1
           set +e
           printf '%s' "$SOURCE_READER_TOKEN" | sudo -n -- /usr/bin/env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/var/root LANG=C LC_ALL=C PYTHONDONTWRITEBYTECODE=1 \
@@ -393,7 +397,8 @@ jobs:
               exit 1
             fi
             IFS= read -r refusal_line < "$failure_file"
-            [[ "$refusal_line" == KD-FEEDBACK-PRODUCER-REFUSAL\ * ]]
+            [[ "$refusal_line" == KD-FEEDBACK-PRODUCER-REFUSAL\ * ]] || exit 1
+            if [[ "$refusal_line" != *'"reason":"cleanup_incomplete"'* && "$refusal_line" != *'"reason":"internal_error"'* && "$refusal_line" != *'"diagnostic":"unavailable","reason":"runner_unavailable","schema_version":1,"stage":"context"'* ]]; then printf 'producer_revocation=confirmed\n' >> "$GITHUB_OUTPUT"; fi
             printf '%s\n' "$refusal_line"
             exit 1
           fi
@@ -428,7 +433,7 @@ jobs:
             exit 1
           fi
           IFS= read -r publish_line < "$publish_file"
-          [[ "$publish_line" == KD-FEEDBACK-PUBLISHER\ * ]]
+          [[ "$publish_line" == KD-FEEDBACK-PUBLISHER\ * ]] || exit 1
           IFS= read -r producer_line < "$stdout_file" || exit 1
           rm -rf "$capture_dir"
           trap - EXIT
@@ -452,8 +457,8 @@ jobs:
           ARTIFACT_DIGEST: ${{ steps.uploader.outputs.artifact-digest }}
         run: |
           set -euo pipefail
-          [[ "$GITHUB_RUN_ATTEMPT" == "1" && "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,18}$ ]]
-          [[ "$ARTIFACT_DIGEST" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" && "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,18}$ ]] || exit 1
+          [[ "$ARTIFACT_DIGEST" =~ ^[a-f0-9]{64}$ ]] || exit 1
           printf 'KD-FEEDBACK-UPLOAD schema=1 request-id=%s artifact-id=%s archive-digest=%s\n' \
             "$KD_FEEDBACK_REQUEST_ID" "$ARTIFACT_ID" "$ARTIFACT_DIGEST"
       - name: Write producer summary
@@ -468,14 +473,22 @@ jobs:
         env:
           SOURCE_READER_TOKEN: ${{ steps.source-token.outputs.token }}
           SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+          PRODUCER_REVOCATION: ${{ steps.producer.outputs.producer_revocation }}
         run: |
           set -euo pipefail
-          [[ -n "$SOURCE_READER_TOKEN" ]]
+          [[ -n "$SOURCE_READER_TOKEN" ]] || exit 1
+          revoke_status=0
           record="$(printf '%s' "$SOURCE_READER_TOKEN" | sudo -n -- /usr/bin/env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C LC_ALL=C SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
-            -I -S -B kit/confinement/macos_core_bootstrap.py --phase revoke --token-stdin 2>/dev/null)"
-          [[ "$record" == '{"metadata":"verified","reason":"ok","repository_scope":"verified","revocation":"confirmed","schema_version":1,"status":"passed"}' ]]
+            -I -S -B kit/confinement/macos_core_bootstrap.py --phase revoke --token-stdin 2>/dev/null)" || revoke_status=$?
+          if [[ "$revoke_status" -eq 0 && "$record" == '{"metadata":"verified","reason":"ok","repository_scope":"verified","revocation":"confirmed","schema_version":1,"status":"passed"}' ]]; then
+            :
+          elif [[ "$PRODUCER_REVOCATION" == "confirmed" && "$record" == '{"metadata":"unverified","reason":"repository_list_unavailable","repository_scope":"unverified","revocation":"unconfirmed","schema_version":1,"status":"refused"}' ]]; then
+            printf 'KD-REVOKE-NOTE token=already-revoked-by-producer\n'
+          else
+            exit 1
+          fi
           printf 'KD-FEEDBACK-CLEANUP schema=1 control-sha=%s run-id=%s run-attempt=1 token-revocation=confirmed\n' "$CI_SHA" "$GITHUB_RUN_ID"
       - name: Remove staged ciphertext
         if: ${{ always() }}

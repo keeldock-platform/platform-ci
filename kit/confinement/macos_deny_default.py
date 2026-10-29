@@ -87,6 +87,11 @@ APPROVED_MACOS_PRODUCT_VERSION = "15.7.9"
 APPROVED_IMAGE_OS_VALUE = "macos15"
 APPROVED_RUNNER_IMAGE_OS = "macos-15-arm64"
 APPROVED_RUNNER_IMAGE_VERSION = "20260907.0337.1"
+APPROVED_HOST_RELEASES = (
+    (APPROVED_MACOS_PRODUCT_VERSION, APPROVED_RUNNER_IMAGE_VERSION),
+    ("15.8.2", "20261028.0489.1"),
+)
+APPROVED_HOST_RELEASE_FIRST_RUNS = {("15.8.2", "20261028.0489.1"): "40941660825"}
 APPROVED_ARCH = "arm64"
 PF_ANCHOR = "com.apple/ci-probe"
 CANARY_PREFIX = b"KD-MACOS-CI-CANARY-v1:"
@@ -2056,13 +2061,16 @@ def _native_receipt(control_sha, run_id, run_attempt, macos_identity):
         "product_version", "image_os", "runner_image_os", "image_version", "architecture",
     }:
         raise Refusal("native_preflight_unavailable")
-    if macos_identity != {
-        "product_version": APPROVED_MACOS_PRODUCT_VERSION,
-        "image_os": APPROVED_IMAGE_OS_VALUE,
-        "runner_image_os": APPROVED_RUNNER_IMAGE_OS,
-        "image_version": APPROVED_RUNNER_IMAGE_VERSION,
-        "architecture": APPROVED_ARCH,
-    }:
+    if macos_identity not in [
+        {
+            "product_version": release[0],
+            "image_os": APPROVED_IMAGE_OS_VALUE,
+            "runner_image_os": APPROVED_RUNNER_IMAGE_OS,
+            "image_version": release[1],
+            "architecture": APPROVED_ARCH,
+        }
+        for release in APPROVED_HOST_RELEASES
+    ]:
         raise Refusal("macos_version_unapproved")
     return {
         "schema_version": 2,
