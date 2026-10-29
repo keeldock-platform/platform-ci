@@ -62,7 +62,7 @@ class RustLockWorkflowPolicyTests(unittest.TestCase):
         for trigger in ("push:", "pull_request", "schedule:", "workflow_run", "workflow_call", "repository_dispatch"):
             with self.subTest(trigger=trigger):
                 self.assertNotIn(trigger, workflow)
-        inputs = re.findall(r"^      ([a-z_]+):\n        description:", header, flags=re.MULTILINE)
+        inputs = re.findall(r"^      ([a-z0-9_]+):\n        description:", header, flags=re.MULTILINE)
         self.assertEqual(inputs, ["request_id", "request_b64", "recipient_spki_b64"])
         for forbidden in ("ref:", "branch", "source_sha:", "base_sha:", "tag:", "url:"):
             with self.subTest(forbidden=forbidden):
@@ -84,7 +84,7 @@ class RustLockWorkflowPolicyTests(unittest.TestCase):
 
     def test_only_the_request_inputs_are_read_and_never_expanded_into_commands(self):
         workflow = RUST_LOCK_WORKFLOW.read_text(encoding="utf-8")
-        expressions = re.findall(r"\$\{\{\s*inputs\.([a-z_]+)\s*\}\}", workflow)
+        expressions = re.findall(r"\$\{\{\s*inputs\.([a-z0-9_]+)\s*\}\}", workflow)
         self.assertEqual(set(expressions), {"request_id", "request_b64", "recipient_spki_b64"})
         for line in workflow.splitlines():
             if "inputs." in line and "run:" not in line:

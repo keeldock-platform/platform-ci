@@ -618,7 +618,7 @@ class CargoLockProducerTests(unittest.TestCase):
     def setUp(self):
         import cargo_lock_bootstrap
         self.bootstrap = cargo_lock_bootstrap
-        self.rust = SimpleNamespace(COMPONENTS=(
+        self.rust = SimpleNamespace(TARGET="aarch64-apple-darwin", COMPONENTS=(
             SimpleNamespace(name="cargo", sha256="a" * 64),
             SimpleNamespace(name="rustc", sha256="b" * 64),
         ))
@@ -628,7 +628,13 @@ class CargoLockProducerTests(unittest.TestCase):
         }
         self.source_environ = {"SOURCE_REPOSITORY_OWNER": "owner", "SOURCE_REPOSITORY_NAME": "repository"}
 
-    def _run(self, *, returncode=0, config_error=None, bundle_error=None, kind="cargo_lock"):
+    def _expected_hash(self):
+        return self.bootstrap.cargo.toolchain_hash(
+            "aarch64-apple-darwin", (("cargo", "a" * 64), ("rustc", "b" * 64)),
+        )
+
+    def _run(self, *, returncode=0, config_error=None, bundle_error=None, kind="cargo_lock",
+             manifest_error=None, members_error=None):
         dispatch = _validated_dispatch(kind)
         state = {"commands": [], "bundles": [], "chdir": []}
 
@@ -658,7 +664,14 @@ class CargoLockProducerTests(unittest.TestCase):
                     patch.object(self.bootstrap, "refuse_cargo_config",
                                  side_effect=config_error, return_value=True) as refuse_config, \
                     patch.object(self.bootstrap, "require_fresh_directory", return_value=True), \
+                    patch.object(producer, "_read_file", return_value=b"manifest"), \
+                    patch.object(self.bootstrap, "check_manifests",
+                                 side_effect=manifest_error, return_value=frozenset(("host-api",))) as check_manifests, \
+                    patch.object(self.bootstrap, "check_lock_members",
+                                 side_effect=members_error, return_value=True) as check_members, \
                     patch.object(self.bootstrap, "produce_bundle", side_effect=record_bundle):
+                state["check_manifests"] = check_manifests
+                state["check_members"] = check_members
                 state["copy"] = copy_files
                 state["read_lock"] = read_lock
                 state["refuse_config"] = refuse_config
@@ -692,7 +705,7 @@ class CargoLockProducerTests(unittest.TestCase):
         state = self._run()
         self.assertNotIn("refusal", state)
         project = state["worker_storage"] / "feedback-cargo-lock"
-        copied = state["copy"].call_args.args[3]
+        copied = state["copy"].call_args.args[2]
         self.assertEqual(copied, (
             "Cargo.toml", "crates/host/api/Cargo.toml", "crates/host/mock/Cargo.toml",
             "crates/host/conformance/Cargo.toml", "crates/host/api/src/lib.rs",
@@ -735,10 +748,16 @@ class CargoLockProducerTests(unittest.TestCase):
             "reviewed_diff_fingerprint": request["reviewed_diff_sha256"],
             "dependency_policy_revision": self.bootstrap.DEPENDENCY_POLICY_REVISION,
             "control_sha": request["control_sha"],
-            "toolchain_hash": hashlib.sha256(
-                ("cargo=" + "a" * 64 + "\nrustc=" + "b" * 64 + "\n").encode("ascii")
-            ).hexdigest(),
+            "toolchain_hash": self._expected_hash(),
         })
+        self.assertEqual(kwargs["toolchain_target"], "aarch64-apple-darwin")
+        self.assertEqual(state["check_members"].call_args.args, (b"lock-bytes", frozenset(("host-api",))))
+        manifests, members = state["check_manifests"].call_args.args
+        self.assertEqual(sorted(manifests), sorted((
+            "Cargo.toml", "crates/host/api/Cargo.toml", "crates/host/mock/Cargo.toml",
+            "crates/host/conformance/Cargo.toml",
+        )))
+        self.assertEqual(members, frozenset(("crates/host/api", "crates/host/mock", "crates/host/conformance")))
         self.assertEqual(kwargs["run_id"], "9876")
         self.assertEqual(kwargs["run_attempt"], 1)
         self.assertEqual(kwargs["expiry"], request["expiry"])
@@ -774,8 +793,12 @@ class CargoLockProducerTests(unittest.TestCase):
 
     def test_toolchain_hash_requires_the_pinned_component_table(self):
         self.assertEqual(
-            producer._cargo_toolchain_hash(self.rust),
-            hashlib.sha256(("cargo=" + "a" * 64 + "\nrustc=" + "b" * 64 + "\n").encode("ascii")).hexdigest(),
+            producer._cargo_toolchain_hash(self.rust, self.bootstrap),
+            ("aarch64-apple-darwin", self._expected_hash()),
+        )
+        other = SimpleNamespace(TARGET="x86_64-unknown-linux-gnu", COMPONENTS=self.rust.COMPONENTS)
+        self.assertNotEqual(
+            producer._cargo_toolchain_hash(other, self.bootstrap)[1], self._expected_hash(),
         )
         for components in (
             None, (), [], (SimpleNamespace(name="cargo", sha256="short"),),
@@ -783,7 +806,33 @@ class CargoLockProducerTests(unittest.TestCase):
         ):
             with self.subTest(components=repr(components)):
                 with self.assertRaises(producer.FeedbackRefusal):
-                    producer._cargo_toolchain_hash(SimpleNamespace(COMPONENTS=components))
+                    producer._cargo_toolchain_hash(
+                        SimpleNamespace(TARGET="aarch64-apple-darwin", COMPONENTS=components),
+                        self.bootstrap,
+                    )
+        with self.assertRaises(producer.FeedbackRefusal):
+            producer._cargo_toolchain_hash(
+                SimpleNamespace(TARGET=None, COMPONENTS=self.rust.COMPONENTS), self.bootstrap,
+            )
+
+    def test_manifest_and_lock_member_refusals_stop_before_cargo_or_publication(self):
+        for stage in ("check_manifests", "check_lock_members"):
+            with self.subTest(stage=stage):
+                refusal = self.bootstrap.BootstrapRefusal(
+                    "bootstrap_manifest_refused" if stage == "check_manifests" else "bootstrap_lock_refused"
+                )
+                if stage == "check_manifests":
+                    state = self._run(manifest_error=refusal)
+                else:
+                    state = self._run(members_error=refusal)
+                self.assertNotIn("result", state)
+                self.assertEqual(state["bundles"], [])
+                if stage == "check_manifests":
+                    self.assertEqual(state["refusal"], "manifest_invalid")
+                    self.assertEqual(state["commands"], [])
+                    state["copy"].assert_not_called()
+                else:
+                    self.assertEqual(state["refusal"], "payload_invalid")
 
 
 if __name__ == "__main__":

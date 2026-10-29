@@ -823,6 +823,31 @@ class FeedbackAdminTests(unittest.TestCase):
             return self.admin._read_state(dir_fd)
 
 
+class ProfilePayloadLimitTests(unittest.TestCase):
+    def test_release_refuses_plaintext_over_the_profile_limit_before_touching_storage(self):
+        stub = types.SimpleNamespace(state_directory="/unused")
+        for kind, profile in feedback_request.PROFILE_BY_KIND.items():
+            with self.subTest(kind=kind):
+                oversize = b"x" * (profile["max_payload_bytes"] + 1)
+                with mock.patch.object(subject, "_create_named") as create:
+                    with self.assertRaises(subject.FeedbackAdminRefusal):
+                        subject.FeedbackAdmin._release_private_output(
+                            stub, -1, {"request_id": "a" * 64}, profile, oversize,
+                        )
+                create.assert_not_called()
+        cargo = feedback_request.PROFILE_BY_KIND["cargo_lock"]
+        with mock.patch.object(subject, "_create_named") as create:
+            path = subject.FeedbackAdmin._release_private_output(
+                stub, -1, {"request_id": "a" * 64}, cargo, b"x" * cargo["max_payload_bytes"],
+            )
+        create.assert_called_once()
+        self.assertTrue(path.endswith("-cargo-lock.payload"))
+        with self.assertRaises(subject.FeedbackAdminRefusal):
+            subject.FeedbackAdmin._release_private_output(
+                stub, -1, {"request_id": "a" * 64}, dict(cargo, max_payload_bytes="1"), b"x",
+            )
+
+
 class UnsupportedPlatformTests(unittest.TestCase):
     def test_constructor_refuses_when_posix_locking_is_unavailable(self):
         arguments = {

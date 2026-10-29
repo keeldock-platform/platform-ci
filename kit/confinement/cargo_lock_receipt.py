@@ -1501,3 +1501,31 @@ def cargo_config_for_vendor(vendor_dir):
                 pass
         _refuse("cargo_config_invalid")
     return arguments, environment
+
+
+TARGET_TRIPLE_RE = re.compile(r"[a-z0-9_]+(?:-[a-z0-9_]+){2,3}\Z")
+COMPONENT_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+
+
+def toolchain_hash(target_triple, components):
+    """Hash one pinned toolchain: the target triple and its component name and archive hashes.
+
+    The target is part of the hashed text, so a receipt that binds this value binds the
+    toolchain target without a receipt format change. Components are sorted by name.
+    """
+    if type(target_triple) is not str or TARGET_TRIPLE_RE.fullmatch(target_triple) is None:
+        _refuse("cargo_receipt_invalid")
+    try:
+        pairs = sorted((name, digest) for name, digest in components)
+    except (TypeError, ValueError):
+        _refuse("cargo_receipt_invalid")
+    if not 1 <= len(pairs) <= 64 or len({name for name, unused in pairs}) != len(pairs):
+        _refuse("cargo_receipt_invalid")
+    for name, digest in pairs:
+        if (type(name) is not str or COMPONENT_NAME_RE.fullmatch(name) is None
+                or not _valid_hex(digest, HEX64_RE)):
+            _refuse("cargo_receipt_invalid")
+    text = "toolchain-target=" + target_triple + "\n" + "".join(
+        name + "=" + digest + "\n" for name, digest in pairs
+    )
+    return hashlib.sha256(text.encode("ascii")).hexdigest()

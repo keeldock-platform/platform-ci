@@ -792,25 +792,25 @@ def run_source_profile(dispatch, source, worker_storage, worker_uid, environment
     _refuse("request_invalid")
 
 
-def _cargo_toolchain_hash(rust):
+def _cargo_toolchain_hash(rust, bootstrap):
     components = getattr(rust, "COMPONENTS", None)
-    if type(components) is not tuple or not components:
+    target = getattr(rust, "TARGET", None)
+    if type(components) is not tuple or not components or type(target) is not str:
         _refuse("tool_unavailable")
-    lines = []
+    pairs = []
     for component in components:
-        name = getattr(component, "name", None)
-        digest = getattr(component, "sha256", None)
-        if type(name) is not str or type(digest) is not str or SHA256_RE.fullmatch(digest) is None:
-            _refuse("tool_unavailable")
-        lines.append(name + "=" + digest + "\n")
-    return hashlib.sha256("".join(lines).encode("ascii")).hexdigest()
+        pairs.append((getattr(component, "name", None), getattr(component, "sha256", None)))
+    try:
+        return target, bootstrap.cargo.toolchain_hash(target, pairs)
+    except bootstrap.cargo.Refusal:
+        _refuse("tool_unavailable")
 
 
 def _cargo_bootstrap_refusal(bootstrap, error):
     reason = getattr(error, "reason", None)
     if reason == "bootstrap_network_refused":
         _refuse("command_failed")
-    if reason in ("bootstrap_config_refused", "bootstrap_source_refused"):
+    if reason in ("bootstrap_config_refused", "bootstrap_source_refused", "bootstrap_manifest_refused"):
         _refuse("manifest_invalid")
     if reason in ("bootstrap_environment_refused", "bootstrap_input_invalid"):
         _refuse("tool_unavailable")
@@ -832,6 +832,10 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
         bootstrap.refuse_cargo_config(source)
         reviewed_paths = _reviewed_rust_paths(source)
         manifests = ("Cargo.toml",) + tuple((root / "Cargo.toml").as_posix() for root in PACKAGE_ROOTS)
+        manifest_bytes = {path: _read_file(source / path, maximum=MAX_PACKAGE_JSON_BYTES) for path in manifests}
+        package_names = bootstrap.check_manifests(
+            manifest_bytes, frozenset(root.as_posix() for root in PACKAGE_ROOTS),
+        )
         _copy_reviewed_files(source, project, manifests + reviewed_paths, worker_uid, worker_gid)
         _make_worker_directory(cargo_home, worker_uid, worker_gid)
         bootstrap.refuse_cargo_config(project)
@@ -857,6 +861,11 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
         except OSError:
             _refuse("cleanup_incomplete")
     lock_bytes = _read_worker_file(project / "Cargo.lock", worker_uid, bootstrap.MAX_LOCK_BYTES)
+    toolchain_target, toolchain_hash = _cargo_toolchain_hash(rust, bootstrap)
+    try:
+        bootstrap.check_lock_members(lock_bytes, package_names)
+    except refusal_type as error:
+        _cargo_bootstrap_refusal(bootstrap, error)
     owner = source_environ.get("SOURCE_REPOSITORY_OWNER", "")
     name = source_environ.get("SOURCE_REPOSITORY_NAME", "")
     trusted_context = {
@@ -868,13 +877,13 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
         "reviewed_diff_fingerprint": request["reviewed_diff_sha256"],
         "dependency_policy_revision": bootstrap.DEPENDENCY_POLICY_REVISION,
         "control_sha": request["control_sha"],
-        "toolchain_hash": _cargo_toolchain_hash(rust),
+        "toolchain_hash": toolchain_hash,
     }
     try:
         bundle = bootstrap.produce_bundle(
             lock_bytes, trusted_context, run_id=dispatch["context"]["run_id"], run_attempt=1,
             now=int(time.time()), expiry=request["expiry"], build_inputs={},
-            fetcher=bootstrap.RegistryFetcher(),
+            fetcher=bootstrap.RegistryFetcher(), toolchain_target=toolchain_target,
         )
     except refusal_type as error:
         _cargo_bootstrap_refusal(bootstrap, error)

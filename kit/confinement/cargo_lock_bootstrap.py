@@ -3,6 +3,11 @@
 Every check that needs no network runs before the first registry request. The
 bundle limits here are the Cargo lock profile's own limits and never reuse the
 Node lock channel size.
+
+Manifests are checked before any Cargo command. A version metadata response may be up
+to 512 KiB, which leaves room for crates with very large feature maps such as windows-sys
+and web-sys; anything larger is refused. The User-Agent names the project only and carries
+no contact address, because a contact URL or email is forbidden in the public tree.
 """
 
 import base64
@@ -14,6 +19,7 @@ import http.client
 import importlib.util
 import json
 import os
+import posixpath
 from pathlib import Path
 import re
 import stat
@@ -45,7 +51,7 @@ MAX_RECEIPT_BYTES = 128 * 1024
 MAX_EVIDENCE_BYTES = 192 * 1024
 MAX_PACKAGES = 512
 MAX_INDEX_ENTRY_BYTES = 4 * 1024 * 1024
-MAX_API_BYTES = 64 * 1024
+MAX_API_BYTES = 512 * 1024
 MAX_TREE_ENTRIES = 20_000
 MIN_PACKAGE_AGE_SECONDS = 7 * 24 * 60 * 60
 CLOCK_SKEW_SECONDS = 300
@@ -66,6 +72,23 @@ CREATED_AT_RE = re.compile(
     r"(?:\.[0-9]{1,9})?(?:Z|\+00:00)\Z"
 )
 CRATE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+MAX_MANIFEST_BYTES = 256 * 1024
+MAX_MANIFEST_LINES = 8192
+MAX_MANIFEST_VALUE_DEPTH = 8
+MAX_MANIFESTS = 16
+BARE_KEY_RE = re.compile(r"[A-Za-z0-9_-]+")
+NUMBER_RE = re.compile(r"[+-]?[0-9][0-9_]*(?:\.[0-9_]+)?(?:[eE][+-]?[0-9]+)?")
+MANIFEST_PIN_RE = re.compile(
+    r"=(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    r"(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z"
+)
+DEPENDENCY_TABLE_NAMES = ("dependencies", "dev-dependencies", "build-dependencies")
+FORBIDDEN_MANIFEST_TABLES = frozenset(("patch", "replace", "source"))
+ARRAY_TABLE_NAMES = frozenset(("bin", "example", "test", "bench"))
+DEPENDENCY_SPEC_KEYS = frozenset((
+    "version", "path", "features", "default-features", "default_features", "optional",
+    "package", "workspace",
+))
 FORBIDDEN_ENVIRONMENT_PREFIXES = (
     "CARGO_", "RUSTC", "RUSTUP", "RUSTFLAGS", "RUSTDOC", "GIT_", "SSL_", "CURL_",
 )
@@ -80,7 +103,7 @@ TARGET_RUNNER_TRIPLES = (
 CONTEXT_FIELDS = frozenset(cargo.CONTEXT_FIELDS)
 EVIDENCE_FIELDS = frozenset((
     "schema_version", "receipt_sha256", "lock_sha256", "run_id", "run_attempt",
-    "generated_at", "expiry", "minimum_age_seconds", "index_origin", "api_origin",
+    "generated_at", "expiry", "minimum_age_seconds", "index_origin", "api_origin", "toolchain_target",
     "build_inputs", "packages",
 ))
 EVIDENCE_PACKAGE_FIELDS = frozenset((
@@ -92,7 +115,7 @@ REASONS = frozenset((
     "bootstrap_lock_refused", "bootstrap_mismatch", "bootstrap_source_refused",
     "bootstrap_package_too_young", "bootstrap_package_yanked", "bootstrap_evidence_invalid",
     "bootstrap_network_refused", "bootstrap_payload_too_large", "bootstrap_build_input_refused",
-    "bootstrap_stale",
+    "bootstrap_stale", "bootstrap_manifest_refused",
 ))
 CARGO_REASON_MAP = {
     "cargo_lock_invalid": "bootstrap_lock_refused",
@@ -152,8 +175,6 @@ def forced_config_items():
     items = [
         ("registry.global-credential-providers", "[]"),
         ("registry.credential-provider", json.dumps("cargo:token")),
-        ("source.crates-io.replace-with", json.dumps("fixed-crates-io")),
-        ("source.fixed-crates-io.registry", json.dumps(cargo.SPARSE_REGISTRY_SOURCE)),
         ("patch.crates-io", "{}"),
         ("net.offline", "false"),
         ("net.git-fetch-with-cli", "false"),
@@ -277,6 +298,314 @@ def validate_build_inputs(inputs, allowed=BUILD_INPUT_ALLOWLIST):
                 or not 0 < len(value) <= 256 or not value.isascii() or not value.isprintable()):
             _refuse("bootstrap_build_input_refused")
     return dict(inputs)
+
+
+def _manifest_refuse():
+    _refuse("bootstrap_manifest_refused")
+
+
+def _skip_space(text, index):
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    return index
+
+
+def _strip_comment(line):
+    quote = None
+    for index, character in enumerate(line):
+        if quote is not None:
+            if character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character == chr(35):
+            return line[:index]
+    if quote is not None:
+        _manifest_refuse()
+    return line
+
+
+def _bracket_depth(text):
+    depth = 0
+    quote = None
+    for character in text:
+        if quote is not None:
+            if character == quote:
+                quote = None
+        elif character in "\"'":
+            quote = character
+        elif character in "[{":
+            depth += 1
+        elif character in "]}":
+            depth -= 1
+    if quote is not None or depth < 0:
+        _manifest_refuse()
+    return depth
+
+
+def _parse_key(text, index):
+    parts = []
+    while True:
+        index = _skip_space(text, index)
+        if index >= len(text):
+            _manifest_refuse()
+        if text[index] in "\"'":
+            end = text.find(text[index], index + 1)
+            if end < 0:
+                _manifest_refuse()
+            part = text[index + 1:end]
+            index = end + 1
+        else:
+            match = BARE_KEY_RE.match(text, index)
+            if match is None:
+                _manifest_refuse()
+            part = match.group(0)
+            index = match.end()
+        if not part:
+            _manifest_refuse()
+        parts.append(part)
+        index = _skip_space(text, index)
+        if index < len(text) and text[index] == ".":
+            index += 1
+            continue
+        return parts, index
+
+
+def _set_path(table, parts, value):
+    current = table
+    for part in parts[:-1]:
+        current = current.setdefault(part, {})
+        if type(current) is not dict:
+            _manifest_refuse()
+    if parts[-1] in current:
+        _manifest_refuse()
+    current[parts[-1]] = value
+
+
+def _parse_value(text, index, depth):
+    if depth > MAX_MANIFEST_VALUE_DEPTH:
+        _manifest_refuse()
+    index = _skip_space(text, index)
+    if index >= len(text):
+        _manifest_refuse()
+    character = text[index]
+    if character in "\"'":
+        end = text.find(character, index + 1)
+        if end < 0:
+            _manifest_refuse()
+        return text[index + 1:end], end + 1
+    if character == "[":
+        values = []
+        index += 1
+        while True:
+            index = _skip_space(text, index)
+            if index < len(text) and text[index] == "]":
+                return values, index + 1
+            value, index = _parse_value(text, index, depth + 1)
+            values.append(value)
+            index = _skip_space(text, index)
+            if index < len(text) and text[index] == ",":
+                index += 1
+            elif index >= len(text) or text[index] != "]":
+                _manifest_refuse()
+    if character == "{":
+        table = {}
+        index += 1
+        while True:
+            index = _skip_space(text, index)
+            if index < len(text) and text[index] == "}":
+                return table, index + 1
+            parts, index = _parse_key(text, index)
+            index = _skip_space(text, index)
+            if index >= len(text) or text[index] != "=":
+                _manifest_refuse()
+            value, index = _parse_value(text, index + 1, depth + 1)
+            _set_path(table, parts, value)
+            index = _skip_space(text, index)
+            if index < len(text) and text[index] == ",":
+                index += 1
+            elif index >= len(text) or text[index] != "}":
+                _manifest_refuse()
+    for word, value in (("true", True), ("false", False)):
+        if text.startswith(word, index):
+            return value, index + len(word)
+    match = NUMBER_RE.match(text, index)
+    if match is None:
+        _manifest_refuse()
+    return ("number", match.group(0)), match.end()
+
+
+def _parse_manifest(data):
+    if (type(data) is not bytes or not 0 < len(data) <= MAX_MANIFEST_BYTES
+            or b"\\" in data or b"\x00" in data):
+        _manifest_refuse()
+    try:
+        text = data.decode("utf-8", "strict")
+    except UnicodeError:
+        _manifest_refuse()
+    if '"""' in text or "'''" in text:
+        _manifest_refuse()
+    lines = text.split("\n")
+    if len(lines) > MAX_MANIFEST_LINES:
+        _manifest_refuse()
+    document = {}
+    current = document
+    defined = set()
+    position = 0
+    while position < len(lines):
+        line = _strip_comment(lines[position].rstrip("\r")).strip()
+        position += 1
+        if not line:
+            continue
+        if line.startswith("["):
+            array = line.startswith("[[")
+            closer = "]]" if array else "]"
+            if not line.endswith(closer):
+                _manifest_refuse()
+            inner = line[2:-2] if array else line[1:-1]
+            parts, index = _parse_key(inner, 0)
+            if _skip_space(inner, index) != len(inner):
+                _manifest_refuse()
+            if array:
+                if len(parts) != 1 or parts[0] not in ARRAY_TABLE_NAMES:
+                    _manifest_refuse()
+                entries = document.setdefault(parts[0], [])
+                if type(entries) is not list:
+                    _manifest_refuse()
+                current = {}
+                entries.append(current)
+                continue
+            if tuple(parts) in defined:
+                _manifest_refuse()
+            defined.add(tuple(parts))
+            current = document
+            for part in parts:
+                current = current.setdefault(part, {})
+                if type(current) is not dict:
+                    _manifest_refuse()
+            continue
+        parts, index = _parse_key(line, 0)
+        index = _skip_space(line, index)
+        if index >= len(line) or line[index] != "=":
+            _manifest_refuse()
+        statement = line[index + 1:]
+        while _bracket_depth(statement) > 0:
+            if position >= len(lines):
+                _manifest_refuse()
+            statement += " " + _strip_comment(lines[position].rstrip("\r")).strip()
+            position += 1
+        value, end = _parse_value(statement, 0, 0)
+        if _skip_space(statement, end) != len(statement):
+            _manifest_refuse()
+        _set_path(current, parts, value)
+    return document
+
+
+def _check_pin(value):
+    if type(value) is not str or MANIFEST_PIN_RE.fullmatch(value) is None:
+        _manifest_refuse()
+
+
+def _check_dependency(name, spec, directory, members):
+    if type(name) is not str or CRATE_NAME_RE.fullmatch(name) is None:
+        _manifest_refuse()
+    if type(spec) is str:
+        _check_pin(spec)
+        return
+    if type(spec) is not dict or set(spec) - DEPENDENCY_SPEC_KEYS:
+        _manifest_refuse()
+    for key in ("default-features", "default_features", "optional"):
+        if key in spec and type(spec[key]) is not bool:
+            _manifest_refuse()
+    features = spec.get("features", [])
+    if type(features) is not list or any(type(item) is not str for item in features):
+        _manifest_refuse()
+    if "package" in spec and (type(spec["package"]) is not str
+                              or CRATE_NAME_RE.fullmatch(spec["package"]) is None):
+        _manifest_refuse()
+    if "workspace" in spec:
+        if spec["workspace"] is not True or "version" in spec or "path" in spec:
+            _manifest_refuse()
+        return
+    if "path" in spec:
+        path = spec["path"]
+        if type(path) is not str or not path or path.startswith("/") or "\\" in path:
+            _manifest_refuse()
+        resolved = posixpath.normpath(posixpath.join(directory, path))
+        if resolved.startswith("..") or resolved not in members:
+            _manifest_refuse()
+        if "version" in spec:
+            _check_pin(spec["version"])
+        return
+    if "version" not in spec:
+        _manifest_refuse()
+    _check_pin(spec["version"])
+
+
+def _check_document(document, directory, members):
+    if set(document) & FORBIDDEN_MANIFEST_TABLES:
+        _manifest_refuse()
+    workspace = document.get("workspace")
+    if workspace is not None and (
+            type(workspace) is not dict or set(workspace) & FORBIDDEN_MANIFEST_TABLES):
+        _manifest_refuse()
+    tables = [document[name] for name in DEPENDENCY_TABLE_NAMES if name in document]
+    target = document.get("target")
+    if target is not None:
+        if type(target) is not dict:
+            _manifest_refuse()
+        for entry in target.values():
+            if type(entry) is not dict or set(entry) & FORBIDDEN_MANIFEST_TABLES:
+                _manifest_refuse()
+            tables.extend(entry[name] for name in DEPENDENCY_TABLE_NAMES if name in entry)
+    if workspace is not None and "dependencies" in workspace:
+        tables.append(workspace["dependencies"])
+    for table in tables:
+        if type(table) is not dict:
+            _manifest_refuse()
+        for name, spec in table.items():
+            _check_dependency(name, spec, directory, members)
+    package = document.get("package")
+    if package is None:
+        return None
+    if type(package) is not dict or type(package.get("name")) is not str:
+        _manifest_refuse()
+    return package["name"]
+
+
+def check_manifests(manifests, members):
+    """Check the root and member manifests before any Cargo command runs.
+
+    Only exact version pins from the default registry and path dependencies that name a
+    fixed workspace member are accepted. Git, registry, registry-index, any other path and
+    any patch, replace or source table are refused, and so is anything that cannot be parsed.
+    Returns the package names the manifests declare.
+    """
+    if (type(manifests) is not dict or type(members) not in (set, frozenset, tuple)
+            or not 1 <= len(manifests) <= MAX_MANIFESTS or "Cargo.toml" not in manifests):
+        _manifest_refuse()
+    member_set = frozenset(members)
+    allowed = {"Cargo.toml"} | {member + "/Cargo.toml" for member in member_set}
+    names = set()
+    for path, data in manifests.items():
+        if type(path) is not str or path not in allowed:
+            _manifest_refuse()
+        directory = posixpath.dirname(path) or "."
+        name = _check_document(_parse_manifest(data), directory, member_set)
+        if name is not None:
+            if name in names:
+                _manifest_refuse()
+            names.add(name)
+    return frozenset(names)
+
+
+def check_lock_members(lock_bytes, package_names):
+    """Require the lock's sourceless packages to be exactly the workspace packages."""
+    lock = parse_lock(lock_bytes)
+    sourceless = {package["name"] for package in lock["packages"] if package.get("source") is None}
+    if type(package_names) not in (set, frozenset) or sourceless != set(package_names):
+        _refuse("bootstrap_lock_refused")
+    return True
 
 
 def refuse_foreign_sources(lock_bytes):
@@ -484,6 +813,11 @@ def _check_times(now, expiry):
         _refuse("bootstrap_stale")
 
 
+def _check_target(target):
+    if type(target) is not str or cargo.TARGET_TRIPLE_RE.fullmatch(target) is None:
+        _refuse("bootstrap_input_invalid")
+
+
 def _check_run(run_id, run_attempt):
     if (type(run_id) is not str or DECIMAL_RE.fullmatch(run_id) is None
             or type(run_attempt) is not int or run_attempt != 1):
@@ -491,11 +825,12 @@ def _check_run(run_id, run_attempt):
 
 
 def build_evidence(lock_bytes, receipt_bytes, trusted_context, *, run_id, run_attempt, now,
-                   expiry, build_inputs, fetcher):
+                   expiry, build_inputs, fetcher, toolchain_target):
     """Record index entry hashes and registry creation times for every receipt package."""
     receipt = self_check(lock_bytes, receipt_bytes, trusted_context)
     inputs = validate_build_inputs(build_inputs)
     _check_run(run_id, run_attempt)
+    _check_target(toolchain_target)
     _check_times(now, expiry)
     if fetcher is None or not callable(getattr(fetcher, "index_entry", None)) \
             or not callable(getattr(fetcher, "version_metadata", None)):
@@ -529,6 +864,7 @@ def build_evidence(lock_bytes, receipt_bytes, trusted_context, *, run_id, run_at
         "minimum_age_seconds": MIN_PACKAGE_AGE_SECONDS,
         "index_origin": INDEX_HOST,
         "api_origin": API_HOST,
+        "toolchain_target": toolchain_target,
         "build_inputs": inputs,
         "packages": packages,
     }
@@ -557,6 +893,7 @@ def validate_evidence(evidence_bytes, receipt_bytes, lock_bytes, *, now):
             or record["minimum_age_seconds"] != MIN_PACKAGE_AGE_SECONDS):
         _refuse("bootstrap_evidence_invalid")
     _check_run(record["run_id"], record["run_attempt"])
+    _check_target(record["toolchain_target"])
     generated_at = record["generated_at"]
     expiry = record["expiry"]
     _check_times(generated_at, expiry)
@@ -643,13 +980,14 @@ def verify_bundle(bundle_bytes, trusted_context, *, now):
 
 
 def produce_bundle(lock_bytes, trusted_context, *, run_id, run_attempt, now, expiry,
-                   build_inputs, fetcher):
+                   build_inputs, fetcher, toolchain_target):
     """Build, self-check and encode the return payload for one generated lock."""
     receipt_bytes = build_receipt(lock_bytes, trusted_context)
     self_check(lock_bytes, receipt_bytes, trusted_context)
     evidence_bytes = build_evidence(
         lock_bytes, receipt_bytes, trusted_context, run_id=run_id, run_attempt=run_attempt,
         now=now, expiry=expiry, build_inputs=build_inputs, fetcher=fetcher,
+        toolchain_target=toolchain_target,
     )
     bundle = encode_bundle(lock_bytes, receipt_bytes, evidence_bytes)
     verify_bundle(bundle, trusted_context, now=now)

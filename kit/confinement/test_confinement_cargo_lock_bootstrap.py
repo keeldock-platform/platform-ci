@@ -17,6 +17,7 @@ import feedback_request
 NOW = 1_793_160_000
 EXPIRY = NOW + 3600
 CHECKSUM = "a" * 64
+TARGET = "aarch64-apple-darwin"
 OTHER_CHECKSUM = "b" * 64
 DAY = 24 * 60 * 60
 LOCK_BYTES = (
@@ -128,7 +129,7 @@ class BootstrapTestCase(unittest.TestCase):
     def evidence(self, fetcher, lock_bytes=LOCK_BYTES, receipt_bytes=None, context=None, **overrides):
         values = {
             "run_id": "987654321", "run_attempt": 1, "now": NOW, "expiry": EXPIRY,
-            "build_inputs": {}, "fetcher": fetcher,
+            "build_inputs": {}, "fetcher": fetcher, "toolchain_target": TARGET,
         }
         values.update(overrides)
         return subject.build_evidence(
@@ -140,9 +141,10 @@ class BootstrapTestCase(unittest.TestCase):
 class ForcedSettingsTests(BootstrapTestCase):
     def test_forced_config_covers_every_setting_family_and_never_carries_a_token(self):
         items = dict(subject.forced_config_items())
+        self.assertFalse([key for key in items if key.startswith("source.")])
         for key in (
             "registry.global-credential-providers", "registry.credential-provider",
-            "source.crates-io.replace-with", "source.fixed-crates-io.registry",
+            "patch.crates-io",
             "patch.crates-io", "net.offline", "net.git-fetch-with-cli", "http.proxy",
             "http.multiplexing", "http.timeout",
         ):
@@ -153,7 +155,6 @@ class ForcedSettingsTests(BootstrapTestCase):
         self.assertEqual(items["http.proxy"], '""')
         self.assertEqual(items["net.offline"], "false")
         self.assertEqual(items["patch.crates-io"], "{}")
-        self.assertEqual(items["source.fixed-crates-io.registry"], json.dumps(cargo.SPARSE_REGISTRY_SOURCE))
         arguments = subject.bootstrap_config_arguments()
         self.assertEqual(len(arguments), 2 * len(items))
         self.assertEqual(set(arguments[0::2]), {"--config"})
@@ -543,7 +544,7 @@ class BundleTests(BootstrapTestCase):
     def produce(self, **overrides):
         values = {
             "run_id": "987654321", "run_attempt": 1, "now": NOW, "expiry": EXPIRY,
-            "build_inputs": {}, "fetcher": FakeFetcher(),
+            "build_inputs": {}, "fetcher": FakeFetcher(), "toolchain_target": TARGET,
         }
         values.update(overrides)
         return subject.produce_bundle(LOCK_BYTES, CONTEXT, **values)
@@ -626,7 +627,7 @@ class BundleTests(BootstrapTestCase):
         record = json.loads(evidence_bytes)
         for field, value in (
             ("receipt_sha256", "f" * 64), ("lock_sha256", "f" * 64), ("index_origin", "other"),
-            ("minimum_age_seconds", 1), ("run_attempt", 2), ("build_inputs", {"LIBSQLITE3_FLAGS": "x"}),
+            ("minimum_age_seconds", 1), ("run_attempt", 2), ("toolchain_target", "bad"), ("build_inputs", {"LIBSQLITE3_FLAGS": "x"}),
         ):
             with self.subTest(field=field):
                 changed = json.dumps(dict(record, **{field: value}), sort_keys=True,
@@ -703,6 +704,210 @@ class ProfileLimitTests(BootstrapTestCase):
         lock = "".join(lines).encode("ascii")
         self.assertLessEqual(len(lock), subject.MAX_LOCK_BYTES)
         self.assert_refused("bootstrap_lock_refused", subject.build_receipt, lock, CONTEXT)
+
+
+MEMBERS = ("crates/host/api", "crates/host/mock", "crates/host/conformance")
+HASH = chr(35)
+ROOT_MANIFEST = (
+    "[workspace]\n"
+    'members = [\n  "crates/host/api",\n  "crates/host/mock",\n  "crates/host/conformance",\n]\n'
+    'resolver = "2"\n\n[workspace.dependencies]\nserde = "=1.0.200"\n'
+)
+API_MANIFEST = (
+    HASH + " a comment\n"
+    '[package]\nname = "host-api"\nversion = "0.1.0"\nedition = "2021"\n\n'
+    "[dependencies]\n"
+    'serde = { version = "=1.0.200", features = [\n  "derive",\n], default-features = false }\n'
+    'shared = { workspace = true }\n'
+)
+MOCK_MANIFEST = (
+    '[package]\nname = "host-mock"\nversion = "0.1.0"\n\n'
+    '[dependencies]\nhost-api = { path = "../api", version = "=0.1.0" }\n\n'
+    '[dev-dependencies]\nserde_json = "=1.0.100"\n\n'
+    '[build-dependencies]\ncc = "=1.0.83"\n\n'
+    "[target.'cfg(unix)'.dependencies]\nlibc = \"=0.2.150\"\n"
+)
+CONFORMANCE_MANIFEST = (
+    '[package]\nname = "host-conformance"\nversion = "0.1.0"\n\n'
+    '[dependencies.host-mock]\npath = "../mock"\n'
+)
+
+
+def _manifests(api=API_MANIFEST, root=ROOT_MANIFEST):
+    return {
+        "Cargo.toml": root.encode("utf-8"),
+        "crates/host/api/Cargo.toml": api.encode("utf-8"),
+        "crates/host/mock/Cargo.toml": MOCK_MANIFEST.encode("utf-8"),
+        "crates/host/conformance/Cargo.toml": CONFORMANCE_MANIFEST.encode("utf-8"),
+    }
+
+
+class ManifestCheckTests(BootstrapTestCase):
+    def test_pinned_registry_and_member_path_dependencies_are_accepted(self):
+        names = subject.check_manifests(_manifests(), MEMBERS)
+        self.assertEqual(names, frozenset(("host-api", "host-mock", "host-conformance")))
+
+    def test_every_non_pinned_or_non_member_dependency_form_is_refused(self):
+        git = "https:" + chr(47) * 2 + "example.invalid/crate"
+        dependencies = (
+            'a = { git = "' + git + '" }',
+            'a = { git = "' + git + '", rev = "abc" }',
+            'a = { version = "=1.0.0", registry = "other" }',
+            'a = { version = "=1.0.0", registry-index = "' + git + '" }',
+            'a = { path = "../../outside" }',
+            'a = { path = "/etc/crate" }',
+            'a = { path = "../other" }',
+            'a = { path = "../api/.." }',
+            'a = "1.0.0"',
+            'a = "^1.0.0"',
+            'a = "=1.0"',
+            'a = "*"',
+            'a = { version = "1.0.0" }',
+            'a = { features = ["x"] }',
+            'a = { version = "=1.0.0", artifact = "bin" }',
+            'a = { workspace = true, version = "=1.0.0" }',
+            'a = { workspace = false }',
+            'a = { version = "=1.0.0", optional = "yes" }',
+            'a = { version = "=1.0.0", features = [1] }',
+            'a = 3',
+            "a.git = '" + git + "'",
+            'a = { version = "=1.0.0", package = "../x" }',
+        )
+        for line in dependencies:
+            with self.subTest(dependency=line):
+                with self.assertRaises(subject.BootstrapRefusal) as raised:
+                    subject.check_manifests(
+                        _manifests(api='[package]\nname = "host-api"\n\n[dependencies]\n' + line + "\n"),
+                        MEMBERS,
+                    )
+                self.assertEqual(raised.exception.reason, "bootstrap_manifest_refused")
+
+    def test_dependency_tables_of_every_kind_are_checked(self):
+        git = "https:" + chr(47) * 2 + "example.invalid/crate"
+        bad = 'a = { git = "' + git + '" }\n'
+        sections = (
+            "[dev-dependencies]\n" + bad,
+            "[build-dependencies]\n" + bad,
+            "[target.'cfg(unix)'.dependencies]\n" + bad,
+            "[target.'cfg(target_os = \"linux\")'.dev-dependencies]\n" + bad,
+            "[target.x86_64-pc-windows-msvc.build-dependencies]\n" + bad,
+            "[dependencies.a]\ngit = \"" + git + "\"\n",
+            "[workspace.dependencies]\n" + bad,
+            "[dependencies]\n\n[dependencies.a]\nversion = \"1.0.0\"\n",
+        )
+        for section in sections:
+            with self.subTest(section=section):
+                with self.assertRaises(subject.BootstrapRefusal):
+                    subject.check_manifests(
+                        _manifests(api='[package]\nname = "host-api"\n\n' + section), MEMBERS,
+                    )
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_manifests(_manifests(root=ROOT_MANIFEST + bad), MEMBERS)
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_manifests(
+                _manifests(root=ROOT_MANIFEST.replace("[workspace.dependencies]\n", "[workspace.dependencies]\n" + bad)),
+                MEMBERS,
+            )
+
+    def test_patch_replace_and_source_sections_are_refused_in_any_manifest(self):
+        git = "https:" + chr(47) * 2 + "example.invalid/crate"
+        sections = (
+            "[patch.crates-io]\na = { git = \"" + git + "\" }\n",
+            "[patch.\"" + git + "\"]\na = { path = \"/abs\" }\n",
+            "[patch.crates-io]\n",
+            "[replace]\n",
+            "[replace.\"a:1.0.0\"]\ngit = \"" + git + "\"\n",
+            "[source.crates-io]\nreplace-with = \"x\"\n",
+            "[source.x]\ndirectory = \"/tmp/x\"\n",
+            "patch.crates-io.a = { path = \"/abs\" }\n",
+            "[workspace.patch.crates-io]\n",
+            "[target.'cfg(unix)'.patch.crates-io]\n",
+        )
+        for section in sections:
+            for position in ("root", "member"):
+                with self.subTest(section=section, position=position):
+                    with self.assertRaises(subject.BootstrapRefusal) as raised:
+                        if position == "root":
+                            subject.check_manifests(_manifests(root=section + ROOT_MANIFEST), MEMBERS)
+                        else:
+                            subject.check_manifests(
+                                _manifests(api=section + API_MANIFEST),
+                                MEMBERS,
+                            )
+                    self.assertEqual(raised.exception.reason, "bootstrap_manifest_refused")
+
+    def test_anything_that_cannot_be_parsed_fails_closed(self):
+        broken = (
+            '[package]\nname = "unterminated\n',
+            '[package]\nname = """multi\nline"""\n',
+            "[package]\nname = 'a\\b'\n",
+            "[package]\nname = 1979-05-27\n",
+            "[package]\nname = \n",
+            "[package]\nname = \"a\" extra\n",
+            '[package]\nname = "a"\nname = "b"\n',
+            "[package]\nname = \"a\"\n[package]\nversion = \"1\"\n",
+            "[dependencies]\na = { version = \"=1.0.0\"\n",
+            "[dependencies\na = \"=1.0.0\"\n",
+            "[dependencies]\na b = \"=1.0.0\"\n",
+            "[[dependencies]]\n",
+            "[[bin]]\nname = \"a\"\n[bin.extra]\n",
+            "[package]\nname = [[[[[[[[[[1]]]]]]]]]]\n",
+            "[package]\nversion = \"1\"\n",
+            "[package]\nname = 7\n",
+        )
+        for text in broken:
+            with self.subTest(text=text):
+                with self.assertRaises(subject.BootstrapRefusal) as raised:
+                    subject.check_manifests(_manifests(api=text), MEMBERS)
+                self.assertEqual(raised.exception.reason, "bootstrap_manifest_refused")
+        for data in (b"", b"\xff\xfe", b"x" * (subject.MAX_MANIFEST_BYTES + 1), b"a = 1\n" * (subject.MAX_MANIFEST_LINES + 1), None):
+            with self.subTest(size=len(data) if data is not None else -1):
+                manifests = _manifests()
+                manifests["crates/host/api/Cargo.toml"] = data
+                with self.assertRaises(subject.BootstrapRefusal):
+                    subject.check_manifests(manifests, MEMBERS)
+
+    def test_manifest_set_must_be_the_root_and_fixed_members_only(self):
+        for mutate in (
+            lambda m: m.pop("Cargo.toml"),
+            lambda m: m.update({"crates/other/Cargo.toml": b"[package]\nname = \"x\"\n"}),
+            lambda m: m.update({"../Cargo.toml": b""}),
+            lambda m: m.update({"crates/host/api/Cargo.lock": b""}),
+            lambda m: m.clear(),
+        ):
+            manifests = _manifests()
+            mutate(manifests)
+            with self.subTest(keys=sorted(manifests)):
+                with self.assertRaises(subject.BootstrapRefusal):
+                    subject.check_manifests(manifests, MEMBERS)
+        for manifests, members in ((None, MEMBERS), ([], MEMBERS), (_manifests(), "crates/host/api")):
+            with self.assertRaises(subject.BootstrapRefusal):
+                subject.check_manifests(manifests, members)
+        duplicate = _manifests()
+        duplicate["crates/host/mock/Cargo.toml"] = API_MANIFEST.encode("utf-8")
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_manifests(duplicate, MEMBERS)
+
+    def test_sourceless_lock_packages_must_be_exactly_the_workspace_packages(self):
+        self.assertTrue(subject.check_lock_members(LOCK_BYTES, frozenset(("contract-root",))))
+        for names in (frozenset(), frozenset(("other",)), frozenset(("contract-root", "extra")), ["contract-root"]):
+            with self.subTest(names=repr(names)):
+                self.assert_refused("bootstrap_lock_refused", subject.check_lock_members, LOCK_BYTES, names)
+        with_path = LOCK_BYTES + b'\n[[package]]\nname = "stray"\nversion = "0.1.0"\n'
+        self.assert_refused(
+            "bootstrap_lock_refused", subject.check_lock_members, with_path, frozenset(("contract-root",)),
+        )
+
+    def test_a_bad_toolchain_target_refuses_before_any_registry_request(self):
+        for target in ("", "darwin", None, "AArch64-apple-darwin"):
+            with self.subTest(target=target):
+                fetcher = FakeFetcher()
+                self.assert_refused(
+                    "bootstrap_input_invalid", self.evidence, fetcher, toolchain_target=target,
+                    receipt_bytes=self.receipt(),
+                )
+                self.assertEqual(fetcher.calls, [])
+        self.assertEqual(json.loads(self.evidence(FakeFetcher()))["toolchain_target"], TARGET)
 
 
 if __name__ == "__main__":
