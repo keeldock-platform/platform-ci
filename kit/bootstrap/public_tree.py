@@ -269,7 +269,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/macos_network_observer.py': 'a7cf6cb16e68f00513e9f8ee08d52511619b18bb8edd37205faf907dcf0a98d9',
     'kit/confinement/test_macos_network_observer.py': '0187ffbe5a7b7395b2edc2025a4dd3e4c0adf5a48c881f8878578010d76307a3',
     'kit/confinement/macos_private_validation.py': 'aa43aa1a560f0ddf1a34f8a8178ef7c6e4dbb784f985351081554a1dde0539a0',
-    'kit/confinement/test_macos_private_validation.py': '3a295f5984bf0ba8c2a777e28c534cfe851fada2fee3d9169295105816613a0e',
+    'kit/confinement/test_macos_private_validation.py': '27ab2f6153f8f5a8853b06364f44e94cbe6aed495ce09f4c6ff70db44b1f80b3',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     '.github/workflows/capsule-vectors.yml': '7366acdb58988c5675e86268abe268e71f71bc16681ab560ba8e33f37fc9f9f7',
     'kit/confinement/capsule_frame.cs': 'b7de9b0af02e305d23e75ea58daf856a9e51d340b0ccee0920925930ffb1bc84',

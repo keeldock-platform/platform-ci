@@ -1855,7 +1855,7 @@ class CoreContractTreeTests(unittest.TestCase):
         entries = self._required_core_contract_entries("core-rust-lock-return")
         entries["Cargo.lock"] = ("100644", "c" * 40)
         self.assertEqual(
-            self._refused(entries=entries, concern="core-rust-lock-return"),
+            self._refused_check(entries, "core-rust-lock-return"),
             "cargo_lock_shape",
         )
 
