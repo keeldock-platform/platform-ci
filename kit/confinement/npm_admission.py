@@ -412,7 +412,7 @@ def _validate_entry_shape(entry, workspace_names, extra_internal_names):
             _refuse("npm_lock_invalid")
 
 
-def parse_lock(lock_bytes, internal_names=()):
+def parse_lock(lock_bytes, internal_names=(), workspace_links=None):
     if type(lock_bytes) is not bytes or len(lock_bytes) > MAX_LOCK_BYTES:
         _refuse("npm_lock_invalid")
     lock = _load_json(lock_bytes, MAX_LOCK_BYTES, "npm_lock_invalid")
@@ -424,7 +424,9 @@ def parse_lock(lock_bytes, internal_names=()):
         _refuse("npm_lock_invalid")
     if type(internal_names) not in (tuple, list, set, frozenset):
         _refuse("npm_lock_invalid")
-    links = WORKSPACE_LINKS
+    links = WORKSPACE_LINKS if workspace_links is None else workspace_links
+    if type(links) is not dict:
+        _refuse("npm_lock_invalid")
     if not links or len(links) > 16:
         _refuse("npm_lock_invalid")
     expected_links = {}
@@ -496,13 +498,14 @@ def parse_lock(lock_bytes, internal_names=()):
     return lock
 
 
-def registry_entries(lock, internal_names=()):
+def registry_entries(lock, internal_names=(), workspace_links=None):
     if type(lock) is not bytes:
         _refuse("npm_lock_invalid")
-    lock = parse_lock(lock, internal_names=internal_names)
+    lock = parse_lock(lock, internal_names=internal_names, workspace_links=workspace_links)
+    links = WORKSPACE_LINKS if workspace_links is None else workspace_links
     entries = []
     for path, entry in lock["packages"].items():
-        if path == "" or path in WORKSPACE_LINKS or path in WORKSPACE_LINKS.values():
+        if path == "" or path in links or path in links.values():
             continue
         normalized = dict(entry)
         normalized.setdefault("name", _package_name_from_lock_path(path))
