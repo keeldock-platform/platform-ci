@@ -988,7 +988,7 @@ class CoreContractTreeTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
 
-    def test_a_batch5_tree_passes_diagnostics_and_is_refused_by_every_other_concern(self):
+    def test_a_batch5_tree_passes_diagnostics_and_is_refused_by_format_return(self):
         diagnostics = subject.CORE_CONTRACT_BATCH5_CONCERN
         entries = self._four_crate_entries(diagnostics)
         entries.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})

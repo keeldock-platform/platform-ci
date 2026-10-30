@@ -1692,7 +1692,7 @@ class DiffCapTests(unittest.TestCase):
     def test_diff_cap_constant_admits_the_four_crate_contract_size(self):
         self.assertEqual(subject.MAX_DIFF_BYTES, 7 * 1024 * 1024)
         self.assertGreater(subject.MAX_DIFF_BYTES, 3_723_563)
-        self.assertGreater(subject.MAX_DIFF_BYTES, 6_314_518)
+        self.assertGreater(subject.MAX_DIFF_BYTES, 6_315_077)
         self.assertLess(subject.MAX_DIFF_BYTES, 8 * 1024 * 1024)
 
     def test_diff_cap_is_enforced_exactly_at_the_boundary(self):

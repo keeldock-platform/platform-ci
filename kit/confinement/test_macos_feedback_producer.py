@@ -1044,7 +1044,7 @@ class CargoLockProducerTests(unittest.TestCase):
             )),
         )
         self.assertNotIn(producer.PACKAGE_ROOTS[0].as_posix(), runtime_members)
-        copied =state["copy"].call_args.args[2]
+        copied = state["copy"].call_args.args[2]
         self.assertEqual(copied[0], "runtime/Cargo.toml")
         self.assertEqual(copied[1:1 + len(runtime_members)], tuple(path + "/Cargo.toml" for path in runtime_members))
         self.assertNotIn("Cargo.toml", copied)
