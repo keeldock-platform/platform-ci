@@ -57,7 +57,7 @@ MIN_PACKAGE_AGE_SECONDS = 7 * 24 * 60 * 60
 CLOCK_SKEW_SECONDS = 300
 MAX_REQUEST_TTL_SECONDS = 24 * 60 * 60
 PENDING_AUDIT_ID = "pending-review"
-DEPENDENCY_POLICY_REVISION = "bootstrap-pending"
+DEPENDENCY_POLICY_REVISION = "contract-policy-2026-10-29.1"
 BUILD_INPUT_ALLOWLIST = ()
 INDEX_HOST = "index.crates.io"
 API_HOST = "crates.io"
@@ -81,6 +81,42 @@ CONTRACT_WORKSPACE = "contract"
 RUNTIME_WORKSPACE = "runtime"
 RUNTIME_WORKSPACE_DIRECTORY = "runtime"
 WORKSPACE_DIRECTORIES = {CONTRACT_WORKSPACE: ".", RUNTIME_WORKSPACE: RUNTIME_WORKSPACE_DIRECTORY}
+CONTRACT_MEMBERS = frozenset((
+    "crates/host/api", "crates/host/mock", "crates/host/conformance", "crates/kernel/i18n",
+))
+CONTRACT_PACKAGE_NAMES = {
+    "crates/host/api": "keeldock" + "-host-api",
+    "crates/host/mock": "keeldock" + "-host-mock",
+    "crates/host/conformance": "keeldock" + "-host-conformance",
+    "crates/kernel/i18n": "keeldock" + "-kernel-i18n",
+}
+CONTRACT_ROOT_DEPENDENCIES = {
+    "keeldock" + "-host-api": {"path": "crates/host/api"},
+    "keeldock" + "-host-mock": {"path": "crates/host/mock"},
+}
+CONTRACT_FIRST_BATCH_DEPENDENCIES = {
+    "serde": {
+        "version": "=1.0.229", "default-features": False, "features": ["derive", "std"],
+    },
+    "serde_json": {
+        "version": "=1.0.154", "default-features": False, "features": ["std"],
+    },
+    "schemars": {
+        "version": "=1.2.3", "default-features": False, "features": ["derive", "std"],
+    },
+}
+CONTRACT_MEMBER_DEPENDENCIES = {
+    "crates/host/api": {"dependencies": CONTRACT_FIRST_BATCH_DEPENDENCIES},
+    "crates/host/mock": {
+        "dependencies": {"keeldock" + "-host-api": {"workspace": True}},
+    },
+    "crates/host/conformance": {
+        "dependencies": {"keeldock" + "-host-api": {"workspace": True}},
+        "dev-dependencies": {"keeldock" + "-host-mock": {"workspace": True}},
+    },
+    "crates/kernel/i18n": {"dependencies": {}},
+}
+CONTRACT_API_MANIFEST_PATH = "crates/host/api/Cargo.toml"
 RUNTIME_MEMBER_PATH_RE = re.compile(
     RUNTIME_WORKSPACE_DIRECTORY + r"/crates/[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z"
 )
@@ -655,6 +691,25 @@ def _check_document(document, directory, members, is_root, root_directory="."):
     return package["name"], package["edition"]
 
 
+def _check_contract_dependency_policy(documents):
+    root = documents.get("Cargo.toml")
+    workspace = root.get("workspace") if type(root) is dict else None
+    if (type(workspace) is not dict
+            or workspace.get("dependencies") != CONTRACT_ROOT_DEPENDENCIES):
+        _manifest_refuse()
+    for member, expected_name in CONTRACT_PACKAGE_NAMES.items():
+        document = documents.get(member + "/Cargo.toml")
+        package = document.get("package") if type(document) is dict else None
+        if type(package) is not dict or package.get("name") != expected_name:
+            _manifest_refuse()
+        if "target" in document:
+            _manifest_refuse()
+        expected_tables = CONTRACT_MEMBER_DEPENDENCIES[member]
+        for table_name in DEPENDENCY_TABLE_NAMES:
+            if document.get(table_name, {}) != expected_tables.get(table_name, {}):
+                _manifest_refuse()
+
+
 def _check_edition(edition, root_document):
     if edition == REQUIRED_EDITION and type(edition) is str:
         return
@@ -702,6 +757,11 @@ def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE):
     for path in manifests:
         if type(path) is not str or path not in allowed:
             _manifest_refuse()
+    if root_directory == "." and member_set == CONTRACT_MEMBERS:
+        if set(manifests) != {root_path} | {
+            member + "/Cargo.toml" for member in CONTRACT_MEMBERS
+        }:
+            _manifest_refuse()
     documents = {path: _parse_manifest(manifests[path]) for path in sorted(manifests)}
     names = set()
     for path, document in documents.items():
@@ -714,6 +774,8 @@ def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE):
             if name in names:
                 _manifest_refuse()
             names.add(name)
+    if root_directory == "." and member_set == CONTRACT_MEMBERS:
+        _check_contract_dependency_policy(documents)
     return frozenset(names)
 
 

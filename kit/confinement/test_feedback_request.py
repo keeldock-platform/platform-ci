@@ -116,6 +116,22 @@ class FeedbackRequestTests(unittest.TestCase):
         self.assert_refused(subject.validate_request, tampered, now=NOW)
         self.assert_refused(subject.validate_request, request, now=request["expiry"])
 
+    def test_cargo_lock_accepts_only_the_exact_batch4_base_pair(self):
+        fields = _fields(subject.CARGO_LOCK_KIND)
+        fields["base_branch"] = subject.CORE_RUST_BOOTSTRAP_BASE_BRANCH
+        fields["base_sha"] = subject.CORE_RUST_BOOTSTRAP_BASE_SHA
+        self.assertEqual(
+            subject.validate_request(subject.create_request(fields, now=NOW), now=NOW),
+            subject.PROFILE_BY_KIND[subject.CARGO_LOCK_KIND],
+        )
+        for branch, sha in (
+            ("plan/core-contract-batch5", subject.CORE_RUST_BOOTSTRAP_BASE_SHA),
+            (subject.CORE_RUST_BOOTSTRAP_BASE_BRANCH, "a" * 40),
+        ):
+            changed = dict(fields, base_branch=branch, base_sha=sha)
+            with self.subTest(branch=branch, sha=sha):
+                self.assert_refused(subject.create_request, changed, now=NOW)
+
     def test_consumption_is_one_use_and_bootstrap_lock_is_global(self):
         request = subject.create_request(_fields(), now=NOW)
         initial = subject.empty_state()

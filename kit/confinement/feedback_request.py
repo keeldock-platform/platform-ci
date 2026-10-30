@@ -7,6 +7,8 @@ import re
 SCHEMA_VERSION = 1
 REQUEST_DOMAIN = "node-feedback-request-v1"
 WORKFLOW_REF = "refs/heads/main"
+CORE_RUST_BOOTSTRAP_BASE_BRANCH = "plan/core-contract-batch4"
+CORE_RUST_BOOTSTRAP_BASE_SHA = "8296d2977a204edd2eafc06ed9e3280bf5480cbf"
 MAX_REQUEST_TTL_SECONDS = 24 * 60 * 60
 EXCEPTION_END = 1_800_835_200
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
@@ -161,9 +163,13 @@ def _validate_values(values, now):
         _refuse()
     if any(not _valid_hex(values[name], 40) for name in ("source_sha", "base_sha", "control_sha")):
         _refuse()
-    if values["base_branch"] not in ("main", "develop", "uat"):
-        _refuse()
     if type(values["base_branch"]) is not str:
+        _refuse()
+    if values["base_branch"] not in ("main", "develop", "uat") and not (
+        profile["kind"] == CARGO_LOCK_KIND
+        and values["base_branch"] == CORE_RUST_BOOTSTRAP_BASE_BRANCH
+        and values["base_sha"] == CORE_RUST_BOOTSTRAP_BASE_SHA
+    ):
         _refuse()
     if (not _valid_hex(values["reviewed_diff_sha256"], 64)
             or not _valid_hex(values["recipient_fingerprint"], 64)
