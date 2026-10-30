@@ -57,7 +57,7 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         return self.version if tuple(argv)[-1] == "--version" else self.resolve
 
     def read_file(self, path, *, maximum, owner=0):
-        return self.files[str(path.relative_to(SOURCE))]
+        return self.files[path.relative_to(SOURCE).as_posix()]
 
     def execute(self, dispatch=None, *, lock=None, **overrides):
         arguments = dict(
@@ -70,13 +70,13 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         arguments.update(overrides)
         with patch.object(producer, "_read_file", self.read_file), \
                 patch.object(producer, "_make_worker_directory",
-                             lambda path, uid, gid: self.directories.append(str(path))), \
+                             lambda path, uid, gid: self.directories.append(Path(path).as_posix())), \
                 patch.object(producer, "_write_worker_file",
-                             lambda path, payload, uid, gid: self.written.append((str(path), payload))), \
+                             lambda path, payload, uid, gid: self.written.append((Path(path).as_posix(), payload))), \
                 patch.object(producer, "_run_worker", self.run_worker), \
                 patch.object(producer, "_read_worker_file",
                              lambda path, uid, maximum: lock if lock is not None else self.world.lock_bytes), \
-                patch.object(producer.os, "chdir", lambda path: self.chdirs.append(str(path))), \
+                patch.object(producer.os, "chdir", lambda path: self.chdirs.append(Path(path).as_posix())), \
                 patch.object(bootstrap, "RegistryFetcher", lambda deadline=None: self.fetcher):
             return producer.run_npm_admission_profile(**arguments)
 
@@ -100,19 +100,19 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         evidence = json.loads(evidence_bytes.decode("ascii"))
         self.assertEqual(evidence["run_id"], "9876")
         self.assertEqual(evidence["totals"]["packages"], 4)
-        self.assertEqual(self.chdirs, [str(STORAGE / "feedback-npm-admission"), str(SOURCE)])
+        self.assertEqual(self.chdirs, [(STORAGE / "feedback-npm-admission").as_posix(), SOURCE.as_posix()])
 
     def test_only_the_inert_inputs_reach_the_worker_and_never_the_request_table(self):
         self.execute()
         project = STORAGE / "feedback-npm-admission"
-        names = sorted(path[len(str(project)) + 1:] for path, payload in self.written if path.startswith(str(project)))
+        names = sorted(path[len(project.as_posix()) + 1:] for path, payload in self.written if path.startswith(project.as_posix()))
         self.assertEqual(names, sorted(bootstrap.project_paths(bootstrap.DEFAULT_FILING)))
         for path, payload in self.written:
-            if path.startswith(str(project)):
-                self.assertEqual(payload, self.files[path[len(str(project)) + 1:]])
+            if path.startswith(project.as_posix()):
+                self.assertEqual(payload, self.files[path[len(project.as_posix()) + 1:]])
         request_doc = bootstrap.FILINGS[bootstrap.DEFAULT_FILING]["request_doc"]
         self.assertFalse([path for path, payload in self.written if path.endswith(request_doc)])
-        config_payloads = [payload for path, payload in self.written if path.startswith(str(STORAGE / "npm-admission-home"))]
+        config_payloads = [payload for path, payload in self.written if path.startswith((STORAGE / "npm-admission-home").as_posix())]
         self.assertEqual(config_payloads, [b"\n", b"\n"])
 
     def test_one_version_probe_then_one_resolver_command_in_a_fixed_environment(self):
@@ -160,13 +160,13 @@ class NpmAdmissionProducerTests(unittest.TestCase):
     def test_resolver_failures_map_to_fixed_producer_reasons(self):
         self.resolve = SimpleNamespace(returncode=1, stdout=b"")
         self.assertEqual(self.refusal(), "command_failed")
-        self.assertEqual(self.chdirs[-1], str(SOURCE))
+        self.assertEqual(self.chdirs[-1], SOURCE.as_posix())
         self.resolve = SimpleNamespace(returncode=0, stdout=b"")
         self.version = SimpleNamespace(returncode=0, stdout=b"11.0.0\n")
         self.assertEqual(self.refusal(), "tool_unavailable")
         self.version = SimpleNamespace(returncode=1, stdout=b"11.19.1\n")
         self.assertEqual(self.refusal(), "tool_unavailable")
-        self.assertEqual(self.chdirs[-1], str(SOURCE))
+        self.assertEqual(self.chdirs[-1], SOURCE.as_posix())
 
     def test_lock_and_evidence_failures_map_to_fixed_producer_reasons(self):
         other = json.loads(self.world.lock_bytes.decode("ascii"))
