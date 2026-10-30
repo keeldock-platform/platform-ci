@@ -326,11 +326,7 @@ jobs:
           WORKER_PATH: ${{ steps.project-deps.outputs.worker_path }}
           CARGO_HOME: ${{ steps.project-deps.outputs.cargo_home }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: |
-          preserve_env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP
-          preserve_env=$preserve_env,REQUESTED_SOURCE_SHA
-          sudo -n --preserve-env="$preserve_env" \
-            python3 -B kit/confinement/linux_source_build.py gates
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge confinement phase records
         if: ${{ always() && steps.selftest.outcome != 'skipped' && steps.recheck.outcome != 'skipped' }}
         run: |

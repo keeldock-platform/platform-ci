@@ -963,6 +963,20 @@ foreach ($case in $cases) {
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, workflow)
 
+    def test_license_guard_uses_variables_the_windows_workflow_sets(self):
+        start = self.wrapper.index("function Assert-RustLicenseAdmission")
+        end = self.wrapper.index("function Invoke-Ladder")
+        guard = self.wrapper[start:end]
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        for name in ("CI_EVENT_NAME", "CI_REF"):
+            with self.subTest(name=name):
+                self.assertIn("$env:" + name, guard)
+                self.assertIn("      " + name + ": ", workflow)
+        self.assertIn("-not $confined", guard)
+        self.assertIn("throw 'archive_producer_unavailable'", guard)
+        self.assertIn("Assert-RustLicenseAdmission $confined", self.wrapper[end:])
+        self.assertNotIn("CI_MODE -ne 'source') { return }", guard)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

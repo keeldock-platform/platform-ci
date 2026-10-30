@@ -230,7 +230,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertIn("REQUESTED_SOURCE_SHA", verifier_gate_step)
         self.assertIn("preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA",
                       verifier_gates)
-        self.assertIn("preserve_env=$preserve_env,REQUESTED_SOURCE_SHA",
+        self.assertIn("preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA",
                       blocks["Run all thirteen offline project gates"])
 
     def test_expected_run_assigns_the_plain_verdict_job_and_action_post(self):
@@ -391,6 +391,40 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 with self.assertRaises(linux_source_build.SourceBuildRefusal):
                     linux_source_build._rust_lock_paths(descriptor)
             self.assertEqual(swapped, [True])
+
+    def test_cargo_lock_discovery_reports_a_vanished_directory_as_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "source"
+            root.mkdir()
+            nested = root / "sub"
+            nested.mkdir()
+            (root / "Cargo.lock").write_bytes(b"version = 4\n")
+            descriptor = self._root_descriptor(root)
+            original = linux_source_build._open_verified_directory
+
+            def remove_then_open(root_fd, parts, identities):
+                if parts == ("sub",) and nested.exists():
+                    nested.rmdir()
+                return original(root_fd, parts, identities)
+
+            with patch.object(linux_source_build, "_open_verified_directory",
+                              side_effect=remove_then_open):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                    linux_source_build._rust_lock_paths(descriptor)
+            self.assertEqual(refused.exception.reason, "lock")
+
+    def test_cargo_lock_discovery_skips_the_npm_tarball_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "source"
+            tarballs = root / ".kd-npm-tarballs"
+            tarballs.mkdir(parents=True)
+            (root / "Cargo.lock").write_bytes(b"version = 4\n")
+            for index in range(3):
+                (tarballs / ("pkg-" + str(index) + ".tgz")).write_bytes(b"x")
+            descriptor = self._root_descriptor(root)
+            with patch.object(linux_source_build, "MAX_DIRECTORY_ENTRIES", 2):
+                found = linux_source_build._rust_lock_paths(descriptor)
+            self.assertEqual([item[0] for item in found], [("Cargo.lock",)])
 
     def test_cargo_lock_directory_entry_materialization_is_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -1478,17 +1478,19 @@ def _open_verified_directory(root_fd, relative_parts, identities):
             descriptors.append(child)
             current = child
         return descriptors
-    except BaseException:
+    except BaseException as error:
         for descriptor in reversed(descriptors):
             try:
                 os.close(descriptor)
             except OSError:
                 pass
+        if isinstance(error, OSError):
+            raise SourceBuildRefusal("lock") from None
         raise
 
 
 def _rust_lock_paths(root_fd):
-    ignored = {".git", "target", "node_modules", ".kd-cargo-home", ".npm-cache"}
+    ignored = {".git", "target", "node_modules", ".kd-cargo-home", ".npm-cache", ".kd-npm-tarballs"}
     paths = []
     root_identity = _directory_identity(os.fstat(root_fd))
     pending = [((), (root_identity,))]

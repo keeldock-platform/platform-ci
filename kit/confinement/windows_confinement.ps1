@@ -480,7 +480,9 @@ function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
 }
 
 function Assert-RustLicenseAdmission([bool]$confined) {
-    if (-not $confined -or $env:CI_MODE -ne 'source') { return }
+    if (-not $confined) { return }
+    $reviewedMain = ($env:CI_EVENT_NAME -eq 'workflow_dispatch' -and $env:CI_REF -eq 'refs/heads/main')
+    if ($reviewedMain -and $env:CI_MODE -ne 'source') { return }
     throw 'archive_producer_unavailable'
 }
 
