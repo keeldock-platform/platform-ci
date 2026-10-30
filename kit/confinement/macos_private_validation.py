@@ -246,6 +246,95 @@ CORE_CONTRACT_INERT_DEPENDENCY_FILES = frozenset((
 CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH = re.compile(
     r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.md\Z"
 )
+CORE_CONTRACT_BATCH5_CONCERN = "core-build-diagnostic-return"
+CORE_CONTRACT_BUILD_DATA_FILES = frozenset((
+    "crates/host/api/src/entitlements/key_register.tsv",
+    "crates/host/api/tests/fixtures/entitlement-key-register.ids",
+    "tools/s0-vectors-reference/plan_case_ids_v3_2.txt",
+))
+CORE_CONTRACT_BUILD_SOURCE_FILES = frozenset((
+    "tools/s0-vectors-independent/src/constructions.rs",
+    "tools/s0-vectors-independent/src/corpus.rs",
+    "tools/s0-vectors-independent/src/encoding.rs",
+    "tools/s0-vectors-independent/src/hash_constructions.rs",
+    "tools/s0-vectors-independent/src/lib.rs",
+    "tools/s0-vectors-independent/src/manifest.rs",
+    "tools/s0-vectors-independent/src/name_constructions.rs",
+    "tools/s0-vectors-independent/src/operation_matrix.rs",
+    "tools/s0-vectors-independent/src/provider.rs",
+    "tools/s0-vectors-independent/src/source_driver.rs",
+    "tools/s0-vectors-independent/src/tree_constructions.rs",
+    "tools/s0-vectors-integration/bounds.rs",
+    "tools/s0-vectors-integration/compare.rs",
+    "tools/s0-vectors-integration/findings.rs",
+    "tools/s0-vectors-integration/mod.rs",
+    "tools/s0-vectors-integration/model.rs",
+    "tools/s0-vectors-integration/tests.rs",
+    "tools/s0-vectors-integration/tests/comparator_guard_cases.rs",
+    "tools/s0-vectors-integration/tests/kat_guard_cases.rs",
+    "tools/s0-vectors-integration/validate.rs",
+    "tools/s0-vectors-reference/artifact.rs",
+    "tools/s0-vectors-reference/catalog.rs",
+    "tools/s0-vectors-reference/construction.rs",
+    "tools/s0-vectors-reference/construction/lp32.rs",
+    "tools/s0-vectors-reference/construction/operations.rs",
+    "tools/s0-vectors-reference/construction/types.rs",
+    "tools/s0-vectors-reference/construction/validation.rs",
+    "tools/s0-vectors-reference/construction_tests.rs",
+    "tools/s0-vectors-reference/consumers.rs",
+    "tools/s0-vectors-reference/mod.rs",
+    "tools/s0-vectors-reference/outcomes.rs",
+    "tools/s0-vectors-reference/provider_boundary.rs",
+    "tools/s0-vectors-reference/pure.rs",
+    "tools/s0-vectors-reference/record_catalog.rs",
+    "tools/s0-vectors-reference/tests.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/parser.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/types.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/version.rs",
+))
+CORE_CONTRACT_NEVER_BUILT_FILES = frozenset((
+    "tools/s0-vectors-independent/README.md",
+    "tools/s0-vectors-integration/README.md",
+    "tools/s0-vectors-reference/README.md",
+    "docs/admission/ed25519-sqlite/ADMISSION-REQUESTS.md",
+    "docs/admission/ed25519-sqlite/CLOSURE.md",
+    "docs/admission/ed25519-sqlite/POLICY-AND-AUDIT-PROPOSAL.md",
+    "docs/admission/sync-crypto/DEPENDENCY-INPUTS.json",
+    "docs/admission/sync-crypto/PACKAGE-REQUEST-MATERIALS.md",
+    "docs/admission/sync-crypto/PROVIDER-R47-PROPOSALS.md",
+    "docs/admission/sync-crypto/RECEIPT-POLICY-CHECKLIST.md",
+    "docs/admission/sync-crypto/REGISTRY-AND-SCOPE-STATUS.md",
+    "docs/admission/sync-crypto/REGISTRY-METADATA.json",
+    "docs/admission/sync-crypto/SCOPED-LICENCE-IMPLEMENTATION.md",
+    "tools/xtask/Cargo.toml",
+    "tools/xtask/README.md",
+    "tools/xtask/src/lib.rs",
+    "tools/xtask/src/main.rs",
+    "tools/xtask/src/new_tool.rs",
+    "tools/xtask/src/new_tool/materializer.rs",
+    "tools/xtask/src/new_tool/materializer_tests.rs",
+    "tools/xtask/src/new_tool/templates.rs",
+    "tools/xtask/src/new_tool/tests.rs",
+    "tools/keeldock" "-tools-sync-license-scope/Cargo.toml",
+    "tools/keeldock" "-tools-sync-license-scope/README.md",
+    "tools/keeldock" "-tools-sync-license-scope/scoped-exceptions.toml",
+    "tools/keeldock" "-tools-sync-license-scope/src/bin/license-scope.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/bin/license-scope/tests.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/lib.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/policy.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/receipt.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/tests.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/tests/bounds.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/tests/configuration.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/tests/expressions.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/tests/identities.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/tests/legacy_slash.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/tests/parser.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/tests/receipt.rs",
+    "tools/keeldock" "-tools-sync-license-scope/src/tests/versions.rs",
+    "tools/keeldock" "-tools-sync-license-scope/tests/license_scope_process.rs",
+))
+CORE_CONTRACT_API_FEATURES = {"default": "[]", "dev-uat-policy-import": "[]"}
 CORE_CONTRACT_MANIFEST_SECTIONS = frozenset(("package", "dependencies", "dev-dependencies", "lints"))
 CORE_CONTRACT_MANIFEST_INHERITED_KEYS = frozenset((
     "version.workspace", "edition.workspace", "rust-version.workspace", "publish.workspace",
@@ -353,7 +442,7 @@ CORE_CONTRACT_RUST_POLICY_FILES = frozenset((
 ))
 CORE_CONTRACT_RUST_POLICY_OBJECTS = {
     "deny.toml": "4d42231927ec45b0fec267d689956dd3a8416076",
-    "dependency-policy.toml": "4dac137e5233421a3242455bf1d384a3cc69bdb4",
+    "dependency-policy.toml": "aa07796b200eece7b6ae79e9fd42dd6ad8d9200d",
     "supply-chain/audits.toml": "a19ea474cabfb9c36200e799072c2822eb391f1a",
     "supply-chain/config.toml": "b1c3c53dde85ac5a423e4079d0551c56ac73d64a",
     "supply-chain/imports.lock": "97800a9d48c227190f29d740c4c84fec5395cfcd",
@@ -376,7 +465,10 @@ RUNTIME_ROOT_FILES = frozenset((RUNTIME_ROOT_MANIFEST_PATH, RUNTIME_ROOT_LOCK_PA
 RUNTIME_PART_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 RUNTIME_CRATES_DIRECTORY = (RUNTIME_WORKSPACE_DIRECTORY, "crates")
 RUNTIME_FIXTURE_DIRECTORY = RUNTIME_CRATES_DIRECTORY + ("test-fixtures",)
-RUNTIME_CRATE_ROOTS = tuple(
+RUNTIME_SERVICES_DIRECTORY = RUNTIME_CRATES_DIRECTORY + ("services",)
+RUNTIME_SERVICE_CRATE_ROOTS = (RUNTIME_SERVICES_DIRECTORY + ("sync-publication",),)
+RUNTIME_SERVICE_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELOG.md"))
+RUNTIME_CRATE_ROOTS = RUNTIME_SERVICE_CRATE_ROOTS + tuple(
     RUNTIME_FIXTURE_DIRECTORY + (name,)
     for name in (
         "host-router", "fixture-data", "tool-a", "tool-b",
@@ -1803,7 +1895,9 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
     lints = fuzz_sections.get("lints.rust")
     api_package = api_sections.get("package")
     if (set(fuzz_sections) != {"package", "dependencies", "workspace", "lints.rust"}
-            or set(api_sections) != {"package", "dependencies", "lints"}
+            or not ({"package", "lints"} <= set(api_sections)
+                    <= {"package", "dependencies", "features", "lints"})
+            or api_sections.get("features", CORE_CONTRACT_API_FEATURES) != CORE_CONTRACT_API_FEATURES
             or type(package) is not dict or type(dependencies) is not dict
             or type(workspace) is not dict or type(lints) is not dict
             or type(api_package) is not dict):
@@ -2044,7 +2138,12 @@ def _core_contract_crate_manifest_shape(text, *, crate_root=None, require_first_
         header = CORE_CONTRACT_MANIFEST_SECTION_PATTERN.fullmatch(stripped)
         if header is not None:
             section = header.group(1)
-            if section not in CORE_CONTRACT_MANIFEST_SECTIONS or section in keys:
+            features_allowed = (
+                section == "features" and crate_root == CORE_CONTRACT_CRATE_ROOTS[0]
+            )
+            if (
+                section not in CORE_CONTRACT_MANIFEST_SECTIONS and not features_allowed
+            ) or section in keys:
                 return False
             keys[section] = set()
             continue
@@ -2082,11 +2181,15 @@ def _core_contract_crate_manifest_shape(text, *, crate_root=None, require_first_
                 key in CORE_CONTRACT_MANIFEST_DEPENDENCIES
                 and CORE_CONTRACT_MANIFEST_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
             )
+        elif section == "features":
+            valid = CORE_CONTRACT_API_FEATURES.get(key) == value
         else:
             valid = key == "workspace" and value == "true"
         if not valid:
             return False
     if "package" not in keys or "name" not in keys["package"]:
+        return False
+    if "features" in keys and keys["features"] != set(CORE_CONTRACT_API_FEATURES):
         return False
     if crate_root == CORE_CONTRACT_CRATE_ROOTS[0] and require_first_batch:
         return (
@@ -2219,6 +2322,15 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
         or CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH.fullmatch(path) is not None
     ):
         return "100644"
+    if (
+        concern == CORE_CONTRACT_BATCH5_CONCERN and type(path) is str
+        and (
+            path in CORE_CONTRACT_BUILD_DATA_FILES
+            or path in CORE_CONTRACT_BUILD_SOURCE_FILES
+            or path in CORE_CONTRACT_NEVER_BUILT_FILES
+        )
+    ):
+        return "100644"
     return _core_contract_package_mode(
         path, feedback_profile=concern in FEEDBACK_PROFILE_CONCERNS,
     )
@@ -2261,6 +2373,11 @@ def _runtime_workspace_mode(path, crate_roots):
         if path.startswith(prefix + "/"):
             relative = path[len(prefix) + 1:]
             if relative == "Cargo.toml":
+                return "100644"
+            if (
+                relative in RUNTIME_SERVICE_DOC_FILES
+                and root[:len(RUNTIME_SERVICES_DIRECTORY)] == RUNTIME_SERVICES_DIRECTORY
+            ):
                 return "100644"
             if (
                 relative.startswith(("src/", "tests/"))

@@ -564,10 +564,13 @@ class CoreContractTreeTests(unittest.TestCase):
     @staticmethod
     def _validate_feedback_tree(
         entries, concern, main_payload=None, workspace_text=None, lock_text=None, manifest_text=None,
+        manifests=None,
     ):
         digest = hashlib.sha256(b"x").hexdigest()
 
         def blob(unused_repository, unused_git, unused_environment, unused_entries, path, **unused):
+            if manifests is not None and path in manifests:
+                return manifests[path].encode("utf-8")
             if path.startswith("crates/") and path.endswith("/Cargo.toml"):
                 return (
                     manifest_text if manifest_text is not None else _core_crate_manifest(
@@ -903,6 +906,116 @@ class CoreContractTreeTests(unittest.TestCase):
                     self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
 
     @staticmethod
+    def _batch5_paths():
+        return (
+            subject.CORE_CONTRACT_BUILD_DATA_FILES
+            | subject.CORE_CONTRACT_BUILD_SOURCE_FILES
+            | subject.CORE_CONTRACT_NEVER_BUILT_FILES
+        )
+
+    def test_batch5_path_sets_are_exact_disjoint_and_regular_file_only(self):
+        data = subject.CORE_CONTRACT_BUILD_DATA_FILES
+        source = subject.CORE_CONTRACT_BUILD_SOURCE_FILES
+        inert = subject.CORE_CONTRACT_NEVER_BUILT_FILES
+        self.assertEqual((len(data), len(source), len(inert)), (3, 38, 40))
+        self.assertEqual(len(self._batch5_paths()), 81)
+        self.assertFalse(data & source or data & inert or source & inert)
+        self.assertEqual(subject.CORE_CONTRACT_BATCH5_CONCERN, "core-build-diagnostic-return")
+        scope = "tools/keeldock" "-tools-sync-license-scope/"
+        self.assertEqual(
+            {path for path in source if path.startswith(scope)},
+            {scope + "src/parser.rs", scope + "src/types.rs", scope + "src/version.rs"},
+        )
+        self.assertEqual(
+            sum(1 for path in inert if path.startswith("docs/admission/")), 10,
+        )
+        self.assertEqual(sum(1 for path in inert if path.startswith("tools/xtask/")), 9)
+        self.assertEqual(sum(1 for path in inert if path.startswith(scope)), 18)
+        self.assertEqual(
+            sum(1 for path in inert if path.startswith("tools/s0-vectors-")), 3,
+        )
+        for path in self._batch5_paths():
+            with self.subTest(path=path):
+                self.assertFalse(path.endswith("build.rs") or "*" in path or path.endswith("/"))
+                self.assertFalse(subject._runtime_workspace_path(path))
+
+    def test_batch5_paths_are_admitted_for_build_diagnostics_only(self):
+        concern = subject.CORE_CONTRACT_BATCH5_CONCERN
+        for path in sorted(self._batch5_paths()):
+            with self.subTest(path=path):
+                self.assertEqual(subject._core_contract_expected_mode(path, concern=concern), "100644")
+                self.assertIsNone(subject._core_contract_expected_mode(path))
+                self.assertFalse(subject._core_contract_foundation_path(path))
+                for other in sorted(subject.CORE_CONTRACT_CONCERNS - {concern}):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=other))
+                self.assertIsNone(subject._core_contract_expected_mode(path, concern="rules-bootstrap"))
+
+    def test_batch5_neighbouring_paths_stay_refused(self):
+        concern = subject.CORE_CONTRACT_BATCH5_CONCERN
+        scope = "tools/keeldock" "-tools-sync-license-scope/"
+        for path in (
+            "crates/host/api/src/entitlements/other.tsv",
+            "crates/host/api/src/entitlements/key_register.tsv.bak",
+            "crates/host/api/tests/fixtures/other.ids",
+            "crates/host/mock/src/entitlements/key_register.tsv",
+            "crates/host/api/src/entitlements/nested/key_register.tsv",
+            "tools/s0-vectors-independent/src/extra.rs",
+            "tools/s0-vectors-independent/build.rs",
+            "tools/s0-vectors-independent/src/build.rs",
+            "tools/s0-vectors-independent/Cargo.toml",
+            "tools/s0-vectors-reference/other.txt",
+            "tools/s0-vectors-reference/construction/extra.rs",
+            "tools/s0-vectors-other/mod.rs",
+            "tools/S0-vectors-reference/mod.rs",
+            "Tools/xtask/src/lib.rs",
+            "tools/xtask/build.rs",
+            "tools/xtask/src/new_tool/extra.rs",
+            "tools/xtask/Cargo.lock",
+            "tools/other/README.md",
+            scope + "build.rs",
+            scope + "Cargo.lock",
+            scope + "src/extra.rs",
+            scope + "src/bin/other.rs",
+            scope + "src/parser.rs.bak",
+            "docs/admission/sync-crypto/NEW-NOTE.md",
+            "docs/admission/other/CLOSURE.md",
+            "docs/admission/CLOSURE.md",
+            "docs/admission/sync-crypto/CLOSURE.MD",
+            "docs/admission/sync-crypto/sub/REGISTRY-METADATA.json",
+            "docs/Admission/sync-crypto/REGISTRY-METADATA.json",
+            "docs/admission/ed25519-sqlite/CLOSURE.sh",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_a_batch5_tree_passes_diagnostics_and_is_refused_by_every_other_concern(self):
+        diagnostics = subject.CORE_CONTRACT_BATCH5_CONCERN
+        entries = self._four_crate_entries(diagnostics)
+        entries.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        marker, unused_blob = self._validate_feedback_tree(
+            entries, diagnostics, workspace_text=self._workspace_text(members),
+        )
+        self.assertEqual(marker, subject.CORE_CONTRACT_PACKAGE_LOCK_TREE)
+        for path in (
+            sorted(subject.CORE_CONTRACT_BUILD_DATA_FILES)[0],
+            sorted(subject.CORE_CONTRACT_BUILD_SOURCE_FILES)[0],
+            sorted(subject.CORE_CONTRACT_NEVER_BUILT_FILES)[0],
+        ):
+            for mode in ("100755", "120000"):
+                changed = dict(entries)
+                changed[path] = (mode, "a" * 40)
+                with self.subTest(path=path, mode=mode):
+                    self.assertEqual(self._refused_check(
+                        changed, diagnostics, workspace_text=self._workspace_text(members),
+                    ), "path_mode")
+        other = self._four_crate_entries("core-rust-format-return")
+        other.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})
+        self.assertEqual(self._refused_check(
+            other, "core-rust-format-return", workspace_text=self._workspace_text(members),
+        ), "path_mode")
+
+    @staticmethod
     def _four_crate_entries(concern):
         entries = CoreContractTreeTests._required_core_contract_entries(concern)
         extra = set(subject.CORE_CONTRACT_KERNEL_FEEDBACK_FILES) | {
@@ -989,6 +1102,98 @@ class CoreContractTreeTests(unittest.TestCase):
         self.assertFalse(subject._core_contract_crate_manifest_shape(
             manifest, crate_root=subject.CORE_CONTRACT_CRATE_ROOTS[1],
         ))
+
+    @staticmethod
+    def _api_features_manifest(features):
+        return (
+            '[package]\nname = "keeldock' + '-host-api"\n'
+            'description = "KeelDock L1 host API: the stable contract between the host and its tools."\n'
+            'version.workspace = true\nedition.workspace = true\n'
+            'rust-version.workspace = true\npublish.workspace = true\n\n'
+            + features + '\n[lints]\nworkspace = true\n'
+        )
+
+    def test_host_api_manifest_admits_only_the_exact_features_table(self):
+        api_root = subject.CORE_CONTRACT_CRATE_ROOTS[0]
+        exact = "[features]\ndefault = []\ndev-uat-policy-import = []\n"
+        self.assertTrue(subject._core_contract_crate_manifest_shape(
+            self._api_features_manifest(exact), crate_root=api_root,
+        ))
+        self.assertTrue(subject._core_contract_crate_manifest_shape(
+            self._api_features_manifest(
+                "[features]\ndev-uat-policy-import = []\ndefault = []\n",
+            ), crate_root=api_root,
+        ))
+        self.assertTrue(subject._core_contract_crate_manifest_shape(
+            self._api_features_manifest(""), crate_root=api_root,
+        ))
+
+    def test_host_api_manifest_refuses_every_other_features_table(self):
+        api_root = subject.CORE_CONTRACT_CRATE_ROOTS[0]
+        for name, features in (
+            ("extra feature", "[features]\ndefault = []\ndev-uat-policy-import = []\nother = []\n"),
+            ("only default", "[features]\ndefault = []\n"),
+            ("only the gate", "[features]\ndev-uat-policy-import = []\n"),
+            ("empty table", "[features]\n"),
+            ("default enables the gate",
+             '[features]\ndefault = ["dev-uat-policy-import"]\ndev-uat-policy-import = []\n'),
+            ("gate enables a dependency",
+             '[features]\ndefault = []\ndev-uat-policy-import = ["dep:serde"]\n'),
+            ("non-empty default", '[features]\ndefault = ["x"]\ndev-uat-policy-import = []\n'),
+            ("non-empty gate", '[features]\ndefault = []\ndev-uat-policy-import = ["x"]\n'),
+            ("spaced empty list", "[features]\ndefault = [ ]\ndev-uat-policy-import = []\n"),
+            ("string value", '[features]\ndefault = "[]"\ndev-uat-policy-import = []\n'),
+            ("true value", "[features]\ndefault = []\ndev-uat-policy-import = true\n"),
+            ("renamed gate", "[features]\ndefault = []\ndev-uat-policy-imports = []\n"),
+            ("duplicate key", "[features]\ndefault = []\ndefault = []\ndev-uat-policy-import = []\n"),
+            ("duplicate table",
+             "[features]\ndefault = []\ndev-uat-policy-import = []\n\n[features]\n"),
+            ("trailing comment",
+             "[features]\ndefault = [] " + chr(35) + " x\ndev-uat-policy-import = []\n"),
+        ):
+            with self.subTest(form=name):
+                self.assertFalse(subject._core_contract_crate_manifest_shape(
+                    self._api_features_manifest(features), crate_root=api_root,
+                ))
+
+    def test_a_features_table_is_refused_on_every_other_crate_and_without_a_root(self):
+        exact = "[features]\ndefault = []\ndev-uat-policy-import = []\n"
+        for crate_root in subject.CORE_CONTRACT_CRATE_ROOTS[1:]:
+            name = subject.CORE_CONTRACT_CRATE_NAMES[crate_root]
+            manifest = self._api_features_manifest(exact).replace(
+                "keeldock" "-host-api", name, 1,
+            )
+            with self.subTest(crate_root=crate_root):
+                self.assertFalse(subject._core_contract_crate_manifest_shape(
+                    manifest, crate_root=crate_root,
+                ))
+        self.assertFalse(subject._core_contract_crate_manifest_shape(
+            self._api_features_manifest(exact),
+        ))
+        self.assertFalse(subject._core_contract_crate_manifest_shape(
+            self._api_features_manifest(exact), crate_root=("crates", "host", "other"),
+        ))
+
+    def test_the_tree_check_tags_a_bad_api_features_table_and_passes_the_exact_one(self):
+        concern = "core-build-diagnostic-return"
+        api_path = "crates/host/api/Cargo.toml"
+        exact = "[features]\ndefault = []\ndev-uat-policy-import = []\n"
+        entries = self._four_crate_entries(concern)
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        marker, unused_blob = self._validate_feedback_tree(
+            entries, concern, workspace_text=self._workspace_text(members),
+            manifests={api_path: self._api_features_manifest(exact)},
+        )
+        self.assertEqual(marker, subject.CORE_CONTRACT_PACKAGE_LOCK_TREE)
+        for features in (exact + "other = []\n", "[features]\ndefault = []\n"):
+            with self.subTest(features=features):
+                self.assertEqual(
+                    self._refused_check(
+                        self._four_crate_entries(concern), concern,
+                        manifests={api_path: self._api_features_manifest(features)},
+                    ),
+                    "package_decode",
+                )
 
     def test_batch4_host_api_manifest_remains_valid_outside_rust_lock_return(self):
         manifest = _core_crate_manifest("crates/host/api/Cargo.toml")
@@ -1666,6 +1871,62 @@ class CoreContractTreeTests(unittest.TestCase):
             external_lock,
         ))
 
+    def test_feedback_fuzz_api_manifest_admits_only_the_exact_features_table(self):
+        fuzz_manifest = (
+            b'[package]\nname = "parser-fixture"\ndescription = "bounded fixture"\n'
+            b'version = "0.1.0"\nedition = "2024"\nrust-version = "1.99.1"\n'
+            b'publish = false\n\n[dependencies]\napi-fixture = { path = "../crates/host/api" }\n'
+            b'\n[workspace]\nresolver = "3"\n\n[lints.rust]\n'
+            b'unsafe_code = "forbid"\nwarnings = "deny"\n'
+        )
+        fuzz_lock = (
+            bytes((35,)) + b' Generated fixture.\nversion = 4\n\n[[package]]\n'
+            b'name = "parser-fixture"\nversion = "0.1.0"\ndependencies = [\n "api-fixture",\n]\n'
+            b'\n[[package]]\nname = "api-fixture"\nversion = "0.1.0"\n'
+        )
+
+        def api(middle):
+            return (
+                b'[package]\nname = "api-fixture"\ndescription = "bounded API fixture"\n'
+                b'version.workspace = true\n'
+                b'edition.workspace = true\nrust-version.workspace = true\npublish.workspace = true\n'
+                b'\n' + middle + b'[lints]\nworkspace = true\n'
+            )
+
+        exact = b'[features]\ndefault = []\ndev-uat-policy-import = []\n\n'
+        empty_dependencies = b'[dependencies]\n\n'
+        for name, middle in (
+            ("features only", exact),
+            ("features and empty dependencies", empty_dependencies + exact),
+            ("empty dependencies only", empty_dependencies),
+            ("neither table", b''),
+            ("reordered keys", b'[features]\ndev-uat-policy-import = []\ndefault = []\n\n'),
+        ):
+            with self.subTest(accepted=name):
+                self.assertTrue(subject._feedback_fuzz_manifest_shape(
+                    fuzz_manifest, api(middle), fuzz_lock,
+                ))
+        for name, middle in (
+            ("extra feature", b'[features]\ndefault = []\ndev-uat-policy-import = []\nother = []\n\n'),
+            ("only default", b'[features]\ndefault = []\n\n'),
+            ("empty table", b'[features]\n\n'),
+            ("non-empty default",
+             b'[features]\ndefault = ["dev-uat-policy-import"]\ndev-uat-policy-import = []\n\n'),
+            ("non-empty gate", b'[features]\ndefault = []\ndev-uat-policy-import = ["x"]\n\n'),
+            ("renamed gate", b'[features]\ndefault = []\ndev-uat-policy-imports = []\n\n'),
+            ("duplicate table", exact + exact),
+            ("unknown section", exact + b'[build-dependencies]\n\n'),
+            ("unknown section without features", b'[dev-dependencies]\n\n'),
+        ):
+            with self.subTest(refused=name):
+                self.assertFalse(subject._feedback_fuzz_manifest_shape(
+                    fuzz_manifest, api(middle), fuzz_lock,
+                ))
+        self.assertFalse(subject._feedback_fuzz_manifest_shape(
+            fuzz_manifest + b'\n[features]\ndefault = []\ndev-uat-policy-import = []\n',
+            api(exact), fuzz_lock,
+        ))
+
     def test_feedback_fuzz_modules_require_one_exact_pair_per_target(self):
         targets = subject.CORE_CONTRACT_FUZZ_CORPUS_TARGETS | {"new_target"}
         valid = self._module_lines(targets)
@@ -1881,6 +2142,13 @@ class CoreContractTreeTests(unittest.TestCase):
         altered = dict(entries)
         altered["dependency-policy.toml"] = ("100644", "a" * 40)
         self.assertFalse(subject._core_contract_rust_policy_matches(altered))
+        self.assertEqual(
+            subject.CORE_CONTRACT_RUST_POLICY_OBJECTS["dependency-policy.toml"],
+            "aa07796b200eece7b6ae79e9fd42dd6ad8d9200d",
+        )
+        previous = dict(entries)
+        previous["dependency-policy.toml"] = ("100644", "4dac137e5233421a3242455bf1d384a3cc69bdb4")
+        self.assertFalse(subject._core_contract_rust_policy_matches(previous))
 
     def test_rust_lock_return_refuses_a_changed_prebootstrap_cargo_lock(self):
         entries = self._required_core_contract_entries("core-rust-lock-return")
@@ -3146,13 +3414,20 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         )
         return refusal.exception.core_check
 
-    def test_the_admitted_runtime_tree_is_exactly_the_std_only_fixture_workspace(self):
+    def test_the_admitted_runtime_tree_is_the_service_crate_plus_the_std_only_fixture_workspace(self):
         self.assertEqual(
             [root[-1] for root in subject.RUNTIME_CRATE_ROOTS],
-            ["host-router", "fixture-data", "tool-a", "tool-b", "tool-bad-no-handler", "tool-bad-no-manifest"],
+            [
+                "sync-publication", "host-router", "fixture-data", "tool-a", "tool-b",
+                "tool-bad-no-handler", "tool-bad-no-manifest",
+            ],
+        )
+        self.assertEqual(
+            subject.RUNTIME_CRATE_ROOTS[0], ("runtime", "crates", "services", "sync-publication"),
         )
         for root in subject.RUNTIME_CRATE_ROOTS:
             self.assertTrue(subject._runtime_root_admitted(root))
+        for root in subject.RUNTIME_CRATE_ROOTS[1:]:
             self.assertEqual(root[:3], ("runtime", "crates", "test-fixtures"))
         self.assertEqual(subject.RUNTIME_WORKSPACE_DIRECTORY, "runtime")
         marker, reads = self._validate()
@@ -3251,6 +3526,58 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 self.assertEqual(self._refused(entries=entries), "path_mode")
 
+    def test_the_service_crate_may_carry_exactly_its_three_documents(self):
+        service = "/".join(subject.RUNTIME_CRATE_ROOTS[0])
+        for name in ("README.md", "CONTRACT.md", "CHANGELOG.md"):
+            entries = self._runtime_entries()
+            entries[service + "/" + name] = ("100644", "a" * 40)
+            with self.subTest(name=name):
+                marker, unused_reads = self._validate(entries=entries)
+                self.assertEqual(marker, "core_contract")
+        for path in (
+            service + "/NOTES.md", service + "/readme.md", service + "/README.MD",
+            service + "/docs/README.md", service + "/src/README.md",
+            service + "/build.rs", service + "/src/build.rs", service + "/src/data.json",
+            service + "/package.json",
+        ):
+            entries = self._runtime_entries()
+            entries[path] = ("100644", "a" * 40)
+            with self.subTest(path=path):
+                self.assertEqual(self._refused(entries=entries), "path_mode")
+        for mode in ("100755", "120000"):
+            entries = self._runtime_entries()
+            entries[service + "/README.md"] = (mode, "a" * 40)
+            with self.subTest(mode=mode):
+                self.assertEqual(self._refused(entries=entries), "path_mode")
+
+    def test_documents_are_refused_under_fixture_crates_and_unlisted_service_crates(self):
+        for root in subject.RUNTIME_CRATE_ROOTS[1:]:
+            for name in ("README.md", "CONTRACT.md", "CHANGELOG.md"):
+                entries = self._runtime_entries()
+                entries["/".join(root) + "/" + name] = ("100644", "a" * 40)
+                with self.subTest(root=root, name=name):
+                    self.assertEqual(self._refused(entries=entries), "path_mode")
+        for path in (
+            "runtime/crates/services/other/README.md",
+            "runtime/crates/services/other/src/lib.rs",
+            "runtime/crates/services/README.md",
+            "runtime/crates/services/sync-publication-extra/README.md",
+        ):
+            entries = self._runtime_entries()
+            entries[path] = ("100644", "a" * 40)
+            with self.subTest(path=path):
+                self.assertEqual(self._refused(entries=entries), "path_mode")
+
+    def test_the_service_crate_root_is_required_and_the_member_list_keeps_its_order(self):
+        roots = subject.RUNTIME_CRATE_ROOTS
+        entries = self._runtime_entries(roots=roots[1:])
+        blobs = self._runtime_blobs(roots=roots[1:])
+        self.assertEqual(self._refused(entries=entries, blobs=blobs), "required_files")
+        moved = roots[1:] + roots[:1]
+        blobs = self._runtime_blobs()
+        blobs[subject.RUNTIME_ROOT_MANIFEST_PATH] = _runtime_root_text(roots=moved).encode("utf-8")
+        self.assertEqual(self._refused(blobs=blobs), "workspace_members")
+
     def test_runtime_root_manifest_is_a_strict_allowlist(self):
         bad_roots = (
             _runtime_root_text(extra='\n[workspace.metadata]\nx = "y"\n'),
@@ -3293,7 +3620,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         self.assertEqual(marker, "core_contract")
 
     def test_runtime_member_manifests_are_a_strict_allowlist(self):
-        root = subject.RUNTIME_CRATE_ROOTS[2]
+        root = subject.RUNTIME_CRATE_ROOTS[3]
         path = "/".join(root) + "/Cargo.toml"
         good = _runtime_member_text(root)
         cases = (
@@ -3316,7 +3643,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self._refused(blobs=blobs), check)
         blobs = self._runtime_blobs()
-        blobs[path] = blobs["/".join(subject.RUNTIME_CRATE_ROOTS[3]) + "/Cargo.toml"]
+        blobs[path] = blobs["/".join(subject.RUNTIME_CRATE_ROOTS[4]) + "/Cargo.toml"]
         self.assertEqual(self._refused(blobs=blobs), "package_decode")
 
     def test_runtime_lock_requires_exactly_the_sourceless_members(self):

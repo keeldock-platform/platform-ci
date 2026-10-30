@@ -1034,7 +1034,17 @@ class CargoLockProducerTests(unittest.TestCase):
         self.assertNotIn("refusal", state)
         project = state["worker_storage"] / "feedback-cargo-lock"
         runtime_members = tuple(root.as_posix() for root in producer.RUNTIME_PACKAGE_ROOTS)
-        copied = state["copy"].call_args.args[2]
+        self.assertEqual(len(runtime_members), 7)
+        self.assertEqual(runtime_members[0], "runtime/crates/services/sync-publication")
+        self.assertEqual(
+            sorted(runtime_members[1:]),
+            sorted("runtime/crates/test-fixtures/" + name for name in (
+                "host-router", "fixture-data", "tool-a", "tool-b",
+                "tool-bad-no-handler", "tool-bad-no-manifest",
+            )),
+        )
+        self.assertNotIn(producer.PACKAGE_ROOTS[0].as_posix(), runtime_members)
+        copied =state["copy"].call_args.args[2]
         self.assertEqual(copied[0], "runtime/Cargo.toml")
         self.assertEqual(copied[1:1 + len(runtime_members)], tuple(path + "/Cargo.toml" for path in runtime_members))
         self.assertNotIn("Cargo.toml", copied)

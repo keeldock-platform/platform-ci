@@ -55,7 +55,7 @@ PACKAGE_ROOTS = (
     Path("crates/host/api"), Path("crates/host/mock"), Path("crates/host/conformance"),
     Path("crates/kernel/i18n"),
 )
-RUNTIME_PACKAGE_ROOTS = tuple(
+RUNTIME_PACKAGE_ROOTS = (Path("runtime/crates/services/sync-publication"),) + tuple(
     Path("runtime/crates/test-fixtures") / name
     for name in (
         "host-router", "fixture-data", "tool-a", "tool-b",
