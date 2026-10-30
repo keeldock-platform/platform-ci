@@ -261,6 +261,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "Verify selected installation identity",
                 "Fetch exact source and verify binding, tree, signatures and lock provenance",
                 "Revoke source-reader token and verify rejection",
+                "Require trusted Rust licence admission",
                 "Fetch npm tarballs by committed lock integrity",
                 "Run trusted dependency audit",
                 "Prepare offline project inputs",
@@ -309,7 +310,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertIn("linux_source_build.py gates", verdict)
         self.assertIn("run: python3 -B kit/confinement/linux_source_build.py verdict", verdict)
         self.assertNotIn("uses:", verdict)
-        self.assertEqual(verdict.count("      - name:"), 16)
+        self.assertEqual(verdict.count("      - name:"), 17)
         self.assertEqual(verdict.count("--preserve-env=KD_CANARY_SECRET"), 2)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", self.text)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", verdict)

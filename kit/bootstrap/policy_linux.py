@@ -273,6 +273,7 @@ jobs:
           python3 -B kit/confinement/test_linux_canaries.py
           python3 -B kit/confinement/test_linux_channels.py
           python3 -B kit/confinement/test_linux_source_build.py
+          python3 -B kit/confinement/test_rust_license_gate.py
           python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
   linux-source-admission-source-read:
     needs:
@@ -401,6 +402,13 @@ jobs:
         env:
           SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
         run: python3 -B kit/confinement/linux_source_build.py revoke
+      - name: Require trusted Rust licence admission
+        id: rust-license-gate
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
       - name: Fetch npm tarballs by committed lock integrity
         id: npm-tarballs
         if: ${{ inputs.mode == 'source' }}
@@ -444,7 +452,8 @@ jobs:
           NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
           WORKER_PATH: ${{ steps.project-deps.outputs.worker_path }}
           CARGO_HOME: ${{ steps.project-deps.outputs.cargo_home }}
-        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP python3 -B kit/confinement/linux_source_build.py gates
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge confinement phase records
         if: ${{ always() && steps.selftest.outcome != 'skipped' && steps.recheck.outcome != 'skipped' }}
         run: |
@@ -566,6 +575,12 @@ jobs:
         env:
           SOURCE_READER_TOKEN: ${{ steps.verifier-token.outputs.token }}
         run: python3 -B kit/confinement/linux_source_build.py revoke
+      - name: Require trusted Rust licence admission independently
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
       - name: Fetch independent npm tarballs by lock integrity
         id: verifier-npm
         if: ${{ inputs.mode == 'source' }}
@@ -607,7 +622,8 @@ jobs:
           CARGO_HOME: ${{ steps.verifier-project.outputs.cargo_home }}
           RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
           NODE_BIN: ${{ steps.verifier-toolchain.outputs.node_bin }}
-        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP python3 -B kit/confinement/linux_source_build.py gates
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge independent confinement records
         if: ${{ always() && steps.verifier-selftest.outcome != 'skipped' && steps.verifier-recheck.outcome != 'skipped' }}
         run: |
