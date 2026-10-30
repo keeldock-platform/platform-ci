@@ -40,6 +40,7 @@ def _dispatch(expiry_offset=3600, **request_changes):
     }
 
 
+@unittest.skipUnless(sys.platform != "win32", "the macOS npm admission producer tests require POSIX paths")
 class NpmAdmissionProducerTests(unittest.TestCase):
     def setUp(self):
         self.world = fixtures.World(policy_epoch_ms=(int(time.time()) - 3600) * 1000)
