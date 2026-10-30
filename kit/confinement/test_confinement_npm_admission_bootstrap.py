@@ -3,6 +3,7 @@ import datetime
 import hashlib
 import io
 import json
+import sys
 import tarfile
 import unittest
 import urllib.error
@@ -541,6 +542,7 @@ class CommandTests(RefusalAssertions):
             with self.subTest(value=value):
                 self.assert_refused("npm_input_invalid", subject.policy_cutoff_ms, value)
 
+    @unittest.skipUnless(sys.platform != "win32", "the macOS npm environment path test requires POSIX paths")
     def test_the_environment_is_built_from_fixed_values_only(self):
         environment = subject.build_npm_environment(
             "/n/bin/node", home="/s/home", tmpdir="/s/tmp", cache="/s/cache",
