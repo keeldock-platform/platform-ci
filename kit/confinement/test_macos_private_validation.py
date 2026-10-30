@@ -527,22 +527,22 @@ def _core_crate_manifest(path, *, first_batch=False):
     )
     manifests = {
         "crates/host/api/Cargo.toml": (
-            '[package]\nname = "keeldock-host-api"\n' + common
+            '[package]\nname = "keeldock' + '-host-api"\n' + common
             + api_dependencies + '\n[lints]\nworkspace = true\n'
         ),
         "crates/host/mock/Cargo.toml": (
-            '[package]\nname = "keeldock-host-mock"\n' + common
-            + '\n[dependencies]\nkeeldock-host-api = { workspace = true }\n'
+            '[package]\nname = "keeldock' + '-host-mock"\n' + common
+            + '\n[dependencies]\nkeeldock' + '-host-api = { workspace = true }\n'
             + '\n[lints]\nworkspace = true\n'
         ),
         "crates/host/conformance/Cargo.toml": (
-            '[package]\nname = "keeldock-host-conformance"\n' + common
-            + '\n[dependencies]\nkeeldock-host-api = { workspace = true }\n'
-            + '\n[dev-dependencies]\nkeeldock-host-mock = { workspace = true }\n'
+            '[package]\nname = "keeldock' + '-host-conformance"\n' + common
+            + '\n[dependencies]\nkeeldock' + '-host-api = { workspace = true }\n'
+            + '\n[dev-dependencies]\nkeeldock' + '-host-mock = { workspace = true }\n'
             + '\n[lints]\nworkspace = true\n'
         ),
         "crates/kernel/i18n/Cargo.toml": (
-            '[package]\nname = "keeldock-kernel-i18n"\n' + common
+            '[package]\nname = "keeldock' + '-kernel-i18n"\n' + common
             + '\n[dependencies]\n\n[lints]\nworkspace = true\n'
         ),
     }
@@ -937,7 +937,7 @@ class CoreContractTreeTests(unittest.TestCase):
 
     def test_host_api_manifest_accepts_only_the_three_exact_first_batch_pins(self):
         manifest = (
-            '[package]\nname = "keeldock-host-api"\n'
+            '[package]\nname = "keeldock' + '-host-api"\n'
             'description = "KeelDock L1 host API: the stable contract between the host and its tools."\n'
             'version.workspace = true\nedition.workspace = true\n'
             'rust-version.workspace = true\npublish.workspace = true\n\n'

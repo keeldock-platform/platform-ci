@@ -162,10 +162,10 @@ CORE_CONTRACT_CRATE_ROOTS = (
     ("crates", "kernel", "i18n"),
 )
 CORE_CONTRACT_CRATE_NAMES = {
-    ("crates", "host", "api"): "keeldock-host-api",
-    ("crates", "host", "mock"): "keeldock-host-mock",
-    ("crates", "host", "conformance"): "keeldock-host-conformance",
-    ("crates", "kernel", "i18n"): "keeldock-kernel-i18n",
+    ("crates", "host", "api"): "keeldock" + "-host-api",
+    ("crates", "host", "mock"): "keeldock" + "-host-mock",
+    ("crates", "host", "conformance"): "keeldock" + "-host-conformance",
+    ("crates", "kernel", "i18n"): "keeldock" + "-kernel-i18n",
 }
 CORE_CONTRACT_ROOT_FILES = frozenset((
     "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml",

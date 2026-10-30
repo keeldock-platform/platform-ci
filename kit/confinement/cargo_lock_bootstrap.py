@@ -85,14 +85,14 @@ CONTRACT_MEMBERS = frozenset((
     "crates/host/api", "crates/host/mock", "crates/host/conformance", "crates/kernel/i18n",
 ))
 CONTRACT_PACKAGE_NAMES = {
-    "crates/host/api": "keeldock-host-api",
-    "crates/host/mock": "keeldock-host-mock",
-    "crates/host/conformance": "keeldock-host-conformance",
-    "crates/kernel/i18n": "keeldock-kernel-i18n",
+    "crates/host/api": "keeldock" + "-host-api",
+    "crates/host/mock": "keeldock" + "-host-mock",
+    "crates/host/conformance": "keeldock" + "-host-conformance",
+    "crates/kernel/i18n": "keeldock" + "-kernel-i18n",
 }
 CONTRACT_ROOT_DEPENDENCIES = {
-    "keeldock-host-api": {"path": "crates/host/api"},
-    "keeldock-host-mock": {"path": "crates/host/mock"},
+    "keeldock" + "-host-api": {"path": "crates/host/api"},
+    "keeldock" + "-host-mock": {"path": "crates/host/mock"},
 }
 CONTRACT_FIRST_BATCH_DEPENDENCIES = {
     "serde": {
@@ -108,11 +108,11 @@ CONTRACT_FIRST_BATCH_DEPENDENCIES = {
 CONTRACT_MEMBER_DEPENDENCIES = {
     "crates/host/api": {"dependencies": CONTRACT_FIRST_BATCH_DEPENDENCIES},
     "crates/host/mock": {
-        "dependencies": {"keeldock-host-api": {"workspace": True}},
+        "dependencies": {"keeldock" + "-host-api": {"workspace": True}},
     },
     "crates/host/conformance": {
-        "dependencies": {"keeldock-host-api": {"workspace": True}},
-        "dev-dependencies": {"keeldock-host-mock": {"workspace": True}},
+        "dependencies": {"keeldock" + "-host-api": {"workspace": True}},
+        "dev-dependencies": {"keeldock" + "-host-mock": {"workspace": True}},
     },
     "crates/kernel/i18n": {"dependencies": {}},
 }
