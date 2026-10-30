@@ -1609,19 +1609,22 @@ def _core_contract_success_value(payload, context, image_os, image_version):
     gates = value.get("gates")
     if type(gates) is not dict:
         _fail("capture_invalid")
-    gate_names = tuple(gates)
-    if gate_names not in CORE_CONTRACT_SUCCESS_GATE_SHAPES:
+    shape = None
+    for candidate in CORE_CONTRACT_SUCCESS_GATE_SHAPES:
+        if set(gates) == set(candidate):
+            shape = candidate
+    if shape is None:
         _fail("capture_invalid")
-    if any(type(gates[name]) is not str or gates[name] != "passed" for name in gate_names):
+    if any(type(gates[name]) is not str or gates[name] != "passed" for name in shape):
         _fail("capture_invalid")
     for key in ("selected_gates", "completed_gates"):
         listed = value.get(key)
-        if (type(listed) is not list or len(listed) != len(gate_names)
+        if (type(listed) is not list or len(listed) != len(shape)
                 or any(type(name) is not str for name in listed)
-                or tuple(listed) != gate_names):
+                or tuple(listed) != shape):
             _fail("capture_invalid")
     for key in ("gate_count", "gates_passed"):
-        if not _exact_int(value.get(key), 0) or value[key] != len(gate_names):
+        if not _exact_int(value.get(key), 0) or value[key] != len(shape):
             _fail("capture_invalid")
     for key, expected_value in expected.items():
         if type(expected_value) is int:

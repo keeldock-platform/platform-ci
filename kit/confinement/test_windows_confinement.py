@@ -964,10 +964,7 @@ foreach ($case in $cases) {
                 self.assertNotIn(forbidden, workflow)
 
     def test_windows_has_no_source_mode_so_the_rust_licence_gate_is_linux_only(self):
-        """Windows has no source mode: the only ladder entry is the spike mode, which
-        already refuses unless the run is a manual dispatch on main, and no Windows
-        workflow sets a source mode. The Rust licence gate therefore applies to Linux
-        source admission only, and the wrapper carries no separate licence guard."""
+        """Windows has no source mode, so the Rust licence gate is Linux source admission only."""
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertNotIn("CI_MODE", workflow)
         self.assertNotIn("CI_MODE", self.wrapper)
