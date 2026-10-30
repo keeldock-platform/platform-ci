@@ -850,7 +850,7 @@ class CoreContractTreeTests(unittest.TestCase):
         for concern in subject.CORE_CONTRACT_CONCERNS:
             with self.subTest(concern=concern):
                 expected = "100644" if concern in (
-                    "core-build-diagnostic-return", "core-rust-format-return",
+                    "core-build-diagnostic-return", "core-rust-format-return", "core-npm-admission-return",
                 ) else None
                 self.assertEqual(
                     subject._core_contract_expected_mode(path, concern=concern), expected,

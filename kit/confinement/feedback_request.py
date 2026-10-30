@@ -25,6 +25,16 @@ CARGO_LOCK_MAX_EVIDENCE_BYTES = 192 * 1024
 CARGO_LOCK_MAX_PACKAGES = 512
 CARGO_LOCK_MAX_CONSUMED = 8
 CARGO_LOCK_BUILD_INPUTS = ()
+NPM_ADMISSION_KIND = "npm_admission"
+NPM_ADMISSION_MAX_PAYLOAD_BYTES = 3 * 1024 * 1024 + 512 * 1024
+NPM_ADMISSION_MAX_LOCK_BYTES = 1536 * 1024
+NPM_ADMISSION_MAX_RECEIPT_BYTES = 256 * 1024
+NPM_ADMISSION_MAX_EVIDENCE_BYTES = 640 * 1024
+NPM_ADMISSION_MAX_PACKAGES = 1024
+NPM_ADMISSION_MAX_CONSUMED = 16
+NPM_ADMISSION_BUILD_INPUTS = ()
+NPM_FILING_SELECTORS = ("contract-ui-batch-a",)
+NPM_DEFAULT_FILING = "contract-ui-batch-a"
 
 PROFILE_FIELDS = (
     "profile_id", "kind", "concern", "workflow_path", "producer_job", "auditor_job",
@@ -44,6 +54,10 @@ _PROFILE_ROWS = (
     (4, CARGO_LOCK_KIND, "core-rust-lock-return", ".github/workflows/core-rust-lock-return.yml",
      "core-rust-lock-return", "core-rust-lock-return-audit", "rust-lock-return-v1.enc",
      CARGO_LOCK_MAX_PAYLOAD_BYTES, CARGO_LOCK_BUILD_INPUTS),
+    (5, NPM_ADMISSION_KIND, "core-npm-admission-return",
+     ".github/workflows/core-npm-admission-return.yml", "core-npm-admission-return",
+     "core-npm-admission-return-audit", "npm-admission-return-v1.enc",
+     NPM_ADMISSION_MAX_PAYLOAD_BYTES, NPM_ADMISSION_BUILD_INPUTS),
 )
 PROFILES = {
     row[2]: dict(zip(PROFILE_FIELDS, row))
@@ -131,6 +145,23 @@ def request_workspace(request):
     return request[WORKSPACE_FIELD]
 
 
+def request_filing(request):
+    """Return the npm filing selector a request carries; an absent field means the default filing."""
+    if type(request) is not dict:
+        _refuse()
+    if WORKSPACE_FIELD not in request:
+        return NPM_DEFAULT_FILING
+    return request[WORKSPACE_FIELD]
+
+
+def _selectors_for(kind):
+    if kind == CARGO_LOCK_KIND:
+        return CARGO_WORKSPACE_SELECTORS
+    if kind == NPM_ADMISSION_KIND:
+        return NPM_FILING_SELECTORS
+    return ()
+
+
 def _profile_for_values(values):
     if type(values) is not dict:
         _refuse()
@@ -148,9 +179,8 @@ def _validate_values(values, now):
         _refuse()
     profile = _profile_for_values(values)
     if WORKSPACE_FIELD in values and (
-        profile["kind"] != CARGO_LOCK_KIND
-        or type(values[WORKSPACE_FIELD]) is not str
-        or values[WORKSPACE_FIELD] not in CARGO_WORKSPACE_SELECTORS
+        type(values[WORKSPACE_FIELD]) is not str
+        or values[WORKSPACE_FIELD] not in _selectors_for(profile["kind"])
     ):
         _refuse()
     if (not _valid_decimal(values["ci_repository_id"])
@@ -333,6 +363,15 @@ def cargo_lock_consumed_count(state):
     )
 
 
+def npm_admission_consumed_count(state):
+    """Count consumed npm admission returns; this state is separate from the single-use lock kind."""
+    _validate_state(state)
+    return sum(
+        1 for entry in state["requests"]
+        if entry["kind"] == NPM_ADMISSION_KIND and entry["status"] == "consumed"
+    )
+
+
 def validate_build_inputs(kind, inputs):
     """Accept only build inputs that the registered profile explicitly allowlists."""
     profile = PROFILE_BY_KIND.get(kind) if type(kind) is str else None
@@ -358,7 +397,9 @@ def _transition_state(state, request_id, *, status, now=None):
                 if (not _safe_int(now, minimum=1) or now >= entry["expiry"]
                         or entry["kind"] == "lock" and state["bootstrap_lock_consumed"]
                         or entry["kind"] == CARGO_LOCK_KIND
-                        and cargo_lock_consumed_count(state) >= CARGO_LOCK_MAX_CONSUMED):
+                        and cargo_lock_consumed_count(state) >= CARGO_LOCK_MAX_CONSUMED
+                        or entry["kind"] == NPM_ADMISSION_KIND
+                        and npm_admission_consumed_count(state) >= NPM_ADMISSION_MAX_CONSUMED):
                     _refuse()
             elif status == "expired":
                 if not _safe_int(now, minimum=1) or now < entry["expiry"]:
@@ -396,6 +437,14 @@ def register_request(state, request, *, now):
         cargo_lock_consumed_count(state) >= CARGO_LOCK_MAX_CONSUMED
         or any(
             entry["kind"] == CARGO_LOCK_KIND and entry["status"] == ACTIVE_STATUS
+            for entry in state["requests"]
+        )
+    ):
+        _refuse()
+    if profile["kind"] == NPM_ADMISSION_KIND and (
+        npm_admission_consumed_count(state) >= NPM_ADMISSION_MAX_CONSUMED
+        or any(
+            entry["kind"] == NPM_ADMISSION_KIND and entry["status"] == ACTIVE_STATUS
             for entry in state["requests"]
         )
     ):

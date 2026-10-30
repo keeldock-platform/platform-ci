@@ -88,6 +88,15 @@ export const RETURN_PROFILES = Object.freeze({
     contextDomain: 'node-feedback-return-context-v1',
     contextFields: FEEDBACK_CONTEXT_FIELDS,
   }),
+  'core-npm-admission-return': Object.freeze({
+    id: 5,
+    concern: 'core-npm-admission-return',
+    kind: 'npm_admission',
+    producerJob: 'core-npm-admission-return',
+    artifactMember: 'npm-admission-return-v1.enc',
+    contextDomain: 'node-feedback-return-context-v1',
+    contextFields: FEEDBACK_CONTEXT_FIELDS,
+  }),
 });
 const HEX_256 = /^[a-f0-9]{64}$/u;
 const GIT_SHA = /^[a-f0-9]{40}$/u;

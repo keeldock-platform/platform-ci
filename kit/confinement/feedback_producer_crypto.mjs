@@ -117,7 +117,7 @@ function validateInput(input) {
     ['schema_version', 'kind', 'payload_b64', 'context', 'recipient_spki_b64', 'now'])
       || input.schema_version !== 1
       || !Number.isSafeInteger(input.now) || input.now < 1
-      || !['lock', 'rust_patch', 'build_diagnostics', 'cargo_lock'].includes(input.kind)) {
+      || !['lock', 'rust_patch', 'build_diagnostics', 'cargo_lock', 'npm_admission'].includes(input.kind)) {
     reject('invalid_input');
   }
   let profile;
@@ -129,7 +129,8 @@ function validateInput(input) {
   if (profile.kind !== input.kind) reject('invalid_context');
   const limit = input.kind === 'lock' ? 4 * 1024 * 1024 - 64 * 1024
     : input.kind === 'rust_patch' ? 4 * 1024 * 1024 - 64 * 1024
-      : input.kind === 'cargo_lock' ? 1024 * 1024 : 512 * 1024;
+      : input.kind === 'cargo_lock' ? 1024 * 1024
+        : input.kind === 'npm_admission' ? 3 * 1024 * 1024 + 512 * 1024 : 512 * 1024;
   const payloadBytes = strictBytes(input.payload_b64, limit);
   const publicKey = publicKeyFromSpki(input.recipient_spki_b64, input.context);
   const options = {

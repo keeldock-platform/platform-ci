@@ -226,7 +226,8 @@ class CargoLockProfileTests(unittest.TestCase):
         self.assertIs(subject.PROFILES["core-rust-lock-return"], profile)
         self.assertNotEqual(profile["kind"], "lock")
         self.assertEqual(
-            sorted(subject.PROFILE_BY_KIND), ["build_diagnostics", "cargo_lock", "lock", "rust_patch"],
+            sorted(subject.PROFILE_BY_KIND),
+            ["build_diagnostics", "cargo_lock", "lock", "npm_admission", "rust_patch"],
         )
         self.assertEqual(
             len({item["member_name"] for item in subject.PROFILES.values()}), len(subject.PROFILES),

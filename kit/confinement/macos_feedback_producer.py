@@ -744,14 +744,14 @@ def _node_environment(environment, node, worker_storage):
 
 
 def _run_worker(rust, argv, worker_uid, environment, python_executable, capability, stage, deadline,
-                *, allow_nonzero_capture=False):
+                *, allow_nonzero_capture=False, timeout=120):
     command = tuple(str(part) for part in argv)
     if any(not part or "\x00" in part for part in command):
         _refuse("capture_invalid")
     try:
         result = rust._run_worker_command(
             command, worker_uid, environment, python_executable, capability,
-            stage=stage, deadline=deadline, timeout=120,
+            stage=stage, deadline=deadline, timeout=timeout,
             allow_nonzero_capture=allow_nonzero_capture,
         )
     except BaseException as error:
@@ -969,6 +969,127 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
         )
     except refusal_type as error:
         _cargo_bootstrap_refusal(bootstrap, error)
+    return {"payload_bytes": bundle, "expected_manifest": None, "reviewed_rust_paths": None,
+            "source_result": "command_completed"}
+
+
+NPM_PROJECT_DIRECTORY = "feedback-npm-admission"
+NPM_HOME_DIRECTORY = "npm-admission-home"
+NPM_RESOLVE_SECONDS = 900
+NPM_VERSION_SECONDS = 30
+
+
+def _npm_bootstrap_refusal(error):
+    reason = getattr(error, "reason", None)
+    if reason in (
+        "npm_input_invalid", "npm_manifest_refused", "npm_request_refused", "npm_request_mismatch",
+        "npm_policy_refused",
+    ):
+        _refuse("manifest_invalid")
+    if reason == "npm_environment_refused":
+        _refuse("tool_unavailable")
+    if reason in ("npm_network_refused", "npm_stale"):
+        _refuse("command_failed")
+    _refuse("payload_invalid")
+
+
+def _write_project_files(destination, files, relative_paths, worker_uid, primary_gid):
+    _make_worker_directory(destination, worker_uid, primary_gid)
+    for relative in relative_paths:
+        rel = Path(relative)
+        if rel.is_absolute() or any(part in ("", ".", "..") for part in rel.parts) or relative not in files:
+            _refuse("manifest_invalid")
+        current = destination
+        for part in rel.parts[:-1]:
+            current = current / part
+            try:
+                current.lstat()
+            except FileNotFoundError:
+                _make_worker_directory(current, worker_uid, primary_gid)
+            except OSError:
+                _refuse("output_unavailable")
+        _write_worker_file(current / rel.name, files[relative], worker_uid, primary_gid)
+
+
+def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, environment,
+                              host_toolchain, capability, rust, deadline, bootstrap, contract,
+                              node, npm_cli, source_environ):
+    profile = dispatch["profile"]
+    if (profile["kind"] != feedback_request.NPM_ADMISSION_KIND or type(source_environ) is not dict
+            or type(environment) is not dict or type(host_toolchain) is not dict
+            or node is None or npm_cli is None):
+        _refuse("request_invalid")
+    request = dispatch["request"]
+    selector = feedback_request.request_filing(request)
+    worker_gid = capability.PROBE_PRIMARY_GID
+    refusal_type = bootstrap.BootstrapRefusal
+    project = worker_storage / NPM_PROJECT_DIRECTORY
+    npm_storage = worker_storage / NPM_HOME_DIRECTORY
+    python_executable = host_toolchain["python"]
+    try:
+        paths = bootstrap.input_paths(selector)
+        files = {path: _read_file(source / path, maximum=bootstrap.MAX_INPUT_BYTES) for path in paths}
+        plan = bootstrap.check_inputs(files, selector)
+        _write_project_files(project, files, bootstrap.project_paths(selector), worker_uid, worker_gid)
+        _make_worker_directory(npm_storage, worker_uid, worker_gid)
+        for name in ("home", "tmp", "cache"):
+            _make_worker_directory(npm_storage / name, worker_uid, worker_gid)
+        user_config = npm_storage / contract.USER_CONFIG_NAME
+        global_config = npm_storage / contract.GLOBAL_CONFIG_NAME
+        _write_worker_file(user_config, contract.EMPTY_CONFIG_BYTES, worker_uid, worker_gid)
+        _write_worker_file(global_config, contract.EMPTY_CONFIG_BYTES, worker_uid, worker_gid)
+        npm_environment = bootstrap.build_npm_environment(
+            node, home=npm_storage / "home", tmpdir=npm_storage / "tmp", cache=npm_storage / "cache",
+            user_config=user_config, global_config=global_config,
+            node_options=contract.NODE_OPTIONS_VALUE,
+        )
+        now = int(time.time())
+        bootstrap.check_policy_time(plan, now)
+        command = bootstrap.resolve_command(
+            node, npm_cli, plan["cutoff_epoch_ms"], user_config, global_config,
+        )
+    except refusal_type as error:
+        _npm_bootstrap_refusal(error)
+    try:
+        os.chdir(project)
+        probe = _run_worker(
+            rust, (str(node), str(npm_cli), "--version"), worker_uid, npm_environment,
+            python_executable, capability, "feedback_lock", deadline,
+            allow_nonzero_capture=True, timeout=NPM_VERSION_SECONDS,
+        )
+        if probe.returncode != 0 or probe.stdout != (bootstrap.NPM_VERSION + "\n").encode("ascii"):
+            _refuse("tool_unavailable")
+        result = _run_worker(
+            rust, command, worker_uid, npm_environment, python_executable, capability,
+            "feedback_lock", deadline, allow_nonzero_capture=True, timeout=NPM_RESOLVE_SECONDS,
+        )
+        if result.returncode != 0:
+            _refuse("command_failed")
+    finally:
+        try:
+            os.chdir(source)
+        except OSError:
+            _refuse("cleanup_incomplete")
+    lock_bytes = _read_worker_file(project / "package-lock.json", worker_uid, bootstrap.MAX_LOCK_BYTES)
+    owner = source_environ.get("SOURCE_REPOSITORY_OWNER", "")
+    name = source_environ.get("SOURCE_REPOSITORY_NAME", "")
+    trusted_context = {
+        "repository": owner + "/" + name,
+        "filing": selector,
+        "source_sha": request["source_sha"],
+        "base_sha": request["base_sha"],
+        "base_branch": request["base_branch"],
+        "reviewed_diff_fingerprint": request["reviewed_diff_sha256"],
+        "control_sha": request["control_sha"],
+    }
+    try:
+        bundle = bootstrap.produce_bundle(
+            lock_bytes, plan, trusted_context, run_id=dispatch["context"]["run_id"], run_attempt=1,
+            now=now, expiry=request["expiry"],
+            fetcher=bootstrap.RegistryFetcher(deadline=deadline),
+        )
+    except refusal_type as error:
+        _npm_bootstrap_refusal(error)
     return {"payload_bytes": bundle, "expected_manifest": None, "reviewed_rust_paths": None,
             "source_result": "command_completed"}
 

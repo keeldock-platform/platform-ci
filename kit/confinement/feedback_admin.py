@@ -1010,7 +1010,9 @@ class FeedbackAdmin:
             _refuse()
         suffix = (
             "lock" if profile["kind"] == "lock" else "patch" if profile["kind"] == "rust_patch"
-            else "cargo-lock" if profile["kind"] == feedback_request.CARGO_LOCK_KIND else "diagnostics"
+            else "cargo-lock" if profile["kind"] == feedback_request.CARGO_LOCK_KIND
+            else "npm-admission" if profile["kind"] == feedback_request.NPM_ADMISSION_KIND
+            else "diagnostics"
         )
         name = "return-" + request["request_id"] + "-" + suffix + ".payload"
         _create_named(dir_fd, name, plaintext, mode=0o600, limit=MAX_PLAINTEXT_BYTES)

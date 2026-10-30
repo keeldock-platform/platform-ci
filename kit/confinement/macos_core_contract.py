@@ -24,6 +24,7 @@ TEMP_ROOT = Path(chr(47) + "private" + chr(47) + "tmp")
 RUN_PREFIX = "macos-core-contract-"
 WORKER_PREFIX = "macos-core-contract-worker-"
 MAX_TOTAL_SECONDS = 15 * 60
+NPM_ADMISSION_TOTAL_SECONDS = 40 * 60
 MAX_COMMAND_SECONDS = 120
 MAX_DIFF_BYTES = 6 * 1024 * 1024
 MAX_CAPTURE_BYTES = 65_536
@@ -39,6 +40,7 @@ ALLOWED_CONTROL_SIBLINGS = frozenset((
     "macos_private_validation", "macos_source_reader", "macos_network_observer",
     "macos_rust_toolchain", "macos_rules_bootstrap", "macos_feedback_producer",
     "macos_node_contract", "foundation_node_feedback", "cargo_lock_bootstrap",
+    "npm_admission_bootstrap",
 ))
 FEEDBACK_TREE_LABELS = {
     "core-contract": "core_contract",
@@ -46,6 +48,7 @@ FEEDBACK_TREE_LABELS = {
     "core-rust-format-return": "core_rust_format_return",
     "core-build-diagnostic-return": "core_build_diagnostic_return",
     "core-rust-lock-return": "core_rust_lock_return",
+    "core-npm-admission-return": "core_npm_admission_return",
 }
 LOCKED_FOUNDATION_TREE = "core_build_diagnostic_return_with_package_lock"
 GATE_NAMES = (
@@ -1510,6 +1513,18 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                                 deadline, _load_control_sibling("cargo_lock_bootstrap"), environ,
                             ),
                         )
+                    elif feedback["profile"]["kind"] == "npm_admission":
+                        feedback_result = _run_inside_source(
+                            source,
+                            original_cwd,
+                            lambda: producer.run_npm_admission_profile(
+                                feedback["dispatch"], source, worker_storage, worker_uid, environment,
+                                host_toolchain, capability, rust, deadline,
+                                _load_control_sibling("npm_admission_bootstrap"),
+                                _load_control_sibling("macos_node_contract"),
+                                feedback["node"], feedback["npm_cli"], environ,
+                            ),
+                        )
                     else:
                         feedback_result = _run_inside_source(
                             source,
@@ -1730,7 +1745,9 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
     operation = "load_controls"
     try:
         started = time.monotonic()
-        deadline = started + MAX_TOTAL_SECONDS
+        deadline = started + (
+            NPM_ADMISSION_TOTAL_SECONDS if feedback_kind == "npm_admission" else MAX_TOTAL_SECONDS
+        )
         controls = _load_controls()
         reviewed, capability, boundary, runtime, rust, rules = controls
         operation = "arguments"
@@ -1770,7 +1787,8 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
             operation = "toolchain_node"
             try:
                 node, npm_cli = feedback_producer.resolve_node(
-                    environ, require_npm=feedback["profile"]["kind"] in ("lock", "build_diagnostics"),
+                    environ,
+                    require_npm=feedback["profile"]["kind"] in ("lock", "build_diagnostics", "npm_admission"),
                 )
                 feedback["node"] = node
                 feedback["npm_cli"] = npm_cli

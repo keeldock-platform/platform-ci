@@ -91,6 +91,7 @@ FEEDBACK_PROFILE_CONCERNS = frozenset((
     "core-rust-format-return",
     "core-build-diagnostic-return",
     "core-rust-lock-return",
+    "core-npm-admission-return",
 ))
 CORE_CONTRACT_CONCERNS = frozenset(("core-contract",)) | FEEDBACK_PROFILE_CONCERNS
 SOURCE_DESCENDANT_CONCERNS = frozenset(("rules-bootstrap",)) | CORE_CONTRACT_CONCERNS
@@ -232,8 +233,13 @@ CORE_CONTRACT_KERNEL_FEEDBACK_FILES = frozenset((
 CORE_CONTRACT_WORKSPACE_MEMBERS_PATTERN = re.compile(r"(?m)^members\s*=\s*\[([^\]]*)\]\s*$")
 CORE_CONTRACT_WORKSPACE_MEMBER_PATTERN = re.compile(r'\s*"([A-Za-z0-9/_-]{1,128})"\s*(?:,|\Z)')
 CORE_CONTRACT_PACKAGE_LOCK_CONCERNS = frozenset((
-    "core-build-diagnostic-return", "core-rust-format-return",
+    "core-build-diagnostic-return", "core-rust-format-return", "core-npm-admission-return",
 ))
+CORE_CONTRACT_NPM_ADMISSION_CONCERN = "core-npm-admission-return"
+CORE_CONTRACT_NPM_REQUEST_PATH = re.compile(
+    r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.(?:md|json)\Z"
+)
+CORE_CONTRACT_NPM_POLICY_PATH = "dependency-policy.json"
 CORE_CONTRACT_MANIFEST_SECTIONS = frozenset(("package", "dependencies", "dev-dependencies", "lints"))
 CORE_CONTRACT_MANIFEST_INHERITED_KEYS = frozenset((
     "version.workspace", "edition.workspace", "rust-version.workspace", "publish.workspace",
@@ -332,6 +338,7 @@ CORE_CONTRACT_TREE_BY_CONCERN = {
     "core-rust-format-return": "core_rust_format_return",
     "core-build-diagnostic-return": "core_build_diagnostic_return",
     "core-rust-lock-return": "core_rust_lock_return",
+    "core-npm-admission-return": "core_npm_admission_return",
 }
 CORE_CONTRACT_RULES_TAG_PATTERN = re.compile(r"tag v(?:2\.0\.0|3\.0\.0)\Z")
 CORE_CONTRACT_RUST_POLICY_FILES = frozenset((
@@ -2197,6 +2204,10 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
     admin_mode = _core_contract_admin_mode(path)
     if admin_mode is not None:
         return admin_mode
+    if (concern == CORE_CONTRACT_NPM_ADMISSION_CONCERN
+            and (CORE_CONTRACT_NPM_REQUEST_PATH.fullmatch(path) is not None
+                 or path == CORE_CONTRACT_NPM_POLICY_PATH)):
+        return "100644"
     return _core_contract_package_mode(
         path, feedback_profile=concern in FEEDBACK_PROFILE_CONCERNS,
     )
