@@ -562,11 +562,16 @@ def _check_ready(api, job, runner):
 def _producers_ready(api, identity, deadline, monotonic):
     if monotonic() > deadline:
         return False
+    run_ready = _validate_run(api, identity)
     try:
-        by_name, _ = _validate_jobs(api, identity)
+        by_name, jobs_ready = _validate_jobs(api, identity)
     except Exception:
         return False
-    ready = True
+    failed = any(
+        job.get("status") == "completed" and job.get("conclusion") not in (None, "success")
+        for runner in RUNNERS for job in by_name[runner]
+    )
+    ready = failed or (run_ready and jobs_ready)
     for runner in RUNNERS:
         if not by_name[runner]:
             ready = False

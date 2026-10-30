@@ -253,6 +253,25 @@ class PartialLogAPI(FakeAPI):
         return super().log_text(job_id)
 
 
+class FaultAPI(FakeAPI):
+    def __init__(self, state, suffix, mode, count):
+        super().__init__(state)
+        self.suffix = suffix
+        self.mode = mode
+        self.count = count
+
+    def json(self, path):
+        if path.endswith(self.suffix) and self.count != 0:
+            if self.count > 0:
+                self.count -= 1
+            if self.mode == "raise":
+                self.calls.append(path)
+                raise OSError("synthetic server error")
+            value, headers = super().json(path)
+            return dict(value, total_count=value["total_count"] - 1), headers
+        return super().json(path)
+
+
 def _audit(state, env, clock=None, api=None):
     clock = Clock() if clock is None else clock
     api = FakeAPI(state) if api is None else api
@@ -552,7 +571,7 @@ class ReadinessAndDetailTests(unittest.TestCase):
         self.assertEqual(clock.sleeps, [10, 10])
         jobs_path = "/actions/runs/24680/jobs?filter=all&per_page=100&page=1"
         self.assertEqual(sum(path.endswith(jobs_path) for path in api.calls), 4)
-        self.assertEqual(sum(path.endswith("/actions/runs/24680") for path in api.calls), 1)
+        self.assertEqual(sum(path.endswith("/actions/runs/24680") for path in api.calls), 4)
 
     def test_readiness_waits_for_completed_check_runs_and_matching_annotation_counts(self):
         state, env = _fixture()
@@ -583,7 +602,7 @@ class ReadinessAndDetailTests(unittest.TestCase):
         self.assertLessEqual(clock.now, 60)
         jobs_path = "/actions/runs/24680/jobs?filter=all&per_page=100&page=1"
         self.assertEqual(sum(path.endswith(jobs_path) for path in api.calls), 7)
-        self.assertEqual(sum(path.endswith("/actions/runs/24680") for path in api.calls), 1)
+        self.assertEqual(sum(path.endswith("/actions/runs/24680") for path in api.calls), 7)
 
     def test_readiness_stops_when_the_clock_bound_is_reached(self):
         state, env = _fixture()
@@ -641,6 +660,47 @@ class ReadinessAndDetailTests(unittest.TestCase):
             _audit(state, env, clock=clock, api=api)
         self.assertEqual(clock.sleeps, [])
         self.assertEqual(caught.exception.reason, "producer_failed")
+
+    def test_readiness_waits_for_a_consistent_run_record(self):
+        state, env = _fixture()
+        state["run"]["status"] = "queued"
+
+        def settle(count):
+            if count == 2:
+                state["run"]["status"] = "in_progress"
+
+        clock = Clock(hook=settle)
+        marker, _ = _audit(state, env, clock=clock)
+        self.assertIn("status=passed", marker)
+        self.assertEqual(clock.sleeps, [10, 10])
+
+    def test_readiness_retries_a_server_error_on_the_run_read(self):
+        state, env = _fixture()
+        api = FaultAPI(state, "/actions/runs/24680", "raise", 1)
+        clock = Clock()
+        marker, _ = _audit(state, env, clock=clock, api=api)
+        self.assertIn("status=passed", marker)
+        self.assertEqual(clock.sleeps, [10])
+
+    def test_readiness_waits_for_the_jobs_total_to_reach_four(self):
+        state, env = _fixture()
+        jobs_suffix = "/actions/runs/24680/jobs?filter=all&per_page=100&page=1"
+        api = FaultAPI(state, jobs_suffix, "short", 2)
+        clock = Clock()
+        marker, _ = _audit(state, env, clock=clock, api=api)
+        self.assertIn("status=passed", marker)
+        self.assertEqual(clock.sleeps, [10, 10])
+
+    def test_jobs_that_never_become_consistent_refuse_with_the_jobs_stage(self):
+        state, env = _fixture()
+        jobs_suffix = "/actions/runs/24680/jobs?filter=all&per_page=100&page=1"
+        api = FaultAPI(state, jobs_suffix, "short", -1)
+        clock = Clock()
+        with self.assertRaises(subject.SmokeAuditRefusal) as caught:
+            _audit(state, env, clock=clock, api=api)
+        self.assertEqual(clock.sleeps, [10] * 5)
+        self.assertEqual(caught.exception.reason, "producer_failed")
+        self.assertEqual(caught.exception.detail, "jobs")
 
     def test_each_detail_token_is_emitted_for_its_failing_sub_check(self):
         for token, mutate in _detail_cases():
