@@ -1,5 +1,6 @@
 """Verify a receipt-bound Cargo vendor tree before an offline source build."""
 
+from dataclasses import dataclass
 import hashlib
 import hmac
 import json
@@ -10,12 +11,26 @@ import stat
 import sys
 
 import cargo_lock_receipt as cargo
+import rust_license_gate
 
 
 VENDOR_RECEIPT_FIELDS = frozenset((
     "schema_version", "lock_receipt_sha256", "lock_sha256", "vendor_sha256",
 ))
 MAX_VENDOR_RECEIPT_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class VendorVerificationRequest:
+    lock_bytes: bytes
+    lock_receipt: object
+    expected_lock_context: dict
+    authorized_audits: dict
+    vendor_directory: object
+    vendor_receipt_bytes: bytes
+    trusted_vendor_receipt_sha256: str
+    trusted_staging_root: object
+    rust_license_gate_receipt: object
 
 
 def _refuse():
@@ -338,21 +353,18 @@ def _require_materialized_path(parent_fd, stage_fd, target, final_name):
             os.close(comparison_fd)
 
 
-def verify_vendor_tree(
-        lock_bytes, lock_receipt, expected_lock_context, authorized_audits,
-        vendor_directory, vendor_receipt_bytes, trusted_vendor_receipt_sha256,
-        trusted_staging_root):
-    """Check lock, vendor receipt, package files and offline Cargo settings.
-
-    The trusted vendor receipt digest must come from the protected preparation
-    handoff. The lock receipt context and audit mapping must also be independently
-    authenticated. A descriptor-bound copy is published under a preexisting
-    private staging root checked by the receipt helper. Cargo receives only the
-    frozen copy. The preparation job excludes untrusted same-user processes;
-    a privileged actor controlling mounts or the private root remains trusted,
-    as in the receipt handoff. Windows refuses until a native handle and ACL
-    handoff is implemented.
-    """
+def _verified_request_inputs(request):
+    if type(request) is not VendorVerificationRequest:
+        _refuse()
+    lock_bytes = request.lock_bytes
+    lock_receipt = request.lock_receipt
+    expected_lock_context = request.expected_lock_context
+    authorized_audits = request.authorized_audits
+    vendor_directory = request.vendor_directory
+    vendor_receipt_bytes = request.vendor_receipt_bytes
+    trusted_vendor_receipt_sha256 = request.trusted_vendor_receipt_sha256
+    trusted_staging_root = request.trusted_staging_root
+    rust_license_gate_receipt = request.rust_license_gate_receipt
     if type(lock_receipt) is bytes:
         lock_record = cargo.decode_receipt(lock_receipt)
     else:
@@ -360,6 +372,16 @@ def verify_vendor_tree(
     cargo.verify_lock_against_receipt(
         lock_bytes, lock_record, expected_lock_context, authorized_audits,
     )
+    try:
+        rust_license_gate.require_vendor_gate_receipt(
+            rust_license_gate_receipt, lock_record["source_sha"],
+            lock_record["workspace_path"], lock_record["lock_sha256"],
+            tuple(rust_license_gate.Package(
+                item["name"], item["version"], item["checksum"],
+            ) for item in lock_record["packages"]),
+        )
+    except rust_license_gate.LicenseGateRefusal:
+        _refuse()
     lock_receipt_digest = hashlib.sha256(cargo.encode_receipt(lock_record)).hexdigest()
     vendor_receipt = _decode_vendor_receipt(
         vendor_receipt_bytes, trusted_vendor_receipt_sha256,
@@ -369,6 +391,39 @@ def verify_vendor_tree(
                 vendor_receipt["lock_sha256"], lock_record["lock_sha256"],
             )):
         _refuse()
+    return (
+        lock_record, vendor_receipt, vendor_directory, trusted_staging_root,
+    )
+
+
+def _cleanup_vendor_state(materialized, environment):
+    if materialized is not None:
+        unused_path, parent_fd, unused_stage_fd, final_name, stage_identity = materialized
+        try:
+            cargo._remove_stage(parent_fd, final_name, stage_identity)
+        except (OSError, cargo.Refusal):
+            pass
+    if environment is not None:
+        for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
+            try:
+                os.rmdir(environment[key])
+            except (KeyError, OSError):
+                pass
+
+
+def _close_vendor_descriptors(materialized, root_fd):
+    if materialized is not None:
+        unused_path, parent_fd, stage_fd, unused_name, unused_identity = materialized
+        os.close(stage_fd)
+        os.close(parent_fd)
+    os.close(root_fd)
+
+
+def verify_vendor_tree(request):
+    """Verify receipts before exposing a frozen, read-only vendor tree."""
+    lock_record, vendor_receipt, vendor_directory, trusted_staging_root = (
+        _verified_request_inputs(request)
+    )
 
     physical_root = _resolve_vendor_root(vendor_directory)
     read_only_superblocks = _read_only_superblocks()
@@ -418,25 +473,10 @@ def verify_vendor_tree(
             "environment": environment,
         }
     except BaseException:
-        if materialized is not None:
-            unused_path, parent_fd, unused_stage_fd, final_name, stage_identity = materialized
-            try:
-                cargo._remove_stage(parent_fd, final_name, stage_identity)
-            except (OSError, cargo.Refusal):
-                pass
-        if environment is not None:
-            for key in ("HOME", "CARGO_HOME", "RUSTUP_HOME"):
-                try:
-                    os.rmdir(environment[key])
-                except (KeyError, OSError):
-                    pass
+        _cleanup_vendor_state(materialized, environment)
         raise
     finally:
-        if materialized is not None:
-            unused_path, parent_fd, stage_fd, unused_name, unused_identity = materialized
-            os.close(stage_fd)
-            os.close(parent_fd)
-        os.close(root_fd)
+        _close_vendor_descriptors(materialized, root_fd)
 
 
 def _require_same_path(root_fd, physical_root, read_only_superblocks):

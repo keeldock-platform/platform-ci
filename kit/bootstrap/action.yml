@@ -96,6 +96,7 @@ runs:
         "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_role_signer.py"
         if [[ "${RUNNER_OS:-}" == "Linux" ]]; then
           "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_linux_source_build.py"
+          "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_rust_license_gate.py"
         fi
         if [[ "${RUNNER_OS:-}" == "macOS" ]]; then
           /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B -m unittest discover -s "$CI_ACTION_PATH/../selector" -p "test_*.py"

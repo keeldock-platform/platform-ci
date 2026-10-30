@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ from unittest.mock import patch
 
 import cargo_lock_receipt as cargo
 import cargo_vendor_verify as subject
+import rust_license_gate
 
 
 CHECKSUM = "a" * 64
@@ -98,15 +100,31 @@ def _vendor_receipt(record, vendor_digest, changes=None):
     return data, hashlib.sha256(data).hexdigest()
 
 
-def _verify(vendor, record, vendor_receipt, trusted_digest, lock_bytes=LOCK_BYTES,
-            staging_root=None):
-    if staging_root is None:
-        staging_root = vendor.parent
+def _license_gate_receipt(record):
+    identity = rust_license_gate.Identity(
+        record["source_sha"], record["workspace_path"], "/synthetic/vendor-root",
+        record["lock_sha256"],
+    )
+    return rust_license_gate.GateReceipt(
+        identity, "f" * 64, len(record["packages"]),
+        "2" * 40, "1" * 64, "e" * 64, "c" * 64, "d" * 64,
+        "e" * 40,
+        rust_license_gate._SEAL,
+    )
+
+
+def _verify(vendor, record, vendor_receipt, trusted_digest, options=None):
+    options = {} if options is None else options
+    lock_bytes = options.get("lock_bytes", LOCK_BYTES)
+    staging_root = options.get("staging_root", vendor.parent)
     with patch.object(subject, "_require_protected_ancestor"), patch.object(
             subject, "_require_read_only_mount"):
         return subject.verify_vendor_tree(
-            lock_bytes, record, _lock_context(record), _authorized_audits(record),
-            vendor, vendor_receipt, trusted_digest, staging_root,
+            subject.VendorVerificationRequest(
+                lock_bytes, record, _lock_context(record), _authorized_audits(record),
+                vendor, vendor_receipt, trusted_digest, staging_root,
+                _license_gate_receipt(record),
+            ),
         )
 
 
@@ -260,7 +278,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
                     with self.assertRaises(cargo.Refusal) as raised:
                         _verify(
                             vendor, record, receipt, trusted_digest,
-                            staging_root=staging_root,
+                            {"staging_root": staging_root},
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
                 self.assertEqual(list(staging_root.iterdir()), [])
@@ -466,7 +484,10 @@ class CargoVendorVerifyTests(unittest.TestCase):
                         cargo, "cargo_config_for_vendor",
                         side_effect=AssertionError("configuration was requested")):
                     with self.assertRaises(cargo.Refusal) as raised:
-                        _verify(vendor, record, receipt, trusted_digest, changed_lock)
+                        _verify(
+                            vendor, record, receipt, trusted_digest,
+                            {"lock_bytes": changed_lock},
+                        )
                 self.assertEqual(raised.exception.reason, "cargo_lock_mismatch")
             finally:
                 _unfreeze(vendor)
@@ -487,6 +508,47 @@ class CargoVendorVerifyTests(unittest.TestCase):
             finally:
                 _unfreeze(vendor)
 
+    def test_bad_license_receipts_are_refused_before_materialization(self):
+        record = _lock_receipt()
+        good = _license_gate_receipt(record)
+        identity = good.identity
+        variants = {
+            "missing": None,
+            "unsealed": dataclasses.replace(good, seal=object()),
+            "source": dataclasses.replace(
+                good, identity=dataclasses.replace(identity, source_sha="9" * 40)),
+            "profile": dataclasses.replace(
+                good, identity=dataclasses.replace(identity, profile="other")),
+            "lock": dataclasses.replace(
+                good, identity=dataclasses.replace(identity, lock_sha256="8" * 64)),
+            "count": dataclasses.replace(good, package_count=good.package_count + 1),
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            digest = _write_vendor(vendor)
+            receipt, trusted_digest = _vendor_receipt(record, digest)
+            try:
+                for name, bad in variants.items():
+                    with self.subTest(receipt=name):
+                        with patch.object(subject, "_require_protected_ancestor"), patch.object(
+                                subject, "_require_read_only_mount"), patch.object(
+                                    subject, "_materialize_vendor",
+                                    side_effect=AssertionError("vendor was materialized")), patch.object(
+                                        cargo, "cargo_config_for_vendor",
+                                        side_effect=AssertionError("configuration was requested")):
+                            with self.assertRaises(cargo.Refusal) as raised:
+                                subject.verify_vendor_tree(
+                                    subject.VendorVerificationRequest(
+                                        LOCK_BYTES, record, _lock_context(record),
+                                        _authorized_audits(record), vendor, receipt,
+                                        trusted_digest, vendor.parent, bad,
+                                    ),
+                                )
+                            self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+            finally:
+                _unfreeze(vendor)
+
     def test_unprotected_ancestor_is_refused_before_configuration(self):
         record = _lock_receipt()
         with tempfile.TemporaryDirectory() as temporary:
@@ -501,9 +563,11 @@ class CargoVendorVerifyTests(unittest.TestCase):
                             side_effect=AssertionError("configuration was requested")):
                     with self.assertRaises(cargo.Refusal) as raised:
                         subject.verify_vendor_tree(
-                            LOCK_BYTES, record, _lock_context(record),
-                            _authorized_audits(record), vendor, receipt, trusted_digest,
-                            vendor.parent,
+                            subject.VendorVerificationRequest(
+                                LOCK_BYTES, record, _lock_context(record),
+                                _authorized_audits(record), vendor, receipt, trusted_digest,
+                                vendor.parent, _license_gate_receipt(record),
+                            ),
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -523,9 +587,11 @@ class CargoVendorVerifyTests(unittest.TestCase):
                             side_effect=AssertionError("configuration was requested")):
                     with self.assertRaises(cargo.Refusal) as raised:
                         subject.verify_vendor_tree(
-                            LOCK_BYTES, record, _lock_context(record),
-                            _authorized_audits(record), vendor, receipt, trusted_digest,
-                            vendor.parent,
+                            subject.VendorVerificationRequest(
+                                LOCK_BYTES, record, _lock_context(record),
+                                _authorized_audits(record), vendor, receipt, trusted_digest,
+                                vendor.parent, _license_gate_receipt(record),
+                            ),
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -549,9 +615,11 @@ class CargoVendorVerifyTests(unittest.TestCase):
                                     side_effect=AssertionError("configuration was requested")):
                     with self.assertRaises(cargo.Refusal) as raised:
                         subject.verify_vendor_tree(
-                            LOCK_BYTES, record, _lock_context(record),
-                            _authorized_audits(record), vendor, receipt, trusted_digest,
-                            vendor.parent,
+                            subject.VendorVerificationRequest(
+                                LOCK_BYTES, record, _lock_context(record),
+                                _authorized_audits(record), vendor, receipt, trusted_digest,
+                                vendor.parent, _license_gate_receipt(record),
+                            ),
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -581,9 +649,11 @@ class CargoVendorVerifyTests(unittest.TestCase):
                                 side_effect=AssertionError("configuration was requested")):
                     with self.assertRaises(cargo.Refusal) as raised:
                         subject.verify_vendor_tree(
-                            LOCK_BYTES, record, _lock_context(record),
-                            _authorized_audits(record), vendor, receipt, trusted_digest,
-                            vendor.parent,
+                            subject.VendorVerificationRequest(
+                                LOCK_BYTES, record, _lock_context(record),
+                                _authorized_audits(record), vendor, receipt, trusted_digest,
+                                vendor.parent, _license_gate_receipt(record),
+                            ),
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -604,9 +674,11 @@ class CargoVendorVerifyTests(unittest.TestCase):
                                 side_effect=AssertionError("configuration was requested")):
                     with self.assertRaises(cargo.Refusal) as raised:
                         subject.verify_vendor_tree(
-                            LOCK_BYTES, record, _lock_context(record),
-                            _authorized_audits(record), vendor, receipt, trusted_digest,
-                            vendor.parent,
+                            subject.VendorVerificationRequest(
+                                LOCK_BYTES, record, _lock_context(record),
+                                _authorized_audits(record), vendor, receipt, trusted_digest,
+                                vendor.parent, _license_gate_receipt(record),
+                            ),
                         )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
@@ -746,7 +818,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
             try:
                 with patch.object(cargo, "cargo_config_for_vendor", side_effect=swap_then_config):
                     result = _verify(
-                        vendor, record, receipt, trusted_digest, staging_root=base,
+                        vendor, record, receipt, trusted_digest, {"staging_root": base},
                     )
                 materialized = result["materialized_vendor_directory"]
                 self.assertEqual(cargo.vendor_tree_digest(materialized), digest)
@@ -785,7 +857,7 @@ class CargoVendorVerifyTests(unittest.TestCase):
             result = None
             try:
                 result = _verify(
-                    vendor, record, receipt, trusted_digest, staging_root=base,
+                    vendor, record, receipt, trusted_digest, {"staging_root": base},
                 )
                 parent.rename(moved)
                 replacement.rename(parent)
@@ -819,9 +891,11 @@ class WindowsVendorHandoffTests(unittest.TestCase):
             try:
                 with self.assertRaises(cargo.Refusal) as raised:
                     subject.verify_vendor_tree(
-                        LOCK_BYTES, record, _lock_context(record),
-                        _authorized_audits(record), vendor, receipt, trusted_digest,
-                        vendor.parent,
+                        subject.VendorVerificationRequest(
+                            LOCK_BYTES, record, _lock_context(record),
+                            _authorized_audits(record), vendor, receipt, trusted_digest,
+                            vendor.parent, _license_gate_receipt(record),
+                        ),
                     )
                 self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
             finally:
