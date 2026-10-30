@@ -200,6 +200,28 @@ class RequestTests(unittest.TestCase):
                 "--concern", "core-feedback-return",
             ))
 
+    def test_rust_lock_return_accepts_only_the_frozen_batch4_base_pair(self):
+        request = subject.parse_request((
+            "--source-sha", "a" * 40,
+            "--base-sha", subject.CORE_RUST_BOOTSTRAP_BASE_SHA,
+            "--base-branch", subject.CORE_RUST_BOOTSTRAP_BASE_BRANCH,
+            "--concern", "core-rust-lock-return",
+        ))
+        self.assertEqual(request["base_sha"], subject.CORE_RUST_BOOTSTRAP_BASE_SHA)
+        for base_sha, base_branch, concern in (
+            (subject.CORE_RUST_BOOTSTRAP_BASE_SHA, "plan/core-contract-batch5", "core-rust-lock-return"),
+            ("b" * 40, subject.CORE_RUST_BOOTSTRAP_BASE_BRANCH, "core-rust-lock-return"),
+            (subject.CORE_RUST_BOOTSTRAP_BASE_SHA, subject.CORE_RUST_BOOTSTRAP_BASE_BRANCH, "core-contract"),
+        ):
+            with self.subTest(base_sha=base_sha, base_branch=base_branch, concern=concern):
+                with self.assertRaises(subject.Refusal):
+                    subject.parse_request((
+                        "--source-sha", "a" * 40,
+                        "--base-sha", base_sha,
+                        "--base-branch", base_branch,
+                        "--concern", concern,
+                    ))
+
     def test_extra_or_unrecognized_arguments_refuse(self):
         values = (
             "--source-sha", "a" * 40,
@@ -491,6 +513,42 @@ CRATE_MANIFEST = (
 )
 
 
+def _core_crate_manifest(path, *, first_batch=False):
+    common = (
+        'version.workspace = true\nedition.workspace = true\n'
+        'rust-version.workspace = true\npublish.workspace = true\n'
+    )
+    api_dependencies = (
+        '\n[dependencies]\n'
+        + 'serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }\n'
+        + 'serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }\n'
+        + 'schemars = { version = "=1.2.3", default-features = false, features = ["derive", "std"] }\n'
+        if first_batch else '\n[dependencies]\n'
+    )
+    manifests = {
+        "crates/host/api/Cargo.toml": (
+            '[package]\nname = "keeldock-host-api"\n' + common
+            + api_dependencies + '\n[lints]\nworkspace = true\n'
+        ),
+        "crates/host/mock/Cargo.toml": (
+            '[package]\nname = "keeldock-host-mock"\n' + common
+            + '\n[dependencies]\nkeeldock-host-api = { workspace = true }\n'
+            + '\n[lints]\nworkspace = true\n'
+        ),
+        "crates/host/conformance/Cargo.toml": (
+            '[package]\nname = "keeldock-host-conformance"\n' + common
+            + '\n[dependencies]\nkeeldock-host-api = { workspace = true }\n'
+            + '\n[dev-dependencies]\nkeeldock-host-mock = { workspace = true }\n'
+            + '\n[lints]\nworkspace = true\n'
+        ),
+        "crates/kernel/i18n/Cargo.toml": (
+            '[package]\nname = "keeldock-kernel-i18n"\n' + common
+            + '\n[dependencies]\n\n[lints]\nworkspace = true\n'
+        ),
+    }
+    return manifests[path]
+
+
 class CoreContractTreeTests(unittest.TestCase):
     @staticmethod
     def _module_lines(names):
@@ -511,7 +569,11 @@ class CoreContractTreeTests(unittest.TestCase):
 
         def blob(unused_repository, unused_git, unused_environment, unused_entries, path, **unused):
             if path.startswith("crates/") and path.endswith("/Cargo.toml"):
-                return (manifest_text or CRATE_MANIFEST).encode("utf-8")
+                return (
+                    manifest_text if manifest_text is not None else _core_crate_manifest(
+                        path, first_batch=concern == "core-rust-lock-return",
+                    )
+                ).encode("utf-8")
             if path == "Cargo.toml":
                 if workspace_text is not None:
                     return workspace_text.encode("utf-8")
@@ -538,7 +600,7 @@ class CoreContractTreeTests(unittest.TestCase):
                 patch.object(subject, "_feedback_manifest_shape", return_value=True), \
                 patch.object(subject, "_feedback_fuzz_manifest_shape", return_value=True), \
                 patch.object(subject, "_core_contract_policy_matches_base", return_value=True), \
-                patch.object(subject, "_rules_v2_file_manifest", return_value={"AGENTS.md": digest}):
+                patch.object(subject, "_rules_file_manifest", return_value={"AGENTS.md": digest}):
             marker = subject._safe_core_contract_tree(
                 "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
                 concern=concern,
@@ -547,6 +609,8 @@ class CoreContractTreeTests(unittest.TestCase):
 
     def test_core_contract_path_scope_is_limited_to_workspace_and_four_crates(self):
         for path in subject.CORE_CONTRACT_ROOT_FILES:
+            self.assertEqual(subject._core_contract_expected_mode(path), "100644")
+        for path in subject.CORE_CONTRACT_RUST_POLICY_FILES:
             self.assertEqual(subject._core_contract_expected_mode(path), "100644")
         for root in subject.CORE_CONTRACT_CRATE_ROOTS:
             prefix = "/".join(root)
@@ -567,6 +631,7 @@ class CoreContractTreeTests(unittest.TestCase):
             "crates/host/api/tests/build.rs",
             ".cargo/config.toml",
             "ci/run-suite.sh",
+            "supply-chain/extra.toml",
         ):
             with self.subTest(path=path):
                 self.assertIsNone(subject._core_contract_expected_mode(path))
@@ -869,6 +934,38 @@ class CoreContractTreeTests(unittest.TestCase):
             '[package]\nname = "synthetic-crate"\n\n[dependencies]\n\n[lints]\nworkspace = true\n'
         )
         self.assertTrue(subject._core_contract_crate_manifest_shape(minimal))
+
+    def test_host_api_manifest_accepts_only_the_three_exact_first_batch_pins(self):
+        manifest = (
+            '[package]\nname = "keeldock-host-api"\n'
+            'description = "KeelDock L1 host API: the stable contract between the host and its tools."\n'
+            'version.workspace = true\nedition.workspace = true\n'
+            'rust-version.workspace = true\npublish.workspace = true\n\n'
+            '[dependencies]\n'
+            'serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }\n'
+            'serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }\n'
+            'schemars = { version = "=1.2.3", default-features = false, features = ["derive", "std"] }\n\n'
+            '[lints]\nworkspace = true\n'
+        )
+        self.assertTrue(subject._core_contract_crate_manifest_shape(
+            manifest, crate_root=subject.CORE_CONTRACT_CRATE_ROOTS[0], require_first_batch=True,
+        ))
+        self.assertFalse(subject._core_contract_crate_manifest_shape(manifest))
+        self.assertFalse(subject._core_contract_crate_manifest_shape(
+            manifest.replace('=1.0.229', '^1.0.229'),
+            crate_root=subject.CORE_CONTRACT_CRATE_ROOTS[0], require_first_batch=True,
+        ))
+        self.assertFalse(subject._core_contract_crate_manifest_shape(
+            manifest, crate_root=subject.CORE_CONTRACT_CRATE_ROOTS[1],
+        ))
+
+    def test_batch4_host_api_manifest_remains_valid_outside_rust_lock_return(self):
+        manifest = _core_crate_manifest("crates/host/api/Cargo.toml")
+        api_root = subject.CORE_CONTRACT_CRATE_ROOTS[0]
+        self.assertTrue(subject._core_contract_crate_manifest_shape(manifest, crate_root=api_root))
+        self.assertFalse(subject._core_contract_crate_manifest_shape(
+            manifest, crate_root=api_root, require_first_batch=True,
+        ))
 
     def test_crate_manifest_shape_refuses_every_build_bypass_form(self):
         header = '[package]\nname = "synthetic-crate"\n'
@@ -1179,7 +1276,7 @@ class CoreContractTreeTests(unittest.TestCase):
                     patch.object(subject, "_feedback_manifest_shape", return_value=True), \
                     patch.object(subject, "_feedback_fuzz_manifest_shape", return_value=True), \
                     patch.object(subject, "_core_contract_policy_matches_base", return_value=True), \
-                    patch.object(subject, "_rules_v2_file_manifest", return_value={"AGENTS.md": digest}), \
+                    patch.object(subject, "_rules_file_manifest", return_value={"AGENTS.md": digest}), \
                     self.assertRaises(subject.Refusal) as refusal:
                 subject._safe_core_contract_tree(
                     "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
@@ -1579,27 +1676,32 @@ class CoreContractTreeTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertFalse(subject._feedback_fuzz_modules_shape(payload, targets))
 
-    def test_rules_lock_requires_v2_and_only_manifested_installed_files(self):
+    def test_rules_lock_accepts_v2_and_v3_tags_with_only_manifested_files(self):
         rules_file = subject.RULES_DIRECTORY + "/rules/shared/rust.md"
         hooks_file = subject.RULES_DIRECTORY + "/hooks/shared/check-shared-lock.sh"
         digest = hashlib.sha256(b"fixture").hexdigest()
         payload = (
             "format 3\n"
             "profile full\n"
-            "tag v2.4.1\n"
+            "tag v2.0.0\n"
             "signature verified\n"
             "file AGENTS.md " + digest + "\n"
             "file " + rules_file + " " + digest + "\n"
             "file " + hooks_file + " " + digest + "\n"
         ).encode("ascii")
-        self.assertEqual(set(subject._rules_v2_file_manifest(payload)), {"AGENTS.md", rules_file, hooks_file})
+        self.assertEqual(set(subject._rules_file_manifest(payload)), {"AGENTS.md", rules_file, hooks_file})
+        self.assertEqual(
+            set(subject._rules_file_manifest(payload.replace(b"tag v2.0.0", b"tag v3.0.0"))),
+            {"AGENTS.md", rules_file, hooks_file},
+        )
         for invalid in (
-            payload.replace(b"tag v2.4.1", b"tag v1.4.1"),
+            payload.replace(b"tag v2.0.0", b"tag v1.0.0"),
+            payload.replace(b"tag v2.0.0", b"tag v3.0.1"),
             payload.replace(rules_file.encode("ascii"), b"outside/rules.md"),
         ):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(subject.Refusal) as refusal:
-                    subject._rules_v2_file_manifest(invalid)
+                    subject._rules_file_manifest(invalid)
             self.assertEqual(
                 (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
                 ("bootstrap_snapshot_invalid", "bootstrap", "rules_manifest"),
@@ -1670,7 +1772,16 @@ class CoreContractTreeTests(unittest.TestCase):
                 "fuzz/corpus/tool_error_codes/valid-seed",
                 "fuzz/corpus/versions/valid-seed",
             ))
-        return {path: ("100644", "a" * 40) for path in paths}
+        if concern == "core-rust-lock-return":
+            paths.update(subject.CORE_CONTRACT_RUST_POLICY_FILES)
+        entries = {path: ("100644", "a" * 40) for path in paths}
+        if concern == "core-rust-lock-return":
+            entries["Cargo.lock"] = ("100644", subject.CORE_CONTRACT_RUST_BOOTSTRAP_LOCK_OBJECT)
+            entries.update({
+                path: ("100644", object_id)
+                for path, object_id in subject.CORE_CONTRACT_RUST_POLICY_OBJECTS.items()
+            })
+        return entries
 
     def test_core_contract_required_file_and_path_mode_checks_are_tagged(self):
         for entries, check in (
@@ -1702,6 +1813,50 @@ class CoreContractTreeTests(unittest.TestCase):
         self.assertEqual(
             (refusal.exception.reason, refusal.exception.stage, refusal.exception.core_check),
             ("bootstrap_snapshot_invalid", "bootstrap", "base_policy"),
+        )
+
+    def test_core_contract_policy_allows_only_the_pinned_v2_to_v3_rules_sync(self):
+        signer = "/".join(subject.SIGNER_PATH_PARTS)
+        base = {
+            path: ("100644", "a" * 40)
+            for path in subject.CORE_CONTRACT_RULES_V3_CHANGED_PATHS
+        }
+        base[subject.RULES_LOCK_PATH] = ("100644", subject.CORE_CONTRACT_RULES_V2_LOCK_OBJECT)
+        base[signer] = ("100644", "c" * 40)
+        settings = subject.RULES_DIRECTORY + "/settings.json"
+        base[settings] = ("100644", "d" * 40)
+        candidate = dict(base)
+        for path in subject.CORE_CONTRACT_RULES_V3_CHANGED_PATHS:
+            candidate[path] = ("100644", "b" * 40)
+        candidate[subject.RULES_LOCK_PATH] = ("100644", subject.CORE_CONTRACT_RULES_V3_LOCK_OBJECT)
+        self.assertTrue(subject._core_contract_policy_matches_base(base, candidate))
+        changed_settings = dict(candidate)
+        changed_settings[settings] = ("100644", "e" * 40)
+        self.assertFalse(subject._core_contract_policy_matches_base(base, changed_settings))
+        added_rule = dict(candidate)
+        added_rule[subject.RULES_DIRECTORY + "/rules/shared/extra.md"] = ("100644", "f" * 40)
+        self.assertFalse(subject._core_contract_policy_matches_base(base, added_rule))
+
+    def test_core_rust_policy_tree_is_an_exact_five_file_object_allowlist(self):
+        entries = {
+            path: ("100644", object_id)
+            for path, object_id in subject.CORE_CONTRACT_RUST_POLICY_OBJECTS.items()
+        }
+        self.assertTrue(subject._core_contract_rust_policy_matches(entries))
+        self.assertTrue(subject._core_contract_rust_policy_matches({}))
+        partial = dict(entries)
+        del partial["deny.toml"]
+        self.assertFalse(subject._core_contract_rust_policy_matches(partial))
+        altered = dict(entries)
+        altered["dependency-policy.toml"] = ("100644", "a" * 40)
+        self.assertFalse(subject._core_contract_rust_policy_matches(altered))
+
+    def test_rust_lock_return_refuses_a_changed_prebootstrap_cargo_lock(self):
+        entries = self._required_core_contract_entries("core-rust-lock-return")
+        entries["Cargo.lock"] = ("100644", "c" * 40)
+        self.assertEqual(
+            self._refused(entries=entries, concern="core-rust-lock-return"),
+            "cargo_lock_shape",
         )
 
     def test_each_feedback_tree_requires_every_fixed_typescript_path(self):
@@ -2931,7 +3086,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             if path in contract_overrides:
                 return contract_overrides[path]
             if path.startswith("crates/") and path.endswith("/Cargo.toml"):
-                return CRATE_MANIFEST.encode("utf-8")
+                return _core_crate_manifest(path).encode("utf-8")
             if path == "Cargo.toml":
                 members = ", ".join('"' + "/".join(root) + '"' for root in subject.CORE_CONTRACT_CRATE_ROOTS)
                 return ("[workspace]\nmembers = [" + members + "]\n").encode("utf-8")
@@ -2945,7 +3100,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             subject, "_contract_tree_entries", side_effect=(dict(merged), merged),
         ), patch.object(subject, "_contract_blob", side_effect=blob), \
                 patch.object(subject, "_core_contract_policy_matches_base", return_value=True), \
-                patch.object(subject, "_rules_v2_file_manifest", return_value={"AGENTS.md": digest}):
+                patch.object(subject, "_rules_file_manifest", return_value={"AGENTS.md": digest}):
             marker = subject._safe_core_contract_tree(
                 "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40, concern="core-contract",
             )
@@ -2982,7 +3137,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         def blob(unused_repository, unused_git, unused_environment, unused_entries, path, **unused):
             reads.append(path)
             if path.startswith("crates/") and path.endswith("/Cargo.toml"):
-                return CRATE_MANIFEST.encode("utf-8")
+                return _core_crate_manifest(path).encode("utf-8")
             if path == "Cargo.toml":
                 members = ", ".join('"' + "/".join(root) + '"' for root in subject.CORE_CONTRACT_CRATE_ROOTS)
                 return ("[workspace]\nmembers = [" + members + "]\n").encode("utf-8")
@@ -2996,7 +3151,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             subject, "_contract_tree_entries", side_effect=(dict(entries), entries),
         ), patch.object(subject, "_contract_blob", side_effect=blob), \
                 patch.object(subject, "_core_contract_policy_matches_base", return_value=True), \
-                patch.object(subject, "_rules_v2_file_manifest", return_value={"AGENTS.md": digest}):
+                patch.object(subject, "_rules_file_manifest", return_value={"AGENTS.md": digest}):
             marker = subject._safe_core_contract_tree(
                 "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40, concern="core-contract",
             )

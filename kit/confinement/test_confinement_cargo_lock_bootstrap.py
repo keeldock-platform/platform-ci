@@ -830,10 +830,16 @@ def _contract_member(name, description, dependencies="", dev_dependencies=""):
 def _contract_manifests(root=None):
     host_api = PRIVATE_PREFIX + "host-api = { workspace = true }\n"
     host_mock = PRIVATE_PREFIX + "host-mock = { workspace = true }\n"
+    first_batch = (
+        'serde = { version = "=1.0.229", default-features = false, features = ["derive", "std"] }\n'
+        'serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }\n'
+        'schemars = { version = "=1.2.3", default-features = false, features = ["derive", "std"] }\n'
+    )
     return {
         "Cargo.toml": (_contract_root() if root is None else root).encode("utf-8"),
         "crates/host/api/Cargo.toml": _contract_member(
             "host-api", "KeelDock L1 host API: the stable contract between the host and its tools.",
+            first_batch,
         ).encode("utf-8"),
         "crates/host/mock/Cargo.toml": _contract_member(
             "host-mock", "KeelDock mock host: an honest in-memory host for tool contract tests.", host_api,
@@ -1142,6 +1148,40 @@ class ManifestCheckTests(BootstrapTestCase):
             with self.subTest(exclude=exclude):
                 root = _contract_root(exclude)
                 self.assertTrue(subject.check_manifests(_contract_manifests(root), CONTRACT_MEMBERS))
+
+    def test_contract_workspace_accepts_only_the_exact_first_batch_member_pins(self):
+        manifests = _contract_manifests()
+        names = subject.check_manifests(manifests, CONTRACT_MEMBERS)
+        self.assertEqual(len(names), 4)
+        path = "crates/host/api/Cargo.toml"
+        for old, new in (
+            ('version = "=1.0.229"', 'version = "^1.0.229"'),
+            ('features = ["derive", "std"]', 'features = ["derive"]'),
+            ('serde_json = { version = "=1.0.154"', 'extra = { version = "=1.0.154"'),
+        ):
+            changed = dict(manifests)
+            changed[path] = manifests[path].replace(old.encode("ascii"), new.encode("ascii"), 1)
+            with self.subTest(old=old, new=new):
+                with self.assertRaises(subject.BootstrapRefusal):
+                    subject.check_manifests(changed, CONTRACT_MEMBERS)
+
+    def test_contract_workspace_refuses_registry_pins_in_other_members_or_root(self):
+        manifests = _contract_manifests()
+        mock_path = "crates/host/mock/Cargo.toml"
+        changed = dict(manifests)
+        changed[mock_path] = manifests[mock_path].replace(
+            b"[dependencies]\n", b'[dependencies]\nserde = "=1.0.229"\n', 1,
+        )
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_manifests(changed, CONTRACT_MEMBERS)
+        root_path = "Cargo.toml"
+        changed = dict(manifests)
+        changed[root_path] = manifests[root_path].replace(
+            b"[workspace.dependencies]\n",
+            b'[workspace.dependencies]\nserde = "=1.0.229"\n', 1,
+        )
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_manifests(changed, CONTRACT_MEMBERS)
 
     def test_workspace_exclude_entries_must_be_normalized_paths_outside_the_members(self):
         base = _contract_root()
