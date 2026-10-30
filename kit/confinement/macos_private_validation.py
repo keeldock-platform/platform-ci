@@ -301,7 +301,7 @@ CORE_CONTRACT_NEVER_BUILT_FILES = frozenset((
     "docs/admission/ed25519-sqlite/POLICY-AND-AUDIT-PROPOSAL.md",
     "docs/admission/sync-crypto/DEPENDENCY-INPUTS.json",
     "docs/admission/sync-crypto/PACKAGE-REQUEST-MATERIALS.md",
-    "docs/admission/sync-crypto/PROVIDER-R47-PROPOSALS.md",
+    "docs/admission/sync-crypto/PROVIDER-PROPOSALS.md",
     "docs/admission/sync-crypto/RECEIPT-POLICY-CHECKLIST.md",
     "docs/admission/sync-crypto/REGISTRY-AND-SCOPE-STATUS.md",
     "docs/admission/sync-crypto/REGISTRY-METADATA.json",
