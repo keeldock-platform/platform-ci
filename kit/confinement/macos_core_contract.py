@@ -197,13 +197,35 @@ SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
     },
 }
 SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(SOURCE_GATES_NODE_DIAGNOSTIC_REASONS)
+SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES = ("temp_dir", "diag_dir", "other_dir")
+SUMMARY_GUARD_VERIFY_FILE_CLASSES = ("env_file", "output_file", "path_file", "summary_file")
+SUMMARY_GUARD_VERIFY_FAILURES = {
+    "probe_access": "access",
+    "probe_process_launch": "launch",
+    "probe_process_identity": "identity",
+    "probe_process_timeout": "timeout",
+    "probe_process_survivor_controls": "survivor",
+    "probe_process_survivor_controls_same_group": "survivor_same_group",
+    "probe_process_survivor_controls_other_group": "survivor_other_group",
+    "probe_process_survivor_controls_multiple": "survivor_multiple",
+    "probe_process_survivor_controls_zombie": "survivor_zombie",
+    "probe_process_survivor_controls_unattributed": "survivor_unattributed",
+    "probe_process_group_cleanup": "cleanup",
+    "probe_process_capture_cleanup": "cleanup",
+    "probe_process_census": "census",
+}
+SUMMARY_GUARD_VERIFY_CHECKS = frozenset(
+    "verify_controls_" + path_class + "_" + failure
+    for path_class in SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES + SUMMARY_GUARD_VERIFY_FILE_CLASSES
+    for failure in frozenset(SUMMARY_GUARD_VERIFY_FAILURES.values()) | frozenset(("identity",))
+)
 SUMMARY_GUARD_CHECKS = frozenset((
     "input", "protect_controls", "runner_identity", "prepare_summary", "real_probe",
     "verify_controls", "make_scratch", "write_denial_probe", "standin_check", "remove_scratch",
     "protect_controls_workspace_owner", "protect_controls_directory_type_owner",
     "protect_controls_directory_permissions", "protect_controls_file_reference",
     "protect_controls_file_type_owner", "protect_controls_file_permissions",
-))
+)) | SUMMARY_GUARD_VERIFY_CHECKS
 SUMMARY_GUARD_DIAGNOSTIC_MAP = {
     check: "summary_guard_" + check for check in SUMMARY_GUARD_CHECKS
 }

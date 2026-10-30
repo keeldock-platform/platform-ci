@@ -508,7 +508,223 @@ class CapacityAnnotationTests(unittest.TestCase):
         self.assertTrue(self._scan("ubuntu-24.04", []))
 
 
+class FakeClock:
+    def __init__(self, step_multiplier=1):
+        self.now = 0.0
+        self.sleeps = []
+        self.step_multiplier = step_multiplier
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds * self.step_multiplier
+
+    def monotonic(self):
+        return self.now
+
+
 class LiveProviderPipelineTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        patcher = patch.object(
+            subject, "_default_clock", return_value=(self.clock.sleep, self.clock.monotonic),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _live(self, profile_name="core-rust-format-return", **provider_options):
+        request, key = _request(profile_name)
+        profile = feedback_request.PROFILES[request["concern"]]
+        environment = _environment(request, key, profile["auditor_job"])
+        environment["GITHUB_TOKEN"] = "A" * 24
+        return environment, LiveAuditProvider(request, **provider_options)
+
+    @staticmethod
+    def _tamper(api, hook):
+        original = api.json
+        counters = {}
+
+        def wrapped(path):
+            result, headers = original(path)
+            parsed_path = urllib.parse.urlsplit(path).path
+            counters[parsed_path] = counters.get(parsed_path, 0) + 1
+            return hook(parsed_path, copy.deepcopy(result), counters[parsed_path]), headers
+
+        api.json = wrapped
+        return counters
+
+    def _run_path(self, api):
+        return "/repos/" + macos_public_audit.REPOSITORY + "/actions/runs/" + str(api.run_id)
+
+    def _audit(self, environment, api):
+        return subject.audit_live(environment, api_factory=lambda unused_token: api, now=NOW)
+
+    def test_readiness_bounds_are_fifteen_attempts_ten_seconds_apart_within_150_seconds(self):
+        self.assertEqual(subject.READINESS_ATTEMPTS, 15)
+        self.assertEqual(subject.READINESS_INTERVAL_SECONDS, 10)
+        self.assertEqual(subject.READINESS_MAX_SECONDS, 150)
+
+    def test_consistent_view_passes_without_any_sleep(self):
+        environment, api = self._live()
+        line = self._audit(environment, api)
+        self.assertTrue(line.startswith("KD-FEEDBACK-AUDIT {"))
+        self.assertEqual(self.clock.sleeps, [])
+
+    def test_stale_queued_run_status_that_later_turns_in_progress_passes(self):
+        environment, api = self._live()
+        run_path = self._run_path(api)
+
+        def hook(path, result, count):
+            if path == run_path and count <= 3:
+                result["status"] = "queued"
+            return result
+
+        self._tamper(api, hook)
+        line = self._audit(environment, api)
+        self.assertTrue(line.startswith("KD-FEEDBACK-AUDIT {"))
+        self.assertEqual(self.clock.sleeps, [10, 10, 10])
+
+    def test_in_progress_step_that_later_completes_passes(self):
+        environment, api = self._live()
+
+        def hook(path, result, count):
+            if path.endswith("/actions/jobs/103") and count <= 2:
+                result["steps"][0]["status"] = "in_progress"
+                result["steps"][0]["conclusion"] = None
+            return result
+
+        self._tamper(api, hook)
+        line = self._audit(environment, api)
+        self.assertTrue(line.startswith("KD-FEEDBACK-AUDIT {"))
+        self.assertEqual(self.clock.sleeps, [10, 10])
+
+    def test_pending_step_that_later_completes_passes(self):
+        environment, api = self._live()
+
+        def hook(path, result, count):
+            if path.endswith("/actions/jobs/101") and count <= 1:
+                result["steps"][0]["status"] = "pending"
+                result["steps"][0]["conclusion"] = None
+            return result
+
+        self._tamper(api, hook)
+        line = self._audit(environment, api)
+        self.assertTrue(line.startswith("KD-FEEDBACK-AUDIT {"))
+        self.assertEqual(self.clock.sleeps, [10])
+
+    def test_non_audit_job_listed_as_in_progress_that_later_completes_passes(self):
+        environment, api = self._live()
+
+        def hook(path, result, count):
+            if path.endswith("/attempts/1/jobs") and count <= 2:
+                result["jobs"][2]["status"] = "in_progress"
+                result["jobs"][2]["conclusion"] = None
+            return result
+
+        self._tamper(api, hook)
+        line = self._audit(environment, api)
+        self.assertTrue(line.startswith("KD-FEEDBACK-AUDIT {"))
+        self.assertEqual(self.clock.sleeps, [10, 10])
+
+    def test_errors_during_readiness_count_as_not_ready_and_are_retried(self):
+        environment, api = self._live()
+        run_path = self._run_path(api)
+
+        def hook(path, result, count):
+            if path == run_path and count <= 2:
+                raise RuntimeError("canary-private-value")
+            return result
+
+        self._tamper(api, hook)
+        line = self._audit(environment, api)
+        self.assertTrue(line.startswith("KD-FEEDBACK-AUDIT {"))
+        self.assertEqual(self.clock.sleeps, [10, 10])
+
+    def test_persistent_queued_run_refuses_with_the_run_phase_after_the_bound(self):
+        environment, api = self._live()
+        run_path = self._run_path(api)
+
+        def hook(path, result, count):
+            if path == run_path:
+                result["status"] = "queued"
+            return result
+
+        counters = self._tamper(api, hook)
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            self._audit(environment, api)
+        self.assertEqual(caught.exception.phase, "run")
+        self.assertEqual(self.clock.sleeps, [10] * 14)
+        self.assertLessEqual(self.clock.now, 150)
+        self.assertEqual(counters[run_path], 16)
+
+    def test_persistent_unfinished_step_refuses_with_the_job_steps_phase_after_the_bound(self):
+        environment, api = self._live()
+
+        def hook(path, result, count):
+            if path.endswith("/actions/jobs/102"):
+                result["steps"][0]["status"] = "in_progress"
+                result["steps"][0]["conclusion"] = None
+            return result
+
+        self._tamper(api, hook)
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            self._audit(environment, api)
+        self.assertEqual(caught.exception.phase, "job_steps")
+        self.assertEqual(self.clock.sleeps, [10] * 14)
+
+    def test_persistently_incomplete_job_listing_refuses_with_the_jobs_phase(self):
+        environment, api = self._live()
+
+        def hook(path, result, count):
+            if path.endswith("/attempts/1/jobs"):
+                result["jobs"][0]["status"] = "in_progress"
+                result["jobs"][0]["conclusion"] = None
+            return result
+
+        self._tamper(api, hook)
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            self._audit(environment, api)
+        self.assertEqual(caught.exception.phase, "job_surfaces")
+        self.assertEqual(self.clock.sleeps, [10] * 14)
+
+    def test_no_readiness_reads_happen_after_the_deadline(self):
+        environment, api = self._live()
+        run_path = self._run_path(api)
+        self.clock.step_multiplier = 10
+
+        def hook(path, result, count):
+            if path == run_path:
+                result["status"] = "queued"
+            return result
+
+        counters = self._tamper(api, hook)
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            self._audit(environment, api)
+        self.assertEqual(caught.exception.phase, "run")
+        self.assertEqual(self.clock.sleeps, [10, 10])
+        self.assertEqual(counters[run_path], 3)
+
+    def test_failed_producer_is_ready_at_once_and_still_refuses(self):
+        environment, api = self._live(failed_producer=True)
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            self._audit(environment, api)
+        self.assertEqual(caught.exception.phase, "job_surfaces")
+        self.assertEqual(self.clock.sleeps, [])
+
+    def test_wrong_head_sha_still_refuses_after_the_bound(self):
+        environment, api = self._live()
+        run_path = self._run_path(api)
+
+        def hook(path, result, count):
+            if path == run_path:
+                result["head_sha"] = "e" * 40
+            return result
+
+        self._tamper(api, hook)
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            self._audit(environment, api)
+        self.assertEqual(caught.exception.phase, "run")
+        self.assertEqual(self.clock.sleeps, [10] * 14)
+
     def test_live_audit_accepts_provider_shaped_in_progress_auditor_pipeline(self):
         for profile_name in feedback_request.PROFILES:
             with self.subTest(profile=profile_name):

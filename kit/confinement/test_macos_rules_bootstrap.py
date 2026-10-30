@@ -1163,6 +1163,183 @@ class SummaryGuardTests(unittest.TestCase):
                     )
                 self.assertEqual(caught.exception.diagnostic, expected)
 
+    @staticmethod
+    def _verify_fakes(directories, files, verify, probe_failure=None):
+        capability = SimpleNamespace(
+            _protect_runner_controls=lambda root: (501, directories, files),
+            _verify_runner_controls_are_private=verify,
+            _remove_probe_tree=lambda path: None,
+        )
+        if probe_failure is not None:
+            capability.ProbeFailure = probe_failure
+        reviewed = SimpleNamespace(
+            _prepare_runner_summary=lambda uid: {},
+            _run_real_summary_probe=lambda *args, **kwargs: None,
+            _child_environment=lambda *args: {},
+            _make_control_scratch=lambda: ("scratch", "standin"),
+            _probe_argv=lambda *args: (),
+            _run_probe_step=lambda *args, **kwargs: None,
+            _assert_standin_unchanged=lambda path: None,
+        )
+        environment = {
+            "CI_STEP_SUMMARY": "summary-path", "GITHUB_STEP_SUMMARY": "summary-path",
+            "RUNNER_HOME": "runner-home",
+        }
+        return capability, reviewed, environment
+
+    def _run_guard(self, capability, reviewed, environment):
+        return bootstrap._summary_guard(
+            502, "home", {"python": "python"}, reviewed, capability, "root",
+            binding_value(), environment, {"guard": None},
+        )
+
+    def test_verify_controls_vocabulary_is_closed_and_free_of_path_text(self):
+        tokens = bootstrap.SUMMARY_GUARD_VERIFY_CHECKS
+        self.assertEqual(len(tokens), 84)
+        self.assertLessEqual(tokens, bootstrap.SUMMARY_GUARD_CHECKS)
+        self.assertNotIn("verify_controls", tokens)
+        self.assertIn("verify_controls", bootstrap.SUMMARY_GUARD_CHECKS)
+        for token in tokens:
+            self.assertRegex(token, r"\Averify_controls_[a-z]+(_[a-z]+)*\Z")
+        for token in (
+            "verify_controls_temp_dir_survivor_multiple",
+            "verify_controls_diag_dir_timeout",
+            "verify_controls_summary_file_access",
+            "verify_controls_env_file_launch",
+        ):
+            self.assertIn(token, tokens)
+            self.assertEqual(
+                bootstrap.Refusal("summary_guard_failed", "summary_guard", diagnostic=token).diagnostic,
+                token,
+            )
+        for invalid in ("verify_controls_work_secret_access", "verify_controls_", "verify_controls_temp_dir"):
+            self.assertIsNone(
+                bootstrap.Refusal("summary_guard_failed", "summary_guard", diagnostic=invalid).diagnostic
+            )
+
+    def test_verify_controls_failure_keeps_a_closed_path_and_failure_class(self):
+        class ProbeFailure(Exception):
+            def __init__(self, check, reason="native_preflight_unavailable"):
+                self.check = check
+                self.reason = reason
+
+        directories = (Path("work") / "_diag", Path("work") / "_temp", Path("work") / "other")
+        files = (Path("env-file"), Path("output-file"), Path("path-file"), Path("summary-file"))
+        path_classes = (
+            ("diag_dir", directories[0]), ("temp_dir", directories[1]), ("other_dir", directories[2]),
+            ("env_file", files[0]), ("output_file", files[1]), ("path_file", files[2]),
+            ("summary_file", files[3]),
+        )
+        failures = bootstrap.SUMMARY_GUARD_VERIFY_FAILURES
+        for path_class, failing_path in path_classes:
+            for subcheck, failure in failures.items():
+                def verify(paths, uid, python_executable=None, failing=failing_path, sub=subcheck):
+                    if failing in paths:
+                        raise ProbeFailure(sub)
+
+                capability, reviewed, environment = self._verify_fakes(
+                    directories, files, verify, probe_failure=ProbeFailure,
+                )
+                with self.subTest(path_class=path_class, subcheck=subcheck):
+                    with self.assertRaises(bootstrap.Refusal) as caught:
+                        self._run_guard(capability, reviewed, environment)
+                    expected = "verify_controls_" + path_class + "_" + failure
+                    self.assertEqual(
+                        (caught.exception.reason, caught.exception.stage, caught.exception.diagnostic),
+                        ("summary_guard_failed", "summary_guard", expected),
+                    )
+                    self.assertIn(expected, bootstrap.SUMMARY_GUARD_VERIFY_CHECKS)
+                    self.assertNotIn("work", str(caught.exception))
+
+    def test_verify_controls_identity_refusal_without_a_check_is_classed_as_identity(self):
+        class ProbeFailure(Exception):
+            def __init__(self):
+                self.check = None
+                self.reason = "probe_identity_unavailable"
+
+        def verify(paths, uid, python_executable=None):
+            raise ProbeFailure()
+
+        capability, reviewed, environment = self._verify_fakes(
+            (Path("work") / "_temp",), (Path("env-file"),), verify, probe_failure=ProbeFailure,
+        )
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            self._run_guard(capability, reviewed, environment)
+        self.assertEqual(caught.exception.diagnostic, "verify_controls_temp_dir_identity")
+
+    def test_verify_controls_unknown_or_foreign_failures_keep_the_plain_token(self):
+        class ProbeFailure(Exception):
+            def __init__(self, check):
+                self.check = check
+                self.reason = "native_preflight_unavailable"
+
+        class ForeignFailure(Exception):
+            @property
+            def check(self):
+                raise AssertionError("untrusted check attribute was read")
+
+        cases = (
+            ProbeFailure("unlisted_check"), ProbeFailure("private path text"), ProbeFailure(None),
+            ProbeFailure(["probe_access"]), ForeignFailure(), RuntimeError("private probe detail"),
+        )
+        for error in cases:
+            def verify(paths, uid, python_executable=None, error=error):
+                raise error
+
+            capability, reviewed, environment = self._verify_fakes(
+                (Path("work") / "_temp",), (Path("env-file"),), verify, probe_failure=ProbeFailure,
+            )
+            with self.subTest(error_type=type(error).__name__):
+                with self.assertRaises(bootstrap.Refusal) as caught:
+                    self._run_guard(capability, reviewed, environment)
+                self.assertEqual(caught.exception.diagnostic, "verify_controls")
+                self.assertNotIn("private", str(caught.exception))
+
+    def test_verify_controls_passes_every_path_once_in_order_and_continues(self):
+        calls = []
+
+        def verify(paths, uid, python_executable=None):
+            calls.append(tuple(paths))
+
+        directories = (Path("work") / "_temp", Path("work") / "_diag")
+        files = (Path("env-file"), Path("output-file"), Path("path-file"), Path("summary-file"))
+        capability, reviewed, environment = self._verify_fakes(directories, files, verify)
+        self.assertIsNone(self._run_guard(capability, reviewed, environment))
+        self.assertEqual(calls, [(path,) for path in directories + files])
+
+    def test_verify_controls_stops_at_the_first_failing_path(self):
+        class ProbeFailure(Exception):
+            def __init__(self, check):
+                self.check = check
+                self.reason = "runner_control_unavailable"
+
+        calls = []
+
+        def verify(paths, uid, python_executable=None):
+            calls.append(tuple(paths))
+            if len(calls) == 2:
+                raise ProbeFailure("probe_access")
+
+        directories = (Path("work") / "_temp", Path("work") / "_diag")
+        files = (Path("env-file"),)
+        capability, reviewed, environment = self._verify_fakes(
+            directories, files, verify, probe_failure=ProbeFailure,
+        )
+        with self.assertRaises(bootstrap.Refusal) as caught:
+            self._run_guard(capability, reviewed, environment)
+        self.assertEqual(caught.exception.diagnostic, "verify_controls_diag_dir_access")
+        self.assertEqual(len(calls), 2)
+
+    def test_verify_controls_without_any_path_is_still_verified_once(self):
+        calls = []
+
+        def verify(paths, uid, python_executable=None):
+            calls.append(tuple(paths))
+
+        capability, reviewed, environment = self._verify_fakes((), (), verify)
+        self.assertIsNone(self._run_guard(capability, reviewed, environment))
+        self.assertEqual(calls, [()])
+
     def test_summary_guard_refusal_discards_unknown_diagnostic_values(self):
         for invalid in ("private detail", None, [], object()):
             with self.subTest(value_type=type(invalid).__name__):

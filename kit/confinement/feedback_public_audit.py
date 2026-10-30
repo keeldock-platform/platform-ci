@@ -376,9 +376,97 @@ def _read_cache_snapshot(log, control_sha, run_id):
     return matches[0].group(3).decode("ascii")
 
 
-def audit_live(environ=None, api_factory=None, *, now=None):
+READINESS_ATTEMPTS = 15
+READINESS_INTERVAL_SECONDS = 10
+READINESS_MAX_SECONDS = 150
+
+
+def _default_clock():
+    return time.sleep, time.monotonic
+
+
+def _run_is_consistent(run, run_id, control_sha, profile, request, actor):
+    return not (
+        type(run) is not dict or run.get("id") != int(run_id)
+        or run.get("run_attempt") != 1 or run.get("head_sha") != control_sha
+        or run.get("path") != profile["workflow_path"]
+        or run.get("head_branch") != "main" or run.get("event") != "workflow_dispatch"
+        or run.get("status") != "in_progress" or run.get("conclusion") is not None
+        or run.get("display_title") != feedback_api.RUN_TITLE_PREFIX + request["request_id"]
+        or type(run.get("actor")) is not dict or run["actor"].get("login") != actor
+        or type(run.get("repository")) is not dict
+        or str(run["repository"].get("id")) != request["ci_repository_id"]
+        or run["repository"].get("full_name") != public_audit.REPOSITORY
+        or not _safe_int(run.get("workflow_id"), 1)
+    )
+
+
+def _audit_ready(api, run_path, run_id, control_sha, request, profile, actor):
+    """One readiness read of the run, the jobs and each completed job's steps.
+
+    Errors count as not ready. This never accepts evidence: the unchanged
+    validation runs afterwards on fresh reads.
+    """
+    try:
+        run, unused_headers = api.json(run_path)
+        if not _run_is_consistent(run, run_id, control_sha, profile, request, actor):
+            return False
+        jobs_path = ("/repos/" + public_audit.REPOSITORY + "/actions/runs/" + run_id
+                     + "/attempts/1/jobs")
+        jobs = public_audit._read_counted_collection(
+            api, jobs_path, "jobs", feedback_api.MAX_JOBS, public_audit._validate_job_record,
+        )
+        expected_names = {
+            profile["producer_job"] + feedback_api.SETTINGS_SUFFIX,
+            profile["producer_job"] + feedback_api.PREPARE_SUFFIX,
+            profile["producer_job"],
+            profile["auditor_job"],
+        }
+        names = [job.get("name") if type(job) is dict else None for job in jobs]
+        if len(jobs) != len(expected_names) or set(names) != expected_names:
+            return False
+        for job in jobs:
+            if job["name"] == profile["auditor_job"]:
+                continue
+            if job.get("status") != "completed":
+                return False
+            detail, unused_check_id, unused_success = public_audit._job_detail(
+                api, job, run_id, "1", control_sha, job["name"],
+            )
+            steps = detail.get("steps")
+            if type(steps) is not list or not steps:
+                return False
+            if any(type(step) is not dict or step.get("status") != "completed"
+                   for step in steps):
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _wait_until_audit_ready(api, run_path, run_id, control_sha, request, profile, actor,
+                            sleep, monotonic):
+    started = monotonic()
+    deadline = started + READINESS_MAX_SECONDS
+    for attempt in range(READINESS_ATTEMPTS):
+        if monotonic() > deadline:
+            return False
+        if _audit_ready(api, run_path, run_id, control_sha, request, profile, actor):
+            return True
+        if attempt + 1 == READINESS_ATTEMPTS:
+            break
+        if monotonic() - started + READINESS_INTERVAL_SECONDS > READINESS_MAX_SECONDS:
+            break
+        sleep(READINESS_INTERVAL_SECONDS)
+    return False
+
+
+def audit_live(environ=None, api_factory=None, *, now=None, sleep=None, monotonic=None):
     env = os.environ if environ is None else environ
     current = int(time.time()) if now is None else now
+    default_sleep, default_monotonic = _default_clock()
+    sleep = default_sleep if sleep is None else sleep
+    monotonic = default_monotonic if monotonic is None else monotonic
     try:
         request, profile = _request_from_environment(env, now=current)
     except BaseException:
@@ -393,18 +481,11 @@ def audit_live(environ=None, api_factory=None, *, now=None):
     factory = public_audit.GitHubAPI if api_factory is None else api_factory
     try:
         api = factory(env.get("GITHUB_TOKEN", ""))
+        _wait_until_audit_ready(
+            api, run_path, run_id, control_sha, request, profile, actor, sleep, monotonic,
+        )
         run, unused_headers = api.json(run_path)
-        if (type(run) is not dict or run.get("id") != int(run_id)
-                or run.get("run_attempt") != 1 or run.get("head_sha") != control_sha
-                or run.get("path") != profile["workflow_path"]
-                or run.get("head_branch") != "main" or run.get("event") != "workflow_dispatch"
-                or run.get("status") != "in_progress" or run.get("conclusion") is not None
-                or run.get("display_title") != feedback_api.RUN_TITLE_PREFIX + request["request_id"]
-                or type(run.get("actor")) is not dict or run["actor"].get("login") != actor
-                or type(run.get("repository")) is not dict
-                or str(run["repository"].get("id")) != request["ci_repository_id"]
-                or run["repository"].get("full_name") != public_audit.REPOSITORY
-                or not _safe_int(run.get("workflow_id"), 1)):
+        if not _run_is_consistent(run, run_id, control_sha, profile, request, actor):
             _refuse("run")
     except FeedbackAuditRefusal:
         _refuse("run")

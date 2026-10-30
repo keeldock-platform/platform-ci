@@ -125,13 +125,35 @@ SUMMARY_SURVIVOR_STAGES = frozenset(
     "cleanup_summary_present_" + category for category in SUMMARY_SURVIVOR_CLASSES
 )
 CLEANUP_STAGES = CLEANUP_STAGES | SUMMARY_SURVIVOR_STAGES
+SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES = ("temp_dir", "diag_dir", "other_dir")
+SUMMARY_GUARD_VERIFY_FILE_CLASSES = ("env_file", "output_file", "path_file", "summary_file")
+SUMMARY_GUARD_VERIFY_FAILURES = {
+    "probe_access": "access",
+    "probe_process_launch": "launch",
+    "probe_process_identity": "identity",
+    "probe_process_timeout": "timeout",
+    "probe_process_survivor_controls": "survivor",
+    "probe_process_survivor_controls_same_group": "survivor_same_group",
+    "probe_process_survivor_controls_other_group": "survivor_other_group",
+    "probe_process_survivor_controls_multiple": "survivor_multiple",
+    "probe_process_survivor_controls_zombie": "survivor_zombie",
+    "probe_process_survivor_controls_unattributed": "survivor_unattributed",
+    "probe_process_group_cleanup": "cleanup",
+    "probe_process_capture_cleanup": "cleanup",
+    "probe_process_census": "census",
+}
+SUMMARY_GUARD_VERIFY_CHECKS = frozenset(
+    "verify_controls_" + path_class + "_" + failure
+    for path_class in SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES + SUMMARY_GUARD_VERIFY_FILE_CLASSES
+    for failure in frozenset(SUMMARY_GUARD_VERIFY_FAILURES.values()) | frozenset(("identity",))
+)
 SUMMARY_GUARD_CHECKS = frozenset((
     "input", "protect_controls", "runner_identity", "prepare_summary", "real_probe",
     "verify_controls", "make_scratch", "write_denial_probe", "standin_check", "remove_scratch",
     "protect_controls_workspace_owner", "protect_controls_directory_type_owner",
     "protect_controls_directory_permissions", "protect_controls_file_reference",
     "protect_controls_file_type_owner", "protect_controls_file_permissions",
-))
+)) | SUMMARY_GUARD_VERIFY_CHECKS
 CONTEXT_GUARD_REASONS = (
     "platform_unapproved", "preflight_unavailable", "pf_unavailable", "pf_rules_unexpected",
     "cleanup_incomplete",
@@ -1086,6 +1108,44 @@ def _run_tree_probe(source, uid, home, toolchain, capability):
         raise Refusal("source_tree_invalid", "source_tree") from None
 
 
+def _verify_controls_targets(directories, files):
+    targets = []
+    for directory in directories:
+        try:
+            name = Path(directory).name
+        except BaseException:
+            name = None
+        if name == "_temp":
+            path_class = SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES[0]
+        elif name == "_diag":
+            path_class = SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES[1]
+        else:
+            path_class = SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES[2]
+        targets.append((path_class, directory))
+    for index, path in enumerate(files):
+        path_class = (
+            SUMMARY_GUARD_VERIFY_FILE_CLASSES[index]
+            if index < len(SUMMARY_GUARD_VERIFY_FILE_CLASSES) else None
+        )
+        targets.append((path_class, path))
+    return targets
+
+
+def _verify_controls_check(error, capability, path_class):
+    probe_failure = getattr(capability, "ProbeFailure", None)
+    if path_class is None or not isinstance(probe_failure, type) or type(error) is not probe_failure:
+        return "verify_controls"
+    subcheck = getattr(error, "check", None)
+    failure = None
+    if type(subcheck) is str:
+        failure = SUMMARY_GUARD_VERIFY_FAILURES.get(subcheck)
+    elif subcheck is None and getattr(error, "reason", None) == "probe_identity_unavailable":
+        failure = "identity"
+    if failure is None:
+        return "verify_controls"
+    return "verify_controls_" + path_class + "_" + failure
+
+
 def _summary_guard(uid, home, toolchain, reviewed, capability, root, binding, environ, guard_state,
                    cleanup_state=None):
     check = "input"
@@ -1117,9 +1177,18 @@ def _summary_guard(uid, home, toolchain, reviewed, capability, root, binding, en
             python_executable=toolchain["python"], binding=binding,
         )
         check = "verify_controls"
-        capability._verify_runner_controls_are_private(
-            directories + files, uid, python_executable=toolchain["python"]
-        )
+        for path_class, path in _verify_controls_targets(directories, files):
+            try:
+                capability._verify_runner_controls_are_private(
+                    (path,), uid, python_executable=toolchain["python"]
+                )
+            except BaseException as error:
+                check = _verify_controls_check(error, capability, path_class)
+                raise
+        if not directories and not files:
+            capability._verify_runner_controls_are_private(
+                (), uid, python_executable=toolchain["python"]
+            )
         check = "make_scratch"
         scratch, standin = reviewed._make_control_scratch()
         try:

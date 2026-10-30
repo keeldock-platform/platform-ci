@@ -598,11 +598,11 @@ class ReadinessAndDetailTests(unittest.TestCase):
             _audit(state, env, clock=clock, api=api)
         self.assertEqual(caught.exception.reason, "producer_failed")
         self.assertEqual(caught.exception.detail, "log_fetch:macos-15")
-        self.assertEqual(clock.sleeps, [10] * 5)
-        self.assertLessEqual(clock.now, 60)
+        self.assertEqual(clock.sleeps, [10] * 14)
+        self.assertLessEqual(clock.now, 150)
         jobs_path = "/actions/runs/24680/jobs?filter=all&per_page=100&page=1"
-        self.assertEqual(sum(path.endswith(jobs_path) for path in api.calls), 7)
-        self.assertEqual(sum(path.endswith("/actions/runs/24680") for path in api.calls), 7)
+        self.assertEqual(sum(path.endswith(jobs_path) for path in api.calls), 16)
+        self.assertEqual(sum(path.endswith("/actions/runs/24680") for path in api.calls), 16)
 
     def test_readiness_stops_when_the_clock_bound_is_reached(self):
         state, env = _fixture()
@@ -618,8 +618,8 @@ class ReadinessAndDetailTests(unittest.TestCase):
             subject.audit_feedback_smoke(
                 env, lambda _token: api, slow_sleep, clock.monotonic
             )
-        self.assertLessEqual(len(clock.sleeps), 5)
-        self.assertLessEqual(clock.now, 90)
+        self.assertLessEqual(len(clock.sleeps), 14)
+        self.assertLessEqual(clock.now, 150)
 
     def test_readiness_waits_for_the_ciphertext_marker_in_a_fetchable_log(self):
         state, env = _fixture()
@@ -646,7 +646,7 @@ class ReadinessAndDetailTests(unittest.TestCase):
         clock = Clock()
         with self.assertRaises(subject.SmokeAuditRefusal) as caught:
             _audit(state, env, clock=clock, api=api)
-        self.assertEqual(clock.sleeps, [10] * 5)
+        self.assertEqual(clock.sleeps, [10] * 14)
         self.assertEqual(caught.exception.reason, "producer_failed")
         self.assertEqual(caught.exception.detail, "log_markers:ubuntu-24.04")
 
@@ -698,7 +698,7 @@ class ReadinessAndDetailTests(unittest.TestCase):
         clock = Clock()
         with self.assertRaises(subject.SmokeAuditRefusal) as caught:
             _audit(state, env, clock=clock, api=api)
-        self.assertEqual(clock.sleeps, [10] * 5)
+        self.assertEqual(clock.sleeps, [10] * 14)
         self.assertEqual(caught.exception.reason, "producer_failed")
         self.assertEqual(caught.exception.detail, "jobs")
 

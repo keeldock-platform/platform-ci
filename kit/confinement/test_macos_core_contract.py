@@ -520,6 +520,58 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual((cleanup.reason, cleanup.stage, cleanup.diagnostic),
                          ("cleanup_incomplete", "cleanup", "cleanup_summary"))
 
+    def test_verify_controls_diagnostics_are_closed_mirrored_and_preserved(self):
+        class RulesRefusal(Exception):
+            def __init__(self, reason, stage, diagnostic):
+                self.reason = reason
+                self.stage = stage
+                self.diagnostic = diagnostic
+
+        rules = SimpleNamespace(Refusal=RulesRefusal)
+        verify_checks = subject.SUMMARY_GUARD_VERIFY_CHECKS
+        self.assertEqual(len(verify_checks), 84)
+        self.assertLessEqual(verify_checks, subject.SUMMARY_GUARD_CHECKS)
+        self.assertEqual(
+            {check for check in subject.SUMMARY_GUARD_CHECKS if check.startswith("verify_controls_")},
+            set(verify_checks),
+        )
+        for check in sorted(verify_checks):
+            diagnostic = "summary_guard_" + check
+            with self.subTest(check=check):
+                self.assertRegex(check, r"\Averify_controls_[a-z]+(_[a-z]+)*\Z")
+                self.assertEqual(
+                    subject._summary_guard_diagnostic(
+                        RulesRefusal("summary_guard_failed", "summary_guard", check), rules,
+                    ),
+                    diagnostic,
+                )
+                self.assertIn(diagnostic, subject.DIAGNOSTICS)
+                attached = subject._FailureDiagnostics().attach(
+                    subject.Refusal("summary_guard_failed", "summary_guard", diagnostic=diagnostic),
+                    "summary_guard_setup",
+                )
+                self.assertEqual(attached.diagnostic, diagnostic)
+                record = {
+                    "diagnostic": diagnostic, "reason": "summary_guard_failed",
+                    "schema_version": 1, "stage": "summary_guard", "status": "refused",
+                }
+                encoded = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
+                self.assertEqual(
+                    feedback_failure._parse_refusal(
+                        feedback_failure.REFUSAL_PREFIX + encoded + b"\n"
+                    ),
+                    record,
+                )
+        for invalid in (
+            "verify_controls_work_dir_access", "verify_controls_temp_dir", "verify_controls_",
+            "verify_controls_temp_dir_private detail",
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(subject._summary_guard_diagnostic(
+                    RulesRefusal("summary_guard_failed", "summary_guard", invalid), rules,
+                ))
+                self.assertNotIn("summary_guard_" + invalid, subject.DIAGNOSTICS)
+
     def test_summary_guard_diagnostic_survives_source_and_main_reattach(self):
         class RulesRefusal(Exception):
             def __init__(self, reason, stage, diagnostic):

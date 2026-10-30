@@ -68,9 +68,9 @@ def _macos_capacity_notice(control_sha):
     }
 
 
-READINESS_ATTEMPTS = 6
+READINESS_ATTEMPTS = 15
 READINESS_INTERVAL_SECONDS = 10
-READINESS_MAX_SECONDS = 60
+READINESS_MAX_SECONDS = 150
 DETAIL_STAGES = frozenset(
     ("run", "jobs", "upload_marker", "artifact")
     + tuple(
