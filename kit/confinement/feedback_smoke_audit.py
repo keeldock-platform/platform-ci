@@ -531,7 +531,7 @@ def _validate_artifact(api, identity, upload):
     return valid
 
 
-def _check_ready(api, job):
+def _check_ready(api, job, runner):
     try:
         check_id = _check_id(job.get("check_run_url"))
         value, _ = api.json(f"/repos/{REPOSITORY}/check-runs/{check_id}")
@@ -545,12 +545,23 @@ def _check_ready(api, job):
         )
         if len(annotations) != output["annotations_count"]:
             return False
-        return type(api.log_text(job["id"])) is bytes
+        log = api.log_text(job["id"])
+        if type(log) is not bytes:
+            return False
+        if (job.get("conclusion") not in (None, "success")
+                or value.get("conclusion") not in (None, "success")):
+            return True
+        parse_ciphertext_marker(log)
+        if runner == "macos-15":
+            parse_upload_marker(log)
+        return True
     except Exception:
         return False
 
 
-def _producers_ready(api, identity):
+def _producers_ready(api, identity, deadline, monotonic):
+    if monotonic() > deadline:
+        return False
     try:
         by_name, _ = _validate_jobs(api, identity)
     except Exception:
@@ -560,15 +571,18 @@ def _producers_ready(api, identity):
         if not by_name[runner]:
             ready = False
         for job in by_name[runner]:
-            if not _check_ready(api, job):
+            if monotonic() > deadline:
+                return False
+            if not _check_ready(api, job, runner):
                 ready = False
     return ready
 
 
 def _wait_for_producers(api, identity, sleep, monotonic):
     started = monotonic()
+    deadline = started + READINESS_MAX_SECONDS
     for attempt in range(READINESS_ATTEMPTS):
-        if _producers_ready(api, identity):
+        if _producers_ready(api, identity, deadline, monotonic):
             return True
         if attempt + 1 == READINESS_ATTEMPTS:
             break

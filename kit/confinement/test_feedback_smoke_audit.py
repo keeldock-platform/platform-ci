@@ -238,6 +238,21 @@ class LogGateAPI(FakeAPI):
         return super().log_text(job_id)
 
 
+class PartialLogAPI(FakeAPI):
+    def __init__(self, state, job_id, partial_log, partial_reads):
+        super().__init__(state)
+        self.job_id = job_id
+        self.partial_log = partial_log
+        self.partial_reads = partial_reads
+
+    def log_text(self, job_id):
+        if job_id == self.job_id and self.partial_reads != 0:
+            if self.partial_reads > 0:
+                self.partial_reads -= 1
+            return self.partial_log
+        return super().log_text(job_id)
+
+
 def _audit(state, env, clock=None, api=None):
     clock = Clock() if clock is None else clock
     api = FakeAPI(state) if api is None else api
@@ -586,6 +601,46 @@ class ReadinessAndDetailTests(unittest.TestCase):
             )
         self.assertLessEqual(len(clock.sleeps), 5)
         self.assertLessEqual(clock.now, 90)
+
+    def test_readiness_waits_for_the_ciphertext_marker_in_a_fetchable_log(self):
+        state, env = _fixture()
+        api = PartialLogAPI(state, JOB_IDS["ubuntu-24.04"], b"partial log without marker\n", 2)
+        clock = Clock()
+        marker, _ = _audit(state, env, clock=clock, api=api)
+        self.assertIn("status=passed", marker)
+        self.assertEqual(clock.sleeps, [10, 10])
+
+    def test_readiness_waits_for_the_macos_upload_marker(self):
+        state, env = _fixture()
+        digest = hashlib.sha256(_ciphertext("macos-15")).hexdigest()
+        api = PartialLogAPI(
+            state, JOB_IDS["macos-15"], _cipher_marker("macos-15", digest) + b"\n", 2
+        )
+        clock = Clock()
+        marker, _ = _audit(state, env, clock=clock, api=api)
+        self.assertIn("status=passed", marker)
+        self.assertEqual(clock.sleeps, [10, 10])
+
+    def test_marker_that_never_appears_exhausts_the_bound_and_refuses_with_detail(self):
+        state, env = _fixture()
+        api = PartialLogAPI(state, JOB_IDS["ubuntu-24.04"], b"partial log without marker\n", -1)
+        clock = Clock()
+        with self.assertRaises(subject.SmokeAuditRefusal) as caught:
+            _audit(state, env, clock=clock, api=api)
+        self.assertEqual(clock.sleeps, [10] * 5)
+        self.assertEqual(caught.exception.reason, "producer_failed")
+        self.assertEqual(caught.exception.detail, "log_markers:ubuntu-24.04")
+
+    def test_failed_producer_without_a_marker_is_ready_at_once(self):
+        state, env = _fixture()
+        state["jobs"][0]["conclusion"] = "failure"
+        state["checks"][CHECK_IDS["ubuntu-24.04"]]["conclusion"] = "failure"
+        api = PartialLogAPI(state, JOB_IDS["ubuntu-24.04"], b"partial log without marker\n", -1)
+        clock = Clock()
+        with self.assertRaises(subject.SmokeAuditRefusal) as caught:
+            _audit(state, env, clock=clock, api=api)
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(caught.exception.reason, "producer_failed")
 
     def test_each_detail_token_is_emitted_for_its_failing_sub_check(self):
         for token, mutate in _detail_cases():
