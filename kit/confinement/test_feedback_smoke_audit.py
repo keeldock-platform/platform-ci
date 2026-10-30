@@ -1,11 +1,14 @@
 import copy
 import hashlib
 import io
+import re
 import stat
 import unittest
 import zipfile
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
 from email.message import Message
+from unittest import mock
 
 import feedback_smoke_audit as subject
 
@@ -204,9 +207,43 @@ class FakeAPI:
         return archive, headers
 
 
-def _audit(state, env):
-    api = FakeAPI(state)
-    result = subject.audit_feedback_smoke(env, lambda _token: api)
+class Clock:
+    def __init__(self, hook=None):
+        self.now = 0.0
+        self.sleeps = []
+        self.hook = hook
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+        if self.hook is not None:
+            self.hook(len(self.sleeps))
+
+    def monotonic(self):
+        return self.now
+
+
+class LogGateAPI(FakeAPI):
+    def __init__(self, state, failures=0, blocked=()):
+        super().__init__(state)
+        self.failures = failures
+        self.blocked = set(blocked)
+
+    def log_text(self, job_id):
+        if job_id in self.blocked:
+            raise OSError("synthetic log unavailable")
+        if self.failures > 0:
+            self.failures -= 1
+            raise OSError("synthetic log unavailable")
+        return super().log_text(job_id)
+
+
+def _audit(state, env, clock=None, api=None):
+    clock = Clock() if clock is None else clock
+    api = FakeAPI(state) if api is None else api
+    result = subject.audit_feedback_smoke(
+        env, lambda _token: api, clock.sleep, clock.monotonic
+    )
     return result, api
 
 
@@ -323,11 +360,11 @@ class ProviderShapeTests(unittest.TestCase):
         state["checks"][CHECK_IDS["ubuntu-24.04"]]["conclusion"] = "failure"
         api = FakeAPI(state)
         with self.assertRaises(subject.SmokeAuditRefusal):
-            subject.audit_feedback_smoke(env, lambda _token: api)
+            _audit(state, env, api=api)
         self.assertEqual(set(api.log_calls), set(JOB_IDS.values()))
         self.assertEqual(
             sum("/annotations?per_page=100&page=1" in path for path in api.calls),
-            len(subject.RUNNERS),
+            2 * len(subject.RUNNERS),
         )
         self.assertTrue(any(path.endswith("/actions/runs/24680/artifacts?per_page=100&page=1")
                             for path in api.calls))
@@ -424,6 +461,185 @@ class ProviderShapeTests(unittest.TestCase):
         )
         with self.assertRaises(subject.SmokeAuditRefusal):
             _audit(state, env)
+
+
+EXPECTED_VOCABULARY = frozenset((
+    "run", "jobs", "upload_marker", "artifact",
+    "check_run:ubuntu-24.04", "check_run:macos-15", "check_run:windows-2025",
+    "annotations:ubuntu-24.04", "annotations:macos-15", "annotations:windows-2025",
+    "log_fetch:ubuntu-24.04", "log_fetch:macos-15", "log_fetch:windows-2025",
+    "log_markers:ubuntu-24.04", "log_markers:macos-15", "log_markers:windows-2025",
+))
+
+
+def _fail_check(runner):
+    return lambda state: state["checks"][CHECK_IDS[runner]].update(conclusion="failure")
+
+
+def _fail_annotations(runner):
+    def mutate(state):
+        check_id = CHECK_IDS[runner]
+        if runner == "macos-15":
+            state["annotations"][check_id][0]["message"] = "unexpected notice"
+        else:
+            state["annotations"][check_id] = [copy.deepcopy(CAPACITY_NOTICE)]
+            state["checks"][check_id]["output"]["annotations_count"] = 1
+    return mutate
+
+
+def _fail_log_fetch(runner):
+    return lambda state: state["logs"].pop(JOB_IDS[runner])
+
+
+def _fail_log_markers(runner):
+    return lambda state: state["logs"].__setitem__(
+        JOB_IDS[runner], state["logs"][JOB_IDS[runner]] + subject.CANARY
+    )
+
+
+def _detail_cases():
+    cases = [
+        ("run", lambda state: state["run"].update(head_sha="b" * 40)),
+        ("jobs", lambda state: state["jobs"][0].update(name="unexpected-job")),
+        ("upload_marker", lambda state: state["logs"].__setitem__(
+            JOB_IDS["ubuntu-24.04"],
+            state["logs"][JOB_IDS["ubuntu-24.04"]] + _upload_marker("e" * 64, "f" * 64) + b"\n",
+        )),
+        ("artifact", lambda state: state["artifacts"][0].update(digest="sha256:" + "d" * 64)),
+    ]
+    for runner in subject.RUNNERS:
+        cases.append(("check_run:" + runner, _fail_check(runner)))
+        cases.append(("annotations:" + runner, _fail_annotations(runner)))
+        cases.append(("log_fetch:" + runner, _fail_log_fetch(runner)))
+        cases.append(("log_markers:" + runner, _fail_log_markers(runner)))
+    return cases
+
+
+def _stderr_for(error):
+    stream = io.StringIO()
+    with mock.patch.object(subject, "audit_feedback_smoke", side_effect=error), \
+            redirect_stderr(stream):
+        status = subject.main()
+    return status, stream.getvalue()
+
+
+class ReadinessAndDetailTests(unittest.TestCase):
+    def test_vocabulary_is_closed_and_exact(self):
+        self.assertEqual(subject.DETAIL_STAGES, EXPECTED_VOCABULARY)
+        self.assertEqual({token for token, _ in _detail_cases()}, EXPECTED_VOCABULARY)
+
+    def test_readiness_succeeding_on_the_third_attempt_then_validates_once(self):
+        state, env = _fixture()
+        api = LogGateAPI(state, failures=2 * len(subject.RUNNERS))
+        clock = Clock()
+        marker, _ = _audit(state, env, clock=clock, api=api)
+        self.assertIn("status=passed", marker)
+        self.assertEqual(clock.sleeps, [10, 10])
+        jobs_path = "/actions/runs/24680/jobs?filter=all&per_page=100&page=1"
+        self.assertEqual(sum(path.endswith(jobs_path) for path in api.calls), 4)
+        self.assertEqual(sum(path.endswith("/actions/runs/24680") for path in api.calls), 1)
+
+    def test_readiness_waits_for_completed_check_runs_and_matching_annotation_counts(self):
+        state, env = _fixture()
+        mac = CHECK_IDS["macos-15"]
+        ubuntu = CHECK_IDS["ubuntu-24.04"]
+        state["checks"][mac]["status"] = "in_progress"
+        state["checks"][ubuntu]["output"]["annotations_count"] = 4
+
+        def heal(count):
+            if count == 2:
+                state["checks"][mac]["status"] = "completed"
+                state["checks"][ubuntu]["output"]["annotations_count"] = 0
+
+        clock = Clock(hook=heal)
+        marker, _ = _audit(state, env, clock=clock)
+        self.assertIn("status=passed", marker)
+        self.assertEqual(clock.sleeps, [10, 10])
+
+    def test_readiness_is_bounded_and_the_validation_then_refuses_with_detail(self):
+        state, env = _fixture()
+        api = LogGateAPI(state, blocked=(JOB_IDS["macos-15"],))
+        clock = Clock()
+        with self.assertRaises(subject.SmokeAuditRefusal) as caught:
+            _audit(state, env, clock=clock, api=api)
+        self.assertEqual(caught.exception.reason, "producer_failed")
+        self.assertEqual(caught.exception.detail, "log_fetch:macos-15")
+        self.assertEqual(clock.sleeps, [10] * 5)
+        self.assertLessEqual(clock.now, 60)
+        jobs_path = "/actions/runs/24680/jobs?filter=all&per_page=100&page=1"
+        self.assertEqual(sum(path.endswith(jobs_path) for path in api.calls), 7)
+        self.assertEqual(sum(path.endswith("/actions/runs/24680") for path in api.calls), 1)
+
+    def test_readiness_stops_when_the_clock_bound_is_reached(self):
+        state, env = _fixture()
+        api = LogGateAPI(state, blocked=(JOB_IDS["windows-2025"],))
+        clock = Clock()
+        clock.now = 0.0
+        real_sleep = clock.sleep
+
+        def slow_sleep(seconds):
+            real_sleep(seconds * 3)
+
+        with self.assertRaises(subject.SmokeAuditRefusal):
+            subject.audit_feedback_smoke(
+                env, lambda _token: api, slow_sleep, clock.monotonic
+            )
+        self.assertLessEqual(len(clock.sleeps), 5)
+        self.assertLessEqual(clock.now, 90)
+
+    def test_each_detail_token_is_emitted_for_its_failing_sub_check(self):
+        for token, mutate in _detail_cases():
+            state, env = _fixture()
+            mutate(state)
+            with self.subTest(token=token), self.assertRaises(subject.SmokeAuditRefusal) as caught:
+                _audit(state, env)
+            self.assertEqual(caught.exception.detail, token)
+            self.assertEqual(
+                caught.exception.reason,
+                "artifact_invalid" if token == "artifact" else "producer_failed",
+            )
+
+    def test_detail_line_is_one_stderr_line_inside_the_vocabulary(self):
+        pattern = re.compile(r"KD-FEEDBACK-AUDIT-DETAIL stage=([a-z_]+(?::[a-z0-9.-]+)?)\Z")
+        for token, mutate in _detail_cases():
+            state, env = _fixture()
+            mutate(state)
+            with self.assertRaises(subject.SmokeAuditRefusal) as caught:
+                _audit(state, env)
+            status, text = _stderr_for(caught.exception)
+            lines = text.splitlines()
+            with self.subTest(token=token):
+                self.assertEqual(status, 1)
+                self.assertEqual(len(lines), 2)
+                self.assertTrue(lines[0].startswith("KD-FEEDBACK-AUDIT-REFUSAL reason="))
+                match = pattern.fullmatch(lines[1])
+                self.assertIsNotNone(match)
+                self.assertEqual(match.group(1), token)
+                self.assertIn(match.group(1), EXPECTED_VOCABULARY)
+
+    def test_free_text_or_unknown_detail_is_never_printed(self):
+        for detail in ("free text sig=secret", "log_fetch:other-runner",
+                       "annotations", "", None, "run extra"):
+            with self.subTest(detail=detail):
+                error = subject.SmokeAuditRefusal("producer_failed", detail)
+                self.assertIsNone(error.detail)
+                status, text = _stderr_for(error)
+                self.assertEqual(status, 1)
+                self.assertEqual(text, "KD-FEEDBACK-AUDIT-REFUSAL reason=producer_failed\n")
+
+    def test_genuinely_failing_producer_refuses_even_when_readiness_succeeds(self):
+        for mutate, token in (
+            (_fail_check("windows-2025"), "check_run:windows-2025"),
+            (lambda state: state["jobs"][1].update(conclusion="failure"), "jobs"),
+        ):
+            state, env = _fixture()
+            mutate(state)
+            clock = Clock()
+            with self.subTest(token=token), self.assertRaises(subject.SmokeAuditRefusal) as caught:
+                _audit(state, env, clock=clock)
+            self.assertEqual(clock.sleeps, [])
+            self.assertEqual(caught.exception.reason, "producer_failed")
+            self.assertEqual(caught.exception.detail, token)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 import urllib.parse
 import urllib.request
@@ -67,12 +68,26 @@ def _macos_capacity_notice(control_sha):
     }
 
 
+READINESS_ATTEMPTS = 6
+READINESS_INTERVAL_SECONDS = 10
+READINESS_MAX_SECONDS = 60
+DETAIL_STAGES = frozenset(
+    ("run", "jobs", "upload_marker", "artifact")
+    + tuple(
+        stage + ":" + runner
+        for stage in ("check_run", "annotations", "log_fetch", "log_markers")
+        for runner in RUNNERS
+    )
+)
+
+
 class SmokeAuditRefusal(Exception):
-    def __init__(self, reason):
+    def __init__(self, reason, detail=None):
         self.reason = reason if reason in {
             "invalid_input", "api_unavailable", "api_status", "api_schema",
             "producer_failed", "summary_invalid", "artifact_invalid", "archive_invalid",
         } else "internal_error"
+        self.detail = detail if detail in DETAIL_STAGES else None
         super().__init__(self.reason)
 
 
@@ -270,13 +285,19 @@ def _check_id(url):
     return int(check_id.group(1))
 
 
-def _audit_check(api, job, identity, runner):
+def _note(stages, token):
+    if stages is not None:
+        stages.append(token)
+
+
+def _audit_check(api, job, identity, runner, stages=None):
     valid = True
     try:
         check_id = _check_id(job.get("check_run_url"))
     except Exception:
         check_id = None
         valid = False
+        _note(stages, "check_run:" + runner)
     output = None
     if check_id is not None:
         try:
@@ -284,14 +305,18 @@ def _audit_check(api, job, identity, runner):
         except Exception:
             value = None
             valid = False
-        if (type(value) is not dict or value.get("id") != check_id
-                or value.get("head_sha") != identity["sha"]
-                or value.get("status") != "completed" or value.get("conclusion") != "success"):
-            valid = False
+            _note(stages, "check_run:" + runner)
+        else:
+            if (type(value) is not dict or value.get("id") != check_id
+                    or value.get("head_sha") != identity["sha"]
+                    or value.get("status") != "completed" or value.get("conclusion") != "success"):
+                valid = False
+                _note(stages, "check_run:" + runner)
         if type(value) is dict:
             output = value.get("output")
 
     annotations = None
+    annotations_failed = False
     if check_id is not None:
         try:
             annotations = _read_annotations(
@@ -299,27 +324,33 @@ def _audit_check(api, job, identity, runner):
             )
         except Exception:
             valid = False
+            annotations_failed = True
     if type(output) is not dict or type(output.get("annotations_count")) is not int:
         valid = False
+        _note(stages, "check_run:" + runner)
         annotations_count = None
     else:
         annotations_count = output["annotations_count"]
         if annotations_count < 0:
             valid = False
+            _note(stages, "check_run:" + runner)
     if type(output) is dict:
         for key in ("title", "summary", "text"):
             field = output.get(key)
             if field is not None:
                 if type(field) is not str:
                     valid = False
+                    _note(stages, "check_run:" + runner)
                     continue
                 try:
                     encoded = field.encode("utf-8", "strict")
                 except UnicodeError:
                     valid = False
+                    _note(stages, "check_run:" + runner)
                     continue
                 if len(encoded) > MAX_SUMMARY_BYTES or CANARY in encoded:
                     valid = False
+                    _note(stages, "check_run:" + runner)
     expected_notice = _macos_capacity_notice(identity["sha"])
     annotations_valid = annotations is not None and annotations_count is not None
     if annotations_valid and len(annotations) != annotations_count:
@@ -334,29 +365,37 @@ def _audit_check(api, job, identity, runner):
             annotations_valid = len(annotations) == 0
     if not annotations_valid:
         valid = False
+        if annotations_failed or annotations is not None:
+            _note(stages, "annotations:" + runner)
 
     try:
         log = api.log_text(job["id"])
     except Exception:
+        _note(stages, "log_fetch:" + runner)
         return None, None, False
     if type(log) is not bytes or len(log) > MAX_LOG_BYTES:
+        _note(stages, "log_fetch:" + runner)
         return None, None, False
     if CANARY in log or b"KD-FEEDBACK-REFUSAL " in log:
         valid = False
+        _note(stages, "log_markers:" + runner)
     try:
         cipher = parse_ciphertext_marker(log)
     except Exception:
         cipher = None
         valid = False
+        _note(stages, "log_markers:" + runner)
     if (cipher is None or cipher["control_sha"] != identity["sha"]
             or cipher["run_id"] != identity["run_id"]):
         valid = False
+        _note(stages, "log_markers:" + runner)
     upload = None
     if runner == "macos-15":
         try:
             upload = parse_upload_marker(log)
         except Exception:
             valid = False
+            _note(stages, "upload_marker")
         if upload is not None and (cipher is None
                 or upload["control_sha"] != identity["sha"]
                 or upload["run_id"] != identity["run_id"]
@@ -364,8 +403,10 @@ def _audit_check(api, job, identity, runner):
                 or upload["ciphertext_sha256"] != cipher["ciphertext_sha256"]
                 or upload["ciphertext_size"] != cipher["ciphertext_size"]):
             valid = False
+            _note(stages, "upload_marker")
     elif b"KD-FEEDBACK-UPLOAD " in log:
         valid = False
+        _note(stages, "upload_marker")
     return cipher, upload, valid
 
 
@@ -490,33 +531,88 @@ def _validate_artifact(api, identity, upload):
     return valid
 
 
-def audit_feedback_smoke(env=None, api_factory=GitHubAPI):
+def _check_ready(api, job):
+    try:
+        check_id = _check_id(job.get("check_run_url"))
+        value, _ = api.json(f"/repos/{REPOSITORY}/check-runs/{check_id}")
+        if type(value) is not dict or value.get("status") != "completed":
+            return False
+        output = value.get("output")
+        if type(output) is not dict or type(output.get("annotations_count")) is not int:
+            return False
+        annotations = _read_annotations(
+            api, f"/repos/{REPOSITORY}/check-runs/{check_id}/annotations"
+        )
+        if len(annotations) != output["annotations_count"]:
+            return False
+        return type(api.log_text(job["id"])) is bytes
+    except Exception:
+        return False
+
+
+def _producers_ready(api, identity):
+    try:
+        by_name, _ = _validate_jobs(api, identity)
+    except Exception:
+        return False
+    ready = True
+    for runner in RUNNERS:
+        if not by_name[runner]:
+            ready = False
+        for job in by_name[runner]:
+            if not _check_ready(api, job):
+                ready = False
+    return ready
+
+
+def _wait_for_producers(api, identity, sleep, monotonic):
+    started = monotonic()
+    for attempt in range(READINESS_ATTEMPTS):
+        if _producers_ready(api, identity):
+            return True
+        if attempt + 1 == READINESS_ATTEMPTS:
+            break
+        if monotonic() - started + READINESS_INTERVAL_SECONDS > READINESS_MAX_SECONDS:
+            break
+        sleep(READINESS_INTERVAL_SECONDS)
+    return False
+
+
+def audit_feedback_smoke(env=None, api_factory=GitHubAPI, sleep=time.sleep,
+                         monotonic=time.monotonic):
     env = os.environ if env is None else env
     identity = _validate_environment(env)
     token = env.get("GITHUB_TOKEN")
     if type(token) is not str or len(token) < 20 or len(token) > 512:
         _fail("invalid_input")
     api = api_factory(token)
+    _wait_for_producers(api, identity, sleep, monotonic)
+    stages = []
     run_valid = _validate_run(api, identity)
+    if not run_valid:
+        stages.append("run")
     jobs, jobs_valid = _validate_jobs(api, identity)
+    if not jobs_valid:
+        stages.append("jobs")
     upload = None
     checks_valid = True
     for runner in RUNNERS:
         if not jobs[runner]:
             checks_valid = False
         for job in jobs[runner]:
-            _, runner_upload, check_valid = _audit_check(api, job, identity, runner)
+            _, runner_upload, check_valid = _audit_check(api, job, identity, runner, stages)
             checks_valid = check_valid and checks_valid
             if runner_upload is not None:
                 if upload is None:
                     upload = runner_upload
                 else:
                     checks_valid = False
+                    stages.append("upload_marker")
     artifact_valid = _validate_artifact(api, identity, upload)
     if not run_valid or not jobs_valid or not checks_valid:
-        _fail("producer_failed")
+        raise SmokeAuditRefusal("producer_failed", stages[0] if stages else None)
     if not artifact_valid:
-        _fail("artifact_invalid")
+        raise SmokeAuditRefusal("artifact_invalid", "artifact")
     return (
         f"KD-FEEDBACK-AUDIT schema=1 status=passed control-sha={identity['sha']} "
         f"run-id={identity['run_id']} run-attempt=1 producers=3 ciphertexts=3 "
@@ -539,6 +635,8 @@ def main():
         sys.stdout.write(marker + "\n")
     except SmokeAuditRefusal as error:
         sys.stderr.write(f"KD-FEEDBACK-AUDIT-REFUSAL reason={error.reason}\n")
+        if error.detail in DETAIL_STAGES:
+            sys.stderr.write(f"KD-FEEDBACK-AUDIT-DETAIL stage={error.detail}\n")
         return 1
     except AuditRefusal as error:
         reason = error.reason if error.reason in {
