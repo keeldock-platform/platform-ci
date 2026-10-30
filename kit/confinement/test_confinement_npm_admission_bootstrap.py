@@ -357,7 +357,7 @@ class RequestDocumentTests(RefusalAssertions):
         self.assertNotEqual(duplicated, doc)
         self.assert_refused("npm_request_refused", subject.parse_request_doc, duplicated.encode("utf-8"))
         canonical = adm._canonical_tarball_url("alpha-pkg", "1.0.0")
-        foreign = World().request_doc().decode("utf-8").replace(
+        foreign = World(layout="narrow").request_doc().decode("utf-8").replace(
             canonical, canonical.replace("registry.npmjs.org", "example.invalid"), 1,
         )
         self.assert_refused("npm_request_refused", subject.parse_request_doc, foreign.encode("utf-8"))
@@ -976,12 +976,11 @@ class FetcherTests(RefusalAssertions):
     def test_default_opener_blocks_proxies_and_redirects(self):
         fetcher = subject.RegistryFetcher()
         handlers = [type(handler).__name__ for handler in fetcher._opener.handlers]
-        self.assertIn("ProxyHandler", handlers)
+        self.assertNotIn("ProxyHandler", handlers)
         self.assertIn("_NoRedirect", handlers)
+        self.assertFalse([handler for handler in fetcher._opener.handlers if hasattr(handler, "proxies")])
         redirect = subject._NoRedirect()
         self.assertIsNone(redirect.redirect_request(None, None, 302, "Found", {}, subject.REGISTRY_URL + "other"))
-        proxy = [handler for handler in fetcher._opener.handlers if type(handler).__name__ == "ProxyHandler"][0]
-        self.assertEqual(proxy.proxies, {})
 
     def test_redirected_failed_empty_oversize_and_unreachable_answers_are_refused(self):
         path = "/plain"
@@ -1280,6 +1279,7 @@ class BundleTests(RefusalAssertions):
         self.assert_refused(
             "npm_input_invalid", subject.produce_bundle, world.lock_bytes, world.plan(), other,
             run_id="1", run_attempt=1, now=NOW, expiry=EXPIRY, fetcher=world.fetcher(),
+            clock=lambda: NOW + 5,
         )
 
     def test_the_proposal_never_exceeds_its_own_profile_limits(self):

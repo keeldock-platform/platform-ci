@@ -339,7 +339,7 @@ PINNED_FILE_SHA256 = {
     'kit/bootstrap/policy_npm.py': '53b15257efc27aba286e5e5811f561b721f5dfdfe26c993c5d485d7eca770658',
     'kit/bootstrap/test_policy_npm.py': 'dbec0a7ab503d0a85a1cb8bc72bde0e6571fba43d75893eb158bb4fecf034760',
     'kit/confinement/npm_admission_bootstrap.py': 'd285ee06f015bf0e8e66e2d4dea1f93c7ce4e44e52b9102fc7e07a1cbc24e929',
-    'kit/confinement/test_confinement_npm_admission_bootstrap.py': 'fe8d7f19ebccc07bfa244ae1e601fbc1e306b9412093823df5434cc5d2dcc230',
+    'kit/confinement/test_confinement_npm_admission_bootstrap.py': '1ff92f76dae1c429ccc1e283e1b01e9787a106e5dab61400fcaf3e69b7cd348b',
     'kit/confinement/npm_semver.py': '0f6207724ea97a793d9c64175a5e9245f138e0fb4b057ab776c67d1722b1c26f',
     'kit/confinement/test_confinement_npm_semver.py': 'de0caa828a3af80166ee7cd1946276ef251504be8c967bc4b2cac046f8e65395',
     'kit/confinement/test_feedback_request_npm.py': '0bca94195128f5f71221fcf1313b736fd2f40dc5fdfc549f12f50773efff19d6',
