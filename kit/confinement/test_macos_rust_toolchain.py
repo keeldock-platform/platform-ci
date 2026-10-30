@@ -311,6 +311,44 @@ class RustToolchainContractTests(unittest.TestCase):
 
         self.assertIsNone(rust.Refusal("gate_failed", command_check="unknown_check_value").command_check)
 
+    def test_runtime_source_gate_stages_keep_bounded_command_diagnostics(self):
+        class ProbeFailure(Exception):
+            def __init__(self, command_check):
+                self.cleanup_complete = True
+                self.command_check = command_check
+
+        cases = (
+            ("nonzero_exit", SimpleNamespace(returncode=9, stdout=b"", stderr=b""),
+             "version_mismatch", "nonzero_exit"),
+            ("timeout", ProbeFailure("timeout"), "version_mismatch", "timeout"),
+            ("capture_overflow", SimpleNamespace(
+                returncode=0, stdout=b"x" * (rust.MAX_CAPTURE_BYTES + 1), stderr=b"",
+            ), "capture_invalid", "capture_overflow"),
+        )
+        for stage in ("format", "runtime_format", "runtime_clippy", "runtime_tests"):
+            self.assertIn(stage, rust.SOURCE_COMMAND_STAGES)
+            for case_name, outcome, expected_reason, expected_check in cases:
+                calls = []
+
+                def run_as_probe_user(*unused_args, **kwargs):
+                    calls.append(kwargs["command_diagnostics"])
+                    if isinstance(outcome, ProbeFailure):
+                        raise outcome
+                    return outcome
+
+                capability = SimpleNamespace(
+                    ProbeFailure=ProbeFailure,
+                    _run_as_probe_user=run_as_probe_user,
+                )
+                with self.subTest(stage=stage, case=case_name), self.assertRaises(rust.Refusal) as raised:
+                    rust._run_worker_command(
+                        ("cargo", "test", "--locked", "--offline"), 502, {}, "/usr/bin/python3",
+                        capability, stage=stage, deadline=rust.time.monotonic() + 30,
+                    )
+                self.assertEqual(raised.exception.reason, expected_reason)
+                self.assertEqual(raised.exception.command_check, expected_check)
+                self.assertEqual(calls, [True])
+
     def test_diagnostic_capture_decodes_only_bounded_worker_frame(self):
         output = b"KD-CAPTURE 1 7 4 4 0 0\nfmt\n"
         result = SimpleNamespace(returncode=0, stdout=output, stderr=b"warn")

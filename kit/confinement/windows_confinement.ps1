@@ -479,8 +479,14 @@ function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
     return $specs
 }
 
+function Assert-RustLicenseAdmission([bool]$confined) {
+    if (-not $confined -or $env:CI_MODE -ne 'source') { return }
+    throw 'archive_producer_unavailable'
+}
+
 function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
     $outcomes = [ordered]@{}
+    Assert-RustLicenseAdmission $confined
     $targetName = 'target-control'
     if ($confined) { $targetName = 'target-lpac' }
     $environment = New-StageEnvironment $scratch $targetName

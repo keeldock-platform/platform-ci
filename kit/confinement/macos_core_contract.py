@@ -52,7 +52,8 @@ GATE_NAMES = (
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
 )
 PARSER_GATE_NAMES = ("parser_format", "parser_clippy", "parser_replay")
-SOURCE_GATE_STAGES = GATE_NAMES + PARSER_GATE_NAMES
+RUNTIME_GATE_NAMES = ("runtime_format", "runtime_clippy", "runtime_tests")
+SOURCE_GATE_STAGES = GATE_NAMES + PARSER_GATE_NAMES + RUNTIME_GATE_NAMES
 SUITE_NAMES = (
     "core.static", "core.host-api", "core.mock-host", "core.conformance",
 )
@@ -100,6 +101,7 @@ STAGES = frozenset((
     "source_diff", "toolchain_install", "worker_setup", "summary_guard", "observer",
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
     "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
+    "runtime_format", "runtime_clippy", "runtime_tests",
     "cleanup", "receipt", "internal",
 ))
 OPERATION_DIAGNOSTICS = frozenset((
@@ -766,8 +768,8 @@ def _stream_git_diff_hash(source, base_sha, source_sha, expected_sha256, git_exe
     return actual
 
 
-def _source_commands(source, tool_paths, *, include_parser=False):
-    if type(include_parser) is not bool:
+def _source_commands(source, tool_paths, *, include_parser=False, include_runtime=False):
+    if type(include_parser) is not bool or type(include_runtime) is not bool:
         raise Refusal("capture_invalid", "source_gates")
     cargo = str(tool_paths["cargo"])
     workspace_manifest = str(source / "Cargo.toml")
@@ -784,16 +786,52 @@ def _source_commands(source, tool_paths, *, include_parser=False):
         ("conformance_tests", (cargo, "test", "--offline", "--manifest-path",
                                 str(source / "crates/host/conformance/Cargo.toml"), "--all-targets", "--locked")),
     )
-    if not include_parser:
-        return commands
-    fuzz_manifest = str(source / "fuzz/Cargo.toml")
-    return commands + (
-        ("parser_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", fuzz_manifest,
-                            "--all", "--", "--check")),
-        ("parser_clippy", (cargo, "clippy", "--offline", "--manifest-path", fuzz_manifest,
-                            "--all-targets", "--locked", "--", "-D", "warnings")),
-        ("parser_replay", (cargo, "run", "--locked", "--offline", "--manifest-path", fuzz_manifest)),
-    )
+    if include_parser:
+        fuzz_manifest = str(source / "fuzz/Cargo.toml")
+        commands += (
+            ("parser_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", fuzz_manifest,
+                                "--all", "--", "--check")),
+            ("parser_clippy", (cargo, "clippy", "--offline", "--manifest-path", fuzz_manifest,
+                                "--all-targets", "--locked", "--", "-D", "warnings")),
+            ("parser_replay", (cargo, "run", "--locked", "--offline", "--manifest-path", fuzz_manifest)),
+        )
+    if include_runtime:
+        runtime_manifest = str(source / "runtime/Cargo.toml")
+        commands += (
+            ("runtime_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path",
+                                 runtime_manifest, "--all", "--", "--check")),
+            ("runtime_clippy", (cargo, "clippy", "--offline", "--manifest-path", runtime_manifest,
+                                 "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
+            ("runtime_tests", (cargo, "test", "--offline", "--manifest-path", runtime_manifest,
+                                "--workspace", "--all-targets", "--locked")),
+        )
+    return commands
+
+
+def _validated_runtime_workspace_present(source):
+    try:
+        runtime_info = (source / "runtime").lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise Refusal("source_validation_failed", "source_validation") from None
+    if not stat.S_ISDIR(runtime_info.st_mode):
+        raise Refusal("source_validation_failed", "source_validation")
+    present = []
+    for relative_path in ("runtime/Cargo.toml", "runtime/Cargo.lock"):
+        try:
+            info = (source / relative_path).lstat()
+        except FileNotFoundError:
+            present.append(False)
+            continue
+        except OSError:
+            raise Refusal("source_validation_failed", "source_validation") from None
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise Refusal("source_validation_failed", "source_validation")
+        present.append(True)
+    if any(present) and not all(present):
+        raise Refusal("source_validation_failed", "source_validation")
+    return all(present)
 
 
 def _validated_fuzz_workspace(source, lease_record, runtime):
@@ -901,13 +939,25 @@ def _run_inside_source(source, original_cwd, command):
 
 
 def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools, deadline,
-               capture_failure=False, include_parser=False):
-    if type(capture_failure) is not bool or type(include_parser) is not bool:
+               capture_failure=False, include_parser=False, include_runtime=False):
+    if (type(capture_failure) is not bool or type(include_parser) is not bool
+            or type(include_runtime) is not bool):
         raise Refusal("capture_invalid", "source_gates")
-    if include_parser and not capture_failure:
+    if (include_parser and not capture_failure) or (include_runtime and capture_failure):
         raise Refusal("gate_failed", "receipt")
-    commands = _source_commands(source, tools, include_parser=include_parser)
+    if not capture_failure and _validated_runtime_workspace_present(source) != include_runtime:
+        raise Refusal("source_validation_failed", "source_validation")
+    commands = _source_commands(
+        source, tools, include_parser=include_parser, include_runtime=include_runtime,
+    )
     selected_gates = tuple(stage for stage, unused_argv in commands)
+    expected_gates = GATE_NAMES
+    if include_parser:
+        expected_gates += PARSER_GATE_NAMES
+    if include_runtime:
+        expected_gates += RUNTIME_GATE_NAMES
+    if not capture_failure and selected_gates != expected_gates:
+        raise Refusal("gate_failed", "receipt")
     completed = []
     for stage, argv in commands:
         if time.monotonic() >= deadline:
@@ -956,18 +1006,31 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
                 "failed_stage": None, "returncode": 0,
                 "stdout": b"", "stderr": b"", "stdout_truncated": False,
                 "stderr_truncated": False}
-    if tuple(completed) != GATE_NAMES:
+    if tuple(completed) != selected_gates:
         raise Refusal("gate_failed", "receipt")
-    return {name: "passed" for name in GATE_NAMES}
+    return {name: "passed" for name in selected_gates}
+
+
+def _success_gate_names(gates):
+    if type(gates) is not dict:
+        raise Refusal("capture_invalid", "receipt")
+    names = tuple(gates)
+    if names not in (GATE_NAMES, GATE_NAMES + RUNTIME_GATE_NAMES):
+        raise Refusal("capture_invalid", "receipt")
+    if any(type(gates[name]) is not str or gates[name] != "passed" for name in names):
+        raise Refusal("capture_invalid", "receipt")
+    return names
 
 
 def _validate_success_record(record, binding, request, lease_record, diff_sha256, versions, gates,
                              network_captured, summary_guard_passed):
+    expected_gates = _success_gate_names(gates)
     keys = {
         "schema_version", "concern", "status", "control_sha", "run_id", "run_attempt", "repository_id",
         "source_sha", "base_sha", "base_branch", "candidate_class", "signer_authority", "signatures",
         "ancestry", "token_revocation", "offline", "image_os", "image_version", "toolchain_versions",
-        "gates", "gate_count", "gates_passed", "gates_failed", "suites", "suite_count",
+        "gates", "selected_gates", "completed_gates", "gate_count", "gates_passed",
+        "gates_failed", "suites", "suite_count",
         "suites_passed", "suites_failed", "reviewed_diff_sha256", "source_tree", "lease_cleanup",
         "process_cleanup", "identity_cleanup", "summary_guard", "summary_guard_bypass_test",
         "positive_sentinel", "network_observation",
@@ -988,8 +1051,10 @@ def _validate_success_record(record, binding, request, lease_record, diff_sha256
             or type(record["offline"]) is not bool or record["offline"] is not True
             or record["image_os"] != binding["image_os"] or record["image_version"] != binding["image_version"]
             or record["toolchain_versions"] != versions or record["gates"] != gates
-            or type(record["gate_count"]) is not int or record["gate_count"] != 6
-            or type(record["gates_passed"]) is not int or record["gates_passed"] != 6
+            or record["selected_gates"] != list(expected_gates)
+            or record["completed_gates"] != list(expected_gates)
+            or type(record["gate_count"]) is not int or record["gate_count"] != len(expected_gates)
+            or type(record["gates_passed"]) is not int or record["gates_passed"] != len(expected_gates)
             or type(record["gates_failed"]) is not int or record["gates_failed"] != 0
             or record["suites"] != list(SUITE_NAMES)
             or type(record["suite_count"]) is not int or record["suite_count"] != 4
@@ -1016,7 +1081,7 @@ def _validate_success_record(record, binding, request, lease_record, diff_sha256
             or set(record["toolchain_versions"]) != {"rustc", "cargo", "rustfmt", "clippy"}
             or any(type(value) is not str or not value.isascii() or len(value) > 128
                    for value in record["toolchain_versions"].values())
-            or type(record["gates"]) is not dict or set(record["gates"]) != set(GATE_NAMES)
+            or type(record["gates"]) is not dict or set(record["gates"]) != set(expected_gates)
             or any(type(value) is not str or value != "passed" for value in record["gates"].values())
             or type(record["suites"]) is not list or any(type(value) is not str for value in record["suites"])):
         raise Refusal("capture_invalid", "receipt")
@@ -1024,6 +1089,7 @@ def _validate_success_record(record, binding, request, lease_record, diff_sha256
 
 
 def _build_success_record(binding, request, lease_record, diff_sha256, versions, gates):
+    expected_gates = _success_gate_names(gates)
     return {
         "schema_version": SCHEMA_VERSION,
         "concern": CONCERN,
@@ -1045,8 +1111,10 @@ def _build_success_record(binding, request, lease_record, diff_sha256, versions,
         "image_version": binding["image_version"],
         "toolchain_versions": dict(versions),
         "gates": dict(gates),
-        "gate_count": 6,
-        "gates_passed": 6,
+        "selected_gates": list(expected_gates),
+        "completed_gates": list(expected_gates),
+        "gate_count": len(expected_gates),
+        "gates_passed": len(expected_gates),
         "gates_failed": 0,
         "suites": list(SUITE_NAMES),
         "suite_count": 4,
@@ -1364,12 +1432,14 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                 phase = "worker_setup"
                 operation = "source_gates"
                 if feedback is None:
+                    runtime_workspace_present = _validated_runtime_workspace_present(source)
                     gates = _run_inside_source(
                         source,
                         original_cwd,
                         lambda: _run_gates(
                             source, environment, worker_uid, host_toolchain, capability, rust,
                             toolchain_paths.command_paths(), deadline,
+                            include_runtime=runtime_workspace_present,
                         ),
                     )
                 else:

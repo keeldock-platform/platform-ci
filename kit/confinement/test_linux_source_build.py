@@ -2,9 +2,11 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -18,6 +20,71 @@ import confinement_public_audit
 import confinement_verdict
 import linux_source_build
 import macos_core_contract
+
+
+class _SyntheticTrustedLicenseBoundary:
+    def __init__(self, control_root):
+        self.gate = linux_source_build.rust_license_gate
+        self.source_sha = "a" * 40
+        self.packages = (self.gate.Package("serde", "1.0.1", "b" * 64),)
+        self.archive = self.gate.ArchivePackage(
+            self.packages[0], self.packages[0].checksum, "MIT", "MIT", True,
+            (("LICENSE-MIT", "d" * 64),),
+        )
+        self.checker = control_root / "checker.fixture"
+        self.deny = control_root / "cargo-deny.fixture"
+        self.policy = control_root / "deny-policy.fixture"
+        self.checker.write_bytes(b"synthetic checker identity")
+        self.deny.write_bytes(b"synthetic cargo-deny identity")
+        self.policy.write_bytes(b"synthetic reviewed policy identity")
+        self.identities = []
+        self.requests = []
+        self.cleaned = []
+
+    def ports(self):
+        return self.gate._validated_ports(self.gate.TrustedPorts(
+            self, self, self, self, self, None,
+        ))
+
+    def validate(self, lock_bytes, identity):
+        if hashlib.sha256(lock_bytes).hexdigest() != identity.lock_sha256:
+            raise self.gate.LicenseGateRefusal("lock")
+        self.identities.append(identity)
+        return self.gate._validated_lock(identity, self.packages)
+
+    def for_identity(self, identity):
+        if identity.source_sha != self.source_sha:
+            raise self.gate.LicenseGateRefusal("identity")
+        return self.gate._validated_config(self.gate.GateConfig(
+            identity, "2" * 40, str(self.checker), self._digest(self.checker),
+            str(self.deny), str(self.checker.parent), self._digest(self.deny),
+            "a" * 64, str(self.policy), self._digest(self.policy),
+            True, True,
+            self.gate._cargo_deny_argv_sha256(identity, str(self.policy)),
+            True, True, "e" * 40, int(time.time()), True, True, None,
+        ))
+
+    def verify_complete(self, lock_bytes, identity, lock_packages):
+        del lock_bytes, lock_packages
+        return self.gate._validated_archives(identity, (self.archive,), "f" * 64)
+
+    def cancelled(self):
+        return False
+
+    def run(self, request):
+        self.requests.append(request)
+        output = (b"result=conditional-pass authenticated=no\n"
+                  if request.argv == ("--stdin-protocol",) else b"")
+        return self.gate._process_result(
+            request, (0, False, False, output, b""), request.executable_sha256,
+        )
+
+    def cleanup(self, request, result):
+        self.cleaned.append((request, result))
+
+    @staticmethod
+    def _digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class LinuxSourceBuildTests(unittest.TestCase):
@@ -43,6 +110,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Verify selected installation identity",
                 "Fetch exact source and verify binding, tree, signatures and lock provenance",
                 "Revoke source-reader token and verify rejection",
+                "Require trusted Rust licence admission",
                 "Fetch npm tarballs by committed lock integrity",
                 "Run trusted dependency audit",
                 "Prepare offline project inputs",
@@ -59,6 +127,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             "Mint verifier scoped source-reader token",
             "Verify source independently against binding, tree, signatures and lock",
             "Revoke verifier token and verify rejection",
+            "Require trusted Rust licence admission independently",
             "Fetch independent npm tarballs by lock integrity",
             "Run independent trusted dependency audit",
             "Prepare independent offline project inputs",
@@ -74,6 +143,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Verify selected installation identity",
                 "Fetch exact source and verify binding, tree, signatures and lock provenance",
                 "Revoke source-reader token and verify rejection",
+                "Require trusted Rust licence admission",
                 "Fetch npm tarballs by committed lock integrity",
                 "Run trusted dependency audit",
                 "Prepare offline project inputs",
@@ -81,6 +151,87 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Forced faults must fail closed",
             )),
         )
+
+    def test_source_step_contract_matches_workflow_in_source_and_synthetic_modes(self):
+        workflow = (Path(__file__).resolve().parents[2]
+                    / ".github/workflows/linux-source-admission.yml").read_text(encoding="utf-8")
+        match = re.search(
+            r"(?ms)^  linux-source-admission-source-read:\n(.*?)(?=^  linux-source-admission-verdict:)",
+            workflow,
+        )
+        self.assertIsNotNone(match)
+        actual_steps = tuple(re.findall(r"^      - name: (.+)$", match.group(1), re.MULTILINE))
+        self.assertEqual(actual_steps, linux_source_build.SOURCE_STEP_NAMES)
+        self.assertIn("Require trusted Rust licence admission", actual_steps)
+        verdict_match = re.search(
+            r"(?ms)^  linux-source-admission-verdict:\n(.*?)(?=^  linux-source-admission-audit:)",
+            workflow,
+        )
+        self.assertIsNotNone(verdict_match)
+        verdict_steps = tuple(re.findall(r"^      - name: (.+)$", verdict_match.group(1), re.MULTILINE))
+        self.assertEqual(verdict_steps, linux_source_build.VERDICT_STEP_NAMES)
+        self.assertIn("Require trusted Rust licence admission independently", verdict_steps)
+        self.assertIn("Require trusted Rust licence admission independently",
+                      linux_source_build.OPTIONAL_VERDICT_SYNTHETIC_STEPS)
+        for mode in ("source", "synthetic"):
+            expected = linux_source_build._expected_run(
+                {"CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1",
+                 "CI_MODE": mode, "REQUESTED_SOURCE_SHA": "b" * 40},
+                "c" * 64,
+            )
+            job = expected["jobs"]["linux-source-admission-source-read"]
+            if mode == "source":
+                self.assertEqual(job["steps"], actual_steps + ("Post Mint scoped source-reader token",))
+                self.assertNotIn("Require trusted Rust licence admission", job["optional_steps"])
+            else:
+                self.assertEqual(job["steps"], actual_steps)
+                self.assertIn("Require trusted Rust licence admission", job["optional_steps"])
+
+    def test_producer_and_independent_verifier_bind_license_gates_before_preparation(self):
+        workflow = (Path(__file__).resolve().parents[2]
+                    / ".github/workflows/linux-source-admission.yml").read_text(encoding="utf-8")
+        blocks = {}
+        for name in (
+                "Require trusted Rust licence admission",
+                "Fetch npm tarballs by committed lock integrity",
+                "Prepare offline project inputs",
+                "Run all thirteen offline project gates",
+                "Require trusted Rust licence admission independently",
+                "Fetch independent npm tarballs by lock integrity",
+                "Prepare independent offline project inputs",
+                "Run independent thirteen offline project gates"):
+            match = re.search(
+                r"(?ms)^      - name: " + re.escape(name)
+                + r"\n(.*?)(?=^      - name: |^  linux-source-admission-)",
+                workflow,
+            )
+            if match:
+                blocks[name] = match.group(1)
+        self.assertIn("Require trusted Rust licence admission", blocks)
+        self.assertIn("REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}",
+                      blocks["Require trusted Rust licence admission"])
+        self.assertIn("REQUESTED_SOURCE_SHA", blocks["Run all thirteen offline project gates"])
+        independent_gate = "\n".join(workflow.splitlines()[
+            workflow.index("      - name: Revoke verifier token and verify rejection"):
+            workflow.index("      - name: Fetch independent npm tarballs by lock integrity")
+        ])
+        self.assertIn("Require trusted Rust licence admission independently", independent_gate)
+        self.assertIn("REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}", independent_gate)
+        self.assertLess(workflow.index("Require trusted Rust licence admission"),
+                        workflow.index("Fetch npm tarballs by committed lock integrity"))
+        self.assertLess(workflow.index("Require trusted Rust licence admission independently"),
+                        workflow.index("Fetch independent npm tarballs by lock integrity"))
+        self.assertLess(workflow.index("Require trusted Rust licence admission"),
+                        workflow.index("Prepare offline project inputs"))
+        self.assertLess(workflow.index("Require trusted Rust licence admission independently"),
+                        workflow.index("Prepare independent offline project inputs"))
+        verifier_gates = workflow[workflow.index("      - name: Run independent thirteen offline project gates"):]
+        verifier_gate_step = verifier_gates.split("\n      - name:", 1)[0]
+        self.assertIn("REQUESTED_SOURCE_SHA", verifier_gate_step)
+        self.assertIn("preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA",
+                      verifier_gates)
+        self.assertIn("preserve_env=$preserve_env,REQUESTED_SOURCE_SHA",
+                      blocks["Run all thirteen offline project gates"])
 
     def test_expected_run_assigns_the_plain_verdict_job_and_action_post(self):
         base = {"CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1"}
@@ -141,6 +292,122 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
                 linux_source_build._validate_cargo_lock_sources(temporary)
 
+    def _root_descriptor(self, root):
+        descriptor = linux_source_build._open_source_root(root)
+        self.addCleanup(os.close, descriptor)
+        return descriptor
+
+    def test_cargo_lock_read_is_bounded_and_refuses_traversal_faults(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            lock = root / "Cargo.lock"
+            lock.write_bytes(b"x" * 17)
+            descriptor = self._root_descriptor(root)
+            candidate = linux_source_build._rust_lock_paths(descriptor)[0]
+            with patch.object(linux_source_build.rust_license_gate, "MAX_LOCK_BYTES", 16):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._read_bounded_cargo_lock(descriptor, candidate)
+
+            lock.write_bytes(b"version = 4\n")
+            candidate = linux_source_build._rust_lock_paths(descriptor)[0]
+            self.assertEqual(
+                linux_source_build._read_bounded_cargo_lock(descriptor, candidate),
+                b"version = 4\n",
+            )
+
+            with patch.object(linux_source_build.os, "scandir",
+                              side_effect=PermissionError("synthetic traversal refusal")):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._rust_lock_paths(descriptor)
+
+            lock.write_text("changed after discovery\n", encoding="ascii")
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._read_bounded_cargo_lock(descriptor, candidate)
+
+            lock.write_text("version = 4\n", encoding="ascii")
+            candidate = linux_source_build._rust_lock_paths(descriptor)[0]
+            original_read = os.read
+
+            def replace_after_read(handle, maximum):
+                payload = original_read(handle, maximum)
+                lock.unlink()
+                lock.write_bytes(b"replacement lock\n")
+                return payload
+
+            with patch.object(linux_source_build.os, "read", side_effect=replace_after_read):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._read_bounded_cargo_lock(descriptor, candidate)
+
+    def test_cargo_lock_traversal_refuses_swapped_ancestor_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            root = base / "source"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (outside / "Cargo.lock").write_bytes(b"outside lock\n")
+            nested = root / "sub"
+            nested.mkdir()
+            (nested / "Cargo.lock").write_bytes(b"version = 4\n")
+            descriptor = self._root_descriptor(root)
+            candidate = linux_source_build._rust_lock_paths(descriptor)[0]
+            self.assertEqual(candidate[0], ("sub", "Cargo.lock"))
+
+            nested.rename(root / "moved")
+            nested.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._read_bounded_cargo_lock(descriptor, candidate)
+
+            nested.unlink()
+            nested.mkdir()
+            (nested / "Cargo.lock").write_bytes(b"version = 4\n")
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._read_bounded_cargo_lock(descriptor, candidate)
+
+    def test_cargo_lock_discovery_refuses_a_directory_swapped_before_its_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            root = base / "source"
+            outside = base / "outside"
+            root.mkdir()
+            outside.mkdir()
+            (outside / "Cargo.lock").write_bytes(b"outside lock\n")
+            nested = root / "sub"
+            nested.mkdir()
+            (root / "Cargo.lock").write_bytes(b"version = 4\n")
+            descriptor = self._root_descriptor(root)
+            original = linux_source_build._open_verified_directory
+            swapped = []
+
+            def swap_then_open(root_fd, parts, identities):
+                if parts == ("sub",) and not swapped:
+                    swapped.append(True)
+                    nested.rename(root / "moved")
+                    nested.symlink_to(outside, target_is_directory=True)
+                return original(root_fd, parts, identities)
+
+            with patch.object(linux_source_build, "_open_verified_directory",
+                              side_effect=swap_then_open):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._rust_lock_paths(descriptor)
+            self.assertEqual(swapped, [True])
+
+    def test_cargo_lock_directory_entry_materialization_is_bounded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for name in ("Cargo.lock", "one", "two"):
+                (root / name).write_text("version = 4\n", encoding="ascii")
+            descriptor = self._root_descriptor(root)
+            with patch.object(linux_source_build, "MAX_DIRECTORY_ENTRIES", 2):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._rust_lock_paths(descriptor)
+
+            (root / "first").mkdir()
+            (root / "second").mkdir()
+            with patch.object(linux_source_build, "MAX_PENDING_DIRECTORIES", 1):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._rust_lock_paths(descriptor)
+
     def test_project_config_files_are_refused_or_removed_before_tool_use(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -172,6 +439,32 @@ class LinuxSourceBuildTests(unittest.TestCase):
         for name in ("node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests"):
             with self.subTest(gate=name):
                 self.assertTrue(any(item.startswith("--workspaces") or item == "--workspaces" for item in by_name[name]))
+
+    def test_runtime_gate_commands_are_selected_for_the_complete_workspace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            runtime = project / "runtime"
+            runtime.mkdir()
+            (runtime / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
+            (runtime / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            commands = linux_source_build._gate_commands(project, "/rust", "/node")
+            self.assertEqual(
+                tuple(name for name, argv in commands),
+                linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES,
+            )
+            cargo = "/rust/bin/cargo"
+            manifest = str(runtime / "Cargo.toml")
+            self.assertEqual(commands[-3:], (
+                ("runtime_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path",
+                                     manifest, "--all", "--", "--check")),
+                ("runtime_clippy", (cargo, "clippy", "--offline", "--manifest-path", manifest,
+                                     "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
+                ("runtime_tests", (cargo, "test", "--offline", "--manifest-path", manifest,
+                                    "--workspace", "--all-targets", "--locked")),
+            ))
+            (runtime / "Cargo.lock").unlink()
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._gate_commands(project, "/rust", "/node")
 
     def test_project_root_refuses_a_hostile_symlink(self):
         with tempfile.TemporaryDirectory(dir="/tmp") as temporary:
@@ -315,25 +608,107 @@ class LinuxSourceBuildTests(unittest.TestCase):
             self.assertFalse((Path(temporary) / "kd-records" / "revocation.json").exists())
 
     def test_real_gates_use_the_shared_stopping_launcher(self):
-        with tempfile.TemporaryDirectory() as temporary, patch.object(
-            linux_source_build, "_project_gate_directories"
-        ) as directories, patch.object(linux_source_build, "_gate_commands", return_value=tuple(
-            (name, ("/usr/bin/true",)) for name in linux_source_build.GATES
-        )), patch.object(linux_source_build.linux_session, "run_host", return_value=types.SimpleNamespace(
-            exit_code=0, timed_out=False, stdout=b"", stderr=b""
-        )) as session:
-            worker = linux_source_build.PROJECT_ROOT / "source"
-            self.assertEqual(linux_source_build.run_project_gates({
-                "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
-                "CARGO_HOME": str(worker / ".kd-cargo-home"), "RUST_ROOT": "/rust", "NODE_BIN": "/node",
-            }), 0)
-            self.assertEqual(directories.call_count, 13)
-            self.assertEqual(session.call_count, 13)
-            for invocation in session.call_args_list:
-                launch = invocation.args[2]
-                self.assertEqual(launch[:3], ("/usr/bin/python3", "-B", "-c"))
-                self.assertEqual(launch[3], linux_source_build.linux_probes.LAUNCHER_SOURCE)
-                self.assertEqual(launch[4:], ("/usr/bin/true",))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worker = root / "source"
+            worker.mkdir()
+            (worker / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            control_root = root / "control"
+            control_root.mkdir()
+            boundary = _SyntheticTrustedLicenseBoundary(control_root)
+            commands = tuple(
+                (name, ("/usr/bin/true",)) for name in linux_source_build.GATES
+            )
+            with patch.object(
+                linux_source_build.rust_license_gate, "TRUSTED_PORTS", boundary.ports(),
+            ), patch.object(
+                linux_source_build, "_project_gate_directories",
+            ) as directories, patch.object(
+                linux_source_build, "_gate_commands", return_value=commands,
+            ), patch.object(
+                linux_source_build, "_runtime_workspace_present", return_value=False,
+            ), patch.object(
+                linux_source_build.linux_session, "run_host",
+                return_value=types.SimpleNamespace(
+                    exit_code=0, timed_out=False, stdout=b"", stderr=b"",
+                ),
+            ) as session:
+                self.assertEqual(linux_source_build.run_project_gates({
+                    "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
+                    "CARGO_HOME": str(worker / ".kd-cargo-home"),
+                    "RUST_ROOT": "/rust", "NODE_BIN": "/node",
+                    "REQUESTED_SOURCE_SHA": boundary.source_sha,
+                }), 0)
+                self.assertEqual(directories.call_count, 13)
+                self.assertEqual(session.call_count, 13)
+                self.assertEqual(boundary.identities[0].profile, ".")
+                self.assertEqual(boundary.identities[0].root, str(worker))
+                for invocation in session.call_args_list:
+                    launch = invocation.args[2]
+                    self.assertEqual(launch[:3], ("/usr/bin/python3", "-B", "-c"))
+                    self.assertEqual(launch[3], linux_source_build.linux_probes.LAUNCHER_SOURCE)
+                    self.assertEqual(launch[4:], ("/usr/bin/true",))
+
+    def test_license_gate_refusal_precedes_preparation_and_command_construction(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worker = root / "source"
+            worker.mkdir()
+            (worker / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            with patch.object(linux_source_build.rust_license_gate, "TRUSTED_PORTS", None), patch.object(
+                linux_source_build, "_project_gate_directories",
+            ) as prepare, patch.object(linux_source_build, "_gate_commands") as construct, patch.object(
+                linux_source_build.linux_session, "run_host",
+            ) as execute:
+                with self.assertRaises(linux_source_build.rust_license_gate.LicenseGateRefusal):
+                    linux_source_build.run_project_gates({
+                        "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
+                        "CARGO_HOME": str(worker / ".kd-cargo-home"),
+                        "RUST_ROOT": "/rust", "NODE_BIN": "/node",
+                        "REQUESTED_SOURCE_SHA": "a" * 40,
+                    })
+            prepare.assert_not_called()
+            construct.assert_not_called()
+            execute.assert_not_called()
+
+    def test_runtime_gate_receipt_requires_every_selected_stage_to_complete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worker = root / "source"
+            worker.mkdir()
+            (worker / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            runtime = worker / "runtime"
+            runtime.mkdir(parents=True)
+            (runtime / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
+            (runtime / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            commands = tuple(
+                (name, ("/usr/bin/true",))
+                for name in linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES
+            )
+            (root / "control").mkdir()
+            boundary = _SyntheticTrustedLicenseBoundary(root / "control")
+            with patch.object(linux_source_build.rust_license_gate, "TRUSTED_PORTS", boundary.ports()), patch.object(
+                linux_source_build, "_project_gate_directories"
+            ), patch.object(
+                linux_source_build, "_gate_commands", return_value=commands
+            ), patch.object(linux_source_build.linux_session, "run_host", return_value=types.SimpleNamespace(
+                exit_code=0, timed_out=False, stdout=b"", stderr=b""
+            )):
+                result = linux_source_build.run_project_gates({
+                    "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
+                    "CARGO_HOME": str(worker / ".kd-cargo-home"), "RUST_ROOT": "/rust", "NODE_BIN": "/node",
+                    "REQUESTED_SOURCE_SHA": boundary.source_sha,
+                })
+            self.assertEqual(result, 0)
+            receipt = json.loads((Path(temporary) / "kd-records" / "gates.json").read_text(encoding="ascii"))
+            self.assertEqual(receipt["selected_gates"], list(linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES))
+            self.assertEqual(receipt["completed_gates"], receipt["selected_gates"])
+            self.assertEqual(receipt["gate_count"], 16)
+            self.assertEqual(
+                [(item.source_sha, item.profile, item.root) for item in boundary.identities],
+                [(boundary.source_sha, ".", str(worker)),
+                 (boundary.source_sha, "runtime", str(runtime))],
+            )
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "the shared launcher stop uses Linux process facilities")
     def test_shared_launcher_really_stops_before_the_command_runs(self):
@@ -445,8 +820,14 @@ class LinuxSourceBuildTests(unittest.TestCase):
             }
             (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
             (records / "merged.json").chmod(0o600)
-            gates = {"schema_version": 1, "gates": {name: "passed" for name in linux_source_build.GATES},
-                     "gate_count": 13, "failed": 0}
+            gates = {
+                "schema_version": 1,
+                "selected_gates": list(linux_source_build.GATES),
+                "completed_gates": list(linux_source_build.GATES),
+                "gates": {name: "passed" for name in linux_source_build.GATES},
+                "gate_count": 13,
+                "failed": 0,
+            }
             receipt = {
                 "schema_version": 1, "status": "confirmed", "control_sha": "a" * 40,
                 "run_id": "7", "run_attempt": "1", "installation_id": "19",
@@ -476,6 +857,45 @@ class LinuxSourceBuildTests(unittest.TestCase):
             receipt["rejected_after_revoke"] = False
             (records / "revocation.json").write_text(json.dumps(receipt), encoding="ascii")
             self.assertEqual(linux_source_build._verdict_record(env)["token_revocation"], "unconfirmed")
+
+    def test_runtime_receipt_records_all_three_stages_without_changing_public_summary_shape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            records = Path(temporary) / "kd-records"
+            records.mkdir()
+            merged = {
+                "channels": {name: {"status": "blocked", "before": True, "after": True}
+                             for name in confinement_verdict.CHANNELS},
+                "memory_canary": "absent", "readable_file_canary": "absent",
+            }
+            (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
+            (records / "merged.json").chmod(0o600)
+            selected = linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES
+            gates = {
+                "schema_version": 1,
+                "selected_gates": list(selected),
+                "completed_gates": list(selected),
+                "gates": {name: "passed" for name in selected},
+                "gate_count": len(selected),
+                "failed": 0,
+            }
+            receipt = {
+                "schema_version": 1, "status": "confirmed", "control_sha": "a" * 40,
+                "run_id": "7", "run_attempt": "1", "installation_id": "19",
+                "rejected_after_revoke": True,
+            }
+            (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
+            (records / "revocation.json").write_text(json.dumps(receipt), encoding="ascii")
+            env = {
+                "RUNNER_TEMP": temporary, "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7",
+                "GITHUB_RUN_ATTEMPT": "1", "SOURCE_READER_INSTALLATION_ID": "19",
+                "CI_MODE": "source", "PRODUCER_RESULT": "success",
+            }
+            public_record = linux_source_build._verdict_record(env)
+            self.assertEqual(public_record["gates"], 13)
+            self.assertTrue(confinement_verdict.run_accepted(public_record))
+            gates["completed_gates"] = list(selected[:-1])
+            (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
+            self.assertEqual(linux_source_build._verdict_record(env)["project_execution"], "not_started")
 
     def test_unprivileged_handoff_refuses_wrong_owner_mode_and_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:

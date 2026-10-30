@@ -175,20 +175,32 @@ class PublicTreeTests(unittest.TestCase):
     def test_linux_source_build_suite_is_registered_and_discovered_at_push_time(self):
         self.assertIn("kit/confinement/linux_source_build.py", PLATFORM_FILES)
         self.assertIn("kit/confinement/test_linux_source_build.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/rust_license_gate.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/test_rust_license_gate.py", PLATFORM_FILES)
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertEqual(action.count('"test_linux_source_build.py"'), 1)
+        self.assertEqual(action.count('"test_rust_license_gate.py"'), 1)
         condition = 'if [[ "${RUNNER_OS:-}" == "Linux" ]]; then\n'
         self.assertEqual(action.count(condition), 1)
         start = action.index(condition)
         end = action.index("\n        fi\n", start)
         block = action[start:end]
         self.assertEqual(block.count('"test_linux_source_build.py"'), 1)
+        self.assertEqual(block.count('"test_rust_license_gate.py"'), 1)
         self.assertIn('"$python_bin" -B -m unittest discover', block)
         self.assertNotIn("python3.9", block)
         self.assertLess(start, action.index('"${RUNNER_OS:-}" == "macOS"'))
         self.assertGreater(start, action.index('"test_role_signer.py"'))
         macos = action[action.index('"${RUNNER_OS:-}" == "macOS"'):]
         self.assertNotIn("test_linux_source_build.py", macos)
+        self.assertNotIn("test_rust_license_gate.py", macos)
+
+        workflow = (ROOT / ".github/workflows/linux-source-admission.yml").read_text(encoding="utf-8")
+        unit_start = workflow.index("  linux-source-admission-unit:")
+        unit_end = workflow.index("  linux-source-admission-source-read:", unit_start)
+        unit_job = workflow[unit_start:unit_end]
+        self.assertIn("python3 -B kit/confinement/test_linux_source_build.py", unit_job)
+        self.assertIn("python3 -B kit/confinement/test_rust_license_gate.py", unit_job)
 
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -219,6 +231,8 @@ class PublicTreeTests(unittest.TestCase):
 
     def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
+            '.github/workflows/linux-source-admission.yml',
+            'kit/bootstrap/action.yml',
             '.github/workflows/node-lock-return.yml',
             '.github/workflows/core-rust-format-return.yml',
             '.github/workflows/core-build-diagnostic-return.yml',
@@ -271,6 +285,11 @@ class PublicTreeTests(unittest.TestCase):
             '.github/workflows/macos-core-contract.yml',
             'kit/confinement/macos_core_contract.py',
             'kit/confinement/test_macos_core_contract.py',
+            'kit/confinement/linux_source_build.py',
+            'kit/confinement/test_linux_source_build.py',
+            'kit/confinement/rust_license_gate.py',
+            'kit/confinement/test_rust_license_gate.py',
+            'kit/bootstrap/test_public_tree.py',
             '.github/workflows/macos-rust-toolchain-smoke.yml',
             'kit/confinement/macos_rust_toolchain.py',
             'kit/confinement/test_macos_rust_toolchain.py',

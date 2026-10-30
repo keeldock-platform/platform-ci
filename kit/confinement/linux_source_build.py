@@ -20,6 +20,7 @@ import linux_harness
 import linux_channels
 import linux_probes
 import linux_session
+import rust_license_gate
 
 
 REPOSITORY = "keeldock-platform/platform-ci"
@@ -43,6 +44,12 @@ GATES = (
     "parser_format", "parser_clippy", "parser_replay", "node_dependency_prepare",
     "node_dependency_audit", "typescript_typecheck", "typescript_tests",
 )
+RUNTIME_GATE_NAMES = ("runtime_format", "runtime_clippy", "runtime_tests")
+RUNTIME_ROOT_FILES = ("runtime/Cargo.toml", "runtime/Cargo.lock")
+MAX_LOCK_DIRECTORIES = 100000
+MAX_DIRECTORY_ENTRIES = 8192
+MAX_TREE_ENTRIES = 1000000
+MAX_PENDING_DIRECTORIES = 8192
 RUST_COMPONENTS = (
     ("rust-std", "https://static.rust-lang.org/dist/2026-10-15/rust-std-1.99.1-x86_64-unknown-linux-gnu.tar.gz", "d1290c05994a59c029e562cb75be1bddc6fb11a4c501e1b7b0f61d119c6cbb12"),
     ("rustc", "https://static.rust-lang.org/dist/2026-10-15/rustc-1.99.1-x86_64-unknown-linux-gnu.tar.gz", "85e7c0e6f21636f714e2a42966011364a6cc56b6548126d32144d6ba90904966"),
@@ -72,6 +79,7 @@ SOURCE_STEP_NAMES = (
     "Verify selected installation identity",
     "Fetch exact source and verify binding, tree, signatures and lock provenance",
     "Revoke source-reader token and verify rejection",
+    "Require trusted Rust licence admission",
     "Fetch npm tarballs by committed lock integrity",
     "Run trusted dependency audit",
     "Prepare offline project inputs",
@@ -89,6 +97,7 @@ VERDICT_STEP_NAMES = (
     "Mint verifier scoped source-reader token",
     "Verify source independently against binding, tree, signatures and lock",
     "Revoke verifier token and verify rejection",
+    "Require trusted Rust licence admission independently",
     "Fetch independent npm tarballs by lock integrity",
     "Run independent trusted dependency audit",
     "Prepare independent offline project inputs",
@@ -102,6 +111,7 @@ OPTIONAL_VERDICT_SYNTHETIC_STEPS = (
     "Mint verifier scoped source-reader token",
     "Verify source independently against binding, tree, signatures and lock",
     "Revoke verifier token and verify rejection",
+    "Require trusted Rust licence admission independently",
     "Fetch independent npm tarballs by lock integrity",
     "Run independent trusted dependency audit",
     "Prepare independent offline project inputs",
@@ -121,6 +131,7 @@ OPTIONAL_SOURCE_STEPS = frozenset((
     "Verify selected installation identity",
     "Fetch exact source and verify binding, tree, signatures and lock provenance",
     "Revoke source-reader token and verify rejection",
+    "Require trusted Rust licence admission",
     "Fetch npm tarballs by committed lock integrity",
     "Run trusted dependency audit",
     "Prepare offline project inputs",
@@ -1407,6 +1418,250 @@ def _validate_cargo_lock_sources(project):
         raise SourceBuildRefusal("lock")
 
 
+def _directory_identity(metadata):
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink
+
+
+def _open_source_root(source):
+    source = Path(source)
+    if not source.is_absolute() or ".." in source.parts:
+        raise SourceBuildRefusal("binding")
+    if (not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW")
+            or os.stat not in os.supports_dir_fd):
+        raise SourceBuildRefusal("binding")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = None
+    try:
+        descriptor = os.open("/", flags)
+        for component in source.parts[1:]:
+            before = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise SourceBuildRefusal("binding")
+            child = os.open(component, flags, dir_fd=descriptor)
+            opened = os.fstat(child)
+            if _directory_identity(opened) != _directory_identity(before):
+                os.close(child)
+                raise SourceBuildRefusal("binding")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except SourceBuildRefusal:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except (OSError, TypeError, ValueError):
+        if descriptor is not None:
+            os.close(descriptor)
+        raise SourceBuildRefusal("binding") from None
+
+
+def _open_verified_directory(root_fd, relative_parts, identities):
+    if len(identities) != len(relative_parts) + 1:
+        raise SourceBuildRefusal("lock")
+    descriptors = []
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    try:
+        current = os.dup(root_fd)
+        descriptors.append(current)
+        if _directory_identity(os.fstat(current)) != identities[0]:
+            raise SourceBuildRefusal("lock")
+        for index, component in enumerate(relative_parts, 1):
+            before = os.stat(component, dir_fd=current, follow_symlinks=False)
+            if (stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode)
+                    or _directory_identity(before) != identities[index]):
+                raise SourceBuildRefusal("lock")
+            child = os.open(component, flags, dir_fd=current)
+            opened = os.fstat(child)
+            if _directory_identity(opened) != identities[index]:
+                os.close(child)
+                raise SourceBuildRefusal("lock")
+            descriptors.append(child)
+            current = child
+        return descriptors
+    except BaseException:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise
+
+
+def _rust_lock_paths(root_fd):
+    ignored = {".git", "target", "node_modules", ".kd-cargo-home", ".npm-cache"}
+    paths = []
+    root_identity = _directory_identity(os.fstat(root_fd))
+    pending = [((), (root_identity,))]
+    visited = 0
+    total_entries = 0
+    while pending:
+        relative_parts, identities = pending.pop()
+        visited += 1
+        if visited > MAX_LOCK_DIRECTORIES:
+            raise SourceBuildRefusal("lock")
+        descriptors = _open_verified_directory(root_fd, relative_parts, identities)
+        current = descriptors[-1]
+        entries_seen = 0
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    entries_seen += 1
+                    total_entries += 1
+                    if (entries_seen > MAX_DIRECTORY_ENTRIES
+                            or total_entries > MAX_TREE_ENTRIES):
+                        raise SourceBuildRefusal("lock")
+                    name = entry.name
+                    if name in ignored:
+                        continue
+                    metadata = os.stat(name, dir_fd=current, follow_symlinks=False)
+                    if stat.S_ISLNK(metadata.st_mode):
+                        if name == "Cargo.lock":
+                            raise SourceBuildRefusal("lock")
+                        continue
+                    child_parts = relative_parts + (name,)
+                    if stat.S_ISDIR(metadata.st_mode):
+                        if len(pending) >= MAX_PENDING_DIRECTORIES:
+                            raise SourceBuildRefusal("lock")
+                        pending.append((child_parts, identities + (_directory_identity(metadata),)))
+                        continue
+                    if name != "Cargo.lock":
+                        continue
+                    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                        raise SourceBuildRefusal("lock")
+                    paths.append((child_parts, identities, _stat_identity(metadata)))
+                    if len(paths) > 32:
+                        raise SourceBuildRefusal("lock")
+        except SourceBuildRefusal:
+            raise
+        except OSError:
+            raise SourceBuildRefusal("lock") from None
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+    if not paths:
+        raise SourceBuildRefusal("lock")
+    return tuple(sorted(paths, key=lambda item: "/".join(item[0])))
+
+
+def _stat_identity(metadata):
+    return (
+        metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_nlink,
+        metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+
+
+def _read_bounded_cargo_lock(root_fd, candidate):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None or type(candidate) is not tuple or len(candidate) != 3:
+        raise SourceBuildRefusal("lock")
+    descriptor = None
+    parent_descriptors = []
+    try:
+        relative_parts, ancestry, discovered_identity = candidate
+        if (type(relative_parts) is not tuple or not relative_parts
+                or type(ancestry) is not tuple):
+            raise SourceBuildRefusal("lock")
+        parent_parts = relative_parts[:-1]
+        parent_descriptors = _open_verified_directory(root_fd, parent_parts, ancestry)
+        parent_fd = parent_descriptors[-1]
+        lock_name = relative_parts[-1]
+        before = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or before.st_size > rust_license_gate.MAX_LOCK_BYTES):
+            raise SourceBuildRefusal("lock")
+        if discovered_identity != _stat_identity(before):
+            raise SourceBuildRefusal("lock")
+        descriptor = os.open(
+            lock_name, os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        if (_stat_identity(before) != _stat_identity(opened)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1):
+            raise SourceBuildRefusal("lock")
+        content = bytearray()
+        while len(content) <= rust_license_gate.MAX_LOCK_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(65536, rust_license_gate.MAX_LOCK_BYTES + 1 - len(content)),
+            )
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > rust_license_gate.MAX_LOCK_BYTES:
+            raise SourceBuildRefusal("lock")
+        after = os.fstat(descriptor)
+        path_after = os.stat(lock_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (_stat_identity(opened) != _stat_identity(after)
+                or _stat_identity(after) != _stat_identity(path_after)
+                or len(content) != after.st_size):
+            raise SourceBuildRefusal("lock")
+        current_ancestors = _open_verified_directory(root_fd, parent_parts, ancestry)
+        try:
+            for current_fd, expected_identity in zip(current_ancestors, ancestry):
+                if _directory_identity(os.fstat(current_fd)) != expected_identity:
+                    raise SourceBuildRefusal("lock")
+        finally:
+            for current_fd in reversed(current_ancestors):
+                os.close(current_fd)
+        return bytes(content)
+    except SourceBuildRefusal:
+        raise
+    except (OSError, ValueError):
+        raise SourceBuildRefusal("lock") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        for parent_fd in reversed(parent_descriptors):
+            os.close(parent_fd)
+
+
+def _require_source_root_identity(source, expected_identity):
+    descriptor = _open_source_root(source)
+    try:
+        if _directory_identity(os.fstat(descriptor)) != expected_identity:
+            raise SourceBuildRefusal("binding")
+    finally:
+        os.close(descriptor)
+
+
+def run_rust_license_gate(environ=None):
+    env = os.environ if environ is None else environ
+    source = Path(env.get("SOURCE_PATH", ""))
+    source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+    if SOURCE_SHA_RE.fullmatch(source_sha) is None:
+        raise SourceBuildRefusal("binding")
+    try:
+        root_fd = _open_source_root(source)
+    except SourceBuildRefusal:
+        raise SourceBuildRefusal("binding") from None
+    root_identity = _directory_identity(os.fstat(root_fd))
+    try:
+        _require_source_root_identity(source, root_identity)
+        for candidate in _rust_lock_paths(root_fd):
+            try:
+                lock_bytes = _read_bounded_cargo_lock(root_fd, candidate)
+                relative_parts = candidate[0][:-1]
+                relative = "/".join(relative_parts) or "."
+                if len(relative) > 64:
+                    raise SourceBuildRefusal("lock")
+                _require_source_root_identity(source, root_identity)
+            except (OSError, ValueError):
+                raise SourceBuildRefusal("lock") from None
+            if not lock_bytes or len(lock_bytes) > rust_license_gate.MAX_LOCK_BYTES:
+                raise SourceBuildRefusal("lock")
+            identity = rust_license_gate.Identity(
+                source_sha, relative, str(source.joinpath(*relative_parts)),
+                hashlib.sha256(lock_bytes).hexdigest(),
+            )
+            rust_license_gate.require_configured_control(
+                lock_bytes, identity, rust_license_gate.TRUSTED_PORTS,
+            )
+    finally:
+        os.close(root_fd)
+    return 0
+
+
 def prepare_project(environ=None):
     env = os.environ if environ is None else environ
     source = Path(env.get("SOURCE_PATH", ""))
@@ -1473,10 +1728,36 @@ def run_trusted_audit(environ=None):
     return 0
 
 
+def _runtime_workspace_present(project):
+    try:
+        runtime_info = (project / "runtime").lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise SourceBuildRefusal("gate") from None
+    if not stat.S_ISDIR(runtime_info.st_mode):
+        raise SourceBuildRefusal("gate")
+    present = []
+    for relative_path in RUNTIME_ROOT_FILES:
+        try:
+            info = (project / relative_path).lstat()
+        except FileNotFoundError:
+            present.append(False)
+            continue
+        except OSError:
+            raise SourceBuildRefusal("gate") from None
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise SourceBuildRefusal("gate")
+        present.append(True)
+    if any(present) and not all(present):
+        raise SourceBuildRefusal("gate")
+    return all(present)
+
+
 def _gate_commands(project, rust_root, node_bin):
     cargo = str(Path(rust_root) / "bin" / "cargo")
     npm = str(Path(node_bin) / "npm")
-    return (
+    commands = (
         ("format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", str(project / "Cargo.toml"), "--all", "--", "--check")),
         ("clippy", (cargo, "clippy", "--offline", "--manifest-path", str(project / "Cargo.toml"), "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
         ("workspace_tests", (cargo, "test", "--offline", "--manifest-path", str(project / "Cargo.toml"), "--workspace", "--all-targets", "--locked")),
@@ -1491,6 +1772,14 @@ def _gate_commands(project, rust_root, node_bin):
         ("typescript_typecheck", (str(Path(node_bin) / "node"), npm, "--offline", "run", "typecheck", "--workspaces", "--ignore-scripts")),
         ("typescript_tests", (str(Path(node_bin) / "node"), npm, "--offline", "run", "test", "--workspaces", "--ignore-scripts")),
     )
+    if not _runtime_workspace_present(project):
+        return commands
+    runtime_manifest = str(project / "runtime/Cargo.toml")
+    return commands + (
+        ("runtime_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", runtime_manifest, "--all", "--", "--check")),
+        ("runtime_clippy", (cargo, "clippy", "--offline", "--manifest-path", runtime_manifest, "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
+        ("runtime_tests", (cargo, "test", "--offline", "--manifest-path", runtime_manifest, "--workspace", "--all-targets", "--locked")),
+    )
 
 
 def run_project_gates(environ=None):
@@ -1501,10 +1790,17 @@ def run_project_gates(environ=None):
     node_bin = env.get("NODE_BIN", "")
     if not rust_root or not node_bin or cargo_home != worker / ".kd-cargo-home":
         raise SourceBuildRefusal("gate")
+    license_environment = dict(env)
+    license_environment["SOURCE_PATH"] = str(worker)
+    run_rust_license_gate(license_environment)
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     records.mkdir(mode=0o700, parents=True, exist_ok=True)
-    outcomes = {name: "not-run" for name in GATES}
     commands = _gate_commands(worker, rust_root, node_bin)
+    selected_gates = tuple(name for name, unused_argv in commands)
+    expected_gates = GATES + (RUNTIME_GATE_NAMES if _runtime_workspace_present(worker) else ())
+    if selected_gates != expected_gates:
+        raise SourceBuildRefusal("gate")
+    outcomes = {name: "not-run" for name in selected_gates}
     for index, (name, argv) in enumerate(commands):
         project_env = {
             "PATH": str(Path(node_bin)) + ":" + str(Path(rust_root) / "bin") + ":/usr/bin:/bin",
@@ -1538,13 +1834,18 @@ def run_project_gates(environ=None):
         else:
             outcomes[name] = "failed"
             break
-    result = {"schema_version": 1, "gates": outcomes, "gate_count": sum(value != "not-run" for value in outcomes.values()),
-              "failed": sum(value == "failed" for value in outcomes.values())}
+    completed_gates = [name for name in selected_gates if outcomes[name] == "passed"]
+    result = {
+        "schema_version": 1, "selected_gates": list(selected_gates),
+        "completed_gates": completed_gates, "gates": outcomes,
+        "gate_count": sum(value != "not-run" for value in outcomes.values()),
+        "failed": sum(value == "failed" for value in outcomes.values()),
+    }
     (records / "gates.json").write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
-    if result["failed"] or result["gate_count"] != len(GATES):
+    if result["failed"] or result["gate_count"] != len(selected_gates):
         sys.stdout.write("linux-project-gates=refused completed=" + str(result["gate_count"]) + " failed=" + str(result["failed"]) + "\n")
         return 1
-    sys.stdout.write("linux-project-gates=passed gates=13 failed=0 offline=true\n")
+    sys.stdout.write("linux-project-gates=passed gates=" + str(len(selected_gates)) + " failed=0 offline=true\n")
     return 0
 
 
@@ -1591,11 +1892,22 @@ def verify_proof_handoff(environ=None):
 def _verified_source_receipts(records, env):
     gates = _load_json(records / "gates.json")
     revoke = _load_json(records / "revocation.json")
-    if (gates is None or revoke is None or gates.get("schema_version") != 1
+    if type(gates) is not dict or type(gates.get("selected_gates")) is not list:
+        return False
+    selected_gates = tuple(gates["selected_gates"])
+    expected_gate_sets = (GATES, GATES + RUNTIME_GATE_NAMES)
+    if (set(gates) != {
+                "schema_version", "selected_gates", "completed_gates", "gates", "gate_count", "failed",
+            }
+            or selected_gates not in expected_gate_sets
+            or gates.get("completed_gates") != list(selected_gates)
+            or revoke is None or gates.get("schema_version") != 1
             or type(gates.get("gates")) is not dict
-            or set(gates["gates"]) != set(GATES)
-            or any(gates["gates"][name] != "passed" for name in GATES)
-            or gates.get("gate_count") != len(GATES) or gates.get("failed") != 0
+            or set(gates["gates"]) != set(selected_gates)
+            or any(gates["gates"][name] != "passed" for name in selected_gates)
+            or type(gates.get("gate_count")) is not int
+            or gates.get("gate_count") != len(selected_gates)
+            or type(gates.get("failed")) is not int or gates.get("failed") != 0
             or revoke.get("schema_version") != 1 or revoke.get("status") != "confirmed"
             or revoke.get("control_sha") != env.get("CI_SHA")
             or revoke.get("run_id") != env.get("GITHUB_RUN_ID")
@@ -1697,6 +2009,7 @@ def _dispatch(command):
         "revoke": revoke_token,
         "npm-tarballs": fetch_npm_tarballs,
         "trusted-audit": run_trusted_audit,
+        "rust-license-gate": run_rust_license_gate,
         "prepare-project": prepare_project,
         "gates": run_project_gates,
         "verify-handoff": verify_proof_handoff,
@@ -1710,6 +2023,11 @@ def _dispatch(command):
         return action()
     except SourceBuildRefusal as error:
         sys.stdout.write("linux-source-build=refused phase=" + command + " reason=" + error.reason + "\n")
+        return 1
+    except rust_license_gate.LicenseGateRefusal as error:
+        refusal = "linux-source-build=refused phase=" + command
+        refusal += " reason=license_" + error.reason + "\n"
+        sys.stdout.write(refusal)
         return 1
     except BaseException:
         sys.stdout.write("linux-source-build=refused phase=" + command + " reason=invalid\n")
