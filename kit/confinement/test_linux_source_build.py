@@ -211,10 +211,10 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertIn("REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}",
                       blocks["Require trusted Rust licence admission"])
         self.assertIn("REQUESTED_SOURCE_SHA", blocks["Run all thirteen offline project gates"])
-        independent_gate = "\n".join(workflow.splitlines()[
+        independent_gate = workflow[
             workflow.index("      - name: Revoke verifier token and verify rejection"):
             workflow.index("      - name: Fetch independent npm tarballs by lock integrity")
-        ])
+        ]
         self.assertIn("Require trusted Rust licence admission independently", independent_gate)
         self.assertIn("REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}", independent_gate)
         self.assertLess(workflow.index("Require trusted Rust licence admission"),

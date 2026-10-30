@@ -254,7 +254,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/macos_core_contract.py': '71a7c9f143d8bf83703bddc81470e03106c147f54e0abe9061cae918594a58ef',
     'kit/confinement/test_macos_core_contract.py': '727a034ab3e4fa8794d33aa27ba8f7ae56f136003f81e703836693388763ff65',
     'kit/confinement/linux_source_build.py': '78e52e0eebd6398f16c85cddf24f1019b0132a1ce50c688d65b22949680802f4',
-    'kit/confinement/test_linux_source_build.py': 'fcc8d8649730c41aecdabae5559bfd4d34652599a7dc3145fdf694dd9ba50aa8',
+    'kit/confinement/test_linux_source_build.py': '4091b4e899ac9b613756192d73e719bb212fb154bf1003c680971f103b817222',
     'kit/confinement/rust_license_gate.py': '4896e53baf2b0bd8bc8047c69e50c8c72dff11096ca9225bfa9efad71913dfc6',
     'kit/confinement/test_rust_license_gate.py': '5c421d6142948a52704fd9a4db72d0761c167ed6a8fea5bae49b633acf53defa',
     '.github/workflows/macos-rust-toolchain-smoke.yml': 'cdf7068f8887c22958d74f3c2cc0a73c5c8c4c41f4eff0b43e16e47f61e58bb7',
