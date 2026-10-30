@@ -22,7 +22,9 @@ the cap, raise the constant together with a test and keep reading the full docum
 wall clock is read once by the caller before the resolver starts; that single reading serves
 the request expiry and the policy-time checks. The advisory fetch time is read separately,
 after the advisory answer arrives, and it alone decides whether an advisory allow record is
-still unexpired.
+still unexpired. Every advisory must carry a severity of info, low, moderate, high or critical;
+a missing, non-string or unknown value refuses the run and is never defaulted. Recorded findings
+are held to the same set when the evidence is verified.
 
 An advisory allow record is honoured only when all of these hold: the advisory severity is
 not high or critical; every locked entry of the named package that the advisory covers is a
@@ -173,6 +175,7 @@ ALLOW_FIELDS = frozenset((
     "removal_condition",
 ))
 SEVERITIES = frozenset(("info", "low", "moderate", "high", "critical"))
+ALLOWABLE_SEVERITIES = SEVERITIES - ALLOW_REFUSED_SEVERITIES
 TRUSTED_CONTEXT_FIELDS = frozenset((
     "repository", "filing", "source_sha", "base_sha", "base_branch",
     "reviewed_diff_fingerprint", "control_sha",
@@ -1082,7 +1085,7 @@ def check_advisories(response_bytes, inventory, allows=(), direct=None, now_ms=0
                     or not 0 < len(item["vulnerable_versions"]) <= 1024
                     or item.get("name", name) != name):
                 _refuse("npm_advisory_invalid")
-            severity = item.get("severity", "info")
+            severity = item.get("severity")
             if type(severity) is not str or severity not in SEVERITIES:
                 _refuse("npm_advisory_invalid")
             identifier = item.get("id")
@@ -1268,7 +1271,8 @@ def _finding_allowed(item, fetched_ms, policy_epoch_ms):
         return False
     expires = item.get("allow_expires_at_ms")
     return (
-        type(expires) is int and item.get("severity") not in ALLOW_REFUSED_SEVERITIES
+        type(expires) is int and type(item.get("severity")) is str
+        and item["severity"] in ALLOWABLE_SEVERITIES
         and _allow_expiry_bounded(expires, policy_epoch_ms) and expires > fetched_ms
     )
 

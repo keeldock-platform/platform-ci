@@ -1225,6 +1225,20 @@ class AdvisoryTests(RefusalAssertions):
                     self.INVENTORY, allows, self.DIRECT_NAMES, 1000, **arguments,
                 )
 
+    def test_a_missing_mistyped_or_unknown_severity_is_invalid_and_never_defaulted(self):
+        allows = (self.allow("alpha-pkg", "7"),)
+        passing = {"alpha-pkg": [{"id": 7, "severity": "low", "vulnerable_versions": "<2.0.0"}]}
+        self.assertEqual(len(self.check(passing, allows)), 1)
+        missing = {"id": 7, "vulnerable_versions": "<2.0.0"}
+        cases = [("missing", missing)]
+        for label, value in (("integer", 3), ("null", None), ("list", ["low"]), ("unknown", "weird"),
+                             ("empty", ""), ("upper", "LOW")):
+            cases.append((label, dict(missing, severity=value)))
+        for label, item in cases:
+            with self.subTest(case=label):
+                self.assert_refused("npm_advisory_invalid", self.check, {"alpha-pkg": [item]}, allows)
+                self.assert_refused("npm_advisory_invalid", self.check, {"alpha-pkg": [item]})
+
     def test_malformed_answers_are_refused(self):
         valid = {"id": 1, "severity": "low", "vulnerable_versions": "<2.0.0"}
         for value in (
@@ -1640,6 +1654,26 @@ class VerificationTests(RefusalAssertions):
                 tampered = subject.encode_bundle(lock_bytes, receipt_bytes, _json(changed))
                 self.assert_refused(
                     "npm_evidence_invalid", subject.verify_bundle, tampered, plan, world.context, now=NOW,
+                )
+        for label in ("missing", "null", "integer", "list", "unknown"):
+            with self.subTest(severity=label):
+                changed = json.loads(json.dumps(record))
+                finding = changed["advisory"]["findings"][0]
+                if label == "missing":
+                    del finding["severity"]
+                else:
+                    finding["severity"] = {"null": None, "integer": 3, "list": ["low"], "unknown": "weird"}[label]
+                tampered = subject.encode_bundle(lock_bytes, receipt_bytes, _json(changed))
+                self.assert_refused(
+                    "npm_evidence_invalid", subject.verify_bundle, tampered, plan, world.context, now=NOW,
+                )
+        for severity in ("info", "low", "moderate"):
+            with self.subTest(severity=severity):
+                changed = json.loads(json.dumps(record))
+                changed["advisory"]["findings"][0]["severity"] = severity
+                subject.verify_bundle(
+                    subject.encode_bundle(lock_bytes, receipt_bytes, _json(changed)),
+                    plan, world.context, now=NOW,
                 )
 
     def test_a_different_lock_or_plan_or_context_does_not_verify(self):
