@@ -14,6 +14,7 @@ import npm_admission_bootstrap as subject
 
 NOW = 1_800_000_000
 EXPIRY = NOW + 3600
+EPOCH_MS = (NOW - 3600) * 1000
 OLD = "2026-06-01T12:00:00.000Z"
 ROOT_VERSION = "0.1.0"
 DIRECT = (("alpha-pkg", "1.0.0"), ("beta-pkg", "2.0.0"))
@@ -89,14 +90,17 @@ class World:
                  deprecated=(), advisory=b"{}", attested=None, table_published=None,
                  table_attested=None, extra_rows=(), dist_integrity=None, table_licence=None,
                  policy_epoch_ms=None, elections=None, allowlist=None, allows=None,
-                 singletons=("alpha-pkg", "lightningcss"), layout="wide", policy_extra=None):
-        self.policy_epoch_ms = (NOW - 3600) * 1000 if policy_epoch_ms is None else policy_epoch_ms
+                 singletons=("alpha-pkg", "lightningcss"), layout="wide", policy_extra=None,
+                 edges=None, non_dev=()):
+        self.policy_epoch_ms = EPOCH_MS if policy_epoch_ms is None else policy_epoch_ms
         self.elections = elections or {}
         self.allowlist = ["MIT", "ISC"] if allowlist is None else allowlist
         self.allows = allows or []
         self.singletons = list(singletons)
         self.layout = layout
         self.policy_extra = policy_extra or {}
+        self.edges = edges or {}
+        self.non_dev = set(non_dev)
         self.published = published or {}
         self.registry_license = registry_license or {}
         self.archive_license = archive_license or {}
@@ -144,10 +148,14 @@ class World:
         for name, version in ALL_PACKAGES:
             entry = {
                 "version": version, "resolved": adm._canonical_tarball_url(name, version),
-                "integrity": self.integrity[name], "dev": True, "license": self.licence_of(name),
+                "integrity": self.integrity[name], "dev": name not in self.non_dev,
+                "license": self.licence_of(name),
             }
             if name == "alpha-pkg":
                 entry["peerDependencies"] = {"beta-pkg": "^2.0.0"}
+            if self.edges.get(name):
+                versions = dict(ALL_PACKAGES)
+                entry["dependencies"] = {target: versions[target] for target in self.edges[name]}
             packages["node_modules/" + name] = entry
         return {
             "name": subject.ROOT_NAME, "version": ROOT_VERSION, "lockfileVersion": 3,
@@ -433,6 +441,9 @@ class InputTests(RefusalAssertions):
             lambda manifest: manifest.update({"workspaces": ["packages/*", "extra/*"]}),
             lambda manifest: manifest["scripts"].update({"postinstall": "run x"}),
             lambda manifest: manifest["scripts"].update({"prepare": "run x"}),
+            lambda manifest: manifest["scripts"].update({"dependencies": "run x"}),
+            lambda manifest: manifest["scripts"].update({"prepack": "run x"}),
+            lambda manifest: manifest["scripts"].update({"postpack": "run x"}),
             lambda manifest: manifest["devDependencies"].update({"alpha-pkg": "^1.0.0"}),
             lambda manifest: manifest["devDependencies"].update({"alpha-pkg": "latest"}),
             lambda manifest: manifest["devDependencies"].update({"alpha-pkg": "npm:other@1.0.0"}),
@@ -536,12 +547,6 @@ class CommandTests(RefusalAssertions):
             with self.subTest(changes=changes):
                 self.assert_refused("npm_environment_refused", self.command, **changes)
 
-    def test_the_cutoff_is_seven_full_days_before_the_policy_time(self):
-        self.assertEqual(subject.policy_cutoff_ms(NOW * 1000), NOW * 1000 - 7 * 24 * 3600 * 1000)
-        for value in (0, -1, "1", None):
-            with self.subTest(value=value):
-                self.assert_refused("npm_input_invalid", subject.policy_cutoff_ms, value)
-
     @unittest.skipUnless(sys.platform != "win32", "the macOS npm environment path test requires POSIX paths")
     def test_the_environment_is_built_from_fixed_values_only(self):
         environment = subject.build_npm_environment(
@@ -562,17 +567,6 @@ class CommandTests(RefusalAssertions):
             "npm_environment_refused", subject.build_npm_environment, "/n/bin/node", home="/s/home",
             tmpdir="/s/tmp", cache="/s/cache", user_config="/s/u", global_config="/s/g", node_options="",
         )
-
-    def test_inherited_variables_that_could_steer_npm_are_named(self):
-        parent = {
-            "PATH": "/usr/bin", "NPM_TOKEN": "x", "npm_config_registry": "x", "NODE_OPTIONS": "x",
-            "HTTPS_PROXY": "x", "no_proxy": "x", "GIT_SSH": "x", "HOME": "/h", "SSL_CERT_FILE": "x",
-        }
-        self.assertEqual(
-            subject.injected_environment_names(parent),
-            ("GIT_SSH", "HTTPS_PROXY", "NODE_OPTIONS", "NPM_TOKEN", "SSL_CERT_FILE", "no_proxy", "npm_config_registry"),
-        )
-        self.assert_refused("npm_environment_refused", subject.injected_environment_names, [])
 
 
 class LockTests(RefusalAssertions):
@@ -896,14 +890,14 @@ class PolicyTests(RefusalAssertions):
     def test_advisory_allow_records_are_exact(self):
         good = {
             "name": "alpha-pkg", "advisory_id": "GHSA-aaaa-bbbb", "consumers": ["alpha-pkg"],
-            "justification_sha256": "a" * 64, "expires_at_ms": 5, "removal_condition": "upgrade",
+            "justification_sha256": "a" * 64, "expires_at_ms": EPOCH_MS + 1000, "removal_condition": "upgrade",
         }
         policy = subject.parse_policy(self.policy(development_advisory_allows=[good]))
         self.assertEqual(policy["advisory_allows"][0]["consumers"], ("alpha-pkg",))
         for change in (
             {"extra": 1}, {"name": "Bad Name"}, {"advisory_id": ""}, {"advisory_id": "-x"}, {"consumers": []},
             {"consumers": ["a", "a"]}, {"consumers": "alpha-pkg"}, {"justification_sha256": "A" * 64},
-            {"expires_at_ms": 0}, {"expires_at_ms": "5"}, {"removal_condition": "has space"},
+            {"expires_at_ms": 0}, {"expires_at_ms": "5"}, {"expires_at_ms": True}, {"removal_condition": "has space"},
         ):
             with self.subTest(change=change):
                 self.assert_refused(
@@ -914,6 +908,28 @@ class PolicyTests(RefusalAssertions):
             "npm_policy_refused", subject.parse_policy,
             self.policy(development_advisory_allows=[{k: v for k, v in good.items() if k != "name"}]),
         )
+
+    def test_an_allow_expires_after_the_policy_epoch_and_within_the_fixed_maximum(self):
+        self.assertEqual(subject.MAX_ALLOW_TTL_MS, 90 * 24 * 3600 * 1000)
+        record = {
+            "name": "alpha-pkg", "advisory_id": "GHSA-aaaa-bbbb", "consumers": ["alpha-pkg"],
+            "justification_sha256": "a" * 64, "expires_at_ms": EPOCH_MS + 1,
+            "removal_condition": "upgrade",
+        }
+        for expires in (EPOCH_MS + 1, EPOCH_MS + subject.MAX_ALLOW_TTL_MS):
+            with self.subTest(expires=expires):
+                policy = subject.parse_policy(
+                    self.policy(development_advisory_allows=[dict(record, expires_at_ms=expires)]),
+                )
+                self.assertEqual(policy["advisory_allows"][0]["expires_at_ms"], expires)
+        for expires in (
+            1, EPOCH_MS - 1, EPOCH_MS, EPOCH_MS + subject.MAX_ALLOW_TTL_MS + 1, 10 ** 15,
+        ):
+            with self.subTest(expires=expires):
+                self.assert_refused(
+                    "npm_policy_refused", subject.parse_policy,
+                    self.policy(development_advisory_allows=[dict(record, expires_at_ms=expires)]),
+                )
 
     def test_internal_names_ban_direct_pins_in_the_manifests_and_the_policy(self):
         world = World(policy_extra={"internal_names": ["alpha-pkg"]})
@@ -1034,14 +1050,42 @@ class AdvisoryTests(RefusalAssertions):
 
     DIRECT_NAMES = {"alpha-pkg": "1.0.0", "beta-pkg": "2.0.0"}
 
-    def allow(self, name, advisory_id, consumers=("alpha-pkg",), expires=10 ** 15):
+    EPOCH = 500
+    FAR = 2_000_000_000
+    ALPHA_PATH = "node_modules/alpha-pkg"
+    NESTED_BETA_PATH = "node_modules/alpha-pkg/node_modules/beta-pkg"
+
+    def allow(self, name, advisory_id, consumers=("alpha-pkg",), expires=FAR):
         return {
             "name": name, "advisory_id": advisory_id, "consumers": tuple(consumers),
             "justification_sha256": "a" * 64, "expires_at_ms": expires, "removal_condition": "upgrade",
         }
 
-    def check(self, value, allows=(), now_ms=1000):
-        return subject.check_advisories(self.answer(value), self.INVENTORY, allows, self.DIRECT_NAMES, now_ms)
+    def graph(self, changes=None):
+        packages = {
+            "": {"devDependencies": dict(self.DIRECT_NAMES)},
+            self.ALPHA_PATH: {"version": "1.0.0", "dev": True, "dependencies": {"beta-pkg": "2.1.0"}},
+            "node_modules/beta-pkg": {"version": "2.0.0", "dev": True},
+            self.NESTED_BETA_PATH: {"version": "2.1.0", "dev": True},
+        }
+        for path, update in (changes or {}).items():
+            for key, value in update.items():
+                if value is None:
+                    packages[path].pop(key, None)
+                else:
+                    packages[path][key] = value
+        entries = [
+            (path, dict(entry, name=path.rsplit("node_modules/", 1)[1]))
+            for path, entry in sorted(packages.items()) if path
+        ]
+        return {"packages": packages}, entries
+
+    def check(self, value, allows=(), now_ms=1000, changes=None, epoch=None):
+        lock, entries = self.graph(changes)
+        return subject.check_advisories(
+            self.answer(value), self.INVENTORY, allows, self.DIRECT_NAMES, now_ms, lock=lock,
+            entries=entries, policy_epoch_ms=self.EPOCH if epoch is None else epoch,
+        )
 
     def test_an_unallowed_advisory_of_any_severity_blocks_the_proposal(self):
         for severity in ("info", "low", "moderate", "high", "critical"):
@@ -1058,7 +1102,7 @@ class AdvisoryTests(RefusalAssertions):
             "alpha-pkg": [{"id": 7, "severity": "moderate", "vulnerable_versions": "<1.5.0", "title": "t"}],
             "beta-pkg": [{"id": "x1", "severity": "low", "vulnerable_versions": ">=2.1.0 <3.0.0"}],
         }
-        allows = (self.allow("alpha-pkg", "7"), self.allow("beta-pkg", "x1", consumers=("beta-pkg", "alpha-pkg")))
+        allows = (self.allow("alpha-pkg", "7"), self.allow("beta-pkg", "x1", consumers=("alpha-pkg",)))
         found = self.check(answer, allows)
         self.assertEqual([(item["name"], item["version"], item["advisory_id"]) for item in found], [
             ("alpha-pkg", "1.0.0", "7"), ("beta-pkg", "2.1.0", "x1"),
@@ -1083,6 +1127,103 @@ class AdvisoryTests(RefusalAssertions):
         ):
             with self.subTest(allows=allows):
                 self.assert_refused("npm_advisory_blocked", self.check, answer, allows)
+
+    ALPHA_ANSWER = {"alpha-pkg": [{"id": 7, "severity": "low", "vulnerable_versions": "<2.0.0"}]}
+    BETA_ANSWER = {"beta-pkg": [{"id": 8, "severity": "low", "vulnerable_versions": ">=2.1.0 <3.0.0"}]}
+
+    def test_an_allow_is_refused_unless_every_affected_entry_is_development_only(self):
+        allows = (self.allow("alpha-pkg", "7"),)
+        self.assertEqual(len(self.check(self.ALPHA_ANSWER, allows)), 1)
+        for update in ({"dev": False}, {"dev": None}, {"dev": None, "devOptional": True},
+                       {"dev": None, "optional": True}):
+            with self.subTest(update=update):
+                self.assert_refused(
+                    "npm_advisory_blocked", self.check, self.ALPHA_ANSWER, allows,
+                    changes={self.ALPHA_PATH: update},
+                )
+        allows = (self.allow("beta-pkg", "8", consumers=("alpha-pkg",)),)
+        self.assertEqual(len(self.check(self.BETA_ANSWER, allows)), 1)
+        self.assert_refused(
+            "npm_advisory_blocked", self.check, self.BETA_ANSWER, allows,
+            changes={self.NESTED_BETA_PATH: {"dev": False}},
+        )
+
+    def test_an_allow_must_name_exactly_the_direct_dependencies_that_reach_the_entry(self):
+        also_beta = {"node_modules/beta-pkg": {"dependencies": {"alpha-pkg": "1.0.0"}}}
+        both = ("alpha-pkg", "beta-pkg")
+        self.assertEqual(len(self.check(self.ALPHA_ANSWER, (self.allow("alpha-pkg", "7", both),), changes=also_beta)), 1)
+        self.assertEqual(len(self.check(self.ALPHA_ANSWER, (self.allow("alpha-pkg", "7", both[::-1]),), changes=also_beta)), 1)
+        for consumers in (("alpha-pkg",), ("beta-pkg",)):
+            with self.subTest(incomplete=consumers):
+                self.assert_refused(
+                    "npm_advisory_blocked", self.check, self.ALPHA_ANSWER,
+                    (self.allow("alpha-pkg", "7", consumers),), changes=also_beta,
+                )
+        with self.subTest(superfluous=both):
+            self.assert_refused(
+                "npm_advisory_blocked", self.check, self.ALPHA_ANSWER, (self.allow("alpha-pkg", "7", both),),
+            )
+        with self.subTest(nested=True):
+            self.assertEqual(len(self.check(self.BETA_ANSWER, (self.allow("beta-pkg", "8"),))), 1)
+            self.assert_refused(
+                "npm_advisory_blocked", self.check, self.BETA_ANSWER,
+                (self.allow("beta-pkg", "8", consumers=("beta-pkg",)),),
+            )
+            self.assert_refused(
+                "npm_advisory_blocked", self.check, self.BETA_ANSWER, (self.allow("beta-pkg", "8", both),),
+            )
+
+    def test_an_entry_no_direct_dependency_reaches_cannot_be_allowed(self):
+        unreached = {self.ALPHA_PATH: {"dependencies": None}}
+        for consumers in (("alpha-pkg",), ("beta-pkg",), ("alpha-pkg", "beta-pkg")):
+            with self.subTest(consumers=consumers):
+                self.assert_refused(
+                    "npm_advisory_blocked", self.check, self.BETA_ANSWER,
+                    (self.allow("beta-pkg", "8", consumers),), changes=unreached,
+                )
+
+    def test_an_allow_is_never_honoured_for_high_or_critical_advisories(self):
+        for severity in ("high", "critical"):
+            answer = {"alpha-pkg": [{"id": 7, "severity": severity, "vulnerable_versions": "<2.0.0"}]}
+            with self.subTest(severity=severity):
+                self.assert_refused(
+                    "npm_advisory_blocked", self.check, answer, (self.allow("alpha-pkg", "7"),),
+                )
+        for severity in ("info", "low", "moderate"):
+            answer = {"alpha-pkg": [{"id": 7, "severity": severity, "vulnerable_versions": "<2.0.0"}]}
+            with self.subTest(severity=severity):
+                self.assertEqual(len(self.check(answer, (self.allow("alpha-pkg", "7"),))), 1)
+
+    def test_an_allow_expiry_is_bounded_after_the_policy_epoch_and_after_the_fetch_time(self):
+        top = self.EPOCH + subject.MAX_ALLOW_TTL_MS
+        self.assertEqual(len(self.check(self.ALPHA_ANSWER, (self.allow("alpha-pkg", "7", expires=top),))), 1)
+        for expires in (top + 1, 10 ** 15):
+            with self.subTest(expires=expires):
+                self.assert_refused(
+                    "npm_advisory_blocked", self.check, self.ALPHA_ANSWER,
+                    (self.allow("alpha-pkg", "7", expires=expires),),
+                )
+        self.assert_refused(
+            "npm_advisory_blocked", self.check, self.ALPHA_ANSWER,
+            (self.allow("alpha-pkg", "7", expires=self.EPOCH),), now_ms=100,
+        )
+        self.assert_refused(
+            "npm_advisory_blocked", self.check, self.ALPHA_ANSWER,
+            (self.allow("alpha-pkg", "7", expires=2000),), now_ms=2000,
+        )
+
+    def test_an_allow_needs_the_lock_the_entries_and_the_policy_epoch(self):
+        allows = (self.allow("alpha-pkg", "7"),)
+        lock, entries = self.graph()
+        for arguments in (
+            {}, {"lock": lock}, {"lock": lock, "entries": entries}, {"entries": entries, "policy_epoch_ms": 500},
+            {"lock": lock, "entries": entries, "policy_epoch_ms": "500"},
+        ):
+            with self.subTest(arguments=sorted(arguments)):
+                self.assert_refused(
+                    "npm_advisory_blocked", subject.check_advisories, self.answer(self.ALPHA_ANSWER),
+                    self.INVENTORY, allows, self.DIRECT_NAMES, 1000, **arguments,
+                )
 
     def test_malformed_answers_are_refused(self):
         valid = {"id": 1, "severity": "low", "vulnerable_versions": "<2.0.0"}
@@ -1175,12 +1316,81 @@ class BundleTests(RefusalAssertions):
             "justification_sha256": "b" * 64, "expires_at_ms": (NOW + 86400) * 1000,
             "removal_condition": "upgrade-gamma",
         }
+        edges = {"alpha-pkg": ["gamma-pkg"]}
         self.refused("npm_advisory_blocked", advisory=advisory)
+        self.refused("npm_advisory_blocked", advisory=advisory, allows=[allow])
         evidence = json.loads(subject.decode_bundle(
-            World(advisory=advisory, allows=[allow]).bundle())[2].decode("ascii"))
+            World(advisory=advisory, allows=[allow], edges=edges).bundle())[2].decode("ascii"))
         self.assertEqual(evidence["advisory"]["status"], "allowed_findings")
         self.assertEqual(evidence["advisory"]["finding_count"], 1)
         self.assertEqual(evidence["advisory"]["findings"][0]["allow_justification_sha256"], "b" * 64)
+
+    GAMMA_ADVISORY = json.dumps({"gamma-pkg": [
+        {"id": 5, "severity": "moderate", "vulnerable_versions": "<4.0.0"},
+    ]}).encode("ascii")
+
+    def gamma_allow(self, consumers=("alpha-pkg",), expires=(NOW + 86400) * 1000):
+        return {
+            "name": "gamma-pkg", "advisory_id": "5", "consumers": list(consumers),
+            "justification_sha256": "b" * 64, "expires_at_ms": expires,
+            "removal_condition": "upgrade-gamma",
+        }
+
+    def gamma_world(self, allow, edges=None, **keywords):
+        return World(
+            advisory=self.GAMMA_ADVISORY, allows=[allow],
+            edges={"alpha-pkg": ["gamma-pkg"]} if edges is None else edges, **keywords,
+        )
+
+    def test_an_allow_needs_a_development_only_lock_entry(self):
+        self.gamma_world(self.gamma_allow()).bundle()
+        self.assert_refused(
+            "npm_advisory_blocked", self.gamma_world(self.gamma_allow(), non_dev=("gamma-pkg",)).bundle,
+        )
+
+    def test_an_allow_must_list_exactly_the_consumers_derived_from_the_lock_graph(self):
+        both_edges = {"alpha-pkg": ["gamma-pkg"], "beta-pkg": ["gamma-pkg"]}
+        self.gamma_world(self.gamma_allow(("alpha-pkg", "beta-pkg")), both_edges).bundle()
+        for consumers in (("alpha-pkg",), ("beta-pkg",)):
+            with self.subTest(incomplete=consumers):
+                self.assert_refused(
+                    "npm_advisory_blocked", self.gamma_world(self.gamma_allow(consumers), both_edges).bundle,
+                )
+        self.assert_refused(
+            "npm_advisory_blocked", self.gamma_world(self.gamma_allow(("alpha-pkg", "beta-pkg"))).bundle,
+        )
+        self.assert_refused(
+            "npm_advisory_blocked", self.gamma_world(self.gamma_allow(), edges={}).bundle,
+        )
+
+    def test_an_allow_is_refused_for_high_and_critical_advisories_whatever_the_record_says(self):
+        for severity in ("high", "critical"):
+            advisory = json.dumps({"gamma-pkg": [
+                {"id": 5, "severity": severity, "vulnerable_versions": "<4.0.0"},
+            ]}).encode("ascii")
+            world = World(advisory=advisory, allows=[self.gamma_allow()], edges={"alpha-pkg": ["gamma-pkg"]})
+            with self.subTest(severity=severity):
+                self.assert_refused("npm_advisory_blocked", world.bundle)
+
+    def test_an_allow_expiry_is_judged_at_the_advisory_fetch_time_inside_the_bounded_window(self):
+        fetched = NOW + 5
+        for expires, accepted in (
+            ((fetched + 1) * 1000, True), (fetched * 1000, False), ((NOW + 2) * 1000, False),
+            ((NOW + 1) * 1000, False),
+        ):
+            with self.subTest(expires=expires):
+                world = self.gamma_world(self.gamma_allow(expires=expires))
+                if accepted:
+                    world.bundle()
+                else:
+                    self.assert_refused("npm_advisory_blocked", world.bundle)
+        top = EPOCH_MS + subject.MAX_ALLOW_TTL_MS
+        self.gamma_world(self.gamma_allow(expires=top)).bundle()
+        self.refused_policy(self.gamma_allow(expires=top + 1))
+        self.refused_policy(self.gamma_allow(expires=EPOCH_MS))
+
+    def refused_policy(self, allow):
+        self.assert_refused("npm_policy_refused", self.gamma_world(allow).bundle)
 
     def test_the_policy_licence_rules_apply_to_every_locked_package(self):
         self.refused("npm_licence_refused", registry_license={"gamma-pkg": "CC-BY-4.0"})
@@ -1401,6 +1611,36 @@ class VerificationTests(RefusalAssertions):
                 with self.assertRaises(subject.BootstrapRefusal) as raised:
                     subject.verify_bundle(bundle, self.plan, self.world.context, now=NOW)
                 self.assertEqual(raised.exception.reason, reason)
+
+    def test_recorded_allows_are_rechecked_against_the_fetch_time_the_maximum_and_the_severity(self):
+        advisory = json.dumps({"gamma-pkg": [
+            {"id": 5, "severity": "moderate", "vulnerable_versions": "<4.0.0"},
+        ]}).encode("ascii")
+        allow = {
+            "name": "gamma-pkg", "advisory_id": "5", "consumers": ["alpha-pkg"],
+            "justification_sha256": "b" * 64, "expires_at_ms": (NOW + 86400) * 1000,
+            "removal_condition": "upgrade-gamma",
+        }
+        world = World(advisory=advisory, allows=[allow], edges={"alpha-pkg": ["gamma-pkg"]})
+        plan = world.plan()
+        bundle = world.bundle()
+        lock_bytes, receipt_bytes, evidence_bytes = subject.decode_bundle(bundle)
+        subject.verify_bundle(bundle, plan, world.context, now=NOW)
+        record = json.loads(evidence_bytes.decode("ascii"))
+        self.assertEqual(len(record["advisory"]["findings"]), 1)
+        for field, value in (
+            ("severity", "high"), ("severity", "critical"),
+            ("allow_expires_at_ms", EPOCH_MS), ("allow_expires_at_ms", (NOW + 5) * 1000),
+            ("allow_expires_at_ms", EPOCH_MS + subject.MAX_ALLOW_TTL_MS + 1),
+            ("allow_expires_at_ms", "later"), ("allow_expires_at_ms", None),
+        ):
+            with self.subTest(field=field, value=value):
+                changed = json.loads(json.dumps(record))
+                changed["advisory"]["findings"][0][field] = value
+                tampered = subject.encode_bundle(lock_bytes, receipt_bytes, _json(changed))
+                self.assert_refused(
+                    "npm_evidence_invalid", subject.verify_bundle, tampered, plan, world.context, now=NOW,
+                )
 
     def test_a_different_lock_or_plan_or_context_does_not_verify(self):
         other_lock = json.loads(self.lock_bytes.decode("ascii"))

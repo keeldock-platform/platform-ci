@@ -1011,6 +1011,24 @@ def _write_project_files(destination, files, relative_paths, worker_uid, primary
         _write_worker_file(current / rel.name, files[relative], worker_uid, primary_gid)
 
 
+def _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid):
+    try:
+        contract._validate_npm_config_files(
+            npm_environment, npm_storage, worker_uid, worker_gid,
+            stage="node_dependency_prepare", substage="lock_generation",
+        )
+    except Exception:
+        _refuse("tool_unavailable")
+
+
+def _npm_lock_absent(contract, project):
+    try:
+        contract._ensure_absent(contract._lock_path(project), reason="lock_already_present")
+    except Exception as error:
+        _refuse("manifest_invalid" if getattr(error, "reason", None) == "lock_already_present"
+                else "tool_unavailable")
+
+
 def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, environment,
                               host_toolchain, capability, rust, deadline, bootstrap, contract,
                               node, npm_cli, source_environ):
@@ -1052,6 +1070,7 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
         _npm_bootstrap_refusal(error)
     try:
         os.chdir(project)
+        _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
         probe = _run_worker(
             rust, (str(node), str(npm_cli), "--version"), worker_uid, npm_environment,
             python_executable, capability, "feedback_lock", deadline,
@@ -1059,10 +1078,13 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
         )
         if probe.returncode != 0 or probe.stdout != (bootstrap.NPM_VERSION + "\n").encode("ascii"):
             _refuse("tool_unavailable")
+        _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
+        _npm_lock_absent(contract, project)
         result = _run_worker(
             rust, command, worker_uid, npm_environment, python_executable, capability,
             "feedback_lock", deadline, allow_nonzero_capture=True, timeout=NPM_RESOLVE_SECONDS,
         )
+        _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
         if result.returncode != 0:
             _refuse("command_failed")
     finally:

@@ -40,9 +40,38 @@ def _dispatch(expiry_offset=3600, **request_changes):
     }
 
 
+class ContractRefusal(Exception):
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
 @unittest.skipUnless(sys.platform != "win32", "the macOS npm admission producer tests require POSIX paths")
 class NpmAdmissionProducerTests(unittest.TestCase):
     def setUp(self):
+        self.events = []
+        self.config_calls = []
+        self.config_failures = set()
+        self.lock_state = None
+
+        def validate(environment, storage, uid, gid, *, stage, substage):
+            self.events.append("config")
+            self.config_calls.append((dict(environment), Path(storage).as_posix(), uid, gid))
+            if len(self.config_calls) in self.config_failures:
+                raise ContractRefusal("tool_unavailable")
+
+        def lock_path(project):
+            return Path(project) / "package-lock.json"
+
+        def ensure_absent(path, *, reason):
+            self.events.append("absent:" + Path(path).as_posix())
+            if self.lock_state is not None:
+                raise ContractRefusal(self.lock_state)
+
+        self.contract = SimpleNamespace(
+            **vars(CONTRACT), _validate_npm_config_files=validate, _lock_path=lock_path,
+            _ensure_absent=ensure_absent,
+        )
         self.world = fixtures.World(policy_epoch_ms=(int(time.time()) - 3600) * 1000)
         self.written = []
         self.directories = []
@@ -55,6 +84,7 @@ class NpmAdmissionProducerTests(unittest.TestCase):
 
     def run_worker(self, rust, argv, uid, environment, python, capability, stage, deadline, **keywords):
         self.commands.append((tuple(argv), dict(environment), stage, keywords))
+        self.events.append("probe" if tuple(argv)[-1] == "--version" else "resolve")
         return self.version if tuple(argv)[-1] == "--version" else self.resolve
 
     def read_file(self, path, *, maximum, owner=0):
@@ -65,7 +95,7 @@ class NpmAdmissionProducerTests(unittest.TestCase):
             dispatch=dispatch or _dispatch(), source=SOURCE, worker_storage=STORAGE, worker_uid=501,
             environment={"HOME": "/h"}, host_toolchain={"python": "/p"},
             capability=SimpleNamespace(PROBE_PRIMARY_GID=20), rust=SimpleNamespace(), deadline=10 ** 12,
-            bootstrap=bootstrap, contract=CONTRACT, node=NODE, npm_cli=NPM_CLI,
+            bootstrap=bootstrap, contract=self.contract, node=NODE, npm_cli=NPM_CLI,
             source_environ={"SOURCE_REPOSITORY_OWNER": "owner", "SOURCE_REPOSITORY_NAME": "name"},
         )
         arguments.update(overrides)
@@ -135,6 +165,43 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         self.assertEqual(environment["npm_config_ignore_scripts"], "true")
         self.assertNotIn("HOME_INHERITED", environment)
         self.assertEqual(environment["HOME"], str(STORAGE / "npm-admission-home" / "home"))
+
+    def test_the_empty_npm_settings_are_rechecked_around_every_worker_command(self):
+        self.execute()
+        lock_path = (STORAGE / "feedback-npm-admission" / "package-lock.json").as_posix()
+        self.assertEqual(
+            self.events, ["config", "probe", "config", "absent:" + lock_path, "resolve", "config"],
+        )
+        home = STORAGE / "npm-admission-home"
+        for environment, storage, uid, gid in self.config_calls:
+            self.assertEqual(storage, home.as_posix())
+            self.assertEqual((uid, gid), (501, 20))
+            self.assertEqual(environment["npm_config_userconfig"], str(home / CONTRACT.USER_CONFIG_NAME))
+            self.assertEqual(environment["npm_config_globalconfig"], str(home / CONTRACT.GLOBAL_CONFIG_NAME))
+
+    def test_a_changed_npm_setting_stops_the_run_at_that_point(self):
+        lock_path = (STORAGE / "feedback-npm-admission" / "package-lock.json").as_posix()
+        full = ["config", "probe", "config", "absent:" + lock_path, "resolve", "config"]
+        for failing, expected in ((1, full[:1]), (2, full[:3]), (3, full)):
+            with self.subTest(failing=failing):
+                self.events = []
+                self.config_calls = []
+                self.config_failures = {failing}
+                self.assertEqual(self.refusal(), "tool_unavailable")
+                self.assertEqual(self.events, expected)
+                self.assertEqual(self.chdirs[-1], SOURCE.as_posix())
+                self.assertEqual(self.fetcher.calls, [])
+
+    def test_an_existing_lock_stops_the_run_before_the_resolver(self):
+        self.lock_state = "lock_already_present"
+        self.assertEqual(self.refusal(), "manifest_invalid")
+        self.assertNotIn("resolve", self.events)
+        self.assertEqual(self.fetcher.calls, [])
+        self.lock_state = "tool_unavailable"
+        self.events = []
+        self.assertEqual(self.refusal(), "tool_unavailable")
+        self.assertNotIn("resolve", self.events)
+        self.assertEqual(self.chdirs[-1], SOURCE.as_posix())
 
     def test_a_wrong_profile_or_missing_tools_refuse_before_anything_runs(self):
         wrong = dict(_dispatch(), profile=producer.PROFILE_BY_KIND["cargo_lock"])

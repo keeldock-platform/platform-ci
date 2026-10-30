@@ -23,6 +23,7 @@ PRODUCER_MODULES = (
     "macos_node_contract",
     "foundation_node_feedback",
     "cargo_lock_bootstrap",
+    "npm_admission_bootstrap",
     "macos_core_bootstrap",
 )
 NOT_ROOT = hasattr(os, "geteuid") and os.geteuid() != 0

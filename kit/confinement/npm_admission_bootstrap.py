@@ -14,6 +14,21 @@ record in one bundle. The bundle is an untrusted proposal: nothing here admits a
 The bundle limits here are the npm admission profile's own limits and never reuse the
 single-use Node lock channel size. Provenance attestations are only recorded as offered or
 not offered; their statements and signatures are not verified in this job.
+
+Operating notes. The full metadata document of each package name is read, because only the
+full document carries per-version publish times; it is capped at MAX_PACKUMENT_BYTES, and a
+larger document fails the run closed with the network reason. If a real package ever exceeds
+the cap, raise the constant together with a test and keep reading the full document. The
+wall clock is read once by the caller before the resolver starts; that single reading serves
+the request expiry and the policy-time checks. The advisory fetch time is read separately,
+after the advisory answer arrives, and it alone decides whether an advisory allow record is
+still unexpired.
+
+An advisory allow record is honoured only when all of these hold: the advisory severity is
+not high or critical; every locked entry of the named package that the advisory covers is a
+development-only entry; the record lists exactly the root direct dependencies whose
+dependency paths reach those entries; and its expiry lies after the policy epoch, no more
+than MAX_ALLOW_TTL_MS after it, and after the advisory fetch time.
 """
 
 import base64
@@ -106,7 +121,11 @@ NODE_VERSION_BYTES = (NODE_VERSION + "\n").encode("ascii")
 NPMRC_BYTES = b"engine-strict=true\nsave-exact=true\nignore-scripts=true\n"
 LIFECYCLE_SCRIPTS = (
     "preinstall", "install", "postinstall", "prepublish", "preprepare", "prepare", "postprepare",
+    "dependencies", "prepack", "postpack",
 )
+MAX_ALLOW_TTL_MS = 90 * 24 * 60 * 60 * 1000
+ALLOW_REFUSED_SEVERITIES = frozenset(("high", "critical"))
+LOCK_EDGE_GROUPS = ("dependencies", "optionalDependencies", "peerDependencies")
 DEPENDENCY_GROUPS = ("dependencies", "devDependencies", "optionalDependencies")
 ROOT_KEYS = frozenset((
     "name", "version", "private", "packageManager", "engines", "workspaces", "scripts",
@@ -431,7 +450,12 @@ def _check_name_list(value, maximum):
     return tuple(value)
 
 
-def _check_allow(record):
+def _allow_expiry_bounded(expires_at_ms, policy_epoch_ms):
+    """An allow lives strictly after the policy epoch and at most MAX_ALLOW_TTL_MS beyond it."""
+    return policy_epoch_ms < expires_at_ms <= policy_epoch_ms + MAX_ALLOW_TTL_MS
+
+
+def _check_allow(record, policy_epoch_ms):
     if (type(record) is not dict or set(record) != set(ALLOW_FIELDS)
             or not adm._valid_package_name(record["name"])
             or type(record["advisory_id"]) is not str
@@ -439,7 +463,8 @@ def _check_allow(record):
             or type(record["removal_condition"]) is not str
             or IDENTIFIER_RE.fullmatch(record["removal_condition"]) is None
             or not _valid_hex(record["justification_sha256"])
-            or type(record["expires_at_ms"]) is not int or record["expires_at_ms"] < 1):
+            or type(record["expires_at_ms"]) is not int or record["expires_at_ms"] < 1
+            or not _allow_expiry_bounded(record["expires_at_ms"], policy_epoch_ms)):
         _refuse("npm_policy_refused")
     consumers = _check_name_list(record["consumers"], 128)
     if not consumers:
@@ -492,7 +517,7 @@ def parse_policy(data):
         "internal_names": internal,
         "licence_allowlist": frozenset(licences),
         "licence_elections": dict(elections),
-        "advisory_allows": [_check_allow(record) for record in allows],
+        "advisory_allows": [_check_allow(record, policy["policy_epoch_ms"]) for record in allows],
     }
 
 
@@ -606,12 +631,6 @@ def _absolute(value):
     )
 
 
-def policy_cutoff_ms(policy_epoch_ms):
-    if type(policy_epoch_ms) is not int or policy_epoch_ms < 1:
-        _refuse("npm_input_invalid")
-    return policy_epoch_ms - MIN_PACKAGE_AGE_SECONDS * 1000
-
-
 def resolve_command(node, npm_cli, cutoff_ms, user_config, global_config):
     """Return the one npm command that resolves a lock without installing or running code."""
     for value in (node, npm_cli, user_config, global_config):
@@ -654,21 +673,6 @@ def build_npm_environment(node, *, home, tmpdir, cache, user_config, global_conf
         "npm_config_fetch_timeout": "30000",
         "npm_config_update_notifier": "false",
     }
-
-
-def injected_environment_names(parent):
-    """Name every inherited variable that could steer npm or the network."""
-    if type(parent) is not dict:
-        _refuse("npm_environment_refused")
-    names = []
-    for name in parent:
-        if type(name) is not str:
-            _refuse("npm_environment_refused")
-        upper = name.upper()
-        if (upper.startswith(("NPM_", "NODE_", "SSL_", "CURL_", "GIT_", "CARGO_"))
-                or upper.endswith("_PROXY") or upper in ("PROXY", "NO_PROXY", "ALL_PROXY")):
-            names.append(name)
-    return tuple(sorted(names))
 
 
 def check_lock(lock_bytes, plan):
@@ -995,25 +999,80 @@ def _advisory_body(entries):
     return {name: sorted(versions) for name, versions in sorted(inventory.items())}
 
 
-def _advisory_allow(allows, direct, name, identifiers, now_ms):
-    for record in allows:
-        if (record["name"] == name and record["advisory_id"] in identifiers
-                and record["expires_at_ms"] > now_ms
-                and all(consumer in direct for consumer in record["consumers"])):
-            return record
-    return None
+def _reachable_paths(packages, start):
+    """Return every lock path reachable from one path over runtime, optional and peer edges."""
+    seen = set()
+    stack = [start]
+    while stack:
+        path = stack.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        entry = packages.get(path)
+        if type(entry) is not dict:
+            continue
+        if entry.get("link") is True and type(entry.get("resolved")) is str:
+            stack.append(entry["resolved"])
+        for group in LOCK_EDGE_GROUPS:
+            edges = entry.get(group, {})
+            if type(edges) is not dict:
+                continue
+            for dependency in edges:
+                target = _resolve_dependency(packages, path, dependency)
+                if target is not None:
+                    stack.append(target)
+    return seen
 
 
-def check_advisories(response_bytes, inventory, allows=(), direct=None, now_ms=0):
+def _direct_reach(lock, direct):
+    """Map each root direct dependency to the set of lock paths its dependency paths reach."""
+    packages = lock["packages"]
+    reach = {}
+    for name in sorted(direct):
+        start = _resolve_dependency(packages, "", name)
+        if start is not None:
+            reach[name] = _reachable_paths(packages, start)
+    return reach
+
+
+def _allow_applies(record, name, versions, severity, entries, reach, fetched_ms, policy_epoch_ms):
+    """Apply every allow rule to one record for one advisory on the locked versions it covers."""
+    if severity in ALLOW_REFUSED_SEVERITIES:
+        return False
+    expires = record["expires_at_ms"]
+    if not _allow_expiry_bounded(expires, policy_epoch_ms) or expires <= fetched_ms:
+        return False
+    affected = {
+        path: entry for path, entry in entries
+        if entry["name"] == name and entry["version"] in versions
+    }
+    if not affected or any(entry.get("dev") is not True for entry in affected.values()):
+        return False
+    consumers = set()
+    covered = set()
+    for root_name, reached in reach.items():
+        hit = set(affected) & reached
+        if hit:
+            consumers.add(root_name)
+            covered |= hit
+    return covered == set(affected) and set(record["consumers"]) == consumers
+
+
+def check_advisories(response_bytes, inventory, allows=(), direct=None, now_ms=0,
+                     lock=None, entries=None, policy_epoch_ms=None):
     """Match the bulk advisory answer against the exact locked versions.
 
-    Every advisory that applies to a locked version blocks the proposal unless a recorded,
-    unexpired development allow names it and all of its consumers are direct dependencies.
+    Every advisory that applies to a locked version blocks the proposal unless a recorded
+    allow covers it. An allow covers an advisory only when its severity is below high, every
+    affected locked entry is development-only, the record names exactly the root direct
+    dependencies that reach those entries, and its expiry is bounded after the policy epoch
+    and still ahead of the advisory fetch time, which is the now_ms value given here.
     """
     record = _strict_json(response_bytes, MAX_ADVISORY_BYTES, "npm_advisory_invalid")
     if type(record) is not dict or set(record) - set(inventory):
         _refuse("npm_advisory_invalid")
     findings = []
+    reach = None
     for name in sorted(record):
         items = record[name]
         if type(items) is not list or len(items) > 10_000:
@@ -1032,16 +1091,33 @@ def check_advisories(response_bytes, inventory, allows=(), direct=None, now_ms=0
             identifiers = {str(identifier)}
             if type(item.get("github_advisory_id")) is str:
                 identifiers.add(item["github_advisory_id"])
+            versions = []
             for version in inventory[name]:
                 try:
                     vulnerable = semver.satisfies(version, item["vulnerable_versions"])
                 except semver.SemverError:
                     _refuse("npm_advisory_invalid")
-                if not vulnerable:
-                    continue
-                allowed = _advisory_allow(allows, direct or {}, name, identifiers, now_ms)
-                if allowed is None:
-                    _refuse("npm_advisory_blocked")
+                if vulnerable:
+                    versions.append(version)
+            if not versions:
+                continue
+            candidates = [
+                allow for allow in allows
+                if allow["name"] == name and allow["advisory_id"] in identifiers
+            ]
+            allowed = None
+            if (candidates and type(lock) is dict and type(entries) is list
+                    and type(policy_epoch_ms) is int):
+                if reach is None:
+                    reach = _direct_reach(lock, direct or {})
+                for candidate in candidates:
+                    if _allow_applies(candidate, name, frozenset(versions), severity, entries,
+                                      reach, now_ms, policy_epoch_ms):
+                        allowed = candidate
+                        break
+            if allowed is None:
+                _refuse("npm_advisory_blocked")
+            for version in versions:
                 findings.append({
                     "name": name, "version": version, "severity": severity,
                     "advisory_id": allowed["advisory_id"], "range": item["vulnerable_versions"],
@@ -1186,6 +1262,17 @@ def validate_receipt(receipt_bytes, lock_bytes, plan, trusted_context):
     return record
 
 
+def _finding_allowed(item, fetched_ms, policy_epoch_ms):
+    """Re-check the parts of a recorded allow that the evidence alone can prove."""
+    if type(item) is not dict:
+        return False
+    expires = item.get("allow_expires_at_ms")
+    return (
+        type(expires) is int and item.get("severity") not in ALLOW_REFUSED_SEVERITIES
+        and _allow_expiry_bounded(expires, policy_epoch_ms) and expires > fetched_ms
+    )
+
+
 def validate_evidence(evidence_bytes, receipt_bytes, lock_bytes, receipt, plan, *, now):
     """Check the evidence against its receipt, lock and plan, the cooling rule and its expiry."""
     if type(evidence_bytes) is not bytes or not 0 < len(evidence_bytes) <= MAX_EVIDENCE_BYTES:
@@ -1232,7 +1319,7 @@ def validate_evidence(evidence_bytes, receipt_bytes, lock_bytes, receipt, plan, 
             or type(advisory["findings"]) is not list
             or advisory["finding_count"] != len(advisory["findings"])
             or (advisory["status"] == "clear") != (not advisory["findings"])
-            or any(type(item) is not dict or item.get("allow_expires_at_ms", 0) <= advisory["fetched_at"] * 1000
+            or any(not _finding_allowed(item, advisory["fetched_at"] * 1000, plan["policy_epoch_ms"])
                    for item in advisory["findings"])):
         _refuse("npm_evidence_invalid")
     return record
@@ -1285,7 +1372,7 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
             archive = _call_adm(adm.verify_tarball, {
                 "name": name, "version": version, "integrity": entry["integrity"],
                 "resolved": entry["resolved"],
-            }, data)
+            }, data, internal_names=plan["internal_names"])
             archive_manifest = _archive_manifest(data)
             archive_licence = licence_text(
                 archive_manifest.get("license", archive_manifest.get("licenses")),
@@ -1317,12 +1404,13 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
     if type(response_bytes) is not bytes:
         _refuse("npm_advisory_invalid")
     check_elections_used(plan, packages)
-    findings = check_advisories(
-        response_bytes, inventory, plan["advisory_allows"], plan["direct"], now * 1000,
-    )
     fetched_at = int((clock if clock is not None else time.time)())
     if fetched_at < now - CLOCK_SKEW_SECONDS:
         _refuse("npm_stale")
+    findings = check_advisories(
+        response_bytes, inventory, plan["advisory_allows"], plan["direct"], fetched_at * 1000,
+        lock=lock, entries=entries, policy_epoch_ms=plan["policy_epoch_ms"],
+    )
     names = {name: len(items) for name, items in groups.items()}
     record = {
         "schema_version": SCHEMA_VERSION,

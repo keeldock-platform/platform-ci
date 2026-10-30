@@ -240,6 +240,12 @@ CORE_CONTRACT_NPM_REQUEST_PATH = re.compile(
     r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.(?:md|json)\Z"
 )
 CORE_CONTRACT_NPM_POLICY_PATH = "dependency-policy.json"
+CORE_CONTRACT_INERT_DEPENDENCY_FILES = frozenset((
+    CORE_CONTRACT_NPM_POLICY_PATH, "docs/dependencies/dependency-policy.schema.json",
+))
+CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH = re.compile(
+    r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.md\Z"
+)
 CORE_CONTRACT_MANIFEST_SECTIONS = frozenset(("package", "dependencies", "dev-dependencies", "lints"))
 CORE_CONTRACT_MANIFEST_INHERITED_KEYS = frozenset((
     "version.workspace", "edition.workspace", "rust-version.workspace", "publish.workspace",
@@ -2207,6 +2213,11 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
     if (concern == CORE_CONTRACT_NPM_ADMISSION_CONCERN
             and (CORE_CONTRACT_NPM_REQUEST_PATH.fullmatch(path) is not None
                  or path == CORE_CONTRACT_NPM_POLICY_PATH)):
+        return "100644"
+    if type(path) is str and (
+        path in CORE_CONTRACT_INERT_DEPENDENCY_FILES
+        or CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH.fullmatch(path) is not None
+    ):
         return "100644"
     return _core_contract_package_mode(
         path, feedback_profile=concern in FEEDBACK_PROFILE_CONCERNS,

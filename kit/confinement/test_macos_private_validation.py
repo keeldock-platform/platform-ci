@@ -871,6 +871,37 @@ class CoreContractTreeTests(unittest.TestCase):
                     "Package-lock.json", concern=concern,
                 ))
 
+    def test_dependency_policy_files_are_inert_inputs_for_every_core_concern(self):
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            for path in (
+                "dependency-policy.json",
+                "docs/dependencies/dependency-policy.schema.json",
+                "docs/dependencies/ui-npm-admission-batch-a.md",
+                "docs/dependencies/p2-exact-file-allowlist.md",
+            ):
+                with self.subTest(concern=concern, path=path):
+                    self.assertEqual(
+                        subject._core_contract_expected_mode(path, concern=concern), "100644",
+                    )
+
+    def test_other_dependency_paths_stay_npm_admission_only_or_refused(self):
+        other_json = "docs/dependencies/other-note.json"
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            expected = "100644" if concern == "core-npm-admission-return" else None
+            with self.subTest(concern=concern, path=other_json):
+                self.assertEqual(
+                    subject._core_contract_expected_mode(other_json, concern=concern), expected,
+                )
+            for path in (
+                "dependency-policy.toml.json", "Dependency-policy.json", "dependency-policy.json/x",
+                "sub/dependency-policy.json", "docs/dependencies/sub/note.md",
+                "docs/dependencies/Note.md", "docs/dependencies/.md", "docs/dependencies/note.md.sh",
+                "docs/dependency/note.md", "docs/dependencies/note.MD", "docs/dependencies/-note.md",
+                "docs/dependencies/dependency-policy.schema.yaml",
+            ):
+                with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
     @staticmethod
     def _four_crate_entries(concern):
         entries = CoreContractTreeTests._required_core_contract_entries(concern)
