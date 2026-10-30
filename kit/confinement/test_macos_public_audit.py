@@ -73,6 +73,8 @@ def core_contract_value():
             "format": "passed", "clippy": "passed", "workspace_tests": "passed",
             "api_tests": "passed", "mock_tests": "passed", "conformance_tests": "passed",
         },
+        "selected_gates": list(audit.CORE_CONTRACT_BASE_GATE_NAMES),
+        "completed_gates": list(audit.CORE_CONTRACT_BASE_GATE_NAMES),
         "gate_count": 6,
         "gates_passed": 6,
         "gates_failed": 0,
@@ -2148,6 +2150,90 @@ class CoreContractReceiptTests(unittest.TestCase):
                 changed[key] = value
                 with self.assertRaises(audit.AuditRefusal):
                     audit._inspect_core_contract_receipt(raw, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, changed)
+
+    def _contract_success_payload(self, include_runtime, mutate=None):
+        import macos_core_contract as core_contract
+
+        gates = {name: "passed" for name in core_contract.GATE_NAMES}
+        if include_runtime:
+            gates.update({name: "passed" for name in core_contract.RUNTIME_GATE_NAMES})
+        record = core_contract._build_success_record(
+            {
+                "control_sha": CONTROL_SHA, "run_id": RUN_ID, "run_attempt": RUN_ATTEMPT,
+                "image_os": "macos-15-arm64", "image_version": "20261027.0337.1",
+            },
+            {"source_sha": "b" * 40, "base_sha": "a" * 40, "base_branch": "develop"},
+            {"repository_id": "1430959909", "candidate_class": "signed-descendant"},
+            "c" * 64,
+            {"rustc": "1.99.1 (58cf8f9c3 2026-10-13)", "cargo": "1.99.1",
+             "rustfmt": "1.10.0", "clippy": "0.1.99"},
+            gates,
+        )
+        if mutate is not None:
+            mutate(record)
+        return json.dumps(
+            record, ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+        ).encode("ascii")
+
+    def test_success_value_accepts_the_contract_record_with_and_without_runtime_gates(self):
+        import macos_core_contract as core_contract
+
+        self.assertEqual(audit.CORE_CONTRACT_BASE_GATE_NAMES, core_contract.GATE_NAMES)
+        self.assertEqual(audit.CORE_CONTRACT_RUNTIME_GATE_NAMES, core_contract.RUNTIME_GATE_NAMES)
+        self.assertTrue(set(core_contract.RUNTIME_GATE_NAMES) <= audit.CORE_CONTRACT_REFUSAL_STAGES)
+        self.assertTrue(set(core_contract.RUNTIME_GATE_NAMES) <= audit.CORE_CONTRACT_GATE_STAGES)
+        context = audit._core_contract_context(
+            core_contract_publish_environment(), require_protected_binding=True,
+        )
+        for include_runtime, count in ((False, 6), (True, 9)):
+            with self.subTest(include_runtime=include_runtime):
+                payload = self._contract_success_payload(include_runtime)
+                value = audit._core_contract_success_value(
+                    payload, context, "macos-15-arm64", "20261027.0337.1",
+                )
+                self.assertEqual(value["gate_count"], count)
+                self.assertEqual(value["selected_gates"], value["completed_gates"])
+                self.assertEqual(len(value["gates"]), count)
+
+    def test_success_value_refuses_inconsistent_gate_shapes(self):
+        context = audit._core_contract_context(
+            core_contract_publish_environment(), require_protected_binding=True,
+        )
+
+        def drop_completed(record):
+            record["completed_gates"] = record["completed_gates"][:-1]
+
+        def wrong_count(record):
+            record["gate_count"] = 6
+
+        def partial_runtime(record):
+            del record["gates"]["runtime_tests"]
+            record["selected_gates"] = record["selected_gates"][:-1]
+            record["completed_gates"] = record["completed_gates"][:-1]
+            record["gate_count"] = 8
+            record["gates_passed"] = 8
+
+        def reordered(record):
+            record["selected_gates"] = list(reversed(record["selected_gates"]))
+
+        def failed_gate(record):
+            record["gates"]["runtime_clippy"] = "failed"
+
+        def missing_lists(record):
+            del record["selected_gates"]
+            del record["completed_gates"]
+
+        for name, mutate in (
+            ("drop_completed", drop_completed), ("wrong_count", wrong_count),
+            ("partial_runtime", partial_runtime), ("reordered", reordered),
+            ("failed_gate", failed_gate), ("missing_lists", missing_lists),
+        ):
+            with self.subTest(case=name):
+                payload = self._contract_success_payload(True, mutate)
+                with self.assertRaises(audit.AuditRefusal):
+                    audit._core_contract_success_value(
+                        payload, context, "macos-15-arm64", "20261027.0337.1",
+                    )
 
 
 class SourceReaderAuditTests(unittest.TestCase):

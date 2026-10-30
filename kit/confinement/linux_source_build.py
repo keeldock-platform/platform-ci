@@ -1490,7 +1490,8 @@ def _open_verified_directory(root_fd, relative_parts, identities):
 
 
 def _rust_lock_paths(root_fd):
-    ignored = {".git", "target", "node_modules", ".kd-cargo-home", ".npm-cache", ".kd-npm-tarballs"}
+    ignored = {".git", "target", "node_modules", ".kd-cargo-home", ".npm-cache"}
+    root_only_ignored = {".kd-npm-tarballs"}
     paths = []
     root_identity = _directory_identity(os.fstat(root_fd))
     pending = [((), (root_identity,))]
@@ -1513,7 +1514,7 @@ def _rust_lock_paths(root_fd):
                             or total_entries > MAX_TREE_ENTRIES):
                         raise SourceBuildRefusal("lock")
                     name = entry.name
-                    if name in ignored:
+                    if name in ignored or (not relative_parts and name in root_only_ignored):
                         continue
                     metadata = os.stat(name, dir_fd=current, follow_symlinks=False)
                     if stat.S_ISLNK(metadata.st_mode):

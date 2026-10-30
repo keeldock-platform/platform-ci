@@ -963,19 +963,16 @@ foreach ($case in $cases) {
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, workflow)
 
-    def test_license_guard_uses_variables_the_windows_workflow_sets(self):
-        start = self.wrapper.index("function Assert-RustLicenseAdmission")
-        end = self.wrapper.index("function Invoke-Ladder")
-        guard = self.wrapper[start:end]
+    def test_windows_has_no_source_mode_so_the_rust_licence_gate_is_linux_only(self):
+        """Windows has no source mode: the only ladder entry is the spike mode, which
+        already refuses unless the run is a manual dispatch on main, and no Windows
+        workflow sets a source mode. The Rust licence gate therefore applies to Linux
+        source admission only, and the wrapper carries no separate licence guard."""
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        for name in ("CI_EVENT_NAME", "CI_REF"):
-            with self.subTest(name=name):
-                self.assertIn("$env:" + name, guard)
-                self.assertIn("      " + name + ": ", workflow)
-        self.assertIn("-not $confined", guard)
-        self.assertIn("throw 'archive_producer_unavailable'", guard)
-        self.assertIn("Assert-RustLicenseAdmission $confined", self.wrapper[end:])
-        self.assertNotIn("CI_MODE -ne 'source') { return }", guard)
+        self.assertNotIn("CI_MODE", workflow)
+        self.assertNotIn("CI_MODE", self.wrapper)
+        self.assertNotIn("Assert-RustLicenseAdmission", self.wrapper)
+        self.assertNotIn("archive_producer_unavailable", self.wrapper)
 
 
 if __name__ == "__main__":

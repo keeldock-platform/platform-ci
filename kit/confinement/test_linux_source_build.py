@@ -426,6 +426,20 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 found = linux_source_build._rust_lock_paths(descriptor)
             self.assertEqual([item[0] for item in found], [("Cargo.lock",)])
 
+    def test_cargo_lock_discovery_scans_a_nested_npm_tarball_named_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve() / "source"
+            nested = root / "sub" / ".kd-npm-tarballs"
+            nested.mkdir(parents=True)
+            (root / "Cargo.lock").write_bytes(b"version = 4\n")
+            (nested / "Cargo.lock").write_bytes(b"version = 4\n")
+            descriptor = self._root_descriptor(root)
+            found = linux_source_build._rust_lock_paths(descriptor)
+            self.assertEqual(
+                sorted(item[0] for item in found),
+                [("Cargo.lock",), ("sub", ".kd-npm-tarballs", "Cargo.lock")],
+            )
+
     def test_cargo_lock_directory_entry_materialization_is_bounded(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()

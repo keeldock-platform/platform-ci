@@ -364,7 +364,8 @@ CORE_CONTRACT_REFUSAL_STAGES = frozenset((
     "arguments", "context", "host", "source_validation", "source_lease", "source_tree",
     "source_diff", "toolchain_install", "worker_setup", "summary_guard", "observer",
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
-    "conformance_tests", "cleanup", "receipt", "internal",
+    "conformance_tests", "runtime_format", "runtime_clippy", "runtime_tests",
+    "cleanup", "receipt", "internal",
 ))
 CORE_CONTRACT_RUNTIME_REASONS = frozenset((
     "invalid_input", "context_unavailable", "configuration_unavailable",
@@ -415,7 +416,18 @@ CORE_CONTRACT_GATE_DIAGNOSTICS = frozenset((
 ))
 CORE_CONTRACT_GATE_STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "runtime_format", "runtime_clippy", "runtime_tests",
 ))
+CORE_CONTRACT_BASE_GATE_NAMES = (
+    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+)
+CORE_CONTRACT_RUNTIME_GATE_NAMES = (
+    "runtime_format", "runtime_clippy", "runtime_tests",
+)
+CORE_CONTRACT_SUCCESS_GATE_SHAPES = (
+    CORE_CONTRACT_BASE_GATE_NAMES,
+    CORE_CONTRACT_BASE_GATE_NAMES + CORE_CONTRACT_RUNTIME_GATE_NAMES,
+)
 CORE_CONTRACT_SOURCE_GATES_SURVIVOR_CLASSES = (
     "python", "ps", "developer_shim", "helper_preferences", "helper_notifications",
     "helper_launch_services", "helper_security", "helper_trust", "helper_containers",
@@ -1552,7 +1564,8 @@ def _core_contract_success_value(payload, context, image_os, image_version):
         "schema_version", "concern", "status", "control_sha", "source_sha", "base_sha",
         "base_branch", "reviewed_diff_sha256", "run_id", "run_attempt", "repository_id",
         "candidate_class", "signer_authority", "signatures", "ancestry", "token_revocation",
-        "offline", "image_os", "image_version", "toolchain_versions", "gates", "gate_count",
+        "offline", "image_os", "image_version", "toolchain_versions", "gates", "selected_gates",
+        "completed_gates", "gate_count",
         "gates_passed", "gates_failed", "suites", "suite_count", "suites_passed",
         "suites_failed", "source_tree", "lease_cleanup", "process_cleanup", "identity_cleanup", "summary_guard",
         "summary_guard_bypass_test", "positive_sentinel", "network_observation",
@@ -1579,12 +1592,6 @@ def _core_contract_success_value(payload, context, image_os, image_version):
         "offline": True,
         "image_os": image_os,
         "image_version": image_version,
-        "gates": {
-            "format": "passed", "clippy": "passed", "workspace_tests": "passed",
-            "api_tests": "passed", "mock_tests": "passed", "conformance_tests": "passed",
-        },
-        "gate_count": 6,
-        "gates_passed": 6,
         "gates_failed": 0,
         "suites": ["core.static", "core.host-api", "core.mock-host", "core.conformance"],
         "suite_count": 4,
@@ -1599,6 +1606,23 @@ def _core_contract_success_value(payload, context, image_os, image_version):
         "positive_sentinel": "passed",
         "network_observation": "captured",
     }
+    gates = value.get("gates")
+    if type(gates) is not dict:
+        _fail("capture_invalid")
+    gate_names = tuple(gates)
+    if gate_names not in CORE_CONTRACT_SUCCESS_GATE_SHAPES:
+        _fail("capture_invalid")
+    if any(type(gates[name]) is not str or gates[name] != "passed" for name in gate_names):
+        _fail("capture_invalid")
+    for key in ("selected_gates", "completed_gates"):
+        listed = value.get(key)
+        if (type(listed) is not list or len(listed) != len(gate_names)
+                or any(type(name) is not str for name in listed)
+                or tuple(listed) != gate_names):
+            _fail("capture_invalid")
+    for key in ("gate_count", "gates_passed"):
+        if not _exact_int(value.get(key), 0) or value[key] != len(gate_names):
+            _fail("capture_invalid")
     for key, expected_value in expected.items():
         if type(expected_value) is int:
             if not _exact_int(value.get(key), 0) or value[key] != expected_value:
