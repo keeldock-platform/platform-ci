@@ -113,7 +113,7 @@ NODE_REFUSAL_CODES = frozenset((
     "encryption_failed",
 ))
 NODE_DETAILS = frozenset("node_" + code for code in NODE_REFUSAL_CODES)
-NODE_STDERR_RE = re.compile(r"KD-FEEDBACK-ENCRYPTION-REFUSAL(?: ([a-z_]{1,40}))?\n\Z")
+NODE_STDERR_RE = re.compile(r"KD-FEEDBACK-ENCRYPTION-REFUSAL(?: ([a-z0-9_]{1,40}))?\n\Z")
 
 
 class FeedbackRefusal(Exception):
