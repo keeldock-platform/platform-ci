@@ -2272,7 +2272,9 @@ class CoreContractReceiptTests(unittest.TestCase):
         self.assertEqual(audit.CORE_CONTRACT_RUNTIME_GATE_NAMES, core_contract.RUNTIME_GATE_NAMES)
         self.assertTrue(set(core_contract.RUNTIME_GATE_NAMES) <= audit.CORE_CONTRACT_REFUSAL_STAGES)
         self.assertTrue(set(core_contract.RUNTIME_GATE_NAMES) <= audit.CORE_CONTRACT_GATE_STAGES)
-        context = audit._core_contract_context(
+        self.assertEqual(audit.CORE_CONTRACT_REFUSAL_STAGES, core_contract.STAGES)
+        self.assertEqual(audit.CORE_CONTRACT_GATE_STAGES, frozenset(core_contract.SOURCE_GATE_STAGES))
+        context =audit._core_contract_context(
             core_contract_publish_environment(), require_protected_binding=True,
         )
         for include_runtime, count in ((False, 6), (True, 9)):

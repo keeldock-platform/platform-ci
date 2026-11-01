@@ -87,11 +87,8 @@ DIAGNOSTIC_GATE_SELECTIONS = (
     DIAGNOSTIC_BASE_GATES, DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES,
     DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES + DIAGNOSTIC_NODE_GATES,
 )
-# Text classes the Node encryptor refuses (development_feedback.mjs decodeText): NUL, CR, C0 other
-# than tab and newline, DEL and C1. The encryptor keeps refusing them; the producer escapes them
-# first (see sanitize_diagnostic_stream). The line limits mirror DEVELOPMENT_FEEDBACK_LIMITS and
-# the per-stream line cap leaves room for the header and the two fixed marker lines.
 UNSAFE_DIAGNOSTIC_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+DISPLAY_UNSAFE_DIAGNOSTIC_RE = re.compile(r"[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 DIAGNOSTIC_MAX_LINES = 8192
 DIAGNOSTIC_MAX_LINE_UNITS = 8192
 DIAGNOSTIC_STREAM_MAX_LINES = 4000
@@ -1188,7 +1185,6 @@ def build_diagnostic_payload(outcome):
         text = payload.decode("utf-8", "strict")
     except UnicodeError:
         _refuse("payload_invalid")
-    # Defence in depth: the sanitiser must already have removed everything the encryptor refuses.
     if (UNSAFE_DIAGNOSTIC_RE.search(text) is not None
             or text.count("\n") + 1 > DIAGNOSTIC_MAX_LINES
             or any(_utf16_units(line) > DIAGNOSTIC_MAX_LINE_UNITS for line in text.split("\n"))):
@@ -1237,6 +1233,10 @@ def sanitize_diagnostic_stream(raw, truncated):
     Escape form (documented, deterministic, ASCII only): an incomplete trailing UTF-8 sequence from
     a byte cut is dropped; any other invalid UTF-8 byte becomes \\xNN; NUL, CR, C0 controls other
     than tab and newline, DEL and C1 controls become \\u{h...h} (lowercase hex, at least two digits).
+    The bidirectional controls U+061C, U+200E, U+200F, U+202A to U+202E and U+2066 to U+2069 get the
+    same form, so project text cannot visually reorder the body in a terminal or editor. Literal
+    backslashes are not escaped, so the form is not injective: project text that already reads
+    \\u{1b} gives the same bytes as an escaped ESC. No consumer may ever un-escape it.
     The result is then bounded to DIAGNOSTIC_STREAM_MAX_LINES lines of DIAGNOSTIC_MAX_LINE_UNITS
     UTF-16 units, so escaping growth can never push the payload past the encryptor's line limits.
     Returns (bytes, truncated) where truncated also covers any cut made here."""
@@ -1244,6 +1244,7 @@ def sanitize_diagnostic_stream(raw, truncated):
         _refuse("capture_invalid")
     data = _trim_incomplete_utf8(raw) if truncated else raw
     text = UNSAFE_DIAGNOSTIC_RE.sub(_escape_unsafe_character, data.decode("utf-8", "backslashreplace"))
+    text = DISPLAY_UNSAFE_DIAGNOSTIC_RE.sub(_escape_unsafe_character, text)
     lines = text.split("\n")
     cut = False
     if len(lines) > DIAGNOSTIC_STREAM_MAX_LINES:

@@ -367,7 +367,6 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                     producer._parse_producer_line(altered, kind, environment)
 
     def test_build_diagnostic_payload_marks_truncated_streams_and_keeps_failure_stage(self):
-        # Short lines: the payload now stays inside the encryptor's per-line limit (8192 units).
         stdout_prefix = (b"bounded stdout\n" + (b"x" * 63 + b"\n") * 600)[:32_768]
         stderr_prefix = (b"bounded stderr\n" + (b"y" * 63 + b"\n") * 600)[:32_768]
         self.assertEqual((len(stdout_prefix), len(stderr_prefix)), (32_768, 32_768))
@@ -436,10 +435,9 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         payload = producer.build_diagnostic_payload(self._failed_outcome(raw, raw))
         body = self._body(payload).decode("utf-8")
         expected = ("a\\u{00}b\\u{0d}c\\u{1b}[31md\\u{08}e\\u{7f}f\tg\nh"
-                    "\\u{80}i\\u{85}j\\u{9f}k l‮m")
+                    "\\u{80}i\\u{85}j\\u{9f}k l\\u{202e}m")
         self.assertEqual(body, expected + "\nstderr:\n" + expected)
         self.assertIsNone(producer.UNSAFE_DIAGNOSTIC_RE.search(payload.decode("utf-8")))
-        # Deterministic: the same input gives the same bytes.
         self.assertEqual(payload, producer.build_diagnostic_payload(self._failed_outcome(raw, raw)))
 
     def test_build_diagnostic_payload_escapes_invalid_utf8_in_the_middle_deterministically(self):
@@ -456,11 +454,9 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                     self._failed_outcome(b"line\n" + tail, b"err\n" + tail, True, True))
                 self.assertEqual(self._body(payload), b"line\n\nstderr:\nerr\n")
                 self.assertIn(b"stdout_truncated=true stderr_truncated=true", payload)
-        # A complete multi-byte character at the cut is kept.
         payload = producer.build_diagnostic_payload(
             self._failed_outcome("ok ⎯".encode("utf-8"), b"", True, False))
         self.assertEqual(self._body(payload), "ok ⎯\nstderr:\n".encode("utf-8"))
-        # Without a truncation flag an incomplete tail is genuine invalid data: escaped, not dropped.
         payload = producer.build_diagnostic_payload(self._failed_outcome(b"line\xe2\x8e", b"", False, False))
         self.assertEqual(self._body(payload), b"line\\xe2\\x8e\nstderr:\n")
 
@@ -474,7 +470,6 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertTrue(all(len(line) <= producer.DIAGNOSTIC_MAX_LINE_UNITS for line in text.split("\n")))
         self.assertIn(b"stdout_truncated=true stderr_truncated=true", payload)
         self.assertIn(b"z" * producer.DIAGNOSTIC_MAX_LINE_UNITS + b"\n", payload + b"\n")
-        # Escaping growth: 32768 NUL bytes become 6 bytes each and stay under the payload cap.
         grown = producer.build_diagnostic_payload(self._failed_outcome(b"\x00" * 32_768, b"\x1b" * 32_768))
         self.assertLessEqual(len(grown), 512 * 1024)
         self.assertLessEqual(grown.decode("utf-8").count("\n") + 1, producer.DIAGNOSTIC_MAX_LINES)

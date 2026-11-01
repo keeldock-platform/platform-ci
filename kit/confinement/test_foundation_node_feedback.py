@@ -785,8 +785,8 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
             self._passed_rust_outcome(), fail_node, FakeContract("verify"),
         )
 
-    def test_stage_less_refusal_after_prepare_reports_the_gate_that_was_running(self):
-        for claimed in ("node_dependency_prepare", "typescript_tests", "node_dependency_audit"):
+    def test_prepare_stage_after_prepare_reports_the_gate_that_was_running(self):
+        for claimed in ("node_dependency_prepare", "node_dependency_audit"):
             refusal = NodeContractRefusal(
                 "capture_invalid", stage=claimed, substage="bulk_audit", stderr=b"helper stderr",
                 completed_stages=subject.NODE_GATE_NAMES[:1],
@@ -795,11 +795,13 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                 outcome = self._extend_with(refusal)
                 self.assertEqual(outcome["failed_stage"], "node_dependency_audit")
                 self.assertEqual(outcome["completed"], subject.RUST_FOUNDATION_GATES + subject.NODE_GATE_NAMES[:1])
-        outcome = self._extend_with(NodeContractRefusal(
-            "manifest_invalid", stage="bogus", completed_stages=(),
-        ))
-        self.assertEqual(outcome["failed_stage"], "node_dependency_prepare")
-        self.assertEqual(outcome["completed"], subject.RUST_FOUNDATION_GATES)
+        for claimed, completed in (
+            ("typescript_tests", subject.NODE_GATE_NAMES[:1]), ("bogus", ()), ("bogus", subject.NODE_GATE_NAMES[:1]),
+        ):
+            refusal = NodeContractRefusal("manifest_invalid", stage=claimed, completed_stages=completed)
+            with self.subTest(claimed=claimed, completed=completed), self.assertRaises(subject.NodeOutcomeInvalid) as caught:
+                self._extend_with(refusal)
+            self.assertEqual(caught.exception.check, "stage")
 
     def test_completed_stages_that_are_not_an_ordered_proper_prefix_are_still_refused(self):
         for completed in (
@@ -948,7 +950,6 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertFalse(path.endswith(".rs"))
                 self.assertFalse(path.startswith("crates/") and not path.endswith(".jsonl"))
-        # A verify copy adds only reviewed TypeScript files; it never adds a Rust source.
         for relative in ("crates/host/api/src/vault/error.rs", "crates/host/api/src/lib.rs"):
             self.assertNotIn(relative, subject.NODE_REVIEWED_FILES)
 

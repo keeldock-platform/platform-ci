@@ -402,7 +402,6 @@ class RustToolchainContractTests(unittest.TestCase):
         three = "⎯".encode("utf-8")
         four = "\U0001f600".encode("utf-8")
         cases = (
-            # (stdout, stderr, kept stdout size, kept stderr size, stdout cut, stderr cut)
             (b"a" * (limit - 1) + three, b"b" * (limit - 2) + four, limit - 1, limit - 2, True, True),
             (b"a" * (limit - 2) + three, b"b" * (limit - 3) + four, limit - 2, limit - 3, True, True),
             (b"a" * (limit - 3) + three + b"zz", b"b" * (limit - 4) + four + b"z", limit, limit, True, True),

@@ -20,11 +20,6 @@ NODE_WORKSPACE_PACKAGES = ("packages/host-api", "packages/kernel-i18n")
 BOOTSTRAP_MANIFESTS = (
     "package.json", "packages/host-api/package.json", "packages/kernel-i18n/package.json",
 )
-# Copy set: the confined Node project holds exactly NODE_FIXED_FILES (which includes the two i18n
-# fixtures), NODE_REVIEWED_FILES and the reviewed packages/*/{src,tests} TypeScript. No Rust source
-# (.rs) and nothing else from the checkout is copied, so TypeScript tests must not import files
-# outside this set (for example `?raw` imports of crates/**/*.rs): such a suite cannot load in
-# confinement. The set is pinned by test_foundation_node_feedback.py.
 NODE_EXTRA_FILES = frozenset((
     "packages/kernel-i18n/tests/support.ts",
 ))
@@ -600,15 +595,14 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
             raise
         node_stage = error.stage
         completed_node = getattr(error, "completed_stages", None)
-        # The gates run in order, so a proper ordered prefix of completed gates names the gate that
-        # was running: the first one not completed. A stage that disagrees with it (a refusal raised
-        # without its own stage) is replaced by that gate; anything else is still refused.
         if (type(completed_node) is not tuple or len(completed_node) >= len(NODE_GATE_NAMES)
                 or completed_node != NODE_GATE_NAMES[:len(completed_node)]):
             raise NodeOutcomeInvalid("node diagnostic invalid", "stage") from None
+        if node_stage == NODE_GATE_NAMES[0] and completed_node:
+            node_stage = NODE_GATE_NAMES[len(completed_node)]
         if (type(node_stage) is not str or node_stage not in NODE_GATE_NAMES
                 or completed_node != NODE_GATE_NAMES[:NODE_GATE_NAMES.index(node_stage)]):
-            node_stage = NODE_GATE_NAMES[len(completed_node)]
+            raise NodeOutcomeInvalid("node diagnostic invalid", "stage") from None
         raw_stdout = getattr(error, "stdout", b"")
         raw_stderr = getattr(error, "stderr", b"")
         if (type(raw_stdout) is not bytes or type(raw_stderr) is not bytes
@@ -625,7 +619,6 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
         metadata = ("node_reason=" + reason + " node_substage=" + substage + "\n").encode("ascii")
         room = max(0, 32_768 - len(metadata))
         stderr_cut = len(raw_stderr) > room
-        # The cut must not leave a partial UTF-8 sequence; the dropped bytes count as truncation.
         stderr = metadata + (_trim_incomplete_utf8(raw_stderr[:room]) if stderr_cut else raw_stderr)
         returncode = getattr(error, "returncode", None)
         if type(returncode) is not int or not 1 <= returncode <= 255:

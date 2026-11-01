@@ -1160,7 +1160,6 @@ class CoreContractTests(unittest.TestCase):
             self._tagged_error("payload_invalid", "private", "payload_invalid"),
             self._tagged_error("payload_invalid", "payload", 7),
             self._tagged_error("payload_invalid", 7, "payload_invalid"),
-            # The tag names a capture failure but the error's own reason does not agree with it.
             self._tagged_error("command_failed", "payload", "capture_invalid"),
             self._tagged_error("command_failed", "node_profile", "capture_invalid"),
             self._tagged_error(None, "node_outcome", "private"),
@@ -1552,8 +1551,6 @@ class CoreContractTests(unittest.TestCase):
                         raise cause
 
                     rust = SimpleNamespace(_run_worker_command=fail_command)
-                    # A clean timeout is only a gate result in capture mode; the survivor-bearing
-                    # and mismatching shapes must refuse in both modes.
                     if (capture_failure and expected == "source_gates_timeout"
                             and attributes.get("survivor_classes") == ()):
                         continue
@@ -1732,7 +1729,7 @@ class CoreContractTests(unittest.TestCase):
 
         def fail_command(*unused_args, **kwargs):
             self.assertEqual(kwargs["deadline"], 50.0)
-            clock["now"] = 100.0  # the wait ran past the job deadline
+            clock["now"] = 100.0
             raise cause
 
         with patch.object(subject, "_source_commands", return_value=(
@@ -1757,7 +1754,7 @@ class CoreContractTests(unittest.TestCase):
 
         def fail_command(*unused_args, **kwargs):
             self.assertEqual(kwargs["deadline"], 50.0)
-            clock["now"] = 49.0  # the wait ended just inside the job deadline
+            clock["now"] = 49.0
             raise cause
 
         with patch.object(subject, "_source_commands", return_value=(

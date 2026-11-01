@@ -667,7 +667,6 @@ def _run_node_contract(
     remaining_ms = max(1, min(MAX_AUDIT_SECONDS * 1000,
                               int((deadline - time.monotonic()) * 1000)))
     audit_deadline_ms = now_for_audit + remaining_ms
-    # Prepare is complete here, so every refusal from now on belongs to the audit stage.
     request = _request_bytes(
         mode, lock_bytes, expected_manifest, identity, npm, generation_proof, accepted,
         now_for_audit, audit_deadline_ms, policy_epoch_ms if mode == "bootstrap" else None,
@@ -682,9 +681,6 @@ def _run_node_contract(
             stage="node_dependency_audit", substage="bulk_audit", project=project_path,
             environment=environment, deadline=deadline, timeout=MAX_AUDIT_SECONDS,
         )
-        # A non-zero exit is checked before the stdout is parsed: only a refusal document (the
-        # helper's own, exit 1) is read for its reason; any other output is a failed helper and keeps
-        # its captured streams.
         if audited.returncode != 0 and not _is_refusal_document(audited.stdout):
             _capture_failure(audited, "audit_response_invalid", stage="node_dependency_audit",
                              substage="bulk_audit")

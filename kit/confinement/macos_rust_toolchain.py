@@ -98,7 +98,7 @@ if err_overflow == 1:
     trim_incomplete_utf8(err)
 if status < 0:
     status = 256
-header =("KD-CAPTURE 1 %d %d %d %d %d\\n"
+header = ("KD-CAPTURE 1 %d %d %d %d %d\\n"
           % (status, len(out), len(err), out_overflow, err_overflow)).encode("ascii")
 def write_all(fd, data):
     offset = 0
