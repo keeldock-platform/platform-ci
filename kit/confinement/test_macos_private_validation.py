@@ -939,14 +939,16 @@ class CoreContractTreeTests(unittest.TestCase):
                 self.assertFalse(path.endswith("build.rs") or "*" in path or path.endswith("/"))
                 self.assertFalse(subject._runtime_workspace_path(path))
 
-    def test_batch5_paths_are_admitted_for_build_diagnostics_only(self):
+    def test_batch5_paths_are_admitted_for_the_two_batch5_concerns_only(self):
         concern = subject.CORE_CONTRACT_BATCH5_CONCERN
         for path in sorted(self._batch5_paths()):
             with self.subTest(path=path):
                 self.assertEqual(subject._core_contract_expected_mode(path, concern=concern), "100644")
                 self.assertIsNone(subject._core_contract_expected_mode(path))
                 self.assertFalse(subject._core_contract_foundation_path(path))
-                for other in sorted(subject.CORE_CONTRACT_CONCERNS - {concern}):
+                for other in sorted(
+                    subject.CORE_CONTRACT_CONCERNS - subject.CORE_CONTRACT_BATCH5_CONCERNS
+                ):
                     self.assertIsNone(subject._core_contract_expected_mode(path, concern=other))
                 self.assertIsNone(subject._core_contract_expected_mode(path, concern="rules-bootstrap"))
 
@@ -1014,6 +1016,93 @@ class CoreContractTreeTests(unittest.TestCase):
         self.assertEqual(self._refused_check(
             other, "core-rust-format-return", workspace_text=self._workspace_text(members),
         ), "path_mode")
+
+    def test_batch5_concern_set_is_exactly_diagnostics_and_npm_admission(self):
+        self.assertEqual(
+            subject.CORE_CONTRACT_BATCH5_CONCERNS,
+            frozenset(("core-build-diagnostic-return", "core-npm-admission-return")),
+        )
+        self.assertTrue(subject.CORE_CONTRACT_BATCH5_CONCERNS <= subject.CORE_CONTRACT_CONCERNS)
+
+    def test_npm_admission_admits_every_batch5_path_and_still_refuses_unlisted_paths(self):
+        concern = "core-npm-admission-return"
+        for path in sorted(self._batch5_paths()):
+            with self.subTest(path=path):
+                self.assertEqual(subject._core_contract_expected_mode(path, concern=concern), "100644")
+        for path in (
+            "crates/host/api/src/entitlements/other.tsv",
+            "tools/s0-vectors-independent/src/extra.rs",
+            "tools/s0-vectors-independent/build.rs",
+            "tools/xtask/build.rs",
+            "tools/xtask/src/new_tool/extra.rs",
+            "tools/other/README.md",
+            "docs/admission/sync-crypto/NEW-NOTE.md",
+            "docs/admission/sync-crypto/sub/REGISTRY-METADATA.json",
+        ):
+            with self.subTest(path=path):
+                self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_other_concerns_stay_unchanged_for_batch5_and_dependency_paths(self):
+        batch5 = sorted(self._batch5_paths())[:3]
+        for concern in (
+            "core-contract", "core-node-lock-return", "core-rust-format-return",
+            "core-rust-lock-return",
+        ):
+            for path in batch5:
+                with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+            with self.subTest(concern=concern, path="dependency-policy.json"):
+                self.assertEqual(
+                    subject._core_contract_expected_mode("dependency-policy.json", concern=concern),
+                    "100644",
+                )
+            with self.subTest(concern=concern, path="docs/dependencies/other-note.json"):
+                self.assertIsNone(subject._core_contract_expected_mode(
+                    "docs/dependencies/other-note.json", concern=concern,
+                ))
+
+    def test_build_diagnostics_admits_the_npm_filing_files_as_inert_data(self):
+        concern = subject.CORE_CONTRACT_BATCH5_CONCERN
+        for path in (
+            "dependency-policy.json",
+            "docs/dependencies/dependency-policy.schema.json",
+            "docs/dependencies/p2-exact-file-allowlist.md",
+            "docs/dependencies/ui-npm-admission-batch-a.md",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(subject._core_contract_expected_mode(path, concern=concern), "100644")
+
+    def test_npm_filing_and_batch5_tree_passes_npm_admission_and_diagnostics(self):
+        filing = (
+            "dependency-policy.json",
+            "docs/dependencies/dependency-policy.schema.json",
+            "docs/dependencies/p2-exact-file-allowlist.md",
+            "docs/dependencies/ui-npm-admission-batch-a.md",
+        )
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        for concern in ("core-npm-admission-return", "core-build-diagnostic-return"):
+            entries = self._four_crate_entries(concern)
+            entries.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})
+            entries.update({path: ("100644", "a" * 40) for path in filing})
+            with self.subTest(concern=concern):
+                marker, unused_blob = self._validate_feedback_tree(
+                    entries, concern, workspace_text=self._workspace_text(members),
+                )
+                expected_marker = subject.CORE_CONTRACT_TREE_BY_CONCERN[concern]
+                if concern == "core-build-diagnostic-return":
+                    expected_marker = subject.CORE_CONTRACT_PACKAGE_LOCK_TREE
+                self.assertEqual(marker, expected_marker)
+                for path, mode in (
+                    (sorted(subject.CORE_CONTRACT_NEVER_BUILT_FILES)[0], "100755"),
+                    (sorted(subject.CORE_CONTRACT_BUILD_SOURCE_FILES)[0], "120000"),
+                    ("tools/other/unlisted.rs", "100644"),
+                ):
+                    changed = dict(entries)
+                    changed[path] = (mode, "a" * 40)
+                    with self.subTest(concern=concern, path=path, mode=mode):
+                        self.assertEqual(self._refused_check(
+                            changed, concern, workspace_text=self._workspace_text(members),
+                        ), "path_mode")
 
     @staticmethod
     def _four_crate_entries(concern):
