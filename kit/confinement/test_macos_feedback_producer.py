@@ -443,7 +443,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
     def test_build_diagnostic_payload_escapes_invalid_utf8_in_the_middle_deterministically(self):
         payload = producer.build_diagnostic_payload(self._failed_outcome(b"ok\xc3(\xff\xfe end\n", b"\xed\xa0\x80\n"))
         self.assertEqual(
-            self._body(payload).decode("ascii"), "ok\\xc3(\\xff\\xfe end\n\nstderr:\n\\xed\\xa0\\x80\n")
+            self._body(payload).decode("ascii"), "ok\\xc3(\\xff\\xfe end\n\nstderr:\n\\xed\\xa0\\x80\n"
         )
         self.assertIn(b"stdout_truncated=false stderr_truncated=false", payload)
 
