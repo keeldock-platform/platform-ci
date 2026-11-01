@@ -146,14 +146,17 @@ function rustPaths(input) {
 }
 
 function decodeText(bytes, maxLines, maxLineCodeUnits) {
-  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) reject('invalid_payload');
+  // Every refusal below keeps the invalid_payload family; the suffix only names the first violated
+  // class so a refused payload can be diagnosed. The checks themselves are unchanged.
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) reject('invalid_payload_bom');
   let text;
   try {
     text = UTF8.decode(bytes);
   } catch {
-    reject('invalid_payload');
+    reject('invalid_payload_utf8');
   }
-  if (text.includes('\0') || text.includes('\r')) reject('invalid_payload');
+  if (text.includes('\0')) reject('invalid_payload_nul');
+  if (text.includes('\r')) reject('invalid_payload_cr');
   let lineCount = 1;
   let lineLength = 0;
   for (const character of text) {
@@ -165,8 +168,8 @@ function decodeText(bytes, maxLines, maxLineCodeUnits) {
       lineLength += character.length;
       if (lineLength > maxLineCodeUnits) reject('limit_exceeded');
       const code = character.codePointAt(0);
-      if (code < 0x20 && code !== 0x09) reject('invalid_payload');
-      if (code >= 0x7f && code <= 0x9f) reject('invalid_payload');
+      if ((code < 0x20 && code !== 0x09) || code === 0x7f) reject('invalid_payload_c0');
+      if (code >= 0x80 && code <= 0x9f) reject('invalid_payload_c1');
     }
   }
   return text;

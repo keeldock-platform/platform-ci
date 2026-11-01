@@ -404,6 +404,33 @@ test('accepts bounded diagnostics and rejects malformed or credential-shaped tex
   }
 });
 
+test('diagnostic text refusals name the violated class and still refuse every such byte', () => {
+  const cases = [
+    [Buffer.from([0xef, 0xbb, 0xbf, 0x61, 0x0a]), 'invalid_payload_bom'],
+    [Buffer.from([0xc3, 0x28]), 'invalid_payload_utf8'],
+    [Buffer.from([0x61, 0xe2, 0x8e]), 'invalid_payload_utf8'],
+    [Buffer.from('first\0second\n', 'utf8'), 'invalid_payload_nul'],
+    [Buffer.from('first\rsecond\n', 'utf8'), 'invalid_payload_cr'],
+    [Buffer.from('first\u001bsecond\n', 'utf8'), 'invalid_payload_c0'],
+    [Buffer.from('first\u0008second\n', 'utf8'), 'invalid_payload_c0'],
+    [Buffer.from('first\u007fsecond\n', 'utf8'), 'invalid_payload_c0'],
+    [Buffer.from('first\u0080second\n', 'utf8'), 'invalid_payload_c1'],
+    [Buffer.from('first\u0085second\n', 'utf8'), 'invalid_payload_c1'],
+    [Buffer.from('first\u009fsecond\n', 'utf8'), 'invalid_payload_c1'],
+  ];
+  for (const [bytes, code] of cases) {
+    assert.throws(() => validate('build_diagnostics', bytes), { code }, code);
+  }
+  // Tab and newline stay allowed, and the visible escape forms the producer emits are plain text.
+  const allowed = Buffer.from('a\tb\nstdout \\u{1b} \\u{85} \\x80 end\n', 'utf8');
+  assert.deepEqual(validate('build_diagnostics', allowed), allowed);
+  // A line over the code-unit limit is still a limit refusal, not a text-class refusal.
+  assert.throws(
+    () => validate('build_diagnostics', Buffer.from('a'.repeat(DEVELOPMENT_FEEDBACK_LIMITS.diagnosticLineCodeUnits + 1))),
+    { code: 'limit_exceeded' },
+  );
+});
+
 test('the development exception requires a trusted in-window clock and bounded expiry', () => {
   const payloadBytes = Buffer.from('compiler completed with zero warnings\n', 'utf8');
   const context = contextFor('core-build-diagnostic-return');

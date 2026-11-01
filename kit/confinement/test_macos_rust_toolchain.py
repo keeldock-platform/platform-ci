@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import stat
+import subprocess
 import sys
 from types import SimpleNamespace
 import unittest
@@ -382,6 +383,45 @@ class RustToolchainContractTests(unittest.TestCase):
         self.assertEqual(truncated.stdout[:4], b"fmt\n")
         self.assertIs(truncated.stdout_truncated, True)
         self.assertIs(truncated.stderr_truncated, False)
+
+    def _run_capture_shim(self, stdout_bytes, stderr_bytes):
+        child = ("import sys; sys.stdout.buffer.write(%r); sys.stderr.buffer.write(%r); sys.exit(3)"
+                 % (stdout_bytes, stderr_bytes))
+        completed = subprocess.run(
+            (sys.executable, "-I", "-S", "-B", "-c", rust.COMMAND_CAPTURE_SCRIPT, sys.executable, "-c", child),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        self.assertEqual(completed.returncode, 0)
+        return rust._decode_command_capture(
+            SimpleNamespace(returncode=0, stdout=completed.stdout, stderr=completed.stderr),
+            ("child",),
+        )
+
+    def test_capture_shim_never_keeps_a_partial_utf8_sequence_at_the_byte_cut(self):
+        limit = rust.DIAGNOSTIC_STREAM_LIMIT
+        three = "⎯".encode("utf-8")
+        four = "\U0001f600".encode("utf-8")
+        cases = (
+            # (stdout, stderr, kept stdout size, kept stderr size, stdout cut, stderr cut)
+            (b"a" * (limit - 1) + three, b"b" * (limit - 2) + four, limit - 1, limit - 2, True, True),
+            (b"a" * (limit - 2) + three, b"b" * (limit - 3) + four, limit - 2, limit - 3, True, True),
+            (b"a" * (limit - 3) + three + b"zz", b"b" * (limit - 4) + four + b"z", limit, limit, True, True),
+            (b"a" * (limit - 3) + three, b"b" * (limit - 4) + four, limit, limit, False, False),
+            (b"a" * (limit + 5), b"", limit, 0, True, False),
+            (b"", b"\xe2\x8e", 0, 2, False, False),
+        )
+        for stdout, stderr, kept_out, kept_err, cut_out, cut_err in cases:
+            with self.subTest(stdout=len(stdout), stderr=len(stderr)):
+                decoded = self._run_capture_shim(stdout, stderr)
+                self.assertEqual((decoded.returncode, len(decoded.stdout), len(decoded.stderr)),
+                                 (3, kept_out, kept_err))
+                self.assertEqual((decoded.stdout_truncated, decoded.stderr_truncated), (cut_out, cut_err))
+                self.assertEqual(decoded.stdout, stdout[:kept_out])
+                self.assertEqual(decoded.stderr, stderr[:kept_err])
+                if cut_out:
+                    decoded.stdout.decode("utf-8", "strict")
+                if cut_err:
+                    decoded.stderr.decode("utf-8", "strict")
 
     def test_opt_in_nonzero_capture_uses_fixed_python_wrapper_and_keeps_success_default(self):
         prefix = b"failed\n" + (b"x" * (rust.DIAGNOSTIC_STREAM_LIMIT - len(b"failed\n")))

@@ -367,8 +367,10 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                     producer._parse_producer_line(altered, kind, environment)
 
     def test_build_diagnostic_payload_marks_truncated_streams_and_keeps_failure_stage(self):
-        stdout_prefix = b"bounded stdout\n" + (b"x" * (32_768 - len(b"bounded stdout\n")))
-        stderr_prefix = b"bounded stderr\n" + (b"y" * (32_768 - len(b"bounded stderr\n")))
+        # Short lines: the payload now stays inside the encryptor's per-line limit (8192 units).
+        stdout_prefix = (b"bounded stdout\n" + (b"x" * 63 + b"\n") * 600)[:32_768]
+        stderr_prefix = (b"bounded stderr\n" + (b"y" * 63 + b"\n") * 600)[:32_768]
+        self.assertEqual((len(stdout_prefix), len(stderr_prefix)), (32_768, 32_768))
         payload = producer.build_diagnostic_payload({
             "failed_stage": "workspace_tests",
             "selected_gates": producer.DIAGNOSTIC_BASE_GATES,
@@ -415,6 +417,89 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             b"mock_tests,conformance_tests completed_gates=format,clippy\n"
             b"stdout:\n\nstderr:\nkd-gate-timeout limit_seconds=300\n",
         )
+
+    def _failed_outcome(self, stdout=b"", stderr=b"", stdout_truncated=False, stderr_truncated=False):
+        return {
+            "failed_stage": "typescript_tests",
+            "selected_gates": producer.DIAGNOSTIC_GATE_SELECTIONS[-1],
+            "completed": producer.DIAGNOSTIC_GATE_SELECTIONS[-1][:-1],
+            "returncode": 1, "stdout": stdout, "stderr": stderr,
+            "stdout_truncated": stdout_truncated, "stderr_truncated": stderr_truncated,
+        }
+
+    def _body(self, payload):
+        return payload.split(b"\nstdout:\n", 1)[1]
+
+    def test_build_diagnostic_payload_escapes_every_class_the_encryptor_refuses(self):
+        raw = (b"a\x00b\rc\x1b[31md\x08e\x7ff\tg\nh"
+               + "\u0080i\u0085j\u009fk l‮m".encode("utf-8"))
+        payload = producer.build_diagnostic_payload(self._failed_outcome(raw, raw))
+        body = self._body(payload).decode("utf-8")
+        expected = ("a\\u{00}b\\u{0d}c\\u{1b}[31md\\u{08}e\\u{7f}f\tg\nh"
+                    "\\u{80}i\\u{85}j\\u{9f}k l‮m")
+        self.assertEqual(body, expected + "\nstderr:\n" + expected)
+        self.assertIsNone(producer.UNSAFE_DIAGNOSTIC_RE.search(payload.decode("utf-8")))
+        # Deterministic: the same input gives the same bytes.
+        self.assertEqual(payload, producer.build_diagnostic_payload(self._failed_outcome(raw, raw)))
+
+    def test_build_diagnostic_payload_escapes_invalid_utf8_in_the_middle_deterministically(self):
+        payload = producer.build_diagnostic_payload(self._failed_outcome(b"ok\xc3(\xff\xfe end\n", b"\xed\xa0\x80\n"))
+        self.assertEqual(
+            self._body(payload).decode("ascii"), "ok\\xc3(\\xff\\xfe end\n\nstderr:\n\\xed\\xa0\\x80\n")
+        )
+        self.assertIn(b"stdout_truncated=false stderr_truncated=false", payload)
+
+    def test_build_diagnostic_payload_trims_an_incomplete_trailing_sequence_only_when_truncated(self):
+        for tail in (b"\xe2", b"\xe2\x8e", b"\xf0\x9f\x98", b"\xc3"):
+            with self.subTest(tail=tail):
+                payload = producer.build_diagnostic_payload(
+                    self._failed_outcome(b"line\n" + tail, b"err\n" + tail, True, True))
+                self.assertEqual(self._body(payload), b"line\n\nstderr:\nerr\n")
+                self.assertIn(b"stdout_truncated=true stderr_truncated=true", payload)
+        # A complete multi-byte character at the cut is kept.
+        payload = producer.build_diagnostic_payload(
+            self._failed_outcome("ok ⎯".encode("utf-8"), b"", True, False))
+        self.assertEqual(self._body(payload), "ok ⎯\nstderr:\n".encode("utf-8"))
+        # Without a truncation flag an incomplete tail is genuine invalid data: escaped, not dropped.
+        payload = producer.build_diagnostic_payload(self._failed_outcome(b"line\xe2\x8e", b"", False, False))
+        self.assertEqual(self._body(payload), b"line\\xe2\\x8e\nstderr:\n")
+
+    def test_build_diagnostic_payload_bounds_lines_after_escaping_and_marks_truncation(self):
+        many_lines = b"\n" * 20_000
+        long_line = b"z" * 20_000
+        payload = producer.build_diagnostic_payload(
+            self._failed_outcome(many_lines[:32_768], long_line, False, False))
+        text = payload.decode("utf-8")
+        self.assertLessEqual(text.count("\n") + 1, producer.DIAGNOSTIC_MAX_LINES)
+        self.assertTrue(all(len(line) <= producer.DIAGNOSTIC_MAX_LINE_UNITS for line in text.split("\n")))
+        self.assertIn(b"stdout_truncated=true stderr_truncated=true", payload)
+        self.assertIn(b"z" * producer.DIAGNOSTIC_MAX_LINE_UNITS + b"\n", payload + b"\n")
+        # Escaping growth: 32768 NUL bytes become 6 bytes each and stay under the payload cap.
+        grown = producer.build_diagnostic_payload(self._failed_outcome(b"\x00" * 32_768, b"\x1b" * 32_768))
+        self.assertLessEqual(len(grown), 512 * 1024)
+        self.assertLessEqual(grown.decode("utf-8").count("\n") + 1, producer.DIAGNOSTIC_MAX_LINES)
+        self.assertTrue(all(len(line) <= producer.DIAGNOSTIC_MAX_LINE_UNITS
+                            for line in grown.decode("utf-8").split("\n")))
+
+    def test_build_diagnostic_payload_still_refuses_bad_shape_before_sanitising(self):
+        for stdout, stderr in ((b"x" * 32_769, b""), (b"", b"y" * 32_769)):
+            with self.subTest(size=len(stdout) + len(stderr)), self.assertRaises(producer.FeedbackRefusal) as raised:
+                producer.build_diagnostic_payload(self._failed_outcome(stdout, stderr))
+            self.assertEqual(raised.exception.reason, "capture_invalid")
+        for bad in ("x", bytearray(b"x"), None):
+            with self.subTest(stream=bad), self.assertRaises(producer.FeedbackRefusal):
+                producer.build_diagnostic_payload(self._failed_outcome(bad, b""))
+
+    def test_encryptor_refusal_classes_are_known_node_details(self):
+        for code in ("bom", "c0", "c1", "cr", "nul", "utf8"):
+            with self.subTest(code=code):
+                stderr = ("KD-FEEDBACK-ENCRYPTION-REFUSAL invalid_payload_" + code + "\n").encode("ascii")
+                self.assertEqual(producer._node_detail(stderr), "node_invalid_payload_" + code)
+                self.assertIn("node_invalid_payload_" + code, producer.NODE_DETAILS)
+        self.assertEqual(
+            producer._node_detail(b"KD-FEEDBACK-ENCRYPTION-REFUSAL invalid_payload\n"), "node_invalid_payload")
+        self.assertEqual(
+            producer._node_detail(b"KD-FEEDBACK-ENCRYPTION-REFUSAL invalid_payload_other\n"), "node_exit")
 
     def test_build_diagnostic_payload_reports_full_parser_selection_and_refuses_skipped_stages(self):
         selected = producer.DIAGNOSTIC_GATE_SELECTIONS[1]

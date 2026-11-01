@@ -184,6 +184,26 @@ test('producer base64 shape check refuses malformed padding, length, alphabet, a
   }
 });
 
+test('producer reports the specific invalid-payload class for raw control bytes and still refuses them', () => {
+  const cases = [
+    [Buffer.from([0x61, 0xe2, 0x8e]), 'invalid_payload_utf8'],
+    [Buffer.from('a\0b\n'), 'invalid_payload_nul'],
+    [Buffer.from('a\rb\n'), 'invalid_payload_cr'],
+    [Buffer.from('a\u001b[31mb\n'), 'invalid_payload_c0'],
+    [Buffer.from('a\u0085b\n'), 'invalid_payload_c1'],
+  ];
+  for (const [payload, code] of cases) {
+    const input = fixture('build_diagnostics').input;
+    input.payload_b64 = payload.toString('base64');
+    assert.throws(() => encryptFeedbackPayload(input), { code }, code);
+  }
+  const success = fixture('build_diagnostics').input;
+  success.payload_b64 = Buffer.from(
+    'KD-BUILD-DIAGNOSTICS schema=1 selected_gates=format,clippy completed_gates=format,clippy result=all-gates-completed\n',
+  ).toString('base64');
+  assert.doesNotThrow(() => encryptFeedbackPayload(success));
+});
+
 test('producer refuses a mismatched key, profile, and unclosed input shape', () => {
   const wrongKey = fixture();
   wrongKey.input.context.recipient_fingerprint = '0'.repeat(64);

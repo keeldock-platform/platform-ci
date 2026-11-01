@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -289,6 +290,92 @@ class MacOSNodeContractTests(unittest.TestCase):
             self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
         self.assertEqual(caught.exception.reason, "vulnerable_dependency")
         self.assertEqual(caught.exception.completed_stages, ("node_dependency_prepare",))
+
+    def _audit_harness(self, returncode, stdout, stderr=b""):
+        class AuditHarness(WorkerHarness):
+            def __call__(inner, argv, *, stage, substage, **kwargs):
+                if substage == "bulk_audit":
+                    inner.calls.append({"substage": substage})
+                    return inner._result(returncode, stdout, stderr)
+                return WorkerHarness.__call__(inner, argv, stage=stage, substage=substage, **kwargs)
+
+        return AuditHarness(self.project)
+
+    def _expect_failed_audit_helper(self, stdout):
+        runner = self._audit_harness(1, stdout, b"helper crashed")
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        refusal = caught.exception
+        self.assertEqual(refusal.reason, "audit_response_invalid")
+        self.assertEqual((refusal.stage, refusal.substage), ("node_dependency_audit", "bulk_audit"))
+        self.assertEqual(refusal.completed_stages, ("node_dependency_prepare",))
+        self.assertEqual((refusal.returncode, refusal.stderr), (1, b"helper crashed"))
+        self.assertFalse((self.storage / "node-contract-request.json").exists())
+
+    def test_audit_helper_crash_with_empty_output_names_the_audit_stage_and_keeps_stderr(self):
+        self._expect_failed_audit_helper(b"")
+
+    def test_audit_helper_non_zero_exit_with_unparseable_output_is_not_parsed(self):
+        self._expect_failed_audit_helper(b"not json\n")
+
+    def test_audit_helper_non_zero_exit_with_a_passed_document_is_still_a_failed_helper(self):
+        self._expect_failed_audit_helper(b'{"schema_version":1,"status":"passed"}\n')
+
+    def test_audit_helper_refusal_document_still_supplies_the_reason_on_a_non_zero_exit(self):
+        refusal_document = b'{"reason":"vulnerable_dependency","schema_version":1,"status":"refused"}\n'
+        runner = self._audit_harness(1, refusal_document)
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        self.assertEqual(caught.exception.reason, "vulnerable_dependency")
+        self.assertEqual(caught.exception.stage, "node_dependency_audit")
+        self.assertEqual(caught.exception.completed_stages, ("node_dependency_prepare",))
+
+    def test_unparseable_audit_output_on_a_zero_exit_is_a_staged_capture_failure(self):
+        runner = self._audit_harness(0, b"not json\n")
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        refusal = caught.exception
+        self.assertEqual(refusal.reason, "capture_invalid")
+        self.assertEqual((refusal.stage, refusal.substage), ("node_dependency_audit", "bulk_audit"))
+        self.assertEqual(refusal.completed_stages, ("node_dependency_prepare",))
+
+    def test_audit_request_preparation_refusals_belong_to_the_audit_stage_after_prepare(self):
+        (self.storage / "node-contract-request.json").write_bytes(b"stale")
+        runner = WorkerHarness(self.project)
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        self.assertEqual(caught.exception.reason, "lock_already_present")
+        self.assertEqual(caught.exception.stage, "node_dependency_audit")
+        self.assertEqual(caught.exception.completed_stages, ("node_dependency_prepare",))
+        self.assertFalse(any(entry["substage"] == "bulk_audit" for entry in runner.calls))
+
+    def test_refusals_before_prepare_completes_keep_the_prepare_stage(self):
+        self.install_committed_lock(_lock_bytes())
+        runner = WorkerHarness(self.project)
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        self.assertEqual(caught.exception.reason, "lock_already_present")
+        self.assertEqual(caught.exception.stage, "node_dependency_prepare")
+        self.assertEqual(caught.exception.completed_stages, ())
+
+    def test_node_environment_is_identical_to_the_foundation_adapter_environment(self):
+        spec = importlib.util.spec_from_file_location(
+            "foundation_node_feedback_environment",
+            Path(__file__).resolve().parent / "foundation_node_feedback.py",
+        )
+        foundation = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(foundation)
+        environment = subject._node_environment(self.node, self.storage, self.uid, self.gid)
+        self.assertEqual(foundation._node_environment(self.storage, self.node, subject), environment)
+        self.assertEqual(environment["NO_COLOR"], "1")
+
+    def test_node_environment_forbids_colour_on_every_command(self):
+        runner = WorkerHarness(self.project)
+        self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        for entry in runner.calls:
+            if "env" in entry:
+                self.assertEqual(entry["env"]["NO_COLOR"], "1")
+                self.assertNotIn("FORCE_COLOR", entry["env"])
 
     def test_verify_uses_accepted_lock_without_regenerating_and_orders_audit_install_and_checks(self):
         lock_bytes = _lock_bytes()

@@ -87,6 +87,14 @@ DIAGNOSTIC_GATE_SELECTIONS = (
     DIAGNOSTIC_BASE_GATES, DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES,
     DIAGNOSTIC_BASE_GATES + DIAGNOSTIC_PARSER_GATES + DIAGNOSTIC_NODE_GATES,
 )
+# Text classes the Node encryptor refuses (development_feedback.mjs decodeText): NUL, CR, C0 other
+# than tab and newline, DEL and C1. The encryptor keeps refusing them; the producer escapes them
+# first (see sanitize_diagnostic_stream). The line limits mirror DEVELOPMENT_FEEDBACK_LIMITS and
+# the per-stream line cap leaves room for the header and the two fixed marker lines.
+UNSAFE_DIAGNOSTIC_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+DIAGNOSTIC_MAX_LINES = 8192
+DIAGNOSTIC_MAX_LINE_UNITS = 8192
+DIAGNOSTIC_STREAM_MAX_LINES = 4000
 WORKSPACE_PACKAGE_PATHS = ("packages/host-api", "packages/kernel-i18n")
 DEPENDENCY_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 PROFILE_BY_KIND = feedback_request.PROFILE_BY_KIND
@@ -101,7 +109,9 @@ ENCRYPT_DETAILS = frozenset((
 NODE_REFUSAL_CODES = frozenset((
     "credential_like_content", "envelope_rejected", "exception_expired", "invalid_cargo_lock",
     "invalid_context", "invalid_expectation", "invalid_input", "invalid_lock_manifest",
-    "invalid_payload", "invalid_recipient", "invalid_rust_patch", "limit_exceeded",
+    "invalid_payload", "invalid_payload_bom", "invalid_payload_c0", "invalid_payload_c1",
+    "invalid_payload_cr", "invalid_payload_nul", "invalid_payload_utf8",
+    "invalid_recipient", "invalid_rust_patch", "limit_exceeded",
     "payload_too_large", "unreviewed_rust_path", "unsupported_kind", "input_too_large",
     "encryption_failed",
 ))
@@ -1162,21 +1172,88 @@ def build_diagnostic_payload(outcome):
     if (type(outcome.get("stdout_truncated")) is not bool
             or type(outcome.get("stderr_truncated")) is not bool):
         _refuse("capture_invalid")
+    stdout, stdout_truncated = sanitize_diagnostic_stream(outcome["stdout"], outcome["stdout_truncated"])
+    stderr, stderr_truncated = sanitize_diagnostic_stream(outcome["stderr"], outcome["stderr_truncated"])
     prefix = ("KD-BUILD-DIAGNOSTICS schema=1 stage=" + failed
-              + " stdout_truncated=" + ("true" if outcome["stdout_truncated"] else "false")
-              + " stderr_truncated=" + ("true" if outcome["stderr_truncated"] else "false")
+              + " stdout_truncated=" + ("true" if stdout_truncated else "false")
+              + " stderr_truncated=" + ("true" if stderr_truncated else "false")
               + " exit=" + str(outcome["returncode"])
               + " selected_gates=" + ",".join(selected)
               + " completed_gates=" + (",".join(completed) if completed else "none")
               + "\nstdout:\n").encode("ascii")
-    payload = prefix + outcome["stdout"] + b"\nstderr:\n" + outcome["stderr"]
+    payload = prefix + stdout + b"\nstderr:\n" + stderr
     if len(payload) > 512 * 1024:
         _refuse("payload_invalid")
     try:
-        payload.decode("utf-8", "strict")
+        text = payload.decode("utf-8", "strict")
     except UnicodeError:
         _refuse("payload_invalid")
+    # Defence in depth: the sanitiser must already have removed everything the encryptor refuses.
+    if (UNSAFE_DIAGNOSTIC_RE.search(text) is not None
+            or text.count("\n") + 1 > DIAGNOSTIC_MAX_LINES
+            or any(_utf16_units(line) > DIAGNOSTIC_MAX_LINE_UNITS for line in text.split("\n"))):
+        _refuse("payload_invalid")
     return payload
+
+
+def _trim_incomplete_utf8(data):
+    """Drop an incomplete trailing UTF-8 sequence left behind by a byte cut."""
+    size = len(data)
+    for back in range(1, min(4, size) + 1):
+        byte = data[size - back]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte >= 0xC0:
+            needed = 2 if byte < 0xE0 else 3 if byte < 0xF0 else 4
+            if needed > back:
+                return data[:size - back]
+        return data
+    return data
+
+
+def _utf16_units(text):
+    return sum(2 if ord(character) > 0xFFFF else 1 for character in text)
+
+
+def _clip_line_units(line):
+    units = 0
+    end = 0
+    for character in line:
+        step = 2 if ord(character) > 0xFFFF else 1
+        if units + step > DIAGNOSTIC_MAX_LINE_UNITS:
+            break
+        units += step
+        end += 1
+    return line[:end]
+
+
+def _escape_unsafe_character(match):
+    return "\\u{%02x}" % ord(match.group(0))
+
+
+def sanitize_diagnostic_stream(raw, truncated):
+    """Make one captured gate stream safe for the build-diagnostics payload.
+
+    Escape form (documented, deterministic, ASCII only): an incomplete trailing UTF-8 sequence from
+    a byte cut is dropped; any other invalid UTF-8 byte becomes \\xNN; NUL, CR, C0 controls other
+    than tab and newline, DEL and C1 controls become \\u{h...h} (lowercase hex, at least two digits).
+    The result is then bounded to DIAGNOSTIC_STREAM_MAX_LINES lines of DIAGNOSTIC_MAX_LINE_UNITS
+    UTF-16 units, so escaping growth can never push the payload past the encryptor's line limits.
+    Returns (bytes, truncated) where truncated also covers any cut made here."""
+    if type(raw) is not bytes or type(truncated) is not bool:
+        _refuse("capture_invalid")
+    data = _trim_incomplete_utf8(raw) if truncated else raw
+    text = UNSAFE_DIAGNOSTIC_RE.sub(_escape_unsafe_character, data.decode("utf-8", "backslashreplace"))
+    lines = text.split("\n")
+    cut = False
+    if len(lines) > DIAGNOSTIC_STREAM_MAX_LINES:
+        lines = lines[:DIAGNOSTIC_STREAM_MAX_LINES]
+        cut = True
+    for index, line in enumerate(lines):
+        if _utf16_units(line) > DIAGNOSTIC_MAX_LINE_UNITS:
+            lines[index] = _clip_line_units(line)
+            cut = True
+    return "\n".join(lines).encode("utf-8"), truncated or cut
 
 
 def encrypt_after_cleanup(dispatch, result, node):

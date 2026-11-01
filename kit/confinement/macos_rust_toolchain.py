@@ -81,9 +81,24 @@ try:
 except BaseException:
     status = 256
     out_overflow = 2
+def trim_incomplete_utf8(buf):
+    size = len(buf)
+    for back in range(1, min(4, size) + 1):
+        byte = buf[size - back]
+        if byte & 192 == 128:
+            continue
+        if byte >= 192:
+            need = 2 if byte < 224 else 3 if byte < 240 else 4
+            if need > back:
+                del buf[size - back:]
+        break
+if out_overflow == 1:
+    trim_incomplete_utf8(out)
+if err_overflow == 1:
+    trim_incomplete_utf8(err)
 if status < 0:
     status = 256
-header = ("KD-CAPTURE 1 %d %d %d %d %d\\n"
+header =("KD-CAPTURE 1 %d %d %d %d %d\\n"
           % (status, len(out), len(err), out_overflow, err_overflow)).encode("ascii")
 def write_all(fd, data):
     offset = 0

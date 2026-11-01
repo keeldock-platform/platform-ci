@@ -13,7 +13,9 @@ const MAX_INPUT_BYTES = 6 * 1024 * 1024;
 const REFUSAL_CODES = new Set([
   'credential_like_content', 'envelope_rejected', 'exception_expired', 'invalid_cargo_lock',
   'invalid_context', 'invalid_expectation', 'invalid_input', 'invalid_lock_manifest',
-  'invalid_payload', 'invalid_recipient', 'invalid_rust_patch', 'limit_exceeded',
+  'invalid_payload', 'invalid_payload_bom', 'invalid_payload_c0', 'invalid_payload_c1',
+  'invalid_payload_cr', 'invalid_payload_nul', 'invalid_payload_utf8',
+  'invalid_recipient', 'invalid_rust_patch', 'limit_exceeded',
   'payload_too_large', 'unreviewed_rust_path', 'unsupported_kind', 'input_too_large',
   'encryption_failed',
 ]);

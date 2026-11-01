@@ -1074,6 +1074,124 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual((refusal.reason, refusal.stage), ("cleanup_incomplete", "cleanup"))
         self.assertNotIn(refusal.diagnostic, subject.SOURCE_GATES_NODE_DIAGNOSTICS)
 
+    def test_step_diagnostic_vocabulary_is_closed_bound_and_separate_from_the_substage_set(self):
+        generated = {"source_gates_payload_invalid", "source_gates_payload_capture_invalid"}
+        generated |= {
+            "source_gates_node_profile_" + reason
+            for reason in ("manifest_invalid", "command_failed", "capture_invalid", "output_unavailable")
+        }
+        generated |= {
+            "source_gates_node_outcome_" + check
+            for check in ("rust", "stage", "capture", "substage", "verification", "reviewed_files")
+        }
+        self.assertEqual(subject.SOURCE_GATES_STEP_DIAGNOSTICS, frozenset(generated))
+        self.assertEqual(len(subject.SOURCE_GATES_STEP_DIAGNOSTICS), 12)
+        self.assertEqual(set(subject.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS), generated)
+        self.assertEqual(
+            set(subject.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.values()), {"capture_invalid", "runner_unavailable"},
+        )
+        self.assertEqual(
+            {name for name, reason in subject.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.items()
+             if reason == "capture_invalid"},
+            {"source_gates_payload_capture_invalid", "source_gates_node_profile_capture_invalid"},
+        )
+        self.assertFalse(subject.SOURCE_GATES_STEP_DIAGNOSTICS & subject.SOURCE_GATES_NODE_DIAGNOSTICS)
+        self.assertFalse(subject.SOURCE_GATES_STEP_DIAGNOSTICS & subject.CLEANUP_DIAGNOSTICS)
+        self.assertTrue(subject.SOURCE_GATES_STEP_DIAGNOSTICS <= subject.DIAGNOSTICS)
+        self.assertTrue(subject.SOURCE_GATES_STEP_DIAGNOSTICS <= subject.DETAILED_DIAGNOSTICS)
+        self.assertTrue(subject.SOURCE_GATES_STEP_DIAGNOSTICS <= subject.PRESERVED_SOURCE_DIAGNOSTICS)
+        self.assertEqual(
+            {key[0] for key in subject.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY},
+            {"payload", "node_profile", "node_outcome"},
+        )
+        for key, diagnostic in subject.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY.items():
+            self.assertRegex(diagnostic, r"\Asource_gates_[a-z_]+\Z")
+            self.assertIn(diagnostic, subject.DIAGNOSTICS)
+
+    def test_node_gate_names_are_refusal_stages(self):
+        self.assertTrue(real_node_contract.STAGES <= subject.STAGES)
+        self.assertTrue(set(foundation_tests.subject.NODE_GATE_NAMES) <= subject.STAGES)
+        for stage in sorted(real_node_contract.STAGES):
+            with self.subTest(stage=stage):
+                refusal = subject.Refusal("runner_unavailable", stage)
+                self.assertEqual(refusal.stage, stage)
+        self.assertEqual(subject.Refusal("runner_unavailable", "typescript_private").stage, "internal")
+
+    def _tagged_error(self, reason, step, key):
+        error = Exception("synthetic")
+        error.reason = reason
+        error.source_gates_step = step
+        error.source_gates_key = key
+        return error
+
+    def test_payload_failures_publish_their_fixed_step_diagnostic(self):
+        self._expect_node_diagnostic(
+            self._tagged_error("payload_invalid", "payload", "payload_invalid"),
+            "source_gates_payload_invalid",
+        )
+        self._expect_node_diagnostic(
+            self._tagged_error("capture_invalid", "payload", "capture_invalid"),
+            "source_gates_payload_capture_invalid", public_reason="capture_invalid",
+        )
+
+    def test_node_profile_failures_publish_their_fixed_step_diagnostic(self):
+        for reason in ("manifest_invalid", "command_failed", "capture_invalid", "output_unavailable"):
+            with self.subTest(reason=reason):
+                self._expect_node_diagnostic(
+                    self._tagged_error(reason, "node_profile", reason),
+                    "source_gates_node_profile_" + reason,
+                    public_reason="capture_invalid" if reason == "capture_invalid" else "runner_unavailable",
+                )
+
+    def test_node_outcome_failures_publish_their_fixed_step_diagnostic(self):
+        for check in subject.SOURCE_GATES_NODE_OUTCOME_CHECKS:
+            with self.subTest(check=check):
+                self._expect_node_diagnostic(
+                    foundation_tests.subject.NodeOutcomeInvalid("synthetic", check),
+                    "source_gates_node_outcome_" + check,
+                )
+        with self.assertRaises(foundation_tests.subject.NodeOutcomeInvalid) as caught:
+            foundation_tests.subject.extend_diagnostic_outcome({}, lambda: None, SimpleNamespace())
+        self._expect_node_diagnostic(caught.exception, "source_gates_node_outcome_rust")
+
+    def test_unlisted_or_mismatched_step_tags_keep_the_generic_source_gates_value(self):
+        for error in (
+            self._tagged_error("payload_invalid", "payload", "private"),
+            self._tagged_error("payload_invalid", "private", "payload_invalid"),
+            self._tagged_error("payload_invalid", "payload", 7),
+            self._tagged_error("payload_invalid", 7, "payload_invalid"),
+            # The tag names a capture failure but the error's own reason does not agree with it.
+            self._tagged_error("command_failed", "payload", "capture_invalid"),
+            self._tagged_error("command_failed", "node_profile", "capture_invalid"),
+            self._tagged_error(None, "node_outcome", "private"),
+            self._tagged_error(None, None, None),
+        ):
+            with self.subTest(reason=error.reason, step=error.source_gates_step, key=error.source_gates_key):
+                self._expect_node_diagnostic(error, "source_gates")
+
+    def test_step_tags_never_override_cleanup_or_other_stages(self):
+        tagged = self._tagged_error("cleanup_incomplete", "node_profile", "command_failed")
+        refusal = subject._toolchain_refusal(tagged, "worker_setup")
+        self.assertEqual((refusal.reason, refusal.stage), ("cleanup_incomplete", "cleanup"))
+        self.assertNotIn(refusal.diagnostic, subject.SOURCE_GATES_STEP_DIAGNOSTICS)
+        other_stage = subject._toolchain_refusal(
+            self._tagged_error("payload_invalid", "payload", "payload_invalid"), "toolchain_install",
+        )
+        self.assertEqual((other_stage.reason, other_stage.stage), ("toolchain_install_failed", "toolchain_install"))
+        self.assertEqual(other_stage.diagnostic, "unavailable")
+        for unlisted in ("source_gates_payload_private", "source_gates_node_outcome_", "source_gates_node_profile"):
+            forced = subject.Refusal("runner_unavailable", "worker_setup", diagnostic=unlisted)
+            self.assertEqual(forced.diagnostic, "unavailable")
+
+    def test_step_tag_helper_keeps_the_first_tag_and_never_raises(self):
+        error = Exception("synthetic")
+        subject._tag_source_gates_step(error, "payload", "payload_invalid")
+        subject._tag_source_gates_step(error, "node_profile", "command_failed")
+        self.assertEqual((error.source_gates_step, error.source_gates_key), ("payload", "payload_invalid"))
+        subject._tag_source_gates_step(object(), "payload", "payload_invalid")
+        self.assertIsNone(subject._source_gates_step_diagnostic(object()))
+        self.assertEqual(subject._source_gates_step_diagnostic(error), "source_gates_payload_invalid")
+
     def test_review_binding_requires_every_protected_value(self):
         request = _request()
         binding = _binding()

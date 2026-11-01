@@ -20,6 +20,11 @@ NODE_WORKSPACE_PACKAGES = ("packages/host-api", "packages/kernel-i18n")
 BOOTSTRAP_MANIFESTS = (
     "package.json", "packages/host-api/package.json", "packages/kernel-i18n/package.json",
 )
+# Copy set: the confined Node project holds exactly NODE_FIXED_FILES (which includes the two i18n
+# fixtures), NODE_REVIEWED_FILES and the reviewed packages/*/{src,tests} TypeScript. No Rust source
+# (.rs) and nothing else from the checkout is copied, so TypeScript tests must not import files
+# outside this set (for example `?raw` imports of crates/**/*.rs): such a suite cannot load in
+# confinement. The set is pinned by test_foundation_node_feedback.py.
 NODE_EXTRA_FILES = frozenset((
     "packages/kernel-i18n/tests/support.ts",
 ))
@@ -78,6 +83,42 @@ COMMAND_CLEANUP_CHECK_DIAGNOSTICS = {
 
 def _refuse(producer, reason):
     producer._refuse(reason)
+
+
+class NodeOutcomeInvalid(ValueError):
+    """An extend_diagnostic_outcome check failed. `check` names which one (a fixed value the core
+    driver maps to a public diagnostic); the message is the pre-existing fixed text."""
+
+    def __init__(self, message, check):
+        super().__init__(message)
+        self.check = check
+        self.source_gates_step = "node_outcome"
+        self.source_gates_key = check
+
+
+def _tag_profile_error(error, key):
+    """Mark a refusal that left run_node_profile so the core driver can name it; first tag wins."""
+    try:
+        if getattr(error, "source_gates_step", None) is None:
+            error.source_gates_step = "node_profile"
+            error.source_gates_key = key
+    except BaseException:
+        pass
+
+
+def _trim_incomplete_utf8(data):
+    """Drop an incomplete trailing UTF-8 sequence left behind by a byte cut."""
+    size = len(data)
+    for back in range(1, min(4, size) + 1):
+        byte = data[size - back]
+        if byte & 0xC0 == 0x80:
+            continue
+        if byte >= 0xC0:
+            needed = 2 if byte < 0xE0 else 3 if byte < 0xF0 else 4
+            if needed > back:
+                return data[:size - back]
+        return data
+    return data
 
 
 def _survivor_diagnostic(classes):
@@ -253,6 +294,7 @@ def _node_environment(storage, node, contract):
         "TMPDIR": str(storage / "node-tmp"),
         "LANG": "C",
         "LC_ALL": "C",
+        "NO_COLOR": "1",
         "NODE_OPTIONS": contract.NODE_OPTIONS_VALUE,
         "npm_config_cache": str(storage / "node-cache"),
         "npm_config_registry": contract.REGISTRY_URL,
@@ -438,8 +480,14 @@ def run_node_profile(mode, *, dispatch, source, worker_storage, worker_uid, envi
             raise
         if getattr(error, "reason", None) in ("cleanup_incomplete", "command_failed", "capture_invalid",
                                                "manifest_invalid", "output_unavailable"):
+            if error.reason != "cleanup_incomplete":
+                _tag_profile_error(error, error.reason)
             raise
-        _refuse(producer, "manifest_invalid")
+        try:
+            _refuse(producer, "manifest_invalid")
+        except Exception as refusal:
+            _tag_profile_error(refusal, "manifest_invalid")
+            raise
 
 
 def _validate_result(mode, result, contract, identity, expected_manifest, lock_bytes,
@@ -531,7 +579,7 @@ def _valid_rust_outcome(outcome):
 
 def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
     if not _valid_rust_outcome(rust_outcome) or not callable(node_callback):
-        raise ValueError("diagnostic outcome invalid")
+        raise NodeOutcomeInvalid("diagnostic outcome invalid", "rust")
     selected = FULL_FOUNDATION_GATES
     failed = rust_outcome["failed_stage"]
     if failed is not None:
@@ -552,15 +600,20 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
             raise
         node_stage = error.stage
         completed_node = getattr(error, "completed_stages", None)
+        # The gates run in order, so a proper ordered prefix of completed gates names the gate that
+        # was running: the first one not completed. A stage that disagrees with it (a refusal raised
+        # without its own stage) is replaced by that gate; anything else is still refused.
+        if (type(completed_node) is not tuple or len(completed_node) >= len(NODE_GATE_NAMES)
+                or completed_node != NODE_GATE_NAMES[:len(completed_node)]):
+            raise NodeOutcomeInvalid("node diagnostic invalid", "stage") from None
         if (type(node_stage) is not str or node_stage not in NODE_GATE_NAMES
-                or type(completed_node) is not tuple
                 or completed_node != NODE_GATE_NAMES[:NODE_GATE_NAMES.index(node_stage)]):
-            raise ValueError("node diagnostic invalid") from None
+            node_stage = NODE_GATE_NAMES[len(completed_node)]
         raw_stdout = getattr(error, "stdout", b"")
         raw_stderr = getattr(error, "stderr", b"")
         if (type(raw_stdout) is not bytes or type(raw_stderr) is not bytes
                 or len(raw_stdout) > 32_768 or len(raw_stderr) > 32_768):
-            raise ValueError("node capture invalid") from None
+            raise NodeOutcomeInvalid("node capture invalid", "capture") from None
         reason = getattr(error, "reason", "contract_refused")
         if type(reason) is not str or reason not in NODE_REASONS:
             reason = "contract_refused"
@@ -568,9 +621,12 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
         if substage is None:
             substage = "none"
         elif type(substage) is not str or substage not in NODE_SUBSTAGES:
-            raise ValueError("node substage invalid") from None
+            raise NodeOutcomeInvalid("node substage invalid", "substage") from None
         metadata = ("node_reason=" + reason + " node_substage=" + substage + "\n").encode("ascii")
-        stderr = metadata + raw_stderr[:max(0, 32_768 - len(metadata))]
+        room = max(0, 32_768 - len(metadata))
+        stderr_cut = len(raw_stderr) > room
+        # The cut must not leave a partial UTF-8 sequence; the dropped bytes count as truncation.
+        stderr = metadata + (_trim_incomplete_utf8(raw_stderr[:room]) if stderr_cut else raw_stderr)
         returncode = getattr(error, "returncode", None)
         if type(returncode) is not int or not 1 <= returncode <= 255:
             returncode = 1
@@ -582,12 +638,11 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
             "stdout": raw_stdout,
             "stderr": stderr,
             "stdout_truncated": bool(getattr(error, "stdout_truncated", False)),
-            "stderr_truncated": bool(getattr(error, "stderr_truncated", False)
-                                      or len(metadata) + len(raw_stderr) > 32_768),
+            "stderr_truncated": bool(getattr(error, "stderr_truncated", False) or stderr_cut),
         }
     if (type(result) is not dict or result.get("mode") != "verify"
             or result.get("status") != "passed" or result.get("stages") != NODE_GATE_NAMES):
-        raise ValueError("node verification incomplete")
+        raise NodeOutcomeInvalid("node verification incomplete", "verification")
     outcome = {
         "selected_gates": selected,
         "completed": selected,
@@ -602,7 +657,7 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
     digest = result.get("node_reviewed_paths_sha256")
     if (type(count) is not int or not 5 <= count <= MAX_NODE_REVIEWED_FILES
             or type(digest) is not str or SHA64_RE.fullmatch(digest) is None):
-        raise ValueError("node reviewed files invalid")
+        raise NodeOutcomeInvalid("node reviewed files invalid", "reviewed_files")
     outcome["node_reviewed_file_count"] = count
     outcome["node_reviewed_paths_sha256"] = digest
     return outcome

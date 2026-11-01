@@ -232,11 +232,11 @@ def _owned_directory(path, uid, gid, *, create=False):
     return target
 
 
-def _write_worker_file(path, payload, uid, gid):
+def _write_worker_file(path, payload, uid, gid, stage=None):
     target = Path(path)
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None or type(payload) is not bytes or not payload:
-        _refuse("tool_unavailable")
+        _refuse("tool_unavailable", stage=stage)
     descriptor = None
     try:
         descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
@@ -257,7 +257,7 @@ def _write_worker_file(path, payload, uid, gid):
                 or stat.S_IMODE(opened.st_mode) != 0o600):
             raise ValueError
     except BaseException:
-        _refuse("tool_unavailable")
+        _refuse("tool_unavailable", stage=stage)
     finally:
         if descriptor is not None:
             try:
@@ -315,9 +315,9 @@ def _read_worker_file(path, uid, maximum):
                 pass
 
 
-def _strict_json(raw, maximum):
+def _strict_json(raw, maximum, *, stage=None, substage=None):
     if type(raw) is not bytes or not 0 < len(raw) <= maximum:
-        _refuse("capture_invalid")
+        _refuse("capture_invalid", stage=stage, substage=substage)
 
     def pairs(items):
         result = {}
@@ -331,7 +331,7 @@ def _strict_json(raw, maximum):
         return json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=pairs,
                           parse_constant=lambda unused: (_ for _ in ()).throw(ValueError()))
     except BaseException:
-        _refuse("capture_invalid")
+        _refuse("capture_invalid", stage=stage, substage=substage)
 
 
 def _worker_result(run_worker, argv, *, stage, substage, project, environment, deadline, timeout):
@@ -398,6 +398,7 @@ def _node_environment(node, worker_storage, worker_uid, worker_gid):
         "TMPDIR": str(temporary),
         "LANG": "C",
         "LC_ALL": "C",
+        "NO_COLOR": "1",
         "NODE_OPTIONS": NODE_OPTIONS_VALUE,
         "npm_config_cache": str(cache),
         "npm_config_registry": REGISTRY_URL,
@@ -471,18 +472,18 @@ def _lock_path(project):
     return Path(project) / "package-lock.json"
 
 
-def _ensure_absent(path, *, reason):
+def _ensure_absent(path, *, reason, stage=None):
     try:
         Path(path).lstat()
     except FileNotFoundError:
         return
     except OSError:
-        _refuse("tool_unavailable")
-    _refuse(reason)
+        _refuse("tool_unavailable", stage=stage)
+    _refuse(reason, stage=stage)
 
 
 def _request_bytes(mode, lock_bytes, expected_manifest, identity, npm_cli, proof, provenance,
-                   now_ms, deadline_ms, policy_epoch_ms):
+                   now_ms, deadline_ms, policy_epoch_ms, stage=None):
     record = {
         "schema_version": 1,
         "mode": mode,
@@ -500,14 +501,23 @@ def _request_bytes(mode, lock_bytes, expected_manifest, identity, npm_cli, proof
         raw = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
                          allow_nan=False).encode("ascii")
     except BaseException:
-        _refuse("manifest_invalid")
+        _refuse("manifest_invalid", stage=stage)
     if len(raw) > MAX_REQUEST_BYTES:
-        _refuse("limit_exceeded")
+        _refuse("limit_exceeded", stage=stage)
     return raw
 
 
+def _is_refusal_document(raw):
+    """True only when the audit helper stdout is a strict JSON object that says status=refused."""
+    try:
+        output = _strict_json(raw, 8192)
+    except NodeContractRefusal:
+        return False
+    return type(output) is dict and output.get("status") == "refused"
+
+
 def _validate_gate_result(raw, lock_bytes, manifest_sha256, mode, policy_epoch_ms, *, stage):
-    output = _strict_json(raw, 8192)
+    output = _strict_json(raw, 8192, stage=stage, substage="bulk_audit")
     if type(output) is not dict or type(output.get("schema_version")) is not int or output["schema_version"] != 1:
         _refuse("capture_invalid", stage=stage, substage="bulk_audit")
     if output.get("status") == "refused":
@@ -657,19 +667,27 @@ def _run_node_contract(
     remaining_ms = max(1, min(MAX_AUDIT_SECONDS * 1000,
                               int((deadline - time.monotonic()) * 1000)))
     audit_deadline_ms = now_for_audit + remaining_ms
+    # Prepare is complete here, so every refusal from now on belongs to the audit stage.
     request = _request_bytes(
         mode, lock_bytes, expected_manifest, identity, npm, generation_proof, accepted,
         now_for_audit, audit_deadline_ms, policy_epoch_ms if mode == "bootstrap" else None,
+        stage="node_dependency_audit",
     )
     request_path = storage_path / "node-contract-request.json"
-    _ensure_absent(request_path, reason="lock_already_present")
-    _write_worker_file(request_path, request, worker_uid, worker_gid)
+    _ensure_absent(request_path, reason="lock_already_present", stage="node_dependency_audit")
+    _write_worker_file(request_path, request, worker_uid, worker_gid, stage="node_dependency_audit")
     try:
         audited = _worker_result(
             checked_worker, (str(node), str(helper), "--request", str(request_path)),
             stage="node_dependency_audit", substage="bulk_audit", project=project_path,
             environment=environment, deadline=deadline, timeout=MAX_AUDIT_SECONDS,
         )
+        # A non-zero exit is checked before the stdout is parsed: only a refusal document (the
+        # helper's own, exit 1) is read for its reason; any other output is a failed helper and keeps
+        # its captured streams.
+        if audited.returncode != 0 and not _is_refusal_document(audited.stdout):
+            _capture_failure(audited, "audit_response_invalid", stage="node_dependency_audit",
+                             substage="bulk_audit")
         audit_result = _validate_gate_result(audited.stdout, lock_bytes, manifest_sha256, mode,
                                              policy_epoch_ms,
                                              stage="node_dependency_audit")

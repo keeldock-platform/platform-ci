@@ -111,6 +111,7 @@ STAGES = frozenset((
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
     "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
     "runtime_format", "runtime_clippy", "runtime_tests",
+    "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
     "cleanup", "receipt", "internal",
 ))
 OPERATION_DIAGNOSTICS = frozenset((
@@ -203,6 +204,33 @@ SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
     },
 }
 SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(SOURCE_GATES_NODE_DIAGNOSTIC_REASONS)
+# Fixed diagnostics for failures inside the source_gates operation that carry no NodeContractRefusal
+# substage: the build-diagnostics payload build, the Node profile setup, and the Node outcome
+# checks. They are bound to stage worker_setup and the public reason in
+# SOURCE_GATES_STEP_DIAGNOSTIC_REASONS, exactly like the substage diagnostics above.
+SOURCE_GATES_NODE_PROFILE_REASONS = (
+    "manifest_invalid", "command_failed", "capture_invalid", "output_unavailable",
+)
+SOURCE_GATES_NODE_OUTCOME_CHECKS = (
+    "rust", "stage", "capture", "substage", "verification", "reviewed_files",
+)
+SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY = {
+    ("payload", "payload_invalid"): "source_gates_payload_invalid",
+    ("payload", "capture_invalid"): "source_gates_payload_capture_invalid",
+    **{
+        ("node_profile", reason): "source_gates_node_profile_" + reason
+        for reason in SOURCE_GATES_NODE_PROFILE_REASONS
+    },
+    **{
+        ("node_outcome", check): "source_gates_node_outcome_" + check
+        for check in SOURCE_GATES_NODE_OUTCOME_CHECKS
+    },
+}
+SOURCE_GATES_STEP_DIAGNOSTIC_REASONS = {
+    diagnostic: "capture_invalid" if key[1] == "capture_invalid" else "runner_unavailable"
+    for key, diagnostic in SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY.items()
+}
+SOURCE_GATES_STEP_DIAGNOSTICS = frozenset(SOURCE_GATES_STEP_DIAGNOSTIC_REASONS)
 SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES = ("temp_dir", "diag_dir", "other_dir")
 SUMMARY_GUARD_VERIFY_FILE_CLASSES = ("env_file", "output_file", "path_file", "summary_file")
 SUMMARY_GUARD_VERIFY_FAILURES = {
@@ -239,7 +267,7 @@ SUMMARY_GUARD_DIAGNOSTICS = frozenset(SUMMARY_GUARD_DIAGNOSTIC_MAP.values())
 PRESERVED_SOURCE_DIAGNOSTICS = (
     SOURCE_RUNTIME_DIAGNOSTICS | SOURCE_FETCH_DIAGNOSTICS
     | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
-    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS
+    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS | SOURCE_GATES_STEP_DIAGNOSTICS
 )
 PRESERVED_SUMMARY_GUARD_DIAGNOSTICS = SUMMARY_GUARD_DIAGNOSTICS
 PRIVILEGE_PROBE_CHECK_DIAGNOSTICS = {
@@ -294,7 +322,9 @@ SUCCESS_RECEIPT_DETAILS = (
 ) + tuple("node_" + code for code in (
     "credential_like_content", "envelope_rejected", "exception_expired", "invalid_cargo_lock",
     "invalid_context", "invalid_expectation", "invalid_input", "invalid_lock_manifest",
-    "invalid_payload", "invalid_recipient", "invalid_rust_patch", "limit_exceeded",
+    "invalid_payload", "invalid_payload_bom", "invalid_payload_c0", "invalid_payload_c1",
+    "invalid_payload_cr", "invalid_payload_nul", "invalid_payload_utf8",
+    "invalid_recipient", "invalid_rust_patch", "limit_exceeded",
     "payload_too_large", "unreviewed_rust_path", "unsupported_kind", "input_too_large",
     "encryption_failed",
 ))
@@ -302,8 +332,8 @@ SUCCESS_RECEIPT_DIAGNOSTICS = frozenset("success_receipt_" + detail for detail i
 DIAGNOSTICS = (
     OPERATION_DIAGNOSTICS | CLEANUP_DIAGNOSTICS | SOURCE_RUNTIME_DIAGNOSTICS
     | SOURCE_FETCH_DIAGNOSTICS | SOURCE_BOOTSTRAP_DIAGNOSTICS | SOURCE_LEASE_OPEN_CLASS_DIAGNOSTICS
-    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS | SUMMARY_GUARD_DIAGNOSTICS
-    | FOREIGN_CONTEXT_DIAGNOSTICS | SUCCESS_RECEIPT_DIAGNOSTICS | frozenset(("none", "unavailable"))
+    | SOURCE_GATE_DIAGNOSTICS | SOURCE_GATES_NODE_DIAGNOSTICS | SOURCE_GATES_STEP_DIAGNOSTICS
+    | SUMMARY_GUARD_DIAGNOSTICS | FOREIGN_CONTEXT_DIAGNOSTICS | SUCCESS_RECEIPT_DIAGNOSTICS | frozenset(("none", "unavailable"))
 )
 DETAILED_DIAGNOSTICS = DIAGNOSTICS - frozenset(("none", "unavailable"))
 NO_OPERATION_STAGES = frozenset(("arguments", "context", "host"))
@@ -1330,6 +1360,30 @@ def _node_refusal_diagnostic(error):
     return None
 
 
+def _tag_source_gates_step(error, step, key):
+    """Record which source_gates step an exception came from. The first tag wins; a tag that cannot
+    be set only costs the specific diagnostic, never the refusal."""
+    try:
+        if getattr(error, "source_gates_step", None) is None:
+            error.source_gates_step = step
+            error.source_gates_key = key
+    except BaseException:
+        pass
+
+
+def _source_gates_step_diagnostic(error):
+    try:
+        step = getattr(error, "source_gates_step", None)
+        key = getattr(error, "source_gates_key", None)
+        if type(step) is str and type(key) is str:
+            candidate = SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY.get((step, key))
+            if candidate in SOURCE_GATES_STEP_DIAGNOSTICS:
+                return candidate
+    except BaseException:
+        pass
+    return None
+
+
 def _toolchain_refusal(error, stage):
     reason = getattr(error, "reason", None)
     if reason == "cleanup_incomplete":
@@ -1337,10 +1391,16 @@ def _toolchain_refusal(error, stage):
         if type(diagnostic) is str and diagnostic in SOURCE_GATES_CLEANUP_DIAGNOSTICS:
             return Refusal("cleanup_incomplete", "cleanup", diagnostic=diagnostic)
         return Refusal("cleanup_incomplete", "cleanup")
-    node_diagnostic = _node_refusal_diagnostic(error) if stage == "worker_setup" else None
-    expected_reason = (
-        SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.get(node_diagnostic) if node_diagnostic is not None else None
-    )
+    node_diagnostic = None
+    if stage == "worker_setup":
+        node_diagnostic = _node_refusal_diagnostic(error)
+        if node_diagnostic is None:
+            node_diagnostic = _source_gates_step_diagnostic(error)
+    expected_reason = None
+    if node_diagnostic is not None:
+        expected_reason = SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.get(
+            node_diagnostic, SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.get(node_diagnostic),
+        )
     if reason == "capture_invalid":
         return Refusal(
             "capture_invalid", stage,
@@ -1588,8 +1648,15 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                                 ),
                                 contract,
                             )
+                        try:
+                            diagnostic_payload = producer.build_diagnostic_payload(outcome)
+                        except BaseException as payload_error:
+                            _tag_source_gates_step(
+                                payload_error, "payload", getattr(payload_error, "reason", None),
+                            )
+                            raise
                         feedback_result = {
-                            "payload_bytes": producer.build_diagnostic_payload(outcome),
+                            "payload_bytes": diagnostic_payload,
                             "expected_manifest": None, "reviewed_rust_paths": None,
                             "source_result": "gate_failure" if outcome["failed_stage"] else "all_gates_completed",
                         }

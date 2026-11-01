@@ -267,8 +267,9 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
             Path("/fixed/worker-storage"), Path("/fixed/node/bin/node"), FakeContract("bootstrap"),
         )
         self.assertEqual(environment["NODE_OPTIONS"], NODE_OPTIONS_EXPECTED)
+        self.assertEqual(environment["NO_COLOR"], "1")
         self.assertEqual(set(environment), {
-            "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "NODE_OPTIONS", "npm_config_cache",
+            "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "NO_COLOR", "NODE_OPTIONS", "npm_config_cache",
             "npm_config_registry", "npm_config_userconfig", "npm_config_globalconfig",
             "npm_config_ignore_scripts", "npm_config_audit", "npm_config_fund",
             "npm_config_fetch_retries", "npm_config_fetch_timeout", "npm_config_update_notifier",
@@ -767,6 +768,189 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                         subject.extend_diagnostic_outcome(
                             dict(rust_outcome), lambda: node_result, FakeContract("verify"),
                         )
+
+    def _passed_rust_outcome(self):
+        return {
+            "selected_gates": subject.RUST_FOUNDATION_GATES,
+            "completed": subject.RUST_FOUNDATION_GATES, "failed_stage": None,
+            "returncode": 0, "stdout": b"", "stderr": b"",
+            "stdout_truncated": False, "stderr_truncated": False,
+        }
+
+    def _extend_with(self, refusal):
+        def fail_node():
+            raise refusal
+
+        return subject.extend_diagnostic_outcome(
+            self._passed_rust_outcome(), fail_node, FakeContract("verify"),
+        )
+
+    def test_stage_less_refusal_after_prepare_reports_the_gate_that_was_running(self):
+        for claimed in ("node_dependency_prepare", "typescript_tests", "node_dependency_audit"):
+            refusal = NodeContractRefusal(
+                "capture_invalid", stage=claimed, substage="bulk_audit", stderr=b"helper stderr",
+                completed_stages=subject.NODE_GATE_NAMES[:1],
+            )
+            with self.subTest(claimed=claimed):
+                outcome = self._extend_with(refusal)
+                self.assertEqual(outcome["failed_stage"], "node_dependency_audit")
+                self.assertEqual(outcome["completed"], subject.RUST_FOUNDATION_GATES + subject.NODE_GATE_NAMES[:1])
+        outcome = self._extend_with(NodeContractRefusal(
+            "manifest_invalid", stage="bogus", completed_stages=(),
+        ))
+        self.assertEqual(outcome["failed_stage"], "node_dependency_prepare")
+        self.assertEqual(outcome["completed"], subject.RUST_FOUNDATION_GATES)
+
+    def test_completed_stages_that_are_not_an_ordered_proper_prefix_are_still_refused(self):
+        for completed in (
+            ("typescript_tests",), ("node_dependency_audit",),
+            ("node_dependency_prepare", "typescript_typecheck"), subject.NODE_GATE_NAMES,
+            list(subject.NODE_GATE_NAMES[:1]), None,
+        ):
+            refusal = NodeContractRefusal(
+                "command_failed", stage="node_dependency_audit", substage="npm_ci",
+                completed_stages=completed,
+            )
+            with self.subTest(completed=completed), self.assertRaises(subject.NodeOutcomeInvalid) as caught:
+                self._extend_with(refusal)
+            self.assertEqual(caught.exception.check, "stage")
+            self.assertIsInstance(caught.exception, ValueError)
+            self.assertEqual(str(caught.exception), "node diagnostic invalid")
+
+    def test_every_outcome_check_raises_a_value_error_naming_its_fixed_check(self):
+        def refusal(**changes):
+            attributes = dict(
+                stage="typescript_tests", substage="tests",
+                completed_stages=subject.NODE_GATE_NAMES[:3],
+            )
+            attributes.update(changes)
+            return NodeContractRefusal("command_failed", **attributes)
+
+        cases = (
+            ("capture", "node capture invalid", refusal(stdout=b"x" * 32_769)),
+            ("capture", "node capture invalid", refusal(stderr="text")),
+            ("substage", "node substage invalid", refusal(substage="private_substage")),
+        )
+        for check, message, error in cases:
+            with self.subTest(check=check, message=message), self.assertRaises(subject.NodeOutcomeInvalid) as caught:
+                self._extend_with(error)
+            self.assertEqual((caught.exception.check, str(caught.exception)), (check, message))
+            self.assertEqual(caught.exception.source_gates_step, "node_outcome")
+            self.assertEqual(caught.exception.source_gates_key, check)
+        with self.assertRaises(subject.NodeOutcomeInvalid) as caught:
+            subject.extend_diagnostic_outcome({}, lambda: None, FakeContract("verify"))
+        self.assertEqual((caught.exception.check, str(caught.exception)), ("rust", "diagnostic outcome invalid"))
+        with self.assertRaises(subject.NodeOutcomeInvalid) as caught:
+            subject.extend_diagnostic_outcome(
+                self._passed_rust_outcome(),
+                lambda: {"mode": "verify", "status": "failed", "stages": subject.NODE_GATE_NAMES},
+                FakeContract("verify"),
+            )
+        self.assertEqual((caught.exception.check, str(caught.exception)),
+                         ("verification", "node verification incomplete"))
+        with self.assertRaises(subject.NodeOutcomeInvalid) as caught:
+            subject.extend_diagnostic_outcome(
+                self._passed_rust_outcome(),
+                lambda: {"mode": "verify", "status": "passed", "stages": subject.NODE_GATE_NAMES,
+                         "node_reviewed_file_count": 4, "node_reviewed_paths_sha256": "a" * 64},
+                FakeContract("verify"),
+            )
+        self.assertEqual((caught.exception.check, str(caught.exception)),
+                         ("reviewed_files", "node reviewed files invalid"))
+
+    def test_node_stderr_cut_never_leaves_a_partial_utf8_sequence_and_marks_truncation(self):
+        metadata = b"node_reason=command_failed node_substage=tests\n"
+        room = 32_768 - len(metadata)
+        character = "⎯".encode("utf-8")
+        for filler, tail, kept in (
+            (room - 1, character, 0), (room - 2, character, 0), (room - 3, character + b"zz", 3),
+            (room - 3, character, None), (room, b"", None),
+        ):
+            raw = b"a" * filler + tail
+            with self.subTest(filler=room - filler, tail=len(tail)):
+                outcome = self._extend_with(NodeContractRefusal(
+                    "command_failed", stage="typescript_tests", substage="tests", stderr=raw,
+                    completed_stages=subject.NODE_GATE_NAMES[:3],
+                ))
+                self.assertTrue(outcome["stderr"].startswith(metadata))
+                self.assertLessEqual(len(outcome["stderr"]), 32_768)
+                outcome["stderr"].decode("utf-8", "strict")
+                cut = len(raw) > room
+                self.assertEqual(outcome["stderr_truncated"], cut)
+                if kept is not None:
+                    self.assertEqual(len(outcome["stderr"]) - len(metadata) - filler, kept)
+
+    def test_trim_incomplete_utf8_matches_the_producer_helper(self):
+        producer_spec = importlib.util.spec_from_file_location(
+            "producer_trim_reference", Path(__file__).resolve().parent / "macos_feedback_producer.py",
+        )
+        producer = importlib.util.module_from_spec(producer_spec)
+        producer_spec.loader.exec_module(producer)
+        for data in (
+            b"", b"a", b"\xe2", b"a\xe2\x8e", "a⎯".encode("utf-8"), b"\xf0\x9f\x98",
+            "\U0001f600".encode("utf-8"), b"\x80\x80\x80\x80\x80", b"ab\xc3", b"\xff",
+        ):
+            with self.subTest(data=data):
+                self.assertEqual(subject._trim_incomplete_utf8(data), producer._trim_incomplete_utf8(data))
+
+    def test_profile_refusals_carry_a_fixed_step_tag_but_cleanup_does_not(self):
+        with self.assertRaises(Exception) as caught:
+            self._run(
+                "bootstrap", "lock", validated_tree="core_node_lock_return",
+                command_error=FeedbackRefusal("command_failed"),
+            )
+        self.assertEqual((caught.exception.source_gates_step, caught.exception.source_gates_key),
+                         ("node_profile", "command_failed"))
+        with self.assertRaises(FeedbackRefusal) as caught:
+            self._run(
+                "bootstrap", "lock", validated_tree="core_node_lock_return",
+                contract_error=ValueError("unexpected"),
+            )
+        self.assertEqual(caught.exception.reason, "manifest_invalid")
+        self.assertEqual((caught.exception.source_gates_step, caught.exception.source_gates_key),
+                         ("node_profile", "manifest_invalid"))
+        with self.assertRaises(Exception) as caught:
+            self._run(
+                "bootstrap", "lock", validated_tree="core_node_lock_return", fail_census=True,
+            )
+        self.assertEqual(caught.exception.reason, "cleanup_incomplete")
+        self.assertFalse(hasattr(caught.exception, "source_gates_step"))
+
+    def test_node_copy_set_is_pinned_and_contains_no_rust_source(self):
+        fixed = {
+            ".node-version", "package.json", "tsconfig.base.json",
+            "packages/host-api/package.json", "packages/host-api/tsconfig.json",
+            "packages/kernel-i18n/package.json", "packages/kernel-i18n/tsconfig.json",
+            "packages/kernel-i18n/tests/support.ts",
+            "crates/host/api/tests/fixtures/i18n-regression-v1.jsonl",
+            "crates/host/api/tests/fixtures/i18n-v1.jsonl",
+        }
+        reviewed = fixed | {
+            "packages/host-api/src/budget.ts", "packages/host-api/src/effects.ts",
+            "packages/host-api/src/entitlements.ts", "packages/host-api/src/errors.ts",
+            "packages/host-api/src/ids.ts", "packages/host-api/src/index.ts",
+            "packages/host-api/src/manifest.ts", "packages/host-api/src/metadata.ts",
+            "packages/host-api/src/module.ts", "packages/host-api/src/plugin.ts",
+            "packages/host-api/src/result.ts", "packages/host-api/src/streams.ts",
+            "packages/host-api/src/version.ts", "packages/host-api/tests/budget-streams.test.ts",
+            "packages/host-api/tests/entitlements-errors.test.ts",
+            "packages/host-api/tests/ids-version.test.ts",
+            "packages/host-api/tests/manifest-metadata.test.ts",
+        }
+        self.assertEqual(set(subject.NODE_FIXED_FILES), fixed)
+        self.assertEqual(set(subject.NODE_REVIEWED_FILES), reviewed)
+        self.assertEqual(set(subject.NODE_EXTRA_FILES), {"packages/kernel-i18n/tests/support.ts"})
+        self.assertEqual(set(subject.NODE_FIXTURE_FILES), {
+            "crates/host/api/tests/fixtures/i18n-regression-v1.jsonl",
+            "crates/host/api/tests/fixtures/i18n-v1.jsonl",
+        })
+        for path in reviewed:
+            with self.subTest(path=path):
+                self.assertFalse(path.endswith(".rs"))
+                self.assertFalse(path.startswith("crates/") and not path.endswith(".jsonl"))
+        # A verify copy adds only reviewed TypeScript files; it never adds a Rust source.
+        for relative in ("crates/host/api/src/vault/error.rs", "crates/host/api/src/lib.rs"):
+            self.assertNotIn(relative, subject.NODE_REVIEWED_FILES)
 
     def test_node_cleanup_refusal_propagates_without_diagnostic_payload(self):
         rust_outcome = {

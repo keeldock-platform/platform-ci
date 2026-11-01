@@ -365,6 +365,7 @@ CORE_CONTRACT_REFUSAL_STAGES = frozenset((
     "source_diff", "toolchain_install", "worker_setup", "summary_guard", "observer",
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
     "conformance_tests", "runtime_format", "runtime_clippy", "runtime_tests",
+    "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
     "cleanup", "receipt", "internal",
 ))
 CORE_CONTRACT_RUNTIME_REASONS = frozenset((
@@ -492,6 +493,28 @@ CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
 CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(
     CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS
 )
+CORE_CONTRACT_SOURCE_GATES_NODE_PROFILE_REASONS = (
+    "manifest_invalid", "command_failed", "capture_invalid", "output_unavailable",
+)
+CORE_CONTRACT_SOURCE_GATES_NODE_OUTCOME_CHECKS = (
+    "rust", "stage", "capture", "substage", "verification", "reviewed_files",
+)
+CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTIC_REASONS = {
+    "source_gates_payload_invalid": "runner_unavailable",
+    "source_gates_payload_capture_invalid": "capture_invalid",
+    **{
+        "source_gates_node_profile_" + reason:
+            "capture_invalid" if reason == "capture_invalid" else "runner_unavailable"
+        for reason in CORE_CONTRACT_SOURCE_GATES_NODE_PROFILE_REASONS
+    },
+    **{
+        "source_gates_node_outcome_" + check: "runner_unavailable"
+        for check in CORE_CONTRACT_SOURCE_GATES_NODE_OUTCOME_CHECKS
+    },
+}
+CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS = frozenset(
+    CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTIC_REASONS
+)
 CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS = frozenset((
     "context_guard_platform_unapproved", "context_guard_preflight_unavailable",
     "context_guard_pf_unavailable", "context_guard_pf_rules_unexpected",
@@ -507,6 +530,8 @@ CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS = frozenset(
         "node_credential_like_content", "node_envelope_rejected", "node_exception_expired",
         "node_invalid_cargo_lock", "node_invalid_context", "node_invalid_expectation",
         "node_invalid_input", "node_invalid_lock_manifest", "node_invalid_payload",
+        "node_invalid_payload_bom", "node_invalid_payload_c0", "node_invalid_payload_c1",
+        "node_invalid_payload_cr", "node_invalid_payload_nul", "node_invalid_payload_utf8",
         "node_invalid_recipient", "node_invalid_rust_patch", "node_limit_exceeded",
         "node_payload_too_large", "node_unreviewed_rust_path", "node_unsupported_kind",
         "node_input_too_large", "node_encryption_failed",
@@ -542,7 +567,7 @@ CORE_CONTRACT_REFUSAL_DIAGNOSTICS = frozenset((
     | CORE_CONTRACT_BOOTSTRAP_DIAGNOSTICS | CORE_CONTRACT_SOURCE_LEASE_OPEN_DIAGNOSTICS
     | CORE_CONTRACT_GATE_DIAGNOSTICS | CORE_CONTRACT_SOURCE_GATES_CLEANUP_DIAGNOSTICS
     | CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS | CORE_CONTRACT_FOREIGN_CONTEXT_DIAGNOSTICS
-    | CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS
+    | CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS | CORE_CONTRACT_SUCCESS_RECEIPT_DIAGNOSTICS
 )
 CORE_CONTRACT_PRIVILEGE_PROBE_DIAGNOSTICS = frozenset((
     "worker_privilege_probe_group_cleanup", "worker_privilege_probe_capture_cleanup",
@@ -1686,6 +1711,11 @@ def _core_contract_refusal_diagnostic_matches(value):
         return (
             value["stage"] == "worker_setup"
             and value["reason"] == CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS[diagnostic]
+        )
+    if diagnostic in CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS:
+        return (
+            value["stage"] == "worker_setup"
+            and value["reason"] == CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTIC_REASONS[diagnostic]
         )
     if diagnostic in CORE_CONTRACT_GATE_DIAGNOSTICS:
         if value["stage"] not in CORE_CONTRACT_GATE_STAGES:
