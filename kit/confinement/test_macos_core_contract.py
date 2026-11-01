@@ -1596,8 +1596,12 @@ class CoreContractTests(unittest.TestCase):
                     rust = SimpleNamespace(_run_worker_command=lambda *args, **kwargs: SimpleNamespace(
                         returncode=0, stdout=b"", stderr=b"",
                     ))
-                    with patch.object(subject, "_source_commands", return_value=(
-                            ("workspace_tests", ("cargo", "test", "--locked")),)):
+                    commands = (("workspace_tests", ("cargo", "test", "--locked")),)
+                    if not capture_failure:
+                        commands = subject._source_commands(
+                            Path("/source"), {"cargo": Path("/toolchain/bin/cargo")},
+                        )
+                    with patch.object(subject, "_source_commands", return_value=commands):
                         with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
                                 _worker_census=census)):
                             with self.assertRaises(subject.Refusal) as raised:

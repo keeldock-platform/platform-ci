@@ -431,11 +431,11 @@ class MacosFeedbackProducerTests(unittest.TestCase):
 
     def test_build_diagnostic_payload_escapes_every_class_the_encryptor_refuses(self):
         raw = (b"a\x00b\rc\x1b[31md\x08e\x7ff\tg\nh"
-               + "\u0080i\u0085j\u009fk l‮m".encode("utf-8"))
+               + "\u0080i\u0085j\u009fk\u2028l\u202em".encode("utf-8"))
         payload = producer.build_diagnostic_payload(self._failed_outcome(raw, raw))
         body = self._body(payload).decode("utf-8")
         expected = ("a\\u{00}b\\u{0d}c\\u{1b}[31md\\u{08}e\\u{7f}f\tg\nh"
-                    "\\u{80}i\\u{85}j\\u{9f}k l\\u{202e}m")
+                    "\\u{80}i\\u{85}j\\u{9f}k\u2028l\\u{202e}m")
         self.assertEqual(body, expected + "\nstderr:\n" + expected)
         self.assertIsNone(producer.UNSAFE_DIAGNOSTIC_RE.search(payload.decode("utf-8")))
         self.assertEqual(payload, producer.build_diagnostic_payload(self._failed_outcome(raw, raw)))
