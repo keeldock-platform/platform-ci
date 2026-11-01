@@ -4,6 +4,7 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 
@@ -385,12 +386,18 @@ class RustToolchainContractTests(unittest.TestCase):
         self.assertIs(truncated.stderr_truncated, False)
 
     def _run_capture_shim(self, stdout_bytes, stderr_bytes):
-        child = ("import sys; sys.stdout.buffer.write(%r); sys.stderr.buffer.write(%r); sys.exit(3)"
-                 % (stdout_bytes, stderr_bytes))
-        completed = subprocess.run(
-            (sys.executable, "-I", "-S", "-B", "-c", rust.COMMAND_CAPTURE_SCRIPT, sys.executable, "-c", child),
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-        )
+        with tempfile.TemporaryDirectory() as temporary:
+            out_path = Path(temporary) / "stdout.bin"
+            err_path = Path(temporary) / "stderr.bin"
+            out_path.write_bytes(stdout_bytes)
+            err_path.write_bytes(stderr_bytes)
+            child = ("import sys; sys.stdout.buffer.write(open(%r, 'rb').read()); "
+                     "sys.stderr.buffer.write(open(%r, 'rb').read()); sys.exit(3)"
+                     % (str(out_path), str(err_path)))
+            completed = subprocess.run(
+                (sys.executable, "-I", "-S", "-B", "-c", rust.COMMAND_CAPTURE_SCRIPT, sys.executable, "-c", child),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
         self.assertEqual(completed.returncode, 0)
         return rust._decode_command_capture(
             SimpleNamespace(returncode=0, stdout=completed.stdout, stderr=completed.stderr),
