@@ -404,6 +404,7 @@ class RustToolchainContractTests(unittest.TestCase):
             ("child",),
         )
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX pipe selectors in the capture shim")
     def test_capture_shim_never_keeps_a_partial_utf8_sequence_at_the_byte_cut(self):
         limit = rust.DIAGNOSTIC_STREAM_LIMIT
         three = "⎯".encode("utf-8")

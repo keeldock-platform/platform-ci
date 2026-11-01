@@ -269,7 +269,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_rust_license_gate.py': '5c421d6142948a52704fd9a4db72d0761c167ed6a8fea5bae49b633acf53defa',
     '.github/workflows/macos-rust-toolchain-smoke.yml': 'cdf7068f8887c22958d74f3c2cc0a73c5c8c4c41f4eff0b43e16e47f61e58bb7',
     'kit/confinement/macos_rust_toolchain.py': '51e4bb411b1ba8b8755a8f0d14611cbca704bbbac1f0e68d4f42e3a9f4f459f9',
-    'kit/confinement/test_macos_rust_toolchain.py': '81b04b4367be93e46431643b815e6a04cea71c191c35645c0d53a878ae8309ee',
+    'kit/confinement/test_macos_rust_toolchain.py': 'd77bcb04ad63f713fa021b0f1958e8adf083468e7c5cb8b5047483baab3cf71e',
     '.github/workflows/macos-rules-bootstrap.yml': 'a91387440f8caceadf8f19f7c87feb3d82377eb3c9e1813de48b518992d48807',
     '.github/workflows/macos-core-bootstrap.yml': '08cf50d62e18e52661befe3153294c2d188b8a980f914437dab7cbd899744b81',
     'kit/confinement/macos_rules_bootstrap.py': '84bd6dcbd184a63c64fda78151af1540e6a166fc8bde7194b43c8336b93b5fad',
