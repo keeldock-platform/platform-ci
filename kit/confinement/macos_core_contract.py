@@ -26,6 +26,8 @@ WORKER_PREFIX = "macos-core-contract-worker-"
 MAX_TOTAL_SECONDS = 15 * 60
 NPM_ADMISSION_TOTAL_SECONDS = 40 * 60
 MAX_COMMAND_SECONDS = 120
+MAX_TEST_COMMAND_SECONDS = 300
+GATE_TIMEOUT_RETURNCODE = 124
 MAX_DIFF_BYTES = 7 * 1024 * 1024
 MAX_CAPTURE_BYTES = 65_536
 MAX_RECEIPT_BYTES = 8192
@@ -57,6 +59,10 @@ GATE_NAMES = (
 PARSER_GATE_NAMES = ("parser_format", "parser_clippy", "parser_replay")
 RUNTIME_GATE_NAMES = ("runtime_format", "runtime_clippy", "runtime_tests")
 SOURCE_GATE_STAGES = GATE_NAMES + PARSER_GATE_NAMES + RUNTIME_GATE_NAMES
+TEST_GATE_STAGES = frozenset((
+    "workspace_tests", "api_tests", "mock_tests", "conformance_tests", "parser_replay",
+    "runtime_tests",
+))
 SUITE_NAMES = (
     "core.static", "core.host-api", "core.mock-host", "core.conformance",
 )
@@ -963,6 +969,74 @@ def _run_inside_source(source, original_cwd, command):
             raise Refusal("cleanup_incomplete", "cleanup", diagnostic="cwd_restore") from None
 
 
+GATE_CLEANUP_CHECK_DIAGNOSTICS = {
+    "probe_process_census": "source_gates_census",
+    "probe_process_group_cleanup": "source_gates_group_cleanup",
+    "probe_process_capture_cleanup": "source_gates_capture_cleanup",
+}
+
+
+def _gate_survivor_diagnostic(classes):
+    if (type(classes) is tuple and classes
+            and all(type(item) is str and item in SOURCE_GATES_SURVIVOR_CLASSES for item in classes)):
+        if len(classes) == 1:
+            return "source_gates_survivor_" + classes[0]
+        return "source_gates_survivor_multiple"
+    return "source_gates_cleanup_unclassified"
+
+
+def _gate_cleanup_diagnostic(error):
+    check = getattr(error, "probe_check", None)
+    command_check = getattr(error, "command_check", None)
+    if type(check) is str:
+        if check == "probe_process_timeout":
+            if type(command_check) is str and command_check == "timeout":
+                return "source_gates_timeout"
+            if type(command_check) is str and command_check == "helper_failure":
+                return "source_gates_wait_uncertain"
+            return "source_gates_cleanup_unclassified"
+        if check in GATE_CLEANUP_CHECK_DIAGNOSTICS:
+            return GATE_CLEANUP_CHECK_DIAGNOSTICS[check]
+        if check == "probe_process_survivor":
+            return _gate_survivor_diagnostic(getattr(error, "survivor_classes", None))
+    if type(command_check) is str and command_check == "timeout":
+        return "source_gates_timeout"
+    return "source_gates_cleanup_unclassified"
+
+
+def _gate_census_diagnostic(error):
+    classes = getattr(error, "survivor_classes", None)
+    if type(classes) is tuple:
+        return _gate_survivor_diagnostic(classes)
+    if type(classes) is str and classes == "unclassified":
+        return "source_gates_survivor_unknown"
+    return "source_gates_census"
+
+
+def _gate_command_seconds(stage):
+    return MAX_TEST_COMMAND_SECONDS if stage in TEST_GATE_STAGES else MAX_COMMAND_SECONDS
+
+
+def _clean_gate_timeout(error):
+    # A timeout reaches this shape only after the capability probe verified a stopped process group,
+    # joined capture threads and an empty worker-uid census; any other cleanup failure raises an
+    # earlier, different probe_check. The caller still re-runs the census before using it.
+    return (getattr(error, "reason", None) == "cleanup_incomplete"
+            and getattr(error, "probe_check", None) == "probe_process_timeout"
+            and getattr(error, "command_check", None) == "timeout"
+            and getattr(error, "survivor_classes", None) == ())
+
+
+def _gate_timeout_result(limit_seconds):
+    result = subprocess.CompletedProcess(
+        (), GATE_TIMEOUT_RETURNCODE, b"",
+        ("kd-gate-timeout limit_seconds=" + str(limit_seconds) + "\n").encode("ascii"),
+    )
+    result.stdout_truncated = False
+    result.stderr_truncated = False
+    return result
+
+
 def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools, deadline,
                capture_failure=False, include_parser=False, include_runtime=False):
     if (type(capture_failure) is not bool or type(include_parser) is not bool
@@ -987,34 +1061,45 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
     for stage, argv in commands:
         if time.monotonic() >= deadline:
             raise Refusal("gate_failed", stage)
+        gate_seconds = _gate_command_seconds(stage)
         try:
             result = rust._run_worker_command(
                 argv, uid, environment, host_toolchain["python"], capability,
-                stage=stage, deadline=deadline, timeout=MAX_COMMAND_SECONDS,
+                stage=stage, deadline=deadline, timeout=gate_seconds,
                 allow_nonzero_capture=capture_failure,
             )
         except BaseException as error:
             if getattr(error, "reason", None) == "cleanup_incomplete":
-                raise Refusal("cleanup_incomplete", "cleanup") from None
-            command_check = getattr(error, "command_check", None)
-            diagnostic = (
-                SOURCE_GATE_COMMAND_DIAGNOSTICS.get(command_check)
-                if type(command_check) is str else None
-            )
-            if diagnostic is not None and stage in SOURCE_GATE_STAGES:
-                reason = "capture_invalid" if getattr(error, "reason", None) == "capture_invalid" else "gate_failed"
-                raise Refusal(reason, stage, diagnostic=diagnostic) from None
-            if getattr(error, "reason", None) == "capture_invalid":
-                raise Refusal("capture_invalid", stage) from None
-            raise Refusal("gate_failed", stage) from None
+                if not (capture_failure and _clean_gate_timeout(error) and time.monotonic() < deadline):
+                    raise Refusal(
+                        "cleanup_incomplete", "cleanup", diagnostic=_gate_cleanup_diagnostic(error),
+                    ) from None
+                result = _gate_timeout_result(gate_seconds)
+            else:
+                command_check = getattr(error, "command_check", None)
+                diagnostic = (
+                    SOURCE_GATE_COMMAND_DIAGNOSTICS.get(command_check)
+                    if type(command_check) is str else None
+                )
+                if diagnostic is not None and stage in SOURCE_GATE_STAGES:
+                    reason = (
+                        "capture_invalid" if getattr(error, "reason", None) == "capture_invalid"
+                        else "gate_failed"
+                    )
+                    raise Refusal(reason, stage, diagnostic=diagnostic) from None
+                if getattr(error, "reason", None) == "capture_invalid":
+                    raise Refusal("capture_invalid", stage) from None
+                raise Refusal("gate_failed", stage) from None
         if (type(result.returncode) is not int
                 or type(result.stdout) is not bytes or type(result.stderr) is not bytes
                 or len(result.stdout) > MAX_CAPTURE_BYTES or len(result.stderr) > MAX_CAPTURE_BYTES):
             raise Refusal("capture_invalid", stage)
         try:
             _load_control_sibling("macos_reviewed_build")._worker_census(uid, host_toolchain["python"], stage)
-        except BaseException:
-            raise Refusal("cleanup_incomplete", "cleanup") from None
+        except BaseException as error:
+            raise Refusal(
+                "cleanup_incomplete", "cleanup", diagnostic=_gate_census_diagnostic(error),
+            ) from None
         if result.returncode != 0:
             if capture_failure:
                 return {

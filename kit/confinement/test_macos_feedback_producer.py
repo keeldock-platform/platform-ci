@@ -396,6 +396,26 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                 "stderr_truncated": False,
             })
 
+    def test_build_diagnostic_payload_accepts_the_clean_gate_timeout_outcome(self):
+        outcome = {
+            "failed_stage": "workspace_tests",
+            "selected_gates": producer.DIAGNOSTIC_BASE_GATES,
+            "completed": ("format", "clippy"),
+            "returncode": 124,
+            "stdout": b"",
+            "stderr": b"kd-gate-timeout limit_seconds=300\n",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+        }
+        payload = producer.build_diagnostic_payload(outcome)
+        self.assertEqual(
+            payload,
+            b"KD-BUILD-DIAGNOSTICS schema=1 stage=workspace_tests stdout_truncated=false "
+            b"stderr_truncated=false exit=124 selected_gates=format,clippy,workspace_tests,api_tests,"
+            b"mock_tests,conformance_tests completed_gates=format,clippy\n"
+            b"stdout:\n\nstderr:\nkd-gate-timeout limit_seconds=300\n",
+        )
+
     def test_build_diagnostic_payload_reports_full_parser_selection_and_refuses_skipped_stages(self):
         selected = producer.DIAGNOSTIC_GATE_SELECTIONS[1]
         successful = producer.build_diagnostic_payload({

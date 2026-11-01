@@ -1394,6 +1394,273 @@ class CoreContractTests(unittest.TestCase):
         self.assertNotIn("gates", outcome)
         self.assertEqual(calls, ["workspace_tests"])
 
+    def _gate_cleanup_error(self, **attributes):
+        class CleanupFailure(Exception):
+            reason = "cleanup_incomplete"
+
+        error = CleanupFailure()
+        for name, value in attributes.items():
+            setattr(error, name, value)
+        return error
+
+    def test_source_gate_cleanup_refusal_keeps_a_listed_source_gates_diagnostic(self):
+        cases = (
+            ({"probe_check": "probe_process_timeout", "command_check": "timeout",
+              "survivor_classes": ()}, "source_gates_timeout"),
+            ({"probe_check": "probe_process_timeout", "command_check": "helper_failure",
+              "survivor_classes": ()}, "source_gates_wait_uncertain"),
+            ({"probe_check": "probe_process_timeout"}, "source_gates_cleanup_unclassified"),
+            ({"probe_check": "probe_process_group_cleanup"}, "source_gates_group_cleanup"),
+            ({"probe_check": "probe_process_capture_cleanup"}, "source_gates_capture_cleanup"),
+            ({"probe_check": "probe_process_census"}, "source_gates_census"),
+            ({"probe_check": "probe_process_survivor", "survivor_classes": ("python",)},
+             "source_gates_survivor_python"),
+            ({"probe_check": "probe_process_survivor", "survivor_classes": ("python", "ps")},
+             "source_gates_survivor_multiple"),
+            ({"probe_check": "probe_process_survivor", "survivor_classes": ()},
+             "source_gates_cleanup_unclassified"),
+            ({"probe_check": "probe_process_survivor", "survivor_classes": ("private",)},
+             "source_gates_cleanup_unclassified"),
+            ({"command_check": "timeout"}, "source_gates_timeout"),
+            ({"command_check": "nonzero_exit"}, "source_gates_cleanup_unclassified"),
+            ({}, "source_gates_cleanup_unclassified"),
+        )
+        for capture_failure in (False, True):
+            for attributes, expected in cases:
+                with self.subTest(capture_failure=capture_failure, attributes=attributes):
+                    cause = self._gate_cleanup_error(**attributes)
+
+                    def fail_command(*unused_args, **unused_kwargs):
+                        raise cause
+
+                    rust = SimpleNamespace(_run_worker_command=fail_command)
+                    # A clean timeout is only a gate result in capture mode; the survivor-bearing
+                    # and mismatching shapes must refuse in both modes.
+                    if (capture_failure and expected == "source_gates_timeout"
+                            and attributes.get("survivor_classes") == ()):
+                        continue
+                    with self.assertRaises(subject.Refusal) as raised:
+                        subject._run_gates(
+                            Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                            rust, {"cargo": Path("/toolchain/bin/cargo")},
+                            subject.time.monotonic() + 30, capture_failure=capture_failure,
+                        )
+                    self.assertEqual(raised.exception.reason, "cleanup_incomplete")
+                    self.assertEqual(raised.exception.stage, "cleanup")
+                    self.assertEqual(raised.exception.diagnostic, expected)
+                    self.assertIn(expected, subject.SOURCE_GATES_CLEANUP_DIAGNOSTICS)
+                    attached = subject._FailureDiagnostics().attach(raised.exception, "source_gates")
+                    self.assertEqual(attached.diagnostic, expected)
+                    reattached = subject._FailureDiagnostics().attach(attached, "source_gates")
+                    record = json.loads(subject._format_refusal(reattached))
+                    self.assertEqual(record["diagnostic"], expected)
+                    self.assertEqual((record["reason"], record["stage"]), ("cleanup_incomplete", "cleanup"))
+                    self.assertEqual(set(record), {"diagnostic", "reason", "schema_version", "stage", "status"})
+
+    def test_source_gate_census_failure_keeps_a_listed_source_gates_diagnostic(self):
+        class CensusFailure(Exception):
+            def __init__(self, survivor_classes):
+                self.survivor_classes = survivor_classes
+
+        cases = (
+            (("helper_trust",), "source_gates_survivor_helper_trust"),
+            (("python", "ps"), "source_gates_survivor_multiple"),
+            ((), "source_gates_cleanup_unclassified"),
+            ("unclassified", "source_gates_survivor_unknown"),
+            ("unavailable", "source_gates_census"),
+            (None, "source_gates_census"),
+        )
+        for capture_failure in (False, True):
+            for classes, expected in cases:
+                with self.subTest(capture_failure=capture_failure, classes=classes):
+                    def census(*unused_args):
+                        raise CensusFailure(classes)
+
+                    rust = SimpleNamespace(_run_worker_command=lambda *args, **kwargs: SimpleNamespace(
+                        returncode=0, stdout=b"", stderr=b"",
+                    ))
+                    with patch.object(subject, "_source_commands", return_value=(
+                            ("workspace_tests", ("cargo", "test", "--locked")),)):
+                        with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
+                                _worker_census=census)):
+                            with self.assertRaises(subject.Refusal) as raised:
+                                subject._run_gates(
+                                    Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                                    rust, {"cargo": Path("/toolchain/bin/cargo")},
+                                    subject.time.monotonic() + 30, capture_failure=capture_failure,
+                                )
+                    self.assertEqual(
+                        (raised.exception.reason, raised.exception.stage, raised.exception.diagnostic),
+                        ("cleanup_incomplete", "cleanup", expected),
+                    )
+
+    def test_clean_gate_timeout_in_capture_mode_is_a_gate_failure_with_a_timeout_marker(self):
+        census_calls = []
+        timeouts = []
+        cause = self._gate_cleanup_error(
+            probe_check="probe_process_timeout", command_check="timeout", survivor_classes=(),
+        )
+
+        def run_command(*unused_args, **kwargs):
+            timeouts.append((kwargs["stage"], kwargs["timeout"]))
+            self.assertIs(kwargs["allow_nonzero_capture"], True)
+            if kwargs["stage"] == "format":
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+            raise cause
+
+        rust = SimpleNamespace(_run_worker_command=run_command)
+        commands = (
+            ("format", ("cargo", "fmt")),
+            ("workspace_tests", ("cargo", "test", "--locked")),
+            ("api_tests", ("cargo", "test", "--locked")),
+        )
+        with patch.object(subject, "_source_commands", return_value=commands):
+            with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
+                    _worker_census=lambda *args: census_calls.append(args[-1]))):
+                outcome = subject._run_gates(
+                    Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                    rust, {"cargo": Path("/toolchain/bin/cargo")}, subject.time.monotonic() + 30,
+                    capture_failure=True,
+                )
+        self.assertEqual(outcome["failed_stage"], "workspace_tests")
+        self.assertEqual(outcome["completed"], ("format",))
+        self.assertEqual(outcome["selected_gates"], ("format", "workspace_tests", "api_tests"))
+        self.assertEqual(outcome["returncode"], subject.GATE_TIMEOUT_RETURNCODE)
+        self.assertEqual(outcome["returncode"], 124)
+        self.assertEqual(outcome["stdout"], b"")
+        self.assertEqual(outcome["stderr"], b"kd-gate-timeout limit_seconds=300\n")
+        self.assertIs(outcome["stdout_truncated"], False)
+        self.assertIs(outcome["stderr_truncated"], False)
+        self.assertEqual(timeouts, [("format", 120), ("workspace_tests", 300)])
+        self.assertEqual(census_calls, ["format", "workspace_tests"])
+        self.assertNotIn("api_tests", census_calls)
+        self.assertNotIn("gates", outcome)
+
+    def test_gate_timeout_outcome_still_requires_a_clean_census(self):
+        class CensusFailure(Exception):
+            survivor_classes = ("python",)
+
+        def census(*unused_args):
+            raise CensusFailure()
+
+        cause = self._gate_cleanup_error(
+            probe_check="probe_process_timeout", command_check="timeout", survivor_classes=(),
+        )
+
+        def fail_command(*unused_args, **unused_kwargs):
+            raise cause
+
+        with patch.object(subject, "_source_commands", return_value=(
+                ("workspace_tests", ("cargo", "test", "--locked")),)):
+            with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
+                    _worker_census=census)):
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject._run_gates(
+                        Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                        SimpleNamespace(_run_worker_command=fail_command),
+                        {"cargo": Path("/toolchain/bin/cargo")}, subject.time.monotonic() + 30,
+                        capture_failure=True,
+                    )
+        self.assertEqual(
+            (raised.exception.reason, raised.exception.stage, raised.exception.diagnostic),
+            ("cleanup_incomplete", "cleanup", "source_gates_survivor_python"),
+        )
+
+    def test_timeout_with_any_unverified_cleanup_still_refuses_in_capture_mode(self):
+        base = {"probe_check": "probe_process_timeout", "command_check": "timeout"}
+        cases = (
+            ({**base, "survivor_classes": ("python",)}, "source_gates_timeout"),
+            ({**base}, "source_gates_timeout"),
+            ({"probe_check": "probe_process_group_cleanup", "command_check": "timeout",
+              "survivor_classes": ()}, "source_gates_group_cleanup"),
+            ({"probe_check": "probe_process_capture_cleanup", "command_check": "timeout",
+              "survivor_classes": ()}, "source_gates_capture_cleanup"),
+            ({"probe_check": "probe_process_census", "command_check": "timeout",
+              "survivor_classes": ()}, "source_gates_census"),
+            ({"probe_check": "probe_process_survivor", "command_check": "timeout",
+              "survivor_classes": ("python",)}, "source_gates_survivor_python"),
+            ({"probe_check": "probe_process_timeout", "command_check": "helper_failure",
+              "survivor_classes": ()}, "source_gates_wait_uncertain"),
+        )
+        for attributes, expected in cases:
+            with self.subTest(attributes=attributes):
+                cause = self._gate_cleanup_error(**attributes)
+
+                def fail_command(*unused_args, **unused_kwargs):
+                    raise cause
+
+                with patch.object(subject, "_source_commands", return_value=(
+                        ("workspace_tests", ("cargo", "test", "--locked")),)):
+                    with self.assertRaises(subject.Refusal) as raised:
+                        subject._run_gates(
+                            Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                            SimpleNamespace(_run_worker_command=fail_command),
+                            {"cargo": Path("/toolchain/bin/cargo")}, subject.time.monotonic() + 30,
+                            capture_failure=True,
+                        )
+                self.assertEqual(
+                    (raised.exception.reason, raised.exception.stage, raised.exception.diagnostic),
+                    ("cleanup_incomplete", "cleanup", expected),
+                )
+
+    def test_clean_timeout_after_the_job_deadline_still_refuses(self):
+        cause = self._gate_cleanup_error(
+            probe_check="probe_process_timeout", command_check="timeout", survivor_classes=(),
+        )
+
+        def fail_command(*unused_args, **unused_kwargs):
+            raise cause
+
+        readings = iter((0.0, 100.0))
+        with patch.object(subject, "_source_commands", return_value=(
+                ("workspace_tests", ("cargo", "test", "--locked")),)):
+            with patch.object(subject.time, "monotonic", side_effect=lambda: next(readings)):
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject._run_gates(
+                        Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                        SimpleNamespace(_run_worker_command=fail_command),
+                        {"cargo": Path("/toolchain/bin/cargo")}, 50.0, capture_failure=True,
+                    )
+        self.assertEqual(
+            (raised.exception.reason, raised.exception.stage, raised.exception.diagnostic),
+            ("cleanup_incomplete", "cleanup", "source_gates_timeout"),
+        )
+
+    def test_test_gates_use_the_larger_command_limit_inside_the_job_deadline(self):
+        self.assertEqual(subject.MAX_COMMAND_SECONDS, 120)
+        self.assertEqual(subject.MAX_TEST_COMMAND_SECONDS, 300)
+        self.assertEqual(
+            subject.TEST_GATE_STAGES,
+            frozenset(("workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+                       "parser_replay", "runtime_tests")),
+        )
+        self.assertLessEqual(subject.TEST_GATE_STAGES, frozenset(subject.SOURCE_GATE_STAGES))
+        self.assertLess(subject.MAX_TEST_COMMAND_SECONDS, subject.MAX_TOTAL_SECONDS)
+        timeouts = {}
+
+        def run_command(*unused_args, **kwargs):
+            timeouts[kwargs["stage"]] = kwargs["timeout"]
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        commands = tuple((stage, ("cargo", stage)) for stage in subject.SOURCE_GATE_STAGES)
+        with patch.object(subject, "_source_commands", return_value=commands):
+            with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
+                    _worker_census=lambda *args: None)):
+                subject._run_gates(
+                    Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                    SimpleNamespace(_run_worker_command=run_command),
+                    {"cargo": Path("/toolchain/bin/cargo")}, subject.time.monotonic() + 30,
+                    capture_failure=True, include_parser=True,
+                )
+        self.assertEqual(set(timeouts), set(subject.SOURCE_GATE_STAGES))
+        for stage, seconds in timeouts.items():
+            self.assertEqual(
+                seconds, 300 if stage in subject.TEST_GATE_STAGES else 120, msg=stage,
+            )
+        for stage in ("format", "clippy", "parser_format", "parser_clippy", "runtime_format",
+                      "runtime_clippy"):
+            self.assertEqual(timeouts[stage], 120)
+
     def test_foundation_parser_failure_reports_selected_and_completed_stages(self):
         source = Path("/synthetic-source")
         tools = {"cargo": Path("/toolchain/bin/cargo")}
