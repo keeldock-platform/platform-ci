@@ -2219,6 +2219,56 @@ class ProbeIdentityBootstrapTests(unittest.TestCase):
         self.assertFalse(raised.exception.cleanup_complete)
         self.assertNotIn("private command", str(raised.exception))
 
+    def test_probe_user_timeout_never_masks_a_cleanup_failure(self):
+        # The core contract turns only a probe_process_timeout into a build-diagnostics gate result;
+        # every cleanup failure observed after the kill must win over the timeout.
+        class StubProcess:
+            pid = 12360
+            returncode = None
+
+            def __init__(self):
+                self.stdout = io.BytesIO(b"")
+                self.stderr = io.BytesIO(b"")
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired("private command", timeout)
+
+            def poll(self):
+                return self.returncode
+
+        cases = (
+            ("group", {"terminate": False}, "probe_process_group_cleanup"),
+            ("capture", {"join": False}, "probe_process_capture_cleanup"),
+            ("census", {"census": OSError("private census detail")}, "probe_process_census"),
+            ("survivor", {"presence": (True, ("python",))}, "probe_process_survivor"),
+        )
+        for label, failure, expected in cases:
+            with self.subTest(label=label):
+                presence = failure.get("presence", (False, ()))
+                census_patch = (
+                    patch.object(macos_capability, "_probe_uid_processes_present",
+                                 side_effect=failure["census"])
+                    if "census" in failure else
+                    patch.object(macos_capability, "_probe_uid_processes_present", return_value=presence)
+                )
+                with patch.object(macos_capability.subprocess, "Popen", return_value=StubProcess()):
+                    with patch.object(macos_capability, "_terminate_probe_tree",
+                                      return_value=failure.get("terminate", True)):
+                        with patch.object(macos_capability._Capture, "join",
+                                          return_value=failure.get("join", True)):
+                            with census_patch:
+                                with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                    macos_capability._run_as_probe_user(
+                                        ["/usr/bin/true"], 502,
+                                        failure_reason="native_preflight_unavailable",
+                                        failure_check="probe_process_toolchain",
+                                        command_diagnostics=True,
+                                        python_executable=TEST_TOOLCHAIN["python"],
+                                    )
+                self.assertEqual(raised.exception.check, expected)
+                self.assertNotEqual(raised.exception.check, "probe_process_timeout")
+                self.assertFalse(raised.exception.cleanup_complete)
+
     def test_probe_failure_command_check_accepts_only_fixed_values(self):
         expected = {
             "spawn_failure", "nonzero_exit", "timeout", "capture_invalid", "capture_overflow", "helper_failure",

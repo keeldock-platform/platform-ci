@@ -1600,6 +1600,8 @@ def _run_as_probe_user(
                     stream.close()
                 except (OSError, ValueError):
                     pass
+    # Reached only when the finally block verified group stop, capture join and an empty census;
+    # macos_core_contract._clean_gate_timeout relies on this ordering. Keep cleanup checks first.
     if timed_out or wait_uncertain:
         command_check = "timeout" if timed_out else "helper_failure"
         raise ProbeFailure(

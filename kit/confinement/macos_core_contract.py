@@ -1018,9 +1018,10 @@ def _gate_command_seconds(stage):
 
 
 def _clean_gate_timeout(error):
-    # A timeout reaches this shape only after the capability probe verified a stopped process group,
-    # joined capture threads and an empty worker-uid census; any other cleanup failure raises an
-    # earlier, different probe_check. The caller still re-runs the census before using it.
+    # Trust comes from macos_capability._run_as_probe_user: probe_process_timeout is raised only after
+    # its finally block verified a stopped group, joined captures and an empty worker-uid census (any
+    # failure there raises a different probe_check first). survivor_classes is always () on this shape;
+    # the check is defence in depth. The caller still re-runs the census before using the result.
     return (getattr(error, "reason", None) == "cleanup_incomplete"
             and getattr(error, "probe_check", None) == "probe_process_timeout"
             and getattr(error, "command_check", None) == "timeout"

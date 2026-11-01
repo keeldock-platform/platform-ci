@@ -1455,7 +1455,9 @@ class CoreContractTests(unittest.TestCase):
                     record = json.loads(subject._format_refusal(reattached))
                     self.assertEqual(record["diagnostic"], expected)
                     self.assertEqual((record["reason"], record["stage"]), ("cleanup_incomplete", "cleanup"))
-                    self.assertEqual(set(record), {"diagnostic", "reason", "schema_version", "stage", "status"})
+                    self.assertEqual(
+                        set(record), {"diagnostic", "reason", "schema_version", "stage", "status"},
+                    )
 
     def test_source_gate_census_failure_keeps_a_listed_source_gates_diagnostic(self):
         class CensusFailure(Exception):
@@ -1608,13 +1610,16 @@ class CoreContractTests(unittest.TestCase):
             probe_check="probe_process_timeout", command_check="timeout", survivor_classes=(),
         )
 
-        def fail_command(*unused_args, **unused_kwargs):
+        clock = {"now": 0.0}
+
+        def fail_command(*unused_args, **kwargs):
+            self.assertEqual(kwargs["deadline"], 50.0)
+            clock["now"] = 100.0  # the wait ran past the job deadline
             raise cause
 
-        readings = iter((0.0, 100.0))
         with patch.object(subject, "_source_commands", return_value=(
                 ("workspace_tests", ("cargo", "test", "--locked")),)):
-            with patch.object(subject.time, "monotonic", side_effect=lambda: next(readings)):
+            with patch.object(subject, "time", SimpleNamespace(monotonic=lambda: clock["now"])):
                 with self.assertRaises(subject.Refusal) as raised:
                     subject._run_gates(
                         Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
@@ -1625,6 +1630,75 @@ class CoreContractTests(unittest.TestCase):
             (raised.exception.reason, raised.exception.stage, raised.exception.diagnostic),
             ("cleanup_incomplete", "cleanup", "source_gates_timeout"),
         )
+
+    def test_clean_timeout_before_the_job_deadline_is_a_gate_failure(self):
+        cause = self._gate_cleanup_error(
+            probe_check="probe_process_timeout", command_check="timeout", survivor_classes=(),
+        )
+        clock = {"now": 0.0}
+
+        def fail_command(*unused_args, **kwargs):
+            self.assertEqual(kwargs["deadline"], 50.0)
+            clock["now"] = 49.0  # the wait ended just inside the job deadline
+            raise cause
+
+        with patch.object(subject, "_source_commands", return_value=(
+                ("workspace_tests", ("cargo", "test", "--locked")),)):
+            with patch.object(subject, "time", SimpleNamespace(monotonic=lambda: clock["now"])):
+                with patch.object(subject, "_load_control_sibling", return_value=SimpleNamespace(
+                        _worker_census=lambda *args: None)):
+                    outcome = subject._run_gates(
+                        Path("/source"), {}, 502, {"python": "/usr/bin/python3"}, object(),
+                        SimpleNamespace(_run_worker_command=fail_command),
+                        {"cargo": Path("/toolchain/bin/cargo")}, 50.0, capture_failure=True,
+                    )
+        self.assertEqual(outcome["failed_stage"], "workspace_tests")
+        self.assertEqual(outcome["returncode"], 124)
+
+    def test_gate_timeout_attribute_contract_matches_the_real_rust_refusal(self):
+        clean = real_rust.Refusal(
+            "cleanup_incomplete", command_check="timeout", probe_check="probe_process_timeout",
+        )
+        self.assertIs(subject._clean_gate_timeout(clean), True)
+        for probe_check in (
+            "probe_process_group_cleanup", "probe_process_capture_cleanup",
+            "probe_process_census", "probe_process_survivor",
+        ):
+            with self.subTest(probe_check=probe_check):
+                unclean = real_rust.Refusal(
+                    "cleanup_incomplete", command_check="timeout", probe_check=probe_check,
+                )
+                self.assertIs(subject._clean_gate_timeout(unclean), False)
+
+    def test_gate_diagnostic_helpers_match_the_node_feedback_helpers(self):
+        node = foundation_tests.subject
+        cleanup_shapes = (
+            {"probe_check": "probe_process_timeout", "command_check": "timeout"},
+            {"probe_check": "probe_process_timeout", "command_check": "helper_failure"},
+            {"probe_check": "probe_process_timeout"},
+            {"probe_check": "probe_process_group_cleanup"},
+            {"probe_check": "probe_process_capture_cleanup"},
+            {"probe_check": "probe_process_census"},
+            {"probe_check": "probe_process_survivor", "survivor_classes": ("python",)},
+            {"probe_check": "probe_process_survivor", "survivor_classes": ("python", "ps")},
+            {"probe_check": "probe_process_survivor", "survivor_classes": ()},
+            {"probe_check": "probe_process_survivor", "survivor_classes": ("private",)},
+            {"command_check": "timeout"},
+            {"command_check": "nonzero_exit"},
+            {},
+        )
+        for attributes in cleanup_shapes:
+            with self.subTest(attributes=attributes):
+                error = self._gate_cleanup_error(**attributes)
+                self.assertEqual(
+                    subject._gate_cleanup_diagnostic(error), node._command_cleanup_diagnostic(error),
+                )
+        for classes in (("helper_trust",), ("python", "ps"), (), "unclassified", "unavailable", None):
+            with self.subTest(classes=classes):
+                error = SimpleNamespace(survivor_classes=classes)
+                self.assertEqual(
+                    subject._gate_census_diagnostic(error), node._census_diagnostic(error),
+                )
 
     def test_test_gates_use_the_larger_command_limit_inside_the_job_deadline(self):
         self.assertEqual(subject.MAX_COMMAND_SECONDS, 120)
