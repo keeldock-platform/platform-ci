@@ -282,6 +282,8 @@ SOURCE_GATES_STEP_DIAGNOSTIC_REASONS = {
     for key, diagnostic in SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY.items()
 }
 SOURCE_GATES_STEP_DIAGNOSTICS = frozenset(SOURCE_GATES_STEP_DIAGNOSTIC_REASONS)
+NPM_DIAGNOSTIC_STEPS = ("npm_resolve", "npm_lock", "npm_bundle")
+NPM_DIAGNOSTIC_LINE_PREFIX = "KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step="
 SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES = ("temp_dir", "diag_dir", "other_dir")
 SUMMARY_GUARD_VERIFY_FILE_CLASSES = ("env_file", "output_file", "path_file", "summary_file")
 SUMMARY_GUARD_VERIFY_FAILURES = {
@@ -1752,17 +1754,20 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                             ),
                         )
                     elif feedback["profile"]["kind"] == "npm_admission":
-                        feedback_result = _run_inside_source(
-                            source,
-                            original_cwd,
-                            lambda: producer.run_npm_admission_profile(
-                                feedback["dispatch"], source, worker_storage, worker_uid, environment,
-                                host_toolchain, capability, rust, deadline,
-                                _load_control_sibling("npm_admission_bootstrap"),
-                                _load_control_sibling("macos_node_contract"),
-                                feedback["node"], feedback["npm_cli"], environ,
-                            ),
-                        )
+                        try:
+                            feedback_result = _run_inside_source(
+                                source,
+                                original_cwd,
+                                lambda: producer.run_npm_admission_profile(
+                                    feedback["dispatch"], source, worker_storage, worker_uid, environment,
+                                    host_toolchain, capability, rust, deadline,
+                                    _load_control_sibling("npm_admission_bootstrap"),
+                                    _load_control_sibling("macos_node_contract"),
+                                    feedback["node"], feedback["npm_cli"], environ,
+                                ),
+                            )
+                        except producer.FeedbackRefusal as npm_error:
+                            feedback_result = producer.npm_diagnostic_result(npm_error)
                     else:
                         feedback_result = _run_inside_source(
                             source,
@@ -2068,6 +2073,8 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
             payload = receipt.encode("ascii", "strict")
             if len(payload) > MAX_RECEIPT_BYTES:
                 raise Refusal("capture_invalid", "receipt")
+            if type(gates) is dict and gates.get("npm_diagnostic") is not None:
+                lifecycle["npm_diagnostic"] = gates["npm_diagnostic"]
             return payload
         record = _build_success_record(binding, request, lease_record, diff_sha256, versions, gates)
         _validate_success_record(
@@ -2184,6 +2191,11 @@ def main(arguments=None, environ=None, stdin=None, stdout=None, feedback_kind=No
     if (pending_tokens
             and lifecycle.get("token_revocation") == "confirmed_before_execution"):
         error_stream.write("KD-PRODUCER-TOKEN-REVOCATION confirmed\n")
+    diagnostic = lifecycle.get("npm_diagnostic")
+    if (feedback_kind == "npm_admission" and type(diagnostic) is tuple and len(diagnostic) == 2
+            and all(type(part) is str for part in diagnostic) and diagnostic[0] in NPM_DIAGNOSTIC_STEPS
+            and diagnostic in SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY):
+        error_stream.write(NPM_DIAGNOSTIC_LINE_PREFIX + diagnostic[0] + " reason=" + diagnostic[1] + "\n")
     return 0
 
 
