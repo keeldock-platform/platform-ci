@@ -202,8 +202,15 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _safe_api_path(path):
+    if type(path) is not str or not path.startswith("/") or "\\" in path or "\x00" in path:
+        return False
+    parts = path[1:].split("?", 1)[0].split("/")
+    return all(urllib.parse.unquote(part) not in ("", ".", "..") for part in parts)
+
+
 def _api_request(path, token, method="GET", payload=None, expected=(200,)):
-    if type(path) is not str or not path.startswith("/") or ".." in path:
+    if not _safe_api_path(path):
         raise SourceBuildRefusal("network")
     headers = {
         "Accept": "application/vnd.github+json",
@@ -251,6 +258,9 @@ def _reference_sha(token, repository, branch):
 
 
 def _comparison(token, repository, base, head):
+    if (type(base) is not str or SOURCE_SHA_RE.fullmatch(base) is None
+            or type(head) is not str or SOURCE_SHA_RE.fullmatch(head) is None):
+        raise SourceBuildRefusal("network")
     status, payload = _api_request(
         "/repos/" + repository + "/compare/" + base + "..." + head, token,
         expected=(200, 404),

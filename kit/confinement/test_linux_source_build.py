@@ -693,6 +693,104 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
                 linux_source_build._verify_environment("token", "source-read")
 
+    def test_api_path_check_refuses_traversal_but_accepts_the_compare_range(self):
+        base = "a" * 40
+        head = "b" * 40
+        repository = linux_source_build.REPOSITORY
+        accepted = (
+            "/repos/" + repository + "/compare/" + base + "..." + head,
+            "/repos/" + repository + "/git/ref/heads/main",
+            "/repos/" + repository + "/environments/linux-source-read/deployment-branch-policies?per_page=100",
+            "/repos/" + repository + "/actions/workflows/linux-source-admission.yml/runs?per_page=100&status=queued",
+            "/installation/token",
+        )
+        for path in accepted:
+            with self.subTest(path=path):
+                self.assertTrue(linux_source_build._safe_api_path(path))
+        refused = (
+            "", "repos/x", "/", "/repos//x", "/repos/x/", "/repos/../x", "/repos/x/..", "/repos/./x",
+            "/repos/%2e%2e/x", "/repos/%2E%2e/x", "/repos/x\\y", "/repos/x\x00", None, 7,
+        )
+        for path in refused:
+            with self.subTest(path=path):
+                self.assertFalse(linux_source_build._safe_api_path(path))
+        with patch.object(linux_source_build.urllib.request, "build_opener", side_effect=AssertionError("no request")):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "network"):
+                linux_source_build._api_request("/repos/../x", "token")
+
+    def test_comparison_sends_the_range_to_the_api_and_refuses_non_commit_values(self):
+        base = "a" * 40
+        head = "b" * 40
+        requests = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, kind, value, trace):
+                return False
+
+            def read(self, size=-1):
+                return b'{"status":"ahead"}'
+
+        class Opener:
+            def open(self, request, timeout=None):
+                requests.append(request.full_url)
+                return Response()
+
+        with patch.object(linux_source_build.urllib.request, "build_opener", return_value=Opener()):
+            self.assertEqual(linux_source_build._comparison("token", linux_source_build.REPOSITORY, base, head), "ahead")
+            self.assertEqual(requests, [
+                linux_source_build.API_ROOT + "/repos/" + linux_source_build.REPOSITORY
+                + "/compare/" + base + "..." + head,
+            ])
+            for bad_base, bad_head in (("main", head), (base, "../x"), (base[:-1], head), (None, head), (base, 7)):
+                with self.subTest(base=bad_base, head=bad_head):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "network"):
+                        linux_source_build._comparison("token", linux_source_build.REPOSITORY, bad_base, bad_head)
+            self.assertEqual(len(requests), 1)
+
+    def test_synthetic_dispatch_reaches_the_environment_readback_through_the_real_comparison(self):
+        sha = "a" * 40
+        env = {
+            "CI_EVENT_NAME": "workflow_dispatch", "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "CI_SERVER_URL": "https://github.com", "CACHE_MODE": "none",
+            "CI_SHA": sha, "GITHUB_SHA": sha, "CI_REF": "refs/heads/main", "CI_MODE": "synthetic",
+            "REQUESTED_ENVIRONMENT_NAME": "linux-source-read", "LINUX_SOURCE_ENVIRONMENT_NAME": "",
+        }
+        requests = []
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, kind, value, trace):
+                return False
+
+            def read(self, size=-1):
+                return b'{"status":"identical"}'
+
+        class Opener:
+            def open(self, request, timeout=None):
+                requests.append(request.full_url)
+                return Response()
+
+        with patch.object(linux_source_build, "_reference_sha", side_effect=[sha, sha]), patch.object(
+            linux_source_build.urllib.request, "build_opener", return_value=Opener()
+        ), patch.object(linux_source_build, "_verify_environment") as environment, patch.object(
+            linux_source_build, "_source_inputs", side_effect=AssertionError("no source binding in synthetic")
+        ):
+            self.assertEqual(linux_source_build.validate_dispatch(env, "token"), "synthetic")
+            environment.assert_called_once_with("token")
+        self.assertEqual(requests, [
+            linux_source_build.API_ROOT + "/repos/" + linux_source_build.REPOSITORY
+            + "/compare/" + sha + "..." + sha,
+        ])
+
     def test_dispatch_reads_back_the_environment_after_binding_and_before_the_duplicate_check(self):
         sha = "a" * 40
         env = {
