@@ -437,23 +437,17 @@ def launch_and_collect(spec, argv, cwd, out, err, chrooted):
     if spec.get("extra_fd"):
         extra = os.pipe()
         pass_fds = (extra[1],)
-    stdin_read, stdin_write = os.pipe()
-    os.close(stdin_write)
-    try:
-        process = subprocess.Popen(
-            argv,
-            stdin=stdin_read,
-            stdout=out[1],
-            stderr=err[1],
-            close_fds=True,
-            cwd=cwd,
-            env=spec["env"],
-            preexec_fn=preexec,
-            start_new_session=True,
-            pass_fds=pass_fds,
-        )
-    finally:
-        os.close(stdin_read)
+    process = subprocess.Popen(
+        argv,
+        stdout=out[1],
+        stderr=err[1],
+        close_fds=True,
+        cwd=cwd,
+        env=spec["env"],
+        preexec_fn=preexec,
+        start_new_session=True,
+        pass_fds=pass_fds,
+    )
     os.close(out[1])
     os.close(err[1])
     code = None

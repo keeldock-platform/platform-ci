@@ -4,6 +4,12 @@ import signal
 import sys
 
 os.kill(os.getpid(), signal.SIGSTOP)
+reader, writer = os.pipe()
+os.close(writer)
+os.set_inheritable(reader, True)
+if reader != 0:
+    os.dup2(reader, 0)
+    os.close(reader)
 os.execv(sys.argv[1], sys.argv[1:])
 """
 

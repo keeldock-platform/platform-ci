@@ -342,9 +342,22 @@ class LinuxProbeSourceTests(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         ]
-        self.assertEqual(sorted(calls), ["execv", "getpid", "kill"])
+        self.assertEqual(
+            sorted(calls),
+            ["close", "close", "dup2", "execv", "getpid", "kill", "pipe", "set_inheritable"],
+        )
         self.assertLess(probes.LAUNCHER_SOURCE.index("SIGSTOP"), probes.LAUNCHER_SOURCE.index("execv"))
         self.assertIn("SIGSTOP", probes.LAUNCHER_SOURCE)
+
+    def test_launcher_gives_the_program_an_end_of_file_stdin_only_after_it_is_verified_and_resumed(self):
+        source = probes.LAUNCHER_SOURCE
+        self.assertLess(source.index("SIGSTOP"), source.index("os.pipe()"))
+        self.assertLess(source.index("os.pipe()"), source.index("os.close(writer)"))
+        self.assertLess(source.index("os.close(writer)"), source.index("os.set_inheritable(reader, True)"))
+        self.assertLess(source.index("os.set_inheritable(reader, True)"), source.index("execv"))
+        self.assertIn("os.dup2(reader, 0)", source)
+        self.assertNotIn("socketpair", source)
+        self.assertNotIn("/dev/null", source)
 
     def test_probe_classifies_ssl_errors_as_not_denied_and_unknown_errors_as_other(self):
         self.assertIn("ssl.SSLError", probes.PROBE_SOURCE)
