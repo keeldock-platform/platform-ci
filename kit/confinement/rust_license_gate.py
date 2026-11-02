@@ -686,7 +686,7 @@ def require_configured_control(lock_bytes, identity, ports=None):
 def require_lock_admission(lock_bytes, identity, ports=None):
     """Admit a lock with no registry packages; otherwise defer to the configured control."""
     if (type(lock_bytes) is not bytes or not lock_bytes or len(lock_bytes) > MAX_LOCK_BYTES
-            or not _identity_shape_valid(identity)
+            or not _identity_valid(identity)
             or not hmac.compare_digest(
                 hashlib.sha256(lock_bytes).hexdigest(), identity.lock_sha256,
             )):

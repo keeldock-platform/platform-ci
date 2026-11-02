@@ -543,6 +543,12 @@ class RegistryFreeAdmissionTests(unittest.TestCase):
         self.assertEqual(self._reason(b"", _identity_for(b"")), "lock")
         self.assertEqual(self._reason(lock, object()), "lock")
 
+    def test_an_unset_profile_never_yields_a_registry_free_receipt(self):
+        for lock in (_path_lock(("root-app",)), _registry_lock()):
+            unset = _identity_for(lock, profile=gate.UNSET)
+            with self.subTest(lock=lock[:24]):
+                self.assertEqual(self._reason(lock, unset), "lock")
+
     def test_registry_free_receipt_is_refused_by_both_receipt_validators(self):
         lock = _path_lock(("root-app",))
         identity = _identity_for(lock)
