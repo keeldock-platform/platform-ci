@@ -36,6 +36,7 @@ MAX_NODE_INPUT_BYTES = 8 * 1024 * 1024
 MAX_NODE_PUBLIC_OUTPUT_BYTES = 4096
 MAX_KEY_BYTES = 16 * 1024
 MAX_PLAINTEXT_BYTES = 4 * 1024 * 1024 - 64 * 1024
+NPM_DIAGNOSTICS_PREFIX = b"KD-NPM-DIAGNOSTICS "
 MAX_SAFE_INTEGER = feedback_request.MAX_SAFE_INTEGER
 REQUEST_INPUT_FIELDS = frozenset((
     "kind", "repository_id", "source_sha", "base_sha", "control_sha",
@@ -465,6 +466,11 @@ def _packet_from_bytes(raw, *, now):
     elif packet["expected_manifest"] is not None or packet["reviewed_rust_paths"] != []:
         _refuse()
     return packet, profile
+
+
+def _is_npm_diagnostic(profile, plaintext):
+    return (profile["kind"] == feedback_request.NPM_ADMISSION_KIND
+            and bytes(plaintext[:len(NPM_DIAGNOSTICS_PREFIX)]) == NPM_DIAGNOSTICS_PREFIX)
 
 
 def _quick_context(request, run_id):
@@ -1026,6 +1032,7 @@ class FeedbackAdmin:
         suffix = (
             "lock" if profile["kind"] == "lock" else "patch" if profile["kind"] == "rust_patch"
             else "cargo-lock" if profile["kind"] == feedback_request.CARGO_LOCK_KIND
+            else "npm-diagnostics" if _is_npm_diagnostic(profile, plaintext)
             else "npm-admission" if profile["kind"] == feedback_request.NPM_ADMISSION_KIND
             else "linux-quick" if profile["kind"] == feedback_request.LINUX_QUICK_KIND
             else "diagnostics"
@@ -1238,12 +1245,15 @@ class FeedbackAdmin:
                     except Exception:
                         pass
                     _refuse()
-                return {
+                result = {
                     "request_id": request_id,
                     "kind": profile["kind"],
                     "private_output_path": output_path,
                     "bootstrap_lock_consumed": state["bootstrap_lock_consumed"],
                 }
+                if _is_npm_diagnostic(profile, plaintext):
+                    result["payload_variant"] = "npm_diagnostics"
+                return result
             except Exception:
                 try:
                     self._recover(dir_fd, self._read_state(dir_fd), self._clock_now())

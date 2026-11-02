@@ -152,3 +152,158 @@ test('npm admission bundles encrypt and decrypt only under their own profile', (
     now: NOW,
   }));
 });
+
+const DIAGNOSTIC_HEADER = 'KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=eresolve';
+
+function diagnostics({
+  header = DIAGNOSTIC_HEADER,
+  stderr = ['  npm error code ERESOLVE', '  npm error While resolving: x@1.0.0'],
+  report = ['  Found: y@2.0.0'],
+} = {}) {
+  const text = `${header}\nstderr:\n${stderr.map((line) => `${line}\n`).join('')}report:\n`
+    + `${report.map((line) => `${line}\n`).join('')}`;
+  return Buffer.from(text, 'utf8');
+}
+
+function refusalCode(error) {
+  return error instanceof DevelopmentFeedbackError ? error.code : 'other';
+}
+
+test('the npm diagnostic payload is a closed variant of the npm admission kind only', () => {
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.npmDiagnosticBytes, 64 * 1024);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.npmDiagnosticLines, 401);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.npmDiagnosticLineCodeUnits, 2048);
+  const payload = diagnostics();
+  assert.deepEqual(validate(payload), payload);
+  for (const step of ['npm_resolve', 'npm_lock', 'npm_bundle']) {
+    const header = `KD-NPM-DIAGNOSTICS schema=1 step=${step} reason=npm_peer_refused`;
+    assert.deepEqual(validate(diagnostics({ header })), diagnostics({ header }));
+  }
+  assert.deepEqual(validate(diagnostics({ stderr: [], report: [] })), diagnostics({ stderr: [], report: [] }));
+  for (const profile of ['core-rust-lock-return', 'core-rust-format-return']) {
+    assert.throws(() => validateDevelopmentFeedback({
+      payloadBytes: payload,
+      context: contextFor(profile),
+      now: NOW,
+    }), DevelopmentFeedbackError);
+  }
+  assert.throws(() => validate(payload, { expectedManifest: {} }), DevelopmentFeedbackError);
+  assert.throws(() => validate(payload, { reviewedRustPaths: ['src/lib.rs'] }), DevelopmentFeedbackError);
+});
+
+test('a diagnostic payload is never accepted as a bundle and a bundle never as a diagnostic', () => {
+  const bundleBytes = bundle();
+  assert.notEqual(bundleBytes.subarray(0, 19).toString('latin1'), 'KD-NPM-DIAGNOSTICS ');
+  assert.deepEqual(validate(bundleBytes), bundleBytes);
+  for (const bad of [
+    Buffer.from(`${DIAGNOSTIC_HEADER}\n${bundleBytes.toString('utf8')}`, 'utf8'),
+    Buffer.from(`${DIAGNOSTIC_HEADER} ${bundleBytes.toString('utf8')}`, 'utf8'),
+    Buffer.from('KD-NPM-DIAGNOSTICS ', 'utf8'),
+  ]) {
+    assert.throws(() => validate(bad), DevelopmentFeedbackError);
+  }
+});
+
+test('the npm diagnostic payload refuses every malformed shape', () => {
+  const wrongHeaders = [
+    'KD-NPM-DIAGNOSTICS schema=2 step=npm_resolve reason=eresolve',
+    'KD-NPM-DIAGNOSTICS schema=1 step=npm_inputs reason=eresolve',
+    'KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=ERESOLVE',
+    'KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=',
+    `KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=${'a'.repeat(41)}`,
+    `${DIAGNOSTIC_HEADER} extra=1`,
+    `${DIAGNOSTIC_HEADER} `,
+    'KD-NPM-DIAGNOSTICS  schema=1 step=npm_resolve reason=eresolve',
+  ];
+  for (const header of wrongHeaders) {
+    assert.throws(() => validate(diagnostics({ header })), DevelopmentFeedbackError, header);
+  }
+  const good = diagnostics().toString('utf8');
+  for (const bad of [
+    good.replace('stderr:\n', ''),
+    good.replace('report:\n', ''),
+    good.replace('stderr:\n', 'stderr: \n'),
+    `${good}report:\n`,
+    good.replace('  npm error code ERESOLVE', 'npm error code ERESOLVE'),
+    good.slice(0, -1),
+    `${good}\n`,
+    good.replace('\n', '\r\n'),
+    good.replace('ERESOLVE', 'ER\u0000ESOLVE'),
+    good.replace('ERESOLVE', `ER${String.fromCharCode(0x85)}ESOLVE`),
+    good.replace('ERESOLVE', 'ER\u001bESOLVE'),
+    `${String.fromCharCode(0xfeff)}${good}`,
+  ]) {
+    assert.throws(() => validate(Buffer.from(bad, 'utf8')), DevelopmentFeedbackError);
+  }
+  assert.throws(() => validate(Buffer.concat([diagnostics(), Buffer.from([0xff, 0x0a])])), DevelopmentFeedbackError);
+});
+
+test('the npm diagnostic payload keeps its byte, line and line-length bounds', () => {
+  const line = `  ${'a'.repeat(2046)}`;
+  assert.deepEqual(validate(diagnostics({ stderr: [line], report: [line] })), diagnostics({ stderr: [line], report: [line] }));
+  assert.throws(() => validate(diagnostics({ stderr: [`${line}a`] })), (error) => refusalCode(error) === 'limit_exceeded');
+  const lines = (count) => Array.from({ length: count }, () => '  npm error x');
+  assert.deepEqual(validate(diagnostics({ stderr: lines(397), report: [] })), diagnostics({ stderr: lines(397), report: [] }));
+  assert.throws(
+    () => validate(diagnostics({ stderr: lines(398), report: [] })),
+    (error) => refusalCode(error) === 'limit_exceeded',
+  );
+  const wide = Array.from({ length: 30 }, () => line);
+  assert.deepEqual(validate(diagnostics({ stderr: wide, report: [] })), diagnostics({ stderr: wide, report: [] }));
+  const heavy = Array.from({ length: 40 }, () => line);
+  assert.throws(
+    () => validate(diagnostics({ stderr: heavy, report: heavy })),
+    (error) => refusalCode(error) === 'payload_too_large',
+  );
+});
+
+test('the npm diagnostic payload is credential screened', () => {
+  for (const secret of [
+    `  npm error token: ${'a'.repeat(12)}`,
+    `  npm error ghp_${'A'.repeat(24)} leaked`,
+    '  npm error Authorization: Bearer abcdefghijklmnopqrstuvwxyz',
+    '  npm error fetch https://user:pass@registry.example/pkg',
+    '  npm error -----BEGIN PRIVATE KEY-----',
+  ]) {
+    assert.throws(
+      () => validate(diagnostics({ stderr: [secret] })),
+      (error) => refusalCode(error) === 'credential_like_content',
+      secret,
+    );
+    assert.throws(
+      () => validate(diagnostics({ report: [secret] })),
+      (error) => refusalCode(error) === 'credential_like_content',
+      secret,
+    );
+  }
+});
+
+test('the npm diagnostic payload encrypts and decrypts only under the npm admission profile', () => {
+  const payload = diagnostics();
+  const context = contextFor(PROFILE);
+  const envelope = encryptDevelopmentFeedback({
+    payloadBytes: payload,
+    context,
+    recipientPublicKey: recipient.publicKey,
+    now: NOW,
+  });
+  assert.equal(envelope[5], RETURN_PROFILES[PROFILE].id);
+  assert.deepEqual(decryptDevelopmentFeedback({
+    envelope,
+    context,
+    recipientPrivateKey: recipient.privateKey,
+    now: NOW,
+  }), payload);
+  assert.throws(() => decryptDevelopmentFeedback({
+    envelope,
+    context: contextFor('core-rust-lock-return'),
+    recipientPrivateKey: recipient.privateKey,
+    now: NOW,
+  }));
+  assert.throws(() => encryptDevelopmentFeedback({
+    payloadBytes: diagnostics({ stderr: ['  npm error password: hunter22222'] }),
+    context,
+    recipientPublicKey: recipient.publicKey,
+    now: NOW,
+  }), DevelopmentFeedbackError);
+});
