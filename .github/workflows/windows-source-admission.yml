@@ -257,7 +257,7 @@ jobs:
       - name: Apply the exact candidate profile and uniqueness policy
         run: |
           set -euo pipefail
-          python -B kit/confinement/role_signer.py verify-snapshot --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --root . --jobs-file "$RUNNER_TEMP/role-signer-evidence/jobs.json" --artifacts-file "$RUNNER_TEMP/role-signer-evidence/artifacts.json" --repository-metadata "$RUNNER_TEMP/role-signer-evidence/repository.json" --run-metadata "$RUNNER_TEMP/role-signer-evidence/run.json" --evidence-directory "$RUNNER_TEMP/role-signer-evidence"
+          python -B kit/confinement/role_signer.py verify-snapshot --profile "$KD_PROFILE" --repository "$KD_REPOSITORY" --ref "$KD_REF" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --root . --jobs-file "$RUNNER_TEMP/role-signer-evidence/jobs.json" --artifacts-file "$RUNNER_TEMP/role-signer-evidence/artifacts.json" --repository-metadata "$RUNNER_TEMP/role-signer-evidence/repository.json" --run-metadata "$RUNNER_TEMP/role-signer-evidence/run.json" --evidence-directory "$RUNNER_TEMP/role-signer-evidence" --linux-logs "$RUNNER_TEMP/role-signer-evidence/linux-logs.json"
   audit:
     needs:
       - settings

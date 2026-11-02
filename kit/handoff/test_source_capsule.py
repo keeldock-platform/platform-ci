@@ -279,7 +279,7 @@ class BundleAndManifestTests(SourceFixtureMixin, unittest.TestCase):
                 repository, "update-index", "--add", "--cacheinfo", "160000,"
                 + git(repository, "rev-parse", "HEAD") + ",module")),
             "non-ascii": ("manifest", lambda repository: (
-                (repository / "café.txt").write_bytes(b"x"), git(repository, "add", "--all"))),
+                (repository / "caf\u00e9.txt").write_bytes(b"x"), git(repository, "add", "--all"))),
             "reserved": ("manifest", lambda repository: (
                 (repository / "aux.txt").write_bytes(b"x"), git(repository, "add", "--all"))),
             "trailing-dot": ("manifest", lambda repository: (
@@ -650,10 +650,14 @@ class CommandLineTests(unittest.TestCase):
         )
 
 
-@unittest.skipUnless(HAS_GIT and HAS_CRYPTOGRAPHY, "git and the cryptography package are required")
+@unittest.skipUnless(HAS_GIT, "git is required")
 class RealProviderTests(SourceFixtureMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if not HAS_CRYPTOGRAPHY:
+            if sys.platform.startswith("linux") and os.environ.get("GITHUB_ACTIONS") == "true":
+                raise AssertionError("the pinned cryptography package is missing on Linux CI")
+            raise unittest.SkipTest("the cryptography package is required")
         cls.build_fixture()
 
     @classmethod

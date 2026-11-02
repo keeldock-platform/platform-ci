@@ -1,5 +1,6 @@
 import io
 import json
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -250,6 +251,7 @@ class ManifestDigestTests(unittest.TestCase):
         (base / "package.json").write_text(json.dumps(root), encoding="ascii")
         return base
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "linux_source_build needs POSIX-only modules")
     def test_the_digest_is_the_one_implementation_linux_source_build_uses(self):
         import linux_source_build
         with tempfile.TemporaryDirectory() as directory:

@@ -379,7 +379,7 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
         self.assertNotIn("source_capsule.py build", text)
         for flag in ("--repository", "--source-sha", "--source-repository-id", "--bundle", "--key-record", "--output", "--summary"):
             self.assertIn(" " + flag + " ", text)
-        self.assertIn("git -C \"$repository\" bundle create \"$bundle\" refs/heads/kd-source", text)
+        self.assertIn("git -c core.hooksPath=/dev/null -C \"$repository\" bundle create \"$bundle\" refs/heads/kd-source", text)
         self.assertIn("-le 268435448", text)
         self.assertIn("KD_SOURCE_PREFIX: WINDOWS_SOURCE", text)
         for key in ("source_sha", "tree_id", "lock_sha256", "manifest_sha256"):
@@ -400,6 +400,32 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
             block = job_block(caller, job_id)
             for name in re.findall(r"(?m)^      ([a-z_]+): ", block.split("    with:\n", 1)[1].split("    permissions:", 1)[0]):
                 self.assertIn("      " + name + ":\n", receiver.split("\njobs:\n", 1)[0])
+
+    def test_the_receivers_get_a_synthetic_canary_that_differs_from_the_one_the_audit_scans_for(self):
+        receiver = read_ascii(WINDOWS_RECEIVER_PATH)
+        admission = read_ascii(WINDOWS_ADMISSION_PATH)
+        pattern = re.compile(r"KD_WINDOWS_LOG_CANARY: \$\{\{ inputs.mode == 'synthetic' && '([0-9a-f]+)' \|\| secrets.KD_WINDOWS_LOG_CANARY \}\}")
+        standin = pattern.findall(receiver)
+        audited = pattern.findall(admission)
+        self.assertEqual((len(standin), len(audited)), (1, 1))
+        self.assertNotEqual(standin[0], audited[0])
+        self.assertTrue(64 <= len(standin[0]) <= 256 and len(standin[0]) % 2 == 0)
+        self.assertGreaterEqual(len(set(standin[0])), 12)
+        self.assertNotIn(audited[0], receiver)
+        self.assertNotIn(standin[0], admission)
+
+    def test_the_fixed_pins_are_enforced_in_a_non_observing_check_before_release_and_at_the_end(self):
+        attester = read_ascii(CAPSULE_ATTESTER_PATH)
+        gates = [line for line in attester.splitlines() if "role_signer.py gate-transition --gate B" in line]
+        self.assertEqual(len(gates), 2)
+        self.assertEqual(sum(1 for line in gates if " --observe" in line), 1)
+        plain = [line for line in gates if " --observe" not in line][0]
+        self.assertIn('--linux-logs "$evidence/linux-logs.json"', plain)
+        self.assertLess(attester.index(gates[1]), attester.index("      - name: Sign only the capsule-attester role statement"))
+        evidence = job_block(read_ascii(WINDOWS_ADMISSION_PATH), "verify-role-evidence")
+        finals = [line for line in evidence.splitlines() if "role_signer.py verify-snapshot" in line and " --observe" not in line]
+        self.assertEqual(len(finals), 1)
+        self.assertIn('--linux-logs "$RUNNER_TEMP/role-signer-evidence/linux-logs.json"', finals[0])
 
     def test_the_capsule_artifacts_are_one_day_uncompressed_and_named_by_run_and_attempt(self):
         text = read_ascii(LINUX_FETCH_PATH)

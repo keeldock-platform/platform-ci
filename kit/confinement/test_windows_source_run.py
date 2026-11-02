@@ -7,7 +7,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "kit/bootstrap"))
 
-from public_tree import MAX_FILE_BYTES, inspect_text
+from public_tree import ACTION_VERSION_COMMENT_PATTERN, MAX_FILE_BYTES, inspect_text
 
 RUNNER = ROOT / "kit/confinement/windows_source_run.ps1"
 FRAME = ROOT / "kit/confinement/capsule_frame.ps1"
@@ -36,7 +36,9 @@ class WindowsSourceRunTests(unittest.TestCase):
                 payload = path.read_bytes()
                 self.assertLessEqual(len(payload), MAX_FILE_BYTES)
                 inspect_text(payload.decode("utf-8"), "platform")
-                self.assertNotIn(chr(35).encode("ascii"), payload)
+                for line in payload.decode("ascii").splitlines():
+                    if chr(35) in line:
+                        self.assertIsNotNone(ACTION_VERSION_COMMENT_PATTERN.fullmatch(line))
                 payload.decode("ascii")
 
     def test_every_reused_function_and_variable_exists_in_the_confinement_script(self):
@@ -93,9 +95,10 @@ class WindowsSourceRunTests(unittest.TestCase):
         for token in ("'^[a-z][a-z_]{2,40}$'", "$gate.Keys.Count -ne 2", "$gates.Count -ne $expectedCount",
                       "$plan.Keys.Count -ne 2", "[string]$gate['name']"):
             self.assertIn(token, self.runner)
-        for stale in ("GateTableGatesCommand", "$gate['cwd']", "$gate['runtime']", "$gate['id']", "-lt 13", "-gt 24"):
+        for stale in ("GateTableGatesCommand", "$gate['cwd']", "$gate['runtime']", "$gate['id']", "-lt 13"):
             self.assertNotIn(stale, self.runner)
         self.assertNotIn("'workspace_tests'", self.runner)
+        self.assertNotRegex(self.runner, r"\$gates.Count -gt 24(?!\d)")
 
     def test_each_config_neutralisation_runs_right_after_the_tree_check_and_before_any_tool(self):
         tree = self.runner.index("Test-ProjectTree $project $manifest.Entries")
@@ -113,6 +116,18 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn("'NPM_CONFIG_GLOBALCONFIG=' + (Join-Path $root 'empty-global.npmrc')", self.runner)
         self.assertNotIn("nul.npmrc", self.runner)
         self.assertIn("NPM_CONFIG_UPDATE_NOTIFIER=false", self.runner)
+
+    def test_a_truncated_gate_capture_counts_as_a_log_canary_hit(self):
+        self.assertIn("if ($run.Truncated -or (Test-LogCanary $combined)) {", self.runner)
+        block = self.runner.split("if ($run.Truncated -or (Test-LogCanary $combined)) {", 1)[1].split("}", 1)[0]
+        self.assertIn("$outcome.Canary = 'present'", block)
+        self.assertIn("$script:RefusalReason = 'log_canary'", block)
+
+    def test_the_tree_listing_cap_covers_the_manifest_entry_limit(self):
+        self.assertIn("$ListingLimit = 3145728", self.runner)
+        self.assertGreaterEqual(3145728, 10000 * (53 + 240 + 1))
+        self.assertIn("$MaxManifestEntries = 10000", self.runner)
+        self.assertIn("--full-tree', $bound['source_sha']) $script:Layout.Private 300 $ListingLimit", self.runner)
 
     def test_key_is_destroyed_before_any_project_step_and_again_in_cleanup(self):
         order = [self.runner.index(token) for token in (
@@ -145,7 +160,10 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertNotIn("Move-Item", self.runner)
 
     def test_removals_are_confined_to_harness_roots(self):
-        self.assertNotRegex(self.runner, r"(?m)^\s*Remove-TreeNoFollow ")
+        calls = re.findall(r"(?m)^\s*Remove-TreeNoFollow ", self.runner)
+        self.assertEqual(len(calls), 1)
+        wrapper = self.runner.index("function Remove-WithinRoots")
+        self.assertGreater(self.runner.index("    Remove-TreeNoFollow $normal"), wrapper)
         self.assertIn("throw 'remove_root'", self.runner)
         self.assertIn("(Test-PathBelow $normal $system)", self.runner)
 

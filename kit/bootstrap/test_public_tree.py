@@ -189,6 +189,24 @@ class PublicTreeTests(unittest.TestCase):
         self.assertEqual(action.count('"test_windows_source_run.py"'), 2)
         self.assertEqual(action.count('"test_source_capsule.py"'), 1)
 
+    def test_the_sealer_dependencies_are_hash_pinned_once_and_installed_the_same_way_in_ci_and_the_workflow(self):
+        requirements = (ROOT / "kit/handoff/provider_requirements.txt").read_text(encoding="ascii")
+        lines = requirements.splitlines()
+        self.assertEqual(len(lines), 3)
+        for line, name in zip(lines, ("cryptography", "cffi", "pycparser")):
+            self.assertRegex(line, r"^" + name + r"==[0-9]+(\.[0-9]+)+ --hash=sha256:[0-9a-f]{64}$")
+        install = "--require-hashes --only-binary=:all: --no-deps --target"
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        workflow = (ROOT / ".github/workflows/lane-h-linux-fetch-encrypt.yml").read_text(encoding="ascii")
+        self.assertEqual(action.count(install), 1)
+        self.assertEqual(workflow.count(install), 1)
+        self.assertEqual(action.count("provider_requirements.txt"), 1)
+        self.assertEqual(workflow.count("kit/handoff/provider_requirements.txt"), 1)
+        self.assertEqual(workflow.count('PYTHONPATH="$RUNNER_TEMP/kd-pydeps" python3 -B kit/handoff/source_capsule.py seal'), 1)
+        block = action[action.index('if [[ "${RUNNER_OS:-}" == "Linux" ]]; then\n'):]
+        block = block[:block.index("\n        fi\n")]
+        self.assertIn('-p "test_source_capsule.py"', block)
+
     def test_synthetic_project_fixture_is_registered_pinned_and_discovered(self):
         prefix = "kit/confinement/synthetic_project/"
         fixture = sorted(name for name in PLATFORM_FILES if name.startswith(prefix))
@@ -380,6 +398,7 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_confinement_gate_table.py",
             "kit/handoff/source_capsule.py",
             "kit/handoff/test_source_capsule.py",
+            "kit/handoff/provider_requirements.txt",
             "kit/confinement/test_role_signer.py",
             "kit/bootstrap/policy_handoff.py",
             "kit/bootstrap/test_policy_handoff.py",

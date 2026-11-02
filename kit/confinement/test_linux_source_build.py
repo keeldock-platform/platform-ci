@@ -2531,6 +2531,12 @@ class WindowsSourceBindingTests(unittest.TestCase):
                 with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
                     linux_source_build.validate_dispatch({}, "token", prefix)
 
+    def test_a_linux_dispatch_refuses_a_stray_source_prefix_variable(self):
+        environment = self._dispatch_environment("refs/heads/main", "synthetic")
+        environment["KD_SOURCE_PREFIX"] = "WINDOWS_SOURCE"
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+            linux_source_build.validate_dispatch(environment, None, "LINUX_SOURCE")
+
     def test_the_prefix_comes_from_the_dispatch_environment_when_not_passed(self):
         with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
             environment = self._environment("WINDOWS_SOURCE")

@@ -232,6 +232,11 @@ jobs:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
           NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
         run: python3 -B kit/confinement/linux_source_build.py trusted-audit
+      - name: Install the pinned hash-checked sealer dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: --no-deps --target "$RUNNER_TEMP/kd-pydeps" -r kit/handoff/provider_requirements.txt
+          PYTHONPATH="$RUNNER_TEMP/kd-pydeps" python3 -B -c 'import cryptography.hazmat.primitives.asymmetric.ec, cryptography.hazmat.primitives.ciphers.aead'
       - name: Build the two receiver-bound source capsules
         id: capsule
         env:
@@ -263,15 +268,15 @@ jobs:
             manifest_sha256="$(python3 -B kit/confinement/gate_table.py manifest-digest --root "$repository")"
           fi
           [[ "$source_sha" =~ ^[a-f0-9]{40}$ && "$source_repository_id" =~ ^[1-9][0-9]{0,19}$ && "$lock_sha256" =~ ^[a-f0-9]{64}$ && "$manifest_sha256" =~ ^[a-f0-9]{64}$ ]]
-          git -C "$repository" update-ref refs/heads/kd-source "$source_sha"
+          git -c core.hooksPath=/dev/null -C "$repository" update-ref refs/heads/kd-source "$source_sha"
           bundle="$RUNNER_TEMP/source.bundle"
-          git -C "$repository" bundle create "$bundle" refs/heads/kd-source
+          git -c core.hooksPath=/dev/null -C "$repository" bundle create "$bundle" refs/heads/kd-source
           [[ "$(stat -c %s "$bundle")" -le 268435448 ]]
           mkdir -p "$RUNNER_TEMP/source-capsule-summaries"
           for role in producer verifier; do
             selected="$(cat "$evidence/windows-$role-name.txt")"
             mkdir -p "$RUNNER_TEMP/source-capsule-$role"
-            python3 -B kit/handoff/source_capsule.py seal --repository "$repository" --source-sha "$source_sha" --source-repository-id "$source_repository_id" --bundle "$bundle" --key-record "$evidence/artifacts/$selected/subject.bin" --output "$RUNNER_TEMP/source-capsule-$role/capsule.bin" --summary "$RUNNER_TEMP/source-capsule-summaries/$role.json"
+            PYTHONPATH="$RUNNER_TEMP/kd-pydeps" python3 -B kit/handoff/source_capsule.py seal --repository "$repository" --source-sha "$source_sha" --source-repository-id "$source_repository_id" --bundle "$bundle" --key-record "$evidence/artifacts/$selected/subject.bin" --output "$RUNNER_TEMP/source-capsule-$role/capsule.bin" --summary "$RUNNER_TEMP/source-capsule-summaries/$role.json"
           done
           rm -f "$bundle"
           python3 -B -c 'import json,sys; a,b,c,d,e,f=sys.argv[1:7]; x=json.load(open(a,encoding="ascii")); y=json.load(open(b,encoding="ascii")); ok=x["source_sha"]==y["source_sha"]==c and x["tree_id"]==y["tree_id"] and len(x["tree_id"])==40 and len(d)==64 and len(e)==64; open(f,"a",encoding="ascii").write("source_sha="+x["source_sha"]+"\ntree_id="+x["tree_id"]+"\nlock_sha256="+d+"\nmanifest_sha256="+e+"\n") if ok else sys.exit(1)' "$RUNNER_TEMP/source-capsule-summaries/producer.json" "$RUNNER_TEMP/source-capsule-summaries/verifier.json" "$source_sha" "$lock_sha256" "$manifest_sha256" "$GITHUB_OUTPUT"

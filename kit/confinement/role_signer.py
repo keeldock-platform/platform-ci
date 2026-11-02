@@ -72,10 +72,10 @@ PROFILE_ROLES = {
     "candidate": CANDIDATE_ROLES,
 }
 PINNED_WORKFLOW_SHA256 = {
-    ".github/workflows/windows-source-admission.yml": "430e128c93d18f729db199990bb3d05ac7c4ffc32b9545ae8b75a327c8dc53d4",
-    ".github/workflows/lane-h-windows-receiver.yml": "c9e0419443121aa0f35045209ab298a76104bbcf2850ec73b6dbfe82454988c9",
-    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "8d3ae122392872d11fa497e183c0b6044d37b4ab95b79f65d97dbcd4f11bc14c",
-    ".github/workflows/lane-h-capsule-attester.yml": "99a4c171a5b574c263a8b0ee7ab6743b932410f737b1eee20981ca0e62f9b9ad",
+    ".github/workflows/windows-source-admission.yml": "d8109fc807a8a4e2fdd4d753c9a2b8d00b35c190b4c8e70e37048bde6b1c8b25",
+    ".github/workflows/lane-h-windows-receiver.yml": "a7b5598823bbfb5e5fab051314a578567da06c17d86e888fbbef04c280174198",
+    ".github/workflows/lane-h-linux-fetch-encrypt.yml": "315cef77a9df73249f23ff54db23dbbc30fe00288922c3fad9543afd0412a033",
+    ".github/workflows/lane-h-capsule-attester.yml": "192d78328f8bf093a68bef0f1dd323a88772e2929d79c92b24a8864d17c1b48c",
 }
 API_JOB_NAME_PINS = {
     profile: {role: "role-call-%s-v1 / role-%s-v1" % (role, role) for role in PROFILE_ROLES[profile]}
@@ -2126,7 +2126,7 @@ def _check_candidate_subject(role, signed_subject, records, linux_subject):
         document = parse_binding_subject(signed_subject)
         for short in ("producer", "verifier"):
             held = records.get("windows-" + short)
-            if held is not None and document["key_record_%s_sha256" % short] != hashlib.sha256(held).hexdigest():
+            if held is None or document["key_record_%s_sha256" % short] != hashlib.sha256(held).hexdigest():
                 raise Refusal("binding-key-record-mismatch")
         return
     if linux_subject is None:
@@ -3225,6 +3225,16 @@ def _cmd_verify_snapshot(arguments):
         })
         print("probe=role-signer observation=collected acceptance=blocked")
         return
+    if profile == "candidate":
+        if not arguments.linux_logs:
+            raise Refusal("linux-logs-missing")
+        fixed_logs = load_json_file(arguments.linux_logs)
+        if type(fixed_logs) is not dict or set(fixed_logs) != {"sections", "other"}:
+            raise Refusal("linux-logs-shape")
+        validate_linux_revocation_evidence(
+            jobs, arguments.run_id, arguments.run_attempt, arguments.control_sha,
+            API_JOB_NAME_PINS[profile]["linux-fetch-encrypt"], API_LINUX_STEP_NAME_PINS[profile],
+            API_LINUX_STEP_ORDINAL_PINS[profile], fixed_logs["sections"], fixed_logs["other"])
     if profile == "production-synthetic":
         raise Refusal("gate-c-and-d-evidence-not-implemented")
     print("probe=role-signer result=source-free-evidence-verified profile=%s gate-c=blocked gate-d=blocked" % profile)

@@ -431,6 +431,8 @@ def validate_dispatch(environ, api_token=None, prefix=LINUX_SOURCE_PREFIX):
     windows = prefix == WINDOWS_SOURCE_PREFIX
     if windows and "KD_LINUX_TIER" in environ:
         raise SourceBuildRefusal("identity")
+    if not windows and "KD_SOURCE_PREFIX" in environ:
+        raise SourceBuildRefusal("identity")
     tier = "admission" if windows else _tier(environ)
     if (environ.get("CI_EVENT_NAME") != "workflow_dispatch"
             or environ.get("CI_REPOSITORY") != REPOSITORY

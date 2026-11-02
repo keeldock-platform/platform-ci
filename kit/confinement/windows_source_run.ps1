@@ -51,6 +51,7 @@ $GateLongPattern = '(^|_)(clippy|tests|replay|prepare|typecheck)$'
 $MaxManifestEntries = 10000
 $MaxTarballs = 6000
 $CaptureLimit = 1048576
+$ListingLimit = 3145728
 $RequiredFunctions = @(
     'Get-CleanText', 'Get-Token', 'Write-DiagLines', 'Invoke-Download', 'Assert-Sha256', 'Assert-Sri', 'Invoke-Tar', 'Copy-Tree',
     'Grant-Access', 'Set-LowIntegrityLabel', 'Test-LowIntegrityLabel', 'Grant-NonPropagating', 'Get-SidRules', 'New-ScratchSet',
@@ -409,8 +410,8 @@ function Test-ProjectTree([string]$root, $entries) {
     if ($seen -ne $expected.Count) { throw 'tree_missing' }
 }
 
-function Invoke-GitStep([string[]]$arguments, [string]$workingDirectory, [int]$seconds) {
-    $result = Invoke-TrustedProcess $script:GitPath $arguments $workingDirectory $script:GitEnvironment $seconds $CaptureLimit
+function Invoke-GitStep([string[]]$arguments, [string]$workingDirectory, [int]$seconds, [int]$limit = 1048576) {
+    $result = Invoke-TrustedProcess $script:GitPath $arguments $workingDirectory $script:GitEnvironment $seconds $limit
     if ($result.TimedOut -or $result.ExitCode -ne 0) { throw 'git_step' }
     return [string]$result.Stdout
 }
@@ -425,7 +426,7 @@ function Import-SourceBundle($bound, $manifest, [string]$bundlePath, [string]$pr
     if ($kind -cne 'commit') { throw 'source_commit' }
     $tree = (Invoke-GitStep @('--git-dir', $gitDirectory, 'rev-parse', ($bound['source_sha'] + '^{tree}')) $script:Layout.Private 120).Trim()
     if ($tree -cne $bound['tree_id'] -or $tree -cne $manifest.Tree) { throw 'tree_id' }
-    $listing = Invoke-GitStep @('--git-dir', $gitDirectory, 'ls-tree', '-r', '-z', '--full-tree', $bound['source_sha']) $script:Layout.Private 300
+    $listing = Invoke-GitStep @('--git-dir', $gitDirectory, 'ls-tree', '-r', '-z', '--full-tree', $bound['source_sha']) $script:Layout.Private 300 $ListingLimit
     $rows = @($listing.Split([char]0) | Where-Object { $_.Length -gt 0 })
     if ($rows.Count -ne $manifest.Entries.Count) { throw 'tree_listing' }
     $byPath = New-Object System.Collections.Hashtable([StringComparer]::Ordinal)
@@ -707,7 +708,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         $result = 'failed'
         if ($passed) { $result = 'passed' }
         Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=' + $result + ' hang=' + $hang)
-        if (Test-LogCanary $combined) {
+        if ($run.Truncated -or (Test-LogCanary $combined)) {
             $outcome.Canary = 'present'
             $outcome.Failure = $index
             $outcome.Failed += 1

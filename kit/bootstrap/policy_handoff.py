@@ -15,10 +15,10 @@ code that the candidate checker validates when the pool is platform.
 WORKFLOW_TEMPLATES = {}
 WORKFLOW_SHA256 = {
     "windows-handoff-synthetic": "240c1df7025c6e69c975b4f393ec5f368846cf43552e12f2b965212ce104520a",
-    "windows-source-admission": "430e128c93d18f729db199990bb3d05ac7c4ffc32b9545ae8b75a327c8dc53d4",
-    "lane-h-windows-receiver": "c9e0419443121aa0f35045209ab298a76104bbcf2850ec73b6dbfe82454988c9",
-    "lane-h-linux-fetch-encrypt": "8d3ae122392872d11fa497e183c0b6044d37b4ab95b79f65d97dbcd4f11bc14c",
-    "lane-h-capsule-attester": "99a4c171a5b574c263a8b0ee7ab6743b932410f737b1eee20981ca0e62f9b9ad",
+    "windows-source-admission": "d8109fc807a8a4e2fdd4d753c9a2b8d00b35c190b4c8e70e37048bde6b1c8b25",
+    "lane-h-windows-receiver": "a7b5598823bbfb5e5fab051314a578567da06c17d86e888fbbef04c280174198",
+    "lane-h-linux-fetch-encrypt": "315cef77a9df73249f23ff54db23dbbc30fe00288922c3fad9543afd0412a033",
+    "lane-h-capsule-attester": "192d78328f8bf093a68bef0f1dd323a88772e2929d79c92b24a8864d17c1b48c",
 }
 CANDIDATE_WORKFLOWS = (
     (

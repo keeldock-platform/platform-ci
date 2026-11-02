@@ -129,7 +129,7 @@ jobs:
           CI_MODE: ${{ inputs.mode }}
           CI_ROLE: ${{ inputs.role }}
           CI_SOURCE_SHA: ${{ inputs.source_sha }}
-          KD_WINDOWS_LOG_CANARY: ${{ inputs.mode == 'synthetic' && '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' || secrets.KD_WINDOWS_LOG_CANARY }}
+          KD_WINDOWS_LOG_CANARY: ${{ inputs.mode == 'synthetic' && 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210' || secrets.KD_WINDOWS_LOG_CANARY }}
         run: |
           $ErrorActionPreference = 'Stop'
           & pwsh -NoProfile -File kit/confinement/windows_source_run.ps1 -Mode run
