@@ -95,7 +95,8 @@ MAX_REQUEST_ROWS = 1024
 MAX_PACKUMENT_BYTES = 96 * 1024 * 1024
 MAX_ADVISORY_BYTES = 8 * 1024 * 1024
 MAX_FINDINGS = 256
-MAX_REQUESTS = 2048
+MAX_REQUESTS = 2 * MAX_PACKAGES + 1
+FETCH_CHUNK_BYTES = 1024 * 1024
 MAX_TOTAL_METADATA_BYTES = 1536 * 1024 * 1024
 MIN_PACKAGE_AGE_SECONDS = 7 * 24 * 60 * 60
 ADVISORY_MAX_AGE_SECONDS = 24 * 60 * 60
@@ -104,6 +105,8 @@ MAX_REQUEST_TTL_SECONDS = 24 * 60 * 60
 FETCH_TIMEOUT_SECONDS = 60
 FETCH_TIMEOUT_TYPES = (TimeoutError, socket.timeout)
 MAX_COLLECTED_REFUSALS = 20
+MAX_PACKAGES_AFTER_REFUSAL = 64
+TOTAL_STOP_HEADS = frozenset(("archive_size", "archive_count"))
 STOP_REFUSAL_REASONS = frozenset((
     "npm_stale", "npm_environment_refused", "npm_network_refused", "npm_payload_too_large",
 ))
@@ -1010,7 +1013,17 @@ class RegistryFetcher:
                 if response.status != 200 or response.geturl() != url:
                     failure = _fetch_status(response.status) if response.status != 200 else "url_changed"
                     raise ValueError("response")
-                data = response.read(limit + 1)
+                chunks = []
+                remaining = limit + 1
+                while remaining > 0:
+                    if self._deadline is not None and time.monotonic() >= self._deadline:
+                        _bundle_refuse("npm_stale", "stale", subject, "fetch_deadline")
+                    chunk = response.read(min(FETCH_CHUNK_BYTES, remaining))
+                    if type(chunk) is not bytes or not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                data = b"".join(chunks)
         except urllib.error.HTTPError as error:
             _bundle_refuse(
                 "npm_network_refused", "fetch", subject, _fetch_status(getattr(error, "code", None)),
@@ -1065,22 +1078,30 @@ class RegistryFetcher:
         )
 
 
-def _packument_version(packument_bytes, name, version):
+def _packument_version(packument_bytes, name, version, cache=None):
+    """Return the manifest and publish time of one version. A cache dict, when given, keeps the
+    parsed versions and times of this name so a packument is parsed once for all its versions."""
     subject = adm.package_subject(name, version)
-    record = _strict_json(
-        packument_bytes, MAX_PACKUMENT_BYTES, "npm_evidence_invalid",
-        bundle_detail("evidence", subject, "packument_json"),
-    )
-    if type(record) is not dict:
-        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_shape")
-    if record.get("name") != name:
-        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_name")
-    versions = record.get("versions")
-    times = record.get("time")
-    if type(versions) is not dict or type(times) is not dict:
-        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_shape")
-    if "unpublished" in times:
-        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "unpublished")
+    parsed = None if cache is None else cache.get(name)
+    if parsed is None:
+        record = _strict_json(
+            packument_bytes, MAX_PACKUMENT_BYTES, "npm_evidence_invalid",
+            bundle_detail("evidence", subject, "packument_json"),
+        )
+        if type(record) is not dict:
+            _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_shape")
+        if record.get("name") != name:
+            _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_name")
+        versions = record.get("versions")
+        times = record.get("time")
+        if type(versions) is not dict or type(times) is not dict:
+            _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_shape")
+        if "unpublished" in times:
+            _bundle_refuse("npm_evidence_invalid", "evidence", subject, "unpublished")
+        parsed = (versions, times)
+        if cache is not None:
+            cache[name] = parsed
+    versions, times = parsed
     manifest = versions.get(version)
     published = times.get(version)
     if type(manifest) is not dict:
@@ -1193,6 +1214,7 @@ def _reachable_paths(packages, start):
 
 
 ADVISORY_CONSUMER_BUDGET = 280
+MAX_SHOWN_CONSUMERS = 128
 
 
 def _advisory_reach_fields(name, versions, direct, lock, entries):
@@ -1217,6 +1239,8 @@ def _advisory_reach_fields(name, versions, direct, lock, entries):
         shown = []
         used = 0
         for consumer in consumers:
+            if len(shown) >= MAX_SHOWN_CONSUMERS:
+                break
             if adm.DETAIL_FIELD_RE.match(consumer) is None:
                 continue
             cost = len(consumer) + (1 if shown else 0)
@@ -1622,10 +1646,30 @@ def _path_key(item):
     return item["path"].encode("ascii", "strict")
 
 
-def _collect_entry(path, entry, name, packument, plan, fetcher, now, totals):
+def _check_inert_manifest(entry, manifest, subject):
+    """Require an inert bundled entry to carry the same cpu list and bundled names as its archive."""
+    if adm._inert_bundled_names(entry) is None:
+        return
+    if manifest.get("cpu") != entry.get("cpu"):
+        _bundle_refuse("npm_archive_refused", "archive_manifest", subject, "inert_cpu")
+    names = []
+    for key in adm.BUNDLED_FIELDS:
+        values = manifest.get(key)
+        if values is None:
+            continue
+        if type(values) is not list or any(type(item) is not str for item in values):
+            _bundle_refuse("npm_archive_refused", "archive_manifest", subject, "inert_bundle")
+        names.extend(values)
+    if sorted(names) != sorted(adm._bundled_names(entry)):
+        _bundle_refuse("npm_archive_refused", "archive_manifest", subject, "inert_bundle")
+
+
+def _collect_entry(path, entry, name, packument, plan, fetcher, now, totals, packument_cache=None):
+    """Verify one locked entry and return its evidence. The run totals include the bytes of an
+    entry that is then refused, so a refused package still counts toward the totals."""
     version = entry["version"]
     subject = adm.package_subject(name, version)
-    manifest, published = _packument_version(packument, name, version)
+    manifest, published = _packument_version(packument, name, version, packument_cache)
     data = fetcher.tarball(name, version)
     archive_entry = {
         "name": name, "version": version, "integrity": entry["integrity"],
@@ -1638,6 +1682,7 @@ def _collect_entry(path, entry, name, packument, plan, fetcher, now, totals):
         adm.verify_tarball, archive_entry, data, internal_names=plan["internal_names"],
     )
     archive_manifest = _archive_manifest(data, name, version)
+    _check_inert_manifest(entry, archive_manifest, subject)
     archive_licence = licence_text(
         archive_manifest.get("license", archive_manifest.get("licenses")),
     )
@@ -1660,13 +1705,22 @@ def _collect_entry(path, entry, name, packument, plan, fetcher, now, totals):
     return package, identity
 
 
+def _is_total_stop(detail):
+    """Whether a detail is an archive running-total refusal: an archive_size or archive_count head
+    whose last subject segment starts with total_."""
+    if type(detail) is not str:
+        return False
+    segments = detail.split(" ", 1)[0].split(":")
+    return len(segments) > 1 and segments[0] in TOTAL_STOP_HEADS and segments[-1].startswith("total_")
+
+
 def _continues_after(error):
     """Whether the per-package loop may look at the next package after this refusal. A refusal
     that comes from the run deadline, the network or the environment, or from a running total,
     ends the loop at once."""
     if error.reason in STOP_REFUSAL_REASONS:
         return False
-    return not (type(error.detail) is str and ":total_" in error.detail)
+    return not _is_total_stop(error.detail)
 
 
 def _record_refusal(refusals, error):
@@ -1685,8 +1739,10 @@ def _raise_first_refusal(refusals):
     if first.detail is not None:
         merged = [first.detail]
         for item in refusals:
-            for detail in (item.detail,) + tuple(item.details):
-                if (detail is not None and len(merged) < MAX_COLLECTED_REFUSALS
+            carried = getattr(item, "details", ())
+            carried = tuple(carried) if type(carried) in (tuple, list) else ()
+            for detail in (getattr(item, "detail", None),) + carried:
+                if (_valid_lock_detail(detail) and len(merged) < MAX_COLLECTED_REFUSALS
                         and detail not in merged):
                     merged.append(detail)
         first.details = tuple(merged)
@@ -1710,7 +1766,11 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
     matched_rows = set()
     groups = _by_name(entries)
     refusals = []
+    after_refusal = 0
     for name in sorted(groups):
+        if refusals and after_refusal >= MAX_PACKAGES_AFTER_REFUSAL:
+            _raise_first_refusal(refusals)
+        packument_cache = {}
         try:
             packument = fetcher.packument(name)
             if type(packument) is not bytes:
@@ -1727,9 +1787,13 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
                 _raise_first_refusal(refusals)
             raise
         for path, entry in groups[name]:
+            if refusals:
+                if after_refusal >= MAX_PACKAGES_AFTER_REFUSAL:
+                    _raise_first_refusal(refusals)
+                after_refusal += 1
             try:
                 package, identity = _collect_entry(
-                    path, entry, name, packument, plan, fetcher, now, totals,
+                    path, entry, name, packument, plan, fetcher, now, totals, packument_cache,
                 )
             except BootstrapRefusal as error:
                 if error.detail is None:

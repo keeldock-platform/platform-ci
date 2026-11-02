@@ -1112,6 +1112,31 @@ class NpmDiagnosticPayloadTests(unittest.TestCase):
                 self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_archive_refused")
                 self.assertEqual(stderr, ["  kd-check " + check])
 
+    def test_the_long_advisory_check_with_reach_fields_is_accepted_by_the_payload_validator(self):
+        consumers = ",".join("@scope-%02d/%s" % (index, "c" * 40) for index in range(5))
+        maximal = bootstrap.bundle_detail(
+            "advisory", "n" * 60 + "@1.0.0", "x" * 64,
+            fields=(
+                ("severity", "moderate"), ("dev", "yes"), ("consumers", consumers), ("more", "99"),
+                ("unreached", "0"),
+            ),
+        )
+        self.assertIsNotNone(maximal)
+        self.assertLessEqual(len(maximal), producer.NPM_CHECK_MAX_BYTES)
+        checks = (
+            "advisory:alpha-pkg@1.0.0:GHSA-aaaa-bbbb-cccc severity:high dev:yes consumers:alpha-pkg,beta-pkg more:3 unreached:0",
+            "advisory:alpha-pkg@1.0.0:9 severity:moderate dev:no consumers:none unreached:2",
+            maximal,
+        )
+        for check in checks:
+            with self.subTest(check=check[:60]):
+                self.assertIsNotNone(bootstrap.LOCK_DETAIL_RE.match(check))
+                self.assertIsNotNone(producer.NPM_CHECK_RE.match(check))
+                payload = producer.build_npm_diagnostic_payload("npm_bundle", "npm_advisory_blocked", None, None, check)
+                header, stderr, report = self.sections(payload)
+                self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_advisory_blocked")
+                self.assertEqual(stderr, ["  kd-check " + check])
+
     def test_the_longest_bundle_check_fits_the_shared_bound_and_the_payload_bounds(self):
         subject_text = bootstrap.adm.package_subject("a" * 214, "1.0.0-" + "b" * 100)
         longest = bootstrap.adm.build_detail(
