@@ -306,7 +306,7 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/lane-h-linux-fetch-encrypt.yml': 'fdd7355a0eabe45248fb497e49b5989645f5e2f31fd134fb6d80ac06cf52f0a7',
     '.github/workflows/lane-h-capsule-attester.yml': 'bdde526a962d01374e2655c8e8c83b786bc004555cb24f411f46eb1f6840a243',
     'kit/confinement/macos_feedback_producer.py': '439cc8137fdb4038163d5a012cb1c8142888a31f66307abb854db9ca600bf77d',
-    'kit/confinement/test_macos_feedback_producer.py': 'debe01b3114dda428129c96a6fd199c9a1e6843d83aacce98ab65b56cd4dc966',
+    'kit/confinement/test_macos_feedback_producer.py': '816979d0a8a8ea6f399ef1a3218eb6d8d88003753bb64b5db8018af17427a967',
     'kit/confinement/feedback_producer_crypto.mjs': 'e1f79d4bd9481b40c38cd73f390a95f871bdab849581a24af79e430f93934895',
     'kit/confinement/test_feedback_producer_crypto.mjs': 'bc4a764e1a5155ba5c68097d291a1dd971ecfcfb25a62cf0a016130bf4e014f7',
     'kit/confinement/feedback_admin.py': '78384adfd70cd18b956653d2d68a3c38650d39ee5403dadd6bfb8b6fdda105f1',

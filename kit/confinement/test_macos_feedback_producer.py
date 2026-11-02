@@ -1049,7 +1049,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             output,
             'KD-FEEDBACK-PRODUCER-REFUSAL '
             '{"diagnostic":"source_gates_node_runtime_version_toolchain_mismatch",'
-            '"reason":"runner_unavailable","schema_version":1,"stage":"worker_setup",'
+            '"reason":"runner_unavailable","schema_version":1,"stage":"node_dependency_prepare",'
             '"status":"refused"}\n',
         )
 
