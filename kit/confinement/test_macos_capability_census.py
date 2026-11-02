@@ -4,6 +4,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path, PurePosixPath
 from unittest.mock import patch
@@ -104,6 +105,43 @@ class CensusRetryTests(unittest.TestCase):
                 self.assertEqual(raised.exception.reason, "native_preflight_unavailable")
                 self.assertEqual(raised.exception.check, "probe_process_census")
                 self.assertFalse(raised.exception.cleanup_complete)
+
+    def test_an_interrupt_or_system_exit_is_never_converted_or_retried(self):
+        for signal_error in (KeyboardInterrupt(), SystemExit(1)):
+            with self.subTest(signal=type(signal_error).__name__):
+                with self._run_patch(side_effect=signal_error) as command:
+                    with patch.object(macos_capability.time, "sleep") as pause:
+                        with self.assertRaises(type(signal_error)):
+                            macos_capability._probe_uid_processes_present(502)
+                command.assert_called_once()
+                pause.assert_not_called()
+
+    def test_retries_are_charged_to_the_caller_deadline_and_the_internal_budget(self):
+        self.assertGreater(
+            macos_capability.CENSUS_READ_BUDGET_SECONDS,
+            macos_capability.CENSUS_READ_ATTEMPTS * macos_capability.CENSUS_ATTEMPT_TIMEOUT_SECONDS
+            + (macos_capability.CENSUS_READ_ATTEMPTS - 1) * macos_capability.CENSUS_READ_RETRY_SECONDS,
+        )
+        for label, keywords, budget in (
+            ("deadline", {"deadline": time.monotonic() + 1.0}, macos_capability.CENSUS_READ_BUDGET_SECONDS),
+            ("budget", {}, 0.0),
+        ):
+            with self.subTest(label=label):
+                with patch.object(macos_capability, "CENSUS_READ_BUDGET_SECONDS", budget):
+                    with self._run_patch(side_effect=(_completed(1, b""),) * 3) as command:
+                        with patch.object(macos_capability.time, "sleep") as pause:
+                            with self.assertRaises(macos_capability.ProbeFailure) as raised:
+                                macos_capability._probe_uid_processes_present(502, **keywords)
+                command.assert_called_once()
+                pause.assert_not_called()
+                self.assertEqual(raised.exception.check, "probe_process_census")
+        with patch.object(macos_capability.time, "sleep") as pause:
+            with self._run_patch(side_effect=(_completed(1, b""), _completed(0, CLEAN_ROWS))) as command:
+                self.assertFalse(macos_capability._probe_uid_processes_present(
+                    502, deadline=time.monotonic() + 60.0,
+                ))
+        self.assertEqual(command.call_count, 2)
+        pause.assert_called_once()
 
     def test_persistent_control_snapshot_failure_still_refuses(self):
         with self._run_patch(return_value=_completed(0, b"1 1 Q 0 0 0\n")) as command:
