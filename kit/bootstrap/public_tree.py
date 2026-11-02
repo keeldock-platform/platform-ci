@@ -231,7 +231,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/release_tool_ledger.json': '2c0004d1e83780d780c501b794a15e6c6928f8aa352dcfab46fe389fe871dc0b',
     'kit/confinement/test_release_tool_ledger.py': '20ef9cfb0f4a64c73e34443c3d726be599c34ac6145df875d1abe8a427de8a4e',
     'kit/confinement/foundation_node_feedback.py': 'bb4959cf3422afe86eaf7e988f5264534c3e56d0f50862a95b76cb0e6903f371',
-    'kit/confinement/test_foundation_node_feedback.py': '5aa67dbcb6b26d6d00a4bcb2d2e5907b86b5a8e3441609b532dd2a0939be4913',
+    'kit/confinement/test_foundation_node_feedback.py': '334db66129e1e8ab15847a68d85ebcf095295e8573b855805ea6523927fd1eef',
     'kit/confinement/native_loopback_profile.py': '5dee8e3f29e1d9178099eeefdec9f7520efe3939ab9b8cae71406b8da48a4ab7',
     'kit/confinement/test_native_loopback_profile.py': 'acbc69ae710ac56931429fdc881a853ceadfaf63327a62aace5e6f1d76e8683d',
     'kit/confinement/linux_harness.py': '066e461ad229d70cd2a270fc95ddcc29e60951da5c7ec5cfdd68e45c4445a8c0',

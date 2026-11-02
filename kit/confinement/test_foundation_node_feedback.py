@@ -188,6 +188,13 @@ class FakeContract:
         return self.expected_result
 
 
+def _filesystem_is_case_insensitive():
+    with tempfile.TemporaryDirectory() as probe_root:
+        probe = Path(probe_root) / "CaseProbe"
+        probe.touch()
+        return (Path(probe_root) / "caseprobe").exists()
+
+
 def _dispatch(kind):
     profiles = FakeProducer().PROFILE_BY_KIND
     profile = profiles[kind]
@@ -540,13 +547,21 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
             make_inert(source)
             (source / "packages/kernel-tokens/package.json").mkdir()
 
+        case_insensitive = _filesystem_is_case_insensitive()
+        skip_reason = (
+            "case-distinct package names cannot coexist on a case-insensitive filesystem"
+        )
         for mutate in (
             with_other_package, with_stray_file, with_case_variant, without_host_api,
             inert_is_a_file, inert_with_package_json, inert_with_package_json_directory,
         ):
             with self.subTest(mutation=mutate.__name__, mode="bootstrap"):
+                if mutate is with_case_variant and case_insensitive:
+                    self.skipTest(skip_reason)
                 self._refused("bootstrap", "lock", "core_node_lock_return", mutate)
             with self.subTest(mutation=mutate.__name__, mode="verify"):
+                if mutate is with_case_variant and case_insensitive:
+                    self.skipTest(skip_reason)
                 self._refused(
                     "verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE, mutate,
                     accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
