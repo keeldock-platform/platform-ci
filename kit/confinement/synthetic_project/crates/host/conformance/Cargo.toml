@@ -1,0 +1,19 @@
+[package]
+name = "fixture-host-conformance"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fixture-host-api = { path = "../api" }
+fixture-host-mock = { path = "../mock" }
+
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+harness = false
+
+[[test]]
+name = "process_pipe"
+path = "tests/process_pipe.rs"
+harness = false

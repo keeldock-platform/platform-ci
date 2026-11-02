@@ -1,0 +1,4 @@
+[workspace]
+resolver = "3"
+members = ["crates/host/api", "crates/host/mock", "crates/host/conformance"]
+exclude = ["fuzz", "runtime"]

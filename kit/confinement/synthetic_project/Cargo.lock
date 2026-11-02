@@ -1,0 +1,20 @@
+version = 4
+
+[[package]]
+name = "fixture-host-api"
+version = "0.1.0"
+
+[[package]]
+name = "fixture-host-conformance"
+version = "0.1.0"
+dependencies = [
+ "fixture-host-api",
+ "fixture-host-mock",
+]
+
+[[package]]
+name = "fixture-host-mock"
+version = "0.1.0"
+dependencies = [
+ "fixture-host-api",
+]

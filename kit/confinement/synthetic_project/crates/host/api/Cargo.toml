@@ -1,0 +1,18 @@
+[package]
+name = "fixture-host-api"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+dev-uat-policy-import = []
+
+[[test]]
+name = "surface"
+path = "tests/surface.rs"
+harness = false
+
+[[test]]
+name = "feature"
+path = "tests/feature.rs"
+harness = false

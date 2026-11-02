@@ -1,0 +1,13 @@
+[package]
+name = "fixture-host-mock"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+fixture-host-api = { path = "../api" }
+
+[[test]]
+name = "mock"
+path = "tests/mock.rs"
+harness = false
