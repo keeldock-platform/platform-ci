@@ -450,14 +450,15 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
                 "core-linux-quick-return-settings",
                 "core-linux-quick-return-unit",
                 "core-linux-quick-return-producer",
+                "core-linux-quick-return-audit",
             ],
         )
-        for name in ("settings", "producer"):
+        for name in ("settings", "producer", "audit"):
             header = jobs["core-linux-quick-return-" + name].split("    runs-on:", 1)[0]
             self.assertIn("github.ref == 'refs/heads/untrusted'", header)
         self.assertEqual(self.text.count('[[ "$CI_REF" == "refs/heads/untrusted" ]]'), 3)
-        self.assertEqual(self.text.count("runs-on: ubuntu-24.04"), 3)
-        self.assertEqual(self.text.count("cache-mode: none"), 4)
+        self.assertEqual(self.text.count("runs-on: ubuntu-24.04"), 4)
+        self.assertEqual(self.text.count("cache-mode: none"), 5)
         self.assertNotIn("latest", self.text)
         self.assertIn("    permissions: {}\n", jobs["core-linux-quick-return-unit"])
         for name in ("settings", "producer"):
@@ -468,12 +469,13 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
 
     def test_quick_tier_has_no_verdict_job_and_never_accepts_a_run(self):
         lowered = self.text.lower()
-        for forbidden in ("verdict", "run_accepted", "verify-handoff", "linux_source_build.py audit",
-                          "confinement_public_audit", "confinement_verdict"):
+        for forbidden in ("verdict", "run_accepted", "verify-handoff", "confinement_public_audit",
+                          "confinement_verdict"):
             self.assertNotIn(forbidden, lowered)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", self.text)
         for name in self.jobs():
-            self.assertFalse(name.endswith(("-verdict", "-audit")), name)
+            self.assertFalse(name.endswith("-verdict"), name)
+        self.assertEqual(self.text.count("linux_source_build.py audit"), 1)
         module = QUICK_MODULE.read_text(encoding="utf-8")
         for forbidden in ("run_accepted", "confinement_verdict", "import linux_source_build", "KD-CONFINEMENT"):
             self.assertNotIn(forbidden, module)
@@ -499,6 +501,8 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
             ("LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", "LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON"),
             ("KD_QUICK_ALLOWED_REQUEST_ID", "LINUX_QUICK_ALLOWED_REQUEST_ID"),
             ("KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT", "LINUX_QUICK_ALLOWED_RECIPIENT_FINGERPRINT"),
+            ("KD_QUICK_ALLOWED_NONCE", "LINUX_QUICK_ALLOWED_NONCE"),
+            ("KD_QUICK_ALLOWED_EXPIRY", "LINUX_QUICK_ALLOWED_EXPIRY"),
         )
         for name in ("settings", "producer"):
             body = self.jobs()["core-linux-quick-return-" + name]
@@ -514,6 +518,52 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
             "SOURCE_REPOSITORY_ID", "SOURCE_READER_INSTALLATION_ID", "SOURCE_READER_CLIENT_ID",
             *(variable for unused, variable in mapped),
         })
+
+    def test_settings_job_snapshots_the_cache_and_exports_the_expected_quick_run(self):
+        settings = self.jobs()["core-linux-quick-return-settings"]
+        self.assertIn("    outputs:\n      expected: ${{ steps.snapshot.outputs.expected }}\n", settings)
+        self.assertIn("      cache_digest: ${{ steps.snapshot.outputs.cache_digest }}\n", settings)
+        self.assertEqual(
+            re.findall(r"(?m)^      - name: (.*)$", settings),
+            [
+                "Fetch exact public control",
+                "Validate quick request and binding",
+                "Snapshot cache inventory and validate preflight",
+            ],
+        )
+        snapshot = settings.split("      - name: Snapshot cache inventory and validate preflight\n", 1)[1]
+        self.assertIn("        id: snapshot\n", snapshot)
+        self.assertIn("          GITHUB_TOKEN: ${{ github.token }}\n", snapshot)
+        self.assertIn("        run: python3 -B kit/confinement/linux_source_build.py snapshot\n", snapshot)
+        self.assertNotIn("linux_source_build.py preflight", settings)
+
+    def test_audit_job_is_source_free_and_audits_the_one_artifact_without_a_verdict(self):
+        audit = self.jobs()["core-linux-quick-return-audit"]
+        self.assertIn(
+            "    needs:\n      - core-linux-quick-return-settings\n      - core-linux-quick-return-unit\n"
+            "      - core-linux-quick-return-producer\n",
+            audit,
+        )
+        self.assertIn(
+            "    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/untrusted' }}\n",
+            audit,
+        )
+        self.assertIn("    environment: linux-source-read\n", audit)
+        self.assertIn("    permissions:\n      actions: read\n      checks: read\n", audit)
+        self.assertNotIn("contents:", audit)
+        self.assertIn("      KD_LINUX_TIER: quick\n", audit)
+        self.assertIn(
+            "      CONFINEMENT_AUDIT_EXPECTED: ${{ needs.core-linux-quick-return-settings.outputs.expected }}\n",
+            audit,
+        )
+        self.assertEqual(
+            re.findall(r"(?m)^      - name: (.*)$", audit),
+            ["Fetch exact public control", "Audit logs, artifact, cache metadata and quick return"],
+        )
+        self.assertIn("          KD_LINUX_LOG_CANARY: ${{ secrets.KD_LINUX_LOG_CANARY }}\n", audit)
+        self.assertIn("        run: python3 -B kit/confinement/linux_source_build.py audit\n", audit)
+        for forbidden in ("uses:", "SOURCE_READER", "SOURCE_REPOSITORY", "sudo", "linux_quick_return.py", "vars."):
+            self.assertNotIn(forbidden, audit)
 
     def test_secrets_stay_out_of_run_blocks_and_arguments(self):
         self.assertEqual(set(re.findall(r"secrets\.([A-Z_]+)", self.text)), {

@@ -133,6 +133,46 @@ UNIT_STEP_NAMES = (
     "Fetch exact public control",
     "Run unprivileged source-free checks",
 )
+QUICK_WORKFLOW_PATH = ".github/workflows/core-linux-quick-return.yml"
+QUICK_JOB_PREFIX = "core-linux-quick-return"
+QUICK_SETTINGS_STEP_NAMES = (
+    "Set up job",
+    "Fetch exact public control",
+    "Validate quick request and binding",
+    "Snapshot cache inventory and validate preflight",
+    "Complete job",
+)
+QUICK_UNIT_STEP_NAMES = (
+    "Set up job",
+    "Fetch exact public control",
+    "Run unprivileged source-free checks",
+    "Complete job",
+)
+QUICK_PRODUCER_STEP_NAMES = (
+    "Set up job",
+    "Fetch exact public control",
+    "Repeat quick preflight before source read",
+    "Record image and fetch pinned Rust and Node toolchains",
+    "Harden runner paths before the proof",
+    "Boundary self-test before source-reader mint",
+    "Mint scoped source-reader token",
+    "Verify selected installation identity",
+    "Fetch exact source and verify binding, tree, signatures and lock provenance",
+    "Revoke source-reader token and verify rejection",
+    "Require trusted Rust licence admission",
+    "Fetch npm tarballs by committed lock integrity",
+    "Run trusted dependency audit",
+    "Prepare offline project inputs",
+    "Re-run positive controls immediately before the first project command",
+    "Run all offline project gates",
+    "Merge confinement phase records",
+    "Encrypt bounded quick return",
+    "Upload the single encrypted member",
+    "Record quick return counts",
+    "Remove staged ciphertext",
+    "Post Mint scoped source-reader token",
+    "Complete job",
+)
 OPTIONAL_SOURCE_STEPS = frozenset((
     "Mint scoped source-reader token",
     "Verify selected installation identity",
@@ -380,7 +420,38 @@ def _audit_modules():
     return confinement_public_audit, confinement_verdict, log_canary
 
 
+def _expected_quick_run(environ, cache_digest):
+    audit, unused_verdict, unused_canary = _audit_modules()
+    request_id = environ.get("KD_QUICK_REQUEST_ID", "")
+    source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
+    expected = {
+        "repository": REPOSITORY,
+        "os": "linux",
+        "mode": "quick",
+        "control_sha": environ.get("CI_SHA", "0" * 40),
+        "run_id": int(environ.get("GITHUB_RUN_ID", "1")) if DECIMAL_RE.fullmatch(environ.get("GITHUB_RUN_ID", "")) else 1,
+        "run_attempt": int(environ.get("GITHUB_RUN_ATTEMPT", "1")) if DECIMAL_RE.fullmatch(environ.get("GITHUB_RUN_ATTEMPT", "")) else 1,
+        "workflow_path": QUICK_WORKFLOW_PATH,
+        "ci_ref": "untrusted",
+        "display_title": TIERS["quick"][1] + source_sha,
+        "jobs": {
+            QUICK_JOB_PREFIX + "-settings": {"steps": QUICK_SETTINGS_STEP_NAMES, "optional_steps": ()},
+            QUICK_JOB_PREFIX + "-unit": {"steps": QUICK_UNIT_STEP_NAMES, "optional_steps": ()},
+            QUICK_JOB_PREFIX + "-producer": {"steps": QUICK_PRODUCER_STEP_NAMES, "optional_steps": ()},
+        },
+        "quick_job": QUICK_JOB_PREFIX + "-producer",
+        "request_id": request_id,
+        "auditor_job": QUICK_JOB_PREFIX + "-audit",
+        "artifact_names": ("linux-quick-" + request_id,),
+        "cache_digest": cache_digest if HEX64_RE.fullmatch(cache_digest or "") else "0" * 64,
+    }
+    audit.validate_expected_quick(expected)
+    return expected
+
+
 def _expected_run(environ, cache_digest):
+    if _tier(environ) == "quick":
+        return _expected_quick_run(environ, cache_digest)
     audit, unused_verdict, unused_canary = _audit_modules()
     mode = environ.get("CI_MODE", "")
     if mode not in ("source", "synthetic"):
@@ -2054,7 +2125,7 @@ def run_audit(environ=None):
             value = SYNTHETIC_LOG_CANARY
         config = log_canary.compute_config(value)
         log_canary.PINNED_CONFIG = config
-        code = audit.main(arguments=[], environ=env)
+        code = audit.main(arguments=["quick"] if _tier(env) == "quick" else [], environ=env)
         return code
     except BaseException:
         sys.stdout.write("KD-CONFINEMENT-AUDIT schema=1 status=refused phase=log_canary reason=confinement_audit_invalid\n")

@@ -43,6 +43,9 @@ jobs:
     permissions:
       actions: read
       contents: read
+    outputs:
+      expected: ${{ steps.snapshot.outputs.expected }}
+      cache_digest: ${{ steps.snapshot.outputs.cache_digest }}
     defaults:
       run:
         shell: bash
@@ -78,6 +81,8 @@ jobs:
       KD_QUICK_RECIPIENT_SPKI_B64: ${{ inputs.recipient_spki_b64 }}
       KD_QUICK_ALLOWED_REQUEST_ID: ${{ vars.LINUX_QUICK_ALLOWED_REQUEST_ID }}
       KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT: ${{ vars.LINUX_QUICK_ALLOWED_RECIPIENT_FINGERPRINT }}
+      KD_QUICK_ALLOWED_NONCE: ${{ vars.LINUX_QUICK_ALLOWED_NONCE }}
+      KD_QUICK_ALLOWED_EXPIRY: ${{ vars.LINUX_QUICK_ALLOWED_EXPIRY }}
     steps:
       - name: Fetch exact public control
         run: |
@@ -92,12 +97,12 @@ jobs:
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
           [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$CI_SHA" ]]
       - name: Validate quick request and binding
+        run: python3 -B kit/confinement/linux_quick_return.py preflight
+      - name: Snapshot cache inventory and validate preflight
+        id: snapshot
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          python3 -B kit/confinement/linux_quick_return.py preflight
-          python3 -B kit/confinement/linux_source_build.py preflight
+        run: python3 -B kit/confinement/linux_source_build.py snapshot
   core-linux-quick-return-unit:
     needs: core-linux-quick-return-settings
     if: ${{ github.event_name == 'workflow_dispatch' && needs.core-linux-quick-return-settings.result == 'success' }}
@@ -188,6 +193,8 @@ jobs:
       KD_QUICK_RECIPIENT_SPKI_B64: ${{ inputs.recipient_spki_b64 }}
       KD_QUICK_ALLOWED_REQUEST_ID: ${{ vars.LINUX_QUICK_ALLOWED_REQUEST_ID }}
       KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT: ${{ vars.LINUX_QUICK_ALLOWED_RECIPIENT_FINGERPRINT }}
+      KD_QUICK_ALLOWED_NONCE: ${{ vars.LINUX_QUICK_ALLOWED_NONCE }}
+      KD_QUICK_ALLOWED_EXPIRY: ${{ vars.LINUX_QUICK_ALLOWED_EXPIRY }}
     steps:
       - name: Fetch exact public control
         run: |
@@ -310,7 +317,7 @@ jobs:
         if: ${{ always() && steps.gates.outcome != 'skipped' }}
         env:
           NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
-        run: sudo -n --preserve-env=KD_QUICK_REQUEST_ID,KD_QUICK_RECIPIENT_SPKI_B64,KD_QUICK_ALLOWED_REQUEST_ID,KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT,CI_SHA,REQUESTED_SOURCE_SHA,REQUESTED_BASE_SHA,REQUESTED_BASE_BRANCH,REQUESTED_FINGERPRINT,SOURCE_REPOSITORY_ID,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,RUNNER_TEMP,NODE_BIN,GITHUB_OUTPUT,ImageOS,ImageVersion python3 -B kit/confinement/linux_quick_return.py encrypt --reader-uid "$(id -u)" --reader-gid "$(id -g)"
+        run: sudo -n --preserve-env=KD_QUICK_REQUEST_ID,KD_QUICK_RECIPIENT_SPKI_B64,KD_QUICK_ALLOWED_REQUEST_ID,KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT,KD_QUICK_ALLOWED_NONCE,KD_QUICK_ALLOWED_EXPIRY,CI_SHA,REQUESTED_SOURCE_SHA,REQUESTED_BASE_SHA,REQUESTED_BASE_BRANCH,REQUESTED_FINGERPRINT,SOURCE_REPOSITORY_ID,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,RUNNER_TEMP,NODE_BIN,GITHUB_OUTPUT,ImageOS,ImageVersion python3 -B kit/confinement/linux_quick_return.py encrypt --reader-uid "$(id -u)" --reader-gid "$(id -g)"
       - name: Upload the single encrypted member
         id: uploader
         if: ${{ always() && steps.encrypt.outcome == 'success' }}
@@ -345,3 +352,38 @@ jobs:
           if [[ -e "$staged" || -L "$staged" ]]; then rm -f -- "$staged"; fi
           staged_dir="${RUNNER_TEMP%/}/kd-quick-upload"
           if [[ -d "$staged_dir" && ! -L "$staged_dir" ]]; then rmdir -- "$staged_dir"; fi
+  core-linux-quick-return-audit:
+    needs:
+      - core-linux-quick-return-settings
+      - core-linux-quick-return-unit
+      - core-linux-quick-return-producer
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/untrusted' }}
+    runs-on: ubuntu-24.04
+    environment: linux-source-read
+    timeout-minutes: 15
+    cache-mode: none
+    permissions:
+      actions: read
+      checks: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_MODE: source
+      KD_LINUX_TIER: quick
+      CONFINEMENT_AUDIT_EXPECTED: ${{ needs.core-linux-quick-return-settings.outputs.expected }}
+    steps:
+      - name: Fetch exact public control
+        run: |
+          set -euo pipefail
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${GITHUB_SERVER_URL%/}/${GITHUB_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$GITHUB_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$GITHUB_SHA" ]]
+      - name: Audit logs, artifact, cache metadata and quick return
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          KD_LINUX_LOG_CANARY: ${{ secrets.KD_LINUX_LOG_CANARY }}
+        run: python3 -B kit/confinement/linux_source_build.py audit

@@ -1279,5 +1279,394 @@ class ParseAndMainTests(AuditCase):
         self.assertEqual(output.getvalue(), "")
 
 
+QUICK_REQUEST = "cd" * 32
+QUICK_TITLE = "Linux quick source " + "e" * 40
+QUICK_SETTINGS_JOB = "core-linux-quick-return-settings"
+QUICK_PRODUCER_JOB = "core-linux-quick-return-producer"
+QUICK_AUDITOR_JOB = "core-linux-quick-return-audit"
+QUICK_SETTINGS_STEPS = (
+    "Set up job", "Fetch exact public control", "Validate quick request and binding",
+    "Snapshot cache inventory and validate preflight", "Complete job",
+)
+QUICK_PRODUCER_STEPS = (
+    "Set up job", "Prepare", subject.QUICK_GATES_STEP, "Encrypt", "Upload", subject.QUICK_LINE_STEP,
+    "Post cleanup", "Complete job",
+)
+QUICK_ARTIFACT_SIZE = subject.QUICK_FRAME_BYTES + 150
+QUICK_ACCEPTED = (
+    "KD-CONFINEMENT-AUDIT schema=1 status=accepted os=linux mode=quick tier=quick admission=never"
+    " control-sha=" + CONTROL + " run-id=5000123456 run-attempt=1 verdict=none log-canary=absent"
+    " artifacts=expected caches=unchanged"
+)
+
+
+def quick_count_line(request=QUICK_REQUEST, selected=13, passed=13, failed=0):
+    return (
+        "KD-LINUX-QUICK schema=1 request-id=" + request + " tier=quick admission=never gates-selected="
+        + str(selected) + " gates-passed=" + str(passed) + " failed=" + str(failed) + " status=encrypted"
+    )
+
+
+def quick_preflight_line(request=QUICK_REQUEST):
+    return (
+        "KD-LINUX-QUICK-PREFLIGHT schema=1 request-id=" + request
+        + " tier=quick admission=never status=verified"
+    )
+
+
+def quick_log(count_line, gate_output=(), encrypt_output=(), tail=("Cleaning up orphan processes",)):
+    out = []
+    for title in ("Runner Image Provisioner", "Operating System", "Runner Image"):
+        out.extend([_group(title), _plain("Version: fixture"), _marker("endgroup")])
+    out.extend(_plain(text) for text in (
+        "Prepare workflow directory", "Prepare all required actions",
+        "Complete job name: " + QUICK_PRODUCER_JOB,
+    ))
+    out.extend(_run_step("prepare command", [quick_preflight_line()]))
+    out.extend(_run_step("gates command", list(gate_output)))
+    out.extend(_run_step("encrypt command", list(encrypt_output)))
+    out.extend(_run_step("upload command", []))
+    out.extend(_run_step("record command", [] if count_line is None else [count_line]))
+    out.extend(_plain(text) for text in tail)
+    return b"\n".join(out) + b"\n"
+
+
+def quick_artifact(**updates):
+    item = {
+        "id": 77, "name": "linux-quick-" + QUICK_REQUEST, "size_in_bytes": QUICK_ARTIFACT_SIZE,
+        "expired": False, "created_at": "2026-11-02T10:00:00Z", "expires_at": "2026-11-03T10:00:00Z",
+        "workflow_run": {"id": RUN_ID, "head_sha": CONTROL, "head_branch": "untrusted"},
+    }
+    item.update(updates)
+    return item
+
+
+class QuickApi(FakeApi):
+    def __init__(self, failed_gate=False):
+        super().__init__()
+        self.expected = {
+            "repository": REPO, "os": "linux", "mode": "quick", "control_sha": CONTROL,
+            "run_id": RUN_ID, "run_attempt": 1, "workflow_path": subject.QUICK_WORKFLOW_PATH,
+            "ci_ref": "untrusted", "display_title": QUICK_TITLE,
+            "jobs": {
+                QUICK_SETTINGS_JOB: {"steps": QUICK_SETTINGS_STEPS, "optional_steps": ()},
+                QUICK_PRODUCER_JOB: {"steps": QUICK_PRODUCER_STEPS, "optional_steps": ("Post cleanup",)},
+            },
+            "quick_job": QUICK_PRODUCER_JOB, "request_id": QUICK_REQUEST,
+            "auditor_job": QUICK_AUDITOR_JOB, "artifact_names": ("linux-quick-" + QUICK_REQUEST,),
+            "cache_digest": subject.cache_inventory_digest([]),
+        }
+        self.run["path"] = subject.QUICK_WORKFLOW_PATH
+        self.run["display_title"] = QUICK_TITLE
+        self.jobs = [
+            make_job(101, 201, QUICK_SETTINGS_JOB, QUICK_SETTINGS_STEPS, "completed", "success"),
+            make_job(102, 202, QUICK_PRODUCER_JOB, QUICK_PRODUCER_STEPS, "completed", "success"),
+            make_job(103, 203, QUICK_AUDITOR_JOB, (), "in_progress", None),
+        ]
+        line = quick_count_line()
+        if failed_gate:
+            line = quick_count_line(passed=4, failed=1)
+            self.jobs[1]["conclusion"] = "failure"
+            self.checks[202]["conclusion"] = "failure"
+            self.set_step(subject.QUICK_GATES_STEP, "failure")
+        self.logs[101] = noise_log(b"settings") + _plain(quick_preflight_line()) + b"\n"
+        self.logs[102] = quick_log(line)
+        self.artifacts = [quick_artifact()]
+
+    def set_step(self, name, conclusion, job=1):
+        for step in self.jobs[job]["steps"]:
+            if step["name"] == name:
+                step["conclusion"] = conclusion
+
+
+class QuickAuditCase(unittest.TestCase):
+    def assert_refused(self, api, phase, expected=None):
+        value = api.expected if expected is None else expected
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.audit_quick(api, value, CONFIG)
+        self.assertEqual(caught.exception.phase, phase)
+        accepted, line = subject.quick_audit_line(api, value, CONFIG)
+        self.assertFalse(accepted)
+        self.assertEqual(line, subject.refusal_line(phase))
+        self.assertNotIn(CANARY, line)
+        self.assertNotIn(chr(35), line)
+
+
+class QuickAcceptanceTests(QuickAuditCase):
+    def test_a_complete_quick_run_is_accepted_with_a_line_that_is_never_an_admission_line(self):
+        api = QuickApi()
+        self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
+        self.assertEqual(subject.quick_audit_line(api, api.expected, CONFIG), (True, QUICK_ACCEPTED))
+        self.assertEqual(subject.quick_accepted_line(api.expected), QUICK_ACCEPTED)
+        self.assertIn("admission=never", QUICK_ACCEPTED)
+        self.assertNotIn("verdict=accepted", QUICK_ACCEPTED)
+        with self.assertRaises(subject.AuditRefusal):
+            subject.decode_audit_line(QUICK_ACCEPTED)
+
+    def test_failed_gates_are_accepted_because_the_failure_is_the_feedback(self):
+        api = QuickApi(failed_gate=True)
+        self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
+
+    def test_the_admission_audit_never_accepts_the_quick_shape(self):
+        api = QuickApi()
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.audit(api, api.expected, CONFIG)
+        self.assertEqual(caught.exception.phase, "request")
+        admission = FakeApi()
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.audit_quick(admission, admission.expected, CONFIG)
+        self.assertEqual(caught.exception.phase, "request")
+
+    def test_expected_json_round_trips_only_through_the_quick_parser(self):
+        api = QuickApi()
+        raw = json.dumps(api.expected)
+        self.assertEqual(subject.parse_expected(raw, True), api.expected)
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.parse_expected(raw)
+        self.assertEqual(caught.exception.phase, "request")
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.parse_expected(json.dumps(FakeApi().expected), True)
+        self.assertEqual(caught.exception.phase, "request")
+
+
+class QuickExpectedTests(QuickAuditCase):
+    def test_the_expected_shape_is_closed_and_bound_to_the_quick_workflow(self):
+        for field, value in (
+            ("os", "windows"), ("mode", "candidate"), ("ci_ref", "main"), ("run_attempt", 2),
+            ("workflow_path", ".github/workflows/linux-source-admission.yml"),
+            ("request_id", "CD" * 32), ("request_id", "cd" * 31), ("artifact_names", ()),
+            ("artifact_names", ("linux-quick-" + "ab" * 32,)),
+            ("artifact_names", ("linux-quick-" + QUICK_REQUEST, "other")),
+            ("quick_job", "missing"), ("auditor_job", QUICK_PRODUCER_JOB), ("cache_digest", "x"),
+            ("control_sha", "z" * 40), ("display_title", ""),
+        ):
+            api = QuickApi()
+            api.expected[field] = value
+            with self.subTest(field=field, value=value):
+                self.assert_refused(api, "request")
+        api = QuickApi()
+        api.expected["verdict_job"] = QUICK_PRODUCER_JOB
+        self.assert_refused(api, "request")
+        api = QuickApi()
+        del api.expected["request_id"]
+        self.assert_refused(api, "request")
+
+    def test_no_job_may_declare_a_verdict_step_and_the_two_named_steps_must_exist_once(self):
+        api = QuickApi()
+        api.expected["jobs"][QUICK_PRODUCER_JOB]["steps"] = QUICK_PRODUCER_STEPS + ("Publish confinement verdict",)
+        self.assert_refused(api, "request")
+        for missing in (subject.QUICK_GATES_STEP, subject.QUICK_LINE_STEP):
+            api = QuickApi()
+            steps = tuple(step for step in QUICK_PRODUCER_STEPS if step != missing)
+            api.expected["jobs"][QUICK_PRODUCER_JOB]["steps"] = steps
+            with self.subTest(missing=missing):
+                self.assert_refused(api, "request")
+            api = QuickApi()
+            api.expected["jobs"][QUICK_PRODUCER_JOB]["steps"] = QUICK_PRODUCER_STEPS + (missing,)
+            with self.subTest(duplicate=missing):
+                self.assert_refused(api, "request")
+            api = QuickApi()
+            api.expected["jobs"][QUICK_PRODUCER_JOB]["optional_steps"] = (missing,)
+            with self.subTest(optional=missing):
+                self.assert_refused(api, "request")
+
+
+class QuickStepAndJobTests(QuickAuditCase):
+    def test_only_the_gate_step_may_fail_and_only_with_a_failed_job(self):
+        api = QuickApi()
+        api.jobs[1]["conclusion"] = "failure"
+        api.checks[202]["conclusion"] = "failure"
+        self.assert_refused(api, "jobs")
+        api = QuickApi()
+        api.set_step(subject.QUICK_GATES_STEP, "failure")
+        self.assert_refused(api, "jobs")
+        api = QuickApi(failed_gate=True)
+        api.set_step(subject.QUICK_GATES_STEP, "skipped")
+        self.assert_refused(api, "job_steps")
+        api = QuickApi(failed_gate=True)
+        api.set_step("Encrypt", "failure")
+        self.assert_refused(api, "job_steps")
+        api = QuickApi(failed_gate=True)
+        api.set_step("Upload", "skipped")
+        self.assert_refused(api, "job_steps")
+        api = QuickApi()
+        api.jobs[1]["conclusion"] = "cancelled"
+        api.checks[202]["conclusion"] = "cancelled"
+        self.assert_refused(api, "jobs")
+
+    def test_every_other_job_must_have_succeeded(self):
+        api = QuickApi()
+        api.jobs[0]["conclusion"] = "failure"
+        api.checks[201]["conclusion"] = "failure"
+        self.assert_refused(api, "jobs")
+        api = QuickApi()
+        api.set_step("Fetch exact public control", "skipped", job=0)
+        self.assert_refused(api, "job_steps")
+
+
+class QuickLogTests(QuickAuditCase):
+    def test_a_verdict_line_in_any_job_log_is_refused(self):
+        api = QuickApi()
+        api.logs[101] += stamped_verdict(verdict_record())
+        self.assert_refused(api, "verdict")
+        api = QuickApi()
+        api.logs[102] += stamped_verdict(verdict_record())
+        self.assert_refused(api, "verdict")
+
+    def test_the_only_public_lines_are_the_preflight_lines_and_one_counts_line(self):
+        refusal = "KD-LINUX-QUICK-REFUSAL schema=1 tier=quick admission=never reason=encryptor"
+        other = "KD-LINUX-QUICK schema=1 request-id=" + QUICK_REQUEST + " tier=quick admission=accepted"
+        for text in (refusal, other, "KD-LINUX-QUICK-EXTRA x"):
+            api = QuickApi()
+            api.logs[102] = quick_log(quick_count_line(), encrypt_output=[text])
+            with self.subTest(text=text):
+                self.assert_refused(api, "verdict")
+            api = QuickApi()
+            api.logs[101] += _plain(text) + b"\n"
+            with self.subTest(settings=text):
+                self.assert_refused(api, "verdict")
+
+    def test_the_counts_line_must_be_single_bound_to_the_request_and_inside_the_record_step(self):
+        api = QuickApi()
+        api.logs[102] = quick_log(None)
+        self.assert_refused(api, "verdict")
+        api = QuickApi()
+        api.logs[102] = quick_log(quick_count_line(), encrypt_output=[quick_count_line()])
+        self.assert_refused(api, "verdict")
+        api = QuickApi()
+        api.logs[102] = quick_log(None, gate_output=[quick_count_line()])
+        self.assert_refused(api, "verdict")
+        api = QuickApi()
+        api.logs[102] = quick_log(quick_count_line(request="ab" * 32))
+        self.assert_refused(api, "verdict")
+        api = QuickApi()
+        api.logs[101] += _plain(quick_count_line()) + b"\n"
+        self.assert_refused(api, "verdict")
+        api = QuickApi()
+        api.logs[101] += _plain(quick_preflight_line("ab" * 32)) + b"\n"
+        self.assert_refused(api, "verdict")
+
+    def test_the_counts_must_agree_with_the_gate_outcome(self):
+        cases = (
+            (False, quick_count_line(selected=13, passed=12, failed=0)),
+            (False, quick_count_line(selected=13, passed=13, failed=1)),
+            (False, quick_count_line(selected=12, passed=12, failed=0)),
+            (False, quick_count_line(selected=17, passed=17, failed=0)),
+            (True, quick_count_line(selected=13, passed=4, failed=0)),
+            (True, quick_count_line(selected=13, passed=13, failed=1)),
+            (True, quick_count_line(selected=13, passed=4, failed=2)),
+            (True, quick_count_line(selected=13, passed=13, failed=1)),
+        )
+        for failed_gate, line in cases:
+            api = QuickApi(failed_gate=failed_gate)
+            api.logs[102] = quick_log(line)
+            with self.subTest(failed_gate=failed_gate, line=line):
+                self.assert_refused(api, "verdict")
+
+    def test_the_log_canary_is_scanned_in_every_job_log_before_other_checks(self):
+        for job in (101, 102):
+            api = QuickApi()
+            api.logs[job] += b"\n" + CANARY.encode("ascii") + b"\n"
+            api.artifacts = []
+            with self.subTest(job=job):
+                self.assert_refused(api, "log_canary")
+        api = QuickApi()
+        api.set_annotations(202, [dict(ANNOTATION, message="x " + CANARY)])
+        self.assert_refused(api, "log_canary")
+
+
+class QuickArtifactTests(QuickAuditCase):
+    def test_exactly_one_named_unexpired_one_day_artifact_of_the_fixed_size_is_required(self):
+        floor = subject.QUICK_FRAME_BYTES
+        ceiling = floor + subject.QUICK_ARTIFACT_SLACK_BYTES
+        cases = (
+            ("none", []),
+            ("two", [quick_artifact(), quick_artifact(id=78, name="other")]),
+            ("name", [quick_artifact(name="linux-quick-" + "ab" * 32)]),
+            ("expired", [quick_artifact(expired=True)]),
+            ("expired type", [quick_artifact(expired="false")]),
+            ("small", [quick_artifact(size_in_bytes=floor - 1)]),
+            ("large", [quick_artifact(size_in_bytes=ceiling + 1)]),
+            ("size type", [quick_artifact(size_in_bytes=str(floor))]),
+            ("retention", [quick_artifact(expires_at="2026-11-09T10:00:00Z")]),
+            ("backwards", [quick_artifact(expires_at="2026-11-02T09:00:00Z")]),
+            ("same instant", [quick_artifact(expires_at="2026-11-02T10:00:00Z")]),
+            ("time shape", [quick_artifact(created_at="yesterday")]),
+            ("time type", [quick_artifact(expires_at=None)]),
+            ("run", [quick_artifact(workflow_run={"id": 1, "head_sha": CONTROL, "head_branch": "untrusted"})]),
+            ("sha", [quick_artifact(workflow_run={"id": RUN_ID, "head_sha": "cd" * 20, "head_branch": "untrusted"})]),
+            ("branch", [quick_artifact(workflow_run={"id": RUN_ID, "head_sha": CONTROL, "head_branch": "main"})]),
+            ("no run", [quick_artifact(workflow_run=None)]),
+            ("not a record", ["linux-quick"]),
+        )
+        for label, artifacts in cases:
+            api = QuickApi()
+            api.artifacts = artifacts
+            with self.subTest(label=label):
+                self.assert_refused(api, "artifact_inventory")
+        for size in (floor, ceiling):
+            api = QuickApi()
+            api.artifacts = [quick_artifact(size_in_bytes=size)]
+            with self.subTest(size=size):
+                self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
+        api = QuickApi()
+        api.artifacts = [quick_artifact(created_at="2026-11-02T10:00:00.250Z", expires_at="2026-11-03T10:00:00.250Z")]
+        self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
+
+    def test_the_frame_size_is_the_envelope_plaintext_plus_its_fixed_overhead(self):
+        self.assertEqual(subject.QUICK_FRAME_BYTES, 4128768 + 486)
+        self.assertLessEqual(subject.QUICK_FRAME_BYTES + subject.QUICK_ARTIFACT_SLACK_BYTES, 4 * 1024 * 1024 + 8192)
+
+    def test_any_cache_change_is_refused(self):
+        api = QuickApi()
+        api.caches = [make_cache(1)]
+        self.assert_refused(api, "cache_inventory")
+        api.sync_cache_digest()
+        self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
+
+
+class QuickMainTests(unittest.TestCase):
+    def environment(self, api, **updates):
+        env = {
+            subject.EXPECTED_ENV: json.dumps(api.expected),
+            "GITHUB_REPOSITORY": REPO,
+            "GITHUB_RUN_ID": str(RUN_ID),
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SHA": CONTROL,
+            "GITHUB_TOKEN": "token-value",
+        }
+        env.update(updates)
+        return env
+
+    def test_main_quick_prints_the_quick_line_and_the_plain_mode_still_rejects_the_quick_shape(self):
+        api = QuickApi()
+        output = io.StringIO()
+        with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
+            status = subject.main(["quick"], self.environment(api), lambda token, repository: api, output)
+        self.assertEqual(status, 0)
+        self.assertEqual(output.getvalue(), QUICK_ACCEPTED + "\n")
+        output = io.StringIO()
+        with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
+            status = subject.main([], self.environment(api), lambda token, repository: api, output)
+        self.assertEqual(status, 1)
+        self.assertEqual(output.getvalue(), subject.refusal_line("request") + "\n")
+
+    def test_main_quick_refuses_on_a_closed_phase_and_other_arguments_exit_two(self):
+        api = QuickApi()
+        api.artifacts = []
+        output = io.StringIO()
+        with mock.patch.object(log_canary, "PINNED_CONFIG", CONFIG):
+            status = subject.main(["quick"], self.environment(api), lambda token, repository: api, output)
+        self.assertEqual(status, 1)
+        self.assertEqual(output.getvalue(), subject.refusal_line("artifact_inventory") + "\n")
+        for arguments in (["--quick"], ["quick", "x"], ["Quick"], ["admission"]):
+            output = io.StringIO()
+            with self.subTest(arguments=arguments):
+                self.assertEqual(
+                    subject.main(arguments, self.environment(api), lambda token, repository: api, output), 2,
+                )
+                self.assertEqual(output.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()
