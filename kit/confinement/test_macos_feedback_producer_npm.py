@@ -2,6 +2,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -148,6 +149,38 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         self.assertEqual(evidence["run_id"], "9876")
         self.assertEqual(evidence["totals"]["packages"], 4)
         self.assertEqual(self.chdirs, [(STORAGE / "feedback-npm-admission").as_posix(), SOURCE.as_posix()])
+
+    def test_the_fixture_filing_and_the_fixture_repository_id_must_agree_before_any_read(self):
+        base = {"SOURCE_REPOSITORY_OWNER": "owner", "SOURCE_REPOSITORY_NAME": "name"}
+        env_name = producer.NPM_FIXTURE_REPOSITORY_ID_ENV
+        self.assertEqual(env_name, "NPM_FIXTURE_REPOSITORY_ID")
+        self.assertEqual(bootstrap.FIXTURE_FILING, "quick-fixture")
+        cases = (
+            ({"workspace": "quick-fixture"}, {}),
+            ({"workspace": "quick-fixture", "repository_id": "5"}, {env_name: ""}),
+            ({"workspace": "quick-fixture", "repository_id": "5"}, {env_name: "6"}),
+            ({"repository_id": "5"}, {env_name: "5"}),
+            ({"workspace": bootstrap.DEFAULT_FILING, "repository_id": "5"}, {env_name: "5"}),
+        )
+        self.read_failure = producer.FeedbackRefusal("manifest_invalid")
+        for changes, extra in cases:
+            with self.subTest(changes=changes, extra=extra):
+                self.events = []
+                self.assertEqual(
+                    self.refusal(dispatch=_dispatch(**changes), source_environ={**base, **extra}),
+                    "request_invalid",
+                )
+                self.assertEqual(self.events, [])
+        for changes, extra in (
+            ({"workspace": "quick-fixture", "repository_id": "5"}, {env_name: "5"}),
+            ({"repository_id": "5"}, {env_name: "6"}),
+            ({"repository_id": "5"}, {}),
+        ):
+            with self.subTest(accepted=changes, extra=extra):
+                self.assertEqual(
+                    self.refusal(dispatch=_dispatch(**changes), source_environ={**base, **extra}),
+                    "manifest_invalid",
+                )
 
     def test_only_the_inert_inputs_reach_the_worker_and_never_the_request_table(self):
         self.execute()
@@ -1079,6 +1112,31 @@ class NpmDiagnosticPayloadTests(unittest.TestCase):
                 self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_archive_refused")
                 self.assertEqual(stderr, ["  kd-check " + check])
 
+    def test_the_long_advisory_check_with_reach_fields_is_accepted_by_the_payload_validator(self):
+        consumers = ",".join("@scope-%02d/%s" % (index, "c" * 40) for index in range(5))
+        maximal = bootstrap.bundle_detail(
+            "advisory", "n" * 60 + "@1.0.0", "x" * 64,
+            fields=(
+                ("severity", "moderate"), ("dev", "yes"), ("consumers", consumers), ("more", "99"),
+                ("unreached", "0"),
+            ),
+        )
+        self.assertIsNotNone(maximal)
+        self.assertLessEqual(len(maximal), producer.NPM_CHECK_MAX_BYTES)
+        checks = (
+            "advisory:alpha-pkg@1.0.0:GHSA-aaaa-bbbb-cccc severity:high dev:yes consumers:alpha-pkg,beta-pkg more:3 unreached:0",
+            "advisory:alpha-pkg@1.0.0:9 severity:moderate dev:no consumers:none unreached:2",
+            maximal,
+        )
+        for check in checks:
+            with self.subTest(check=check[:60]):
+                self.assertIsNotNone(bootstrap.LOCK_DETAIL_RE.match(check))
+                self.assertIsNotNone(producer.NPM_CHECK_RE.match(check))
+                payload = producer.build_npm_diagnostic_payload("npm_bundle", "npm_advisory_blocked", None, None, check)
+                header, stderr, report = self.sections(payload)
+                self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_advisory_blocked")
+                self.assertEqual(stderr, ["  kd-check " + check])
+
     def test_the_longest_bundle_check_fits_the_shared_bound_and_the_payload_bounds(self):
         subject_text = bootstrap.adm.package_subject("a" * 214, "1.0.0-" + "b" * 100)
         longest = bootstrap.adm.build_detail(
@@ -1203,6 +1261,62 @@ class NpmDiagnosticPayloadTests(unittest.TestCase):
                 payload = producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", _stderr(sample), None)
                 self.assertEqual(self.sections(payload)[1], ["  " + sample.decode("ascii")])
 
+    def test_the_path_screen_also_drops_file_urls_and_escape_prefixed_paths(self):
+        dropped = (
+            b"npm error at file:///etc/passwd", b"npm error FILE:///tmp/x", b"npm error url=file:///var/x",
+            b"npm error at \x1b/etc/passwd", b"npm error \x1b[31m/etc/passwd\x1b[0m",
+            b"npm error \x1b[1;31m~/secret", b"npm error \x01/etc/passwd",
+        )
+        for sample in dropped:
+            with self.subTest(sample=sample):
+                payload = producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", _stderr(sample), None)
+                self.assertEqual(self.sections(payload)[1], ["  [omitted 1 lines]"])
+        kept = (
+            b"npm error profile: see the docs", b"npm error file: a relative name", b"npm error a/b/c",
+            b"npm error https://registry.npmjs.org/pkg",
+        )
+        for sample in kept:
+            with self.subTest(kept=sample):
+                payload = producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", _stderr(sample), None)
+                self.assertEqual(self.sections(payload)[1], ["  " + sample.decode("ascii")])
+
+    def test_the_python_credential_screen_is_the_javascript_screen_plus_the_npm_config_keys(self):
+        source = (Path(__file__).resolve().parent / "development_feedback.mjs").read_text(encoding="utf-8")
+        names = ("TOKEN_SHAPE", "PRIVATE_KEY_HEADER", "CREDENTIAL_ASSIGNMENT", "BEARER_TOKEN", "CREDENTIAL_URL")
+        shared = producer.NPM_CREDENTIAL_PATTERNS[:len(names)]
+        self.assertEqual(len(producer.NPM_CREDENTIAL_PATTERNS), len(names) + 1)
+        for name, pattern in zip(names, shared):
+            with self.subTest(name=name):
+                found = re.findall(r"(?m)^const " + name + r" = /(.+)/([a-z]*);$", source)
+                self.assertEqual(len(found), 1)
+                body, flags = found[0]
+                self.assertEqual(body.replace("\\/", "/"), pattern.pattern)
+                self.assertEqual("i" in flags, bool(pattern.flags & re.IGNORECASE))
+                self.assertIn("u", flags)
+        extra = producer.NPM_CREDENTIAL_PATTERNS[-1]
+        self.assertIsNotNone(extra.search("//registry.example/:_authToken=x"))
+        self.assertIsNotNone(extra.search("_password = x"))
+        self.assertIsNone(extra.search("password manager"))
+
+    def test_the_shared_credential_vectors_are_screened_by_every_shared_pattern_set(self):
+        vectors = (
+            ("ghp_" + "A" * 24, True), ("github_pat_" + "B" * 24, True), ("xoxb-" + "c" * 16, True),
+            ("npm_" + "D" * 20, True), ("AKIA" + "E" * 16, True), ("ASIA" + "F" * 16, True),
+            ("Authorization: Bearer abcdefgh", True), ("Bearer " + "f" * 24, True),
+            ("-----BEGIN RSA PRIVATE KEY-----", True), ("https://u:p@host/", True),
+            ("password=hunter2hunter2", True), ("api_key: abcdefghij", True),
+            ("token = abcdefgh", True), ("client-secret:abcdefgh", True),
+            ("ghp_short", False), ("password=short", False), ("https://host/path", False),
+            ("Bearer short", False), ("mytoken=abcdefghij", False), ("AKIA" + "E" * 15, False),
+            ("npm_" + "D" * 19, False), ("BEGIN PRIVATE KEY", False),
+        )
+        for text, expected in vectors:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    any(pattern.search(text) is not None for pattern in producer.NPM_CREDENTIAL_PATTERNS[:5]),
+                    expected,
+                )
+
 
 @unittest.skipUnless(sys.platform != "win32", "the eresolve report reader requires POSIX ownership checks")
 class NpmEresolveReportReaderTests(unittest.TestCase):
@@ -1253,6 +1367,31 @@ class NpmEresolveReportReaderTests(unittest.TestCase):
         (self.storage / "cache" / "_logs").rename(real)
         os.symlink(str(real), str(self.storage / "cache" / "_logs"))
         self.assertIsNone(producer._npm_read_report(self.storage, self.uid))
+
+    def test_a_symlinked_or_foreign_cache_directory_is_not_read(self):
+        self.write("2026-11-02T10_00_00_000Z-eresolve-report.txt", b"report\n")
+        cache = self.storage / "cache"
+        self.assertEqual(producer._npm_read_report(self.storage, self.uid), b"report\n")
+        self.assertIsNone(producer._npm_read_report(self.storage, self.uid + 1))
+        real = self.storage / "real-cache"
+        cache.rename(real)
+        os.symlink(str(real), str(cache))
+        self.assertIsNone(producer._npm_read_report(self.storage, self.uid))
+
+    def test_the_report_is_opened_without_blocking_so_a_swapped_in_pipe_cannot_hang_the_run(self):
+        self.write("2026-11-02T10_00_00_000Z-eresolve-report.txt", b"report\n")
+        flags = []
+        real_open = os.open
+
+        def spy(path, flag, *arguments, **keywords):
+            flags.append(flag)
+            return real_open(path, flag, *arguments, **keywords)
+
+        with patch.object(producer.os, "open", spy):
+            self.assertEqual(producer._npm_read_report(self.storage, self.uid), b"report\n")
+        self.assertEqual(len(flags), 1)
+        self.assertTrue(flags[0] & os.O_NONBLOCK)
+        self.assertTrue(flags[0] & os.O_NOFOLLOW)
 
     def test_a_large_report_is_read_only_up_to_the_fixed_prefix_bound(self):
         name = "2026-11-02T10_00_00_000Z-eresolve-report.txt"

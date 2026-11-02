@@ -324,6 +324,13 @@ def _reject_json_number(value):
     raise ValueError("number")
 
 
+class OpaqueNumber(str):
+    """The source text of a JSON float, kept as inert text. Its type is never exactly str, so exact
+    type checks on names, versions and script values refuse it."""
+
+    __slots__ = ()
+
+
 def _reject_json_constant(value):
     raise ValueError("constant")
 
@@ -334,7 +341,7 @@ def _check_json_bounds(value, reason, depth=0, counter=None):
     counter[0] += 1
     if counter[0] > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
         _refuse(reason, build_detail("json_limits"))
-    if type(value) is str:
+    if type(value) is str or type(value) is OpaqueNumber:
         try:
             encoded = value.encode("utf-8", "strict")
         except UnicodeError:
@@ -369,7 +376,7 @@ def _load_json(data, maximum, reason, ascii_only=False, opaque_numbers=False):
             text,
             object_pairs_hook=_unique_json_pairs,
             parse_int=_parse_json_int,
-            parse_float=str if opaque_numbers else _reject_json_number,
+            parse_float=OpaqueNumber if opaque_numbers else _reject_json_number,
             parse_constant=_reject_json_constant,
         )
     except Refusal:
@@ -561,6 +568,8 @@ def _inbundle_child_allowed(path, entry, packages):
         return False
     names = _inert_bundled_names(parent)
     if names is None or name not in names:
+        return False
+    if entry.get("optional") is not True:
         return False
     if any(key in entry for key in ("resolved", "integrity", "link", "hasInstallScript")
            + BUNDLED_FIELDS):
@@ -1013,6 +1022,25 @@ def _detail_head(detail):
     return detail.split(" ", 1)[0].split(":", 1)[0]
 
 
+ENTRY_POINT_FIELDS = ("main", "module", "browser", "bin", "exports", "types", "typings")
+ENTRY_POINT_SEGMENT_RE = re.compile(r"[\\/]+")
+
+
+def _entry_point_in_node_modules(manifest):
+    """Whether any entry point string of the manifest names a node_modules path segment."""
+    pending = [manifest[field] for field in ENTRY_POINT_FIELDS if field in manifest]
+    while pending:
+        value = pending.pop()
+        if type(value) is str:
+            if any(part.lower() == "node_modules" for part in ENTRY_POINT_SEGMENT_RE.split(value)):
+                return True
+        elif type(value) is dict:
+            pending.extend(value.values())
+        elif type(value) is list:
+            pending.extend(value)
+    return False
+
+
 def _manifest_scripts(data, name, version, subject=None):
     try:
         manifest = _load_json(data, MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid", opaque_numbers=True)
@@ -1020,10 +1048,12 @@ def _manifest_scripts(data, name, version, subject=None):
         _archive_refuse("archive_manifest", subject, _detail_head(error.detail))
     if type(manifest) is not dict:
         _archive_refuse("archive_manifest", subject, "shape")
-    if manifest.get("name") != name:
+    if type(manifest.get("name")) is not str or manifest["name"] != name:
         _archive_refuse("archive_manifest", subject, "name_mismatch")
-    if manifest.get("version") != version:
+    if type(manifest.get("version")) is not str or manifest["version"] != version:
         _archive_refuse("archive_manifest", subject, "version_mismatch")
+    if _entry_point_in_node_modules(manifest):
+        _archive_refuse("archive_manifest", subject, "entry_node_modules")
     scripts = manifest.get("scripts", {})
     if type(scripts) is not dict or len(scripts) > 256:
         _archive_refuse("archive_manifest", subject, "scripts_shape")

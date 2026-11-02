@@ -981,7 +981,9 @@ class QuickEvidenceTests(unittest.TestCase):
 
     def test_a_wrong_artifact_size_is_refused(self):
         frame = feedback_api.QUICK_FRAME_BYTES
-        for member_size in (frame - 1000, frame + feedback_api.QUICK_ARTIFACT_SLACK_BYTES):
+        for member_size in (
+            frame - 1000, frame - 1, frame + 1, frame + 4096, frame + feedback_api.QUICK_ARTIFACT_SLACK_BYTES,
+        ):
             with self.subTest(member_size=member_size):
                 self.api.member_size = member_size
                 self.api.archive = _quick_archive(member_size)

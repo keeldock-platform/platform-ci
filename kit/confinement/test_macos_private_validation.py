@@ -923,7 +923,7 @@ class CoreContractTreeTests(unittest.TestCase):
         self.assertEqual((len(data), len(source), len(inert)), (3, 38, 40))
         self.assertEqual(len(self._batch5_paths()), 81)
         self.assertFalse(data & source or data & inert or source & inert)
-        self.assertEqual(subject.CORE_CONTRACT_BATCH5_CONCERN, "core-build-diagnostic-return")
+        self.assertEqual(subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN, "core-build-diagnostic-return")
         scope = "tools/keeldock" "-tools-sync-license-scope/"
         self.assertEqual(
             {path for path in source if path.startswith(scope)},
@@ -943,20 +943,20 @@ class CoreContractTreeTests(unittest.TestCase):
                 self.assertFalse(subject._runtime_workspace_path(path))
 
     def test_batch5_paths_are_admitted_for_the_two_batch5_concerns_only(self):
-        concern = subject.CORE_CONTRACT_BATCH5_CONCERN
+        concern = subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN
         for path in sorted(self._batch5_paths()):
             with self.subTest(path=path):
                 self.assertEqual(subject._core_contract_expected_mode(path, concern=concern), "100644")
                 self.assertIsNone(subject._core_contract_expected_mode(path))
                 self.assertFalse(subject._core_contract_foundation_path(path))
                 for other in sorted(
-                    subject.CORE_CONTRACT_CONCERNS - subject.CORE_CONTRACT_BATCH5_CONCERNS
+                    subject.CORE_CONTRACT_CONCERNS - subject.CORE_CONTRACT_BUILD_FILE_CONCERNS
                 ):
                     self.assertIsNone(subject._core_contract_expected_mode(path, concern=other))
                 self.assertIsNone(subject._core_contract_expected_mode(path, concern="rules-bootstrap"))
 
     def test_batch5_neighbouring_paths_stay_refused(self):
-        concern = subject.CORE_CONTRACT_BATCH5_CONCERN
+        concern = subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN
         scope = "tools/keeldock" "-tools-sync-license-scope/"
         for path in (
             "crates/host/api/src/entitlements/other.tsv",
@@ -994,7 +994,7 @@ class CoreContractTreeTests(unittest.TestCase):
                 self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
 
     def test_a_batch5_tree_passes_diagnostics_and_is_refused_by_format_return(self):
-        diagnostics = subject.CORE_CONTRACT_BATCH5_CONCERN
+        diagnostics = subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN
         entries = self._four_crate_entries(diagnostics)
         entries.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})
         members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
@@ -1022,10 +1022,10 @@ class CoreContractTreeTests(unittest.TestCase):
 
     def test_batch5_concern_set_is_exactly_diagnostics_and_npm_admission(self):
         self.assertEqual(
-            subject.CORE_CONTRACT_BATCH5_CONCERNS,
+            subject.CORE_CONTRACT_BUILD_FILE_CONCERNS,
             frozenset(("core-build-diagnostic-return", "core-npm-admission-return")),
         )
-        self.assertTrue(subject.CORE_CONTRACT_BATCH5_CONCERNS <= subject.CORE_CONTRACT_CONCERNS)
+        self.assertTrue(subject.CORE_CONTRACT_BUILD_FILE_CONCERNS <= subject.CORE_CONTRACT_CONCERNS)
 
     def test_npm_admission_admits_every_batch5_path_and_still_refuses_unlisted_paths(self):
         concern = "core-npm-admission-return"
@@ -1065,7 +1065,7 @@ class CoreContractTreeTests(unittest.TestCase):
                 ))
 
     def test_build_diagnostics_admits_the_npm_filing_files_as_inert_data(self):
-        concern = subject.CORE_CONTRACT_BATCH5_CONCERN
+        concern = subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN
         for path in (
             "dependency-policy.json",
             "docs/dependencies/dependency-policy.schema.json",
@@ -1223,7 +1223,7 @@ class CoreContractTreeTests(unittest.TestCase):
             "core-rust-format-return", "core-build-diagnostic-return", "core-npm-admission-return",
         ):
             entries = self._four_crate_entries(concern)
-            if concern in subject.CORE_CONTRACT_BATCH5_CONCERNS:
+            if concern in subject.CORE_CONTRACT_BUILD_FILE_CONCERNS:
                 entries.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})
             entries.update({path: ("100644", "a" * 40) for path in listed})
             with self.subTest(concern=concern):
@@ -3973,6 +3973,230 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             self.assertEqual(marker, "core_contract")
             entries["runtime/crates/test-fixtures/tool-a/Cargo.toml"] = ("100644", "a" * 40)
             self.assertEqual(self._refused(entries=entries, blobs=blobs), "path_mode")
+
+
+class NpmFixtureProfileTests(unittest.TestCase):
+    CONCERN = "core-npm-admission-return"
+    ENV = subject.NPM_FIXTURE_REPOSITORY_ID_ENV
+
+    @staticmethod
+    def _entries(drop=(), add=()):
+        entries = {
+            path: ("100644", "a" * 40) for path in subject.NPM_FIXTURE_FILES
+            if path != subject.CORE_CONTRACT_PACKAGE_LOCK_PATH and path not in drop
+        }
+        entries.update({path: ("100644", "a" * 40) for path in add})
+        return entries
+
+    def _check(self, base, source, size=1):
+        with patch.object(
+            subject, "_contract_tree_entries", side_effect=(dict(base), dict(source)),
+        ), patch.object(subject, "_contract_blob_size", return_value=size):
+            return subject._safe_npm_fixture_tree(
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40,
+            )
+
+    def _refused(self, base, source, **keywords):
+        with self.assertRaises(subject.Refusal) as refusal:
+            self._check(base, source, **keywords)
+        self.assertEqual(refusal.exception.reason, "bootstrap_snapshot_invalid")
+        return refusal.exception.core_check
+
+    def test_the_fixture_file_list_is_exact_and_npm_material_is_the_only_changeable_part(self):
+        self.assertIs(type(subject.NPM_FIXTURE_FILES), frozenset)
+        self.assertTrue(subject.NPM_FIXTURE_REQUIRED_FILES <= subject.NPM_FIXTURE_FILES)
+        self.assertTrue(subject.NPM_FIXTURE_NPM_MATERIAL <= subject.NPM_FIXTURE_FILES)
+        self.assertNotIn("docs/commit-signers", subject.NPM_FIXTURE_NPM_MATERIAL)
+        self.assertIn("docs/commit-signers", subject.NPM_FIXTURE_REQUIRED_FILES)
+        self.assertEqual(subject.NPM_FIXTURE_TREE, "npm_fixture_admission_return")
+        self.assertNotIn(subject.NPM_FIXTURE_TREE, subject.CORE_CONTRACT_TREE_BY_CONCERN.values())
+        for path in subject.NPM_FIXTURE_FILES:
+            with self.subTest(path=path):
+                self.assertTrue(path.isascii())
+                self.assertFalse(path.startswith((subject.RULES_DIRECTORY + "/", "crates/kernel/", "docs/adr/")))
+        for path in (
+            ".gitignore", "AGENTS.md", "CLAUDE.md", "rustfmt.toml", "clippy.toml",
+            subject.RULES_LOCK_PATH, subject.RULES_DIRECTORY + "/settings.json", "crates/kernel/i18n/Cargo.toml",
+        ):
+            with self.subTest(core_path=path):
+                self.assertNotIn(path, subject.NPM_FIXTURE_FILES)
+
+    def test_selection_needs_the_npm_concern_a_set_id_and_an_equal_repository_id(self):
+        selected = subject._npm_fixture_selected
+        self.assertTrue(selected(self.CONCERN, {self.ENV: "7"}, 7))
+        self.assertFalse(selected(self.CONCERN, {self.ENV: "7"}, 8))
+        self.assertFalse(selected(self.CONCERN, {}, 7))
+        self.assertFalse(selected(self.CONCERN, {self.ENV: ""}, 7))
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS - {self.CONCERN}):
+            with self.subTest(concern=concern):
+                self.assertFalse(selected(concern, {self.ENV: "7"}, 7))
+        for concern in ("core-bootstrap", "rules-bootstrap", None, 5):
+            with self.subTest(concern=concern):
+                self.assertFalse(selected(concern, {self.ENV: "7"}, 7))
+        for value in ("0", "07", "x", "-1", " 7", "7 ", "7\n", "1" * 20, 7):
+            with self.subTest(value=value), self.assertRaises(subject.Refusal) as refusal:
+                selected(self.CONCERN, {self.ENV: value}, 7)
+            self.assertEqual(
+                (refusal.exception.reason, refusal.exception.stage),
+                ("bootstrap_not_approved", "configuration"),
+            )
+        with self.assertRaises(subject.Refusal):
+            selected(self.CONCERN, {self.ENV: "7"}, "7")
+
+    def test_the_exact_fixture_tree_is_accepted_with_or_without_the_generated_lock(self):
+        base = self._entries()
+        self.assertEqual(self._check(base, base), subject.NPM_FIXTURE_TREE)
+        with_lock = dict(base)
+        with_lock[subject.CORE_CONTRACT_PACKAGE_LOCK_PATH] = ("100644", "b" * 40)
+        self.assertEqual(self._check(base, with_lock), subject.NPM_FIXTURE_TREE)
+        changed = dict(with_lock)
+        for path in sorted(subject.NPM_FIXTURE_NPM_MATERIAL):
+            changed[path] = ("100644", "c" * 40)
+        self.assertEqual(self._check(base, changed), subject.NPM_FIXTURE_TREE)
+
+    def test_a_core_tree_is_never_accepted_under_the_fixture_profile(self):
+        for concern in sorted(subject.FEEDBACK_PROFILE_CONCERNS):
+            core = CoreContractTreeTests._four_crate_entries(concern)
+            with self.subTest(concern=concern):
+                self.assertEqual(self._refused(core, core), "path_mode")
+        core_minimum = CoreContractTreeTests._required_core_contract_entries(self.CONCERN)
+        self.assertEqual(self._refused(core_minimum, core_minimum), "path_mode")
+        mixed = self._entries(add=(subject.RULES_LOCK_PATH,))
+        self.assertEqual(self._refused(mixed, mixed), "path_mode")
+        for path in (
+            "AGENTS.md", ".gitignore", "CLAUDE.md", "rustfmt.toml", "clippy.toml",
+            subject.RULES_DIRECTORY + "/settings.json", "crates/kernel/i18n/Cargo.toml",
+            "packages/host-api/src/budget.ts", "docs/adr/0003-npm-contract-workspace.md",
+            "docs/dependencies/ui-npm-admission-batch-a.md", "tools/other/unlisted.rs",
+        ):
+            with self.subTest(path=path):
+                tree = self._entries(add=(path,))
+                self.assertEqual(self._refused(tree, tree), "path_mode")
+
+    def test_the_fixture_tree_is_refused_for_extra_renamed_or_mis_moded_paths(self):
+        base = self._entries()
+        for path in ("README2.md", "src/main.rs", "docs/dependencies/other.md", "Package.json"):
+            with self.subTest(extra=path):
+                self.assertEqual(self._refused(base, self._entries(add=(path,))), "path_mode")
+                self.assertEqual(self._refused(self._entries(add=(path,)), base), "path_mode")
+        renamed = self._entries(drop=(subject.NPM_FIXTURE_REQUEST_PATH,), add=("docs/dependencies/other.md",))
+        self.assertEqual(self._refused(base, renamed), "path_mode")
+        for path in sorted(subject.NPM_FIXTURE_FILES - {subject.CORE_CONTRACT_PACKAGE_LOCK_PATH}):
+            with self.subTest(executable=path):
+                source = self._entries()
+                source[path] = ("100755", "a" * 40)
+                self.assertEqual(self._refused(base, source), "path_mode")
+
+    def test_every_required_fixture_file_must_be_present(self):
+        base = self._entries()
+        for path in sorted(subject.NPM_FIXTURE_REQUIRED_FILES):
+            with self.subTest(path=path):
+                self.assertEqual(self._refused(base, self._entries(drop=(path,))), "required_files")
+
+    def test_the_signer_file_and_non_npm_paths_cannot_change_between_base_and_source(self):
+        base = self._entries()
+        source = self._entries()
+        source["docs/commit-signers"] = ("100644", "b" * 40)
+        self.assertEqual(self._refused(base, source), "base_policy")
+        for path in sorted(subject.NPM_FIXTURE_FILES - subject.NPM_FIXTURE_NPM_MATERIAL):
+            with self.subTest(path=path):
+                changed = self._entries()
+                changed[path] = ("100644", "b" * 40)
+                self.assertEqual(self._refused(base, changed), "base_policy")
+        removed = self._entries(drop=("README.md",))
+        self.assertEqual(self._refused(base, removed), "base_policy")
+
+    def test_the_fixture_tree_size_is_capped(self):
+        base = self._entries()
+        self.assertEqual(self._refused(base, base, size=subject.MAX_TREE_BYTES), "tree_entries")
+        with patch.object(subject, "_contract_tree_entries", side_effect=(dict(base), dict(base))), \
+                patch.object(
+                    subject, "_contract_blob_size",
+                    side_effect=subject.Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries"),
+                ), self.assertRaises(subject.Refusal):
+            subject._safe_npm_fixture_tree("repository", "/usr/bin/git", {}, "a" * 40, "b" * 40)
+
+    def _route(self, environ, repository_id, concern=None):
+        request = {"base_sha": "a" * 40, "source_sha": "b" * 40, "concern": concern or self.CONCERN}
+        with patch.object(subject, "_safe_npm_fixture_tree", return_value=subject.NPM_FIXTURE_TREE) as fixture_tree, \
+                patch.object(subject, "_safe_core_contract_tree", return_value="core_marker") as core_tree:
+            result = subject._snapshot_tree(
+                "repository", "/usr/bin/git", {}, request, environ, repository_id,
+            )
+        return result, fixture_tree.call_count, core_tree.call_count
+
+    def test_the_snapshot_routes_to_the_fixture_profile_only_for_the_pinned_repository_id(self):
+        self.assertEqual(
+            self._route({self.ENV: "7"}, 7), ((subject.NPM_FIXTURE_TREE, "not-applicable"), 1, 0),
+        )
+        self.assertEqual(self._route({self.ENV: "7"}, 9), (("core_marker", "present"), 0, 1))
+        self.assertEqual(self._route({}, 7), (("core_marker", "present"), 0, 1))
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS - {self.CONCERN}):
+            with self.subTest(concern=concern):
+                self.assertEqual(
+                    self._route({self.ENV: "7"}, 7, concern=concern), (("core_marker", "present"), 0, 1),
+                )
+
+    def test_the_fixture_profile_never_applies_to_the_core_repository_id(self):
+        core_id = 4242
+        self.assertEqual(
+            self._route({self.ENV: "7"}, core_id), (("core_marker", "present"), 0, 1),
+        )
+        core = CoreContractTreeTests._four_crate_entries(self.CONCERN)
+        with patch.object(subject, "_contract_tree_entries", side_effect=(dict(core), dict(core))), \
+                patch.object(subject, "_contract_blob_size", return_value=1), \
+                patch.object(subject, "_safe_core_contract_tree") as core_tree:
+            request = {"base_sha": "a" * 40, "source_sha": "b" * 40, "concern": self.CONCERN}
+            with self.assertRaises(subject.Refusal) as refusal:
+                subject._snapshot_tree(
+                    "repository", "/usr/bin/git", {}, request, {self.ENV: str(core_id)}, core_id,
+                )
+        self.assertEqual(refusal.exception.core_check, "path_mode")
+        core_tree.assert_not_called()
+
+    def test_a_fixture_shaped_tree_is_never_accepted_under_the_core_profile(self):
+        fixture = self._entries(add=(subject.CORE_CONTRACT_PACKAGE_LOCK_PATH,))
+        for concern in sorted(subject.FEEDBACK_PROFILE_CONCERNS):
+            with self.subTest(concern=concern), self.assertRaises(subject.Refusal) as refusal:
+                CoreContractTreeTests._validate_feedback_tree(fixture, concern)
+            self.assertEqual(refusal.exception.core_check, "required_files")
+
+    @staticmethod
+    def _record(**changes):
+        record = {
+            "repository_id": "7", "source_sha": "a" * 40, "base_sha": "b" * 40, "base_branch": "main",
+            "concern": "core-npm-admission-return", "candidate_class": "signed-descendant",
+            "signature": "verified", "rules_lock": "not-applicable", "tree": subject.NPM_FIXTURE_TREE,
+            "source_execution": "not_run_at_yield", "app_build": "not_run", "cleanup": "complete",
+            "control_sha": "c" * 40, "run_id": "11", "run_attempt": "1", "image_os": "macos15",
+            "image_version": "20260101.1", "repository_scope": "verified", "metadata": "verified",
+            "token_revocation": "confirmed_before_yield", "signer_authority": "bound_base",
+            "signatures": "all_new_commits_verified", "ancestry": "base_ancestor",
+            "revocation_policy": "current_control_fingerprints", "worker_access": "uid_read_only",
+        }
+        record.update(changes)
+        return record
+
+    def test_the_success_line_names_the_fixture_tree_and_no_rules_lock(self):
+        binding = {
+            "control_sha": "c" * 40, "run_id": "11", "run_attempt": "1", "image_os": "macos15",
+            "image_version": "20260101.1",
+        }
+        line = subject._format_success(self._record(), binding)
+        self.assertIn(" rules-lock=not-applicable ", line)
+        self.assertTrue(line.endswith(" tree=" + subject.NPM_FIXTURE_TREE))
+        for changes in (
+            {"rules_lock": "present"},
+            {"concern": "core-build-diagnostic-return"},
+            {"concern": "core-rust-format-return"},
+            {"tree": "core_npm_admission_return"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(subject.Refusal):
+                subject._format_success(self._record(**changes), binding)
+        with self.assertRaises(subject.Refusal):
+            subject._format_success(
+                self._record(tree="core_npm_admission_return", rules_lock="not-applicable"), binding,
+            )
 
 
 if __name__ == "__main__":

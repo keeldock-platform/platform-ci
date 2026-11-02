@@ -731,7 +731,7 @@ def _quick_artifact(api, request, profile, run, now):
     member = node_lock_receipt.validate_ciphertext_archive(
         archive, member_name=profile["member_name"],
     )
-    if member[:4] != QUICK_MAGIC or len(member) > len(archive):
+    if member[:4] != QUICK_MAGIC or len(member) != QUICK_FRAME_BYTES:
         _refuse()
     return artifact["id"], digest, member
 

@@ -1572,6 +1572,82 @@ class CoreContractTests(unittest.TestCase):
             legacy, request, binding, 504, private_validation,
         )["tree"], "core_build_diagnostic_return")
 
+    def test_fixture_lease_marker_is_limited_to_npm_admission_and_carries_no_rules_lock(self):
+        request = {**_request(), "concern": "core-npm-admission-return"}
+        binding = _binding()
+        record = {
+            **binding, **request, "repository_id": "67890", "candidate_class": "signed-descendant",
+            "signature": "verified", "rules_lock": "not-applicable", "tree": subject.NPM_FIXTURE_TREE,
+            "source_execution": "not_run_at_yield", "app_build": "not_run", "cleanup": "lease_open",
+            "repository_scope": "verified", "metadata": "verified",
+            "token_revocation": "confirmed_before_yield", "signer_authority": "bound_base",
+            "signatures": "all_new_commits_verified", "ancestry": "base_ancestor",
+            "revocation_policy": "current_control_fingerprints", "worker_access": "uid_read_only",
+        }
+        self.assertEqual(subject._validate_source_lease(
+            record, request, binding, 504, private_validation,
+        )["tree"], subject.NPM_FIXTURE_TREE)
+        for concern in (
+            "core-contract", "core-node-lock-return", "core-rust-format-return",
+            "core-build-diagnostic-return", "core-rust-lock-return",
+        ):
+            with self.subTest(concern=concern), self.assertRaises(subject.Refusal):
+                subject._validate_source_lease(
+                    {**record, "concern": concern}, {**request, "concern": concern},
+                    binding, 504, private_validation,
+                )
+        for changes in (
+            {"rules_lock": "present"},
+            {"tree": "core_npm_admission_return"},
+            {"tree": "npm_fixture_admission_return_v2"},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(subject.Refusal):
+                subject._validate_source_lease(
+                    {**record, **changes}, request, binding, 504, private_validation,
+                )
+        with self.assertRaises(subject.Refusal):
+            subject._validate_source_lease(record, request, binding, 504, SimpleNamespace())
+        core = {**record, "rules_lock": "present", "tree": "core_npm_admission_return"}
+        self.assertEqual(subject._validate_source_lease(
+            core, request, binding, 504, private_validation,
+        )["tree"], "core_npm_admission_return")
+        with self.assertRaises(subject.Refusal):
+            subject._validate_source_lease(
+                {**core, "rules_lock": "not-applicable"}, request, binding, 504, private_validation,
+            )
+
+    def test_fixture_source_path_check_needs_only_the_fixture_cargo_files(self):
+        self.assertEqual(subject.FIXTURE_SOURCE_FILES, (
+            "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
+            "crates/host/api/Cargo.toml", "crates/host/mock/Cargo.toml",
+            "crates/host/conformance/Cargo.toml",
+        ))
+        seen = []
+
+        def regular(path, *args, **kwargs):
+            seen.append(Path(path).as_posix())
+            mode = stat.S_IFDIR | 0o500 if Path(path).name in ("source", ".git") else stat.S_IFREG | 0o400
+            return SimpleNamespace(st_mode=mode, st_uid=0, st_nlink=1)
+
+        with patch.object(Path, "lstat", regular), \
+                patch.object(Path, "resolve", lambda self, strict=False: self), \
+                patch.object(Path, "is_symlink", lambda self: False), \
+                patch.object(Path, "is_dir", lambda self: True):
+            source = Path("/storage/source")
+            self.assertEqual(
+                subject._validate_source_path(source, Path("/storage"), fixture=True), source,
+            )
+            fixture_reads = list(seen)
+            del seen[:]
+            self.assertEqual(
+                subject._validate_source_path(source, Path("/storage")), source,
+            )
+        for relative in subject.FIXTURE_SOURCE_FILES:
+            self.assertIn("/storage/source/" + relative, fixture_reads)
+        for relative in ("rustfmt.toml", "clippy.toml", "crates/kernel/i18n/Cargo.toml"):
+            self.assertNotIn("/storage/source/" + relative, fixture_reads)
+            self.assertIn("/storage/source/" + relative, seen)
+
     def test_fuzz_workspace_selection_requires_a_validated_feedback_lease(self):
         source = Path("/synthetic-source")
         marker = source / "fuzz/Cargo.toml"

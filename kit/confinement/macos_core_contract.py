@@ -53,6 +53,8 @@ FEEDBACK_TREE_LABELS = {
     "core-npm-admission-return": "core_npm_admission_return",
 }
 LOCKED_FOUNDATION_TREE = "core_build_diagnostic_return_with_package_lock"
+NPM_FIXTURE_TREE = "npm_fixture_admission_return"
+NPM_ADMISSION_CONCERN = "core-npm-admission-return"
 API_FEATURE_GATE_NAMES = ("api_feature_clippy", "api_feature_tests")
 API_FEATURE_NAME = "dev-uat-policy-import"
 GATE_NAMES = (
@@ -762,10 +764,16 @@ def _validate_source_lease(record, request, binding, worker_uid, runtime):
             and record.get("tree") == LOCKED_FOUNDATION_TREE
             and getattr(runtime, "CORE_CONTRACT_PACKAGE_LOCK_TREE", None) == LOCKED_FOUNDATION_TREE):
         expected_tree = LOCKED_FOUNDATION_TREE
+    expected_rules_lock = "present"
+    if (request["concern"] == NPM_ADMISSION_CONCERN
+            and record.get("tree") == NPM_FIXTURE_TREE
+            and getattr(runtime, "NPM_FIXTURE_TREE", None) == NPM_FIXTURE_TREE):
+        expected_tree = NPM_FIXTURE_TREE
+        expected_rules_lock = "not-applicable"
     expected = {
         "source_sha": request["source_sha"], "base_sha": request["base_sha"],
         "base_branch": request["base_branch"], "concern": request["concern"],
-        "signature": "verified", "rules_lock": "present",
+        "signature": "verified", "rules_lock": expected_rules_lock,
         "tree": expected_tree,
         "source_execution": "not_run_at_yield", "app_build": "not_run", "cleanup": "lease_open",
         "repository_scope": "verified", "metadata": "verified", "control_sha": binding["control_sha"],
@@ -784,7 +792,14 @@ def _validate_source_lease(record, request, binding, worker_uid, runtime):
     return dict(record)
 
 
-def _validate_source_path(source_path, storage_root):
+FIXTURE_SOURCE_FILES = (
+    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
+    "crates/host/api/Cargo.toml", "crates/host/mock/Cargo.toml",
+    "crates/host/conformance/Cargo.toml",
+)
+
+
+def _validate_source_path(source_path, storage_root, fixture=False):
     try:
         source = Path(source_path)
         if source.resolve(strict=True) != source or source.is_symlink() or not source.is_dir():
@@ -793,7 +808,7 @@ def _validate_source_path(source_path, storage_root):
         info = source.lstat()
         if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o077:
             raise ValueError
-        for relative in (
+        for relative in FIXTURE_SOURCE_FILES if fixture is True else (
             "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml",
             "crates/host/api/Cargo.toml", "crates/host/mock/Cargo.toml",
             "crates/host/conformance/Cargo.toml", "crates/kernel/i18n/Cargo.toml",
@@ -1623,7 +1638,9 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                 lease_record = _validate_source_lease(lease.record, request, binding, worker_uid, runtime)
                 phase = "source_tree"
                 operation = "source_path_validation"
-                source = _validate_source_path(lease.source_path, lease_storage)
+                source = _validate_source_path(
+                    lease.source_path, lease_storage, fixture=lease_record["tree"] == NPM_FIXTURE_TREE,
+                )
                 operation = "source_tree_probe"
                 rules._run_tree_probe(source, worker_uid, home, host_toolchain, capability)
                 operation = "resolve_git"

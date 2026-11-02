@@ -415,6 +415,31 @@ class InputTests(RefusalAssertions):
         self.assert_refused("npm_input_invalid", subject.input_paths, "other-filing")
         self.assert_refused("npm_input_invalid", subject.input_paths, None)
 
+    def test_the_fixture_filing_reads_its_own_request_doc_and_takes_no_overrides(self):
+        world = World()
+        doc = subject.FILINGS[subject.FIXTURE_FILING]["request_doc"]
+        default_doc = subject.FILINGS[subject.DEFAULT_FILING]["request_doc"]
+        self.assertEqual(doc, "docs/dependencies/quick-fixture.md")
+        self.assertEqual(subject.FILINGS[subject.FIXTURE_FILING]["overrides"], {})
+        paths = subject.input_paths(subject.FIXTURE_FILING)
+        self.assertEqual(paths[:3], (".node-version", ".npmrc", "package.json"))
+        self.assertIn(doc, paths)
+        self.assertNotIn(default_doc, paths)
+        self.assertEqual(set(paths) - set(subject.project_paths(subject.FIXTURE_FILING)), {doc, subject.POLICY_FILE})
+        files = {path: data for path, data in world.files.items() if path != default_doc}
+        files[doc] = world.files[default_doc]
+        self.assert_refused("npm_manifest_refused", subject.check_inputs, files, subject.FIXTURE_FILING)
+        root = json.loads(files["package.json"].decode("ascii"))
+        del root["overrides"]
+        files["package.json"] = _json(root) + b"\n"
+        plan = subject.check_inputs(files, subject.FIXTURE_FILING)
+        self.assertEqual(plan["filing"], subject.FIXTURE_FILING)
+        self.assertEqual(plan["overrides"], {})
+        self.assert_refused("npm_input_invalid", subject.check_inputs, files, subject.DEFAULT_FILING)
+        self.assert_refused("npm_manifest_refused", subject.check_inputs, {
+            **world.files, "package.json": files["package.json"],
+        }, subject.DEFAULT_FILING)
+
     def test_missing_extra_empty_or_non_bytes_files_are_refused(self):
         world = World()
         short = dict(world.files)
@@ -1184,6 +1209,7 @@ class FakeResponse:
         self.status = status
         self.body = body
         self.url = url
+        self.offset = 0
 
     def __enter__(self):
         return self
@@ -1195,7 +1221,10 @@ class FakeResponse:
         return self.url
 
     def read(self, size=-1):
-        return self.body if size < 0 else self.body[:size]
+        start = self.offset
+        end = len(self.body) if size is None or size < 0 else min(len(self.body), start + size)
+        self.offset = end
+        return self.body[start:end]
 
 
 class FakeOpener:
@@ -1269,6 +1298,69 @@ class FetcherTests(RefusalAssertions):
         expired = subject.RegistryFetcher(opener=opener, deadline=0.0)
         self.assert_refused("npm_stale", expired._exchange, "/plain", 10, "application/json")
         self.assertEqual(opener.requests, [])
+
+    def test_the_deadline_is_checked_between_chunks_of_one_response(self):
+        chunk = subject.FETCH_CHUNK_BYTES
+        clock = [100.0]
+
+        class SlowResponse(FakeResponse):
+            def read(self, size=-1):
+                clock[0] += 10.0
+                return super().read(size)
+
+        class SlowOpener(FakeOpener):
+            def open(self, request, timeout=None):
+                self.requests.append((request.full_url, request.get_method(), request.data, timeout))
+                return SlowResponse(*self.routes[request.full_url])
+
+        opener = SlowOpener({self.url("/plain"): (200, b"x" * (3 * chunk), self.url("/plain"))})
+        fetcher = subject.RegistryFetcher(opener=opener, deadline=125.0)
+        with unittest.mock.patch.object(subject.time, "monotonic", lambda: clock[0]):
+            self.assert_refused("npm_stale", fetcher._exchange, "/plain", 4 * chunk, "application/json")
+        clock[0] = 100.0
+        generous = subject.RegistryFetcher(opener=opener, deadline=10 ** 6)
+        with unittest.mock.patch.object(subject.time, "monotonic", lambda: clock[0]):
+            self.assertEqual(len(generous._exchange("/plain", 4 * chunk, "application/json")), 3 * chunk)
+
+    def test_a_large_body_is_read_in_bounded_chunks_and_oversize_is_still_refused(self):
+        chunk = subject.FETCH_CHUNK_BYTES
+        sizes = []
+
+        class RecordingResponse(FakeResponse):
+            def read(self, size=-1):
+                sizes.append(size)
+                return super().read(size)
+
+        class RecordingOpener(FakeOpener):
+            def open(self, request, timeout=None):
+                return RecordingResponse(*self.routes[request.full_url])
+
+        body = b"y" * (2 * chunk + 5)
+        fetcher = subject.RegistryFetcher(opener=RecordingOpener({self.url("/plain"): (200, body, self.url("/plain"))}))
+        self.assertEqual(fetcher._exchange("/plain", 3 * chunk, "application/json"), body)
+        self.assertTrue(all(0 < size <= chunk for size in sizes))
+        self.assertEqual(sizes[:3], [chunk] * 3)
+        over = subject.RegistryFetcher(opener=RecordingOpener({self.url("/plain"): (200, body, self.url("/plain"))}))
+        self.assert_refused("npm_network_refused", over._exchange, "/plain", chunk, "application/json")
+
+    def test_a_packument_over_the_size_cap_and_the_metadata_total_are_refused(self):
+        route = {self.url("/plain"): (200, b"x" * 11, self.url("/plain"))}
+        with unittest.mock.patch.object(subject, "MAX_PACKUMENT_BYTES", 10):
+            fetcher = subject.RegistryFetcher(opener=FakeOpener(route))
+            with self.assertRaises(subject.BootstrapRefusal) as raised:
+                fetcher.packument("plain")
+        self.assertEqual(raised.exception.reason, "npm_network_refused")
+        self.assertEqual(raised.exception.detail, "fetch:plain:too_large")
+        small = {self.url("/plain"): (200, b"{}", self.url("/plain"))}
+        fetcher = subject.RegistryFetcher(opener=FakeOpener(small))
+        fetcher.bytes_read = subject.MAX_TOTAL_METADATA_BYTES + adm.MAX_TOTAL_COMPRESSED_BYTES - 1
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            fetcher.packument("plain")
+        self.assertEqual(raised.exception.reason, "npm_network_refused")
+        self.assertEqual(raised.exception.detail, "fetch:plain:total_bytes")
+
+    def test_the_request_cap_covers_one_packument_and_one_archive_per_package_plus_the_advisory_call(self):
+        self.assertEqual(subject.MAX_REQUESTS, 2 * subject.MAX_PACKAGES + 1)
 
     def test_invalid_names_versions_and_bodies_are_refused_before_any_request(self):
         opener = FakeOpener({})
@@ -2195,6 +2287,60 @@ class BundleDetailTests(RefusalAssertions):
                 with unittest.mock.patch.object(adm, name, value):
                     self.assertEqual(self.world_detail("npm_archive_refused"), expected)
 
+    def test_the_loop_stops_a_fixed_number_of_packages_after_the_first_refusal(self):
+        world = self.tampered_world(("alpha-pkg", "beta-pkg", "gamma-pkg", "lightningcss"))
+        fetcher = world.fetcher()
+        self.assertEqual(subject.MAX_PACKAGES_AFTER_REFUSAL, 64)
+        with unittest.mock.patch.object(subject, "MAX_PACKAGES_AFTER_REFUSAL", 1):
+            with self.assertRaises(subject.BootstrapRefusal) as raised:
+                world.bundle(fetcher=fetcher)
+        self.assertEqual(raised.exception.details, (
+            self.shared_detail("alpha-pkg", "1.0.0"), self.shared_detail("beta-pkg", "2.0.0"),
+        ))
+        self.assertEqual(
+            fetcher.calls,
+            [("packument", "alpha-pkg"), ("tarball", "alpha-pkg", "1.0.0"),
+             ("packument", "beta-pkg"), ("tarball", "beta-pkg", "2.0.0")],
+        )
+
+    def test_the_total_stop_matches_only_the_archive_running_totals(self):
+        for detail in (
+            "archive_size:alpha-pkg@1.0.0:total_compressed", "archive_size:alpha-pkg@1.0.0:total_unpacked",
+            "archive_count:gamma-pkg@3.1.0:total_files",
+            "archive_size:alpha-pkg@1.0.0:total_compressed index:1",
+        ):
+            with self.subTest(detail=detail):
+                self.assertTrue(subject._is_total_stop(detail))
+                self.assertFalse(subject._continues_after(subject.BootstrapRefusal("npm_archive_refused", detail)))
+        for detail in (
+            None, 7, "archive_manifest:total_utils@1.0.0:name_mismatch", "deprecated:total_utils@1.0.0",
+            "archive_size:alpha-pkg@1.0.0:member index:1", "archive_size:total_utils@1.0.0:member",
+            "archive_size", "fetch:alpha-pkg:total_bytes", "evidence:alpha-pkg@1.0.0:items count:1 note:total_x",
+        ):
+            with self.subTest(detail=detail):
+                self.assertFalse(subject._is_total_stop(detail))
+        refusal = subject.BootstrapRefusal("npm_archive_refused", "archive_manifest:total_utils@1.0.0:name_mismatch")
+        self.assertTrue(subject._continues_after(refusal))
+
+    def test_only_valid_tuple_or_list_details_are_merged_into_the_first_refusal(self):
+        first = subject.BootstrapRefusal("npm_archive_refused", "deprecated:pkg-00@1.0.0")
+        second = subject.BootstrapRefusal("npm_archive_refused", "deprecated:pkg-01@1.0.0")
+        second.details = ("deprecated:pkg-02@1.0.0", "bad detail with spaces", 7, None, "x" * 600)
+        third = subject.BootstrapRefusal("npm_archive_refused", "deprecated:pkg-03@1.0.0")
+        third.details = "deprecated:pkg-04@1.0.0"
+        fourth = subject.BootstrapRefusal("npm_archive_refused", "deprecated:pkg-05@1.0.0")
+        fourth.details = ["deprecated:pkg-06@1.0.0", "deprecated:pkg-06@1.0.0"]
+        fifth = subject.BootstrapRefusal("npm_archive_refused", "deprecated:pkg-07@1.0.0")
+        fifth.details = 12
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            subject._raise_first_refusal([first, second, third, fourth, fifth])
+        self.assertIs(raised.exception, first)
+        self.assertEqual(first.details, (
+            "deprecated:pkg-00@1.0.0", "deprecated:pkg-01@1.0.0", "deprecated:pkg-02@1.0.0",
+            "deprecated:pkg-03@1.0.0", "deprecated:pkg-05@1.0.0", "deprecated:pkg-06@1.0.0",
+            "deprecated:pkg-07@1.0.0",
+        ))
+
     def test_the_run_and_time_refusals_name_their_check(self):
         world = World()
         for keywords, reason, expected in (
@@ -2541,6 +2687,8 @@ class SiblingLoadTests(unittest.TestCase):
     def test_the_default_filing_is_registered_with_the_request_profile(self):
         import feedback_request
         self.assertIn(subject.DEFAULT_FILING, feedback_request.NPM_FILING_SELECTORS)
+        self.assertIn(subject.FIXTURE_FILING, feedback_request.NPM_FILING_SELECTORS)
+        self.assertEqual(set(feedback_request.NPM_FILING_SELECTORS), set(subject.FILINGS))
         self.assertEqual(feedback_request.NPM_DEFAULT_FILING, subject.DEFAULT_FILING)
         self.assertEqual(feedback_request.NPM_ADMISSION_MAX_PAYLOAD_BYTES, subject.MAX_BUNDLE_BYTES)
         self.assertEqual(feedback_request.NPM_ADMISSION_MAX_LOCK_BYTES, subject.MAX_LOCK_BYTES)
@@ -2594,6 +2742,148 @@ class AdvisoryReachFieldTests(unittest.TestCase):
         self.assertLessEqual(len(fields["consumers"]), subject.ADVISORY_CONSUMER_BUDGET)
         self.assertEqual(int(fields["more"]), len(names) - len(shown))
         self.assertEqual(fields["unreached"], "0")
+
+
+    def test_reach_follows_every_edge_group_and_links_and_lists_consumers_in_sorted_order(self):
+        entries = [("node_modules/m", {"name": "m", "version": "1.0.0", "dev": True})]
+        for group in subject.LOCK_EDGE_GROUPS:
+            with self.subTest(group=group):
+                lock = {"packages": {"": {}, "node_modules/a": {group: {"m": "^1.0.0"}}, "node_modules/m": {}}}
+                self.assertEqual(
+                    subject._advisory_reach_fields("m", frozenset({"1.0.0"}), {"a": "1.0.0"}, lock, entries),
+                    (("dev", "yes"), ("consumers", "a"), ("unreached", "0")),
+                )
+        linked = {"packages": {
+            "": {}, "node_modules/w": {"link": True, "resolved": "packages/w"},
+            "packages/w": {"dependencies": {"m": "^1.0.0"}}, "node_modules/m": {},
+        }}
+        self.assertEqual(
+            subject._advisory_reach_fields("m", frozenset({"1.0.0"}), {"w": "1.0.0"}, linked, entries),
+            (("dev", "yes"), ("consumers", "w"), ("unreached", "0")),
+        )
+        several = {"packages": {
+            "": {}, "node_modules/zed": {"dependencies": {"m": "^1.0.0"}},
+            "node_modules/beta": {"optionalDependencies": {"m": "^1.0.0"}},
+            "node_modules/alpha": {"peerDependencies": {"m": "^1.0.0"}},
+            "node_modules/other": {}, "node_modules/m": {},
+        }}
+        direct = {"zed": "1.0.0", "beta": "1.0.0", "alpha": "1.0.0", "other": "1.0.0"}
+        self.assertEqual(
+            subject._advisory_reach_fields("m", frozenset({"1.0.0"}), direct, several, entries),
+            (("dev", "yes"), ("consumers", "alpha,beta,zed"), ("unreached", "0")),
+        )
+
+    def test_the_shown_consumers_are_capped_at_the_allow_record_maximum(self):
+        self.assertEqual(subject.MAX_SHOWN_CONSUMERS, 128)
+        names = ["c%03d" % index for index in range(200)]
+        packages = {"": {}, "node_modules/m": {}}
+        for consumer in names:
+            packages["node_modules/" + consumer] = {"dependencies": {"m": "^1.0.0"}}
+        entries = [("node_modules/m", {"name": "m", "version": "1.0.0", "dev": True})]
+        with unittest.mock.patch.object(subject, "ADVISORY_CONSUMER_BUDGET", 10 ** 6):
+            fields = dict(subject._advisory_reach_fields(
+                "m", frozenset({"1.0.0"}), {name: "1.0.0" for name in names}, {"packages": packages}, entries,
+            ))
+        self.assertEqual(fields["consumers"].split(","), names[:128])
+        self.assertEqual(fields["more"], "72")
+
+    def test_the_longest_blocked_advisory_check_stays_inside_the_detail_bound(self):
+        name = "n" * 60
+        consumers = ["@scope-%02d/%s" % (index, "c" * 40) for index in range(12)]
+        packages = {"": {}, "node_modules/" + name: {}}
+        for consumer in consumers:
+            packages["node_modules/" + consumer] = {"dependencies": {name: "^1.0.0"}}
+        entries = [("node_modules/" + name, {"name": name, "version": "1.0.0", "dev": True})]
+        advisory = json.dumps({name: [{
+            "id": 1, "github_advisory_id": "GHSA-" + "x" * 59, "severity": "moderate",
+            "vulnerable_versions": "<2.0.0",
+        }]}).encode("ascii")
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            subject.check_advisories(
+                advisory, {name: ["1.0.0"]}, (), {consumer: "1.0.0" for consumer in consumers}, 0,
+                lock={"packages": packages}, entries=entries, policy_epoch_ms=1,
+            )
+        self.assertEqual(raised.exception.reason, "npm_advisory_blocked")
+        detail = raised.exception.detail
+        self.assertIsNotNone(detail)
+        self.assertLessEqual(len(detail), subject.LOCK_DETAIL_MAX_BYTES)
+        self.assertTrue(subject._valid_lock_detail(detail))
+        self.assertIn(" severity:moderate dev:yes consumers:", detail)
+        self.assertIn(" more:", detail)
+        self.assertTrue(detail.endswith(" unreached:0"))
+
+
+class InertManifestTests(RefusalAssertions):
+    ENTRY = {
+        "name": "inert-pkg", "version": "1.0.0", "optional": True, "cpu": ["wasm32"],
+        "bundleDependencies": ["a-lib", "b-lib"],
+    }
+    SUBJECT = "inert-pkg@1.0.0"
+
+    def test_an_inert_entry_must_match_the_cpu_and_bundled_names_of_its_archive(self):
+        matching = (
+            {"cpu": ["wasm32"], "bundleDependencies": ["b-lib", "a-lib"]},
+            {"cpu": ["wasm32"], "bundledDependencies": ["a-lib", "b-lib"]},
+            {"cpu": ["wasm32"], "bundleDependencies": ["a-lib"], "bundledDependencies": ["b-lib"]},
+        )
+        for manifest in matching:
+            with self.subTest(manifest=manifest):
+                self.assertIsNone(subject._check_inert_manifest(self.ENTRY, manifest, self.SUBJECT))
+        for manifest, token in (
+            ({"bundleDependencies": ["a-lib", "b-lib"]}, "inert_cpu"),
+            ({"cpu": ["x64"], "bundleDependencies": ["a-lib", "b-lib"]}, "inert_cpu"),
+            ({"cpu": ["wasm32", "x64"], "bundleDependencies": ["a-lib", "b-lib"]}, "inert_cpu"),
+            ({"cpu": ["wasm32"]}, "inert_bundle"),
+            ({"cpu": ["wasm32"], "bundleDependencies": ["a-lib"]}, "inert_bundle"),
+            ({"cpu": ["wasm32"], "bundleDependencies": ["a-lib", "b-lib", "c-lib"]}, "inert_bundle"),
+            ({"cpu": ["wasm32"], "bundleDependencies": True}, "inert_bundle"),
+            ({"cpu": ["wasm32"], "bundleDependencies": ["a-lib", 7]}, "inert_bundle"),
+            ({"cpu": ["wasm32"], "bundleDependencies": ["a-lib", "a-lib"]}, "inert_bundle"),
+        ):
+            with self.subTest(manifest=manifest):
+                with self.assertRaises(subject.BootstrapRefusal) as raised:
+                    subject._check_inert_manifest(self.ENTRY, manifest, self.SUBJECT)
+                self.assertEqual(raised.exception.reason, "npm_archive_refused")
+                self.assertEqual(
+                    raised.exception.detail, "archive_manifest:" + self.SUBJECT + ":" + token,
+                )
+
+    def test_an_entry_that_is_not_inert_is_not_compared_with_its_archive_manifest(self):
+        for entry in (
+            {"name": "plain-pkg", "version": "1.0.0"},
+            dict(self.ENTRY, optional=False),
+            dict(self.ENTRY, cpu=["x64"]),
+        ):
+            with self.subTest(entry=entry):
+                self.assertIsNone(subject._check_inert_manifest(entry, {"cpu": ["arm"]}, self.SUBJECT))
+
+    def test_an_archive_manifest_float_is_read_as_opaque_text_and_not_as_a_string(self):
+        payload = b'{"name":"alpha-pkg","version":"1.0.0","license":"MIT","x":1.5}'
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            info = tarfile.TarInfo("package/package.json")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        manifest = subject._archive_manifest(gzip.compress(buffer.getvalue()), "alpha-pkg", "1.0.0")
+        self.assertEqual(manifest["x"], "1.5")
+        self.assertIs(type(manifest["x"]), adm.OpaqueNumber)
+        self.assertIs(type(manifest["license"]), str)
+        self.assertIsNone(subject.licence_text(manifest["x"]))
+
+    def test_a_packument_is_parsed_once_per_name_when_a_cache_is_passed(self):
+        data = World().packuments()["alpha-pkg"]
+        cache = {}
+        with unittest.mock.patch.object(subject, "_strict_json", wraps=subject._strict_json) as parse:
+            first = subject._packument_version(data, "alpha-pkg", "1.0.0", cache)
+            second = subject._packument_version(data, "alpha-pkg", "1.0.0", cache)
+            third = subject._packument_version(data, "alpha-pkg", "1.0.0")
+        self.assertEqual(parse.call_count, 2)
+        self.assertEqual(first, second)
+        self.assertEqual(first, third)
+        self.assertEqual(list(cache), ["alpha-pkg"])
+        self.assert_refused("npm_evidence_invalid", subject._packument_version, data, "alpha-pkg", "9.9.9", cache)
+        self.assert_refused("npm_evidence_invalid", subject._packument_version, data, "beta-pkg", "2.0.0", {})
+
 
 
 class MetadataCapTests(unittest.TestCase):

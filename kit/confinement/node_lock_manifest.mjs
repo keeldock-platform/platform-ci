@@ -401,15 +401,16 @@ function inertBundledNames(entry) {
 }
 
 function bundledChildAllowed(packages, key, entry, workspaceDirectories) {
-  if (entry.inBundle !== true || typeof key !== 'string') return false;
+  if (entry.inBundle !== true || entry.optional !== true || typeof key !== 'string') return false;
   const marker = key.lastIndexOf('/node_modules/');
   if (marker <= 0) return false;
   const parentPath = key.slice(0, marker);
   const name = key.slice(marker + '/node_modules/'.length);
-  if (!Object.hasOwn(packages, parentPath) || !nodeModulesPackageName(parentPath, workspaceDirectories)) return false;
+  if (!parentPath.startsWith('node_modules/') || !Object.hasOwn(packages, parentPath)
+      || !nodeModulesPackageName(parentPath, workspaceDirectories)) return false;
   const parent = packages[parentPath];
   if (parent === null || typeof parent !== 'object' || Array.isArray(parent)
-      || parent.inBundle === true || parent.link === true) return false;
+      || parent.inBundle === true || Object.hasOwn(parent, 'link')) return false;
   const names = inertBundledNames(parent);
   if (names === null || !names.has(name)) return false;
   if (['resolved', 'integrity', 'link', 'hasInstallScript', ...BUNDLED_FIELDS]

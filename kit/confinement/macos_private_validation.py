@@ -240,6 +240,32 @@ CORE_CONTRACT_NPM_REQUEST_PATH = re.compile(
     r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.(?:md|json)\Z"
 )
 CORE_CONTRACT_NPM_POLICY_PATH = "dependency-policy.json"
+NPM_FIXTURE_REPOSITORY_ID_ENV = "NPM_FIXTURE_REPOSITORY_ID"
+NPM_FIXTURE_TREE = "npm_fixture_admission_return"
+NPM_FIXTURE_REQUEST_PATH = "docs/dependencies/quick-fixture.md"
+NPM_FIXTURE_NPM_MATERIAL = frozenset((
+    ".node-version", ".npmrc", "package.json", CORE_CONTRACT_NPM_POLICY_PATH,
+    NPM_FIXTURE_REQUEST_PATH, CORE_CONTRACT_PACKAGE_LOCK_PATH,
+    "packages/host-api/package.json", "packages/kernel-i18n/package.json",
+))
+NPM_FIXTURE_REQUIRED_FILES = frozenset((
+    ".node-version", ".npmrc", "package.json", CORE_CONTRACT_NPM_POLICY_PATH,
+    NPM_FIXTURE_REQUEST_PATH, "packages/host-api/package.json",
+    "packages/kernel-i18n/package.json", "docs/commit-signers",
+    "Cargo.toml", "Cargo.lock", "rust-toolchain.toml",
+    "crates/host/api/Cargo.toml", "crates/host/conformance/Cargo.toml",
+    "crates/host/mock/Cargo.toml",
+))
+NPM_FIXTURE_FILES = NPM_FIXTURE_NPM_MATERIAL | NPM_FIXTURE_REQUIRED_FILES | frozenset((
+    "LICENSE", "README.md",
+    "crates/host/api/src/lib.rs", "crates/host/conformance/src/lib.rs",
+    "crates/host/mock/src/lib.rs",
+    "fuzz/Cargo.lock", "fuzz/Cargo.toml", "fuzz/src/main.rs",
+    "packages/host-api/src/index.ts", "packages/host-api/tests/smoke.mjs",
+    "packages/host-api/tsconfig.json",
+    "packages/kernel-i18n/src/index.ts", "packages/kernel-i18n/tests/smoke.mjs",
+    "packages/kernel-i18n/tsconfig.json",
+))
 CORE_CONTRACT_INERT_DEPENDENCY_FILES = frozenset((
     CORE_CONTRACT_NPM_POLICY_PATH, "docs/dependencies/dependency-policy.schema.json",
 ))
@@ -268,9 +294,9 @@ CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES = frozenset((
 CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH = re.compile(
     r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.md\Z"
 )
-CORE_CONTRACT_BATCH5_CONCERN = "core-build-diagnostic-return"
-CORE_CONTRACT_BATCH5_CONCERNS = frozenset((
-    CORE_CONTRACT_BATCH5_CONCERN, CORE_CONTRACT_NPM_ADMISSION_CONCERN,
+CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN = "core-build-diagnostic-return"
+CORE_CONTRACT_BUILD_FILE_CONCERNS = frozenset((
+    CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN, CORE_CONTRACT_NPM_ADMISSION_CONCERN,
 ))
 CORE_CONTRACT_BUILD_DATA_FILES = frozenset((
     "crates/host/api/src/entitlements/key_register.tsv",
@@ -2349,7 +2375,7 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
     ):
         return "100644"
     if (
-        concern in CORE_CONTRACT_BATCH5_CONCERNS and type(path) is str
+        concern in CORE_CONTRACT_BUILD_FILE_CONCERNS and type(path) is str
         and (
             path in CORE_CONTRACT_BUILD_DATA_FILES
             or path in CORE_CONTRACT_BUILD_SOURCE_FILES
@@ -2993,6 +3019,61 @@ def _safe_core_contract_tree(
     if concern == "core-build-diagnostic-return" and package_lock_present:
         tree_kind = CORE_CONTRACT_PACKAGE_LOCK_TREE
     return tree_kind
+
+
+def _npm_fixture_selected(concern, environ, repository_id):
+    if type(concern) is not str or concern != CORE_CONTRACT_NPM_ADMISSION_CONCERN:
+        return False
+    value = environ.get(NPM_FIXTURE_REPOSITORY_ID_ENV, "")
+    if value == "":
+        return False
+    if (
+        type(value) is not str or REPOSITORY_ID_PATTERN.fullmatch(value) is None
+        or type(repository_id) is not int
+    ):
+        raise Refusal("bootstrap_not_approved", "configuration")
+    return int(value) == repository_id
+
+
+def _safe_npm_fixture_tree(repository, git_executable, repo_env, base_commit, commit):
+    base_entries = _contract_tree_entries(repository, git_executable, repo_env, base_commit)
+    entries = _contract_tree_entries(repository, git_executable, repo_env, commit)
+    for tree in (base_entries, entries):
+        for path, (mode, unused_object_id) in tree.items():
+            if path not in NPM_FIXTURE_FILES or mode != "100644":
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
+    if not NPM_FIXTURE_REQUIRED_FILES.issubset(entries):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+    signer_path = "/".join(SIGNER_PATH_PARTS)
+    if base_entries.get(signer_path) != entries.get(signer_path):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="base_policy")
+    changed = {
+        path for path in set(base_entries) | set(entries)
+        if base_entries.get(path) != entries.get(path)
+    }
+    if not changed.issubset(NPM_FIXTURE_NPM_MATERIAL):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="base_policy")
+    total_bytes = 0
+    for path in sorted(entries):
+        total_bytes += _contract_blob_size(
+            repository, git_executable, repo_env, entries, path, core_check="tree_entries",
+        )
+        if total_bytes > MAX_TREE_BYTES:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="tree_entries")
+    return NPM_FIXTURE_TREE
+
+
+def _snapshot_tree(repository, git_executable, repo_env, request, environ, repository_id):
+    if _npm_fixture_selected(request["concern"], environ, repository_id):
+        tree_kind = _safe_npm_fixture_tree(
+            repository, git_executable, repo_env, request["base_sha"], request["source_sha"],
+        )
+        return tree_kind, "not-applicable"
+    tree_kind = _safe_core_contract_tree(
+        repository, git_executable, repo_env, request["base_sha"], request["source_sha"],
+        concern=request["concern"],
+    )
+    return tree_kind, "present"
 
 
 LEASE_ACCESS_SCRIPT = '''\
@@ -3990,11 +4071,9 @@ def _source_snapshot(
             rules_lock = "not-applicable"
             tree_kind = "rules_regular_files"
         elif request["concern"] in CORE_CONTRACT_CONCERNS:
-            tree_kind = _safe_core_contract_tree(
-                repository, git_executable, env, request["base_sha"], request["source_sha"],
-                concern=request["concern"],
+            tree_kind, rules_lock = _snapshot_tree(
+                repository, git_executable, env, request, environ, repository_id,
             )
-            rules_lock = "present"
         else:
             raise Refusal("bootstrap_not_approved", "configuration")
         source_path = _checkout_source(
@@ -4058,9 +4137,18 @@ def _format_success(record, binding):
     if (record.get("concern") == "core-build-diagnostic-return"
             and record.get("tree") == CORE_CONTRACT_PACKAGE_LOCK_TREE):
         expected_tree = CORE_CONTRACT_PACKAGE_LOCK_TREE
+    fixture_tree = (
+        record.get("concern") == CORE_CONTRACT_NPM_ADMISSION_CONCERN
+        and record.get("tree") == NPM_FIXTURE_TREE
+    )
+    if fixture_tree:
+        expected_tree = NPM_FIXTURE_TREE
     fixed = {
         "signature": "verified",
-        "rules_lock": "not-applicable" if record.get("concern") == "rules-bootstrap" else "present",
+        "rules_lock": (
+            "not-applicable" if record.get("concern") == "rules-bootstrap" or fixture_tree
+            else "present"
+        ),
         "tree": expected_tree,
         "source_execution": "not_run_at_yield",
         "repository_scope": "verified",

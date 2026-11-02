@@ -23,6 +23,8 @@ MAX_CAPTURE_BYTES = 65536
 MAX_PROBE_SECONDS = 45
 CENSUS_READ_ATTEMPTS = 3
 CENSUS_READ_RETRY_SECONDS = 0.2
+CENSUS_ATTEMPT_TIMEOUT_SECONDS = 5
+CENSUS_READ_BUDGET_SECONDS = 16.0
 MAX_RUNNER_ANCESTORS = 16
 MAX_PROCESS_PATH_BYTES = 4096
 MAX_TOOL_PATH_BYTES = 4096
@@ -982,9 +984,11 @@ def _probe_uid_process_snapshot_attempt(uid, launched_pgid=None, *, include_surv
         result = _run(
             ["/bin/ps", "-A", "-o", fields],
             env={"LANG": "C", "LC_ALL": "C"},
-            timeout=5,
+            timeout=CENSUS_ATTEMPT_TIMEOUT_SECONDS,
             timeout_check="probe_process_census",
         )
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except BaseException:
         raise ProbeFailure(
             "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
@@ -1073,12 +1077,19 @@ def _probe_uid_process_snapshot_attempt(uid, launched_pgid=None, *, include_surv
     return result + (survivor_classes,) if include_survivor_classes else result
 
 
-def _probe_uid_process_snapshot(uid, launched_pgid=None, *, include_survivor_classes=False, python_executable=None):
+def _probe_uid_process_snapshot(
+    uid, launched_pgid=None, *, include_survivor_classes=False, python_executable=None, deadline=None,
+):
     if uid <= 0 or (launched_pgid is not None and launched_pgid <= 0):
         raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
     failure = None
+    limit = time.monotonic() + CENSUS_READ_BUDGET_SECONDS
+    if deadline is not None:
+        limit = min(limit, deadline)
     for attempt in range(CENSUS_READ_ATTEMPTS):
         if attempt:
+            if time.monotonic() + CENSUS_READ_RETRY_SECONDS + CENSUS_ATTEMPT_TIMEOUT_SECONDS > limit:
+                break
             time.sleep(CENSUS_READ_RETRY_SECONDS)
         try:
             return _probe_uid_process_snapshot_attempt(
@@ -1098,11 +1109,12 @@ def _probe_uid_process_snapshot(uid, launched_pgid=None, *, include_survivor_cla
     raise failure
 
 
-def _probe_uid_processes_present(uid, *, include_survivor_classes=False, python_executable=None):
+def _probe_uid_processes_present(uid, *, include_survivor_classes=False, python_executable=None, deadline=None):
     snapshot = _probe_uid_process_snapshot(
         uid,
         include_survivor_classes=include_survivor_classes,
         python_executable=python_executable,
+        deadline=deadline,
     )
     if include_survivor_classes:
         return snapshot[0], snapshot[2]

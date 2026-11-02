@@ -120,6 +120,27 @@ class NpmAdmissionWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, workflow)
 
+    def test_the_fixture_repository_id_is_one_variable_passed_only_to_the_producer_run(self):
+        workflow = NPM_ADMISSION_WORKFLOW.read_text(encoding="utf-8")
+        producer = job_blocks(workflow)["core-npm-admission-return"]
+        mapping = "NPM_FIXTURE_REPOSITORY_ID: ${{ vars.NPM_FIXTURE_REPOSITORY_ID }}"
+        passed = 'NPM_FIXTURE_REPOSITORY_ID="$NPM_FIXTURE_REPOSITORY_ID" \\\n'
+        self.assertEqual(workflow.count(mapping), 1)
+        self.assertEqual(producer.count(mapping), 1)
+        self.assertEqual(workflow.count("NPM_FIXTURE_REPOSITORY_ID"), 4)
+        self.assertEqual(workflow.count(passed), 1)
+        self.assertNotIn("secrets.NPM_FIXTURE", workflow)
+        self.assertLess(
+            producer.index(passed), producer.index("macos_feedback_producer.py run --profile npm_admission"),
+        )
+        self.assertLess(
+            producer.index(mapping), producer.index("macos_feedback_producer.py run --profile npm_admission"),
+        )
+        self.assertGreater(
+            producer.index("macos_feedback_producer.py publish --profile npm_admission"),
+            producer.index(passed),
+        )
+
     def test_the_producer_step_echoes_at_most_one_strict_closed_diagnostic_line_from_its_stderr(self):
         workflow = NPM_ADMISSION_WORKFLOW.read_text(encoding="utf-8")
         blocks = job_blocks(workflow)

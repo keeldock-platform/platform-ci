@@ -511,11 +511,16 @@ class LinuxFixtureDiagnosticLineTests(unittest.TestCase):
         self.assertTrue(channels.diag_unsafe("k" * 20 + "-" + "k" * 20, "k" * 20 + "-" + "k" * 20, NONCE, ()))
 
     def test_the_token_scan_also_runs_on_the_raw_line_before_cleaning(self):
-        wide = "g" * 20 + "_" + "g" * 20
+        token = "g" * 20 + "_" + "g" * 20
+        wide = "k " * 101 + token
         cleaned = channels.diag_clean(wide)
-        self.assertEqual(cleaned, wide)
+        self.assertEqual(len(cleaned), channels.DIAG_MAX_CHARS)
+        self.assertNotIn(token, cleaned)
         self.assertIsNone(channels.DIAG_TOKEN.search(cleaned))
+        self.assertIsNone(channels.DIAG_TOKEN_URL.search(cleaned))
+        self.assertIsNotNone(channels.DIAG_TOKEN_URL.search(wide))
         self.assertTrue(channels.diag_unsafe(wide, cleaned, NONCE, ()))
+        self.assertFalse(channels.diag_unsafe(cleaned, cleaned, NONCE, ()))
         self.assertFalse(channels.diag_unsafe("plain text", "plain text", NONCE, ()))
 
     def test_a_bare_hex_needle_drops_a_short_fragment_line(self):
