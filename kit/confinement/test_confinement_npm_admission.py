@@ -1160,6 +1160,24 @@ class NpmInertBundledTests(unittest.TestCase):
             "entry_inbundle:" + self.PATH + "/node_modules/left-pad",
         )
 
+    def test_a_bundled_child_must_be_marked_optional(self):
+        for label, flags in {
+            "absent": {}, "false": {"optional": False}, "dev optional only": {"devOptional": True},
+            "string": {"optional": "true"},
+        }.items():
+            children = {name: dict({"version": "1.2.3", "inBundle": True}, **flags) for name in self.BUNDLED}
+            with self.subTest(case=label):
+                self.assertTrue(
+                    self.child_refusal(self.child_lock(children=children)).startswith(
+                        "entry_inbundle:" + self.PATH + "/node_modules/"),
+                )
+        one_unmarked = {name: {"version": "1.2.3", "inBundle": True, "optional": True} for name in self.BUNDLED}
+        del one_unmarked[self.BUNDLED[-1]]["optional"]
+        self.assertEqual(
+            self.child_refusal(self.child_lock(children=one_unmarked)),
+            "entry_inbundle:" + self.PATH + "/node_modules/" + self.BUNDLED[-1],
+        )
+
     def test_a_bundled_child_with_a_source_script_link_or_bad_shape_refuses(self):
         for label, extra in {
             "resolved": {"resolved": "https://registry.npmjs.org/plain-lib/-/plain-lib-1.2.3.tgz"},
@@ -1584,6 +1602,66 @@ class NpmArchiveDetailTests(unittest.TestCase):
             b'{"name":"sample","version":"1.0.0","testling":{"browsers":{"ff":[3.5,10]}}}',
         )
         self.assertEqual(subject.verify_tarball(self.entry(data), data)["file_count"], 1)
+
+    def test_a_float_is_opaque_text_that_exact_type_checks_refuse(self):
+        self.assertIs(type(subject._load_json(b'{"a":1.5}', 100, "npm_archive_invalid", opaque_numbers=True)["a"]), subject.OpaqueNumber)
+        self.assertTrue(issubclass(subject.OpaqueNumber, str))
+        self.assertIsNot(subject.OpaqueNumber, str)
+        for text, token in (
+            ('{"name":"sample","version":"1.0.0","scripts":{"install":1.5}}', "scripts_value"),
+            ('{"name":"sample","version":"1.0.0","scripts":{"postinstall":2.5e3}}', "scripts_value"),
+            ('{"name":1.5,"version":"1.0.0"}', "name_mismatch"),
+            ('{"name":"sample","version":1.5}', "version_mismatch"),
+            ('{"name":"sample","version":"1.0.0","x":1.' + "1" * 9000 + "}", "json_string"),
+        ):
+            with self.subTest(token=token, text=text[:40]):
+                data = self.member_tar(tarfile.TarInfo("package/package.json"), text.encode("ascii"))
+                self.assertEqual(self.refusal(data), "archive_manifest:" + self.SUBJECT + ":" + token)
+        data = self.member_tar(
+            tarfile.TarInfo("package/package.json"),
+            b'{"name":"sample","version":"1.0.0","scripts":{"test":"run"},"x":1.5}',
+        )
+        self.assertEqual(subject.verify_tarball(self.entry(data), data)["install_scripts"], ())
+
+    def test_entry_points_that_name_a_node_modules_path_refuse(self):
+        template = '{"name":"sample","version":"1.0.0",%s}'
+        for fields in (
+            '"main":"node_modules/x/index.js"',
+            '"main":"./test/node_modules/a.js"',
+            '"module":"lib\\\\Node_Modules\\\\a.js"',
+            '"browser":"NODE_MODULES/x.js"',
+            '"bin":"bin/../node_modules/.bin/x"',
+            '"bin":{"x":"node_modules/x/cli.js"}',
+            '"exports":{".":{"import":"./node_modules/x/index.mjs"}}',
+            '"exports":["./a.js","./node_modules/b.js"]',
+            '"types":"node_modules/@types/x/index.d.ts"',
+            '"typings":"test/node_modules/x.d.ts"',
+        ):
+            with self.subTest(fields=fields):
+                data = self.member_tar(tarfile.TarInfo("package/package.json"), (template % fields).encode("ascii"))
+                self.assertEqual(self.refusal(data), "archive_manifest:" + self.SUBJECT + ":entry_node_modules")
+        for fields in (
+            '"main":"lib/index.js"',
+            '"main":"lib/node_modulesx/a.js"',
+            '"main":"my_node_modules/a.js"',
+            '"exports":{"./node_modules":"./lib/modules.js"}',
+            '"bin":{"node_modules":"bin/cli.js"}',
+            '"description":"uses node_modules/is-fine"',
+            '"files":["node_modules/not-an-entry"]',
+        ):
+            with self.subTest(allowed=fields):
+                data = self.member_tar(tarfile.TarInfo("package/package.json"), (template % fields).encode("ascii"))
+                self.assertEqual(subject.verify_tarball(self.entry(data), data)["install_scripts"], ())
+
+    def test_a_native_binary_under_an_admitted_test_node_modules_is_still_reported(self):
+        data = _rooted_tarball("package", extra=(
+            ("package/test/node_modules/x/addon.node", b"synthetic"),
+            ("package/test/node_modules/x/blob.bin", b"\x7fELF" + bytes(8)),
+            ("package/test/node_modules/x/plain.js", b"synthetic"),
+        ))
+        self.assertEqual(self.accepted(data)["native_binaries"], (
+            "package/test/node_modules/x/addon.node", "package/test/node_modules/x/blob.bin",
+        ))
 
     def test_the_manifest_refusals_name_their_check(self):
         other_name = _tarball("other", "1.0.0")
