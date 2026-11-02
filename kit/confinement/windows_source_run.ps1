@@ -54,7 +54,7 @@ $RequiredFunctions = @(
     'Grant-Access', 'Set-LowIntegrityLabel', 'Test-LowIntegrityLabel', 'Grant-NonPropagating', 'Get-SidRules', 'New-ScratchSet',
     'New-StageEnvironment', 'Get-NormalPath', 'Test-PathUnder', 'Get-Mib', 'Test-Passed', 'Invoke-ConfinedProbe',
     'Initialize-ContainerTemp', 'Test-OtherContainerNul', 'Remove-TreeNoFollow', 'Remove-ReparsePoints', 'Get-JobLiveness',
-    'Write-CleanupDetail', 'Remove-Canaries', 'Initialize-LinkFixtures', 'Initialize-ChannelContext', 'Remove-ChannelFixtures',
+    'Write-CleanupDetail', 'Register-RemovalRoot', 'Remove-Canaries', 'Initialize-LinkFixtures', 'Initialize-ChannelContext', 'Remove-ChannelFixtures',
     'Test-LpacTokenText', 'Invoke-ChannelPhase', 'Get-ChannelBlockedCount', 'Get-ChannelControlState', 'Initialize-FixtureSources',
     'Invoke-FixturePhase', 'Get-StatusName'
 )
@@ -764,6 +764,7 @@ try {
             $recordsDirectory = Join-Path $runnerTemp 'kd-records'
             New-Item -ItemType Directory -Force -Path $recordsDirectory | Out-Null
             $script:Redactions = @($baseDirectory, $runnerTemp, $env:CI_WORKSPACE, $script:LogCanary)
+            Register-RemovalRoot $baseDirectory
             $script:Layout = @{
                 Base = $baseDirectory
                 Downloads = (Join-Path $baseDirectory 'dl')
@@ -796,6 +797,7 @@ try {
             $box = [KeelDock.Platform.WindowsConfinement.Sandbox]::Create()
             $script:Sid = $box.SidText
             $script:ProfileFolder = Join-Path (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Packages') $box.ProfileName
+            Register-RemovalRoot $script:ProfileFolder
 
             $phase = 'acl_grant'
             Grant-Access $layout.ReadOnly $script:Sid 'ReadAndExecute, Synchronize' $true
@@ -892,6 +894,7 @@ try {
             $script:Canaries += $canaryDirectory
             $script:Canaries += $script:CanaryWorkspace
             $script:Canaries += $script:CanaryProfile
+            foreach ($rootItem in $script:Canaries) { Register-RemovalRoot $rootItem }
             $canaryFiles = @($script:CanaryRunnerTemp, $script:CanaryWorkspace, $script:CanaryProfile, $script:CanaryControl)
             foreach ($canaryFile in $canaryFiles) {
                 if ($canaryFile -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw 'canary_path' }

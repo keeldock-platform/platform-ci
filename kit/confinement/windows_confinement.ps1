@@ -866,6 +866,7 @@ function Test-OtherContainerNul($first) {
     $other = [KeelDock.Platform.WindowsConfinement.Sandbox]::Create()
     $script:OtherBox = $other
     $script:OtherFolder = Join-Path (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Packages') $other.ProfileName
+    Register-RemovalRoot $script:OtherFolder
     if (([string]$other.SidText -ceq [string]$script:Sid) -or ([string]$other.ProfileName -ceq [string]$first.ProfileName)) { throw 'nul_other_not_distinct' }
     $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
     $commandLine = '"' + $cmd + '" /d /c echo x>NUL'
@@ -886,6 +887,11 @@ function Remove-TreeNoFollow([string]$path) {
 function Remove-ReparsePoints([string]$path) {
     [KeelDock.Platform.WindowsConfinement.HandleRemover]::RemoveLinks($path)
 }
+
+function Register-RemovalRoot([string]$path) {
+    [KeelDock.Platform.WindowsConfinement.HandleRemover]::AllowRoot($path)
+}
+
 
 function Get-JobLiveness($sandboxes, [int]$waitSeconds) {
     $state = 'none'
@@ -939,6 +945,7 @@ function Initialize-LinkFixtures {
     $sentinel = Join-Path $inner 'sentinel.txt'
     [IO.File]::WriteAllText($sentinel, 'kd-sentinel')
     $script:TrapDirectory = $trap
+    Register-RemovalRoot $trap
     $script:TrapSentinel = $sentinel
     $nested = Join-Path (Join-Path $script:Lpac.Tmp 'nested') 'deeper'
     New-Item -ItemType Directory -Force -Path $nested | Out-Null
@@ -1891,6 +1898,7 @@ try {
         $baseDirectory = Join-Path $env:RUNNER_TEMP ('kd-confinement-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
         if ($baseDirectory -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw 'workspace_path' }
         $script:Redactions = @($baseDirectory, $env:RUNNER_TEMP, $env:CI_WORKSPACE)
+        Register-RemovalRoot $baseDirectory
         $script:Layout = @{
             Base = $baseDirectory
             Downloads = (Join-Path $baseDirectory 'dl')
@@ -1923,6 +1931,7 @@ try {
         $box = [KeelDock.Platform.WindowsConfinement.Sandbox]::Create()
         $script:Sid = $box.SidText
         $script:ProfileFolder = Join-Path (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Packages') $box.ProfileName
+        Register-RemovalRoot $script:ProfileFolder
 
         $phase = 'acl_grant'
         Grant-Access $layout.ReadOnly $script:Sid 'ReadAndExecute, Synchronize' $true
@@ -2027,6 +2036,7 @@ try {
         $script:Canaries += $canaryDirectory
         $script:Canaries += $script:CanaryWorkspace
         $script:Canaries += $script:CanaryProfile
+        foreach ($rootItem in $script:Canaries) { Register-RemovalRoot $rootItem }
         $canaryFiles = @($script:CanaryRunnerTemp, $script:CanaryWorkspace, $script:CanaryProfile, $script:CanaryControl)
         foreach ($canaryFile in $canaryFiles) {
             if ($canaryFile -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw 'canary_path' }
