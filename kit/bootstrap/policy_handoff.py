@@ -16,7 +16,7 @@ WORKFLOW_TEMPLATES = {}
 WORKFLOW_SHA256 = {
     "windows-handoff-synthetic": "240c1df7025c6e69c975b4f393ec5f368846cf43552e12f2b965212ce104520a",
     "windows-source-admission": "d8109fc807a8a4e2fdd4d753c9a2b8d00b35c190b4c8e70e37048bde6b1c8b25",
-    "lane-h-windows-receiver": "a7b5598823bbfb5e5fab051314a578567da06c17d86e888fbbef04c280174198",
+    "lane-h-windows-receiver": "124a6a0ee378ccd3fa4ae791f9e9dc6c85776f8ca7b79f8af0f53deb93d3940e",
     "lane-h-linux-fetch-encrypt": "315cef77a9df73249f23ff54db23dbbc30fe00288922c3fad9543afd0412a033",
     "lane-h-capsule-attester": "192d78328f8bf093a68bef0f1dd323a88772e2929d79c92b24a8864d17c1b48c",
 }

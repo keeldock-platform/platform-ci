@@ -73,7 +73,7 @@ PROFILE_ROLES = {
 }
 PINNED_WORKFLOW_SHA256 = {
     ".github/workflows/windows-source-admission.yml": "d8109fc807a8a4e2fdd4d753c9a2b8d00b35c190b4c8e70e37048bde6b1c8b25",
-    ".github/workflows/lane-h-windows-receiver.yml": "a7b5598823bbfb5e5fab051314a578567da06c17d86e888fbbef04c280174198",
+    ".github/workflows/lane-h-windows-receiver.yml": "124a6a0ee378ccd3fa4ae791f9e9dc6c85776f8ca7b79f8af0f53deb93d3940e",
     ".github/workflows/lane-h-linux-fetch-encrypt.yml": "315cef77a9df73249f23ff54db23dbbc30fe00288922c3fad9543afd0412a033",
     ".github/workflows/lane-h-capsule-attester.yml": "192d78328f8bf093a68bef0f1dd323a88772e2929d79c92b24a8864d17c1b48c",
 }

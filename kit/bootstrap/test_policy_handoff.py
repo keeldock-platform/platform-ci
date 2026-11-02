@@ -427,11 +427,25 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
         self.assertEqual(len(finals), 1)
         self.assertIn('--linux-logs "$RUNNER_TEMP/role-signer-evidence/linux-logs.json"', finals[0])
 
+    def test_job_level_env_and_names_use_only_contexts_available_there(self):
+        for path in SOURCE_ADMISSION_PATHS:
+            text = read_ascii(path)
+            with self.subTest(path=path.name):
+                for block in re.findall(r"(?m)^    env:\n((?:      [^\n]*\n)+)", text):
+                    for context in ("runner.", "steps.", "job.", "secrets."):
+                        if context == "secrets." and path in (LINUX_FETCH_PATH,):
+                            continue
+                        self.assertNotIn(context, block)
+                self.assertIsNone(re.search(r"(?m)^env:", text))
+                for line in re.findall(r"(?m)^    (?:name|runs-on|timeout-minutes|environment): .*$", text):
+                    self.assertNotIn("runner.", line)
+                    self.assertNotIn("steps.", line)
+
     def test_the_capsule_artifacts_are_one_day_uncompressed_and_named_by_run_and_attempt(self):
         text = read_ascii(LINUX_FETCH_PATH)
         for role in ("producer", "verifier"):
             block = text[text.index("      - name: Upload the " + role + " source capsule\n"):]
-            block = block.split("\n      - name: ", 1)[0]
+            block = block.split("\n      - name: ", 1)[0] + "\n"
             with self.subTest(role=role):
                 self.assertIn("name: source-capsule-" + role + "-${{ github.run_id }}-${{ github.run_attempt }}\n", block)
                 self.assertIn("retention-days: 1\n", block)

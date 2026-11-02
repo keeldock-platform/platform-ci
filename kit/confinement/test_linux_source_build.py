@@ -670,7 +670,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         refused = (
             "", "repos/x", "/", "/repos//x", "/repos/x/", "/repos/../x", "/repos/x/..", "/repos/./x",
             "/repos/%2e%2e/x", "/repos/%2E%2e/x", "/repos/x\\y", "/repos/x\x00", None, 7,
-            "/repos/x%2Fy", "/repos/x%5Cy", "/repos/x%00", "/repos/x?a#b", "/repos/x y", "/repos/x\n",
+            "/repos/x%2Fy", "/repos/x%5Cy", "/repos/x%00", "/repos/x?a" + chr(35) + "b", "/repos/x y", "/repos/x\n",
             "/repos/caf\u00e9", "/repos/x?a?b", "/repos/x;y", "/repos/x:y", "/repos/x@y", "/repos/x+y",
         )
         for path in refused:
