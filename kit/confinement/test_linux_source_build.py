@@ -1911,13 +1911,13 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
     def test_audit_honours_exactly_the_recorded_findings(self):
         allows = [_allow(self.now_ms)]
         counts = linux_source_build._check_audit_report(_honoured_report(), allows, LOCKED, self.now_ms)
-        self.assertEqual(counts, (2, 1))
+        self.assertEqual(counts, (2, 1, 1))
         github_form = [_allow(self.now_ms, advisory_id="GHSA-aaaa-bbbb-cccc")]
         self.assertEqual(
-            linux_source_build._check_audit_report(_honoured_report(), github_form, LOCKED, self.now_ms), (2, 1),
+            linux_source_build._check_audit_report(_honoured_report(), github_form, LOCKED, self.now_ms), (2, 1, 1),
         )
         clean = _audit_json({})
-        self.assertEqual(linux_source_build._check_audit_report(clean, allows, LOCKED, self.now_ms), (0, 0))
+        self.assertEqual(linux_source_build._check_audit_report(clean, allows, LOCKED, self.now_ms), (0, 0, 0))
 
     def _audit_refused(self, report, allows=None, packages=None, now_ms=None):
         with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
@@ -2027,26 +2027,32 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
         wide = _vulnerability("fixture-lib", via=["tool-a"] * (linux_source_build.MAX_AUDIT_VIA + 1), nodes=["node_modules/fixture-lib"])
         self._audit_refused(_audit_json({"fixture-lib": wide, "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"])}))
 
-    def _run_audit(self, returncode, stdout, allows=None):
+    def _run_audit(self, returncode, stdout, allows=None, valid_until=None, entry=None, missing_node=False,
+                   source_inputs=None, check_lock=None, run=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "source").mkdir()
             (root / "source/package-lock.json").write_bytes(b"{}")
             (root / "bin").mkdir()
-            (root / "bin/node").write_bytes(b"")
+            if not missing_node:
+                (root / "bin/node").write_bytes(b"")
             (root / "bin/npm").write_bytes(b"")
             env = {"SOURCE_PATH": str(root / "source"), "NODE_BIN": str(root / "bin"), "RUNNER_TEMP": str(root)}
             result = types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=b"")
-            record = {"advisory": {"findings": [_allow(self.now_ms)] if allows is None else allows}}
+            record = {"advisory": {
+                "findings": [_allow(self.now_ms)] if allows is None else allows,
+                "valid_until": self.now + 3600 if valid_until is None else valid_until,
+            }}
             output = io.StringIO()
+            command = linux_source_build.run_trusted_audit if entry is None else entry
             with patch.object(linux_source_build, "_neutralize_config_files"), \
-                    patch.object(linux_source_build, "_source_inputs", return_value={}), \
-                    patch.object(linux_source_build, "_check_lock_provenance"), \
+                    patch.object(linux_source_build, "_source_inputs", return_value={}, side_effect=source_inputs), \
+                    patch.object(linux_source_build, "_check_lock_provenance", side_effect=check_lock), \
                     patch.object(linux_source_build, "_validate_provenance_binding", return_value=record), \
                     patch.object(linux_source_build, "_locked_packages", return_value=({"packages": LOCKED}, {})), \
-                    patch.object(linux_source_build, "_run", return_value=result), \
+                    patch.object(linux_source_build, "_run", return_value=result, side_effect=run), \
                     patch("sys.stdout", output):
-                code = linux_source_build.run_trusted_audit(env)
+                code = command(env)
             return code, output.getvalue()
 
     def test_trusted_audit_accepts_the_recorded_finding_with_counts_only(self):
@@ -2068,6 +2074,218 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
         for index, (returncode, stdout, allows) in enumerate(cases):
             with self.subTest(case=index), self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
                 self._run_audit(returncode, stdout, allows)
+
+
+def _dispatch_audit(env):
+    with patch.dict(os.environ, env):
+        return linux_source_build._dispatch("trusted-audit")
+
+
+def _lib(**changes):
+    entry = _vulnerability("fixture-lib", via=[_advisory_via()], nodes=["node_modules/fixture-lib"])
+    entry.update(changes)
+    return entry
+
+
+LINE_PATTERN = re.compile(
+    r"linux-source-build=refused phase=trusted-audit reason=[a-z_]+ detail=audit_[a-z_]+( count=[0-9]{1,2})?\n"
+)
+
+
+class LinuxAuditDetailTests(unittest.TestCase):
+    _run_audit = LinuxNodeProvenanceAndAuditTests._run_audit
+
+    def setUp(self):
+        self.now = int(time.time())
+        self.now_ms = self.now * 1000
+
+    def _detail(self, report, allows=None, packages=None, now_ms=None):
+        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+            linux_source_build._check_audit_report(
+                report, [_allow(self.now_ms)] if allows is None else allows,
+                LOCKED if packages is None else packages, self.now_ms if now_ms is None else now_ms,
+            )
+        self.assertEqual(refused.exception.reason, "lock")
+        return refused.exception
+
+    def _report_cases(self):
+        good = json.loads(_honoured_report())
+        many = {"pkg-" + str(index): _vulnerability("pkg-" + str(index), via=["pkg-0"], nodes=[])
+                for index in range(linux_source_build.MAX_AUDIT_VULNERABILITIES + 1)}
+        runtime = dict(LOCKED, **{"node_modules/fixture-lib": {"version": "1.5.0"}})
+        newer = dict(LOCKED, **{"node_modules/fixture-lib": {"version": "1.6.0", "dev": True}})
+        cycle = _audit_json({
+            "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
+            "fixture-lib": _vulnerability("fixture-lib", via=["tool-a"], nodes=["node_modules/fixture-lib"]),
+        })
+        low_root = _audit_json({
+            "fixture-lib": _lib(severity="low", via=[_advisory_via(severity="low")]),
+            "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
+        }, low=1, moderate=1)
+        return {
+            "audit_json": (b"not json", None, None, None),
+            "audit_top_keys": (json.dumps(dict(good, extra={})).encode("ascii"), None, None, None),
+            "audit_version": (json.dumps(dict(good, auditReportVersion=1)).encode("ascii"), None, None, None),
+            "audit_entry_shape": (json.dumps(dict(good, vulnerabilities=[])).encode("ascii"), None, None, None),
+            "audit_meta": (json.dumps(dict(good, metadata=[])).encode("ascii"), None, None, None),
+            "audit_limit": (_audit_json(many), None, None, None),
+            "audit_count": (_audit_json({}, moderate=-1), None, None, None),
+            "audit_high": (_audit_json({}, high=1), None, None, None),
+            "audit_key_name": (_audit_json({"Bad Name": _lib(name="Bad Name")}), None, None, None),
+            "audit_severity": (_audit_json({"fixture-lib": _lib(severity="high")}), None, None, None),
+            "audit_via_shape": (_audit_json({"fixture-lib": _lib(via=[5])}), None, None, None),
+            "audit_via_unknown": (_audit_json({"fixture-lib": _lib(via=["absent-lib"])}), None, None, None),
+            "audit_advisory_unmatched": (_honoured_report(), [], None, None),
+            "audit_allow_expired": (_honoured_report(), [_allow(self.now_ms, allow_expires_at_ms=self.now_ms - 1)], None, None),
+            "audit_advisory_severity": (_audit_json({"fixture-lib": _lib(via=[_advisory_via(severity="high")])}), None, None, None),
+            "audit_nodes_shape": (_audit_json({"fixture-lib": _lib(nodes=[])}), None, None, None),
+            "audit_nondev": (_honoured_report(), None, runtime, None),
+            "audit_version_not_allowed": (_honoured_report(), None, newer, None),
+            "audit_consumer_over_ceiling": (low_root, [_allow(self.now_ms, severity="low")], None, None),
+            "audit_consumer_unreached": (cycle, None, None, None),
+        }
+
+    def test_every_report_detail_token_is_produced_by_its_case(self):
+        cases = self._report_cases()
+        for token, (report, allows, packages, now_ms) in cases.items():
+            with self.subTest(token=token):
+                self.assertEqual(self._detail(report, allows, packages, now_ms).detail, token)
+
+    def test_every_run_detail_token_is_produced_by_its_case(self):
+        refusal = linux_source_build.SourceBuildRefusal("lock")
+        cases = {
+            "audit_toolchain": dict(returncode=1, stdout=b"", missing_node=True),
+            "audit_provenance": dict(returncode=1, stdout=b"", source_inputs=refusal),
+            "audit_advisory_expired": dict(returncode=1, stdout=_honoured_report(), valid_until=self.now - 1),
+            "audit_run": dict(returncode=1, stdout=b"", run=OSError("x")),
+            "audit_exit": dict(returncode=2, stdout=_honoured_report()),
+            "audit_lock_changed": dict(returncode=1, stdout=_honoured_report(), check_lock=[None, refusal]),
+            "audit_exit_mismatch": dict(returncode=0, stdout=_honoured_report()),
+        }
+        for token, arguments in cases.items():
+            with self.subTest(token=token), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                self._run_audit(**arguments)
+            self.assertEqual(refused.exception.detail, token)
+        covered = set(self._report_cases()) | set(cases) | {"audit_unclassified", "audit_unexpected"}
+        self.assertEqual(covered, set(linux_source_build.AUDIT_DETAILS))
+
+    def test_top_level_key_count_is_reported_and_bounded(self):
+        good = json.loads(_honoured_report())
+        two = self._detail(json.dumps(dict(good, one=1, two=2)).encode("ascii"))
+        self.assertEqual((two.detail, two.count), ("audit_top_keys", 2))
+        wide = {"key" + str(index): index for index in range(150)}
+        capped = self._detail(json.dumps(dict(good, **wide)).encode("ascii"))
+        self.assertEqual(capped.count, linux_source_build.MAX_DETAIL_COUNT)
+        self.assertIsNone(self._detail(b"not json").count)
+
+    def test_public_line_carries_only_a_token_for_the_audit_phase(self):
+        cases = {
+            "audit_exit": dict(returncode=2, stdout=_honoured_report()),
+            "audit_exit_mismatch": dict(returncode=0, stdout=_honoured_report()),
+            "audit_advisory_unmatched": dict(returncode=1, stdout=_honoured_report(), allows=[]),
+        }
+        for token, arguments in cases.items():
+            with self.subTest(token=token):
+                code, output = self._run_audit(entry=_dispatch_audit, **arguments)
+                self.assertEqual(code, 1)
+                self.assertEqual(output, "linux-source-build=refused phase=trusted-audit reason=lock detail=" + token + "\n")
+        good = json.loads(_honoured_report())
+        code, output = self._run_audit(
+            1, json.dumps(dict(good, one=1, two=2, three=3)).encode("ascii"), entry=_dispatch_audit,
+        )
+        self.assertEqual(
+            output, "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_top_keys count=3\n",
+        )
+        refusal = linux_source_build.SourceBuildRefusal("lock", "audit_json")
+        self.assertEqual(linux_source_build._refusal_line("checkout", refusal), "linux-source-build=refused phase=checkout reason=lock\n")
+        self.assertEqual(
+            linux_source_build._refusal_line("trusted-audit", linux_source_build.SourceBuildRefusal("lock")),
+            "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_unclassified\n",
+        )
+        invented = linux_source_build.SourceBuildRefusal("lock", "fixture-lib 1.5.0", count=-3)
+        self.assertIsNone(invented.detail)
+        self.assertIsNone(invented.count)
+        with patch.object(linux_source_build, "run_trusted_audit", side_effect=RuntimeError("fixture-lib")), \
+                patch("sys.stdout", io.StringIO()) as output:
+            self.assertEqual(linux_source_build._dispatch("trusted-audit"), 1)
+        self.assertEqual(
+            output.getvalue(), "linux-source-build=refused phase=trusted-audit reason=invalid detail=audit_unexpected\n",
+        )
+
+    def test_no_package_name_version_or_value_reaches_the_public_line(self):
+        secret = "zz-secret-lib"
+        entry = _vulnerability(secret, via=[_advisory_via(secret, source=7777777)], nodes=["node_modules/" + secret])
+        report = _audit_json({secret: entry})
+        lines = []
+        for arguments in (
+            dict(returncode=1, stdout=report, allows=[]),
+            dict(returncode=1, stdout=report),
+            dict(returncode=1, stdout=report.replace(secret.encode("ascii"), b"Bad Name")),
+            dict(returncode=2, stdout=report),
+            dict(returncode=1, stdout=json.dumps(dict(json.loads(report), **{secret: secret})).encode("ascii")),
+        ):
+            lines.append(self._run_audit(entry=_dispatch_audit, **arguments)[1])
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertRegex(line, LINE_PATTERN)
+                for fragment in (secret, "7.7.7", "7777777", "GHSA", "Bad Name"):
+                    self.assertNotIn(fragment, line)
+        for token, (report, allows, packages, now_ms) in self._report_cases().items():
+            error = self._detail(report, allows, packages, now_ms)
+            line = linux_source_build._refusal_line("trusted-audit", error)
+            self.assertRegex(line, LINE_PATTERN)
+            self.assertIn(token, line)
+            for fragment in ("fixture-lib", "tool-a", "runtime-lib", "9000001", "GHSA"):
+                self.assertNotIn(fragment, line)
+
+    def test_info_only_report_with_a_zero_exit_is_accepted(self):
+        info = _audit_json(
+            {"fixture-lib": _lib(severity="info", via=[_advisory_via(severity="info")])}, info=1, moderate=0,
+        )
+        self.assertEqual(
+            linux_source_build._check_audit_report(info, [_allow(self.now_ms)], LOCKED, self.now_ms), (1, 1, 0),
+        )
+        code, output = self._run_audit(0, info)
+        self.assertEqual((code, output), (0, "linux-node-audit=verified phase=trusted findings=1 allowed=1\n"))
+        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+            self._run_audit(1, info)
+        self.assertEqual(refused.exception.detail, "audit_exit_mismatch")
+
+    def test_expected_exit_follows_the_low_and_moderate_counts(self):
+        low = _audit_json({"fixture-lib": _lib(severity="low", via=[_advisory_via(severity="low")])}, low=1, moderate=0)
+        self.assertEqual(linux_source_build._check_audit_report(low, [_allow(self.now_ms)], LOCKED, self.now_ms)[2], 1)
+        self.assertEqual(linux_source_build._check_audit_report(_honoured_report(), [_allow(self.now_ms)], LOCKED, self.now_ms)[2], 1)
+        self.assertEqual(self._detail(_audit_json({"fixture-lib": _lib()}, moderate=0)).detail, "audit_count")
+        self.assertEqual(self._detail(_audit_json({}, moderate=1)).detail, "audit_count")
+
+    def test_advisory_validity_window_is_enforced(self):
+        self.assertEqual(self._run_audit(1, _honoured_report(), valid_until=self.now + 60)[0], 0)
+        for valid_until in (self.now, self.now - 1):
+            with self.subTest(valid_until=valid_until), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                self._run_audit(1, _honoured_report(), valid_until=valid_until)
+            self.assertEqual(refused.exception.detail, "audit_advisory_expired")
+
+    def test_consumer_chain_must_reach_a_matched_advisory(self):
+        chain = _audit_json({
+            "fixture-lib": _lib(),
+            "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
+            "tool-b": _vulnerability("tool-b", via=["tool-a"], nodes=["node_modules/tool-b"]),
+        })
+        packages = dict(LOCKED, **{"node_modules/tool-b": {"version": "1.0.0", "dev": True}})
+        self.assertEqual(
+            linux_source_build._check_audit_report(chain, [_allow(self.now_ms)], packages, self.now_ms), (3, 1, 1),
+        )
+        cycle = _audit_json({
+            "tool-a": _vulnerability("tool-a", via=["tool-b"], nodes=["node_modules/tool-a"]),
+            "tool-b": _vulnerability("tool-b", via=["tool-a"], nodes=["node_modules/tool-b"]),
+        })
+        self.assertEqual(self._detail(cycle, packages=packages).detail, "audit_consumer_unreached")
+        detached = _audit_json({
+            "fixture-lib": _lib(),
+            "tool-a": _vulnerability("tool-a", via=["tool-b"], nodes=["node_modules/tool-a"]),
+            "tool-b": _vulnerability("tool-b", via=["tool-a"], nodes=["node_modules/tool-b"]),
+        })
+        self.assertEqual(self._detail(detached, packages=packages).detail, "audit_consumer_unreached")
 
 
 if __name__ == "__main__":

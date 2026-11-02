@@ -215,14 +215,39 @@ OPTIONAL_SOURCE_STEPS = frozenset((
 ))
 
 
+AUDIT_DETAILS = frozenset((
+    "audit_toolchain", "audit_provenance", "audit_run", "audit_exit", "audit_json",
+    "audit_top_keys", "audit_version", "audit_meta", "audit_count", "audit_high",
+    "audit_limit", "audit_entry_shape", "audit_key_name", "audit_severity",
+    "audit_via_shape", "audit_via_unknown", "audit_advisory_unmatched",
+    "audit_allow_expired", "audit_advisory_severity", "audit_nodes_shape", "audit_nondev",
+    "audit_version_not_allowed", "audit_consumer_over_ceiling", "audit_consumer_unreached",
+    "audit_exit_mismatch", "audit_lock_changed", "audit_advisory_expired",
+    "audit_unclassified", "audit_unexpected",
+))
+AUDIT_DETAIL_PHASE = "trusted-audit"
+MAX_DETAIL_COUNT = 99
+
+
 class SourceBuildRefusal(Exception):
-    def __init__(self, reason="invalid"):
+    def __init__(self, reason="invalid", detail=None, count=None):
         self.reason = reason if reason in {
             "identity", "freshness", "untrusted", "source", "binding", "duplicate",
             "cache", "toolchain", "hash_mismatch", "token", "checkout", "signature",
             "revocation", "lock", "registry", "network", "gate", "boundary", "audit",
         } else "invalid"
+        self.detail = detail if detail in AUDIT_DETAILS else None
+        self.count = min(count, MAX_DETAIL_COUNT) if type(count) is int and count >= 0 else None
         super().__init__(self.reason)
+
+
+def _refusal_line(command, error):
+    line = "linux-source-build=refused phase=" + command + " reason=" + error.reason
+    if command == AUDIT_DETAIL_PHASE:
+        line += " detail=" + (error.detail or "audit_unclassified")
+        if error.count is not None:
+            line += " count=" + str(error.count)
+    return line + "\n"
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -2061,25 +2086,30 @@ def _locked_node_name(path):
     return path[index + len(marker):] if index >= 0 else None
 
 
+def _audit_refuse(detail, count=None):
+    return SourceBuildRefusal("lock", detail, count)
+
+
 def _audit_nodes_are_dev_only(nodes, packages, name, versions):
     if type(nodes) is not list or not 0 < len(nodes) <= MAX_AUDIT_NODES:
-        return False
+        raise _audit_refuse("audit_nodes_shape")
     for node in nodes:
         if type(node) is not str or len(node) > 1024:
-            return False
+            raise _audit_refuse("audit_nodes_shape")
         entry = packages.get(node)
-        if (type(entry) is not dict or _locked_node_name(node) != name or entry.get("dev") is not True
-                or (versions is not None and entry.get("version") not in versions)):
-            return False
-    return True
+        if type(entry) is not dict or _locked_node_name(node) != name:
+            raise _audit_refuse("audit_nodes_shape")
+        if entry.get("dev") is not True:
+            raise _audit_refuse("audit_nondev")
+        if versions is not None and entry.get("version") not in versions:
+            raise _audit_refuse("audit_version_not_allowed")
 
 
 def _audit_versions_are_dev_only(packages, name, versions):
     for path, entry in packages.items():
         if (type(entry) is dict and _locked_node_name(path) == name
                 and entry.get("version") in versions and entry.get("dev") is not True):
-            return False
-    return True
+            raise _audit_refuse("audit_nondev")
 
 
 def _audit_advisory_candidates(item, name, allows, now_ms):
@@ -2087,20 +2117,42 @@ def _audit_advisory_candidates(item, name, allows, now_ms):
     severity = item.get("severity")
     if (item.get("name") != name or type(severity) is not str or severity not in SEVERITY_RANK
             or type(source) not in (int, str)):
-        return None
+        raise _audit_refuse("audit_via_shape")
     identifiers = {str(source)}
     url = item.get("url")
     if type(url) is str and len(url) <= MAX_AUDIT_TEXT and url.startswith(ADVISORY_URL_PREFIX):
         tail = url[len(ADVISORY_URL_PREFIX):]
         if IDENTIFIER_RE.fullmatch(tail) is not None:
             identifiers.add(tail)
-    return [
+    named = [
         allow for allow in allows
         if allow["name"] == name and allow["advisory_id"] in identifiers
         and allow["severity"] in ALLOWABLE_SEVERITIES
-        and SEVERITY_RANK[severity] <= SEVERITY_RANK[allow["severity"]]
-        and allow["allow_expires_at_ms"] > now_ms
     ]
+    if not named:
+        raise _audit_refuse("audit_advisory_unmatched")
+    live = [allow for allow in named if allow["allow_expires_at_ms"] > now_ms]
+    if not live:
+        raise _audit_refuse("audit_allow_expired")
+    fitting = [allow for allow in live if SEVERITY_RANK[severity] <= SEVERITY_RANK[allow["severity"]]]
+    if not fitting:
+        raise _audit_refuse("audit_advisory_severity")
+    return fitting
+
+
+def _audit_reached_from_advisories(rooted, consumers):
+    dependents = {}
+    for name, targets in consumers.items():
+        for target in targets:
+            dependents.setdefault(target, []).append(name)
+    reached = set(rooted)
+    queue = list(rooted)
+    while queue:
+        for name in dependents.get(queue.pop(), ()):
+            if name not in reached:
+                reached.add(name)
+                queue.append(name)
+    return reached
 
 
 def _check_audit_report(stdout, allows, packages, now_ms):
@@ -2109,61 +2161,84 @@ def _check_audit_report(stdout, allows, packages, now_ms):
     Every vulnerability that names an advisory must match an allowed finding on the locked
     name, the advisory id, a severity no higher than the recorded one and an unexpired allow,
     and all its locked nodes must be development-only entries of an allowed version. A
-    vulnerability that only lists other vulnerable packages must point at listed ones and be
-    development-only too. Anything else refuses. Returns the counts of vulnerabilities and
-    matched advisories."""
+    vulnerability that only lists other vulnerable packages must point at listed ones, be
+    development-only, and reach an advisory-matched vulnerability through those listings.
+    Anything else refuses with a fixed detail token and never a name or value. Returns the
+    counts of vulnerabilities and matched advisories and the exit code npm gives such a
+    report: one when any low, moderate, high or critical count is above zero, else zero."""
     try:
         report = _strict_json_loads(stdout.decode("utf-8", "strict"))
     except (UnicodeError, ValueError, TypeError, RecursionError):
-        raise SourceBuildRefusal("lock") from None
-    if (type(report) is not dict or not set(report) <= {"auditReportVersion", "vulnerabilities", "metadata"}
-            or type(report.get("auditReportVersion")) is not int or report["auditReportVersion"] != 2
-            or type(report.get("vulnerabilities")) is not dict
-            or type(report.get("metadata")) is not dict
-            or type(report["metadata"].get("vulnerabilities")) is not dict):
-        raise SourceBuildRefusal("lock")
+        raise _audit_refuse("audit_json") from None
+    if type(report) is not dict:
+        raise _audit_refuse("audit_json")
+    unexpected = set(report) - {"auditReportVersion", "vulnerabilities", "metadata"}
+    if unexpected:
+        raise _audit_refuse("audit_top_keys", len(unexpected))
+    if type(report.get("auditReportVersion")) is not int or report["auditReportVersion"] != 2:
+        raise _audit_refuse("audit_version")
+    if type(report.get("vulnerabilities")) is not dict:
+        raise _audit_refuse("audit_entry_shape")
+    if type(report.get("metadata")) is not dict or type(report["metadata"].get("vulnerabilities")) is not dict:
+        raise _audit_refuse("audit_meta")
     vulnerabilities = report["vulnerabilities"]
     if len(vulnerabilities) > MAX_AUDIT_VULNERABILITIES:
-        raise SourceBuildRefusal("lock")
-    for severity in ("high", "critical"):
-        count = report["metadata"]["vulnerabilities"].get(severity, 0)
-        if type(count) is not int or count != 0:
-            raise SourceBuildRefusal("lock")
+        raise _audit_refuse("audit_limit")
+    counts = report["metadata"]["vulnerabilities"]
+    for severity in SEVERITY_RANK:
+        count = counts.get(severity, 0)
+        if type(count) is not int or count < 0:
+            raise _audit_refuse("audit_count")
+    if counts.get("high", 0) != 0 or counts.get("critical", 0) != 0:
+        raise _audit_refuse("audit_high")
+    if (len(vulnerabilities) == 0) != (sum(counts.get(severity, 0) for severity in SEVERITY_RANK) == 0):
+        raise _audit_refuse("audit_count")
+    expected_exit = 1 if counts.get("low", 0) + counts.get("moderate", 0) > 0 else 0
     ceiling = max((SEVERITY_RANK[allow["severity"]] for allow in allows), default=-1)
     matched = 0
+    rooted = set()
+    consumers = {}
     for key, entry in vulnerabilities.items():
         if type(entry) is not dict:
-            raise SourceBuildRefusal("lock")
+            raise _audit_refuse("audit_entry_shape")
         severity = entry.get("severity")
         via = entry.get("via")
         if (type(key) is not str or len(key) > 214 or MANIFEST_PACKAGE_RE.fullmatch(key) is None
-                or entry.get("name") != key or type(severity) is not str
-                or severity not in ALLOWABLE_SEVERITIES
-                or type(via) is not list or not 0 < len(via) <= MAX_AUDIT_VIA):
-            raise SourceBuildRefusal("lock")
+                or entry.get("name") != key):
+            raise _audit_refuse("audit_key_name")
+        if type(severity) is not str or severity not in ALLOWABLE_SEVERITIES:
+            raise _audit_refuse("audit_severity")
+        if type(via) is not list or not 0 < len(via) <= MAX_AUDIT_VIA:
+            raise _audit_refuse("audit_via_shape")
         advisory_versions = set()
+        listed = set()
         for item in via:
             if type(item) is str:
-                if len(item) > MAX_AUDIT_TEXT or item == key or item not in vulnerabilities:
-                    raise SourceBuildRefusal("lock")
+                if len(item) > MAX_AUDIT_TEXT or item == key:
+                    raise _audit_refuse("audit_via_shape")
+                if item not in vulnerabilities:
+                    raise _audit_refuse("audit_via_unknown")
+                listed.add(item)
                 continue
             if type(item) is not dict:
-                raise SourceBuildRefusal("lock")
+                raise _audit_refuse("audit_via_shape")
             candidates = _audit_advisory_candidates(item, key, allows, now_ms)
-            if not candidates or SEVERITY_RANK[severity] > min(
-                SEVERITY_RANK[allow["severity"]] for allow in candidates
-            ):
-                raise SourceBuildRefusal("lock")
+            if SEVERITY_RANK[severity] > min(SEVERITY_RANK[allow["severity"]] for allow in candidates):
+                raise _audit_refuse("audit_advisory_severity")
             advisory_versions |= {allow["version"] for allow in candidates}
             matched += 1
         if advisory_versions:
-            if (not _audit_nodes_are_dev_only(entry.get("nodes"), packages, key, advisory_versions)
-                    or not _audit_versions_are_dev_only(packages, key, advisory_versions)):
-                raise SourceBuildRefusal("lock")
-        elif (SEVERITY_RANK[severity] > ceiling
-                or not _audit_nodes_are_dev_only(entry.get("nodes"), packages, key, None)):
-            raise SourceBuildRefusal("lock")
-    return len(vulnerabilities), matched
+            _audit_nodes_are_dev_only(entry.get("nodes"), packages, key, advisory_versions)
+            _audit_versions_are_dev_only(packages, key, advisory_versions)
+            rooted.add(key)
+        else:
+            if SEVERITY_RANK[severity] > ceiling:
+                raise _audit_refuse("audit_consumer_over_ceiling")
+            _audit_nodes_are_dev_only(entry.get("nodes"), packages, key, None)
+            consumers[key] = listed
+    if any(name not in _audit_reached_from_advisories(rooted, consumers) for name in consumers):
+        raise _audit_refuse("audit_consumer_unreached")
+    return len(vulnerabilities), matched, expected_exit
 
 
 def run_trusted_audit(environ=None):
@@ -2172,33 +2247,46 @@ def run_trusted_audit(environ=None):
     node = Path(env.get("NODE_BIN", "")) / "node"
     npm = Path(env.get("NODE_BIN", "")) / "npm"
     if not source.is_dir() or not node.is_file() or not npm.exists():
-        raise SourceBuildRefusal("toolchain")
-    _neutralize_config_files(source)
-    identity = _source_inputs(env)
-    lock_bytes = (source / "package-lock.json").read_bytes()
-    _check_lock_provenance(lock_bytes, identity, env, source)
-    allows = _validate_provenance_binding(identity, env)["advisory"]["findings"]
+        raise SourceBuildRefusal("toolchain", "audit_toolchain")
+    try:
+        _neutralize_config_files(source)
+        identity = _source_inputs(env)
+        lock_bytes = (source / "package-lock.json").read_bytes()
+        _check_lock_provenance(lock_bytes, identity, env, source)
+        record = _validate_provenance_binding(identity, env)
+        allows = record["advisory"]["findings"]
+        valid_until = record["advisory"]["valid_until"]
+    except (SourceBuildRefusal, OSError, ValueError, KeyError, TypeError):
+        raise _audit_refuse("audit_provenance") from None
+    if time.time() * 1000 >= valid_until * 1000:
+        raise _audit_refuse("audit_advisory_expired")
     private = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-audit"
     private.mkdir(mode=0o700, parents=True, exist_ok=True)
-    result = _run(
-        (str(node), str(npm), "audit", "--package-lock-only", "--json"), source,
-        {"PATH": str(node.parent) + ":/usr/bin:/bin", "HOME": str(private), "TMPDIR": str(private),
-         "LANG": "C", "LC_ALL": "C", "NPM_CONFIG_USERCONFIG": "/dev/null",
-         "NPM_CONFIG_GLOBALCONFIG": "/dev/null", "NPM_CONFIG_CACHE": str(private / "cache")},
-        timeout=120, maximum=4 * 1024 * 1024,
-    )
+    try:
+        result = _run(
+            (str(node), str(npm), "audit", "--package-lock-only", "--json"), source,
+            {"PATH": str(node.parent) + ":/usr/bin:/bin", "HOME": str(private), "TMPDIR": str(private),
+             "LANG": "C", "LC_ALL": "C", "NPM_CONFIG_USERCONFIG": "/dev/null",
+             "NPM_CONFIG_GLOBALCONFIG": "/dev/null", "NPM_CONFIG_CACHE": str(private / "cache")},
+            timeout=120, maximum=4 * 1024 * 1024,
+        )
+    except Exception:
+        raise _audit_refuse("audit_run") from None
     (private / "audit.stdout").write_bytes(result.stdout)
     (private / "audit.stderr").write_bytes(result.stderr)
     if result.returncode not in (0, 1):
-        raise SourceBuildRefusal("lock")
-    lock_after = (source / "package-lock.json").read_bytes()
-    _check_lock_provenance(lock_after, identity, env, source)
-    locked, unused = _locked_packages(lock_after)
-    found, matched = _check_audit_report(
+        raise _audit_refuse("audit_exit")
+    try:
+        lock_after = (source / "package-lock.json").read_bytes()
+        _check_lock_provenance(lock_after, identity, env, source)
+        locked, unused = _locked_packages(lock_after)
+    except (SourceBuildRefusal, OSError, ValueError, KeyError, TypeError):
+        raise _audit_refuse("audit_lock_changed") from None
+    found, matched, expected_exit = _check_audit_report(
         result.stdout, allows, locked["packages"], int(time.time() * 1000),
     )
-    if (result.returncode == 0) != (found == 0):
-        raise SourceBuildRefusal("lock")
+    if result.returncode != expected_exit:
+        raise _audit_refuse("audit_exit_mismatch")
     (private / "audit.json").write_bytes(result.stdout)
     sys.stdout.write(
         "linux-node-audit=verified phase=trusted findings=" + str(found)
@@ -2510,7 +2598,7 @@ def _dispatch(command):
     try:
         return action()
     except SourceBuildRefusal as error:
-        sys.stdout.write("linux-source-build=refused phase=" + command + " reason=" + error.reason + "\n")
+        sys.stdout.write(_refusal_line(command, error))
         return 1
     except rust_license_gate.LicenseGateRefusal as error:
         refusal = "linux-source-build=refused phase=" + command
@@ -2518,7 +2606,7 @@ def _dispatch(command):
         sys.stdout.write(refusal)
         return 1
     except BaseException:
-        sys.stdout.write("linux-source-build=refused phase=" + command + " reason=invalid\n")
+        sys.stdout.write(_refusal_line(command, SourceBuildRefusal("invalid", "audit_unexpected")))
         return 1
 
 
