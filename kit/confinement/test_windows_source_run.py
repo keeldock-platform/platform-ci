@@ -137,7 +137,9 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertNotRegex(function, r"Write-Line|\.Stdout|\.Stderr")
         self.assertIn("$causeText = ' cause=' + $script:GateCause", self.runner)
         self.assertIn("if (-not $passed) {", self.runner)
-        self.assertIn("@('timeout', 'limit', 'signal', 'exit', 'launch') -ccontains $script:GateCause", self.runner)
+        self.assertIn("@('timeout', 'limit', 'signal', 'exit', 'launch', 'deadline') -ccontains $script:GateCause", self.runner)
+        self.assertIn("result=not_run hang=none cause=deadline", self.runner)
+        self.assertIn("$script:GateCause = 'deadline'", self.runner)
         self.assertIn("$gateText += ' cause=' + $script:GateCause", self.runner)
         self.assertNotRegex(self.runner, r"' cause=' \+ \[string\]\$run\.ExitCode")
 

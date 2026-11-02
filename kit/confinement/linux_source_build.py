@@ -2447,7 +2447,8 @@ def _gate_commands(project, rust_root, node_bin):
 
 PROJECT_GATE_LIMITS = "project"
 PROJECT_GATE_TIMEOUT_SECONDS = 1800
-GATE_CAUSES = ("timeout", "limit", "signal", "exit", "launch")
+GATE_CAUSES = ("timeout", "limit", "signal", "exit", "launch", "deadline")
+PROJECT_GATE_BUDGET_SECONDS = 330 * 60
 LIMIT_SIGNALS = (signal.SIGXCPU, signal.SIGXFSZ, signal.SIGKILL)
 
 
@@ -2490,7 +2491,11 @@ def run_project_gates(environ=None):
     outcomes = {name: "not-run" for name in selected_gates}
     durations = {}
     failure = (None, None)
+    budget_started = time.monotonic()
     for index, (name, argv) in enumerate(commands):
+        if PROJECT_GATE_BUDGET_SECONDS - (time.monotonic() - budget_started) < PROJECT_GATE_TIMEOUT_SECONDS:
+            failure = (name, "deadline")
+            break
         project_env = {
             "PATH": str(Path(node_bin)) + ":" + str(Path(rust_root) / "bin") + ":/usr/bin:/bin",
             "LANG": "C", "LC_ALL": "C", "HOME": str(worker / ".home"),

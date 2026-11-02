@@ -699,7 +699,8 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
             $outcome.Failure = $index
             $outcome.Failed += 1
             $script:RefusalReason = 'deadline'
-            Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=not_run hang=none')
+            $script:GateCause = 'deadline'
+            Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=not_run hang=none cause=deadline')
             return $outcome
         }
         if ($seconds -gt $remaining) { $seconds = $remaining }
@@ -1131,7 +1132,7 @@ try {
     $gateText = ''
     if ($phase -ceq 'gates' -and $script:GateFailure -gt 0) {
         $gateText = ' gate=' + $script:GateFailure
-        if (@('timeout', 'limit', 'signal', 'exit', 'launch') -ccontains $script:GateCause) { $gateText += ' cause=' + $script:GateCause }
+        if (@('timeout', 'limit', 'signal', 'exit', 'launch', 'deadline') -ccontains $script:GateCause) { $gateText += ' cause=' + $script:GateCause }
     }
     $refusal = 'windows-source-run=refused phase=' + $safePhase + ' reason=' + $reason + $detailText + $gateText
 }

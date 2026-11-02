@@ -1188,13 +1188,60 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 for forbidden in ("kd-secret", "srv", "137", "101", "secret"):
                     self.assertNotIn(forbidden, text)
 
+    def _run_gates_with_clock(self, advance_after_first):
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worker = root / "source"
+            worker.mkdir()
+            (worker / "Cargo.lock").write_text(_path_only_lock(4), encoding="ascii")
+            commands = tuple((name, ("/usr/bin/true",)) for name in linux_source_build.GATES)
+            calls = []
+
+            def host(*arguments, **keywords):
+                calls.append(keywords)
+                if len(calls) == 1:
+                    clock[0] += advance_after_first
+                return types.SimpleNamespace(exit_code=0, timed_out=False, stdout=b"", stderr=b"")
+
+            with patch.object(linux_source_build, "_project_gate_directories"), patch.object(
+                linux_source_build, "_gate_commands", return_value=commands,
+            ), patch.object(linux_source_build, "_runtime_workspace_present", return_value=False), patch.object(
+                linux_source_build.linux_session, "run_host", side_effect=host,
+            ), patch.object(linux_source_build.time, "monotonic", side_effect=lambda: clock[0]):
+                sink = io.StringIO()
+                with contextlib.redirect_stdout(sink):
+                    code = linux_source_build.run_project_gates({
+                        "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
+                        "CARGO_HOME": str(worker / ".kd-cargo-home"),
+                        "RUST_ROOT": "/rust", "NODE_BIN": "/node", "REQUESTED_SOURCE_SHA": "a" * 40,
+                    })
+                return code, sink.getvalue(), len(calls)
+
+    def test_no_gate_starts_when_less_than_one_gate_timeout_remains_of_the_budget(self):
+        budget = linux_source_build.PROJECT_GATE_BUDGET_SECONDS
+        timeout = linux_source_build.PROJECT_GATE_TIMEOUT_SECONDS
+        self.assertEqual(budget, 330 * 60)
+        self.assertLess(budget, 350 * 60)
+        code, text, calls = self._run_gates_with_clock(budget - timeout + 1)
+        self.assertEqual((code, calls), (1, 1))
+        self.assertEqual(
+            text.splitlines()[-1], "linux-project-gates=refused completed=1 failed=0 gate=clippy cause=deadline")
+
+    def test_a_gate_still_starts_when_exactly_one_gate_timeout_remains(self):
+        budget = linux_source_build.PROJECT_GATE_BUDGET_SECONDS
+        timeout = linux_source_build.PROJECT_GATE_TIMEOUT_SECONDS
+        code, text, calls = self._run_gates_with_clock(budget - timeout)
+        self.assertEqual((code, calls), (0, 15))
+        self.assertIn("linux-project-gates=passed", text)
+
     def test_the_refusal_line_adds_only_public_gate_names_and_closed_causes(self):
         line = linux_source_build._gate_refusal_line
         self.assertEqual(line(3, 1, "format", "exit"), "linux-project-gates=refused completed=3 failed=1 gate=format cause=exit\n")
         self.assertEqual(line(3, 1, "runtime_tests", "limit"), "linux-project-gates=refused completed=3 failed=1 gate=runtime_tests cause=limit\n")
         for gate, cause in (("evil gate", "exit"), ("format", "137"), (None, None), ("format", None)):
             self.assertEqual(line(2, 1, gate, cause), "linux-project-gates=refused completed=2 failed=1\n")
-        self.assertEqual(linux_source_build.GATE_CAUSES, ("timeout", "limit", "signal", "exit", "launch"))
+        self.assertEqual(linux_source_build.GATE_CAUSES, ("timeout", "limit", "signal", "exit", "launch", "deadline"))
 
     def test_license_gate_refusal_precedes_preparation_and_command_construction(self):
         with tempfile.TemporaryDirectory() as temporary:
