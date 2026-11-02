@@ -101,7 +101,20 @@ class NpmAdmissionProfileTests(unittest.TestCase):
         self.assertEqual(subject.parse_request(record, now=NOW), request)
         self.assertEqual(subject.request_filing(request), subject.NPM_DEFAULT_FILING)
         self.assertNotEqual(request["request_id"], default["request_id"])
-        for value in ("runtime", "contract", "", "other-filing", "Contract-Ui-Batch-A"):
+        fixture = _fields()
+        fixture["workspace"] = "quick-fixture"
+        fixture_request = subject.create_request(fixture, now=NOW)
+        self.assertEqual(subject.request_filing(fixture_request), "quick-fixture")
+        self.assertEqual(
+            subject.parse_request(subject.encode_request(fixture_request, now=NOW), now=NOW), fixture_request,
+        )
+        self.assertNotEqual(fixture_request["request_id"], request["request_id"])
+        for kind in ("lock", "rust_patch", "build_diagnostics", "cargo_lock"):
+            changed = _fields(kind=kind)
+            changed["workspace"] = "quick-fixture"
+            with self.subTest(fixture_kind=kind):
+                self.assert_refused(subject.create_request, changed, now=NOW)
+        for value in ("runtime", "contract", "", "other-filing", "Contract-Ui-Batch-A", "Quick-Fixture"):
             changed = _fields()
             changed["workspace"] = value
             with self.subTest(value=value):
