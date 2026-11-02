@@ -344,7 +344,7 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/core-rust-lock-return.yml': 'c76fc926d01d64b13c577cce9eb6b8268b9ef61542df6e50525e11120e68a0a0',
     '.github/workflows/core-npm-admission-return.yml': '0e74c76f85c94ec1089b2697d35ddad1a062c1afa38b61e3ba0240346dfd2e21',
     'kit/bootstrap/policy_npm.py': '8f0d007f41c93ffc527b5609e0875089239182789f323496caa0de893426a744',
-    'kit/bootstrap/test_policy_npm.py': '455fc87fbc15cbecbbd240dfe7b02bcb8ae142c5edd581426d37df9ecab31b75',
+    'kit/bootstrap/test_policy_npm.py': 'cc7de25dd4a8e56d86fbda9f51859109060b7142716c1b711c3a6979fcab67cc',
     'kit/confinement/npm_admission_bootstrap.py': '8585975a6e0ef6027efcdebe6116880ccc6ebacea9fb48ea6e40f3d4fff1d2e9',
     'kit/confinement/test_confinement_npm_admission_bootstrap.py': '7298e2ee6d1a47fe2cedd114d622b60a07802f9535f0eb105445b56e49b1dc8f',
     'kit/confinement/npm_semver.py': '0f6207724ea97a793d9c64175a5e9245f138e0fb4b057ab776c67d1722b1c26f',
