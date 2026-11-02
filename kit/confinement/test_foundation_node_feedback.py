@@ -938,7 +938,8 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         marker_re = re.compile(rb"\n\[\.\.\. ([0-9]+) bytes omitted \.\.\.\]\n")
         for filler, tail in (
             (room - 1, character), (room - 2, character), (room - 3, character + b"zz"),
-            (room - 3, character), (room, b""), (room + 5, b""), (40_000, b"end of run\n"),
+            (room - 3, character), (room, b""), (room + 5, b""),
+            (32_768 - len(b"end of run\n"), b"end of run\n"),
         ):
             raw = b"a" * filler + tail
             with self.subTest(filler=room - filler, tail=len(tail)):
@@ -964,6 +965,14 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                 self.assertGreater(len(kept_tail), 16_000)
                 if tail:
                     self.assertTrue(body.endswith(tail[-3:]))
+
+    def test_node_stderr_over_the_capture_limit_is_refused(self):
+        with self.assertRaises(subject.NodeOutcomeInvalid) as caught:
+            self._extend_with(NodeContractRefusal(
+                "command_failed", stage="typescript_tests", substage="tests", stderr=b"a" * 32_769,
+                completed_stages=subject.NODE_GATE_NAMES[:3],
+            ))
+        self.assertEqual(str(caught.exception), "node capture invalid")
 
     def test_head_tail_cut_helper_is_a_no_op_when_the_data_fits(self):
         self.assertEqual(subject._cut_head_tail(b"abc", 3), b"abc")
