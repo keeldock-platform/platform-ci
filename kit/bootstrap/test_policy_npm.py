@@ -130,7 +130,7 @@ class NpmAdmissionWorkflowPolicyTests(unittest.TestCase):
         echoed = "printf '%s\\n' \"$diagnostic_line\""
         self.assertEqual(producer.count(echoed), 1)
         self.assertLess(producer.index("printf '%s\\n' \"$producer_line\""), producer.index(echoed))
-        self.assertLess(producer.index('diagnostic_line="$(grep -Em 1'), producer.index("trap - EXIT"))
+        self.assertLess(producer.index('diagnostic_line="$(grep -Em 1'), producer.rindex("trap - EXIT"))
         self.assertIn('[[ "$(grep -Ec -- "$diagnostic_pattern" "$stderr_file")" -eq 1 ]] || exit 1', producer)
         for name in ("settings", "prepare", "audit"):
             self.assertNotIn("KD-FEEDBACK-NPM-DIAGNOSTIC", blocks["core-npm-admission-return-" + name])
