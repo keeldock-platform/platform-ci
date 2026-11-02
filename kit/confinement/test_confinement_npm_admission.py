@@ -1415,6 +1415,70 @@ class NpmArchiveDetailTests(unittest.TestCase):
             self.refusal(renamed), "archive_root:" + self.SUBJECT + ":package index:2",
         )
 
+    def test_node_modules_is_allowed_only_below_a_first_level_test_directory(self):
+        for path in (
+            "package/test/resolver/symlinked/_/node_modules/foo.js",
+            "package/test/shadowed_core/node_modules/util/index.js",
+            "package/tests/node_modules/x.js",
+            "package/__tests__/a/node_modules/x.js",
+            "package/fixtures/node_modules/x.js",
+            "package/__fixtures__/node_modules/x.js",
+            "package/example/node_modules/x.js",
+            "package/examples/a/b/node_modules/x/y.js",
+        ):
+            with self.subTest(path=path):
+                report = self.accepted(_rooted_tarball("package", extra=((path, b"x"),)))
+                self.assertEqual(report["install_scripts"], ())
+        data = _rooted_tarball("package", extra=(
+            ("package/test/resolver/symlinked/_/node_modules/foo.js", b"x"),
+            ("package/test/shadowed_core/node_modules/util/index.js", b"x"),
+        ))
+        self.assertEqual(self.accepted(data)["file_count"], 3)
+
+    def test_node_modules_elsewhere_or_with_other_spellings_still_refuses(self):
+        for path, index in (
+            ("package/node_modules/x.js", 2),
+            ("package/lib/node_modules/x.js", 2),
+            ("package/test/../node_modules/x.js", 2),
+            ("package/Test/node_modules/x.js", 2),
+            ("package/TEST/node_modules/x.js", 2),
+            ("package/test/Node_Modules/x.js", 2),
+            ("package/test/a/NODE_MODULES/x.js", 2),
+            ("package/testing/node_modules/x.js", 2),
+            ("package/lib/test/node_modules/x.js", 2),
+        ):
+            with self.subTest(path=path):
+                detail = self.refusal(_rooted_tarball("package", extra=((path, b"x"),)))
+                self.assertTrue(detail.startswith("archive_path:" + self.SUBJECT + ":"), detail)
+                self.assertIn(":node_modules:" if ".." not in path else ":dot_segment:", detail)
+        data = _rooted_tarball("package", extra=(("package/node_modules/x.js", b"x"),))
+        self.assertEqual(
+            self.refusal(data),
+            "archive_path:" + self.SUBJECT + ":node_modules:package/node_modules/x.js index:2",
+        )
+        data = _rooted_tarball("package", extra=(("package/lib/node_modules/x.js", b"x"),))
+        self.assertEqual(
+            self.refusal(data),
+            "archive_path:" + self.SUBJECT + ":node_modules:package/lib/node_modules/x.js index:2",
+        )
+        data = _rooted_tarball("node_modules", extra=(("node_modules/test/x.js", b"x"),))
+        self.assertTrue(self.refusal(data).startswith("archive_root:"))
+        self.assertFalse(subject._test_tree_node_modules_allowed(["package", "node_modules"]))
+        self.assertFalse(subject._test_tree_node_modules_allowed(["package", "node_modules", "x"]))
+
+    def test_a_nested_manifest_under_a_test_node_modules_is_a_plain_file(self):
+        nested = b'{"name":"evil","version":"9.9.9","scripts":{"install":"synthetic"}}'
+        data = _rooted_tarball(
+            "package", extra=(("package/test/node_modules/evil/package.json", nested),),
+        )
+        report = self.accepted(data)
+        self.assertEqual((report["name"], report["version"]), ("sample", "1.0.0"))
+        self.assertEqual(report["install_scripts"], ())
+        data = _rooted_tarball(
+            "package", extra=(("package/test/node_modules/evil/binding.gyp", b"{}"),),
+        )
+        self.assertEqual(self.accepted(data)["implicit_install_scripts"], ())
+
     def test_mixed_archive_roots_refuse_with_the_same_token(self):
         data = _rooted_tarball("aria-query", extra=(("other/x.js", b"x"),))
         self.assertEqual(self.refusal(data), "archive_root:" + self.SUBJECT + ":other index:2")

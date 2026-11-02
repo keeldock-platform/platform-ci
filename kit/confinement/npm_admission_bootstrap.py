@@ -162,6 +162,7 @@ CONDITIONAL_LICENCES = frozenset((
 BUILTIN_LICENCES = frozenset((
     "MIT", "Apache-2.0", "MPL-2.0", "OFL-1.1", "ISC", "BSD-2-Clause", "BSD-3-Clause", "MIT-0",
     "BlueOak-1.0.0", "CC0-1.0", "Unicode-3.0",
+    "0BSD",
 ))
 SCOPED_LICENCES = {"CC-BY-4.0": ("caniuse-lite",)}
 IDENTIFIER_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}\Z")

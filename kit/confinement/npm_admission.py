@@ -510,6 +510,19 @@ def _inert_bundled_names(entry):
     return frozenset(names)
 
 
+TEST_TREE_ROOTS = frozenset((
+    "test", "tests", "__tests__", "fixtures", "__fixtures__", "example", "examples",
+))
+
+
+def _test_tree_node_modules_allowed(parts):
+    """D166: a node_modules segment is allowed only below a first-level test or example
+    directory of the archive, spelled exactly. Every other spelling or place still refuses."""
+    if len(parts) < 3 or parts[1] not in TEST_TREE_ROOTS:
+        return False
+    return all(part == "node_modules" for part in parts[2:] if part.lower() == "node_modules")
+
+
 def _bundled_member_allowed(parts, is_directory, bundled):
     if bundled is None:
         return False
@@ -1101,6 +1114,7 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
                 folded.add(folded_relative)
                 parts = relative.split("/")
                 if (any(part.lower() == "node_modules" for part in parts[1:])
+                        and not _test_tree_node_modules_allowed(parts)
                         and not _bundled_member_allowed(parts, is_directory, bundled)):
                     _archive_refuse("archive_path", subject, "node_modules", label, index=index)
                 for position in range(1, len(parts) + 1):

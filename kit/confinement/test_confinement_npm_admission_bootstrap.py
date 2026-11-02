@@ -981,12 +981,12 @@ class LicenceTests(RefusalAssertions):
     def test_every_decided_licence_is_allowed_and_conditional_ones_are_flagged(self):
         for licence in (
             "MIT", "Apache-2.0", "MPL-2.0", "OFL-1.1", "ISC", "BSD-2-Clause", "BSD-3-Clause", "MIT-0",
-            "BlueOak-1.0.0", "CC0-1.0", "Unicode-3.0",
+            "BlueOak-1.0.0", "CC0-1.0", "Unicode-3.0", "0BSD",
         ):
             with self.subTest(licence=licence):
                 expected = [licence] if licence in ("MPL-2.0", "OFL-1.1") else []
                 self.assertEqual(subject.resolve_licence("pkg", licence, self.plan()), (licence, expected))
-        self.assertEqual(len(subject.BUILTIN_LICENCES), 11)
+        self.assertEqual(len(subject.BUILTIN_LICENCES), 12)
 
     def test_licences_outside_the_allowlist_are_refused_with_no_wildcards_or_other_forms(self):
         for value in (
@@ -997,6 +997,13 @@ class LicenceTests(RefusalAssertions):
         ):
             with self.subTest(value=value):
                 self.assert_refused("npm_licence_refused", subject.resolve_licence, "pkg", value, self.plan())
+
+    def test_0bsd_is_a_builtin_licence_and_passes_only_when_the_policy_allows_it(self):
+        self.assertIn("0BSD", subject.BUILTIN_LICENCES)
+        self.assertEqual(subject.resolve_licence("tslib", "0BSD", self.plan()), ("0BSD", []))
+        self.assert_refused(
+            "npm_licence_refused", subject.resolve_licence, "tslib", "0BSD", self.plan(allowlist=["MIT"]),
+        )
 
     def test_cc_by_is_allowed_only_for_caniuse_lite(self):
         plan = self.plan()
