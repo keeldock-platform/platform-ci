@@ -1009,6 +1009,7 @@ NPM_STDERR_LINE_RE = re.compile(r"npm (?:error|warn) ")
 NPM_CHECK_LINE_PREFIX = "  kd-check "
 NPM_CHECK_MAX_BYTES = 512
 NPM_CHECK_STEPS = ("npm_lock", "npm_bundle")
+NPM_CHECK_MAX_LINES = 20
 NPM_CHECK_GRAMMAR = (
     r"[a-z_]{1,32}(?::[A-Za-z0-9._~@/_-]{1,214}){0,6}"
     r"(?: [a-z]{1,16}:[A-Za-z0-9._~@/:,+-]{1,512})*\Z"
@@ -1119,23 +1120,33 @@ def build_npm_diagnostic_payload(step, key, stderr, report, check=None):
     eresolve report text. The header carries only the closed step tag and the closed reason.
     For the npm_lock and npm_bundle steps an optional check identifier is the first stderr body line, in the
     form two spaces, kd-check, one space, the identifier. It must be printable ASCII of the
-    closed token, npm name and semver shapes and at most 512 bytes, else the payload is refused."""
+    closed token, npm name and semver shapes and at most 512 bytes, else the payload is refused.
+    For the npm_bundle step the check may instead be a list of one to twenty such identifiers,
+    rendered as that many first lines in the same order."""
     if (type(step) is not str or step not in NPM_DIAGNOSTIC_STEPS or type(key) is not str
             or NPM_DIAGNOSTIC_KEY_RE.match(key) is None):
         _refuse("payload_invalid")
-    if check is not None and (
-        step not in NPM_CHECK_STEPS or type(check) is not str or not check.isascii()
-        or len(check) > NPM_CHECK_MAX_BYTES or NPM_CHECK_RE.match(check) is None
-    ):
+    if check is None:
+        checks = []
+    elif type(check) is list and step == "npm_bundle":
+        checks = check
+        if not 1 <= len(checks) <= NPM_CHECK_MAX_LINES:
+            _refuse("payload_invalid")
+    else:
+        checks = [check]
+    if checks and step not in NPM_CHECK_STEPS:
         _refuse("payload_invalid")
+    for item in checks:
+        if (type(item) is not str or not item.isascii() or len(item) > NPM_CHECK_MAX_BYTES
+                or NPM_CHECK_RE.match(item) is None):
+            _refuse("payload_invalid")
     header = NPM_DIAGNOSTIC_PREFIX + step + " reason=" + key + "\n"
     stderr_lines, stderr_omitted, stderr_cut = _npm_section(
-        stderr, True, NPM_DIAGNOSTIC_STDERR_LINES - (1 if check is not None else 0),
-        NPM_DIAGNOSTIC_STDERR_BYTES - (NPM_CHECK_MAX_BYTES + 16 if check is not None else 0),
+        stderr, True, NPM_DIAGNOSTIC_STDERR_LINES - len(checks),
+        NPM_DIAGNOSTIC_STDERR_BYTES - (NPM_CHECK_MAX_BYTES + 16) * len(checks),
     )
     stderr_rendered = _npm_render_section(stderr_lines, stderr_omitted, stderr_cut)
-    if check is not None:
-        stderr_rendered.insert(0, NPM_CHECK_LINE_PREFIX + check)
+    stderr_rendered[0:0] = [NPM_CHECK_LINE_PREFIX + item for item in checks]
     used_bytes = len(header) + len("stderr:\nreport:\n") + sum(
         len(line.encode("utf-8")) + 1 for line in stderr_rendered
     )
@@ -1273,10 +1284,26 @@ def _npm_mapped_reason(reason):
     return "payload_invalid"
 
 
-def _npm_check_allowed(step, reason):
+def _npm_check_allowed(step, reason, check=None):
     if step == "npm_bundle":
         return True
+    if type(check) is list:
+        return False
     return (step, reason) == ("npm_lock", "npm_lock_refused")
+
+
+def _npm_check_of(error, step, reason):
+    """The check carried by a bootstrap refusal for this step: a list of up to twenty identifiers
+    for npm_bundle, else the single identifier, else None."""
+    if not _npm_check_allowed(step, reason):
+        return None
+    details = getattr(error, "details", None)
+    if step == "npm_bundle" and type(details) in (tuple, list) and details:
+        items = list(details)[:NPM_CHECK_MAX_LINES]
+        if all(type(item) is str and item for item in items):
+            return items
+    check = getattr(error, "detail", None)
+    return check if type(check) is str and check else None
 
 
 def _npm_bootstrap_refusal(error, step=None, capture=None):
@@ -1285,8 +1312,8 @@ def _npm_bootstrap_refusal(error, step=None, capture=None):
     if step is not None and type(reason) is str:
         _npm_tag(refusal, step, reason)
         if capture is not None:
-            check = getattr(error, "detail", None) if _npm_check_allowed(step, reason) else None
-            if type(check) is str and check:
+            check = _npm_check_of(error, step, reason)
+            if check is not None:
                 _npm_attach(refusal, capture(step, reason, check))
             else:
                 _npm_attach(refusal, capture(step, reason))

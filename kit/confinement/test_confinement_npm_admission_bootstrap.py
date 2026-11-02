@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import io
 import json
+import socket
 import sys
 import tarfile
 import unittest
@@ -39,23 +40,23 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
-def _tarball(name, version, licence="MIT", scripts=None, binary=False):
+def _tarball(name, version, licence="MIT", scripts=None, binary=False, root="package"):
     fields = {"name": name, "version": version, "scripts": scripts or {}}
     if licence is not None:
         fields["license"] = licence
     manifest = _json(fields)
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
-        directory = tarfile.TarInfo("package/")
+        directory = tarfile.TarInfo(root + "/")
         directory.type = tarfile.DIRTYPE
         directory.mode = 0o755
         directory.mtime = 0
         archive.addfile(directory)
-        members = [("package/package.json", manifest)]
+        members = [(root + "/package.json", manifest)]
         if scripts:
-            members.append(("package/install.js", b"synthetic script"))
+            members.append((root + "/install.js", b"synthetic script"))
         if binary:
-            members.append(("package/binding.node", b"\x7fELFsynthetic"))
+            members.append((root + "/binding.node", b"\x7fELFsynthetic"))
         for path, content in members:
             info = tarfile.TarInfo(path)
             info.mode = 0o644
@@ -95,7 +96,7 @@ class World:
                  table_attested=None, extra_rows=(), dist_integrity=None, table_licence=None,
                  policy_epoch_ms=None, elections=None, allowlist=None, allows=None,
                  singletons=("alpha-pkg", "lightningcss"), layout="wide", policy_extra=None,
-                 edges=None, non_dev=()):
+                 edges=None, non_dev=(), roots=None):
         self.policy_epoch_ms = EPOCH_MS if policy_epoch_ms is None else policy_epoch_ms
         self.elections = elections or {}
         self.allowlist = ["MIT", "ISC"] if allowlist is None else allowlist
@@ -119,7 +120,7 @@ class World:
         self.archives = {}
         self.integrity = {}
         for name, version in ALL_PACKAGES:
-            data = _tarball(name, version, licence=self.archive_license.get(
+            data = _tarball(name, version, root=(roots or {}).get(name, "package"), licence=self.archive_license.get(
                 name, self.registry_license.get(name, "MIT")))
             self.archives[(name, version)] = data
             self.integrity[name] = _sri(data)
@@ -2044,6 +2045,139 @@ class BundleDetailTests(RefusalAssertions):
             "shared_parser:npm_archive_invalid:integrity_mismatch:gamma-pkg@3.1.0:archive",
         )
 
+    def tampered_world(self, names):
+        world = World()
+        for name, version in ALL_PACKAGES:
+            if name in names:
+                world.archives[(name, version)] = _tarball(name, version, licence="ISC")
+        return world
+
+    def shared_detail(self, name, version):
+        return "shared_parser:npm_archive_invalid:integrity_mismatch:" + name + "@" + version + ":archive"
+
+    def test_every_per_package_refusal_is_collected_and_the_first_one_is_raised(self):
+        world = self.tampered_world(("alpha-pkg", "gamma-pkg", "lightningcss"))
+        fetcher = world.fetcher()
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            world.bundle(fetcher=fetcher)
+        error = raised.exception
+        self.assertEqual((error.reason, str(error), error.args), ("npm_archive_refused",) * 2 + (("npm_archive_refused",),))
+        self.assertEqual(repr(error), "BootstrapRefusal('npm_archive_refused')")
+        self.assertEqual(error.detail, self.shared_detail("alpha-pkg", "1.0.0"))
+        self.assertEqual(error.details, (
+            self.shared_detail("alpha-pkg", "1.0.0"), self.shared_detail("gamma-pkg", "3.1.0"),
+            self.shared_detail("lightningcss", "1.33.0"),
+        ))
+        self.assertEqual(error.details[0], error.detail)
+        self.assertEqual(
+            [call for call in fetcher.calls if call[0] == "tarball"],
+            [("tarball", name, version) for name, version in sorted(ALL_PACKAGES)],
+        )
+        self.assertFalse([call for call in fetcher.calls if call[0] == "advisories"])
+
+    def test_a_package_named_root_folder_is_bundled_like_the_package_folder(self):
+        roots = {"alpha-pkg": "alpha-pkg", "gamma-pkg": "gamma-pkg", "lightningcss": "types"}
+        world = World(roots=roots)
+        self.assertEqual(
+            sorted(subject._archive_manifest(world.archives[key], *key)["name"] for key in world.archives),
+            sorted(name for name, version in ALL_PACKAGES),
+        )
+        self.assertTrue(world.bundle())
+        for name, version in ALL_PACKAGES:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    subject._archive_manifest(world.archives[(name, version)], name, version)["version"],
+                    version,
+                )
+
+    def test_a_single_refusal_keeps_a_single_detail(self):
+        world = self.tampered_world(("gamma-pkg",))
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            world.bundle()
+        self.assertEqual(raised.exception.details, (self.shared_detail("gamma-pkg", "3.1.0"),))
+        self.assertEqual(subject.BootstrapRefusal("npm_stale").details, ())
+
+    def test_the_collection_stops_after_twenty_distinct_details(self):
+        refusals = []
+        for index in range(25):
+            error = subject.BootstrapRefusal("npm_archive_refused", "deprecated:pkg-%02d@1.0.0" % index)
+            more = subject._record_refusal(refusals, error)
+            self.assertEqual(more, index < 19)
+        self.assertEqual(len(refusals), subject.MAX_COLLECTED_REFUSALS)
+        self.assertEqual(subject.MAX_COLLECTED_REFUSALS, 20)
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            subject._raise_first_refusal(refusals)
+        self.assertIs(raised.exception, refusals[0])
+        self.assertEqual(len(raised.exception.details), 20)
+        self.assertEqual(raised.exception.details[0], "deprecated:pkg-00@1.0.0")
+        again = []
+        duplicate = subject.BootstrapRefusal("npm_archive_refused", "deprecated:pkg-00@1.0.0")
+        self.assertTrue(subject._record_refusal(again, duplicate))
+        self.assertTrue(subject._record_refusal(again, subject.BootstrapRefusal(
+            "npm_archive_refused", "deprecated:pkg-00@1.0.0")))
+        self.assertEqual(len(again), 1)
+
+    def test_the_loop_honours_the_collection_cap(self):
+        world = self.tampered_world(("alpha-pkg", "beta-pkg", "gamma-pkg", "lightningcss"))
+        fetcher = world.fetcher()
+        with unittest.mock.patch.object(subject, "MAX_COLLECTED_REFUSALS", 2):
+            with self.assertRaises(subject.BootstrapRefusal) as raised:
+                world.bundle(fetcher=fetcher)
+        self.assertEqual(raised.exception.details, (
+            self.shared_detail("alpha-pkg", "1.0.0"), self.shared_detail("beta-pkg", "2.0.0"),
+        ))
+        self.assertEqual(
+            [call for call in fetcher.calls if call[0] == "tarball"],
+            [("tarball", "alpha-pkg", "1.0.0"), ("tarball", "beta-pkg", "2.0.0")],
+        )
+
+    def stopping_fetcher(self, world, name, reason, token, *segments):
+        class StoppingFetcher(FakeFetcher):
+            def tarball(self, package, version):
+                if package == name:
+                    self.calls.append(("tarball", package, version))
+                    raise subject.BootstrapRefusal(reason, subject.bundle_detail(token, package + "@" + version, *segments))
+                return super().tarball(package, version)
+        return StoppingFetcher(world.packuments(), world.archives, world.advisory)
+
+    def test_a_deadline_or_stale_refusal_after_another_one_stops_at_once(self):
+        world = self.tampered_world(("alpha-pkg",))
+        fetcher = self.stopping_fetcher(world, "beta-pkg", "npm_stale", "stale", "fetch_deadline")
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            world.bundle(fetcher=fetcher)
+        self.assertEqual(raised.exception.reason, "npm_archive_refused")
+        self.assertEqual(raised.exception.details, (
+            self.shared_detail("alpha-pkg", "1.0.0"), "stale:beta-pkg@2.0.0:fetch_deadline",
+        ))
+        self.assertEqual(
+            fetcher.calls,
+            [("packument", "alpha-pkg"), ("tarball", "alpha-pkg", "1.0.0"),
+             ("packument", "beta-pkg"), ("tarball", "beta-pkg", "2.0.0")],
+        )
+
+    def test_a_deadline_or_stale_refusal_first_is_raised_as_it_always_was(self):
+        for reason, token, segment in (
+            ("npm_stale", "stale", "fetch_deadline"), ("npm_environment_refused", "environment", "node"),
+            ("npm_network_refused", "fetch", "timeout"),
+        ):
+            with self.subTest(reason=reason):
+                world = self.tampered_world(("beta-pkg",))
+                fetcher = self.stopping_fetcher(world, "alpha-pkg", reason, token, segment)
+                with self.assertRaises(subject.BootstrapRefusal) as raised:
+                    world.bundle(fetcher=fetcher)
+                self.assertEqual((raised.exception.reason, str(raised.exception)), (reason, reason))
+                self.assertEqual(raised.exception.details, (raised.exception.detail,))
+                self.assertEqual(fetcher.calls, [("packument", "alpha-pkg"), ("tarball", "alpha-pkg", "1.0.0")])
+
+    def test_a_running_total_refusal_stops_at_once(self):
+        with unittest.mock.patch.object(adm, "MAX_TOTAL_COMPRESSED_BYTES", 1):
+            world = World()
+            fetcher = world.fetcher()
+            with self.assertRaises(subject.BootstrapRefusal) as raised:
+                world.bundle(fetcher=fetcher)
+        self.assertEqual(raised.exception.details, ("archive_size:alpha-pkg@1.0.0:total_compressed",))
+        self.assertEqual([call[1] for call in fetcher.calls if call[0] == "tarball"], ["alpha-pkg"])
+
     def test_the_budget_refusals_name_the_package_that_crossed_them(self):
         for name, value, expected in (
             ("MAX_TOTAL_COMPRESSED_BYTES", 1, "archive_size:alpha-pkg@1.0.0:total_compressed"),
@@ -2212,6 +2346,8 @@ class BundleDetailTests(RefusalAssertions):
             (urllib.error.URLError("unreachable"), "connect"),
             (urllib.error.URLError(TimeoutError()), "timeout"),
             (TimeoutError(), "timeout"),
+            (urllib.error.URLError(socket.timeout()), "timeout"),
+            (socket.timeout(), "timeout"),
             (OSError("reset"), "transport"),
         ):
             with self.subTest(token=token):

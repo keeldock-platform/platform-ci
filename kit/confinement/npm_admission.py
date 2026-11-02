@@ -1051,6 +1051,7 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
     manifest_bytes = None
     native_paths = []
     root_binding_gyp = False
+    archive_root = None
     try:
         archive = tarfile.open(
             fileobj=io.BytesIO(tar_bytes), mode="r:", encoding="utf-8", errors="strict",
@@ -1083,10 +1084,12 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
                 if member.linkname:
                     _archive_refuse("archive_path", subject, "link", label, index=index)
                 relative = raw_name.rstrip("/")
-                if relative.split("/", 1)[0] != "package":
+                member_root = relative.split("/", 1)[0]
+                if archive_root is None:
+                    archive_root = member_root
+                if member_root != archive_root or member_root.lower() == "node_modules":
                     _archive_refuse(
-                        "archive_root", subject, _archive_member_label(relative.split("/", 1)[0]),
-                        index=index,
+                        "archive_root", subject, _archive_member_label(member_root), index=index,
                     )
                 if raw_name.endswith("//") or (not is_directory and raw_name.endswith("/")):
                     _archive_refuse("archive_path", subject, "slash", label, index=index)
@@ -1119,28 +1122,30 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
                     total += member.size
                     if total > MAX_PACKAGE_UNPACKED_BYTES:
                         _archive_refuse("archive_size", subject, "unpacked", index=index)
-                entries[relative] = (is_directory, member)
-                if relative == "package/package.json" and not is_directory:
+                entries[relative] = (is_directory, member, index)
+                if relative == archive_root + "/package.json" and not is_directory:
                     package_json_member = member
-                if folded_relative == "package/binding.gyp" and not is_directory:
+                if folded_relative == archive_root.lower() + "/binding.gyp" and not is_directory:
                     root_binding_gyp = True
                 if not is_directory and _native_path(relative):
                     native_paths.append(relative)
-            for path, (is_directory, member) in entries.items():
+            for path, (is_directory, member, member_index) in entries.items():
                 parts = path.split("/")
                 label = _archive_member_label(path)
                 for position in range(1, len(parts)):
                     parent = "/".join(parts[:position])
                     parent_entry = entries.get(parent)
                     if parent_entry is not None and not parent_entry[0]:
-                        _archive_refuse("archive_path", subject, "file_parent", label)
+                        _archive_refuse(
+                            "archive_path", subject, "file_parent", label, index=member_index,
+                        )
                 if is_directory:
                     continue
                 stream = archive.extractfile(member)
                 if stream is None:
-                    _archive_refuse("archive_path", subject, "unreadable", label)
+                    _archive_refuse("archive_path", subject, "unreadable", label, index=member_index)
                 with stream:
-                    if path == "package/package.json":
+                    if path == archive_root + "/package.json":
                         content = stream.read(MAX_PACKAGE_JSON_BYTES + 1)
                         if len(content) != member.size or len(content) > MAX_PACKAGE_JSON_BYTES:
                             _archive_refuse("archive_manifest", subject, "size")
@@ -1173,7 +1178,7 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
         "sha256": archive_sha256,
         "compressed_bytes": len(data),
         "unpacked_bytes": total,
-        "file_count": sum(1 for is_directory, unused in entries.values() if not is_directory),
+        "file_count": sum(1 for is_directory, unused, unused_index in entries.values() if not is_directory),
         "install_scripts": install_scripts,
         "implicit_install_scripts": ("install",) if implicit_install else (),
         "native_binaries": tuple(sorted(native_paths)),

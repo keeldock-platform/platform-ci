@@ -226,6 +226,42 @@ test('a lock diagnostic with a kd-check line is accepted, encrypted and decrypte
   );
 });
 
+test('a bundle diagnostic with kd-check lines is accepted, encrypted and decrypted unchanged', () => {
+  const header = 'KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_archive_refused';
+  const checks = [
+    'shared_parser:npm_archive_invalid:archive_path:sample@1.0.0:non_ascii:unrepresentable index:4',
+    'licence:gamma-pkg@3.1.0:election_missing id:_MIT_OR_CC0-1.0_',
+    'shared_parser:npm_archive_invalid:archive_root:aria-query@5.0.4:node_modules index:0',
+    'fetch:advisories:timeout',
+  ];
+  const many = Array.from({ length: 20 }, (unused, index) => `deprecated:pkg-${index}@1.0.0`);
+  for (const group of [checks.slice(0, 1), checks.slice(1, 2), checks, many]) {
+    const payload = diagnostics({
+      header,
+      stderr: [...group.map((check) => `  kd-check ${check}`), '  npm warn deprecated a@1.0.0: old'],
+      report: [],
+    });
+    assert.deepEqual(validate(payload), payload);
+    const context = contextFor(PROFILE);
+    const envelope = encryptDevelopmentFeedback({
+      payloadBytes: payload,
+      context,
+      recipientPublicKey: recipient.publicKey,
+      now: NOW,
+    });
+    assert.deepEqual(decryptDevelopmentFeedback({
+      envelope,
+      context,
+      recipientPrivateKey: recipient.privateKey,
+      now: NOW,
+    }), payload);
+  }
+  assert.throws(
+    () => validate(diagnostics({ header, stderr: ['kd-check fetch:advisories:timeout'], report: [] })),
+    (error) => refusalCode(error) === 'invalid_payload',
+  );
+});
+
 test('a diagnostic payload is never accepted as a bundle and a bundle never as a diagnostic', () => {
   const bundleBytes = bundle();
   assert.notEqual(bundleBytes.subarray(0, 19).toString('latin1'), 'KD-NPM-DIAGNOSTICS ');

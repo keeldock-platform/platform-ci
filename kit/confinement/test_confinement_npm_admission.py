@@ -82,6 +82,25 @@ def _tarball(name, version, scripts=None, binary=False, extra=(), gypfile=None):
     return output.getvalue()
 
 
+def _rooted_tarball(root, name="sample", version="1.0.0", extra=(), with_directory=True):
+    manifest = json.dumps(
+        {"name": name, "version": version, "scripts": {}}, sort_keys=True, separators=(",", ":"),
+    ).encode("ascii")
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.USTAR_FORMAT) as archive:
+        if with_directory:
+            directory = tarfile.TarInfo(root + "/")
+            directory.type = tarfile.DIRTYPE
+            directory.mode = 0o755
+            archive.addfile(directory)
+        for path, content in ((root + "/package.json", manifest),) + tuple(extra):
+            info = tarfile.TarInfo(path)
+            info.mode = 0o644
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+    return output.getvalue()
+
+
 def _tar_with_members(members):
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.USTAR_FORMAT) as archive:
@@ -1353,7 +1372,74 @@ class NpmArchiveDetailTests(unittest.TestCase):
         )
         data = _tarball("sample", "1.0.0", extra=(("package/a", b"x"), ("package/a/b", b"y")))
         self.assertEqual(
-            self.refusal(data), "archive_path:" + self.SUBJECT + ":file_parent:package/a/b",
+            self.refusal(data), "archive_path:" + self.SUBJECT + ":file_parent:package/a/b index:3",
+        )
+        data = _tarball("sample", "1.0.0", extra=(("package/a b", b"x"), ("package/a b/c", b"y")))
+        self.assertEqual(
+            self.refusal(data),
+            "archive_path:" + self.SUBJECT + ":file_parent:unrepresentable index:3",
+        )
+
+    def accepted(self, data, **fields):
+        return subject.verify_tarball(self.entry(data, **fields), data)
+
+    def test_a_single_top_level_directory_of_any_name_is_the_archive_root(self):
+        for root in ("package", "aria-query", "node", "Types", "a.b", "x_y", "@scope"):
+            with self.subTest(root=root):
+                data = _rooted_tarball(root, extra=((root + "/index.d.ts", b"export {};"),))
+                report = self.accepted(data)
+                self.assertEqual((report["name"], report["version"]), ("sample", "1.0.0"))
+                self.assertEqual(report["file_count"], 2)
+                self.assertEqual(report["install_scripts"], ())
+        data = _rooted_tarball("aria-query", with_directory=False)
+        self.assertEqual(self.accepted(data)["file_count"], 1)
+
+    def test_every_other_archive_rule_applies_relative_to_the_chosen_root(self):
+        data = _rooted_tarball("aria-query", extra=(("aria-query/binding.gyp", b"{}"),))
+        self.assertEqual(self.accepted(data)["implicit_install_scripts"], ("install",))
+        data = _rooted_tarball("aria-query", extra=(("aria-query/lib/binding.gyp", b"{}"),))
+        self.assertEqual(self.accepted(data)["implicit_install_scripts"], ())
+        data = _rooted_tarball("aria-query", extra=(("aria-query/lib/node_modules/x/y.js", b"x"),))
+        self.assertEqual(
+            self.refusal(data),
+            "archive_path:" + self.SUBJECT + ":node_modules:aria-query/lib/node_modules/x/y.js index:2",
+        )
+        data = _rooted_tarball("aria-query", extra=(("aria-query/a.js", b"x"), ("aria-query/a.js", b"y")))
+        self.assertEqual(
+            self.refusal(data), "archive_path:" + self.SUBJECT + ":duplicate:aria-query/a.js index:3",
+        )
+        data = _rooted_tarball("aria-query", name="other")
+        self.assertEqual(self.refusal(data), "archive_manifest:" + self.SUBJECT + ":name_mismatch")
+        renamed = _rooted_tarball("aria-query", extra=(("package/package.json", b"{}"),))
+        self.assertEqual(
+            self.refusal(renamed), "archive_root:" + self.SUBJECT + ":package index:2",
+        )
+
+    def test_mixed_archive_roots_refuse_with_the_same_token(self):
+        data = _rooted_tarball("aria-query", extra=(("other/x.js", b"x"),))
+        self.assertEqual(self.refusal(data), "archive_root:" + self.SUBJECT + ":other index:2")
+        data = _rooted_tarball("aria-query", extra=(("package/x.js", b"x"),))
+        self.assertEqual(self.refusal(data), "archive_root:" + self.SUBJECT + ":package index:2")
+        data = _rooted_tarball("aria-query", extra=(("Aria-Query/x.js", b"x"),))
+        self.assertEqual(self.refusal(data), "archive_root:" + self.SUBJECT + ":Aria-Query index:2")
+
+    def test_a_node_modules_root_refuses(self):
+        for root in ("node_modules", "Node_Modules"):
+            with self.subTest(root=root):
+                data = _rooted_tarball(root)
+                self.assertEqual(self.refusal(data), "archive_root:" + self.SUBJECT + ":" + root + " index:0")
+
+    def test_a_member_at_the_top_level_refuses(self):
+        data = _tarball("sample", "1.0.0", extra=(("top.js", b"x"),))
+        self.assertEqual(self.refusal(data), "archive_root:" + self.SUBJECT + ":top.js index:2")
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.USTAR_FORMAT) as archive:
+            info = tarfile.TarInfo("package.json")
+            info.size = 2
+            archive.addfile(info, io.BytesIO(b"{}"))
+        self.assertEqual(
+            self.refusal(output.getvalue()),
+            "archive_path:" + self.SUBJECT + ":root_file:package.json index:0",
         )
 
     def test_the_gzip_and_tar_framing_refusals_name_their_check(self):

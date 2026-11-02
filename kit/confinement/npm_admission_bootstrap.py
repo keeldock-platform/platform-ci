@@ -45,6 +45,7 @@ import io
 import json
 import posixpath
 import re
+import socket
 import sys
 import tarfile
 import time
@@ -101,6 +102,11 @@ ADVISORY_MAX_AGE_SECONDS = 24 * 60 * 60
 CLOCK_SKEW_SECONDS = 300
 MAX_REQUEST_TTL_SECONDS = 24 * 60 * 60
 FETCH_TIMEOUT_SECONDS = 60
+FETCH_TIMEOUT_TYPES = (TimeoutError, socket.timeout)
+MAX_COLLECTED_REFUSALS = 20
+STOP_REFUSAL_REASONS = frozenset((
+    "npm_stale", "npm_environment_refused", "npm_network_refused", "npm_payload_too_large",
+))
 REGISTRY_HOST = "registry.npmjs.org"
 REGISTRY_URL = "https:" + chr(47) * 2 + REGISTRY_HOST + chr(47)
 ADVISORY_PATH = "/-/npm/v1/security/advisories/bulk"
@@ -250,6 +256,7 @@ class BootstrapRefusal(Exception):
             reason = "npm_input_invalid"
         self.reason = reason
         self.detail = detail if _valid_lock_detail(detail) else None
+        self.details = () if self.detail is None else (self.detail,)
         super().__init__(reason)
 
 
@@ -927,7 +934,10 @@ def _archive_manifest(data, name=None, version=None):
         with tarfile.open(
             fileobj=io.BytesIO(tar_bytes), mode="r:", encoding="utf-8", errors="strict",
         ) as archive:
-            member = archive.getmember("package/package.json")
+            first = archive.next()
+            if first is None:
+                raise KeyError("root")
+            member = archive.getmember(first.name.split("/", 1)[0] + "/package.json")
             stream = archive.extractfile(member) if member.isreg() else None
             if stream is None or member.size > adm.MAX_PACKAGE_JSON_BYTES:
                 _bundle_refuse("npm_archive_refused", "archive_manifest", subject, "unreadable")
@@ -1000,11 +1010,11 @@ class RegistryFetcher:
                 "npm_network_refused", "fetch", subject, _fetch_status(getattr(error, "code", None)),
             )
         except urllib.error.URLError as error:
-            timed_out = isinstance(getattr(error, "reason", None), TimeoutError)
+            timed_out = isinstance(getattr(error, "reason", None), FETCH_TIMEOUT_TYPES)
             _bundle_refuse(
                 "npm_network_refused", "fetch", subject, "timeout" if timed_out else "connect",
             )
-        except TimeoutError:
+        except FETCH_TIMEOUT_TYPES:
             _bundle_refuse("npm_network_refused", "fetch", subject, "timeout")
         except (OSError, http.client.HTTPException):
             _bundle_refuse("npm_network_refused", "fetch", subject, "transport")
@@ -1600,6 +1610,33 @@ def _collect_entry(path, entry, name, packument, plan, fetcher, now, totals):
     return package, identity
 
 
+def _continues_after(error):
+    """Whether the per-package loop may look at the next package after this refusal. A refusal
+    that comes from the run deadline, the network or the environment, or from a running total,
+    ends the loop at once."""
+    if error.reason in STOP_REFUSAL_REASONS:
+        return False
+    return not (type(error.detail) is str and ":total_" in error.detail)
+
+
+def _record_refusal(refusals, error):
+    """Remember a per-package refusal and say whether the loop continues. The list holds the
+    first refusal and then up to nineteen more with distinct details, nothing else."""
+    if not refusals:
+        refusals.append(error)
+    elif (error.detail is not None and len(refusals) < MAX_COLLECTED_REFUSALS
+            and all(item.detail != error.detail for item in refusals)):
+        refusals.append(error)
+    return _continues_after(error) and len(refusals) < MAX_COLLECTED_REFUSALS
+
+
+def _raise_first_refusal(refusals):
+    first = refusals[0]
+    if first.detail is not None:
+        first.details = tuple(item.detail for item in refusals if item.detail is not None)
+    raise first
+
+
 def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, fetcher,
                      clock=None, node_version=NODE_VERSION, npm_version=NPM_VERSION):
     """Fetch metadata, archives and advisories; return the evidence record and archive identities."""
@@ -1616,12 +1653,23 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
     totals = {"compressed_bytes": 0, "unpacked_bytes": 0, "file_count": 0}
     matched_rows = set()
     groups = _by_name(entries)
+    refusals = []
     for name in sorted(groups):
-        packument = fetcher.packument(name)
-        if type(packument) is not bytes:
-            _bundle_refuse(
-                "npm_evidence_invalid", "evidence", adm.package_subject(name), "packument_type",
-            )
+        try:
+            packument = fetcher.packument(name)
+            if type(packument) is not bytes:
+                _bundle_refuse(
+                    "npm_evidence_invalid", "evidence", adm.package_subject(name),
+                    "packument_type",
+                )
+        except BootstrapRefusal as error:
+            if _record_refusal(refusals, error):
+                continue
+            _raise_first_refusal(refusals)
+        except Exception:
+            if refusals:
+                _raise_first_refusal(refusals)
+            raise
         for path, entry in groups[name]:
             try:
                 package, identity = _collect_entry(
@@ -1629,15 +1677,23 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
                 )
             except BootstrapRefusal as error:
                 if error.detail is None:
-                    _bundle_refuse(
-                        error.reason, "package_step", adm.package_subject(name, entry["version"]),
+                    error = BootstrapRefusal(error.reason, bundle_detail(
+                        "package_step", adm.package_subject(name, entry["version"]),
                         adm.detail_text(error.reason, 40),
-                    )
+                    ))
+                if _record_refusal(refusals, error):
+                    continue
+                _raise_first_refusal(refusals)
+            except Exception:
+                if refusals:
+                    _raise_first_refusal(refusals)
                 raise
             packages.append(package)
             if (name, entry["version"]) in plan["rows"]:
                 matched_rows.add((name, entry["version"]))
             identities.append(identity)
+    if refusals:
+        _raise_first_refusal(refusals)
     if set(plan["rows"]) != matched_rows:
         _bundle_refuse(
             "npm_request_mismatch", "request_mismatch", "bundle", "unmatched_rows",
