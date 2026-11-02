@@ -250,8 +250,8 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertNotIn("vars.LINUX_SOURCE_REPOSITORY", self.text)
         self.assertNotIn("vars.SOURCE_REPOSITORY_OWNER", self.text)
         self.assertNotIn("vars.SOURCE_REPOSITORY_NAME", self.text)
-        self.assertEqual(self.text.count("secrets.SOURCE_REPOSITORY_OWNER"), 5)
-        self.assertEqual(self.text.count("secrets.SOURCE_REPOSITORY_NAME"), 5)
+        self.assertEqual(self.text.count("secrets.SOURCE_REPOSITORY_OWNER"), 4)
+        self.assertEqual(self.text.count("secrets.SOURCE_REPOSITORY_NAME"), 4)
         jobs = self.jobs()
         for name in ("settings", "source-read", "verdict"):
             body = jobs["linux-source-admission-" + name]
