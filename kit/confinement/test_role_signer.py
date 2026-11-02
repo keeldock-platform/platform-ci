@@ -856,7 +856,8 @@ class WorkflowAndJobMappingTests(unittest.TestCase):
             subject.validate_jobs_snapshot(snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, {role: None for role in subject.ROLE_ORDER})
 
     def test_linux_step_names_and_observed_ordinals_are_pinned(self):
-        for profile in subject.CALLER_PROFILES:
+        self.assertEqual(set(subject.CALLER_PROFILES), {"probe", "production-synthetic", "candidate"})
+        for profile in ("probe", "production-synthetic"):
             self.assertEqual(
                 subject.API_LINUX_STEP_NAME_PINS[profile],
                 {
@@ -871,6 +872,15 @@ class WorkflowAndJobMappingTests(unittest.TestCase):
                 "linux-fetch-encrypt": "role-call-linux-fetch-encrypt-v1 / role-linux-fetch-encrypt-v1",
                 "capsule-attester": "role-call-capsule-attester-v1 / role-capsule-attester-v1",
             })
+        self.assertEqual(subject.API_LINUX_STEP_NAME_PINS["candidate"], {
+            "revoke-source-token": "handoff-revoke-source-token-v1",
+            "verify-token-rejection": "handoff-verify-token-rejection-v1",
+        })
+        self.assertEqual(subject.API_LINUX_STEP_ORDINAL_PINS["candidate"],
+                         {"revoke-source-token": 12, "verify-token-rejection": 13})
+        self.assertEqual(subject.API_JOB_NAME_PINS["candidate"], {
+            role: "role-call-%s-v1 / role-%s-v1" % (role, role) for role in subject.CANDIDATE_ROLES
+        })
 
     def test_api_rejects_wrong_sha_run_attempt_status_runner_and_step_shapes(self):
         hosted = subject.validate_jobs_snapshot(fixture_job_snapshot(), RUN_ID,
@@ -2243,10 +2253,10 @@ class CandidateProfileTests(unittest.TestCase):
                                    self.UNTRUSTED, RUN_ID, RUN_ATTEMPT, record, record)
 
     def test_run_metadata_accepts_the_branch_of_either_candidate_ref_only(self):
-        def document(branch):
+        def document(branch, profile="candidate"):
             return {
                 "id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT), "head_sha": CONTROL_SHA,
-                "path": subject.CALLER_PROFILES["candidate"]["path"], "event": "workflow_dispatch",
+                "path": subject.CALLER_PROFILES[profile]["path"], "event": "workflow_dispatch",
                 "head_branch": branch, "repository": {"id": 8150001, "full_name": REPOSITORY},
                 "status": "in_progress", "conclusion": None,
             }
@@ -2261,7 +2271,7 @@ class CandidateProfileTests(unittest.TestCase):
             with self.subTest(profile=profile, branch=branch):
                 with self.assertRaisesRegex(subject.Refusal, "run-ref-mismatch"):
                     subject.validate_run_metadata(
-                        document(branch), profile, REPOSITORY, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, 8150001)
+                        document(branch, profile), profile, REPOSITORY, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, 8150001)
 
     def test_the_pinned_step_ordinals_match_the_checked_in_fetch_workflow(self):
         text = (ROOT / FETCH_PATH).read_text(encoding="ascii")

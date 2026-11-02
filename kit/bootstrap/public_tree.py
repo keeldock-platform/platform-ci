@@ -373,7 +373,7 @@ PINNED_FILE_SHA256 = {
     'kit/handoff/source_capsule.py': 'a1369abb354f0723bd3cfc3209aa15c4769bfb113b2fe6369023c7f95e4546ac',
     'kit/handoff/test_source_capsule.py': 'e59005de4c184dcfdbd3a45c720229095b9e5df0ef6e1115d196a41744d8403e',
     'kit/handoff/provider_requirements.txt': 'c812f3c3f036921e86568feaa3bc934040b68f3d743072cefce8ea758bd56150',
-    'kit/confinement/test_role_signer.py': 'eb75c9440bc6d816ad6330ebba2bef1f49526bb3722ee346e0d58d1384143d4c',
+    'kit/confinement/test_role_signer.py': 'fb28edfa8f7eb66481f11c5d10f7a3d5d605a32f07e2f71d089f230e9a8fa15a',
     'kit/bootstrap/policy_handoff.py': 'f9e6d55324ab138aaea4dc76fe05981c67acaa83b6c7e8200a2e9da0de702956',
     'kit/bootstrap/test_policy_handoff.py': '90798c3ddc12b4ec822c34754646e99df89eba5be9370fcba0a142b21252693f',
     'kit/confinement/confinement_public_audit.py': 'de881849e764a1ac4c0c3af89ca3ba9ab070d550f2e1e12d56ae13758768fadb',
