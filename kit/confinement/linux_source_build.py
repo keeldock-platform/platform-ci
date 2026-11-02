@@ -468,10 +468,10 @@ def _expected_run(environ, cache_digest):
     all_steps = ["Set up job"] + list(SOURCE_STEP_NAMES)
     if mode == "source":
         all_steps.append("Post Mint scoped source-reader token")
-    all_steps.append("Complete job")
         optional = ("Forced faults must fail closed",)
     else:
         optional = tuple(sorted(OPTIONAL_SOURCE_STEPS - {"Forced faults must fail closed"}))
+    all_steps.append("Complete job")
     expected = {
         "repository": REPOSITORY,
         "os": "linux",

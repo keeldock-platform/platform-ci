@@ -267,7 +267,7 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
     'kit/confinement/macos_core_contract.py': '1613ed078c9af3cee2e305c0e619073f7e25bab57de311aea8dd6e4619d1ad93',
     'kit/confinement/test_macos_core_contract.py': '581dd349db2f19227e9ef3b804dee9eaf500ee917119c0fe016db76b4a68be81',
-    'kit/confinement/linux_source_build.py': '391e9c3afe6ebb37e50f3cdb4d901c4f3b4c4e920708bbd1c5239fe5672ec394',
+    'kit/confinement/linux_source_build.py': '4eb0b548562745c7acc9c3bebe26e88630f1d16ae7660eba7ff3f5e5a1b1f3eb',
     'kit/confinement/test_linux_source_build.py': '243383fbdec3267a9e07a401fcc548221b8e3d9b394ac268ac8aee77916c2421',
     '.github/workflows/core-linux-quick-return.yml': '430fc8fdde43e46e3d57fe445b34854c5ab65a01126fd1e6b9dcaac69528b9cb',
     'kit/confinement/linux_quick_return.py': '48f55433c099a533e0b76146f5b6df1d1e0338b63c5ee3d9a13d5a3d743bdb4a',
