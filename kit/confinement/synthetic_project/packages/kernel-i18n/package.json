@@ -1,0 +1,13 @@
+{
+  "name": "fixture-kernel-i18n",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "node --check src/index.js",
+    "test": "node tests/run.js"
+  },
+  "dependencies": {
+    "ms": "2.1.3"
+  }
+}

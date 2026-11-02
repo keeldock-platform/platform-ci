@@ -189,6 +189,16 @@ class PublicTreeTests(unittest.TestCase):
         self.assertEqual(action.count('"test_windows_source_run.py"'), 2)
         self.assertEqual(action.count('"test_source_capsule.py"'), 1)
 
+    def test_synthetic_project_fixture_is_registered_pinned_and_discovered(self):
+        prefix = "kit/confinement/synthetic_project/"
+        fixture = sorted(name for name in PLATFORM_FILES if name.startswith(prefix))
+        self.assertEqual(len(fixture), 28)
+        for name in fixture + ["kit/confinement/test_confinement_synthetic_project.py"]:
+            with self.subTest(name=name):
+                self.assertIn(name, PINNED_FILE_SHA256)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertEqual(action.count('-p "test_confinement*.py"'), 2)
+
     def test_linux_source_build_suite_is_registered_and_discovered_at_push_time(self):
         self.assertIn("kit/confinement/linux_source_build.py", PLATFORM_FILES)
         self.assertIn("kit/confinement/test_linux_source_build.py", PLATFORM_FILES)
@@ -406,6 +416,35 @@ class PublicTreeTests(unittest.TestCase):
             "kit/baselines/test_baselines_prepare.py",
             "kit/bootstrap/policy_baselines.py",
             "kit/bootstrap/test_policy_baselines.py",
+            "kit/confinement/synthetic_project/Cargo.lock",
+            "kit/confinement/synthetic_project/Cargo.toml",
+            "kit/confinement/synthetic_project/crates/host/api/Cargo.toml",
+            "kit/confinement/synthetic_project/crates/host/api/src/lib.rs",
+            "kit/confinement/synthetic_project/crates/host/api/tests/feature.rs",
+            "kit/confinement/synthetic_project/crates/host/api/tests/surface.rs",
+            "kit/confinement/synthetic_project/crates/host/conformance/Cargo.toml",
+            "kit/confinement/synthetic_project/crates/host/conformance/src/lib.rs",
+            "kit/confinement/synthetic_project/crates/host/conformance/tests/conformance.rs",
+            "kit/confinement/synthetic_project/crates/host/conformance/tests/process_pipe.rs",
+            "kit/confinement/synthetic_project/crates/host/mock/Cargo.toml",
+            "kit/confinement/synthetic_project/crates/host/mock/src/lib.rs",
+            "kit/confinement/synthetic_project/crates/host/mock/tests/mock.rs",
+            "kit/confinement/synthetic_project/fuzz/Cargo.lock",
+            "kit/confinement/synthetic_project/fuzz/Cargo.toml",
+            "kit/confinement/synthetic_project/fuzz/src/main.rs",
+            "kit/confinement/synthetic_project/package-lock.json",
+            "kit/confinement/synthetic_project/package.json",
+            "kit/confinement/synthetic_project/packages/host-api/package.json",
+            "kit/confinement/synthetic_project/packages/host-api/src/index.js",
+            "kit/confinement/synthetic_project/packages/host-api/tests/run.js",
+            "kit/confinement/synthetic_project/packages/kernel-i18n/package.json",
+            "kit/confinement/synthetic_project/packages/kernel-i18n/src/index.js",
+            "kit/confinement/synthetic_project/packages/kernel-i18n/tests/run.js",
+            "kit/confinement/synthetic_project/runtime/Cargo.lock",
+            "kit/confinement/synthetic_project/runtime/Cargo.toml",
+            "kit/confinement/synthetic_project/runtime/src/lib.rs",
+            "kit/confinement/synthetic_project/runtime/tests/runtime.rs",
+            "kit/confinement/test_confinement_synthetic_project.py",
             "kit/confinement/confinement_public_audit.py",
             "kit/confinement/macos_public_audit.py",
         }
