@@ -980,7 +980,7 @@ foreach ($case in $cases) {
         ladder = self.function_body("Invoke-Ladder")
         for required in (
             "' hang=' + $hang",
-            "' cpu_ms=' + $result.CpuMs",
+            "handles_method=list_attr_readback cpu_ms=' + $result.CpuMs",
             "' peak_process_mib=' + (Get-Mib $result.PeakProcessMemory)",
             "' peak_job_mib=' + (Get-Mib $result.PeakJobMemory)",
             "' class46=' + $class46Text",
