@@ -1,5 +1,7 @@
 import base64
+import inspect
 import json
+import os
 import socket
 import stat
 import subprocess
@@ -13,7 +15,7 @@ import linux_session as session
 from linux_channels import BoundaryRefusal
 
 
-__all__ = ["LinuxSessionPureTests", "LinuxSessionSpecTests", "LinuxSessionLaunchTests", "LinuxSeccompNumberTests"]
+__all__ = ["LinuxSessionPureTests", "LinuxSessionBindTargetTests", "LinuxSessionSpecTests", "LinuxSessionLaunchTests", "LinuxSeccompNumberTests"]
 
 NONCE = "0123456789abcdef01234567"
 MOUNTINFO = (
@@ -173,6 +175,52 @@ class LinuxSessionPureTests(unittest.TestCase):
         self.assertIn("--fork", session.HOST_UNSHARE)
         self.assertIn("--kill-child=KILL", session.HOST_UNSHARE)
         self.assertNotIn("--user", session.CONFINED_UNSHARE + session.OPEN_UNSHARE + session.HOST_UNSHARE)
+
+
+class LinuxSessionBindTargetTests(unittest.TestCase):
+    def test_every_missing_component_of_a_bind_target_is_created_searchable_whatever_the_umask(self):
+        with tempfile.TemporaryDirectory() as base:
+            previous = os.umask(0o077)
+            try:
+                leaf = session.make_tree(base, "/srv/runner/.kit/toolchains/stable")
+            finally:
+                os.umask(previous)
+            self.assertEqual(leaf, os.path.join(base, "srv/runner/.kit/toolchains/stable"))
+            walked = base
+            for part in ("srv", "runner", ".kit", "toolchains", "stable"):
+                walked = os.path.join(walked, part)
+                self.assertTrue(os.path.isdir(walked))
+                self.assertEqual(stat.S_IMODE(os.stat(walked).st_mode), 0o755, walked)
+
+    def test_existing_components_are_reused_and_never_changed(self):
+        with tempfile.TemporaryDirectory() as base:
+            os.mkdir(os.path.join(base, "keep"), 0o700)
+            os.chmod(os.path.join(base, "keep"), 0o700)
+            leaf = session.make_tree(base, "/keep/inner")
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(base, "keep")).st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(os.stat(leaf).st_mode), 0o755)
+            self.assertEqual(session.make_tree(base, "/keep/inner"), leaf)
+            self.assertEqual(session.make_tree(base, "keep//inner/"), leaf)
+
+    def test_dot_components_and_empty_targets_are_refused_and_a_file_in_the_way_is_an_error(self):
+        with tempfile.TemporaryDirectory() as base:
+            for bad in ("", "/", "/a/../b", "/..", "/./a", "/a/."):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(harness.ProofFailure) as raised:
+                        session.make_tree(base, bad)
+                    self.assertEqual(raised.exception.reason, 96)
+            self.assertEqual(os.listdir(base), [])
+            with open(os.path.join(base, "file"), "wt", encoding="ascii") as sink:
+                sink.write("x")
+            with self.assertRaises(FileExistsError):
+                session.make_tree(base, "/file/below")
+            with self.assertRaises(FileExistsError):
+                session.make_tree(base, "/file")
+
+    def test_the_root_builder_uses_the_helper_for_every_bind_target(self):
+        source = inspect.getsource(session.extend_rootfs)
+        self.assertIn("make_tree(rootfs, bind[", source)
+        self.assertNotIn("makedirs(target", source)
 
 
 class LinuxSessionSpecTests(unittest.TestCase):

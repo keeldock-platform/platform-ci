@@ -1,5 +1,6 @@
 import json
 import re
+import string
 
 
 SCHEMA_VERSION = 1
@@ -122,20 +123,32 @@ NETWORK_CHANNELS = (
 )
 ATTEMPT_LINE = re.compile(r"KDATT ([a-z0-9-]{1,40}) (denied|allowed|contained|na|other)")
 MAX_REFUSAL_DETAIL = 255
+DIAG_PHASES = ("selftest",)
+DIAG_MAX_LINES = 20
+DIAG_MAX_CHARS = 200
+DIAG_TAIL_BYTES = 16384
+DIAG_ALPHABET = frozenset(string.ascii_letters + string.digits + " ._:/=+,()'" + chr(34) + "-")
+DIAG_TOKEN = re.compile(r"[A-Za-z0-9+/]{33,}")
+DIAG_FORM = re.compile(r"[a-z_]{1,20}")
 
 
 class BoundaryRefusal(Exception):
-    def __init__(self, reason, channel=None, detail=None):
+    def __init__(self, reason, channel=None, detail=None, evidence=None):
         if reason not in REASONS:
             reason = "environment"
         if channel is not None and channel not in CHANNELS:
             channel = None
         if detail is not None and (type(detail) is not int or detail < 0 or detail > MAX_REFUSAL_DETAIL):
             detail = None
+        if evidence is not None and not (
+            type(evidence) is tuple and len(evidence) == 2 and type(evidence[0]) is str and type(evidence[1]) is bytes
+        ):
+            evidence = None
         super().__init__(reason)
         self.reason = reason
         self.channel = channel
         self.detail = detail
+        self.evidence = evidence
 
 
 def parse_attempts(output):
@@ -249,6 +262,62 @@ def fixture_line(phase, form, refusal):
     if refusal.detail is not None:
         text += " detail=" + str(refusal.detail)
     return text
+
+
+def diag_line(phase, form, text):
+    if phase not in DIAG_PHASES or type(form) is not str or DIAG_FORM.fullmatch(form) is None:
+        raise ValueError("diag-line")
+    if type(text) is not str or len(text) > DIAG_MAX_CHARS or any(character not in DIAG_ALPHABET for character in text):
+        raise ValueError("diag-line")
+    return (
+        LINE_PREFIX + "-FIXTURE-DIAG schema=" + str(SCHEMA_VERSION) + " phase=" + phase
+        + " form=" + form + " stream=stderr line=" + text
+    )
+
+
+def diag_clean(raw):
+    return "".join(character if character in DIAG_ALPHABET else "?" for character in raw.strip())[:DIAG_MAX_CHARS]
+
+
+def diag_unsafe(raw, clean, nonce, needles):
+    folded = raw.lower()
+    if type(nonce) is str and nonce and nonce in folded:
+        return True
+    if "kd-log-" in folded or "kd_canary" in folded or raw.lstrip().startswith("::") or clean.startswith("::"):
+        return True
+    original = raw.encode("latin-1", "replace").lower()
+    sanitized = clean.encode("ascii", "replace").lower()
+    for needle in needles:
+        if type(needle) is bytes and needle and (needle.lower() in original or needle.lower() in sanitized):
+            return True
+    if DIAG_TOKEN.search(clean) is not None:
+        return True
+    return not any(character.isalnum() for character in clean)
+
+
+def fixture_diag_lines(phase, form, stderr, nonce, needles, header=None):
+    if phase not in DIAG_PHASES:
+        return ()
+    if type(form) is not str or DIAG_FORM.fullmatch(form) is None:
+        raise ValueError("diag-line")
+    chosen = []
+    if type(header) is str:
+        text = diag_clean(header)
+        if not diag_unsafe(header, text, nonce, needles):
+            chosen.append(text)
+    kept = []
+    if type(stderr) is bytes:
+        raw_lines = stderr[-DIAG_TAIL_BYTES:].decode("latin-1").split(chr(10))
+        if len(stderr) > DIAG_TAIL_BYTES:
+            raw_lines = raw_lines[1:]
+        for raw in raw_lines:
+            text = diag_clean(raw)
+            if not diag_unsafe(raw, text, nonce, needles):
+                kept.append(text)
+    room = DIAG_MAX_LINES - len(chosen)
+    if room > 0:
+        chosen.extend(kept[-room:])
+    return tuple(diag_line(phase, form, text) for text in chosen)
 
 
 def verdict_line(phase, refusal, blocked_count):

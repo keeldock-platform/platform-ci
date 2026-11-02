@@ -1,5 +1,6 @@
 import ast
 import json
+import re
 import unittest
 
 import linux_channels as channels
@@ -13,6 +14,7 @@ __all__ = [
     "LinuxRecordTests",
     "LinuxProbeSourceTests",
     "LinuxReviewFixChannelTests",
+    "LinuxFixtureDiagnosticLineTests",
 ]
 
 EXPECTED_CHANNELS = (
@@ -371,6 +373,136 @@ class LinuxReviewFixChannelTests(unittest.TestCase):
         self.assertIn("NoNewPrivs:", probes.PROBE_SOURCE)
         self.assertNotIn("prctl(38", probes.PROBE_SOURCE)
 
+
+class LinuxFixtureDiagnosticLineTests(unittest.TestCase):
+    LINE = re.compile(
+        r"^KD-LINUX-FIXTURE-DIAG schema=1 phase=selftest form=[a-z_]{1,20} stream=stderr line=[A-Za-z0-9 ._:/=+,()'" + chr(34) + r"-]*$"
+    )
+
+    def lines(self, stderr, needles=(), header=None, nonce=NONCE, form="build_rs", phase="selftest"):
+        return channels.fixture_diag_lines(phase, form, stderr, nonce, needles, header)
+
+    def texts(self, produced):
+        prefix = "KD-LINUX-FIXTURE-DIAG schema=1 phase=selftest form=build_rs stream=stderr line="
+        return [line[len(prefix):] for line in produced]
+
+    def test_a_diagnostic_line_has_the_exact_public_shape(self):
+        self.assertEqual(
+            channels.diag_line("selftest", "build_rs", "error: linking with gcc failed"),
+            "KD-LINUX-FIXTURE-DIAG schema=1 phase=selftest form=build_rs stream=stderr line=error: linking with gcc failed",
+        )
+        produced = self.lines(b"first\nsecond line: ok\n")
+        self.assertEqual(self.texts(produced), ["first", "second line: ok"])
+        for line in produced:
+            self.assertRegex(line, self.LINE)
+            self.assertFalse(line.startswith("::"))
+
+    def test_every_character_outside_the_allowed_set_becomes_a_question_mark(self):
+        raw = b"error[E0463]: can't find crate\tfor `std` <x> {y} $z @ % ! ~ ; | * \\ \xc3\xa9"
+        produced = self.lines(raw)
+        self.assertEqual(len(produced), 1)
+        text = self.texts(produced)[0]
+        self.assertEqual(text, "error?E0463?: can't find crate?for ?std? ?x? ?y? ?z ? ? ? ? ? ? ? ? ??")
+        for character in text:
+            self.assertTrue(character in channels.DIAG_ALPHABET or character == "?")
+        self.assertIn("'", channels.DIAG_ALPHABET)
+        self.assertIn(chr(34), channels.DIAG_ALPHABET)
+        self.assertNotIn("[", channels.DIAG_ALPHABET)
+        self.assertNotIn(chr(10), channels.DIAG_ALPHABET)
+
+    def test_each_line_is_capped_at_two_hundred_characters(self):
+        produced = self.lines(("ab " * 100).encode("ascii") + b"\nshort\n")
+        texts = self.texts(produced)
+        self.assertEqual(len(texts[0]), 200)
+        self.assertEqual(texts[1], "short")
+        with self.assertRaises(ValueError):
+            channels.diag_line("selftest", "build_rs", "a" * 201)
+
+    def test_at_most_twenty_lines_are_kept_from_the_end_of_the_stream(self):
+        stderr = "".join("line " + str(index) + chr(10) for index in range(60)).encode("ascii")
+        texts = self.texts(self.lines(stderr))
+        self.assertEqual(len(texts), channels.DIAG_MAX_LINES)
+        self.assertEqual(texts[0], "line 40")
+        self.assertEqual(texts[-1], "line 59")
+        with_header = self.texts(self.lines(stderr, header="kd-host exit=134"))
+        self.assertEqual(len(with_header), channels.DIAG_MAX_LINES)
+        self.assertEqual(with_header[0], "kd-host exit=134")
+        self.assertEqual(with_header[1], "line 41")
+        self.assertEqual(with_header[-1], "line 59")
+        self.assertEqual(self.lines(b""), ())
+        self.assertEqual(self.lines(b"\n\n  \n"), ())
+
+    def test_a_truncated_first_line_of_a_long_stream_is_dropped(self):
+        stderr = b"cut off tail text\n" * 1500
+        self.assertGreater(len(stderr), channels.DIAG_TAIL_BYTES)
+        texts = self.texts(self.lines(stderr))
+        self.assertEqual(texts, ["cut off tail text"] * channels.DIAG_MAX_LINES)
+
+    def test_lines_carrying_the_nonce_a_canary_form_or_a_marker_are_dropped(self):
+        needle = b"kd-synthetic-standin-NOT-A-SECRET"
+        stderr = b"\n".join((
+            b"keep one",
+            b"::error::fx-secret-" + NONCE.encode("ascii"),
+            b"   ::add-mask::value",
+            b"prefix fx-npm-" + NONCE.upper().encode("ascii") + b" suffix",
+            b"seen " + needle + b" here",
+            b"seen " + needle.lower() + b" lower",
+            b"marker kd-log-" + NONCE.encode("ascii"),
+            b"env KD_CANARY_SECRET=value",
+            b"keep two",
+        ))
+        texts = self.texts(self.lines(stderr, (needle,)))
+        self.assertEqual(texts, ["keep one", "keep two"])
+
+    def test_token_like_runs_longer_than_thirty_two_characters_are_dropped(self):
+        thirty_two = "a" * 32
+        stderr = "\n".join((
+            "keep " + thirty_two,
+            "drop " + "a" * 33,
+            "drop " + "0123456789abcdef" * 3,
+            "drop " + "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo" + "/+AAAA",
+            "keep path /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crt1.o",
+            "keep core::fmt::Formatter::write_str",
+        )).encode("ascii")
+        texts = self.texts(self.lines(stderr))
+        self.assertEqual(len(texts), 3)
+        self.assertEqual(texts[0], "keep " + thirty_two)
+        self.assertTrue(texts[1].startswith("keep path"))
+        self.assertTrue(texts[2].startswith("keep core"))
+        self.assertEqual(sum(1 for text in texts if text.startswith("drop")), 0)
+
+    def test_lines_without_any_letter_or_digit_are_dropped(self):
+        self.assertEqual(self.lines(b"-----\n???\n[]{}<>\n   \n.\n"), ())
+
+    def test_only_the_selftest_phase_can_ever_produce_a_diagnostic(self):
+        stderr = b"error: something\n"
+        self.assertEqual(len(self.lines(stderr)), 1)
+        for phase in ("recheck", "source", "project", "build", "", "SELFTEST", None, 5):
+            with self.subTest(phase=phase):
+                self.assertEqual(self.lines(stderr, phase=phase), ())
+                with self.assertRaises(ValueError):
+                    channels.diag_line(phase, "build_rs", "error")
+        self.assertEqual(channels.DIAG_PHASES, ("selftest",))
+
+    def test_the_form_must_be_a_fixture_name(self):
+        for form in ("Shell", "a b", 5, None, "x" * 21, ""):
+            with self.assertRaises(ValueError):
+                channels.fixture_diag_lines("selftest", form, b"error\n", NONCE, ())
+            with self.assertRaises(ValueError):
+                channels.diag_line("selftest", form, "error")
+
+    def test_the_stream_must_be_bytes_and_the_header_is_filtered_like_any_line(self):
+        self.assertEqual(self.lines("text"), ())
+        self.assertEqual(self.lines(None), ())
+        self.assertEqual(self.texts(self.lines(b"", header="kd-host ok")), ["kd-host ok"])
+        self.assertEqual(self.lines(b"", header="kd-host " + NONCE), ())
+
+    def test_refusal_evidence_is_a_header_and_bytes_pair_or_nothing(self):
+        good = ("kd-host exit=1", b"error\n")
+        self.assertEqual(BoundaryRefusal("fixture_incomplete", None, 1, good).evidence, good)
+        self.assertIsNone(BoundaryRefusal("fixture_incomplete").evidence)
+        for bad in ("text", ("a", "b"), (b"a", b"b"), ("a",), ["a", b"b"], 5):
+            self.assertIsNone(BoundaryRefusal("fixture_incomplete", None, 1, bad).evidence)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

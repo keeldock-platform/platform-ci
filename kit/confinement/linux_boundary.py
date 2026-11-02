@@ -166,6 +166,8 @@ class Boundary:
         self.scope = "unread"
         self.fixture_controlled = 0
         self.fixture_uncontrolled = 0
+        self.secret_needles = ()
+        self.phase = "selftest"
 
     def close(self):
         if self.tripwires is not None:
@@ -483,7 +485,7 @@ class Boundary:
         argv = LAUNCH + fixtures.fixture_argv(form, self.nonce)
         options = {"work": True, "limits": "fixture", "timeout": fixtures.RUN_TIMEOUT[form], "cwd": "/work"}
         self.tripwires.store.clear()
-        self.chroot(argv, environment, mode="open", files=files, binds=binds, **options)
+        opened = self.chroot(argv, environment, mode="open", files=files, binds=binds, **options)
         control = all(self.tripwires.store.seen(name, marker) for name, marker in fixtures.control_markers(form, self.nonce))
         self.tripwires.store.clear()
         mode = "open" if self.fault == "fixture-allowed" and form == "python" else "confined"
@@ -495,7 +497,7 @@ class Boundary:
         self.tripwires.store.clear()
         verdict = channels.judge_attempts(fixtures.fixture_rules(form), result.stdout, fixtures.fixture_optional(form))
         if result.timed_out or verdict in ("incomplete",):
-            raise BoundaryRefusal("fixture_incomplete", None, exit_detail(result))
+            raise BoundaryRefusal("fixture_incomplete", None, exit_detail(result), self.fixture_evidence(opened, result))
         if events or verdict == "leak":
             raise BoundaryRefusal("fixture_allowed")
         if verdict == "unexpected":
@@ -507,6 +509,22 @@ class Boundary:
         self.fixture_controlled += total - uncontrolled
         self.fixture_uncontrolled += uncontrolled
 
+    def fixture_evidence(self, opened, result):
+        names = [name for name, unused in channels.parse_attempts(result.stdout)]
+        header = (
+            "kd-host open_exit=" + str(exit_detail(opened)) + " exit=" + str(exit_detail(result))
+            + " timed_out=" + str(int(bool(result.timed_out))) + " attempts=" + str(len(names))
+            + " last=" + (names[-1] if names else "none")
+        )
+        return header, bytes(result.stderr)
+
+    def emit_diagnostic(self, form, refusal):
+        if self.phase not in channels.DIAG_PHASES or refusal.reason != "fixture_incomplete" or refusal.evidence is None:
+            return
+        header, stderr = refusal.evidence
+        for line in channels.fixture_diag_lines(self.phase, form, stderr, self.nonce, self.secret_needles, header):
+            self.emitter.emit(line)
+
     def run_fixtures(self):
         first = None
         completed = 0
@@ -516,6 +534,7 @@ class Boundary:
                 completed += 1
             except BoundaryRefusal as refusal:
                 self.emitter.emit(channels.fixture_line("selftest", form, refusal))
+                self.emit_diagnostic(form, refusal)
                 if first is None:
                     first = refusal
             except harness.ProofFailure as failure:
@@ -528,6 +547,7 @@ class Boundary:
 
 def run_phase(boundary, phase, with_fixtures):
     emitter = boundary.emitter
+    boundary.phase = phase
     record = channels.empty_record(phase)
     refusal = None
     outcomes = {}

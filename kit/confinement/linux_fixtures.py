@@ -168,6 +168,8 @@ attempt("output-exfil", exfiltrate, contained=True)
 
 NODE_DRIVER = """cd /fixtures/npm_postinstall || exit 1
 [ -x "$KD_NODE" ] || exit 6
+echo "kd-diag limits nproc=$(ulimit -u) nofile=$(ulimit -n) as=$(ulimit -v) stack=$(ulimit -s)" >&2
+echo "kd-diag node=$("$KD_NODE" --version 2>&1 | head -n 1)" >&2
 mkdir -p /work/bin && ln -s "$KD_NODE" /work/bin/node || exit 7
 export PATH=/work/bin:/usr/local/bin:/usr/bin
 export npm_lifecycle_event=postinstall npm_package_name=hostile-fixture INIT_CWD=/work
@@ -248,9 +250,9 @@ function connectAndSend(options, payload) {
 
 function spawn(path, args) {
   return function (done) {
-    const result = childProcess.spawnSync(path, args, { timeout: 5000 });
+    const result = childProcess.spawnSync(path, args, { timeout: 5000, stdio: "ignore" });
     if (result.error) {
-      done(result.error.code === "ENOENT" ? "na" : "other");
+      done(result.error.code === "ENOENT" ? "na" : outcome(result.error));
       return;
     }
     done(result.status === 0 ? "allowed" : "denied");
@@ -435,19 +437,30 @@ PROC_MACRO = "extern crate proc_macro;\nuse proc_macro::TokenStream;\n" + RUST_U
 
 PROC_MACRO_USER = "hostile::hostile!();\n\nfn main() {}\n"
 
-RUST_BUILD_DRIVER = """cd /work || exit 1
+RUST_DRIVER_HEAD = """cd /work || exit 1
 export TMPDIR=/work HOME=/work
+: >/work/rustc.err
+fail() {
+  echo "kd-diag stage=$1 exit=$2" >&2
+  echo "kd-diag limits nproc=$(ulimit -u) nofile=$(ulimit -n) as=$(ulimit -v) stack=$(ulimit -s)" >&2
+  ls -ld "${KD_RUSTC%/bin/rustc}" "${KD_RUSTC%/bin/rustc}/lib" "$KD_RUSTC" /usr/bin/ld 2>&1 | head -n 4 >&2
+  head -n 5 "$3" >&2
+  echo "kd-diag tail" >&2
+  tail -n 6 "$3" >&2
+  exit "$2"
+}
 [ -x @LINKER@ ] || exit 5
-"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=@LINKER@ -o /work/build_script /fixtures/build_rs/build.rs || exit 3
-/work/build_script
-""".replace("@LINKER@", LINKER)
+[ -x "$KD_RUSTC" ] || fail rustc-missing 8 /work/rustc.err
+"$KD_RUSTC" --version >/work/rustc.ver 2>/work/rustc.err || fail rustc-version 9 /work/rustc.err
+"""
 
-RUST_MACRO_DRIVER = """cd /work || exit 1
-export TMPDIR=/work HOME=/work
-[ -x @LINKER@ ] || exit 5
-"$KD_RUSTC" --edition 2021 --crate-type proc-macro -C linker=@LINKER@ --crate-name hostile --out-dir /work /fixtures/proc_macro/hostile.rs || exit 3
-"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=@LINKER@ --extern hostile=/work/libhostile.so -o /work/use_hostile /fixtures/proc_macro/use_hostile.rs || exit 4
-""".replace("@LINKER@", LINKER)
+RUST_BUILD_DRIVER = (RUST_DRIVER_HEAD + """"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=@LINKER@ -o /work/build_script /fixtures/build_rs/build.rs 2>/work/rustc.err || fail compile 3 /work/rustc.err
+/work/build_script
+""").replace("@LINKER@", LINKER)
+
+RUST_MACRO_DRIVER = (RUST_DRIVER_HEAD + """"$KD_RUSTC" --edition 2021 --crate-type proc-macro -C linker=@LINKER@ --crate-name hostile --out-dir /work /fixtures/proc_macro/hostile.rs 2>/work/rustc.err || fail macro 3 /work/rustc.err
+"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=@LINKER@ --extern hostile=/work/libhostile.so -o /work/use_hostile /fixtures/proc_macro/use_hostile.rs || fail use 4 /dev/null
+""").replace("@LINKER@", LINKER)
 
 
 def validate_form(form):
