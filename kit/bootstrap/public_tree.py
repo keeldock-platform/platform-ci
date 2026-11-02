@@ -338,7 +338,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/role_signer.py': 'cd933d637a3f385b3b44519ece5d3d7570e2c62dafc63e9847d831c1d200eeaf',
     'kit/confinement/gate_table.py': '7e12dd08c6aa94c3e6d5272b970f0bdbf3032943e4ff40703a0a15219f5c3749',
     'kit/confinement/test_confinement_gate_table.py': 'c69597b5555c5c5e9ec674da4aa7de9c6a74d08744aa7b0f65242e736d47749d',
-    'kit/handoff/source_capsule.py': 'ab3eed0f813602a5e2c7dc8e98968de469241938beda5b4480fc9c20d71fdc10',
+    'kit/handoff/source_capsule.py': 'be68bc74146ffffadd5084984058972b3f0bad6e04131be3a47458b85ea2efe9',
     'kit/handoff/test_source_capsule.py': '3569f495c7c4fef0fe6db5a84115c9094545d427d8876f12f932552e8a768dd2',
     'kit/confinement/test_role_signer.py': 'adaeda591034c9e852e22c12a0d926f0fb25f712f4c7f97c5fe2681674380627',
     'kit/bootstrap/policy_handoff.py': 'cf3c683aa1c9778125c56ec54ece9c5d263dc009c91bf8f2879be91463c63b18',

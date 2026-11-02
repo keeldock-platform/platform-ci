@@ -1,6 +1,6 @@
 """Seal one reviewed source tree into a receiver-bound capsule, and open it again for verification.
 
-Input: a git bundle of exactly one commit (no prerequisites), the repository that holds that commit,
+Input: a prerequisite-free git bundle with exactly one ref equal to the source commit and its full history, the repository that holds that commit,
 and the receiver key record. Output: one fixed-length capsule file as defined by capsule_frame.
 The manifest lists every file of the commit tree with its mode, blob id, size and SHA-256, so the
 receiver can check the unpacked tree against what the Linux leg verified. Only regular files are
