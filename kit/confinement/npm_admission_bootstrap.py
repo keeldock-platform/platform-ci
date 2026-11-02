@@ -273,6 +273,23 @@ def _call_adm(function, *arguments, **keywords):
         raise BootstrapRefusal(ADM_REASON_MAP.get(shared, "npm_lock_refused"), detail) from None
 
 
+def bundle_detail(token, subject, *segments, fields=()):
+    """Build the bounded check identifier of one bundle step refusal: a fixed token, the package
+    as name@version or the word bundle, then fixed rule words and sanitised public values."""
+    if type(subject) is not str:
+        subject = "bundle"
+    text = adm.build_detail(token, (subject,) + segments, fields=fields)
+    return text if _valid_lock_detail(text) else None
+
+
+def _bundle_refuse(reason, token, subject, *segments, fields=()):
+    raise BootstrapRefusal(reason, bundle_detail(token, subject, *segments, fields=fields))
+
+
+def _fetch_status(value):
+    return str(value) if type(value) is int and 100 <= value <= 599 else "status"
+
+
 def _valid_hex(value):
     return type(value) is str and HEX64_RE.fullmatch(value) is not None
 
@@ -287,16 +304,16 @@ def _canonical(record, reason):
             record, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False,
         ).encode("ascii", "strict")
     except (TypeError, ValueError, UnicodeError):
-        _refuse(reason)
+        _refuse(reason, bundle_detail("canonical", "bundle", "encode"))
 
 
 def _reject_constant(value):
     raise ValueError("constant")
 
 
-def _strict_json(data, maximum, reason):
+def _strict_json(data, maximum, reason, detail=None):
     if type(data) is not bytes or not 0 < len(data) <= maximum:
-        _refuse(reason)
+        _refuse(reason, detail)
     try:
         text = data.decode("utf-8", "strict")
         if text.startswith(chr(0xFEFF)):
@@ -305,7 +322,7 @@ def _strict_json(data, maximum, reason):
             text, object_pairs_hook=adm._unique_json_pairs, parse_constant=_reject_constant,
         )
     except (ValueError, TypeError, UnicodeError, RecursionError):
-        _refuse(reason)
+        _refuse(reason, detail)
 
 
 def _ascii_text(value, maximum):
@@ -315,15 +332,15 @@ def _ascii_text(value, maximum):
     )
 
 
-def _parse_time(value):
+def _parse_time(value, subject=None):
     match = TIME_RE.fullmatch(value) if type(value) is str else None
     if match is None:
-        _refuse("npm_evidence_invalid")
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "time_format")
     fields = tuple(int(part) for part in match.groups())
     try:
         moment = datetime.datetime(*fields)
     except ValueError:
-        _refuse("npm_evidence_invalid")
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "time_value")
     return calendar.timegm(moment.utctimetuple())
 
 
@@ -633,10 +650,12 @@ def check_inputs(files, selector):
 def check_policy_time(plan, now):
     """Require the filing time to be in the past and at most one day old at run time."""
     if type(now) is not int or now < 1:
-        _refuse("npm_stale")
+        _bundle_refuse("npm_stale", "stale", "bundle", "policy_now")
     filed = plan["policy_epoch_ms"] // 1000
-    if filed > now + CLOCK_SKEW_SECONDS or now - filed > MAX_REQUEST_TTL_SECONDS:
-        _refuse("npm_stale")
+    if filed > now + CLOCK_SKEW_SECONDS:
+        _bundle_refuse("npm_stale", "stale", "bundle", "policy_future")
+    if now - filed > MAX_REQUEST_TTL_SECONDS:
+        _bundle_refuse("npm_stale", "stale", "bundle", "policy_age")
     return filed
 
 
@@ -714,7 +733,7 @@ def check_lock(lock_bytes, plan):
     if type(lock_bytes) is not bytes or not lock_bytes:
         _refuse("npm_lock_refused", lock_detail("lock_empty"))
     if len(lock_bytes) > MAX_LOCK_BYTES:
-        _refuse("npm_payload_too_large")
+        _bundle_refuse("npm_payload_too_large", "payload_size", "bundle", "lock")
     links = workspace_links()
     internal = plan["internal_names"]
     lock = _call_adm(adm.parse_lock, lock_bytes, internal_names=internal, workspace_links=links)
@@ -781,6 +800,14 @@ def _resolve_dependency(packages, path, name):
         current = current[:index] if index != -1 else ""
 
 
+def _entry_subject(path, entry):
+    name = entry.get("name") if type(entry) is dict else None
+    version = entry.get("version") if type(entry) is dict else None
+    if type(name) is str and type(version) is str:
+        return adm.package_subject(name, version)
+    return adm.detail_text(path, 100)
+
+
 def check_peers(lock, entries):
     """Re-check every peer range against the locked tree; npm already ran with strict peers."""
     packages = lock["packages"]
@@ -789,12 +816,14 @@ def check_peers(lock, entries):
     for path, entry in entries:
         peers = entry.get("peerDependencies", {})
         meta = entry.get("peerDependenciesMeta", {})
+        subject = _entry_subject(path, entry)
         for name in sorted(peers):
             target = _resolve_dependency(packages, path, name)
             optional = type(meta.get(name)) is dict and meta[name].get("optional") is True
+            peer_name = adm.detail_text(name, 60)
             if target is None:
                 if not optional:
-                    _refuse("npm_peer_refused")
+                    _bundle_refuse("npm_peer_refused", "peer", subject, peer_name, "missing")
                 optional_missing += 1
                 continue
             version = packages[target].get("version")
@@ -804,9 +833,9 @@ def check_peers(lock, entries):
             try:
                 satisfied = semver.satisfies(version, peers[name])
             except semver.SemverError:
-                _refuse("npm_peer_refused")
+                _bundle_refuse("npm_peer_refused", "peer", subject, peer_name, "unparseable")
             if not satisfied:
-                _refuse("npm_peer_refused")
+                _bundle_refuse("npm_peer_refused", "peer", subject, peer_name, "range")
             verified += 1
     return {"verified": verified, "optional_missing": optional_missing}
 
@@ -828,14 +857,21 @@ def licence_text(value):
     return text if _ascii_text(text, 256) else None
 
 
-def _expression_alternatives(text):
+def _licence_refuse(subject, why, value):
+    _bundle_refuse(
+        "npm_licence_refused", "licence", subject, why,
+        fields=(("id", adm.detail_text(value, 64, adm.DETAIL_FIELD_CHAR_RE)),),
+    )
+
+
+def _expression_alternatives(text, subject=None):
     """Return the two identifiers of an exact two-way OR expression, or None for a plain licence."""
     inner = text[1:-1] if text.startswith("(") and text.endswith(")") else text
     if " OR " not in inner:
         return None
     parts = inner.split(" OR ")
     if len(parts) != 2 or any(LICENCE_ID_RE.fullmatch(part) is None for part in parts):
-        _refuse("npm_licence_refused")
+        _licence_refuse(subject, "expression_shape", text)
     return tuple(parts)
 
 
@@ -844,39 +880,49 @@ def licence_permitted(name, licence, allowlist):
     return licence in allowlist or name in SCOPED_LICENCES.get(licence, ())
 
 
-def resolve_licence(name, text, plan):
+def resolve_licence(name, text, plan, subject=None):
     """Return the effective licence and its condition flags, or refuse.
 
     A plain licence must be permitted for the package. An exact two-way OR expression is
     accepted only when the policy elects one of its two identifiers for that package and the
     elected licence is permitted. An election for a package without an expression refuses.
     """
+    if subject is None:
+        subject = adm.package_subject(name)
     if type(text) is not str or not text:
-        _refuse("npm_licence_refused")
+        _licence_refuse(subject, "missing", None)
     elections = plan["licence_elections"]
-    alternatives = _expression_alternatives(text)
+    alternatives = _expression_alternatives(text, subject)
     if alternatives is None:
         if name in elections:
-            _refuse("npm_licence_refused")
+            _licence_refuse(subject, "election_without_expression", text)
         chosen = text
     else:
         chosen = elections.get(name)
         if chosen not in alternatives:
-            _refuse("npm_licence_refused")
+            _licence_refuse(subject, "election_missing", text)
     if not licence_permitted(name, chosen, plan["licence_allowlist"]):
-        _refuse("npm_licence_refused")
+        _licence_refuse(subject, "not_allowed", chosen)
     return chosen, [chosen] if chosen in CONDITIONAL_LICENCES else []
 
 
 def check_elections_used(plan, packages):
     """Every recorded election must belong to a package whose licence is an expression."""
     used = {item["name"] for item in packages if item["licence"] != item["licence_elected"]}
-    if set(plan["licence_elections"]) != used:
-        _refuse("npm_licence_refused")
+    recorded = set(plan["licence_elections"])
+    if recorded != used:
+        unused = sorted(recorded - used)
+        extra = sorted(used - recorded)
+        culprit = (unused or extra)[0]
+        _licence_refuse(
+            adm.package_subject(culprit), "election_unused" if unused else "election_unrecorded",
+            plan["licence_elections"].get(culprit),
+        )
 
 
-def _archive_manifest(data):
-    tar_bytes = _call_adm(adm._read_bounded_gzip, data)
+def _archive_manifest(data, name=None, version=None):
+    subject = adm.package_subject(name, version) if name is not None else "bundle"
+    tar_bytes = _call_adm(adm._read_bounded_gzip, data, subject)
     try:
         with tarfile.open(
             fileobj=io.BytesIO(tar_bytes), mode="r:", encoding="utf-8", errors="strict",
@@ -884,16 +930,25 @@ def _archive_manifest(data):
             member = archive.getmember("package/package.json")
             stream = archive.extractfile(member) if member.isreg() else None
             if stream is None or member.size > adm.MAX_PACKAGE_JSON_BYTES:
-                _refuse("npm_archive_refused")
+                _bundle_refuse("npm_archive_refused", "archive_manifest", subject, "unreadable")
             with stream:
                 content = stream.read(adm.MAX_PACKAGE_JSON_BYTES + 1)
     except BootstrapRefusal:
         raise
-    except (KeyError, tarfile.TarError, OSError, ValueError, UnicodeError, EOFError):
-        _refuse("npm_archive_refused")
-    manifest = _call_adm(adm._load_json, content, adm.MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid")
+    except (KeyError, tarfile.TarError, OSError, ValueError, UnicodeError, EOFError) as error:
+        _bundle_refuse(
+            "npm_archive_refused", "archive_manifest", subject, "read",
+            adm.detail_text(type(error).__name__, 40),
+        )
+    try:
+        manifest = _call_adm(
+            adm._load_json, content, adm.MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid",
+        )
+    except BootstrapRefusal as error:
+        token = adm._detail_head(error.detail.split(":", 2)[-1] if error.detail else None)
+        _bundle_refuse(error.reason, "archive_manifest", subject, token)
     if type(manifest) is not dict:
-        _refuse("npm_archive_refused")
+        _bundle_refuse("npm_archive_refused", "archive_manifest", subject, "shape")
     return manifest
 
 
@@ -913,71 +968,109 @@ class RegistryFetcher:
         self.requests_made = 0
         self.bytes_read = 0
 
-    def _exchange(self, path, limit, accept, body=None):
+    def _exchange(self, path, limit, accept, body=None, subject="fetch"):
         if (type(path) is not str or not path.startswith(chr(47)) or "?" in path
                 or chr(35) in path or len(path) > 1024):
-            _refuse("npm_network_refused")
+            _bundle_refuse("npm_network_refused", "fetch", subject, "path")
         if self._deadline is not None and time.monotonic() >= self._deadline:
-            _refuse("npm_stale")
+            _bundle_refuse("npm_stale", "stale", subject, "fetch_deadline")
         if self.requests_made >= MAX_REQUESTS:
-            _refuse("npm_network_refused")
+            _bundle_refuse("npm_network_refused", "fetch", subject, "request_cap")
         self.requests_made += 1
         url = REGISTRY_URL[:-1] + path
         parsed = urllib.parse.urlsplit(url)
         if (parsed.scheme != "https" or parsed.hostname != REGISTRY_HOST or parsed.port is not None
                 or parsed.query or parsed.fragment or parsed.username or parsed.password):
-            _refuse("npm_network_refused")
+            _bundle_refuse("npm_network_refused", "fetch", subject, "origin")
         headers = {"Accept": accept, "User-Agent": USER_AGENT}
         if body is not None:
             headers["Content-Type"] = "application/json"
         request = urllib.request.Request(
             url, data=body, headers=headers, method="GET" if body is None else "POST",
         )
+        failure = "response"
         try:
             with self._opener.open(request, timeout=FETCH_TIMEOUT_SECONDS) as response:
                 if response.status != 200 or response.geturl() != url:
+                    failure = _fetch_status(response.status) if response.status != 200 else "url_changed"
                     raise ValueError("response")
                 data = response.read(limit + 1)
-        except (OSError, ValueError, http.client.HTTPException, urllib.error.URLError):
-            _refuse("npm_network_refused")
+        except urllib.error.HTTPError as error:
+            _bundle_refuse(
+                "npm_network_refused", "fetch", subject, _fetch_status(getattr(error, "code", None)),
+            )
+        except urllib.error.URLError as error:
+            timed_out = isinstance(getattr(error, "reason", None), TimeoutError)
+            _bundle_refuse(
+                "npm_network_refused", "fetch", subject, "timeout" if timed_out else "connect",
+            )
+        except TimeoutError:
+            _bundle_refuse("npm_network_refused", "fetch", subject, "timeout")
+        except (OSError, http.client.HTTPException):
+            _bundle_refuse("npm_network_refused", "fetch", subject, "transport")
+        except ValueError:
+            _bundle_refuse("npm_network_refused", "fetch", subject, failure)
         if type(data) is not bytes or not 0 < len(data) <= limit:
-            _refuse("npm_network_refused")
+            too_large = type(data) is bytes and len(data) > limit
+            _bundle_refuse(
+                "npm_network_refused", "fetch", subject, "too_large" if too_large else "empty",
+            )
         self.bytes_read += len(data)
         if self.bytes_read > MAX_TOTAL_METADATA_BYTES + adm.MAX_TOTAL_COMPRESSED_BYTES:
-            _refuse("npm_network_refused")
+            _bundle_refuse("npm_network_refused", "fetch", subject, "total_bytes")
         return data
 
     def packument(self, name):
+        subject = adm.package_subject(name)
         if not _valid_name(name):
-            _refuse("npm_input_invalid")
+            _bundle_refuse("npm_input_invalid", "bundle_input", subject, "packument_name")
         return self._exchange(
             chr(47) + urllib.parse.quote(name, safe="@"), MAX_PACKUMENT_BYTES, "application/json",
+            subject=subject,
         )
 
     def tarball(self, name, version):
-        if not _valid_name(name) or not _exact_version(version):
-            _refuse("npm_input_invalid")
+        subject = adm.package_subject(name, version)
+        if not _valid_name(name):
+            _bundle_refuse("npm_input_invalid", "bundle_input", subject, "tarball_name")
+        if not _exact_version(version):
+            _bundle_refuse("npm_input_invalid", "bundle_input", subject, "tarball_version")
         url = adm._canonical_tarball_url(name, version)
-        return self._exchange(url[len(REGISTRY_URL) - 1:], adm.MAX_TARBALL_BYTES, "application/octet-stream")
+        return self._exchange(
+            url[len(REGISTRY_URL) - 1:], adm.MAX_TARBALL_BYTES, "application/octet-stream",
+            subject=subject,
+        )
 
     def advisories(self, body):
         if type(body) is not bytes or not body:
-            _refuse("npm_input_invalid")
-        return self._exchange(ADVISORY_PATH, MAX_ADVISORY_BYTES, "application/json", body)
+            _bundle_refuse("npm_input_invalid", "bundle_input", "advisories", "request_body")
+        return self._exchange(
+            ADVISORY_PATH, MAX_ADVISORY_BYTES, "application/json", body, subject="advisories",
+        )
 
 
 def _packument_version(packument_bytes, name, version):
-    record = _strict_json(packument_bytes, MAX_PACKUMENT_BYTES, "npm_evidence_invalid")
-    if type(record) is not dict or record.get("name") != name:
-        _refuse("npm_evidence_invalid")
+    subject = adm.package_subject(name, version)
+    record = _strict_json(
+        packument_bytes, MAX_PACKUMENT_BYTES, "npm_evidence_invalid",
+        bundle_detail("evidence", subject, "packument_json"),
+    )
+    if type(record) is not dict:
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_shape")
+    if record.get("name") != name:
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_name")
     versions = record.get("versions")
     times = record.get("time")
-    if type(versions) is not dict or type(times) is not dict or "unpublished" in times:
-        _refuse("npm_evidence_invalid")
+    if type(versions) is not dict or type(times) is not dict:
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_shape")
+    if "unpublished" in times:
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "unpublished")
     manifest = versions.get(version)
     published = times.get(version)
-    if type(manifest) is not dict or type(published) is not str:
-        _refuse("npm_evidence_invalid")
+    if type(manifest) is not dict:
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_version")
+    if type(published) is not str:
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "packument_time")
     return manifest, published
 
 
@@ -985,44 +1078,58 @@ def _entry_evidence(path, entry, manifest, published, archive, archive_licence, 
                     now, direct):
     name = entry["name"]
     version = entry["version"]
+    subject = adm.package_subject(name, version)
     dist = manifest.get("dist")
     if type(dist) is not dict:
-        _refuse("npm_evidence_invalid")
-    if manifest.get("name") != name or manifest.get("version") != version:
-        _refuse("npm_evidence_invalid")
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "dist_shape")
+    if manifest.get("name") != name:
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "manifest_name")
+    if manifest.get("version") != version:
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "manifest_version")
     if dist.get("integrity") != entry["integrity"]:
-        _refuse("npm_integrity_mismatch")
+        _bundle_refuse("npm_integrity_mismatch", "integrity_mismatch", subject, "dist_integrity")
     if dist.get("tarball") != entry["resolved"]:
-        _refuse("npm_integrity_mismatch")
+        _bundle_refuse("npm_integrity_mismatch", "integrity_mismatch", subject, "dist_tarball")
     if "shasum" in dist and dist["shasum"] != archive_sha1:
-        _refuse("npm_integrity_mismatch")
-    published_epoch = _parse_time(published)
+        _bundle_refuse("npm_integrity_mismatch", "integrity_mismatch", subject, "dist_shasum")
+    published_epoch = _parse_time(published, subject)
     if published_epoch > now + CLOCK_SKEW_SECONDS:
-        _refuse("npm_evidence_invalid")
+        _bundle_refuse("npm_evidence_invalid", "evidence", subject, "published_future")
     age = plan["policy_epoch_ms"] // 1000 - published_epoch
     if age < MIN_PACKAGE_AGE_SECONDS:
-        _refuse("npm_package_too_young")
+        _bundle_refuse(
+            "npm_package_too_young", "too_young", subject, fields=(("age", max(age // 86400, 0)),),
+        )
     registry_licence = licence_text(manifest.get("license", manifest.get("licenses")))
-    if registry_licence is None or registry_licence != archive_licence:
-        _refuse("npm_licence_refused")
+    if registry_licence is None:
+        _licence_refuse(subject, "registry_missing", None)
+    if registry_licence != archive_licence:
+        _licence_refuse(subject, "archive_mismatch", registry_licence)
     if type(entry.get("license")) is str and entry["license"] != registry_licence:
-        _refuse("npm_licence_refused")
-    elected, flags = resolve_licence(name, registry_licence, plan)
+        _licence_refuse(subject, "lock_mismatch", registry_licence)
+    elected, flags = resolve_licence(name, registry_licence, plan, subject)
     deprecated = bool(manifest.get("deprecated"))
     if deprecated and direct:
-        _refuse("npm_package_deprecated")
+        _bundle_refuse("npm_package_deprecated", "deprecated", subject)
     user = manifest.get("_npmUser")
     publisher = user.get("name") if type(user) is dict else None
     publisher = publisher if _ascii_text(publisher, 128) else ""
     attested = type(dist.get("attestations")) is dict
     row = plan["rows"].get((name, version))
-    if row is not None and (
-        row["published"] != published or row["integrity"] != entry["integrity"]
-        or row["licence"] != registry_licence
-        or (row["attested"] is not None and row["attested"] != attested)
-        or (row["shasum"] is not None and row["shasum"] != archive_sha1)
-    ):
-        _refuse("npm_request_mismatch")
+    if row is not None:
+        mismatch = None
+        if row["published"] != published:
+            mismatch = "published"
+        elif row["integrity"] != entry["integrity"]:
+            mismatch = "integrity"
+        elif row["licence"] != registry_licence:
+            mismatch = "licence"
+        elif row["attested"] is not None and row["attested"] != attested:
+            mismatch = "attested"
+        elif row["shasum"] is not None and row["shasum"] != archive_sha1:
+            mismatch = "shasum"
+        if mismatch is not None:
+            _bundle_refuse("npm_request_mismatch", "request_mismatch", subject, mismatch)
     native = archive["native_binaries"]
     return {
         "path": path, "name": name, "version": version, "sha256": archive["sha256"],
@@ -1113,26 +1220,35 @@ def check_advisories(response_bytes, inventory, allows=(), direct=None, now_ms=0
     dependencies that reach those entries, and its expiry is bounded after the policy epoch
     and still ahead of the advisory fetch time, which is the now_ms value given here.
     """
-    record = _strict_json(response_bytes, MAX_ADVISORY_BYTES, "npm_advisory_invalid")
-    if type(record) is not dict or set(record) - set(inventory):
-        _refuse("npm_advisory_invalid")
+    record = _strict_json(
+        response_bytes, MAX_ADVISORY_BYTES, "npm_advisory_invalid",
+        bundle_detail("advisory_invalid", "advisories", "json"),
+    )
+    if type(record) is not dict:
+        _bundle_refuse("npm_advisory_invalid", "advisory_invalid", "advisories", "shape")
+    if set(record) - set(inventory):
+        _bundle_refuse(
+            "npm_advisory_invalid", "advisory_invalid", "advisories", "unknown_package",
+            adm.detail_text(sorted(set(record) - set(inventory))[0], 60),
+        )
     findings = []
     reach = None
     for name in sorted(record):
         items = record[name]
+        package = adm.package_subject(name)
         if type(items) is not list or len(items) > 10_000:
-            _refuse("npm_advisory_invalid")
+            _bundle_refuse("npm_advisory_invalid", "advisory_invalid", package, "items_shape")
         for item in items:
             if (type(item) is not dict or type(item.get("vulnerable_versions")) is not str
                     or not 0 < len(item["vulnerable_versions"]) <= 1024
                     or item.get("name", name) != name):
-                _refuse("npm_advisory_invalid")
+                _bundle_refuse("npm_advisory_invalid", "advisory_invalid", package, "item_shape")
             severity = item.get("severity")
             if type(severity) is not str or severity not in SEVERITIES:
-                _refuse("npm_advisory_invalid")
+                _bundle_refuse("npm_advisory_invalid", "advisory_invalid", package, "severity")
             identifier = item.get("id")
             if type(identifier) not in (int, str):
-                _refuse("npm_advisory_invalid")
+                _bundle_refuse("npm_advisory_invalid", "advisory_invalid", package, "id_type")
             identifiers = {str(identifier)}
             if type(item.get("github_advisory_id")) is str:
                 identifiers.add(item["github_advisory_id"])
@@ -1141,7 +1257,7 @@ def check_advisories(response_bytes, inventory, allows=(), direct=None, now_ms=0
                 try:
                     vulnerable = semver.satisfies(version, item["vulnerable_versions"])
                 except semver.SemverError:
-                    _refuse("npm_advisory_invalid")
+                    _bundle_refuse("npm_advisory_invalid", "advisory_invalid", package, "range")
                 if vulnerable:
                     versions.append(version)
             if not versions:
@@ -1161,7 +1277,13 @@ def check_advisories(response_bytes, inventory, allows=(), direct=None, now_ms=0
                         allowed = candidate
                         break
             if allowed is None:
-                _refuse("npm_advisory_blocked")
+                advisory_id = item.get("github_advisory_id")
+                if type(advisory_id) is not str:
+                    advisory_id = str(identifier)
+                _bundle_refuse(
+                    "npm_advisory_blocked", "advisory", adm.package_subject(name, sorted(versions)[0]),
+                    adm.detail_text(advisory_id, 64), fields=(("severity", severity),),
+                )
             for version in versions:
                 findings.append({
                     "name": name, "version": version, "severity": severity,
@@ -1171,37 +1293,41 @@ def check_advisories(response_bytes, inventory, allows=(), direct=None, now_ms=0
                     "allow_removal_condition": allowed["removal_condition"],
                 })
                 if len(findings) > MAX_FINDINGS:
-                    _refuse("npm_payload_too_large")
+                    _bundle_refuse("npm_payload_too_large", "payload_size", "advisories", "findings")
     findings.sort(key=lambda item: (item["name"], item["version"], item["advisory_id"]))
     return findings
 
 
 def _check_context(trusted_context):
     if type(trusted_context) is not dict or set(trusted_context) != set(TRUSTED_CONTEXT_FIELDS):
-        _refuse("npm_input_invalid")
+        _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "context_shape")
     for name, value in trusted_context.items():
         if not _ascii_text(value, 256):
-            _refuse("npm_input_invalid")
+            _bundle_refuse(
+                "npm_input_invalid", "bundle_input", "bundle", "context_value",
+                adm.detail_text(name, 40),
+            )
     return dict(trusted_context)
 
 
 def _check_times(now, expiry):
     if (type(now) is not int or type(expiry) is not int or now < 1 or expiry <= now
             or expiry - now > MAX_REQUEST_TTL_SECONDS):
-        _refuse("npm_stale")
+        _bundle_refuse("npm_stale", "stale", "bundle", "times")
 
 
 def _check_run(run_id, run_attempt):
-    if (type(run_id) is not str or DECIMAL_RE.fullmatch(run_id) is None
-            or type(run_attempt) is not int or run_attempt != 1):
-        _refuse("npm_input_invalid")
+    if type(run_id) is not str or DECIMAL_RE.fullmatch(run_id) is None:
+        _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "run_id")
+    if type(run_attempt) is not int or run_attempt != 1:
+        _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "run_attempt")
 
 
 def build_receipt(lock_bytes, plan, trusted_context, identities):
     """Build the canonical proposed receipt; every audit record stays pending review."""
     context = _check_context(trusted_context)
     if context["filing"] != plan["filing"]:
-        _refuse("npm_input_invalid")
+        _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "filing")
     lock_sha = _sha256(lock_bytes)
     record = {
         "schema_version": SCHEMA_VERSION,
@@ -1216,21 +1342,21 @@ def build_receipt(lock_bytes, plan, trusted_context, identities):
     }
     encoded = _canonical(record, "npm_evidence_invalid")
     if len(encoded) > MAX_RECEIPT_BYTES:
-        _refuse("npm_payload_too_large")
+        _bundle_refuse("npm_payload_too_large", "payload_size", "bundle", "receipt")
     return encoded
 
 
 
 def encode_bundle(lock_bytes, receipt_bytes, evidence_bytes):
     """Encode the single return payload under the npm admission profile's own limits."""
-    for data, maximum in (
-        (lock_bytes, MAX_LOCK_BYTES), (receipt_bytes, MAX_RECEIPT_BYTES),
-        (evidence_bytes, MAX_EVIDENCE_BYTES),
+    for label, data, maximum in (
+        ("lock", lock_bytes, MAX_LOCK_BYTES), ("receipt", receipt_bytes, MAX_RECEIPT_BYTES),
+        ("evidence", evidence_bytes, MAX_EVIDENCE_BYTES),
     ):
         if type(data) is not bytes or not data:
-            _refuse("npm_input_invalid")
+            _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", label + "_empty")
         if len(data) > maximum:
-            _refuse("npm_payload_too_large")
+            _bundle_refuse("npm_payload_too_large", "payload_size", "bundle", label)
     encoded = _canonical({
         "schema_version": SCHEMA_VERSION,
         "lock_b64": base64.b64encode(lock_bytes).decode("ascii"),
@@ -1238,21 +1364,24 @@ def encode_bundle(lock_bytes, receipt_bytes, evidence_bytes):
         "evidence_b64": base64.b64encode(evidence_bytes).decode("ascii"),
     }, "npm_input_invalid")
     if len(encoded) > MAX_BUNDLE_BYTES:
-        _refuse("npm_payload_too_large")
+        _bundle_refuse("npm_payload_too_large", "payload_size", "bundle", "bundle")
     return encoded
 
 
 def decode_bundle(bundle_bytes):
     """Decode only canonical bounded bundle bytes into lock, receipt and evidence bytes."""
     if type(bundle_bytes) is not bytes or not bundle_bytes:
-        _refuse("npm_input_invalid")
+        _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "bundle_empty")
     if len(bundle_bytes) > MAX_BUNDLE_BYTES:
-        _refuse("npm_payload_too_large")
-    record = _strict_json(bundle_bytes, MAX_BUNDLE_BYTES, "npm_input_invalid")
+        _bundle_refuse("npm_payload_too_large", "payload_size", "bundle", "bundle")
+    record = _strict_json(
+        bundle_bytes, MAX_BUNDLE_BYTES, "npm_input_invalid",
+        bundle_detail("bundle_input", "bundle", "bundle_json"),
+    )
     if (type(record) is not dict or set(record) != set(BUNDLE_FIELDS)
             or type(record["schema_version"]) is not int
             or record["schema_version"] != SCHEMA_VERSION):
-        _refuse("npm_input_invalid")
+        _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "bundle_shape")
     members = []
     for name, maximum in (
         ("lock_b64", MAX_LOCK_BYTES), ("receipt_b64", MAX_RECEIPT_BYTES),
@@ -1260,51 +1389,71 @@ def decode_bundle(bundle_bytes):
     ):
         text = record[name]
         if type(text) is not str or not text:
-            _refuse("npm_input_invalid")
+            _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "member_shape", name)
         try:
             data = base64.b64decode(text.encode("ascii"), validate=True)
         except (ValueError, UnicodeError):
-            _refuse("npm_input_invalid")
+            _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "member_base64", name)
         if base64.b64encode(data).decode("ascii") != text or not data:
-            _refuse("npm_input_invalid")
+            _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "member_base64", name)
         if len(data) > maximum:
-            _refuse("npm_payload_too_large")
+            _bundle_refuse("npm_payload_too_large", "payload_size", "bundle", name)
         members.append(data)
     if encode_bundle(*members) != bundle_bytes:
-        _refuse("npm_input_invalid")
+        _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "bundle_canonical")
     return tuple(members)
 
 
 def validate_receipt(receipt_bytes, lock_bytes, plan, trusted_context):
     """Check the receipt against its lock, the plan and the trusted context."""
     if type(receipt_bytes) is not bytes or not 0 < len(receipt_bytes) <= MAX_RECEIPT_BYTES:
-        _refuse("npm_evidence_invalid")
-    record = _strict_json(receipt_bytes, MAX_RECEIPT_BYTES, "npm_evidence_invalid")
-    if (type(record) is not dict or set(record) != set(RECEIPT_FIELDS)
-            or _canonical(record, "npm_evidence_invalid") != receipt_bytes
-            or record["schema_version"] != SCHEMA_VERSION or record["record_type"] != RECORD_TYPE
-            or record["context"] != _check_context(trusted_context)
-            or record["inputs_sha256"] != plan["inputs_sha256"]
-            or record["request_doc_sha256"] != plan["request_doc_sha256"]
-            or not hmac.compare_digest(record["lock_sha256"], _sha256(lock_bytes))):
-        _refuse("npm_evidence_invalid")
+        _evidence_refuse("receipt_size")
+    record = _strict_json(
+        receipt_bytes, MAX_RECEIPT_BYTES, "npm_evidence_invalid",
+        bundle_detail("evidence", "bundle", "receipt_json"),
+    )
+    if type(record) is not dict or set(record) != set(RECEIPT_FIELDS):
+        _evidence_refuse("receipt_shape")
+    if _canonical(record, "npm_evidence_invalid") != receipt_bytes:
+        _evidence_refuse("receipt_canonical")
+    if record["schema_version"] != SCHEMA_VERSION or record["record_type"] != RECORD_TYPE:
+        _evidence_refuse("receipt_type")
+    if record["context"] != _check_context(trusted_context):
+        _evidence_refuse("receipt_context")
+    if (record["inputs_sha256"] != plan["inputs_sha256"]
+            or record["request_doc_sha256"] != plan["request_doc_sha256"]):
+        _evidence_refuse("receipt_inputs")
+    if not hmac.compare_digest(record["lock_sha256"], _sha256(lock_bytes)):
+        _evidence_refuse("receipt_lock")
     entries = _call_adm(adm.registry_entries, lock_bytes, workspace_links=workspace_links())
     packages = record["packages"]
     if type(packages) is not list or len(packages) != len(entries):
-        _refuse("npm_evidence_invalid")
+        _evidence_refuse("receipt_packages")
     identities = []
     for item, (path, entry) in zip(packages, entries):
-        if (type(item) is not dict or set(item) != set(RECEIPT_PACKAGE_FIELDS)
-                or item["path"] != path or item["name"] != entry["name"]
-                or item["version"] != entry["version"] or item["integrity"] != entry["integrity"]
-                or item["audit_record_id"] != PENDING_AUDIT_ID or not _valid_hex(item["sha256"])):
-            _refuse("npm_evidence_invalid")
+        subject = adm.package_subject(entry["name"], entry["version"])
+        if type(item) is not dict or set(item) != set(RECEIPT_PACKAGE_FIELDS):
+            _evidence_refuse("item_shape", subject)
+        for field, expected in (
+            ("path", path), ("name", entry["name"]), ("version", entry["version"]),
+            ("integrity", entry["integrity"]),
+        ):
+            if item[field] != expected:
+                _evidence_refuse("item_" + field, subject)
+        if item["audit_record_id"] != PENDING_AUDIT_ID:
+            _evidence_refuse("item_audit", subject)
+        if not _valid_hex(item["sha256"]):
+            _evidence_refuse("item_sha256", subject)
         identities.append({key: item[key] for key in ("path", "name", "version", "integrity", "sha256")})
     if (record["archive_set_sha256"] != _call_adm(adm.archive_set_digest, identities)
             or record["package_set_sha256"]
             != _call_adm(adm.package_set_digest, record["lock_sha256"], identities)):
-        _refuse("npm_evidence_invalid")
+        _evidence_refuse("receipt_digest")
     return record
+
+
+def _evidence_refuse(what, subject="bundle"):
+    _bundle_refuse("npm_evidence_invalid", "evidence", subject, what)
 
 
 def _finding_allowed(item, fetched_ms, policy_epoch_ms):
@@ -1322,52 +1471,74 @@ def _finding_allowed(item, fetched_ms, policy_epoch_ms):
 def validate_evidence(evidence_bytes, receipt_bytes, lock_bytes, receipt, plan, *, now):
     """Check the evidence against its receipt, lock and plan, the cooling rule and its expiry."""
     if type(evidence_bytes) is not bytes or not 0 < len(evidence_bytes) <= MAX_EVIDENCE_BYTES:
-        _refuse("npm_evidence_invalid")
-    record = _strict_json(evidence_bytes, MAX_EVIDENCE_BYTES, "npm_evidence_invalid")
-    if (type(record) is not dict or set(record) != set(EVIDENCE_FIELDS)
-            or _canonical(record, "npm_evidence_invalid") != evidence_bytes
-            or record["schema_version"] != SCHEMA_VERSION
-            or not hmac.compare_digest(record["receipt_sha256"], _sha256(receipt_bytes))
-            or not hmac.compare_digest(record["lock_sha256"], _sha256(lock_bytes))
-            or record["inputs_sha256"] != receipt["inputs_sha256"]
-            or record["registry_origin"] != REGISTRY_HOST
+        _evidence_refuse("evidence_size")
+    record = _strict_json(
+        evidence_bytes, MAX_EVIDENCE_BYTES, "npm_evidence_invalid",
+        bundle_detail("evidence", "bundle", "evidence_json"),
+    )
+    if type(record) is not dict or set(record) != set(EVIDENCE_FIELDS):
+        _evidence_refuse("evidence_shape")
+    if _canonical(record, "npm_evidence_invalid") != evidence_bytes:
+        _evidence_refuse("evidence_canonical")
+    if record["schema_version"] != SCHEMA_VERSION:
+        _evidence_refuse("evidence_schema")
+    if not hmac.compare_digest(record["receipt_sha256"], _sha256(receipt_bytes)):
+        _evidence_refuse("evidence_receipt")
+    if not hmac.compare_digest(record["lock_sha256"], _sha256(lock_bytes)):
+        _evidence_refuse("evidence_lock")
+    if record["inputs_sha256"] != receipt["inputs_sha256"]:
+        _evidence_refuse("evidence_inputs")
+    if (record["registry_origin"] != REGISTRY_HOST
             or record["minimum_age_seconds"] != MIN_PACKAGE_AGE_SECONDS
             or record["attestation_verification"] != "not_performed"):
-        _refuse("npm_evidence_invalid")
+        _evidence_refuse("evidence_constants")
     _check_run(record["run_id"], record["run_attempt"])
     generated = record["generated_at"]
     expiry = record["expiry"]
     _check_times(generated, expiry)
-    if (type(now) is not int or now >= expiry or now < generated - CLOCK_SKEW_SECONDS
-            or record["policy_epoch_ms"] != plan["policy_epoch_ms"]
+    if type(now) is not int or now >= expiry or now < generated - CLOCK_SKEW_SECONDS:
+        _bundle_refuse("npm_stale", "stale", "bundle", "evidence_window")
+    if (record["policy_epoch_ms"] != plan["policy_epoch_ms"]
             or record["cutoff_epoch_ms"] != plan["cutoff_epoch_ms"]):
-        _refuse("npm_stale")
+        _bundle_refuse("npm_stale", "stale", "bundle", "evidence_policy")
     check_policy_time(plan, generated)
     packages = record["packages"]
     if type(packages) is not list or len(packages) != len(receipt["packages"]):
-        _refuse("npm_evidence_invalid")
+        _evidence_refuse("evidence_packages")
     for item, expected in zip(packages, receipt["packages"]):
-        if (type(item) is not dict or set(item) != set(EVIDENCE_PACKAGE_FIELDS)
-                or item["path"] != expected["path"] or item["name"] != expected["name"]
-                or item["version"] != expected["version"] or item["sha256"] != expected["sha256"]):
-            _refuse("npm_evidence_invalid")
-        if plan["policy_epoch_ms"] // 1000 - _parse_time(item["published"]) < MIN_PACKAGE_AGE_SECONDS:
-            _refuse("npm_package_too_young")
-        elected, flags = resolve_licence(item["name"], item["licence"], plan)
+        subject = adm.package_subject(expected["name"], expected["version"])
+        if type(item) is not dict or set(item) != set(EVIDENCE_PACKAGE_FIELDS):
+            _evidence_refuse("item_shape", subject)
+        for field in ("path", "name", "version", "sha256"):
+            if item[field] != expected[field]:
+                _evidence_refuse("item_" + field, subject)
+        published = _parse_time(item["published"], subject)
+        age = plan["policy_epoch_ms"] // 1000 - published
+        if age < MIN_PACKAGE_AGE_SECONDS:
+            _bundle_refuse(
+                "npm_package_too_young", "too_young", subject,
+                fields=(("age", max(age // 86400, 0)),),
+            )
+        elected, flags = resolve_licence(item["name"], item["licence"], plan, subject)
         if item["licence_elected"] != elected or item["licence_flags"] != flags:
-            _refuse("npm_licence_refused")
+            _licence_refuse(subject, "elected_mismatch", item["licence"])
     check_elections_used(plan, packages)
     advisory = record["advisory"]
-    if (type(advisory) is not dict or set(advisory) != set(ADVISORY_FIELDS)
-            or advisory["endpoint"] != ADVISORY_ENDPOINT
-            or advisory["valid_until"] != advisory["fetched_at"] + ADVISORY_MAX_AGE_SECONDS
-            or advisory["status"] not in ("clear", "allowed_findings")
-            or type(advisory["findings"]) is not list
-            or advisory["finding_count"] != len(advisory["findings"])
-            or (advisory["status"] == "clear") != (not advisory["findings"])
-            or any(not _finding_allowed(item, advisory["fetched_at"] * 1000, plan["policy_epoch_ms"])
-                   for item in advisory["findings"])):
-        _refuse("npm_evidence_invalid")
+    if type(advisory) is not dict or set(advisory) != set(ADVISORY_FIELDS):
+        _evidence_refuse("advisory_shape")
+    if advisory["endpoint"] != ADVISORY_ENDPOINT:
+        _evidence_refuse("advisory_endpoint")
+    if advisory["valid_until"] != advisory["fetched_at"] + ADVISORY_MAX_AGE_SECONDS:
+        _evidence_refuse("advisory_validity")
+    if advisory["status"] not in ("clear", "allowed_findings"):
+        _evidence_refuse("advisory_status")
+    if type(advisory["findings"]) is not list or advisory["finding_count"] != len(advisory["findings"]):
+        _evidence_refuse("advisory_findings")
+    if (advisory["status"] == "clear") != (not advisory["findings"]):
+        _evidence_refuse("advisory_status_findings")
+    if any(not _finding_allowed(item, advisory["fetched_at"] * 1000, plan["policy_epoch_ms"])
+           for item in advisory["findings"]):
+        _evidence_refuse("advisory_allow")
     return record
 
 
@@ -1391,6 +1562,44 @@ def _path_key(item):
     return item["path"].encode("ascii", "strict")
 
 
+def _collect_entry(path, entry, name, packument, plan, fetcher, now, totals):
+    version = entry["version"]
+    subject = adm.package_subject(name, version)
+    manifest, published = _packument_version(packument, name, version)
+    data = fetcher.tarball(name, version)
+    archive_entry = {
+        "name": name, "version": version, "integrity": entry["integrity"],
+        "resolved": entry["resolved"],
+    }
+    for field in ("optional", "devOptional", "cpu", "bundledDependencies", "bundleDependencies"):
+        if field in entry:
+            archive_entry[field] = entry[field]
+    archive = _call_adm(
+        adm.verify_tarball, archive_entry, data, internal_names=plan["internal_names"],
+    )
+    archive_manifest = _archive_manifest(data, name, version)
+    archive_licence = licence_text(
+        archive_manifest.get("license", archive_manifest.get("licenses")),
+    )
+    for key in totals:
+        totals[key] += archive[key]
+    if totals["compressed_bytes"] > adm.MAX_TOTAL_COMPRESSED_BYTES:
+        _bundle_refuse("npm_archive_refused", "archive_size", subject, "total_compressed")
+    if totals["unpacked_bytes"] > adm.MAX_TOTAL_UNPACKED_BYTES:
+        _bundle_refuse("npm_archive_refused", "archive_size", subject, "total_unpacked")
+    if totals["file_count"] > adm.MAX_ARCHIVE_FILES:
+        _bundle_refuse("npm_archive_refused", "archive_count", subject, "total_files")
+    package = _entry_evidence(
+        path, entry, manifest, published, archive, archive_licence,
+        hashlib.sha1(data).hexdigest(), plan, now, name in plan["direct"],
+    )
+    identity = {
+        "path": path, "name": name, "version": version,
+        "integrity": entry["integrity"], "sha256": archive["sha256"],
+    }
+    return package, identity
+
+
 def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, fetcher,
                      clock=None, node_version=NODE_VERSION, npm_version=NPM_VERSION):
     """Fetch metadata, archives and advisories; return the evidence record and archive identities."""
@@ -1400,7 +1609,7 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
     if fetcher is None or not all(
         callable(getattr(fetcher, method, None)) for method in ("packument", "tarball", "advisories")
     ):
-        _refuse("npm_input_invalid")
+        _bundle_refuse("npm_input_invalid", "bundle_input", "bundle", "fetcher")
     peer_summary = check_peers(lock, entries)
     identities = []
     packages = []
@@ -1410,56 +1619,41 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
     for name in sorted(groups):
         packument = fetcher.packument(name)
         if type(packument) is not bytes:
-            _refuse("npm_evidence_invalid")
+            _bundle_refuse(
+                "npm_evidence_invalid", "evidence", adm.package_subject(name), "packument_type",
+            )
         for path, entry in groups[name]:
-            version = entry["version"]
-            manifest, published = _packument_version(packument, name, version)
-            data = fetcher.tarball(name, version)
-            archive_entry = {
-                "name": name, "version": version, "integrity": entry["integrity"],
-                "resolved": entry["resolved"],
-            }
-            for field in ("optional", "devOptional", "cpu", "bundledDependencies",
-                          "bundleDependencies"):
-                if field in entry:
-                    archive_entry[field] = entry[field]
-            archive = _call_adm(
-                adm.verify_tarball, archive_entry, data, internal_names=plan["internal_names"],
-            )
-            archive_manifest = _archive_manifest(data)
-            archive_licence = licence_text(
-                archive_manifest.get("license", archive_manifest.get("licenses")),
-            )
-            for key in totals:
-                totals[key] += archive[key]
-            if (totals["compressed_bytes"] > adm.MAX_TOTAL_COMPRESSED_BYTES
-                    or totals["unpacked_bytes"] > adm.MAX_TOTAL_UNPACKED_BYTES
-                    or totals["file_count"] > adm.MAX_ARCHIVE_FILES):
-                _refuse("npm_archive_refused")
-            packages.append(_entry_evidence(
-                path, entry, manifest, published, archive, archive_licence,
-                hashlib.sha1(data).hexdigest(), plan, now,
-                name in plan["direct"],
-            ))
-            if (name, version) in plan["rows"]:
-                matched_rows.add((name, version))
-            identities.append({
-                "path": path, "name": name, "version": version,
-                "integrity": entry["integrity"], "sha256": archive["sha256"],
-            })
+            try:
+                package, identity = _collect_entry(
+                    path, entry, name, packument, plan, fetcher, now, totals,
+                )
+            except BootstrapRefusal as error:
+                if error.detail is None:
+                    _bundle_refuse(
+                        error.reason, "package_step", adm.package_subject(name, entry["version"]),
+                        adm.detail_text(error.reason, 40),
+                    )
+                raise
+            packages.append(package)
+            if (name, entry["version"]) in plan["rows"]:
+                matched_rows.add((name, entry["version"]))
+            identities.append(identity)
     if set(plan["rows"]) != matched_rows:
-        _refuse("npm_request_mismatch")
+        _bundle_refuse(
+            "npm_request_mismatch", "request_mismatch", "bundle", "unmatched_rows",
+            fields=(("count", len(set(plan["rows"]) - matched_rows)),),
+        )
     identities.sort(key=_path_key)
     packages.sort(key=_path_key)
     inventory = _advisory_body(entries)
     request_body = _canonical(inventory, "npm_advisory_invalid")
     response_bytes = fetcher.advisories(request_body)
     if type(response_bytes) is not bytes:
-        _refuse("npm_advisory_invalid")
+        _bundle_refuse("npm_advisory_invalid", "advisory_invalid", "advisories", "response_type")
     check_elections_used(plan, packages)
     fetched_at = int((clock if clock is not None else time.time)())
     if fetched_at < now - CLOCK_SKEW_SECONDS:
-        _refuse("npm_stale")
+        _bundle_refuse("npm_stale", "stale", "bundle", "advisory_clock")
     findings = check_advisories(
         response_bytes, inventory, plan["advisory_allows"], plan["direct"], fetched_at * 1000,
         lock=lock, entries=entries, policy_epoch_ms=plan["policy_epoch_ms"],
@@ -1506,13 +1700,13 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
 def build_evidence(record, lock_bytes, receipt_bytes):
     """Bind the collected evidence record to its lock and receipt and encode it canonically."""
     if type(record) is not dict:
-        _refuse("npm_evidence_invalid")
+        _bundle_refuse("npm_evidence_invalid", "evidence", "bundle", "record_type")
     bound = dict(record)
     bound["receipt_sha256"] = _sha256(receipt_bytes)
     bound["lock_sha256"] = _sha256(lock_bytes)
     encoded = _canonical(bound, "npm_evidence_invalid")
     if len(encoded) > MAX_EVIDENCE_BYTES:
-        _refuse("npm_payload_too_large")
+        _bundle_refuse("npm_payload_too_large", "payload_size", "bundle", "evidence")
     return encoded
 
 

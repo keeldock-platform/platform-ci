@@ -1929,6 +1929,463 @@ class VerificationTests(RefusalAssertions):
             subject.verify_bundle(self.bundle, self.plan, dict(self.world.context, base_sha="e" * 40), now=NOW)
 
 
+class RaisingOpener:
+    def __init__(self, error):
+        self.error = error
+
+    def open(self, request, timeout=None):
+        raise self.error
+
+
+def _raw_members(items):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for info, content in items:
+            if info.isreg():
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+            else:
+                archive.addfile(info)
+    return gzip.compress(output.getvalue(), mtime=0)
+
+
+class BundleDetailTests(RefusalAssertions):
+    ACUTE = chr(0xE9)
+    BIDI = chr(0x202E)
+
+    def detail(self, reason, function, *arguments, **keywords):
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            function(*arguments, **keywords)
+        error = raised.exception
+        self.assertEqual((error.reason, str(error), error.args), (reason, reason, (reason,)))
+        self.assertIsNotNone(error.detail)
+        self.assertLessEqual(len(error.detail), subject.LOCK_DETAIL_MAX_BYTES)
+        self.assertTrue(error.detail.isascii())
+        self.assertIsNotNone(subject.LOCK_DETAIL_RE.match(error.detail))
+        return error.detail
+
+    def world_detail(self, reason, **world_arguments):
+        return self.detail(reason, World(**world_arguments).bundle)
+
+    def test_the_bundle_check_and_the_lock_check_share_one_grammar(self):
+        self.assertEqual(subject.LOCK_DETAIL_GRAMMAR, adm.DETAIL_GRAMMAR)
+        self.assertEqual(subject.LOCK_DETAIL_MAX_BYTES, adm.DETAIL_MAX_BYTES)
+        self.assertEqual(subject.bundle_detail("deprecated", "a@1.0.0"), "deprecated:a@1.0.0")
+        self.assertEqual(subject.bundle_detail("deprecated", None), "deprecated:bundle")
+        self.assertIsNone(subject.bundle_detail("Bad", "a@1.0.0"))
+        self.assertEqual(subject.bundle_detail("deprecated", "a b"), "deprecated:invalid_name")
+        self.assertEqual(
+            subject.BootstrapRefusal("npm_archive_refused", "archive_path:a@1.0.0:tilde:package/x index:2").detail,
+            "archive_path:a@1.0.0:tilde:package/x index:2",
+        )
+        self.assertIsNone(subject.BootstrapRefusal("npm_archive_refused", "x" * 513).detail)
+
+    def test_every_evidence_refusal_names_its_package_and_check(self):
+        young = _iso(NOW - 3 * 86400)
+        wrong = "sha512-" + base64.b64encode(b"x" * 64).decode("ascii")
+        blocked = json.dumps({"alpha-pkg": [
+            {"id": 9, "severity": "high", "vulnerable_versions": "<2.0.0"},
+        ]}).encode("ascii")
+        hostile = json.dumps({"alpha-pkg": [
+            {"id": "bad id", "github_advisory_id": "x y", "severity": "low", "vulnerable_versions": "<2.0.0"},
+        ]}).encode("ascii")
+        cases = (
+            ("npm_package_too_young", {"published": {"beta-pkg": young}}, "too_young:beta-pkg@2.0.0 age:2"),
+            ("npm_package_deprecated", {"deprecated": {"alpha-pkg"}}, "deprecated:alpha-pkg@1.0.0"),
+            ("npm_integrity_mismatch", {"dist_integrity": {"gamma-pkg": wrong}},
+             "integrity_mismatch:gamma-pkg@3.1.0:dist_integrity"),
+            ("npm_evidence_invalid", {"published": {"gamma-pkg": _iso(NOW + 3600)}},
+             "evidence:gamma-pkg@3.1.0:published_future"),
+            ("npm_licence_refused",
+             {"archive_license": {"gamma-pkg": "Apache-2.0"}, "registry_license": {"gamma-pkg": "MIT"}},
+             "licence:gamma-pkg@3.1.0:archive_mismatch id:MIT"),
+            ("npm_licence_refused",
+             {"registry_license": {"gamma-pkg": "GPL-3.0-only"}, "table_licence": {"gamma-pkg": "GPL-3.0-only"}},
+             "licence:gamma-pkg@3.1.0:not_allowed id:GPL-3.0-only"),
+            ("npm_licence_refused", {"registry_license": {"gamma-pkg": "UNLICENSED"}},
+             "licence:gamma-pkg@3.1.0:not_allowed id:UNLICENSED"),
+            ("npm_licence_refused", {"registry_license": {"gamma-pkg": "(MIT OR CC0-1.0)"}},
+             "licence:gamma-pkg@3.1.0:election_missing id:_MIT_OR_CC0-1.0_"),
+            ("npm_licence_refused",
+             {"registry_license": {"gamma-pkg": "MIT"}, "elections": {"gamma-pkg": "MIT"}},
+             "licence:gamma-pkg@3.1.0:election_without_expression id:MIT"),
+            ("npm_request_mismatch", {"table_published": {"alpha-pkg": "2026-06-01T12:00:00.001Z"}},
+             "request_mismatch:alpha-pkg@1.0.0:published"),
+            ("npm_request_mismatch", {"table_attested": {"alpha-pkg": False}},
+             "request_mismatch:alpha-pkg@1.0.0:attested"),
+            ("npm_request_mismatch", {"table_licence": {"beta-pkg": "ISC"}},
+             "request_mismatch:beta-pkg@2.0.0:licence"),
+            ("npm_request_mismatch", {"extra_rows": (("delta-pkg", "4.0.0"),)},
+             "request_mismatch:bundle:unmatched_rows count:1"),
+            ("npm_advisory_blocked", {"advisory": blocked}, "advisory:alpha-pkg@1.0.0:9 severity:high"),
+            ("npm_advisory_blocked", {"advisory": hostile}, "advisory:alpha-pkg@1.0.0:x_y severity:low"),
+            ("npm_advisory_invalid", {"advisory": b"not json"}, "advisory_invalid:advisories:json"),
+            ("npm_advisory_invalid", {"advisory": b"[]"}, "advisory_invalid:advisories:shape"),
+            ("npm_advisory_invalid", {"advisory": b'{"ghost-pkg":[]}'},
+             "advisory_invalid:advisories:unknown_package:ghost-pkg"),
+            ("npm_advisory_invalid", {"advisory": b'{"alpha-pkg":"x"}'},
+             "advisory_invalid:alpha-pkg:items_shape"),
+            ("npm_advisory_invalid",
+             {"advisory": b'{"alpha-pkg":[{"id":1,"severity":"bogus","vulnerable_versions":"<2.0.0"}]}'},
+             "advisory_invalid:alpha-pkg:severity"),
+            ("npm_advisory_invalid",
+             {"advisory": b'{"alpha-pkg":[{"id":1.5,"severity":"low","vulnerable_versions":"<2.0.0"}]}'},
+             "advisory_invalid:alpha-pkg:id_type"),
+        )
+        for reason, world_arguments, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(self.world_detail(reason, **world_arguments), expected)
+
+    def test_a_tampered_archive_names_the_package_and_the_shared_check(self):
+        world = World()
+        world.archives[("gamma-pkg", "3.1.0")] = _tarball("gamma-pkg", "3.1.0", licence="ISC")
+        self.assertEqual(
+            self.detail("npm_archive_refused", world.bundle),
+            "shared_parser:npm_archive_invalid:integrity_mismatch:gamma-pkg@3.1.0:archive",
+        )
+
+    def test_the_budget_refusals_name_the_package_that_crossed_them(self):
+        for name, value, expected in (
+            ("MAX_TOTAL_COMPRESSED_BYTES", 1, "archive_size:alpha-pkg@1.0.0:total_compressed"),
+            ("MAX_TOTAL_UNPACKED_BYTES", 1, "archive_size:alpha-pkg@1.0.0:total_unpacked"),
+            ("MAX_ARCHIVE_FILES", 2, "archive_count:gamma-pkg@3.1.0:total_files"),
+        ):
+            with self.subTest(name=name):
+                with unittest.mock.patch.object(adm, name, value):
+                    self.assertEqual(self.world_detail("npm_archive_refused"), expected)
+
+    def test_the_run_and_time_refusals_name_their_check(self):
+        world = World()
+        for keywords, reason, expected in (
+            ({"expiry": NOW}, "npm_stale", "stale:bundle:times"),
+            ({"expiry": NOW + 24 * 3600 + 1}, "npm_stale", "stale:bundle:times"),
+            ({"now": 0}, "npm_stale", "stale:bundle:times"),
+            ({"clock": lambda: NOW - 10_000}, "npm_stale", "stale:bundle:advisory_clock"),
+            ({"now": NOW + 24 * 3600, "expiry": NOW + 25 * 3600}, "npm_stale", "stale:bundle:policy_age"),
+            ({"run_attempt": 2}, "npm_input_invalid", "bundle_input:bundle:run_attempt"),
+            ({"run_id": "0123"}, "npm_input_invalid", "bundle_input:bundle:run_id"),
+            ({"fetcher": None}, "npm_input_invalid", "bundle_input:bundle:fetcher"),
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(self.detail(reason, world.bundle, **keywords), expected)
+        future = World(policy_epoch_ms=(NOW + 3600) * 1000)
+        self.assertEqual(self.detail("npm_stale", future.bundle), "stale:bundle:policy_future")
+        self.assertEqual(self.detail("npm_stale", subject.check_policy_time, world.plan(), 0), "stale:bundle:policy_now")
+
+    def test_the_context_refusals_name_the_field(self):
+        world = World()
+        self.assertEqual(
+            self.detail("npm_input_invalid", subject._check_context, {}), "bundle_input:bundle:context_shape",
+        )
+        self.assertEqual(
+            self.detail("npm_input_invalid", subject._check_context, dict(world.context, repository="")),
+            "bundle_input:bundle:context_value:repository",
+        )
+        self.assertEqual(
+            self.detail("npm_input_invalid", subject._check_context,
+                        dict(world.context, source_sha="a" + self.ACUTE)),
+            "bundle_input:bundle:context_value:source_sha",
+        )
+        self.assertEqual(
+            self.detail("npm_input_invalid", subject.build_receipt, world.lock_bytes, world.plan(),
+                        dict(world.context, filing="other"), []),
+            "bundle_input:bundle:filing",
+        )
+
+    def test_the_peer_refusals_name_the_package_and_the_peer(self):
+        packages = {
+            "node_modules/a": {"version": "1.0.0", "peerDependencies": {"absent": "^1"}},
+            "node_modules/react": {"version": "19.3.1"},
+        }
+        lock = {"packages": packages}
+        entries = [("node_modules/a", packages["node_modules/a"])]
+        self.assertEqual(
+            self.detail("npm_peer_refused", subject.check_peers, lock, entries),
+            "peer:node_modules/a:absent:missing",
+        )
+        packages["node_modules/a"] = {"name": "a", "version": "1.0.0", "peerDependencies": {"react": "^18"}}
+        entries = [("node_modules/a", packages["node_modules/a"])]
+        self.assertEqual(
+            self.detail("npm_peer_refused", subject.check_peers, lock, entries), "peer:a@1.0.0:react:range",
+        )
+        packages["node_modules/a"]["peerDependencies"] = {"react": "latest"}
+        detail = self.detail("npm_peer_refused", subject.check_peers, lock, entries)
+        self.assertIn(detail, ("peer:a@1.0.0:react:range", "peer:a@1.0.0:react:unparseable"))
+
+    def test_the_licence_refusals_never_echo_unsafe_text_and_stay_bounded(self):
+        plan = World().plan()
+        self.assertEqual(
+            self.detail("npm_licence_refused", subject.resolve_licence, "gamma-pkg", "GPL-2.0+", plan),
+            "licence:gamma-pkg:not_allowed id:GPL-2.0+",
+        )
+        detail = self.detail(
+            "npm_licence_refused", subject.resolve_licence, "gamma-pkg", "Bad (x) y" + self.ACUTE, plan,
+        )
+        self.assertEqual(detail, "licence:gamma-pkg:not_allowed id:Bad__x__y_")
+        detail = self.detail("npm_licence_refused", subject.resolve_licence, "gamma-pkg", "a" * 300, plan)
+        self.assertEqual(detail, "licence:gamma-pkg:not_allowed id:" + "a" * 61 + "...")
+        self.assertEqual(
+            self.detail("npm_licence_refused", subject.resolve_licence, "gamma-pkg", "", plan),
+            "licence:gamma-pkg:missing id:invalid",
+        )
+        self.assertEqual(
+            self.detail("npm_licence_refused", subject.resolve_licence, "gamma-pkg", "(MIT OR A OR B)", plan),
+            "licence:gamma-pkg:expression_shape id:_MIT_OR_A_OR_B_",
+        )
+        elected = self.plan_with_elections(plan, {"type-fest": "MIT"})
+        packages = [{"name": "alpha-pkg", "licence": "MIT", "licence_elected": "MIT"}]
+        self.assertEqual(
+            self.detail("npm_licence_refused", subject.check_elections_used, elected, packages),
+            "licence:type-fest:election_unused id:MIT",
+        )
+        packages.append({"name": "type-fest", "licence": "(MIT OR CC0-1.0)", "licence_elected": "MIT"})
+        self.assertEqual(
+            self.detail("npm_licence_refused", subject.check_elections_used, plan, packages),
+            "licence:type-fest:election_unrecorded id:invalid",
+        )
+
+    def plan_with_elections(self, plan, elections):
+        changed = dict(plan)
+        changed["licence_elections"] = elections
+        return changed
+
+    def test_the_archive_manifest_refusals_name_the_package_and_the_check(self):
+        def refused(data, reason="npm_archive_refused"):
+            return self.detail(reason, subject._archive_manifest, data, "sample", "1.0.0")
+
+        floats = _raw_members(((tarfile.TarInfo("package/package.json"), b'{"x":1.5}'),))
+        self.assertEqual(refused(floats), "archive_manifest:sample@1.0.0:json_decode")
+        listing = _raw_members(((tarfile.TarInfo("package/package.json"), b"[]"),))
+        self.assertEqual(refused(listing), "archive_manifest:sample@1.0.0:shape")
+        other = _raw_members(((tarfile.TarInfo("package/other.txt"), b"x"),))
+        self.assertEqual(refused(other), "archive_manifest:sample@1.0.0:read:KeyError")
+        self.assertEqual(
+            refused(b"abc"), "shared_parser:npm_archive_invalid:archive_gzip:sample@1.0.0:not_gzip",
+        )
+
+    def test_a_shared_archive_member_refusal_keeps_its_member_name_or_its_index(self):
+        def refused(info, content=b""):
+            data = _raw_members(((info, content),))
+            entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+            return self.detail("npm_archive_refused", subject._call_adm, adm.verify_tarball, entry, data)
+
+        link = tarfile.TarInfo("package/link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "x"
+        self.assertEqual(
+            refused(link),
+            "shared_parser:npm_archive_invalid:archive_member_type:sample@1.0.0:symlink:package/link index:0",
+        )
+        self.assertEqual(
+            refused(tarfile.TarInfo("package/a~b.js"), b"x"),
+            "shared_parser:npm_archive_invalid:archive_path:sample@1.0.0:tilde:package/a~b.js index:0",
+        )
+        self.assertEqual(
+            refused(tarfile.TarInfo("package/a" + self.BIDI + "b"), b"x"),
+            "shared_parser:npm_archive_invalid:archive_path:sample@1.0.0:non_ascii:unrepresentable index:0",
+        )
+        self.assertEqual(
+            refused(tarfile.TarInfo("package/a\nb"), b"x"),
+            "shared_parser:npm_archive_invalid:archive_path:sample@1.0.0:control_char:unrepresentable index:0",
+        )
+        worst = tarfile.TarInfo("package/" + "d" * 40 + "/" + "a" * 40 + "~")
+        text = refused(worst, b"x")
+        self.assertTrue(text.startswith("shared_parser:npm_archive_invalid:archive_path:sample@1.0.0:tilde:"))
+        self.assertLessEqual(len(text), subject.LOCK_DETAIL_MAX_BYTES)
+
+    def test_every_fetch_failure_names_the_subject_and_the_status(self):
+        path = "/plain"
+        url = subject.REGISTRY_URL[:-1] + path
+        for status, body, final, token in (
+            (200, b"{}", url + "x", "url_changed"), (404, b"{}", url, "404"), (200, b"", url, "empty"),
+            (200, b"x" * 11, url, "too_large"), (301, b"{}", url, "301"), (503, b"{}", url, "503"),
+        ):
+            with self.subTest(token=token):
+                fetcher = subject.RegistryFetcher(opener=FakeOpener({url: (status, body, final)}))
+                self.assertEqual(
+                    self.detail("npm_network_refused", fetcher._exchange, path, 10, "application/json",
+                                subject="plain"),
+                    "fetch:plain:" + token,
+                )
+        for error, token in (
+            (urllib.error.HTTPError(url, 503, "busy", {}, None), "503"),
+            (urllib.error.URLError("unreachable"), "connect"),
+            (urllib.error.URLError(TimeoutError()), "timeout"),
+            (TimeoutError(), "timeout"),
+            (OSError("reset"), "transport"),
+        ):
+            with self.subTest(token=token):
+                fetcher = subject.RegistryFetcher(opener=RaisingOpener(error))
+                self.assertEqual(
+                    self.detail("npm_network_refused", fetcher._exchange, path, 10, "application/json",
+                                subject="plain"),
+                    "fetch:plain:" + token,
+                )
+        fetcher = subject.RegistryFetcher(opener=RaisingOpener(urllib.error.URLError("unreachable")))
+        self.assertEqual(self.detail("npm_network_refused", fetcher.packument, "plain"), "fetch:plain:connect")
+        self.assertEqual(
+            self.detail("npm_network_refused", fetcher.tarball, "plain", "1.0.0"), "fetch:plain@1.0.0:connect",
+        )
+        self.assertEqual(
+            self.detail("npm_network_refused", fetcher.advisories, b"{}"), "fetch:advisories:connect",
+        )
+
+    def test_the_fetch_guards_and_input_refusals_name_their_check(self):
+        fetcher = subject.RegistryFetcher(opener=FakeOpener({}))
+        self.assertEqual(
+            self.detail("npm_network_refused", fetcher._exchange, "plain", 10, "application/json", subject="p"),
+            "fetch:p:path",
+        )
+        fetcher.requests_made = subject.MAX_REQUESTS
+        self.assertEqual(
+            self.detail("npm_network_refused", fetcher._exchange, "/plain", 10, "application/json", subject="p"),
+            "fetch:p:request_cap",
+        )
+        expired = subject.RegistryFetcher(opener=FakeOpener({}), deadline=0.0)
+        self.assertEqual(
+            self.detail("npm_stale", expired._exchange, "/plain", 10, "application/json", subject="p"),
+            "stale:p:fetch_deadline",
+        )
+        self.assertEqual(
+            self.detail("npm_input_invalid", fetcher.packument, "Bad Name"), "bundle_input:Bad_Name:packument_name",
+        )
+        self.assertEqual(
+            self.detail("npm_input_invalid", fetcher.tarball, "plain", "^1.0.0"),
+            "bundle_input:plain@_1.0.0:tarball_version",
+        )
+        self.assertEqual(
+            self.detail("npm_input_invalid", fetcher.tarball, "Bad Name", "1.0.0"),
+            "bundle_input:Bad_Name@1.0.0:tarball_name",
+        )
+        self.assertEqual(
+            self.detail("npm_input_invalid", fetcher.advisories, b""), "bundle_input:advisories:request_body",
+        )
+
+    def test_a_package_step_refusal_without_a_check_still_names_the_package(self):
+        world = World()
+        fetcher = world.fetcher()
+
+        def failing(name, version):
+            raise subject.BootstrapRefusal("npm_network_refused")
+
+        fetcher.tarball = failing
+        self.assertEqual(
+            self.detail("npm_network_refused", world.bundle, fetcher=fetcher),
+            "package_step:alpha-pkg@1.0.0:npm_network_refused",
+        )
+        fetcher = world.fetcher()
+
+        def failing_with_check(name, version):
+            raise subject.BootstrapRefusal("npm_network_refused", "fetch:alpha-pkg@1.0.0:404")
+
+        fetcher.tarball = failing_with_check
+        self.assertEqual(
+            self.detail("npm_network_refused", world.bundle, fetcher=fetcher), "fetch:alpha-pkg@1.0.0:404",
+        )
+
+    def test_the_bundle_codec_refusals_name_their_check(self):
+        for reason, function, arguments, expected in (
+            ("npm_input_invalid", subject.encode_bundle, (b"", b"r", b"e"), "bundle_input:bundle:lock_empty"),
+            ("npm_input_invalid", subject.encode_bundle, (b"l", b"", b"e"), "bundle_input:bundle:receipt_empty"),
+            ("npm_input_invalid", subject.encode_bundle, (b"l", b"r", b""), "bundle_input:bundle:evidence_empty"),
+            ("npm_payload_too_large", subject.encode_bundle,
+             (b"x" * (subject.MAX_LOCK_BYTES + 1), b"r", b"e"), "payload_size:bundle:lock"),
+            ("npm_payload_too_large", subject.encode_bundle,
+             (b"l", b"x" * (subject.MAX_RECEIPT_BYTES + 1), b"e"), "payload_size:bundle:receipt"),
+            ("npm_payload_too_large", subject.encode_bundle,
+             (b"l", b"r", b"x" * (subject.MAX_EVIDENCE_BYTES + 1)), "payload_size:bundle:evidence"),
+            ("npm_input_invalid", subject.decode_bundle, (b"",), "bundle_input:bundle:bundle_empty"),
+            ("npm_payload_too_large", subject.decode_bundle, (b"x" * (subject.MAX_BUNDLE_BYTES + 1),),
+             "payload_size:bundle:bundle"),
+            ("npm_input_invalid", subject.decode_bundle, (b"not json",), "bundle_input:bundle:bundle_json"),
+            ("npm_input_invalid", subject.decode_bundle, (_json({"schema_version": 1}),),
+             "bundle_input:bundle:bundle_shape"),
+            ("npm_input_invalid", subject.decode_bundle,
+             (_json({"schema_version": 1, "lock_b64": 5, "receipt_b64": "x", "evidence_b64": "y"}),),
+             "bundle_input:bundle:member_shape:lock_b64"),
+            ("npm_input_invalid", subject.decode_bundle,
+             (_json({"schema_version": 1, "lock_b64": "!!!", "receipt_b64": "x", "evidence_b64": "y"}),),
+             "bundle_input:bundle:member_base64:lock_b64"),
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(self.detail(reason, function, *arguments), expected)
+        bundle = World().bundle()
+        reformatted = json.dumps(json.loads(bundle.decode("ascii")), indent=2, sort_keys=True).encode("ascii")
+        self.assertEqual(
+            self.detail("npm_input_invalid", subject.decode_bundle, reformatted), "bundle_input:bundle:bundle_canonical",
+        )
+
+    def test_the_verification_refusals_name_the_changed_part(self):
+        world = World()
+        plan = world.plan()
+        bundle = world.bundle()
+        lock_bytes, receipt_bytes, evidence_bytes = subject.decode_bundle(bundle)
+        receipt = json.loads(receipt_bytes.decode("ascii"))
+        evidence = json.loads(evidence_bytes.decode("ascii"))
+
+        def verify(reason, receipt_change=None, evidence_change=None):
+            changed_receipt = json.loads(json.dumps(receipt))
+            changed_evidence = json.loads(json.dumps(evidence))
+            if receipt_change is not None:
+                receipt_change(changed_receipt)
+            if evidence_change is not None:
+                evidence_change(changed_evidence)
+            rewritten = subject.encode_bundle(lock_bytes, _json(changed_receipt), _json(changed_evidence))
+            return self.detail(reason, subject.verify_bundle, rewritten, plan, world.context, now=NOW)
+
+        for change, expected in (
+            (lambda value: value.update({"inputs_sha256": "0" * 64}), "evidence:bundle:receipt_inputs"),
+            (lambda value: value.update({"lock_sha256": "0" * 64}), "evidence:bundle:receipt_lock"),
+            (lambda value: value["context"].update({"source_sha": "e" * 40}), "evidence:bundle:receipt_context"),
+            (lambda value: value["packages"][0].update({"sha256": "0" * 64}), "evidence:bundle:receipt_digest"),
+            (lambda value: value["packages"][0].update({"audit_record_id": "approved"}),
+             "evidence:alpha-pkg@1.0.0:item_audit"),
+            (lambda value: value["packages"].pop(), "evidence:bundle:receipt_packages"),
+            (lambda value: value.update({"extra": 1}), "evidence:bundle:receipt_shape"),
+            (lambda value: value.update({"record_type": "other"}), "evidence:bundle:receipt_type"),
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(verify("npm_evidence_invalid", receipt_change=change), expected)
+        for change, expected in (
+            (lambda value: value.update({"receipt_sha256": "0" * 64}), "evidence:bundle:evidence_receipt"),
+            (lambda value: value.update({"lock_sha256": "0" * 64}), "evidence:bundle:evidence_lock"),
+            (lambda value: value.update({"inputs_sha256": "0" * 64}), "evidence:bundle:evidence_inputs"),
+            (lambda value: value.update({"registry_origin": "example.invalid"}), "evidence:bundle:evidence_constants"),
+            (lambda value: value.update({"extra": 1}), "evidence:bundle:evidence_shape"),
+            (lambda value: value["packages"].pop(), "evidence:bundle:evidence_packages"),
+            (lambda value: value["packages"][0].update({"sha256": "0" * 64}), "evidence:alpha-pkg@1.0.0:item_sha256"),
+            (lambda value: value["advisory"].update({"status": "findings_present"}), "evidence:bundle:advisory_status"),
+            (lambda value: value["advisory"].update({"valid_until": 1}), "evidence:bundle:advisory_validity"),
+            (lambda value: value["advisory"].update({"endpoint": "other"}), "evidence:bundle:advisory_endpoint"),
+        ):
+            with self.subTest(expected=expected):
+                self.assertEqual(verify("npm_evidence_invalid", evidence_change=change), expected)
+        self.assertEqual(
+            verify("npm_licence_refused",
+                   evidence_change=lambda value: value["packages"][0].update({"licence": "GPL-3.0-only"})),
+            "licence:alpha-pkg@1.0.0:not_allowed id:GPL-3.0-only",
+        )
+        self.assertEqual(
+            verify("npm_package_too_young",
+                   evidence_change=lambda value: value["packages"][0].update({"published": _iso(NOW - 86400)})),
+            "too_young:alpha-pkg@1.0.0 age:0",
+        )
+        self.assertEqual(
+            self.detail("npm_stale", subject.verify_bundle, bundle, plan, world.context, now=EXPIRY),
+            "stale:bundle:evidence_window",
+        )
+
+    def test_the_public_text_of_every_refusal_is_the_reason_alone(self):
+        world = World(deprecated={"alpha-pkg"})
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            world.bundle()
+        error = raised.exception
+        self.assertEqual(repr(error), "BootstrapRefusal('npm_package_deprecated')")
+        self.assertEqual((str(error), error.reason, error.args), ("npm_package_deprecated",) * 2 + (("npm_package_deprecated",),))
+        self.assertNotIn("alpha-pkg", str(error))
+        self.assertNotIn("alpha-pkg", repr(error.args))
+
+
 class SiblingLoadTests(unittest.TestCase):
     def test_the_shared_helpers_are_the_reviewed_sibling_modules(self):
         self.assertIs(subject.adm, adm)

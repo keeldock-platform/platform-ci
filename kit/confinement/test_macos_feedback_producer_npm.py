@@ -708,6 +708,87 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         self.assertEqual(producer.npm_diagnostic_result(error)["npm_diagnostic"],
                          ("npm_bundle", "npm_network_refused"))
 
+    def bundle_refusal(self, detail, reason="npm_network_refused"):
+        refusal = bootstrap.BootstrapRefusal(reason)
+        refusal.detail = detail
+
+        def failing(name):
+            raise refusal
+
+        self.fetcher.packument = failing
+
+    def test_the_bundle_step_diagnostic_carries_the_check_as_its_first_stderr_line(self):
+        self.resolve = SimpleNamespace(returncode=0, stdout=b"", stderr=b"npm warn deprecated a@1.0.0: old\n")
+        check = bootstrap.bundle_detail("fetch", "alpha-pkg", "404")
+        self.assertEqual(check, "fetch:alpha-pkg:404")
+        self.bundle_refusal(check)
+        with patch.object(producer, "_npm_read_report", return_value=None):
+            error = self.failure()
+        self.assertEqual((error.reason, error.source_gates_step, error.source_gates_key),
+                         ("command_failed", "npm_bundle", "npm_network_refused"))
+        header, stderr, report = self.sections(error.npm_diagnostic)
+        self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_network_refused")
+        self.assertEqual(stderr[0], "  kd-check fetch:alpha-pkg:404")
+        self.assertEqual(report, [])
+        self.assertEqual(producer.npm_diagnostic_result(error)["npm_diagnostic"],
+                         ("npm_bundle", "npm_network_refused"))
+
+    def test_the_bundle_public_outcome_does_not_depend_on_whether_the_check_was_kept(self):
+        self.resolve = SimpleNamespace(returncode=0, stdout=b"", stderr=b"npm warn deprecated a@1.0.0: old\n")
+        outcomes = []
+        for check in ("fetch:alpha-pkg:404", "bad\nline", None):
+            self.fetcher = self.world.fetcher()
+            self.bundle_refusal(check)
+            with patch.object(producer, "_npm_read_report", return_value=None):
+                error = self.failure()
+            outcomes.append((
+                error.reason, error.detail, error.source_gates_step, error.source_gates_key, str(error),
+                error.args, producer.npm_diagnostic_result(error)["npm_diagnostic"],
+            ))
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertEqual(outcomes[0], outcomes[2])
+        self.assertNotIn("alpha-pkg", repr(outcomes[0]))
+
+    def test_an_unsafe_bundle_check_keeps_the_diagnostic_without_the_check(self):
+        self.resolve = SimpleNamespace(returncode=0, stdout=b"", stderr=b"npm warn deprecated a@1.0.0: old\n")
+        for hostile in ("bad\nline", "caf" + chr(233), "x" * 600, "fetch:a b", "fetch:x found:", 7, b"fetch"):
+            with self.subTest(check=hostile):
+                self.fetcher = self.world.fetcher()
+                self.bundle_refusal(hostile)
+                with patch.object(producer, "_npm_read_report", return_value=None):
+                    error = self.failure()
+                header, stderr, report = self.sections(error.npm_diagnostic)
+                self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_network_refused")
+                self.assertEqual(stderr, ["  npm warn deprecated a@1.0.0: old"])
+
+    def test_a_real_bundle_refusal_reaches_the_diagnostic_with_its_package_and_check(self):
+        self.resolve = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        self.fetcher.advisory = json.dumps({"alpha-pkg": [
+            {"id": 9, "severity": "high", "vulnerable_versions": "<2.0.0"},
+        ]}).encode("ascii")
+        with patch.object(producer, "_npm_read_report", return_value=None):
+            error = self.failure()
+        self.assertEqual((error.reason, error.source_gates_step, error.source_gates_key),
+                         ("payload_invalid", "npm_bundle", "npm_advisory_blocked"))
+        header, stderr, report = self.sections(error.npm_diagnostic)
+        self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_advisory_blocked")
+        self.assertEqual(stderr, ["  kd-check advisory:alpha-pkg@1.0.0:9 severity:high"])
+        self.assertEqual(report, [])
+
+    def test_a_hostile_archive_member_name_reaches_the_diagnostic_only_as_its_index(self):
+        self.resolve = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        check = bootstrap.bundle_detail(
+            "archive_path", "sample@1.0.0", "non_ascii", "unrepresentable", fields=(("index", 4),),
+        )
+        self.assertEqual(check, "archive_path:sample@1.0.0:non_ascii:unrepresentable index:4")
+        self.bundle_refusal(check, "npm_archive_refused")
+        with patch.object(producer, "_npm_read_report", return_value=None):
+            error = self.failure()
+        header, stderr, report = self.sections(error.npm_diagnostic)
+        self.assertEqual(stderr, ["  kd-check " + check])
+        self.assertEqual((error.reason, str(error)), ("payload_invalid", "payload_invalid"))
+        self.assertNotIn("sample", repr((error.reason, error.detail, str(error), error.args)))
+
     def test_a_resolve_capture_failure_keeps_the_report_but_other_runner_failures_carry_nothing(self):
         self.runner_failures = {"resolve": self.runner_refusal("capture_invalid")}
         with patch.object(producer, "_npm_read_report", return_value=b"Found: a@1\n"):
@@ -861,7 +942,7 @@ class NpmDiagnosticPayloadTests(unittest.TestCase):
                 self.assertEqual(self.sections(payload)[1], ["  kd-check " + check])
 
     def test_the_check_is_refused_for_other_steps_and_for_anything_outside_the_closed_shapes(self):
-        for step in ("npm_resolve", "npm_bundle"):
+        for step in ("npm_resolve",):
             with self.subTest(step=step):
                 with self.assertRaises(producer.FeedbackRefusal):
                     producer.build_npm_diagnostic_payload(step, "other", None, None, "lock_empty")
@@ -873,6 +954,60 @@ class NpmDiagnosticPayloadTests(unittest.TestCase):
             with self.subTest(check=hostile):
                 with self.assertRaises(producer.FeedbackRefusal):
                     producer.build_npm_diagnostic_payload("npm_lock", "npm_lock_refused", None, None, hostile)
+
+    def test_every_bundle_check_shape_is_accepted_by_the_payload_validator(self):
+        for check in (
+            "fetch:alpha-pkg:404", "fetch:advisories:connect", "too_young:beta-pkg@2.0.0 age:2",
+            "deprecated:alpha-pkg@1.0.0", "licence:gamma-pkg@3.1.0:not_allowed id:GPL-2.0+",
+            "licence:gamma-pkg@3.1.0:election_missing id:_MIT_OR_CC0-1.0_",
+            "advisory:alpha-pkg@1.0.0:9 severity:high", "advisory_invalid:alpha-pkg:severity",
+            "request_mismatch:bundle:unmatched_rows count:1", "request_mismatch:alpha-pkg@1.0.0:published",
+            "peer:a@1.0.0:react:range", "integrity_mismatch:gamma-pkg@3.1.0:dist_integrity",
+            "shared_parser:npm_archive_invalid:archive_path:sample@1.0.0:tilde:package/a~b.js index:2",
+            "shared_parser:npm_archive_invalid:archive_member_type:sample@1.0.0:symlink:package/link index:1",
+            "shared_parser:npm_archive_invalid:archive_path:sample@1.0.0:non_ascii:unrepresentable index:4",
+            "shared_parser:npm_archive_invalid:integrity_mismatch:gamma-pkg@3.1.0:archive",
+            "archive_manifest:sample@1.0.0:json_decode", "archive_root:sample@1.0.0:other index:2",
+            "archive_size:alpha-pkg@1.0.0:total_compressed", "archive_count:gamma-pkg@3.1.0:total_files",
+            "package_step:alpha-pkg@1.0.0:npm_network_refused", "stale:bundle:times",
+            "payload_size:bundle:lock", "bundle_input:bundle:context_value:repository",
+            "evidence:alpha-pkg@1.0.0:item_sha256",
+        ):
+            with self.subTest(check=check):
+                self.assertIsNotNone(bootstrap.LOCK_DETAIL_RE.match(check))
+                payload = producer.build_npm_diagnostic_payload("npm_bundle", "npm_archive_refused", None, None, check)
+                header, stderr, report = self.sections(payload)
+                self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_archive_refused")
+                self.assertEqual(stderr, ["  kd-check " + check])
+
+    def test_the_longest_bundle_check_fits_the_shared_bound_and_the_payload_bounds(self):
+        subject_text = bootstrap.adm.package_subject("a" * 214, "1.0.0-" + "b" * 100)
+        longest = bootstrap.adm.build_detail(
+            "archive_member_type", (subject_text, "gnu_longname", "d" * 50 + "/" + "e" * 49),
+            fields=(("index", 99999),),
+        )
+        combined = "shared_parser:npm_archive_invalid:" + longest
+        self.assertLessEqual(len(combined), producer.NPM_CHECK_MAX_BYTES)
+        self.assertIsNotNone(producer.NPM_CHECK_RE.match(combined))
+        stderr = b"".join(b"npm warn " + (b"w" * 100) + b" " + str(index).encode("ascii") + b"\n" for index in range(600))
+        report = b"".join(b"report line " + str(index).encode("ascii") + b"\n" for index in range(2000))
+        payload = producer.build_npm_diagnostic_payload("npm_bundle", "npm_archive_refused", stderr, report, combined)
+        text = payload.decode("ascii")
+        self.assertLessEqual(len(payload), producer.NPM_DIAGNOSTIC_MAX_BYTES)
+        self.assertLessEqual(text.count("\n"), producer.NPM_DIAGNOSTIC_MAX_LINES)
+        self.assertEqual(text.splitlines()[2], "  kd-check " + combined)
+        self.assertEqual(text.count("kd-check"), 1)
+
+    def test_the_bundle_check_is_refused_outside_the_closed_shapes(self):
+        for hostile in (
+            "", "bad\nline", "archive_path:sample@1.0.0:tilde:package/a" + chr(233), "x" * 513,
+            "archive_path:sample@1.0.0:tilde:package/a b", "archive_path:p:r:a" + chr(0x202E) + "b",
+            "archive_path:p:r:a|b", "Archive_Path:p", b"archive_path:p", 7, ["a"],
+            "archive_path:" + "a" * 215, "a:b:c:d:e:f:g:h", "archive_path:p index:1;2",
+        ):
+            with self.subTest(check=hostile):
+                with self.assertRaises(producer.FeedbackRefusal):
+                    producer.build_npm_diagnostic_payload("npm_bundle", "npm_archive_refused", None, None, hostile)
 
     def test_the_check_keeps_the_payload_inside_every_bound(self):
         check = bootstrap.lock_detail(

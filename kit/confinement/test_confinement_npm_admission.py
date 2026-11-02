@@ -8,6 +8,7 @@ import re
 import tarfile
 import tempfile
 import unittest
+import unittest.mock
 
 import npm_admission as subject
 
@@ -1234,6 +1235,265 @@ class NpmInertBundledTests(unittest.TestCase):
         escaping = _tarball("sample", "1.0.0", extra=(("package/../escape", b"x"),))
         with self.assertRaises(subject.Refusal):
             subject.verify_tarball(self._inert_entry(escaping), escaping)
+
+
+ACUTE = chr(0xE9)
+BIDI = chr(0x202E)
+CYRILLIC = chr(0x430) + "b" + chr(0x441)
+SUPERSCRIPT_TWO = chr(0xB2)
+SUPERSCRIPT_ONE = chr(0xB9)
+
+
+class NpmArchiveDetailTests(unittest.TestCase):
+    SUBJECT = "sample@1.0.0"
+
+    def entry(self, data, **fields):
+        value = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+        value.update(fields)
+        return value
+
+    def refusal(self, data, **fields):
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.verify_tarball(self.entry(data, **fields), data)
+        error = raised.exception
+        self.assertEqual((error.reason, str(error)), ("npm_archive_invalid", "npm_archive_invalid"))
+        self.assertIsNotNone(error.detail)
+        self.assertLessEqual(len(error.detail), subject.DETAIL_MAX_BYTES)
+        self.assertTrue(error.detail.isascii())
+        self.assertIsNotNone(subject.DETAIL_RE.match(error.detail))
+        return error.detail
+
+    def member_tar(self, info, content=b""):
+        return _tar_with_members(((info, content),))
+
+    def test_a_refused_member_name_is_shown_with_its_rule_and_index(self):
+        for path, rule in (
+            ("package/a~b.js", "tilde"), ("package/lib/aux.js", "reserved_name"),
+            ("package/lib/con", "reserved_name"), ("package/lib/lpt3.txt", "reserved_name"),
+            ("package/trail.", "trailing_dot"), ("package/dir/../x", "dot_segment"),
+            ("package/./x", "dot_segment"), ("package//x", "empty_segment"),
+        ):
+            with self.subTest(path=path):
+                data = _tarball("sample", "1.0.0", extra=((path, b"x"),))
+                self.assertEqual(
+                    self.refusal(data), "archive_path:" + self.SUBJECT + ":" + rule + ":" + path + " index:2",
+                )
+
+    def test_a_member_name_outside_the_shared_grammar_is_never_echoed(self):
+        for path, rule in (
+            ("package/a\nb", "control_char"), ("package/caf" + ACUTE + ".js", "non_ascii"),
+            ("package/a" + BIDI + "b", "non_ascii"), ("package/<script>", "bad_char"),
+            ("package/with space/x:y", "bad_char"), ("package/a\\b", "backslash"),
+            ("package/" + CYRILLIC, "non_ascii"), ("package/trail ", "trailing_space"),
+            ("package/a:b", "bad_char"), ("package/a|b", "bad_char"),
+        ):
+            with self.subTest(path=path):
+                data = _tarball("sample", "1.0.0", extra=((path, b"x"),))
+                detail = self.refusal(data)
+                self.assertEqual(
+                    detail, "archive_path:" + self.SUBJECT + ":" + rule + ":unrepresentable index:2",
+                )
+                self.assertNotIn("script", detail)
+                self.assertNotIn("\n", detail)
+                self.assertNotIn(BIDI, detail)
+                self.assertTrue(detail.isascii())
+
+    def test_a_long_member_name_is_replaced_by_its_index(self):
+        path = "package/" + "d" * 50 + "/" + "a" * 60 + "~"
+        data = _tarball("sample", "1.0.0", extra=((path, b"x"),))
+        self.assertEqual(
+            self.refusal(data), "archive_path:" + self.SUBJECT + ":tilde:unrepresentable index:2",
+        )
+        shown = "package/" + "d" * 40 + "/" + "a" * 40 + "~"
+        self.assertLessEqual(len(shown), subject.ARCHIVE_MEMBER_NAME_LIMIT)
+        data = _tarball("sample", "1.0.0", extra=((shown, b"x"),))
+        self.assertEqual(self.refusal(data), "archive_path:" + self.SUBJECT + ":tilde:" + shown + " index:2")
+
+    def test_a_member_type_other_than_a_file_or_directory_is_named(self):
+        for kind, name in (
+            (tarfile.SYMTYPE, "symlink"), (tarfile.LNKTYPE, "hardlink"), (tarfile.CHRTYPE, "chardevice"),
+            (tarfile.BLKTYPE, "blockdevice"), (tarfile.FIFOTYPE, "fifo"),
+        ):
+            with self.subTest(kind=name):
+                info = tarfile.TarInfo("package/special")
+                info.type = kind
+                if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                    info.linkname = "package/package.json"
+                data = self.member_tar(info)
+                self.assertEqual(
+                    self.refusal(data),
+                    "archive_member_type:" + self.SUBJECT + ":" + name + ":package/special index:1",
+                )
+
+    def test_a_pax_header_member_is_named_by_its_type(self):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.PAX_FORMAT) as archive:
+            info = tarfile.TarInfo("package/caf" + ACUTE + ".js")
+            info.size = 1
+            archive.addfile(info, io.BytesIO(b"x"))
+        detail = self.refusal(output.getvalue())
+        self.assertTrue(detail.startswith("archive_member_type:" + self.SUBJECT + ":pax_header:"))
+        self.assertTrue(detail.endswith(" index:0"))
+
+    def test_a_non_package_root_a_nested_node_modules_and_duplicates_are_named(self):
+        data = _tarball("sample", "1.0.0", extra=(("other/x.js", b"x"),))
+        self.assertEqual(self.refusal(data), "archive_root:" + self.SUBJECT + ":other index:2")
+        data = _tarball("sample", "1.0.0", extra=(("package/lib/node_modules/x/y.js", b"x"),))
+        self.assertEqual(
+            self.refusal(data),
+            "archive_path:" + self.SUBJECT + ":node_modules:package/lib/node_modules/x/y.js index:2",
+        )
+        data = _tarball("sample", "1.0.0", extra=(("package/a.js", b"x"), ("package/a.js", b"y")))
+        self.assertEqual(
+            self.refusal(data), "archive_path:" + self.SUBJECT + ":duplicate:package/a.js index:3",
+        )
+        data = _tarball("sample", "1.0.0", extra=(("package/A.js", b"x"), ("package/a.js", b"y")))
+        self.assertEqual(
+            self.refusal(data), "archive_path:" + self.SUBJECT + ":case_collision:package/a.js index:3",
+        )
+        data = _tarball("sample", "1.0.0", extra=(("package/a", b"x"), ("package/a/b", b"y")))
+        self.assertEqual(
+            self.refusal(data), "archive_path:" + self.SUBJECT + ":file_parent:package/a/b",
+        )
+
+    def test_the_gzip_and_tar_framing_refusals_name_their_check(self):
+        self.assertEqual(self.refusal(b"plain bytes"), "archive_gzip:" + self.SUBJECT + ":not_gzip")
+        broken = b"\x1f\x8b" + b"garbage garbage"
+        self.assertEqual(self.refusal(broken), "archive_gzip:" + self.SUBJECT + ":corrupt")
+        short = gzip.compress(b"x" * 100)
+        self.assertEqual(self.refusal(short), "archive_tar:" + self.SUBJECT + ":shape")
+        valid = gzip.decompress(_tarball("sample", "1.0.0"))
+        garbled = bytearray(valid)
+        garbled[148:156] = b"zzzzzzz\x00"
+        self.assertEqual(
+            self.refusal(gzip.compress(bytes(garbled))),
+            "archive_tar:" + self.SUBJECT + ":octal_checksum index:0",
+        )
+        wrong = bytearray(valid)
+        wrong[0:1] = b"q"
+        self.assertEqual(
+            self.refusal(gzip.compress(bytes(wrong))), "archive_tar:" + self.SUBJECT + ":checksum index:0",
+        )
+        trailing = valid + b"junk" + bytes(508)
+        self.assertEqual(
+            self.refusal(gzip.compress(trailing)), "archive_tar:" + self.SUBJECT + ":trailing_data",
+        )
+        self.assertEqual(
+            self.refusal(gzip.compress(valid[:1536])), "archive_tar:" + self.SUBJECT + ":no_end",
+        )
+
+    def test_the_size_and_count_refusals_name_their_check(self):
+        data = _tarball("sample", "1.0.0")
+        with unittest.mock.patch.object(subject, "MAX_TARBALL_BYTES", 10):
+            self.assertEqual(self.refusal(data), "archive_size:" + self.SUBJECT + ":tarball")
+        with unittest.mock.patch.object(subject, "MAX_TAR_BYTES", 10):
+            self.assertEqual(self.refusal(data), "archive_size:" + self.SUBJECT + ":tar")
+        with unittest.mock.patch.object(subject, "MAX_ARCHIVE_FILES", 1):
+            self.assertEqual(self.refusal(data), "archive_count:" + self.SUBJECT + ":members index:1")
+        with unittest.mock.patch.object(subject, "MAX_PACKAGE_UNPACKED_BYTES", 5):
+            self.assertEqual(self.refusal(data), "archive_size:" + self.SUBJECT + ":member index:1")
+        bigger = _tarball("sample", "1.0.0", extra=(("package/a.js", b"x" * 100),))
+        with unittest.mock.patch.object(subject, "MAX_PACKAGE_UNPACKED_BYTES", 120):
+            self.assertEqual(self.refusal(bigger), "archive_size:" + self.SUBJECT + ":unpacked index:2")
+        oversized = tarfile.TarInfo("package/too-large")
+        oversized.size = subject.MAX_PACKAGE_UNPACKED_BYTES + 1
+        raw_tar = oversized.tobuf(format=tarfile.USTAR_FORMAT) + bytes(1024)
+        self.assertEqual(
+            self.refusal(gzip.compress(raw_tar)), "archive_size:" + self.SUBJECT + ":member index:0",
+        )
+
+    def test_the_integrity_and_input_refusals_name_their_check(self):
+        data = _tarball("sample", "1.0.0")
+        self.assertEqual(
+            self.refusal(data, integrity=_sri(b"other")), "integrity_mismatch:" + self.SUBJECT + ":archive",
+        )
+        self.assertEqual(
+            self.refusal(b"", integrity=_sri(b"x")), "archive_input:" + self.SUBJECT + ":tarball_empty",
+        )
+        self.assertEqual(
+            self.refusal(data, resolved="https://example.invalid/x.tgz"),
+            "archive_input:" + self.SUBJECT + ":resolved",
+        )
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.verify_tarball(self.entry(data), data, internal_names=("sample",))
+        self.assertEqual(raised.exception.detail, "archive_input:" + self.SUBJECT + ":internal")
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.verify_tarball({"name": "sample"}, data)
+        self.assertEqual(raised.exception.detail, "archive_input:unknown:entry_shape")
+        self.assertEqual(self.refusal(data, name="Bad Name"), "archive_input:Bad_Name@1.0.0:name")
+        self.assertEqual(self.refusal(data, version="x"), "archive_input:sample@x:version")
+
+    def test_the_manifest_refusals_name_their_check(self):
+        other_name = _tarball("other", "1.0.0")
+        self.assertEqual(self.refusal(other_name), "archive_manifest:" + self.SUBJECT + ":name_mismatch")
+        other_version = _tarball("sample", "2.0.0")
+        self.assertEqual(self.refusal(other_version), "archive_manifest:" + self.SUBJECT + ":version_mismatch")
+        no_manifest = self.member_tar(tarfile.TarInfo("package/readme.txt"), b"x")
+        self.assertEqual(self.refusal(no_manifest), "archive_manifest:" + self.SUBJECT + ":missing")
+        for text, token in (
+            ('{"name":"sample","version":"1.0.0","x":1.5}', "json_decode"),
+            ('{"name":"sample","version":"1.0.0","x":1,"x":2}', "json_decode"),
+            ('{"name":"sample","version":"1.0.0","scripts":[]}', "scripts_shape"),
+            ('{"name":"sample","version":"1.0.0","scripts":{"a":1}}', "scripts_value"),
+            ("[]", "shape"),
+            ('{"name":"sample","version":"1.0.0","x":"' + "y" * 9000 + '"}', "json_string"),
+        ):
+            with self.subTest(token=token):
+                data = self.member_tar(tarfile.TarInfo("package/package.json"), text.encode("ascii"))
+                self.assertEqual(self.refusal(data), "archive_manifest:" + self.SUBJECT + ":" + token)
+
+    def test_a_long_package_subject_is_shortened_and_the_whole_detail_stays_bounded(self):
+        name = "a" * 214
+        version = "1.0.0-" + "b" * 100
+        data = _tarball(name, version, extra=(("package/a~b", b"x"),))
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.verify_tarball({"name": name, "version": version, "integrity": _sri(data)}, data)
+        detail = raised.exception.detail
+        self.assertIsNotNone(detail)
+        self.assertLessEqual(len(detail), subject.DETAIL_MAX_BYTES)
+        self.assertIsNotNone(subject.DETAIL_RE.match(detail))
+        self.assertIn("a" * 57 + "...@1.0.0-", detail)
+        self.assertEqual(raised.exception.reason, "npm_archive_invalid")
+
+    def test_the_classifier_agrees_with_the_safe_path_rule_for_every_sample(self):
+        samples = (
+            "", "package/x", "package/a b", "package/a~b", "package/con", "package/COM1.txt",
+            "package/lpt" + SUPERSCRIPT_TWO, "package/nul.", "package/a.", "package/a ", "/abs", "a\\b",
+            "a//b", "a/./b", "a/../b", "package/" + "a" * 600, "caf" + ACUTE, "tab\tname", "package/<a>",
+            'package/a"b', "package/a|b", "package/a?b", "package/a*b", "package/a:b",
+            "package/.hidden", "package/..x", "package/x.y.z", "package/CON.d.ts", "package/conin$",
+            "package/lib/clock$", "package/com0", "package/com9.js", "package/lpt" + SUPERSCRIPT_ONE,
+            None, 5, b"x",
+        )
+        rules = set()
+        for value in samples:
+            with self.subTest(value=value):
+                rule = subject._archive_path_rule(value)
+                self.assertEqual(rule is None, subject._safe_relative_archive_path(value))
+                rules.add(rule)
+        self.assertTrue({
+            "empty", "backslash", "absolute", "too_long", "non_ascii", "control_char", "empty_segment",
+            "dot_segment", "trailing_dot", "trailing_space", "tilde", "bad_char", "reserved_name", None,
+        }.issubset(rules))
+
+    def test_the_shared_detail_helpers_bound_every_value(self):
+        self.assertEqual(subject.detail_text("MIT"), "MIT")
+        self.assertEqual(subject.detail_text("(MIT OR GPL)"), "_MIT_OR_GPL_")
+        self.assertEqual(subject.detail_text("GPL-2.0+", 64, subject.DETAIL_FIELD_CHAR_RE), "GPL-2.0+")
+        self.assertEqual(subject.detail_text(""), "empty")
+        self.assertEqual(subject.detail_text(None), "invalid")
+        long_text = subject.detail_text("a" * 500, 64)
+        self.assertEqual((len(long_text), long_text[-3:]), (64, "..."))
+        shortened = subject.package_subject("a" * 214, "1.0.0+" + "b" * 90)
+        self.assertEqual(shortened.count("@"), 1)
+        self.assertLessEqual(len(shortened), 81)
+        text = subject.build_detail("archive_path", ("p@1.0.0", "tilde"), fields=(("index", 7), ("id", "A+b:c")))
+        self.assertEqual(text, "archive_path:p@1.0.0:tilde index:7 id:A+b:c")
+        self.assertIsNotNone(subject.DETAIL_RE.match(text))
+        hostile = subject.build_detail("a", ("p",), fields=(("Bad", 1), ("index", -1), ("id", "a b"), ("x", True)))
+        self.assertEqual(hostile, "a:p index:invalid id:invalid x:invalid")
+        self.assertIsNone(subject.build_detail("a", ("p",), fields=7))
+        self.assertIsNone(subject.build_detail("a", ("p",), fields=(("id", "x" * 512),) * 3))
 
 
 if __name__ == "__main__":

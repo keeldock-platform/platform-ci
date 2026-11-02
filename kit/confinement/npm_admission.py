@@ -126,6 +126,9 @@ DETAIL_SEGMENT_RE = re.compile(r"[A-Za-z0-9._~@/_-]{1,214}\Z")
 DETAIL_SCHEME_RE = re.compile(r"[a-z]{1,16}\Z")
 DETAIL_VERSION_RE = re.compile(r"[0-9A-Za-z.+-]{1,64}\Z")
 DETAIL_SPEC_SCHEME_RE = re.compile(r"([a-z]{1,16})[:+]")
+DETAIL_SEGMENT_CHAR_RE = re.compile(r"[^A-Za-z0-9._~@/_-]")
+DETAIL_FIELD_CHAR_RE = re.compile(r"[^A-Za-z0-9._~@/:,+-]")
+DETAIL_FIELD_RE = re.compile(r"[A-Za-z0-9._~@/:,+-]{1,512}\Z")
 
 
 def _detail_segment(value, limit):
@@ -136,7 +139,7 @@ def _detail_segment(value, limit):
     return value
 
 
-def _detail_text(token, segments, kept, count, scheme, limit):
+def _detail_text(token, segments, kept, count, scheme, limit, fields=()):
     text = token
     for segment in segments:
         text += ":" + _detail_segment(segment, limit)
@@ -146,6 +149,8 @@ def _detail_text(token, segments, kept, count, scheme, limit):
         text += " scheme:" + (
             scheme if type(scheme) is str and DETAIL_SCHEME_RE.match(scheme) is not None else "other"
         )
+    for key, value in fields:
+        text += " " + key + ":" + value
     kept = list(kept)
     while True:
         rendered = text + (" found:" + ",".join(kept) if kept else "")
@@ -154,14 +159,51 @@ def _detail_text(token, segments, kept, count, scheme, limit):
         kept.pop()
 
 
-def build_detail(token, segments=(), versions=None, count=None, scheme=None):
+def detail_text(value, limit=64, pattern=DETAIL_SEGMENT_CHAR_RE):
+    """Return value made safe for a detail segment or field: every character outside the
+    charset becomes an underscore, and a long value keeps its head and ends with three dots."""
+    if type(value) is not str:
+        return "invalid"
+    if not value:
+        return "empty"
+    text = pattern.sub("_", value[:limit + 1])
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+def package_subject(name, version=None):
+    """Return the bounded name@version subject segment of a package detail."""
+    text = detail_text(name, 60)
+    if version is not None:
+        text += "@" + detail_text(version, 20)
+    return text
+
+
+def _detail_fields(fields):
+    cleaned = []
+    for item in fields:
+        if type(item) is not tuple or len(item) != 2:
+            continue
+        key, value = item
+        if type(key) is not str or DETAIL_SCHEME_RE.match(key) is None:
+            continue
+        if type(value) is int and not isinstance(value, bool):
+            value = str(value) if 0 <= value <= 99_999_999 else "invalid"
+        elif type(value) is not str or DETAIL_FIELD_RE.match(value) is None:
+            value = "invalid"
+        cleaned.append((key, value))
+    return tuple(cleaned)
+
+
+def build_detail(token, segments=(), versions=None, count=None, scheme=None, fields=()):
     """Build the bounded, ASCII-only refusal detail: a fixed lowercase token, colon separated
     subject segments (lock paths, field and package names), then space separated key:value fields.
     A segment outside the name charset is replaced and never echoed, a long segment is shortened
-    once if the whole text would not fit, and versions are dropped whole until it fits."""
+    once if the whole text would not fit, and versions are dropped whole until it fits. Extra
+    key:value fields carry a bounded integer or a value of the field charset, else invalid."""
     if (type(token) is not str or DETAIL_TOKEN_RE.match(token) is None
-            or type(segments) not in (tuple, list)):
+            or type(segments) not in (tuple, list) or type(fields) not in (tuple, list)):
         return None
+    fields = _detail_fields(fields)
     kept = []
     if versions is not None:
         for version in versions:
@@ -172,7 +214,7 @@ def build_detail(token, segments=(), versions=None, count=None, scheme=None):
             if len(kept) >= DETAIL_MAX_VERSIONS:
                 break
     for limit in (None, DETAIL_SHORT_SEGMENT):
-        text = _detail_text(token, segments, kept, count, scheme, limit)
+        text = _detail_text(token, segments, kept, count, scheme, limit, fields)
         if len(text) <= DETAIL_MAX_BYTES and DETAIL_RE.match(text) is not None:
             return text
     return None
@@ -731,6 +773,92 @@ def compute_material_digest(material_files):
     return digest.hexdigest()
 
 
+ARCHIVE_MEMBER_NAME_LIMIT = 100
+ARCHIVE_MEMBER_TYPE_NAMES = {
+    b"1": "hardlink", b"2": "symlink", b"3": "chardevice", b"4": "blockdevice", b"6": "fifo",
+    b"7": "contiguous", b"g": "pax_global", b"x": "pax_header", b"L": "gnu_longname",
+    b"K": "gnu_longlink", b"S": "gnu_sparse", b"D": "gnu_dumpdir", b"V": "gnu_volume",
+    b"M": "gnu_multivolume", b"N": "gnu_names",
+}
+
+
+def _archive_member_type(raw):
+    if type(raw) is not bytes:
+        return "other"
+    return ARCHIVE_MEMBER_TYPE_NAMES.get(raw, "other")
+
+
+def _archive_member_label(value):
+    """Return the member name when its whole text fits the shared segment grammar, else the
+    fixed word unrepresentable. An absolute name is never shown."""
+    if (type(value) is str and 0 < len(value) <= ARCHIVE_MEMBER_NAME_LIMIT
+            and not value.startswith("/") and DETAIL_SEGMENT_RE.match(value) is not None):
+        return value
+    return "unrepresentable"
+
+
+def _archive_member_label_bytes(raw):
+    try:
+        return _archive_member_label(raw.decode("utf-8", "strict"))
+    except (UnicodeError, AttributeError):
+        return "unrepresentable"
+
+
+def _archive_index(index):
+    return (("index", index),) if type(index) is int else ()
+
+
+def _archive_refuse(check, subject, *segments, index=None):
+    """Refuse an archive with its public reason and a bounded detail of the form
+    check:name@version:rule[:member] with an optional index:n field."""
+    raise Refusal("npm_archive_invalid", build_detail(
+        check, (subject if type(subject) is str else "unknown",) + segments,
+        fields=_archive_index(index),
+    ))
+
+
+def _archive_path_rule(value):
+    """Name the first rule of _safe_relative_archive_path that rejects value, or return None
+    when that function accepts it. It only classifies a refusal and never decides one."""
+    if type(value) is not str or not value:
+        return "empty"
+    if "\\" in value:
+        return "backslash"
+    if value.startswith("/"):
+        return "absolute"
+    try:
+        encoded = value.encode("utf-8", "strict")
+    except UnicodeError:
+        return "bad_char"
+    if len(encoded) > MAX_ARCHIVE_PATH_BYTES:
+        return "too_long"
+    for char in value:
+        if ord(char) < 32:
+            return "control_char"
+        if ord(char) > 126:
+            return "non_ascii"
+    parts = value.split("/")
+    if any(part == "" for part in parts):
+        return "empty_segment"
+    if any(part in (".", "..") for part in parts):
+        return "dot_segment"
+    for part in parts:
+        if part[-1] == ".":
+            return "trailing_dot"
+        if part[-1] == " ":
+            return "trailing_space"
+        if "~" in part:
+            return "tilde"
+        if any(char in '<>:"|?*' for char in part):
+            return "bad_char"
+        basename = part.split(".", 1)[0].strip(" ").lower()
+        if (basename in WINDOWS_RESERVED_BASENAMES
+                or (len(basename) == 4 and basename[:3] in ("com", "lpt")
+                    and (basename[3] in "123456789" or ord(basename[3]) in (0xB9, 0xB2, 0xB3)))):
+            return "reserved_name"
+    return None
+
+
 def _safe_relative_archive_path(value):
     if type(value) is not str or not value or "\\" in value or value.startswith("/"):
         return False
@@ -755,9 +883,9 @@ def _safe_relative_archive_path(value):
     return True
 
 
-def _read_bounded_gzip(data):
+def _read_bounded_gzip(data, subject=None):
     if type(data) is not bytes or len(data) < 2 or data[:2] != b"\x1f\x8b":
-        _refuse("npm_archive_invalid")
+        _archive_refuse("archive_gzip", subject, "not_gzip")
     output = io.BytesIO()
     try:
         with gzip.GzipFile(fileobj=io.BytesIO(data), mode="rb") as stream:
@@ -768,25 +896,25 @@ def _read_bounded_gzip(data):
                     break
                 total += len(chunk)
                 if total > MAX_TAR_BYTES:
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse("archive_size", subject, "tar")
                 output.write(chunk)
     except Refusal:
         raise
     except (OSError, EOFError, gzip.BadGzipFile, zlib.error):
-        _refuse("npm_archive_invalid")
+        _archive_refuse("archive_gzip", subject, "corrupt")
     return output.getvalue()
 
 
-def _tar_octal(raw):
+def _tar_octal(raw, subject=None, field="field", index=None):
     value = raw.strip(b"\x00 ")
     if not value or any(byte not in b"01234567" for byte in value):
-        _refuse("npm_archive_invalid")
+        _archive_refuse("archive_tar", subject, "octal_" + field, index=index)
     return int(value, 8)
 
 
-def _preflight_tar_headers(data):
+def _preflight_tar_headers(data, subject=None):
     if type(data) is not bytes or len(data) < 1024 or len(data) % 512:
-        _refuse("npm_archive_invalid")
+        _archive_refuse("archive_tar", subject, "shape")
     offset = 0
     count = 0
     total = 0
@@ -796,48 +924,59 @@ def _preflight_tar_headers(data):
         if header == bytes(512):
             found_end = True
             if any(data[offset:]):
-                _refuse("npm_archive_invalid")
+                _archive_refuse("archive_tar", subject, "trailing_data")
             break
         count += 1
+        index = count - 1
         if count > MAX_ARCHIVE_FILES:
-            _refuse("npm_archive_invalid")
-        stored_checksum = _tar_octal(header[148:156])
+            _archive_refuse("archive_count", subject, "members", index=index)
+        stored_checksum = _tar_octal(header[148:156], subject, "checksum", index)
         actual_checksum = sum(header[:148]) + (32 * 8) + sum(header[156:])
         if stored_checksum != actual_checksum:
-            _refuse("npm_archive_invalid")
+            _archive_refuse("archive_tar", subject, "checksum", index=index)
         member_type = header[156:157]
-        if member_type not in (b"0", b"5", b"\x00"):
-            _refuse("npm_archive_invalid")
         raw_name = header[:100].split(b"\x00", 1)[0]
         raw_prefix = header[345:500].split(b"\x00", 1)[0]
-        if not raw_name:
-            _refuse("npm_archive_invalid")
         raw_path = raw_prefix + b"/" + raw_name if raw_prefix else raw_name
+        label = _archive_member_label_bytes(raw_path)
+        if member_type not in (b"0", b"5", b"\x00"):
+            _archive_refuse(
+                "archive_member_type", subject, _archive_member_type(member_type), label,
+                index=index,
+            )
+        if not raw_name:
+            _archive_refuse("archive_path", subject, "empty_name", label, index=index)
         if member_type == b"5":
             if not raw_path.endswith(b"/") or raw_path.endswith(b"//"):
-                _refuse("npm_archive_invalid")
+                _archive_refuse("archive_path", subject, "directory_slash", label, index=index)
             validated_path = raw_path[:-1]
         else:
             if raw_path.endswith(b"/"):
-                _refuse("npm_archive_invalid")
+                _archive_refuse("archive_path", subject, "file_slash", label, index=index)
             validated_path = raw_path
         try:
             path_text = validated_path.decode("utf-8", "strict")
         except UnicodeError:
-            _refuse("npm_archive_invalid")
+            _archive_refuse("archive_path", subject, "bad_utf8", "unrepresentable", index=index)
+        label = _archive_member_label(path_text)
         if not _safe_relative_archive_path(path_text):
-            _refuse("npm_archive_invalid")
-        size = _tar_octal(header[124:136])
-        if size > MAX_PACKAGE_UNPACKED_BYTES or (member_type == b"5" and size != 0):
-            _refuse("npm_archive_invalid")
+            _archive_refuse(
+                "archive_path", subject, _archive_path_rule(path_text) or "unsafe", label,
+                index=index,
+            )
+        size = _tar_octal(header[124:136], subject, "size", index)
+        if size > MAX_PACKAGE_UNPACKED_BYTES:
+            _archive_refuse("archive_size", subject, "member", index=index)
+        if member_type == b"5" and size != 0:
+            _archive_refuse("archive_path", subject, "directory_size", label, index=index)
         total += size
         if total > MAX_PACKAGE_UNPACKED_BYTES:
-            _refuse("npm_archive_invalid")
+            _archive_refuse("archive_size", subject, "unpacked", index=index)
         offset += 512 + (((size + 511) // 512) * 512)
         if offset > len(data):
-            _refuse("npm_archive_invalid")
+            _archive_refuse("archive_tar", subject, "truncated", index=index)
     if not found_end:
-        _refuse("npm_archive_invalid")
+        _archive_refuse("archive_tar", subject, "no_end")
 
 
 def _native_path(path):
@@ -855,32 +994,55 @@ def _native_magic(data):
     )
 
 
-def _manifest_scripts(data, name, version):
-    manifest = _load_json(data, MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid")
-    if type(manifest) is not dict or manifest.get("name") != name or manifest.get("version") != version:
-        _refuse("npm_archive_invalid")
+def _detail_head(detail):
+    if type(detail) is not str or not detail:
+        return "json"
+    return detail.split(" ", 1)[0].split(":", 1)[0]
+
+
+def _manifest_scripts(data, name, version, subject=None):
+    try:
+        manifest = _load_json(data, MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid")
+    except Refusal as error:
+        _archive_refuse("archive_manifest", subject, _detail_head(error.detail))
+    if type(manifest) is not dict:
+        _archive_refuse("archive_manifest", subject, "shape")
+    if manifest.get("name") != name:
+        _archive_refuse("archive_manifest", subject, "name_mismatch")
+    if manifest.get("version") != version:
+        _archive_refuse("archive_manifest", subject, "version_mismatch")
     scripts = manifest.get("scripts", {})
     if type(scripts) is not dict or len(scripts) > 256:
-        _refuse("npm_archive_invalid")
+        _archive_refuse("archive_manifest", subject, "scripts_shape")
     for key, value in scripts.items():
         if type(key) is not str or type(value) is not str or len(key) > 128:
-            _refuse("npm_archive_invalid")
+            _archive_refuse("archive_manifest", subject, "scripts_value")
     return scripts, manifest.get("gypfile", True)
 
 
 def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=None):
-    if (not _valid_package_name(name) or not _valid_version(version)
-            or _internal_name(name, internal_names) or not _valid_integrity(integrity)
-            or type(data) is not bytes
-            or len(data) == 0 or len(data) > MAX_TARBALL_BYTES):
-        _refuse("npm_archive_invalid")
+    subject = package_subject(name, version)
+    if not _valid_package_name(name):
+        _archive_refuse("archive_input", subject, "name")
+    if not _valid_version(version):
+        _archive_refuse("archive_input", subject, "version")
+    if _internal_name(name, internal_names):
+        _archive_refuse("archive_input", subject, "internal")
+    if not _valid_integrity(integrity):
+        _archive_refuse("archive_input", subject, "integrity")
+    if type(data) is not bytes:
+        _archive_refuse("archive_input", subject, "data_type")
+    if len(data) == 0:
+        _archive_refuse("archive_input", subject, "tarball_empty")
+    if len(data) > MAX_TARBALL_BYTES:
+        _archive_refuse("archive_size", subject, "tarball")
     expected_digest = _integrity_bytes(integrity)
     actual_digest = hashlib.sha512(data).digest()
     if not hmac.compare_digest(actual_digest, expected_digest):
-        _refuse("npm_archive_invalid")
+        _archive_refuse("integrity_mismatch", subject, "archive")
     archive_sha256 = hashlib.sha256(data).hexdigest()
-    tar_bytes = _read_bounded_gzip(data)
-    _preflight_tar_headers(tar_bytes)
+    tar_bytes = _read_bounded_gzip(data, subject)
+    _preflight_tar_headers(tar_bytes, subject)
     entries = {}
     folded = set()
     spellings = {}
@@ -897,48 +1059,66 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
             count = 0
             for member in archive:
                 count += 1
+                index = count - 1
                 if count > MAX_ARCHIVE_FILES:
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse("archive_count", subject, "members", index=index)
                 raw_name = member.name
-                if (member.pax_headers or getattr(member, "sparse", None)
-                        or not _safe_relative_archive_path(raw_name.rstrip("/"))):
-                    _refuse("npm_archive_invalid")
+                label = _archive_member_label(raw_name.rstrip("/"))
+                if member.pax_headers:
+                    _archive_refuse("archive_path", subject, "pax_header", label, index=index)
+                if getattr(member, "sparse", None):
+                    _archive_refuse("archive_path", subject, "sparse", label, index=index)
+                if not _safe_relative_archive_path(raw_name.rstrip("/")):
+                    _archive_refuse(
+                        "archive_path", subject,
+                        _archive_path_rule(raw_name.rstrip("/")) or "unsafe", label, index=index,
+                    )
                 is_directory = member.type == tarfile.DIRTYPE
                 is_regular = member.type in (tarfile.REGTYPE, tarfile.AREGTYPE)
                 if not is_directory and not is_regular:
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse(
+                        "archive_member_type", subject, _archive_member_type(member.type), label,
+                        index=index,
+                    )
                 if member.linkname:
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse("archive_path", subject, "link", label, index=index)
                 relative = raw_name.rstrip("/")
                 if relative.split("/", 1)[0] != "package":
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse(
+                        "archive_root", subject, _archive_member_label(relative.split("/", 1)[0]),
+                        index=index,
+                    )
                 if raw_name.endswith("//") or (not is_directory and raw_name.endswith("/")):
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse("archive_path", subject, "slash", label, index=index)
                 folded_relative = relative.lower()
-                if relative in entries or folded_relative in folded:
-                    _refuse("npm_archive_invalid")
+                if relative in entries:
+                    _archive_refuse("archive_path", subject, "duplicate", label, index=index)
+                if folded_relative in folded:
+                    _archive_refuse("archive_path", subject, "case_collision", label, index=index)
                 folded.add(folded_relative)
                 parts = relative.split("/")
                 if (any(part.lower() == "node_modules" for part in parts[1:])
                         and not _bundled_member_allowed(parts, is_directory, bundled)):
-                    _refuse("npm_archive_invalid")
-                for index in range(1, len(parts) + 1):
-                    spelling = "/".join(parts[:index])
+                    _archive_refuse("archive_path", subject, "node_modules", label, index=index)
+                for position in range(1, len(parts) + 1):
+                    spelling = "/".join(parts[:position])
                     key = spelling.lower()
                     previous = spellings.get(key)
                     if previous is not None and previous != spelling:
-                        _refuse("npm_archive_invalid")
+                        _archive_refuse(
+                            "archive_path", subject, "case_collision", label, index=index,
+                        )
                     spellings[key] = spelling
                 if len(parts) == 1 and not is_directory:
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse("archive_path", subject, "root_file", label, index=index)
                 if member.size < 0 or member.size > MAX_PACKAGE_UNPACKED_BYTES:
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse("archive_size", subject, "member", index=index)
                 if is_directory and member.size != 0:
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse("archive_path", subject, "directory_size", label, index=index)
                 if not is_directory:
                     total += member.size
                     if total > MAX_PACKAGE_UNPACKED_BYTES:
-                        _refuse("npm_archive_invalid")
+                        _archive_refuse("archive_size", subject, "unpacked", index=index)
                 entries[relative] = (is_directory, member)
                 if relative == "package/package.json" and not is_directory:
                     package_json_member = member
@@ -948,21 +1128,22 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
                     native_paths.append(relative)
             for path, (is_directory, member) in entries.items():
                 parts = path.split("/")
-                for index in range(1, len(parts)):
-                    parent = "/".join(parts[:index])
+                label = _archive_member_label(path)
+                for position in range(1, len(parts)):
+                    parent = "/".join(parts[:position])
                     parent_entry = entries.get(parent)
                     if parent_entry is not None and not parent_entry[0]:
-                        _refuse("npm_archive_invalid")
+                        _archive_refuse("archive_path", subject, "file_parent", label)
                 if is_directory:
                     continue
                 stream = archive.extractfile(member)
                 if stream is None:
-                    _refuse("npm_archive_invalid")
+                    _archive_refuse("archive_path", subject, "unreadable", label)
                 with stream:
                     if path == "package/package.json":
                         content = stream.read(MAX_PACKAGE_JSON_BYTES + 1)
                         if len(content) != member.size or len(content) > MAX_PACKAGE_JSON_BYTES:
-                            _refuse("npm_archive_invalid")
+                            _archive_refuse("archive_manifest", subject, "size")
                         manifest_bytes = content
                     else:
                         content = stream.read(8)
@@ -970,13 +1151,13 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
                     native_paths.append(path)
     except Refusal:
         raise
-    except (tarfile.TarError, OSError, UnicodeError, ValueError, EOFError, RecursionError):
-        _refuse("npm_archive_invalid")
+    except (tarfile.TarError, OSError, UnicodeError, ValueError, EOFError, RecursionError) as error:
+        _archive_refuse("archive_tar", subject, "parse", detail_text(type(error).__name__, 40))
     if package_json_member is None:
-        _refuse("npm_archive_invalid")
+        _archive_refuse("archive_manifest", subject, "missing")
     if manifest_bytes is None:
-        _refuse("npm_archive_invalid")
-    scripts, gypfile = _manifest_scripts(manifest_bytes, name, version)
+        _archive_refuse("archive_manifest", subject, "unread")
+    scripts, gypfile = _manifest_scripts(manifest_bytes, name, version, subject)
     implicit_install = (
         root_binding_gyp and gypfile is not False
         and not scripts.get("preinstall") and not scripts.get("install")
@@ -1001,14 +1182,18 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
 
 def verify_tarball(entry, data, internal_names=()):
     if type(entry) is not dict or not {"name", "version", "integrity"}.issubset(entry):
-        _refuse("npm_archive_invalid")
+        _archive_refuse("archive_input", None, "entry_shape")
     name = entry["name"]
     version = entry["version"]
-    if (not _valid_package_name(name) or not _valid_version(version)
-            or _internal_name(name, internal_names)):
-        _refuse("npm_archive_invalid")
+    subject = package_subject(name, version)
+    if not _valid_package_name(name):
+        _archive_refuse("archive_input", subject, "name")
+    if not _valid_version(version):
+        _archive_refuse("archive_input", subject, "version")
+    if _internal_name(name, internal_names):
+        _archive_refuse("archive_input", subject, "internal")
     if "resolved" in entry and entry["resolved"] != _canonical_tarball_url(name, version):
-        _refuse("npm_archive_invalid")
+        _archive_refuse("archive_input", subject, "resolved")
     return _inspect_tarball(
         name, version, entry["integrity"], data, internal_names, _inert_bundled_names(entry),
     )
