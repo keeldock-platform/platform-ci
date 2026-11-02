@@ -1757,7 +1757,7 @@ def _vulnerability(name, severity="moderate", via=None, nodes=None):
 def _advisory_via(name="fixture-lib", source=9000001, severity="moderate", url=None):
     return {
         "source": source, "name": name, "dependency": name, "title": "fixture advisory",
-        "url": url or "https://github.com/advisories/GHSA-aaaa-bbbb-cccc", "severity": severity,
+        "url": url or linux_source_build.ADVISORY_URL_PREFIX + "GHSA-aaaa-bbbb-cccc", "severity": severity,
         "cwe": [], "cvss": {"score": 0, "vectorString": None}, "range": "<2.0.0",
     }
 
@@ -1929,7 +1929,7 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
     def test_audit_refuses_an_extra_finding(self):
         other = _audit_json({
             "fixture-lib": _vulnerability(
-                "fixture-lib", via=[_advisory_via(), _advisory_via(source=9000002, url="https://github.com/advisories/GHSA-dddd-eeee-ffff")],
+                "fixture-lib", via=[_advisory_via(), _advisory_via(source=9000002, url=linux_source_build.ADVISORY_URL_PREFIX + "GHSA-dddd-eeee-ffff")],
                 nodes=["node_modules/fixture-lib"],
             ),
         })
