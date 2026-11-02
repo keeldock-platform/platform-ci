@@ -994,7 +994,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 int assigned = ReadAssignedProcesses(job);
                 if (assigned < 0)
                 {
-                    return "unknown";
+                    return "unreadable";
                 }
                 if (assigned > 0)
                 {

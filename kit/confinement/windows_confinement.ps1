@@ -892,7 +892,7 @@ function Get-JobLiveness($sandboxes, [int]$waitSeconds) {
     foreach ($sandbox in @($sandboxes)) {
         if ($null -eq $sandbox) { continue }
         $item = [string]$sandbox.JobState($waitSeconds * 1000)
-        if ($item -ceq 'unknown') { return 'unknown' }
+        if ($item -ceq 'unreadable') { return 'unknown' }
         if ($item -ceq 'alive') { $state = 'alive' }
     }
     return $state

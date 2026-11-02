@@ -1957,7 +1957,7 @@ foreach ($case in $cases) {
             "ErrorMoreData = 234",
             "return Marshal.ReadInt32(buffer, 0);",
             'return alive ? "alive" : "none";',
-            'return "unknown";',
+            'return "unreadable";',
         ):
             with self.subTest(required=required):
                 self.assertIn(required, native)
@@ -2251,7 +2251,8 @@ foreach ($case in $cases) {
             "Native.CreateFileW(path, access, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero)",
             "Native.SetFileInformationByHandle(handle, ClassDispositionInfoEx, buffer, 4)",
             "Native.GetFileInformationByHandleEx(handle, infoClass, buffer, (uint)DirectoryBufferBytes)",
-            'return "\\\\\\\\?\\\\" + path.TrimEnd(\'\\\\\');',
+            'string trimmed = path.TrimEnd(\'\\\\\');',
+            'return "\\\\\\\\?\\\\" + trimmed;',
         ):
             with self.subTest(required=required):
                 self.assertIn(required, remover)
