@@ -516,7 +516,7 @@ TEST_TREE_ROOTS = frozenset((
 
 
 def _test_tree_node_modules_allowed(parts):
-    """D166: a node_modules segment is allowed only below a first-level test or example
+    """A node_modules segment is allowed only below a first-level test or example
     directory of the archive, spelled exactly. Every other spelling or place still refuses."""
     if len(parts) < 3 or parts[1] not in TEST_TREE_ROOTS:
         return False
