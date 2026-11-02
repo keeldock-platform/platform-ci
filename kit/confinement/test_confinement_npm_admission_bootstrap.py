@@ -2542,5 +2542,14 @@ class SiblingLoadTests(unittest.TestCase):
         self.assertEqual(feedback_request.NPM_ADMISSION_MAX_PACKAGES, subject.MAX_PACKAGES)
 
 
+class MetadataCapTests(unittest.TestCase):
+    def test_caps_fit_the_largest_real_registry_documents_and_stay_bounded(self):
+        largest_observed = 39 * 1000 * 1000
+        self.assertGreaterEqual(subject.MAX_PACKUMENT_BYTES, 2 * largest_observed)
+        self.assertLessEqual(subject.MAX_PACKUMENT_BYTES, 128 * 1024 * 1024)
+        self.assertGreaterEqual(subject.MAX_TOTAL_METADATA_BYTES, 8 * subject.MAX_PACKUMENT_BYTES)
+        self.assertLessEqual(subject.MAX_TOTAL_METADATA_BYTES, 2 * 1024 * 1024 * 1024)
+
+
 if __name__ == "__main__":
     unittest.main()
