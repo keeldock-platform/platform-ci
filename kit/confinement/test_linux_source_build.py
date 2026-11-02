@@ -2124,7 +2124,7 @@ class LinuxAuditDetailTests(unittest.TestCase):
         }, low=1, moderate=1)
         return {
             "audit_json_empty": (b" \n\t", None, None, None),
-            "audit_json_utf8": (b'{"fixture-marker": "\xff"}', None, None, None),
+            "audit_json_encoding": (b'{"fixture-marker": "\xff"}', None, None, None),
             "audit_json_prefix": (b"not json", None, None, None),
             "audit_json_trailing": (b'{"fixture-marker": 1}\n{}', None, None, None),
             "audit_json_duplicate": (b'{"fixture-marker": 1, "fixture-marker": 2}', None, None, None),
@@ -2206,7 +2206,7 @@ class LinuxAuditDetailTests(unittest.TestCase):
     def test_non_utf8_audit_output_is_named_by_shape(self):
         self.assertEqual(
             self._json_line(b'{"fixture-marker": "\xff"}', b"fixture-stderr\n"),
-            "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_utf8\n",
+            "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_encoding\n",
         )
 
     def test_audit_output_not_starting_with_an_object_counts_lines_before_one(self):

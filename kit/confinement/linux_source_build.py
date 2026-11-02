@@ -218,7 +218,7 @@ OPTIONAL_SOURCE_STEPS = frozenset((
 AUDIT_DETAILS = frozenset((
     "audit_toolchain", "audit_provenance", "audit_run", "audit_exit",
     "audit_json_empty", "audit_json_empty_stderr_json", "audit_json_empty_stderr_text",
-    "audit_json_utf8", "audit_json_prefix", "audit_json_trailing",
+    "audit_json_encoding", "audit_json_prefix", "audit_json_trailing",
     "audit_json_duplicate", "audit_json_syntax", "audit_json_not_object",
     "audit_top_keys", "audit_version", "audit_meta", "audit_count", "audit_high",
     "audit_limit", "audit_entry_shape", "audit_key_name", "audit_severity",
@@ -2205,7 +2205,7 @@ def _check_audit_report(stdout, allows, packages, now_ms, stderr=b""):
     try:
         text = stdout.decode("utf-8", "strict")
     except UnicodeError:
-        raise _audit_refuse("audit_json_utf8") from None
+        raise _audit_refuse("audit_json_encoding") from None
     start = len(text) - len(text.lstrip(JSON_WHITESPACE))
     decoder = json.JSONDecoder(object_pairs_hook=_unique_json_pairs, parse_constant=_reject_json_constant)
     first = text[start:start + 1]
