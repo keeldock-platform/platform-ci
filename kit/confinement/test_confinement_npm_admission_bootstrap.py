@@ -7,6 +7,7 @@ import json
 import sys
 import tarfile
 import unittest
+import unittest.mock
 import urllib.error
 
 import npm_admission as adm
@@ -676,6 +677,137 @@ class LockTests(RefusalAssertions):
                 with self.assertRaises(subject.BootstrapRefusal) as raised:
                     self.check(change)
                 self.assertEqual(raised.exception.reason, "npm_lock_refused")
+
+
+    def detail_of(self, change, expected=None, shared_allowed=False):
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            self.check(change)
+        self.assertEqual(raised.exception.reason, "npm_lock_refused")
+        self.assertEqual(str(raised.exception), "npm_lock_refused")
+        detail = raised.exception.detail
+        if expected is not None:
+            if shared_allowed and detail is not None and detail.startswith("shared_parser:"):
+                return detail
+            self.assertEqual(detail, expected)
+        return detail
+
+    def test_an_empty_or_non_bytes_lock_names_the_lock_empty_check(self):
+        plan = World().plan()
+        for value in (b"", "text", None):
+            with self.subTest(value=value):
+                with self.assertRaises(subject.BootstrapRefusal) as raised:
+                    subject.check_lock(value, plan)
+                self.assertEqual((raised.exception.reason, str(raised.exception)), ("npm_lock_refused",) * 2)
+                self.assertEqual(raised.exception.detail, "lock_empty")
+
+    def test_the_shared_parser_refusal_names_a_bounded_parser_reason(self):
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            subject.check_lock(b"{}", World().plan())
+        self.assertEqual(raised.exception.reason, "npm_lock_refused")
+        self.assertTrue(raised.exception.detail.startswith("shared_parser:"))
+        self.assertIsNotNone(subject.LOCK_DETAIL_RE.match(raised.exception.detail))
+
+    def test_the_entry_count_check_is_named_with_the_count(self):
+        world = World()
+        with unittest.mock.patch.object(subject, "MAX_PACKAGES", 1):
+            with self.assertRaises(subject.BootstrapRefusal) as raised:
+                subject.check_lock(world.lock_bytes, world.plan())
+        self.assertEqual(raised.exception.reason, "npm_lock_refused")
+        self.assertEqual(raised.exception.detail, "entry_count count:" + str(len(ALL_PACKAGES)))
+
+    def test_root_and_workspace_checks_name_their_subject(self):
+        self.detail_of(
+            lambda lock: lock["packages"][""].update({"engines": {"node": "24.22.1", "npm": "11.0.0"}}),
+            "root_identity:engines",
+        )
+        self.detail_of(
+            lambda lock: lock["packages"][""].update({"workspaces": ["other/*"]}),
+            "root_identity:workspaces", shared_allowed=True,
+        )
+        self.detail_of(
+            lambda lock: lock["packages"][""].update({"devDependencies": {"alpha-pkg": "1.0.0"}}),
+            "root_group:devDependencies", shared_allowed=True,
+        )
+        self.detail_of(
+            lambda lock: lock["packages"][""].update({"dependencies": {"alpha-pkg": "1.0.0"}}),
+            "root_group:dependencies", shared_allowed=True,
+        )
+        self.detail_of(
+            lambda lock: lock["packages"]["packages/host-api"].update({"version": "9.9.9"}),
+            "workspace:packages/host-api",
+        )
+
+    def test_direct_singleton_and_override_checks_name_the_package_and_the_versions_found(self):
+        def wrong_version(lock, name, version):
+            lock["packages"]["node_modules/" + name].update({
+                "version": version, "resolved": adm._canonical_tarball_url(name, version),
+            })
+
+        self.detail_of(lambda lock: lock["packages"].pop("node_modules/alpha-pkg"), "direct_missing:alpha-pkg")
+        self.detail_of(
+            lambda lock: wrong_version(lock, "alpha-pkg", "1.0.1"), "direct_missing:alpha-pkg found:1.0.1",
+        )
+        self.detail_of(
+            lambda lock: lock["packages"].update({
+                "node_modules/gamma-pkg/node_modules/alpha-pkg": dict(lock["packages"]["node_modules/alpha-pkg"]),
+            }),
+            "singleton_duplicate:alpha-pkg count:2 found:1.0.0,1.0.0",
+        )
+        self.detail_of(
+            lambda lock: lock["packages"].pop("node_modules/lightningcss"),
+            "override_mismatch:lightningcss count:0",
+        )
+        self.detail_of(
+            lambda lock: wrong_version(lock, "lightningcss", "1.32.0"),
+            "override_mismatch:lightningcss count:1 found:1.32.0",
+        )
+
+    def test_a_shrinkwrap_entry_names_its_lock_path(self):
+        world = World()
+        real = adm.registry_entries
+
+        def flagged(*arguments, **keywords):
+            result = []
+            for path, entry in real(*arguments, **keywords):
+                entry = dict(entry)
+                if path == "node_modules/gamma-pkg":
+                    entry["hasShrinkwrap"] = True
+                result.append((path, entry))
+            return result
+
+        with unittest.mock.patch.object(subject.adm, "registry_entries", flagged):
+            with self.assertRaises(subject.BootstrapRefusal) as raised:
+                subject.check_lock(world.lock_bytes, world.plan())
+        self.assertEqual(raised.exception.reason, "npm_lock_refused")
+        self.assertEqual(raised.exception.detail, "shrinkwrap:node_modules/gamma-pkg")
+
+    def test_the_detail_is_bounded_ascii_and_hostile_values_are_replaced_never_echoed(self):
+        detail = subject.lock_detail
+        self.assertEqual(detail("root_group", "dependencies"), "root_group:dependencies")
+        for hostile in ("caf\u00e9", "a\nb", "a b", "", "x" * 300, "a\u202eb", "a\x00b", 7):
+            with self.subTest(name=hostile):
+                self.assertEqual(detail("direct_missing", hostile), "direct_missing:invalid_name")
+        self.assertEqual(
+            detail("direct_missing", "pkg", ["1.0.0", "1\n0", "\u00e91", "1" * 65]),
+            "direct_missing:pkg found:1.0.0,invalid,invalid,invalid",
+        )
+        many = detail("singleton_duplicate", "@scope/" + "a" * 200, ["1." + "9" * 60] * 40, count=40)
+        self.assertLessEqual(len(many.encode("ascii")), subject.LOCK_DETAIL_MAX_BYTES)
+        self.assertIsNotNone(subject.LOCK_DETAIL_RE.match(many))
+        self.assertLessEqual(many.count(","), subject.LOCK_DETAIL_MAX_VERSIONS - 1)
+        for token in ("", "Bad", "a\nb", "x" * 33, "caf\u00e9", None, 3):
+            with self.subTest(token=token):
+                self.assertIsNone(detail(token))
+
+    def test_a_refusal_keeps_its_public_reason_and_drops_an_unsafe_detail(self):
+        for bad in ("a\nb", "caf\u00e9", "x" * 513, 7, b"x"):
+            with self.subTest(detail=bad):
+                refusal = subject.BootstrapRefusal("npm_lock_refused", bad)
+                self.assertIsNone(refusal.detail)
+                self.assertEqual((refusal.reason, str(refusal)), ("npm_lock_refused",) * 2)
+        refusal = subject.BootstrapRefusal("npm_lock_refused", "lock_empty")
+        self.assertEqual((refusal.detail, refusal.reason, str(refusal)), ("lock_empty", "npm_lock_refused", "npm_lock_refused"))
+        self.assertIsNone(subject.BootstrapRefusal("npm_stale").detail)
 
 
 class PeerTests(RefusalAssertions):

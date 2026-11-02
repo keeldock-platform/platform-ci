@@ -611,7 +611,9 @@ class NpmAdmissionProducerTests(unittest.TestCase):
                          ("payload_invalid", "npm_lock", "npm_lock_refused"))
         header, stderr, report = self.sections(error.npm_diagnostic)
         self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused")
-        self.assertEqual(stderr, ["  npm warn deprecated a@1.0.0: old"])
+        self.assertEqual(len(stderr), 2)
+        self.assertTrue(stderr[0].startswith("  kd-check "))
+        self.assertEqual(stderr[1], "  npm warn deprecated a@1.0.0: old")
         self.assertEqual(report, [])
         self.assertEqual(producer.npm_diagnostic_result(error)["npm_diagnostic"], ("npm_lock", "npm_lock_refused"))
         self.lock_failure = producer.FeedbackRefusal("capture_invalid")
@@ -619,6 +621,43 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         self.assertEqual((error.reason, error.source_gates_key), ("capture_invalid", "capture_invalid"))
         self.assertEqual(self.sections(error.npm_diagnostic)[0],
                          "KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=capture_invalid")
+
+    def test_the_lock_step_diagnostic_carries_the_check_as_its_first_stderr_line(self):
+        self.resolve = SimpleNamespace(returncode=0, stdout=b"", stderr=b"npm warn deprecated a@1.0.0: old\n")
+        other = json.loads(self.world.lock_bytes.decode("ascii"))
+        other["packages"].pop("node_modules/alpha-pkg")
+        with patch.object(producer, "_npm_read_report", return_value=None):
+            error = self.failure(lock=fixtures._json(other) + b"\n")
+        self.assertEqual((error.reason, error.source_gates_step, error.source_gates_key),
+                         ("payload_invalid", "npm_lock", "npm_lock_refused"))
+        header, stderr, report = self.sections(error.npm_diagnostic)
+        self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused")
+        self.assertEqual(stderr, ["  kd-check direct_missing:alpha-pkg", "  npm warn deprecated a@1.0.0: old"])
+        self.assertEqual(report, [])
+        result = producer.npm_diagnostic_result(error)
+        self.assertEqual(result["npm_diagnostic"], ("npm_lock", "npm_lock_refused"))
+        self.assertEqual(result["payload_bytes"], error.npm_diagnostic)
+
+    def test_a_lock_refusal_with_an_unsafe_check_keeps_the_plain_refusal(self):
+        for hostile in ("bad\nline", "caf\u00e9", "x" * 600, "direct_missing:a b c"):
+            with self.subTest(check=hostile):
+                refusal = bootstrap.BootstrapRefusal("npm_lock_refused", "lock_empty")
+                refusal.detail = hostile
+                with patch.object(bootstrap, "check_lock", side_effect=refusal):
+                    error = self.failure()
+                self.assertEqual((error.reason, error.source_gates_step, error.source_gates_key),
+                                 ("payload_invalid", "npm_lock", "npm_lock_refused"))
+                self.assertFalse(hasattr(error, "npm_diagnostic"))
+
+    def test_only_the_lock_step_carries_a_check_and_a_refusal_without_one_adds_no_line(self):
+        refusal = bootstrap.BootstrapRefusal("npm_lock_refused")
+        with patch.object(bootstrap, "check_lock", side_effect=refusal):
+            error = self.failure()
+        self.assertEqual(self.sections(error.npm_diagnostic)[1], [])
+        refusal = bootstrap.BootstrapRefusal("npm_payload_too_large", "lock_empty")
+        with patch.object(bootstrap, "check_lock", side_effect=refusal):
+            error = self.failure()
+        self.assertNotIn(b"kd-check", error.npm_diagnostic)
 
     def test_the_bundle_step_failure_carries_a_diagnostic_with_the_bootstrap_reason(self):
         def failing(name):
@@ -719,6 +758,64 @@ class NpmDiagnosticPayloadTests(unittest.TestCase):
         self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=eresolve")
         self.assertEqual(stderr, ["  npm error code ERESOLVE", "  npm error While resolving: a@1.0.0", "  npm warn peer b@2"])
         self.assertEqual(report, ["  While resolving: a@1.0.0", "  Found: b@2.0.0"])
+
+    def test_the_lock_check_is_the_first_stderr_line_and_the_header_stays_closed(self):
+        payload = producer.build_npm_diagnostic_payload(
+            "npm_lock", "npm_lock_refused", _stderr(b"npm warn peer b@2"), None,
+            "singleton_duplicate:@scope/pkg count:2 found:1.0.0,2.0.0-rc.1+build",
+        )
+        header, stderr, report = self.sections(payload)
+        self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused")
+        self.assertEqual(stderr, [
+            "  kd-check singleton_duplicate:@scope/pkg count:2 found:1.0.0,2.0.0-rc.1+build",
+            "  npm warn peer b@2",
+        ])
+        self.assertEqual(report, [])
+        self.assertEqual(
+            producer.build_npm_diagnostic_payload("npm_lock", "npm_lock_refused", None, None, None),
+            b"KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused\nstderr:\nreport:\n",
+        )
+
+    def test_every_bootstrap_check_shape_is_accepted_by_the_payload_validator(self):
+        for check in (
+            "lock_empty", "entry_count count:0", "root_identity:engines", "root_group:optionalDependencies",
+            "workspace:packages/host-api", "direct_missing:alpha-pkg", "direct_missing:alpha-pkg found:1.0.1",
+            "singleton_duplicate:alpha_pkg count:2 found:1.0.0,1.0.0", "override_mismatch:lightningcss count:0",
+            "shrinkwrap:node_modules/a/node_modules/@s/b", "shared_parser:npm_lock_invalid",
+        ):
+            with self.subTest(check=check):
+                self.assertIsNotNone(bootstrap.lock_detail(check.split(":")[0].split(" ")[0]))
+                payload = producer.build_npm_diagnostic_payload("npm_lock", "npm_lock_refused", None, None, check)
+                self.assertEqual(self.sections(payload)[1], ["  kd-check " + check])
+
+    def test_the_check_is_refused_for_other_steps_and_for_anything_outside_the_closed_shapes(self):
+        for step in ("npm_resolve", "npm_bundle"):
+            with self.subTest(step=step):
+                with self.assertRaises(producer.FeedbackRefusal):
+                    producer.build_npm_diagnostic_payload(step, "other", None, None, "lock_empty")
+        for hostile in (
+            "", "bad\nline", "two\nlines:x", "caf\u00e9", "a\u202eb", "x" * 513, "Lock_Empty", "a b",
+            "direct_missing:a b", "direct_missing:" + "a" * 215, "direct_missing:a\x00", "root_group:a$b",
+            "direct_missing:x found:1;rm", "direct_missing:x found:", b"lock_empty", 7, ["lock_empty"],
+        ):
+            with self.subTest(check=hostile):
+                with self.assertRaises(producer.FeedbackRefusal):
+                    producer.build_npm_diagnostic_payload("npm_lock", "npm_lock_refused", None, None, hostile)
+
+    def test_the_check_keeps_the_payload_inside_every_bound(self):
+        check = bootstrap.lock_detail(
+            "singleton_duplicate", "@scope/" + "a" * 200, ["1." + "9" * 60] * 40, count=40,
+        )
+        self.assertLessEqual(len(check), producer.NPM_CHECK_MAX_BYTES)
+        stderr = b"".join(b"npm warn " + (b"w" * 100) + b" " + str(index).encode("ascii") + b"\n" for index in range(600))
+        report = b"".join(b"report line " + str(index).encode("ascii") + b"\n" for index in range(2000))
+        payload = producer.build_npm_diagnostic_payload("npm_lock", "npm_lock_refused", stderr, report, check)
+        text = payload.decode("ascii")
+        self.assertLessEqual(len(payload), producer.NPM_DIAGNOSTIC_MAX_BYTES)
+        self.assertLessEqual(text.count("\n"), producer.NPM_DIAGNOSTIC_MAX_LINES)
+        self.assertEqual(text.splitlines()[2], "  kd-check " + check)
+        self.assertEqual(text.count("kd-check"), 1)
+        self.assertTrue(all(len(line) <= producer.NPM_DIAGNOSTIC_LINE_UNITS for line in text.splitlines()))
 
     def test_missing_inputs_give_the_bare_fixed_layout(self):
         for stderr, report in ((None, None), (b"", b""), ("text", "text"), (bytearray(b"npm error x\n"), None)):

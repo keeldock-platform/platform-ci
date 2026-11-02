@@ -221,25 +221,67 @@ ADM_REASON_MAP = {
 }
 
 
+LOCK_DETAIL_MAX_BYTES = 512
+LOCK_DETAIL_RE = re.compile(r"[A-Za-z0-9._~@/:,+ _-]{1,512}\Z")
+LOCK_DETAIL_TOKEN_RE = re.compile(r"[a-z_]{1,32}\Z")
+LOCK_DETAIL_NAME_RE = re.compile(r"[A-Za-z0-9._~@/_-]{1,214}\Z")
+LOCK_DETAIL_REASON_RE = re.compile(r"[a-z_]{1,40}\Z")
+LOCK_DETAIL_VERSION_RE = re.compile(r"[0-9A-Za-z.+-]{1,64}\Z")
+LOCK_DETAIL_MAX_VERSIONS = 8
+
+
+def lock_detail(token, subject=None, versions=None, count=None):
+    """Build the bounded, ASCII-only check identifier carried by one lock refusal.
+
+    The token is a fixed lowercase word, the subject an npm name or lock path and the versions
+    semver-shaped strings. Anything outside those shapes is replaced or dropped, never echoed."""
+    if type(token) is not str or LOCK_DETAIL_TOKEN_RE.match(token) is None:
+        return None
+    text = token
+    if subject is not None:
+        valid = type(subject) is str and LOCK_DETAIL_NAME_RE.match(subject) is not None
+        text += ":" + (subject if valid else "invalid_name")
+    if count is not None and type(count) is int and 0 <= count <= 99999:
+        text += " count:" + str(count)
+    if versions is not None:
+        kept = []
+        for version in versions:
+            if type(version) is str and LOCK_DETAIL_VERSION_RE.match(version) is not None:
+                kept.append(version)
+            else:
+                kept.append("invalid")
+            if len(kept) >= LOCK_DETAIL_MAX_VERSIONS:
+                break
+        if kept:
+            text += " found:" + ",".join(kept)
+    text = text[:LOCK_DETAIL_MAX_BYTES]
+    return text if LOCK_DETAIL_RE.match(text) is not None else None
+
+
 class BootstrapRefusal(Exception):
     """A refusal with a fixed reason that never contains caller-provided data."""
 
-    def __init__(self, reason="npm_input_invalid"):
+    def __init__(self, reason="npm_input_invalid", detail=None):
         if reason not in REASONS:
             reason = "npm_input_invalid"
         self.reason = reason
+        self.detail = detail if type(detail) is str and LOCK_DETAIL_RE.match(detail) is not None else None
         super().__init__(reason)
 
 
-def _refuse(reason="npm_input_invalid"):
-    raise BootstrapRefusal(reason)
+def _refuse(reason="npm_input_invalid", detail=None):
+    raise BootstrapRefusal(reason, detail)
 
 
 def _call_adm(function, *arguments, **keywords):
     try:
         return function(*arguments, **keywords)
     except adm.Refusal as error:
-        raise BootstrapRefusal(ADM_REASON_MAP.get(error.reason, "npm_lock_refused")) from None
+        shared = getattr(error, "reason", None)
+        detail = None
+        if type(shared) is str and LOCK_DETAIL_REASON_RE.match(shared) is not None:
+            detail = lock_detail("shared_parser", shared)
+        raise BootstrapRefusal(ADM_REASON_MAP.get(shared, "npm_lock_refused"), detail) from None
 
 
 def _valid_hex(value):
@@ -681,7 +723,7 @@ def build_npm_environment(node, *, home, tmpdir, cache, user_config, global_conf
 def check_lock(lock_bytes, plan):
     """Check the resolved lock against the plan and return the parsed lock and registry entries."""
     if type(lock_bytes) is not bytes or not lock_bytes:
-        _refuse("npm_lock_refused")
+        _refuse("npm_lock_refused", lock_detail("lock_empty"))
     if len(lock_bytes) > MAX_LOCK_BYTES:
         _refuse("npm_payload_too_large")
     links = workspace_links()
@@ -691,39 +733,50 @@ def check_lock(lock_bytes, plan):
         adm.registry_entries, lock_bytes, internal_names=internal, workspace_links=links,
     )
     if not entries or len(entries) > MAX_PACKAGES:
-        _refuse("npm_lock_refused")
+        _refuse("npm_lock_refused", lock_detail("entry_count", count=len(entries) if entries else 0))
     packages = lock["packages"]
     root = packages[""]
     expected = plan["root"]
-    if (lock["name"] != expected["name"] or lock["version"] != expected["version"]
-            or root.get("workspaces") != ["packages/*"]
-            or root.get("engines") != {"node": NODE_VERSION, "npm": NPM_VERSION}):
-        _refuse("npm_lock_refused")
+    for field, same in (
+        ("name", lock["name"] == expected["name"]),
+        ("version", lock["version"] == expected["version"]),
+        ("workspaces", root.get("workspaces") == ["packages/*"]),
+        ("engines", root.get("engines") == {"node": NODE_VERSION, "npm": NPM_VERSION}),
+    ):
+        if not same:
+            _refuse("npm_lock_refused", lock_detail("root_identity", field))
     for group in DEPENDENCY_GROUPS:
         if root.get(group, {}) != expected[group]:
-            _refuse("npm_lock_refused")
+            _refuse("npm_lock_refused", lock_detail("root_group", group))
     for workspace in plan["workspaces"]:
         entry = packages[workspace["path"]]
         if (entry.get("name") != workspace["name"] or entry.get("version") != workspace["version"]
                 or entry.get("dependencies", {}) != workspace["dependencies"]
                 or entry.get("devDependencies", {}) != workspace["devDependencies"]):
-            _refuse("npm_lock_refused")
+            _refuse("npm_lock_refused", lock_detail("workspace", workspace["path"]))
     by_name = {}
     for path, entry in entries:
         by_name.setdefault(entry["name"], []).append((path, entry["version"]))
     for name, version in plan["direct"].items():
         if ("node_modules/" + name, version) not in by_name.get(name, []):
-            _refuse("npm_lock_refused")
+            _refuse("npm_lock_refused", lock_detail(
+                "direct_missing", name, [found[1] for found in by_name.get(name, [])],
+            ))
     for name in plan["singletons"]:
         if len(by_name.get(name, [])) > 1:
-            _refuse("npm_lock_refused")
+            _refuse("npm_lock_refused", lock_detail(
+                "singleton_duplicate", name, [found[1] for found in by_name[name]],
+                count=len(by_name[name]),
+            ))
     for name, version in plan["overrides"].items():
         found = by_name.get(name, [])
         if len(found) != 1 or found[0][1] != version:
-            _refuse("npm_lock_refused")
+            _refuse("npm_lock_refused", lock_detail(
+                "override_mismatch", name, [item[1] for item in found], count=len(found),
+            ))
     for path, entry in entries:
         if entry.get("hasShrinkwrap") is True:
-            _refuse("npm_lock_refused")
+            _refuse("npm_lock_refused", lock_detail("shrinkwrap", path))
     return lock, entries
 
 

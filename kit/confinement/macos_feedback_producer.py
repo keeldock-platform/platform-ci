@@ -1006,6 +1006,9 @@ NPM_DIAGNOSTIC_STDERR_LINES = 200
 NPM_DIAGNOSTIC_STDERR_BYTES = 24 * 1024
 NPM_DIAGNOSTIC_REPORT_READ_BYTES = 1024 * 1024
 NPM_STDERR_LINE_RE = re.compile(r"npm (?:error|warn) ")
+NPM_CHECK_LINE_PREFIX = "  kd-check "
+NPM_CHECK_MAX_BYTES = 512
+NPM_CHECK_RE = re.compile(r"[a-z_]{1,32}(?::[A-Za-z0-9._~@/_-]{1,214})?(?: [a-z]{1,16}:[A-Za-z0-9._~@/:,+-]{1,512})*\Z")
 NPM_REPORT_NAME_RE = re.compile(r"[0-9A-Za-z_.-]{1,80}-eresolve-report\.txt\Z")
 NPM_PATH_LINE_RE = re.compile(r"(?:^|[\s\"'=(\[,])(?:/|~/)[A-Za-z0-9._~@-]")
 NPM_CREDENTIAL_PATTERNS = (
@@ -1103,20 +1106,31 @@ def _npm_render_section(lines, omitted, cut):
     return rendered
 
 
-def build_npm_diagnostic_payload(step, key, stderr, report):
+def build_npm_diagnostic_payload(step, key, stderr, report, check=None):
     """Build the bounded KD-NPM-DIAGNOSTICS payload for one failed npm admission step.
 
     Layout, ASCII structure lines and two-space indented body lines:
     header line, a stderr: line, the screened npm stderr lines, a report: line, the screened
-    eresolve report text. The header carries only the closed step tag and the closed reason."""
+    eresolve report text. The header carries only the closed step tag and the closed reason.
+    For the npm_lock step an optional check identifier is the first stderr body line, in the
+    form two spaces, kd-check, one space, the identifier. It must be printable ASCII of the
+    closed token, npm name and semver shapes and at most 512 bytes, else the payload is refused."""
     if (type(step) is not str or step not in NPM_DIAGNOSTIC_STEPS or type(key) is not str
             or NPM_DIAGNOSTIC_KEY_RE.match(key) is None):
         _refuse("payload_invalid")
+    if check is not None and (
+        step != "npm_lock" or type(check) is not str or not check.isascii()
+        or len(check) > NPM_CHECK_MAX_BYTES or NPM_CHECK_RE.match(check) is None
+    ):
+        _refuse("payload_invalid")
     header = NPM_DIAGNOSTIC_PREFIX + step + " reason=" + key + "\n"
     stderr_lines, stderr_omitted, stderr_cut = _npm_section(
-        stderr, True, NPM_DIAGNOSTIC_STDERR_LINES, NPM_DIAGNOSTIC_STDERR_BYTES,
+        stderr, True, NPM_DIAGNOSTIC_STDERR_LINES - (1 if check is not None else 0),
+        NPM_DIAGNOSTIC_STDERR_BYTES - (NPM_CHECK_MAX_BYTES + 16 if check is not None else 0),
     )
     stderr_rendered = _npm_render_section(stderr_lines, stderr_omitted, stderr_cut)
+    if check is not None:
+        stderr_rendered.insert(0, NPM_CHECK_LINE_PREFIX + check)
     used_bytes = len(header) + len("stderr:\nreport:\n") + sum(
         len(line.encode("utf-8")) + 1 for line in stderr_rendered
     )
@@ -1187,9 +1201,11 @@ def _npm_read_report(npm_storage, worker_uid):
         return None
 
 
-def _npm_capture_diagnostic(step, key, stderr, npm_storage, worker_uid):
+def _npm_capture_diagnostic(step, key, stderr, npm_storage, worker_uid, check=None):
     try:
-        return build_npm_diagnostic_payload(step, key, stderr, _npm_read_report(npm_storage, worker_uid))
+        return build_npm_diagnostic_payload(
+            step, key, stderr, _npm_read_report(npm_storage, worker_uid), check,
+        )
     except BaseException:
         return None
 
@@ -1254,7 +1270,11 @@ def _npm_bootstrap_refusal(error, step=None, capture=None):
     if step is not None and type(reason) is str:
         _npm_tag(refusal, step, reason)
         if capture is not None:
-            _npm_attach(refusal, capture(step, reason))
+            check = getattr(error, "detail", None) if (step, reason) == ("npm_lock", "npm_lock_refused") else None
+            if type(check) is str and check:
+                _npm_attach(refusal, capture(step, reason, check))
+            else:
+                _npm_attach(refusal, capture(step, reason))
     raise refusal
 
 
@@ -1341,8 +1361,8 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
     step = "npm_config"
     resolve_stderr = None
 
-    def capture(step_name, key):
-        return _npm_capture_diagnostic(step_name, key, resolve_stderr, npm_storage, worker_uid)
+    def capture(step_name, key, check=None):
+        return _npm_capture_diagnostic(step_name, key, resolve_stderr, npm_storage, worker_uid, check)
 
     try:
         os.chdir(project)
