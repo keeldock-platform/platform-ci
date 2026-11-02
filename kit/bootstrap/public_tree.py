@@ -348,7 +348,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/npm_semver.py': '0f6207724ea97a793d9c64175a5e9245f138e0fb4b057ab776c67d1722b1c26f',
     'kit/confinement/test_confinement_npm_semver.py': 'de0caa828a3af80166ee7cd1946276ef251504be8c967bc4b2cac046f8e65395',
     'kit/confinement/test_feedback_request_npm.py': '8b13fad42f732e9029f00ca053febe6298dff2ac688cb2ef1f7f56d3f62d9fbb',
-    'kit/confinement/test_macos_feedback_producer_npm.py': '6bbfa43a88858be9198164b3abb3138fca7786fd3971fbb240b39cc255a54d6e',
+    'kit/confinement/test_macos_feedback_producer_npm.py': '9c32767d0e213d92ede332ab93d21aa03e6a418255123663dbcf722839268c6f',
     'kit/confinement/test_npm_admission_feedback.mjs': '7eff3e88259a7f346002dc415e0477f874b4b8ac75e53adbdbad33738fc83ac1',
     'kit/confinement/test_release_evidence.py': '8157fdaf8f9a691d4bae699eec3b7eb07143cc8f0fef6bed7619ebf45da8c6f3',
     '.github/workflows/baselines-prepare.yml': '970eec0b3be196ab2c0e02f7652a06e186b9ab2f76df704daba53a935af0388d',
