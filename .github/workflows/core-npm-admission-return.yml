@@ -439,10 +439,17 @@ jobs:
           IFS= read -r publish_line < "$publish_file"
           [[ "$publish_line" == KD-FEEDBACK-PUBLISHER\ * ]] || exit 1
           IFS= read -r producer_line < "$stdout_file" || exit 1
+          diagnostic_pattern='^KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=npm_(resolve|lock|bundle) reason=[a-z0-9_]{1,40}$'
+          diagnostic_line=""
+          if grep -Eq -- "$diagnostic_pattern" "$stderr_file"; then
+            [[ "$(grep -Ec -- "$diagnostic_pattern" "$stderr_file")" -eq 1 ]] || exit 1
+            diagnostic_line="$(grep -Em 1 -- "$diagnostic_pattern" "$stderr_file")"
+          fi
           rm -rf "$capture_dir"
           trap - EXIT
           printf 'token_revocation=confirmed\n' >> "$GITHUB_OUTPUT"
           printf '%s\n' "$producer_line"
+          if [[ -n "$diagnostic_line" ]]; then printf '%s\n' "$diagnostic_line"; fi
       - name: Upload the single encrypted member
         id: uploader
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
