@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import re
 from pathlib import Path
 import stat
 import subprocess
@@ -327,7 +328,8 @@ class RustToolchainContractTests(unittest.TestCase):
                 returncode=0, stdout=b"x" * (rust.MAX_CAPTURE_BYTES + 1), stderr=b"",
             ), "capture_invalid", "capture_overflow"),
         )
-        for stage in ("format", "runtime_format", "runtime_clippy", "runtime_tests"):
+        for stage in ("format", "api_feature_clippy", "api_feature_tests", "runtime_format",
+                      "runtime_clippy", "runtime_tests"):
             self.assertIn(stage, rust.SOURCE_COMMAND_STAGES)
             for case_name, outcome, expected_reason, expected_check in cases:
                 calls = []
@@ -404,31 +406,79 @@ class RustToolchainContractTests(unittest.TestCase):
             ("child",),
         )
 
+    MARKER_RE = re.compile(rb"\n\[\.\.\. ([0-9]+) bytes omitted \.\.\.\]\n")
+
+    def _check_head_tail(self, data, head_floor=16320, tail_floor=16256):
+        decoded = self._run_capture_shim(data, data)
+        for stream, flag in ((decoded.stdout, decoded.stdout_truncated),
+                             (decoded.stderr, decoded.stderr_truncated)):
+            self.assertIs(flag, True)
+            self.assertLessEqual(len(stream), 32_640)
+            self.assertLessEqual(len(stream), rust.DIAGNOSTIC_STREAM_LIMIT)
+            stream.decode("utf-8", "strict")
+            marker = self.MARKER_RE.search(stream)
+            head, tail = stream[:marker.start()], stream[marker.end():]
+            self.assertTrue(data.startswith(head))
+            self.assertTrue(data.endswith(tail))
+            self.assertEqual(int(marker.group(1)), len(data) - len(head) - len(tail))
+            self.assertGreaterEqual(len(head), head_floor - 3)
+            self.assertGreaterEqual(len(tail), tail_floor - 3)
+        return decoded
+
     @unittest.skipIf(sys.platform == "win32", "POSIX pipe selectors in the capture shim")
-    def test_capture_shim_never_keeps_a_partial_utf8_sequence_at_the_byte_cut(self):
-        limit = rust.DIAGNOSTIC_STREAM_LIMIT
-        three = "⎯".encode("utf-8")
-        four = "\U0001f600".encode("utf-8")
-        cases = (
-            (b"a" * (limit - 1) + three, b"b" * (limit - 2) + four, limit - 1, limit - 2, True, True),
-            (b"a" * (limit - 2) + three, b"b" * (limit - 3) + four, limit - 2, limit - 3, True, True),
-            (b"a" * (limit - 3) + three + b"zz", b"b" * (limit - 4) + four + b"z", limit, limit, True, True),
-            (b"a" * (limit - 3) + three, b"b" * (limit - 4) + four, limit, limit, False, False),
-            (b"a" * (limit + 5), b"", limit, 0, True, False),
-            (b"", b"\xe2\x8e", 0, 2, False, False),
-        )
-        for stdout, stderr, kept_out, kept_err, cut_out, cut_err in cases:
-            with self.subTest(stdout=len(stdout), stderr=len(stderr)):
-                decoded = self._run_capture_shim(stdout, stderr)
-                self.assertEqual((decoded.returncode, len(decoded.stdout), len(decoded.stderr)),
-                                 (3, kept_out, kept_err))
-                self.assertEqual((decoded.stdout_truncated, decoded.stderr_truncated), (cut_out, cut_err))
-                self.assertEqual(decoded.stdout, stdout[:kept_out])
-                self.assertEqual(decoded.stderr, stderr[:kept_err])
-                if cut_out:
-                    decoded.stdout.decode("utf-8", "strict")
-                if cut_err:
-                    decoded.stderr.decode("utf-8", "strict")
+    def test_capture_shim_keeps_the_head_and_the_tail_around_an_omission_marker(self):
+        head_limit, tail_keep, budget = 16320, 16256, 32640
+        self.assertLessEqual(budget, rust.DIAGNOSTIC_STREAM_LIMIT)
+        for lines in (10, 2720, 2721, 3000, 9000):
+            data = b"".join(b"line %06d\n" % index for index in range(lines))
+            with self.subTest(total=len(data)):
+                decoded = self._run_capture_shim(data, data[:5])
+                self.assertEqual(decoded.returncode, 3)
+                self.assertEqual(decoded.stderr, data[:5])
+                self.assertIs(decoded.stderr_truncated, False)
+                if len(data) <= budget:
+                    self.assertEqual(decoded.stdout, data)
+                    self.assertIs(decoded.stdout_truncated, False)
+                else:
+                    omitted = len(data) - head_limit - tail_keep
+                    marker = ("\n[... %d bytes omitted ...]\n" % omitted).encode("ascii")
+                    self.assertEqual(decoded.stdout, data[:head_limit] + marker + data[-tail_keep:])
+                    self.assertIs(decoded.stdout_truncated, True)
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX pipe selectors in the capture shim")
+    def test_capture_shim_never_keeps_a_partial_utf8_sequence_at_either_cut(self):
+        head_limit, tail_keep = 16320, 16256
+        for glyph in ("\u23af".encode("utf-8"), "\U0001f600".encode("utf-8")):
+            for inside in range(1, len(glyph)):
+                head_cut = b"a" * (head_limit - inside) + glyph + b"b" * 40000
+                with self.subTest(cut="head", glyph=len(glyph), inside=inside):
+                    decoded = self._check_head_tail(head_cut, head_floor=head_limit - 3)
+                    marker = self.MARKER_RE.search(decoded.stdout)
+                    self.assertEqual(decoded.stdout[:marker.start()], b"a" * (head_limit - inside))
+                tail_length = tail_keep + inside - len(glyph)
+                tail_cut = b"a" * 40000 + glyph + b"z" * tail_length
+                with self.subTest(cut="tail", glyph=len(glyph), inside=inside):
+                    decoded = self._check_head_tail(tail_cut, tail_floor=tail_keep - 3)
+                    marker = self.MARKER_RE.search(decoded.stdout)
+                    self.assertEqual(
+                        decoded.stdout[marker.end():], b"z" * tail_length,
+                    )
+        whole = b"a" * (head_limit + tail_keep + 100) + "\u23af".encode("utf-8") * 2
+        self._check_head_tail(whole)
+
+    @unittest.skipIf(sys.platform == "win32", "POSIX pipe selectors in the capture shim")
+    def test_capture_shim_marker_is_ascii_text_the_sanitiser_leaves_unchanged(self):
+        import macos_feedback_producer as producer
+
+        data = b"".join(b"line %06d\n" % index for index in range(9000))
+        decoded = self._run_capture_shim(data, data)
+        marker = self.MARKER_RE.search(decoded.stdout).group(0)
+        self.assertTrue(marker.isascii())
+        self.assertEqual(marker.count(b"\n"), 2)
+        cleaned, truncated = producer.sanitize_diagnostic_stream(decoded.stdout, decoded.stdout_truncated)
+        self.assertIs(truncated, True)
+        self.assertIn(marker, cleaned)
+        self.assertTrue(cleaned.endswith(decoded.stdout[-16256:]))
 
     def test_opt_in_nonzero_capture_uses_fixed_python_wrapper_and_keeps_success_default(self):
         prefix = b"failed\n" + (b"x" * (rust.DIAGNOSTIC_STREAM_LIMIT - len(b"failed\n")))

@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -481,6 +482,76 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                     accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
                 )
 
+    def test_an_inert_kernel_tokens_directory_is_accepted_and_never_copied(self):
+        def add_inert(source):
+            inert = source / "packages/kernel-tokens"
+            (inert / "src").mkdir(parents=True)
+            (inert / "src/tokens.ts").write_text("export const tokens = 1;\n", encoding="ascii")
+            (inert / "README.txt").write_text("inert\n", encoding="ascii")
+
+        self.assertEqual(subject.INERT_PACKAGE_NAME, "kernel-tokens")
+        for mode, kind, tree, options in (
+            ("bootstrap", "lock", "core_node_lock_return", {}),
+            ("verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE,
+             {"accepted_provenance": {"status": "accepted"}, "lock_bytes": b"lock"}),
+        ):
+            with self.subTest(mode=mode):
+                result, producer, unused_contract = self._run(
+                    mode, kind, validated_tree=tree, mutate_source=add_inert, **options,
+                )
+                copied = producer.copies[0][2]
+                self.assertFalse(any("kernel-tokens" in path for path in copied))
+                self.assertEqual(result["stages"], subject.NODE_GATE_NAMES if mode == "verify"
+                                 else subject.NODE_BOOTSTRAP_GATES)
+                if mode == "verify":
+                    self.assertEqual(result["node_reviewed_file_count"], len(copied))
+        self.assertEqual(subject.NODE_WORKSPACE_PACKAGES, ("packages/host-api", "packages/kernel-i18n"))
+        self.assertFalse(any("kernel-tokens" in path for path in subject.BOOTSTRAP_MANIFESTS))
+        self.assertFalse(any("kernel-tokens" in path for path in subject.NODE_REVIEWED_FILES))
+
+    def test_kernel_tokens_never_widens_the_package_listing_beyond_itself(self):
+        def make_inert(source):
+            (source / "packages/kernel-tokens/src").mkdir(parents=True)
+
+        def with_other_package(source):
+            make_inert(source)
+            (source / "packages/third-package/src").mkdir(parents=True)
+
+        def with_stray_file(source):
+            make_inert(source)
+            (source / "packages/stray.txt").touch()
+
+        def with_case_variant(source):
+            make_inert(source)
+            (source / "packages/Kernel-Tokens").mkdir()
+
+        def without_host_api(source):
+            make_inert(source)
+            shutil.rmtree(source / "packages/host-api")
+
+        def inert_is_a_file(source):
+            (source / "packages/kernel-tokens").write_text("x\n", encoding="ascii")
+
+        def inert_with_package_json(source):
+            make_inert(source)
+            (source / "packages/kernel-tokens/package.json").write_text("{}\n", encoding="ascii")
+
+        def inert_with_package_json_directory(source):
+            make_inert(source)
+            (source / "packages/kernel-tokens/package.json").mkdir()
+
+        for mutate in (
+            with_other_package, with_stray_file, with_case_variant, without_host_api,
+            inert_is_a_file, inert_with_package_json, inert_with_package_json_directory,
+        ):
+            with self.subTest(mutation=mutate.__name__, mode="bootstrap"):
+                self._refused("bootstrap", "lock", "core_node_lock_return", mutate)
+            with self.subTest(mutation=mutate.__name__, mode="verify"):
+                self._refused(
+                    "verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE, mutate,
+                    accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+                )
+
     def test_verify_refuses_kernel_sources_outside_the_reviewed_patterns(self):
         def remove_support(source):
             (source / "packages/kernel-i18n/tests/support.ts").unlink()
@@ -860,13 +931,14 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         self.assertEqual((caught.exception.check, str(caught.exception)),
                          ("reviewed_files", "node reviewed files invalid"))
 
-    def test_node_stderr_cut_never_leaves_a_partial_utf8_sequence_and_marks_truncation(self):
+    def test_node_stderr_cut_keeps_head_and_tail_without_partial_utf8_and_marks_truncation(self):
         metadata = b"node_reason=command_failed node_substage=tests\n"
         room = 32_768 - len(metadata)
         character = "⎯".encode("utf-8")
-        for filler, tail, kept in (
-            (room - 1, character, 0), (room - 2, character, 0), (room - 3, character + b"zz", 3),
-            (room - 3, character, None), (room, b"", None),
+        marker_re = re.compile(rb"\n\[\.\.\. ([0-9]+) bytes omitted \.\.\.\]\n")
+        for filler, tail in (
+            (room - 1, character), (room - 2, character), (room - 3, character + b"zz"),
+            (room - 3, character), (room, b""), (room + 5, b""), (40_000, b"end of run\n"),
         ):
             raw = b"a" * filler + tail
             with self.subTest(filler=room - filler, tail=len(tail)):
@@ -876,11 +948,31 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                 ))
                 self.assertTrue(outcome["stderr"].startswith(metadata))
                 self.assertLessEqual(len(outcome["stderr"]), 32_768)
-                outcome["stderr"].decode("utf-8", "strict")
+                body = outcome["stderr"][len(metadata):]
+                body.decode("utf-8", "strict")
                 cut = len(raw) > room
                 self.assertEqual(outcome["stderr_truncated"], cut)
-                if kept is not None:
-                    self.assertEqual(len(outcome["stderr"]) - len(metadata) - filler, kept)
+                if not cut:
+                    self.assertEqual(body, raw)
+                    continue
+                marker = marker_re.search(body)
+                head, kept_tail = body[:marker.start()], body[marker.end():]
+                self.assertTrue(raw.startswith(head))
+                self.assertTrue(raw.endswith(kept_tail))
+                self.assertEqual(int(marker.group(1)), len(raw) - len(head) - len(kept_tail))
+                self.assertGreater(len(head), 16_000)
+                self.assertGreater(len(kept_tail), 16_000)
+                if tail:
+                    self.assertTrue(body.endswith(tail[-3:]))
+
+    def test_head_tail_cut_helper_is_a_no_op_when_the_data_fits(self):
+        self.assertEqual(subject._cut_head_tail(b"abc", 3), b"abc")
+        self.assertEqual(subject._cut_head_tail(b"", 0), b"")
+        self.assertEqual(subject._cut_head_tail(b"a" * 10, 20), b"a" * 10)
+        self.assertEqual(subject._cut_head_tail(b"a" * 200, 64), b"")
+        self.assertEqual(subject._trim_leading_utf8(b"\x8e\xafz"), b"z")
+        self.assertEqual(subject._trim_leading_utf8(b"\x80\x80\x80\x80z"), b"\x80z")
+        self.assertEqual(subject._trim_leading_utf8(b"abc"), b"abc")
 
     def test_trim_incomplete_utf8_matches_the_producer_helper(self):
         producer_spec = importlib.util.spec_from_file_location(

@@ -520,6 +520,18 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual((cleanup.reason, cleanup.stage, cleanup.diagnostic),
                          ("cleanup_incomplete", "cleanup", "cleanup_summary"))
 
+    def test_verify_controls_token_lists_equal_the_rules_bootstrap_lists(self):
+        import macos_rules_bootstrap as rules_bootstrap
+
+        for name in (
+            "SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES", "SUMMARY_GUARD_VERIFY_FILE_CLASSES",
+            "SUMMARY_GUARD_VERIFY_FAILURES", "SUMMARY_GUARD_VERIFY_CHECKS", "SUMMARY_GUARD_CHECKS",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(getattr(subject, name), getattr(rules_bootstrap, name))
+        self.assertEqual(len(subject.SUMMARY_GUARD_VERIFY_CHECKS), 84)
+        self.assertEqual(len(rules_bootstrap.SUMMARY_GUARD_VERIFY_CHECKS), 84)
+
     def test_verify_controls_diagnostics_are_closed_mirrored_and_preserved(self):
         class RulesRefusal(Exception):
             def __init__(self, reason, stage, diagnostic):
@@ -916,13 +928,27 @@ class CoreContractTests(unittest.TestCase):
         line = feedback_failure.REFUSAL_PREFIX + payload + b"\n"
         return attached, record, feedback_failure.normalize_refusal(line) == line
 
+    NODE_STAGE_BY_SUBSTAGE = (
+        ("runtime_version", "node_dependency_prepare"), ("npm_version", "node_dependency_prepare"),
+        ("lock_generation", "node_dependency_prepare"), ("lock_validation", "node_dependency_prepare"),
+        ("bulk_audit", "node_dependency_audit"), ("npm_ci", "node_dependency_audit"),
+        ("typecheck", "typescript_typecheck"), ("tests", "typescript_tests"),
+    )
+
+    def _expected_node_stage(self, expected):
+        for substage, stage in self.NODE_STAGE_BY_SUBSTAGE:
+            if expected.startswith("source_gates_node_" + substage + "_"):
+                return stage
+        return "worker_setup"
+
     def _expect_node_diagnostic(self, error, expected, public_reason="runner_unavailable"):
         attached, record, normalized = self._published_node_refusal(error)
+        expected_stage = self._expected_node_stage(expected)
         self.assertEqual(attached.diagnostic, expected)
-        self.assertEqual((attached.reason, attached.stage), (public_reason, "worker_setup"))
+        self.assertEqual((attached.reason, attached.stage), (public_reason, expected_stage))
         self.assertEqual(
             (record["reason"], record["stage"], record["diagnostic"]),
-            (public_reason, "worker_setup", expected),
+            (public_reason, expected_stage, expected),
         )
         self.assertTrue(normalized)
 
@@ -1007,10 +1033,12 @@ class CoreContractTests(unittest.TestCase):
         )
 
     def test_every_listed_node_combination_publishes_its_bound_value(self):
+        stage_for = dict(self.NODE_STAGE_BY_SUBSTAGE)
         for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
             for reason in reasons:
                 error = real_node_contract.NodeContractRefusal(
                     reason, substage=None if substage == "none" else substage,
+                    stage=stage_for.get(substage, "node_dependency_prepare"),
                 )
                 expected = "source_gates_node_" + substage + "_" + reason
                 with self.subTest(diagnostic=expected):
@@ -1023,10 +1051,70 @@ class CoreContractTests(unittest.TestCase):
             for check in subject.SOURCE_GATES_NODE_COMMAND_CHECKS:
                 error = real_node_contract.NodeContractRefusal(
                     "command_failed", substage=substage, command_check=check,
+                    stage=stage_for[substage],
                 )
                 expected = "source_gates_node_" + substage + "_command_" + check
                 with self.subTest(diagnostic=expected):
                     self._expect_node_diagnostic(error, expected)
+
+    def test_node_substage_values_bind_to_exactly_one_node_stage(self):
+        stage_for = dict(self.NODE_STAGE_BY_SUBSTAGE)
+        self.assertEqual(subject.SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE, stage_for)
+        self.assertEqual(
+            set(stage_for.values()),
+            {"node_dependency_prepare", "node_dependency_audit", "typescript_typecheck",
+             "typescript_tests"},
+        )
+        self.assertEqual(set(stage_for.values()), set(foundation_tests.subject.NODE_GATE_NAMES))
+        generated = {}
+        for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
+            if substage in stage_for:
+                for reason in reasons:
+                    generated["source_gates_node_" + substage + "_" + reason] = stage_for[substage]
+        for substage in subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES:
+            for check in subject.SOURCE_GATES_NODE_COMMAND_CHECKS:
+                generated["source_gates_node_" + substage + "_command_" + check] = stage_for[substage]
+        self.assertEqual(subject.SOURCE_GATES_NODE_DIAGNOSTIC_STAGES, generated)
+        self.assertEqual(len(generated), 90 - 10)
+        self.assertTrue(set(generated) <= subject.SOURCE_GATES_NODE_DIAGNOSTICS)
+        for diagnostic in subject.SOURCE_GATES_NODE_DIAGNOSTICS - set(generated):
+            self.assertTrue(diagnostic.startswith("source_gates_node_none_"), msg=diagnostic)
+
+    def test_node_substage_refusals_keep_worker_setup_without_a_known_substage(self):
+        refusal = real_node_contract.NodeContractRefusal
+        for stage in sorted(real_node_contract.STAGES):
+            for reason in ("invalid_input", "tool_unavailable", "capture_invalid"):
+                with self.subTest(stage=stage, reason=reason):
+                    self._expect_node_diagnostic(
+                        refusal(reason, stage=stage), "source_gates_node_none_" + reason,
+                        public_reason="capture_invalid" if reason == "capture_invalid"
+                        else "runner_unavailable",
+                    )
+
+    def test_node_substage_refusal_at_a_disagreeing_stage_keeps_the_generic_value(self):
+        refusal = real_node_contract.NodeContractRefusal
+        stage_for = dict(self.NODE_STAGE_BY_SUBSTAGE)
+        for substage, bound in sorted(stage_for.items()):
+            for stage in sorted(real_node_contract.STAGES - {bound}):
+                with self.subTest(substage=substage, stage=stage):
+                    self._expect_node_diagnostic(
+                        refusal("command_failed", stage=stage, substage=substage, command_check="timeout"),
+                        "source_gates",
+                    )
+        refused = subject._toolchain_refusal(
+            refusal("command_failed", stage="typescript_tests", substage="tests", command_check="timeout"),
+            "worker_setup",
+        )
+        self.assertEqual(
+            (refused.reason, refused.stage, refused.diagnostic),
+            ("runner_unavailable", "typescript_tests", "source_gates_node_tests_command_timeout"),
+        )
+        other = subject._toolchain_refusal(
+            refusal("command_failed", stage="typescript_tests", substage="tests", command_check="timeout"),
+            "toolchain_install",
+        )
+        self.assertEqual((other.reason, other.stage), ("toolchain_install_failed", "toolchain_install"))
+        self.assertEqual(other.diagnostic, "unavailable")
 
     def test_unlisted_node_combinations_keep_the_generic_source_gates_value(self):
         refusal = real_node_contract.NodeContractRefusal
@@ -1220,7 +1308,7 @@ class CoreContractTests(unittest.TestCase):
             with self.subTest(field=name), self.assertRaises(subject.Refusal):
                 subject._validate_review_gate(request, binding, altered, runtime)
 
-    def test_rust_commands_are_fixed_offline_and_cover_all_six_gates(self):
+    def test_rust_commands_are_fixed_offline_and_cover_all_eight_gates(self):
         with tempfile.TemporaryDirectory() as temporary:
             test_root = Path(temporary)
             source = test_root / "source"
@@ -1238,8 +1326,41 @@ class CoreContractTests(unittest.TestCase):
                 self.assertIn("--offline", argv)
                 self.assertIn("--locked", argv)
         self.assertIn(str(source / "crates/host/api/Cargo.toml"), commands[3][1])
-        self.assertIn(str(source / "crates/host/mock/Cargo.toml"), commands[4][1])
-        self.assertIn(str(source / "crates/host/conformance/Cargo.toml"), commands[5][1])
+        self.assertIn(str(source / "crates/host/mock/Cargo.toml"), commands[6][1])
+        self.assertIn(str(source / "crates/host/conformance/Cargo.toml"), commands[7][1])
+
+    def test_api_feature_gates_follow_api_tests_and_pass_the_dev_feature_exactly(self):
+        import macos_feedback_producer as producer_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            test_root = Path(temporary)
+            source = test_root / "source"
+            tool_paths = {"cargo": test_root / "toolchain" / "bin" / "cargo"}
+            commands = dict(subject._source_commands(source, tool_paths))
+        cargo = str(tool_paths["cargo"])
+        manifest = str(source / "crates/host/api/Cargo.toml")
+        self.assertEqual(commands["api_feature_clippy"], (
+            cargo, "clippy", "--offline", "--manifest-path", manifest, "--all-targets",
+            "--features", "dev-uat-policy-import", "--locked", "--", "-D", "warnings",
+        ))
+        self.assertEqual(commands["api_feature_tests"], (
+            cargo, "test", "--offline", "--manifest-path", manifest, "--all-targets",
+            "--features", "dev-uat-policy-import", "--locked",
+        ))
+        self.assertEqual(subject.API_FEATURE_GATE_NAMES, ("api_feature_clippy", "api_feature_tests"))
+        self.assertEqual(
+            subject.GATE_NAMES[3:6], ("api_tests", "api_feature_clippy", "api_feature_tests"),
+        )
+        for stage in subject.API_FEATURE_GATE_NAMES:
+            self.assertIn(stage, subject.SOURCE_GATE_STAGES)
+            self.assertIn(stage, subject.STAGES)
+            self.assertIn(stage, real_rust.SOURCE_COMMAND_STAGES)
+        self.assertIn("api_feature_tests", subject.TEST_GATE_STAGES)
+        self.assertNotIn("api_feature_clippy", subject.TEST_GATE_STAGES)
+        self.assertEqual(subject._gate_command_seconds("api_feature_tests"), 300)
+        self.assertEqual(subject._gate_command_seconds("api_feature_clippy"), 120)
+        self.assertEqual(foundation_tests.subject.RUST_GATE_NAMES, subject.GATE_NAMES)
+        self.assertEqual(producer_module.DIAGNOSTIC_BASE_GATES, subject.GATE_NAMES)
 
     def test_runtime_commands_are_fixed_locked_offline_and_cover_all_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1824,8 +1945,8 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(subject.MAX_TEST_COMMAND_SECONDS, 300)
         self.assertEqual(
             subject.TEST_GATE_STAGES,
-            frozenset(("workspace_tests", "api_tests", "mock_tests", "conformance_tests",
-                       "parser_replay", "runtime_tests")),
+            frozenset(("workspace_tests", "api_tests", "api_feature_tests", "mock_tests",
+                       "conformance_tests", "parser_replay", "runtime_tests")),
         )
         self.assertLessEqual(subject.TEST_GATE_STAGES, frozenset(subject.SOURCE_GATE_STAGES))
         self.assertLess(subject.MAX_TEST_COMMAND_SECONDS, subject.MAX_TOTAL_SECONDS)
@@ -1957,7 +2078,7 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(validated["suites"], [
             "core.static", "core.host-api", "core.mock-host", "core.conformance",
         ])
-        self.assertEqual(validated["gate_count"], 6)
+        self.assertEqual(validated["gate_count"], 8)
         self.assertEqual(validated["selected_gates"], list(subject.GATE_NAMES))
         self.assertEqual(validated["completed_gates"], list(subject.GATE_NAMES))
         self.assertEqual(validated["suite_count"], 4)
@@ -1974,7 +2095,7 @@ class CoreContractTests(unittest.TestCase):
             runtime_record, _binding(), _request(), _lease_record(), DIFF_SHA256,
             runtime_versions, runtime_gates, True, True,
         )
-        self.assertEqual(runtime_validated["gate_count"], 9)
+        self.assertEqual(runtime_validated["gate_count"], 11)
         self.assertEqual(runtime_validated["selected_gates"],
                          list(subject.GATE_NAMES + subject.RUNTIME_GATE_NAMES))
         self.assertEqual(runtime_validated["completed_gates"], runtime_validated["selected_gates"])

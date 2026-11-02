@@ -46,6 +46,7 @@ CLEANUP_BOUND_DIAGNOSTICS = (
     | frozenset(getattr(_CORE_CONTRACT, "PRIVILEGE_PROBE_CHECK_DIAGNOSTICS", {}).values())
 )
 NODE_BOUND_DIAGNOSTIC_REASONS = dict(getattr(_CORE_CONTRACT, "SOURCE_GATES_NODE_DIAGNOSTIC_REASONS", {}))
+NODE_BOUND_DIAGNOSTIC_STAGES = dict(getattr(_CORE_CONTRACT, "SOURCE_GATES_NODE_DIAGNOSTIC_STAGES", {}))
 STEP_BOUND_DIAGNOSTIC_REASONS = dict(getattr(_CORE_CONTRACT, "SOURCE_GATES_STEP_DIAGNOSTIC_REASONS", {}))
 
 
@@ -92,7 +93,7 @@ def _parse_refusal(raw):
             or record["diagnostic"] in CLEANUP_BOUND_DIAGNOSTICS
             and (record["stage"] != "cleanup" or record["reason"] != "cleanup_incomplete")
             or record["diagnostic"] in NODE_BOUND_DIAGNOSTIC_REASONS
-            and (record["stage"] != "worker_setup"
+            and (record["stage"] != NODE_BOUND_DIAGNOSTIC_STAGES.get(record["diagnostic"], "worker_setup")
                  or record["reason"] != NODE_BOUND_DIAGNOSTIC_REASONS[record["diagnostic"]])
             or record["diagnostic"] in STEP_BOUND_DIAGNOSTIC_REASONS
             and (record["stage"] != "worker_setup"

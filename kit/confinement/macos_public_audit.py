@@ -363,9 +363,9 @@ CORE_CONTRACT_REFUSAL_REASONS = frozenset((
 CORE_CONTRACT_REFUSAL_STAGES = frozenset((
     "arguments", "context", "host", "source_validation", "source_lease", "source_tree",
     "source_diff", "toolchain_install", "worker_setup", "summary_guard", "observer",
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
-    "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
-    "runtime_format", "runtime_clippy", "runtime_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy",
+    "api_feature_tests", "mock_tests", "conformance_tests", "parser_format", "parser_clippy",
+    "parser_replay", "runtime_format", "runtime_clippy", "runtime_tests",
     "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
     "cleanup", "receipt", "internal",
 ))
@@ -417,12 +417,13 @@ CORE_CONTRACT_GATE_DIAGNOSTICS = frozenset((
     "source_gate_capture_invalid", "source_gate_capture_overflow",
 ))
 CORE_CONTRACT_GATE_STAGES = frozenset((
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
-    "parser_format", "parser_clippy", "parser_replay",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
     "runtime_format", "runtime_clippy", "runtime_tests",
 ))
 CORE_CONTRACT_BASE_GATE_NAMES = (
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests",
 )
 CORE_CONTRACT_RUNTIME_GATE_NAMES = (
     "runtime_format", "runtime_clippy", "runtime_tests",
@@ -495,6 +496,27 @@ CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
 CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(
     CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS
 )
+CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE = {
+    "runtime_version": "node_dependency_prepare", "npm_version": "node_dependency_prepare",
+    "lock_generation": "node_dependency_prepare", "lock_validation": "node_dependency_prepare",
+    "bulk_audit": "node_dependency_audit", "npm_ci": "node_dependency_audit",
+    "typecheck": "typescript_typecheck", "tests": "typescript_tests",
+}
+CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_STAGES = {
+    **{
+        "source_gates_node_" + substage + "_" + reason:
+            CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
+        for substage, reasons in CORE_CONTRACT_SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
+        if substage in CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE
+        for reason in reasons
+    },
+    **{
+        "source_gates_node_" + substage + "_command_" + check:
+            CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
+        for substage in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_SUBSTAGES
+        for check in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_CHECKS
+    },
+}
 CORE_CONTRACT_SOURCE_GATES_NODE_PROFILE_REASONS = (
     "manifest_invalid", "command_failed", "capture_invalid", "output_unavailable",
 )
@@ -1711,7 +1733,9 @@ def _core_contract_refusal_diagnostic_matches(value):
     diagnostic = value["diagnostic"]
     if diagnostic in CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS:
         return (
-            value["stage"] == "worker_setup"
+            value["stage"] == CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_STAGES.get(
+                diagnostic, "worker_setup",
+            )
             and value["reason"] == CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS[diagnostic]
         )
     if diagnostic in CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS:

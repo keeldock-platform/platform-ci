@@ -7,7 +7,8 @@ import time
 
 
 RUST_GATE_NAMES = (
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests",
 )
 PARSER_GATE_NAMES = ("parser_format", "parser_clippy", "parser_replay")
 RUST_FOUNDATION_GATES = RUST_GATE_NAMES + PARSER_GATE_NAMES
@@ -17,6 +18,8 @@ NODE_GATE_NAMES = (
 NODE_BOOTSTRAP_GATES = ("node_dependency_prepare", "node_dependency_audit")
 FULL_FOUNDATION_GATES = RUST_FOUNDATION_GATES + NODE_GATE_NAMES
 NODE_WORKSPACE_PACKAGES = ("packages/host-api", "packages/kernel-i18n")
+INERT_PACKAGE_NAME = "kernel-tokens"
+STREAM_MARKER_ROOM = 64
 BOOTSTRAP_MANIFESTS = (
     "package.json", "packages/host-api/package.json", "packages/kernel-i18n/package.json",
 )
@@ -114,6 +117,29 @@ def _trim_incomplete_utf8(data):
                 return data[:size - back]
         return data
     return data
+
+
+def _trim_leading_utf8(data):
+    """Drop continuation bytes left at the start of a tail by a byte cut."""
+    drop = 0
+    while drop < 3 and drop < len(data) and data[drop] & 0xC0 == 0x80:
+        drop += 1
+    return data[drop:]
+
+
+def _cut_head_tail(data, room):
+    """Fit data into room bytes by keeping its head and its tail around an omission marker line."""
+    if len(data) <= room:
+        return data
+    keep = room - STREAM_MARKER_ROOM
+    if keep <= 0:
+        return b""
+    head_length = keep // 2
+    head = _trim_incomplete_utf8(data[:head_length])
+    tail = _trim_leading_utf8(data[len(data) - (keep - head_length):])
+    omitted = len(data) - len(head) - len(tail)
+    marker = ("\n[... %d bytes omitted ...]\n" % omitted).encode("ascii")
+    return head + marker + tail
 
 
 def _survivor_diagnostic(classes):
@@ -232,6 +258,24 @@ def _profile_context(mode, dispatch, producer, source_runtime, validated_tree, a
     return profile, request, identity, policy_epoch_ms
 
 
+def _require_inert_package(directory, producer):
+    """The one extra packages entry allowed beside the two workspaces. It is only checked, never
+    copied, read or listed: it must be a real directory without a package.json, so npm cannot
+    treat it as a workspace."""
+    try:
+        if not stat.S_ISDIR(directory.lstat().st_mode):
+            _refuse(producer, "manifest_invalid")
+    except OSError:
+        _refuse(producer, "manifest_invalid")
+    try:
+        (directory / "package.json").lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        _refuse(producer, "manifest_invalid")
+    _refuse(producer, "manifest_invalid")
+
+
 def _reviewed_files(source_runtime, mode, producer, source):
     source_files = getattr(source_runtime, "CORE_CONTRACT_FEEDBACK_FILES", None)
     kernel_files = getattr(source_runtime, "CORE_CONTRACT_KERNEL_FEEDBACK_FILES", None)
@@ -247,7 +291,10 @@ def _reviewed_files(source_runtime, mode, producer, source):
             package_names = sorted(entry.name for entry in iterator)
     except OSError:
         _refuse(producer, "manifest_invalid")
-    if package_names != sorted(path.rsplit("/", 1)[-1] for path in NODE_WORKSPACE_PACKAGES):
+    expected_names = sorted(path.rsplit("/", 1)[-1] for path in NODE_WORKSPACE_PACKAGES)
+    if package_names == sorted(expected_names + [INERT_PACKAGE_NAME]):
+        _require_inert_package(source / "packages" / INERT_PACKAGE_NAME, producer)
+    elif package_names != expected_names:
         _refuse(producer, "manifest_invalid")
     if mode == "bootstrap":
         return BOOTSTRAP_MANIFESTS
@@ -619,7 +666,7 @@ def extend_diagnostic_outcome(rust_outcome, node_callback, contract):
         metadata = ("node_reason=" + reason + " node_substage=" + substage + "\n").encode("ascii")
         room = max(0, 32_768 - len(metadata))
         stderr_cut = len(raw_stderr) > room
-        stderr = metadata + (_trim_incomplete_utf8(raw_stderr[:room]) if stderr_cut else raw_stderr)
+        stderr = metadata + _cut_head_tail(raw_stderr, room)
         returncode = getattr(error, "returncode", None)
         if type(returncode) is not int or not 1 <= returncode <= 255:
             returncode = 1

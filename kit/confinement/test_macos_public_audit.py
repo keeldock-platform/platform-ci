@@ -71,12 +71,13 @@ def core_contract_value():
         },
         "gates": {
             "format": "passed", "clippy": "passed", "workspace_tests": "passed",
-            "api_tests": "passed", "mock_tests": "passed", "conformance_tests": "passed",
+            "api_tests": "passed", "api_feature_clippy": "passed", "api_feature_tests": "passed",
+            "mock_tests": "passed", "conformance_tests": "passed",
         },
         "selected_gates": list(audit.CORE_CONTRACT_BASE_GATE_NAMES),
         "completed_gates": list(audit.CORE_CONTRACT_BASE_GATE_NAMES),
-        "gate_count": 6,
-        "gates_passed": 6,
+        "gate_count": 8,
+        "gates_passed": 8,
         "gates_failed": 0,
         "suites": ["core.static", "core.host-api", "core.mock-host", "core.conformance"],
         "suite_count": 4,
@@ -1969,6 +1970,22 @@ class CoreContractReceiptTests(unittest.TestCase):
             core_contract.SOURCE_GATES_NODE_DIAGNOSTICS,
         )
         self.assertEqual(len(audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS), 90)
+        self.assertEqual(
+            audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_STAGES,
+            core_contract.SOURCE_GATES_NODE_DIAGNOSTIC_STAGES,
+        )
+        self.assertEqual(
+            audit.CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE,
+            core_contract.SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE,
+        )
+        stage_by_substage = (
+            ("runtime_version", "node_dependency_prepare"), ("npm_version", "node_dependency_prepare"),
+            ("lock_generation", "node_dependency_prepare"), ("lock_validation", "node_dependency_prepare"),
+            ("bulk_audit", "node_dependency_audit"), ("npm_ci", "node_dependency_audit"),
+            ("typecheck", "typescript_typecheck"), ("tests", "typescript_tests"),
+        )
+        candidates = ("worker_setup", "node_dependency_prepare", "node_dependency_audit",
+                      "typescript_typecheck", "typescript_tests")
         self.assertTrue(
             audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS <= audit.CORE_CONTRACT_REFUSAL_DIAGNOSTICS
         )
@@ -1978,8 +1995,13 @@ class CoreContractReceiptTests(unittest.TestCase):
             "reason": "runner_unavailable", "diagnostic": "source_gates",
         }
         for diagnostic, reason in sorted(audit.CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.items()):
+            stage = "worker_setup"
+            for substage, bound_stage in stage_by_substage:
+                if diagnostic.startswith("source_gates_node_" + substage + "_"):
+                    stage = bound_stage
             accepted = core_contract_line(
-                {**base, "reason": reason, "diagnostic": diagnostic}, b"KD-CORE-CONTRACT-REFUSAL ",
+                {**base, "reason": reason, "diagnostic": diagnostic, "stage": stage},
+                b"KD-CORE-CONTRACT-REFUSAL ",
             )
             with self.subTest(diagnostic=diagnostic):
                 output = io.BytesIO()
@@ -1988,12 +2010,14 @@ class CoreContractReceiptTests(unittest.TestCase):
                 )
                 self.assertEqual(output.getvalue(), accepted)
             other_reason = "capture_invalid" if reason == "runner_unavailable" else "runner_unavailable"
-            for wrong in (
+            wrongs = [
                 {"reason": other_reason}, {"stage": "cleanup"}, {"stage": "toolchain_install"},
                 {"stage": "cleanup", "reason": "cleanup_incomplete"}, {"reason": "internal_error"},
-            ):
+            ]
+            wrongs += [{"stage": other} for other in candidates if other != stage]
+            for wrong in wrongs:
                 rejected = core_contract_line(
-                    {**base, "reason": reason, "diagnostic": diagnostic, **wrong},
+                    {**base, "reason": reason, "diagnostic": diagnostic, "stage": stage, **wrong},
                     b"KD-CORE-CONTRACT-REFUSAL ",
                 )
                 with self.subTest(diagnostic=diagnostic, wrong=wrong):
@@ -2274,10 +2298,15 @@ class CoreContractReceiptTests(unittest.TestCase):
         self.assertTrue(set(core_contract.RUNTIME_GATE_NAMES) <= audit.CORE_CONTRACT_GATE_STAGES)
         self.assertEqual(audit.CORE_CONTRACT_REFUSAL_STAGES, core_contract.STAGES)
         self.assertEqual(audit.CORE_CONTRACT_GATE_STAGES, frozenset(core_contract.SOURCE_GATE_STAGES))
+        self.assertTrue(set(core_contract.API_FEATURE_GATE_NAMES) <= audit.CORE_CONTRACT_REFUSAL_STAGES)
+        self.assertTrue(set(core_contract.API_FEATURE_GATE_NAMES) <= audit.CORE_CONTRACT_GATE_STAGES)
+        self.assertEqual(audit.CORE_CONTRACT_BASE_GATE_NAMES[3:6], (
+            "api_tests", "api_feature_clippy", "api_feature_tests",
+        ))
         context =audit._core_contract_context(
             core_contract_publish_environment(), require_protected_binding=True,
         )
-        for include_runtime, count in ((False, 6), (True, 9)):
+        for include_runtime, count in ((False, 8), (True, 11)):
             with self.subTest(include_runtime=include_runtime):
                 payload = self._contract_success_payload(include_runtime)
                 value = audit._core_contract_success_value(
@@ -2302,8 +2331,8 @@ class CoreContractReceiptTests(unittest.TestCase):
             del record["gates"]["runtime_tests"]
             record["selected_gates"] = record["selected_gates"][:-1]
             record["completed_gates"] = record["completed_gates"][:-1]
-            record["gate_count"] = 8
-            record["gates_passed"] = 8
+            record["gate_count"] = 10
+            record["gates_passed"] = 10
 
         def reordered(record):
             record["selected_gates"] = list(reversed(record["selected_gates"]))

@@ -53,15 +53,18 @@ FEEDBACK_TREE_LABELS = {
     "core-npm-admission-return": "core_npm_admission_return",
 }
 LOCKED_FOUNDATION_TREE = "core_build_diagnostic_return_with_package_lock"
+API_FEATURE_GATE_NAMES = ("api_feature_clippy", "api_feature_tests")
+API_FEATURE_NAME = "dev-uat-policy-import"
 GATE_NAMES = (
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests",
 )
 PARSER_GATE_NAMES = ("parser_format", "parser_clippy", "parser_replay")
 RUNTIME_GATE_NAMES = ("runtime_format", "runtime_clippy", "runtime_tests")
 SOURCE_GATE_STAGES = GATE_NAMES + PARSER_GATE_NAMES + RUNTIME_GATE_NAMES
 TEST_GATE_STAGES = frozenset((
-    "workspace_tests", "api_tests", "mock_tests", "conformance_tests", "parser_replay",
-    "runtime_tests",
+    "workspace_tests", "api_tests", "api_feature_tests", "mock_tests", "conformance_tests",
+    "parser_replay", "runtime_tests",
 ))
 SUITE_NAMES = (
     "core.static", "core.host-api", "core.mock-host", "core.conformance",
@@ -108,8 +111,9 @@ REASONS = frozenset((
 STAGES = frozenset((
     "arguments", "context", "host", "source_validation", "source_lease", "source_tree",
     "source_diff", "toolchain_install", "worker_setup", "summary_guard", "observer",
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
-    "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy",
+    "api_feature_tests", "mock_tests", "conformance_tests", "parser_format", "parser_clippy",
+    "parser_replay",
     "runtime_format", "runtime_clippy", "runtime_tests",
     "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
     "cleanup", "receipt", "internal",
@@ -204,6 +208,26 @@ SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
     },
 }
 SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(SOURCE_GATES_NODE_DIAGNOSTIC_REASONS)
+SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE = {
+    "runtime_version": "node_dependency_prepare", "npm_version": "node_dependency_prepare",
+    "lock_generation": "node_dependency_prepare", "lock_validation": "node_dependency_prepare",
+    "bulk_audit": "node_dependency_audit", "npm_ci": "node_dependency_audit",
+    "typecheck": "typescript_typecheck", "tests": "typescript_tests",
+}
+SOURCE_GATES_NODE_DIAGNOSTIC_STAGES = {
+    **{
+        "source_gates_node_" + substage + "_" + reason: SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
+        for substage, reasons in SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
+        if substage in SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE
+        for reason in reasons
+    },
+    **{
+        "source_gates_node_" + substage + "_command_" + check:
+            SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
+        for substage in SOURCE_GATES_NODE_COMMAND_SUBSTAGES
+        for check in SOURCE_GATES_NODE_COMMAND_CHECKS
+    },
+}
 SOURCE_GATES_NODE_PROFILE_REASONS = (
     "manifest_invalid", "command_failed", "capture_invalid", "output_unavailable",
 )
@@ -838,6 +862,12 @@ def _source_commands(source, tool_paths, *, include_parser=False, include_runtim
                               "--workspace", "--all-targets", "--locked")),
         ("api_tests", (cargo, "test", "--offline", "--manifest-path",
                         str(source / "crates/host/api/Cargo.toml"), "--all-targets", "--locked")),
+        ("api_feature_clippy", (cargo, "clippy", "--offline", "--manifest-path",
+                                 str(source / "crates/host/api/Cargo.toml"), "--all-targets",
+                                 "--features", API_FEATURE_NAME, "--locked", "--", "-D", "warnings")),
+        ("api_feature_tests", (cargo, "test", "--offline", "--manifest-path",
+                                str(source / "crates/host/api/Cargo.toml"), "--all-targets",
+                                "--features", API_FEATURE_NAME, "--locked")),
         ("mock_tests", (cargo, "test", "--offline", "--manifest-path",
                          str(source / "crates/host/mock/Cargo.toml"), "--all-targets", "--locked")),
         ("conformance_tests", (cargo, "test", "--offline", "--manifest-path",
@@ -1384,20 +1414,28 @@ def _toolchain_refusal(error, stage):
             return Refusal("cleanup_incomplete", "cleanup", diagnostic=diagnostic)
         return Refusal("cleanup_incomplete", "cleanup")
     node_diagnostic = None
+    node_stage = None
     if stage == "worker_setup":
         node_diagnostic = _node_refusal_diagnostic(error)
         if node_diagnostic is None:
             node_diagnostic = _source_gates_step_diagnostic(error)
+        elif node_diagnostic in SOURCE_GATES_NODE_DIAGNOSTIC_STAGES:
+            node_stage = SOURCE_GATES_NODE_DIAGNOSTIC_STAGES[node_diagnostic]
+            if getattr(error, "stage", None) != node_stage:
+                node_diagnostic = None
+                node_stage = None
     expected_reason = None
     if node_diagnostic is not None:
         expected_reason = SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.get(
             node_diagnostic, SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.get(node_diagnostic),
         )
     if reason == "capture_invalid":
-        return Refusal(
-            "capture_invalid", stage,
-            diagnostic=node_diagnostic if expected_reason == "capture_invalid" else None,
-        )
+        if expected_reason == "capture_invalid":
+            return Refusal(
+                "capture_invalid", stage if node_stage is None else node_stage,
+                diagnostic=node_diagnostic,
+            )
+        return Refusal("capture_invalid", stage)
     if reason == "version_mismatch":
         return Refusal("toolchain_version_mismatch", "toolchain_install")
     if stage == "observer":
@@ -1408,10 +1446,12 @@ def _toolchain_refusal(error, stage):
         return Refusal("source_diff_mismatch", "source_diff")
     if stage == "toolchain_install":
         return Refusal("toolchain_install_failed", "toolchain_install")
-    return Refusal(
-        "runner_unavailable", "worker_setup",
-        diagnostic=node_diagnostic if expected_reason == "runner_unavailable" else None,
-    )
+    if expected_reason == "runner_unavailable":
+        return Refusal(
+            "runner_unavailable", "worker_setup" if node_stage is None else node_stage,
+            diagnostic=node_diagnostic,
+        )
+    return Refusal("runner_unavailable", "worker_setup")
 
 
 def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha256, deadline, lifecycle,

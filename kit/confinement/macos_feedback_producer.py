@@ -77,7 +77,8 @@ MAX_FOUNDATION_FUZZ_TARGETS = 16
 FOUNDATION_FUZZ_MANIFESTS = ("fuzz/Cargo.toml", "fuzz/Cargo.lock")
 RUST_ROOT_FILES = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "rustfmt.toml", "clippy.toml")
 DIAGNOSTIC_BASE_GATES = (
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests",
 )
 DIAGNOSTIC_PARSER_GATES = ("parser_format", "parser_clippy", "parser_replay")
 DIAGNOSTIC_NODE_GATES = (
