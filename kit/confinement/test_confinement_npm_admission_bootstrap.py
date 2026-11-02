@@ -1,5 +1,6 @@
 import base64
 import datetime
+import gzip
 import hashlib
 import io
 import json
@@ -43,10 +44,11 @@ def _tarball(name, version, licence="MIT", scripts=None, binary=False):
         fields["license"] = licence
     manifest = _json(fields)
     output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode="w:gz", format=tarfile.USTAR_FORMAT) as archive:
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
         directory = tarfile.TarInfo("package/")
         directory.type = tarfile.DIRTYPE
         directory.mode = 0o755
+        directory.mtime = 0
         archive.addfile(directory)
         members = [("package/package.json", manifest)]
         if scripts:
@@ -56,9 +58,10 @@ def _tarball(name, version, licence="MIT", scripts=None, binary=False):
         for path, content in members:
             info = tarfile.TarInfo(path)
             info.mode = 0o644
+            info.mtime = 0
             info.size = len(content)
             archive.addfile(info, io.BytesIO(content))
-    return output.getvalue()
+    return gzip.compress(output.getvalue(), mtime=0)
 
 
 def _workspace_name(path):
