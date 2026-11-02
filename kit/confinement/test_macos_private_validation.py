@@ -4013,10 +4013,10 @@ class NpmFixtureProfileTests(unittest.TestCase):
         for path in subject.NPM_FIXTURE_FILES:
             with self.subTest(path=path):
                 self.assertTrue(path.isascii())
-                self.assertFalse(path.startswith((".claude/", "crates/kernel/", "docs/adr/")))
+                self.assertFalse(path.startswith((subject.RULES_DIRECTORY + "/", "crates/kernel/", "docs/adr/")))
         for path in (
             ".gitignore", "AGENTS.md", "CLAUDE.md", "rustfmt.toml", "clippy.toml",
-            ".claude/shared.lock", ".claude/settings.json", "crates/kernel/i18n/Cargo.toml",
+            subject.RULES_LOCK_PATH, subject.RULES_DIRECTORY + "/settings.json", "crates/kernel/i18n/Cargo.toml",
         ):
             with self.subTest(core_path=path):
                 self.assertNotIn(path, subject.NPM_FIXTURE_FILES)
@@ -4061,11 +4061,11 @@ class NpmFixtureProfileTests(unittest.TestCase):
                 self.assertEqual(self._refused(core, core), "path_mode")
         core_minimum = CoreContractTreeTests._required_core_contract_entries(self.CONCERN)
         self.assertEqual(self._refused(core_minimum, core_minimum), "path_mode")
-        mixed = self._entries(add=(".claude/shared.lock",))
+        mixed = self._entries(add=(subject.RULES_LOCK_PATH,))
         self.assertEqual(self._refused(mixed, mixed), "path_mode")
         for path in (
             "AGENTS.md", ".gitignore", "CLAUDE.md", "rustfmt.toml", "clippy.toml",
-            ".claude/settings.json", "crates/kernel/i18n/Cargo.toml",
+            subject.RULES_DIRECTORY + "/settings.json", "crates/kernel/i18n/Cargo.toml",
             "packages/host-api/src/budget.ts", "docs/adr/0003-npm-contract-workspace.md",
             "docs/dependencies/ui-npm-admission-batch-a.md", "tools/other/unlisted.rs",
         ):
