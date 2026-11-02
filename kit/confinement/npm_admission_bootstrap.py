@@ -1187,27 +1187,45 @@ def _reachable_paths(packages, start):
     return seen
 
 
+ADVISORY_CONSUMER_BUDGET = 280
+
+
 def _advisory_reach_fields(name, versions, direct, lock, entries):
     """Name, for a blocked advisory, whether every affected entry is development-only and which
     root direct dependencies reach it, so an allow record can be written to match exactly."""
-    if type(lock) is not dict or type(entries) is not list:
-        return ()
-    affected = {
-        path for path, entry in entries
-        if entry.get("name") == name and entry.get("version") in versions
-    }
-    if not affected:
-        return ()
-    dev = all(entry.get("dev") is True for path, entry in entries if path in affected)
     try:
+        if type(lock) is not dict or type(entries) is not list:
+            return ()
+        affected = {
+            path for path, entry in entries
+            if entry.get("name") == name and entry.get("version") in versions
+        }
+        if not affected:
+            return ()
+        dev = all(entry.get("dev") is True for path, entry in entries if path in affected)
         reach = _direct_reach(lock, direct or {})
-    except (KeyError, TypeError, ValueError):
-        return (("dev", "yes" if dev else "no"),)
-    consumers = sorted(root for root, reached in reach.items() if affected & reached)
-    text = ",".join(consumers)[:320] if consumers else "none"
-    if adm.DETAIL_FIELD_RE.match(text) is None:
-        text = "unrepresentable"
-    return (("dev", "yes" if dev else "no"), ("consumers", text))
+        consumers = sorted(root for root, reached in reach.items() if affected & reached)
+        covered = set()
+        for reached in reach.values():
+            covered |= affected & reached
+        unreached = len(affected - covered)
+        shown = []
+        used = 0
+        for consumer in consumers:
+            if adm.DETAIL_FIELD_RE.match(consumer) is None:
+                continue
+            cost = len(consumer) + (1 if shown else 0)
+            if used + cost > ADVISORY_CONSUMER_BUDGET:
+                break
+            shown.append(consumer)
+            used += cost
+        fields = [("dev", "yes" if dev else "no"), ("consumers", ",".join(shown) if shown else "none")]
+        if len(shown) < len(consumers):
+            fields.append(("more", str(len(consumers) - len(shown))))
+        fields.append(("unreached", str(unreached)))
+        return tuple(fields)
+    except Exception:
+        return ()
 
 
 def _direct_reach(lock, direct):

@@ -871,7 +871,7 @@ class NpmAdmissionProducerTests(unittest.TestCase):
                          ("payload_invalid", "npm_bundle", "npm_advisory_blocked"))
         header, stderr, report = self.sections(error.npm_diagnostic)
         self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_advisory_blocked")
-        self.assertEqual(stderr, ["  kd-check advisory:alpha-pkg@1.0.0:9 severity:high dev:yes consumers:alpha-pkg"])
+        self.assertEqual(stderr, ["  kd-check advisory:alpha-pkg@1.0.0:9 severity:high dev:yes consumers:alpha-pkg unreached:0"])
         self.assertEqual(report, [])
 
     def test_a_hostile_archive_member_name_reaches_the_diagnostic_only_as_its_index(self):

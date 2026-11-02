@@ -2025,8 +2025,8 @@ class BundleDetailTests(RefusalAssertions):
              "request_mismatch:beta-pkg@2.0.0:licence"),
             ("npm_request_mismatch", {"extra_rows": (("delta-pkg", "4.0.0"),)},
              "request_mismatch:bundle:unmatched_rows count:1"),
-            ("npm_advisory_blocked", {"advisory": blocked}, "advisory:alpha-pkg@1.0.0:9 severity:high dev:yes consumers:alpha-pkg"),
-            ("npm_advisory_blocked", {"advisory": hostile}, "advisory:alpha-pkg@1.0.0:x_y severity:low dev:yes consumers:alpha-pkg"),
+            ("npm_advisory_blocked", {"advisory": blocked}, "advisory:alpha-pkg@1.0.0:9 severity:high dev:yes consumers:alpha-pkg unreached:0"),
+            ("npm_advisory_blocked", {"advisory": hostile}, "advisory:alpha-pkg@1.0.0:x_y severity:low dev:yes consumers:alpha-pkg unreached:0"),
             ("npm_advisory_invalid", {"advisory": b"not json"}, "advisory_invalid:advisories:json"),
             ("npm_advisory_invalid", {"advisory": b"[]"}, "advisory_invalid:advisories:shape"),
             ("npm_advisory_invalid", {"advisory": b'{"ghost-pkg":[]}'},
@@ -2565,15 +2565,35 @@ class AdvisoryReachFieldTests(unittest.TestCase):
         direct = {"a": "1.0.0", "b": "1.0.0"}
         self.assertEqual(
             subject._advisory_reach_fields("m", frozenset({"1.0.0"}), direct, lock, entries),
-            (("dev", "yes"), ("consumers", "a")),
+            (("dev", "yes"), ("consumers", "a"), ("unreached", "0")),
         )
         entries[2][1]["dev"] = False
         self.assertEqual(
             subject._advisory_reach_fields("m", frozenset({"1.0.0"}), direct, lock, entries),
-            (("dev", "no"), ("consumers", "a")),
+            (("dev", "no"), ("consumers", "a"), ("unreached", "0")),
         )
         self.assertEqual(subject._advisory_reach_fields("m", frozenset({"9.9.9"}), direct, lock, entries), ())
         self.assertEqual(subject._advisory_reach_fields("m", frozenset({"1.0.0"}), direct, None, entries), ())
+        self.assertEqual(
+            subject._advisory_reach_fields("m", frozenset({"1.0.0"}), {"b": "1.0.0"}, lock, entries),
+            (("dev", "no"), ("consumers", "none"), ("unreached", "1")),
+        )
+        self.assertEqual(subject._advisory_reach_fields("m", frozenset({"1.0.0"}), direct, {"packages": 7}, entries), ())
+
+    def test_consumer_names_are_dropped_whole_with_a_count_when_the_budget_is_reached(self):
+        names = ["@scope-%02d/%s" % (index, "n" * 40) for index in range(12)]
+        packages = {"": {}, "node_modules/m": {}}
+        for consumer in names:
+            packages["node_modules/" + consumer] = {"dependencies": {"m": "^1.0.0"}}
+        entries = [("node_modules/m", {"name": "m", "version": "1.0.0", "dev": True})]
+        fields = dict(subject._advisory_reach_fields(
+            "m", frozenset({"1.0.0"}), {consumer: "1.0.0" for consumer in names}, {"packages": packages}, entries,
+        ))
+        shown = fields["consumers"].split(",")
+        self.assertTrue(all(name in names for name in shown))
+        self.assertLessEqual(len(fields["consumers"]), subject.ADVISORY_CONSUMER_BUDGET)
+        self.assertEqual(int(fields["more"]), len(names) - len(shown))
+        self.assertEqual(fields["unreached"], "0")
 
 
 class MetadataCapTests(unittest.TestCase):
