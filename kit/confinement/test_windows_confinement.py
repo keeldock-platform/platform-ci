@@ -1908,7 +1908,8 @@ foreach ($case in $cases) {
         na = {re.search(r"Name = '([a-z0-9-]+)'", line).group(1) for line in lines if "NaPattern" in line}
         self.assertEqual(na, {"pipe-runner-open"})
         pipe = next(line for line in lines if "Name = 'pipe-runner-open'" in line)
-        self.assertIn("NaPattern = '^open=err(2|231)$'", pipe)
+        self.assertIn("NaPattern = '^open=err2$'", pipe)
+        self.assertNotIn("231", re.search(r"NaPattern = '([^']*)'", pipe).group(1))
         self.assertNotIn("231", re.search(r"Deny = '([^']*)'", pipe).group(1))
         attempt = self.function_body("Invoke-ChannelAttempt")
         self.assertIn("$attempt.ContainsKey('NaPattern') -or $optional", attempt)
