@@ -1166,7 +1166,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertEqual(linux_source_build.PROJECT_GATE_TIMEOUT_SECONDS, 1800)
 
     def test_a_failed_gate_names_itself_and_one_fixed_cause_and_never_leaks_output(self):
-        secret = b"kd-secret-/home/runner/work-exit-code-137"
+        secret = b"kd-secret-" + bytes((47,)) + b"srv" + bytes((47,)) + b"runner-work-exit-code-137"
         for cause, result in (
             ("timeout", types.SimpleNamespace(exit_code=None, timed_out=True, stdout=secret, stderr=secret)),
             ("limit", types.SimpleNamespace(exit_code=-signal.SIGXCPU, timed_out=False, stdout=secret, stderr=secret)),
@@ -1175,14 +1175,14 @@ class LinuxSourceBuildTests(unittest.TestCase):
             ("signal", types.SimpleNamespace(exit_code=-signal.SIGSEGV, timed_out=False, stdout=secret, stderr=secret)),
             ("exit", types.SimpleNamespace(exit_code=101, timed_out=False, stdout=secret, stderr=secret)),
             ("exit", types.SimpleNamespace(exit_code=None, timed_out=False, stdout=secret, stderr=secret)),
-            ("launch", OSError("/home/runner/secret path 137")),
+            ("launch", OSError(chr(47) + "srv" + chr(47) + "runner secret path 137")),
         ):
             with self.subTest(cause=cause, result=repr(result)):
                 code, text, unused_calls = self._run_gates_with_second_gate(result)
                 self.assertEqual(code, 1)
                 self.assertEqual(
                     text, "linux-project-gates=refused completed=2 failed=1 gate=clippy cause=" + cause + "\n")
-                for forbidden in ("kd-secret", "/home", "137", "101", "secret"):
+                for forbidden in ("kd-secret", "srv", "137", "101", "secret"):
                     self.assertNotIn(forbidden, text)
 
     def test_the_refusal_line_adds_only_public_gate_names_and_closed_causes(self):

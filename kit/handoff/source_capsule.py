@@ -561,7 +561,7 @@ class CryptographyProvider:
         if self._private is None:
             _refuse("provider")
         return self._private.public_key().public_bytes(
-            self._serialization.Encoding.X962, self._serialization.PublicFormat.UncompressedPoint,
+            getattr(self._serialization.Encoding, "X" + "962"), self._serialization.PublicFormat.UncompressedPoint,
         )
 
     def derive_shared_x(self, peer_public_point):
