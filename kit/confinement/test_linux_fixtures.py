@@ -205,6 +205,8 @@ class LinuxFixtureGenerationTests(unittest.TestCase):
             with self.subTest(form=form):
                 body = driver[driver.index("fail() {"):driver.index("}\n", driver.index("fail() {"))]
                 self.assertIn("head -n 4 >&2", body)
+                self.assertIn("ls -ldn ", body)
+                self.assertNotIn("ls -ld ", body)
                 self.assertIn('head -n 5 "$3" >&2', body)
                 self.assertIn('tail -n 6 "$3" >&2', body)
                 self.assertEqual(body.count("echo "), 3)

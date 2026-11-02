@@ -455,13 +455,13 @@ class LinuxFixtureDiagnosticLineTests(unittest.TestCase):
         self.assertEqual(texts, ["keep one", "keep two"])
 
     def test_token_like_runs_longer_than_thirty_two_characters_are_dropped(self):
-        thirty_two = "a" * 32
+        thirty_two = "g" * 32
         stderr = "\n".join((
             "keep " + thirty_two,
-            "drop " + "a" * 33,
+            "drop " + "g" * 33,
             "drop " + "0123456789abcdef" * 3,
             "drop " + "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo" + "/+AAAA",
-            "keep path /usr/lib/gcc/x86_64-linux-gnu/13/../../../x86_64-linux-gnu/crt1.o",
+            "keep path /usr/lib/x86_64-linux-gnu/crt1.o",
             "keep core::fmt::Formatter::write_str",
         )).encode("ascii")
         texts = self.texts(self.lines(stderr))
@@ -470,6 +470,49 @@ class LinuxFixtureDiagnosticLineTests(unittest.TestCase):
         self.assertTrue(texts[1].startswith("keep path"))
         self.assertTrue(texts[2].startswith("keep core"))
         self.assertEqual(sum(1 for text in texts if text.startswith("drop")), 0)
+
+    def test_a_hex_run_of_twenty_or_more_characters_is_dropped_but_shorter_runs_stay(self):
+        stderr = "\n".join((
+            "keep " + "abcdef0123456789abc",
+            "drop " + "abcdef0123456789abcd",
+            "drop " + "0123456789ABCDEF0123456789abcdef",
+            "drop prefix-" + "ab12" * 8,
+        )).encode("ascii")
+        self.assertEqual(self.texts(self.lines(stderr)), ["keep abcdef0123456789abc"])
+
+    def test_base64url_values_are_caught_on_the_raw_line_including_dash_and_underscore(self):
+        part = "QUJDREVGR0hJSktMTU5P"
+        stderr = "\n".join((
+            "drop " + part + "-" + part,
+            "drop " + part + "_" + part,
+            "drop " + "x" * 16 + "_" + "y" * 16 + "-" + "z" * 4,
+            "keep " + "x" * 16 + "_" + "y" * 15,
+        )).encode("ascii")
+        self.assertEqual(self.texts(self.lines(stderr)), ["keep " + "x" * 16 + "?" + "y" * 15])
+
+    def test_the_token_scan_also_runs_on_the_raw_line_before_cleaning(self):
+        wide = "g" * 20 + "_" + "g" * 20
+        cleaned = channels.diag_clean(wide)
+        self.assertEqual(cleaned, "g" * 20 + "?" + "g" * 20)
+        self.assertIsNone(channels.DIAG_TOKEN.search(cleaned))
+        self.assertTrue(channels.diag_unsafe(wide, cleaned, NONCE, ()))
+        self.assertFalse(channels.diag_unsafe("plain text", "plain text", NONCE, ()))
+
+    def test_a_bare_hex_needle_drops_a_short_fragment_line(self):
+        needle = b"0123456789abcdef"
+        stderr = b"keep one\nvalue 0123456789ABCDEF here\nkeep two\n"
+        self.assertEqual(self.texts(self.lines(stderr, (needle,))), ["keep one", "keep two"])
+        self.assertEqual(self.texts(self.lines(stderr)), ["keep one", "value 0123456789ABCDEF here", "keep two"])
+
+    def test_diag_line_accepts_the_replacement_character_and_rejects_other_characters(self):
+        self.assertEqual(
+            channels.diag_line("selftest", "build_rs", "a?b"),
+            "KD-LINUX-FIXTURE-DIAG schema=1 phase=selftest form=build_rs stream=stderr line=a?b",
+        )
+        for text in ("a[b", "a`b", "a" + chr(10) + "b", "a" + chr(233), "a$b", 5, None):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    channels.diag_line("selftest", "build_rs", text)
 
     def test_lines_without_any_letter_or_digit_are_dropped(self):
         self.assertEqual(self.lines(b"-----\n???\n[]{}<>\n   \n.\n"), ())

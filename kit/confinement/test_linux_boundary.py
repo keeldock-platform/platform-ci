@@ -919,6 +919,7 @@ class LinuxBoundaryFixtureStderrDiagnosticTests(unittest.TestCase):
             config=lambda: {"nonce": "n", "ports": {"https4": 1}, "unix_path": "/ipc/docker.sock", "abstract_name": "kd-x"},
         )
         subject.ipc_dir = "/ipc-source"
+        subject.phase = "selftest"
         return subject, emitter
 
     def ran(self, exit_code=0, stdout=b"", stderr=b"", timed_out=False):
@@ -945,6 +946,56 @@ class LinuxBoundaryFixtureStderrDiagnosticTests(unittest.TestCase):
         self.assertEqual(output[1:4], [head + "kd-host open_exit=3 exit=3", head + "error: linking with gcc failed", head + "ld: cannot find crt1.o"])
         self.assertEqual(len(output), 4)
         self.assertEqual((completed, first.reason), (4, "fixture_incomplete"))
+
+    def test_a_fresh_boundary_has_an_unset_phase_and_prints_no_diagnostic(self):
+        subject, emitter = make(rust_sysroot="/opt/rust")
+        self.assertEqual(subject.phase, "unset")
+        self.assertNotIn(subject.phase, channels.DIAG_PHASES)
+        subject.emit_diagnostic("build_rs", BoundaryRefusal("fixture_incomplete", None, 3, ("kd-host exit=3", b"error: boom\n")))
+        self.assertEqual(self.diag_lines(emitter), [])
+        self.assertEqual(emitter.stream.getvalue(), "")
+
+    def test_a_formatting_error_never_aborts_the_run_and_prints_one_fixed_line(self):
+        subject, emitter = self.scaffold()
+        evidence = ("kd-host exit=3", b"error: boom\n")
+        for error in (ValueError("diag-line"), UnicodeError("x"), TypeError("x")):
+            emitter.stream.seek(0)
+            emitter.stream.truncate()
+            with self.subTest(error=type(error).__name__), self.refusing(evidence), \
+                 patch.object(channels, "fixture_diag_lines", side_effect=error):
+                completed, first = subject.run_fixtures()
+            self.assertEqual((completed, first.reason), (4, "fixture_incomplete"))
+            shown = self.diag_lines(emitter)
+            self.assertEqual(shown, ["KD-LINUX-FIXTURE-DIAG schema=1 phase=selftest form=unknown stream=stderr line=unavailable"])
+            self.assertNotIn("boom", emitter.stream.getvalue())
+
+    def test_a_malformed_evidence_pair_is_also_contained(self):
+        subject, emitter = self.scaffold()
+        subject.emit_diagnostic("build_rs", BoundaryRefusal("fixture_incomplete", None, 3, ("only-one",)))
+        self.assertEqual(len(self.diag_lines(emitter)), 1)
+        self.assertTrue(self.diag_lines(emitter)[0].endswith("line=unavailable"))
+
+    def test_a_tripwire_event_is_refused_as_allowed_before_the_incomplete_verdict_and_prints_nothing(self):
+        subject, emitter = self.scaffold()
+        subject.tripwires.store.snapshot = lambda: ["tripwire-event"]
+        calls = [self.ran(0, b"", b"open\n"), self.ran(None, b"", b"error: escaped\n", True)]
+        with patch.object(boundary.Boundary, "chroot", side_effect=calls):
+            with self.assertRaises(BoundaryRefusal) as raised:
+                subject.fixture_outcome("shell")
+        self.assertEqual(raised.exception.reason, "fixture_allowed")
+        self.assertIsNone(raised.exception.evidence)
+
+    def test_the_bare_hex_bodies_of_the_placed_canaries_are_dropped_from_a_diagnostic(self):
+        subject, emitter = self.scaffold()
+        subject.nonce_canary = "kd-nonce-0123456789abcdef"
+        subject.derived_canary = "fedcba9876543210"
+        subject.bare_needles = (b"0123456789abcdef", b"fedcba9876543210")
+        stderr = b"error: first\nbody 0123456789ABCDEF seen\nderived fedcba9876543210 seen\nerror: last\n"
+        with self.refusing(("kd-host exit=3", stderr)):
+            subject.run_fixtures()
+        shown = [line.split("line=", 1)[1] for line in self.diag_lines(emitter)]
+        self.assertEqual(shown, ["kd-host exit=3", "error: first", "error: last"])
+        self.assertNotIn("0123456789", emitter.stream.getvalue())
 
     def test_only_an_incomplete_refusal_with_evidence_prints_anything(self):
         evidence = ("kd-host exit=3", b"error: boom\n")

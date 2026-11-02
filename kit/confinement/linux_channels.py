@@ -129,7 +129,8 @@ DIAG_MAX_CHARS = 200
 DIAG_TAIL_BYTES = 16384
 DIAG_ALPHABET = frozenset(string.ascii_letters + string.digits + " ._:/=+,()'" + chr(34) + "-")
 DIAG_PRINTED = DIAG_ALPHABET | frozenset("?")
-DIAG_TOKEN = re.compile(r"[A-Za-z0-9+/]{33,}")
+DIAG_TOKEN = re.compile(r"[A-Za-z0-9+/_-]{33,}")
+DIAG_HEX_RUN = re.compile(r"[0-9a-fA-F]{20,}")
 DIAG_FORM = re.compile(r"[a-z_]{1,20}")
 
 
@@ -291,8 +292,9 @@ def diag_unsafe(raw, clean, nonce, needles):
     for needle in needles:
         if type(needle) is bytes and needle and (needle.lower() in original or needle.lower() in sanitized):
             return True
-    if DIAG_TOKEN.search(clean) is not None:
-        return True
+    for candidate in (raw, clean):
+        if DIAG_TOKEN.search(candidate) is not None or DIAG_HEX_RUN.search(candidate) is not None:
+            return True
     return not any(character.isalnum() for character in clean)
 
 

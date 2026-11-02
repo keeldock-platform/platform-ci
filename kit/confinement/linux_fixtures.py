@@ -443,7 +443,7 @@ export TMPDIR=/work HOME=/work
 fail() {
   echo "kd-diag stage=$1 exit=$2" >&2
   echo "kd-diag limits nproc=$(ulimit -u) nofile=$(ulimit -n) as=$(ulimit -v) stack=$(ulimit -s)" >&2
-  ls -ld "${KD_RUSTC%/bin/rustc}" "${KD_RUSTC%/bin/rustc}/lib" "$KD_RUSTC" /usr/bin/ld 2>&1 | head -n 4 >&2
+  ls -ldn "${KD_RUSTC%/bin/rustc}" "${KD_RUSTC%/bin/rustc}/lib" "$KD_RUSTC" /usr/bin/ld 2>&1 | head -n 4 >&2
   head -n 5 "$3" >&2
   echo "kd-diag tail" >&2
   tail -n 6 "$3" >&2

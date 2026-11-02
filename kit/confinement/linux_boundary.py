@@ -167,7 +167,8 @@ class Boundary:
         self.fixture_controlled = 0
         self.fixture_uncontrolled = 0
         self.secret_needles = ()
-        self.phase = "selftest"
+        self.bare_needles = ()
+        self.phase = "unset"
 
     def close(self):
         if self.tripwires is not None:
@@ -220,6 +221,10 @@ class Boundary:
         variants.update(canaries.needles_for(self.derived_canary))
         variants.update(canaries.needles_for(self.nonce_canary))
         self.secret_needles = tuple(sorted(variants))
+        self.bare_needles = (
+            self.nonce_canary[len("kd-nonce-"):].encode("ascii"),
+            self.derived_canary.encode("ascii"),
+        )
         canaries.place_canaries(self.canary_dir, self.placed)
         canaries.plant_control_files(self.control_dir, self.nonce)
         self.runner_root = canaries.runner_root()
@@ -496,10 +501,10 @@ class Boundary:
         events = self.tripwires.store.snapshot()
         self.tripwires.store.clear()
         verdict = channels.judge_attempts(fixtures.fixture_rules(form), result.stdout, fixtures.fixture_optional(form))
-        if result.timed_out or verdict in ("incomplete",):
-            raise BoundaryRefusal("fixture_incomplete", None, exit_detail(result), self.fixture_evidence(opened, result))
         if events or verdict == "leak":
             raise BoundaryRefusal("fixture_allowed")
+        if result.timed_out or verdict in ("incomplete",):
+            raise BoundaryRefusal("fixture_incomplete", None, exit_detail(result), self.fixture_evidence(opened, result))
         if verdict == "unexpected":
             raise BoundaryRefusal("attempt_unexpected", None, channels.first_unaccepted(fixtures.fixture_rules(form), result.stdout, fixtures.fixture_optional(form)))
         if not control:
@@ -521,8 +526,15 @@ class Boundary:
     def emit_diagnostic(self, form, refusal):
         if self.phase not in channels.DIAG_PHASES or refusal.reason != "fixture_incomplete" or refusal.evidence is None:
             return
-        header, stderr = refusal.evidence
-        for line in channels.fixture_diag_lines(self.phase, form, stderr, self.nonce, self.secret_needles, header):
+        try:
+            header, stderr = refusal.evidence
+            needles = tuple(self.secret_needles) + tuple(self.bare_needles)
+            lines = channels.fixture_diag_lines(self.phase, form, stderr, self.nonce, needles, header)
+            lines = tuple(lines)
+        except (ValueError, TypeError, UnicodeError):
+            self.emitter.emit(channels.LINE_PREFIX + "-FIXTURE-DIAG schema=" + str(channels.SCHEMA_VERSION) + " phase=selftest form=unknown stream=stderr line=unavailable")
+            return
+        for line in lines:
             self.emitter.emit(line)
 
     def run_fixtures(self):
