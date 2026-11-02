@@ -149,7 +149,7 @@ jobs:
     needs: windows-policy
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
     runs-on: windows-2025
-    timeout-minutes: 120
+    timeout-minutes: 200
     defaults:
       run:
         shell: pwsh

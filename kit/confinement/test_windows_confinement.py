@@ -1,5 +1,6 @@
 import fnmatch
 import re
+import shutil
 import subprocess
 import sys
 import unittest
@@ -8,8 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "kit/bootstrap"))
+sys.path.insert(0, str(ROOT / "kit/confinement"))
 
 from public_tree import MAX_FILE_BYTES, inspect_text
+from linux_channels import CHANNELS as LINUX_CHANNELS
 
 NATIVE = ROOT / "kit/confinement/windows_confinement.cs"
 WRAPPER = ROOT / "kit/confinement/windows_confinement.ps1"
@@ -65,7 +68,79 @@ PROBE_COMMANDS = (
     "spawn",
     "tempdir",
     "echo",
+    "append",
+    "pipemake",
+    "pipeopen",
+    "procopen",
+    "conout",
+    "eventlog",
+    "envhunt",
+    "marker",
+    "regread",
+    "regcreate",
+    "dacopen",
+    "walk",
+    "jobbreak",
+    "jobmember",
+    "profile",
+    "scm",
+    "symlink",
+    "hardlink",
+    "tokenraise",
+    "tokenpriv",
 )
+CHANNEL_ATTEMPTS = {
+    "https": ("tls-ipv4", "tls-ipv6", "tls-hostname"),
+    "dns": ("getaddrinfo", "unique-name", "udp-query", "tcp-query"),
+    "redirect": ("http-redirect",),
+    "proxy": ("proxy-env-http", "proxy-connect"),
+    "runner_ipc": (
+        "pipe-root-create",
+        "pipe-existing-open",
+        "pipe-runner-open",
+        "process-open-runner",
+        "handle-inventory",
+        "named-pipe-local",
+    ),
+    "raw_logs": ("stdout-markers", "conout-open", "eventlog"),
+    "artifact_upload": ("env-hunt", "endpoint-post", "staging-write"),
+    "cache_upload": ("env-hunt", "endpoint-post", "cache-write"),
+    "runner_files": (
+        "canary-reads",
+        "diag-read",
+        "command-files",
+        "cng-keys",
+        "registry-canary",
+        "bounded-walk",
+        "walk-control-scratch",
+    ),
+    "process_memory": ("mem-read", "environ-read", "debug-attach", "control-self-memory"),
+    "boundary_disablement": (
+        "job-breakaway",
+        "job-membership",
+        "profile-create",
+        "scm-open",
+        "nul-write-dac",
+        "ancestor-write-dac",
+        "hklm-write",
+        "hkcu-write",
+        "symlink",
+        "hardlink-ro",
+        "integrity-raise",
+        "privilege-enable",
+    ),
+}
+DENIAL_CODES = {
+    "err2",
+    "err3",
+    "err5",
+    "err6",
+    "err1300",
+    "err1314",
+    "err10013",
+    "err11003",
+    "hr80070005",
+}
 EXPECTED_SUMMARY = (
     ("rust", "compiled"),
     ("node", "ran"),
@@ -91,6 +166,10 @@ EXPECTED_SUMMARY = (
     ("control_rust", "compiled"),
     ("control_node", "ran"),
     ("css_transform", "ok"),
+    ("channels_before", "blocked"),
+    ("channels_after", "blocked"),
+    ("channel_controls", "fired"),
+    ("dns_after", "open"),
 )
 
 
@@ -581,12 +660,45 @@ foreach ($case in $cases) {
         probe_build = int(re.search(r"\$probeEnvironment, ([0-9]+), \[uint32\]32\)", self.wrapper).group(1)) // 1000
         other_seconds = int(re.search(r"\$script:OtherContainerSeconds = ([0-9]+)", self.wrapper).group(1))
         staging_allowance = 600 + probe_build + 2 * other_seconds
-        worst = ladders + downloads * attempts * per_attempt + staging_allowance
+        dns_after = int(re.search(r"Name = 'network_control_dns'; Exe = \$probe; Arguments = 'dns github\.com'; Timeout = ([0-9]+);", specs).group(1))
+        worst = ladders + downloads * attempts * per_attempt + staging_allowance + dns_after + self.channel_budget()
         workflow = WORKFLOW.read_text(encoding="utf-8")
         minutes = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", workflow)]
         self.assertEqual(len(minutes), 2)
-        self.assertEqual(minutes[1], 120)
+        self.assertEqual(minutes[1], 200)
         self.assertLessEqual(worst, minutes[1] * 60 * 0.8)
+
+    def channel_attempt_lines(self):
+        body = self.function_body("Get-ChannelAttempts")
+        return [line for line in body.splitlines() if line.strip().startswith("$attempts += @{")]
+
+    def channel_field(self, line, field):
+        found = re.search(r"(?<![A-Za-z])" + field + r" = ('[^']*'|\$true|@\([^)]*\)|[0-9]+)", line)
+        return None if found is None else found.group(1)
+
+    def channel_budget(self):
+        multipliers = {"{pid}": 3, "{runner_pipe}": 6, "{drive}": 2}
+
+        def runs(line, field, timeout):
+            raw = self.channel_field(line, field)
+            if raw is None:
+                return 0
+            total = 0
+            for template in re.findall(r"'([^']*)'", raw):
+                count = 1
+                for token, factor in multipliers.items():
+                    if token in template:
+                        count *= factor
+                total += (timeout + 3) * count
+            return total
+
+        budget = 0
+        for line in self.channel_attempt_lines():
+            timeout = int(self.channel_field(line, "Timeout"))
+            control_timeout = self.channel_field(line, "ControlTimeout")
+            control = int(control_timeout) if control_timeout else timeout
+            budget += 2 * runs(line, "Runs", timeout) + runs(line, "ControlRuns", control)
+        return budget
 
     def test_wrapper_reports_stable_lines_and_fails_closed(self):
         for required in (
@@ -765,13 +877,13 @@ foreach ($case in $cases) {
         restore = tail.index("$script:NullLease.Restore()")
         canaries = tail.index("Remove-Canaries")
         dispose = tail.index("$box.Dispose()")
-        base = tail.index("Remove-Item -LiteralPath $baseDirectory")
+        base = tail.index("Remove-TreeNoFollow $baseDirectory")
         self.assertLess(restore, canaries)
         self.assertLess(canaries, dispose)
         self.assertLess(dispose, base)
         self.assertIn("if ($nullRestore -eq 'failed') { $cleanup = 'incomplete' }", tail)
         self.assertIn(
-            "if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or $profileText -ne 'deleted' -or $tempState -ne 'removed') { $exitCode = 1 }",
+            "if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified') { $exitCode = 1 }",
             tail,
         )
 
@@ -902,7 +1014,7 @@ foreach ($case in $cases) {
         spawn = text[text.index("fn probe_spawn"):text.index("fn probe_tempdir")]
         self.assertEqual(re.findall(r'^\s*"([a-z_]+)" => status_text', spawn, re.M), ["inherit", "piped_no_null", "output"])
         self.assertIn('println!("kd-probe {} {}", command, text);', text)
-        for forbidden in ("LoadLibrary", "CreateNamedPipe", "CreatePipe", "CreateSemaphore", "CreateMutex", "std::io::pipe", "pipe_make", "pipe_open", "pipe_squat", "identity"):
+        for forbidden in ("LoadLibrary", "CreatePipe", "CreateSemaphore", "CreateMutex", "std::io::pipe", "pipe_make", "pipe_open", "pipe_squat", "identity", "CoCreateInstance", "FwpmEngineOpen", "DebugActiveProcess", "ReadProcessMemory", "ITaskService"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, text)
         specs = self.function_body("Get-StageSpecs")
@@ -916,7 +1028,7 @@ foreach ($case in $cases) {
             found = tuple(re.findall(r"(\w+) = ", line.split("Check =", 1)[0] + "Check = "))
             with self.subTest(line=line.strip()[:60]):
                 self.assertIn(found, (fields, fields[:4] + ("Quiet", "Check")))
-        self.assertIn("-l kernel32 -l ws2_32", self.wrapper)
+        self.assertIn("-l kernel32 -l ws2_32 -l advapi32 -l userenv -o", self.wrapper)
         self.assertIn("$phase = 'build_probe'", self.wrapper)
         self.assertLess(self.wrapper.index("$phase = 'build_probe'"), self.wrapper.index("$phase = 'acl_readback'"))
         self.assertIn("$layout.ProbeExe = Join-Path $layout.ProbeDir 'kd_probe.exe'", self.wrapper)
@@ -1162,7 +1274,6 @@ foreach ($case in $cases) {
             ("resolve=ok connect=err11003", "connect"),
             ("resolve=err11004", "connect"),
             ("resolve=err11004", "dns"),
-            ("resolve=err11003 ", "dns"),
             ("resolve=ERR11003", "dns"),
             ("resolve=err110031", "dns"),
             ("resolve=ok count=0", "dns"),
@@ -1290,7 +1401,7 @@ foreach ($case in $cases) {
         self.assertLess(other, confined)
         tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
         self.assertLess(tail.index("$script:NullLease.Restore()"), tail.index("$script:OtherBox.Dispose()"))
-        self.assertLess(tail.index("$script:OtherBox.Dispose()"), tail.index("Remove-Item -LiteralPath $baseDirectory"))
+        self.assertLess(tail.index("$script:OtherBox.Dispose()"), tail.index("Remove-TreeNoFollow $baseDirectory"))
 
     def test_temp_probe_failure_prints_a_closed_reason(self):
         body = self.function_body("Initialize-ContainerTemp")
@@ -1305,6 +1416,573 @@ foreach ($case in $cases) {
             with self.subTest(required=required):
                 self.assertIn(required, body)
         self.assertNotIn("throw 'probe'", body)
+
+    NETWORK_CASES = (
+        ("resolve=ok connect=open", "connect"),
+        ("resolve=ok connect=err10013", "connect"),
+        ("resolve=ok connect=err10051", "connect"),
+        ("resolve=ok connect=err10047", "connect"),
+        ("resolve=ok connect=err10061", "connect"),
+        ("resolve=err11003", "connect"),
+        ("resolve=err11001", "connect"),
+        ("resolve=err10013", "connect"),
+        ("resolve=err11004", "connect"),
+        ("resolve=empty", "connect"),
+        ("resolve=err11003 connect=open", "connect"),
+        ("resolve=ok connect=err11003", "connect"),
+        ("wsa=failed", "connect"),
+        ("", "connect"),
+        ("resolve=ok count=3", "dns"),
+        ("resolve=ok count=0", "dns"),
+        ("resolve=err11003", "dns"),
+        ("resolve=err11001", "dns"),
+        ("resolve=err10013", "dns"),
+        ("resolve=err11004", "dns"),
+        ("resolve=ERR11003", "dns"),
+        ("resolve=err110031", "dns"),
+        ("send=ok recv=data", "udp"),
+        ("send=err10013", "udp"),
+        ("send=err11003", "udp"),
+        ("bind=err10013", "udp"),
+        ("bind=err10013 send=ok", "udp"),
+        ("bind=err10048", "udp"),
+        ("bind=err11003", "udp"),
+        ("bind=", "udp"),
+        ("bind=err", "udp"),
+        ("resolve=err11003", "udp"),
+        ("bind=err10013", "connect"),
+        ("bind=err10013", "dns"),
+    )
+
+    def write_pwsh_script(self, directory, body):
+        path = Path(directory) / "check.ps1"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def run_pwsh(self, body, timeout=180):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.write_pwsh_script(directory, body)
+            result = subprocess.run(
+                ["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(path)],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout
+
+    def top_level_line(self, name):
+        found = re.search(r"^\$" + re.escape(name) + r" = .*$", self.wrapper, re.M)
+        self.assertIsNotNone(found, name)
+        return found.group(0)
+
+    def test_network_state_model_is_tied_to_the_wrapper_by_running_the_extracted_functions(self):
+        if shutil.which("pwsh") is None:
+            self.skipTest("pwsh is not available")
+        lines = [self.top_level_line(name) for name in (
+            "NetworkDeniedConnect",
+            "NetworkDeniedResolve",
+            "NetworkDeniedUdp",
+            "NetworkDeniedHostResolve",
+            "NetworkDeniedBind",
+            "NetworkUnroutableConnect",
+        )]
+        cases = ",\n".join(
+            "    @('" + kind + "', '" + text + "')" for text, kind in self.NETWORK_CASES
+        )
+        body = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + "\n".join(lines)
+            + "\n"
+            + self.function_body("Get-ProbeText")
+            + "\n"
+            + self.function_body("Get-NetworkState")
+            + "\n$cases = @(\n"
+            + cases
+            + "\n)\n"
+            + "foreach ($case in $cases) {\n"
+            + "    $stdout = 'kd-probe ' + $case[0] + ' ' + $case[1]\n"
+            + "    Write-Output ($case[0] + '|' + $case[1] + '|' + (Get-NetworkState $stdout $case[0]))\n"
+            + "}\n"
+        )
+        output = self.run_pwsh(body)
+        rows = [line.split("|") for line in output.splitlines() if line.count("|") == 2]
+        self.assertEqual(len(rows), len(self.NETWORK_CASES))
+        for (text, kind), (row_kind, row_text, state) in zip(self.NETWORK_CASES, rows):
+            with self.subTest(text=text, kind=kind):
+                self.assertEqual((row_kind, row_text), (kind, text))
+                self.assertEqual(state, self.network_state_model(text.strip(), kind))
+        trimmed = {(row[0], row[1]): row[2] for row in rows}
+        self.assertEqual(trimmed[("dns", "resolve=ERR11003")], "unexpected")
+        self.assertEqual(trimmed[("dns", "resolve=err11003")], "blocked_resolve")
+        self.assertEqual(trimmed[("udp", "bind=err10013")], "blocked_bind")
+
+    def test_trailing_space_is_trimmed_by_the_wrapper_before_classification(self):
+        self.assertIn("$trimmed = $line.Trim()", self.function_body("Get-ProbeText"))
+        self.assertEqual(self.network_state_model("resolve=err11003".strip(), "dns"), "blocked_resolve")
+
+    BANK = {
+        "connect": ("resolve=ok connect=open", "resolve=ok connect=err10013", "resolve=ok connect=err10061", "resolve=ok connect=err10060", "resolve=ok connect=err10051", "resolve=err11003", "resolve=err11001", "resolve=err10013", "resolve=empty", "wsa=failed", ""),
+        "dns": ("resolve=ok count=2", "resolve=ok count=0", "resolve=err11003", "resolve=err11001", "resolve=err11004", "resolve=err10013", "wsa=failed"),
+        "udp": ("send=ok recv=data", "send=ok recv=err10060", "send=err10013", "bind=err10013", "bind=err10048", "wsa=failed"),
+        "envhunt": ("found=0", "found=1", "found=12", "found=usage", "found="),
+        "pipemake": ("create=ok", "create=err5", "create=err2", "create=err231", "create=usage"),
+        "pipeopen": ("open=ok", "open=err5", "open=err2", "open=err231", "open=usage"),
+        "procopen": ("open=ok", "open=err5", "open=err87", "open=usage"),
+        "echo": ("result=ok", "result=fail", "result=usage"),
+        "conout": ("open=ok", "open=err5", "open=err6", "open=err2", "open=err3", "open=err87"),
+        "eventlog": ("open=ok", "open=err5", "open=err1722"),
+        "write": ("create=ok write=ok", "create=err5", "create=err80", "create=ok write=err5"),
+        "read": ("open=ok read=ok bytes=36", "open=ok read=ok bytes=0", "open=err5", "open=err2", "open=err3", "open=err32", "open=ok read=err5"),
+        "append": ("open=ok", "open=err5", "open=err2", "open=err32"),
+        "list": ("list=ok count=3", "list=err5", "list=err2"),
+        "regread": ("open=ok", "open=err5", "open=err2"),
+        "regcreate": ("create=ok", "create=err5", "create=err1314"),
+        "walk": ("scanned=10 found=0", "scanned=10 found=1", "scanned=0 found=usage", "scanned=x found=1"),
+        "jobbreak": ("spawn=ok", "spawn=err5", "spawn=err2"),
+        "jobmember": ("injob=yes", "injob=no", "injob=err87"),
+        "profile": ("create=ok", "create=hr80070005", "create=hr800700b7", "create=hr80070057"),
+        "scm": ("open=ok", "open=err5", "open=err1722"),
+        "nuldac": ("result=ok", "result=err5", "result=err2"),
+        "dacopen": ("open=ok", "open=err5", "open=err2"),
+        "symlink": ("create=ok", "create=err5", "create=err1314", "create=err183"),
+        "hardlink": ("create=ok", "create=err5", "create=err1314", "create=err183", "create=err17"),
+        "tokenraise": ("open=ok set=ok", "open=ok set=err5", "open=ok set=err1314", "open=err5 set=na", "open=err87 set=na", "open=ok set=err87"),
+        "tokenpriv": ("adjust=ok", "adjust=err5", "adjust=err1300", "adjust=err87"),
+    }
+
+    def attempt_model(self, line, text):
+        allow = re.search(r"(?<![A-Za-z])Allow = '([^']*)'", line).group(1)
+        deny = re.search(r"Deny = '([^']*)'", line).group(1)
+        expect = re.search(r"Expect = '([a-z]+)'", line).group(1)
+        if not text:
+            return "other"
+        if re.search(allow, text):
+            return "allowed"
+        if re.search(deny, text):
+            return "contained" if expect == "contained" else "denied"
+        return "other"
+
+    def test_attempt_classifier_matches_the_python_model_for_every_attempt_under_pwsh(self):
+        if shutil.which("pwsh") is None:
+            self.skipTest("pwsh is not available")
+        bank = ",\n".join(
+            "    @('" + command + "', '" + text + "')"
+            for command, texts in self.BANK.items()
+            for text in texts
+        )
+        body = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$script:Redactions = @()\n"
+            + self.function_body("Get-CleanText")
+            + "\n"
+            + self.function_body("Get-ProbeText")
+            + "\n"
+            + self.function_body("Get-AttemptResult")
+            + "\n"
+            + self.function_body("Get-ChannelAttempts")
+            + "\n$bank = @(\n"
+            + bank
+            + "\n)\n"
+            + "foreach ($attempt in (Get-ChannelAttempts)) {\n"
+            + "    if ($attempt.ContainsKey('Marker')) { continue }\n"
+            + "    $command = ($attempt.Runs[0] -split ' ')[0]\n"
+            + "    foreach ($entry in $bank) {\n"
+            + "        if ($entry[0] -cne $command) { continue }\n"
+            + "        $run = @{ Stdout = ('kd-probe ' + $command + ' ' + $entry[1]) }\n"
+            + "        Write-Output ($attempt.Channel + '/' + $attempt.Name + '|' + $entry[1] + '|' + (Get-AttemptResult $run $command $attempt))\n"
+            + "    }\n"
+            + "}\n"
+        )
+        output = self.run_pwsh(body)
+        rows = [line.split("|") for line in output.splitlines() if line.count("|") == 2]
+        lines = {}
+        for line in self.channel_attempt_lines():
+            if "Marker = $true" in line:
+                continue
+            channel = re.search(r"Channel = '([a-z_]+)'", line).group(1)
+            name = re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            lines[channel + "/" + name] = line
+        expected_rows = sum(len(self.BANK.get(re.findall(r"'([^']*)'", self.channel_field(line, "Runs"))[0].split(" ")[0], ())) for line in lines.values())
+        self.assertEqual(len(rows), expected_rows)
+        self.assertGreater(len(rows), 200)
+        results = {}
+        for key, text, result in rows:
+            with self.subTest(attempt=key, text=text):
+                self.assertEqual(result, self.attempt_model(lines[key], text))
+            results[(key, text)] = result
+        self.assertEqual(results[("boundary_disablement/symlink", "create=err1314")], "denied")
+        self.assertEqual(results[("boundary_disablement/symlink", "create=err183")], "other")
+        self.assertEqual(results[("boundary_disablement/privilege-enable", "adjust=err1300")], "denied")
+        self.assertEqual(results[("boundary_disablement/privilege-enable", "adjust=ok")], "allowed")
+        self.assertEqual(results[("runner_files/bounded-walk", "scanned=10 found=0")], "contained")
+        self.assertEqual(results[("runner_files/bounded-walk", "scanned=10 found=1")], "allowed")
+        self.assertEqual(results[("dns/unique-name", "resolve=err11001")], "other")
+        self.assertEqual(results[("dns/getaddrinfo", "resolve=err11003")], "denied")
+        self.assertEqual(results[("runner_ipc/pipe-root-create", "create=err5")], "denied")
+        self.assertEqual(results[("runner_ipc/pipe-root-create", "create=err231")], "other")
+
+    def test_expansion_of_channel_runs_skips_unresolved_placeholders_under_pwsh(self):
+        if shutil.which("pwsh") is None:
+            self.skipTest("pwsh is not available")
+        body = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.function_body("Expand-ChannelRun")
+            + "\n"
+            "$script:Channel = @{ Pids = @(11, 22); RunnerPipes = @(); Drives = @('C:\\', 'D:\\'); Scalars = @{ port = '4242'; diag_file = ''; needle = 'abc' } }\n"
+            "foreach ($template in @('procopen {pid} dup', 'pipeopen {runner_pipe}', 'walk {drive} 150 {needle}', 'read {diag_file}', 'connect 127.0.0.1:{port}', 'pipeopen {pipe}', 'read {unknown}', 'echo')) {\n"
+            "    $items = @(Expand-ChannelRun $template)\n"
+            "    Write-Output ($template + '|' + $items.Count + '|' + ($items -join ';'))\n"
+            "}\n"
+        )
+        output = self.run_pwsh(body)
+        rows = {line.split("|")[0]: line.split("|")[1:] for line in output.splitlines() if line.count("|") == 2}
+        self.assertEqual(rows["procopen {pid} dup"], ["2", "procopen 11 dup;procopen 22 dup"])
+        self.assertEqual(rows["pipeopen {runner_pipe}"][0], "0")
+        self.assertEqual(rows["walk {drive} 150 {needle}"], ["2", "walk C:\\ 150 abc;walk D:\\ 150 abc"])
+        self.assertEqual(rows["read {diag_file}"][0], "0")
+        self.assertEqual(rows["connect 127.0.0.1:{port}"], ["1", "connect 127.0.0.1:4242"])
+        self.assertEqual(rows["pipeopen {pipe}"], ["1", "pipeopen {pipe}"])
+        self.assertEqual(rows["read {unknown}"][0], "0")
+        self.assertEqual(rows["echo"], ["1", "echo"])
+
+    def test_channel_table_mirrors_the_linux_channel_set_and_pins_every_attempt(self):
+        self.assertEqual(len(LINUX_CHANNELS), 11)
+        found = re.search(r"^\$ChannelNames = @\((.*)\)$", self.wrapper, re.M)
+        self.assertIsNotNone(found)
+        self.assertEqual(tuple(re.findall(r"'([a-z_]+)'", found.group(1))), tuple(LINUX_CHANNELS))
+        self.assertEqual(tuple(CHANNEL_ATTEMPTS), tuple(LINUX_CHANNELS))
+        seen = {}
+        for line in self.channel_attempt_lines():
+            channel = re.search(r"Channel = '([a-z_]+)'", line).group(1)
+            name = re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            seen.setdefault(channel, []).append(name)
+        self.assertEqual({key: tuple(value) for key, value in seen.items()}, CHANNEL_ATTEMPTS)
+        for line in self.channel_attempt_lines():
+            with self.subTest(line=line.strip()[:70]):
+                self.assertTrue(line.rstrip().endswith("}"))
+                self.assertTrue(line.isascii())
+                self.assertIsNone(re.search(r"\b(?:Remove|Set|Grant)-", line))
+
+    def test_every_attempt_has_a_closed_narrow_denial_rule_and_a_control(self):
+        no_codes = {
+            "proxy-env-http",
+            "env-hunt",
+            "bounded-walk",
+            "walk-control-scratch",
+            "handle-inventory",
+            "stdout-markers",
+            "job-membership",
+        }
+        no_control = {
+            "pipe-runner-open",
+            "handle-inventory",
+            "named-pipe-local",
+            "walk-control-scratch",
+            "control-self-memory",
+            "job-breakaway",
+            "nul-write-dac",
+        }
+        expect_allowed = {"named-pipe-local", "walk-control-scratch", "control-self-memory"}
+
+        def denial_codes(pattern):
+            codes = {"err" + value for value in re.findall(r"err([0-9]+)", pattern)}
+            for group in re.findall(r"err\(([0-9|]+)\)", pattern):
+                codes.update("err" + item for item in group.split("|"))
+            codes.update(re.findall(r"hr[0-9a-f]{8}", pattern))
+            return codes
+
+        without_control = set()
+        for line in self.channel_attempt_lines():
+            name = re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            expect = re.search(r"Expect = '([a-z]+)'", line).group(1)
+            allow = re.search(r"(?<![A-Za-z])Allow = '([^']*)'", line).group(1)
+            deny = re.search(r"Deny = '([^']*)'", line).group(1)
+            with self.subTest(attempt=name):
+                self.assertIn(expect, ("denied", "contained", "allowed"))
+                self.assertEqual(expect == "allowed", name in expect_allowed)
+                for pattern in (allow, deny):
+                    for piece in re.sub(r"\([^)]*\)", "G", pattern).split("|"):
+                        self.assertTrue(piece.startswith("^") and piece.endswith("$"), pattern)
+                codes = denial_codes(deny)
+                self.assertLessEqual(codes, DENIAL_CODES)
+                if not codes:
+                    self.assertIn(name, no_codes)
+                self.assertFalse(denial_codes(allow))
+                runs = re.findall(r"'([^']*)'", self.channel_field(line, "Runs"))
+                self.assertTrue(runs)
+                for run in runs:
+                    self.assertIn(run.split(" ")[0], PROBE_COMMANDS)
+                controls = re.findall(r"'([^']*)'", self.channel_field(line, "ControlRuns"))
+                if not controls:
+                    without_control.add(name)
+                for control in controls:
+                    self.assertIn(control.split(" ")[0], PROBE_COMMANDS)
+        self.assertEqual(without_control, no_control)
+        for channel, names in CHANNEL_ATTEMPTS.items():
+            controlled = [
+                line
+                for line in self.channel_attempt_lines()
+                if "Channel = '" + channel + "'" in line and self.channel_field(line, "ControlRuns") != "@()"
+            ]
+            with self.subTest(channel=channel):
+                self.assertTrue(controlled)
+
+    def test_network_channel_attempts_pair_each_name_with_an_identical_unconfined_control(self):
+        for line in self.channel_attempt_lines():
+            channel = re.search(r"Channel = '([a-z_]+)'", line).group(1)
+            if channel not in ("https", "dns", "redirect", "proxy", "artifact_upload", "cache_upload"):
+                continue
+            if "Name = 'env-hunt'" in line or "Name = 'staging-write'" in line or "Name = 'cache-write'" in line:
+                continue
+            with self.subTest(line=line.strip()[:60]):
+                self.assertEqual(self.channel_field(line, "Runs"), self.channel_field(line, "ControlRuns"))
+        unique = next(line for line in self.channel_attempt_lines() if "Name = 'unique-name'" in line)
+        self.assertIn("ControlAllow = '^resolve=err(11001|11004)$'", unique)
+        self.assertNotIn("11001", re.search(r"Deny = '([^']*)'", unique).group(1))
+        wrapper = self.wrapper
+        self.assertIn("'ACTIONS_RUNTIME_TOKEN=kd-sentinel'", wrapper)
+        self.assertIn("'HTTPS_PROXY=kd-sentinel'", wrapper)
+        for line in self.channel_attempt_lines():
+            if "envhunt" in line:
+                with self.subTest(line=line.strip()[:60]):
+                    self.assertIn("ControlEnvironment = $true", line)
+
+    def test_channel_suite_runs_before_and_after_the_ladder_and_dns_is_rechecked(self):
+        wrapper = self.wrapper
+        order = (
+            "$phase = 'channel_fixtures'",
+            "$controlOutcomes = Invoke-Ladder $box $false $script:Control",
+            "$phase = 'channels_before'",
+            "$channelsBefore = Invoke-ChannelPhase $box 'selftest' $true",
+            "$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac",
+            "$phase = 'channels_after'",
+            "$channelsAfter = Invoke-ChannelPhase $box 'recheck' $false",
+            "$dnsAfterOutcomes = Invoke-Ladder $box $false $script:Control @('network_control_dns') '_after'",
+            "$phase = 'cleanup_links'\n        Initialize-LinkFixtures\n",
+            "$firstFailure = 'none'",
+        )
+        positions = [wrapper.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertLess(wrapper.index("Test-OtherContainerNul $box"), wrapper.index("$channelsBefore = "))
+        self.assertIn("if ($dnsAfter -cne 'open') { $networkControls = $false }", wrapper)
+        self.assertIn("if (Test-Passed $dnsAfterOutcomes @('network_control_dns')) { $dnsAfter = 'open' }", wrapper)
+        self.assertIn("$observed['dns_after'] = $dnsAfter", wrapper)
+        self.assertLess(wrapper.index("$dnsAfter = 'failed'"), wrapper.index("if ($networkDenied -and $networkControls)"))
+        ladder = self.function_body("Invoke-Ladder")
+        self.assertIn("[string[]]$only = @()", ladder.splitlines()[0])
+        self.assertIn("[string]$suffix = ''", ladder.splitlines()[0])
+        self.assertIn("if ($only.Count -gt 0 -and ($only -cnotcontains $spec.Name)) { continue }", ladder)
+        self.assertIn("$spec.Name + $suffix + ' confined='", ladder)
+        specs = self.function_body("Get-StageSpecs")
+        control_branch = specs.split("} else {", 1)[1]
+        self.assertIn("Name = 'network_control_dns'", control_branch)
+        self.assertEqual(wrapper.count("Invoke-Ladder $box $false $script:Control"), 2)
+
+    def test_channel_reports_are_fixed_lines_and_informational_attempts_never_gate(self):
+        phase = self.function_body("Invoke-ChannelPhase")
+        for required in (
+            "windows-confinement-attempt='",
+            "windows-confinement-channel='",
+            "' status=' + $entry.Status",
+            "$entry.Status = 'observed-leak'",
+            "$entry.Status = 'refused'",
+            "$entry.Reason = 'fixture_incomplete'",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, phase)
+        self.assertLess(phase.index("if ($informational) {"), phase.index("$entry.Attempts += 1"))
+        attempt = self.function_body("Invoke-ChannelAttempt")
+        for reason in ("control_not_fired", "channel_leak", "attempt_unexpected", "attempt_incomplete", "fixture_incomplete"):
+            with self.subTest(reason=reason):
+                self.assertIn("'" + reason + "'", attempt)
+        self.assertIn("$outcome.Result = 'na'", attempt)
+        self.assertIn("if ($controlRuns -eq 0) {", attempt)
+        self.assertLess(attempt.index("Invoke-ChannelRun $sandbox $false"), attempt.index("Invoke-ChannelRun $sandbox $true"))
+        run = self.function_body("Invoke-ChannelRun")
+        self.assertIn("$sandbox.Run($confined,", run)
+        self.assertIn("finally {", run)
+        valid = self.function_body("Test-ChannelRunValid")
+        for required in ("$run.TimedOut", "$run.ExitCode -ne 0", "[uint32]$run.HandleCount -ne 3", "Test-LpacTokenText $tokenText", "-like 'assigned,*'"):
+            with self.subTest(required=required):
+                self.assertIn(required, valid)
+        ladder = self.function_body("Invoke-Ladder")
+        proof = re.search(r"^ *\$lpacProven = (.+)$", ladder, re.M).group(1)
+        helper = self.function_body("Test-LpacTokenText")
+        self.assertEqual(
+            re.findall(r"\$tokenText -like '([^']+)'", proof),
+            re.findall(r"\$tokenText -like '([^']+)'", helper),
+        )
+
+    def test_channel_fixtures_add_no_acl_and_use_a_user_only_pipe(self):
+        pipe = self.function_body("New-TrustedPipe")
+        self.assertEqual(pipe.count("AddAccessRule"), 1)
+        for required in ("WindowsIdentity]::GetCurrent().User", "PipeAccessRights]::FullControl", "NamedPipeServerStreamAcl]::Create"):
+            with self.subTest(required=required):
+                self.assertIn(required, pipe)
+        for forbidden in ("S-1-15-2", "S-1-1-0", "WorldSid", "Everyone", "AuthenticatedUser", "AnonymousSid"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, pipe)
+        context = self.function_body("Initialize-ChannelContext")
+        for forbidden in ("SetAccessControl", "Set-Acl", "Grant-Access", "Grant-NonPropagating", "icacls", "AddAccessRule"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, context)
+        self.assertEqual(context.count("CreateSubKey('Software\\KeelDock\\Canary')"), 1)
+        self.assertIn("[Microsoft.Win32.Registry]::CurrentUser, [Microsoft.Win32.Registry]::LocalMachine", context)
+        removal = self.function_body("Remove-ChannelFixtures")
+        self.assertIn("DeleteSubKeyTree('Software\\KeelDock', $false)", removal)
+        self.assertIn("'kd-att-*.tmp'", removal)
+        self.assertIn("$script:Listener.Stop()", removal)
+        self.assertIn("[System.Net.IPAddress]::Loopback, 0", context)
+        self.assertIn("Software\\\\KeelDock\\\\Canary", self.probe)
+        self.assertIn("Software\\\\KeelDock\\\\Att", self.probe)
+        for shape in ("channel_env", "channel_file", "channel_host", "channel_registry", "channel_needle"):
+            with self.subTest(shape=shape):
+                self.assertIn("throw '" + shape + "'", self.wrapper)
+        tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
+        self.assertLess(tail.index("Remove-Canaries"), tail.index("Remove-ChannelFixtures"))
+        self.assertLess(tail.index("Remove-ChannelFixtures"), tail.index("$box.Dispose()"))
+
+    def test_the_scratch_needle_differs_from_the_needle_planted_outside_the_container(self):
+        wrapper = self.wrapper
+        self.assertIn("if ($canaryFile -ceq $script:CanaryControl) { $canaryValue = $script:CanaryScratchNeedle }", wrapper)
+        self.assertIn("$script:CanaryNeedle -ceq $script:CanaryScratchNeedle) { throw 'channel_needle' }", wrapper)
+        scratch = next(line for line in self.channel_attempt_lines() if "Name = 'walk-control-scratch'" in line)
+        self.assertIn("walk {scratch_tmp} 30 {scratch_needle}", scratch)
+        self.assertNotIn("{needle}", scratch)
+        outside = next(line for line in self.channel_attempt_lines() if "Name = 'bounded-walk'" in line)
+        self.assertIn("walk {drive} 150 {needle}", outside)
+        self.assertIn("walk {control_root} 30 {needle}", outside)
+        self.assertNotIn("scratch_needle", outside)
+        self.assertIn("Join-Path $script:Control.Root 'kd_walk_control.txt'), $script:CanaryNeedle", wrapper)
+        context = self.function_body("Initialize-ChannelContext")
+        self.assertIn("$key.SetValue('canary', $script:CanaryNeedle)", context)
+
+    def test_probe_commands_are_bounded_and_never_write_runner_command_files(self):
+        probe = self.probe
+        for required in (
+            "if needle.len() < 16 || needle.len() > 64 {",
+            "value > 0 && value <= 600",
+            "meta.file_attributes() & 0x400 != 0",
+            "if depth < 40 {",
+            "valid_token(id, \"-\", 40)",
+            "valid_token(name, \".-_{}\", 120)",
+            "OpenOptions::new().append(true)",
+            "creation_flags(0x0100_0000)",
+            "0x082A",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, probe)
+        append = probe[probe.index("fn probe_append"):probe.index("fn probe_pipemake")]
+        self.assertNotIn("write_all", append)
+        self.assertNotIn("write!", append)
+        self.assertIn('println!("::debug::kd-marker");', probe)
+        for forbidden in ("OpenOptions::new().write(true).append", "set_len", "remove_file(path"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, append)
+        self.assertEqual(probe.count("DeleteAppContainerProfile(name.as_ptr())"), 1)
+        self.assertEqual(probe.count("RegDeleteKeyW(root, sub.as_ptr())"), 1)
+
+    def test_cleanup_never_follows_reparse_points(self):
+        for name in ("Remove-TreeNoFollow", "Remove-ReparsePoints"):
+            body = self.function_body(name)
+            with self.subTest(function=name):
+                for required in ("[System.IO.File]::GetAttributes(", "-band 1024", "GetFileSystemEntries(", "[System.IO.Directory]::Delete("):
+                    self.assertIn(required, body)
+                for forbidden in ("Remove-Item", "-Recurse", "Get-ChildItem", "Delete($path, $true)", "Delete($child, $true)", "robocopy", "rmdir", "cmd.exe"):
+                    self.assertNotIn(forbidden, body)
+                recursion = "Remove-TreeNoFollow $child" if name == "Remove-TreeNoFollow" else "Remove-ReparsePoints $child"
+                self.assertLess(body.index("-band 1024"), body.index(recursion))
+        self.assertNotIn("Remove-Item", self.wrapper)
+        tree = self.function_body("Remove-TreeNoFollow")
+        self.assertLess(tree.index("[System.IO.Directory]::Delete($path, $false) } else"), tree.index("foreach ($child in"))
+        self.assertIn("[System.IO.File]::SetAttributes($path, [System.IO.FileAttributes]::Normal)", tree)
+        self.assertIn("Remove-TreeNoFollow $item", self.function_body("Remove-Canaries"))
+        tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
+        self.assertLess(tail.index("Remove-ReparsePoints $script:ProfileFolder"), tail.index("$box.Dispose()"))
+        self.assertLess(tail.index("Remove-ReparsePoints $script:OtherFolder"), tail.index("$script:OtherBox.Dispose()"))
+        self.assertLess(tail.index("Remove-TreeNoFollow $script:ProfileFolder"), tail.index("$script:OtherBox.Dispose()"))
+        self.assertLess(tail.index("Remove-TreeNoFollow $baseDirectory"), tail.index("$linksState = 'verified'"))
+        for required in (
+            "if ($script:PlantedJunctions -lt 3) { $linksState = 'incomplete' }",
+            "$linksState = 'followed'",
+            "[IO.File]::ReadAllText($script:TrapSentinel) -cne 'kd-sentinel'",
+            "Remove-TreeNoFollow $script:TrapDirectory",
+            "' links=' + $linksState",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, tail)
+
+    def test_link_fixtures_plant_junctions_and_symlinks_inside_container_writable_trees(self):
+        body = self.function_body("Initialize-LinkFixtures")
+        for required in (
+            "Join-Path $env:RUNNER_TEMP ('kd-trap-' + $suffix)",
+            "(Join-Path $script:Lpac.Tmp 'kd_junction')",
+            "(Join-Path $nested 'kd_junction')",
+            "(Join-Path $packageAc 'kd_junction')",
+            "$packageAc = Join-Path $script:ProfileFolder 'AC'",
+            "New-LinkFixture 'Junction' $junction $trap",
+            "New-LinkFixture 'SymbolicLink' (Join-Path $script:Lpac.Tmp 'kd_symlink_dir') $trap",
+            "New-LinkFixture 'SymbolicLink' (Join-Path $nested 'kd_symlink_file') $sentinel",
+            "throw 'link_fixture'",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        link = self.function_body("New-LinkFixture")
+        self.assertIn("New-Item -ItemType $kind -Path $path -Value $target | Out-Null", link)
+        for forbidden in ("Grant-", "icacls", "SetAccessControl", "Set-Acl"):
+            self.assertNotIn(forbidden, body)
+
+    def test_cleanup_helpers_unlink_junctions_and_symlinks_without_following_in_windows_ci(self):
+        if sys.platform != "win32" or shutil.which("pwsh") is None:
+            self.skipTest("junction cleanup runs in Windows CI")
+        body = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.function_body("Remove-TreeNoFollow")
+            + "\n"
+            + self.function_body("Remove-ReparsePoints")
+            + "\n"
+            "$root = Join-Path ([IO.Path]::GetTempPath()) ('kd-cleanup-' + [Guid]::NewGuid().ToString('N'))\n"
+            "try {\n"
+            "    $trap = Join-Path $root 'trap'\n"
+            "    $tree = Join-Path $root 'tree'\n"
+            "    $sentinel = Join-Path $trap 'inner\\sentinel.txt'\n"
+            "    New-Item -ItemType Directory -Path (Join-Path $trap 'inner') -Force | Out-Null\n"
+            "    [IO.File]::WriteAllText($sentinel, 'kd-sentinel')\n"
+            "    New-Item -ItemType Directory -Path (Join-Path $tree 'nested\\deeper') -Force | Out-Null\n"
+            "    [IO.File]::WriteAllText((Join-Path $tree 'readonly.txt'), 'x')\n"
+            "    [IO.File]::SetAttributes((Join-Path $tree 'readonly.txt'), [System.IO.FileAttributes]::ReadOnly)\n"
+            "    $links = @((Join-Path $tree 'junction'), (Join-Path $tree 'nested\\deeper\\junction'))\n"
+            "    foreach ($link in $links) { New-Item -ItemType Junction -Path $link -Value $trap | Out-Null }\n"
+            "    $symlinks = 0\n"
+            "    try { New-Item -ItemType SymbolicLink -Path (Join-Path $tree 'symdir') -Value $trap | Out-Null; $symlinks += 1 } catch { }\n"
+            "    try { New-Item -ItemType SymbolicLink -Path (Join-Path $tree 'symfile') -Value $sentinel | Out-Null; $symlinks += 1 } catch { }\n"
+            "    Remove-ReparsePoints $tree\n"
+            "    if (-not (Test-Path -LiteralPath $sentinel)) { throw 'links_pass_followed' }\n"
+            "    if (Test-Path -LiteralPath (Join-Path $tree 'junction')) { throw 'junction_left' }\n"
+            "    if (-not (Test-Path -LiteralPath (Join-Path $tree 'readonly.txt'))) { throw 'files_removed_by_links_pass' }\n"
+            "    foreach ($link in $links) { if (-not (Test-Path -LiteralPath (Split-Path -Parent $link))) { throw 'parent_missing' } }\n"
+            "    foreach ($link in $links) { New-Item -ItemType Junction -Path $link -Value $trap | Out-Null }\n"
+            "    Remove-TreeNoFollow $tree\n"
+            "    if (Test-Path -LiteralPath $tree) { throw 'tree_left' }\n"
+            "    if (-not (Test-Path -LiteralPath $sentinel)) { throw 'tree_followed' }\n"
+            "    if ([IO.File]::ReadAllText($sentinel) -cne 'kd-sentinel') { throw 'sentinel_changed' }\n"
+            "    Write-Output ('cleanup-links=verified symlinks=' + $symlinks)\n"
+            "} finally {\n"
+            "    if (Test-Path -LiteralPath $root) { Remove-ReparsePoints $root; Remove-TreeNoFollow $root }\n"
+            "}\n"
+        )
+        output = self.run_pwsh(body)
+        self.assertIn("cleanup-links=verified", output)
+
+    def test_wrapper_does_not_carry_the_probe_apis_or_a_task_registration(self):
+        for forbidden in ("DebugActiveProcess", "CoCreateInstance", "FwpmEngineOpen", "OpenSCManager", "RegisterEventSource", "schtasks"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.wrapper)
+        self.assertIn("-band 1024", self.wrapper)
 
 
 if __name__ == "__main__":

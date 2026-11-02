@@ -24,6 +24,15 @@ $script:CanaryRunnerTemp = ''
 $script:CanaryWorkspace = ''
 $script:CanaryProfile = ''
 $script:CanaryControl = ''
+$script:CanaryNeedle = ''
+$script:CanaryScratchNeedle = ''
+$script:Channel = $null
+$script:Listener = $null
+$script:ChannelRegistry = $false
+$script:TrapDirectory = $null
+$script:TrapSentinel = $null
+$script:PlantedJunctions = 0
+$script:PlantedSymlinks = 0
 
 $RustVersion = '1.99.1'
 $RustTarget = 'x86_64-pc-windows-msvc'
@@ -470,6 +479,8 @@ $NetworkDeniedUdp = @('err10013')
 $NetworkDeniedHostResolve = @('err11003')
 $NetworkDeniedBind = @('err10013')
 $NetworkUnroutableConnect = @('err10047', 'err10051')
+$ChannelNames = @('https', 'dns', 'redirect', 'proxy', 'runner_ipc', 'raw_logs', 'artifact_upload', 'cache_upload', 'runner_files', 'process_memory', 'boundary_disablement')
+$ChannelSentinelEnvironment = [string[]]@('ACTIONS_RUNTIME_TOKEN=kd-sentinel', 'ACTIONS_RESULTS_URL=kd-sentinel', 'ACTIONS_CACHE_URL=kd-sentinel', 'GITHUB_TOKEN=kd-sentinel', 'RUNNER_TOOL_CACHE=kd-sentinel', 'HTTPS_PROXY=kd-sentinel')
 
 function Get-NetworkState([string]$stdout, [string]$name) {
     $text = Get-ProbeText $stdout $name
@@ -582,12 +593,498 @@ function Test-OtherContainerNul($first) {
     Write-Line 'windows-confinement-nul-other=denied container=distinct error=5 control=granted'
 }
 
+function Remove-TreeNoFollow([string]$path) {
+    $attributes = [int][System.IO.File]::GetAttributes($path)
+    $isDirectory = (($attributes -band 16) -ne 0)
+    if (($attributes -band 1024) -ne 0) {
+        if ($isDirectory) { [System.IO.Directory]::Delete($path, $false) } else { [System.IO.File]::Delete($path) }
+        return
+    }
+    if ($isDirectory) {
+        foreach ($child in [System.IO.Directory]::GetFileSystemEntries($path)) {
+            Remove-TreeNoFollow $child
+        }
+        [System.IO.File]::SetAttributes($path, [System.IO.FileAttributes]::Directory)
+        [System.IO.Directory]::Delete($path, $false)
+        return
+    }
+    [System.IO.File]::SetAttributes($path, [System.IO.FileAttributes]::Normal)
+    [System.IO.File]::Delete($path)
+}
+
+function Remove-ReparsePoints([string]$path) {
+    foreach ($child in [System.IO.Directory]::GetFileSystemEntries($path)) {
+        $attributes = [int][System.IO.File]::GetAttributes($child)
+        $isDirectory = (($attributes -band 16) -ne 0)
+        if (($attributes -band 1024) -ne 0) {
+            if ($isDirectory) { [System.IO.Directory]::Delete($child, $false) } else { [System.IO.File]::Delete($child) }
+        } elseif ($isDirectory) {
+            Remove-ReparsePoints $child
+        }
+    }
+}
+
 function Remove-Canaries {
     foreach ($item in @($script:Canaries)) {
         if ($item -and (Test-Path -LiteralPath $item)) {
-            Remove-Item -LiteralPath $item -Recurse -Force -ErrorAction Stop
+            Remove-TreeNoFollow $item
         }
     }
+}
+
+function New-LinkFixture([string]$kind, [string]$path, [string]$target) {
+    try {
+        New-Item -ItemType $kind -Path $path -Value $target | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Initialize-LinkFixtures {
+    $suffix = [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $trap = Join-Path $env:RUNNER_TEMP ('kd-trap-' + $suffix)
+    $inner = Join-Path $trap 'inner'
+    New-Item -ItemType Directory -Path $inner | Out-Null
+    $sentinel = Join-Path $inner 'sentinel.txt'
+    [IO.File]::WriteAllText($sentinel, 'kd-sentinel')
+    $script:TrapDirectory = $trap
+    $script:TrapSentinel = $sentinel
+    $nested = Join-Path (Join-Path $script:Lpac.Tmp 'nested') 'deeper'
+    New-Item -ItemType Directory -Force -Path $nested | Out-Null
+    $packageAc = Join-Path $script:ProfileFolder 'AC'
+    if (-not (Test-Path -LiteralPath $packageAc -PathType Container)) { $packageAc = $script:ProfileFolder }
+    $junctions = @((Join-Path $script:Lpac.Tmp 'kd_junction'), (Join-Path $nested 'kd_junction'), (Join-Path $packageAc 'kd_junction'))
+    foreach ($junction in $junctions) {
+        if (-not (New-LinkFixture 'Junction' $junction $trap)) { throw 'link_fixture' }
+        $script:PlantedJunctions += 1
+    }
+    if (New-LinkFixture 'SymbolicLink' (Join-Path $script:Lpac.Tmp 'kd_symlink_dir') $trap) { $script:PlantedSymlinks += 1 }
+    if (New-LinkFixture 'SymbolicLink' (Join-Path $nested 'kd_symlink_file') $sentinel) { $script:PlantedSymlinks += 1 }
+    Write-Line ('windows-confinement-links=planted junctions=' + $script:PlantedJunctions + ' symlinks=' + $script:PlantedSymlinks)
+}
+
+function Test-PathShape([string]$path) {
+    return [bool]($path -match '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$')
+}
+
+function Get-HostAddress([string]$name) {
+    foreach ($address in [System.Net.Dns]::GetHostAddresses($name)) {
+        if ($address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { return [string]$address.IPAddressToString }
+    }
+    throw 'channel_host'
+}
+
+function Get-ChannelHost([string]$variable, [string]$fallback) {
+    $value = [string][Environment]::GetEnvironmentVariable($variable)
+    if ($value.Length -gt 0) {
+        $uri = $null
+        if ([Uri]::TryCreate($value, [UriKind]::Absolute, [ref]$uri) -and $uri.Scheme -eq 'https' -and $uri.Host -match '^[A-Za-z0-9.-]{1,100}$') { return [string]$uri.Host }
+    }
+    return $fallback
+}
+
+function Get-FirstExistingDirectory([string[]]$candidates) {
+    foreach ($candidate in $candidates) {
+        if ((Test-PathShape $candidate) -and (Test-Path -LiteralPath $candidate -PathType Container)) { return [string]$candidate }
+    }
+    return ''
+}
+
+function Get-RunnerDiagnosticFile([int]$workerPid) {
+    if ($workerPid -le 0) { return '' }
+    try {
+        $workerPath = [string](Get-Process -Id $workerPid -ErrorAction Stop).Path
+        $diagnosticDirectory = Join-Path (Split-Path -Parent (Split-Path -Parent $workerPath)) '_diag'
+        if (-not (Test-Path -LiteralPath $diagnosticDirectory -PathType Container)) { return '' }
+        $first = @(Get-ChildItem -LiteralPath $diagnosticDirectory -File -ErrorAction Stop | Select-Object -First 1)
+        if ($first.Count -gt 0 -and (Test-PathShape $first[0].FullName)) { return [string]$first[0].FullName }
+    } catch {
+        return ''
+    }
+    return ''
+}
+
+function Initialize-ChannelContext {
+    $values = @{}
+    foreach ($name in @('RUNNER_TEMP', 'RUNNER_TOOL_CACHE', 'GITHUB_ENV', 'GITHUB_OUTPUT', 'GITHUB_PATH', 'GITHUB_STEP_SUMMARY')) {
+        $value = [string][Environment]::GetEnvironmentVariable($name)
+        if (-not (Test-PathShape $value)) { throw 'channel_env' }
+        $values[$name] = $value
+    }
+    foreach ($name in @('GITHUB_ENV', 'GITHUB_OUTPUT', 'GITHUB_PATH', 'GITHUB_STEP_SUMMARY')) {
+        if (-not (Test-Path -LiteralPath $values[$name] -PathType Leaf)) { throw 'channel_file' }
+    }
+    foreach ($name in @('RUNNER_TEMP', 'RUNNER_TOOL_CACHE')) {
+        if (-not (Test-Path -LiteralPath $values[$name] -PathType Container)) { throw 'channel_file' }
+    }
+    if ([string]::IsNullOrEmpty($script:CanaryNeedle) -or [string]::IsNullOrEmpty($script:CanaryScratchNeedle) -or $script:CanaryNeedle -ceq $script:CanaryScratchNeedle) { throw 'channel_needle' }
+    $harnessPid = [int]$PID
+    $parentPid = 0
+    $self = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = ' + $harnessPid) -ErrorAction SilentlyContinue
+    if ($self) { $parentPid = [int]$self.ParentProcessId }
+    $workerPid = 0
+    $workers = @(Get-Process -Name 'Runner.Worker' -ErrorAction SilentlyContinue)
+    if ($workers.Count -gt 0) { $workerPid = [int]$workers[0].Id }
+    $pids = @()
+    foreach ($candidate in @($harnessPid, $parentPid, $workerPid)) {
+        if ($candidate -gt 0 -and $pids -notcontains $candidate) { $pids += $candidate }
+    }
+    $runnerPipes = @()
+    try {
+        foreach ($pipePath in [System.IO.Directory]::GetFiles('\\.\pipe\')) {
+            $leaf = [System.IO.Path]::GetFileName($pipePath)
+            if ($runnerPipes.Count -lt 6 -and $leaf -match '^[A-Za-z0-9._{}-]{1,120}$' -and $leaf -match '(?i)runner|actions|github|hosted') { $runnerPipes += $leaf }
+        }
+    } catch {
+        $runnerPipes = @()
+    }
+    $drives = @()
+    foreach ($drive in @('C:\', 'D:\')) {
+        if (Test-Path -LiteralPath $drive -PathType Container) { $drives += $drive }
+    }
+    $cryptoDirectory = Get-FirstExistingDirectory @((Join-Path $env:APPDATA 'Microsoft\Crypto\Keys'), (Join-Path $env:APPDATA 'Microsoft\Crypto'), (Join-Path $env:APPDATA 'Microsoft\Protect'), $env:APPDATA)
+    if ($cryptoDirectory.Length -eq 0 -or $drives.Count -eq 0) { throw 'channel_file' }
+    $resultsIp = Get-HostAddress (Get-ChannelHost 'ACTIONS_RESULTS_URL' 'results-receiver.actions.githubusercontent.com')
+    $cacheIp = Get-HostAddress (Get-ChannelHost 'ACTIONS_CACHE_URL' 'artifactcache.actions.githubusercontent.com')
+    $script:ChannelRegistry = $true
+    foreach ($hive in @([Microsoft.Win32.Registry]::CurrentUser, [Microsoft.Win32.Registry]::LocalMachine)) {
+        $key = $hive.CreateSubKey('Software\KeelDock\Canary')
+        if ($null -eq $key) { throw 'channel_registry' }
+        $key.SetValue('canary', $script:CanaryNeedle)
+        $key.Dispose()
+    }
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText((Join-Path $script:Control.Root 'kd_walk_control.txt'), $script:CanaryNeedle, $encoding)
+    $script:Listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $script:Listener.Start()
+    $port = [int]([System.Net.IPEndPoint]$script:Listener.LocalEndpoint).Port
+    $scalars = @{
+        runner_temp = $values['RUNNER_TEMP']
+        tool_cache = $values['RUNNER_TOOL_CACHE']
+        github_env = $values['GITHUB_ENV']
+        github_output = $values['GITHUB_OUTPUT']
+        github_path = $values['GITHUB_PATH']
+        github_summary = $values['GITHUB_STEP_SUMMARY']
+        diag_file = (Get-RunnerDiagnosticFile $workerPid)
+        crypto_dir = $cryptoDirectory
+        base = [string]$script:Layout.Base
+        canary_runner_temp = [string]$script:CanaryRunnerTemp
+        canary_workspace = [string]$script:CanaryWorkspace
+        canary_profile = [string]$script:CanaryProfile
+        scratch_tmp = [string]$script:Lpac.Tmp
+        control_tmp = [string]$script:Control.Tmp
+        control_root = [string]$script:Control.Root
+        ro_file = [string]$script:Layout.NodeTest
+        needle = [string]$script:CanaryNeedle
+        scratch_needle = [string]$script:CanaryScratchNeedle
+        harness_pid = [string]$harnessPid
+        port = [string]$port
+        results_ip = $resultsIp
+        cache_ip = $cacheIp
+    }
+    $script:Channel = @{ Pids = $pids; RunnerPipes = $runnerPipes; Drives = $drives; Scalars = $scalars }
+    $diagState = 'absent'
+    if (([string]$scalars['diag_file']).Length -gt 0) { $diagState = 'present' }
+    Write-Line ('windows-confinement-channel-fixtures=ready targets=' + $pids.Count + ' runner_pipes=' + $runnerPipes.Count + ' drives=' + $drives.Count + ' diag=' + $diagState)
+}
+
+function Remove-ChannelFixtures {
+    if ($script:Listener) { $script:Listener.Stop() }
+    if ($script:ChannelRegistry) {
+        foreach ($hive in @([Microsoft.Win32.Registry]::CurrentUser, [Microsoft.Win32.Registry]::LocalMachine)) {
+            $hive.DeleteSubKeyTree('Software\KeelDock', $false)
+        }
+    }
+    if ($script:Channel) {
+        foreach ($name in @('runner_temp', 'tool_cache')) {
+            foreach ($file in [System.IO.Directory]::GetFiles([string]$script:Channel.Scalars[$name], 'kd-att-*.tmp')) {
+                [System.IO.File]::Delete($file)
+            }
+        }
+    }
+}
+
+function New-TrustedPipe([string]$name) {
+    $security = New-Object System.IO.Pipes.PipeSecurity
+    $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $rule = New-Object System.IO.Pipes.PipeAccessRule($user, [System.IO.Pipes.PipeAccessRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)
+    $security.AddAccessRule($rule)
+    return [System.IO.Pipes.NamedPipeServerStreamAcl]::Create($name, [System.IO.Pipes.PipeDirection]::InOut, 1, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::None, 0, 0, $security)
+}
+
+function Test-LpacTokenText([string]$tokenText) {
+    return (($tokenText -like 'appcontainer=1,*') -and ($tokenText -like '*,capabilities=1,*') -and ($tokenText -like '*,integrity=0x1000,*') -and ($tokenText -like '*,lpac=attr,*') -and ($tokenText -like '*,cap=registryRead,*') -and ($tokenText -like '*,sid=match,*') -and ($tokenText -like '*,aap=absent'))
+}
+
+function Test-ChannelRunValid($run, [bool]$confined) {
+    if ($run.Failure -ne '' -or -not $run.Exited -or $run.TimedOut -or $run.ExitCode -ne 0) { return $false }
+    if ([uint32]$run.HandleCount -ne 3) { return $false }
+    if ($confined) {
+        $tokenText = Get-Token (([string]$run.Token) -replace ' ', ',') '^[A-Za-z0-9=,_.-]{1,160}$'
+        $jobText = Get-Token (([string]$run.Job) -replace ' ', ',') '^[A-Za-z0-9=,_.-]{1,120}$'
+        if (-not (Test-LpacTokenText $tokenText)) { return $false }
+        if (-not ($jobText -like 'assigned,*')) { return $false }
+    }
+    return $true
+}
+
+function Expand-ChannelRun([string]$template) {
+    $items = @($template)
+    $multiple = [ordered]@{ '{pid}' = $script:Channel.Pids; '{runner_pipe}' = $script:Channel.RunnerPipes; '{drive}' = $script:Channel.Drives }
+    foreach ($token in $multiple.Keys) {
+        $values = @($multiple[$token])
+        $next = @()
+        foreach ($item in $items) {
+            if ($item.Contains($token)) {
+                foreach ($value in $values) { $next += $item.Replace($token, [string]$value) }
+            } else {
+                $next += $item
+            }
+        }
+        $items = $next
+    }
+    $final = @()
+    foreach ($item in $items) {
+        $text = $item.Replace('{rand}', [Guid]::NewGuid().ToString('N').Substring(0, 12))
+        $skip = $false
+        foreach ($key in $script:Channel.Scalars.Keys) {
+            $marker = '{' + $key + '}'
+            if ($text.Contains($marker)) {
+                $value = [string]$script:Channel.Scalars[$key]
+                if ($value.Length -eq 0) { $skip = $true } else { $text = $text.Replace($marker, $value) }
+            }
+        }
+        if ($text.Replace('{pipe}', '').Contains('{')) { $skip = $true }
+        if (-not $skip) { $final += $text }
+    }
+    return $final
+}
+
+function Invoke-ChannelRun($sandbox, [bool]$confined, [string]$arguments, [int]$timeoutSeconds, [string[]]$extraEnvironment) {
+    $exe = $script:Layout.ProbeExe
+    $scratch = $script:Control
+    $targetName = 'target-channel-control'
+    if ($confined) {
+        $scratch = $script:Lpac
+        $targetName = 'target-probe'
+    }
+    $environment = New-StageEnvironment $scratch $targetName
+    if ($extraEnvironment -and $extraEnvironment.Count -gt 0) { $environment = [string[]]($environment + $extraEnvironment) }
+    $pipe = $null
+    $text = $arguments
+    if ($text.Contains('{pipe}')) {
+        $pipeName = 'kd-trusted-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
+        $pipe = New-TrustedPipe $pipeName
+        $text = $text.Replace('{pipe}', $pipeName)
+    }
+    try {
+        return $sandbox.Run($confined, $exe, ('"' + $exe + '" ' + $text), $scratch.Root, $environment, ($timeoutSeconds * 1000), [uint32]32)
+    } finally {
+        if ($pipe) { $pipe.Dispose() }
+    }
+}
+
+function Get-AttemptResult($run, [string]$command, $attempt) {
+    $stdout = [string]$run.Stdout
+    $text = Get-ProbeText $stdout $command
+    if ($attempt.ContainsKey('Marker')) {
+        if (($text -ceq 'text=ok') -and ($stdout -match '(?m)^::debug::kd-marker\s*$') -and ((Get-CleanText $stdout 500) -cnotmatch ':')) { return 'contained' }
+        return 'other'
+    }
+    if ($text.Length -eq 0) { return 'other' }
+    if ($text -cmatch $attempt.Allow) { return 'allowed' }
+    if ($text -cmatch $attempt.Deny) {
+        if ($attempt.Expect -ceq 'contained') { return 'contained' }
+        return 'denied'
+    }
+    return 'other'
+}
+
+function Get-ChannelAttempts {
+    $attempts = @()
+    $attempts += @{ Channel = 'https'; Name = 'tls-ipv4'; Runs = @('connect 1.1.1.1:443'); ControlRuns = @('connect 1.1.1.1:443'); Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'https'; Name = 'tls-ipv6'; Runs = @('connect [2606:4700:4700::1111]:443'); ControlRuns = @('connect [2606:4700:4700::1111]:443'); ControlNa = '^resolve=ok connect=err(10047|10051)$|^resolve=empty$'; Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'https'; Name = 'tls-hostname'; Runs = @('connect registry.npmjs.org:443'); ControlRuns = @('connect registry.npmjs.org:443'); Allow = '^resolve=ok connect=open$'; Deny = '^resolve=(err11003|err10013)$|^resolve=ok connect=err10013$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'dns'; Name = 'getaddrinfo'; Runs = @('dns github.com'); ControlRuns = @('dns github.com'); Allow = '^resolve=ok count=[1-9][0-9]*$'; Deny = '^resolve=(err11003|err10013)$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'dns'; Name = 'unique-name'; Runs = @('dns kd-{rand}.example.com'); ControlRuns = @('dns kd-{rand}.example.com'); ControlAllow = '^resolve=err(11001|11004)$'; Allow = '^resolve=ok count=[1-9][0-9]*$'; Deny = '^resolve=(err11003|err10013)$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'dns'; Name = 'udp-query'; Runs = @('udp 1.1.1.1:53'); ControlRuns = @('udp 1.1.1.1:53'); Allow = '^send=ok recv=data$'; Deny = '^bind=err10013$|^send=err10013$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'dns'; Name = 'tcp-query'; Runs = @('connect 1.1.1.1:53'); ControlRuns = @('connect 1.1.1.1:53'); Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'redirect'; Name = 'http-redirect'; Runs = @('connect github.com:80'); ControlRuns = @('connect github.com:80'); Allow = '^resolve=ok connect=open$'; Deny = '^resolve=(err11003|err10013)$|^resolve=ok connect=err10013$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'proxy'; Name = 'proxy-env-http'; Runs = @('envhunt proxy'); ControlRuns = @('envhunt proxy'); ControlEnvironment = $true; Allow = '^found=[1-9][0-9]*$'; Deny = '^found=0$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'proxy'; Name = 'proxy-connect'; Runs = @('connect 127.0.0.1:{port}'); ControlRuns = @('connect 127.0.0.1:{port}'); Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'runner_ipc'; Name = 'pipe-root-create'; Runs = @('pipemake root {rand}'); ControlRuns = @('pipemake root {rand}'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_ipc'; Name = 'pipe-existing-open'; Runs = @('pipeopen {pipe}'); ControlRuns = @('pipeopen {pipe}'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_ipc'; Name = 'pipe-runner-open'; Optional = $true; Runs = @('pipeopen {runner_pipe}'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_ipc'; Name = 'process-open-runner'; Runs = @('procopen {pid} dup'); ControlRuns = @('procopen {harness_pid} dup'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_ipc'; Name = 'handle-inventory'; Runs = @('echo'); ControlRuns = @(); Allow = '^result=fail$'; Deny = '^result=ok$'; Expect = 'contained'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_ipc'; Name = 'named-pipe-local'; Informational = $true; Runs = @('pipemake local {rand}'); ControlRuns = @(); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'allowed'; Timeout = 10 }
+    $attempts += @{ Channel = 'raw_logs'; Name = 'stdout-markers'; Marker = $true; Runs = @('marker'); ControlRuns = @('marker'); ControlAllow = '^text=ok$'; Allow = '^text=never$'; Deny = '^text=never$'; Expect = 'contained'; Timeout = 10 }
+    $attempts += @{ Channel = 'raw_logs'; Name = 'conout-open'; Runs = @('conout'); ControlRuns = @('conout'); ControlInformational = $true; Allow = '^open=ok$'; Deny = '^open=err(2|5|6)$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'raw_logs'; Name = 'eventlog'; Runs = @('eventlog'); ControlRuns = @('eventlog'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'artifact_upload'; Name = 'env-hunt'; Runs = @('envhunt actions'); ControlRuns = @('envhunt actions'); ControlEnvironment = $true; Allow = '^found=[1-9][0-9]*$'; Deny = '^found=0$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'artifact_upload'; Name = 'endpoint-post'; Runs = @('connect {results_ip}:443'); ControlRuns = @('connect {results_ip}:443'); Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'artifact_upload'; Name = 'staging-write'; Runs = @('write {runner_temp}\kd-att-{rand}.tmp'); ControlRuns = @('write {runner_temp}\kd-att-{rand}.tmp'); Allow = '^create=ok write=ok$'; Deny = '^create=err5$'; Expect = 'contained'; Timeout = 10 }
+    $attempts += @{ Channel = 'cache_upload'; Name = 'env-hunt'; Runs = @('envhunt actions'); ControlRuns = @('envhunt actions'); ControlEnvironment = $true; Allow = '^found=[1-9][0-9]*$'; Deny = '^found=0$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'cache_upload'; Name = 'endpoint-post'; Runs = @('connect {cache_ip}:443'); ControlRuns = @('connect {cache_ip}:443'); Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'cache_upload'; Name = 'cache-write'; Runs = @('write {tool_cache}\kd-att-{rand}.tmp'); ControlRuns = @('write {tool_cache}\kd-att-{rand}.tmp'); Allow = '^create=ok write=ok$'; Deny = '^create=err5$'; Expect = 'contained'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_files'; Name = 'canary-reads'; Runs = @('read {canary_runner_temp}', 'read {canary_workspace}', 'read {canary_profile}'); ControlRuns = @('read {canary_runner_temp}', 'read {canary_workspace}', 'read {canary_profile}'); Allow = '^open=ok read=ok bytes=[0-9]+$'; Deny = '^open=err(2|3|5)$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_files'; Name = 'diag-read'; Optional = $true; Runs = @('read {diag_file}'); ControlRuns = @('read {diag_file}'); Allow = '^open=ok read=ok bytes=[0-9]+$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_files'; Name = 'command-files'; Runs = @('read {github_env}', 'read {github_output}', 'read {github_path}', 'read {github_summary}', 'append {github_env}', 'append {github_output}', 'append {github_path}', 'append {github_summary}'); ControlRuns = @('read {github_env}', 'read {github_output}', 'read {github_path}', 'read {github_summary}', 'append {github_env}', 'append {github_output}', 'append {github_path}', 'append {github_summary}'); Allow = '^open=ok( read=ok bytes=[0-9]+)?$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_files'; Name = 'cng-keys'; Runs = @('list {crypto_dir}'); ControlRuns = @('list {crypto_dir}'); Allow = '^list=ok count=[0-9]+$'; Deny = '^list=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_files'; Name = 'registry-canary'; Runs = @('regread hkcu', 'regread hklm'); ControlRuns = @('regread hkcu', 'regread hklm'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_files'; Name = 'bounded-walk'; Runs = @('walk {drive} 150 {needle}'); ControlRuns = @('walk {control_root} 30 {needle}'); Allow = '^scanned=[0-9]+ found=1$'; Deny = '^scanned=[0-9]+ found=0$'; Expect = 'contained'; Timeout = 200; ControlTimeout = 60 }
+    $attempts += @{ Channel = 'runner_files'; Name = 'walk-control-scratch'; Runs = @('walk {scratch_tmp} 30 {scratch_needle}'); ControlRuns = @(); Allow = '^scanned=[0-9]+ found=1$'; Deny = '^scanned=[0-9]+ found=0$'; Expect = 'allowed'; Timeout = 60 }
+    $attempts += @{ Channel = 'process_memory'; Name = 'mem-read'; Runs = @('procopen {pid} vmread'); ControlRuns = @('procopen {harness_pid} vmread'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'process_memory'; Name = 'environ-read'; Runs = @('procopen {pid} environ'); ControlRuns = @('procopen {harness_pid} environ'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'process_memory'; Name = 'debug-attach'; Runs = @('procopen {pid} debug'); ControlRuns = @('procopen {harness_pid} debug'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'process_memory'; Name = 'control-self-memory'; Runs = @('procopen self vmread'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'allowed'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'job-breakaway'; Runs = @('jobbreak'); ControlRuns = @(); Allow = '^spawn=ok$'; Deny = '^spawn=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'job-membership'; Runs = @('jobmember'); ControlRuns = @('jobmember'); ControlAllow = '^injob=yes$'; Allow = '^injob=no$'; Deny = '^injob=yes$'; Expect = 'contained'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'profile-create'; Runs = @('profile'); ControlRuns = @('profile'); Allow = '^create=ok$'; Deny = '^create=hr80070005$'; Expect = 'denied'; Timeout = 20 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'scm-open'; Runs = @('scm'); ControlRuns = @('scm'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'nul-write-dac'; Runs = @('nuldac'); ControlRuns = @(); Allow = '^result=ok$'; Deny = '^result=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'ancestor-write-dac'; Runs = @('dacopen {base}'); ControlRuns = @('dacopen {base}'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'hklm-write'; Runs = @('regcreate hklm'); ControlRuns = @('regcreate hklm'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'hkcu-write'; Runs = @('regcreate hkcu'); ControlRuns = @('regcreate hkcu'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'symlink'; Runs = @('symlink {scratch_tmp}\kd_att_{rand}.lnk {ro_file}'); ControlRuns = @('symlink {control_tmp}\kd_att_{rand}.lnk {ro_file}'); Allow = '^create=ok$'; Deny = '^create=err(5|1314)$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'hardlink-ro'; Runs = @('hardlink {scratch_tmp}\kd_att_{rand}.lnk {ro_file}'); ControlRuns = @('hardlink {control_tmp}\kd_att_{rand}.lnk {ro_file}'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'integrity-raise'; Runs = @('tokenraise'); ControlRuns = @('tokenraise'); Allow = '^open=ok set=ok$'; Deny = '^open=ok set=err(5|1314)$|^open=err5 set=na$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'privilege-enable'; Runs = @('tokenpriv'); ControlRuns = @('tokenpriv'); Allow = '^adjust=ok$'; Deny = '^adjust=err(5|1300)$'; Expect = 'denied'; Timeout = 10 }
+    return $attempts
+}
+
+function Invoke-ChannelAttempt($sandbox, $attempt, [string]$phase, [bool]$withControls) {
+    $outcome = @{ Result = 'other'; Reason = 'none'; Runs = 0; Control = 'none' }
+    $label = [string]$attempt.Channel + '_' + [string]$attempt.Name
+    $optional = $attempt.ContainsKey('Optional')
+    $informationalControl = $attempt.ContainsKey('ControlInformational')
+    $expanded = @()
+    foreach ($template in $attempt.Runs) {
+        foreach ($item in @(Expand-ChannelRun $template)) { $expanded += $item }
+    }
+    if ($withControls -and $attempt.ControlRuns.Count -gt 0) {
+        $controlAllow = [string]$attempt.Allow
+        if ($attempt.ContainsKey('ControlAllow')) { $controlAllow = [string]$attempt.ControlAllow }
+        $controlTimeout = [int]$attempt.Timeout
+        if ($attempt.ContainsKey('ControlTimeout')) { $controlTimeout = [int]$attempt.ControlTimeout }
+        $controlEnvironment = @()
+        if ($attempt.ContainsKey('ControlEnvironment')) { $controlEnvironment = $ChannelSentinelEnvironment }
+        $controlRuns = 0
+        $controlFailed = $false
+        $controlNa = $false
+        foreach ($template in $attempt.ControlRuns) {
+            foreach ($arguments in @(Expand-ChannelRun $template)) {
+                $controlRuns += 1
+                $run = Invoke-ChannelRun $sandbox $false $arguments $controlTimeout $controlEnvironment
+                $command = ($arguments -split ' ')[0]
+                $text = Get-ProbeText ([string]$run.Stdout) $command
+                $fired = (Test-ChannelRunValid $run $false) -and ($text -cmatch $controlAllow)
+                if (-not $fired -and (Test-ChannelRunValid $run $false) -and $attempt.ContainsKey('ControlNa') -and ($text -cmatch [string]$attempt.ControlNa)) {
+                    $controlNa = $true
+                } elseif (-not $fired) {
+                    $controlFailed = $true
+                    Write-DiagLines ($label + '_control') 'stdout' ([string]$run.Stdout)
+                }
+            }
+        }
+        if ($controlRuns -eq 0) {
+            if ($optional) {
+                $outcome.Result = 'na'
+                return $outcome
+            }
+            $controlFailed = $true
+        }
+        if ($controlNa -and -not $controlFailed) {
+            $outcome.Control = 'na'
+            $outcome.Result = 'na'
+            return $outcome
+        }
+        if ($controlFailed -and -not $informationalControl) {
+            $outcome.Control = 'not_fired'
+            $outcome.Reason = 'control_not_fired'
+            return $outcome
+        }
+        $outcome.Control = 'fired'
+        if ($controlFailed) { $outcome.Control = 'informational' }
+    }
+    if ($expanded.Count -eq 0) {
+        if ($optional) {
+            $outcome.Result = 'na'
+            return $outcome
+        }
+        $outcome.Reason = 'fixture_incomplete'
+        return $outcome
+    }
+    $results = @()
+    foreach ($arguments in $expanded) {
+        $run = Invoke-ChannelRun $sandbox $true $arguments ([int]$attempt.Timeout) @()
+        $outcome.Runs += 1
+        $command = ($arguments -split ' ')[0]
+        $result = 'invalid'
+        if (Test-ChannelRunValid $run $true) { $result = Get-AttemptResult $run $command $attempt }
+        $results += $result
+        if ($result -cne [string]$attempt.Expect) { Write-DiagLines $label 'stdout' ([string]$run.Stdout) }
+    }
+    $outcome.Result = [string]$attempt.Expect
+    foreach ($result in $results) {
+        if ($result -ceq [string]$attempt.Expect) { continue }
+        if ($outcome.Reason -cne 'none') { continue }
+        $outcome.Result = $result
+        if ($result -ceq 'allowed') { $outcome.Reason = 'channel_leak' }
+        elseif ($result -ceq 'invalid') { $outcome.Reason = 'attempt_incomplete' }
+        else { $outcome.Reason = 'attempt_unexpected' }
+    }
+    return $outcome
+}
+
+function Invoke-ChannelPhase($sandbox, [string]$phase, [bool]$withControls) {
+    $report = [ordered]@{}
+    foreach ($channel in $ChannelNames) {
+        $report[$channel] = @{ Status = 'blocked'; Reason = 'none'; Attempts = 0; Informational = 0; ControlsFired = 0; ControlsMissed = 0 }
+    }
+    foreach ($attempt in (Get-ChannelAttempts)) {
+        $entry = $report[[string]$attempt.Channel]
+        $outcome = Invoke-ChannelAttempt $sandbox $attempt $phase $withControls
+        $informational = $attempt.ContainsKey('Informational')
+        Write-Line ('windows-confinement-attempt=' + $attempt.Channel + '/' + $attempt.Name + ' phase=' + $phase + ' result=' + $outcome.Result + ' expect=' + $attempt.Expect + ' runs=' + $outcome.Runs + ' control=' + $outcome.Control + ' reason=' + $outcome.Reason + ' informational=' + $informational.ToString().ToLowerInvariant())
+        if ($informational) {
+            $entry.Informational += 1
+            continue
+        }
+        $entry.Attempts += 1
+        if ($outcome.Control -ceq 'not_fired') { $entry.ControlsMissed += 1 }
+        if (@('fired', 'na') -ccontains $outcome.Control) { $entry.ControlsFired += 1 }
+        if ($outcome.Reason -cne 'none' -and $entry.Status -ceq 'blocked') {
+            $entry.Status = 'refused'
+            if ($outcome.Reason -ceq 'channel_leak') { $entry.Status = 'observed-leak' }
+            $entry.Reason = $outcome.Reason
+        }
+    }
+    foreach ($channel in $ChannelNames) {
+        $entry = $report[$channel]
+        if ($entry.Attempts -eq 0 -and $entry.Status -ceq 'blocked') {
+            $entry.Status = 'refused'
+            $entry.Reason = 'fixture_incomplete'
+        }
+        Write-Line ('windows-confinement-channel=' + $channel + ' phase=' + $phase + ' status=' + $entry.Status + ' reason=' + $entry.Reason + ' attempts=' + $entry.Attempts + ' informational=' + $entry.Informational + ' controls_fired=' + $entry.ControlsFired + ' controls_missed=' + $entry.ControlsMissed)
+    }
+    return $report
+}
+
+function Get-ChannelBlockedCount($report) {
+    $count = 0
+    foreach ($channel in $ChannelNames) {
+        if ($report[$channel].Status -ceq 'blocked') { $count += 1 }
+    }
+    return $count
+}
+
+function Get-ChannelControlState($report) {
+    foreach ($channel in $ChannelNames) {
+        if ($report[$channel].ControlsMissed -gt 0 -or $report[$channel].ControlsFired -eq 0) { return 'not_fired' }
+    }
+    return 'fired'
 }
 
 function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
@@ -635,12 +1132,13 @@ function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
     return $specs
 }
 
-function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
+function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch, [string[]]$only = @(), [string]$suffix = '') {
     $outcomes = [ordered]@{}
     $targetName = 'target-control'
     if ($confined) { $targetName = 'target-lpac' }
     $environment = New-StageEnvironment $scratch $targetName
     foreach ($spec in (Get-StageSpecs $confined $scratch)) {
+        if ($only.Count -gt 0 -and ($only -cnotcontains $spec.Name)) { continue }
         $commandLine = '"' + $spec.Exe + '" ' + $spec.Arguments
         $result = $sandbox.Run($confined, $spec.Exe, $commandLine, $scratch.Root, $environment, ([int]$spec.Timeout * 1000), [uint32]32)
         $ran = ($result.Failure -eq '' -and $result.Exited -and -not $result.TimedOut)
@@ -661,7 +1159,7 @@ function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
         }
         $verdict = 'failed'
         if ($passed) { $verdict = 'ok' }
-        Write-Line ('windows-confinement-stage=' + $spec.Name + ' confined=' + $confined.ToString().ToLowerInvariant() + ' result=' + $verdict + ' exit=' + $exitText + ' status=' + (Get-StatusName ([uint32]$result.ExitCode)) + ' ms=' + $result.ElapsedMs + ' timed_out=' + $result.TimedOut.ToString().ToLowerInvariant() + ' hang=' + $hang + ' failure=' + $failureText + ' create_error=' + $result.CreateError + ' job=' + $jobText + ' token=' + $tokenText + ' handles=' + $result.HandleCount + ' handles_method=list_attr_readback cpu_ms=' + $result.CpuMs + ' peak_process_mib=' + (Get-Mib $result.PeakProcessMemory) + ' peak_job_mib=' + (Get-Mib $result.PeakJobMemory) + ' class46=' + $class46Text)
+        Write-Line ('windows-confinement-stage=' + $spec.Name + $suffix + ' confined=' + $confined.ToString().ToLowerInvariant() + ' result=' + $verdict + ' exit=' + $exitText + ' status=' + (Get-StatusName ([uint32]$result.ExitCode)) + ' ms=' + $result.ElapsedMs + ' timed_out=' + $result.TimedOut.ToString().ToLowerInvariant() + ' hang=' + $hang + ' failure=' + $failureText + ' create_error=' + $result.CreateError + ' job=' + $jobText + ' token=' + $tokenText + ' handles=' + $result.HandleCount + ' handles_method=list_attr_readback cpu_ms=' + $result.CpuMs + ' peak_process_mib=' + (Get-Mib $result.PeakProcessMemory) + ' peak_job_mib=' + (Get-Mib $result.PeakJobMemory) + ' class46=' + $class46Text)
         if (-not $passed) {
             if ($result.Detail) { Write-DiagLines $spec.Name 'detail' $result.Detail }
             if (-not $quiet) {
@@ -863,15 +1361,22 @@ try {
             if ($canaryFile -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw 'canary_path' }
         }
         New-Item -ItemType Directory -Path $canaryDirectory | Out-Null
+        $script:CanaryNeedle = [Guid]::NewGuid().ToString('N')
+        $script:CanaryScratchNeedle = [Guid]::NewGuid().ToString('N')
         foreach ($canaryFile in $canaryFiles) {
-            [IO.File]::WriteAllText($canaryFile, [Guid]::NewGuid().ToString('N'), $encoding)
+            $canaryValue = $script:CanaryNeedle
+            if ($canaryFile -ceq $script:CanaryControl) { $canaryValue = $script:CanaryScratchNeedle }
+            [IO.File]::WriteAllText($canaryFile, $canaryValue, $encoding)
         }
+
+        $phase = 'channel_fixtures'
+        Initialize-ChannelContext
 
         $phase = 'build_probe'
         $probeBuilt = Join-Path $script:Control.Root 'kd_probe_build.exe'
         $probeSource = Join-Path $PSScriptRoot 'windows_probe.rs'
         $probeRustc = Join-Path $layout.RustBin 'rustc.exe'
-        $probeArguments = '--edition 2021 -C opt-level=1 -C debuginfo=0 -C link-arg=/DEBUG:NONE -C linker=' + $layout.MsvcBin + '\link.exe -l kernel32 -l ws2_32 -o ' + $probeBuilt + ' ' + $probeSource
+        $probeArguments = '--edition 2021 -C opt-level=1 -C debuginfo=0 -C link-arg=/DEBUG:NONE -C linker=' + $layout.MsvcBin + '\link.exe -l kernel32 -l ws2_32 -l advapi32 -l userenv -o' + $probeBuilt + ' ' + $probeSource
         $probeEnvironment = New-StageEnvironment $script:Control 'target-probe-build'
         $probeBuild = $box.Run($false, $probeRustc, ('"' + $probeRustc + '" ' + $probeArguments), $script:Control.Root, $probeEnvironment, 240000, [uint32]32)
         if ($probeBuild.Failure -ne '' -or -not $probeBuild.Exited -or $probeBuild.TimedOut -or $probeBuild.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $probeBuilt)) {
@@ -904,8 +1409,20 @@ try {
         $phase = 'nul_other_container'
         Test-OtherContainerNul $box
 
+        $phase = 'channels_before'
+        $channelsBefore = Invoke-ChannelPhase $box 'selftest' $true
+
         $phase = 'ladder'
         $confinedOutcomes = Invoke-Ladder $box $true $script:Lpac
+
+        $phase = 'channels_after'
+        $channelsAfter = Invoke-ChannelPhase $box 'recheck' $false
+
+        $phase = 'ladder'
+        $dnsAfterOutcomes = Invoke-Ladder $box $false $script:Control @('network_control_dns') '_after'
+
+        $phase = 'cleanup_links'
+        Initialize-LinkFixtures
 
         $firstFailure = 'none'
         foreach ($key in $confinedOutcomes.Keys) {
@@ -967,6 +1484,9 @@ try {
         if (($ipv6Control -ceq 'unroutable') -and ($ipv6Confined -cin @('blocked', 'unroutable'))) { $observed['ipv6'] = 'not_applicable' }
         $networkDenied = (Test-Passed $confinedOutcomes @('network_tcp_ipv4', 'network_tcp_ipv6', 'network_tcp_host', 'network_dns', 'network_udp')) -and -not (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'unroutable'))
         $networkControls = Test-Passed $controlOutcomes @('network_control', 'network_control_ipv6', 'network_control_dns', 'network_control_udp')
+        $dnsAfter = 'failed'
+        if (Test-Passed $dnsAfterOutcomes @('network_control_dns')) { $dnsAfter = 'open' }
+        if ($dnsAfter -cne 'open') { $networkControls = $false }
         if ($networkDenied -and $networkControls) { $observed['network'] = 'blocked' }
         if ($networkDenied -and -not $networkControls) { $observed['network'] = 'inconclusive' }
         $observed['canary'] = 'failed'
@@ -977,7 +1497,13 @@ try {
         if (Test-Passed $controlOutcomes @('node_version', 'node_bindings')) { $observed['control_node'] = 'ran' }
         $observed['css_transform'] = 'failed'
         if ($confinedOutcomes['node_bindings'].Stdout -match 'name=minifies_a_stylesheet result=pass') { $observed['css_transform'] = 'ok' }
-        $expectedTokens = [ordered]@{ rust = 'compiled'; node = 'ran'; node_child = 'ran'; first_failure = 'none'; lpac = 'verified'; lpac_basis = 'attr'; capabilities = 'registryRead'; job = 'verified'; acl = 'verified'; scratch_write = 'ok'; ro_write = 'denied'; downloads = 'denied'; nul_open = 'ok'; nul_write_dac = 'denied'; stdin = 'eof_pipe'; temp_dir = 'verified'; spawn_piped = 'ok'; network = 'blocked'; ipv6 = 'blocked'; ipv6_control = 'open'; canary = 'absent'; control_rust = 'compiled'; control_node = 'ran'; css_transform = 'ok' }
+        $observed['channels_before'] = 'failed'
+        if ((Get-ChannelBlockedCount $channelsBefore) -eq $ChannelNames.Count) { $observed['channels_before'] = 'blocked' }
+        $observed['channels_after'] = 'failed'
+        if ((Get-ChannelBlockedCount $channelsAfter) -eq $ChannelNames.Count) { $observed['channels_after'] = 'blocked' }
+        $observed['channel_controls'] = Get-ChannelControlState $channelsBefore
+        $observed['dns_after'] = $dnsAfter
+        $expectedTokens = [ordered]@{ rust = 'compiled'; node = 'ran'; node_child = 'ran'; first_failure = 'none'; lpac = 'verified'; lpac_basis = 'attr'; capabilities = 'registryRead'; job = 'verified'; acl = 'verified'; scratch_write = 'ok'; ro_write = 'denied'; downloads = 'denied'; nul_open = 'ok'; nul_write_dac = 'denied'; stdin = 'eof_pipe'; temp_dir = 'verified'; spawn_piped = 'ok'; network = 'blocked'; ipv6 = 'blocked'; ipv6_control = 'open'; canary = 'absent'; control_rust = 'compiled'; control_node = 'ran'; css_transform = 'ok'; channels_before = 'blocked'; channels_after = 'blocked'; channel_controls = 'fired'; dns_after = 'open' }
         if ($observed['ipv6'] -ceq 'not_applicable') { $expectedTokens['ipv6'] = 'not_applicable'; $expectedTokens['ipv6_control'] = 'unroutable' }
         $summary = 'windows-confinement-spike=observed'
         $allExpected = $true
@@ -1011,6 +1537,14 @@ if ($nullRestore -eq 'failed') { $cleanup = 'incomplete' }
 
 try {
     Remove-Canaries
+    Remove-ChannelFixtures
+} catch {
+    $cleanup = 'incomplete'
+}
+
+try {
+    if ($script:ProfileFolder -and (Test-Path -LiteralPath $script:ProfileFolder)) { Remove-ReparsePoints $script:ProfileFolder }
+    if ($script:OtherFolder -and (Test-Path -LiteralPath $script:OtherFolder)) { Remove-ReparsePoints $script:OtherFolder }
 } catch {
     $cleanup = 'incomplete'
 }
@@ -1022,7 +1556,7 @@ try {
         if (-not $box.CleanupComplete) { $cleanup = 'incomplete' }
         $profileState = 'deleted_by_api'
         if ($script:ProfileFolder -and (Test-Path -LiteralPath $script:ProfileFolder)) {
-            Remove-Item -LiteralPath $script:ProfileFolder -Recurse -Force -ErrorAction Stop
+            Remove-TreeNoFollow $script:ProfileFolder
             $profileState = 'removed_manually'
         }
         if ($script:ProfileFolder -and (Test-Path -LiteralPath $script:ProfileFolder)) { $profileState = 'failed' }
@@ -1037,7 +1571,7 @@ try {
         $script:OtherBox.Dispose()
         if (-not $script:OtherBox.CleanupComplete) { $cleanup = 'incomplete' }
         if ($script:OtherFolder -and (Test-Path -LiteralPath $script:OtherFolder)) {
-            Remove-Item -LiteralPath $script:OtherFolder -Recurse -Force -ErrorAction Stop
+            Remove-TreeNoFollow $script:OtherFolder
         }
         if ($script:OtherFolder -and (Test-Path -LiteralPath $script:OtherFolder)) { $cleanup = 'incomplete' }
     }
@@ -1048,7 +1582,7 @@ try {
 $tempState = 'removed'
 try {
     if ($baseDirectory -and (Test-Path -LiteralPath $baseDirectory)) {
-        Remove-Item -LiteralPath $baseDirectory -Recurse -Force -ErrorAction Stop
+        Remove-TreeNoFollow $baseDirectory
     }
     if ($baseDirectory -and (Test-Path -LiteralPath $baseDirectory)) { $tempState = 'failed' }
     if ($script:ExpectedTemp -and (Test-Path -LiteralPath $script:ExpectedTemp)) { $tempState = 'failed' }
@@ -1056,6 +1590,21 @@ try {
     $tempState = 'failed'
 }
 if ($tempState -eq 'failed') { $cleanup = 'incomplete' }
+
+$linksState = 'not_planted'
+try {
+    if ($script:TrapDirectory) {
+        $linksState = 'verified'
+        if ($script:PlantedJunctions -lt 3) { $linksState = 'incomplete' }
+        if (-not (Test-Path -LiteralPath $script:TrapSentinel -PathType Leaf)) { $linksState = 'followed' }
+        elseif ([IO.File]::ReadAllText($script:TrapSentinel) -cne 'kd-sentinel') { $linksState = 'followed' }
+        Remove-TreeNoFollow $script:TrapDirectory
+        if (Test-Path -LiteralPath $script:TrapDirectory) { $linksState = 'failed' }
+    }
+} catch {
+    $linksState = 'failed'
+}
+if (@('verified', 'not_planted') -cnotcontains $linksState) { $cleanup = 'incomplete' }
 
 if ($refusal) {
     Write-Line ($refusal + ' cleanup=' + $cleanup + ' null_restore=' + $nullRestore)
@@ -1065,7 +1614,7 @@ if ($Mode -eq 'spike') {
     $profileText = 'deleted'
     if (@('deleted_by_api', 'removed_manually') -cnotcontains $profileState) { $profileText = $profileState }
     Write-Line ('windows-confinement-profile-folder=' + $profileState)
-    Write-Line ('windows-confinement-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' profile=' + $profileText + ' temp_dir=' + $tempState)
-    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or $profileText -ne 'deleted' -or $tempState -ne 'removed') { $exitCode = 1 }
+    Write-Line ('windows-confinement-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' symlinks=' + $script:PlantedSymlinks)
+    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified') { $exitCode = 1 }
 }
 exit $exitCode
