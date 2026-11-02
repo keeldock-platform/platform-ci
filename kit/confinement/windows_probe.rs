@@ -28,7 +28,6 @@ extern "system" {
     fn IsProcessInJob(process: isize, job: isize, result: *mut i32) -> i32;
     fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
     fn SetTokenInformation(token: isize, class: u32, information: *mut u8, length: u32) -> i32;
-    fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut u32) -> i32;
     fn AdjustTokenPrivileges(token: isize, disable_all: i32, state: *mut u8, length: u32, previous: *mut u8, returned: *mut u32) -> i32;
     fn CreateAppContainerProfile(name: *const u16, display: *const u16, description: *const u16, capabilities: *mut u8, count: u32, sid: *mut isize) -> i32;
     fn DeleteAppContainerProfile(name: *const u16) -> i32;
@@ -576,17 +575,7 @@ fn probe_tokenpriv() -> String {
         let last = last_error();
         return format!("open=err{}", last);
     }
-    let name = wide("SeDebugPrivilege");
-    let mut luid: [u32; 2] = [0, 0];
-    let looked = unsafe { LookupPrivilegeValueW(ptr::null(), name.as_ptr(), luid.as_mut_ptr()) };
-    if looked == 0 {
-        let last = last_error();
-        unsafe {
-            CloseHandle(token);
-        }
-        return format!("adjust=err{}", last);
-    }
-    let mut state: [u32; 4] = [1, luid[0], luid[1], 2];
+    let mut state: [u32; 4] = [1, 20, 0, 2];
     unsafe {
         SetLastError(0);
     }

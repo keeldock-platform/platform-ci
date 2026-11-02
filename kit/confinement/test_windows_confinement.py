@@ -1962,6 +1962,8 @@ foreach ($case in $cases) {
         self.assertIn('format!("open=err{}", last)', body)
         self.assertLess(body.index('format!("open=err{}", last)'), body.index("AdjustTokenPrivileges"))
         self.assertIn("SetLastError(0)", body)
+        self.assertIn("let mut state: [u32; 4] = [1, 20, 0, 2];", body)
+        self.assertNotIn("LookupPrivilegeValueW", self.probe)
         self.assertIn('String::from("adjust=ok")', body)
         self.assertIn('format!("adjust=err{}", last)', body)
         line = next(item for item in self.channel_attempt_lines() if "Name = 'privilege-enable'" in item)
