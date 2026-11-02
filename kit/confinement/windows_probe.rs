@@ -37,8 +37,8 @@ extern "system" {
     fn CoCreateInstance(clsid: *const u8, outer: *mut u8, context: u32, iid: *const u8, object: *mut *mut u8) -> i32;
     fn SysAllocString(text: *const u16) -> *mut u16;
     fn SysFreeString(text: *mut u16);
-    fn FwpmEngineOpen0(server: *const u16, authn: u32, credentials: *mut u8, session: *const u8, engine: *mut isize) -> u32;
-    fn FwpmEngineClose0(engine: isize) -> u32;
+    fn LoadLibraryExW(name: *const u16, file: isize, flags: u32) -> isize;
+    fn GetProcAddress(module: isize, name: *const u8) -> usize;
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -628,9 +628,12 @@ fn probe_taskreg() -> String {
         }
         return format!("create=hr{:08x}", made as u32);
     }
-    let empty: [u64; 2] = [0, 0];
-    let connect: extern "system" fn(*mut u8, *const u8, *const u8, *const u8, *const u8) -> i32 = unsafe { std::mem::transmute(vtable_entry(object, 10)) };
-    let connected = connect(object, empty.as_ptr() as *const u8, empty.as_ptr() as *const u8, empty.as_ptr() as *const u8, empty.as_ptr() as *const u8);
+    let mut server: [u64; 3] = [0, 0, 0];
+    let mut user: [u64; 3] = [0, 0, 0];
+    let mut domain: [u64; 3] = [0, 0, 0];
+    let mut secret: [u64; 3] = [0, 0, 0];
+    let connect: extern "system" fn(*mut u8, *mut u8, *mut u8, *mut u8, *mut u8) -> i32 = unsafe { std::mem::transmute(vtable_entry(object, 10)) };
+    let connected = connect(object, server.as_mut_ptr() as *mut u8, user.as_mut_ptr() as *mut u8, domain.as_mut_ptr() as *mut u8, secret.as_mut_ptr() as *mut u8);
     release_object(object);
     unsafe {
         CoUninitialize();
@@ -676,14 +679,25 @@ fn probe_wmi() -> String {
 }
 
 fn probe_wfp() -> String {
+    let library = wide("fwpuclnt.dll");
+    let module = unsafe { LoadLibraryExW(library.as_ptr(), 0, 0x0800) };
+    if module == 0 {
+        let last = last_error();
+        return format!("open=load_err{}", last);
+    }
+    let open_address = unsafe { GetProcAddress(module, b"FwpmEngineOpen0\0".as_ptr()) };
+    let close_address = unsafe { GetProcAddress(module, b"FwpmEngineClose0\0".as_ptr()) };
+    if open_address == 0 || close_address == 0 {
+        return String::from("open=proc_err");
+    }
+    let open: extern "system" fn(*const u16, u32, *mut u8, *const u8, *mut isize) -> u32 = unsafe { std::mem::transmute(open_address) };
+    let close: extern "system" fn(isize) -> u32 = unsafe { std::mem::transmute(close_address) };
     let mut engine: isize = 0;
-    let status = unsafe { FwpmEngineOpen0(ptr::null(), 10, ptr::null_mut(), ptr::null(), &mut engine) };
+    let status = open(ptr::null(), 10, ptr::null_mut(), ptr::null(), &mut engine);
     if status != 0 {
         return format!("open=err{}", status);
     }
-    unsafe {
-        FwpmEngineClose0(engine);
-    }
+    close(engine);
     String::from("open=ok")
 }
 

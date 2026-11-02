@@ -298,7 +298,19 @@ fn child(arguments: &[&str]) -> String {
     }
 }
 
+fn child_cmd() -> String {
+    let shell = variable("ComSpec");
+    match Command::new(&shell).args(["/d", "/c", "exit", "7"]).output() {
+        Ok(done) => match done.status.code() {
+            Some(value) => format!("exit={}", value),
+            None => String::from("exit=none"),
+        },
+        Err(error) => format!("child={}", code(&error)),
+    }
+}
+
 fn run_attempts() {
+    println!();
     let nonce = variable("KD_FX_NONCE");
     let temp = variable("KD_FX_TEMP");
     let loopback = format!("127.0.0.1:{}", variable("KD_FX_PORT"));
@@ -314,6 +326,7 @@ fn run_attempts() {
     report("pipe-open", &open_pipe(&pipe));
     report("child-network", &child(&["connect", "1.1.1.1:443"]));
     report("child-write", &child(&["write", spawned.as_str()]));
+    report("child-cmd", &child_cmd());
     println!("::debug::kd-fx-marker");
     eprintln!("::debug::kd-fx-marker");
     report("output-exfil", "text=ok");
@@ -1365,11 +1378,14 @@ function Invoke-ChannelAttempt($sandbox, $attempt, [string]$phase, [bool]$withCo
         }
         if ($controlFailed -and -not $informationalControl) {
             $outcome.Control = 'not_fired'
-            $outcome.Reason = 'control_not_fired'
-            return $outcome
+            if (-not $attempt.ContainsKey('LeakGuard')) {
+                $outcome.Reason = 'control_not_fired'
+                return $outcome
+            }
+        } else {
+            $outcome.Control = 'fired'
+            if ($controlFailed) { $outcome.Control = 'informational' }
         }
-        $outcome.Control = 'fired'
-        if ($controlFailed) { $outcome.Control = 'informational' }
     }
     if ($expanded.Count -eq 0) {
         if ($optional) {
@@ -1385,7 +1401,9 @@ function Invoke-ChannelAttempt($sandbox, $attempt, [string]$phase, [bool]$withCo
         $outcome.Runs += 1
         $command = ($arguments -split ' ')[0]
         $result = 'invalid'
-        if (Test-ChannelRunValid $run $true) { $result = Get-AttemptResult $run $command $attempt }
+        $runValid = Test-ChannelRunValid $run $true
+        if ($runValid -or $attempt.ContainsKey('LeakGuard')) { $result = Get-AttemptResult $run $command $attempt }
+        if (-not $runValid -and $result -cne 'allowed') { $result = 'invalid' }
         if ($result -ceq 'not_applicable' -and $attempt.ContainsKey('NaRecheck') -and (Test-PipeListed (($arguments -split ' ')[1]))) { $result = 'other' }
         $results += $result
         if ($result -cne [string]$attempt.Expect) { Write-DiagLines $label 'stdout' ([string]$run.Stdout) }
@@ -1506,13 +1524,13 @@ function Get-FixtureAttempts([string]$form) {
     if ($form -ceq 'node_install') {
         $attempts += @{ Name = 'net-external'; Allow = '^connect=open$'; Deny = '^connect=EACCES$'; Expect = 'denied' }
         $attempts += @{ Name = 'net-loopback'; Allow = '^connect=open$'; Deny = '^connect=EACCES$'; Expect = 'denied' }
-        $attempts += @{ Name = 'dns-lookup'; Informational = $true; LeakGuard = $true; Allow = '^resolve=ok$'; Deny = '^resolve=EAI_FAIL$'; Expect = 'denied' }
+        $attempts += @{ Name = 'dns-lookup'; Informational = $true; LeakGuard = $true; Allow = '^resolve=ok$'; Deny = '^resolve=(EAI_FAIL|EACCES)$'; Expect = 'denied' }
         $attempts += @{ Name = 'read-canary'; Allow = '^open=ok read=ok bytes=[0-9]+$'; Deny = '^open=(EPERM|ENOENT)$'; Expect = 'denied' }
         $attempts += @{ Name = 'write-escape'; Allow = '^create=ok write=ok$'; Deny = '^create=EPERM$'; Expect = 'contained' }
         $attempts += @{ Name = 'env-hunt'; Basis = 'harness'; Allow = '^found=[1-9][0-9]*$'; Deny = '^found=0$'; Expect = 'contained' }
         $attempts += @{ Name = 'pipe-open'; Allow = '^open=ok$'; Deny = '^open=EPERM$'; Expect = 'denied' }
         $attempts += @{ Name = 'output-exfil'; Basis = 'harness'; Marker = $true; Allow = '^text=never$'; Deny = '^text=never$'; Expect = 'contained' }
-        $attempts += @{ Name = 'spawn-pipe'; Separate = $true; Informational = $true; LeakGuard = $true; Allow = '^spawn=ok$'; Deny = '^spawn=never$'; Expect = 'denied' }
+        $attempts += @{ Name = 'spawn-pipe'; Separate = $true; RequireHang = 'busy'; Informational = $true; LeakGuard = $true; Allow = '^spawn=ok$'; Deny = '^spawn=never$'; Expect = 'denied' }
     } else {
         $attempts += @{ Name = 'net-external'; Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied' }
         $attempts += @{ Name = 'net-loopback'; Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied' }
@@ -1523,6 +1541,7 @@ function Get-FixtureAttempts([string]$form) {
         $attempts += @{ Name = 'pipe-open'; Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied' }
         $attempts += @{ Name = 'child-network'; Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied' }
         $attempts += @{ Name = 'child-write'; Allow = '^create=ok write=ok$'; Deny = '^create=err5$'; Expect = 'contained' }
+        $attempts += @{ Name = 'child-cmd'; Allow = '^exit=7$'; Deny = '^exit=never$'; Expect = 'allowed' }
         $attempts += @{ Name = 'output-exfil'; Basis = 'harness'; Marker = $true; Allow = '^text=never$'; Deny = '^text=never$'; Expect = 'contained' }
     }
     return $attempts
@@ -1624,20 +1643,21 @@ function Invoke-FixtureSeparate($sandbox, [string]$form, $attempt, $report) {
     $run = Invoke-FixtureRun $sandbox $form $true $attempt.Name
     $result = 'other'
     $hang = 'none'
-    if ($run.TimedOut) {
+    $lines = Get-FixtureLines ([string]$run.Stdout + "`n" + [string]$run.Stderr)
+    $text = ''
+    if ($lines.Items.ContainsKey($attempt.Name)) { $text = [string]$lines.Items[$attempt.Name] }
+    if ($text -cmatch $attempt.Allow) {
+        $result = 'allowed'
+    } elseif ($run.TimedOut) {
         $result = 'timeout'
         $hang = 'slow'
         if (([uint64]$run.CpuMs * 10) -ge ([uint64]$run.ElapsedMs * 8)) { $hang = 'busy' }
-    } elseif (Test-ChannelRunValid $run $true) {
-        $lines = Get-FixtureLines ([string]$run.Stdout + "`n" + [string]$run.Stderr)
-        $text = ''
-        if ($lines.Items.ContainsKey($attempt.Name)) { $text = [string]$lines.Items[$attempt.Name] }
-        if ($lines.Valid -and ($text -cmatch $attempt.Allow)) { $result = 'allowed' }
     }
     Write-Line ('windows-confinement-fixture-attempt=' + $form + '/' + $attempt.Name + ' result=' + $result + ' expect=' + $attempt.Expect + ' control=' + $control + ' hang=' + $hang + ' informational=true basis=boundary')
     $report.Informational += 1
     if ($result -cne 'allowed' -and $result -cne 'timeout') { Write-FixtureDiag $label $run }
-    if ($result -ceq 'allowed' -and $control -ceq 'fired') { Set-FixtureRefusal $report 'observed-leak' 'fixture_allowed' }
+    if ($result -ceq 'allowed') { Set-FixtureRefusal $report 'observed-leak' 'fixture_allowed' }
+    elseif ($attempt.ContainsKey('RequireHang') -and ($result -cne 'timeout' -or $hang -cne [string]$attempt.RequireHang)) { Set-FixtureRefusal $report 'refused' 'attempt_unexpected' }
 }
 
 function Invoke-FixtureForm($sandbox, [string]$form) {
@@ -1687,7 +1707,7 @@ function Invoke-FixtureForm($sandbox, [string]$form) {
             $text = [string]$lines.Items[$attempt.Name]
             if ($attempt.ContainsKey('Marker')) {
                 $result = 'other'
-                if (($text -ceq 'text=ok') -and ((Get-CleanText ([string]$run.Stdout + [string]$run.Stderr) 20000) -cnotmatch ':')) { $result = 'contained' }
+                if (($text -ceq 'text=ok') -and (([string]$run.Stdout + "`n" + [string]$run.Stderr) -match '(?m)^(?:\[[A-Za-z0-9_.+-]{1,40} [0-9][A-Za-z0-9_.+-]{0,20}\] )?::debug::kd-fx-marker\s*$')) { $result = 'contained' }
             } else {
                 $result = Get-TextClass $text $attempt
             }
@@ -2027,7 +2047,7 @@ try {
         $probeBuilt = Join-Path $script:Control.Root 'kd_probe_build.exe'
         $probeSource = Join-Path $PSScriptRoot 'windows_probe.rs'
         $probeRustc = Join-Path $layout.RustBin 'rustc.exe'
-        $probeArguments = '--edition 2021 -C opt-level=1 -C debuginfo=0 -C link-arg=/DEBUG:NONE -C linker=' + $layout.MsvcBin + '\link.exe -l kernel32 -l ws2_32 -l advapi32 -l userenv -l ole32 -l oleaut32 -l fwpuclnt -o ' + $probeBuilt + ' ' + $probeSource
+        $probeArguments = '--edition 2021 -C opt-level=1 -C debuginfo=0 -C link-arg=/DEBUG:NONE -C linker=' + $layout.MsvcBin + '\link.exe -l kernel32 -l ws2_32 -l advapi32 -l userenv -l ole32 -l oleaut32 -o ' + $probeBuilt + ' ' + $probeSource
         $probeEnvironment = New-StageEnvironment $script:Control 'target-probe-build'
         $probeBuild = $box.Run($false, $probeRustc, ('"' + $probeRustc + '" ' + $probeArguments), $script:Control.Root, $probeEnvironment, 240000, [uint32]32)
         if ($probeBuild.Failure -ne '' -or -not $probeBuild.Exited -or $probeBuild.TimedOut -or $probeBuild.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $probeBuilt)) {

@@ -1039,7 +1039,7 @@ foreach ($case in $cases) {
         spawn = text[text.index("fn probe_spawn"):text.index("fn probe_tempdir")]
         self.assertEqual(re.findall(r'^\s*"([a-z_]+)" => status_text', spawn, re.M), ["inherit", "piped_no_null", "output"])
         self.assertIn('println!("kd-probe {} {}", command, text);', text)
-        for forbidden in ("LoadLibrary", "CreatePipe", "CreateSemaphore", "CreateMutex", "std::io::pipe", "pipe_make", "pipe_open", "pipe_squat", "identity", "DebugActiveProcess", "ReadProcessMemory", "ITaskService", "RegisterTaskDefinition"):
+        for forbidden in ("LoadLibraryA", "LoadLibraryW", "CreatePipe", "CreateSemaphore", "CreateMutex", "std::io::pipe", "pipe_make", "pipe_open", "pipe_squat", "identity", "DebugActiveProcess", "ReadProcessMemory", "ITaskService", "RegisterTaskDefinition"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, text)
         specs = self.function_body("Get-StageSpecs")
@@ -1053,7 +1053,7 @@ foreach ($case in $cases) {
             found = tuple(re.findall(r"(\w+) = ", line.split("Check =", 1)[0] + "Check = "))
             with self.subTest(line=line.strip()[:60]):
                 self.assertIn(found, (fields, fields[:4] + ("Quiet", "Check")))
-        self.assertIn("-l kernel32 -l ws2_32 -l advapi32 -l userenv -l ole32 -l oleaut32 -l fwpuclnt -o ' + $probeBuilt", self.wrapper)
+        self.assertIn("-l kernel32 -l ws2_32 -l advapi32 -l userenv -l ole32 -l oleaut32 -o ' + $probeBuilt", self.wrapper)
         self.assertIn("$phase = 'build_probe'", self.wrapper)
         self.assertLess(self.wrapper.index("$phase = 'build_probe'"), self.wrapper.index("$phase = 'acl_readback'"))
         self.assertIn("$layout.ProbeExe = Join-Path $layout.ProbeDir 'kd_probe.exe'", self.wrapper)
@@ -2391,9 +2391,14 @@ foreach ($case in $cases) {
         self.assertIn("vtable_entry(object, 3)", wmi)
         self.assertIn('SysAllocString(namespace.as_ptr())', wmi)
         self.assertIn('wide("ROOT\\\\CIMV2")', wmi)
-        self.assertIn("FwpmEngineOpen0(ptr::null(), 10, ptr::null_mut(), ptr::null(), &mut engine)", wfp)
+        self.assertIn("LoadLibraryExW(library.as_ptr(), 0, 0x0800)", wfp)
+        self.assertIn("open=load_err", wfp)
+        self.assertEqual(probe.count("LoadLibraryExW("), 2)
+        self.assertNotIn("-l fwpuclnt", self.wrapper)
+        self.assertIn("FwpmEngineOpen0\\0", wfp)
+        self.assertIn("(ptr::null(), 10, ptr::null_mut(), ptr::null(), &mut engine)", wfp)
         self.assertIn('format!("open=err{}", status)', wfp)
-        self.assertIn("FwpmEngineClose0(engine)", wfp)
+        self.assertIn("close(engine);", wfp)
         self.assertIn("command.arg(\"peerwait\");", peer)
         self.assertIn("OpenProcess(0x1010, 0, child.id())", peer)
         self.assertIn("drop(child.stdin.take());", peer)
@@ -2402,7 +2407,7 @@ foreach ($case in $cases) {
             for forbidden in ("ReadProcessMemory", "WriteProcessMemory", "RegisterTaskDefinition", "CreateService", "FwpmFilterAdd", "FwpmTransactionBegin"):
                 self.assertNotIn(forbidden, body)
         self.assertEqual(probe.count("CoCreateInstance("), 3)
-        for library in ("ole32", "oleaut32", "fwpuclnt"):
+        for library in ("ole32", "oleaut32"):
             self.assertIn("-l " + library + " ", self.wrapper)
         lines = {
             re.search(r"Name = '([a-z0-9-]+)'", line).group(1): line
@@ -2444,6 +2449,7 @@ foreach ($case in $cases) {
         "pipe-open",
         "child-network",
         "child-write",
+        "child-cmd",
         "output-exfil",
     )
     FIXTURE_NODE = (
@@ -2566,7 +2572,7 @@ foreach ($case in $cases) {
                     for pattern in (allow, deny):
                         for piece in re.sub(r"\([^)]*\)", "G", pattern).split("|"):
                             self.assertTrue(piece.startswith("^") and piece.endswith("$"), pattern)
-                    self.assertIn(expect, ("denied", "contained"))
+                    self.assertIn(expect, ("denied", "contained", "allowed") if name == "child-cmd" else ("denied", "contained"))
                     if not node and name in self.FIXTURE_SAME_AS_CHANNEL:
                         self.assertEqual((allow, deny, expect), channel[self.FIXTURE_SAME_AS_CHANNEL[name]])
                     if not node:
@@ -2577,7 +2583,7 @@ foreach ($case in $cases) {
                     else:
                         codes = set(re.findall(r"E[A-Z_]+", deny))
                         gating = "Informational" not in line
-                        self.assertLessEqual(codes, {"EACCES", "EPERM", "ENOENT"} if gating else {"EAI_FAIL"})
+                        self.assertLessEqual(codes, {"EACCES", "EPERM", "ENOENT"} if gating else {"EAI_FAIL", "EACCES"})
                         self.assertNotIn(".*", deny)
         informational = {
             re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
@@ -2641,7 +2647,7 @@ foreach ($case in $cases) {
             "if ($names -cnotcontains [string]$seen) {",
             "$result = Get-TextClass $text $attempt",
             "if ($result -ceq [string]$attempt.Expect) { continue }",
-            "-cnotmatch ':'",
+            "::debug::kd-fx-marker\\s*$')) { $result = 'contained' }",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, form)
@@ -2650,7 +2656,10 @@ foreach ($case in $cases) {
         self.assertIn("$upgrade = ($status -ceq 'observed-leak') -and ($report.Status -cne 'observed-leak')", refusal)
         separate = self.function_body("Invoke-FixtureSeparate")
         self.assertLess(separate.index("Invoke-FixtureRun $sandbox $form $false $attempt.Name"), separate.index("Invoke-FixtureRun $sandbox $form $true $attempt.Name"))
-        self.assertIn("if ($result -ceq 'allowed' -and $control -ceq 'fired') { Set-FixtureRefusal $report 'observed-leak' 'fixture_allowed' }", separate)
+        self.assertIn("if ($result -ceq 'allowed') { Set-FixtureRefusal $report 'observed-leak' 'fixture_allowed' }", separate)
+        self.assertIn("elseif ($attempt.ContainsKey('RequireHang') -and ($result -cne 'timeout' -or $hang -cne [string]$attempt.RequireHang))", separate)
+        self.assertNotIn("Test-ChannelRunValid", separate.split("Invoke-FixtureRun $sandbox $form $true $attempt.Name")[1])
+        self.assertNotIn("-cnotmatch ':'", form)
         self.assertIn("$hang = 'busy'", separate)
         self.assertIn("([uint64]$run.CpuMs * 10) -ge ([uint64]$run.ElapsedMs * 8)", separate)
 
@@ -2699,11 +2708,12 @@ foreach ($case in $cases) {
         "pipe-open": ("open=ok", "open=err5", "open=err2", "open=err231"),
         "child-network": ("resolve=ok connect=open", "resolve=ok connect=err10013", "child=err5", "child=noline"),
         "child-write": ("create=ok write=ok", "create=err5", "child=err5"),
+        "child-cmd": ("exit=7", "exit=1", "exit=none", "child=err5"),
     }
     FIXTURE_NODE_BANK = {
         "net-external": ("connect=open", "connect=EACCES", "connect=ECONNREFUSED", "connect=timeout", "connect=EPERM"),
         "net-loopback": ("connect=open", "connect=EACCES", "connect=ECONNREFUSED"),
-        "dns-lookup": ("resolve=ok", "resolve=EAI_FAIL", "resolve=ENOTFOUND", "resolve=timeout"),
+        "dns-lookup": ("resolve=ok", "resolve=EAI_FAIL", "resolve=EACCES", "resolve=ENOTFOUND", "resolve=timeout"),
         "read-canary": ("open=ok read=ok bytes=16", "open=EPERM", "open=ENOENT", "open=EBUSY", "open=ok read=EPERM"),
         "write-escape": ("create=ok write=ok", "create=EPERM", "create=EEXIST", "create=EACCES"),
         "env-hunt": ("found=0", "found=2"),
@@ -2821,6 +2831,53 @@ foreach ($case in $cases) {
         self.assertIn("    timeout-minutes: 220\n", workflow)
         self.assertEqual(template.count("    timeout-minutes: 220\n"), 1)
         self.assertNotIn("    timeout-minutes: 200\n", workflow + template)
+
+    def test_leak_guards_run_and_judge_the_confined_attempt_whatever_the_control_and_exit_code(self):
+        attempt = self.function_body("Invoke-ChannelAttempt")
+        self.assertIn("if (-not $attempt.ContainsKey('LeakGuard')) {\n                $outcome.Reason = 'control_not_fired'\n                return $outcome\n            }", attempt)
+        self.assertLess(attempt.index("$outcome.Control = 'not_fired'"), attempt.index("Invoke-ChannelRun $sandbox $true"))
+        self.assertIn("$runValid = Test-ChannelRunValid $run $true", attempt)
+        self.assertIn("if ($runValid -or $attempt.ContainsKey('LeakGuard')) { $result = Get-AttemptResult $run $command $attempt }", attempt)
+        self.assertIn("if (-not $runValid -and $result -cne 'allowed') { $result = 'invalid' }", attempt)
+        separate = self.function_body("Invoke-FixtureSeparate")
+        tail = separate.split("Invoke-FixtureRun $sandbox $form $true $attempt.Name")[1]
+        self.assertIn("if ($text -cmatch $attempt.Allow) {", tail)
+        self.assertNotIn("$control", tail.split("Write-Line")[0])
+        spawn = next(line for line in self.fixture_attempt_lines(True) if "Name = 'spawn-pipe'" in line)
+        self.assertIn("RequireHang = 'busy'", spawn)
+
+    def test_cleanup_verifies_every_child_final_path_and_refuses_unsafe_roots(self):
+        native = self.native
+        remover = native[native.index("public static class HandleRemover"):native.index("public sealed class Sandbox")]
+        for required in (
+            "private static string FinalPath(IntPtr handle)",
+            "Native.GetFinalPathNameByHandleW(handle, buffer, (uint)FinalPathChars, 0)",
+            "string here = FinalPath(handle);",
+            "!string.Equals(here, expectedFinal, StringComparison.OrdinalIgnoreCase)",
+            'throw new InvalidOperationException("remove_failed step=verify error=redirected");',
+            'RemoveEntry(path + "\\\\" + names[index], here + "\\\\" + names[index], depth + 1, linksOnly);',
+            "RemoveEntry(Extend(path), null, 0, false);",
+            "RemoveEntry(Extend(path), null, 0, true);",
+            "if (parts.Length < 2)",
+            'part == "." || part == ".."',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, remover)
+        entry = remover[remover.index("private static void RemoveEntry"):remover.index("private static class Native")]
+        self.assertLess(entry.index("string here = FinalPath(handle);"), entry.index("DeleteByHandle(handle, attributes, links);"))
+        self.assertLess(entry.index("remove_failed step=verify"), entry.index("ReadInformation(handle"))
+        self.assertIn("Delete | Synchronize | FileReadAttributes\n", remover)
+
+    def test_taskreg_variants_are_separate_24_byte_buffers_and_wfp_loads_at_run_time(self):
+        probe = self.probe
+        task = probe[probe.index("fn probe_taskreg"):probe.index("fn probe_wmi")]
+        for name in ("server", "user", "domain", "secret"):
+            self.assertIn("let mut " + name + ": [u64; 3] = [0, 0, 0];", task)
+        self.assertNotIn("empty", task)
+        self.assertEqual(task.count("as_mut_ptr() as *mut u8"), 4)
+        self.assertNotIn("FwpmEngineOpen0(", probe.split("fn probe_wfp")[0])
+        self.assertIn("LoadLibraryExW(library.as_ptr(), 0, 0x0800)", probe)
+        self.assertNotIn("fwpuclnt", self.wrapper.split("-o ' + $probeBuilt")[0].split("$probeArguments = ")[1])
 
 
 if __name__ == "__main__":

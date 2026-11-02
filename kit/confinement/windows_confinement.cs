@@ -520,6 +520,8 @@ namespace KeelDock.Platform.WindowsConfinement
         private const uint DispositionDeletePosixIgnoreReadOnly = 0x13;
         private const uint DispositionDeleteIgnoreReadOnly = 0x11;
         private const int ErrorSharingViolation = 32;
+        private const int ErrorAccessDenied = 5;
+        private const int FinalPathChars = 32768;
         private const int ErrorNoMoreFiles = 18;
         private const int MaxDepth = 64;
         private const int MaxOpenRetries = 25;
@@ -530,12 +532,12 @@ namespace KeelDock.Platform.WindowsConfinement
 
         public static void Remove(string path)
         {
-            RemoveEntry(Extend(path), 0, false);
+            RemoveEntry(Extend(path), null, 0, false);
         }
 
         public static void RemoveLinks(string path)
         {
-            RemoveEntry(Extend(path), 0, true);
+            RemoveEntry(Extend(path), null, 0, true);
         }
 
         private static string Extend(string path)
@@ -544,29 +546,65 @@ namespace KeelDock.Platform.WindowsConfinement
             {
                 throw new InvalidOperationException("remove_path");
             }
-            return "\\\\?\\" + path.TrimEnd('\\');
+            string trimmed = path.TrimEnd('\\');
+            string[] parts = trimmed.Substring(3).Split('\\');
+            if (parts.Length < 2)
+            {
+                throw new InvalidOperationException("remove_path");
+            }
+            foreach (string part in parts)
+            {
+                if (part.Length == 0 || part == "." || part == "..")
+                {
+                    throw new InvalidOperationException("remove_path");
+                }
+            }
+            return "\\\\?\\" + trimmed;
         }
 
         private static IntPtr OpenEntry(string path)
         {
-            uint access = Delete | Synchronize | FileListDirectory | FileReadAttributes | FileWriteAttributes;
+            uint[] tiers = new uint[]
+            {
+                Delete | Synchronize | FileListDirectory | FileReadAttributes | FileWriteAttributes,
+                Delete | Synchronize | FileListDirectory | FileReadAttributes,
+                Delete | Synchronize | FileReadAttributes
+            };
             uint flags = FlagBackupSemantics | FlagOpenReparsePoint;
             int error = 0;
-            for (int attempt = 0; attempt < MaxOpenRetries; ++attempt)
+            foreach (uint access in tiers)
             {
-                IntPtr handle = Native.CreateFileW(path, access, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
-                if (handle != new IntPtr(-1))
+                for (int attempt = 0; attempt < MaxOpenRetries; ++attempt)
                 {
-                    return handle;
+                    IntPtr handle = Native.CreateFileW(path, access, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
+                    if (handle != new IntPtr(-1))
+                    {
+                        return handle;
+                    }
+                    error = Marshal.GetLastWin32Error();
+                    if (error != ErrorSharingViolation)
+                    {
+                        break;
+                    }
+                    Thread.Sleep(200);
                 }
-                error = Marshal.GetLastWin32Error();
-                if (error != ErrorSharingViolation)
+                if (error != ErrorAccessDenied)
                 {
                     break;
                 }
-                Thread.Sleep(200);
             }
             throw new InvalidOperationException("remove_failed step=open error=" + error.ToString());
+        }
+
+        private static string FinalPath(IntPtr handle)
+        {
+            StringBuilder buffer = new StringBuilder(FinalPathChars);
+            uint length = Native.GetFinalPathNameByHandleW(handle, buffer, (uint)FinalPathChars, 0);
+            if (length == 0 || length >= FinalPathChars)
+            {
+                throw new InvalidOperationException("remove_failed step=verify error=" + Marshal.GetLastWin32Error().ToString());
+            }
+            return buffer.ToString();
         }
 
         private static void ReadInformation(IntPtr handle, out uint attributes, out uint links)
@@ -724,7 +762,7 @@ namespace KeelDock.Platform.WindowsConfinement
             throw new InvalidOperationException("remove_failed step=delete error=" + error.ToString());
         }
 
-        private static void RemoveEntry(string path, int depth, bool linksOnly)
+        private static void RemoveEntry(string path, string expectedFinal, int depth, bool linksOnly)
         {
             if (depth > MaxDepth)
             {
@@ -733,6 +771,11 @@ namespace KeelDock.Platform.WindowsConfinement
             IntPtr handle = OpenEntry(path);
             try
             {
+                string here = FinalPath(handle);
+                if (expectedFinal != null && !string.Equals(here, expectedFinal, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("remove_failed step=verify error=redirected");
+                }
                 uint attributes;
                 uint links;
                 ReadInformation(handle, out attributes, out links);
@@ -753,7 +796,7 @@ namespace KeelDock.Platform.WindowsConfinement
                         {
                             continue;
                         }
-                        RemoveEntry(path + "\\" + names[index], depth + 1, linksOnly);
+                        RemoveEntry(path + "\\" + names[index], here + "\\" + names[index], depth + 1, linksOnly);
                     }
                     if (!linksOnly)
                     {
@@ -788,6 +831,9 @@ namespace KeelDock.Platform.WindowsConfinement
             [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool SetFileInformationByHandle(IntPtr handle, int informationClass, IntPtr buffer, uint size);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            internal static extern uint GetFinalPathNameByHandleW(IntPtr handle, StringBuilder path, uint length, uint flags);
 
             [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
