@@ -350,6 +350,17 @@ class LinuxSessionLaunchTests(unittest.TestCase):
         self.assertEqual(captured["spec"]["view"], "host")
         self.assertEqual(captured["spec"]["mode"], "confined")
 
+    def test_host_view_can_share_the_host_pid_namespace_only_when_asked(self):
+        self.assertNotIn("--pid", session.HOST_SHARED_PID_UNSHARE)
+        for flag in ("--mount", "--fork", "--ipc", "--net", "--kill-child=KILL"):
+            self.assertIn(flag, session.HOST_SHARED_PID_UNSHARE)
+        self.assertNotIn("--user", session.HOST_SHARED_PID_UNSHARE)
+        with patch("linux_session._spawn") as spawn:
+            session.run_host("/tmp", NONCE, ["/x"], {}, {})
+            session.run_host("/tmp", NONCE, ["/x"], {}, {}, host_pids=True)
+        self.assertIs(spawn.call_args_list[0].args[2], session.HOST_UNSHARE)
+        self.assertIs(spawn.call_args_list[1].args[2], session.HOST_SHARED_PID_UNSHARE)
+
     def test_open_mode_omits_the_network_namespace_and_fault_names_are_closed(self):
         captured = self.run_spawn()
         self.assertIn("--net", captured["command"])

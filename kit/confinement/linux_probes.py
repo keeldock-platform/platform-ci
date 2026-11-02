@@ -307,12 +307,17 @@ class Iov(ctypes.Structure):
 def each_target(action):
     reached = False
     last = None
+    stray = None
     for pid in cfg["targets"]:
         try:
             action(pid)
             reached = True
         except OSError as error:
             last = error
+            if error.errno not in (errno.EPERM, errno.EACCES) and stray is None:
+                stray = error
+    if stray is not None and not reached:
+        raise stray
     if not reached:
         raise last if last is not None else OSError(errno.EPERM, "closed")
 

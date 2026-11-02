@@ -188,6 +188,31 @@ class LinuxAttemptJudgementTests(unittest.TestCase):
         leak = output.replace(b"KDATT mem-read denied", b"KDATT mem-read allowed")
         self.assertEqual(channels.judge_attempts(rules, leak), "leak")
 
+    def test_first_unaccepted_names_the_rule_index_and_ignores_controls_and_optional_na(self):
+        rules = channels.ATTEMPT_RULES["process_memory"]
+        good = passing("process_memory")
+        self.assertIsNone(channels.first_unaccepted(rules, good))
+        other = good.replace(b"KDATT ptrace-attach denied", b"KDATT ptrace-attach other")
+        self.assertEqual(channels.first_unaccepted(rules, other), 2)
+        leak = good.replace(b"KDATT mem-read denied", b"KDATT mem-read allowed")
+        self.assertIsNone(channels.first_unaccepted(rules, leak))
+        weak = good.replace(b"KDATT control-peer-environ allowed", b"KDATT control-peer-environ other")
+        self.assertIsNone(channels.first_unaccepted(rules, weak))
+        boundary_rules = channels.ATTEMPT_RULES["boundary_disablement"]
+        na = lines(*("KDATT " + name + (" na" if name == "sudo" else " denied") for name, accepted in boundary_rules))
+        self.assertEqual(channels.first_unaccepted(boundary_rules, na), 9)
+        self.assertIsNone(channels.first_unaccepted(boundary_rules, na, channels.OPTIONAL_ATTEMPTS["boundary_disablement"]))
+
+    def test_fixture_lines_are_closed_and_bounded(self):
+        line = channels.fixture_line("selftest", "proc_macro", BoundaryRefusal("fixture_incomplete", None, 3))
+        self.assertEqual(
+            line, "KD-LINUX-FIXTURE schema=1 phase=selftest form=proc_macro result=refused reason=fixture_incomplete detail=3"
+        )
+        self.assertNotIn("detail", channels.fixture_line("recheck", "shell", BoundaryRefusal("fixture_allowed")))
+        for phase, form in (("other", "shell"), ("selftest", "Shell"), ("selftest", "a b"), ("selftest", 5), ("selftest", "x" * 21)):
+            with self.assertRaises(ValueError):
+                channels.fixture_line(phase, form, BoundaryRefusal("fixture_allowed"))
+
     def test_nonce_validation_is_exact(self):
         self.assertTrue(channels.valid_nonce(NONCE))
         for bad in ("", "A" * 24, NONCE + "0", NONCE[:-1], None, 5, "g" * 24):

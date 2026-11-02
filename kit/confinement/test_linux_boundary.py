@@ -25,6 +25,8 @@ __all__ = [
     "LinuxBoundaryCommandTests",
     "LinuxBoundaryReviewFixTests",
     "LinuxBoundarySecondReviewTests",
+    "LinuxBoundaryProcessMemoryTests",
+    "LinuxBoundaryFixtureDiagnosticTests",
 ]
 
 SHA = "a" * 40
@@ -684,6 +686,112 @@ class LinuxBoundarySecondReviewTests(unittest.TestCase):
                 subject.channel_process_memory()
         self.assertEqual(captured["extra"], {"KD_CANARY_SECRET": "d" * 64})
         self.assertNotIn(subject.canary, captured["extra"].values())
+
+
+MEMORY_REFUSED = (
+    b"KDATT mem-read denied\nKDATT environ-read denied\nKDATT ptrace-attach denied\n"
+    b"KDATT process-vm-readv denied\nKDATT control-self-memory allowed\nKDATT control-peer-environ allowed\n"
+)
+
+
+class LinuxBoundaryProcessMemoryTests(unittest.TestCase):
+    def memory(self, stdout, scope="3", scan=None):
+        subject, unused = make()
+        subject.workdir = "/work"
+        subject.public_dir = "/work/public"
+        subject.secret_needles = (b"needle",)
+        captured = {}
+        reply = SimpleNamespace(stdout=stdout, stderr=b"", timed_out=False, readback={"ptrace_scope": scope}, exit_code=0)
+
+        def host(*args, **kwargs):
+            captured["kwargs"] = kwargs
+            return reply
+
+        verdict = scan or {"secret": False, "readable_control": True}
+        with patch("linux_boundary.session.start_peer", return_value=SimpleNamespace(pid=4321)), \
+             patch("linux_boundary.session.stop_peer"), \
+             patch("linux_boundary.session.run_host", side_effect=host), \
+             patch("linux_boundary.canaries.run_walker", return_value={}), \
+             patch("linux_boundary.canaries.evaluate_environ", return_value=verdict), \
+             patch("linux_boundary.vm_readv_self_control", return_value=True), \
+             patch("linux_boundary.find_pids", return_value=[]):
+            outcome = subject.channel_process_memory()
+        return outcome, subject, captured
+
+    def test_the_memory_attempts_run_in_the_host_pid_namespace(self):
+        outcome, unused, captured = self.memory(MEMORY_REFUSED)
+        self.assertTrue(captured["kwargs"]["host_pids"])
+        self.assertEqual((outcome.status, outcome.control), ("blocked", True))
+
+    def test_eperm_attempts_under_scope_three_count_as_blocked_with_the_readback(self):
+        outcome, subject, unused = self.memory(MEMORY_REFUSED)
+        self.assertIsNone(outcome.refusal)
+        self.assertEqual(subject.memory_canary, "absent")
+
+    def test_a_missing_scope_readback_refuses(self):
+        for scope in ("0", "1", "2", "unread"):
+            with self.subTest(scope=scope):
+                with self.assertRaises(BoundaryRefusal) as raised:
+                    self.memory(MEMORY_REFUSED, scope=scope)
+                self.assertEqual(raised.exception.reason, "readback_failed")
+
+    def test_unreachable_targets_are_never_counted_as_blocked(self):
+        other = MEMORY_REFUSED.replace(b"KDATT mem-read denied", b"KDATT mem-read other")
+        dead_peer = MEMORY_REFUSED.replace(b"KDATT control-peer-environ allowed", b"KDATT control-peer-environ other")
+        for stdout in (other, dead_peer):
+            with self.subTest(stdout=stdout):
+                outcome, subject, unused = self.memory(stdout)
+                self.assertNotEqual((outcome.status, outcome.control), ("blocked", True))
+
+    def test_an_unexpected_attempt_names_its_rule_index_and_stays_not_run(self):
+        other = MEMORY_REFUSED.replace(b"KDATT ptrace-attach denied", b"KDATT ptrace-attach other")
+        outcome, subject, unused = self.memory(other)
+        self.assertEqual(outcome.status, "not-run")
+        self.assertFalse(outcome.control)
+        self.assertEqual((outcome.refusal.reason, outcome.refusal.detail), ("attempt_unexpected", 2))
+        self.assertEqual(subject.memory_canary, "present")
+
+    def test_a_readable_secret_is_a_leak_even_when_every_attempt_is_denied(self):
+        outcome, unused, unused2 = self.memory(MEMORY_REFUSED, scan={"secret": True, "readable_control": True})
+        self.assertEqual(outcome.status, "observed-leak")
+
+    def test_the_probe_rejects_targets_that_are_not_refused_with_a_permission_error(self):
+        self.assertIn("stray", probes.PROBE_SOURCE)
+        self.assertIn("errno.EPERM, errno.EACCES", probes.PROBE_SOURCE)
+
+
+class LinuxBoundaryFixtureDiagnosticTests(unittest.TestCase):
+    def test_each_failed_fixture_form_is_named_with_a_closed_vocabulary_line(self):
+        subject, emitter = make()
+
+        def outcome(form):
+            if form == "shell":
+                return None
+            raise BoundaryRefusal("fixture_incomplete", None, 3)
+
+        with patch.object(boundary.Boundary, "fixture_outcome", side_effect=outcome):
+            completed, first = subject.run_fixtures()
+        self.assertEqual(completed, 1)
+        self.assertEqual(first.reason, "fixture_incomplete")
+        output = emitter.stream.getvalue().splitlines()
+        self.assertEqual(len(output), 4)
+        self.assertIn("KD-LINUX-FIXTURE schema=1 phase=selftest form=build_rs result=refused reason=fixture_incomplete detail=3", output)
+        for line in output:
+            self.assertRegex(line, r"^[A-Za-z0-9 =/_.-]+$")
+
+    def test_a_proof_failure_is_reported_for_its_form(self):
+        subject, emitter = make()
+        with patch.object(boundary.Boundary, "fixture_outcome", side_effect=harness.ProofFailure(25)):
+            completed, first = subject.run_fixtures()
+        self.assertEqual(completed, 0)
+        self.assertEqual(len(emitter.stream.getvalue().splitlines()), 5)
+        self.assertIn("form=npm_postinstall result=refused reason=readback_failed detail=25", emitter.stream.getvalue())
+
+    def test_exit_detail_is_bounded(self):
+        self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=3)), 3)
+        for code in (-9, 100, None, "x"):
+            self.assertIsNone(boundary.exit_detail(SimpleNamespace(exit_code=code)))
+        self.assertIsNone(boundary.exit_detail(SimpleNamespace()))
 
 
 if __name__ == "__main__":

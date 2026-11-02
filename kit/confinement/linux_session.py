@@ -42,6 +42,7 @@ LIMIT_PROFILES = {"probe": PROBE_LIMITS, "fixture": FIXTURE_LIMITS}
 CONFINED_UNSHARE = tuple(harness.UNSHARE_ARGUMENTS)
 OPEN_UNSHARE = ("--mount", "--pid", "--fork", "--ipc", "--propagation", "private", "--kill-child=KILL")
 HOST_UNSHARE = ("--mount", "--pid", "--fork", "--ipc", "--net", "--propagation", "private", "--kill-child=KILL")
+HOST_SHARED_PID_UNSHARE = ("--mount", "--fork", "--ipc", "--net", "--propagation", "private", "--kill-child=KILL")
 MODES = ("confined", "open")
 VIEWS = ("chroot", "host")
 FAULTS = ("usr-writable", "uid-root")
@@ -678,7 +679,7 @@ def run_chroot(workdir, nonce, argv, env, mode, files, binds=(), work=False, lim
     return _spawn(workdir, spec, arguments)
 
 
-def run_host(workdir, nonce, argv, env, files, limits="probe", timeout=30, cwd="/"):
+def run_host(workdir, nonce, argv, env, files, limits="probe", timeout=30, cwd="/", host_pids=False):
     spec = {
         "mode": "confined",
         "view": "host",
@@ -695,7 +696,7 @@ def run_host(workdir, nonce, argv, env, files, limits="probe", timeout=30, cwd="
         "fault": None,
         "cwd": cwd,
     }
-    return _spawn(workdir, spec, HOST_UNSHARE)
+    return _spawn(workdir, spec, HOST_SHARED_PID_UNSHARE if host_pids else HOST_UNSHARE)
 
 
 def start_peer(token, extra=None):

@@ -127,6 +127,13 @@ def verify_control_sha(expected):
         raise BoundaryRefusal("environment")
 
 
+def exit_detail(result):
+    code = getattr(result, "exit_code", None)
+    if type(code) is int and 0 <= code <= 99:
+        return code
+    return None
+
+
 def find_pids(names):
     found = []
     for item in os.listdir("/proc"):
@@ -250,13 +257,13 @@ class Boundary:
     def probe_argv(self, channel, config):
         return LAUNCH + ["/usr/bin/python3", "-B", "/probe.py", channel, json.dumps(config, sort_keys=True)]
 
-    def decide(self, result, verdict, leaks, control):
+    def decide(self, result, verdict, leaks, control, detail=None):
         if result.timed_out:
             return Outcome("not-run", False, BoundaryRefusal("attempt_incomplete"))
         if leaks or verdict == "leak":
             return Outcome("observed-leak", control, BoundaryRefusal("channel_leak"))
         if verdict == "unexpected":
-            return Outcome("not-run", False, BoundaryRefusal("attempt_unexpected"))
+            return Outcome("not-run", False, BoundaryRefusal("attempt_unexpected", None, detail))
         if verdict == "incomplete":
             return Outcome("not-run", False, BoundaryRefusal("attempt_incomplete"))
         if not control:
@@ -396,7 +403,7 @@ class Boundary:
                 "/usr/bin/python3", "-B", base + "/launch.py",
                 "/usr/bin/python3", "-B", base + "/probe.py", "process_memory", json.dumps(config, sort_keys=True),
             ]
-            result = session.run_host(self.workdir, self.nonce, argv, BASE_ENV, files)
+            result = session.run_host(self.workdir, self.nonce, argv, BASE_ENV, files, host_pids=True)
             groups = [
                 (canaries.GROUP_SECRET, self.secret_needles),
                 (canaries.GROUP_READABLE_CONTROL, (token.encode("ascii"),)),
@@ -414,7 +421,8 @@ class Boundary:
         self.memory_canary = "absent" if (verdict == "ok" and not scan["secret"]) else "present"
         if scan["secret"]:
             return Outcome("observed-leak", control, BoundaryRefusal("canary_present", "process_memory"))
-        return self.decide(result, verdict, [], control)
+        detail = channels.first_unaccepted(channels.ATTEMPT_RULES["process_memory"], result.stdout) if verdict == "unexpected" else None
+        return self.decide(result, verdict, [], control, detail)
 
     def run_channel(self, channel):
         table = {name: (lambda name=name: self.network_channel(name)) for name in channels.NETWORK_CHANNELS}
@@ -460,11 +468,11 @@ class Boundary:
         self.tripwires.store.clear()
         verdict = channels.judge_attempts(fixtures.fixture_rules(form), result.stdout, fixtures.fixture_optional(form))
         if result.timed_out or verdict in ("incomplete",):
-            raise BoundaryRefusal("fixture_incomplete")
+            raise BoundaryRefusal("fixture_incomplete", None, exit_detail(result))
         if events or verdict == "leak":
             raise BoundaryRefusal("fixture_allowed")
         if verdict == "unexpected":
-            raise BoundaryRefusal("attempt_unexpected")
+            raise BoundaryRefusal("attempt_unexpected", None, channels.first_unaccepted(fixtures.fixture_rules(form), result.stdout, fixtures.fixture_optional(form)))
         if not control:
             raise BoundaryRefusal("control_not_fired")
         total = len(fixtures.fixture_rules(form))
@@ -480,11 +488,14 @@ class Boundary:
                 self.fixture_outcome(form)
                 completed += 1
             except BoundaryRefusal as refusal:
+                self.emitter.emit(channels.fixture_line("selftest", form, refusal))
                 if first is None:
                     first = refusal
             except harness.ProofFailure as failure:
+                caught = BoundaryRefusal("readback_failed", None, failure.reason)
+                self.emitter.emit(channels.fixture_line("selftest", form, caught))
                 if first is None:
-                    first = BoundaryRefusal("readback_failed", None, failure.reason)
+                    first = caught
         return completed, first
 
 

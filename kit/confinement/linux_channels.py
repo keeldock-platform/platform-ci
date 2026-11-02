@@ -226,6 +226,31 @@ def readback_line(phase, fields):
     )
 
 
+def first_unaccepted(rules, output, optional=()):
+    seen = dict(parse_attempts(output))
+    for index, (name, accepted) in enumerate(rules):
+        result = seen.get(name)
+        if result is None or name.startswith("control-"):
+            continue
+        if result == "na" and name in optional:
+            continue
+        if result not in accepted and result != "allowed":
+            return index
+    return None
+
+
+def fixture_line(phase, form, refusal):
+    if phase not in PHASES or type(form) is not str or re.fullmatch(r"[a-z_]{1,20}", form) is None:
+        raise ValueError("fixture-line")
+    text = (
+        LINE_PREFIX + "-FIXTURE schema=" + str(SCHEMA_VERSION) + " phase=" + phase
+        + " form=" + form + " result=refused reason=" + refusal.reason
+    )
+    if refusal.detail is not None:
+        text += " detail=" + str(refusal.detail)
+    return text
+
+
 def verdict_line(phase, refusal, blocked_count):
     if phase not in PHASES or type(blocked_count) is not int or not 0 <= blocked_count <= len(CHANNELS):
         raise ValueError("verdict-line")
