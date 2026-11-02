@@ -1017,7 +1017,10 @@ NPM_CHECK_GRAMMAR = (
 )
 NPM_CHECK_RE = re.compile(NPM_CHECK_GRAMMAR)
 NPM_REPORT_NAME_RE = re.compile(r"[0-9A-Za-z_.-]{1,80}-eresolve-report\.txt\Z")
-NPM_PATH_LINE_RE = re.compile(r"(?:^|[\s\"'=(\[,])(?:/|~/)[A-Za-z0-9._~@-]")
+NPM_PATH_LINE_RE = re.compile(
+    r"(?:^|[\s\"'=(\[,\x00-\x1f]|\x1b\[[0-9;]*[A-Za-z])(?:/|~/)[A-Za-z0-9._~@-]|\bfile:/{2}",
+    re.IGNORECASE,
+)
 NPM_CREDENTIAL_PATTERNS = (
     re.compile(
         r"(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}"
@@ -1178,7 +1181,7 @@ def _npm_read_prefix(path, worker_uid, limit):
         if (not stat.S_ISREG(before.st_mode) or before.st_uid != worker_uid or before.st_nlink != 1
                 or before.st_size <= 0):
             return None
-        descriptor = os.open(path, os.O_RDONLY | nofollow)
+        descriptor = os.open(path, os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0))
         opened = os.fstat(descriptor)
         if ((before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
                 or not stat.S_ISREG(opened.st_mode) or opened.st_uid != worker_uid
@@ -1206,7 +1209,12 @@ def _npm_read_prefix(path, worker_uid, limit):
 def _npm_read_report(npm_storage, worker_uid):
     """Return the newest eresolve report under this run's own npm cache, or None."""
     try:
-        logs = Path(npm_storage) / "cache" / "_logs"
+        cache = Path(npm_storage) / "cache"
+        cache_info = cache.lstat()
+        if (not stat.S_ISDIR(cache_info.st_mode) or stat.S_ISLNK(cache_info.st_mode)
+                or cache_info.st_uid != worker_uid):
+            return None
+        logs = cache / "_logs"
         info = logs.lstat()
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != worker_uid:
             return None
