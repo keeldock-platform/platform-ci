@@ -88,6 +88,11 @@ PROBE_COMMANDS = (
     "hardlink",
     "tokenraise",
     "tokenpriv",
+    "taskreg",
+    "wmi",
+    "wfp",
+    "procpeer",
+    "peerwait",
 )
 CHANNEL_ATTEMPTS = {
     "https": ("tls-ipv4", "tls-ipv6", "tls-hostname"),
@@ -114,7 +119,7 @@ CHANNEL_ATTEMPTS = {
         "bounded-walk",
         "walk-control-scratch",
     ),
-    "process_memory": ("mem-read", "environ-read", "debug-attach", "control-self-memory"),
+    "process_memory": ("mem-read", "environ-read", "debug-attach", "control-self-memory", "control-peer-memory"),
     "boundary_disablement": (
         "job-breakaway",
         "job-membership",
@@ -128,6 +133,9 @@ CHANNEL_ATTEMPTS = {
         "hardlink-ro",
         "integrity-raise",
         "privilege-enable",
+        "task-register",
+        "wmi",
+        "wfp",
     ),
 }
 DENIAL_CODES = {
@@ -141,6 +149,7 @@ DENIAL_CODES = {
     "err11003",
     "hr80070005",
     "hr800706d9",
+    "hr80041003",
 }
 EXPECTED_SUMMARY = (
     ("rust", "compiled"),
@@ -171,6 +180,7 @@ EXPECTED_SUMMARY = (
     ("channels_after", "blocked"),
     ("channel_controls", "fired"),
     ("dns_after", "open"),
+    ("fixtures", "contained"),
 )
 
 
@@ -662,11 +672,11 @@ foreach ($case in $cases) {
         other_seconds = int(re.search(r"\$script:OtherContainerSeconds = ([0-9]+)", self.wrapper).group(1))
         staging_allowance = 600 + probe_build + 2 * other_seconds
         dns_after = int(re.search(r"Name = 'network_control_dns'; Exe = \$probe; Arguments = 'dns github\.com'; Timeout = ([0-9]+);", specs).group(1))
-        worst = ladders + downloads * attempts * per_attempt + staging_allowance + dns_after + self.channel_budget()
+        worst = ladders + downloads * attempts * per_attempt + staging_allowance + dns_after + self.channel_budget() + self.fixture_budget()
         workflow = WORKFLOW.read_text(encoding="utf-8")
         minutes = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", workflow)]
         self.assertEqual(len(minutes), 2)
-        self.assertEqual(minutes[1], 200)
+        self.assertEqual(minutes[1], 220)
         self.assertLessEqual(worst, minutes[1] * 60 * 0.8)
 
     def channel_attempt_lines(self):
@@ -676,6 +686,21 @@ foreach ($case in $cases) {
     def channel_field(self, line, field):
         found = re.search(r"(?<![A-Za-z])" + field + r" = ('[^']*'|\$true|@\([^)]*\)|[0-9]+)", line)
         return None if found is None else found.group(1)
+
+    def fixture_budget(self):
+        def number(name):
+            found = re.search(r"^\$" + name + r" = ([0-9]+)$", self.wrapper, re.M)
+            self.assertIsNotNone(found, name)
+            return int(found.group(1))
+
+        forms = re.search(r"^\$FixtureForms = @\((.*)\)$", self.wrapper, re.M)
+        self.assertIsNotNone(forms)
+        cargo_forms = len(re.findall(r"'([a-z_]+)'", forms.group(1))) - 1
+        return (
+            2 * cargo_forms * (number("FixtureCargoSeconds") + 3)
+            + 2 * (number("FixtureNodeSeconds") + 3)
+            + 2 * (number("FixtureSpawnSeconds") + 3)
+        )
 
     def channel_budget(self):
         multipliers = {"{pid}": 3, "{runner_pipe}": 6, "{drive}": 2}
@@ -1014,7 +1039,7 @@ foreach ($case in $cases) {
         spawn = text[text.index("fn probe_spawn"):text.index("fn probe_tempdir")]
         self.assertEqual(re.findall(r'^\s*"([a-z_]+)" => status_text', spawn, re.M), ["inherit", "piped_no_null", "output"])
         self.assertIn('println!("kd-probe {} {}", command, text);', text)
-        for forbidden in ("LoadLibrary", "CreatePipe", "CreateSemaphore", "CreateMutex", "std::io::pipe", "pipe_make", "pipe_open", "pipe_squat", "identity", "CoCreateInstance", "FwpmEngineOpen", "DebugActiveProcess", "ReadProcessMemory", "ITaskService"):
+        for forbidden in ("LoadLibrary", "CreatePipe", "CreateSemaphore", "CreateMutex", "std::io::pipe", "pipe_make", "pipe_open", "pipe_squat", "identity", "DebugActiveProcess", "ReadProcessMemory", "ITaskService", "RegisterTaskDefinition"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, text)
         specs = self.function_body("Get-StageSpecs")
@@ -1028,7 +1053,7 @@ foreach ($case in $cases) {
             found = tuple(re.findall(r"(\w+) = ", line.split("Check =", 1)[0] + "Check = "))
             with self.subTest(line=line.strip()[:60]):
                 self.assertIn(found, (fields, fields[:4] + ("Quiet", "Check")))
-        self.assertIn("-l kernel32 -l ws2_32 -l advapi32 -l userenv -o ' + $probeBuilt", self.wrapper)
+        self.assertIn("-l kernel32 -l ws2_32 -l advapi32 -l userenv -l ole32 -l oleaut32 -l fwpuclnt -o ' + $probeBuilt", self.wrapper)
         self.assertIn("$phase = 'build_probe'", self.wrapper)
         self.assertLess(self.wrapper.index("$phase = 'build_probe'"), self.wrapper.index("$phase = 'acl_readback'"))
         self.assertIn("$layout.ProbeExe = Join-Path $layout.ProbeDir 'kd_probe.exe'", self.wrapper)
@@ -1552,10 +1577,17 @@ foreach ($case in $cases) {
         "hardlink": ("create=ok", "create=err5", "create=err1314", "create=err183", "create=err17"),
         "tokenraise": ("open=ok set=ok", "open=ok set=err5", "open=ok set=err1314", "open=err5 set=na", "open=err87 set=na", "open=ok set=err87"),
         "tokenpriv": ("adjust=ok", "adjust=err5", "adjust=err1300", "adjust=err87", "adjust=err6", "open=err5", "open=err6"),
+        "taskreg": ("create=ok connect=ok", "create=ok connect=hr80070005", "create=ok connect=hr800706d9", "create=hr80040154", "create=ok connect=hr80041003"),
+        "wmi": ("create=ok connect=ok", "create=ok connect=hr80070005", "create=ok connect=hr80041003", "create=hr80040154", "create=ok connect=hr800706ba"),
+        "wfp": ("open=ok", "open=err5", "open=err1722", "open=err1062"),
+        "procpeer": ("open=ok", "open=err5", "open=err87", "spawn=err5", "spawn=err2"),
     }
 
     def attempt_model(self, line, text):
         allow = re.search(r"(?<![A-Za-z])Allow = '([^']*)'", line).group(1)
+        confined = re.search(r"ConfinedAllow = '([^']*)'", line)
+        if confined:
+            allow = confined.group(1)
         deny = re.search(r"Deny = '([^']*)'", line).group(1)
         expect = re.search(r"Expect = '([a-z]+)'", line).group(1)
         if not text:
@@ -1583,6 +1615,8 @@ foreach ($case in $cases) {
             + self.function_body("Get-CleanText")
             + "\n"
             + self.function_body("Get-ProbeText")
+            + "\n"
+            + self.function_body("Get-TextClass")
             + "\n"
             + self.function_body("Get-AttemptResult")
             + "\n"
@@ -1627,6 +1661,19 @@ foreach ($case in $cases) {
         self.assertEqual(results[("dns/getaddrinfo", "resolve=err11003")], "denied")
         self.assertEqual(results[("runner_ipc/pipe-root-create", "create=err5")], "denied")
         self.assertEqual(results[("runner_ipc/pipe-root-create", "create=err231")], "other")
+        self.assertEqual(results[("process_memory/control-peer-memory", "open=ok")], "allowed")
+        self.assertEqual(results[("process_memory/control-peer-memory", "open=err5")], "not_applicable")
+        self.assertEqual(results[("process_memory/control-peer-memory", "spawn=err5")], "other")
+        self.assertEqual(results[("boundary_disablement/task-register", "create=ok connect=ok")], "allowed")
+        self.assertEqual(results[("boundary_disablement/task-register", "create=ok connect=hr80070005")], "denied")
+        self.assertEqual(results[("boundary_disablement/task-register", "create=ok connect=hr800706d9")], "other")
+        self.assertEqual(results[("boundary_disablement/task-register", "create=hr80040154")], "other")
+        self.assertEqual(results[("boundary_disablement/wmi", "create=ok connect=hr80041003")], "denied")
+        self.assertEqual(results[("boundary_disablement/wmi", "create=ok connect=hr800706ba")], "other")
+        self.assertEqual(results[("boundary_disablement/wfp", "open=err5")], "denied")
+        self.assertEqual(results[("boundary_disablement/wfp", "open=err1722")], "other")
+        self.assertEqual(results[("boundary_disablement/wfp", "open=ok")], "allowed")
+        self.assertEqual(results[("boundary_disablement/profile-create", "create=ok")], "allowed")
 
     def test_expansion_of_channel_runs_skips_unresolved_placeholders_under_pwsh(self):
         if shutil.which("pwsh") is None:
@@ -1679,6 +1726,7 @@ foreach ($case in $cases) {
             "handle-inventory",
             "stdout-markers",
             "job-membership",
+            "control-peer-memory",
         }
         no_control = {
             "pipe-runner-open",
@@ -1689,7 +1737,7 @@ foreach ($case in $cases) {
             "job-breakaway",
             "nul-write-dac",
         }
-        expect_allowed = {"named-pipe-local", "walk-control-scratch", "control-self-memory"}
+        expect_allowed = {"named-pipe-local", "walk-control-scratch", "control-self-memory", "control-peer-memory"}
 
         def denial_codes(pattern):
             codes = {"err" + value for value in re.findall(r"err([0-9]+)", pattern)}
@@ -1877,23 +1925,57 @@ foreach ($case in $cases) {
         for path in (NATIVE, PROBE, WORKFLOW):
             self.assertNotIn("RegistryAccessRule", path.read_text(encoding="utf-8"))
 
-    def test_cleanup_asserts_no_container_process_is_alive_before_removing_trees(self):
-        count = self.function_body("Get-ContainerProcessCount")
-        self.assertIn("Test-PathUnder $path $base", count)
+    def test_cleanup_asserts_the_job_process_lists_are_empty_before_any_removal(self):
+        self.assertNotIn("Get-ContainerProcessCount", self.wrapper)
+        liveness = self.function_body("Get-JobLiveness")
+        for required in ("$sandbox.JobState($waitSeconds * 1000)", "return 'unknown'", "$state = 'alive'"):
+            with self.subTest(required=required):
+                self.assertIn(required, liveness)
+        for forbidden in (".Path", "Test-PathUnder", "ImageName", "Get-Process"):
+            self.assertNotIn(forbidden, liveness)
         tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
-        check = tail.index("Get-ContainerProcessCount $baseDirectory")
+        check = tail.index("Get-JobLiveness @($box, $script:OtherBox) 10")
+        self.assertLess(check, tail.index("Remove-Canaries"))
+        self.assertLess(check, tail.index("Remove-ChannelFixtures"))
         self.assertLess(check, tail.index("Remove-ReparsePoints $script:ProfileFolder"))
         self.assertLess(check, tail.index("Remove-TreeNoFollow $script:ProfileFolder"))
         self.assertLess(check, tail.index("Remove-TreeNoFollow $baseDirectory"))
         self.assertGreaterEqual(tail.count("$processState -eq 'none'"), 5)
-        self.assertIn("' processes=' + $processState", tail)
+        self.assertIn("' processes=' + $processState + ' liveness=job'", tail)
         self.assertIn("if ($processState -ne 'none') { $cleanup = 'incomplete' }", tail)
+        self.assertIn("$processState = 'unknown'", tail)
         self.assertEqual(len(re.findall(r"(?m)^try \{\n    Remove-(?:Canaries|ChannelFixtures)\n\} catch \{", tail)), 2)
 
-    def test_hosts_are_current_and_only_the_cache_endpoint_may_be_not_applicable(self):
+    def test_native_sandbox_keeps_every_job_handle_and_reports_the_assigned_process_count(self):
+        native = self.native
+        for required in (
+            "private readonly List<IntPtr> retainedJobs",
+            "RetainJob(ref job);",
+            "public string JobState(int waitMs)",
+            "JobObjectBasicProcessIdList = 3",
+            "Native.QueryInformationJobObject(job, JobObjectBasicProcessIdList, buffer, (uint)size, out returned)",
+            "ErrorMoreData = 234",
+            "return Marshal.ReadInt32(buffer, 0);",
+            'return alive ? "alive" : "none";',
+            'return "unknown";',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, native)
+        run = native[native.index("public RunResult Run("):native.index("private static IntPtr CreateJob")]
+        self.assertNotIn("CloseOne(ref job);", run)
+        self.assertLess(run.index("Native.TerminateJobObject(job, JobKillExitCode);\n                }\n                else if (process"), run.index("RetainJob(ref job);"))
+        dispose = native[native.index("public void Dispose()"):native.index("private void RetainJob")]
+        self.assertIn("Native.CloseHandle(retained);", dispose)
+
+    def test_hosts_are_current_and_every_not_applicable_path_is_pinned(self):
         wrapper = self.wrapper
         self.assertNotIn("artifactcache", wrapper)
-        self.assertIn("Get-ChannelHost 'ACTIONS_CACHE_URL' $resultsHost", wrapper)
+        context = self.function_body("Initialize-ChannelContext")
+        self.assertIn("$resultsFromEnv = Get-ChannelHost 'ACTIONS_RESULTS_URL' ''", context)
+        self.assertIn("$cacheFromEnv = Get-ChannelHost 'ACTIONS_CACHE_URL' ''", context)
+        self.assertIn("$cacheHost = $resultsHost\n    $cacheSource = 'results'", context)
+        self.assertIn("$cacheSource = 'env'", context)
+        self.assertIn("' results_host=' + $hostSource + ' cache_host=' + $cacheSource + ' results_ip='", context)
         self.assertIn("results-receiver.actions.githubusercontent.com", wrapper)
         self.assertNotIn("throw 'channel_host'", wrapper)
         lines = self.channel_attempt_lines()
@@ -1907,14 +1989,116 @@ foreach ($case in $cases) {
             {("runner_ipc", "pipe-runner-open"), ("runner_files", "diag-read"), ("cache_upload", "endpoint-post")},
         )
         na = {re.search(r"Name = '([a-z0-9-]+)'", line).group(1) for line in lines if "NaPattern" in line}
-        self.assertEqual(na, {"pipe-runner-open"})
+        self.assertEqual(na, {"pipe-runner-open", "control-peer-memory"})
+        control_na = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            for line in lines
+            if "ControlNa" in line
+        }
+        self.assertEqual(control_na, {"tls-ipv6"})
+        ipv6 = next(line for line in lines if "Name = 'tls-ipv6'" in line)
+        self.assertIn("ControlNa = '^resolve=ok connect=err(10047|10051)$|^resolve=empty$'", ipv6)
+        self.assertIn("Deny = '^resolve=ok connect=err10013$'", ipv6)
+        attempt = self.function_body("Invoke-ChannelAttempt")
+        self.assertIn("$attempt.ContainsKey('ControlNa')", attempt)
+        self.assertIn("$outcome.Control = 'na'", attempt)
         pipe = next(line for line in lines if "Name = 'pipe-runner-open'" in line)
         self.assertIn("NaPattern = '^open=err2$'", pipe)
         self.assertNotIn("231", re.search(r"NaPattern = '([^']*)'", pipe).group(1))
         self.assertNotIn("231", re.search(r"Deny = '([^']*)'", pipe).group(1))
-        attempt = self.function_body("Invoke-ChannelAttempt")
+        peer = next(line for line in lines if "Name = 'control-peer-memory'" in line)
+        self.assertIn("NaPattern = '^open=err5$'", peer)
+        self.assertIn("Deny = '^open=never$'", peer)
+        self.assertIn("Expect = 'allowed'", peer)
         self.assertIn("$attempt.ContainsKey('NaPattern') -or $optional", attempt)
-        self.assertIn("'not_applicable'", self.function_body("Get-AttemptResult"))
+        self.assertIn("'not_applicable'", self.function_body("Get-TextClass"))
+
+    def test_a_missing_runner_pipe_is_not_applicable_only_while_the_pipe_is_still_absent(self):
+        lines = self.channel_attempt_lines()
+        rechecked = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            for line in lines
+            if "NaRecheck" in line
+        }
+        self.assertEqual(rechecked, {"pipe-runner-open"})
+        pipe = next(line for line in lines if "Name = 'pipe-runner-open'" in line)
+        self.assertIn("NaRecheck = 'pipe'", pipe)
+        attempt = self.function_body("Invoke-ChannelAttempt")
+        recheck = (
+            "if ($result -ceq 'not_applicable' -and $attempt.ContainsKey('NaRecheck') "
+            "-and (Test-PipeListed (($arguments -split ' ')[1]))) { $result = 'other' }"
+        )
+        self.assertIn(recheck, attempt)
+        self.assertLess(attempt.index("Get-AttemptResult $run $command $attempt"), attempt.index(recheck))
+        self.assertLess(attempt.index(recheck), attempt.index("$results += $result"))
+        listed = self.function_body("Test-PipeListed")
+        self.assertIn("[System.IO.Directory]::GetFiles('\\\\.\\pipe\\')", listed)
+        self.assertIn("-ceq $leaf", listed)
+        self.assertIn("} catch {\n        return $true\n    }", listed)
+        self.assertTrue(listed.rstrip().endswith("return $false\n}"))
+
+    def test_a_channel_needs_a_gating_boundary_attempt_that_was_not_skipped(self):
+        phase = self.function_body("Invoke-ChannelPhase")
+        for required in (
+            "NotApplicable = 0; Boundary = 0;",
+            "$entry.NotApplicable += 1",
+            "elseif ($basis -ceq 'boundary' -and $attempt.Expect -cne 'allowed' -and $outcome.Reason -ceq 'none') {",
+            "$entry.Boundary += 1",
+            "if ($entry.Boundary -eq 0 -and $entry.Status -ceq 'blocked') {",
+            "' not_applicable=' + $entry.NotApplicable + ' boundary=' + $entry.Boundary + ' informational='",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, phase)
+        self.assertLess(phase.index("if ($informational) {"), phase.index("$entry.Attempts += 1"))
+        self.assertLess(phase.index("$entry.Attempts += 1"), phase.index("$entry.NotApplicable += 1"))
+        self.assertNotIn("if ($entry.Attempts -eq 0", phase)
+        gating = {}
+        for line in self.channel_attempt_lines():
+            channel = re.search(r"Channel = '([a-z_]+)'", line).group(1)
+            if "Informational = $true" in line or "Expect = 'allowed'" in line or "Basis = 'harness'" in line:
+                continue
+            if "Optional = $true" in line or "NaPattern" in line:
+                continue
+            gating.setdefault(channel, []).append(re.search(r"Name = '([a-z0-9-]+)'", line).group(1))
+        self.assertEqual(set(gating), set(LINUX_CHANNELS))
+        for channel, names in gating.items():
+            with self.subTest(channel=channel):
+                self.assertTrue(names)
+
+    def test_confined_self_deleting_creates_are_leaks_and_controls_stay_exact(self):
+        lines = self.channel_attempt_lines()
+        pattern = "ConfinedAllow = '^create=ok( delete=(err[0-9]+|hr[0-9a-f]{8}))?$'"
+        found = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            for line in lines
+            if "ConfinedAllow" in line
+        }
+        self.assertEqual(found, {"profile-create", "hklm-write", "hkcu-write"})
+        for line in lines:
+            if "ConfinedAllow" in line:
+                with self.subTest(line=line.strip()[:70]):
+                    self.assertIn(pattern, line)
+                    self.assertIn("Allow = '^create=ok$'", line)
+                    for text in ("create=ok", "create=ok delete=err5", "create=ok delete=hr80070005"):
+                        self.assertEqual(self.attempt_model(line, text), "allowed")
+                    for text in ("create=ok delete=", "create=ok delete=errx", "create=ok write=ok"):
+                        self.assertNotEqual(self.attempt_model(line, text), "allowed")
+        attempt = self.function_body("Invoke-ChannelAttempt")
+        self.assertIn("$controlAllow = [string]$attempt.Allow", attempt)
+        self.assertNotIn("ConfinedAllow", attempt)
+        self.assertIn("ConfinedAllow", self.function_body("Get-TextClass"))
+
+    def test_attempt_results_use_the_not_applicable_spelling_not_the_linux_na_token(self):
+        for name in ("Get-TextClass", "Get-AttemptResult", "Invoke-ChannelAttempt"):
+            body = self.function_body(name)
+            with self.subTest(function=name):
+                self.assertNotIn("'na'", body.replace("$outcome.Control = 'na'", ""))
+        tokens = set()
+        for name in ("Get-TextClass", "Get-AttemptResult", "Invoke-ChannelAttempt"):
+            tokens.update(re.findall(r"return '([a-z_]+)'", self.function_body(name)))
+            tokens.update(re.findall(r"\$outcome\.Result = '([a-z_]+)'", self.function_body(name)))
+        self.assertLessEqual(tokens, {"other", "allowed", "denied", "contained", "not_applicable"})
+        self.assertIn("not_applicable", tokens)
 
     def test_harness_invariants_and_console_attempt_are_labelled_and_never_boundary_evidence(self):
         lines = self.channel_attempt_lines()
@@ -1932,7 +2116,17 @@ foreach ($case in $cases) {
             for line in lines
             if "Informational = $true" in line
         }
-        self.assertEqual(informational, {"named-pipe-local", "conout-open"})
+        self.assertEqual(informational, {"named-pipe-local", "conout-open", "task-register", "wmi", "wfp"})
+        leak_guarded = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            for line in lines
+            if "LeakGuard = $true" in line
+        }
+        self.assertEqual(leak_guarded, {"task-register", "wmi", "wfp"})
+        for line in lines:
+            if "LeakGuard" in line:
+                self.assertIn("Informational = $true", line)
+                self.assertIn("Expect = 'denied'", line)
         self.assertIn("' basis=' + $basis", self.function_body("Invoke-ChannelPhase"))
 
     def test_probe_buffers_and_deletes_are_exact(self):
@@ -2033,24 +2227,49 @@ foreach ($case in $cases) {
         self.assertEqual(probe.count("DeleteAppContainerProfile(name.as_ptr())"), 1)
         self.assertEqual(probe.count("RegDeleteKeyW(root, sub.as_ptr())"), 1)
 
-    def test_cleanup_never_follows_reparse_points(self):
-        for name in ("Remove-TreeNoFollow", "Remove-ReparsePoints"):
+    def test_cleanup_deletes_by_handle_and_never_traverses_reparse_points(self):
+        for name, native_name in (("Remove-TreeNoFollow", "Remove"), ("Remove-ReparsePoints", "RemoveLinks")):
             body = self.function_body(name)
             with self.subTest(function=name):
-                for required in ("[System.IO.File]::GetAttributes(", "-band 1024", "GetFileSystemEntries(", "[System.IO.Directory]::Delete("):
-                    self.assertIn(required, body)
-                for forbidden in ("Remove-Item", "-Recurse", "Get-ChildItem", "Delete($path, $true)", "Delete($child, $true)", "robocopy", "rmdir", "cmd.exe"):
+                self.assertIn("[KeelDock.Platform.WindowsConfinement.HandleRemover]::" + native_name + "($path)", body)
+                for forbidden in ("Remove-Item", "-Recurse", "Get-ChildItem", "GetFileSystemEntries", "[System.IO.Directory]::Delete", "[System.IO.File]::Delete", "SetAttributes", "robocopy", "rmdir", "cmd.exe"):
                     self.assertNotIn(forbidden, body)
-                recursion = "Remove-TreeNoFollow $child" if name == "Remove-TreeNoFollow" else "Remove-ReparsePoints $child"
-                self.assertLess(body.index("-band 1024"), body.index(recursion))
         self.assertNotIn("Remove-Item", self.wrapper)
-        tree = self.function_body("Remove-TreeNoFollow")
-        self.assertLess(tree.index("[System.IO.Directory]::Delete($path, $false) } else"), tree.index("foreach ($child in"))
-        self.assertNotIn("FileAttributes]::Normal", tree)
-        self.assertNotIn("FileAttributes]::Directory", tree)
-        self.assertEqual(tree.count("($attributes -band (-bnot 1))"), 2)
-        self.assertIn("if ($linkType -cne 'HardLink')", tree)
-        self.assertLess(tree.index("$linkType = "), tree.index("[System.IO.File]::Delete($path)\n}"))
+        self.assertNotIn("GetFileSystemEntries", self.wrapper)
+        self.assertNotIn("[System.IO.Directory]::Delete", self.wrapper)
+        self.assertNotIn("[System.IO.File]::Delete($path)", self.wrapper)
+        native = self.native
+        remover = native[native.index("public static class HandleRemover"):native.index("public sealed class Sandbox")]
+        for required in (
+            "FlagBackupSemantics = 0x02000000",
+            "FlagOpenReparsePoint = 0x00200000",
+            "AttributeReparsePoint = 0x00000400",
+            "ClassDispositionInfoEx = 21",
+            "DispositionDeletePosixIgnoreReadOnly = 0x13",
+            "ClassFullDirectoryRestartInfo = 15",
+            "uint flags = FlagBackupSemantics | FlagOpenReparsePoint;",
+            "Native.CreateFileW(path, access, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero)",
+            "Native.SetFileInformationByHandle(handle, ClassDispositionInfoEx, buffer, 4)",
+            "Native.GetFileInformationByHandleEx(handle, infoClass, buffer, (uint)DirectoryBufferBytes)",
+            'return "\\\\\\\\?\\\\" + path.TrimEnd(\'\\\\\');',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, remover)
+        self.assertNotIn("ShareDelete", remover)
+        for forbidden in ("Directory.Delete", "File.Delete", "Directory.GetFiles", "Directory.EnumerateFileSystemEntries", "DeleteFileW", "RemoveDirectoryW", "FindFirstFile", "Process.Start"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, remover)
+        entry = remover[remover.index("private static void RemoveEntry"):remover.index("private static class Native")]
+        self.assertLess(entry.index("ReadInformation(handle, out attributes, out links);"), entry.index("(attributes & AttributeReparsePoint) != 0"))
+        self.assertLess(entry.index("(attributes & AttributeReparsePoint) != 0"), entry.index("ListEntries(handle, names, kinds);"))
+        reparse = entry[entry.index("(attributes & AttributeReparsePoint) != 0"):entry.index("(attributes & AttributeDirectory) != 0")]
+        self.assertIn("DeleteByHandle(handle, attributes, links);\n                    return;", reparse)
+        self.assertNotIn("RemoveEntry(", reparse)
+        self.assertIn("if (linksOnly && plain)", entry)
+        self.assertIn("if (depth > MaxDepth)", entry)
+        delete = remover[remover.index("private static void DeleteByHandle"):remover.index("private static void RemoveEntry")]
+        self.assertIn("(attributes & AttributeReadOnly) != 0 && links <= 1 && (attributes & AttributeReparsePoint) == 0", delete)
+        self.assertIn('throw new InvalidOperationException("remove_failed step=delete error="', delete)
         self.assertIn("Remove-TreeNoFollow $item", self.function_body("Remove-Canaries"))
         tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
         self.assertLess(tail.index("Remove-ReparsePoints $script:ProfileFolder"), tail.index("$box.Dispose()"))
@@ -2063,9 +2282,12 @@ foreach ($case in $cases) {
             "[IO.File]::ReadAllText($script:TrapSentinel) -cne 'kd-sentinel'",
             "Remove-TreeNoFollow $script:TrapDirectory",
             "' links=' + $linksState",
+            "Write-CleanupDetail 'trap' $_",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, tail)
+        detail = self.function_body("Write-CleanupDetail")
+        self.assertIn("Get-CleanText $message 160", detail)
 
     def test_link_fixtures_plant_junctions_and_symlinks_inside_container_writable_trees(self):
         body = self.function_body("Initialize-LinkFixtures")
@@ -2092,6 +2314,7 @@ foreach ($case in $cases) {
             self.skipTest("junction cleanup runs in Windows CI")
         body = (
             "$ErrorActionPreference = 'Stop'\n"
+            + "Add-Type -Path '" + str(NATIVE) + "'\n"
             + self.function_body("Remove-TreeNoFollow")
             + "\n"
             + self.function_body("Remove-ReparsePoints")
@@ -2111,6 +2334,10 @@ foreach ($case in $cases) {
             "    $symlinks = 0\n"
             "    try { New-Item -ItemType SymbolicLink -Path (Join-Path $tree 'symdir') -Value $trap | Out-Null; $symlinks += 1 } catch { }\n"
             "    try { New-Item -ItemType SymbolicLink -Path (Join-Path $tree 'symfile') -Value $sentinel | Out-Null; $symlinks += 1 } catch { }\n"
+            "    $shared = Join-Path $root 'shared.txt'\n"
+            "    [IO.File]::WriteAllText($shared, 'shared')\n"
+            "    [IO.File]::SetAttributes($shared, [System.IO.FileAttributes]::ReadOnly)\n"
+            "    New-Item -ItemType HardLink -Path (Join-Path $tree 'nested\\hard.txt') -Value $shared | Out-Null\n"
             "    Remove-ReparsePoints $tree\n"
             "    if (-not (Test-Path -LiteralPath $sentinel)) { throw 'links_pass_followed' }\n"
             "    if (Test-Path -LiteralPath (Join-Path $tree 'junction')) { throw 'junction_left' }\n"
@@ -2121,6 +2348,8 @@ foreach ($case in $cases) {
             "    if (Test-Path -LiteralPath $tree) { throw 'tree_left' }\n"
             "    if (-not (Test-Path -LiteralPath $sentinel)) { throw 'tree_followed' }\n"
             "    if ([IO.File]::ReadAllText($sentinel) -cne 'kd-sentinel') { throw 'sentinel_changed' }\n"
+            "    if (-not (Test-Path -LiteralPath $shared)) { throw 'shared_removed' }\n"
+            "    if (([int][IO.File]::GetAttributes($shared) -band 1) -eq 0) { throw 'shared_attributes_changed' }\n"
             "    Write-Output ('cleanup-links=verified symlinks=' + $symlinks)\n"
             "} finally {\n"
             "    if (Test-Path -LiteralPath $root) { Remove-ReparsePoints $root; Remove-TreeNoFollow $root }\n"
@@ -2133,7 +2362,465 @@ foreach ($case in $cases) {
         for forbidden in ("DebugActiveProcess", "CoCreateInstance", "FwpmEngineOpen", "OpenSCManager", "RegisterEventSource", "schtasks"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.wrapper)
-        self.assertIn("-band 1024", self.wrapper)
+        self.assertIn("HandleRemover", self.wrapper)
+        self.assertNotIn("-band 1024", self.wrapper)
+
+    def test_gate_four_attempts_use_closed_probe_forms_and_unverified_codes_stay_informational(self):
+        import uuid
+
+        probe = self.probe
+        words = {
+            "taskreg_clsid": ("0F87369F-A4E5-4CFC-BD3E-73E6154572DD", "let clsid: [u32; 4] = [{}];"),
+            "taskreg_iid": ("2FABA4C7-4DA9-4013-9697-20CC3FD40F85", "let iid: [u32; 4] = [{}];"),
+            "wmi_clsid": ("4590F811-1D3A-11D0-891F-00AA004B2E24", "let clsid: [u32; 4] = [{}];"),
+            "wmi_iid": ("DC12A687-737F-11CF-884D-00AA004B2E24", "let iid: [u32; 4] = [{}];"),
+        }
+        for name, (guid, template) in words.items():
+            raw = uuid.UUID(guid).bytes_le
+            values = [int.from_bytes(raw[index:index + 4], "little") for index in range(0, 16, 4)]
+            text = ", ".join("0x{:08X}".format(value) for value in values)
+            with self.subTest(guid=name):
+                self.assertIn(template.format(text), probe)
+        task = probe[probe.index("fn probe_taskreg"):probe.index("fn probe_wmi")]
+        wmi = probe[probe.index("fn probe_wmi"):probe.index("fn probe_wfp")]
+        wfp = probe[probe.index("fn probe_wfp"):probe.index("fn probe_procpeer")]
+        peer = probe[probe.index("fn probe_procpeer"):probe.index("fn main")]
+        self.assertIn("vtable_entry(object, 10)", task)
+        self.assertIn("*const u8, *const u8, *const u8, *const u8) -> i32", task)
+        self.assertIn('format!("create=ok connect=hr{:08x}", connected as u32)', task)
+        self.assertIn("vtable_entry(object, 3)", wmi)
+        self.assertIn('SysAllocString(namespace.as_ptr())', wmi)
+        self.assertIn('wide("ROOT\\\\CIMV2")', wmi)
+        self.assertIn("FwpmEngineOpen0(ptr::null(), 10, ptr::null_mut(), ptr::null(), &mut engine)", wfp)
+        self.assertIn('format!("open=err{}", status)', wfp)
+        self.assertIn("FwpmEngineClose0(engine)", wfp)
+        self.assertIn("command.arg(\"peerwait\");", peer)
+        self.assertIn("OpenProcess(0x1010, 0, child.id())", peer)
+        self.assertIn("drop(child.stdin.take());", peer)
+        self.assertLess(peer.index("OpenProcess(0x1010, 0, child.id())"), peer.index("drop(child.stdin.take());"))
+        for body in (task, wmi, wfp, peer):
+            for forbidden in ("ReadProcessMemory", "WriteProcessMemory", "RegisterTaskDefinition", "CreateService", "FwpmFilterAdd", "FwpmTransactionBegin"):
+                self.assertNotIn(forbidden, body)
+        self.assertEqual(probe.count("CoCreateInstance("), 3)
+        for library in ("ole32", "oleaut32", "fwpuclnt"):
+            self.assertIn("-l " + library + " ", self.wrapper)
+        lines = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1): line
+            for line in self.channel_attempt_lines()
+        }
+        for name, command in (("task-register", "taskreg"), ("wmi", "wmi"), ("wfp", "wfp")):
+            with self.subTest(attempt=name):
+                line = lines[name]
+                self.assertIn("Channel = 'boundary_disablement'", line)
+                self.assertIn("Informational = $true; LeakGuard = $true", line)
+                self.assertIn("Runs = @('" + command + "'); ControlRuns = @('" + command + "')", line)
+        self.assertIn("Channel = 'process_memory'", lines["control-peer-memory"])
+        self.assertEqual(self.attempt_model(lines["wmi"], "create=ok connect=hr80041003"), "denied")
+        self.assertEqual(self.attempt_model(lines["wmi"], "create=ok connect=hr80070005"), "denied")
+        self.assertEqual(self.attempt_model(lines["task-register"], "create=ok connect=hr80041003"), "other")
+        self.assertEqual(self.attempt_model(lines["task-register"], "create=ok connect=ok"), "allowed")
+        self.assertEqual(self.attempt_model(lines["wfp"], "open=err1722"), "other")
+
+    def test_a_leak_on_a_leak_guarded_informational_attempt_still_fails_the_channel(self):
+        phase = self.function_body("Invoke-ChannelPhase")
+        guard = (
+            "if ($attempt.ContainsKey('LeakGuard') -and $outcome.Reason -ceq 'channel_leak' -and $entry.Status -ceq 'blocked') {\n"
+            "                $entry.Status = 'observed-leak'\n"
+            "                $entry.Reason = 'channel_leak'\n"
+            "            }\n"
+            "            continue"
+        )
+        self.assertIn(guard, phase)
+        self.assertLess(phase.index("$entry.Informational += 1"), phase.index(guard))
+        self.assertLess(phase.index(guard), phase.index("$entry.Attempts += 1"))
+
+    FIXTURE_RUST = (
+        "net-external",
+        "net-loopback",
+        "dns-lookup",
+        "read-canary",
+        "write-escape",
+        "env-hunt",
+        "pipe-open",
+        "child-network",
+        "child-write",
+        "output-exfil",
+    )
+    FIXTURE_NODE = (
+        "net-external",
+        "net-loopback",
+        "dns-lookup",
+        "read-canary",
+        "write-escape",
+        "env-hunt",
+        "pipe-open",
+        "output-exfil",
+        "spawn-pipe",
+    )
+    FIXTURE_SAME_AS_CHANNEL = {
+        "net-external": ("https", "tls-ipv4"),
+        "net-loopback": ("proxy", "proxy-connect"),
+        "dns-lookup": ("dns", "getaddrinfo"),
+        "read-canary": ("runner_files", "canary-reads"),
+        "write-escape": ("artifact_upload", "staging-write"),
+        "env-hunt": ("artifact_upload", "env-hunt"),
+        "pipe-open": ("runner_ipc", "pipe-existing-open"),
+        "child-network": ("https", "tls-ipv4"),
+        "child-write": ("artifact_upload", "staging-write"),
+    }
+
+    def fixture_attempt_lines(self, node):
+        body = self.function_body("Get-FixtureAttempts")
+        head, tail = body.split("    } else {", 1)
+        text = head if node else tail
+        return [line for line in text.splitlines() if line.strip().startswith("$attempts += @{")]
+
+    def fixture_source(self, name):
+        found = re.search(r"^\$" + name + r" = @'\n(.*?)\n'@$", self.wrapper, re.S | re.M)
+        self.assertIsNotNone(found, name)
+        return found.group(1)
+
+    def test_fixture_forms_mirror_the_linux_forms_and_every_form_has_a_control(self):
+        forms = re.search(r"^\$FixtureForms = @\((.*)\)$", self.wrapper, re.M)
+        self.assertEqual(tuple(re.findall(r"'([a-z_]+)'", forms.group(1))), ("build_rs", "test", "binary", "node_install"))
+        rust = self.fixture_source("FixtureRustText")
+        node = self.fixture_source("FixtureNodeText")
+        for text in (rust, node):
+            self.assertTrue(text.isascii())
+            self.assertNotIn(chr(35), text)
+        self.assertEqual(tuple(re.findall(r'report\("([a-z-]+)"', rust)), self.FIXTURE_RUST)
+        self.assertEqual(tuple(re.findall(r"report\('([a-z-]+)'", node)), (self.FIXTURE_NODE[-1],) + self.FIXTURE_NODE[:-1])
+        for required in (
+            "TcpStream::connect_timeout(&addresses[0], Duration::from_secs(8))",
+            "(host, 443u16).to_socket_addrs()",
+            "OpenOptions::new().write(true).create_new(true).open(path)",
+            "Command::new(&probe).args(arguments).output()",
+            'println!("::debug::kd-fx-marker");',
+            'eprintln!("::debug::kd-fx-marker");',
+            'report("output-exfil", "text=ok");',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, rust)
+        for required in (
+            "net.connect(options)",
+            "fs.openSync(path, 'wx')",
+            "stdio: 'pipe'",
+            "if (mode === 'spawn-pipe') {",
+            "process.exit(0);",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, node)
+        spawn_branch = node[node.index("if (mode === 'spawn-pipe') {"):node.index("report('net-external'")]
+        self.assertIn("process.exit(0);", spawn_branch)
+        self.assertEqual(node.count("spawnSync("), 1)
+        for forbidden in ("child_process.exec", "fork(", "eval(", "Function("):
+            self.assertNotIn(forbidden, node)
+        sources = self.function_body("Initialize-FixtureSources")
+        for required in (
+            "$sources['build_rs\\build.rs'] = $mainText",
+            "$sources['build_rs\\src\\main.rs'] = \"fn main() {}`n\"",
+            "$sources['test\\src\\lib.rs'] = $libText",
+            "$sources['binary\\src\\main.rs'] = $mainText",
+            "$sources['node_install\\install.js'] = $nodeText",
+            "$sources['node_install\\package.json'] = $FixtureNodePackage",
+            ".Replace('KDHASH', $hash)",
+            "foreach ($set in @($script:Lpac, $script:Control)) {",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, sources)
+        for forbidden in ("Grant-", "icacls", "SetAccessControl", "Set-Acl"):
+            self.assertNotIn(forbidden, sources)
+        self.assertIn('"scripts":{"postinstall":"node install.js"}', self.wrapper)
+        order = (
+            "[IO.File]::WriteAllText($layout.NodeChild,",
+            "Initialize-FixtureSources\n",
+            "$phase = 'canaries'",
+        )
+        positions = [self.wrapper.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_fixture_attempts_use_the_channel_suite_codes_and_no_generic_code(self):
+        channel = {}
+        for line in self.channel_attempt_lines():
+            key = (
+                re.search(r"Channel = '([a-z_]+)'", line).group(1),
+                re.search(r"Name = '([a-z0-9-]+)'", line).group(1),
+            )
+            channel[key] = (
+                re.search(r"(?<![A-Za-z])Allow = '([^']*)'", line).group(1),
+                re.search(r"Deny = '([^']*)'", line).group(1),
+                re.search(r"Expect = '([a-z]+)'", line).group(1),
+            )
+        for node, expected in ((False, self.FIXTURE_RUST), (True, self.FIXTURE_NODE)):
+            lines = self.fixture_attempt_lines(node)
+            names = tuple(re.search(r"Name = '([a-z0-9-]+)'", line).group(1) for line in lines)
+            with self.subTest(node=node):
+                self.assertEqual(names, expected)
+            for line in lines:
+                name = re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+                allow = re.search(r"(?<![A-Za-z])Allow = '([^']*)'", line).group(1)
+                deny = re.search(r"Deny = '([^']*)'", line).group(1)
+                expect = re.search(r"Expect = '([a-z]+)'", line).group(1)
+                with self.subTest(node=node, attempt=name):
+                    self.assertTrue(line.isascii())
+                    for pattern in (allow, deny):
+                        for piece in re.sub(r"\([^)]*\)", "G", pattern).split("|"):
+                            self.assertTrue(piece.startswith("^") and piece.endswith("$"), pattern)
+                    self.assertIn(expect, ("denied", "contained"))
+                    if not node and name in self.FIXTURE_SAME_AS_CHANNEL:
+                        self.assertEqual((allow, deny, expect), channel[self.FIXTURE_SAME_AS_CHANNEL[name]])
+                    if not node:
+                        codes = {"err" + value for value in re.findall(r"err([0-9]+)", deny)}
+                        for group in re.findall(r"err\(([0-9|]+)\)", deny):
+                            codes.update("err" + item for item in group.split("|"))
+                        self.assertLessEqual(codes, DENIAL_CODES)
+                    else:
+                        codes = set(re.findall(r"E[A-Z_]+", deny))
+                        gating = "Informational" not in line
+                        self.assertLessEqual(codes, {"EACCES", "EPERM", "ENOENT"} if gating else {"EAI_FAIL"})
+                        self.assertNotIn(".*", deny)
+        informational = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            for line in self.fixture_attempt_lines(True) + self.fixture_attempt_lines(False)
+            if "Informational = $true" in line
+        }
+        self.assertEqual(informational, {"dns-lookup", "spawn-pipe"})
+        for line in self.fixture_attempt_lines(True):
+            if "Informational" in line:
+                self.assertIn("LeakGuard = $true", line)
+        spawn = next(line for line in self.fixture_attempt_lines(True) if "Name = 'spawn-pipe'" in line)
+        self.assertIn("Separate = $true", spawn)
+        self.assertIn("Allow = '^spawn=ok$'", spawn)
+        markers = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            for line in self.fixture_attempt_lines(True) + self.fixture_attempt_lines(False)
+            if "Marker = $true" in line
+        }
+        self.assertEqual(markers, {"output-exfil"})
+        harness = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            for line in self.fixture_attempt_lines(False)
+            if "Basis = 'harness'" in line
+        }
+        self.assertEqual(harness, {"env-hunt", "output-exfil"})
+
+    def test_fixtures_run_confined_after_the_selftest_and_before_the_recheck_and_gate_the_summary(self):
+        wrapper = self.wrapper
+        order = (
+            "$channelsBefore = Invoke-ChannelPhase $box 'selftest' $true",
+            "$phase = 'fixtures'\n        $fixtureState = Invoke-FixturePhase $box",
+            "$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac",
+            "$channelsAfter = Invoke-ChannelPhase $box 'recheck' $false",
+            "$observed['fixtures'] = $fixtureState",
+        )
+        positions = [wrapper.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(wrapper.count("Invoke-FixturePhase $box"), 1)
+        self.assertEqual(wrapper.count("Invoke-ChannelPhase $box 'selftest'"), 1)
+        phase = self.function_body("Invoke-FixturePhase")
+        for required in (
+            "windows-confinement-fixture=' + $form + ' status='",
+            "windows-confinement-fixtures=' + $state + ' forms='",
+            "$state = 'observed-leak'",
+            "if ($state -cne 'observed-leak' -and $contained -ne $FixtureForms.Count) { $state = 'refused' }",
+            "' controlled=' + $controlled + ' uncontrolled=0'",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, phase)
+        form = self.function_body("Invoke-FixtureForm")
+        control = form.index("Invoke-FixtureRun $sandbox $form $false ''")
+        confined = form.index("Invoke-FixtureRun $sandbox $form $true ''")
+        self.assertLess(control, confined)
+        self.assertLess(form.index("Set-FixtureRefusal $report 'refused' 'control_not_fired'"), confined)
+        for required in (
+            "Test-ChannelRunValid $control $false",
+            "Test-ChannelRunValid $run $true",
+            "Set-FixtureRefusal $report 'refused' 'fixture_incomplete'",
+            "Set-FixtureRefusal $report 'observed-leak' 'fixture_allowed'",
+            "Set-FixtureRefusal $report 'refused' 'attempt_unexpected'",
+            "if ($names -cnotcontains [string]$seen) {",
+            "$result = Get-TextClass $text $attempt",
+            "if ($result -ceq [string]$attempt.Expect) { continue }",
+            "-cnotmatch ':'",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, form)
+        self.assertIn("return $report", form)
+        refusal = self.function_body("Set-FixtureRefusal")
+        self.assertIn("$upgrade = ($status -ceq 'observed-leak') -and ($report.Status -cne 'observed-leak')", refusal)
+        separate = self.function_body("Invoke-FixtureSeparate")
+        self.assertLess(separate.index("Invoke-FixtureRun $sandbox $form $false $attempt.Name"), separate.index("Invoke-FixtureRun $sandbox $form $true $attempt.Name"))
+        self.assertIn("if ($result -ceq 'allowed' -and $control -ceq 'fired') { Set-FixtureRefusal $report 'observed-leak' 'fixture_allowed' }", separate)
+        self.assertIn("$hang = 'busy'", separate)
+        self.assertIn("([uint64]$run.CpuMs * 10) -ge ([uint64]$run.ElapsedMs * 8)", separate)
+
+    def test_fixture_runs_use_the_stage_environment_offline_and_only_trusted_values(self):
+        body = self.function_body("Invoke-FixtureRun")
+        for required in (
+            "$scratch = $script:Lpac",
+            "New-StageEnvironment $scratch ('target-fx-' + $form)",
+            "if (-not $confined) { $environment = [string[]]($environment + $FixtureSentinelEnvironment) }",
+            "'build -vv --offline --manifest-path '",
+            "'test --offline --manifest-path '",
+            "' -- --nocapture'",
+            "'run --offline --manifest-path '",
+            "$sandbox.Run($confined, $exe,",
+            "$pipe = New-TrustedPipe $pipeName",
+            "$pipe.Dispose()",
+            "throw 'fixture_form'",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        names = re.findall(r"'(KD_[A-Z_]+)='", body)
+        self.assertEqual(set(names), {"KD_PROBE", "KD_FX_NONCE", "KD_FX_PORT", "KD_FX_TEMP", "KD_FX_CANARY", "KD_FX_PIPE"})
+        for name in names:
+            self.assertFalse(name.startswith(("ACTIONS_", "GITHUB_", "RUNNER_")))
+        sentinel = self.top_level_line("FixtureSentinelEnvironment")
+        for name in re.findall(r"'([A-Z_]+)=kd-sentinel'", sentinel):
+            self.assertTrue(name.startswith(("ACTIONS_", "GITHUB_", "RUNNER_")))
+        self.assertNotIn("PROXY", sentinel)
+        self.assertNotIn("$script:Control, ", body)
+        for name in (
+            "$FixtureCargoSeconds",
+            "$FixtureNodeSeconds",
+            "$FixtureSpawnSeconds",
+        ):
+            self.assertIn(name, body)
+        for forbidden in ("Start-Process", "Invoke-Expression"):
+            self.assertNotIn(forbidden, body)
+
+    FIXTURE_BANK = {
+        "net-external": ("resolve=ok connect=open", "resolve=ok connect=err10013", "resolve=ok connect=err10061", "resolve=err11003", ""),
+        "net-loopback": ("resolve=ok connect=open", "resolve=ok connect=err10013", "resolve=ok connect=err10061", "resolve=empty"),
+        "dns-lookup": ("resolve=ok count=2", "resolve=ok count=0", "resolve=err11003", "resolve=err10013", "resolve=err11001"),
+        "read-canary": ("open=ok read=ok bytes=16", "open=err5", "open=err2", "open=err3", "open=err32", "open=ok read=err5"),
+        "write-escape": ("create=ok write=ok", "create=err5", "create=err80", "create=ok write=err5"),
+        "env-hunt": ("found=0", "found=3", "found=usage"),
+        "pipe-open": ("open=ok", "open=err5", "open=err2", "open=err231"),
+        "child-network": ("resolve=ok connect=open", "resolve=ok connect=err10013", "child=err5", "child=noline"),
+        "child-write": ("create=ok write=ok", "create=err5", "child=err5"),
+    }
+    FIXTURE_NODE_BANK = {
+        "net-external": ("connect=open", "connect=EACCES", "connect=ECONNREFUSED", "connect=timeout", "connect=EPERM"),
+        "net-loopback": ("connect=open", "connect=EACCES", "connect=ECONNREFUSED"),
+        "dns-lookup": ("resolve=ok", "resolve=EAI_FAIL", "resolve=ENOTFOUND", "resolve=timeout"),
+        "read-canary": ("open=ok read=ok bytes=16", "open=EPERM", "open=ENOENT", "open=EBUSY", "open=ok read=EPERM"),
+        "write-escape": ("create=ok write=ok", "create=EPERM", "create=EEXIST", "create=EACCES"),
+        "env-hunt": ("found=0", "found=2"),
+        "pipe-open": ("open=ok", "open=EPERM", "open=ENOENT"),
+        "spawn-pipe": ("spawn=ok", "spawn=ETIMEDOUT", "spawn=fail"),
+    }
+
+    def test_fixture_classifier_matches_the_python_model_under_pwsh(self):
+        if shutil.which("pwsh") is None:
+            self.skipTest("pwsh is not available")
+        cases = []
+        for form, bank in (("build_rs", self.FIXTURE_BANK), ("node_install", self.FIXTURE_NODE_BANK)):
+            for name, texts in bank.items():
+                for text in texts:
+                    cases.append((form, name, text))
+        entries = ",\n".join("    @('" + form + "', '" + name + "', '" + text + "')" for form, name, text in cases)
+        body = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.function_body("Get-TextClass")
+            + "\n"
+            + self.function_body("Get-FixtureAttempts")
+            + "\n$cases = @(\n"
+            + entries
+            + "\n)\n"
+            + "foreach ($case in $cases) {\n"
+            + "    foreach ($attempt in @(Get-FixtureAttempts $case[0])) {\n"
+            + "        if ($attempt.Name -cne $case[1]) { continue }\n"
+            + "        Write-Output ($case[0] + '/' + $case[1] + '|' + $case[2] + '|' + (Get-TextClass $case[2] $attempt))\n"
+            + "    }\n"
+            + "}\n"
+        )
+        output = self.run_pwsh(body)
+        rows = [line.split("|") for line in output.splitlines() if line.count("|") == 2]
+        self.assertEqual(len(rows), len(cases))
+        lines = {}
+        for node in (False, True):
+            for line in self.fixture_attempt_lines(node):
+                lines[("node_install" if node else "build_rs") + "/" + re.search(r"Name = '([a-z0-9-]+)'", line).group(1)] = line
+        for key, text, result in rows:
+            with self.subTest(attempt=key, text=text):
+                self.assertEqual(result, self.attempt_model(lines[key], text))
+        results = {(key, text): result for key, text, result in rows}
+        self.assertEqual(results[("build_rs/net-external", "resolve=ok connect=err10013")], "denied")
+        self.assertEqual(results[("build_rs/net-external", "resolve=ok connect=err10061")], "other")
+        self.assertEqual(results[("build_rs/write-escape", "create=err5")], "contained")
+        self.assertEqual(results[("build_rs/write-escape", "create=ok write=ok")], "allowed")
+        self.assertEqual(results[("build_rs/env-hunt", "found=0")], "contained")
+        self.assertEqual(results[("build_rs/pipe-open", "open=err231")], "other")
+        self.assertEqual(results[("build_rs/child-network", "child=err5")], "other")
+        self.assertEqual(results[("node_install/net-external", "connect=EACCES")], "denied")
+        self.assertEqual(results[("node_install/net-external", "connect=EPERM")], "other")
+        self.assertEqual(results[("node_install/spawn-pipe", "spawn=ok")], "allowed")
+        self.assertEqual(results[("node_install/spawn-pipe", "spawn=fail")], "other")
+        self.assertEqual(results[("node_install/dns-lookup", "resolve=ok")], "allowed")
+        self.assertEqual(results[("node_install/dns-lookup", "resolve=ENOTFOUND")], "other")
+
+    def fixture_line_model(self, text):
+        pattern = re.compile(r"^(?:\[[A-Za-z0-9_.+-]{1,40} [0-9][A-Za-z0-9_.+-]{0,20}\] )?KDATT ([a-z0-9-]{1,40}) ([A-Za-z0-9_=. -]{1,100})$")
+        items = {}
+        valid = True
+        for line in text.split("\n"):
+            trimmed = line.strip()
+            if "KDATT " not in trimmed:
+                continue
+            found = pattern.match(trimmed)
+            if not found or found.group(1) in items:
+                valid = False
+                continue
+            items[found.group(1)] = found.group(2)
+        return valid, items
+
+    def test_fixture_line_parser_is_strict_and_matches_the_python_model_under_pwsh(self):
+        if shutil.which("pwsh") is None:
+            self.skipTest("pwsh is not available")
+        cases = (
+            "KDATT net-external resolve=ok connect=err10013",
+            "[kd_fx 0.1.0] KDATT read-canary open=err5\\nKDATT env-hunt found=0",
+            "KDATT a open=ok\\nKDATT a open=err5",
+            "KDATT net-external resolve=ok connect=err10013 extra!",
+            "prefix KDATT net-external resolve=ok connect=err10013",
+            "KDATT NET open=ok",
+            "noise only\\nrunning 1 test",
+            "KDATT write-escape create=err5\\r\\nKDATT output-exfil text=ok",
+        )
+        entries = ",\n".join("    '" + case + "'" for case in cases)
+        body = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + self.function_body("Get-FixtureLines")
+            + "\n$cases = @(\n"
+            + entries
+            + "\n)\n"
+            + "foreach ($case in $cases) {\n"
+            + "    $text = $case.Replace('\\n', \"`n\").Replace('\\r', \"`r\")\n"
+            + "    $parsed = Get-FixtureLines $text\n"
+            + "    $keys = (@($parsed.Items.Keys) | Sort-Object) -join ','\n"
+            + "    Write-Output ($case + '|' + $parsed.Valid.ToString().ToLowerInvariant() + '|' + $keys)\n"
+            + "}\n"
+        )
+        output = self.run_pwsh(body)
+        rows = [line.split("|") for line in output.splitlines() if line.count("|") == 2]
+        self.assertEqual(len(rows), len(cases))
+        for (case, valid, keys), expected in zip(rows, cases):
+            text = expected.replace("\\n", "\n").replace("\\r", "\r")
+            model_valid, model_items = self.fixture_line_model(text)
+            with self.subTest(case=case):
+                self.assertEqual(valid, str(model_valid).lower())
+                self.assertEqual(keys, ",".join(sorted(model_items)))
+        self.assertEqual(self.fixture_line_model("KDATT a x=1\nKDATT a x=2")[0], False)
+
+    def test_fixture_budget_is_part_of_the_worst_case_and_the_timeout_is_justified(self):
+        budget = self.fixture_budget()
+        self.assertEqual(budget, 2 * 3 * 243 + 2 * 63 + 2 * 33)
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        template = (ROOT / "kit/bootstrap/policy_windows.py").read_text(encoding="utf-8")
+        self.assertIn("    timeout-minutes: 220\n", workflow)
+        self.assertEqual(template.count("    timeout-minutes: 220\n"), 1)
+        self.assertNotIn("    timeout-minutes: 200\n", workflow + template)
 
 
 if __name__ == "__main__":

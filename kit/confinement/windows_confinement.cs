@@ -497,6 +497,304 @@ namespace KeelDock.Platform.WindowsConfinement
         }
     }
 
+    public static class HandleRemover
+    {
+        private const uint Delete = 0x00010000;
+        private const uint Synchronize = 0x00100000;
+        private const uint FileListDirectory = 0x00000001;
+        private const uint FileReadAttributes = 0x00000080;
+        private const uint FileWriteAttributes = 0x00000100;
+        private const uint ShareRead = 0x00000001;
+        private const uint ShareWrite = 0x00000002;
+        private const uint OpenExisting = 3;
+        private const uint FlagBackupSemantics = 0x02000000;
+        private const uint FlagOpenReparsePoint = 0x00200000;
+        private const uint AttributeReadOnly = 0x00000001;
+        private const uint AttributeDirectory = 0x00000010;
+        private const uint AttributeReparsePoint = 0x00000400;
+        private const int ClassBasicInfo = 0;
+        private const int ClassDispositionInfo = 4;
+        private const int ClassFullDirectoryInfo = 14;
+        private const int ClassFullDirectoryRestartInfo = 15;
+        private const int ClassDispositionInfoEx = 21;
+        private const uint DispositionDeletePosixIgnoreReadOnly = 0x13;
+        private const uint DispositionDeleteIgnoreReadOnly = 0x11;
+        private const int ErrorSharingViolation = 32;
+        private const int ErrorNoMoreFiles = 18;
+        private const int MaxDepth = 64;
+        private const int MaxOpenRetries = 25;
+        private const int DirectoryBufferBytes = 65536;
+        private const int NameOffset = 68;
+        private const int NameLengthOffset = 60;
+        private const int AttributesOffset = 56;
+
+        public static void Remove(string path)
+        {
+            RemoveEntry(Extend(path), 0, false);
+        }
+
+        public static void RemoveLinks(string path)
+        {
+            RemoveEntry(Extend(path), 0, true);
+        }
+
+        private static string Extend(string path)
+        {
+            if (string.IsNullOrEmpty(path) || path.Length < 4 || path.Length > 32000 || path[1] != ':' || path[2] != '\\')
+            {
+                throw new InvalidOperationException("remove_path");
+            }
+            return "\\\\?\\" + path.TrimEnd('\\');
+        }
+
+        private static IntPtr OpenEntry(string path)
+        {
+            uint access = Delete | Synchronize | FileListDirectory | FileReadAttributes | FileWriteAttributes;
+            uint flags = FlagBackupSemantics | FlagOpenReparsePoint;
+            int error = 0;
+            for (int attempt = 0; attempt < MaxOpenRetries; ++attempt)
+            {
+                IntPtr handle = Native.CreateFileW(path, access, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
+                if (handle != new IntPtr(-1))
+                {
+                    return handle;
+                }
+                error = Marshal.GetLastWin32Error();
+                if (error != ErrorSharingViolation)
+                {
+                    break;
+                }
+                Thread.Sleep(200);
+            }
+            throw new InvalidOperationException("remove_failed step=open error=" + error.ToString());
+        }
+
+        private static void ReadInformation(IntPtr handle, out uint attributes, out uint links)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(52);
+            try
+            {
+                if (!Native.GetFileInformationByHandle(handle, buffer))
+                {
+                    throw new InvalidOperationException("remove_failed step=query error=" + Marshal.GetLastWin32Error().ToString());
+                }
+                attributes = unchecked((uint)Marshal.ReadInt32(buffer, 0));
+                links = unchecked((uint)Marshal.ReadInt32(buffer, 40));
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static void ListEntries(IntPtr handle, List<string> names, List<uint> attributes)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(DirectoryBufferBytes);
+            try
+            {
+                int infoClass = ClassFullDirectoryRestartInfo;
+                while (true)
+                {
+                    if (!Native.GetFileInformationByHandleEx(handle, infoClass, buffer, (uint)DirectoryBufferBytes))
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        if (error == ErrorNoMoreFiles)
+                        {
+                            return;
+                        }
+                        throw new InvalidOperationException("remove_failed step=list error=" + error.ToString());
+                    }
+                    infoClass = ClassFullDirectoryInfo;
+                    int offset = 0;
+                    while (true)
+                    {
+                        int next = Marshal.ReadInt32(buffer, offset);
+                        int nameBytes = Marshal.ReadInt32(buffer, offset + NameLengthOffset);
+                        if (nameBytes < 0 || nameBytes > 1024 || offset + NameOffset + nameBytes > DirectoryBufferBytes)
+                        {
+                            throw new InvalidOperationException("remove_failed step=list error=shape");
+                        }
+                        string name = Marshal.PtrToStringUni(new IntPtr(buffer.ToInt64() + offset + NameOffset), nameBytes / 2);
+                        if (name != "." && name != "..")
+                        {
+                            names.Add(name);
+                            attributes.Add(unchecked((uint)Marshal.ReadInt32(buffer, offset + AttributesOffset)));
+                        }
+                        if (next == 0)
+                        {
+                            break;
+                        }
+                        offset += next;
+                    }
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static int SetDisposition(IntPtr handle, uint flags)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(4);
+            try
+            {
+                Marshal.WriteInt32(buffer, 0, unchecked((int)flags));
+                if (Native.SetFileInformationByHandle(handle, ClassDispositionInfoEx, buffer, 4))
+                {
+                    return 0;
+                }
+                return Marshal.GetLastWin32Error();
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static int ClearReadOnly(IntPtr handle, uint attributes)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(40);
+            try
+            {
+                for (int offset = 0; offset < 40; offset += 8)
+                {
+                    Marshal.WriteInt64(buffer, offset, 0L);
+                }
+                uint updated = attributes & ~AttributeReadOnly;
+                if (updated == 0)
+                {
+                    updated = 0x80;
+                }
+                Marshal.WriteInt32(buffer, 32, unchecked((int)updated));
+                if (Native.SetFileInformationByHandle(handle, ClassBasicInfo, buffer, 40))
+                {
+                    return 0;
+                }
+                return Marshal.GetLastWin32Error();
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static int SetClassicDisposition(IntPtr handle)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(8);
+            try
+            {
+                Marshal.WriteInt64(buffer, 0, 1L);
+                if (Native.SetFileInformationByHandle(handle, ClassDispositionInfo, buffer, 1))
+                {
+                    return 0;
+                }
+                return Marshal.GetLastWin32Error();
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static void DeleteByHandle(IntPtr handle, uint attributes, uint links)
+        {
+            int error = SetDisposition(handle, DispositionDeletePosixIgnoreReadOnly);
+            if (error == 0)
+            {
+                return;
+            }
+            error = SetDisposition(handle, DispositionDeleteIgnoreReadOnly);
+            if (error == 0)
+            {
+                return;
+            }
+            if ((attributes & AttributeReadOnly) != 0 && links <= 1 && (attributes & AttributeReparsePoint) == 0)
+            {
+                error = ClearReadOnly(handle, attributes);
+                if (error == 0)
+                {
+                    error = SetClassicDisposition(handle);
+                    if (error == 0)
+                    {
+                        return;
+                    }
+                }
+            }
+            throw new InvalidOperationException("remove_failed step=delete error=" + error.ToString());
+        }
+
+        private static void RemoveEntry(string path, int depth, bool linksOnly)
+        {
+            if (depth > MaxDepth)
+            {
+                throw new InvalidOperationException("remove_failed step=depth error=0");
+            }
+            IntPtr handle = OpenEntry(path);
+            try
+            {
+                uint attributes;
+                uint links;
+                ReadInformation(handle, out attributes, out links);
+                if ((attributes & AttributeReparsePoint) != 0)
+                {
+                    DeleteByHandle(handle, attributes, links);
+                    return;
+                }
+                if ((attributes & AttributeDirectory) != 0)
+                {
+                    List<string> names = new List<string>();
+                    List<uint> kinds = new List<uint>();
+                    ListEntries(handle, names, kinds);
+                    for (int index = 0; index < names.Count; ++index)
+                    {
+                        bool plain = (kinds[index] & (AttributeDirectory | AttributeReparsePoint)) == 0;
+                        if (linksOnly && plain)
+                        {
+                            continue;
+                        }
+                        RemoveEntry(path + "\\" + names[index], depth + 1, linksOnly);
+                    }
+                    if (!linksOnly)
+                    {
+                        DeleteByHandle(handle, attributes, links);
+                    }
+                    return;
+                }
+                if (!linksOnly)
+                {
+                    DeleteByHandle(handle, attributes, links);
+                }
+            }
+            finally
+            {
+                Native.CloseHandle(handle);
+            }
+        }
+
+        private static class Native
+        {
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            internal static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+
+            [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool GetFileInformationByHandle(IntPtr handle, IntPtr information);
+
+            [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool GetFileInformationByHandleEx(IntPtr handle, int informationClass, IntPtr buffer, uint size);
+
+            [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool SetFileInformationByHandle(IntPtr handle, int informationClass, IntPtr buffer, uint size);
+
+            [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool CloseHandle(IntPtr handle);
+        }
+    }
+
     public sealed class Sandbox : IDisposable
     {
         private const int ErrorInsufficientBuffer = 122;
@@ -538,12 +836,17 @@ namespace KeelDock.Platform.WindowsConfinement
         private const uint WaitObject0 = 0;
         private const uint WaitTimeout = 0x00000102;
         private const uint JobKillExitCode = 0x4b44574b;
+        private const uint JobObjectBasicProcessIdList = 3;
+        private const int ErrorMoreData = 234;
+        private const int JobListSlots = 64;
 
         private string profileName;
         private IntPtr profileSid = IntPtr.Zero;
         private string sidText = "";
         private bool profileCreated;
         private bool cleanupComplete = true;
+        private readonly List<IntPtr> retainedJobs = new List<IntPtr>();
+        private readonly object jobLock = new object();
 
         public string SidText
         {
@@ -595,6 +898,89 @@ namespace KeelDock.Platform.WindowsConfinement
             {
                 Native.FreeSid(profileSid);
                 profileSid = IntPtr.Zero;
+            }
+            lock (jobLock)
+            {
+                foreach (IntPtr retained in retainedJobs)
+                {
+                    Native.CloseHandle(retained);
+                }
+                retainedJobs.Clear();
+            }
+        }
+
+        private void RetainJob(ref IntPtr job)
+        {
+            if (job != IntPtr.Zero)
+            {
+                lock (jobLock)
+                {
+                    retainedJobs.Add(job);
+                }
+                job = IntPtr.Zero;
+            }
+        }
+
+        public string JobState(int waitMs)
+        {
+            Stopwatch clock = Stopwatch.StartNew();
+            while (true)
+            {
+                string state = ScanJobs();
+                if (state != "alive" || clock.ElapsedMilliseconds >= waitMs)
+                {
+                    return state;
+                }
+                Thread.Sleep(100);
+            }
+        }
+
+        private string ScanJobs()
+        {
+            IntPtr[] jobs;
+            lock (jobLock)
+            {
+                jobs = retainedJobs.ToArray();
+            }
+            bool alive = false;
+            foreach (IntPtr job in jobs)
+            {
+                int assigned = ReadAssignedProcesses(job);
+                if (assigned < 0)
+                {
+                    return "unknown";
+                }
+                if (assigned > 0)
+                {
+                    alive = true;
+                }
+            }
+            return alive ? "alive" : "none";
+        }
+
+        private static int ReadAssignedProcesses(IntPtr job)
+        {
+            int size = 8 + IntPtr.Size * JobListSlots;
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                for (int offset = 0; offset < size; offset += 8)
+                {
+                    Marshal.WriteInt64(buffer, offset, 0L);
+                }
+                uint returned;
+                if (!Native.QueryInformationJobObject(job, JobObjectBasicProcessIdList, buffer, (uint)size, out returned))
+                {
+                    if (Marshal.GetLastWin32Error() != ErrorMoreData)
+                    {
+                        return -1;
+                    }
+                }
+                return Marshal.ReadInt32(buffer, 0);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
             }
         }
 
@@ -927,7 +1313,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 CloseOne(ref thread);
                 CloseOne(ref process);
-                CloseOne(ref job);
+                RetainJob(ref job);
                 if (attributeListInitialized)
                 {
                     Native.DeleteProcThreadAttributeList(attributeBuffer);

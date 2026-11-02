@@ -195,6 +195,279 @@ async function main() {
 
 main();
 '@
+$FixtureRustText = @'
+use std::env;
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::process::Command;
+use std::time::Duration;
+
+fn code(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(value) => format!("err{}", value),
+        None => String::from("errnone"),
+    }
+}
+
+fn variable(name: &str) -> String {
+    env::var(name).unwrap_or_default()
+}
+
+fn report(name: &str, text: &str) {
+    println!("KDATT {} {}", name, text);
+}
+
+fn connect(target: &str) -> String {
+    let addresses: Vec<SocketAddr> = match target.to_socket_addrs() {
+        Ok(list) => list.collect(),
+        Err(error) => return format!("resolve={}", code(&error)),
+    };
+    if addresses.is_empty() {
+        return String::from("resolve=empty");
+    }
+    match TcpStream::connect_timeout(&addresses[0], Duration::from_secs(8)) {
+        Ok(_) => String::from("resolve=ok connect=open"),
+        Err(error) => format!("resolve=ok connect={}", code(&error)),
+    }
+}
+
+fn lookup(host: &str) -> String {
+    match (host, 443u16).to_socket_addrs() {
+        Ok(list) => format!("resolve=ok count={}", list.count()),
+        Err(error) => format!("resolve={}", code(&error)),
+    }
+}
+
+fn read_file(path: &str) -> String {
+    match OpenOptions::new().read(true).open(path) {
+        Ok(mut file) => {
+            let mut buffer = [0u8; 16];
+            match file.read(&mut buffer) {
+                Ok(count) => format!("open=ok read=ok bytes={}", count),
+                Err(error) => format!("open=ok read={}", code(&error)),
+            }
+        }
+        Err(error) => format!("open={}", code(&error)),
+    }
+}
+
+fn write_file(path: &str) -> String {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => match file.write_all(b"kd") {
+            Ok(_) => String::from("create=ok write=ok"),
+            Err(error) => format!("create=ok write={}", code(&error)),
+        },
+        Err(error) => format!("create={}", code(&error)),
+    }
+}
+
+fn open_pipe(path: &str) -> String {
+    match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(_) => String::from("open=ok"),
+        Err(error) => format!("open={}", code(&error)),
+    }
+}
+
+fn hunt() -> String {
+    let mut found: u32 = 0;
+    for (key, _) in env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("ACTIONS_") || name.starts_with("GITHUB_") || name.starts_with("RUNNER_") {
+            found += 1;
+        }
+    }
+    format!("found={}", found)
+}
+
+fn child(arguments: &[&str]) -> String {
+    let probe = variable("KD_PROBE");
+    let prefix = format!("kd-probe {} ", arguments[0]);
+    match Command::new(&probe).args(arguments).output() {
+        Ok(done) => {
+            let text = String::from_utf8_lossy(&done.stdout).to_string();
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with(&prefix) {
+                    return trimmed[prefix.len()..].to_string();
+                }
+            }
+            String::from("child=noline")
+        }
+        Err(error) => format!("child={}", code(&error)),
+    }
+}
+
+fn run_attempts() {
+    let nonce = variable("KD_FX_NONCE");
+    let temp = variable("KD_FX_TEMP");
+    let loopback = format!("127.0.0.1:{}", variable("KD_FX_PORT"));
+    let pipe = format!("\\\\.\\pipe\\{}", variable("KD_FX_PIPE"));
+    let direct = format!("{}\\kd-att-fx{}.tmp", temp, nonce);
+    let spawned = format!("{}\\kd-att-fy{}.tmp", temp, nonce);
+    report("net-external", &connect("1.1.1.1:443"));
+    report("net-loopback", &connect(&loopback));
+    report("dns-lookup", &lookup("github.com"));
+    report("read-canary", &read_file(&variable("KD_FX_CANARY")));
+    report("write-escape", &write_file(&direct));
+    report("env-hunt", &hunt());
+    report("pipe-open", &open_pipe(&pipe));
+    report("child-network", &child(&["connect", "1.1.1.1:443"]));
+    report("child-write", &child(&["write", spawned.as_str()]));
+    println!("::debug::kd-fx-marker");
+    eprintln!("::debug::kd-fx-marker");
+    report("output-exfil", "text=ok");
+}
+'@
+$FixtureNodeText = @'
+'use strict';
+
+const net = require('node:net');
+const dns = require('node:dns');
+const fs = require('node:fs');
+const childProcess = require('node:child_process');
+
+const mode = process.argv[2] || 'main';
+const nonce = process.env.KD_FX_NONCE || '';
+const temp = process.env.KD_FX_TEMP || '';
+const canary = process.env.KD_FX_CANARY || '';
+const port = Number(process.env.KD_FX_PORT || '0');
+const pipePath = '\\\\.\\pipe\\' + (process.env.KD_FX_PIPE || '');
+
+function report(name, text) {
+  console.log('KDATT ' + name + ' ' + text);
+}
+
+function code(error) {
+  return error && error.code ? String(error.code) : 'none';
+}
+
+function connectState(options) {
+  return new Promise(function (resolve) {
+    let settled = false;
+    const finish = function (text) {
+      if (!settled) {
+        settled = true;
+        resolve(text);
+      }
+    };
+    const timer = setTimeout(function () {
+      finish('connect=timeout');
+    }, 8000);
+    const socket = net.connect(options);
+    socket.on('connect', function () {
+      clearTimeout(timer);
+      socket.destroy();
+      finish('connect=open');
+    });
+    socket.on('error', function (error) {
+      clearTimeout(timer);
+      finish('connect=' + code(error));
+    });
+  });
+}
+
+function readState(path) {
+  let handle = -1;
+  try {
+    handle = fs.openSync(path, 'r');
+  } catch (error) {
+    return 'open=' + code(error);
+  }
+  try {
+    const buffer = Buffer.alloc(16);
+    const count = fs.readSync(handle, buffer, 0, 16, null);
+    return 'open=ok read=ok bytes=' + count;
+  } catch (error) {
+    return 'open=ok read=' + code(error);
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+function writeState(path) {
+  let handle = -1;
+  try {
+    handle = fs.openSync(path, 'wx');
+  } catch (error) {
+    return 'create=' + code(error);
+  }
+  try {
+    fs.writeSync(handle, 'kd');
+    return 'create=ok write=ok';
+  } catch (error) {
+    return 'create=ok write=' + code(error);
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+function pipeState(path) {
+  try {
+    fs.closeSync(fs.openSync(path, 'r+'));
+    return 'open=ok';
+  } catch (error) {
+    return 'open=' + code(error);
+  }
+}
+
+function envState() {
+  let found = 0;
+  for (const key of Object.keys(process.env)) {
+    const name = key.toUpperCase();
+    if (name.startsWith('ACTIONS_') || name.startsWith('GITHUB_') || name.startsWith('RUNNER_')) {
+      found += 1;
+    }
+  }
+  return 'found=' + found;
+}
+
+function lookupState() {
+  return new Promise(function (resolve) {
+    const timer = setTimeout(function () {
+      resolve('resolve=timeout');
+    }, 8000);
+    dns.lookup('github.com', function (error) {
+      clearTimeout(timer);
+      resolve(error ? 'resolve=' + code(error) : 'resolve=ok');
+    });
+  });
+}
+
+function spawnState() {
+  const result = childProcess.spawnSync(process.execPath, ['-e', '0'], { stdio: 'pipe', timeout: 15000 });
+  if (result.error) {
+    return 'spawn=' + code(result.error);
+  }
+  return result.status === 0 ? 'spawn=ok' : 'spawn=fail';
+}
+
+async function main() {
+  if (mode === 'spawn-pipe') {
+    report('spawn-pipe', spawnState());
+    process.exit(0);
+  }
+  report('net-external', await connectState({ host: '1.1.1.1', port: 443 }));
+  report('net-loopback', await connectState({ host: '127.0.0.1', port: port }));
+  report('dns-lookup', await lookupState());
+  report('read-canary', readState(canary));
+  report('write-escape', writeState(temp + '\\kd-att-fx' + nonce + '.tmp'));
+  report('env-hunt', envState());
+  report('pipe-open', pipeState(pipePath));
+  console.log('::debug::kd-fx-marker');
+  console.error('::debug::kd-fx-marker');
+  report('output-exfil', 'text=ok');
+  process.exit(0);
+}
+
+main();
+'@
+$FixtureNodePackage = '{"name":"hostile-fixture","version":"0.0.0","private":true,"scripts":{"postinstall":"node install.js"}}'
+$FixtureForms = @('build_rs', 'test', 'binary', 'node_install')
+$FixtureCargoSeconds = 240
+$FixtureNodeSeconds = 60
+$FixtureSpawnSeconds = 30
+$FixtureSentinelEnvironment = [string[]]@('ACTIONS_RUNTIME_TOKEN=kd-sentinel', 'GITHUB_TOKEN=kd-sentinel', 'RUNNER_TOOL_CACHE=kd-sentinel')
 
 function Write-Line([string]$text) {
     [Console]::Out.WriteLine($text)
@@ -594,48 +867,38 @@ function Test-OtherContainerNul($first) {
 }
 
 function Remove-TreeNoFollow([string]$path) {
-    $attributes = [int][System.IO.File]::GetAttributes($path)
-    $isDirectory = (($attributes -band 16) -ne 0)
-    if (($attributes -band 1024) -ne 0) {
-        if ($isDirectory) { [System.IO.Directory]::Delete($path, $false) } else { [System.IO.File]::Delete($path) }
-        return
-    }
-    if ($isDirectory) {
-        foreach ($child in [System.IO.Directory]::GetFileSystemEntries($path)) {
-            Remove-TreeNoFollow $child
-        }
-        if (($attributes -band 1) -ne 0) { [System.IO.File]::SetAttributes($path, [System.IO.FileAttributes]($attributes -band (-bnot 1))) }
-        [System.IO.Directory]::Delete($path, $false)
-        return
-    }
-    if (($attributes -band 1) -ne 0) {
-        $linkType = [string](Get-Item -LiteralPath $path -Force).LinkType
-        if ($linkType -cne 'HardLink') { [System.IO.File]::SetAttributes($path, [System.IO.FileAttributes]($attributes -band (-bnot 1))) }
-    }
-    [System.IO.File]::Delete($path)
+    [KeelDock.Platform.WindowsConfinement.HandleRemover]::Remove($path)
 }
 
 function Remove-ReparsePoints([string]$path) {
-    foreach ($child in [System.IO.Directory]::GetFileSystemEntries($path)) {
-        $attributes = [int][System.IO.File]::GetAttributes($child)
-        $isDirectory = (($attributes -band 16) -ne 0)
-        if (($attributes -band 1024) -ne 0) {
-            if ($isDirectory) { [System.IO.Directory]::Delete($child, $false) } else { [System.IO.File]::Delete($child) }
-        } elseif ($isDirectory) {
-            Remove-ReparsePoints $child
-        }
-    }
+    [KeelDock.Platform.WindowsConfinement.HandleRemover]::RemoveLinks($path)
 }
 
-function Get-ContainerProcessCount([string]$base) {
-    $count = 0
-    if ([string]::IsNullOrEmpty($base)) { return 0 }
-    foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
-        $path = ''
-        try { $path = [string]$process.Path } catch { $path = '' }
-        if ($path.Length -gt 0 -and (Test-PathUnder $path $base)) { $count += 1 }
+function Get-JobLiveness($sandboxes, [int]$waitSeconds) {
+    $state = 'none'
+    foreach ($sandbox in @($sandboxes)) {
+        if ($null -eq $sandbox) { continue }
+        $item = [string]$sandbox.JobState($waitSeconds * 1000)
+        if ($item -ceq 'unknown') { return 'unknown' }
+        if ($item -ceq 'alive') { $state = 'alive' }
     }
-    return $count
+    return $state
+}
+
+function Write-CleanupDetail([string]$stage, $failure) {
+    $message = [string]$failure.Exception.Message
+    Write-Line ('kd-diag stage=cleanup_' + $stage + ' stream=detail line=' + (Get-CleanText $message 160))
+}
+
+function Test-PipeListed([string]$leaf) {
+    try {
+        foreach ($pipePath in [System.IO.Directory]::GetFiles('\\.\pipe\')) {
+            if ([System.IO.Path]::GetFileName($pipePath) -ceq $leaf) { return $true }
+        }
+    } catch {
+        return $true
+    }
+    return $false
 }
 
 function Remove-Canaries {
@@ -802,12 +1065,22 @@ function Initialize-ChannelContext {
     }
     $cryptoDirectory = Get-FirstExistingDirectory @((Join-Path $env:APPDATA 'Microsoft\Crypto\Keys'), (Join-Path $env:APPDATA 'Microsoft\Crypto'), (Join-Path $env:APPDATA 'Microsoft\Protect'), $env:APPDATA)
     if ($cryptoDirectory.Length -eq 0 -or $drives.Count -eq 0) { throw 'channel_file' }
-    $resultsHost = Get-ChannelHost 'ACTIONS_RESULTS_URL' 'results-receiver.actions.githubusercontent.com'
-    $cacheHost = Get-ChannelHost 'ACTIONS_CACHE_URL' $resultsHost
+    $resultsHost = 'results-receiver.actions.githubusercontent.com'
+    $hostSource = 'default'
+    $resultsFromEnv = Get-ChannelHost 'ACTIONS_RESULTS_URL' ''
+    if ($resultsFromEnv.Length -gt 0) {
+        $resultsHost = $resultsFromEnv
+        $hostSource = 'env'
+    }
+    $cacheHost = $resultsHost
+    $cacheSource = 'results'
+    $cacheFromEnv = Get-ChannelHost 'ACTIONS_CACHE_URL' ''
+    if ($cacheFromEnv.Length -gt 0) {
+        $cacheHost = $cacheFromEnv
+        $cacheSource = 'env'
+    }
     $resultsIp = Get-HostAddress $resultsHost
     $cacheIp = Get-HostAddress $cacheHost
-    $hostSource = 'default'
-    if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('ACTIONS_RESULTS_URL'))) { $hostSource = 'env' }
     $script:ChannelRegistry = $true
     foreach ($hive in @([Microsoft.Win32.Registry]::CurrentUser, [Microsoft.Win32.Registry]::LocalMachine)) {
         New-RegistryCanary $hive $script:CanaryNeedle
@@ -844,7 +1117,7 @@ function Initialize-ChannelContext {
     $script:Channel = @{ Pids = $pids; RunnerPipes = $runnerPipes; Drives = $drives; Scalars = $scalars }
     $diagState = 'absent'
     if (([string]$scalars['diag_file']).Length -gt 0) { $diagState = 'present' }
-    Write-Line ('windows-confinement-channel-fixtures=ready targets=' + $pids.Count + ' runner_pipes=' + $runnerPipes.Count + ' drives=' + $drives.Count + ' diag=' + $diagState + ' results_host=' + $hostSource + ' results_ip=' + [string]($resultsIp.Length -gt 0) + ' cache_ip=' + [string]($cacheIp.Length -gt 0))
+    Write-Line ('windows-confinement-channel-fixtures=ready targets=' + $pids.Count + ' runner_pipes=' + $runnerPipes.Count + ' drives=' + $drives.Count + ' diag=' + $diagState + ' results_host=' + $hostSource + ' cache_host=' + $cacheSource + ' results_ip=' + [string]($resultsIp.Length -gt 0) + ' cache_ip=' + [string]($cacheIp.Length -gt 0))
 }
 
 function Remove-ChannelFixtures {
@@ -964,6 +1237,19 @@ function Invoke-ChannelRun($sandbox, [bool]$confined, [string]$arguments, [int]$
     }
 }
 
+function Get-TextClass([string]$text, $attempt) {
+    if ($text.Length -eq 0) { return 'other' }
+    $allow = [string]$attempt.Allow
+    if ($attempt.ContainsKey('ConfinedAllow')) { $allow = [string]$attempt.ConfinedAllow }
+    if ($text -cmatch $allow) { return 'allowed' }
+    if ($text -cmatch $attempt.Deny) {
+        if ($attempt.Expect -ceq 'contained') { return 'contained' }
+        return 'denied'
+    }
+    if ($attempt.ContainsKey('NaPattern') -and ($text -cmatch $attempt.NaPattern)) { return 'not_applicable' }
+    return 'other'
+}
+
 function Get-AttemptResult($run, [string]$command, $attempt) {
     $stdout = [string]$run.Stdout
     $text = Get-ProbeText $stdout $command
@@ -971,14 +1257,7 @@ function Get-AttemptResult($run, [string]$command, $attempt) {
         if (($text -ceq 'text=ok') -and ($stdout -match '(?m)^::debug::kd-marker\s*$') -and ((Get-CleanText $stdout 500) -cnotmatch ':')) { return 'contained' }
         return 'other'
     }
-    if ($text.Length -eq 0) { return 'other' }
-    if ($text -cmatch $attempt.Allow) { return 'allowed' }
-    if ($text -cmatch $attempt.Deny) {
-        if ($attempt.Expect -ceq 'contained') { return 'contained' }
-        return 'denied'
-    }
-    if ($attempt.ContainsKey('NaPattern') -and ($text -cmatch $attempt.NaPattern)) { return 'not_applicable' }
-    return 'other'
+    return (Get-TextClass $text $attempt)
 }
 
 function Get-ChannelAttempts {
@@ -995,7 +1274,7 @@ function Get-ChannelAttempts {
     $attempts += @{ Channel = 'proxy'; Name = 'proxy-connect'; Runs = @('connect 127.0.0.1:{port}'); ControlRuns = @('connect 127.0.0.1:{port}'); Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied'; Timeout = 30 }
     $attempts += @{ Channel = 'runner_ipc'; Name = 'pipe-root-create'; Runs = @('pipemake root {rand}'); ControlRuns = @('pipemake root {rand}'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'runner_ipc'; Name = 'pipe-existing-open'; Runs = @('pipeopen {pipe}'); ControlRuns = @('pipeopen {pipe}'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
-    $attempts += @{ Channel = 'runner_ipc'; Name = 'pipe-runner-open'; Optional = $true; NaPattern = '^open=err2$'; Runs = @('pipeopen {runner_pipe}'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'runner_ipc'; Name = 'pipe-runner-open'; Optional = $true; NaPattern = '^open=err2$'; NaRecheck = 'pipe'; Runs = @('pipeopen {runner_pipe}'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'runner_ipc'; Name = 'process-open-runner'; Runs = @('procopen {pid} dup'); ControlRuns = @('procopen {harness_pid} dup'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'runner_ipc'; Name = 'handle-inventory'; Runs = @('echo'); ControlRuns = @(); Allow = '^result=fail$'; Deny = '^result=ok$'; Expect = 'contained'; Timeout = 10 }
     $attempts += @{ Channel = 'runner_ipc'; Name = 'named-pipe-local'; Informational = $true; Runs = @('pipemake local {rand}'); ControlRuns = @(); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'allowed'; Timeout = 10 }
@@ -1019,18 +1298,22 @@ function Get-ChannelAttempts {
     $attempts += @{ Channel = 'process_memory'; Name = 'environ-read'; Runs = @('procopen {pid} environ'); ControlRuns = @('procopen {harness_pid} environ'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'process_memory'; Name = 'debug-attach'; Runs = @('procopen {pid} debug'); ControlRuns = @('procopen {harness_pid} debug'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'process_memory'; Name = 'control-self-memory'; Runs = @('procopen self vmread'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'allowed'; Timeout = 10 }
+    $attempts += @{ Channel = 'process_memory'; Name = 'control-peer-memory'; Runs = @('procpeer'); ControlRuns = @('procpeer'); Allow = '^open=ok$'; Deny = '^open=never$'; NaPattern = '^open=err5$'; Expect = 'allowed'; Timeout = 20 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'job-breakaway'; Runs = @('jobbreak'); ControlRuns = @(); Allow = '^spawn=ok$'; Deny = '^spawn=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'job-membership'; Basis = 'harness'; Runs = @('jobmember'); ControlRuns = @('jobmember'); ControlAllow = '^injob=yes$'; Allow = '^injob=no$'; Deny = '^injob=yes$'; Expect = 'contained'; Timeout = 10 }
-    $attempts += @{ Channel = 'boundary_disablement'; Name = 'profile-create'; Runs = @('profile'); ControlRuns = @('profile'); Allow = '^create=ok$'; Deny = '^create=hr80070005$|^create=hr800706d9$'; Expect = 'denied'; Timeout = 20 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'profile-create'; Runs = @('profile'); ControlRuns = @('profile'); Allow = '^create=ok$'; ConfinedAllow = '^create=ok( delete=(err[0-9]+|hr[0-9a-f]{8}))?$'; Deny = '^create=hr80070005$|^create=hr800706d9$'; Expect = 'denied'; Timeout = 20 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'scm-open'; Runs = @('scm'); ControlRuns = @('scm'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'nul-write-dac'; Runs = @('nuldac'); ControlRuns = @(); Allow = '^result=ok$'; Deny = '^result=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'ancestor-write-dac'; Runs = @('dacopen {base}'); ControlRuns = @('dacopen {base}'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
-    $attempts += @{ Channel = 'boundary_disablement'; Name = 'hklm-write'; Runs = @('regcreate hklm'); ControlRuns = @('regcreate hklm'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
-    $attempts += @{ Channel = 'boundary_disablement'; Name = 'hkcu-write'; Runs = @('regcreate hkcu'); ControlRuns = @('regcreate hkcu'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'hklm-write'; Runs = @('regcreate hklm'); ControlRuns = @('regcreate hklm'); Allow = '^create=ok$'; ConfinedAllow = '^create=ok( delete=(err[0-9]+|hr[0-9a-f]{8}))?$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'hkcu-write'; Runs = @('regcreate hkcu'); ControlRuns = @('regcreate hkcu'); Allow = '^create=ok$'; ConfinedAllow = '^create=ok( delete=(err[0-9]+|hr[0-9a-f]{8}))?$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'symlink'; Runs = @('symlink {scratch_tmp}\kd_att_{rand}.lnk {ro_file}'); ControlRuns = @('symlink {control_tmp}\kd_att_{rand}.lnk {ro_file}'); Allow = '^create=ok$'; Deny = '^create=err(5|1314)$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'hardlink-ro'; Runs = @('hardlink {scratch_tmp}\kd_att_{rand}.lnk {ro_file}'); ControlRuns = @('hardlink {control_tmp}\kd_att_{rand}.lnk {ro_file}'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'integrity-raise'; Runs = @('tokenraise'); ControlRuns = @('tokenraise'); Allow = '^open=ok set=ok$'; Deny = '^open=ok set=err(5|1314)$|^open=err5 set=na$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'privilege-enable'; Runs = @('tokenpriv'); ControlRuns = @('tokenpriv'); Allow = '^adjust=ok$'; Deny = '^adjust=err1300$|^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'task-register'; Informational = $true; LeakGuard = $true; Runs = @('taskreg'); ControlRuns = @('taskreg'); Allow = '^create=ok connect=ok$'; Deny = '^create=ok connect=hr80070005$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'wmi'; Informational = $true; LeakGuard = $true; Runs = @('wmi'); ControlRuns = @('wmi'); Allow = '^create=ok connect=ok$'; Deny = '^create=ok connect=hr80070005$|^create=ok connect=hr80041003$'; Expect = 'denied'; Timeout = 30 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'wfp'; Informational = $true; LeakGuard = $true; Runs = @('wfp'); ControlRuns = @('wfp'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 20 }
     return $attempts
 }
 
@@ -1103,6 +1386,7 @@ function Invoke-ChannelAttempt($sandbox, $attempt, [string]$phase, [bool]$withCo
         $command = ($arguments -split ' ')[0]
         $result = 'invalid'
         if (Test-ChannelRunValid $run $true) { $result = Get-AttemptResult $run $command $attempt }
+        if ($result -ceq 'not_applicable' -and $attempt.ContainsKey('NaRecheck') -and (Test-PipeListed (($arguments -split ' ')[1]))) { $result = 'other' }
         $results += $result
         if ($result -cne [string]$attempt.Expect) { Write-DiagLines $label 'stdout' ([string]$run.Stdout) }
     }
@@ -1132,7 +1416,7 @@ function Invoke-ChannelAttempt($sandbox, $attempt, [string]$phase, [bool]$withCo
 function Invoke-ChannelPhase($sandbox, [string]$phase, [bool]$withControls) {
     $report = [ordered]@{}
     foreach ($channel in $ChannelNames) {
-        $report[$channel] = @{ Status = 'blocked'; Reason = 'none'; Attempts = 0; Informational = 0; ControlsFired = 0; ControlsMissed = 0 }
+        $report[$channel] = @{ Status = 'blocked'; Reason = 'none'; Attempts = 0; NotApplicable = 0; Boundary = 0; Informational = 0; ControlsFired = 0; ControlsMissed = 0 }
     }
     foreach ($attempt in (Get-ChannelAttempts)) {
         $entry = $report[[string]$attempt.Channel]
@@ -1143,9 +1427,18 @@ function Invoke-ChannelPhase($sandbox, [string]$phase, [bool]$withControls) {
         Write-Line ('windows-confinement-attempt=' + $attempt.Channel + '/' + $attempt.Name + ' phase=' + $phase + ' result=' + $outcome.Result + ' expect=' + $attempt.Expect + ' runs=' + $outcome.Runs + ' control=' + $outcome.Control + ' reason=' + $outcome.Reason + ' informational=' + $informational.ToString().ToLowerInvariant() + ' basis=' + $basis)
         if ($informational) {
             $entry.Informational += 1
+            if ($attempt.ContainsKey('LeakGuard') -and $outcome.Reason -ceq 'channel_leak' -and $entry.Status -ceq 'blocked') {
+                $entry.Status = 'observed-leak'
+                $entry.Reason = 'channel_leak'
+            }
             continue
         }
         $entry.Attempts += 1
+        if ($outcome.Result -ceq 'not_applicable') {
+            $entry.NotApplicable += 1
+        } elseif ($basis -ceq 'boundary' -and $attempt.Expect -cne 'allowed' -and $outcome.Reason -ceq 'none') {
+            $entry.Boundary += 1
+        }
         if ($outcome.Control -ceq 'not_fired') { $entry.ControlsMissed += 1 }
         if (@('fired', 'na') -ccontains $outcome.Control) { $entry.ControlsFired += 1 }
         if ($outcome.Reason -cne 'none' -and $entry.Status -ceq 'blocked') {
@@ -1156,11 +1449,11 @@ function Invoke-ChannelPhase($sandbox, [string]$phase, [bool]$withControls) {
     }
     foreach ($channel in $ChannelNames) {
         $entry = $report[$channel]
-        if ($entry.Attempts -eq 0 -and $entry.Status -ceq 'blocked') {
+        if ($entry.Boundary -eq 0 -and $entry.Status -ceq 'blocked') {
             $entry.Status = 'refused'
             $entry.Reason = 'fixture_incomplete'
         }
-        Write-Line ('windows-confinement-channel=' + $channel + ' phase=' + $phase + ' status=' + $entry.Status + ' reason=' + $entry.Reason + ' attempts=' + $entry.Attempts + ' informational=' + $entry.Informational + ' controls_fired=' + $entry.ControlsFired + ' controls_missed=' + $entry.ControlsMissed)
+        Write-Line ('windows-confinement-channel=' + $channel + ' phase=' + $phase + ' status=' + $entry.Status + ' reason=' + $entry.Reason + ' attempts=' + $entry.Attempts + ' not_applicable=' + $entry.NotApplicable + ' boundary=' + $entry.Boundary + ' informational=' + $entry.Informational + ' controls_fired=' + $entry.ControlsFired + ' controls_missed=' + $entry.ControlsMissed)
     }
     return $report
 }
@@ -1178,6 +1471,270 @@ function Get-ChannelControlState($report) {
         if ($report[$channel].ControlsMissed -gt 0 -or $report[$channel].ControlsFired -eq 0) { return 'not_fired' }
     }
     return 'fired'
+}
+
+function Initialize-FixtureSources {
+    $hash = [string][char]35
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $manifest = "[package]`nname = `"kd_fx`"`nversion = `"0.1.0`"`nedition = `"2021`"`n"
+    $body = $FixtureRustText.Replace("`r`n", "`n")
+    $mainText = $body + "`nfn main() {`n    run_attempts();`n}`n"
+    $libText = ($body + "`nKDHASH[test]`nfn hostile_attempts() {`n    run_attempts();`n}`n").Replace('KDHASH', $hash)
+    $nodeText = $FixtureNodeText.Replace("`r`n", "`n")
+    foreach ($set in @($script:Lpac, $script:Control)) {
+        $root = Join-Path $set.Root 'fx'
+        $sources = [ordered]@{}
+        $sources['build_rs\Cargo.toml'] = $manifest
+        $sources['build_rs\build.rs'] = $mainText
+        $sources['build_rs\src\main.rs'] = "fn main() {}`n"
+        $sources['test\Cargo.toml'] = $manifest + "`n[lib]`npath = `"src/lib.rs`"`n"
+        $sources['test\src\lib.rs'] = $libText
+        $sources['binary\Cargo.toml'] = $manifest
+        $sources['binary\src\main.rs'] = $mainText
+        $sources['node_install\package.json'] = $FixtureNodePackage
+        $sources['node_install\install.js'] = $nodeText
+        foreach ($name in $sources.Keys) {
+            $path = Join-Path $root $name
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+            [IO.File]::WriteAllText($path, [string]$sources[$name], $encoding)
+        }
+    }
+}
+
+function Get-FixtureAttempts([string]$form) {
+    $attempts = @()
+    if ($form -ceq 'node_install') {
+        $attempts += @{ Name = 'net-external'; Allow = '^connect=open$'; Deny = '^connect=EACCES$'; Expect = 'denied' }
+        $attempts += @{ Name = 'net-loopback'; Allow = '^connect=open$'; Deny = '^connect=EACCES$'; Expect = 'denied' }
+        $attempts += @{ Name = 'dns-lookup'; Informational = $true; LeakGuard = $true; Allow = '^resolve=ok$'; Deny = '^resolve=EAI_FAIL$'; Expect = 'denied' }
+        $attempts += @{ Name = 'read-canary'; Allow = '^open=ok read=ok bytes=[0-9]+$'; Deny = '^open=(EPERM|ENOENT)$'; Expect = 'denied' }
+        $attempts += @{ Name = 'write-escape'; Allow = '^create=ok write=ok$'; Deny = '^create=EPERM$'; Expect = 'contained' }
+        $attempts += @{ Name = 'env-hunt'; Basis = 'harness'; Allow = '^found=[1-9][0-9]*$'; Deny = '^found=0$'; Expect = 'contained' }
+        $attempts += @{ Name = 'pipe-open'; Allow = '^open=ok$'; Deny = '^open=EPERM$'; Expect = 'denied' }
+        $attempts += @{ Name = 'output-exfil'; Basis = 'harness'; Marker = $true; Allow = '^text=never$'; Deny = '^text=never$'; Expect = 'contained' }
+        $attempts += @{ Name = 'spawn-pipe'; Separate = $true; Informational = $true; LeakGuard = $true; Allow = '^spawn=ok$'; Deny = '^spawn=never$'; Expect = 'denied' }
+    } else {
+        $attempts += @{ Name = 'net-external'; Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied' }
+        $attempts += @{ Name = 'net-loopback'; Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied' }
+        $attempts += @{ Name = 'dns-lookup'; Allow = '^resolve=ok count=[1-9][0-9]*$'; Deny = '^resolve=(err11003|err10013)$'; Expect = 'denied' }
+        $attempts += @{ Name = 'read-canary'; Allow = '^open=ok read=ok bytes=[0-9]+$'; Deny = '^open=err(2|3|5)$'; Expect = 'denied' }
+        $attempts += @{ Name = 'write-escape'; Allow = '^create=ok write=ok$'; Deny = '^create=err5$'; Expect = 'contained' }
+        $attempts += @{ Name = 'env-hunt'; Basis = 'harness'; Allow = '^found=[1-9][0-9]*$'; Deny = '^found=0$'; Expect = 'contained' }
+        $attempts += @{ Name = 'pipe-open'; Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied' }
+        $attempts += @{ Name = 'child-network'; Allow = '^resolve=ok connect=open$'; Deny = '^resolve=ok connect=err10013$'; Expect = 'denied' }
+        $attempts += @{ Name = 'child-write'; Allow = '^create=ok write=ok$'; Deny = '^create=err5$'; Expect = 'contained' }
+        $attempts += @{ Name = 'output-exfil'; Basis = 'harness'; Marker = $true; Allow = '^text=never$'; Deny = '^text=never$'; Expect = 'contained' }
+    }
+    return $attempts
+}
+
+function Get-FixtureLines([string]$text) {
+    $items = @{}
+    $valid = $true
+    $pattern = '^(?:\[[A-Za-z0-9_.+-]{1,40} [0-9][A-Za-z0-9_.+-]{0,20}\] )?KDATT ([a-z0-9-]{1,40}) ([A-Za-z0-9_=. -]{1,100})$'
+    foreach ($line in ($text -split "`n")) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed.Contains('KDATT ')) { continue }
+        $match = [regex]::Match($trimmed, $pattern)
+        if (-not $match.Success) {
+            $valid = $false
+            continue
+        }
+        $name = $match.Groups[1].Value
+        if ($items.ContainsKey($name)) {
+            $valid = $false
+            continue
+        }
+        $items[$name] = $match.Groups[2].Value
+    }
+    return @{ Valid = $valid; Items = $items }
+}
+
+function Invoke-FixtureRun($sandbox, [string]$form, [bool]$confined, [string]$mode) {
+    $layout = $script:Layout
+    $scratch = $script:Control
+    if ($confined) { $scratch = $script:Lpac }
+    $directory = Join-Path (Join-Path $scratch.Root 'fx') $form
+    $environment = New-StageEnvironment $scratch ('target-fx-' + $form)
+    $pipeName = 'kd-trusted-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
+    $extra = [string[]]@(
+        ('KD_PROBE=' + $layout.ProbeExe),
+        ('KD_FX_NONCE=' + [Guid]::NewGuid().ToString('N').Substring(0, 12)),
+        ('KD_FX_PORT=' + [string]$script:Channel.Scalars['port']),
+        ('KD_FX_TEMP=' + [string]$script:Channel.Scalars['runner_temp']),
+        ('KD_FX_CANARY=' + [string]$script:CanaryRunnerTemp),
+        ('KD_FX_PIPE=' + $pipeName)
+    )
+    $environment = [string[]]($environment + $extra)
+    if (-not $confined) { $environment = [string[]]($environment + $FixtureSentinelEnvironment) }
+    $exe = $layout.RustBin + '\cargo.exe'
+    $manifest = Join-Path $directory 'Cargo.toml'
+    $arguments = ''
+    $seconds = $FixtureCargoSeconds
+    if ($form -ceq 'build_rs') {
+        $arguments = 'build -vv --offline --manifest-path ' + $manifest
+    } elseif ($form -ceq 'test') {
+        $arguments = 'test --offline --manifest-path ' + $manifest + ' -- --nocapture'
+    } elseif ($form -ceq 'binary') {
+        $arguments = 'run --offline --manifest-path ' + $manifest
+    } elseif ($form -ceq 'node_install') {
+        $exe = $layout.NodeDir + '\node.exe'
+        $arguments = Join-Path $directory 'install.js'
+        $seconds = $FixtureNodeSeconds
+        if ($mode.Length -gt 0) {
+            $arguments = $arguments + ' ' + $mode
+            $seconds = $FixtureSpawnSeconds
+        }
+        $environment = [string[]]($environment + @('npm_lifecycle_event=postinstall', 'npm_package_name=hostile-fixture', ('INIT_CWD=' + $scratch.Root)))
+    } else {
+        throw 'fixture_form'
+    }
+    $pipe = New-TrustedPipe $pipeName
+    try {
+        return $sandbox.Run($confined, $exe, ('"' + $exe + '" ' + $arguments), $scratch.Root, $environment, ($seconds * 1000), [uint32]32)
+    } finally {
+        $pipe.Dispose()
+    }
+}
+
+function Write-FixtureDiag([string]$label, $run) {
+    $text = [string]$run.Stdout + "`n" + [string]$run.Stderr
+    if ($text.Length -gt 2400) { $text = $text.Substring($text.Length - 2400) }
+    $state = 'exit=0x' + ([uint32]$run.ExitCode).ToString('x8') + ' timed_out=' + $run.TimedOut.ToString().ToLowerInvariant() + ' failure=' + (Get-Token ([string]$run.Failure) '^[a-z_]{0,24}$') + ' handles=' + $run.HandleCount
+    Write-Line ('kd-diag stage=' + $label + ' stream=state line=' + $state)
+    if ($run.Detail) { Write-DiagLines $label 'detail' ([string]$run.Detail) }
+    Write-DiagLines $label 'tail' $text
+}
+
+function Set-FixtureRefusal($report, [string]$status, [string]$reason) {
+    $upgrade = ($status -ceq 'observed-leak') -and ($report.Status -cne 'observed-leak')
+    if ($report.Reason -cne 'none' -and -not $upgrade) { return }
+    $report.Status = $status
+    $report.Reason = $reason
+}
+
+function Invoke-FixtureSeparate($sandbox, [string]$form, $attempt, $report) {
+    $label = 'fixture_' + $form + '_' + $attempt.Name
+    $controlRun = Invoke-FixtureRun $sandbox $form $false $attempt.Name
+    $controlLines = Get-FixtureLines ([string]$controlRun.Stdout + "`n" + [string]$controlRun.Stderr)
+    $controlText = ''
+    if ($controlLines.Items.ContainsKey($attempt.Name)) { $controlText = [string]$controlLines.Items[$attempt.Name] }
+    $control = 'not_fired'
+    if ((Test-ChannelRunValid $controlRun $false) -and $controlLines.Valid -and ($controlText -cmatch $attempt.Allow)) { $control = 'fired' }
+    $run = Invoke-FixtureRun $sandbox $form $true $attempt.Name
+    $result = 'other'
+    $hang = 'none'
+    if ($run.TimedOut) {
+        $result = 'timeout'
+        $hang = 'slow'
+        if (([uint64]$run.CpuMs * 10) -ge ([uint64]$run.ElapsedMs * 8)) { $hang = 'busy' }
+    } elseif (Test-ChannelRunValid $run $true) {
+        $lines = Get-FixtureLines ([string]$run.Stdout + "`n" + [string]$run.Stderr)
+        $text = ''
+        if ($lines.Items.ContainsKey($attempt.Name)) { $text = [string]$lines.Items[$attempt.Name] }
+        if ($lines.Valid -and ($text -cmatch $attempt.Allow)) { $result = 'allowed' }
+    }
+    Write-Line ('windows-confinement-fixture-attempt=' + $form + '/' + $attempt.Name + ' result=' + $result + ' expect=' + $attempt.Expect + ' control=' + $control + ' hang=' + $hang + ' informational=true basis=boundary')
+    $report.Informational += 1
+    if ($result -cne 'allowed' -and $result -cne 'timeout') { Write-FixtureDiag $label $run }
+    if ($result -ceq 'allowed' -and $control -ceq 'fired') { Set-FixtureRefusal $report 'observed-leak' 'fixture_allowed' }
+}
+
+function Invoke-FixtureForm($sandbox, [string]$form) {
+    $report = @{ Status = 'contained'; Reason = 'none'; Attempts = 0; Informational = 0; ControlsFired = 0 }
+    $attempts = @(Get-FixtureAttempts $form)
+    $main = @($attempts | Where-Object { -not $_.ContainsKey('Separate') })
+    $separate = @($attempts | Where-Object { $_.ContainsKey('Separate') })
+    $label = 'fixture_' + $form
+    $control = Invoke-FixtureRun $sandbox $form $false ''
+    $controlLines = Get-FixtureLines ([string]$control.Stdout + "`n" + [string]$control.Stderr)
+    $controlFired = (Test-ChannelRunValid $control $false) -and $controlLines.Valid
+    if ($controlFired) {
+        foreach ($attempt in $main) {
+            if ($attempt.ContainsKey('Informational')) { continue }
+            $expected = [string]$attempt.Allow
+            if ($attempt.ContainsKey('Marker')) { $expected = '^text=ok$' }
+            if (-not $controlLines.Items.ContainsKey($attempt.Name)) {
+                $controlFired = $false
+            } elseif ([string]$controlLines.Items[$attempt.Name] -cnotmatch $expected) {
+                $controlFired = $false
+            }
+        }
+    }
+    if (-not $controlFired) {
+        Write-FixtureDiag ($label + '_control') $control
+        Set-FixtureRefusal $report 'refused' 'control_not_fired'
+        return $report
+    }
+    $run = Invoke-FixtureRun $sandbox $form $true ''
+    if (-not (Test-ChannelRunValid $run $true)) {
+        Write-FixtureDiag $label $run
+        Set-FixtureRefusal $report 'refused' 'fixture_incomplete'
+        return $report
+    }
+    $lines = Get-FixtureLines ([string]$run.Stdout + "`n" + [string]$run.Stderr)
+    if (-not $lines.Valid) { Set-FixtureRefusal $report 'refused' 'attempt_unexpected' }
+    $names = @($main | ForEach-Object { [string]$_.Name })
+    foreach ($seen in @($lines.Items.Keys)) {
+        if ($names -cnotcontains [string]$seen) { Set-FixtureRefusal $report 'refused' 'attempt_unexpected' }
+    }
+    foreach ($attempt in $main) {
+        $informational = $attempt.ContainsKey('Informational')
+        $basis = 'boundary'
+        if ($attempt.ContainsKey('Basis')) { $basis = [string]$attempt.Basis }
+        $result = 'missing'
+        if ($lines.Items.ContainsKey($attempt.Name)) {
+            $text = [string]$lines.Items[$attempt.Name]
+            if ($attempt.ContainsKey('Marker')) {
+                $result = 'other'
+                if (($text -ceq 'text=ok') -and ((Get-CleanText ([string]$run.Stdout + [string]$run.Stderr) 20000) -cnotmatch ':')) { $result = 'contained' }
+            } else {
+                $result = Get-TextClass $text $attempt
+            }
+        }
+        Write-Line ('windows-confinement-fixture-attempt=' + $form + '/' + $attempt.Name + ' result=' + $result + ' expect=' + $attempt.Expect + ' control=fired hang=none informational=' + $informational.ToString().ToLowerInvariant() + ' basis=' + $basis)
+        if ($informational) {
+            $report.Informational += 1
+            if ($result -cne [string]$attempt.Expect) {
+                $diagLine = 'result=' + $result
+                if ($lines.Items.ContainsKey($attempt.Name)) { $diagLine = [string]$lines.Items[$attempt.Name] }
+                Write-DiagLines ($label + '_' + $attempt.Name) 'observed' $diagLine
+            }
+            if ($attempt.ContainsKey('LeakGuard') -and $result -ceq 'allowed') { Set-FixtureRefusal $report 'observed-leak' 'fixture_allowed' }
+            continue
+        }
+        $report.Attempts += 1
+        $report.ControlsFired += 1
+        if ($result -ceq [string]$attempt.Expect) { continue }
+        if ($result -ceq 'allowed') { Set-FixtureRefusal $report 'observed-leak' 'fixture_allowed' }
+        elseif ($result -ceq 'missing') { Set-FixtureRefusal $report 'refused' 'fixture_incomplete' }
+        else { Set-FixtureRefusal $report 'refused' 'attempt_unexpected' }
+    }
+    if ($report.Status -cne 'contained') { Write-FixtureDiag $label $run }
+    foreach ($attempt in $separate) {
+        Invoke-FixtureSeparate $sandbox $form $attempt $report
+    }
+    return $report
+}
+
+function Invoke-FixturePhase($sandbox) {
+    $reports = [ordered]@{}
+    $contained = 0
+    $controlled = 0
+    foreach ($form in $FixtureForms) {
+        $report = Invoke-FixtureForm $sandbox $form
+        $reports[$form] = $report
+        Write-Line ('windows-confinement-fixture=' + $form + ' status=' + $report.Status + ' reason=' + $report.Reason + ' attempts=' + $report.Attempts + ' informational=' + $report.Informational + ' controls_fired=' + $report.ControlsFired)
+        if ($report.Status -ceq 'contained') { $contained += 1 }
+        $controlled += $report.ControlsFired
+    }
+    $state = 'contained'
+    foreach ($form in $FixtureForms) {
+        if ($reports[$form].Status -ceq 'observed-leak') { $state = 'observed-leak' }
+    }
+    if ($state -cne 'observed-leak' -and $contained -ne $FixtureForms.Count) { $state = 'refused' }
+    Write-Line ('windows-confinement-fixtures=' + $state + ' forms=' + $contained + '/' + $FixtureForms.Count + ' controlled=' + $controlled + ' uncontrolled=0')
+    return $state
 }
 
 function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
@@ -1438,6 +1995,7 @@ try {
         }
         [IO.File]::WriteAllText($layout.NodeTest, $NodeTestText.Replace("`r`n", "`n"), $encoding)
         [IO.File]::WriteAllText($layout.NodeChild, $NodeChildText.Replace("`r`n", "`n"), $encoding)
+        Initialize-FixtureSources
 
         $phase = 'canaries'
         $canarySuffix = [Guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -1469,7 +2027,7 @@ try {
         $probeBuilt = Join-Path $script:Control.Root 'kd_probe_build.exe'
         $probeSource = Join-Path $PSScriptRoot 'windows_probe.rs'
         $probeRustc = Join-Path $layout.RustBin 'rustc.exe'
-        $probeArguments = '--edition 2021 -C opt-level=1 -C debuginfo=0 -C link-arg=/DEBUG:NONE -C linker=' + $layout.MsvcBin + '\link.exe -l kernel32 -l ws2_32 -l advapi32 -l userenv -o ' + $probeBuilt + ' ' + $probeSource
+        $probeArguments = '--edition 2021 -C opt-level=1 -C debuginfo=0 -C link-arg=/DEBUG:NONE -C linker=' + $layout.MsvcBin + '\link.exe -l kernel32 -l ws2_32 -l advapi32 -l userenv -l ole32 -l oleaut32 -l fwpuclnt -o ' + $probeBuilt + ' ' + $probeSource
         $probeEnvironment = New-StageEnvironment $script:Control 'target-probe-build'
         $probeBuild = $box.Run($false, $probeRustc, ('"' + $probeRustc + '" ' + $probeArguments), $script:Control.Root, $probeEnvironment, 240000, [uint32]32)
         if ($probeBuild.Failure -ne '' -or -not $probeBuild.Exited -or $probeBuild.TimedOut -or $probeBuild.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $probeBuilt)) {
@@ -1504,6 +2062,9 @@ try {
 
         $phase = 'channels_before'
         $channelsBefore = Invoke-ChannelPhase $box 'selftest' $true
+
+        $phase = 'fixtures'
+        $fixtureState = Invoke-FixturePhase $box
 
         $phase = 'ladder'
         $confinedOutcomes = Invoke-Ladder $box $true $script:Lpac
@@ -1596,7 +2157,8 @@ try {
         if ((Get-ChannelBlockedCount $channelsAfter) -eq $ChannelNames.Count) { $observed['channels_after'] = 'blocked' }
         $observed['channel_controls'] = Get-ChannelControlState $channelsBefore
         $observed['dns_after'] = $dnsAfter
-        $expectedTokens = [ordered]@{ rust = 'compiled'; node = 'ran'; node_child = 'ran'; first_failure = 'none'; lpac = 'verified'; lpac_basis = 'attr'; capabilities = 'registryRead'; job = 'verified'; acl = 'verified'; scratch_write = 'ok'; ro_write = 'denied'; downloads = 'denied'; nul_open = 'ok'; nul_write_dac = 'denied'; stdin = 'eof_pipe'; temp_dir = 'verified'; spawn_piped = 'ok'; network = 'blocked'; ipv6 = 'blocked'; ipv6_control = 'open'; canary = 'absent'; control_rust = 'compiled'; control_node = 'ran'; css_transform = 'ok'; channels_before = 'blocked'; channels_after = 'blocked'; channel_controls = 'fired'; dns_after = 'open' }
+        $observed['fixtures'] = $fixtureState
+        $expectedTokens = [ordered]@{ rust = 'compiled'; node = 'ran'; node_child = 'ran'; first_failure = 'none'; lpac = 'verified'; lpac_basis = 'attr'; capabilities = 'registryRead'; job = 'verified'; acl = 'verified'; scratch_write = 'ok'; ro_write = 'denied'; downloads = 'denied'; nul_open = 'ok'; nul_write_dac = 'denied'; stdin = 'eof_pipe'; temp_dir = 'verified'; spawn_piped = 'ok'; network = 'blocked'; ipv6 = 'blocked'; ipv6_control = 'open'; canary = 'absent'; control_rust = 'compiled'; control_node = 'ran'; css_transform = 'ok'; channels_before = 'blocked'; channels_after = 'blocked'; channel_controls = 'fired'; dns_after = 'open'; fixtures = 'contained' }
         if ($observed['ipv6'] -ceq 'not_applicable') { $expectedTokens['ipv6'] = 'not_applicable'; $expectedTokens['ipv6_control'] = 'unroutable' }
         $summary = 'windows-confinement-spike=observed'
         $allExpected = $true
@@ -1628,10 +2190,19 @@ try {
 }
 if ($nullRestore -eq 'failed') { $cleanup = 'incomplete' }
 
+$processState = 'none'
+try {
+    $processState = Get-JobLiveness @($box, $script:OtherBox) 10
+} catch {
+    $processState = 'unknown'
+}
+if ($processState -ne 'none') { $cleanup = 'incomplete' }
+
 try {
     Remove-Canaries
 } catch {
     $cleanup = 'incomplete'
+    Write-CleanupDetail 'canaries' $_
 }
 
 try {
@@ -1640,24 +2211,12 @@ try {
     $cleanup = 'incomplete'
 }
 
-$processState = 'none'
-try {
-    $waited = 0
-    while ((Get-ContainerProcessCount $baseDirectory) -gt 0 -and $waited -lt 10) {
-        Start-Sleep -Seconds 1
-        $waited += 1
-    }
-    if ((Get-ContainerProcessCount $baseDirectory) -gt 0) { $processState = 'alive' }
-} catch {
-    $processState = 'unknown'
-}
-if ($processState -ne 'none') { $cleanup = 'incomplete' }
-
 try {
     if ($processState -eq 'none' -and $script:ProfileFolder -and (Test-Path -LiteralPath $script:ProfileFolder)) { Remove-ReparsePoints $script:ProfileFolder }
     if ($processState -eq 'none' -and $script:OtherFolder -and (Test-Path -LiteralPath $script:OtherFolder)) { Remove-ReparsePoints $script:OtherFolder }
 } catch {
     $cleanup = 'incomplete'
+    Write-CleanupDetail 'links' $_
 }
 
 $profileState = 'not_created'
@@ -1674,6 +2233,7 @@ try {
     }
 } catch {
     $profileState = 'failed'
+    Write-CleanupDetail 'profile' $_
 }
 if ($profileState -eq 'failed') { $cleanup = 'incomplete' }
 
@@ -1688,6 +2248,7 @@ try {
     }
 } catch {
     $cleanup = 'incomplete'
+    Write-CleanupDetail 'other' $_
 }
 
 $tempState = 'removed'
@@ -1699,6 +2260,7 @@ try {
     if ($script:ExpectedTemp -and (Test-Path -LiteralPath $script:ExpectedTemp)) { $tempState = 'failed' }
 } catch {
     $tempState = 'failed'
+    Write-CleanupDetail 'base' $_
 }
 if ($tempState -eq 'failed') { $cleanup = 'incomplete' }
 
@@ -1714,6 +2276,7 @@ try {
     }
 } catch {
     $linksState = 'failed'
+    Write-CleanupDetail 'trap' $_
 }
 if (@('verified', 'not_planted') -cnotcontains $linksState) { $cleanup = 'incomplete' }
 
@@ -1725,7 +2288,7 @@ if ($Mode -eq 'spike') {
     $profileText = 'deleted'
     if (@('deleted_by_api', 'removed_manually') -cnotcontains $profileState) { $profileText = $profileState }
     Write-Line ('windows-confinement-profile-folder=' + $profileState)
-    Write-Line ('windows-confinement-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' symlinks=' + $script:PlantedSymlinks + ' processes=' + $processState)
+    Write-Line ('windows-confinement-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' symlinks=' + $script:PlantedSymlinks + ' processes=' + $processState + ' liveness=job')
     if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }
 }
 exit $exitCode

@@ -32,6 +32,13 @@ extern "system" {
     fn CreateAppContainerProfile(name: *const u16, display: *const u16, description: *const u16, capabilities: *mut u8, count: u32, sid: *mut isize) -> i32;
     fn DeleteAppContainerProfile(name: *const u16) -> i32;
     fn FreeSid(sid: isize) -> isize;
+    fn CoInitializeEx(reserved: *mut u8, flags: u32) -> i32;
+    fn CoUninitialize();
+    fn CoCreateInstance(clsid: *const u8, outer: *mut u8, context: u32, iid: *const u8, object: *mut *mut u8) -> i32;
+    fn SysAllocString(text: *const u16) -> *mut u16;
+    fn SysFreeString(text: *mut u16);
+    fn FwpmEngineOpen0(server: *const u16, authn: u32, credentials: *mut u8, session: *const u8, engine: *mut isize) -> u32;
+    fn FwpmEngineClose0(engine: isize) -> u32;
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -591,6 +598,130 @@ fn probe_tokenpriv() -> String {
     }
 }
 
+fn vtable_entry(object: *mut u8, index: usize) -> usize {
+    unsafe {
+        let table = *(object as *const *const usize);
+        *table.add(index)
+    }
+}
+
+fn release_object(object: *mut u8) {
+    if object.is_null() {
+        return;
+    }
+    let release: extern "system" fn(*mut u8) -> u32 = unsafe { std::mem::transmute(vtable_entry(object, 2)) };
+    release(object);
+}
+
+fn probe_taskreg() -> String {
+    let init = unsafe { CoInitializeEx(ptr::null_mut(), 0) };
+    if init < 0 {
+        return format!("create=hr{:08x}", init as u32);
+    }
+    let clsid: [u32; 4] = [0x0F87369F, 0x4CFCA4E5, 0xE6733EBD, 0xDD724515];
+    let iid: [u32; 4] = [0x2FABA4C7, 0x40134DA9, 0xCC209796, 0x850FD43F];
+    let mut object: *mut u8 = ptr::null_mut();
+    let made = unsafe { CoCreateInstance(clsid.as_ptr() as *const u8, ptr::null_mut(), 5, iid.as_ptr() as *const u8, &mut object) };
+    if made < 0 || object.is_null() {
+        unsafe {
+            CoUninitialize();
+        }
+        return format!("create=hr{:08x}", made as u32);
+    }
+    let empty: [u64; 2] = [0, 0];
+    let connect: extern "system" fn(*mut u8, *const u8, *const u8, *const u8, *const u8) -> i32 = unsafe { std::mem::transmute(vtable_entry(object, 10)) };
+    let connected = connect(object, empty.as_ptr() as *const u8, empty.as_ptr() as *const u8, empty.as_ptr() as *const u8, empty.as_ptr() as *const u8);
+    release_object(object);
+    unsafe {
+        CoUninitialize();
+    }
+    if connected < 0 {
+        return format!("create=ok connect=hr{:08x}", connected as u32);
+    }
+    String::from("create=ok connect=ok")
+}
+
+fn probe_wmi() -> String {
+    let init = unsafe { CoInitializeEx(ptr::null_mut(), 0) };
+    if init < 0 {
+        return format!("create=hr{:08x}", init as u32);
+    }
+    let clsid: [u32; 4] = [0x4590F811, 0x11D01D3A, 0xAA001F89, 0x242E4B00];
+    let iid: [u32; 4] = [0xDC12A687, 0x11CF737F, 0xAA004D88, 0x242E4B00];
+    let mut object: *mut u8 = ptr::null_mut();
+    let made = unsafe { CoCreateInstance(clsid.as_ptr() as *const u8, ptr::null_mut(), 5, iid.as_ptr() as *const u8, &mut object) };
+    if made < 0 || object.is_null() {
+        unsafe {
+            CoUninitialize();
+        }
+        return format!("create=hr{:08x}", made as u32);
+    }
+    let namespace = wide("ROOT\\CIMV2");
+    let name = unsafe { SysAllocString(namespace.as_ptr()) };
+    let mut services: *mut u8 = ptr::null_mut();
+    let connect: extern "system" fn(*mut u8, *mut u16, *mut u16, *mut u16, *mut u16, i32, *mut u16, *mut u8, *mut *mut u8) -> i32 = unsafe { std::mem::transmute(vtable_entry(object, 3)) };
+    let connected = connect(object, name, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), 0, ptr::null_mut(), ptr::null_mut(), &mut services);
+    release_object(services);
+    unsafe {
+        SysFreeString(name);
+    }
+    release_object(object);
+    unsafe {
+        CoUninitialize();
+    }
+    if connected < 0 {
+        return format!("create=ok connect=hr{:08x}", connected as u32);
+    }
+    String::from("create=ok connect=ok")
+}
+
+fn probe_wfp() -> String {
+    let mut engine: isize = 0;
+    let status = unsafe { FwpmEngineOpen0(ptr::null(), 10, ptr::null_mut(), ptr::null(), &mut engine) };
+    if status != 0 {
+        return format!("open=err{}", status);
+    }
+    unsafe {
+        FwpmEngineClose0(engine);
+    }
+    String::from("open=ok")
+}
+
+fn probe_procpeer() -> String {
+    let executable = match env::current_exe() {
+        Ok(value) => value,
+        Err(error) => return format!("spawn={}", code(&error)),
+    };
+    let mut command = Command::new(executable);
+    command.arg("peerwait");
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(value) => value,
+        Err(error) => return format!("spawn={}", code(&error)),
+    };
+    let handle = unsafe { OpenProcess(0x1010, 0, child.id()) };
+    let state = if handle == 0 {
+        let last = last_error();
+        format!("open=err{}", last)
+    } else {
+        unsafe {
+            CloseHandle(handle);
+        }
+        String::from("open=ok")
+    };
+    drop(child.stdin.take());
+    let _ = child.wait();
+    state
+}
+
+fn probe_peerwait() -> String {
+    let mut buffer = [0u8; 16];
+    let _ = std::io::stdin().read(&mut buffer);
+    String::from("result=ok")
+}
+
 fn main() {
     let arguments: Vec<String> = env::args().collect();
     let command = arguments.get(1).map(|value| value.as_str()).unwrap_or("");
@@ -632,6 +763,11 @@ fn main() {
         "hardlink" => probe_hardlink(first, second),
         "tokenraise" => probe_tokenraise(),
         "tokenpriv" => probe_tokenpriv(),
+        "taskreg" => probe_taskreg(),
+        "wmi" => probe_wmi(),
+        "wfp" => probe_wfp(),
+        "procpeer" => probe_procpeer(),
+        "peerwait" => probe_peerwait(),
         _ => String::from("usage"),
     };
     println!("kd-probe {} {}", command, text);
