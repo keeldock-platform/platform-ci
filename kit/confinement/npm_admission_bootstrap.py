@@ -1187,6 +1187,29 @@ def _reachable_paths(packages, start):
     return seen
 
 
+def _advisory_reach_fields(name, versions, direct, lock, entries):
+    """Name, for a blocked advisory, whether every affected entry is development-only and which
+    root direct dependencies reach it, so an allow record can be written to match exactly."""
+    if type(lock) is not dict or type(entries) is not list:
+        return ()
+    affected = {
+        path for path, entry in entries
+        if entry.get("name") == name and entry.get("version") in versions
+    }
+    if not affected:
+        return ()
+    dev = all(entry.get("dev") is True for path, entry in entries if path in affected)
+    try:
+        reach = _direct_reach(lock, direct or {})
+    except (KeyError, TypeError, ValueError):
+        return (("dev", "yes" if dev else "no"),)
+    consumers = sorted(root for root, reached in reach.items() if affected & reached)
+    text = ",".join(consumers)[:320] if consumers else "none"
+    if adm.DETAIL_FIELD_RE.match(text) is None:
+        text = "unrepresentable"
+    return (("dev", "yes" if dev else "no"), ("consumers", text))
+
+
 def _direct_reach(lock, direct):
     """Map each root direct dependency to the set of lock paths its dependency paths reach."""
     packages = lock["packages"]
@@ -1293,7 +1316,10 @@ def check_advisories(response_bytes, inventory, allows=(), direct=None, now_ms=0
                     advisory_id = str(identifier)
                 _bundle_refuse(
                     "npm_advisory_blocked", "advisory", adm.package_subject(name, sorted(versions)[0]),
-                    adm.detail_text(advisory_id, 64), fields=(("severity", severity),),
+                    adm.detail_text(advisory_id, 64),
+                    fields=(("severity", severity),) + _advisory_reach_fields(
+                        name, frozenset(versions), direct, lock, entries,
+                    ),
                 )
             for version in versions:
                 findings.append({

@@ -2025,8 +2025,8 @@ class BundleDetailTests(RefusalAssertions):
              "request_mismatch:beta-pkg@2.0.0:licence"),
             ("npm_request_mismatch", {"extra_rows": (("delta-pkg", "4.0.0"),)},
              "request_mismatch:bundle:unmatched_rows count:1"),
-            ("npm_advisory_blocked", {"advisory": blocked}, "advisory:alpha-pkg@1.0.0:9 severity:high"),
-            ("npm_advisory_blocked", {"advisory": hostile}, "advisory:alpha-pkg@1.0.0:x_y severity:low"),
+            ("npm_advisory_blocked", {"advisory": blocked}, "advisory:alpha-pkg@1.0.0:9 severity:high dev:yes consumers:alpha-pkg"),
+            ("npm_advisory_blocked", {"advisory": hostile}, "advisory:alpha-pkg@1.0.0:x_y severity:low dev:yes consumers:alpha-pkg"),
             ("npm_advisory_invalid", {"advisory": b"not json"}, "advisory_invalid:advisories:json"),
             ("npm_advisory_invalid", {"advisory": b"[]"}, "advisory_invalid:advisories:shape"),
             ("npm_advisory_invalid", {"advisory": b'{"ghost-pkg":[]}'},
@@ -2547,6 +2547,33 @@ class SiblingLoadTests(unittest.TestCase):
         self.assertEqual(feedback_request.NPM_ADMISSION_MAX_RECEIPT_BYTES, subject.MAX_RECEIPT_BYTES)
         self.assertEqual(feedback_request.NPM_ADMISSION_MAX_EVIDENCE_BYTES, subject.MAX_EVIDENCE_BYTES)
         self.assertEqual(feedback_request.NPM_ADMISSION_MAX_PACKAGES, subject.MAX_PACKAGES)
+
+
+class AdvisoryReachFieldTests(unittest.TestCase):
+    def test_a_blocked_advisory_names_the_dev_flag_and_the_root_consumers(self):
+        lock = {"packages": {
+            "": {},
+            "node_modules/a": {"dependencies": {"m": "^1.0.0"}},
+            "node_modules/b": {},
+            "node_modules/m": {},
+        }}
+        entries = [
+            ("node_modules/a", {"name": "a", "version": "1.0.0", "dev": True}),
+            ("node_modules/b", {"name": "b", "version": "1.0.0", "dev": True}),
+            ("node_modules/m", {"name": "m", "version": "1.0.0", "dev": True}),
+        ]
+        direct = {"a": "1.0.0", "b": "1.0.0"}
+        self.assertEqual(
+            subject._advisory_reach_fields("m", frozenset({"1.0.0"}), direct, lock, entries),
+            (("dev", "yes"), ("consumers", "a")),
+        )
+        entries[2][1]["dev"] = False
+        self.assertEqual(
+            subject._advisory_reach_fields("m", frozenset({"1.0.0"}), direct, lock, entries),
+            (("dev", "no"), ("consumers", "a")),
+        )
+        self.assertEqual(subject._advisory_reach_fields("m", frozenset({"9.9.9"}), direct, lock, entries), ())
+        self.assertEqual(subject._advisory_reach_fields("m", frozenset({"1.0.0"}), direct, None, entries), ())
 
 
 class MetadataCapTests(unittest.TestCase):
