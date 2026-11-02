@@ -2924,6 +2924,11 @@ foreach ($case in $cases) {
         self.assertIn("-ceq 'canary-reads' -and -not (Test-NotFoundAttributable", self.wrapper)
         self.assertIn("-ceq 'read-canary' -and -not (Test-NotFoundAttributable $text $script:CanaryRunnerTemp)", self.wrapper)
 
+    def test_connect_state_matches_each_pattern_once(self):
+        body = self.function_body("Get-NetworkState")
+        self.assertEqual(body.count("'^resolve=ok connect=(err[0-9]{1,5})$'"), 1)
+        self.assertEqual(body.count("'^resolve=(err[0-9]{1,5})$'"), 2)
+
     def test_taskreg_variants_are_separate_24_byte_buffers_and_wfp_loads_at_run_time(self):
         probe = self.probe
         task = probe[probe.index("fn probe_taskreg"):probe.index("fn probe_wmi")]

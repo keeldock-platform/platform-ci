@@ -774,15 +774,13 @@ function Get-NetworkState([string]$stdout, [string]$name) {
     if ($text -ceq 'wsa=failed') { return 'wsa_failed' }
     if ($name -ceq 'connect') {
         if ($text -ceq 'resolve=ok connect=open') { return 'open' }
-        $found = [regex]::Match($text, '^resolve=ok connect=(err[0-9]{1,5})$')
-        if ($found.Success -and ($NetworkDeniedConnect -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        $connectFound = [regex]::Match($text, '^resolve=ok connect=(err[0-9]{1,5})$')
+        if ($connectFound.Success -and ($NetworkDeniedConnect -ccontains $connectFound.Groups[1].Value)) { return 'blocked' }
         $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
         if ($found.Success -and ($NetworkDeniedResolve -ccontains $found.Groups[1].Value)) { return 'blocked' }
-        $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
         if ($found.Success -and ($NetworkDeniedHostResolve -ccontains $found.Groups[1].Value)) { return 'blocked_resolve' }
         if ($text -ceq 'resolve=empty') { return 'unroutable' }
-        $found = [regex]::Match($text, '^resolve=ok connect=(err[0-9]{1,5})$')
-        if ($found.Success -and ($NetworkUnroutableConnect -ccontains $found.Groups[1].Value)) { return 'unroutable' }
+        if ($connectFound.Success -and ($NetworkUnroutableConnect -ccontains $connectFound.Groups[1].Value)) { return 'unroutable' }
         return 'unexpected'
     }
     if ($name -ceq 'dns') {
