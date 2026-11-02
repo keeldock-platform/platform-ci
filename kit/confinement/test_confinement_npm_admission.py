@@ -551,8 +551,8 @@ class NpmAdmissionTests(unittest.TestCase):
         double_slash.type = tarfile.DIRTYPE
         legacy_directory = tarfile.TarInfo("package/legacy/")
         legacy_directory.type = tarfile.AREGTYPE
+        subject._preflight_tar_headers(bytes(no_slash) + bytes(1024))
         for header in (
-                bytes(no_slash),
                 double_slash.tobuf(format=tarfile.USTAR_FORMAT),
                 legacy_directory.tobuf(format=tarfile.USTAR_FORMAT)):
             raw = header + bytes(1024)
@@ -1509,6 +1509,18 @@ class NpmArchiveDetailTests(unittest.TestCase):
         self.assertEqual(self.refusal(data, name="Bad Name"), "archive_input:Bad_Name@1.0.0:name")
         self.assertEqual(self.refusal(data, version="x"), "archive_input:sample@x:version")
 
+    def test_archive_manifests_keep_json_floats_as_opaque_text_and_nothing_else_does(self):
+        loaded = subject._load_json(b'{"a":1.5,"b":[3.5,10]}', 100, "npm_archive_invalid", opaque_numbers=True)
+        self.assertEqual(loaded, {"a": "1.5", "b": ["3.5", 10]})
+        with self.assertRaises(subject.Refusal) as raised:
+            subject._load_json(b'{"a":1.5}', 100, "npm_lock_invalid")
+        self.assertEqual(raised.exception.reason, "npm_lock_invalid")
+        data = self.member_tar(
+            tarfile.TarInfo("package/package.json"),
+            b'{"name":"sample","version":"1.0.0","testling":{"browsers":{"ff":[3.5,10]}}}',
+        )
+        self.assertEqual(subject.verify_tarball(self.entry(data), data)["file_count"], 1)
+
     def test_the_manifest_refusals_name_their_check(self):
         other_name = _tarball("other", "1.0.0")
         self.assertEqual(self.refusal(other_name), "archive_manifest:" + self.SUBJECT + ":name_mismatch")
@@ -1517,7 +1529,8 @@ class NpmArchiveDetailTests(unittest.TestCase):
         no_manifest = self.member_tar(tarfile.TarInfo("package/readme.txt"), b"x")
         self.assertEqual(self.refusal(no_manifest), "archive_manifest:" + self.SUBJECT + ":missing")
         for text, token in (
-            ('{"name":"sample","version":"1.0.0","x":1.5}', "json_decode"),
+            ('{"name":"sample","version":"1.0.0","x":NaN}', "json_decode"),
+            ('{"name":"sample","version":"1.0.0","x":Infinity}', "json_decode"),
             ('{"name":"sample","version":"1.0.0","x":1,"x":2}', "json_decode"),
             ('{"name":"sample","version":"1.0.0","scripts":[]}', "scripts_shape"),
             ('{"name":"sample","version":"1.0.0","scripts":{"a":1}}', "scripts_value"),

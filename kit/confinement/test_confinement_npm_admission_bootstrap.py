@@ -2287,8 +2287,8 @@ class BundleDetailTests(RefusalAssertions):
         def refused(data, reason="npm_archive_refused"):
             return self.detail(reason, subject._archive_manifest, data, "sample", "1.0.0")
 
-        floats = _raw_members(((tarfile.TarInfo("package/package.json"), b'{"x":1.5}'),))
-        self.assertEqual(refused(floats), "archive_manifest:sample@1.0.0:json_decode")
+        constants = _raw_members(((tarfile.TarInfo("package/package.json"), b'{"x":NaN}'),))
+        self.assertEqual(refused(constants), "archive_manifest:sample@1.0.0:json_decode")
         listing = _raw_members(((tarfile.TarInfo("package/package.json"), b"[]"),))
         self.assertEqual(refused(listing), "archive_manifest:sample@1.0.0:shape")
         other = _raw_members(((tarfile.TarInfo("package/other.txt"), b"x"),))

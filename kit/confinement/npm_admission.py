@@ -24,8 +24,8 @@ MAX_RECEIPT_BYTES = 2 * 1024 * 1024
 MAX_TARBALL_BYTES = 32 * 1024 * 1024
 MAX_TAR_BYTES = 192 * 1024 * 1024
 MAX_PACKAGE_UNPACKED_BYTES = 128 * 1024 * 1024
-MAX_TOTAL_COMPRESSED_BYTES = 192 * 1024 * 1024
-MAX_TOTAL_UNPACKED_BYTES = 768 * 1024 * 1024
+MAX_TOTAL_COMPRESSED_BYTES = 1024 * 1024 * 1024
+MAX_TOTAL_UNPACKED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_ARCHIVE_FILES = 100_000
 MAX_ARCHIVE_PATH_BYTES = 512
 MAX_PACKAGE_JSON_BYTES = 256 * 1024
@@ -357,7 +357,7 @@ def _check_json_bounds(value, reason, depth=0, counter=None):
         _refuse(reason, build_detail("json_type"))
 
 
-def _load_json(data, maximum, reason, ascii_only=False):
+def _load_json(data, maximum, reason, ascii_only=False, opaque_numbers=False):
     if type(data) is not bytes or not data or len(data) > maximum:
         _refuse(reason, build_detail("json_size"))
     encoding = "ascii" if ascii_only else "utf-8"
@@ -369,7 +369,7 @@ def _load_json(data, maximum, reason, ascii_only=False):
             text,
             object_pairs_hook=_unique_json_pairs,
             parse_int=_parse_json_int,
-            parse_float=_reject_json_number,
+            parse_float=str if opaque_numbers else _reject_json_number,
             parse_constant=_reject_json_constant,
         )
     except Refusal:
@@ -947,9 +947,9 @@ def _preflight_tar_headers(data, subject=None):
         if not raw_name:
             _archive_refuse("archive_path", subject, "empty_name", label, index=index)
         if member_type == b"5":
-            if not raw_path.endswith(b"/") or raw_path.endswith(b"//"):
+            if raw_path.endswith(b"//"):
                 _archive_refuse("archive_path", subject, "directory_slash", label, index=index)
-            validated_path = raw_path[:-1]
+            validated_path = raw_path[:-1] if raw_path.endswith(b"/") else raw_path
         else:
             if raw_path.endswith(b"/"):
                 _archive_refuse("archive_path", subject, "file_slash", label, index=index)
@@ -1002,7 +1002,7 @@ def _detail_head(detail):
 
 def _manifest_scripts(data, name, version, subject=None):
     try:
-        manifest = _load_json(data, MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid")
+        manifest = _load_json(data, MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid", opaque_numbers=True)
     except Refusal as error:
         _archive_refuse("archive_manifest", subject, _detail_head(error.detail))
     if type(manifest) is not dict:

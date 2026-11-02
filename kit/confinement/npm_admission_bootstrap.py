@@ -952,7 +952,7 @@ def _archive_manifest(data, name=None, version=None):
         )
     try:
         manifest = _call_adm(
-            adm._load_json, content, adm.MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid",
+            adm._load_json, content, adm.MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid", opaque_numbers=True,
         )
     except BootstrapRefusal as error:
         token = adm._detail_head(error.detail.split(":", 2)[-1] if error.detail else None)
