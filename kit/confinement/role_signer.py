@@ -3154,6 +3154,20 @@ def load_provider_snapshots(artifact_map, roles, artifact_directory,
     return provider_snapshots
 
 
+def check_fixed_linux_evidence(profile, jobs, run_id, run_attempt, control_sha, linux_logs_path):
+    if profile != "candidate":
+        raise Refusal("profile-invalid")
+    if not linux_logs_path:
+        raise Refusal("linux-logs-missing")
+    logs = load_json_file(linux_logs_path)
+    if type(logs) is not dict or set(logs) != {"sections", "other"}:
+        raise Refusal("linux-logs-shape")
+    return validate_linux_revocation_evidence(
+        jobs, run_id, run_attempt, control_sha,
+        API_JOB_NAME_PINS[profile]["linux-fetch-encrypt"], API_LINUX_STEP_NAME_PINS[profile],
+        API_LINUX_STEP_ORDINAL_PINS[profile], logs["sections"], logs["other"])
+
+
 def _cmd_verify_snapshot(arguments):
     profile = arguments.profile
     if profile not in CALLER_PROFILES:
@@ -3226,15 +3240,8 @@ def _cmd_verify_snapshot(arguments):
         print("probe=role-signer observation=collected acceptance=blocked")
         return
     if profile == "candidate":
-        if not arguments.linux_logs:
-            raise Refusal("linux-logs-missing")
-        fixed_logs = load_json_file(arguments.linux_logs)
-        if type(fixed_logs) is not dict or set(fixed_logs) != {"sections", "other"}:
-            raise Refusal("linux-logs-shape")
-        validate_linux_revocation_evidence(
-            jobs, arguments.run_id, arguments.run_attempt, arguments.control_sha,
-            API_JOB_NAME_PINS[profile]["linux-fetch-encrypt"], API_LINUX_STEP_NAME_PINS[profile],
-            API_LINUX_STEP_ORDINAL_PINS[profile], fixed_logs["sections"], fixed_logs["other"])
+        check_fixed_linux_evidence(
+            profile, jobs, arguments.run_id, arguments.run_attempt, arguments.control_sha, arguments.linux_logs)
     if profile == "production-synthetic":
         raise Refusal("gate-c-and-d-evidence-not-implemented")
     print("probe=role-signer result=source-free-evidence-verified profile=%s gate-c=blocked gate-d=blocked" % profile)

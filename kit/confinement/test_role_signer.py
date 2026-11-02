@@ -3088,5 +3088,128 @@ class ReceiveCapsuleTests(unittest.TestCase):
                 "--run-attempt", "1", "--deadline-seconds", "1", "--output-directory", "x"])
 
 
+class CandidateFixedPinTests(unittest.TestCase):
+    LOGS = {
+        "sections": {
+            "revoke-source-token": "linux-source-token=revoked rejection=verified receipt=positive\n",
+            "verify-token-rejection": "handoff-revocation=confirmed\n",
+        },
+        "other": [""],
+    }
+
+    def _jobs(self, revoke=12, verify=13):
+        api_root = "https:" + chr(47) * 2 + "api.github.com/repos/" + REPOSITORY
+        rows = []
+        for index, role in enumerate(subject.CANDIDATE_ROLES, 1):
+            steps = [{"number": 1, "name": "x", "status": "completed", "conclusion": "success"}]
+            if role == "linux-fetch-encrypt":
+                steps += [
+                    {"number": revoke, "name": "handoff-revoke-source-token-v1", "status": "completed",
+                     "conclusion": "success"},
+                    {"number": verify, "name": "handoff-verify-token-rejection-v1", "status": "completed",
+                     "conclusion": "success"},
+                ]
+            rows.append({
+                "id": 1000 + index, "run_id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT),
+                "name": subject.API_JOB_NAME_PINS["candidate"][role], "head_sha": CONTROL_SHA,
+                "status": "completed", "conclusion": "success", "runner_name": "runner %d" % index,
+                "labels": [subject.ROLE_RUNNERS[role]],
+                "check_run_url": api_root + "/check-runs/" + str(2000 + index), "steps": steps,
+            })
+        return fixture_job_snapshot(rows)
+
+    def _write_logs(self, directory, document=None):
+        path = Path(directory) / "linux-logs.json"
+        path.write_text(json.dumps(self.LOGS if document is None else document), encoding="ascii")
+        return str(path)
+
+    def test_the_fixed_ordinals_and_names_are_twelve_and_thirteen(self):
+        self.assertEqual(subject.API_LINUX_STEP_ORDINAL_PINS["candidate"],
+                         {"revoke-source-token": 12, "verify-token-rejection": 13})
+
+    def test_verify_snapshot_check_accepts_the_pinned_ordinals_and_logs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            job = subject.check_fixed_linux_evidence(
+                "candidate", self._jobs(), RUN_ID, RUN_ATTEMPT, CONTROL_SHA, self._write_logs(temporary))
+            self.assertEqual(job["conclusion"], "success")
+
+    def test_verify_snapshot_check_refuses_a_wrong_ordinal_missing_or_malformed_logs_and_other_profiles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            logs = self._write_logs(temporary)
+            for revoke, verify in ((5, 6), (12, 14), (13, 12)):
+                with self.subTest(revoke=revoke, verify=verify):
+                    with self.assertRaises(subject.Refusal):
+                        subject.check_fixed_linux_evidence(
+                            "candidate", self._jobs(revoke, verify), RUN_ID, RUN_ATTEMPT, CONTROL_SHA, logs)
+            for missing in (None, ""):
+                with self.subTest(missing=missing):
+                    with self.assertRaisesRegex(subject.Refusal, "linux-logs-missing"):
+                        subject.check_fixed_linux_evidence(
+                            "candidate", self._jobs(), RUN_ID, RUN_ATTEMPT, CONTROL_SHA, missing)
+            for bad in ({"sections": {}}, [], {"sections": {}, "other": [], "extra": 1}):
+                with self.subTest(bad=bad):
+                    with self.assertRaisesRegex(subject.Refusal, "linux-logs-shape"):
+                        subject.check_fixed_linux_evidence(
+                            "candidate", self._jobs(), RUN_ID, RUN_ATTEMPT, CONTROL_SHA,
+                            self._write_logs(temporary, bad))
+            doubled = {"sections": dict(self.LOGS["sections"]), "other": [""]}
+            doubled["sections"]["verify-token-rejection"] = "handoff-revocation=confirmed\n" * 2
+            with self.assertRaises(subject.Refusal):
+                subject.check_fixed_linux_evidence(
+                    "candidate", self._jobs(), RUN_ID, RUN_ATTEMPT, CONTROL_SHA, self._write_logs(temporary, doubled))
+            for profile in ("probe", "production-synthetic"):
+                with self.assertRaisesRegex(subject.Refusal, "profile-invalid"):
+                    subject.check_fixed_linux_evidence(profile, self._jobs(), RUN_ID, RUN_ATTEMPT, CONTROL_SHA, logs)
+
+    def _gate_b(self, temporary, ref, jobs, pins, ordinals, logs):
+        world = CandidateWorld(ref)
+        world.write_evidence(Path(temporary) / "artifacts")
+        directory = install_control_tree(temporary, "candidate")
+        roles = subject.CANDIDATE_ROLES[:3]
+        names = {world.names[role] for role in roles}
+        rows = [row for row in world.rows if row["name"] in names]
+        providers = {}
+        for role in roles:
+            digest = hashlib.sha256(world.subjects[role][1]).hexdigest()
+            providers[digest] = {
+                "snapshot": fixture_provider_snapshot(digest, [{"bundle": world.bundles[role]}]),
+                "verified": [world.verified[world.names[role]]],
+            }
+        branch = ref[len("refs/heads/"):]
+        return subject.verify_transition_evidence(
+            "B", "candidate", REPOSITORY, ref, CONTROL_SHA, RUN_ID, RUN_ATTEMPT,
+            {"id": 8150001, "full_name": REPOSITORY, "owner_id": 99101, "visibility": "public"},
+            {"id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT), "head_sha": CONTROL_SHA,
+             "path": subject.CALLER_PROFILES["candidate"]["path"], "event": "workflow_dispatch",
+             "head_branch": branch, "repository": {"id": 8150001, "full_name": REPOSITORY},
+             "status": "in_progress", "conclusion": None},
+            jobs, fixture_artifact_snapshot(rows), providers, directory, Path(temporary) / "artifacts",
+            subject.API_JOB_NAME_PINS["candidate"], pins,
+            subject.API_LINUX_STEP_NAME_PINS["candidate"], ordinals, logs["sections"], logs["other"])
+
+    def test_gate_b_accepts_the_pinned_digests_and_ordinals_for_both_refs(self):
+        for ref in (REF, CANDIDATE_REF_UNTRUSTED):
+            with self.subTest(ref=ref), tempfile.TemporaryDirectory() as temporary:
+                result = self._gate_b(
+                    temporary, ref, self._jobs(), subject.resolve_certificate_pins("candidate", CONTROL_SHA),
+                    subject.API_LINUX_STEP_ORDINAL_PINS["candidate"], self.LOGS)
+                self.assertEqual(set(result["subject_digests"]), set(subject.CANDIDATE_ROLES[:3]))
+
+    def test_gate_b_refuses_a_wrong_certificate_digest(self):
+        pins = subject.resolve_certificate_pins("candidate", CONTROL_SHA)
+        wrong = {role: dict(value, sourceRepositoryDigest="b" * 40) for role, value in pins.items()}
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(subject.Refusal, "certificate-digest-mismatch"):
+                self._gate_b(temporary, CANDIDATE_REF_UNTRUSTED, self._jobs(), wrong,
+                             subject.API_LINUX_STEP_ORDINAL_PINS["candidate"], self.LOGS)
+
+    def test_gate_b_refuses_a_wrong_step_ordinal(self):
+        pins = subject.resolve_certificate_pins("candidate", CONTROL_SHA)
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(subject.Refusal, "linux-step-ordinal"):
+                self._gate_b(temporary, CANDIDATE_REF_UNTRUSTED, self._jobs(5, 6), pins,
+                             subject.API_LINUX_STEP_ORDINAL_PINS["candidate"], self.LOGS)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

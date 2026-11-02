@@ -100,8 +100,10 @@ runs:
         if [[ "${RUNNER_OS:-}" == "Linux" ]]; then
           "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_linux_source_build.py"
           "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../confinement" -p "test_rust_license_gate.py"
-          "$python_bin" -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: --no-deps --target "${RUNNER_TEMP:-/tmp}/kd-pydeps" -r "$CI_ACTION_PATH/../handoff/provider_requirements.txt"
-          PYTHONPATH="${RUNNER_TEMP:-/tmp}/kd-pydeps" "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../handoff" -p "test_source_capsule.py"
+          if [[ "${CI_POOL:-}" == "platform" ]]; then
+            "$python_bin" -m pip install --disable-pip-version-check --no-input --require-hashes --only-binary=:all: --no-deps --target "${RUNNER_TEMP:-/tmp}/kd-pydeps" -r "$CI_ACTION_PATH/../handoff/provider_requirements.txt"
+            PYTHONPATH="${RUNNER_TEMP:-/tmp}/kd-pydeps" "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../handoff" -p "test_source_capsule.py"
+          fi
           "$python_bin" -B -m unittest discover -s "$CI_ACTION_PATH/../../core-ci" -p "test_*.py"
         fi
         if [[ "${RUNNER_OS:-}" == "macOS" ]]; then

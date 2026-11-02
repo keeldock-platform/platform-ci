@@ -206,6 +206,14 @@ class PublicTreeTests(unittest.TestCase):
         block = action[action.index('if [[ "${RUNNER_OS:-}" == "Linux" ]]; then\n'):]
         block = block[:block.index("\n        fi\n")]
         self.assertIn('-p "test_source_capsule.py"', block)
+        guard = '          if [[ "${CI_POOL:-}" == "platform" ]]; then\n'
+        self.assertEqual(block.count(guard), 1)
+        inner = block[block.index(guard):]
+        inner = inner[:inner.index("\n          fi\n")]
+        self.assertIn(install, inner)
+        self.assertIn("provider_requirements.txt", inner)
+        self.assertIn('-p "test_source_capsule.py"', inner)
+        self.assertNotIn(install, block.replace(inner, ""))
 
     def test_synthetic_project_fixture_is_registered_pinned_and_discovered(self):
         prefix = "kit/confinement/synthetic_project/"
