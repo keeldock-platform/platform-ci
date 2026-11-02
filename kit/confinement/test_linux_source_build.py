@@ -21,6 +21,7 @@ import confinement_verdict
 import log_canary
 import linux_source_build
 import macos_core_contract
+import npm_admission_bootstrap
 
 
 def _path_only_lock(count, prefix="member"):
@@ -1649,6 +1650,424 @@ class LinuxSourceBuildTests(unittest.TestCase):
             base = self._write_manifests(Path(directory) / "narrow", {"workspaces": ["packages/host-api"]})
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
                 linux_source_build._manifest_digest(base)
+
+
+LOCK_SHA = "5" * 64
+RESOLVER = {"node_version": "24.22.1", "npm_version": "11.19.1"}
+LOCKED = {
+    "node_modules/fixture-lib": {"version": "1.5.0", "dev": True},
+    "node_modules/tool-a": {"version": "9.0.0", "dev": True},
+    "node_modules/tool-a/node_modules/fixture-lib": {"version": "1.5.0", "dev": True},
+    "node_modules/runtime-lib": {"version": "1.0.0"},
+}
+
+
+def _synthetic_receipt():
+    return {
+        "schema_version": 1, "record_type": "npm-admission-proposal-receipt",
+        "context": {
+            "repository": "owner/source", "filing": "filing-one", "source_sha": "a" * 40,
+            "base_sha": "b" * 40, "base_branch": "develop", "reviewed_diff_fingerprint": "c" * 64,
+            "control_sha": "d" * 40,
+        },
+        "inputs_sha256": "1" * 64, "request_doc_sha256": "2" * 64, "lock_sha256": LOCK_SHA,
+        "archive_set_sha256": "3" * 64, "package_set_sha256": "4" * 64,
+        "packages": [{
+            "path": "node_modules/fixture-lib", "name": "fixture-lib", "version": "1.5.0",
+            "integrity": "sha512-" + "A" * 86 + "==", "sha256": "8" * 64,
+            "audit_record_id": "pending-review",
+        }],
+    }
+
+
+def _synthetic_evidence(now, finding_changes=None, **changes):
+    policy_epoch = (now - 7200) * 1000
+    finding = {
+        "advisory_id": "9000001", "allow_expires_at_ms": policy_epoch + 30 * 86400 * 1000,
+        "allow_justification_sha256": "6" * 64, "allow_removal_condition": "fixture-adopted-by-consumers",
+        "name": "fixture-lib", "range": "<2.0.0", "severity": "moderate", "version": "1.5.0",
+    }
+    finding.update(finding_changes or {})
+    evidence = {
+        "schema_version": 1, "receipt_sha256": "7" * 64, "lock_sha256": LOCK_SHA,
+        "inputs_sha256": "1" * 64, "run_id": "1234567890", "run_attempt": 1,
+        "generated_at": now - 600, "expiry": now + 3600, "policy_epoch_ms": policy_epoch,
+        "cutoff_epoch_ms": policy_epoch - 7 * 86400 * 1000, "minimum_age_seconds": 604800,
+        "registry_origin": "registry.npmjs.org", "resolver": dict(RESOLVER),
+        "attestation_verification": "not_performed",
+        "totals": {
+            "packages": 1, "distinct_names": 1, "compressed_bytes": 10, "unpacked_bytes": 20,
+            "file_count": 2, "install_script_packages": 0, "native_packages": 0,
+            "unattested_packages": 1, "peer_checks": 0, "optional_peers_missing": 0,
+        },
+        "advisory": {
+            "endpoint": "npm-bulk-advisory-v1", "fetched_at": now - 500, "valid_until": now + 85900,
+            "request_sha256": "9" * 64, "response_sha256": "e" * 64, "package_count": 1,
+            "finding_count": 1, "status": "allowed_findings", "findings": [finding],
+        },
+        "duplicates": [],
+        "packages": [{
+            "path": "node_modules/fixture-lib", "name": "fixture-lib", "version": "1.5.0",
+            "sha256": "8" * 64, "published": "2026-01-01T00:00:00.000Z", "age_days": 100,
+            "licence": "MIT", "licence_elected": "MIT", "licence_flags": [], "install_scripts": [],
+            "native_count": 0, "native_sample": [], "attested": False, "publisher": "someone",
+            "deprecated": False, "dev": True, "optional": False, "compressed_bytes": 10,
+            "unpacked_bytes": 20, "file_count": 2, "direct": False,
+        }],
+    }
+    evidence.update(changes)
+    return evidence
+
+
+def _project_provenance(receipt, evidence_bytes):
+    evidence = json.loads(evidence_bytes)
+    record = {
+        name: evidence[name] for name in (
+            "schema_version", "receipt_sha256", "lock_sha256", "resolver", "minimum_age_seconds",
+            "policy_epoch_ms", "cutoff_epoch_ms", "generated_at", "expiry", "advisory",
+        )
+    }
+    record["context"] = receipt["context"]
+    record["evidence_sha256"] = hashlib.sha256(evidence_bytes).hexdigest()
+    return record
+
+
+def _encode(record):
+    return json.dumps(record, sort_keys=True, separators=(",", ":"))
+
+
+def _allow(now_ms, **changes):
+    allow = {
+        "name": "fixture-lib", "version": "1.5.0", "severity": "moderate", "advisory_id": "9000001",
+        "range": "<2.0.0", "allow_justification_sha256": "6" * 64,
+        "allow_expires_at_ms": now_ms + 86400 * 1000,
+        "allow_removal_condition": "fixture-adopted-by-consumers",
+    }
+    allow.update(changes)
+    return allow
+
+
+def _vulnerability(name, severity="moderate", via=None, nodes=None):
+    return {
+        "name": name, "severity": severity, "isDirect": False, "via": via, "effects": [],
+        "range": "<2.0.0", "nodes": nodes, "fixAvailable": True,
+    }
+
+
+def _advisory_via(name="fixture-lib", source=9000001, severity="moderate", url=None):
+    return {
+        "source": source, "name": name, "dependency": name, "title": "fixture advisory",
+        "url": url or "https://github.com/advisories/GHSA-aaaa-bbbb-cccc", "severity": severity,
+        "cwe": [], "cvss": {"score": 0, "vectorString": None}, "range": "<2.0.0",
+    }
+
+
+def _audit_json(vulnerabilities, **counts):
+    metadata = {"info": 0, "low": 0, "moderate": len(vulnerabilities), "high": 0, "critical": 0,
+                "total": len(vulnerabilities)}
+    metadata.update(counts)
+    return json.dumps({
+        "auditReportVersion": 2, "vulnerabilities": vulnerabilities,
+        "metadata": {"vulnerabilities": metadata, "dependencies": {"total": 4}},
+    }).encode("ascii")
+
+
+def _honoured_report():
+    return _audit_json({
+        "fixture-lib": _vulnerability(
+            "fixture-lib", via=[_advisory_via()],
+            nodes=["node_modules/fixture-lib", "node_modules/tool-a/node_modules/fixture-lib"],
+        ),
+        "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
+    })
+
+
+class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
+    def setUp(self):
+        self.now = int(time.time())
+        self.now_ms = self.now * 1000
+
+    def _environment(self, record):
+        return {
+            "LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": record if type(record) is str else _encode(record),
+            "LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256": LOCK_SHA,
+        }
+
+    def _provenance(self, **evidence_changes):
+        evidence = _synthetic_evidence(self.now, **evidence_changes)
+        encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("ascii")
+        return _project_provenance(_synthetic_receipt(), encoded)
+
+    def _refused(self, record):
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+            linux_source_build._validate_provenance_binding({}, self._environment(record))
+
+    def test_provenance_shape_matches_the_trusted_receipt_and_evidence_structure(self):
+        receipt = _synthetic_receipt()
+        evidence = _synthetic_evidence(self.now)
+        self.assertEqual(set(receipt), npm_admission_bootstrap.RECEIPT_FIELDS)
+        self.assertEqual(set(receipt["context"]), npm_admission_bootstrap.TRUSTED_CONTEXT_FIELDS)
+        self.assertEqual(set(evidence), npm_admission_bootstrap.EVIDENCE_FIELDS)
+        self.assertEqual(set(evidence["advisory"]), npm_admission_bootstrap.ADVISORY_FIELDS)
+        self.assertEqual(set(evidence["packages"][0]), npm_admission_bootstrap.EVIDENCE_PACKAGE_FIELDS)
+        provenance = self._provenance()
+        self.assertEqual(set(provenance), linux_source_build.PROVENANCE_FIELDS)
+        self.assertEqual(
+            linux_source_build.PROVENANCE_FIELDS - {"context", "evidence_sha256"},
+            linux_source_build.PROVENANCE_FIELDS & npm_admission_bootstrap.EVIDENCE_FIELDS,
+        )
+        self.assertEqual(
+            linux_source_build.PROVENANCE_CONTEXT_FIELDS, npm_admission_bootstrap.TRUSTED_CONTEXT_FIELDS,
+        )
+        self.assertEqual(
+            linux_source_build.PROVENANCE_ADVISORY_FIELDS, npm_admission_bootstrap.ADVISORY_FIELDS,
+        )
+        self.assertEqual(set(provenance["advisory"]["findings"][0]), linux_source_build.PROVENANCE_FINDING_FIELDS)
+        self.assertEqual(linux_source_build.PROVENANCE_RESOLVER_FIELDS, set(evidence["resolver"]))
+        self.assertEqual(linux_source_build.NODE_VERSION, evidence["resolver"]["node_version"])
+        self.assertEqual(linux_source_build.NPM_VERSION, evidence["resolver"]["npm_version"])
+        self.assertLess(
+            len(_encode(provenance)), linux_source_build.MAX_PROVENANCE_BYTES,
+        )
+        record = linux_source_build._validate_provenance_binding({}, self._environment(provenance))
+        self.assertEqual(record["advisory"]["findings"][0]["advisory_id"], "9000001")
+
+    def test_provenance_accepts_a_clear_advisory_result(self):
+        record = self._provenance()
+        record["advisory"] = dict(record["advisory"], status="clear", finding_count=0, findings=[])
+        accepted = linux_source_build._validate_provenance_binding({}, self._environment(record))
+        self.assertEqual(accepted["advisory"]["findings"], [])
+
+    def test_provenance_refuses_fields_the_trusted_run_cannot_supply(self):
+        for name in ("status", "age_status", "generation_attempts", "audit_status", "manifest_sha256"):
+            with self.subTest(extra=name):
+                self._refused(dict(self._provenance(), **{name: "passed"}))
+        for name in linux_source_build.PROVENANCE_FIELDS:
+            with self.subTest(missing=name):
+                record = self._provenance()
+                del record[name]
+                self._refused(record)
+
+    def test_provenance_refuses_a_changed_binding_or_stale_run(self):
+        changes = {
+            "lock": {"lock_sha256": "0" * 64},
+            "node": {"resolver": {"node_version": "24.0.0", "npm_version": "11.19.1"}},
+            "npm": {"resolver": {"node_version": "24.22.1", "npm_version": "10.0.0"}},
+            "age": {"minimum_age_seconds": 86400},
+            "cutoff": {"cutoff_epoch_ms": 1},
+            "expired": {"expiry": self.now - 1},
+            "future": {"generated_at": self.now + 3600},
+            "before_policy": {"generated_at": 1},
+            "receipt": {"receipt_sha256": "short"},
+            "schema": {"schema_version": 2},
+            "boolean": {"schema_version": True},
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self._refused(dict(self._provenance(), **change))
+        for label, text in (("empty", ""), ("array", "[]"), ("text", "not json"), ("big", " " * 40000)):
+            with self.subTest(text=label):
+                self._refused(text)
+        duplicate = _encode(self._provenance()).replace('"schema_version":1', '"schema_version":1,"schema_version":1')
+        self._refused(duplicate)
+        self._refused(_encode(self._provenance()).replace('"expiry":', '"expiry":NaN,"x":'))
+
+    def test_provenance_refuses_an_unsound_allowed_finding(self):
+        changes = {
+            "high": {"severity": "high"},
+            "critical": {"severity": "critical"},
+            "unknown_severity": {"severity": "urgent"},
+            "expired_at_fetch": {"allow_expires_at_ms": (self.now - 500) * 1000},
+            "beyond_ttl": {"allow_expires_at_ms": (self.now - 7200) * 1000 + 91 * 86400 * 1000},
+            "before_policy": {"allow_expires_at_ms": 1},
+            "version": {"version": ">=1"},
+            "name": {"name": "Not A Name"},
+            "justification": {"allow_justification_sha256": "abc"},
+            "identifier": {"advisory_id": "bad id"},
+            "range": {"range": ""},
+            "condition": {"allow_removal_condition": 5},
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                evidence = _synthetic_evidence(self.now, finding_changes=change)
+                encoded = json.dumps(evidence).encode("ascii")
+                self._refused(_project_provenance(_synthetic_receipt(), encoded))
+        record = self._provenance()
+        advisory = record["advisory"]
+        for label, change in {
+            "count": {"finding_count": 2},
+            "clear_with_findings": {"status": "clear"},
+            "endpoint": {"endpoint": "other"},
+            "request": {"request_sha256": "x"},
+            "valid": {"valid_until": 1},
+            "duplicate": {"findings": advisory["findings"] * 2, "finding_count": 2},
+            "extra": {"findings": [dict(advisory["findings"][0], consumers=["a"])]},
+        }.items():
+            with self.subTest(advisory=label):
+                self._refused(dict(record, advisory=dict(advisory, **change)))
+        self._refused(dict(record, context=dict(record["context"], base_branch="feature")))
+        self._refused(dict(record, context=dict(record["context"], source_sha="abc")))
+
+    def test_audit_honours_exactly_the_recorded_findings(self):
+        allows = [_allow(self.now_ms)]
+        counts = linux_source_build._check_audit_report(_honoured_report(), allows, LOCKED, self.now_ms)
+        self.assertEqual(counts, (2, 1))
+        github_form = [_allow(self.now_ms, advisory_id="GHSA-aaaa-bbbb-cccc")]
+        self.assertEqual(
+            linux_source_build._check_audit_report(_honoured_report(), github_form, LOCKED, self.now_ms), (2, 1),
+        )
+        clean = _audit_json({})
+        self.assertEqual(linux_source_build._check_audit_report(clean, allows, LOCKED, self.now_ms), (0, 0))
+
+    def _audit_refused(self, report, allows=None, packages=None, now_ms=None):
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+            linux_source_build._check_audit_report(
+                report, [_allow(self.now_ms)] if allows is None else allows,
+                LOCKED if packages is None else packages, self.now_ms if now_ms is None else now_ms,
+            )
+
+    def test_audit_refuses_an_extra_finding(self):
+        other = _audit_json({
+            "fixture-lib": _vulnerability(
+                "fixture-lib", via=[_advisory_via(), _advisory_via(source=9000002, url="https://github.com/advisories/GHSA-dddd-eeee-ffff")],
+                nodes=["node_modules/fixture-lib"],
+            ),
+        })
+        self._audit_refused(other)
+        runtime = _audit_json({
+            "runtime-lib": _vulnerability("runtime-lib", via=[_advisory_via("runtime-lib")], nodes=["node_modules/runtime-lib"]),
+        })
+        self._audit_refused(runtime)
+        self._audit_refused(_honoured_report(), allows=[])
+        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, name="other-lib")])
+        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, advisory_id="9000002")])
+        dangling = _audit_json({
+            "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
+        })
+        self._audit_refused(dangling)
+        selfish = _audit_json({
+            "fixture-lib": _vulnerability("fixture-lib", via=["fixture-lib"], nodes=["node_modules/fixture-lib"]),
+        })
+        self._audit_refused(selfish)
+
+    def test_audit_refuses_an_expired_allow(self):
+        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, allow_expires_at_ms=self.now_ms - 1)])
+        self._audit_refused(_honoured_report(), now_ms=self.now_ms + 2 * 86400 * 1000)
+
+    def test_audit_refuses_a_severity_above_the_recorded_one(self):
+        high_via = _audit_json({
+            "fixture-lib": _vulnerability(
+                "fixture-lib", via=[_advisory_via(severity="high")], nodes=["node_modules/fixture-lib"],
+            ),
+        })
+        self._audit_refused(high_via)
+        high_entry = _audit_json({
+            "fixture-lib": _vulnerability(
+                "fixture-lib", severity="high", via=[_advisory_via()], nodes=["node_modules/fixture-lib"],
+            ),
+        })
+        self._audit_refused(high_entry)
+        critical = _audit_json({}, critical=1)
+        self._audit_refused(critical)
+        self._audit_refused(_audit_json({}, high=1))
+        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, severity="low")])
+        self._audit_refused(_honoured_report(), allows=[_allow(self.now_ms, severity="high")])
+
+    def test_audit_refuses_a_finding_that_is_not_development_only(self):
+        runtime = dict(LOCKED, **{"node_modules/fixture-lib": {"version": "1.5.0"}})
+        self._audit_refused(_honoured_report(), packages=runtime)
+        nested = dict(LOCKED, **{"node_modules/tool-a/node_modules/fixture-lib": {"version": "1.5.0", "dev": False}})
+        self._audit_refused(_honoured_report(), packages=nested)
+        elsewhere = dict(LOCKED, **{"node_modules/other/node_modules/fixture-lib": {"version": "1.5.0"}})
+        self._audit_refused(_honoured_report(), packages=elsewhere)
+        newer = dict(LOCKED, **{"node_modules/fixture-lib": {"version": "1.6.0", "dev": True}})
+        self._audit_refused(_honoured_report(), packages=newer)
+        no_nodes = _audit_json({"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes=[])})
+        self._audit_refused(no_nodes)
+        missing = _audit_json({"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes=["node_modules/absent"])})
+        self._audit_refused(missing)
+        wrong_name = _audit_json({"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes=["node_modules/runtime-lib"])})
+        self._audit_refused(wrong_name)
+        runtime_consumer = _audit_json({
+            "fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes=["node_modules/fixture-lib"]),
+            "runtime-lib": _vulnerability("runtime-lib", via=["fixture-lib"], nodes=["node_modules/runtime-lib"]),
+        })
+        self._audit_refused(runtime_consumer)
+
+    def test_audit_refuses_malformed_json_and_shapes(self):
+        good = json.loads(_honoured_report())
+        for label, payload in {
+            "empty": b"",
+            "text": b"not json",
+            "truncated": _honoured_report()[:-5],
+            "non_utf8": b"\xff\xfe",
+            "array": b"[]",
+            "constant": b'{"auditReportVersion":2,"vulnerabilities":NaN,"metadata":{}}',
+            "duplicate": b'{"auditReportVersion":2,"auditReportVersion":2,"vulnerabilities":{},"metadata":{}}',
+            "error": json.dumps({"error": {"code": "ENOAUDIT", "summary": "x", "detail": "y"}}).encode("ascii"),
+            "version": json.dumps(dict(good, auditReportVersion=1)).encode("ascii"),
+            "extra_key": json.dumps(dict(good, extra={})).encode("ascii"),
+            "vulnerabilities": json.dumps(dict(good, vulnerabilities=[])).encode("ascii"),
+            "metadata": json.dumps(dict(good, metadata=[])).encode("ascii"),
+            "counts": json.dumps(dict(good, metadata={"vulnerabilities": []})).encode("ascii"),
+            "entry": json.dumps(dict(good, vulnerabilities={"fixture-lib": []})).encode("ascii"),
+            "name": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("other", via=["x"], nodes=[])})).encode("ascii"),
+            "via": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", via=[], nodes=["node_modules/fixture-lib"])})).encode("ascii"),
+            "via_type": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", via=[5], nodes=["node_modules/fixture-lib"])})).encode("ascii"),
+            "source_type": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via(source=True)], nodes=["node_modules/fixture-lib"])})).encode("ascii"),
+            "nodes_type": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", via=[_advisory_via()], nodes="node_modules/fixture-lib")})).encode("ascii"),
+            "severity_type": json.dumps(dict(good, vulnerabilities={"fixture-lib": _vulnerability("fixture-lib", severity=["moderate"], via=[_advisory_via()], nodes=["node_modules/fixture-lib"])})).encode("ascii"),
+            "key": json.dumps(dict(good, vulnerabilities={"Bad Name": _vulnerability("Bad Name", via=["x"], nodes=[])})).encode("ascii"),
+            "deep": b"[" * 100000,
+        }.items():
+            with self.subTest(payload=label):
+                self._audit_refused(payload)
+        many = {"pkg-" + str(index): _vulnerability("pkg-" + str(index), via=["pkg-0"], nodes=[]) for index in range(linux_source_build.MAX_AUDIT_VULNERABILITIES + 1)}
+        self._audit_refused(_audit_json(many))
+        wide = _vulnerability("fixture-lib", via=["tool-a"] * (linux_source_build.MAX_AUDIT_VIA + 1), nodes=["node_modules/fixture-lib"])
+        self._audit_refused(_audit_json({"fixture-lib": wide, "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"])}))
+
+    def _run_audit(self, returncode, stdout, allows=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source").mkdir()
+            (root / "source/package-lock.json").write_bytes(b"{}")
+            (root / "bin").mkdir()
+            (root / "bin/node").write_bytes(b"")
+            (root / "bin/npm").write_bytes(b"")
+            env = {"SOURCE_PATH": str(root / "source"), "NODE_BIN": str(root / "bin"), "RUNNER_TEMP": str(root)}
+            result = types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=b"")
+            record = {"advisory": {"findings": [_allow(self.now_ms)] if allows is None else allows}}
+            output = io.StringIO()
+            with patch.object(linux_source_build, "_neutralize_config_files"), \
+                    patch.object(linux_source_build, "_source_inputs", return_value={}), \
+                    patch.object(linux_source_build, "_check_lock_provenance"), \
+                    patch.object(linux_source_build, "_validate_provenance_binding", return_value=record), \
+                    patch.object(linux_source_build, "_locked_packages", return_value=({"packages": LOCKED}, {})), \
+                    patch.object(linux_source_build, "_run", return_value=result), \
+                    patch("sys.stdout", output):
+                code = linux_source_build.run_trusted_audit(env)
+            return code, output.getvalue()
+
+    def test_trusted_audit_accepts_the_recorded_finding_with_counts_only(self):
+        code, output = self._run_audit(1, _honoured_report())
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "linux-node-audit=verified phase=trusted findings=2 allowed=1\n")
+        code, output = self._run_audit(0, _audit_json({}))
+        self.assertEqual((code, output), (0, "linux-node-audit=verified phase=trusted findings=0 allowed=0\n"))
+
+    def test_trusted_audit_refuses_with_the_same_public_reason(self):
+        extra = _audit_json({
+            "runtime-lib": _vulnerability("runtime-lib", via=[_advisory_via("runtime-lib")], nodes=["node_modules/runtime-lib"]),
+        })
+        cases = (
+            (1, extra, None), (1, _honoured_report(), []), (1, b"not json", None), (2, _honoured_report(), None),
+            (1, _audit_json({}), None), (0, _honoured_report(), None), (1, b"", None),
+            (1, _honoured_report(), [_allow(self.now_ms, allow_expires_at_ms=self.now_ms - 1)]),
+        )
+        for index, (returncode, stdout, allows) in enumerate(cases):
+            with self.subTest(case=index), self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+                self._run_audit(returncode, stdout, allows)
 
 
 if __name__ == "__main__":

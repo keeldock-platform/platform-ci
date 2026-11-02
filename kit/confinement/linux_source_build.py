@@ -66,12 +66,38 @@ RUST_COMPONENTS = (
     ("clippy-preview", "https://static.rust-lang.org/dist/2026-10-15/clippy-1.99.1-x86_64-unknown-linux-gnu.tar.gz", "3c6d008544b6e456cc785c86f8ce3713f0d845b94be3a6c8a34662b8504561b5"),
 )
 PROVENANCE_FIELDS = frozenset((
-    "schema_version", "status", "generation_identity", "accepted_source_identity", "lock_sha256",
-    "manifest_sha256", "node_version", "npm_version", "release_age_days", "policy_epoch_ms",
-    "cutoff_epoch_ms", "age_status", "generation_attempts", "audit_endpoint", "audit_status",
-    "accepted_at_ms",
+    "schema_version", "receipt_sha256", "evidence_sha256", "lock_sha256", "context", "resolver",
+    "minimum_age_seconds", "policy_epoch_ms", "cutoff_epoch_ms", "generated_at", "expiry",
+    "advisory",
 ))
-IDENTITY_FIELDS = ("source_sha", "base_sha", "control_sha", "reviewed_diff_sha256")
+PROVENANCE_CONTEXT_FIELDS = frozenset((
+    "repository", "filing", "source_sha", "base_sha", "base_branch", "reviewed_diff_fingerprint",
+    "control_sha",
+))
+PROVENANCE_ADVISORY_FIELDS = frozenset((
+    "endpoint", "fetched_at", "valid_until", "request_sha256", "response_sha256", "package_count",
+    "finding_count", "status", "findings",
+))
+PROVENANCE_FINDING_FIELDS = frozenset((
+    "name", "version", "severity", "advisory_id", "range", "allow_justification_sha256",
+    "allow_expires_at_ms", "allow_removal_condition",
+))
+PROVENANCE_RESOLVER_FIELDS = frozenset(("node_version", "npm_version"))
+AUDIT_ENDPOINT = "npm-bulk-advisory-v1"
+MINIMUM_AGE_SECONDS = 7 * 24 * 60 * 60
+MAX_ALLOW_TTL_MS = 90 * 24 * 60 * 60 * 1000
+MAX_PROVENANCE_BYTES = 32 * 1024
+MAX_ALLOWED_FINDINGS = 64
+SEVERITY_RANK = {"info": 0, "low": 1, "moderate": 2, "high": 3, "critical": 4}
+ALLOWABLE_SEVERITIES = ("info", "low", "moderate")
+CONTEXT_TEXT_RE = re.compile(r"[A-Za-z0-9._/:-]{1,256}\Z")
+IDENTIFIER_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}\Z")
+LOCKED_VERSION_RE = re.compile(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(?:[-+][0-9A-Za-z.+-]{1,64})?\Z")
+ADVISORY_URL_PREFIX = "https://github.com/advisories/"
+MAX_AUDIT_VULNERABILITIES = 4096
+MAX_AUDIT_VIA = 64
+MAX_AUDIT_NODES = 1024
+MAX_AUDIT_TEXT = 512
 MANIFEST_WORKSPACE_PATHS = ("packages/host-api", "packages/kernel-i18n")
 MANIFEST_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 MANIFEST_PACKAGE_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$")
@@ -902,58 +928,113 @@ def _signer_keys(payload):
     return b"".join(accepted), fingerprints
 
 
-def _validate_provenance_binding(identity, environ):
-    try:
-        def unique_pairs(items):
-            result = {}
-            for key, value in items:
-                if key in result:
-                    raise ValueError
-                result[key] = value
-            return result
+def _unique_json_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError
+        result[key] = value
+    return result
 
-        record = json.loads(
-            environ.get("LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", ""),
-            object_pairs_hook=unique_pairs,
-            parse_constant=lambda unused: (_ for _ in ()).throw(ValueError()),
-        )
-    except (ValueError, TypeError):
+
+def _strict_json_loads(text):
+    return json.loads(
+        text,
+        object_pairs_hook=_unique_json_pairs,
+        parse_constant=lambda unused: (_ for _ in ()).throw(ValueError()),
+    )
+
+
+def _is_count(value):
+    return type(value) is int and value >= 0
+
+
+def _check_provenance_finding(finding, policy_epoch, fetched_at):
+    if type(finding) is not dict or set(finding) != PROVENANCE_FINDING_FIELDS:
+        raise SourceBuildRefusal("lock")
+    name = finding["name"]
+    version = finding["version"]
+    expires = finding["allow_expires_at_ms"]
+    if (type(name) is not str or len(name) > 214 or MANIFEST_PACKAGE_RE.fullmatch(name) is None
+            or type(version) is not str or LOCKED_VERSION_RE.fullmatch(version) is None
+            or type(finding["severity"]) is not str or finding["severity"] not in ALLOWABLE_SEVERITIES
+            or type(finding["advisory_id"]) is not str
+            or IDENTIFIER_RE.fullmatch(finding["advisory_id"]) is None
+            or type(finding["range"]) is not str or not 0 < len(finding["range"]) <= 1024
+            or type(finding["allow_removal_condition"]) is not str
+            or IDENTIFIER_RE.fullmatch(finding["allow_removal_condition"]) is None
+            or type(finding["allow_justification_sha256"]) is not str
+            or HEX64_RE.fullmatch(finding["allow_justification_sha256"]) is None
+            or type(expires) is not int
+            or not policy_epoch < expires <= policy_epoch + MAX_ALLOW_TTL_MS
+            or expires <= fetched_at * 1000):
+        raise SourceBuildRefusal("lock")
+
+
+def _validate_provenance_binding(identity, environ):
+    text = environ.get("LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", "")
+    if type(text) is not str or not 0 < len(text) <= MAX_PROVENANCE_BYTES:
+        raise SourceBuildRefusal("lock")
+    try:
+        record = _strict_json_loads(text)
+    except (ValueError, TypeError, RecursionError):
         raise SourceBuildRefusal("lock") from None
     if type(record) is not dict or set(record) != PROVENANCE_FIELDS:
         raise SourceBuildRefusal("lock")
-    accepted_identity = record.get("accepted_source_identity")
-    if type(accepted_identity) is not dict or set(accepted_identity) != set(IDENTITY_FIELDS):
+    context = record["context"]
+    resolver = record["resolver"]
+    advisory = record["advisory"]
+    if (type(context) is not dict or set(context) != PROVENANCE_CONTEXT_FIELDS
+            or type(resolver) is not dict or set(resolver) != PROVENANCE_RESOLVER_FIELDS
+            or type(advisory) is not dict or set(advisory) != PROVENANCE_ADVISORY_FIELDS):
         raise SourceBuildRefusal("lock")
-    for name in IDENTITY_FIELDS:
-        value = identity[name]
-        if accepted_identity.get(name) != value:
+    for name in ("repository", "filing"):
+        if type(context[name]) is not str or CONTEXT_TEXT_RE.fullmatch(context[name]) is None:
             raise SourceBuildRefusal("lock")
-    if (type(record.get("schema_version")) is not int or record.get("schema_version") != 1
-            or record.get("status") != "accepted"
-            or record.get("lock_sha256") != environ.get("LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256")
-            or record.get("manifest_sha256") != environ.get("LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256")
-            or record.get("node_version") != NODE_VERSION or record.get("npm_version") != NPM_VERSION
-            or type(record.get("release_age_days")) is not int or record.get("release_age_days") != 7
-            or record.get("age_status") != "passed"
-            or type(record.get("generation_attempts")) is not int or record.get("generation_attempts") != 1
-            or record.get("audit_endpoint") != "npm-bulk-advisory-v1"
-            or record.get("audit_status") != "passed"):
+    for name in ("source_sha", "base_sha", "control_sha"):
+        if type(context[name]) is not str or SOURCE_SHA_RE.fullmatch(context[name]) is None:
+            raise SourceBuildRefusal("lock")
+    if (type(context["reviewed_diff_fingerprint"]) is not str
+            or HEX64_RE.fullmatch(context["reviewed_diff_fingerprint"]) is None
+            or context["base_branch"] not in ("main", "develop", "uat")):
         raise SourceBuildRefusal("lock")
-    for key in ("generation_identity", "accepted_source_identity"):
-        entry = record.get(key)
-        if type(entry) is not dict or set(entry) != set(IDENTITY_FIELDS):
-            raise SourceBuildRefusal("lock")
-        if (SOURCE_SHA_RE.fullmatch(entry.get("source_sha", "")) is None
-                or SOURCE_SHA_RE.fullmatch(entry.get("base_sha", "")) is None
-                or SOURCE_SHA_RE.fullmatch(entry.get("control_sha", "")) is None
-                or HEX64_RE.fullmatch(entry.get("reviewed_diff_sha256", "")) is None):
-            raise SourceBuildRefusal("lock")
-    policy_epoch = record.get("policy_epoch_ms")
-    accepted_at = record.get("accepted_at_ms")
-    if (type(policy_epoch) is not int or type(accepted_at) is not int
-            or record.get("cutoff_epoch_ms") != policy_epoch - 7 * 24 * 60 * 60 * 1000
-            or not policy_epoch <= accepted_at <= int(time.time() * 1000)):
+    policy_epoch = record["policy_epoch_ms"]
+    generated = record["generated_at"]
+    expiry = record["expiry"]
+    now = time.time()
+    if (type(record["schema_version"]) is not int or record["schema_version"] != 1
+            or any(type(record[name]) is not str or HEX64_RE.fullmatch(record[name]) is None
+                   for name in ("receipt_sha256", "evidence_sha256", "lock_sha256"))
+            or record["lock_sha256"] != environ.get("LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256")
+            or resolver["node_version"] != NODE_VERSION or resolver["npm_version"] != NPM_VERSION
+            or type(record["minimum_age_seconds"]) is not int
+            or record["minimum_age_seconds"] != MINIMUM_AGE_SECONDS
+            or type(policy_epoch) is not int or policy_epoch < 1
+            or record["cutoff_epoch_ms"] != policy_epoch - MINIMUM_AGE_SECONDS * 1000
+            or type(generated) is not int or type(expiry) is not int
+            or not policy_epoch <= generated * 1000 <= now * 1000 < expiry * 1000):
         raise SourceBuildRefusal("lock")
+    findings = advisory["findings"]
+    fetched = advisory["fetched_at"]
+    if (advisory["endpoint"] != AUDIT_ENDPOINT
+            or advisory["status"] not in ("clear", "allowed_findings")
+            or type(findings) is not list or len(findings) > MAX_ALLOWED_FINDINGS
+            or not _is_count(advisory["finding_count"]) or advisory["finding_count"] != len(findings)
+            or (advisory["status"] == "clear") != (not findings)
+            or not _is_count(fetched) or not _is_count(advisory["valid_until"])
+            or not _is_count(advisory["package_count"])
+            or not policy_epoch <= fetched * 1000 <= now * 1000
+            or advisory["valid_until"] <= fetched
+            or any(type(advisory[name]) is not str or HEX64_RE.fullmatch(advisory[name]) is None
+                   for name in ("request_sha256", "response_sha256"))):
+        raise SourceBuildRefusal("lock")
+    seen = set()
+    for finding in findings:
+        _check_provenance_finding(finding, policy_epoch, fetched)
+        key = (finding["name"], finding["version"], finding["advisory_id"])
+        if key in seen:
+            raise SourceBuildRefusal("lock")
+        seen.add(key)
     return record
 
 
@@ -965,8 +1046,7 @@ def _check_lock_provenance(lock_bytes, identity, environ, source_root):
     manifest_digest = _manifest_digest(source_root)
     if (lock_sha != environ.get("LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256")
             or record.get("lock_sha256") != lock_sha
-            or manifest_digest != environ.get("LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256")
-            or record.get("manifest_sha256") != manifest_digest):
+            or manifest_digest != environ.get("LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256")):
         raise SourceBuildRefusal("lock")
     return lock_sha, manifest_digest
 
@@ -1975,6 +2055,117 @@ def prepare_project(environ=None):
     return 0
 
 
+def _locked_node_name(path):
+    marker = "node_modules/"
+    index = path.rfind(marker)
+    return path[index + len(marker):] if index >= 0 else None
+
+
+def _audit_nodes_are_dev_only(nodes, packages, name, versions):
+    if type(nodes) is not list or not 0 < len(nodes) <= MAX_AUDIT_NODES:
+        return False
+    for node in nodes:
+        if type(node) is not str or len(node) > 1024:
+            return False
+        entry = packages.get(node)
+        if (type(entry) is not dict or _locked_node_name(node) != name or entry.get("dev") is not True
+                or (versions is not None and entry.get("version") not in versions)):
+            return False
+    return True
+
+
+def _audit_versions_are_dev_only(packages, name, versions):
+    for path, entry in packages.items():
+        if (type(entry) is dict and _locked_node_name(path) == name
+                and entry.get("version") in versions and entry.get("dev") is not True):
+            return False
+    return True
+
+
+def _audit_advisory_candidates(item, name, allows, now_ms):
+    source = item.get("source")
+    severity = item.get("severity")
+    if (item.get("name") != name or type(severity) is not str or severity not in SEVERITY_RANK
+            or type(source) not in (int, str)):
+        return None
+    identifiers = {str(source)}
+    url = item.get("url")
+    if type(url) is str and len(url) <= MAX_AUDIT_TEXT and url.startswith(ADVISORY_URL_PREFIX):
+        tail = url[len(ADVISORY_URL_PREFIX):]
+        if IDENTIFIER_RE.fullmatch(tail) is not None:
+            identifiers.add(tail)
+    return [
+        allow for allow in allows
+        if allow["name"] == name and allow["advisory_id"] in identifiers
+        and allow["severity"] in ALLOWABLE_SEVERITIES
+        and SEVERITY_RANK[severity] <= SEVERITY_RANK[allow["severity"]]
+        and allow["allow_expires_at_ms"] > now_ms
+    ]
+
+
+def _check_audit_report(stdout, allows, packages, now_ms):
+    """Match one strict npm audit report against the findings the trusted run allowed.
+
+    Every vulnerability that names an advisory must match an allowed finding on the locked
+    name, the advisory id, a severity no higher than the recorded one and an unexpired allow,
+    and all its locked nodes must be development-only entries of an allowed version. A
+    vulnerability that only lists other vulnerable packages must point at listed ones and be
+    development-only too. Anything else refuses. Returns the counts of vulnerabilities and
+    matched advisories."""
+    try:
+        report = _strict_json_loads(stdout.decode("utf-8", "strict"))
+    except (UnicodeError, ValueError, TypeError, RecursionError):
+        raise SourceBuildRefusal("lock") from None
+    if (type(report) is not dict or not set(report) <= {"auditReportVersion", "vulnerabilities", "metadata"}
+            or type(report.get("auditReportVersion")) is not int or report["auditReportVersion"] != 2
+            or type(report.get("vulnerabilities")) is not dict
+            or type(report.get("metadata")) is not dict
+            or type(report["metadata"].get("vulnerabilities")) is not dict):
+        raise SourceBuildRefusal("lock")
+    vulnerabilities = report["vulnerabilities"]
+    if len(vulnerabilities) > MAX_AUDIT_VULNERABILITIES:
+        raise SourceBuildRefusal("lock")
+    for severity in ("high", "critical"):
+        count = report["metadata"]["vulnerabilities"].get(severity, 0)
+        if type(count) is not int or count != 0:
+            raise SourceBuildRefusal("lock")
+    ceiling = max((SEVERITY_RANK[allow["severity"]] for allow in allows), default=-1)
+    matched = 0
+    for key, entry in vulnerabilities.items():
+        if type(entry) is not dict:
+            raise SourceBuildRefusal("lock")
+        severity = entry.get("severity")
+        via = entry.get("via")
+        if (type(key) is not str or len(key) > 214 or MANIFEST_PACKAGE_RE.fullmatch(key) is None
+                or entry.get("name") != key or type(severity) is not str
+                or severity not in ALLOWABLE_SEVERITIES
+                or type(via) is not list or not 0 < len(via) <= MAX_AUDIT_VIA):
+            raise SourceBuildRefusal("lock")
+        advisory_versions = set()
+        for item in via:
+            if type(item) is str:
+                if len(item) > MAX_AUDIT_TEXT or item == key or item not in vulnerabilities:
+                    raise SourceBuildRefusal("lock")
+                continue
+            if type(item) is not dict:
+                raise SourceBuildRefusal("lock")
+            candidates = _audit_advisory_candidates(item, key, allows, now_ms)
+            if not candidates or SEVERITY_RANK[severity] > min(
+                SEVERITY_RANK[allow["severity"]] for allow in candidates
+            ):
+                raise SourceBuildRefusal("lock")
+            advisory_versions |= {allow["version"] for allow in candidates}
+            matched += 1
+        if advisory_versions:
+            if (not _audit_nodes_are_dev_only(entry.get("nodes"), packages, key, advisory_versions)
+                    or not _audit_versions_are_dev_only(packages, key, advisory_versions)):
+                raise SourceBuildRefusal("lock")
+        elif (SEVERITY_RANK[severity] > ceiling
+                or not _audit_nodes_are_dev_only(entry.get("nodes"), packages, key, None)):
+            raise SourceBuildRefusal("lock")
+    return len(vulnerabilities), matched
+
+
 def run_trusted_audit(environ=None):
     env = os.environ if environ is None else environ
     source = Path(env.get("SOURCE_PATH", ""))
@@ -1986,6 +2177,7 @@ def run_trusted_audit(environ=None):
     identity = _source_inputs(env)
     lock_bytes = (source / "package-lock.json").read_bytes()
     _check_lock_provenance(lock_bytes, identity, env, source)
+    allows = _validate_provenance_binding(identity, env)["advisory"]["findings"]
     private = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-audit"
     private.mkdir(mode=0o700, parents=True, exist_ok=True)
     result = _run(
@@ -1995,14 +2187,23 @@ def run_trusted_audit(environ=None):
          "NPM_CONFIG_GLOBALCONFIG": "/dev/null", "NPM_CONFIG_CACHE": str(private / "cache")},
         timeout=120, maximum=4 * 1024 * 1024,
     )
-    if result.returncode != 0:
-        (private / "audit.stdout").write_bytes(result.stdout)
-        (private / "audit.stderr").write_bytes(result.stderr)
+    (private / "audit.stdout").write_bytes(result.stdout)
+    (private / "audit.stderr").write_bytes(result.stderr)
+    if result.returncode not in (0, 1):
         raise SourceBuildRefusal("lock")
     lock_after = (source / "package-lock.json").read_bytes()
     _check_lock_provenance(lock_after, identity, env, source)
+    locked, unused = _locked_packages(lock_after)
+    found, matched = _check_audit_report(
+        result.stdout, allows, locked["packages"], int(time.time() * 1000),
+    )
+    if (result.returncode == 0) != (found == 0):
+        raise SourceBuildRefusal("lock")
     (private / "audit.json").write_bytes(result.stdout)
-    sys.stdout.write("linux-node-audit=verified phase=trusted\n")
+    sys.stdout.write(
+        "linux-node-audit=verified phase=trusted findings=" + str(found)
+        + " allowed=" + str(matched) + "\n"
+    )
     return 0
 
 
