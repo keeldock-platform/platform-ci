@@ -1633,7 +1633,13 @@ def _record_refusal(refusals, error):
 def _raise_first_refusal(refusals):
     first = refusals[0]
     if first.detail is not None:
-        first.details = tuple(item.detail for item in refusals if item.detail is not None)
+        merged = [first.detail]
+        for item in refusals:
+            for detail in (item.detail,) + tuple(item.details):
+                if (detail is not None and len(merged) < MAX_COLLECTED_REFUSALS
+                        and detail not in merged):
+                    merged.append(detail)
+        first.details = tuple(merged)
     raise first
 
 
