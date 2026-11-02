@@ -510,6 +510,28 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertEqual(diagnostic["kind"], "build_diagnostics")
         self.assertNotEqual(diagnostic["recipient_fingerprint"], patch_request["recipient_fingerprint"])
 
+    def test_the_linux_quick_kind_registers_on_the_untrusted_ref_and_is_released_under_its_own_name(self):
+        quick = self.create("linux_quick")["request"]
+        self.assertEqual(quick["kind"], "linux_quick")
+        self.assertEqual(quick["concern"], "core-linux-quick-return")
+        self.assertEqual(quick["workflow_ref"], "refs/heads/untrusted")
+        self.assertEqual(quick["workflow_path"], ".github/workflows/core-linux-quick-return.yml")
+        self.assertEqual(self._state()["requests"][0]["kind"], "linux_quick")
+        profile = feedback_request.PROFILE_BY_KIND["linux_quick"]
+        stub = types.SimpleNamespace(state_directory="/unused")
+        with mock.patch.object(subject, "_create_named") as create:
+            path = subject.FeedbackAdmin._release_private_output(
+                stub, -1, {"request_id": "a" * 64}, profile, b"x" * profile["max_payload_bytes"],
+            )
+        create.assert_called_once()
+        self.assertTrue(path.endswith("-linux-quick.payload"))
+        with mock.patch.object(subject, "_create_named") as create:
+            with self.assertRaises(subject.FeedbackAdminRefusal):
+                subject.FeedbackAdmin._release_private_output(
+                    stub, -1, {"request_id": "a" * 64}, profile, b"x" * (profile["max_payload_bytes"] + 1),
+                )
+        create.assert_not_called()
+
     def test_private_state_directory_rejects_symlink_aliases(self):
         base = os.path.realpath(self.temporary.name)
         real = os.path.join(base, "real-state")

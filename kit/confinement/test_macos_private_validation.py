@@ -181,7 +181,10 @@ class RequestTests(unittest.TestCase):
     def test_feedback_return_requests_match_the_closed_profile_table(self):
         self.assertEqual(
             subject.FEEDBACK_PROFILE_CONCERNS,
-            frozenset(profile["concern"] for profile in feedback_requests.PROFILES.values()),
+            frozenset(
+                profile["concern"] for profile in feedback_requests.PROFILES.values()
+                if profile["kind"] != feedback_requests.LINUX_QUICK_KIND
+            ),
         )
         for concern in sorted(subject.FEEDBACK_PROFILE_CONCERNS):
             with self.subTest(concern=concern):

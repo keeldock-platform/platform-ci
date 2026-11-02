@@ -39,7 +39,7 @@ def _dispatch(kind="build_diagnostics"):
         "concern": profile["concern"],
         "ci_repository_id": "1234",
         "workflow_path": profile["workflow_path"],
-        "workflow_ref": "refs/heads/main",
+        "workflow_ref": requests.workflow_ref_for_kind(kind),
         "repository_id": "5678",
         "source_sha": SOURCE_SHA,
         "base_sha": BASE_SHA,
@@ -127,6 +127,8 @@ def _foundation_bootstrap_with_fakes(**options):
 class MacosFeedbackProducerTests(unittest.TestCase):
     def test_dispatch_binds_each_closed_profile_and_omits_lock_kind_from_context(self):
         for kind in producer.PROFILE_BY_KIND:
+            if kind == requests.LINUX_QUICK_KIND:
+                continue
             request, environment = _dispatch(kind)
             result = producer.validate_dispatch(kind, environment, now=NOW)
             self.assertEqual(result["request"], request)
@@ -136,6 +138,15 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             self.assertEqual(result["context"]["producer_job"],
                              producer.PROFILE_BY_KIND[kind]["producer_job"])
             self.assertEqual("kind" in result["context"], kind != "lock")
+
+    def test_the_linux_quick_profile_is_never_accepted_as_a_macos_dispatch(self):
+        request, environment = _dispatch(requests.LINUX_QUICK_KIND)
+        self.assertEqual(request["workflow_ref"], "refs/heads/untrusted")
+        with self.assertRaises(producer.FeedbackRefusal):
+            producer.validate_dispatch(requests.LINUX_QUICK_KIND, environment, now=NOW)
+        for kind in producer.PROFILE_BY_KIND:
+            if kind != requests.LINUX_QUICK_KIND:
+                self.assertEqual(_dispatch(kind)[0]["workflow_ref"], "refs/heads/main")
 
     def test_dispatch_rejects_run_profile_binding_and_recipient_mismatches(self):
         _, environment = _dispatch("build_diagnostics")

@@ -43,7 +43,7 @@ class NpmAdmissionProfileTests(unittest.TestCase):
         self.assertEqual(profile["member_name"], "npm-admission-return-v1.enc")
         self.assertIs(subject.PROFILES["core-npm-admission-return"], profile)
         self.assertEqual(profile["build_inputs"], ())
-        self.assertEqual(sorted(item["profile_id"] for item in subject.PROFILES.values()), [1, 2, 3, 4, 5])
+        self.assertEqual(sorted(item["profile_id"] for item in subject.PROFILES.values()), [1, 2, 3, 4, 5, 6])
         for other in ("lock", "cargo_lock", "rust_patch", "build_diagnostics"):
             with self.subTest(other=other):
                 self.assertNotEqual(subject.PROFILE_BY_KIND[other]["member_name"], profile["member_name"])

@@ -80,7 +80,7 @@ function makeContext(fingerprint, profileName = 'core-node-lock-return') {
     control_sha: 'f'.repeat(40),
     base_branch: 'develop',
     reviewed_diff_sha256: 'a'.repeat(64),
-    workflow_ref: 'refs/heads/main',
+    workflow_ref: profile.workflowRef ?? 'refs/heads/main',
     run_id: '24680',
     producer_job: profile.producerJob,
     run_attempt: 1,
@@ -309,3 +309,49 @@ test('refuses hosts without POSIX owner and no-follow filesystem semantics',
       operation: 'keygen', private_key_path: join(tmpdir(), 'synthetic-key.der'),
     }));
   });
+
+function quickPayload() {
+  const total = 4 * 1024 * 1024 - 64 * 1024;
+  const body = '{"gates":[],"tier":"quick"}';
+  const header = `KD-LINUX-QUICK-PAYLOAD 1 ${String(body.length).padStart(8, '0')}\n`;
+  return Buffer.from(header + body + ' '.repeat(total - header.length - body.length), 'ascii');
+}
+
+test('decrypts a Linux quick payload only under its untrusted-ref context',
+  { skip: !POSIX_OWNER_FILESYSTEM }, async (t) => {
+  const state = await setup();
+  t.after(() => rmSync(state.directory, { recursive: true, force: true }));
+  const context = makeContext(state.keyInfo.recipient_fingerprint, 'core-linux-quick-return');
+  assert.equal(context.workflow_ref, 'refs/heads/untrusted');
+  assert.equal(context.kind, 'linux_quick');
+  const payload = quickPayload();
+  const envelope = encryptDevelopmentFeedback({
+    payloadBytes: payload,
+    context,
+    recipientPublicKey: state.publicKey,
+    now: NOW,
+  });
+  const open = async (name, contextValue) => {
+    const outputPath = join(state.directory, `${name}.payload`);
+    const fd = openSync(outputPath, 'wx', 0o600);
+    try {
+      const result = await handleRequest({
+        operation: 'decrypt',
+        private_key_path: state.keyPath,
+        context: contextValue,
+        now: NOW,
+        envelope_base64: Buffer.from(envelope).toString('base64'),
+        plaintext_fd: fd,
+      });
+      return { result, outputPath };
+    } finally {
+      closeSync(fd);
+    }
+  };
+  const { result, outputPath } = await open('quick-output', context);
+  assert.deepEqual(result, { schema_version: 1, ok: true });
+  assert.deepEqual(readFileSync(outputPath), payload);
+  await assert.rejects(open('quick-main', { ...context, workflow_ref: 'refs/heads/main' }));
+  await assert.rejects(open('quick-nonce', { ...context, nonce: '3'.repeat(64) }));
+  await assert.rejects(open('quick-kind', makeContext(state.keyInfo.recipient_fingerprint, 'core-build-diagnostic-return')));
+});

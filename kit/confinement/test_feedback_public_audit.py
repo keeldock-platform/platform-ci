@@ -31,6 +31,10 @@ except ImportError:
 
 NOW = 1793160000
 CONTROL_SHA = "c" * 40
+MAIN_PROFILES = tuple(
+    name for name, item in feedback_request.PROFILES.items()
+    if item["kind"] != feedback_request.LINUX_QUICK_KIND
+)
 def _request(profile_name="core-rust-format-return"):
     profile = feedback_request.PROFILES[profile_name]
     key = b"synthetic-public-recipient-key"
@@ -379,7 +383,7 @@ class LiveAuditProvider(macos_public_audit.GitHubAPI):
 
 class PreflightTests(unittest.TestCase):
     def test_all_registered_profiles_bind_exact_protected_source_fields(self):
-        for profile_name in feedback_request.PROFILES:
+        for profile_name in MAIN_PROFILES:
             request, key = _request(profile_name)
             job_name = feedback_request.PROFILES[profile_name]["producer_job"] + "-settings"
             env = _environment(request, key, job_name)
@@ -419,7 +423,7 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(output_writer.call_args.args[1]["base_sha"], request["base_sha"])
 
     def test_producer_preflight_binds_public_request_to_all_protected_values(self):
-        for profile_name in feedback_request.PROFILES:
+        for profile_name in MAIN_PROFILES:
             request, key = _request(profile_name)
             profile = feedback_request.PROFILES[profile_name]
             env = _environment(request, key, profile["producer_job"])
@@ -726,7 +730,7 @@ class LiveProviderPipelineTests(unittest.TestCase):
         self.assertEqual(self.clock.sleeps, [10] * 14)
 
     def test_live_audit_accepts_provider_shaped_in_progress_auditor_pipeline(self):
-        for profile_name in feedback_request.PROFILES:
+        for profile_name in MAIN_PROFILES:
             with self.subTest(profile=profile_name):
                 request, key = _request(profile_name)
                 profile = feedback_request.PROFILES[request["concern"]]

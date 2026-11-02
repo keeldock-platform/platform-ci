@@ -286,3 +286,74 @@ test('rejects oversized plaintext and frame input before cryptographic processin
   assert.throws(() => encrypted(context, tooLarge), LockEnvelopeError);
   assert.throws(() => decrypt(Buffer.alloc(LOCK_ENVELOPE_LIMITS.frameBytes + 1)), LockEnvelopeError);
 });
+
+test('the Linux quick profile is the sixth closed profile and the only one bound to the untrusted ref', () => {
+  const name = 'core-linux-quick-return';
+  const profile = RETURN_PROFILES[name];
+  assert.equal(profile.id, 6);
+  assert.equal(profile.concern, name);
+  assert.equal(profile.kind, 'linux_quick');
+  assert.equal(profile.producerJob, 'core-linux-quick-return-producer');
+  assert.equal(profile.artifactMember, 'linux-quick-return-v1.enc');
+  assert.equal(profile.contextDomain, 'node-feedback-return-context-v1');
+  assert.equal(profile.workflowRef, 'refs/heads/untrusted');
+  const quick = { ...feedbackContext(name), workflow_ref: 'refs/heads/untrusted' };
+  assert.equal(returnProfileForContext(quick), profile);
+  const aad = canonicalContext(quick);
+  assert.ok(aad.toString('ascii').includes('\nworkflow_ref=refs/heads/untrusted\n'));
+  assert.deepEqual(parseCanonicalContext(aad), quick);
+  assert.throws(() => canonicalContext({ ...quick, workflow_ref: 'refs/heads/main' }), LockEnvelopeError);
+  assert.throws(() => canonicalContext({ ...quick, workflow_ref: 'refs/heads/feature' }), LockEnvelopeError);
+  assert.throws(() => canonicalContext({ ...quick, run_attempt: 2 }), LockEnvelopeError);
+  assert.throws(() => canonicalContext({ ...quick, producer_job: 'core-build-diagnostic-return' }), LockEnvelopeError);
+  assert.throws(() => canonicalContext({ ...quick, kind: 'build_diagnostics' }), LockEnvelopeError);
+  for (const other of Object.keys(RETURN_PROFILES)) {
+    if (other === name) continue;
+    const base = other === 'core-node-lock-return' ? sampleContext() : feedbackContext(other);
+    assert.equal(RETURN_PROFILES[other].workflowRef, undefined, other);
+    assert.ok(canonicalContext(base).byteLength > 0, other);
+    assert.throws(
+      () => canonicalContext({ ...base, workflow_ref: 'refs/heads/untrusted' }),
+      LockEnvelopeError,
+      other,
+    );
+  }
+});
+
+test('the Linux quick profile seals a maximal fixed-size payload that only its own context opens', () => {
+  const quick = { ...feedbackContext('core-linux-quick-return'), workflow_ref: 'refs/heads/untrusted' };
+  const payload = Buffer.alloc(LOCK_ENVELOPE_LIMITS.plaintextBytes, 0x20);
+  const sealed = encryptReturnEnvelope({
+    payloadBytes: payload,
+    recipientPublicKey: recipient.publicKey,
+    context: quick,
+    now: NOW,
+  });
+  assert.equal(sealed[5], 6);
+  assert.equal(sealed.byteLength, 4128768 + 486);
+  assert.ok(sealed.byteLength <= LOCK_ENVELOPE_LIMITS.frameBytes);
+  const open = (expectedContext, key = recipient.privateKey) => decryptReturnEnvelope({
+    envelope: sealed,
+    recipientPrivateKey: key,
+    expectedContext,
+    now: NOW,
+  });
+  assert.deepEqual(open(quick), payload);
+  assert.throws(() => open({ ...quick, nonce: '3'.repeat(64) }), LockEnvelopeError);
+  assert.throws(() => open({ ...quick, expiry: quick.expiry + 1 }), LockEnvelopeError);
+  assert.throws(() => open({ ...quick, run_id: '987654322' }), LockEnvelopeError);
+  assert.throws(() => open(feedbackContext('core-build-diagnostic-return')), LockEnvelopeError);
+  assert.throws(() => open(quick, otherRecipient.privateKey), LockEnvelopeError);
+  assert.throws(() => decryptLock({
+    envelope: sealed,
+    recipientPrivateKey: recipient.privateKey,
+    expectedContext: quick,
+    now: NOW,
+  }), LockEnvelopeError);
+  assert.throws(() => encryptReturnEnvelope({
+    payloadBytes: Buffer.alloc(LOCK_ENVELOPE_LIMITS.plaintextBytes + 1),
+    recipientPublicKey: recipient.publicKey,
+    context: quick,
+    now: NOW,
+  }), LockEnvelopeError);
+});

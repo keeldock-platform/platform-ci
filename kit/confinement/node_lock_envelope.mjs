@@ -97,6 +97,16 @@ export const RETURN_PROFILES = Object.freeze({
     contextDomain: 'node-feedback-return-context-v1',
     contextFields: FEEDBACK_CONTEXT_FIELDS,
   }),
+  'core-linux-quick-return': Object.freeze({
+    id: 6,
+    concern: 'core-linux-quick-return',
+    kind: 'linux_quick',
+    producerJob: 'core-linux-quick-return-producer',
+    artifactMember: 'linux-quick-return-v1.enc',
+    contextDomain: 'node-feedback-return-context-v1',
+    contextFields: FEEDBACK_CONTEXT_FIELDS,
+    workflowRef: 'refs/heads/untrusted',
+  }),
 });
 const HEX_256 = /^[a-f0-9]{64}$/u;
 const GIT_SHA = /^[a-f0-9]{40}$/u;
@@ -193,7 +203,7 @@ function normalizeContext(input, profile = contextProfile(input)) {
   if (typeof context.reviewed_diff_sha256 !== 'string' || !HEX_256.test(context.reviewed_diff_sha256)) {
     reject('invalid_context');
   }
-  if (context.workflow_ref !== 'refs/heads/main') reject('invalid_context');
+  if (context.workflow_ref !== (profile.workflowRef ?? 'refs/heads/main')) reject('invalid_context');
   if (!isPositiveApiId(context.run_id)) reject('invalid_context');
   if (context.producer_job !== profile.producerJob) reject('invalid_context');
   if (context.run_attempt !== 1) reject('invalid_context');

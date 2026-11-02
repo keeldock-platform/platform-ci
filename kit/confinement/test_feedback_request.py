@@ -14,7 +14,7 @@ def _fields(kind="lock", *, now=NOW, expiry=None):
         "concern": profile["concern"],
         "ci_repository_id": "987654321",
         "workflow_path": profile["workflow_path"],
-        "workflow_ref": subject.WORKFLOW_REF,
+        "workflow_ref": subject.workflow_ref_for_kind(kind),
         "repository_id": "1430959909",
         "source_sha": "d" * 40,
         "base_sha": "e" * 40,
@@ -227,7 +227,7 @@ class CargoLockProfileTests(unittest.TestCase):
         self.assertNotEqual(profile["kind"], "lock")
         self.assertEqual(
             sorted(subject.PROFILE_BY_KIND),
-            ["build_diagnostics", "cargo_lock", "lock", "npm_admission", "rust_patch"],
+            ["build_diagnostics", "cargo_lock", "linux_quick", "lock", "npm_admission", "rust_patch"],
         )
         self.assertEqual(
             len({item["member_name"] for item in subject.PROFILES.values()}), len(subject.PROFILES),
@@ -413,6 +413,80 @@ class WorkspaceSelectorTests(unittest.TestCase):
         ):
             with self.subTest(bad=bad):
                 self.assert_refused(subject.parse_request, bad, now=NOW)
+
+
+class LinuxQuickProfileTests(unittest.TestCase):
+    def assert_refused(self, operation, *args, **kwargs):
+        with self.assertRaises(subject.RequestRefusal) as raised:
+            operation(*args, **kwargs)
+        self.assertEqual(raised.exception.reason, "request_invalid")
+
+    def test_profile_is_the_sixth_closed_profile_with_the_exact_envelope_payload_limit(self):
+        profile = subject.PROFILE_BY_KIND["linux_quick"]
+        self.assertEqual(profile["profile_id"], 6)
+        self.assertEqual(profile["concern"], "core-linux-quick-return")
+        self.assertEqual(profile["workflow_path"], ".github/workflows/core-linux-quick-return.yml")
+        self.assertEqual(profile["producer_job"], "core-linux-quick-return-producer")
+        self.assertEqual(profile["auditor_job"], "core-linux-quick-return-audit")
+        self.assertEqual(profile["member_name"], "linux-quick-return-v1.enc")
+        self.assertEqual(profile["max_payload_bytes"], 4128768)
+        self.assertEqual(profile["max_payload_bytes"], 4 * 1024 * 1024 - 64 * 1024)
+        self.assertEqual(profile["max_payload_bytes"], subject.LINUX_QUICK_MAX_PAYLOAD_BYTES)
+        self.assertEqual(profile["build_inputs"], ())
+        self.assertEqual(set(profile), set(subject.PROFILE_FIELDS))
+        self.assertIs(subject.PROFILES["core-linux-quick-return"], profile)
+        self.assertEqual(subject.LINUX_QUICK_KIND, "linux_quick")
+
+    def test_only_the_quick_kind_binds_untrusted_and_every_other_kind_keeps_main(self):
+        self.assertEqual(subject.WORKFLOW_REF, "refs/heads/main")
+        self.assertEqual(subject.LINUX_QUICK_WORKFLOW_REF, "refs/heads/untrusted")
+        for kind in subject.PROFILE_BY_KIND:
+            quick = kind == subject.LINUX_QUICK_KIND
+            expected = "refs/heads/untrusted" if quick else "refs/heads/main"
+            other = "refs/heads/main" if quick else "refs/heads/untrusted"
+            with self.subTest(kind=kind):
+                self.assertEqual(subject.workflow_ref_for_kind(kind), expected)
+                request = subject.create_request(_fields(kind), now=NOW)
+                self.assertEqual(request["workflow_ref"], expected)
+                self.assertEqual(subject.validate_request(request, now=NOW), subject.PROFILE_BY_KIND[kind])
+                self.assert_refused(subject.create_request, dict(_fields(kind), workflow_ref=other), now=NOW)
+                swapped = dict(request, workflow_ref=other)
+                self.assert_refused(subject.validate_request, swapped, now=NOW)
+
+    def test_no_other_kind_accepts_the_untrusted_ref_in_a_parsed_record(self):
+        for kind in subject.PROFILE_BY_KIND:
+            if kind == subject.LINUX_QUICK_KIND:
+                continue
+            record = subject.encode_request(subject.create_request(_fields(kind), now=NOW), now=NOW)
+            changed = record.replace(b"workflow_ref=refs/heads/main\n", b"workflow_ref=refs/heads/untrusted\n", 1)
+            self.assertNotEqual(changed, record)
+            with self.subTest(kind=kind):
+                self.assert_refused(subject.parse_request, changed, now=NOW)
+
+    def test_quick_record_round_trips_and_refuses_the_main_ref(self):
+        request = subject.create_request(_fields("linux_quick"), now=NOW)
+        record = subject.encode_request(request, now=NOW)
+        self.assertIn(b"kind=linux_quick\n", record)
+        self.assertIn(b"concern=core-linux-quick-return\n", record)
+        self.assertIn(b"workflow_ref=refs/heads/untrusted\n", record)
+        self.assertEqual(subject.parse_request(record, now=NOW), request)
+        changed = record.replace(b"workflow_ref=refs/heads/untrusted\n", b"workflow_ref=refs/heads/main\n", 1)
+        self.assert_refused(subject.parse_request, changed, now=NOW)
+        wrong_path = dict(_fields("linux_quick"), workflow_path=".github/workflows/core-build-diagnostic-return.yml")
+        self.assert_refused(subject.create_request, wrong_path, now=NOW)
+        wrong_concern = dict(_fields("linux_quick"), concern="core-build-diagnostic-return")
+        self.assert_refused(subject.create_request, wrong_concern, now=NOW)
+
+    def test_quick_request_registers_and_is_consumed_once(self):
+        request = subject.create_request(_fields("linux_quick"), now=NOW)
+        state = subject.register_request(subject.empty_state(), request, now=NOW)
+        self.assertEqual(state["requests"][0]["kind"], "linux_quick")
+        consumed = subject.consume_request(state, request["request_id"], now=NOW + 1)
+        self.assertEqual(consumed["requests"][0]["status"], "consumed")
+        self.assertFalse(consumed["bootstrap_lock_consumed"])
+        self.assert_refused(subject.consume_request, consumed, request["request_id"], now=NOW + 2)
+        self.assertEqual(subject.validate_build_inputs("linux_quick", {}), {})
+        self.assert_refused(subject.validate_build_inputs, "linux_quick", {"anything": "x"})
 
 
 if __name__ == "__main__":

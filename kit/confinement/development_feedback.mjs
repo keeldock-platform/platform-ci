@@ -32,9 +32,12 @@ export const DEVELOPMENT_FEEDBACK_LIMITS = Object.freeze({
   npmAdmissionLockBytes: 1536 * 1024,
   npmAdmissionReceiptBytes: 256 * 1024,
   npmAdmissionEvidenceBytes: 640 * 1024,
+  linuxQuickBytes: 4 * 1024 * 1024 - 64 * 1024,
+  linuxQuickLines: 2,
+  linuxQuickLineCodeUnits: 4 * 1024 * 1024 - 64 * 1024,
 });
 
-const PROFILE_KINDS = new Set(['lock', 'rust_patch', 'build_diagnostics', 'cargo_lock', 'npm_admission']);
+const PROFILE_KINDS = new Set(['lock', 'rust_patch', 'build_diagnostics', 'cargo_lock', 'npm_admission', 'linux_quick']);
 const CARGO_LOCK_FIELDS = Object.freeze(['evidence_b64', 'lock_b64', 'receipt_b64', 'schema_version']);
 const BASE64_TEXT = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const RUST_PATH = /^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*\.rs$/u;
@@ -461,6 +464,12 @@ function validatePayload(bytes, profile, options, originalRustFiles) {
     parseRustPatch(text, reviewedPaths);
     return;
   }
+  if (profile.kind === 'linux_quick') {
+    if (bytes.byteLength > DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes) reject('payload_too_large');
+    validateDiagnosticText(decodeText(bytes, DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickLines,
+      DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickLineCodeUnits));
+    return;
+  }
   if (bytes.byteLength > DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes) reject('payload_too_large');
   const text = decodeText(bytes, DEVELOPMENT_FEEDBACK_LIMITS.diagnosticLines,
     DEVELOPMENT_FEEDBACK_LIMITS.diagnosticLineCodeUnits);
@@ -472,6 +481,7 @@ function payloadLimit(kind) {
   if (kind === 'build_diagnostics') return DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes;
   if (kind === 'cargo_lock') return DEVELOPMENT_FEEDBACK_LIMITS.cargoLockBytes;
   if (kind === 'npm_admission') return DEVELOPMENT_FEEDBACK_LIMITS.npmAdmissionBytes;
+  if (kind === 'linux_quick') return DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes;
   return LOCK_MANIFEST_LIMITS.inputBytes;
 }
 

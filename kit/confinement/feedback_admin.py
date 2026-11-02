@@ -843,7 +843,7 @@ class FeedbackAdmin:
                     "concern": profile["concern"],
                     "ci_repository_id": str(self.ci_repository_id),
                     "workflow_path": profile["workflow_path"],
-                    "workflow_ref": feedback_request.WORKFLOW_REF,
+                    "workflow_ref": feedback_request.workflow_ref_for_kind(kind),
                     "repository_id": reviewed_fields["repository_id"],
                     "source_sha": reviewed_fields["source_sha"],
                     "base_sha": reviewed_fields["base_sha"],
@@ -1012,6 +1012,7 @@ class FeedbackAdmin:
             "lock" if profile["kind"] == "lock" else "patch" if profile["kind"] == "rust_patch"
             else "cargo-lock" if profile["kind"] == feedback_request.CARGO_LOCK_KIND
             else "npm-admission" if profile["kind"] == feedback_request.NPM_ADMISSION_KIND
+            else "linux-quick" if profile["kind"] == feedback_request.LINUX_QUICK_KIND
             else "diagnostics"
         )
         name = "return-" + request["request_id"] + "-" + suffix + ".payload"

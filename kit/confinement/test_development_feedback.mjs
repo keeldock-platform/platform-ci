@@ -51,7 +51,7 @@ function contextFor(profileName) {
     control_sha: 'c'.repeat(40),
     base_branch: 'main',
     reviewed_diff_sha256: 'd'.repeat(64),
-    workflow_ref: 'refs/heads/main',
+    workflow_ref: profile.workflowRef ?? 'refs/heads/main',
     run_id: '987654321',
     producer_job: profile.producerJob,
     run_attempt: 1,
@@ -162,7 +162,8 @@ function manyFilePatch(count) {
 function validate(kind, payloadBytes, extra = {}) {
   const profileName = kind === 'lock' ? 'core-node-lock-return'
     : kind === 'rust_patch' ? 'core-rust-format-return'
-      : kind === 'cargo_lock' ? 'core-rust-lock-return' : 'core-build-diagnostic-return';
+      : kind === 'cargo_lock' ? 'core-rust-lock-return'
+        : kind === 'linux_quick' ? 'core-linux-quick-return' : 'core-build-diagnostic-return';
   return validateDevelopmentFeedback({ payloadBytes, context: contextFor(profileName), now: NOW, ...extra });
 }
 
@@ -608,4 +609,122 @@ test('cargo lock bundles encrypt and decrypt only under their own profile', () =
     recipientPrivateKey: recipient.privateKey,
     now: NOW,
   }), DevelopmentFeedbackError);
+});
+
+function quickPayload(bodyText = '{"gates":[],"tier":"quick"}', total = DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes) {
+  const header = `KD-LINUX-QUICK-PAYLOAD 1 ${String(Buffer.byteLength(bodyText, 'ascii')).padStart(8, '0')}\n`;
+  const used = header.length + bodyText.length;
+  return Buffer.from(header + bodyText + ' '.repeat(total - used), 'ascii');
+}
+
+test('the Linux quick limits are the envelope plaintext bound with a two line frame', () => {
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes, 4128768);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes, LOCK_ENVELOPE_LIMITS.plaintextBytes);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickLines, 2);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickLineCodeUnits, DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes);
+  assert.ok(DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes > DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes, 512 * 1024);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.diagnosticLines, 8192);
+  assert.equal(DEVELOPMENT_FEEDBACK_LIMITS.diagnosticLineCodeUnits, 8192);
+});
+
+test('accepts the fixed-size padded Linux quick payload and rejects malformed or credential-shaped text', () => {
+  const payload = quickPayload();
+  assert.equal(payload.byteLength, DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes);
+  assert.deepEqual(validate('linux_quick', payload), payload);
+  const body = '{"gates":[{"name":"format","outcome":"passed","duration_ms":10,"stdout_tail":"ok\\n"}]}';
+  assert.deepEqual(validate('linux_quick', quickPayload(body)), quickPayload(body));
+  const cases = [
+    [Buffer.from([0xef, 0xbb, 0xbf, 0x61, 0x0a]), 'invalid_payload_bom'],
+    [Buffer.from([0xc3, 0x28]), 'invalid_payload_utf8'],
+    [Buffer.from('first\0second\n', 'utf8'), 'invalid_payload_nul'],
+    [Buffer.from('first\rsecond\n', 'utf8'), 'invalid_payload_cr'],
+    [Buffer.from('first\u001bsecond\n', 'utf8'), 'invalid_payload_c0'],
+    [Buffer.from('first\u007fsecond\n', 'utf8'), 'invalid_payload_c0'],
+    [Buffer.from('first\u0085second\n', 'utf8'), 'invalid_payload_c1'],
+    [Buffer.from('one\ntwo\nthree', 'utf8'), 'limit_exceeded'],
+    [quickPayload('{"stderr_tail":"error token=abcdefghijkl"}'), 'credential_like_content'],
+    [quickPayload('{"stderr_tail":"password=synthetic-fixture-value"}'), 'credential_like_content'],
+    [quickPayload('{"stderr_tail":"https://user:placeholder@example.invalid/path"}'), 'credential_like_content'],
+    [quickPayload('{"stderr_tail":"-----BEGIN PRIVATE KEY-----"}'), 'credential_like_content'],
+    [Buffer.alloc(DEVELOPMENT_FEEDBACK_LIMITS.linuxQuickBytes + 1, 0x20), 'payload_too_large'],
+  ];
+  for (const [bytes, code] of cases) {
+    assert.throws(() => validate('linux_quick', bytes), { code }, code);
+  }
+  const tab = Buffer.from('header\n{"a":"b\\tc"} \tend', 'ascii');
+  assert.deepEqual(validate('linux_quick', tab), tab);
+});
+
+test('the Linux quick payload is limited by its own bound and never by the diagnostic bound', () => {
+  const longLine = Buffer.from(`head\n${' '.repeat(DEVELOPMENT_FEEDBACK_LIMITS.diagnosticLineCodeUnits + 1)}`, 'ascii');
+  assert.deepEqual(validate('linux_quick', longLine), longLine);
+  assert.throws(() => validate('build_diagnostics', longLine), { code: 'limit_exceeded' });
+  const bigDiagnostic = Buffer.alloc(DEVELOPMENT_FEEDBACK_LIMITS.diagnosticBytes + 1, 0x20);
+  assert.deepEqual(validate('linux_quick', bigDiagnostic), bigDiagnostic);
+  assert.throws(() => validate('build_diagnostics', bigDiagnostic), { code: 'payload_too_large' });
+});
+
+test('Linux quick payloads encrypt and decrypt only under their own untrusted-ref profile', () => {
+  const payload = quickPayload();
+  const context = contextFor('core-linux-quick-return');
+  assert.equal(context.workflow_ref, 'refs/heads/untrusted');
+  assert.equal(context.kind, 'linux_quick');
+  const envelope = encryptDevelopmentFeedback({
+    payloadBytes: payload,
+    context,
+    recipientPublicKey: recipient.publicKey,
+    now: NOW,
+  });
+  assert.equal(envelope[5], RETURN_PROFILES['core-linux-quick-return'].id);
+  assert.equal(envelope[5], 6);
+  assert.deepEqual(decryptDevelopmentFeedback({
+    envelope,
+    context,
+    recipientPrivateKey: recipient.privateKey,
+    now: NOW,
+  }), payload);
+  for (const wrong of [
+    contextFor('core-build-diagnostic-return'),
+    { ...context, workflow_ref: 'refs/heads/main' },
+    { ...context, nonce: '3'.repeat(64) },
+  ]) {
+    assert.throws(() => decryptDevelopmentFeedback({
+      envelope,
+      context: wrong,
+      recipientPrivateKey: recipient.privateKey,
+      now: NOW,
+    }), DevelopmentFeedbackError);
+  }
+  assert.throws(() => encryptDevelopmentFeedback({
+    payloadBytes: payload,
+    context: { ...context, workflow_ref: 'refs/heads/main' },
+    recipientPublicKey: recipient.publicKey,
+    now: NOW,
+  }), DevelopmentFeedbackError);
+  assert.throws(() => encryptDevelopmentFeedback({
+    payloadBytes: quickPayload('{"stderr_tail":"error token=abcdefghijkl"}'),
+    context,
+    recipientPublicKey: recipient.publicKey,
+    now: NOW,
+  }), { code: 'credential_like_content' });
+  assert.throws(() => encryptDevelopmentFeedback({
+    payloadBytes: payload,
+    context,
+    recipientPublicKey: recipient.publicKey,
+    now: 1_800_835_200,
+  }), { code: 'exception_expired' });
+});
+
+test('no other profile accepts the untrusted ref in a development feedback context', () => {
+  for (const name of Object.keys(RETURN_PROFILES)) {
+    if (name === 'core-linux-quick-return') continue;
+    const context = { ...contextFor(name), workflow_ref: 'refs/heads/untrusted' };
+    assert.equal(RETURN_PROFILES[name].workflowRef, undefined, name);
+    assert.throws(() => validateDevelopmentFeedback({
+      payloadBytes: Buffer.from('synthetic\n', 'utf8'),
+      context,
+      now: NOW,
+    }), DevelopmentFeedbackError, name);
+  }
 });
