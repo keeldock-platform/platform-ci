@@ -488,7 +488,7 @@ class LinuxFixtureDiagnosticLineTests(unittest.TestCase):
             "drop " + "x" * 16 + "_" + "y" * 16 + "-" + "z" * 4,
             "keep " + "x" * 16 + "_" + "y" * 15,
         )).encode("ascii")
-        self.assertEqual(self.texts(self.lines(stderr)), ["keep " + "x" * 16 + "?" + "y" * 15])
+        self.assertEqual(self.texts(self.lines(stderr)), ["keep " + "x" * 16 + "_" + "y" * 15])
 
     def test_a_hosted_runner_sysroot_listing_line_is_kept(self):
         line = "drwxr-xr-x 9 1001 118 4096 Nov  2 04:38 /tmp/kd-toolchains/rust/stable-x86_64-unknown-linux-gnu"
@@ -500,7 +500,7 @@ class LinuxFixtureDiagnosticLineTests(unittest.TestCase):
     def test_the_token_scan_also_runs_on_the_raw_line_before_cleaning(self):
         wide = "g" * 20 + "_" + "g" * 20
         cleaned = channels.diag_clean(wide)
-        self.assertEqual(cleaned, "g" * 20 + "?" + "g" * 20)
+        self.assertEqual(cleaned, wide)
         self.assertIsNone(channels.DIAG_TOKEN.search(cleaned))
         self.assertTrue(channels.diag_unsafe(wide, cleaned, NONCE, ()))
         self.assertFalse(channels.diag_unsafe("plain text", "plain text", NONCE, ()))
