@@ -1,4 +1,5 @@
 import copy
+import re
 import base64
 import hashlib
 import contextlib
@@ -22,6 +23,7 @@ RUN_ID = "701"
 RUN_ATTEMPT = "2"
 REPOSITORY = subject.CONTROL_REPOSITORY
 REF = "refs/heads/main"
+PRISTINE_PINS = dict(subject.PINNED_WORKFLOW_SHA256)
 FIXTURE_NOW = int(time.time())
 WORKFLOW_REF = REPOSITORY + "/" + subject.CALLER_PROFILES["probe"]["path"] + "@" + REF
 DIGEST_PINS = {
@@ -313,7 +315,7 @@ def fixture_successful_evidence(root, profile="probe", digest_values=None):
         "jobs_snapshot": fixture_job_snapshot(jobs),
         "artifacts_snapshot": fixture_artifact_snapshot(artifacts),
         "provider_snapshots": provider_snapshots,
-        "control_root": ROOT, "evidence_root": root,
+        "control_root": install_control_tree(root, profile), "evidence_root": root,
         "api_name_pins": fixture_api_names(),
         "digest_pins": {role: dict(digest_values) for role in subject.ROLE_ORDER},
     }
@@ -444,6 +446,111 @@ def mutate_artifact_statement_digest(root, artifact):
     verified["verificationResult"]["statement"]["subject"][0]["digest"]["sha256"] = "0" * 64
     verified_path.write_text(json.dumps(verified), encoding="ascii")
     repack_artifact(root, artifact)
+
+
+ATTEST_STEP = (
+    "      - name: sign\n        uses: actions/attest@" + "a" * 40 + " " + chr(35) + " v4.2.2\n"
+)
+CANDIDATE_REF_MAIN = "refs/heads/main"
+CANDIDATE_REF_UNTRUSTED = "refs/heads/untrusted"
+RECEIVER_PATH = subject.ROLE_PATHS["windows-producer"]
+FETCH_PATH = subject.ROLE_PATHS["linux-fetch-encrypt"]
+ATTESTER_PATH = subject.ROLE_PATHS["capsule-attester"]
+GENERATOR_POINT = subject.P256_GENERATOR
+CAPSULE_TEST_SIZE = 8192
+
+
+def legacy_role_text(role):
+    return (
+        "name: " + role + "\non:\n  workflow_call:\n    inputs:\n      profile:\n        required: true\n"
+        "        type: string\npermissions: {}\njobs:\n  " + role + ":\n    runs-on: "
+        + subject.ROLE_RUNNERS[role] + "\n    steps:\n" + ATTEST_STEP
+    )
+
+
+def legacy_caller_text(profile):
+    jobs = ""
+    for role in subject.ROLE_ORDER:
+        needs = "    needs:\n      - linux-fetch-encrypt\n" if role == "capsule-attester" else ""
+        guard = "    if: ${{ github.ref == 'refs/heads/main' }}\n" if role == "windows-receiver" else ""
+        jobs += "  %s:\n%s%s    uses: ./%s\n    with:\n      profile: %s\n" % (
+            role, guard, needs, subject.ROLE_PATHS[role], profile)
+    return "name: caller\non:\n  workflow_dispatch:\npermissions: {}\njobs:\n" + jobs
+
+
+def candidate_role_text(job_id, runner, names, extra=""):
+    inputs = ""
+    for name in names:
+        required = "true" if name == "profile" else "false"
+        inputs += "      %s:\n        required: %s\n        type: string\n" % (name, required)
+    return (
+        "name: " + job_id + "\non:\n  workflow_call:\n    inputs:\n" + inputs + "permissions: {}\njobs:\n  "
+        + job_id + ":\n    if: ${{ inputs.profile == 'candidate' }}\n    runs-on: " + runner + "\n" + extra
+        + "    permissions:\n      id-token: write\n      attestations: write\n    steps:\n" + ATTEST_STEP
+    )
+
+
+def candidate_caller_text():
+    def call(job_id, path, needs, role=None):
+        text = "  %s:\n    needs:\n%s    uses: ./%s\n    with:\n      profile: candidate\n" % (
+            job_id, "".join("      - %s\n" % item for item in needs), path)
+        if role is not None:
+            text += "      role: %s\n" % role
+        return text
+
+    return (
+        "name: windows-source-admission\non:\n  workflow_dispatch:\n    inputs:\n      mode:\n"
+        "        required: true\n        type: string\npermissions: {}\njobs:\n  settings:\n"
+        "    if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted' }}\n"
+        "    runs-on: ubuntu-24.04\n"
+        + call("windows-producer", RECEIVER_PATH, ("settings",), "producer")
+        + call("windows-verifier", RECEIVER_PATH, ("settings",), "verifier")
+        + call("linux-fetch-encrypt", FETCH_PATH, ("settings",))
+        + call("capsule-attester", ATTESTER_PATH, ("settings", "linux-fetch-encrypt"))
+        + "  verify-role-evidence:\n    runs-on: ubuntu-24.04\n  audit:\n    runs-on: ubuntu-24.04\n"
+    )
+
+
+def candidate_tree_files():
+    return {
+        subject.CALLER_PROFILES["candidate"]["path"]: candidate_caller_text(),
+        RECEIVER_PATH: candidate_role_text(
+            "windows-candidate", "windows-2025", ("profile", "role", "mode", "source_sha"),
+            "    environment: ${{ inputs.mode == 'source' && 'windows-source-exec' || '' }}\n"),
+        FETCH_PATH: candidate_role_text(
+            "linux-fetch-encrypt", "ubuntu-24.04",
+            ("profile", "mode", "source_sha", "base_sha", "base_branch", "fingerprint", "environment_name"),
+            subject.FETCH_ENVIRONMENT_LINE + "\n"),
+        ATTESTER_PATH: candidate_role_text("capsule-attester", "ubuntu-24.04", ("profile", "mode")),
+    }
+
+
+def write_tree(directory, files):
+    pins = {}
+    for relative, text in files.items():
+        path = Path(directory) / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(text.encode("ascii"))
+        pins[relative] = hashlib.sha256(text.encode("ascii")).hexdigest()
+    return pins
+
+
+def write_control_tree(directory, profile):
+    if profile == "candidate":
+        return write_tree(directory, candidate_tree_files())
+    files = {subject.CALLER_PROFILES[profile]["path"]: legacy_caller_text(profile)}
+    for role in subject.ROLE_ORDER:
+        files[subject.ROLE_PATHS[role]] = legacy_role_text(role)
+    return write_tree(directory, files)
+
+
+def install_control_tree(root, profile):
+    directory = Path(root) / "fixture-control"
+    pins = write_control_tree(directory, profile)
+    patcher = mock.patch.dict(subject.PINNED_WORKFLOW_SHA256, pins)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    return directory
 
 
 class CanonicalIdentityTests(unittest.TestCase):
@@ -640,27 +747,46 @@ class KeyRecordAndPredicateTests(unittest.TestCase):
 
 
 class WorkflowAndJobMappingTests(unittest.TestCase):
-    def test_checked_in_caller_and_role_graphs_have_exact_pins(self):
+    def test_checked_in_candidate_caller_and_role_graphs_have_valid_shape(self):
+        paths = subject.profile_workflow_paths("candidate")
+        pins = {relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest() for relative in paths}
+        result = subject.verify_workflow_bytes(ROOT, "candidate", pins)
+        self.assertEqual(set(result), set(paths))
+        self.assertEqual(set(paths), {subject.CALLER_PROFILES["candidate"]["path"]} | set(subject.ROLE_PATHS.values()))
+        self.assertTrue(subject.validate_workflow_graph(ROOT, "candidate"))
+
+    def test_legacy_profiles_validate_against_fixture_trees(self):
         for profile in ("probe", "production-synthetic"):
-            with self.subTest(profile=profile):
-                result = subject.verify_workflow_bytes(ROOT, profile)
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                pins = write_control_tree(temporary, profile)
+                result = subject.verify_workflow_bytes(temporary, profile, pins)
                 self.assertEqual(
                     set(result),
                     {subject.CALLER_PROFILES[profile]["path"]} | set(subject.ROLE_PATHS.values()),
                 )
+                self.assertEqual(subject.profile_roles(profile), subject.ROLE_ORDER)
+                self.assertEqual(subject.profile_refs(profile), (REF,))
 
     def test_workflow_byte_pin_rejects_changed_callee(self):
-        pins = dict(subject.PINNED_WORKFLOW_SHA256)
+        for profile in ("candidate", "probe"):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                pins = write_control_tree(root, profile)
+                target = root / subject.ROLE_PATHS["linux-fetch-encrypt"]
+                target.write_bytes(target.read_bytes() + b"\n")
+                with self.assertRaisesRegex(subject.Refusal, "workflow-byte-mismatch"):
+                    subject.verify_workflow_bytes(root, profile, pins)
+
+    def test_default_pins_no_longer_name_the_retired_probe_caller(self):
+        self.assertNotIn(subject.CALLER_PROFILES["probe"]["path"], PRISTINE_PINS)
+        self.assertEqual(
+            set(PRISTINE_PINS), {subject.CALLER_PROFILES["candidate"]["path"]} | set(subject.ROLE_PATHS.values()),
+        )
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            for relative in pins:
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes((ROOT / relative).read_bytes())
-            target = root / subject.ROLE_PATHS["linux-fetch-encrypt"]
-            target.write_bytes(target.read_bytes() + b"\n")
-            with self.assertRaisesRegex(subject.Refusal, "workflow-byte-mismatch"):
-                subject.verify_workflow_bytes(root, "probe", pins)
+            write_control_tree(temporary, "probe")
+            with mock.patch.dict(subject.PINNED_WORKFLOW_SHA256, PRISTINE_PINS, clear=True):
+                with self.assertRaisesRegex(subject.Refusal, "workflow-pin-unresolved"):
+                    subject.verify_workflow_bytes(temporary, "probe")
 
     def test_call_graph_requires_one_fixed_call_per_role_and_one_signing_job(self):
         graph = {
@@ -1072,7 +1198,7 @@ class ArtifactAndStageTests(unittest.TestCase):
                         "gate-transition", "--gate", gate, "--profile", "probe",
                         "--repository", REPOSITORY, "--ref", REF,
                         "--control-sha", CONTROL_SHA, "--run-id", RUN_ID,
-                        "--run-attempt", RUN_ATTEMPT, "--root", str(ROOT),
+                        "--run-attempt", RUN_ATTEMPT, "--root", str(evidence["control_root"]),
                         "--jobs-file", str(prefix) + "-jobs.json",
                         "--artifacts-file", str(prefix) + "-artifacts.json",
                         "--repository-metadata", str(prefix) + "-repository.json",
@@ -1132,7 +1258,7 @@ class ArtifactAndStageTests(unittest.TestCase):
             command = [
                 "verify-snapshot", "--profile", "probe", "--repository", REPOSITORY,
                 "--ref", REF, "--control-sha", CONTROL_SHA, "--run-id", RUN_ID,
-                "--run-attempt", RUN_ATTEMPT, "--root", str(ROOT),
+                "--run-attempt", RUN_ATTEMPT, "--root", str(evidence["control_root"]),
                 "--jobs-file", str(Path(temporary) / "jobs.json"),
                 "--artifacts-file", str(Path(temporary) / "artifacts.json"),
                 "--repository-metadata", str(Path(temporary) / "repository.json"),
@@ -1186,7 +1312,7 @@ class ArtifactAndStageTests(unittest.TestCase):
                 "verify-snapshot", "--profile", "production-synthetic",
                 "--repository", REPOSITORY, "--ref", REF,
                 "--control-sha", CONTROL_SHA, "--run-id", RUN_ID,
-                "--run-attempt", RUN_ATTEMPT, "--root", str(ROOT),
+                "--run-attempt", RUN_ATTEMPT, "--root", str(evidence["control_root"]),
                 "--jobs-file", str(Path(temporary) / "jobs.json"),
                 "--artifacts-file", str(Path(temporary) / "artifacts.json"),
                 "--repository-metadata", str(Path(temporary) / "repository.json"),
@@ -1398,10 +1524,10 @@ class ArtifactAndStageTests(unittest.TestCase):
                             mutate_artifact_nonce(temporary, artifacts[0])
                         elif case == "workflow-bytes":
                             control = Path(temporary) / "control"
-                            for relative in subject.PINNED_WORKFLOW_SHA256:
+                            for relative in subject.profile_workflow_paths("probe"):
                                 path = control / relative
                                 path.parent.mkdir(parents=True, exist_ok=True)
-                                path.write_bytes((ROOT / relative).read_bytes())
+                                path.write_bytes((evidence["control_root"] / relative).read_bytes())
                             target = control / subject.ROLE_PATHS["windows-receiver"]
                             target.write_bytes(target.read_bytes() + b"\n")
                             arguments["control_root"] = control
@@ -1826,10 +1952,179 @@ class CertificatePinTests(unittest.TestCase):
             subject.resolve_certificate_pins("unknown", CONTROL_SHA)
 
 
-class CandidateProfileTests(unittest.TestCase):
-    UNTRUSTED = "refs/heads/untrusted"
+def candidate_workflow_ref(ref=REF):
+    return REPOSITORY + "/" + subject.CALLER_PROFILES["candidate"]["path"] + "@" + ref
 
-    def _expected(self, profile, ref, role="windows-receiver"):
+
+def candidate_record(ref=REF, point=GENERATOR_POINT):
+    return subject.make_key_record(
+        8150001, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, candidate_workflow_ref(ref), now=FIXTURE_NOW, public_point=point,
+    )
+
+
+def candidate_signed_files(role, record, signed_subject, ref=REF):
+    predicate = subject.make_predicate(
+        "candidate", role, REPOSITORY, CONTROL_SHA, ref, RUN_ID, RUN_ATTEMPT, record, signed_subject)
+    statement = {
+        "_type": "https://in-toto.io/Statement/v1",
+        "subject": [{"name": "subject.bin", "digest": {"sha256": hashlib.sha256(signed_subject).hexdigest()}}],
+        "predicateType": subject.PREDICATE_TYPE,
+        "predicate": predicate,
+    }
+    payload = json.dumps(statement, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
+    bundle = {"dsseEnvelope": {
+        "payloadType": "application/vnd.in-toto+json",
+        "payload": base64.b64encode(payload).decode("ascii"),
+        "signatures": [{"sig": "synthetic"}],
+    }}
+    expected = subject.certificate_expectations(
+        "candidate", REPOSITORY, ref, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
+        role, subject.ROLE_RUNNERS[role], dict(DIGEST_PINS))
+    certificate = {field: expected[field] for field in CERTIFICATE_FIELDS}
+    certificate["sourceRepositoryIdentifier"] = "8150001"
+    certificate["sourceRepositoryOwnerIdentifier"] = "99101"
+    verified = {"verificationResult": {"signature": {"certificate": certificate}, "statement": statement}}
+    files = {
+        "subject.bin": signed_subject,
+        "predicate.json": json.dumps(predicate, sort_keys=True).encode("ascii"),
+        "bundle.json": json.dumps(bundle, sort_keys=True).encode("ascii"),
+    }
+    return files, verified, bundle
+
+
+def zip_bytes(files):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for name, value in files.items():
+            archive.writestr(name, value)
+    return output.getvalue()
+
+
+def artifact_row(identifier, name, archive_bytes, head_sha=CONTROL_SHA):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return {
+        "id": identifier, "name": name, "workflow_run": {"id": int(RUN_ID), "head_sha": head_sha},
+        "expired": False, "size_in_bytes": len(archive_bytes),
+        "digest": "sha256:" + hashlib.sha256(archive_bytes).hexdigest(),
+        "created_at": now.isoformat(), "expires_at": (now + datetime.timedelta(hours=1)).isoformat(),
+    }
+
+
+def binding_document(producer, verifier, producer_capsule, verifier_capsule, revocation="confirmed"):
+    return {
+        "capsule_producer_sha256": hashlib.sha256(producer_capsule).hexdigest(),
+        "capsule_verifier_sha256": hashlib.sha256(verifier_capsule).hexdigest(),
+        "key_record_producer_sha256": hashlib.sha256(producer).hexdigest(),
+        "key_record_verifier_sha256": hashlib.sha256(verifier).hexdigest(),
+        "lock_sha256": "3" * 64, "manifest_sha256": "4" * 64, "revocation": revocation,
+        "schema": 1, "source_sha": "1" * 40, "tree_id": "2" * 40,
+    }
+
+
+class CandidateWorld:
+    def __init__(self, ref=REF, revocation="confirmed", size=CAPSULE_TEST_SIZE):
+        self.ref = ref
+        self.size = size
+        self.producer_record = candidate_record(ref)
+        self.verifier_record = candidate_record(ref)
+        self.capsules = {"producer": b"P" * size, "verifier": b"V" * size}
+        document = binding_document(
+            self.producer_record, self.verifier_record, self.capsules["producer"], self.capsules["verifier"],
+            revocation)
+        self.linux_subject = subject.canonical_json_subject(document)
+        attested = dict(document)
+        attested["kind"] = "attested"
+        attested["linux_subject_sha256"] = hashlib.sha256(self.linux_subject).hexdigest()
+        self.attester_subject = subject.canonical_json_subject(attested)
+        self.subjects = {
+            "windows-producer": (self.producer_record, self.producer_record),
+            "windows-verifier": (self.verifier_record, self.verifier_record),
+            "linux-fetch-encrypt": (self.producer_record, self.linux_subject),
+            "capsule-attester": (self.producer_record, self.attester_subject),
+        }
+        self.zips = {}
+        self.verified = {}
+        self.bundles = {}
+        self.rows = []
+        self.names = {}
+        self.statement_files = {}
+        for index, role in enumerate(subject.CANDIDATE_ROLES, 1):
+            record, signed_subject = self.subjects[role]
+            files, verified, bundle = candidate_signed_files(role, record, signed_subject, ref)
+            name = "role-statement-%s-%s-%s-%s" % (role, RUN_ID, RUN_ATTEMPT, record[52:68].hex())
+            archive = zip_bytes(files)
+            self.names[role] = name
+            self.zips[3000 + index] = archive
+            self.verified[name] = verified
+            self.bundles[role] = bundle
+            self.statement_files[name] = files
+            self.rows.append(artifact_row(3000 + index, name, archive))
+        for index, short in enumerate(("producer", "verifier"), 1):
+            self.set_capsule(short, zip_bytes({"capsule.bin": self.capsules[short]}))
+
+    def set_capsule(self, short, archive):
+        identifier = 3100 + (1 if short == "producer" else 2)
+        name = "source-capsule-%s-%s-%s" % (short, RUN_ID, RUN_ATTEMPT)
+        self.rows = [row for row in self.rows if row["name"] != name]
+        self.zips[identifier] = archive
+        self.rows.append(artifact_row(identifier, name, archive))
+
+    def artifact_map(self, roles=subject.CANDIDATE_ROLES):
+        result = {}
+        for role in roles:
+            row = next(item for item in self.rows if item["name"] == self.names[role])
+            result[role] = {
+                "id": row["id"], "name": row["name"], "transfer_id": self.subjects[role][0][52:68].hex(),
+                "expired": False, "digest": row["digest"], "size_in_bytes": row["size_in_bytes"],
+                "created_at": row["created_at"], "expires_at": row["expires_at"],
+            }
+        return result
+
+    def write_evidence(self, root):
+        for name, files in self.statement_files.items():
+            directory = Path(root) / name
+            directory.mkdir(parents=True)
+            for filename, value in files.items():
+                (directory / filename).write_bytes(value)
+            (directory / "verified.json").write_text(json.dumps(self.verified[name]), encoding="ascii")
+        for row in self.rows:
+            if row["name"] in self.statement_files:
+                (Path(root) / (row["name"] + ".zip")).write_bytes(self.zips[row["id"]])
+
+    def gh(self, rows=None, calls=None, attestation=True):
+        rows = self.rows if rows is None else rows
+
+        def run(arguments, output_path):
+            if calls is not None:
+                calls.append(list(arguments))
+            if arguments[:3] == ["api", "--paginate", "--slurp"]:
+                Path(output_path).write_text(json.dumps([{"total_count": len(rows), "artifacts": rows}]))
+                return True
+            if arguments[0] == "api" and arguments[1].endswith("/zip"):
+                data = self.zips.get(int(arguments[1].split("/")[-2]))
+                if data is None:
+                    return False
+                Path(output_path).write_bytes(data)
+                return True
+            if arguments[0] == "api" and arguments[2:3] == ["--jq"]:
+                Path(output_path).write_text(json.dumps({
+                    "id": 8150001, "full_name": REPOSITORY, "owner_id": 99101, "visibility": "public"}))
+                return True
+            if arguments[:2] == ["attestation", "verify"] and attestation:
+                document = self.verified.get(Path(arguments[2]).parent.name)
+                if document is None:
+                    return False
+                Path(output_path).write_text(json.dumps(document))
+                return True
+            return False
+
+        return run
+
+
+class CandidateProfileTests(unittest.TestCase):
+    UNTRUSTED = CANDIDATE_REF_UNTRUSTED
+
+    def _expected(self, profile, ref, role="windows-producer"):
         return subject.certificate_expectations(
             profile, REPOSITORY, ref, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
             role, subject.ROLE_RUNNERS[role], dict(DIGEST_PINS),
@@ -1841,77 +2136,112 @@ class CandidateProfileTests(unittest.TestCase):
         certificate["sourceRepositoryOwnerIdentifier"] = "99101"
         return certificate
 
-    def test_candidate_is_the_windows_caller_on_untrusted_and_inherits_the_pins(self):
+    def test_profile_tables_carry_the_candidate_role_set_and_both_refs(self):
         candidate = subject.CALLER_PROFILES["candidate"]
         production = subject.CALLER_PROFILES["production-synthetic"]
         self.assertEqual(set(subject.CALLER_PROFILES), {"probe", "production-synthetic", "candidate"})
         self.assertEqual(candidate["path"], production["path"])
         self.assertEqual(candidate["name"], production["name"])
-        self.assertEqual(candidate["ref"], self.UNTRUSTED)
-        self.assertEqual(production["ref"], "refs/heads/main")
-        for table in (subject.API_JOB_NAME_PINS, subject.API_LINUX_STEP_NAME_PINS,
-                      subject.API_LINUX_STEP_ORDINAL_PINS):
-            self.assertEqual(table["candidate"], table["production-synthetic"])
+        self.assertEqual(candidate["refs"], (REF, self.UNTRUSTED))
+        self.assertNotIn("ref", candidate)
+        self.assertEqual(production["refs"], (REF,))
+        self.assertEqual(subject.CANDIDATE_ROLES, (
+            "windows-producer", "windows-verifier", "linux-fetch-encrypt", "capsule-attester"))
+        self.assertEqual(subject.profile_roles("candidate"), subject.CANDIDATE_ROLES)
+        self.assertEqual(subject.profile_roles("probe"), subject.ROLE_ORDER)
+        self.assertEqual(subject.profile_roles("production-synthetic"), subject.ROLE_ORDER)
         self.assertEqual(
-            set(subject.resolve_certificate_pins("candidate", CONTROL_SHA)), set(subject.ROLE_ORDER),
+            subject.API_JOB_NAME_PINS["candidate"],
+            {role: "role-call-%s-v1 / role-%s-v1" % (role, role) for role in subject.CANDIDATE_ROLES},
         )
+        self.assertEqual(set(subject.API_JOB_NAME_PINS["probe"]), set(subject.ROLE_ORDER))
+        self.assertEqual(subject.API_LINUX_STEP_ORDINAL_PINS["probe"],
+                         {"revoke-source-token": 9, "verify-token-rejection": 10})
+        self.assertEqual(subject.API_LINUX_STEP_ORDINAL_PINS["candidate"],
+                         {"revoke-source-token": 12, "verify-token-rejection": 13})
+        self.assertEqual(
+            set(subject.resolve_certificate_pins("candidate", CONTROL_SHA)), set(subject.CANDIDATE_ROLES))
+        self.assertEqual(
+            set(subject.resolve_certificate_pins("probe", CONTROL_SHA)), set(subject.ROLE_ORDER))
+        self.assertEqual(subject.gate_roles("candidate", "A"), subject.CANDIDATE_ROLES[:2])
+        self.assertEqual(subject.gate_roles("candidate", "B"), subject.CANDIDATE_ROLES[:3])
+        self.assertEqual(subject.gate_roles("probe", "A"), subject.ROLE_ORDER[:1])
+        self.assertEqual(subject.gate_roles("probe", "B"), subject.ROLE_ORDER[:2])
 
-    def test_certificate_expectations_follow_the_candidate_ref_for_every_role(self):
-        for role in subject.ROLE_ORDER:
-            with self.subTest(role=role):
-                expected = self._expected("candidate", self.UNTRUSTED, role)
-                self.assertEqual(expected["githubWorkflowRef"], self.UNTRUSTED)
-                self.assertEqual(expected["sourceRepositoryRef"], self.UNTRUSTED)
-                self.assertEqual(expected["githubWorkflowName"], "windows-source-admission")
-                self.assertTrue(expected["buildSignerURI"].endswith(
-                    "/" + subject.ROLE_PATHS[role] + "@" + self.UNTRUSTED))
-                self.assertTrue(expected["buildConfigURI"].endswith(
-                    "/.github/workflows/windows-source-admission.yml@" + self.UNTRUSTED))
-                with self.assertRaisesRegex(subject.Refusal, "profile-repository-ref"):
-                    self._expected("candidate", "refs/heads/main", role)
-                with self.assertRaisesRegex(subject.Refusal, "profile-repository-ref"):
-                    self._expected("production-synthetic", self.UNTRUSTED, role)
-                with self.assertRaisesRegex(subject.Refusal, "profile-repository-ref"):
-                    self._expected("probe", self.UNTRUSTED, role)
+    def test_both_windows_roles_share_the_receiver_workflow_and_runner(self):
+        for role in ("windows-producer", "windows-verifier", "windows-receiver"):
+            self.assertEqual(subject.ROLE_PATHS[role], RECEIVER_PATH)
+            self.assertEqual(subject.ROLE_RUNNERS[role], "windows-2025")
+        self.assertTrue(subject.ARTIFACT_NAME.fullmatch(
+            "role-statement-windows-verifier-1-1-" + "a" * 32))
 
-    def test_a_main_certificate_cannot_satisfy_the_candidate_and_the_reverse(self):
-        candidate = self._expected("candidate", self.UNTRUSTED)
-        production = self._expected("production-synthetic", "refs/heads/main")
-        self.assertTrue(subject.validate_certificate(self._certificate(candidate), candidate))
-        self.assertTrue(subject.validate_certificate(self._certificate(production), production))
+    def test_certificate_expectations_follow_each_ref_for_every_candidate_role(self):
+        for role in subject.CANDIDATE_ROLES:
+            for ref in (REF, self.UNTRUSTED):
+                with self.subTest(role=role, ref=ref):
+                    expected = self._expected("candidate", ref, role)
+                    self.assertEqual(expected["githubWorkflowRef"], ref)
+                    self.assertEqual(expected["sourceRepositoryRef"], ref)
+                    self.assertEqual(expected["githubWorkflowName"], "windows-source-admission")
+                    self.assertTrue(expected["buildSignerURI"].endswith(
+                        "/" + subject.ROLE_PATHS[role] + "@" + ref))
+                    self.assertTrue(expected["buildConfigURI"].endswith(
+                        "/.github/workflows/windows-source-admission.yml@" + ref))
+            with self.assertRaisesRegex(subject.Refusal, "profile-repository-ref"):
+                self._expected("candidate", "refs/heads/develop", role)
+        with self.assertRaisesRegex(subject.Refusal, "profile-role-invalid"):
+            self._expected("candidate", REF, "windows-receiver")
+        with self.assertRaisesRegex(subject.Refusal, "profile-role-invalid"):
+            self._expected("probe", REF, "windows-producer")
+        with self.assertRaisesRegex(subject.Refusal, "profile-repository-ref"):
+            self._expected("production-synthetic", self.UNTRUSTED, "linux-fetch-encrypt")
+        with self.assertRaisesRegex(subject.Refusal, "profile-repository-ref"):
+            self._expected("probe", self.UNTRUSTED, "linux-fetch-encrypt")
+
+    def test_a_main_certificate_cannot_satisfy_the_untrusted_expectation(self):
+        main = self._expected("candidate", REF)
+        untrusted = self._expected("candidate", self.UNTRUSTED)
+        self.assertTrue(subject.validate_certificate(self._certificate(main), main))
+        self.assertTrue(subject.validate_certificate(self._certificate(untrusted), untrusted))
         with self.assertRaises(subject.Refusal):
-            subject.validate_certificate(self._certificate(production), candidate)
+            subject.validate_certificate(self._certificate(main), untrusted)
         with self.assertRaises(subject.Refusal):
-            subject.validate_certificate(self._certificate(candidate), production)
+            subject.validate_certificate(self._certificate(untrusted), main)
 
-    def test_predicates_bind_the_candidate_profile_and_the_untrusted_ref(self):
-        workflow_ref = REPOSITORY + "/" + subject.CALLER_PROFILES["candidate"]["path"] + "@" + self.UNTRUSTED
-        record = subject.make_key_record(8150001, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, workflow_ref, now=FIXTURE_NOW)
-        predicate = subject.make_predicate(
-            "candidate", "windows-receiver", REPOSITORY, CONTROL_SHA, self.UNTRUSTED,
-            RUN_ID, RUN_ATTEMPT, record, record,
-        )
-        self.assertEqual(predicate["profile"], "candidate")
-        self.assertEqual(predicate["controlRef"], self.UNTRUSTED)
-        for profile, ref in (("candidate", "refs/heads/main"), ("production-synthetic", self.UNTRUSTED),
-                             ("probe", self.UNTRUSTED)):
+    def test_the_two_windows_roles_have_distinct_signer_identity_only_by_role_claim(self):
+        producer = self._expected("candidate", REF, "windows-producer")
+        verifier = self._expected("candidate", REF, "windows-verifier")
+        self.assertEqual(producer["buildSignerURI"], verifier["buildSignerURI"])
+        self.assertNotEqual(producer["role"], verifier["role"])
+
+    def test_predicates_bind_the_candidate_profile_and_either_ref(self):
+        for ref in (REF, self.UNTRUSTED):
+            with self.subTest(ref=ref):
+                record = candidate_record(ref)
+                predicate = subject.make_predicate(
+                    "candidate", "windows-producer", REPOSITORY, CONTROL_SHA, ref, RUN_ID, RUN_ATTEMPT,
+                    record, record)
+                self.assertEqual(predicate["profile"], "candidate")
+                self.assertEqual(predicate["controlRef"], ref)
+                self.assertEqual(predicate["role"], "windows-producer")
+        record = candidate_record(REF)
+        for profile, role, ref in (
+            ("candidate", "windows-producer", "refs/heads/develop"),
+            ("production-synthetic", "windows-receiver", self.UNTRUSTED),
+            ("probe", "windows-receiver", self.UNTRUSTED),
+        ):
             with self.subTest(profile=profile, ref=ref):
                 with self.assertRaisesRegex(subject.Refusal, "profile-ref"):
-                    subject.make_predicate(
-                        profile, "windows-receiver", REPOSITORY, CONTROL_SHA, ref,
-                        RUN_ID, RUN_ATTEMPT, record, record,
-                    )
-        main_record = subject.make_key_record(
-            8150001, CONTROL_SHA, RUN_ID, RUN_ATTEMPT,
-            REPOSITORY + "/" + subject.CALLER_PROFILES["candidate"]["path"] + "@refs/heads/main", now=FIXTURE_NOW,
-        )
+                    subject.make_predicate(profile, role, REPOSITORY, CONTROL_SHA, ref, RUN_ID,
+                                           RUN_ATTEMPT, record, record)
+        with self.assertRaisesRegex(subject.Refusal, "role-invalid"):
+            subject.make_predicate("candidate", "windows-receiver", REPOSITORY, CONTROL_SHA, REF,
+                                   RUN_ID, RUN_ATTEMPT, record, record)
         with self.assertRaises(subject.Refusal):
-            subject.make_predicate(
-                "candidate", "windows-receiver", REPOSITORY, CONTROL_SHA, self.UNTRUSTED,
-                RUN_ID, RUN_ATTEMPT, main_record, main_record,
-            )
+            subject.make_predicate("candidate", "windows-producer", REPOSITORY, CONTROL_SHA,
+                                   self.UNTRUSTED, RUN_ID, RUN_ATTEMPT, record, record)
 
-    def test_run_metadata_requires_the_branch_of_the_profile(self):
+    def test_run_metadata_accepts_the_branch_of_either_candidate_ref_only(self):
         def document(branch):
             return {
                 "id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT), "head_sha": CONTROL_SHA,
@@ -1920,44 +2250,841 @@ class CandidateProfileTests(unittest.TestCase):
                 "status": "in_progress", "conclusion": None,
             }
 
-        self.assertTrue(subject.validate_run_metadata(
-            document("untrusted"), "candidate", REPOSITORY, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, 8150001))
+        for branch in ("main", "untrusted"):
+            self.assertTrue(subject.validate_run_metadata(
+                document(branch), "candidate", REPOSITORY, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, 8150001))
         self.assertTrue(subject.validate_run_metadata(
             document("main"), "production-synthetic", REPOSITORY, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, 8150001))
-        for profile, branch in (("candidate", "main"), ("candidate", "feature"), ("candidate", "untrusted/x"),
-                                ("candidate", ""), ("production-synthetic", "untrusted")):
+        for profile, branch in (("candidate", "feature"), ("candidate", "untrusted/x"), ("candidate", ""),
+                                ("production-synthetic", "untrusted"), ("probe", "untrusted")):
             with self.subTest(profile=profile, branch=branch):
                 with self.assertRaisesRegex(subject.Refusal, "run-ref-mismatch"):
                     subject.validate_run_metadata(
                         document(branch), profile, REPOSITORY, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, 8150001)
 
-    def test_caller_workflow_must_name_the_untrusted_ref_for_the_candidate_profile(self):
-        relative = subject.CALLER_PROFILES["candidate"]["path"]
-        original = (ROOT / relative).read_text(encoding="ascii")
-        main_guard = "github.ref == 'refs/heads/main'"
-        both_guard = "(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted')"
-        self.assertIn(main_guard, original)
-        candidate_caller = original.replace(main_guard, both_guard).replace(
-            "profile: production-synthetic", "profile: candidate")
+    def test_the_pinned_step_ordinals_match_the_checked_in_fetch_workflow(self):
+        text = (ROOT / FETCH_PATH).read_text(encoding="ascii")
+        names = re.findall(r"(?m)^      - name: (.+)$", text)
+        ordinals = {name: index for index, name in enumerate(names, 2)}
+        pins = subject.API_LINUX_STEP_ORDINAL_PINS["candidate"]
+        names_by_step = subject.API_LINUX_STEP_NAME_PINS["candidate"]
+        self.assertEqual(ordinals["handoff-revoke-source-token-v1"], 12)
+        self.assertEqual(ordinals["handoff-verify-token-rejection-v1"], 13)
+        for step_id, ordinal in pins.items():
+            self.assertEqual(ordinals[names_by_step[step_id]], ordinal)
+
+    def test_candidate_log_markers_find_the_two_revocation_steps(self):
+        messages = unlabeled_run_block(["printf '%s\\n' 'unrelated=true'"], ["unrelated=true"])
+        messages += unlabeled_run_block(
+            ['if [[ "$KD_MODE" == "source" ]]; then', "python3 -B kit/confinement/linux_source_build.py revoke",
+             "else", "printf '%s\\n' '" + REVOKE_OUTPUT + "'", "fi"],
+            ["linux-source-token=revoked rejection=verified receipt=positive"])
+        messages += unlabeled_run_block(
+            ["printf '%s\\n' 'handoff-revocation=confirmed'"], [CONFIRMED_LINE])
+        names = subject.API_LINUX_STEP_NAME_PINS["candidate"]
+        parsed = subject._marker_log_sections(
+            messages, names, subject.LINUX_STEP_LOG_MARKERS_BY_PROFILE["candidate"])
+        self.assertEqual(parsed["sections"]["verify-token-rejection"], CONFIRMED_LINE)
+        self.assertIn("revoked", parsed["sections"]["revoke-source-token"])
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-missing"):
+            subject._marker_log_sections(
+                messages, subject.API_LINUX_STEP_NAME_PINS["probe"],
+                subject.LINUX_STEP_LOG_MARKERS_BY_PROFILE["probe"])
+
+
+class PublicPointAndKeyRecordTests(unittest.TestCase):
+    def test_the_generator_is_accepted_and_every_malformed_point_is_refused(self):
+        self.assertEqual(subject.validate_public_point(GENERATOR_POINT), GENERATOR_POINT)
+        off_curve = GENERATOR_POINT[:-1] + bytes([GENERATOR_POINT[-1] ^ 1])
+        for point, code in (
+            (off_curve, "public-point-curve"),
+            (b"\x02" + GENERATOR_POINT[1:], "public-point-shape"),
+            (GENERATOR_POINT[:-1], "public-point-shape"),
+            (GENERATOR_POINT + b"\x00", "public-point-shape"),
+            (b"\x04" + b"\xff" * 64, "public-point-range"),
+            (bytearray(GENERATOR_POINT), "public-point-shape"),
+        ):
+            with self.subTest(code=code, size=len(point)):
+                with self.assertRaisesRegex(subject.Refusal, code):
+                    subject.validate_public_point(point)
+
+    def test_a_candidate_record_carries_the_receiver_point_and_its_digest_as_key_id(self):
+        record = candidate_record()
+        self.assertEqual(len(record), subject.KEY_RECORD_SIZE)
+        self.assertEqual(record[100:165], GENERATOR_POINT)
+        self.assertEqual(record[68:100], hashlib.sha256(GENERATOR_POINT).digest())
+        self.assertEqual(record[197:229], hashlib.sha256(b"windows-receiver").digest())
+        info = subject.validate_key_record(
+            record, 8150001, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, candidate_workflow_ref(),
+            now=FIXTURE_NOW, allow_any_point=True)
+        self.assertEqual(info["transfer_id"], record[52:68].hex())
+
+    def test_probe_style_records_still_require_the_generator_and_keep_their_layout(self):
+        record = fixture_record()
+        self.assertEqual(len(record), subject.KEY_RECORD_SIZE)
+        self.assertEqual(record[100:165], subject.P256_GENERATOR)
+        self.assertEqual(record[68:100], hashlib.sha256(subject.P256_GENERATOR).digest())
+        with self.assertRaises(subject.Refusal):
+            subject.make_key_record(8150001, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, WORKFLOW_REF,
+                                    now=FIXTURE_NOW, public_point=b"\x04" + bytes(64))
+        other = bytearray(record)
+        other[100:165] = b"\x04" + bytes(range(64))
+        other[68:100] = hashlib.sha256(bytes(other[100:165])).digest()
+        with self.assertRaisesRegex(subject.Refusal, "key-record-public-point"):
+            subject.validate_key_record(bytes(other), 8150001, CONTROL_SHA, RUN_ID, RUN_ATTEMPT,
+                                        WORKFLOW_REF, now=FIXTURE_NOW)
+        with self.assertRaisesRegex(subject.Refusal, "public-point-curve"):
+            subject.validate_key_record(bytes(other), 8150001, CONTROL_SHA, RUN_ID, RUN_ATTEMPT,
+                                        WORKFLOW_REF, now=FIXTURE_NOW, allow_any_point=True)
+
+
+class BindingSubjectTests(unittest.TestCase):
+    def setUp(self):
+        self.producer = candidate_record()
+        self.verifier = candidate_record()
+        self.args = (self.producer, self.verifier, "a" * 64, "b" * 64, "1" * 40, "2" * 40, "3" * 64, "4" * 64)
+
+    def test_the_linux_subject_is_canonical_ascii_json_with_exactly_the_bound_fields(self):
+        encoded = subject.build_binding_subject(*self.args)
+        self.assertTrue(encoded.endswith(b"\n"))
+        document = json.loads(encoded)
+        self.assertEqual(set(document), set(subject.BINDING_KEYS))
+        self.assertEqual(document["revocation"], "confirmed")
+        self.assertEqual(document["schema"], 1)
+        self.assertEqual(document["key_record_producer_sha256"], hashlib.sha256(self.producer).hexdigest())
+        self.assertEqual(document["key_record_verifier_sha256"], hashlib.sha256(self.verifier).hexdigest())
+        self.assertEqual(encoded, (json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n").encode("ascii"))
+        self.assertEqual(subject.parse_binding_subject(encoded), document)
+
+    def test_the_attested_subject_adds_the_linux_digest_and_kind_only(self):
+        linux = subject.build_binding_subject(*self.args)
+        attested = subject.build_attested_subject(linux)
+        document = json.loads(attested)
+        self.assertEqual(set(document), set(subject.ATTESTED_KEYS))
+        self.assertEqual(document["kind"], "attested")
+        self.assertEqual(document["linux_subject_sha256"], hashlib.sha256(linux).hexdigest())
+        self.assertEqual(subject.parse_binding_subject(attested, attested=True), document)
+        with self.assertRaisesRegex(subject.Refusal, "binding-fields"):
+            subject.parse_binding_subject(attested)
+        with self.assertRaisesRegex(subject.Refusal, "binding-fields"):
+            subject.parse_binding_subject(linux, attested=True)
+
+    def test_malformed_values_and_documents_are_refused(self):
+        linux = subject.build_binding_subject(*self.args)
+        document = json.loads(linux)
+        cases = (
+            ("source_sha", "A" * 40, "binding-hex"),
+            ("tree_id", "2" * 39, "binding-hex"),
+            ("lock_sha256", "z" * 64, "binding-hex"),
+            ("revocation", "unconfirmed", "binding-revocation"),
+            ("schema", 2, "binding-schema"),
+            ("schema", True, "binding-schema"),
+        )
+        for name, value, code in cases:
+            with self.subTest(name=name):
+                changed = dict(document)
+                changed[name] = value
+                with self.assertRaisesRegex(subject.Refusal, code):
+                    subject.parse_binding_subject(subject.canonical_json_subject(changed))
+        extra = dict(document)
+        extra["extra"] = "x"
+        with self.assertRaisesRegex(subject.Refusal, "binding-fields"):
+            subject.parse_binding_subject(subject.canonical_json_subject(extra))
+        with self.assertRaisesRegex(subject.Refusal, "binding-not-canonical"):
+            subject.parse_binding_subject(json.dumps(document, indent=1).encode("ascii") + b"\n")
+        with self.assertRaisesRegex(subject.Refusal, "binding-size"):
+            subject.parse_binding_subject(b"x" * 5000)
+        with self.assertRaisesRegex(subject.Refusal, "json-invalid"):
+            subject.parse_binding_subject(b"not json")
+        with self.assertRaisesRegex(subject.Refusal, "binding-hex"):
+            subject.build_binding_subject(self.producer, self.verifier, "a" * 64, "b" * 64,
+                                          "1" * 40, "2" * 40, "3" * 63, "4" * 64)
+
+    def test_revocation_receipts_follow_the_ref(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            receipt = Path(temporary) / "revocation.json"
+
+            def write(**changes):
+                value = {
+                    "schema_version": 1, "status": "confirmed", "control_sha": CONTROL_SHA,
+                    "run_id": RUN_ID, "run_attempt": RUN_ATTEMPT, "installation_id": "7",
+                    "rejected_after_revoke": True,
+                }
+                value.update(changes)
+                receipt.write_text(json.dumps(value), encoding="ascii")
+                return str(receipt)
+
+            self.assertEqual(subject.validate_revocation_receipt(
+                None, REF, CONTROL_SHA, RUN_ID, RUN_ATTEMPT), "confirmed")
+            with self.assertRaisesRegex(subject.Refusal, "revocation-receipt-forbidden"):
+                subject.validate_revocation_receipt(write(), REF, CONTROL_SHA, RUN_ID, RUN_ATTEMPT)
+            with self.assertRaisesRegex(subject.Refusal, "revocation-receipt-required"):
+                subject.validate_revocation_receipt(
+                    None, CANDIDATE_REF_UNTRUSTED, CONTROL_SHA, RUN_ID, RUN_ATTEMPT)
+            self.assertEqual(subject.validate_revocation_receipt(
+                write(), CANDIDATE_REF_UNTRUSTED, CONTROL_SHA, RUN_ID, RUN_ATTEMPT), "confirmed")
+            for changes in (
+                {"status": "unconfirmed"}, {"rejected_after_revoke": False}, {"schema_version": 2},
+                {"schema_version": True}, {"control_sha": "b" * 40}, {"run_id": "9"}, {"run_attempt": "9"},
+            ):
+                with self.subTest(changes=changes):
+                    with self.assertRaisesRegex(subject.Refusal, "revocation-receipt-invalid"):
+                        subject.validate_revocation_receipt(
+                            write(**changes), CANDIDATE_REF_UNTRUSTED, CONTROL_SHA, RUN_ID, RUN_ATTEMPT)
+            with self.assertRaisesRegex(subject.Refusal, "revocation-receipt-unavailable"):
+                subject.validate_revocation_receipt(
+                    str(Path(temporary) / "missing"), CANDIDATE_REF_UNTRUSTED, CONTROL_SHA, RUN_ID, RUN_ATTEMPT)
+
+
+class CandidateWorkflowGuardTests(unittest.TestCase):
+    def _code(self, mutate):
+        files = candidate_tree_files()
+        mutate(files)
+        with tempfile.TemporaryDirectory() as temporary:
+            write_tree(temporary, files)
+            try:
+                subject.validate_workflow_graph(temporary, "candidate")
+            except subject.Refusal as error:
+                return error.code
+        return None
+
+    def _replace(self, relative, old, new, count=-1):
+        def mutate(files):
+            self.assertIn(old, files[relative])
+            files[relative] = files[relative].replace(old, new, count)
+
+        return mutate
+
+    def test_the_compliant_fixture_tree_passes(self):
+        self.assertIsNone(self._code(lambda files: None))
+
+    def test_caller_shape_failures_use_the_closed_codes(self):
+        caller = subject.CALLER_PROFILES["candidate"]["path"]
+
+        def append(text):
+            def mutate(files):
+                files[caller] += text
+            return mutate
+
+        for code, mutate in (
+            ("caller-trigger-shape", append("  workflow_call:\n")),
+            ("caller-guard-shape", append("    strategy:\n")),
+            ("caller-source-path", append("    environment: linux-source-read\n")),
+            ("caller-source-path", append("    secrets: inherit\n")),
+            ("caller-masked-failure", append("    continue-on-error: true\n")),
+            ("role-job-cardinality", self._replace(caller, "  audit:\n    runs-on: ubuntu-24.04\n", "")),
+            ("role-job-cardinality", append("  extra:\n    runs-on: ubuntu-24.04\n")),
+            ("handoff-start-order", self._replace(
+                caller, "  windows-producer:\n    needs:\n      - settings\n",
+                "  windows-producer:\n    needs:\n      - settings\n      - windows-verifier\n")),
+            ("handoff-start-order", self._replace(
+                caller, "  linux-fetch-encrypt:\n    needs:\n      - settings\n",
+                "  linux-fetch-encrypt:\n    needs:\n      - settings\n      - windows-producer\n")),
+            ("attester-order", self._replace(
+                caller, "      - settings\n      - linux-fetch-encrypt\n", "      - settings\n")),
+            ("role-fixed-input", self._replace(caller, "      profile: candidate\n", "      profile: probe\n", 1)),
+            ("role-fixed-input", self._replace(caller, "      role: producer\n", "      role: verifier\n")),
+            ("role-call-cardinality", self._replace(
+                caller, "    uses: ./" + FETCH_PATH + "\n", "    uses: ./" + ATTESTER_PATH + "\n")),
+            ("action-pin-invalid", append("    uses: actions/checkout@v4\n")),
+        ):
+            with self.subTest(code=code):
+                self.assertEqual(self._code(mutate), code)
+
+    def test_role_workflow_failures_use_the_closed_codes(self):
+        receiver_text = "    runs-on: windows-2025\n"
+        attest = "      - name: sign\n        uses: actions/attest@" + "a" * 40
+        for code, mutate in (
+            ("role-trigger-shape", self._replace(ATTESTER_PATH, "workflow_call:", "workflow_calls:")),
+            ("role-input-schema", self._replace(
+                ATTESTER_PATH, "      mode:\n        required: false\n", "      mode:\n        required: true\n")),
+            ("role-input-schema", self._replace(RECEIVER_PATH, "      role:\n", "      kind:\n")),
+            ("role-input-schema", self._replace(FETCH_PATH, "      fingerprint:\n", "      fingerprints:\n")),
+            ("role-sign-step-cardinality", self._replace(ATTESTER_PATH, attest, attest + "\n" + attest)),
+            ("role-job-cardinality", self._replace(
+                RECEIVER_PATH, "jobs:\n", "jobs:\n  second:\n    runs-on: windows-2025\n")),
+            ("role-runner", self._replace(RECEIVER_PATH, receiver_text, "    runs-on: ubuntu-24.04\n")),
+            ("role-matrix", self._replace(FETCH_PATH, "    permissions:\n", "    strategy:\n    permissions:\n")),
+            ("role-nested-call", self._replace(
+                ATTESTER_PATH, "    steps:\n", "    uses: ./.github/workflows/other.yml\n    steps:\n")),
+            ("role-source-path", self._replace(FETCH_PATH, subject.FETCH_ENVIRONMENT_LINE + "\n", "")),
+            ("role-source-path", self._replace(
+                RECEIVER_PATH, "windows-source-exec", "linux-source-read")),
+            ("role-source-path", self._replace(ATTESTER_PATH, "    steps:\n", "    secrets: inherit\n    steps:\n")),
+            ("role-masked-failure", self._replace(
+                ATTESTER_PATH, "    steps:\n", "    continue-on-error: true\n    steps:\n")),
+            ("role-permissions", self._replace(
+                FETCH_PATH, "      id-token: write\n", "      id-token: write\n      contents: write\n")),
+            ("action-pin-invalid", self._replace(RECEIVER_PATH, "@" + "a" * 40, "@v4")),
+            ("role-fixed-input", self._replace(ATTESTER_PATH, "inputs.profile == 'candidate'", "true")),
+        ):
+            with self.subTest(code=code):
+                self.assertEqual(self._code(mutate), code)
+
+    def test_missing_workflow_files_are_unavailable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            files = candidate_tree_files()
+            del files[ATTESTER_PATH]
+            write_tree(temporary, files)
+            with self.assertRaisesRegex(subject.Refusal, "role-workflow-unavailable"):
+                subject.validate_workflow_graph(temporary, "candidate")
+
+    def test_candidate_call_graph_accepts_two_receiver_calls_and_the_windows_job_id(self):
+        sites = []
+        for role in subject.CANDIDATE_ROLES:
+            sites.append({"role": role, "uses": subject.ROLE_PATHS[role], "profile": "candidate",
+                          "matrix": False, "dynamic": False, "condition": "mode-bound"})
+        callees = [
+            {"role": role, "path": subject.ROLE_PATHS[role],
+             "jobs": ["windows-candidate" if role.startswith("windows-") else role],
+             "sign_steps": ["attest-role-statement"], "nested_calls": [], "matrix": False, "dynamic": False}
+            for role in subject.CANDIDATE_ROLES
+        ]
+        graph = {"caller": {"path": subject.CALLER_PROFILES["candidate"]["path"], "ref": CANDIDATE_REF_UNTRUSTED,
+                            "source_access": False, "call_sites": sites}, "roles": callees}
+        self.assertTrue(subject.validate_call_graph(graph, "candidate"))
+        wrong = copy.deepcopy(graph)
+        wrong["roles"][0]["jobs"] = ["windows-producer"]
+        with self.assertRaisesRegex(subject.Refusal, "callee-job-or-sign-step"):
+            subject.validate_call_graph(wrong, "candidate")
+        wrong = copy.deepcopy(graph)
+        wrong["caller"]["ref"] = "refs/heads/develop"
+        with self.assertRaisesRegex(subject.Refusal, "call-graph-profile"):
+            subject.validate_call_graph(wrong, "candidate")
+
+
+class CandidateEvidenceTests(unittest.TestCase):
+    def test_the_full_artifact_set_verifies_and_exposes_the_producer_record(self):
+        for ref in (REF, CANDIDATE_REF_UNTRUSTED):
+            with self.subTest(ref=ref), tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld(ref)
+                world.write_evidence(temporary)
+                result = subject.validate_role_artifact_set(
+                    "candidate", REPOSITORY, ref, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
+                    world.artifact_map(), temporary,
+                    subject.resolve_certificate_pins("candidate", CONTROL_SHA))
+                self.assertEqual(result["record"], world.producer_record)
+                self.assertEqual(set(result["subject_digests"]), set(subject.CANDIDATE_ROLES))
+                self.assertEqual(len(set(result["subject_digests"].values())), 4)
+
+    def test_wrong_ref_binding_and_foreign_statements_are_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            world = CandidateWorld(REF)
+            world.write_evidence(temporary)
+            pins = subject.resolve_certificate_pins("candidate", CONTROL_SHA)
+            with self.assertRaises(subject.Refusal):
+                subject.validate_role_artifact_set(
+                    "candidate", REPOSITORY, CANDIDATE_REF_UNTRUSTED, CONTROL_SHA, RUN_ID, RUN_ATTEMPT,
+                    8150001, 99101, world.artifact_map(), temporary, pins)
+            with self.assertRaisesRegex(subject.Refusal, "role-artifact-map"):
+                subject.validate_role_artifact_set(
+                    "candidate", REPOSITORY, REF, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
+                    world.artifact_map(subject.CANDIDATE_ROLES[:3]), temporary, pins)
+
+    def test_the_attester_needs_the_linux_statement_before_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            world = CandidateWorld(REF)
+            world.write_evidence(temporary)
+            pins = subject.resolve_certificate_pins("candidate", CONTROL_SHA)
+            roles = ("windows-producer", "windows-verifier", "capsule-attester")
+            with self.assertRaisesRegex(subject.Refusal, "linux-statement-missing"):
+                subject.validate_role_artifact_set(
+                    "candidate", REPOSITORY, REF, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
+                    world.artifact_map(roles), temporary, pins, roles)
+
+    def test_the_linux_subject_must_name_both_key_records(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            world = CandidateWorld(REF)
+            other = candidate_record()
+            document = binding_document(
+                world.producer_record, other, world.capsules["producer"], world.capsules["verifier"])
+            linux = subject.canonical_json_subject(document)
+            name = world.names["linux-fetch-encrypt"]
+            world.statement_files[name]["subject.bin"] = linux
+            record, unused = world.subjects["linux-fetch-encrypt"]
+            files, verified, bundle = candidate_signed_files("linux-fetch-encrypt", record, linux, REF)
+            world.statement_files[name] = files
+            world.verified[name] = verified
+            row = next(item for item in world.rows if item["name"] == name)
+            archive = zip_bytes(files)
+            world.zips[row["id"]] = archive
+            row.update(artifact_row(row["id"], name, archive))
+            world.write_evidence(temporary)
+            with self.assertRaisesRegex(subject.Refusal, "binding-key-record-mismatch"):
+                subject.validate_role_artifact_set(
+                    "candidate", REPOSITORY, REF, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
+                    world.artifact_map(subject.CANDIDATE_ROLES[:3]), temporary,
+                    subject.resolve_certificate_pins("candidate", CONTROL_SHA), subject.CANDIDATE_ROLES[:3])
+
+    def test_artifact_inventory_binds_linux_and_attester_to_the_producer_transfer(self):
+        world = CandidateWorld(REF)
+        snapshot = fixture_artifact_snapshot([row for row in world.rows if row["name"].startswith("role-statement-")])
+        result = subject.validate_artifact_inventory(
+            snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, subject.CANDIDATE_ROLES, "candidate")
+        self.assertEqual(set(result), set(subject.CANDIDATE_ROLES))
+        self.assertEqual(
+            result["linux-fetch-encrypt"][0]["transfer_id"], result["windows-producer"][0]["transfer_id"])
+        self.assertNotEqual(
+            result["windows-verifier"][0]["transfer_id"], result["windows-producer"][0]["transfer_id"])
+        changed = copy.deepcopy(snapshot)
+        for row in changed["pages"][0]["artifacts"]:
+            if "linux-fetch-encrypt" in row["name"]:
+                row["name"] = row["name"][:-1] + ("d" if row["name"].endswith("c") else "c")
+        with self.assertRaisesRegex(subject.Refusal, "artifact-transfer-mismatch"):
+            subject.validate_artifact_inventory(
+                changed, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, subject.CANDIDATE_ROLES, "candidate")
+        with self.assertRaisesRegex(subject.Refusal, "artifact-role-cardinality"):
+            subject.validate_artifact_inventory(
+                snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, subject.ROLE_ORDER, "probe")
+
+    def test_jobs_snapshot_uses_the_four_candidate_job_names(self):
+        rows = []
+        api_root = "https:" + chr(47) * 2 + "api.github.com/repos/" + REPOSITORY
+        for index, role in enumerate(subject.CANDIDATE_ROLES, 1):
+            rows.append({
+                "id": 1000 + index, "run_id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT),
+                "name": subject.API_JOB_NAME_PINS["candidate"][role], "head_sha": CONTROL_SHA,
+                "status": "completed", "conclusion": "success", "runner_name": "runner %d" % index,
+                "labels": [subject.ROLE_RUNNERS[role]], "check_run_url": api_root + "/check-runs/" + str(2000 + index),
+                "steps": [{"number": 1, "name": "x", "status": "completed", "conclusion": "success"}],
+            })
+        snapshot = fixture_job_snapshot(rows)
+        result = subject.validate_jobs_snapshot(
+            snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, subject.API_JOB_NAME_PINS["candidate"],
+            subject.CANDIDATE_ROLES)
+        self.assertEqual(set(result), set(subject.CANDIDATE_ROLES))
+        with self.assertRaisesRegex(subject.Refusal, "api-job-map-unresolved"):
+            subject.validate_jobs_snapshot(
+                snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, subject.API_JOB_NAME_PINS["candidate"])
+
+    def test_provider_listing_separates_the_two_receiver_statements(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            world = CandidateWorld(REF)
+            world.write_evidence(temporary)
+            result = subject.validate_role_artifact_set(
+                "candidate", REPOSITORY, REF, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
+                world.artifact_map(), temporary, subject.resolve_certificate_pins("candidate", CONTROL_SHA))
+            providers = {}
+            for role in subject.CANDIDATE_ROLES:
+                digest = result["subject_digests"][role]
+                providers[digest] = {
+                    "snapshot": fixture_provider_snapshot(digest, [{"bundle": world.bundles[role]}]),
+                    "verified": [world.verified[world.names[role]]],
+                }
+            records = subject.reconcile_provider_evidence(
+                result, providers, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, subject.CANDIDATE_ROLES)
+            self.assertEqual({item["role"] for item in records}, set(subject.CANDIDATE_ROLES))
+
+    def test_the_whole_snapshot_verifies_for_both_refs(self):
+        for ref in (REF, CANDIDATE_REF_UNTRUSTED):
+            with self.subTest(ref=ref), tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld(ref)
+                world.write_evidence(Path(temporary) / "artifacts")
+                directory = install_control_tree(temporary, "candidate")
+                rows = []
+                api_root = "https:" + chr(47) * 2 + "api.github.com/repos/" + REPOSITORY
+                for index, role in enumerate(subject.CANDIDATE_ROLES, 1):
+                    rows.append({
+                        "id": 1000 + index, "run_id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT),
+                        "name": subject.API_JOB_NAME_PINS["candidate"][role], "head_sha": CONTROL_SHA,
+                        "status": "completed", "conclusion": "success", "runner_name": "runner %d" % index,
+                        "labels": [subject.ROLE_RUNNERS[role]],
+                        "check_run_url": api_root + "/check-runs/" + str(2000 + index),
+                        "steps": [{"number": 1, "name": "x", "status": "completed", "conclusion": "success"}],
+                    })
+                artifact_rows = [row for row in world.rows if row["name"].startswith("role-statement-")]
+                result = subject.validate_role_artifact_set(
+                    "candidate", REPOSITORY, ref, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
+                    world.artifact_map(), Path(temporary) / "artifacts",
+                    subject.resolve_certificate_pins("candidate", CONTROL_SHA))
+                providers = {}
+                for role in subject.CANDIDATE_ROLES:
+                    digest = result["subject_digests"][role]
+                    providers[digest] = {
+                        "snapshot": fixture_provider_snapshot(digest, [{"bundle": world.bundles[role]}]),
+                        "verified": [world.verified[world.names[role]]],
+                    }
+                branch = ref[len("refs/heads/"):]
+                evidence = subject.verify_source_free_evidence(
+                    "candidate", REPOSITORY, ref, CONTROL_SHA, RUN_ID, RUN_ATTEMPT,
+                    {"id": 8150001, "full_name": REPOSITORY, "owner_id": 99101, "visibility": "public"},
+                    {"id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT), "head_sha": CONTROL_SHA,
+                     "path": subject.CALLER_PROFILES["candidate"]["path"], "event": "workflow_dispatch",
+                     "head_branch": branch, "repository": {"id": 8150001, "full_name": REPOSITORY},
+                     "status": "in_progress", "conclusion": None},
+                    fixture_job_snapshot(rows), fixture_artifact_snapshot(artifact_rows), providers,
+                    directory, temporary, subject.API_JOB_NAME_PINS["candidate"],
+                    subject.resolve_certificate_pins("candidate", CONTROL_SHA))
+                self.assertEqual(evidence["record"], world.producer_record)
+
+
+class CandidatePrepareTests(unittest.TestCase):
+    def _run(self, directory, role, ref=REF, profile="candidate", extra=None, runner=None):
+        output = Path(directory) / ("out-" + role + "-" + profile)
+        windows = role.startswith("windows-")
+        command = [
+            "prepare", "--profile", profile, "--role", role, "--repository", REPOSITORY,
+            "--repository-id", "8150001", "--control-sha", CONTROL_SHA, "--ref", ref,
+            "--run-id", RUN_ID, "--run-attempt", RUN_ATTEMPT,
+            "--workflow-ref", REPOSITORY + "/" + subject.CALLER_PROFILES[profile]["path"] + "@" + ref,
+            "--runner", runner or ("windows-2025" if windows else "ubuntu-24.04"),
+            "--output-directory", str(output),
+        ]
+        for name, value in (extra or {}).items():
+            command += ["--" + name, str(value)]
+        captured = io.StringIO()
+        marker = Path(directory) / ("github-output-" + role)
+        if marker.exists():
+            marker.unlink()
+        with mock.patch.dict("os.environ", {"GITHUB_OUTPUT": str(marker)}):
+            with contextlib.redirect_stdout(captured):
+                code = subject.main(command)
+        transfer = None
+        if marker.exists():
+            transfer = marker.read_text(encoding="ascii").strip().split("=", 1)[1]
+        return code, captured.getvalue(), output, transfer
+
+    def _files(self, directory, ref=REF):
+        root = Path(directory)
+        (root / "point.bin").write_bytes(GENERATOR_POINT)
+        code, unused, producer_out, producer_transfer = self._run(
+            directory, "windows-producer", ref, extra={"public-point-file": root / "point.bin"})
+        self.assertEqual(code, 0)
+        verifier_directory = root / "verifier"
+        verifier_directory.mkdir()
+        code, unused, verifier_out, verifier_transfer = self._run(
+            verifier_directory, "windows-verifier", ref, extra={"public-point-file": root / "point.bin"})
+        self.assertEqual(code, 0)
+        (root / "producer.bin").write_bytes((producer_out / "subject.bin").read_bytes())
+        (root / "verifier.bin").write_bytes((verifier_out / "subject.bin").read_bytes())
+        (root / "capsule-producer.bin").write_bytes(b"producer-capsule")
+        (root / "capsule-verifier.bin").write_bytes(b"verifier-capsule")
+        return producer_transfer, verifier_transfer
+
+    def _linux_extra(self, root):
+        return {
+            "receiver-record": root / "producer.bin", "verifier-record": root / "verifier.bin",
+            "capsule-producer": root / "capsule-producer.bin", "capsule-verifier": root / "capsule-verifier.bin",
+            "source-sha": "1" * 40, "tree-id": "2" * 40, "lock-sha256": "3" * 64, "manifest-sha256": "4" * 64,
+        }
+
+    def test_each_candidate_role_prepares_its_exact_subject_on_the_synthetic_ref(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for name in set(subject.ROLE_PATHS.values()):
-                (root / name).parent.mkdir(parents=True, exist_ok=True)
-                (root / name).write_bytes((ROOT / name).read_bytes())
-            (root / relative).write_text(candidate_caller, encoding="ascii")
-            pins = {
-                name: hashlib.sha256((root / name).read_bytes()).hexdigest()
-                for name in set(subject.ROLE_PATHS.values()) | {relative}
+            producer_transfer, verifier_transfer = self._files(temporary)
+            self.assertNotEqual(producer_transfer, verifier_transfer)
+            record = (root / "producer.bin").read_bytes()
+            self.assertEqual(len(record), subject.KEY_RECORD_SIZE)
+            self.assertEqual(record[100:165], GENERATOR_POINT)
+            self.assertEqual(record[52:68].hex(), producer_transfer)
+            code, text, linux_out, linux_transfer = self._run(temporary, "linux-fetch-encrypt", extra=self._linux_extra(root))
+            self.assertEqual(code, 0, text)
+            self.assertEqual(linux_transfer, producer_transfer)
+            linux_subject = (linux_out / "subject.bin").read_bytes()
+            document = subject.parse_binding_subject(linux_subject)
+            self.assertEqual(document["capsule_producer_sha256"], hashlib.sha256(b"producer-capsule").hexdigest())
+            self.assertEqual(document["key_record_verifier_sha256"], hashlib.sha256((root / "verifier.bin").read_bytes()).hexdigest())
+            predicate = json.loads((linux_out / "predicate.json").read_text(encoding="ascii"))
+            self.assertEqual(predicate["role"], "linux-fetch-encrypt")
+            self.assertEqual(predicate["transferId"], producer_transfer)
+            (root / "linux-subject.bin").write_bytes(linux_subject)
+            extra = self._linux_extra(root)
+            for name in ("source-sha", "tree-id", "lock-sha256", "manifest-sha256"):
+                del extra[name]
+            extra["linux-subject"] = root / "linux-subject.bin"
+            code, text, attester_out, attester_transfer = self._run(temporary, "capsule-attester", extra=extra)
+            self.assertEqual(code, 0, text)
+            self.assertEqual(attester_transfer, producer_transfer)
+            self.assertEqual((attester_out / "subject.bin").read_bytes(), subject.build_attested_subject(linux_subject))
+
+    def test_the_source_ref_requires_a_matching_revocation_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._files(temporary, CANDIDATE_REF_UNTRUSTED)
+            extra = self._linux_extra(root)
+            code, text, unused, unused_transfer = self._run(
+                temporary, "linux-fetch-encrypt", CANDIDATE_REF_UNTRUSTED, extra=extra)
+            self.assertEqual(code, 1)
+            self.assertIn("reason=prepare-flag-missing", text)
+            receipt = root / "revocation.json"
+            receipt.write_text(json.dumps({
+                "schema_version": 1, "status": "confirmed", "control_sha": CONTROL_SHA, "run_id": RUN_ID,
+                "run_attempt": RUN_ATTEMPT, "installation_id": "7", "rejected_after_revoke": True}), encoding="ascii")
+            extra["revocation-receipt"] = receipt
+            code, text, unused, unused_transfer = self._run(
+                temporary, "linux-fetch-encrypt", CANDIDATE_REF_UNTRUSTED, extra=extra)
+            self.assertEqual(code, 0, text)
+            receipt.write_text(json.dumps({"status": "unconfirmed"}), encoding="ascii")
+            code, text, unused, unused_transfer = self._run(
+                temporary, "linux-fetch-encrypt", CANDIDATE_REF_UNTRUSTED, extra=extra)
+            self.assertEqual(code, 1)
+            self.assertIn("reason=revocation-receipt-invalid", text)
+
+    def test_the_synthetic_ref_refuses_a_receipt(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._files(temporary)
+            extra = self._linux_extra(root)
+            extra["revocation-receipt"] = root / "producer.bin"
+            code, text, unused, unused_transfer = self._run(temporary, "linux-fetch-encrypt", extra=extra)
+            self.assertEqual(code, 1)
+            self.assertIn("reason=prepare-flag-foreign", text)
+
+    def test_flags_that_do_not_belong_to_the_role_or_profile_are_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._files(temporary)
+            point = root / "point.bin"
+            for role, extra, reason in (
+                ("windows-producer", {"public-point-file": point, "source-sha": "1" * 40}, "prepare-flag-foreign"),
+                ("windows-verifier", {}, "prepare-flag-missing"),
+                ("windows-producer", {"public-point-file": point, "receiver-record": root / "producer.bin"},
+                 "prepare-flag-foreign"),
+            ):
+                with self.subTest(role=role, reason=reason):
+                    code, text, unused, unused_transfer = self._run(temporary, role, extra=extra)
+                    self.assertEqual(code, 1)
+                    self.assertIn("reason=" + reason, text)
+            extra = self._linux_extra(root)
+            del extra["tree-id"]
+            code, text, unused, unused_transfer = self._run(temporary, "linux-fetch-encrypt", extra=extra)
+            self.assertEqual((code, "reason=prepare-flag-missing" in text), (1, True))
+            extra = self._linux_extra(root)
+            extra["linux-subject"] = root / "producer.bin"
+            code, text, unused, unused_transfer = self._run(temporary, "linux-fetch-encrypt", extra=extra)
+            self.assertIn("reason=prepare-flag-foreign", text)
+            code, text, unused, unused_transfer = self._run(
+                temporary, "windows-receiver", profile="probe", runner="windows-2025", extra={"public-point-file": point})
+            self.assertEqual(code, 1)
+            self.assertIn("reason=prepare-flag-profile", text)
+            code, text, unused, unused_transfer = self._run(
+                temporary, "windows-receiver", profile="candidate", runner="windows-2025")
+            self.assertIn("reason=prepare-profile-role", text)
+            code, text, unused, unused_transfer = self._run(
+                temporary, "windows-producer", runner="ubuntu-24.04", extra={"public-point-file": point})
+            self.assertIn("reason=prepare-runner", text)
+
+    def test_the_attester_refuses_digests_that_differ_from_the_linux_subject(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._files(temporary)
+            code, text, linux_out, unused = self._run(temporary, "linux-fetch-encrypt", extra=self._linux_extra(root))
+            self.assertEqual(code, 0, text)
+            (root / "linux-subject.bin").write_bytes((linux_out / "subject.bin").read_bytes())
+            base = {
+                "receiver-record": root / "producer.bin", "verifier-record": root / "verifier.bin",
+                "capsule-producer": root / "capsule-producer.bin", "capsule-verifier": root / "capsule-verifier.bin",
+                "linux-subject": root / "linux-subject.bin",
             }
-            result = subject.verify_workflow_bytes(root, "candidate", pins)
-            self.assertEqual(set(result), set(pins))
-            with self.assertRaisesRegex(subject.Refusal, "role-fixed-input"):
-                subject.verify_workflow_bytes(root, "production-synthetic", pins)
-            (root / relative).write_text(original.replace(
-                "profile: production-synthetic", "profile: candidate"), encoding="ascii")
-            pins[relative] = hashlib.sha256((root / relative).read_bytes()).hexdigest()
-            with self.assertRaisesRegex(subject.Refusal, "caller-guard-shape"):
-                subject.verify_workflow_bytes(root, "candidate", pins)
+            (root / "other-capsule.bin").write_bytes(b"other")
+            for name, replacement in (
+                ("capsule-producer", root / "other-capsule.bin"),
+                ("capsule-verifier", root / "other-capsule.bin"),
+                ("receiver-record", root / "verifier.bin"),
+            ):
+                with self.subTest(name=name):
+                    extra = dict(base)
+                    extra[name] = replacement
+                    code, text, unused, unused_transfer = self._run(temporary, "capsule-attester", extra=extra)
+                    self.assertEqual(code, 1)
+                    self.assertRegex(text, "reason=(binding-mismatch|receiver-records-identical)")
+            code, text, unused, unused_transfer = self._run(temporary, "capsule-attester", extra=dict(base))
+            self.assertEqual(code, 0, text)
+
+    def test_a_non_curve_public_point_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bad = Path(temporary) / "bad.bin"
+            bad.write_bytes(b"\x04" + bytes(64))
+            code, text, unused, unused_transfer = self._run(
+                temporary, "windows-producer", extra={"public-point-file": bad})
+            self.assertEqual(code, 1)
+            self.assertIn("reason=public-point-curve", text)
+
+    def test_legacy_prepare_outputs_keep_their_layout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            code, text, receiver_out, transfer = self._run(temporary, "windows-receiver", profile="probe",
+                                                           runner="windows-2025")
+            self.assertEqual(code, 0, text)
+            record = (receiver_out / "subject.bin").read_bytes()
+            self.assertEqual(len(record), subject.KEY_RECORD_SIZE)
+            self.assertEqual(record[100:165], subject.P256_GENERATOR)
+            self.assertEqual(record[52:68].hex(), transfer)
+            (root / "receiver.bin").write_bytes(record)
+            code, text, linux_out, linux_transfer = self._run(
+                temporary, "linux-fetch-encrypt", profile="probe",
+                extra={"receiver-record": root / "receiver.bin"})
+            self.assertEqual(code, 0, text)
+            self.assertEqual((linux_out / "subject.bin").read_bytes(), subject.make_synthetic_capsule(record))
+            self.assertEqual(linux_transfer, transfer)
+            predicate = json.loads((linux_out / "predicate.json").read_text(encoding="ascii"))
+            self.assertEqual(predicate["profile"], "probe")
+            self.assertEqual(predicate["controlRef"], REF)
+            self.assertIn("subject=created role=linux-fetch-encrypt bytes=%d sha256=" % subject.CAPSULE_SIZE, text)
+
+
+class ReceiveCapsuleTests(unittest.TestCase):
+    def _arguments(self, directory, role="windows-producer", ref=REF, seconds=30):
+        return types.SimpleNamespace(
+            profile="candidate", role=role, repository=REPOSITORY, repository_id="8150001",
+            control_sha=CONTROL_SHA, ref=ref, run_id=RUN_ID, run_attempt=RUN_ATTEMPT,
+            deadline_seconds=seconds, output_directory=str(Path(directory) / "capsule"),
+        )
+
+    def _receive(self, world, directory, role="windows-producer", ref=REF, gh=None, seconds=30):
+        ticks = [0]
+
+        def clock():
+            ticks[0] += 10
+            return ticks[0]
+
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            subject.receive_capsule(
+                self._arguments(directory, role, ref, seconds), gh=world.gh() if gh is None else gh,
+                sleep=lambda seconds_: None, clock=clock)
+        return captured.getvalue()
+
+    def test_both_receivers_obtain_their_own_capsule_and_the_bound_values(self):
+        with mock.patch.object(subject, "DESIGN_CAPSULE_SIZE", CAPSULE_TEST_SIZE):
+            for ref in (REF, CANDIDATE_REF_UNTRUSTED):
+                for short in ("producer", "verifier"):
+                    with self.subTest(ref=ref, short=short), tempfile.TemporaryDirectory() as temporary:
+                        world = CandidateWorld(ref)
+                        calls = []
+                        text = self._receive(world, temporary, "windows-" + short, ref, gh=world.gh(calls=calls))
+                        digest = hashlib.sha256(world.capsules[short]).hexdigest()
+                        self.assertEqual(text, "capsule=received role=windows-%s sha256=%s\n" % (short, digest))
+                        output = Path(temporary) / "capsule"
+                        self.assertEqual(sorted(item.name for item in output.iterdir()), ["bound.json", "capsule.bin"])
+                        self.assertEqual((output / "capsule.bin").read_bytes(), world.capsules[short])
+                        bound = json.loads((output / "bound.json").read_text(encoding="ascii"))
+                        self.assertEqual(bound, {
+                            "capsule_sha256": digest, "source_sha": "1" * 40, "tree_id": "2" * 40,
+                            "lock_sha256": "3" * 64, "manifest_sha256": "4" * 64, "revocation": "confirmed"})
+                        verifies = [call for call in calls if call[:2] == ["attestation", "verify"]]
+                        self.assertEqual(len(verifies), 4)
+                        for call in verifies:
+                            self.assertIn("--deny-self-hosted-runners", call)
+                            self.assertIn(subject.PREDICATE_TYPE, call)
+                        self.assertEqual(
+                            sorted(item for item in os.listdir(temporary)), ["capsule"])
+
+    def test_a_missing_statement_artifact_runs_to_the_deadline(self):
+        with mock.patch.object(subject, "DESIGN_CAPSULE_SIZE", CAPSULE_TEST_SIZE):
+            with tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld()
+                rows = [row for row in world.rows if "capsule-attester" not in row["name"]]
+                with self.assertRaisesRegex(subject.Refusal, "receive-deadline"):
+                    self._receive(world, temporary, gh=world.gh(rows=rows))
+                self.assertFalse((Path(temporary) / "capsule").exists())
+            with tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld()
+                rows = [row for row in world.rows if not row["name"].startswith("source-capsule-producer")]
+                with self.assertRaisesRegex(subject.Refusal, "receive-deadline"):
+                    self._receive(world, temporary, gh=world.gh(rows=rows))
+
+    def test_a_capsule_that_differs_from_the_bound_digest_is_refused_and_removed(self):
+        with mock.patch.object(subject, "DESIGN_CAPSULE_SIZE", CAPSULE_TEST_SIZE):
+            with tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld()
+                world.set_capsule("producer", zip_bytes({"capsule.bin": b"X" * CAPSULE_TEST_SIZE}))
+                with self.assertRaisesRegex(subject.Refusal, "receive-capsule-digest"):
+                    self._receive(world, temporary)
+                self.assertFalse((Path(temporary) / "capsule").exists())
+
+    def test_a_capsule_of_the_wrong_length_or_with_extra_members_is_refused(self):
+        with mock.patch.object(subject, "DESIGN_CAPSULE_SIZE", CAPSULE_TEST_SIZE):
+            for label, archive, code in (
+                ("short", zip_bytes({"capsule.bin": b"P" * (CAPSULE_TEST_SIZE - 1)}), "receive-capsule-length"),
+                ("long", zip_bytes({"capsule.bin": b"P" * (CAPSULE_TEST_SIZE + 1)}), "receive-capsule-length"),
+                ("extra", zip_bytes({"capsule.bin": b"P" * CAPSULE_TEST_SIZE, "extra.txt": b"x"}),
+                 "receive-capsule-members"),
+                ("renamed", zip_bytes({"other.bin": b"P" * CAPSULE_TEST_SIZE}), "receive-capsule-members"),
+            ):
+                with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                    world = CandidateWorld()
+                    world.set_capsule("producer", archive)
+                    with self.assertRaisesRegex(subject.Refusal, code):
+                        self._receive(world, temporary)
+                    self.assertFalse((Path(temporary) / "capsule").exists())
+
+    def test_a_capsule_artifact_of_the_wrong_size_class_is_refused(self):
+        with mock.patch.object(subject, "DESIGN_CAPSULE_SIZE", CAPSULE_TEST_SIZE):
+            with tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld()
+                world.set_capsule("producer", zip_bytes({"capsule.bin": b"P" * 100}))
+                with self.assertRaisesRegex(subject.Refusal, "receive-capsule-size"):
+                    self._receive(world, temporary)
+
+    def test_a_revocation_that_is_not_confirmed_is_refused(self):
+        with mock.patch.object(subject, "DESIGN_CAPSULE_SIZE", CAPSULE_TEST_SIZE):
+            with tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld(revocation="unconfirmed")
+                with self.assertRaisesRegex(subject.Refusal, "binding-revocation"):
+                    self._receive(world, temporary)
+                self.assertFalse((Path(temporary) / "capsule").exists())
+
+    def test_a_linux_statement_signed_for_another_role_is_refused(self):
+        with mock.patch.object(subject, "DESIGN_CAPSULE_SIZE", CAPSULE_TEST_SIZE):
+            with tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld()
+                linux = next(row for row in world.rows if "linux-fetch-encrypt" in row["name"])
+                attester = next(row for row in world.rows if "capsule-attester" in row["name"])
+                world.zips[linux["id"]] = world.zips[attester["id"]]
+                linux.update(artifact_row(linux["id"], linux["name"], world.zips[linux["id"]]))
+                with self.assertRaises(subject.Refusal):
+                    self._receive(world, temporary)
+                self.assertFalse((Path(temporary) / "capsule").exists())
+
+    def test_attestation_and_download_failures_fail_closed(self):
+        with mock.patch.object(subject, "DESIGN_CAPSULE_SIZE", CAPSULE_TEST_SIZE):
+            with tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld()
+                with self.assertRaisesRegex(subject.Refusal, "receive-attestation-verify"):
+                    self._receive(world, temporary, gh=world.gh(attestation=False))
+                self.assertFalse((Path(temporary) / "capsule").exists())
+            with tempfile.TemporaryDirectory() as temporary:
+                world = CandidateWorld()
+                world.zips.pop(3101)
+                with self.assertRaisesRegex(subject.Refusal, "receive-download-failed"):
+                    self._receive(world, temporary)
+
+    def test_arguments_and_the_output_directory_are_checked_first(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            world = CandidateWorld()
+            for field, value, code in (
+                ("profile", "probe", "receive-profile-role"),
+                ("role", "windows-receiver", "receive-profile-role"),
+                ("ref", "refs/heads/develop", "receive-ref"),
+                ("repository", "other/repo", "control-repository"),
+                ("deadline_seconds", 0, "receive-deadline-range"),
+                ("deadline_seconds", 3601, "receive-deadline-range"),
+            ):
+                with self.subTest(field=field, value=value):
+                    arguments = self._arguments(temporary)
+                    setattr(arguments, field, value)
+                    with self.assertRaisesRegex(subject.Refusal, code):
+                        subject.receive_capsule(arguments, gh=world.gh(), sleep=lambda unused: None)
+            occupied = Path(temporary) / "capsule"
+            occupied.mkdir()
+            (occupied / "stale").write_bytes(b"x")
+            with self.assertRaisesRegex(subject.Refusal, "receive-output"):
+                subject.receive_capsule(self._arguments(temporary), gh=world.gh(), sleep=lambda unused: None)
+            self.assertTrue((occupied / "stale").exists())
+
+    def test_the_command_line_accepts_the_workflow_flags(self):
+        parsed = subject.build_parser().parse_args([
+            "receive-capsule", "--profile", "candidate", "--role", "windows-verifier", "--repository", REPOSITORY,
+            "--repository-id", "8150001", "--control-sha", CONTROL_SHA, "--ref", REF, "--run-id", RUN_ID,
+            "--run-attempt", RUN_ATTEMPT, "--deadline-seconds", "1500", "--output-directory", "capsule",
+        ])
+        self.assertEqual((parsed.role, parsed.deadline_seconds), ("windows-verifier", 1500))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            subject.build_parser().parse_args([
+                "receive-capsule", "--profile", "candidate", "--role", "windows-receiver", "--repository", REPOSITORY,
+                "--repository-id", "1", "--control-sha", CONTROL_SHA, "--ref", REF, "--run-id", "1",
+                "--run-attempt", "1", "--deadline-seconds", "1", "--output-directory", "x"])
 
 
 if __name__ == "__main__":

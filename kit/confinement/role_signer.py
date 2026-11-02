@@ -7,8 +7,10 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -25,42 +27,58 @@ CONTROL_REPOSITORY = "keeldock-platform/platform-ci"
 OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 PREDICATE_TYPE = "https://example.invalid/role-statement/v1"
 ROLE_ORDER = ("windows-receiver", "linux-fetch-encrypt", "capsule-attester")
+CANDIDATE_ROLES = ("windows-producer", "windows-verifier", "linux-fetch-encrypt", "capsule-attester")
+ALL_ROLES = (
+    "windows-receiver", "windows-producer", "windows-verifier", "linux-fetch-encrypt", "capsule-attester",
+)
+WINDOWS_ROLES = ("windows-receiver", "windows-producer", "windows-verifier")
+RECEIVER_WORKFLOW_PATH = ".github/workflows/lane-h-windows-receiver.yml"
 ROLE_PATHS = {
-    "windows-receiver": ".github/workflows/lane-h-windows-receiver.yml",
+    "windows-receiver": RECEIVER_WORKFLOW_PATH,
     "linux-fetch-encrypt": ".github/workflows/lane-h-linux-fetch-encrypt.yml",
     "capsule-attester": ".github/workflows/lane-h-capsule-attester.yml",
+    "windows-producer": RECEIVER_WORKFLOW_PATH,
+    "windows-verifier": RECEIVER_WORKFLOW_PATH,
 }
 ROLE_RUNNERS = {
     "windows-receiver": "windows-2025",
     "linux-fetch-encrypt": "ubuntu-24.04",
     "capsule-attester": "ubuntu-24.04",
+    "windows-producer": "windows-2025",
+    "windows-verifier": "windows-2025",
 }
 CALLER_PROFILES = {
     "probe": {
         "path": ".github/workflows/attestation-role-signer-probe.yml",
         "name": "attestation-role-signer-probe",
         "ref": "refs/heads/main",
+        "refs": ("refs/heads/main",),
     },
     "production-synthetic": {
         "path": ".github/workflows/windows-source-admission.yml",
         "name": "windows-source-admission",
         "ref": "refs/heads/main",
+        "refs": ("refs/heads/main",),
     },
     "candidate": {
         "path": ".github/workflows/windows-source-admission.yml",
         "name": "windows-source-admission",
-        "ref": "refs/heads/untrusted",
+        "refs": ("refs/heads/main", "refs/heads/untrusted"),
     },
+}
+PROFILE_ROLES = {
+    "probe": ROLE_ORDER,
+    "production-synthetic": ROLE_ORDER,
+    "candidate": CANDIDATE_ROLES,
 }
 PINNED_WORKFLOW_SHA256 = {
     ".github/workflows/windows-source-admission.yml": "9783b15773e7ac970aaf83eabe0a6ac333fca31d258553f2066e8aab7e79ca3a",
     ".github/workflows/lane-h-windows-receiver.yml": "5347fcfdf29c979f7af8c63cee48f77b856fd7cc38d34ad675da75a0b806b448",
     ".github/workflows/lane-h-linux-fetch-encrypt.yml": "fdd7355a0eabe45248fb497e49b5989645f5e2f31fd134fb6d80ac06cf52f0a7",
     ".github/workflows/lane-h-capsule-attester.yml": "bdde526a962d01374e2655c8e8c83b786bc004555cb24f411f46eb1f6840a243",
-    ".github/workflows/attestation-role-signer-probe.yml": "ba5154846c0ae90fa3dad7caecf5a0a715336247aae67e4ed1b3c35d1aeac2e3",
 }
 API_JOB_NAME_PINS = {
-    profile: {role: "role-call-%s-v1 / role-%s-v1" % (role, role) for role in ROLE_ORDER}
+    profile: {role: "role-call-%s-v1 / role-%s-v1" % (role, role) for role in PROFILE_ROLES[profile]}
     for profile in CALLER_PROFILES
 }
 API_LINUX_STEP_NAME_PINS = {
@@ -74,6 +92,7 @@ API_LINUX_STEP_ORDINAL_PINS = {
     profile: {"revoke-source-token": 9, "verify-token-rejection": 10}
     for profile in CALLER_PROFILES
 }
+API_LINUX_STEP_ORDINAL_PINS["candidate"] = {"revoke-source-token": 12, "verify-token-rejection": 13}
 UNLABELED_LOG_STEP = "UNKNOWN STEP"
 BYTE_ORDER_MARK = chr(65279)
 LOG_GROUP_PREFIX = chr(35) * 2 + "[group]Run "
@@ -81,6 +100,15 @@ LOG_GROUP_END = chr(35) * 2 + "[endgroup]"
 LINUX_STEP_LOG_MARKERS = {
     "revoke-source-token": "printf '%s\\n' 'probe=source-free-revocation-simulation status=passed'",
     "verify-token-rejection": "printf '%s\\n' 'probe=source-free-revocation-simulation result=synthetic'",
+}
+CANDIDATE_LINUX_STEP_LOG_MARKERS = {
+    "revoke-source-token": "python3 -B kit/confinement/linux_source_build.py revoke",
+    "verify-token-rejection": "printf '%s\\n' 'handoff-revocation=confirmed'",
+}
+LINUX_STEP_LOG_MARKERS_BY_PROFILE = {
+    "probe": LINUX_STEP_LOG_MARKERS,
+    "production-synthetic": LINUX_STEP_LOG_MARKERS,
+    "candidate": CANDIDATE_LINUX_STEP_LOG_MARKERS,
 }
 ANSI_ESCAPE = re.compile(r"(?:\x1b|\^\[)\[[0-9;]*m")
 CONTROL_BYTES = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
@@ -132,9 +160,37 @@ HEX_32 = re.compile(r"[a-f0-9]{64}\Z")
 HEX_16 = re.compile(r"[a-f0-9]{32}\Z")
 DECIMAL = re.compile(r"[1-9][0-9]*\Z")
 ARTIFACT_NAME = re.compile(
-    r"role-statement-(windows-receiver|linux-fetch-encrypt|capsule-attester)-"
+    r"role-statement-(windows-receiver|windows-producer|windows-verifier|linux-fetch-encrypt|capsule-attester)-"
     r"([1-9][0-9]{0,19})-([1-9][0-9]{0,9})-([a-f0-9]{32})\Z"
 )
+P256_PRIME = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+P256_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+BINDING_KEYS = frozenset((
+    "capsule_producer_sha256", "capsule_verifier_sha256", "key_record_producer_sha256",
+    "key_record_verifier_sha256", "lock_sha256", "manifest_sha256", "revocation", "schema",
+    "source_sha", "tree_id",
+))
+ATTESTED_KEYS = BINDING_KEYS | frozenset(("kind", "linux_subject_sha256"))
+BINDING_MAX_BYTES = 4096
+HASH_BLOCK_BYTES = 1048576
+CAPSULE_SLACK_BYTES = 8192
+RECEIVE_POLL_SECONDS = 5
+PREPARE_FLAGS = (
+    "receiver_record", "verifier_record", "capsule_producer", "capsule_verifier", "public_point_file",
+    "revocation_receipt", "source_sha", "tree_id", "lock_sha256", "manifest_sha256", "linux_subject",
+)
+PREPARE_CANDIDATE_ONLY_FLAGS = frozenset(PREPARE_FLAGS) - {"receiver_record"}
+PREPARE_ROLE_FLAGS = {
+    "windows-producer": frozenset(("public_point_file",)),
+    "windows-verifier": frozenset(("public_point_file",)),
+    "linux-fetch-encrypt": frozenset((
+        "receiver_record", "verifier_record", "capsule_producer", "capsule_verifier", "source_sha",
+        "tree_id", "lock_sha256", "manifest_sha256",
+    )),
+    "capsule-attester": frozenset((
+        "receiver_record", "verifier_record", "capsule_producer", "capsule_verifier", "linux_subject",
+    )),
+}
 KEY_RECORD_SIZE = 320
 CAPSULE_SIZE = 4096
 DESIGN_CAPSULE_SIZE = 286261248
@@ -150,6 +206,37 @@ class Refusal(ValueError):
     def __init__(self, code):
         super().__init__(code)
         self.code = code
+
+
+def profile_roles(profile):
+    if type(profile) is not str or profile not in PROFILE_ROLES:
+        raise Refusal("profile-invalid")
+    return PROFILE_ROLES[profile]
+
+
+def profile_refs(profile):
+    if type(profile) is not str or profile not in CALLER_PROFILES:
+        raise Refusal("profile-invalid")
+    return CALLER_PROFILES[profile]["refs"]
+
+
+def gate_roles(profile, gate):
+    roles = profile_roles(profile)
+    if profile == "candidate":
+        return roles[:2] if gate == "A" else roles[:3]
+    return roles[:1] if gate == "A" else roles[:2]
+
+
+def validate_public_point(point):
+    if type(point) is not bytes or len(point) != 65 or point[0] != 4:
+        raise Refusal("public-point-shape")
+    x = int.from_bytes(point[1:33], "big")
+    y = int.from_bytes(point[33:65], "big")
+    if x >= P256_PRIME or y >= P256_PRIME:
+        raise Refusal("public-point-range")
+    if (y * y - (x * x * x - 3 * x + P256_B)) % P256_PRIME != 0:
+        raise Refusal("public-point-curve")
+    return point
 
 
 def _pairs_without_duplicates(pairs):
@@ -291,7 +378,7 @@ def validate_run_invocation(raw, repository, run_id, run_attempt):
 def role_nonce(key_record, role, subject):
     if type(key_record) is not bytes or type(subject) is not bytes:
         raise Refusal("nonce-input-type")
-    if role not in ROLE_ORDER:
+    if role not in ALL_ROLES:
         raise Refusal("nonce-role")
     key_digest = hashlib.sha256(key_record).digest()
     subject_digest = hashlib.sha256(subject).digest()
@@ -312,7 +399,7 @@ def _runtime_hex(value, length, code):
     return bytes.fromhex(value)
 
 
-def make_key_record(repository_id, control_sha, run_id, run_attempt, workflow_ref, now=None):
+def make_key_record(repository_id, control_sha, run_id, run_attempt, workflow_ref, now=None, public_point=None):
     repository_number = _is_u64(repository_id)
     run_number = _is_u64(run_id)
     attempt_number = _is_u32(run_attempt)
@@ -321,7 +408,8 @@ def make_key_record(repository_id, control_sha, run_id, run_attempt, workflow_re
         raise Refusal("workflow-ref-invalid")
     created = int(time.time()) if now is None else _is_u64(now)
     transfer = secrets.token_bytes(16)
-    key_id = hashlib.sha256(P256_GENERATOR).digest()
+    point = P256_GENERATOR if public_point is None else validate_public_point(public_point)
+    key_id = hashlib.sha256(point).digest()
     result = bytearray(KEY_RECORD_SIZE)
     result[0:8] = b"KDWHKEY1"
     result[8:10] = (1).to_bytes(2, "big")
@@ -332,7 +420,7 @@ def make_key_record(repository_id, control_sha, run_id, run_attempt, workflow_re
     result[48:52] = attempt_number.to_bytes(4, "big")
     result[52:68] = transfer
     result[68:100] = key_id
-    result[100:165] = P256_GENERATOR
+    result[100:165] = point
     result[165:197] = hashlib.sha256(workflow_ref.encode("ascii")).digest()
     result[197:229] = hashlib.sha256(b"windows-receiver").digest()
     result[229:237] = created.to_bytes(8, "big")
@@ -351,6 +439,7 @@ def validate_key_record(
     run_attempt,
     workflow_ref,
     now=None,
+    allow_any_point=False,
 ):
     if type(record) is not bytes or len(record) != KEY_RECORD_SIZE:
         raise Refusal("key-record-size")
@@ -372,7 +461,9 @@ def validate_key_record(
         raise Refusal("key-record-transfer")
     if record[68:100] != hashlib.sha256(record[100:165]).digest():
         raise Refusal("key-record-key-id")
-    if record[100:165] != P256_GENERATOR:
+    if allow_any_point:
+        validate_public_point(record[100:165])
+    elif record[100:165] != P256_GENERATOR:
         raise Refusal("key-record-public-point")
     if type(workflow_ref) is not str or not workflow_ref.isascii():
         raise Refusal("workflow-ref-invalid")
@@ -427,10 +518,10 @@ def make_synthetic_capsule(key_record):
 def make_predicate(profile, role, repository, control_sha, ref, run_id, run_attempt, key_record, subject):
     if profile not in CALLER_PROFILES:
         raise Refusal("profile-invalid")
-    if role not in ROLE_ORDER:
+    if role not in profile_roles(profile):
         raise Refusal("role-invalid")
     profile_data = CALLER_PROFILES[profile]
-    if ref != profile_data["ref"]:
+    if ref not in profile_refs(profile):
         raise Refusal("profile-ref")
     validate_commit_sha(control_sha)
     run_number = _is_u64(run_id)
@@ -445,6 +536,7 @@ def make_predicate(profile, role, repository, control_sha, ref, run_id, run_atte
         run_number,
         attempt_number,
         repository + "/" + profile_data["path"] + "@" + ref,
+        allow_any_point=profile == "candidate",
     )
     subject_hash = hashlib.sha256(subject).hexdigest()
     return {
@@ -515,10 +607,10 @@ def certificate_expectations(
     runner,
     digest_pins,
 ):
-    if profile not in CALLER_PROFILES or role not in ROLE_ORDER:
+    if profile not in CALLER_PROFILES or role not in PROFILE_ROLES[profile]:
         raise Refusal("profile-role-invalid")
     profile_data = CALLER_PROFILES[profile]
-    if repository != CONTROL_REPOSITORY or ref != profile_data["ref"]:
+    if repository != CONTROL_REPOSITORY or ref not in profile_data["refs"]:
         raise Refusal("profile-repository-ref")
     validate_commit_sha(control_sha)
     expected_invocation = canonical_run_invocation(repository, run_id, run_attempt)
@@ -573,7 +665,7 @@ def resolve_certificate_pins(profile, control_sha):
         raise Refusal("certificate-control-sha-missing")
     pins = {field: control_sha for field in CERTIFICATE_DIGEST_FIELDS}
     pins["certificateIssuer"] = CERTIFICATE_ISSUER_PIN
-    return {role: dict(pins) for role in ROLE_ORDER}
+    return {role: dict(pins) for role in PROFILE_ROLES[profile]}
 
 
 def validate_certificate(certificate, expected):
@@ -676,7 +768,7 @@ def validate_statement_predicate(predicate, expected, key_record, subject):
     if set(predicate) != required or "certificate" in predicate:
         raise Refusal("predicate-fields")
     role = predicate["role"]
-    if role not in ROLE_ORDER:
+    if role not in ALL_ROLES:
         raise Refusal("predicate-role")
     actual = {
         "schemaVersion": 1,
@@ -727,7 +819,7 @@ def verify_workflow_bytes(root, profile, pinned=None):
     if profile not in CALLER_PROFILES:
         raise Refusal("profile-invalid")
     expected_pins = PINNED_WORKFLOW_SHA256 if pinned is None else pinned
-    required_paths = (CALLER_PROFILES[profile]["path"],) + tuple(ROLE_PATHS.values())
+    required_paths = profile_workflow_paths(profile)
     digests = {}
     for relative in required_paths:
         expected = expected_pins.get(relative)
@@ -751,7 +843,171 @@ def verify_workflow_bytes(root, profile, pinned=None):
     return digests
 
 
+CANDIDATE_CALLER_JOBS = (
+    "settings", "windows-producer", "windows-verifier", "linux-fetch-encrypt", "capsule-attester",
+    "verify-role-evidence", "audit",
+)
+CANDIDATE_ROLE_FILES = (
+    (RECEIVER_WORKFLOW_PATH, "windows-candidate", "windows-2025", ("profile", "role", "mode", "source_sha")),
+    (
+        ROLE_PATHS["linux-fetch-encrypt"], "linux-fetch-encrypt", "ubuntu-24.04",
+        ("profile", "mode", "source_sha", "base_sha", "base_branch", "fingerprint", "environment_name"),
+    ),
+    (ROLE_PATHS["capsule-attester"], "capsule-attester", "ubuntu-24.04", ("profile", "mode")),
+)
+FETCH_ENVIRONMENT_LINE = "    environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}"
+ACTION_USE_PATTERN = re.compile(
+    r"\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[a-f0-9]{40}\s+"
+    + chr(35)
+    + r"\s+v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?"
+)
+
+
+def _read_workflow_text(path, code):
+    try:
+        return Path(path).read_text(encoding="ascii")
+    except (OSError, UnicodeDecodeError):
+        raise Refusal(code)
+
+
+def _jobs_section(text):
+    marker = "\njobs:\n"
+    if marker not in text:
+        raise Refusal("workflow-jobs-missing")
+    return text.split(marker, 1)[1]
+
+
+def _job_ids(text):
+    return re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", _jobs_section(text))
+
+
+def _job_block(text, job_id):
+    found = re.search(
+        r"(?ms)^  " + re.escape(job_id) + r":\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", _jobs_section(text),
+    )
+    return None if found is None else found.group(1)
+
+
+def _check_action_uses(text):
+    for line in [item for item in text.splitlines() if re.match(r"\s*uses:\s+", item)]:
+        if line.strip().startswith("uses: ./"):
+            continue
+        if ACTION_USE_PATTERN.fullmatch(line) is None:
+            raise Refusal("action-pin-invalid")
+
+
+def _check_candidate_inputs(workflow, names):
+    opening = "    inputs:\n"
+    start = workflow.find(opening)
+    end = workflow.find("\npermissions: {}\n")
+    if start < 0 or end < start:
+        raise Refusal("role-input-schema")
+    block = workflow[start + len(opening):end + 1]
+    entries = re.findall(r"(?ms)^      ([A-Za-z0-9_]+):\n((?:        [^\n]*\n)+)", block)
+    if tuple(name for name, unused in entries) != names:
+        raise Refusal("role-input-schema")
+    if sum(8 + len(name) + len(body) for name, body in entries) != len(block):
+        raise Refusal("role-input-schema")
+    for name, body in entries:
+        required = "true" if name == "profile" else "false"
+        if (body.count("        required: ") != 1 or "        required: " + required + "\n" not in body
+                or body.count("        type: string\n") != 1):
+            raise Refusal("role-input-schema")
+
+
+def validate_candidate_caller(root):
+    caller = _read_workflow_text(Path(root) / CALLER_PROFILES["candidate"]["path"], "caller-workflow-unavailable")
+    if caller.count("workflow_dispatch:") != 1 or "workflow_call:" in caller:
+        raise Refusal("caller-trigger-shape")
+    permissions = "\npermissions: {}\n"
+    if ("\non:\n  workflow_dispatch:\n" not in caller or caller.count(permissions) != 1
+            or "\njobs:\n" not in caller or caller.index(permissions) > caller.index("\njobs:\n")):
+        raise Refusal("caller-extra-trigger")
+    if any(ref not in caller for ref in profile_refs("candidate")) or "matrix:" in caller or "strategy:" in caller:
+        raise Refusal("caller-guard-shape")
+    if "source-read" in caller or "secrets: inherit" in caller:
+        raise Refusal("caller-source-path")
+    if re.search(r"(?m)^\s*continue-on-error\s*:", caller):
+        raise Refusal("caller-masked-failure")
+    _check_action_uses(caller)
+    if tuple(_job_ids(caller)) != CANDIDATE_CALLER_JOBS:
+        raise Refusal("role-job-cardinality")
+    for role in CANDIDATE_ROLES:
+        block = _job_block(caller, role)
+        if block is None or block.count("uses: ./" + ROLE_PATHS[role] + "\n") != 1:
+            raise Refusal("role-call-cardinality")
+        if "      profile: candidate\n" not in block:
+            raise Refusal("role-fixed-input")
+        if role in ("windows-producer", "windows-verifier") and (
+                "      role: " + role[len("windows-"):] + "\n" not in block):
+            raise Refusal("role-fixed-input")
+        needs = re.search(r"(?m)^    needs:\n((?:      - [A-Za-z0-9_-]+\n)+)", block)
+        items = [] if needs is None else re.findall(r"- ([A-Za-z0-9_-]+)", needs.group(1))
+        if block.count("needs:") != 1:
+            items = []
+        if role == "capsule-attester":
+            if items != ["settings", "linux-fetch-encrypt"]:
+                raise Refusal("attester-order")
+        elif items != ["settings"]:
+            raise Refusal("handoff-start-order")
+    for path in sorted(set(ROLE_PATHS[role] for role in CANDIDATE_ROLES)):
+        expected = 2 if path == RECEIVER_WORKFLOW_PATH else 1
+        if caller.count("uses: ./" + path + "\n") != expected:
+            raise Refusal("role-call-cardinality")
+
+
+def validate_candidate_role_files(root):
+    for relative, job_id, runner, names in CANDIDATE_ROLE_FILES:
+        workflow = _read_workflow_text(Path(root) / relative, "role-workflow-unavailable")
+        if workflow.count("workflow_call:") != 1:
+            raise Refusal("role-trigger-shape")
+        _check_candidate_inputs(workflow, names)
+        if workflow.count("uses: actions/attest@") != 1:
+            raise Refusal("role-sign-step-cardinality")
+        if _job_ids(workflow) != [job_id]:
+            raise Refusal("role-job-cardinality")
+        if "    runs-on: " + runner + "\n" not in workflow:
+            raise Refusal("role-runner")
+        if "matrix:" in workflow or "strategy:" in workflow:
+            raise Refusal("role-matrix")
+        if "uses: ./.github/workflows/" in workflow or "workflow_dispatch:" in workflow:
+            raise Refusal("role-nested-call")
+        environments = re.findall(r"(?m)^ *environment:.*$", workflow)
+        if relative == ROLE_PATHS["linux-fetch-encrypt"]:
+            if environments != [FETCH_ENVIRONMENT_LINE]:
+                raise Refusal("role-source-path")
+        elif "source-read" in workflow:
+            raise Refusal("role-source-path")
+        if "secrets: inherit" in workflow:
+            raise Refusal("role-source-path")
+        if re.search(r"(?m)^\s*continue-on-error\s*:", workflow):
+            raise Refusal("role-masked-failure")
+        if set(re.findall(r"(?m)^\s+([a-z-]+): write$", workflow)) - {"id-token", "attestations"}:
+            raise Refusal("role-permissions")
+        _check_action_uses(workflow)
+        condition = re.search(r"(?m)^    if: (.*)$", _job_block(workflow, job_id) or "")
+        if condition is None or "inputs.profile == 'candidate'" not in condition.group(1):
+            raise Refusal("role-fixed-input")
+    return True
+
+
+def validate_candidate_graph(root):
+    validate_candidate_caller(root)
+    validate_candidate_role_files(root)
+    return True
+
+
+def profile_workflow_paths(profile):
+    paths = [CALLER_PROFILES[profile]["path"]]
+    for role in profile_roles(profile):
+        if ROLE_PATHS[role] not in paths:
+            paths.append(ROLE_PATHS[role])
+    return tuple(paths)
+
+
 def validate_workflow_graph(root, profile):
+    if profile == "candidate":
+        return validate_candidate_graph(root)
     caller_path = Path(root) / CALLER_PROFILES[profile]["path"]
     try:
         caller = caller_path.read_text(encoding="ascii")
@@ -778,7 +1034,8 @@ def validate_workflow_graph(root, profile):
             line,
         ) is None:
             raise Refusal("action-pin-invalid")
-    for role, path in ROLE_PATHS.items():
+    for role in ROLE_ORDER:
+        path = ROLE_PATHS[role]
         local_call = "uses: ./%s" % path
         if caller.count(local_call) != 1:
             raise Refusal("role-call-cardinality")
@@ -794,7 +1051,8 @@ def validate_workflow_graph(root, profile):
             raise Refusal("handoff-start-order")
         if role == "capsule-attester" and "needs:\n      - linux-fetch-encrypt\n" not in caller_job.group(1):
             raise Refusal("attester-order")
-    for role, relative in ROLE_PATHS.items():
+    for role in ROLE_ORDER:
+        relative = ROLE_PATHS[role]
         path = Path(root) / relative
         try:
             workflow = path.read_text(encoding="ascii")
@@ -843,30 +1101,32 @@ def validate_call_graph(graph, profile):
     if type(caller) is not dict or set(caller) != {"path", "ref", "call_sites", "source_access"}:
         raise Refusal("call-graph-caller")
     profile_data = CALLER_PROFILES[profile]
-    if caller["path"] != profile_data["path"] or caller["ref"] != profile_data["ref"]:
+    profile_set = PROFILE_ROLES[profile]
+    if caller["path"] != profile_data["path"] or caller["ref"] not in profile_data["refs"]:
         raise Refusal("call-graph-profile")
     if caller["source_access"] is not False:
         raise Refusal("call-graph-source-access")
     calls = caller["call_sites"]
-    if type(calls) is not list or len(calls) != len(ROLE_ORDER):
+    if type(calls) is not list or len(calls) != len(profile_set):
         raise Refusal("call-site-cardinality")
+    conditions = (None, "mode-bound") if profile == "candidate" else (None, "main-only")
     observed = []
     for call in calls:
         expected_keys = {"role", "uses", "profile", "matrix", "dynamic", "condition"}
         if type(call) is not dict or set(call) != expected_keys:
             raise Refusal("call-site-shape")
         role = call["role"]
-        if role not in ROLE_ORDER or call["uses"] != ROLE_PATHS[role]:
+        if role not in profile_set or call["uses"] != ROLE_PATHS[role]:
             raise Refusal("call-site-role")
         if call["profile"] != profile or call["matrix"] is not False or call["dynamic"] is not False:
             raise Refusal("call-site-dynamic")
-        if call["condition"] not in (None, "main-only"):
+        if call["condition"] not in conditions:
             raise Refusal("call-site-condition")
         observed.append(role)
-    if tuple(sorted(observed)) != tuple(sorted(ROLE_ORDER)) or len(set(observed)) != len(ROLE_ORDER):
+    if tuple(sorted(observed)) != tuple(sorted(profile_set)) or len(set(observed)) != len(profile_set):
         raise Refusal("call-site-duplicate")
     roles = graph["roles"]
-    if type(roles) is not list or len(roles) != len(ROLE_ORDER):
+    if type(roles) is not list or len(roles) != len(profile_set):
         raise Refusal("callee-cardinality")
     role_names = []
     for callee in roles:
@@ -874,14 +1134,15 @@ def validate_call_graph(graph, profile):
         if type(callee) is not dict or set(callee) != expected_keys:
             raise Refusal("callee-shape")
         role = callee["role"]
-        if role not in ROLE_ORDER or callee["path"] != ROLE_PATHS[role]:
+        if role not in profile_set or callee["path"] != ROLE_PATHS[role]:
             raise Refusal("callee-role")
-        if callee["jobs"] != [role] or callee["sign_steps"] != ["attest-role-statement"]:
+        expected_job = "windows-candidate" if profile == "candidate" and role in WINDOWS_ROLES else role
+        if callee["jobs"] != [expected_job] or callee["sign_steps"] != ["attest-role-statement"]:
             raise Refusal("callee-job-or-sign-step")
         if callee["nested_calls"] != [] or callee["matrix"] is not False or callee["dynamic"] is not False:
             raise Refusal("callee-dynamic")
         role_names.append(role)
-    if len(set(role_names)) != len(ROLE_ORDER) or set(role_names) != set(ROLE_ORDER):
+    if len(set(role_names)) != len(profile_set) or set(role_names) != set(profile_set):
         raise Refusal("callee-duplicate")
     return True
 
@@ -1247,28 +1508,29 @@ def validate_api_runner(job, role):
     return name, labels
 
 
-def validate_jobs_snapshot(snapshot, run_id, run_attempt, head_sha, api_name_pins):
+def validate_jobs_snapshot(snapshot, run_id, run_attempt, head_sha, api_name_pins, roles=None):
     jobs = _validate_snapshot(snapshot, "jobs", run_id, run_attempt, head_sha)
-    if type(api_name_pins) is not dict or set(api_name_pins) != set(ROLE_ORDER):
+    roles = ROLE_ORDER if roles is None else tuple(roles)
+    if type(api_name_pins) is not dict or set(api_name_pins) != set(roles):
         raise Refusal("api-job-map-unresolved")
     if any(type(name) is not str or not name for name in api_name_pins.values()):
         raise Refusal("api-job-map-unresolved")
-    if len(set(api_name_pins.values())) != len(ROLE_ORDER):
+    if len(set(api_name_pins.values())) != len(roles):
         raise Refusal("api-job-map-duplicate")
-    role_markers = tuple(ROLE_ORDER)
+    role_markers = tuple(roles)
     relevant = [
         job for job in jobs
         if type(job) is dict
         and type(job.get("name")) is str
         and any(marker in job["name"] for marker in role_markers)
     ]
-    if len(relevant) != len(ROLE_ORDER):
+    if len(relevant) != len(roles):
         raise Refusal("api-role-job-cardinality")
     result = {}
     identifiers = set()
     check_run_ids = set()
     names = set()
-    for role in ROLE_ORDER:
+    for role in roles:
         matches = [job for job in jobs if type(job) is dict and job.get("name") == api_name_pins[role]]
         if len(matches) != 1:
             raise Refusal("api-role-job-not-unique")
@@ -1344,7 +1606,7 @@ def validate_jobs_snapshot(snapshot, run_id, run_attempt, head_sha, api_name_pin
 
 def validate_role_job(snapshot, run_id, run_attempt, head_sha, role, api_name, allowed_statuses):
     jobs = _validate_snapshot(snapshot, "jobs", run_id, run_attempt, head_sha)
-    if role not in ROLE_ORDER or type(api_name) is not str or not api_name:
+    if role not in ALL_ROLES or type(api_name) is not str or not api_name:
         raise Refusal("api-job-map-unresolved")
     matches = [job for job in jobs if type(job) is dict and job.get("name") == api_name]
     role_marked = [
@@ -1504,7 +1766,7 @@ def validate_run_metadata(document, profile, repository, run_id, run_attempt, he
         raise Refusal("run-head-sha-mismatch")
     if document.get("path") != profile_data["path"] or document.get("event") != "workflow_dispatch":
         raise Refusal("run-workflow-identity")
-    if document.get("head_branch") != profile_data["ref"][len("refs/heads/"):]:
+    if document.get("head_branch") not in [ref[len("refs/heads/"):] for ref in profile_data["refs"]]:
         raise Refusal("run-ref-mismatch")
     api_repository = document.get("repository")
     if type(api_repository) is not dict or api_repository.get("full_name") != repository:
@@ -1636,7 +1898,7 @@ def extract_artifact_archive(artifact, archive_bytes, directory):
     return content
 
 
-def validate_artifact_inventory(snapshot, run_id, run_attempt, head_sha, expected_roles=ROLE_ORDER):
+def validate_artifact_inventory(snapshot, run_id, run_attempt, head_sha, expected_roles=ROLE_ORDER, profile=None):
     artifacts = _validate_snapshot(snapshot, "artifacts", run_id, run_attempt, head_sha)
     names = set()
     identifiers = set()
@@ -1665,6 +1927,14 @@ def validate_artifact_inventory(snapshot, run_id, run_attempt, head_sha, expecte
         by_role.setdefault(role, []).append(dict(metadata, id=identifier, name=name, transfer_id=transfer))
     if set(by_role) != set(expected_roles) or any(len(by_role[role]) != 1 for role in expected_roles):
         raise Refusal("artifact-role-cardinality")
+    if profile == "candidate":
+        anchor = by_role["windows-producer"][0]["transfer_id"] if "windows-producer" in by_role else None
+        for role in expected_roles:
+            if role in ("linux-fetch-encrypt", "capsule-attester") and by_role[role][0]["transfer_id"] != anchor:
+                raise Refusal("artifact-transfer-mismatch")
+        if "windows-verifier" in by_role and by_role["windows-verifier"][0]["transfer_id"] == anchor:
+            raise Refusal("artifact-transfer-reused")
+        return by_role
     transfers = {by_role[role][0]["transfer_id"] for role in expected_roles}
     if len(transfers) != 1:
         raise Refusal("artifact-transfer-mismatch")
@@ -1751,6 +2021,11 @@ def normalize_provider_attestations(snapshot, subject_digest, role_expectations,
             if certificate.get("buildSignerURI") == expected["certificate"]["buildSignerURI"]
             and certificate.get("subjectAlternativeName") == expected["certificate"]["subjectAlternativeName"]
         ]
+        if len(matches) > 1:
+            matches = [
+                candidate for candidate in matches
+                if hashlib.sha256(role_expectations[candidate]["subject"]).hexdigest() == subject_digest
+            ]
         if len(matches) != 1:
             raise Refusal("provider-verified-role-identity")
         role = matches[0]
@@ -1772,6 +2047,142 @@ def normalize_provider_attestations(snapshot, subject_digest, role_expectations,
     return normalized
 
 
+def _hex_text(value, length, code):
+    if type(value) is not str or re.fullmatch(r"[a-f0-9]{%d}" % length, value) is None:
+        raise Refusal(code)
+    return value
+
+
+def canonical_json_subject(document):
+    try:
+        encoded = (json.dumps(
+            document, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False,
+        ) + "\n").encode("ascii")
+    except (TypeError, ValueError):
+        raise Refusal("binding-encoding")
+    if len(encoded) > BINDING_MAX_BYTES:
+        raise Refusal("binding-size")
+    return encoded
+
+
+def _binding_fields(document, keys):
+    if type(document) is not dict or set(document) != keys:
+        raise Refusal("binding-fields")
+    if type(document["schema"]) is not int or document["schema"] != 1:
+        raise Refusal("binding-schema")
+    for name in ("source_sha", "tree_id"):
+        _hex_text(document[name], 40, "binding-hex")
+    for name in (
+        "capsule_producer_sha256", "capsule_verifier_sha256", "key_record_producer_sha256",
+        "key_record_verifier_sha256", "lock_sha256", "manifest_sha256",
+    ):
+        _hex_text(document[name], 64, "binding-hex")
+    if document["revocation"] != "confirmed":
+        raise Refusal("binding-revocation")
+    return document
+
+
+def parse_binding_subject(subject, attested=False):
+    if type(subject) is not bytes or len(subject) > BINDING_MAX_BYTES:
+        raise Refusal("binding-size")
+    document = load_json_bytes(subject, BINDING_MAX_BYTES)
+    _binding_fields(document, ATTESTED_KEYS if attested else BINDING_KEYS)
+    if attested:
+        if document["kind"] != "attested":
+            raise Refusal("binding-kind")
+        _hex_text(document["linux_subject_sha256"], 64, "binding-hex")
+    if canonical_json_subject(document) != subject:
+        raise Refusal("binding-not-canonical")
+    return document
+
+
+def build_binding_subject(producer_record, verifier_record, producer_capsule, verifier_capsule,
+                          source_sha, tree_id, lock_sha256, manifest_sha256):
+    document = {
+        "capsule_producer_sha256": producer_capsule,
+        "capsule_verifier_sha256": verifier_capsule,
+        "key_record_producer_sha256": hashlib.sha256(producer_record).hexdigest(),
+        "key_record_verifier_sha256": hashlib.sha256(verifier_record).hexdigest(),
+        "lock_sha256": lock_sha256,
+        "manifest_sha256": manifest_sha256,
+        "revocation": "confirmed",
+        "schema": 1,
+        "source_sha": source_sha,
+        "tree_id": tree_id,
+    }
+    _binding_fields(document, BINDING_KEYS)
+    return canonical_json_subject(document)
+
+
+def build_attested_subject(linux_subject):
+    document = dict(parse_binding_subject(linux_subject))
+    document["kind"] = "attested"
+    document["linux_subject_sha256"] = hashlib.sha256(linux_subject).hexdigest()
+    return canonical_json_subject(document)
+
+
+def _check_candidate_subject(role, signed_subject, records, linux_subject):
+    if role == "linux-fetch-encrypt":
+        document = parse_binding_subject(signed_subject)
+        for short in ("producer", "verifier"):
+            held = records.get("windows-" + short)
+            if held is not None and document["key_record_%s_sha256" % short] != hashlib.sha256(held).hexdigest():
+                raise Refusal("binding-key-record-mismatch")
+        return
+    if linux_subject is None:
+        raise Refusal("linux-statement-missing")
+    if signed_subject != build_attested_subject(linux_subject):
+        raise Refusal("attested-subject-mismatch")
+
+
+def _read_regular(path, limit, code):
+    try:
+        item = Path(path)
+        if item.is_symlink() or not item.is_file() or item.stat().st_size > limit:
+            raise Refusal(code)
+        return item.read_bytes()
+    except (OSError, TypeError):
+        raise Refusal(code)
+
+
+def _file_digest(path, code):
+    digest = hashlib.sha256()
+    try:
+        item = Path(path)
+        if item.is_symlink() or not item.is_file():
+            raise Refusal(code)
+        with item.open("rb") as source:
+            while True:
+                block = source.read(HASH_BLOCK_BYTES)
+                if not block:
+                    break
+                digest.update(block)
+    except (OSError, TypeError):
+        raise Refusal(code)
+    return digest.hexdigest()
+
+
+def validate_revocation_receipt(path, ref, control_sha, run_id, run_attempt):
+    if ref == "refs/heads/main":
+        if path is not None:
+            raise Refusal("revocation-receipt-forbidden")
+        return "confirmed"
+    if ref != "refs/heads/untrusted":
+        raise Refusal("prepare-ref")
+    if path is None:
+        raise Refusal("revocation-receipt-required")
+    document = load_json_bytes(_read_regular(path, 4096, "revocation-receipt-unavailable"), 4096)
+    if (type(document) is not dict
+            or type(document.get("schema_version")) is not int or document["schema_version"] != 1
+            or document.get("status") != "confirmed"
+            or document.get("rejected_after_revoke") is not True
+            or document.get("control_sha") != control_sha
+            or document.get("run_id") != str(_is_u64(run_id))
+            or document.get("run_attempt") != str(_is_u32(run_attempt))):
+        raise Refusal("revocation-receipt-invalid")
+    return "confirmed"
+
+
 def validate_role_artifact_set(
     profile,
     repository,
@@ -1784,13 +2195,17 @@ def validate_role_artifact_set(
     artifact_map,
     evidence_root,
     digest_pins,
-    required_roles=ROLE_ORDER,
+    required_roles=None,
 ):
+    profile_set = PROFILE_ROLES.get(profile, ROLE_ORDER)
+    required_roles = profile_set if required_roles is None else required_roles
     if type(artifact_map) is not dict or set(artifact_map) != set(required_roles):
         raise Refusal("role-artifact-map")
-    if type(digest_pins) is not dict or set(digest_pins) != set(ROLE_ORDER):
+    if type(digest_pins) is not dict or set(digest_pins) != set(profile_set):
         raise Refusal("certificate-digest-profile-unresolved")
     record = None
+    records = {}
+    linux_subject = None
     role_subjects = {}
     role_predicates = {}
     artifact_records = []
@@ -1836,16 +2251,36 @@ def validate_role_artifact_set(
             raise Refusal("role-artifact-size")
         predicate = load_json_file(predicate_path)
         verified = load_json_file(verified_path)
-        if role == "windows-receiver":
-            record = signed_subject
-            validate_key_record(record, repository_id, control_sha, run_id, run_attempt,
-                                repository + "/" + CALLER_PROFILES[profile]["path"] + "@" + ref)
-        elif record is None:
-            raise Refusal("receiver-statement-missing")
-        if record is None:
-            raise Refusal("receiver-statement-missing")
-        if role != "windows-receiver" and signed_subject != make_synthetic_capsule(record):
-            raise Refusal("capsule-subject-mismatch")
+        if profile == "candidate":
+            if role in ("windows-producer", "windows-verifier"):
+                validate_key_record(signed_subject, repository_id, control_sha, run_id, run_attempt,
+                                    repository + "/" + CALLER_PROFILES[profile]["path"] + "@" + ref,
+                                    allow_any_point=True)
+                if signed_subject in records.values():
+                    raise Refusal("receiver-records-identical")
+                records[role] = signed_subject
+                if role == "windows-producer":
+                    record = signed_subject
+                predicate_record = signed_subject
+            else:
+                if record is None:
+                    raise Refusal("receiver-statement-missing")
+                _check_candidate_subject(role, signed_subject, records, linux_subject)
+                if role == "linux-fetch-encrypt":
+                    linux_subject = signed_subject
+                predicate_record = record
+        else:
+            if role == "windows-receiver":
+                record = signed_subject
+                validate_key_record(record, repository_id, control_sha, run_id, run_attempt,
+                                    repository + "/" + CALLER_PROFILES[profile]["path"] + "@" + ref)
+            elif record is None:
+                raise Refusal("receiver-statement-missing")
+            if record is None:
+                raise Refusal("receiver-statement-missing")
+            if role != "windows-receiver" and signed_subject != make_synthetic_capsule(record):
+                raise Refusal("capsule-subject-mismatch")
+            predicate_record = record
         expected_predicate = make_predicate(
             profile,
             role,
@@ -1854,7 +2289,7 @@ def validate_role_artifact_set(
             ref,
             run_id,
             run_attempt,
-            record,
+            predicate_record,
             signed_subject,
         )
         if predicate != expected_predicate or artifact["transfer_id"] != expected_predicate["transferId"]:
@@ -1881,7 +2316,7 @@ def validate_role_artifact_set(
             "run_id": run_id,
             "run_attempt": run_attempt,
             "transfer_id": expected_predicate["transferId"],
-            "key_record": record,
+            "key_record": predicate_record,
         }
         result, unused_certificate, verified_statement = verified_result(verified)
         if type(result.get("statement")) is not dict:
@@ -1938,10 +2373,12 @@ def verify_source_free_evidence(
     repository_id, owner_id = validate_repository_metadata(repository_metadata, repository)
     validate_run_metadata(run_metadata, profile, repository, run_id, run_attempt, control_sha, repository_id)
     verify_workflow_bytes(control_root, profile)
-    jobs = validate_jobs_snapshot(jobs_snapshot, run_id, run_attempt, control_sha, api_name_pins)
+    profile_set = profile_roles(profile)
+    jobs = validate_jobs_snapshot(jobs_snapshot, run_id, run_attempt, control_sha, api_name_pins, profile_set)
     if any(job["status"] != "completed" or job["conclusion"] != "success" for job in jobs.values()):
         raise Refusal("role-job-not-successful")
-    artifact_map = validate_artifact_inventory(artifacts_snapshot, run_id, run_attempt, control_sha)
+    artifact_map = validate_artifact_inventory(
+        artifacts_snapshot, run_id, run_attempt, control_sha, profile_set, profile)
     roles = validate_role_artifact_set(
         profile,
         repository,
@@ -1951,12 +2388,13 @@ def verify_source_free_evidence(
         run_attempt,
         repository_id,
         owner_id,
-        {role: artifact_map[role][0] for role in ROLE_ORDER},
+        {role: artifact_map[role][0] for role in profile_set},
         Path(evidence_root) / "artifacts",
         digest_pins,
+        profile_set,
     )
     reconcile_provider_evidence(roles, provider_snapshots, run_id, run_attempt,
-                                control_sha, ROLE_ORDER)
+                                control_sha, profile_set)
     return roles
 
 
@@ -2039,13 +2477,13 @@ def verify_transition_evidence(
     validate_run_metadata(run_metadata, profile, repository, run_id, run_attempt,
                           control_sha, repository_id)
     verify_workflow_bytes(control_root, profile)
-    if type(api_name_pins) is not dict or set(api_name_pins) != set(ROLE_ORDER):
+    if type(api_name_pins) is not dict or set(api_name_pins) != set(PROFILE_ROLES[profile]):
         raise Refusal("api-job-map-unresolved")
-    required_roles = ROLE_ORDER[:1] if gate == "A" else ROLE_ORDER[:2]
+    required_roles = gate_roles(profile, gate)
     job_ids = set()
     check_urls = set()
     for role in required_roles:
-        allowed_statuses = ("in_progress", "completed") if role == "windows-receiver" else ("completed",)
+        allowed_statuses = ("in_progress", "completed") if role in WINDOWS_ROLES else ("completed",)
         job = validate_role_job(jobs_snapshot, run_id, run_attempt, control_sha,
                                 role, api_name_pins[role], allowed_statuses)
         if job["status"] == "completed" and job["conclusion"] != "success":
@@ -2056,7 +2494,7 @@ def verify_transition_evidence(
         job_ids.add(identifier)
         check_urls.add(job["check_run_url"])
     artifact_map = validate_artifact_inventory(
-        artifacts_snapshot, run_id, run_attempt, control_sha, required_roles)
+        artifacts_snapshot, run_id, run_attempt, control_sha, required_roles, profile)
     roles = {role: artifact_map[role][0] for role in required_roles}
     result = validate_role_artifact_set(
         profile, repository, ref, control_sha, run_id, run_attempt,
@@ -2135,13 +2573,40 @@ def _write_json(path, value):
     )
 
 
+def _prepare_flags(arguments, profile, role, ref):
+    provided = {name for name in PREPARE_FLAGS if getattr(arguments, name, None) is not None}
+    if profile != "candidate":
+        if provided & PREPARE_CANDIDATE_ONLY_FLAGS:
+            raise Refusal("prepare-flag-profile")
+        return provided
+    required = set(PREPARE_ROLE_FLAGS[role])
+    if role == "linux-fetch-encrypt" and ref == "refs/heads/untrusted":
+        required.add("revocation_receipt")
+    if required - provided:
+        raise Refusal("prepare-flag-missing")
+    if provided - required:
+        raise Refusal("prepare-flag-foreign")
+    return provided
+
+
+def _candidate_records(arguments, repository_id, control_sha, run_id, run_attempt, workflow_ref):
+    producer = _read_regular(arguments.receiver_record, KEY_RECORD_SIZE, "receiver-record-unavailable")
+    verifier = _read_regular(arguments.verifier_record, KEY_RECORD_SIZE, "verifier-record-unavailable")
+    for held in (producer, verifier):
+        validate_key_record(held, repository_id, control_sha, run_id, run_attempt, workflow_ref,
+                            allow_any_point=True)
+    if producer == verifier:
+        raise Refusal("receiver-records-identical")
+    return producer, verifier
+
+
 def prepare_subject(arguments):
     profile = arguments.profile
     role = arguments.role
-    if profile not in CALLER_PROFILES or role not in ROLE_ORDER:
+    if profile not in CALLER_PROFILES or role not in profile_roles(profile):
         raise Refusal("prepare-profile-role")
     profile_data = CALLER_PROFILES[profile]
-    if arguments.ref != profile_data["ref"]:
+    if arguments.ref not in profile_data["refs"]:
         raise Refusal("prepare-ref")
     repository = arguments.repository
     if repository != CONTROL_REPOSITORY:
@@ -2153,10 +2618,41 @@ def prepare_subject(arguments):
     run_attempt = _is_u32(arguments.run_attempt)
     if arguments.runner != ROLE_RUNNERS[role]:
         raise Refusal("prepare-runner")
-    workflow_ref = repository + "/" + profile_data["path"] + "@" + profile_data["ref"]
+    workflow_ref = repository + "/" + profile_data["path"] + "@" + arguments.ref
     if arguments.workflow_ref != workflow_ref:
         raise Refusal("prepare-workflow-ref")
-    if role == "windows-receiver":
+    _prepare_flags(arguments, profile, role, arguments.ref)
+    allow_any = profile == "candidate"
+    if profile == "candidate" and role in ("windows-producer", "windows-verifier"):
+        point = _read_regular(arguments.public_point_file, 65, "public-point-unavailable")
+        subject = make_key_record(
+            repository_id, control_sha, run_id, run_attempt, workflow_ref, public_point=point,
+        )
+        key_record = subject
+    elif profile == "candidate":
+        key_record, verifier_record = _candidate_records(
+            arguments, repository_id, control_sha, run_id, run_attempt, workflow_ref)
+        producer_capsule = _file_digest(arguments.capsule_producer, "capsule-producer-unavailable")
+        verifier_capsule = _file_digest(arguments.capsule_verifier, "capsule-verifier-unavailable")
+        if role == "linux-fetch-encrypt":
+            revocation = validate_revocation_receipt(
+                arguments.revocation_receipt, arguments.ref, control_sha, run_id, run_attempt)
+            if revocation != "confirmed":
+                raise Refusal("binding-revocation")
+            subject = build_binding_subject(
+                key_record, verifier_record, producer_capsule, verifier_capsule,
+                arguments.source_sha, arguments.tree_id, arguments.lock_sha256, arguments.manifest_sha256,
+            )
+        else:
+            linux_bytes = _read_regular(arguments.linux_subject, BINDING_MAX_BYTES, "linux-subject-unavailable")
+            document = parse_binding_subject(linux_bytes)
+            if (document["key_record_producer_sha256"] != hashlib.sha256(key_record).hexdigest()
+                    or document["key_record_verifier_sha256"] != hashlib.sha256(verifier_record).hexdigest()
+                    or document["capsule_producer_sha256"] != producer_capsule
+                    or document["capsule_verifier_sha256"] != verifier_capsule):
+                raise Refusal("binding-mismatch")
+            subject = build_attested_subject(linux_bytes)
+    elif role == "windows-receiver":
         subject = make_key_record(
             repository_id,
             control_sha,
@@ -2186,7 +2682,7 @@ def prepare_subject(arguments):
         role,
         repository,
         control_sha,
-        profile_data["ref"],
+        arguments.ref,
         run_id,
         run_attempt,
         key_record,
@@ -2199,6 +2695,7 @@ def prepare_subject(arguments):
         run_id,
         run_attempt,
         workflow_ref,
+        allow_any_point=allow_any,
     )
     target = Path(arguments.output_directory)
     target.mkdir(parents=True, exist_ok=True)
@@ -2292,7 +2789,7 @@ def _cmd_export_provider(arguments):
         unused_payload, statement = signed_statement_payload(row["bundle"])
         predicate = statement.get("predicate")
         role = predicate.get("role") if type(predicate) is dict else None
-        if role not in ROLE_ORDER:
+        if role not in ALL_ROLES:
             raise Refusal("provider-role-predicate")
         _write_json(directory / ("bundle-%d.json" % index), row["bundle"])
         manifest.append("%d %s" % (index, role))
@@ -2302,7 +2799,10 @@ def _cmd_export_provider(arguments):
 def _cmd_find_job(arguments):
     snapshot = load_json_file(arguments.jobs_file)
     role = arguments.role
-    api_name = API_JOB_NAME_PINS[arguments.profile][role]
+    pins = API_JOB_NAME_PINS[arguments.profile]
+    if role not in pins:
+        raise Refusal("find-job-role")
+    api_name = pins[role]
     if arguments.observe:
         jobs = _validate_snapshot(snapshot, "jobs", arguments.run_id,
                                   arguments.run_attempt, arguments.head_sha)
@@ -2324,7 +2824,7 @@ def _without_mark(text):
     return text[1:] if text.startswith(BYTE_ORDER_MARK) else text
 
 
-def parse_linux_log_sections(log_text, job_name, step_names):
+def parse_linux_log_sections(log_text, job_name, step_names, markers=None):
     if type(log_text) is not str or type(job_name) is not str:
         raise Refusal("linux-log-shape")
     sections = {step_id: [] for step_id in step_names}
@@ -2348,7 +2848,7 @@ def parse_linux_log_sections(log_text, job_name, step_names):
         labels.append(fields[1])
         messages.append(CONTROL_BYTES.sub(_caret_form, match.group(2)))
     if messages and all(label == UNLABELED_LOG_STEP for label in labels):
-        return _marker_log_sections(messages, step_names)
+        return _marker_log_sections(messages, step_names, markers)
     for label, message in zip(labels, messages):
         matches = [step_id for step_id, name in step_names.items() if label == name]
         if len(matches) == 1:
@@ -2361,7 +2861,8 @@ def parse_linux_log_sections(log_text, job_name, step_names):
             "other": ["\n".join(other)]}
 
 
-def _marker_log_sections(messages, step_names):
+def _marker_log_sections(messages, step_names, markers=None):
+    markers = LINUX_STEP_LOG_MARKERS if markers is None else markers
     blocks = []
     header = False
     for index, message in enumerate(messages):
@@ -2382,7 +2883,7 @@ def _marker_log_sections(messages, step_names):
             blocks[-1]["output"].append(index)
     claimed = {}
     for step_id in step_names:
-        marker = LINUX_STEP_LOG_MARKERS.get(step_id)
+        marker = markers.get(step_id)
         found = [number for number, block in enumerate(blocks) if marker in block["script"]]
         if marker is None or not found:
             raise Refusal("linux-log-section-missing")
@@ -2512,7 +3013,8 @@ def _cmd_parse_linux_logs(arguments):
     except (OSError, UnicodeDecodeError):
         raise Refusal("linux-log-unavailable")
     _write_json(arguments.output, parse_linux_log_sections(
-        log_text, job["name"], API_LINUX_STEP_NAME_PINS[arguments.profile]))
+        log_text, job["name"], API_LINUX_STEP_NAME_PINS[arguments.profile],
+        LINUX_STEP_LOG_MARKERS_BY_PROFILE[arguments.profile]))
 
 
 def _cmd_gate_transition(arguments):
@@ -2523,10 +3025,10 @@ def _cmd_gate_transition(arguments):
         raise Refusal("observation-output-missing")
     jobs = load_json_file(arguments.jobs_file)
     artifacts = load_json_file(arguments.artifacts_file)
-    required_roles = ROLE_ORDER[:1] if arguments.gate == "A" else ROLE_ORDER[:2]
+    required_roles = gate_roles(profile, arguments.gate)
     artifact_map = validate_artifact_inventory(artifacts, arguments.run_id,
                                                arguments.run_attempt, arguments.control_sha,
-                                               required_roles)
+                                               required_roles, profile)
     providers = load_provider_snapshots(artifact_map, required_roles,
                                         arguments.artifact_directory,
                                         arguments.provider_directory,
@@ -2565,11 +3067,11 @@ def _cmd_gate_transition(arguments):
 
 def observed_pins(jobs_snapshot, artifact_map, artifact_directory, roles,
                   run_id, run_attempt, control_sha, profile):
-    if profile not in CALLER_PROFILES or not roles or set(roles) - set(ROLE_ORDER):
+    if profile not in CALLER_PROFILES or not roles or set(roles) - set(PROFILE_ROLES[profile]):
         raise Refusal("observation-profile")
     jobs = _validate_snapshot(jobs_snapshot, "jobs", run_id, run_attempt, control_sha)
-    api_pins = {role: None for role in ROLE_ORDER}
-    digest_pins = {role: None for role in ROLE_ORDER}
+    api_pins = {role: None for role in PROFILE_ROLES[profile]}
+    digest_pins = {role: None for role in PROFILE_ROLES[profile]}
     ordinal_pins = {step: None for step in API_LINUX_STEP_NAME_PINS[profile]}
     job_observations = {}
     for role in roles:
@@ -2578,14 +3080,15 @@ def observed_pins(jobs_snapshot, artifact_map, artifact_directory, roles,
         if len(matches) != 1:
             raise Refusal("observation-job-cardinality")
         name = matches[0]["name"]
-        allowed = ("in_progress", "completed") if role == "windows-receiver" else ("completed",)
+        allowed = ("in_progress", "completed") if role in WINDOWS_ROLES else ("completed",)
         job = validate_role_job(jobs_snapshot, run_id, run_attempt, control_sha,
                                 role, name, allowed)
         if job["status"] == "completed" and job["conclusion"] != "success":
             raise Refusal("observation-job-not-successful")
         api_pins[role] = name
         job_observations[role] = {
-            "policy_caller_job_id": role, "policy_callee_job_id": role,
+            "policy_caller_job_id": role,
+            "policy_callee_job_id": "windows-candidate" if profile == "candidate" and role in WINDOWS_ROLES else role,
             "job_id": _api_numeric_id(job["id"], "api-job-id"),
             "check_run_id": _api_numeric_id(job["check_run_url"].rsplit("/", 1)[1],
                                             "api-check-run-id"),
@@ -2661,7 +3164,7 @@ def _cmd_verify_snapshot(arguments):
     if repository != CONTROL_REPOSITORY:
         raise Refusal("control-repository")
     validate_commit_sha(arguments.control_sha)
-    if arguments.ref != CALLER_PROFILES[profile]["ref"]:
+    if arguments.ref not in profile_refs(profile):
         raise Refusal("profile-ref")
     jobs = _read_pages_argument(arguments.jobs_file)
     artifacts = _read_pages_argument(arguments.artifacts_file)
@@ -2672,9 +3175,10 @@ def _cmd_verify_snapshot(arguments):
     repository_metadata = load_json_file(arguments.repository_metadata)
     run_metadata = load_json_file(arguments.run_metadata)
     artifact_map = validate_artifact_inventory(artifacts, arguments.run_id,
-                                               arguments.run_attempt, arguments.control_sha)
+                                               arguments.run_attempt, arguments.control_sha,
+                                               profile_roles(profile), profile)
     provider_snapshots = load_provider_snapshots(
-        artifact_map, ROLE_ORDER, Path(arguments.evidence_directory) / "artifacts",
+        artifact_map, profile_roles(profile), Path(arguments.evidence_directory) / "artifacts",
         arguments.evidence_directory, arguments.run_id, arguments.run_attempt,
         arguments.control_sha)
     api_pins = API_JOB_NAME_PINS[profile]
@@ -2684,7 +3188,7 @@ def _cmd_verify_snapshot(arguments):
     if arguments.observe:
         api_pins, digest_pins, ordinal_pins, job_observations = observed_pins(
             jobs, artifact_map, Path(arguments.evidence_directory) / "artifacts",
-            ROLE_ORDER, arguments.run_id, arguments.run_attempt,
+            profile_roles(profile), arguments.run_id, arguments.run_attempt,
             arguments.control_sha, profile)
         if not arguments.linux_logs:
             raise Refusal("observation-linux-logs-missing")
@@ -2726,6 +3230,212 @@ def _cmd_verify_snapshot(arguments):
     print("probe=role-signer result=source-free-evidence-verified profile=%s gate-c=blocked gate-d=blocked" % profile)
 
 
+def run_gh(arguments, output_path):
+    try:
+        with open(output_path, "wb") as handle:
+            result = subprocess.run(
+                ["gh"] + list(arguments), stdin=subprocess.DEVNULL, stdout=handle,
+                stderr=subprocess.DEVNULL, timeout=GUARD_TIMEOUT_SECONDS, check=False,
+            )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _capsule_artifact(row, run_id, control_sha):
+    run = row.get("workflow_run")
+    if (type(run) is not dict or _api_numeric_id(run.get("id"), "receive-capsule-artifact") != run_id
+            or run.get("head_sha") != control_sha or row.get("expired") is not False):
+        raise Refusal("receive-capsule-artifact")
+    size = _is_u64(row.get("size_in_bytes"), positive=False)
+    if not DESIGN_CAPSULE_SIZE <= size <= DESIGN_CAPSULE_SIZE + CAPSULE_SLACK_BYTES:
+        raise Refusal("receive-capsule-size")
+    digest = row.get("digest")
+    if type(digest) is not str or re.fullmatch(r"sha256:[a-f0-9]{64}", digest) is None:
+        raise Refusal("receive-capsule-artifact")
+    return {"id": _api_numeric_id(row.get("id"), "receive-capsule-artifact"), "size": size, "digest": digest}
+
+
+def _receive_wait(gh, sleep, clock, work, repository, run_id, attempt, control_sha, short, seconds):
+    deadline = clock() + seconds
+    pages_path = work / "artifact-pages.json"
+    api_path = "repos/%s/actions/runs/%d/artifacts?per_page=100" % (repository, run_id)
+    capsule_name = "source-capsule-%s-%d-%d" % (short, run_id, attempt)
+    prefixes = ["role-statement-%s-%d-%d-" % (role, run_id, attempt) for role in CANDIDATE_ROLES]
+    while True:
+        if gh(["api", "--paginate", "--slurp", api_path], str(pages_path)):
+            try:
+                pages = load_json_file(pages_path)
+                if type(pages) is not list:
+                    raise Refusal("api-pages-shape")
+                snapshot = wrap_api_pages("artifacts", pages, run_id, attempt, control_sha)
+                rows = _validate_snapshot(snapshot, "artifacts", run_id, attempt, control_sha)
+            except Refusal:
+                snapshot = None
+            if snapshot is not None:
+                names = [row.get("name") for row in rows if type(row) is dict]
+                if capsule_name in names and all(
+                        any(type(name) is str and name.startswith(prefix) for name in names)
+                        for prefix in prefixes):
+                    return snapshot, rows, capsule_name
+        if clock() >= deadline:
+            raise Refusal("receive-deadline")
+        sleep(RECEIVE_POLL_SECONDS)
+
+
+def _receive_statements(gh, work, repository, run_id, attempt, snapshot):
+    evidence = work / "artifacts"
+    evidence.mkdir()
+    artifacts = {}
+    for role in CANDIDATE_ROLES:
+        artifact = select_artifact(snapshot, run_id, run_id, attempt, role)
+        archive_path = evidence / (artifact["name"] + ".zip")
+        if not gh(["api", "repos/%s/actions/artifacts/%d/zip" % (repository, artifact["id"])], str(archive_path)):
+            raise Refusal("receive-download-failed")
+        archive = read_bounded_archive(archive_path, artifact["size_in_bytes"])
+        directory = evidence / artifact["name"]
+        extract_artifact_archive(artifact, archive, directory)
+        verified = gh([
+            "attestation", "verify", str(directory / "subject.bin"), "--bundle", str(directory / "bundle.json"),
+            "--repo", repository, "--signer-workflow", repository + "/" + ROLE_PATHS[role],
+            "--predicate-type", PREDICATE_TYPE, "--cert-oidc-issuer", OIDC_ISSUER,
+            "--deny-self-hosted-runners", "--format", "json",
+        ], str(directory / "verified.json"))
+        if not verified:
+            raise Refusal("receive-attestation-verify")
+        artifacts[role] = artifact
+    return evidence, artifacts
+
+
+def _receive_extract(archive_path, output):
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = archive.infolist()
+            if len(members) != 1 or members[0].filename != "capsule.bin":
+                raise Refusal("receive-capsule-members")
+            member = members[0]
+            if member.is_dir() or (member.external_attr >> 16) & 0o170000 == 0o120000:
+                raise Refusal("receive-capsule-members")
+            if member.file_size != DESIGN_CAPSULE_SIZE:
+                raise Refusal("receive-capsule-length")
+            digest = hashlib.sha256()
+            count = 0
+            with archive.open(member) as source, open(output / "capsule.bin", "xb") as sink:
+                while True:
+                    block = source.read(HASH_BLOCK_BYTES)
+                    if not block:
+                        break
+                    count += len(block)
+                    if count > DESIGN_CAPSULE_SIZE:
+                        raise Refusal("receive-capsule-length")
+                    digest.update(block)
+                    sink.write(block)
+    except Refusal:
+        raise
+    except (OSError, zipfile.BadZipFile, RuntimeError, ValueError, EOFError):
+        raise Refusal("receive-capsule-archive")
+    if count != DESIGN_CAPSULE_SIZE:
+        raise Refusal("receive-capsule-length")
+    return digest.hexdigest()
+
+
+def _receive_into(gh, sleep, clock, work, output, arguments, repository_id, run_id, attempt, control_sha, short):
+    repository = arguments.repository
+    snapshot, rows, capsule_name = _receive_wait(
+        gh, sleep, clock, work, repository, run_id, attempt, control_sha, short, arguments.deadline_seconds)
+    capsule_rows = [row for row in rows if type(row) is dict and row.get("name") == capsule_name]
+    if len(capsule_rows) != 1:
+        raise Refusal("receive-capsule-artifact")
+    capsule = _capsule_artifact(capsule_rows[0], run_id, control_sha)
+    metadata_path = work / "repository.json"
+    if not gh(["api", "repos/" + repository, "--jq",
+               "{id:.id,full_name:.full_name,owner_id:.owner.id,visibility:.visibility}"], str(metadata_path)):
+        raise Refusal("receive-api-failed")
+    metadata_id, owner_id = validate_repository_metadata(load_json_file(metadata_path), repository)
+    if metadata_id != repository_id:
+        raise Refusal("receive-repository-id")
+    evidence, artifacts = _receive_statements(gh, work, repository, run_id, attempt, snapshot)
+    validate_role_artifact_set(
+        "candidate", repository, arguments.ref, control_sha, run_id, attempt, repository_id, owner_id,
+        artifacts, evidence, resolve_certificate_pins("candidate", control_sha), CANDIDATE_ROLES,
+    )
+    own = (evidence / artifacts[arguments.role]["name"] / "subject.bin").read_bytes()
+    binding = parse_binding_subject(
+        (evidence / artifacts["linux-fetch-encrypt"]["name"] / "subject.bin").read_bytes())
+    if binding["key_record_%s_sha256" % short] != hashlib.sha256(own).hexdigest():
+        raise Refusal("receive-key-record-mismatch")
+    capsule_zip = work / "capsule.zip"
+    if not gh(["api", "repos/%s/actions/artifacts/%d/zip" % (repository, capsule["id"])], str(capsule_zip)):
+        raise Refusal("receive-download-failed")
+    if capsule_zip.is_symlink() or not capsule_zip.is_file() or capsule_zip.stat().st_size != capsule["size"]:
+        raise Refusal("receive-capsule-size")
+    if "sha256:" + _file_digest(capsule_zip, "receive-capsule-archive") != capsule["digest"]:
+        raise Refusal("receive-capsule-digest")
+    digest = _receive_extract(capsule_zip, output)
+    if digest != binding["capsule_%s_sha256" % short]:
+        raise Refusal("receive-capsule-digest")
+    if binding["revocation"] != "confirmed":
+        raise Refusal("binding-revocation")
+    _write_json(output / "bound.json", {
+        "capsule_sha256": digest, "source_sha": binding["source_sha"], "tree_id": binding["tree_id"],
+        "lock_sha256": binding["lock_sha256"], "manifest_sha256": binding["manifest_sha256"],
+        "revocation": binding["revocation"],
+    })
+    return digest
+
+
+def _clear_directory(directory, remove):
+    try:
+        for item in Path(directory).iterdir():
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink()
+        if remove:
+            Path(directory).rmdir()
+    except OSError:
+        pass
+
+
+def receive_capsule(arguments, gh=None, sleep=None, clock=None):
+    gh = run_gh if gh is None else gh
+    sleep = time.sleep if sleep is None else sleep
+    clock = time.monotonic if clock is None else clock
+    if arguments.profile != "candidate" or arguments.role not in ("windows-producer", "windows-verifier"):
+        raise Refusal("receive-profile-role")
+    if arguments.ref not in profile_refs("candidate"):
+        raise Refusal("receive-ref")
+    if arguments.repository != CONTROL_REPOSITORY:
+        raise Refusal("control-repository")
+    repository_id = _is_u64(arguments.repository_id)
+    control_sha = validate_commit_sha(arguments.control_sha)
+    run_id = _is_u64(arguments.run_id)
+    attempt = _is_u32(arguments.run_attempt)
+    seconds = arguments.deadline_seconds
+    if type(seconds) is not int or not 1 <= seconds <= 3600:
+        raise Refusal("receive-deadline-range")
+    output = Path(arguments.output_directory)
+    created = not output.exists()
+    if not created and (output.is_symlink() or not output.is_dir() or any(output.iterdir())):
+        raise Refusal("receive-output")
+    output.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(output, 0o700)
+    except OSError:
+        pass
+    work = Path(tempfile.mkdtemp(prefix="kd-receive-", dir=str(output.parent)))
+    try:
+        digest = _receive_into(
+            gh, sleep, clock, work, output, arguments, repository_id, run_id, attempt, control_sha,
+            arguments.role[len("windows-"):])
+    except BaseException:
+        _clear_directory(output, created)
+        raise
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print("capsule=received role=%s sha256=%s" % (arguments.role, digest))
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2742,6 +3452,27 @@ def build_parser():
     prepare.add_argument("--runner", required=True)
     prepare.add_argument("--output-directory", required=True)
     prepare.add_argument("--receiver-record")
+    prepare.add_argument("--verifier-record")
+    prepare.add_argument("--capsule-producer")
+    prepare.add_argument("--capsule-verifier")
+    prepare.add_argument("--public-point-file")
+    prepare.add_argument("--revocation-receipt")
+    prepare.add_argument("--source-sha")
+    prepare.add_argument("--tree-id")
+    prepare.add_argument("--lock-sha256")
+    prepare.add_argument("--manifest-sha256")
+    prepare.add_argument("--linux-subject")
+    receive = commands.add_parser("receive-capsule")
+    receive.add_argument("--profile", required=True)
+    receive.add_argument("--role", choices=("windows-producer", "windows-verifier"), required=True)
+    receive.add_argument("--repository", required=True)
+    receive.add_argument("--repository-id", required=True)
+    receive.add_argument("--control-sha", required=True)
+    receive.add_argument("--ref", required=True)
+    receive.add_argument("--run-id", required=True)
+    receive.add_argument("--run-attempt", required=True)
+    receive.add_argument("--deadline-seconds", type=int, required=True)
+    receive.add_argument("--output-directory", required=True)
     wrap = commands.add_parser("wrap-pages")
     wrap.add_argument("--kind", choices=("jobs", "artifacts"), required=True)
     wrap.add_argument("--input", required=True)
@@ -2758,13 +3489,13 @@ def build_parser():
     provider.add_argument("--head-sha", required=True)
     find = commands.add_parser("find-artifact")
     find.add_argument("--artifacts-file", required=True)
-    find.add_argument("--role", choices=ROLE_ORDER, required=True)
+    find.add_argument("--role", choices=ALL_ROLES, required=True)
     find.add_argument("--run-id", required=True)
     find.add_argument("--run-attempt", required=True)
     find.add_argument("--field", choices=("id", "name"), default="name")
     extract = commands.add_parser("extract-artifact")
     extract.add_argument("--artifacts-file", required=True)
-    extract.add_argument("--role", choices=ROLE_ORDER, required=True)
+    extract.add_argument("--role", choices=ALL_ROLES, required=True)
     extract.add_argument("--run-id", required=True)
     extract.add_argument("--run-attempt", required=True)
     extract.add_argument("--head-sha", required=True)
@@ -2785,7 +3516,7 @@ def build_parser():
     guard.add_argument("guard_command", nargs=argparse.REMAINDER)
     find_job = commands.add_parser("find-job")
     find_job.add_argument("--profile", choices=tuple(CALLER_PROFILES), required=True)
-    find_job.add_argument("--role", choices=ROLE_ORDER, required=True)
+    find_job.add_argument("--role", choices=ALL_ROLES, required=True)
     find_job.add_argument("--jobs-file", required=True)
     find_job.add_argument("--run-id", required=True)
     find_job.add_argument("--run-attempt", required=True)
@@ -2858,6 +3589,8 @@ def main(argv=None):
             _cmd_parse_linux_logs(arguments)
         elif arguments.command == "gate-transition":
             _cmd_gate_transition(arguments)
+        elif arguments.command == "receive-capsule":
+            receive_capsule(arguments)
         elif arguments.command == "guard":
             return _cmd_guard(arguments)
         else:
