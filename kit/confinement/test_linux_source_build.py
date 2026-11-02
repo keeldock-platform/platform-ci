@@ -16,6 +16,7 @@ if not sys.platform.startswith("linux"):
     raise unittest.SkipTest("the Linux source build suite runs only on Linux")
 
 import foundation_node_feedback
+import gate_table
 import confinement_public_audit
 import confinement_verdict
 import log_canary
@@ -48,13 +49,12 @@ def _registry_lock():
 class LinuxSourceBuildTests(unittest.TestCase):
     def test_gate_order_matches_the_shared_macos_contracts(self):
         expected = (
-            tuple(name for name in macos_core_contract.GATE_NAMES
-                  if name not in macos_core_contract.API_FEATURE_GATE_NAMES)
+            macos_core_contract.GATE_NAMES
             + macos_core_contract.PARSER_GATE_NAMES
             + foundation_node_feedback.NODE_GATE_NAMES
         )
         self.assertEqual(linux_source_build.GATES, expected)
-        self.assertEqual(len(linux_source_build.GATES), 13)
+        self.assertEqual(len(linux_source_build.GATES), 15)
 
     def test_source_job_steps_match_the_policy_audit_contract(self):
         self.assertEqual(
@@ -1005,8 +1005,8 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     "RUST_ROOT": "/rust", "NODE_BIN": "/node",
                     "REQUESTED_SOURCE_SHA": source_sha,
                 }), 0)
-                self.assertEqual(directories.call_count, 13)
-                self.assertEqual(session.call_count, 13)
+                self.assertEqual(directories.call_count, 15)
+                self.assertEqual(session.call_count, 15)
                 durations = json.loads((root / "kd-records" / "gate-durations.json").read_text(encoding="ascii"))
                 self.assertEqual(durations["schema_version"], 1)
                 self.assertEqual(set(durations["durations_ms"]), set(linux_source_build.GATES))
@@ -1276,7 +1276,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             receipt = json.loads((Path(temporary) / "kd-records" / "gates.json").read_text(encoding="ascii"))
             self.assertEqual(receipt["selected_gates"], list(linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES))
             self.assertEqual(receipt["completed_gates"], receipt["selected_gates"])
-            self.assertEqual(receipt["gate_count"], 16)
+            self.assertEqual(receipt["gate_count"], 18)
             self.assertEqual(
                 sorted((call.args[1].source_sha, call.args[1].profile, call.args[1].root)
                        for call in admission.call_args_list),
@@ -1364,7 +1364,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "run_id": 7, "run_attempt": 1, "channels": merged["channels"],
                 "memory_canary": "absent", "readable_file_canary": "absent",
                 "handoff": "not-applicable", "project_execution": "completed",
-                "gates": 13, "failed": 0, "token_revocation": "confirmed",
+                "gates": 15, "failed": 0, "token_revocation": "confirmed",
             }
             self.assertTrue(confinement_verdict.run_accepted(forged))
             env = {
@@ -1402,7 +1402,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "selected_gates": list(linux_source_build.GATES),
                 "completed_gates": list(linux_source_build.GATES),
                 "gates": {name: "passed" for name in linux_source_build.GATES},
-                "gate_count": 13,
+                "gate_count": 15,
                 "failed": 0,
             }
             receipt = {
@@ -1418,7 +1418,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "CI_MODE": "source", "PRODUCER_RESULT": "success",
             }
             trusted = linux_source_build._verdict_record(env)
-            self.assertEqual(trusted["gates"], 13)
+            self.assertEqual(trusted["gates"], 15)
             self.assertTrue(confinement_verdict.run_accepted(trusted))
             with patch.object(linux_source_build.sys, "stdout", io.StringIO()):
                 self.assertEqual(linux_source_build.emit_verdict(env), 0)
@@ -1469,9 +1469,9 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "CI_MODE": "source", "PRODUCER_RESULT": "success",
             }
             public_record = linux_source_build._verdict_record(env)
-            self.assertEqual(public_record["gates"], 16)
-            self.assertEqual(len(selected), 16)
-            self.assertIn(" gates=16 failed=0 ", confinement_verdict.encode_line(public_record))
+            self.assertEqual(public_record["gates"], 18)
+            self.assertEqual(len(selected), 18)
+            self.assertIn(" gates=18 failed=0 ", confinement_verdict.encode_line(public_record))
             self.assertTrue(confinement_verdict.run_accepted(public_record))
             gates["completed_gates"] = list(selected[:-1])
             (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
@@ -2368,6 +2368,267 @@ class LinuxAuditDetailTests(unittest.TestCase):
             "tool-b": _vulnerability("tool-b", via=["tool-a"], nodes=["node_modules/tool-b"]),
         })
         self.assertEqual(self._detail(detached, packages=packages).detail, "audit_consumer_unreached")
+
+
+class WindowsSourceBindingTests(unittest.TestCase):
+    SOURCE = "a" * 40
+    BASE = "b" * 40
+    CONTROL = "d" * 40
+    FINGERPRINT = "c" * 64
+
+    def _environment(self, prefix="WINDOWS_SOURCE"):
+        return {
+            "REQUESTED_SOURCE_SHA": self.SOURCE, "REQUESTED_BASE_SHA": self.BASE,
+            "REQUESTED_BASE_BRANCH": "main", "REQUESTED_FINGERPRINT": self.FINGERPRINT,
+            "CI_SHA": self.CONTROL,
+            prefix + "_ALLOWED_SHA": self.SOURCE, prefix + "_ALLOWED_BASE_SHA": self.BASE,
+            prefix + "_ALLOWED_BASE_BRANCH": "main",
+            prefix + "_ALLOWED_FINGERPRINT": self.FINGERPRINT,
+            prefix + "_ALLOWED_CONTROL_SHA": self.CONTROL,
+            "SOURCE_REPOSITORY_ID": "7", "SOURCE_REPOSITORY_OWNER": "owner",
+            "SOURCE_REPOSITORY_NAME": "source", "SOURCE_READER_INSTALLATION_ID": "8",
+            "SOURCE_READER_CLIENT_ID": "client",
+            prefix + "_ACCEPTED_NODE_LOCK_SHA256": "f" * 64,
+            prefix + "_ACCEPTED_MANIFEST_SHA256": "1" * 64,
+            prefix + "_ACCEPTED_NODE_PROVENANCE_JSON": "{}",
+            prefix + "_ENVIRONMENT_NAME": "linux-source-read",
+            "REQUESTED_ENVIRONMENT_NAME": "linux-source-read",
+        }
+
+    def _dispatch_environment(self, ref, mode):
+        return {
+            "CI_EVENT_NAME": "workflow_dispatch", "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "CI_SERVER_URL": "https://github.com", "CACHE_MODE": "none",
+            "CI_SHA": self.CONTROL, "GITHUB_SHA": self.CONTROL, "CI_REF": ref, "CI_MODE": mode,
+        }
+
+    def test_prefixes_are_the_closed_pair(self):
+        self.assertEqual(linux_source_build.LINUX_SOURCE_PREFIX, "LINUX_SOURCE")
+        self.assertEqual(linux_source_build.WINDOWS_SOURCE_PREFIX, "WINDOWS_SOURCE")
+        self.assertEqual(linux_source_build.SOURCE_PREFIXES, ("LINUX_SOURCE", "WINDOWS_SOURCE"))
+        self.assertEqual(
+            linux_source_build.WINDOWS_TIER, ("windows-source-admission.yml", "Windows admission source "),
+        )
+
+    def test_windows_binding_reads_only_the_windows_names(self):
+        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
+            identity = linux_source_build._source_inputs(self._environment(), prefix="WINDOWS_SOURCE")
+            self.assertEqual(identity["source_sha"], self.SOURCE)
+            self.assertEqual(identity["reviewed_diff_sha256"], self.FINGERPRINT)
+            self.assertEqual(identity["repository_id"], "7")
+            provenance.assert_called_once()
+            self.assertEqual(provenance.call_args.args[2], "WINDOWS_SOURCE")
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build._source_inputs(self._environment("LINUX_SOURCE"), prefix="WINDOWS_SOURCE")
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build._source_inputs(self._environment("WINDOWS_SOURCE"))
+            provenance.assert_called_once()
+            linux_source_build._source_inputs(self._environment("LINUX_SOURCE"))
+            self.assertEqual(provenance.call_count, 2)
+
+    def test_every_windows_binding_name_is_required_and_checked(self):
+        for suffix in (
+            "_ALLOWED_SHA", "_ALLOWED_BASE_SHA", "_ALLOWED_BASE_BRANCH", "_ALLOWED_FINGERPRINT",
+            "_ALLOWED_CONTROL_SHA", "_ACCEPTED_NODE_LOCK_SHA256", "_ACCEPTED_MANIFEST_SHA256",
+            "_ACCEPTED_NODE_PROVENANCE_JSON", "_ENVIRONMENT_NAME",
+        ):
+            changes = ("missing", "empty") if suffix == "_ACCEPTED_NODE_PROVENANCE_JSON" else ("missing", "empty", "other")
+            for change in changes:
+                environment = self._environment()
+                name = "WINDOWS_SOURCE" + suffix
+                if change == "missing":
+                    del environment[name]
+                elif change == "empty":
+                    environment[name] = ""
+                else:
+                    environment[name] = "x" * 3
+                with self.subTest(name=name, change=change), patch.object(
+                    linux_source_build, "_validate_provenance_binding"
+                ) as provenance:
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
+                    provenance.assert_not_called()
+        environment = self._environment()
+        environment["WINDOWS_SOURCE_ENVIRONMENT_NAME"] = "source-read"
+        environment["REQUESTED_ENVIRONMENT_NAME"] = "source-read"
+        with patch.object(linux_source_build, "_validate_provenance_binding"):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
+
+    def test_unknown_prefixes_are_refused_everywhere(self):
+        for prefix in ("", "WINDOWS", "windows_source", "LINUX_SOURCE_", "MACOS_SOURCE", None, 5, b"LINUX_SOURCE"):
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                    linux_source_build._source_inputs(self._environment("LINUX_SOURCE"), prefix=prefix)
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+                    linux_source_build._validate_provenance_binding({}, {}, prefix)
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+                    linux_source_build.validate_dispatch({}, "token", prefix)
+
+    def test_windows_provenance_text_comes_from_the_windows_variable(self):
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+            linux_source_build._validate_provenance_binding(
+                {}, {"LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": "{}"}, "WINDOWS_SOURCE",
+            )
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+            linux_source_build._validate_provenance_binding(
+                {}, {"WINDOWS_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": "{}"},
+            )
+
+    def test_windows_source_dispatch_runs_only_on_untrusted_and_synthetic_only_on_main(self):
+        order = []
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, self.CONTROL]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(
+            linux_source_build, "_source_inputs", side_effect=lambda environ, prefix: order.append(prefix) or {}
+        ), patch.object(
+            linux_source_build, "_verify_environment", side_effect=lambda token: order.append("environment")
+        ), patch.object(
+            linux_source_build, "_require_no_duplicate",
+            side_effect=lambda token, environ, workflow: order.append(workflow),
+        ):
+            env = self._dispatch_environment("refs/heads/untrusted", "source")
+            self.assertEqual(linux_source_build.validate_dispatch(env, "token", "WINDOWS_SOURCE"), "source")
+        self.assertEqual(order, ["WINDOWS_SOURCE", "environment", linux_source_build.WINDOWS_TIER])
+        with patch.object(linux_source_build, "_reference_sha", side_effect=[self.CONTROL, self.CONTROL]), patch.object(
+            linux_source_build, "_comparison", return_value="identical"
+        ), patch.object(
+            linux_source_build, "_source_inputs", side_effect=AssertionError("no binding for a main source run")
+        ):
+            env = self._dispatch_environment("refs/heads/main", "source")
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+                linux_source_build.validate_dispatch(env, "token", "WINDOWS_SOURCE")
+        with patch.object(linux_source_build, "_reference_sha", side_effect=[self.CONTROL, self.CONTROL]), patch.object(
+            linux_source_build, "_comparison", return_value="identical"
+        ), patch.object(
+            linux_source_build, "_source_inputs", side_effect=AssertionError("no binding in synthetic")
+        ), patch.object(linux_source_build, "_verify_environment") as environment:
+            env = self._dispatch_environment("refs/heads/main", "synthetic")
+            self.assertEqual(linux_source_build.validate_dispatch(env, "token", "WINDOWS_SOURCE"), "synthetic")
+            environment.assert_called_once_with("token")
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, self.CONTROL]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ):
+            env = self._dispatch_environment("refs/heads/untrusted", "synthetic")
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+                linux_source_build.validate_dispatch(env, "token", "WINDOWS_SOURCE")
+
+    def test_windows_dispatch_refuses_a_linux_tier_variable_and_a_stale_untrusted_branch(self):
+        for tier in ("quick", "admission", "windows", ""):
+            with self.subTest(tier=tier):
+                env = dict(self._dispatch_environment("refs/heads/untrusted", "source"), KD_LINUX_TIER=tier)
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+                    linux_source_build.validate_dispatch(env, "token", "WINDOWS_SOURCE")
+        env = self._dispatch_environment("refs/heads/untrusted", "source")
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, "e" * 40]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "freshness"):
+                linux_source_build.validate_dispatch(env, "token", "WINDOWS_SOURCE")
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, self.CONTROL]), patch.object(
+            linux_source_build, "_comparison", return_value="diverged"
+        ):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "untrusted"):
+                linux_source_build.validate_dispatch(env, "token", "WINDOWS_SOURCE")
+
+    def test_windows_duplicate_check_uses_the_windows_workflow_and_title(self):
+        calls = []
+
+        def runs(title):
+            def fake(path, token, method="GET", payload=None, expected=(200,)):
+                calls.append(path)
+                status = "queued" if path.endswith("status=queued") else "in_progress"
+                return 200, {"total_count": 1, "workflow_runs": [{
+                    "id": 9, "display_title": title + self.SOURCE, "status": status, "event": "workflow_dispatch",
+                }]}
+            return fake
+
+        environment = {"GITHUB_RUN_ID": "5", "REQUESTED_SOURCE_SHA": self.SOURCE}
+        windows = linux_source_build.WINDOWS_TIER
+        with patch.object(linux_source_build, "_api_request", side_effect=runs("Windows admission source ")):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
+                linux_source_build._require_no_duplicate("token", environment, workflow=windows)
+        self.assertTrue(calls[0].startswith(
+            "/repos/" + linux_source_build.REPOSITORY + "/actions/workflows/windows-source-admission.yml/runs?"
+        ))
+        with patch.object(linux_source_build, "_api_request", side_effect=runs("Linux admission source ")):
+            self.assertIsNone(linux_source_build._require_no_duplicate("token", environment, workflow=windows))
+        for workflow in (("linux-source-admission.yml", "Linux admission source "), ("x", "y"), "windows", ()):
+            with self.subTest(workflow=workflow):
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
+                    linux_source_build._require_no_duplicate("token", environment, workflow=workflow)
+
+    def test_windows_entry_points_print_fixed_lines(self):
+        environment = {"GITHUB_TOKEN": "token"}
+        for function, name, suffix in (
+            (linux_source_build.windows_preflight, "windows-source-preflight", " cache-mode=none"),
+        ):
+            with patch.object(linux_source_build, "validate_dispatch", return_value="source") as dispatch:
+                output = io.StringIO()
+                with patch.object(linux_source_build.sys, "stdout", output):
+                    self.assertEqual(function(environment), 0)
+                self.assertEqual(output.getvalue(), name + "=verified mode=source" + suffix + "\n")
+                self.assertEqual(dispatch.call_args.args[2], "WINDOWS_SOURCE")
+            for error, reason in (
+                (linux_source_build.SourceBuildRefusal("binding"), "binding"), (ValueError("x"), "invalid"),
+            ):
+                with patch.object(linux_source_build, "validate_dispatch", side_effect=error):
+                    output = io.StringIO()
+                    with patch.object(linux_source_build.sys, "stdout", output):
+                        self.assertEqual(function(environment), 1)
+                    self.assertEqual(output.getvalue(), name + "=refused reason=" + reason + "\n")
+        audit = types.SimpleNamespace(
+            _default_api_factory=Mock(return_value="api"), _collect_caches=Mock(return_value=[]),
+            cache_inventory_digest=Mock(return_value="e" * 64),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            sink = Path(temporary) / "output"
+            environment = {"GITHUB_TOKEN": "token", "GITHUB_OUTPUT": str(sink)}
+            with patch.object(linux_source_build, "_audit_modules", return_value=(audit, None, None)), patch.object(
+                linux_source_build, "validate_dispatch", return_value="synthetic"
+            ) as dispatch:
+                output = io.StringIO()
+                with patch.object(linux_source_build.sys, "stdout", output):
+                    self.assertEqual(linux_source_build.windows_snapshot(environment), 0)
+                self.assertEqual(output.getvalue(), "windows-source-settings=verified mode=synthetic cache=snapped\n")
+                self.assertEqual(dispatch.call_args.args, (environment, "token", "WINDOWS_SOURCE"))
+            self.assertEqual(sink.read_text(encoding="ascii"), "cache_digest=" + "e" * 64 + "\n")
+            with patch.object(linux_source_build, "_audit_modules", side_effect=ValueError("x")):
+                output = io.StringIO()
+                with patch.object(linux_source_build.sys, "stdout", output):
+                    self.assertEqual(linux_source_build.windows_snapshot(environment), 1)
+                self.assertEqual(output.getvalue(), "windows-source-settings=refused reason=invalid\n")
+
+    def test_windows_commands_are_routed_by_the_dispatcher(self):
+        for command, function in (
+            ("windows-snapshot", "windows_snapshot"), ("windows-preflight", "windows_preflight"),
+        ):
+            with self.subTest(command=command), patch.object(linux_source_build, function, return_value=0) as target:
+                self.assertEqual(linux_source_build.main([command]), 0)
+                target.assert_called_once_with()
+        self.assertEqual(linux_source_build.main(["windows-unknown"]), 2)
+
+    def test_gate_commands_render_the_shared_table_including_the_feature_gates(self):
+        commands = linux_source_build._gate_commands(Path("/work"), "/rust", "/node")
+        self.assertEqual(
+            commands,
+            gate_table.render(
+                gate_table.gate_templates(False), "/work", "/rust/bin/cargo", "/node/bin/node", "/node/bin/npm",
+            ),
+        )
+        by_name = dict(commands)
+        feature = ("--features", "dev-uat-policy-import")
+        for name in ("api_feature_clippy", "api_feature_tests"):
+            with self.subTest(gate=name):
+                argv = by_name[name]
+                self.assertEqual(argv[argv.index("--features"):argv.index("--features") + 2], feature)
+                self.assertIn("/work/crates/host/api/Cargo.toml", argv)
+        self.assertEqual(linux_source_build.GATES, gate_table.GATES)
+        self.assertEqual(linux_source_build.RUNTIME_GATE_NAMES, gate_table.RUNTIME_GATE_NAMES)
+        self.assertEqual(linux_source_build.RUNTIME_ROOT_FILES, gate_table.RUNTIME_ROOT_FILES)
+        with patch.object(linux_source_build.gate_table, "render", side_effect=gate_table.GateTableRefusal("tool")):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "gate"):
+                linux_source_build._gate_commands(Path("/work"), "/rust", "/node")
 
 
 if __name__ == "__main__":
