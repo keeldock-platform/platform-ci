@@ -41,7 +41,9 @@ $script:PublicLinePattern = '^(windows-source|windows-confinement|capsule-decryp
 
 $NpmVersion = '11.19.1'
 $GateTableScript = 'gate_table.py'
-$GateTableGatesCommand = 'windows'
+$GateTableEmitCommand = 'emit'
+$RequiredGateCount = 15
+$MaxGateCount = 18
 $GateTableManifestCommand = 'manifest-digest'
 $GateLongSeconds = 900
 $GateShortSeconds = 300
@@ -436,25 +438,62 @@ function Import-SourceBundle($bound, $manifest, [string]$bundlePath, [string]$pr
         if ($match.Groups[1].Value -ceq '100755') { $mode = 33261 }
         if ($entry.BlobId -cne $match.Groups[2].Value -or [int]$entry.Mode -ne $mode) { throw 'tree_listing' }
     }
-    $checkout = @('--git-dir', $gitDirectory, '--work-tree', $project, '-c', 'core.autocrlf=false', '-c', 'core.symlinks=false', '-c', 'core.protectNTFS=true', '-c', 'core.longpaths=true', '-c', 'core.fsmonitor=false', '-c', 'core.eol=lf', 'checkout', '--force', $bound['source_sha'], '--', '.')
+    $checkout = @('--git-dir', $gitDirectory, '--work-tree', $project, '-c', 'core.autocrlf=false', '-c', 'core.symlinks=false', '-c', 'core.protectNTFS=true', '-c', 'core.longpaths=true', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=NUL', '-c', 'core.eol=lf', 'checkout', '--force', $bound['source_sha'], '--', '.')
     [void](Invoke-GitStep $checkout $project 600)
 }
 
-function Remove-SourceConfigFiles([string]$project) {
-    foreach ($file in @([IO.Directory]::EnumerateFiles($project, '.npmrc', [IO.SearchOption]::AllDirectories))) {
-        [IO.File]::Delete($file)
+function Get-SourceWalk([string]$project, [string]$pattern, [bool]$directories) {
+    $found = @()
+    $pending = New-Object System.Collections.Generic.Queue[string]
+    $pending.Enqueue($project)
+    $flat = New-Object System.IO.EnumerationOptions
+    $flat.RecurseSubdirectories = $false
+    $flat.AttributesToSkip = [IO.FileAttributes]::None
+    $flat.IgnoreInaccessible = $false
+    $flat.MatchCasing = [System.IO.MatchCasing]::CaseInsensitive
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        foreach ($child in [IO.Directory]::EnumerateDirectories($current, '*', $flat)) {
+            $info = New-Object IO.DirectoryInfo($child)
+            if (([int]$info.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                if ($info.Name -ieq '.cargo') { $found += ('L|' + $child) }
+                continue
+            }
+            if ($directories -and $info.Name -ieq $pattern) { $found += ('D|' + $child) }
+            $pending.Enqueue($child)
+        }
+        if (-not $directories) {
+            foreach ($file in [IO.Directory]::EnumerateFiles($current, $pattern, $flat)) { $found += ('F|' + $file) }
+        }
     }
-    $found = 0
-    foreach ($directory in @([IO.Directory]::EnumerateDirectories($project, '.cargo', [IO.SearchOption]::AllDirectories))) {
+    return $found
+}
+
+function Remove-SourceConfigFiles([string]$project) {
+    foreach ($entry in @(Get-SourceWalk $project '.cargo' $true)) {
+        $kind = $entry.Substring(0, 1)
+        $directory = $entry.Substring(2)
+        if ($kind -ceq 'L') {
+            [IO.Directory]::Delete($directory)
+            continue
+        }
         foreach ($file in @([IO.Directory]::EnumerateFiles($directory, 'config*', [IO.SearchOption]::TopDirectoryOnly))) {
+            $info = New-Object IO.FileInfo($file)
+            if (([int]$info.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) {
+                [IO.File]::Delete($file)
+                continue
+            }
             $payload = [IO.File]::ReadAllText($file, (New-Object System.Text.UTF8Encoding($false, $true)))
             if ($payload -match '(?im)^\s*\[(?:source\.|registries\.)|^\s*(?:replace-with|registry)\s*=') { throw 'registry' }
             [IO.File]::Delete($file)
-            $found += 1
         }
     }
+    foreach ($entry in @(Get-SourceWalk $project '.npmrc' $false)) {
+        [IO.File]::Delete($entry.Substring(2))
+    }
     $locks = 0
-    foreach ($file in @([IO.Directory]::EnumerateFiles($project, 'Cargo.lock', [IO.SearchOption]::AllDirectories))) {
+    foreach ($entry in @(Get-SourceWalk $project 'Cargo.lock' $false)) {
+        $file = $entry.Substring(2)
         $item = Get-Item -LiteralPath $file -Force
         if ($item.Length -gt 4194304) { throw 'lock' }
         foreach ($line in [IO.File]::ReadAllLines($file)) {
@@ -549,34 +588,40 @@ function Initialize-NpmTarballs([string]$project) {
 function Get-GatePlan([string]$project, [string]$cargo, [string]$node, [string]$npm) {
     $python = Get-TrustedTool 'python.exe'
     $gateScript = Join-Path $PSScriptRoot $GateTableScript
-    $result = Invoke-TrustedProcess $python @('-B', $gateScript, $GateTableGatesCommand) $PSScriptRoot (Get-TrustedEnvironment $python $script:Layout.Private) 120 65536
+    $runtime = Test-RuntimeWorkspace $project
+    $selection = 'base'
+    $expectedCount = $RequiredGateCount
+    if ($runtime) {
+        $selection = 'runtime'
+        $expectedCount = $MaxGateCount
+    }
+    $result = Invoke-TrustedProcess $python @('-B', $gateScript, $GateTableEmitCommand, $selection) $PSScriptRoot (Get-TrustedEnvironment $python $script:Layout.Private) 120 65536
     if ($result.TimedOut -or $result.ExitCode -ne 0) { throw 'gate_plan' }
     $plan = [string]$result.Stdout | ConvertFrom-Json -AsHashtable
-    if ($plan['schema_version'] -ne 1 -or $plan['gates'] -isnot [System.Collections.IEnumerable]) { throw 'gate_plan' }
+    if ($plan.Keys.Count -ne 2 -or $plan['schema_version'] -ne 1 -or $plan['gates'] -isnot [System.Collections.IEnumerable]) { throw 'gate_plan' }
     $gates = @()
-    $ids = @{}
-    $runtime = Test-RuntimeWorkspace $project
+    $names = @{}
     foreach ($gate in @($plan['gates'])) {
-        $id = [string]$gate['id']
-        if ($id -cnotmatch '^[a-z][a-z_]{2,40}$' -or $ids.ContainsKey($id)) { throw 'gate_plan' }
-        $ids[$id] = $true
-        if ($gate['runtime'] -isnot [bool] -or [string]$gate['cwd'] -cne '{project}') { throw 'gate_plan' }
+        if ($gate -isnot [System.Collections.IDictionary] -or $gate.Keys.Count -ne 2) { throw 'gate_plan' }
+        $name = [string]$gate['name']
+        if ($name -cnotmatch '^[a-z][a-z_]{2,40}$' -or $names.ContainsKey($name)) { throw 'gate_plan' }
+        $names[$name] = $true
         $argv = @($gate['argv'])
         if ($argv.Count -lt 2 -or $argv.Count -gt 64) { throw 'gate_plan' }
         $expanded = @()
         foreach ($item in $argv) {
             $argument = [string]$item
             if ($argument.Length -gt 400 -or $argument -cnotmatch '^[ -~]+$') { throw 'gate_plan' }
-            $withProject = $argument.Contains('{project}')
+            $withProject = $argument.StartsWith('{project}', [StringComparison]::Ordinal)
+            if ($withProject -and $argument.Length -gt 9 -and $argument[9] -ne '/') { throw 'gate_plan' }
             $argument = $argument.Replace('{cargo}', $cargo).Replace('{node}', $node).Replace('{npm}', $npm).Replace('{project}', $project)
             if ($argument -cmatch '\{[a-z_]*\}') { throw 'gate_plan' }
             if ($withProject) { $argument = $argument.Replace('/', '\') }
             $expanded += $argument
         }
-        if ($gate['runtime'] -and -not $runtime) { continue }
-        $gates += @{ Id = $id; Argv = [string[]]$expanded }
+        $gates += @{ Id = $name; Argv = [string[]]$expanded }
     }
-    if ($gates.Count -lt 13 -or $gates.Count -gt 24) { throw 'gate_plan' }
+    if ($gates.Count -ne $expectedCount) { throw 'gate_plan' }
     return $gates
 }
 
@@ -607,8 +652,8 @@ function New-GateEnvironment {
         'NPM_CONFIG_OFFLINE=true',
         'npm_config_offline=true',
         ('NPM_CONFIG_CACHE=' + (Join-Path $root 'npm-cache')),
-        ('NPM_CONFIG_USERCONFIG=' + (Join-Path $root 'nul.npmrc')),
-        ('NPM_CONFIG_GLOBALCONFIG=' + (Join-Path $root 'nul.npmrc')),
+        ('NPM_CONFIG_USERCONFIG=' + (Join-Path $root 'empty-user.npmrc')),
+        ('NPM_CONFIG_GLOBALCONFIG=' + (Join-Path $root 'empty-global.npmrc')),
         ('NPM_CONFIG_PREFIX=' + (Join-Path $root 'npm-prefix')),
         'NPM_CONFIG_UPDATE_NOTIFIER=false',
         'NPM_CONFIG_AUDIT=false',
@@ -825,7 +870,7 @@ try {
             }
             $encoding = New-Object System.Text.UTF8Encoding($false)
             [IO.File]::WriteAllText($layout.NodeTest, 'kd-readonly', $encoding)
-            [IO.File]::WriteAllText((Join-Path $script:Lpac.Root 'nul.npmrc'), '', $encoding)
+            foreach ($npmConfigName in @('empty-user.npmrc', 'empty-global.npmrc')) { [IO.File]::WriteAllText((Join-Path $script:Lpac.Root $npmConfigName), '', $encoding) }
             Write-Line ('windows-confinement-acl=granted ro=read_execute scratch=modify ancestors_read_attributes=' + $script:AncestorPaths.Count + ' ancestors_failed=0')
 
             $phase = 'fetch'
@@ -952,6 +997,7 @@ try {
 
             $phase = 'capsule_verify'
             $bound = Read-BoundValues $capsuleDirectory
+            if ($runMode -ceq 'source' -and ([string]$env:CI_SOURCE_SHA -cne $bound['source_sha'])) { throw 'binding' }
             $capsuleItem = Get-Item -LiteralPath $capsulePath -Force -ErrorAction Stop
             if ($capsuleItem.PSIsContainer -or ([int]$capsuleItem.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'capsule_file' }
             if ((Get-FileSha256 $capsulePath) -cne $bound['capsule_sha256']) { throw 'capsule_digest' }
@@ -982,12 +1028,12 @@ try {
             $project = $script:Lpac.Project
             Import-SourceBundle $bound $manifest $bundlePath $project
             Test-ProjectTree $project $manifest.Entries
+            Remove-SourceConfigFiles $project
             $lockSha = Get-FileSha256 (Join-Path $project 'package-lock.json')
             if ($lockSha -cne $bound['lock_sha256']) { throw 'lock_digest' }
             $python = Get-TrustedTool 'python.exe'
             $digest = Invoke-TrustedProcess $python @('-B', (Join-Path $PSScriptRoot $GateTableScript), $GateTableManifestCommand, '--root', $project) $PSScriptRoot (Get-TrustedEnvironment $python $layout.Private) 120 4096
             if ($digest.TimedOut -or $digest.ExitCode -ne 0 -or ([string]$digest.Stdout).Trim() -cne $bound['manifest_sha256']) { throw 'manifest_digest' }
-            Remove-SourceConfigFiles $project
             Write-Line ('windows-source-tree=verified entries=' + $manifest.Entries.Count + ' lock=match manifest=match tree=match configs=neutralized')
             Remove-WithinRoots $decryptDirectory
             Remove-WithinRoots (Join-Path $layout.Private 'repo')

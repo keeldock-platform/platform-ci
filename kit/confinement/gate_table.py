@@ -7,9 +7,13 @@ Placeholders are the exact strings {cargo}, {node} and {npm} for a whole argumen
 in a template or a rendered value is refused.
 """
 
+import hashlib
 import json
+import os
 import re
+import stat
 import sys
+from pathlib import Path
 
 
 SCHEMA_VERSION = 1
@@ -168,12 +172,143 @@ def emit_json(include_runtime):
     )
 
 
+MANIFEST_WORKSPACE_PATHS = ("packages/host-api", "packages/kernel-i18n")
+MANIFEST_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
+MANIFEST_PACKAGE_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$")
+MANIFEST_VERSION_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
+MANIFEST_WORKSPACE_VERSION_RE = re.compile(r"workspace:(?:\*|\^|~|[0-9][0-9A-Za-z.+-]*)")
+MANIFEST_ROOT_OVERRIDES = {"lightningcss": "1.33.0"}
+MAX_PACKAGE_JSON_BYTES = 256 * 1024
+OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+
+
+def manifest_json(path):
+    descriptor = -1
+    try:
+        descriptor = os.open(path, OPEN_FLAGS)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PACKAGE_JSON_BYTES:
+            raise GateTableRefusal("lock")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            payload = source.read(MAX_PACKAGE_JSON_BYTES + 1)
+    except OSError:
+        raise GateTableRefusal("lock") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not payload or len(payload) > MAX_PACKAGE_JSON_BYTES:
+        raise GateTableRefusal("lock")
+
+    def unique_pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(
+            payload.decode("utf-8", "strict"),
+            object_pairs_hook=unique_pairs,
+            parse_constant=lambda unused: (_ for _ in ()).throw(ValueError()),
+        )
+    except BaseException:
+        raise GateTableRefusal("lock") from None
+
+
+def _manifest_root_overrides(root):
+    if "overrides" not in root:
+        return None
+    value = root["overrides"]
+    if (type(value) is not dict or set(value) != set(MANIFEST_ROOT_OVERRIDES)
+            or any(type(item) is not str or item != MANIFEST_ROOT_OVERRIDES[name] for name, item in value.items())):
+        raise GateTableRefusal("lock")
+    return dict(value)
+
+
+def manifest_digest(source_root):
+    root = manifest_json(Path(source_root) / "package.json")
+    if (type(root) is not dict or type(root.get("name")) is not str
+            or type(root.get("version")) is not str
+            or any(key in root for key in ("resolutions", "bundleDependencies", "bundledDependencies"))):
+        raise GateTableRefusal("lock")
+    workspaces = root.get("workspaces")
+    if type(workspaces) is dict:
+        if set(workspaces) != {"packages"}:
+            raise GateTableRefusal("lock")
+        workspaces = workspaces.get("packages")
+    if (type(workspaces) is not list or len(workspaces) != 1
+            or workspaces[0] != "packages/*"):
+        raise GateTableRefusal("lock")
+    root_expected = {"name": root["name"], "version": root["version"], "workspaces": workspaces}
+    for group in MANIFEST_GROUPS:
+        if group in root:
+            root_expected[group] = root[group]
+    overrides = _manifest_root_overrides(root)
+    if overrides is not None:
+        root_expected["overrides"] = overrides
+    workspace_paths = []
+    for workspace_path in MANIFEST_WORKSPACE_PATHS:
+        if any(pattern == workspace_path or pattern == "packages/*" and workspace_path.startswith("packages/")
+               for pattern in workspaces):
+            workspace_paths.append(workspace_path)
+    if len(workspace_paths) != len(MANIFEST_WORKSPACE_PATHS):
+        raise GateTableRefusal("lock")
+    workspace_manifests = []
+    for workspace_path in workspace_paths:
+        package = manifest_json(Path(source_root) / workspace_path / "package.json")
+        if (type(package) is not dict or type(package.get("name")) is not str
+                or type(package.get("version")) is not str
+                or any(key in package for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies"))):
+            raise GateTableRefusal("lock")
+        workspace_expected = {"path": workspace_path, "name": package["name"], "version": package["version"]}
+        for group in MANIFEST_GROUPS:
+            if group in package:
+                workspace_expected[group] = package[group]
+        workspace_manifests.append(workspace_expected)
+    workspace_names = {item["name"] for item in workspace_manifests}
+    for manifest in [root_expected] + workspace_manifests:
+        for group in MANIFEST_GROUPS:
+            dependencies = manifest.get(group, {})
+            if type(dependencies) is not dict or len(dependencies) > 512:
+                raise GateTableRefusal("lock")
+            for name, spec in dependencies.items():
+                if (type(name) is not str or len(name) > 214 or not MANIFEST_PACKAGE_RE.fullmatch(name)
+                        or ".." in name or type(spec) is not str or len(spec) > 128):
+                    raise GateTableRefusal("lock")
+                if name in workspace_names and spec.startswith("workspace:"):
+                    if MANIFEST_WORKSPACE_VERSION_RE.fullmatch(spec) is None:
+                        raise GateTableRefusal("lock")
+                elif not MANIFEST_VERSION_RE.fullmatch(spec):
+                    raise GateTableRefusal("lock")
+    expected = {"root": root_expected, "workspaces": workspace_manifests}
+    try:
+        encoded = json.dumps(
+            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+        ).encode("ascii")
+    except BaseException:
+        raise GateTableRefusal("lock") from None
+    if len(encoded) > 256 * 1024:
+        raise GateTableRefusal("lock")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def main(arguments=None):
-    actual = sys.argv[1:] if arguments is None else arguments
-    if len(actual) != 2 or actual[0] != "emit" or actual[1] not in EMIT_SELECTIONS:
-        return 2
-    sys.stdout.write(emit_json(actual[1] == "runtime") + "\n")
-    return 0
+    actual = sys.argv[1:] if arguments is None else list(arguments)
+    if len(actual) == 2 and actual[0] == "emit" and actual[1] in EMIT_SELECTIONS:
+        sys.stdout.write(emit_json(actual[1] == "runtime") + "\n")
+        return 0
+    if len(actual) == 3 and actual[0] == "manifest-digest" and actual[1] == "--root":
+        try:
+            digest = manifest_digest(actual[2])
+        except GateTableRefusal:
+            sys.stdout.write("gate-table=refused reason=lock\n")
+            return 1
+        sys.stdout.write(digest + "\n")
+        return 0
+    return 2
 
 
 if __name__ == "__main__":

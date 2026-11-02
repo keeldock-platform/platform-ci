@@ -681,7 +681,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         for value in ("owner", "_owner", "o.w-n_er", "a" * 100, "7"):
             with self.subTest(value=value):
                 self.assertIsNotNone(linux_source_build.OWNER_RE.fullmatch(value))
-        for value in ("", ".", "..", ".hidden", "-x", "a" * 101, "a/b", "a b", "a%2e", "a\n", "café"):
+        for value in ("", ".", "..", ".hidden", "-x", "a" * 101, "a/b", "a b", "a%2e", "a\n", "caf\u00e9"):
             with self.subTest(value=value):
                 self.assertIsNone(linux_source_build.OWNER_RE.fullmatch(value))
 
@@ -2522,7 +2522,7 @@ class WindowsSourceBindingTests(unittest.TestCase):
                 linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
 
     def test_unknown_prefixes_are_refused_everywhere(self):
-        for prefix in ("", "WINDOWS", "windows_source", "LINUX_SOURCE_", "MACOS_SOURCE", None, 5, b"LINUX_SOURCE"):
+        for prefix in ("", "WINDOWS", "windows_source", "LINUX_SOURCE_", "MACOS_SOURCE", 5, b"LINUX_SOURCE"):
             with self.subTest(prefix=prefix):
                 with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
                     linux_source_build._source_inputs(self._environment("LINUX_SOURCE"), prefix=prefix)
@@ -2530,6 +2530,40 @@ class WindowsSourceBindingTests(unittest.TestCase):
                     linux_source_build._validate_provenance_binding({}, {}, prefix)
                 with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
                     linux_source_build.validate_dispatch({}, "token", prefix)
+
+    def test_the_prefix_comes_from_the_dispatch_environment_when_not_passed(self):
+        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
+            environment = self._environment("WINDOWS_SOURCE")
+            environment["KD_SOURCE_PREFIX"] = "WINDOWS_SOURCE"
+            identity = linux_source_build._source_inputs(environment)
+            self.assertEqual(identity["source_sha"], self.SOURCE)
+            self.assertEqual(provenance.call_args.args[2], "WINDOWS_SOURCE")
+            environment["KD_SOURCE_PREFIX"] = "LINUX_SOURCE"
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build._source_inputs(environment)
+            for value in ("", "WINDOWS", "windows_source", "MACOS_SOURCE"):
+                environment["KD_SOURCE_PREFIX"] = value
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._source_inputs(environment)
+
+    def test_the_lock_provenance_check_reads_the_prefixed_accepted_values(self):
+        environment = self._environment("WINDOWS_SOURCE")
+        environment["KD_SOURCE_PREFIX"] = "WINDOWS_SOURCE"
+        lock = b"{}"
+        environment["WINDOWS_SOURCE_ACCEPTED_NODE_LOCK_SHA256"] = hashlib.sha256(lock).hexdigest()
+        environment["WINDOWS_SOURCE_ACCEPTED_MANIFEST_SHA256"] = "2" * 64
+        with patch.object(
+            linux_source_build, "_validate_provenance_binding",
+            return_value={"lock_sha256": hashlib.sha256(lock).hexdigest()},
+        ), patch.object(linux_source_build, "_manifest_digest", return_value="2" * 64):
+            self.assertEqual(
+                linux_source_build._check_lock_provenance(lock, {}, environment, Path(".")),
+                (hashlib.sha256(lock).hexdigest(), "2" * 64),
+            )
+            environment["WINDOWS_SOURCE_ACCEPTED_MANIFEST_SHA256"] = "3" * 64
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+                linux_source_build._check_lock_provenance(lock, {}, environment, Path("."))
 
     def test_windows_provenance_text_comes_from_the_windows_variable(self):
         with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):

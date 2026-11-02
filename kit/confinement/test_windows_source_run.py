@@ -83,11 +83,36 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertNotIn("--pool=threads", self.runner)
         self.assertNotIn("'pipe'", self.runner)
 
-    def test_gate_plan_comes_from_the_shared_table_and_is_validated(self):
+    def test_gate_plan_comes_from_the_shared_table_emit_and_is_validated(self):
         self.assertIn("$GateTableScript = 'gate_table.py'", self.runner)
-        for token in ("'^[a-z][a-z_]{2,40}$'", "[string]$gate['cwd'] -cne '{project}'", "$gates.Count -lt 13"):
+        self.assertIn("$GateTableEmitCommand = 'emit'", self.runner)
+        self.assertIn("$GateTableManifestCommand = 'manifest-digest'", self.runner)
+        self.assertIn("$RequiredGateCount = 15", self.runner)
+        self.assertIn("$MaxGateCount = 18", self.runner)
+        self.assertIn("$selection = 'runtime'", self.runner)
+        for token in ("'^[a-z][a-z_]{2,40}$'", "$gate.Keys.Count -ne 2", "$gates.Count -ne $expectedCount",
+                      "$plan.Keys.Count -ne 2", "[string]$gate['name']"):
             self.assertIn(token, self.runner)
+        for stale in ("GateTableGatesCommand", "$gate['cwd']", "$gate['runtime']", "$gate['id']", "-lt 13", "-gt 24"):
+            self.assertNotIn(stale, self.runner)
         self.assertNotIn("'workspace_tests'", self.runner)
+
+    def test_each_config_neutralisation_runs_right_after_the_tree_check_and_before_any_tool(self):
+        tree = self.runner.index("Test-ProjectTree $project $manifest.Entries")
+        neutral = self.runner.index("Remove-SourceConfigFiles $project\n", tree)
+        digest = self.runner.index("$GateTableManifestCommand, '--root'")
+        plan = self.runner.index("$phase = 'gate_plan'")
+        self.assertLess(tree, neutral)
+        self.assertLess(neutral, digest)
+        self.assertLess(digest, plan)
+        self.assertIn("core.hooksPath=NUL", self.runner)
+        self.assertIn("[string]$env:CI_SOURCE_SHA -cne $bound['source_sha']", self.runner)
+
+    def test_npm_user_and_global_config_are_two_distinct_empty_files(self):
+        self.assertIn("'NPM_CONFIG_USERCONFIG=' + (Join-Path $root 'empty-user.npmrc')", self.runner)
+        self.assertIn("'NPM_CONFIG_GLOBALCONFIG=' + (Join-Path $root 'empty-global.npmrc')", self.runner)
+        self.assertNotIn("nul.npmrc", self.runner)
+        self.assertIn("NPM_CONFIG_UPDATE_NOTIFIER=false", self.runner)
 
     def test_key_is_destroyed_before_any_project_step_and_again_in_cleanup(self):
         order = [self.runner.index(token) for token in (
@@ -153,6 +178,20 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertNotIn("SOURCE_REPOSITORY", self.workflow)
         for name in ("windows_confinement.cs", "windows_confinement.ps1", "windows_probe.rs"):
             self.assertNotIn(name, self.workflow)
+
+    def test_workflow_has_one_job_the_source_input_and_only_the_verifier_publishes_the_verdict(self):
+        self.assertEqual(re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", self.workflow.split("\njobs:\n", 1)[1]), ["windows-candidate"])
+        self.assertIn("    name: role-windows-${{ inputs.role }}-v1\n", self.workflow)
+        self.assertIn("      source_sha:\n        required: false\n        type: string\n", self.workflow)
+        self.assertIn("CI_SOURCE_SHA: ${{ inputs.source_sha }}", self.workflow)
+        self.assertIn("--ref $env:KD_REF", self.workflow)
+        step = self.workflow.split("      - name: Publish confinement verdict\n", 1)[1]
+        self.assertTrue(step.startswith("        if: ${{ always() && inputs.role == 'verifier' }}\n"))
+        self.assertIn("confinement_verdict.py windows-run --record", step)
+        self.assertIn("--role $env:KD_ROLE --mode $env:KD_MODE", step)
+        self.assertEqual(self.workflow.count("Publish confinement verdict"), 1)
+        self.assertNotIn("KD-CONFINEMENT-VERDICT", self.workflow)
+        self.assertEqual(self.workflow.count("uses: actions/attest@"), 1)
 
 
 if __name__ == "__main__":

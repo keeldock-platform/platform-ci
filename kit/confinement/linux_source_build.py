@@ -100,12 +100,12 @@ MAX_AUDIT_VULNERABILITIES = 4096
 MAX_AUDIT_VIA = 64
 MAX_AUDIT_NODES = 1024
 MAX_AUDIT_TEXT = 512
-MANIFEST_WORKSPACE_PATHS = ("packages/host-api", "packages/kernel-i18n")
-MANIFEST_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
-MANIFEST_PACKAGE_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$")
-MANIFEST_VERSION_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
-MANIFEST_WORKSPACE_VERSION_RE = re.compile(r"workspace:(?:\*|\^|~|[0-9][0-9A-Za-z.+-]*)")
-MAX_PACKAGE_JSON_BYTES = 256 * 1024
+MANIFEST_WORKSPACE_PATHS = gate_table.MANIFEST_WORKSPACE_PATHS
+MANIFEST_GROUPS = gate_table.MANIFEST_GROUPS
+MANIFEST_PACKAGE_RE = gate_table.MANIFEST_PACKAGE_RE
+MANIFEST_VERSION_RE = gate_table.MANIFEST_VERSION_RE
+MANIFEST_WORKSPACE_VERSION_RE = gate_table.MANIFEST_WORKSPACE_VERSION_RE
+MAX_PACKAGE_JSON_BYTES = gate_table.MAX_PACKAGE_JSON_BYTES
 SOURCE_STEP_NAMES = (
     "Fetch exact public control",
     "Repeat preflight in source-read",
@@ -329,7 +329,16 @@ def _comparison(token, repository, base, head):
     return state if state in ("ahead", "behind", "identical", "diverged") else "unavailable"
 
 
-def _source_inputs(environ, prefix=LINUX_SOURCE_PREFIX):
+def _environment_prefix(environ):
+    value = environ.get("KD_SOURCE_PREFIX", LINUX_SOURCE_PREFIX)
+    if type(value) is not str or value not in SOURCE_PREFIXES:
+        raise SourceBuildRefusal("binding")
+    return value
+
+
+def _source_inputs(environ, prefix=None):
+    if prefix is None:
+        prefix = _environment_prefix(environ)
     if type(prefix) is not str or prefix not in SOURCE_PREFIXES:
         raise SourceBuildRefusal("binding")
     source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
@@ -461,7 +470,7 @@ def validate_dispatch(environ, api_token=None, prefix=LINUX_SOURCE_PREFIX):
         _verify_environment(api_token)
         _require_no_duplicate(api_token, environ, workflow=WINDOWS_TIER)
         return "source"
-    identity = _source_inputs(environ)
+    identity = _source_inputs(environ, prefix=LINUX_SOURCE_PREFIX)
     _verify_environment(api_token)
     _require_no_duplicate(api_token, environ)
     return "source"
@@ -1078,7 +1087,9 @@ def _check_provenance_finding(finding, policy_epoch, fetched_at):
         raise SourceBuildRefusal("lock")
 
 
-def _validate_provenance_binding(identity, environ, prefix=LINUX_SOURCE_PREFIX):
+def _validate_provenance_binding(identity, environ, prefix=None):
+    if prefix is None:
+        prefix = _environment_prefix(environ)
     if type(prefix) is not str or prefix not in SOURCE_PREFIXES:
         raise SourceBuildRefusal("lock")
     text = environ.get(prefix + "_ACCEPTED_NODE_PROVENANCE_JSON", "")
@@ -1151,11 +1162,12 @@ def _check_lock_provenance(lock_bytes, identity, environ, source_root):
     if len(lock_bytes) > 4 * 1024 * 1024 - 64 * 1024:
         raise SourceBuildRefusal("lock")
     lock_sha = hashlib.sha256(lock_bytes).hexdigest()
-    record = _validate_provenance_binding(identity, environ)
+    prefix = _environment_prefix(environ)
+    record = _validate_provenance_binding(identity, environ, prefix)
     manifest_digest = _manifest_digest(source_root)
-    if (lock_sha != environ.get("LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256")
+    if (lock_sha != environ.get(prefix + "_ACCEPTED_NODE_LOCK_SHA256")
             or record.get("lock_sha256") != lock_sha
-            or manifest_digest != environ.get("LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256")):
+            or manifest_digest != environ.get(prefix + "_ACCEPTED_MANIFEST_SHA256")):
         raise SourceBuildRefusal("lock")
     return lock_sha, manifest_digest
 
@@ -1369,119 +1381,20 @@ def _locked_packages(lock_bytes):
 
 
 def _manifest_json(path):
-    descriptor = -1
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PACKAGE_JSON_BYTES:
-            raise SourceBuildRefusal("lock")
-        with os.fdopen(descriptor, "rb") as source:
-            descriptor = -1
-            payload = source.read(MAX_PACKAGE_JSON_BYTES + 1)
-    except OSError:
-        raise SourceBuildRefusal("lock") from None
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-    if not payload or len(payload) > MAX_PACKAGE_JSON_BYTES:
-        raise SourceBuildRefusal("lock")
-
-    def unique_pairs(items):
-        result = {}
-        for key, value in items:
-            if key in result:
-                raise ValueError
-            result[key] = value
-        return result
-
-    try:
-        return json.loads(
-            payload.decode("utf-8", "strict"),
-            object_pairs_hook=unique_pairs,
-            parse_constant=lambda unused: (_ for _ in ()).throw(ValueError()),
-        )
-    except BaseException:
+        return gate_table.manifest_json(path)
+    except gate_table.GateTableRefusal:
         raise SourceBuildRefusal("lock") from None
 
 
-MANIFEST_ROOT_OVERRIDES = {"lightningcss": "1.33.0"}
-
-
-def _manifest_root_overrides(root):
-    if "overrides" not in root:
-        return None
-    value = root["overrides"]
-    if (type(value) is not dict or set(value) != set(MANIFEST_ROOT_OVERRIDES)
-            or any(type(item) is not str or item != MANIFEST_ROOT_OVERRIDES[name] for name, item in value.items())):
-        raise SourceBuildRefusal("lock")
-    return dict(value)
+MANIFEST_ROOT_OVERRIDES = gate_table.MANIFEST_ROOT_OVERRIDES
 
 
 def _manifest_digest(source_root):
-    root = _manifest_json(Path(source_root) / "package.json")
-    if (type(root) is not dict or type(root.get("name")) is not str
-            or type(root.get("version")) is not str
-            or any(key in root for key in ("resolutions", "bundleDependencies", "bundledDependencies"))):
-        raise SourceBuildRefusal("lock")
-    workspaces = root.get("workspaces")
-    if type(workspaces) is dict:
-        if set(workspaces) != {"packages"}:
-            raise SourceBuildRefusal("lock")
-        workspaces = workspaces.get("packages")
-    if (type(workspaces) is not list or len(workspaces) != 1
-            or workspaces[0] != "packages/*"):
-        raise SourceBuildRefusal("lock")
-    root_expected = {"name": root["name"], "version": root["version"], "workspaces": workspaces}
-    for group in MANIFEST_GROUPS:
-        if group in root:
-            root_expected[group] = root[group]
-    overrides = _manifest_root_overrides(root)
-    if overrides is not None:
-        root_expected["overrides"] = overrides
-    workspace_paths = []
-    for workspace_path in MANIFEST_WORKSPACE_PATHS:
-        if any(pattern == workspace_path or pattern == "packages/*" and workspace_path.startswith("packages/")
-               for pattern in workspaces):
-            workspace_paths.append(workspace_path)
-    if len(workspace_paths) != len(MANIFEST_WORKSPACE_PATHS):
-        raise SourceBuildRefusal("lock")
-    workspace_manifests = []
-    for workspace_path in workspace_paths:
-        package = _manifest_json(Path(source_root) / workspace_path / "package.json")
-        if (type(package) is not dict or type(package.get("name")) is not str
-                or type(package.get("version")) is not str
-                or any(key in package for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies"))):
-            raise SourceBuildRefusal("lock")
-        workspace_expected = {"path": workspace_path, "name": package["name"], "version": package["version"]}
-        for group in MANIFEST_GROUPS:
-            if group in package:
-                workspace_expected[group] = package[group]
-        workspace_manifests.append(workspace_expected)
-    workspace_names = {item["name"] for item in workspace_manifests}
-    for manifest in [root_expected] + workspace_manifests:
-        for group in MANIFEST_GROUPS:
-            dependencies = manifest.get(group, {})
-            if type(dependencies) is not dict or len(dependencies) > 512:
-                raise SourceBuildRefusal("lock")
-            for name, spec in dependencies.items():
-                if (type(name) is not str or len(name) > 214 or not MANIFEST_PACKAGE_RE.fullmatch(name)
-                        or ".." in name or type(spec) is not str or len(spec) > 128):
-                    raise SourceBuildRefusal("lock")
-                if name in workspace_names and spec.startswith("workspace:"):
-                    if MANIFEST_WORKSPACE_VERSION_RE.fullmatch(spec) is None:
-                        raise SourceBuildRefusal("lock")
-                elif not MANIFEST_VERSION_RE.fullmatch(spec):
-                    raise SourceBuildRefusal("lock")
-    expected = {"root": root_expected, "workspaces": workspace_manifests}
     try:
-        encoded = json.dumps(
-            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
-        ).encode("ascii")
-    except BaseException:
+        return gate_table.manifest_digest(source_root)
+    except gate_table.GateTableRefusal:
         raise SourceBuildRefusal("lock") from None
-    if len(encoded) > 256 * 1024:
-        raise SourceBuildRefusal("lock")
-    return hashlib.sha256(encoded).hexdigest()
 
 
 def _cargo_config_files(root):

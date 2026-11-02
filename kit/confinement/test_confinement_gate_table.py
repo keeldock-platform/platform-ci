@@ -1,7 +1,9 @@
 import io
 import json
+import tempfile
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 
 import confinement_verdict
 import gate_table
@@ -231,6 +233,61 @@ class EmitTests(unittest.TestCase):
                 code, text = self._emit(arguments)
                 self.assertEqual(code, 2)
                 self.assertEqual(text, "")
+
+
+class ManifestDigestTests(unittest.TestCase):
+    def _write(self, base, root_extra=None):
+        root = {
+            "name": "synthetic-root", "version": "1.0.0", "workspaces": ["packages/*"],
+            "devDependencies": {"typescript": "6.0.3"},
+        }
+        root.update(root_extra or {})
+        for name in ("host-api", "kernel-i18n"):
+            (base / "packages" / name).mkdir(parents=True)
+            (base / "packages" / name / "package.json").write_text(
+                json.dumps({"name": "@synthetic/" + name, "version": "1.0.0"}), encoding="ascii",
+            )
+        (base / "package.json").write_text(json.dumps(root), encoding="ascii")
+        return base
+
+    def test_the_digest_is_the_one_implementation_linux_source_build_uses(self):
+        import linux_source_build
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write(Path(directory))
+            self.assertEqual(gate_table.manifest_digest(base), linux_source_build._manifest_digest(base))
+            self.assertEqual(len(gate_table.manifest_digest(base)), 64)
+        self.assertIs(linux_source_build.MANIFEST_WORKSPACE_PATHS, gate_table.MANIFEST_WORKSPACE_PATHS)
+
+    def test_the_module_needs_no_posix_only_import(self):
+        source = Path(gate_table.__file__).read_text(encoding="ascii")
+        for name in ("fcntl", "pwd", "grp", "resource"):
+            self.assertNotIn("import " + name, source)
+
+    def test_refusals_use_the_closed_lock_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write(Path(directory), {"resolutions": {"a": "1.0.0"}})
+            with self.assertRaises(gate_table.GateTableRefusal) as caught:
+                gate_table.manifest_digest(base)
+            self.assertEqual(caught.exception.reason, "lock")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(gate_table.GateTableRefusal):
+                gate_table.manifest_digest(directory)
+
+    def test_the_command_prints_the_digest_and_refuses_other_shapes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write(Path(directory))
+            sink = io.StringIO()
+            with redirect_stdout(sink):
+                code = gate_table.main(["manifest-digest", "--root", str(base)])
+            self.assertEqual((code, sink.getvalue()), (0, gate_table.manifest_digest(base) + "\n"))
+            sink = io.StringIO()
+            with redirect_stdout(sink):
+                code = gate_table.main(["manifest-digest", "--root", str(base / "missing")])
+            self.assertEqual((code, sink.getvalue()), (1, "gate-table=refused reason=lock\n"))
+        for arguments in (["manifest-digest"], ["manifest-digest", "--root"], ["manifest-digest", "--dir", "x"],
+                          ["manifest-digest", "--root", "a", "b"]):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(gate_table.main(arguments), 2)
 
 
 if __name__ == "__main__":
