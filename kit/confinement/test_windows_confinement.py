@@ -2320,7 +2320,9 @@ foreach ($case in $cases) {
             + "\n"
             + self.function_body("Remove-ReparsePoints")
             + "\n"
-            "$root = Join-Path ([IO.Path]::GetTempPath()) ('kd-cleanup-' + [Guid]::NewGuid().ToString('N'))\n"
+            "$tempBase = $env:RUNNER_TEMP; if (-not $tempBase) { $tempBase = [IO.Path]::GetTempPath() }\n"
+            "$root = Join-Path $tempBase ('kd-cleanup-' + [Guid]::NewGuid().ToString('N'))\n"
+            "[KeelDock.Platform.WindowsConfinement.HandleRemover]::AllowRoot($root)\n"
             "try {\n"
             "    $trap = Join-Path $root 'trap'\n"
             "    $tree = Join-Path $root 'tree'\n"
@@ -2868,6 +2870,64 @@ foreach ($case in $cases) {
         self.assertLess(entry.index("string here = FinalPath(handle);"), entry.index("DeleteByHandle(handle, attributes, links);"))
         self.assertLess(entry.index("remove_failed step=verify"), entry.index("ReadInformation(handle"))
         self.assertIn("Delete | Synchronize | FileReadAttributes\n", remover)
+
+    def test_remover_refuses_every_path_outside_registered_roots_and_the_system_root(self):
+        remover = self.native[self.native.index("public static class HandleRemover"):self.native.index("public sealed class Sandbox")]
+        for required in (
+            "public static void AllowRoot(string path)",
+            "private static void RequireAllowed(string trimmed)",
+            "private static void RefuseSystemRoot(string lowered)",
+            'Environment.GetEnvironmentVariable("SystemRoot")',
+            "lowered.StartsWith(systemLowered + \"\\\\\", StringComparison.Ordinal)",
+            "lowered.StartsWith(root + \"\\\\\", StringComparison.Ordinal)",
+            "string trimmed = Shape(path);\n            RequireAllowed(trimmed);",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, remover)
+        self.assertNotIn("public static void Remove(string path, ", remover)
+        calls = [
+            (name, body.count("Register-RemovalRoot"))
+            for name, body in (
+                ("Test-OtherContainerNul", self.function_body("Test-OtherContainerNul")),
+                ("Initialize-LinkFixtures", self.function_body("Initialize-LinkFixtures")),
+            )
+        ]
+        self.assertEqual(calls, [("Test-OtherContainerNul", 1), ("Initialize-LinkFixtures", 1)])
+        self.assertIn("Register-RemovalRoot $baseDirectory", self.wrapper)
+        self.assertIn("Register-RemovalRoot $script:ProfileFolder", self.wrapper)
+        self.assertIn("foreach ($rootItem in $script:Canaries) { Register-RemovalRoot $rootItem }", self.wrapper)
+
+    def test_remover_verifies_the_root_and_holds_directories_without_share_write(self):
+        remover = self.native[self.native.index("public static class HandleRemover"):self.native.index("public sealed class Sandbox")]
+        entry = remover[remover.index("private static void RemoveEntry"):remover.index("private static class Native")]
+        self.assertIn("if (expectedFinal == null && depth == 0)", entry)
+        self.assertIn("expectedFinal = path;", entry)
+        self.assertLess(entry.index("expectedFinal = path;"), entry.index("OpenEntry(path)"))
+        reopen = remover[remover.index("private static IntPtr ReopenDirectory"):remover.index("private static IntPtr OpenEntry")]
+        self.assertIn("Native.CreateFileW(path, access, ShareRead, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero)", reopen)
+        self.assertNotIn("ShareWrite", reopen)
+        self.assertIn("(attributes & AttributeReparsePoint) == 0", reopen)
+        self.assertIn("string.Equals(FinalPath(handle), expectedFinal, StringComparison.OrdinalIgnoreCase)", reopen)
+        self.assertLess(entry.index("handle = ReopenDirectory(path, here);"), entry.index("ListEntries(handle, names, kinds);"))
+
+    def test_deep_trees_fail_closed_at_a_fixed_depth_and_path_cap(self):
+        remover = self.native[self.native.index("public static class HandleRemover"):self.native.index("public sealed class Sandbox")]
+        self.assertIn("private const int MaxDepth = 1024;", remover)
+        self.assertIn("private const int MaxPathChars = 32000;", remover)
+        self.assertIn('throw new InvalidOperationException("remove_failed step=depth error=path");', remover)
+        self.assertIn('throw new InvalidOperationException("remove_failed step=depth error=0");', remover)
+
+    def test_a_confined_not_found_canary_read_is_attributable_only_while_the_canary_exists(self):
+        body = self.function_body("Test-NotFoundAttributable")
+        self.assertIn("'^open=(err2|err3|ENOENT)$'", body)
+        self.assertIn("Test-Path -LiteralPath $path -PathType Leaf", body)
+        self.assertIn("-ceq 'canary-reads' -and -not (Test-NotFoundAttributable", self.wrapper)
+        self.assertIn("-ceq 'read-canary' -and -not (Test-NotFoundAttributable $text $script:CanaryRunnerTemp)", self.wrapper)
+
+    def test_connect_state_matches_each_pattern_once(self):
+        body = self.function_body("Get-NetworkState")
+        self.assertEqual(body.count("'^resolve=ok connect=(err[0-9]{1,5})$'"), 1)
+        self.assertEqual(body.count("'^resolve=(err[0-9]{1,5})$'"), 2)
 
     def test_taskreg_variants_are_separate_24_byte_buffers_and_wfp_loads_at_run_time(self):
         probe = self.probe

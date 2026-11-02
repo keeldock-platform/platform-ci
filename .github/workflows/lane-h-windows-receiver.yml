@@ -5,6 +5,14 @@ on:
       profile:
         required: true
         type: string
+      role:
+        required: false
+        type: string
+        default: ""
+      mode:
+        required: false
+        type: string
+        default: ""
 permissions: {}
 jobs:
   windows-receiver:
@@ -81,3 +89,114 @@ jobs:
           path: ${{ runner.temp }}/role-statement
           if-no-files-found: error
           retention-days: 1
+  windows-candidate:
+    name: role-windows-${{ inputs.role }}-v1
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'candidate' && (inputs.role == 'producer' || inputs.role == 'verifier') && ((inputs.mode == 'synthetic' && github.ref == 'refs/heads/main') || (inputs.mode == 'source' && github.ref == 'refs/heads/untrusted')) }}
+    runs-on: windows-2025
+    environment: ${{ inputs.mode == 'source' && 'windows-source-exec' || '' }}
+    timeout-minutes: 330
+    cache-mode: none
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      GH_TOKEN: ${{ github.token }}
+      KD_PROFILE: ${{ inputs.profile }}
+      KD_ROLE: ${{ inputs.role }}
+      KD_MODE: ${{ inputs.mode }}
+      KD_REPOSITORY: ${{ github.repository }}
+      KD_SHA: ${{ github.sha }}
+      KD_REF: ${{ github.ref }}
+      KD_WORKFLOW_REF: ${{ github.workflow_ref }}
+      KD_RUNNER: windows-2025
+      KD_RUN_ID: ${{ github.run_id }}
+      KD_RUN_ATTEMPT: ${{ github.run_attempt }}
+      KD_KEY_DIRECTORY: ${{ runner.temp }}\kd-receiver
+      KD_CAPSULE_DIRECTORY: ${{ runner.temp }}\kd-capsule
+    steps:
+      - name: Checkout reviewed control files
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Refuse non-source-free invocation
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:KD_REPOSITORY -ne 'keeldock-platform/platform-ci' -or $env:KD_SHA -notmatch '^[a-f0-9]{40}$') { throw 'context' }
+          if ($env:KD_PROFILE -ne 'candidate' -or $env:KD_ROLE -notin @('producer', 'verifier') -or $env:KD_MODE -notin @('synthetic', 'source')) { throw 'profile' }
+          $expectedRef = 'refs/heads/main'
+          if ($env:KD_MODE -eq 'source') { $expectedRef = 'refs/heads/untrusted' }
+          if ($env:KD_REF -ne $expectedRef) { throw 'ref' }
+          if ($env:KD_WORKFLOW_REF -ne ($env:KD_REPOSITORY + '/.github/workflows/windows-source-admission.yml@' + $expectedRef)) { throw 'caller' }
+      - name: Read numeric control repository identifier
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identifierPath = Join-Path $env:RUNNER_TEMP 'control-repository-id.txt'
+          & gh api "repos/$env:KD_REPOSITORY" --jq '.id' 1> $identifierPath 2>$null
+          if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath $identifierPath -Raw).Trim() -notmatch '^[1-9][0-9]{0,19}$') { throw 'repository-id' }
+      - name: Generate the non-exportable receiver key
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & pwsh -NoProfile -File kit/confinement/windows_source_run.ps1 -Mode keygen
+          if ($LASTEXITCODE -ne 0) { throw 'keygen' }
+      - name: Create exact receiver key record and role predicate
+        id: subject
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identifier = (Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'control-repository-id.txt') -Raw).Trim()
+          $target = Join-Path $env:RUNNER_TEMP 'role-statement'
+          & python -B kit/confinement/role_signer.py prepare --profile $env:KD_PROFILE --role ('windows-' + $env:KD_ROLE) --repository $env:KD_REPOSITORY --repository-id $identifier --control-sha $env:KD_SHA --ref $env:KD_REF --run-id $env:KD_RUN_ID --run-attempt $env:KD_RUN_ATTEMPT --workflow-ref $env:KD_WORKFLOW_REF --runner $env:KD_RUNNER --public-point-file (Join-Path $env:KD_KEY_DIRECTORY 'public-point.bin') --output-directory $target
+          if ($LASTEXITCODE -ne 0) { throw 'subject' }
+          Copy-Item -LiteralPath (Join-Path $target 'subject.bin') -Destination (Join-Path $env:KD_KEY_DIRECTORY 'key-record.bin')
+      - name: Sign only the receiver role statement
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ runner.temp }}/role-statement/subject.bin
+          predicate-type: https://example.invalid/role-statement/v1
+          predicate-path: ${{ runner.temp }}/role-statement/predicate.json
+          push-to-registry: false
+          create-storage-record: true
+          show-summary: false
+      - name: Package exact signed receiver statement
+        env:
+          ROLE_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:ROLE_BUNDLE)) { throw 'bundle' }
+          Copy-Item -LiteralPath $env:ROLE_BUNDLE -Destination (Join-Path $env:RUNNER_TEMP 'role-statement/bundle.json')
+      - name: Upload exact receiver subject, predicate, and bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: role-statement-windows-${{ inputs.role }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.subject.outputs.transfer_id }}
+          path: ${{ runner.temp }}/role-statement
+          if-no-files-found: error
+          retention-days: 1
+      - name: Wait for, verify and download the bound capsule
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $identifier = (Get-Content -LiteralPath (Join-Path $env:RUNNER_TEMP 'control-repository-id.txt') -Raw).Trim()
+          & python -B kit/confinement/role_signer.py receive-capsule --profile $env:KD_PROFILE --role ('windows-' + $env:KD_ROLE) --repository $env:KD_REPOSITORY --repository-id $identifier --control-sha $env:KD_SHA --run-id $env:KD_RUN_ID --run-attempt $env:KD_RUN_ATTEMPT --deadline-seconds 1500 --output-directory $env:KD_CAPSULE_DIRECTORY
+          if ($LASTEXITCODE -ne 0) { throw 'capsule' }
+      - name: Run the bound source under the Windows boundary
+        env:
+          CI_EVENT_NAME: ${{ github.event_name }}
+          CI_REF: ${{ github.ref }}
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_SERVER_URL: ${{ github.server_url }}
+          CI_SHA: ${{ github.sha }}
+          CI_WORKSPACE: ${{ github.workspace }}
+          CI_MODE: ${{ inputs.mode }}
+          CI_ROLE: ${{ inputs.role }}
+          KD_WINDOWS_LOG_CANARY: ${{ inputs.mode == 'synthetic' && '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' || secrets.KD_WINDOWS_LOG_CANARY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & pwsh -NoProfile -File kit/confinement/windows_source_run.ps1 -Mode run
+          if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -774,15 +774,13 @@ function Get-NetworkState([string]$stdout, [string]$name) {
     if ($text -ceq 'wsa=failed') { return 'wsa_failed' }
     if ($name -ceq 'connect') {
         if ($text -ceq 'resolve=ok connect=open') { return 'open' }
-        $found = [regex]::Match($text, '^resolve=ok connect=(err[0-9]{1,5})$')
-        if ($found.Success -and ($NetworkDeniedConnect -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        $connectFound = [regex]::Match($text, '^resolve=ok connect=(err[0-9]{1,5})$')
+        if ($connectFound.Success -and ($NetworkDeniedConnect -ccontains $connectFound.Groups[1].Value)) { return 'blocked' }
         $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
         if ($found.Success -and ($NetworkDeniedResolve -ccontains $found.Groups[1].Value)) { return 'blocked' }
-        $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
         if ($found.Success -and ($NetworkDeniedHostResolve -ccontains $found.Groups[1].Value)) { return 'blocked_resolve' }
         if ($text -ceq 'resolve=empty') { return 'unroutable' }
-        $found = [regex]::Match($text, '^resolve=ok connect=(err[0-9]{1,5})$')
-        if ($found.Success -and ($NetworkUnroutableConnect -ccontains $found.Groups[1].Value)) { return 'unroutable' }
+        if ($connectFound.Success -and ($NetworkUnroutableConnect -ccontains $connectFound.Groups[1].Value)) { return 'unroutable' }
         return 'unexpected'
     }
     if ($name -ceq 'dns') {
@@ -866,6 +864,7 @@ function Test-OtherContainerNul($first) {
     $other = [KeelDock.Platform.WindowsConfinement.Sandbox]::Create()
     $script:OtherBox = $other
     $script:OtherFolder = Join-Path (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Packages') $other.ProfileName
+    Register-RemovalRoot $script:OtherFolder
     if (([string]$other.SidText -ceq [string]$script:Sid) -or ([string]$other.ProfileName -ceq [string]$first.ProfileName)) { throw 'nul_other_not_distinct' }
     $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
     $commandLine = '"' + $cmd + '" /d /c echo x>NUL'
@@ -885,6 +884,16 @@ function Remove-TreeNoFollow([string]$path) {
 
 function Remove-ReparsePoints([string]$path) {
     [KeelDock.Platform.WindowsConfinement.HandleRemover]::RemoveLinks($path)
+}
+
+function Register-RemovalRoot([string]$path) {
+    [KeelDock.Platform.WindowsConfinement.HandleRemover]::AllowRoot($path)
+}
+
+function Test-NotFoundAttributable([string]$text, [string]$path) {
+    if ($text -cnotmatch '^open=(err2|err3|ENOENT)$') { return $true }
+    if ([string]::IsNullOrEmpty($path)) { return $false }
+    return [bool](Test-Path -LiteralPath $path -PathType Leaf)
 }
 
 function Get-JobLiveness($sandboxes, [int]$waitSeconds) {
@@ -939,6 +948,7 @@ function Initialize-LinkFixtures {
     $sentinel = Join-Path $inner 'sentinel.txt'
     [IO.File]::WriteAllText($sentinel, 'kd-sentinel')
     $script:TrapDirectory = $trap
+    Register-RemovalRoot $trap
     $script:TrapSentinel = $sentinel
     $nested = Join-Path (Join-Path $script:Lpac.Tmp 'nested') 'deeper'
     New-Item -ItemType Directory -Force -Path $nested | Out-Null
@@ -1405,6 +1415,7 @@ function Invoke-ChannelAttempt($sandbox, $attempt, [string]$phase, [bool]$withCo
         if ($runValid -or $attempt.ContainsKey('LeakGuard')) { $result = Get-AttemptResult $run $command $attempt }
         if (-not $runValid -and $result -cne 'allowed') { $result = 'invalid' }
         if ($result -ceq 'not_applicable' -and $attempt.ContainsKey('NaRecheck') -and (Test-PipeListed (($arguments -split ' ')[1]))) { $result = 'other' }
+        if ($result -ceq 'denied' -and [string]$attempt.Name -ceq 'canary-reads' -and -not (Test-NotFoundAttributable (Get-ProbeText ([string]$run.Stdout) $command) (($arguments -split ' ', 2)[1]))) { $result = 'other' }
         $results += $result
         if ($result -cne [string]$attempt.Expect) { Write-DiagLines $label 'stdout' ([string]$run.Stdout) }
     }
@@ -1710,6 +1721,7 @@ function Invoke-FixtureForm($sandbox, [string]$form) {
                 if (($text -ceq 'text=ok') -and (([string]$run.Stdout + "`n" + [string]$run.Stderr) -match '(?m)^(?:\[[A-Za-z0-9_.+-]{1,40} [0-9][A-Za-z0-9_.+-]{0,20}\] )?::debug::kd-fx-marker\s*$')) { $result = 'contained' }
             } else {
                 $result = Get-TextClass $text $attempt
+                if ($result -ceq 'denied' -and [string]$attempt.Name -ceq 'read-canary' -and -not (Test-NotFoundAttributable $text $script:CanaryRunnerTemp)) { $result = 'other' }
             }
         }
         Write-Line ('windows-confinement-fixture-attempt=' + $form + '/' + $attempt.Name + ' result=' + $result + ' expect=' + $attempt.Expect + ' control=fired hang=none informational=' + $informational.ToString().ToLowerInvariant() + ' basis=' + $basis)
@@ -1891,6 +1903,7 @@ try {
         $baseDirectory = Join-Path $env:RUNNER_TEMP ('kd-confinement-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
         if ($baseDirectory -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw 'workspace_path' }
         $script:Redactions = @($baseDirectory, $env:RUNNER_TEMP, $env:CI_WORKSPACE)
+        Register-RemovalRoot $baseDirectory
         $script:Layout = @{
             Base = $baseDirectory
             Downloads = (Join-Path $baseDirectory 'dl')
@@ -1923,6 +1936,7 @@ try {
         $box = [KeelDock.Platform.WindowsConfinement.Sandbox]::Create()
         $script:Sid = $box.SidText
         $script:ProfileFolder = Join-Path (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Packages') $box.ProfileName
+        Register-RemovalRoot $script:ProfileFolder
 
         $phase = 'acl_grant'
         Grant-Access $layout.ReadOnly $script:Sid 'ReadAndExecute, Synchronize' $true
@@ -2027,6 +2041,7 @@ try {
         $script:Canaries += $canaryDirectory
         $script:Canaries += $script:CanaryWorkspace
         $script:Canaries += $script:CanaryProfile
+        foreach ($rootItem in $script:Canaries) { Register-RemovalRoot $rootItem }
         $canaryFiles = @($script:CanaryRunnerTemp, $script:CanaryWorkspace, $script:CanaryProfile, $script:CanaryControl)
         foreach ($canaryFile in $canaryFiles) {
             if ($canaryFile -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw 'canary_path' }

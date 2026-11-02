@@ -523,7 +523,10 @@ namespace KeelDock.Platform.WindowsConfinement
         private const int ErrorAccessDenied = 5;
         private const int FinalPathChars = 32768;
         private const int ErrorNoMoreFiles = 18;
-        private const int MaxDepth = 64;
+        private const int MaxDepth = 1024;
+        private const int MaxPathChars = 32000;
+        private static readonly List<string> AllowedRoots = new List<string>();
+        private static readonly object RootLock = new object();
         private const int MaxOpenRetries = 25;
         private const int DirectoryBufferBytes = 65536;
         private const int NameOffset = 68;
@@ -540,7 +543,58 @@ namespace KeelDock.Platform.WindowsConfinement
             RemoveEntry(Extend(path), null, 0, true);
         }
 
+        public static void AllowRoot(string path)
+        {
+            string lowered = Shape(path).ToLowerInvariant();
+            RefuseSystemRoot(lowered);
+            lock (RootLock)
+            {
+                if (!AllowedRoots.Contains(lowered))
+                {
+                    AllowedRoots.Add(lowered);
+                }
+            }
+        }
+
+        private static void RefuseSystemRoot(string lowered)
+        {
+            string system = Environment.GetEnvironmentVariable("SystemRoot");
+            if (string.IsNullOrEmpty(system) || system.Length < 4)
+            {
+                throw new InvalidOperationException("remove_path");
+            }
+            string systemLowered = system.TrimEnd('\\').ToLowerInvariant();
+            if (lowered == systemLowered || lowered.StartsWith(systemLowered + "\\", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("remove_path");
+            }
+        }
+
+        private static void RequireAllowed(string trimmed)
+        {
+            string lowered = trimmed.ToLowerInvariant();
+            RefuseSystemRoot(lowered);
+            lock (RootLock)
+            {
+                foreach (string root in AllowedRoots)
+                {
+                    if (lowered == root || lowered.StartsWith(root + "\\", StringComparison.Ordinal))
+                    {
+                        return;
+                    }
+                }
+            }
+            throw new InvalidOperationException("remove_path");
+        }
+
         private static string Extend(string path)
+        {
+            string trimmed = Shape(path);
+            RequireAllowed(trimmed);
+            return "\\\\?\\" + trimmed;
+        }
+
+        private static string Shape(string path)
         {
             if (string.IsNullOrEmpty(path) || path.Length < 4 || path.Length > 32000 || path[1] != ':' || path[2] != '\\')
             {
@@ -559,7 +613,61 @@ namespace KeelDock.Platform.WindowsConfinement
                     throw new InvalidOperationException("remove_path");
                 }
             }
-            return "\\\\?\\" + trimmed;
+            return trimmed;
+        }
+
+
+        private static IntPtr ReopenDirectory(string path, string expectedFinal)
+        {
+            uint[] tiers = new uint[]
+            {
+                Delete | Synchronize | FileListDirectory | FileReadAttributes | FileWriteAttributes,
+                Delete | Synchronize | FileListDirectory | FileReadAttributes
+            };
+            uint flags = FlagBackupSemantics | FlagOpenReparsePoint;
+            int error = 0;
+            foreach (uint access in tiers)
+            {
+                for (int attempt = 0; attempt < MaxOpenRetries; ++attempt)
+                {
+                    IntPtr handle = Native.CreateFileW(path, access, ShareRead, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
+                    if (handle != new IntPtr(-1))
+                    {
+                        bool good = false;
+                        try
+                        {
+                            uint attributes;
+                            uint links;
+                            ReadInformation(handle, out attributes, out links);
+                            good = (attributes & AttributeDirectory) != 0 && (attributes & AttributeReparsePoint) == 0
+                                && string.Equals(FinalPath(handle), expectedFinal, StringComparison.OrdinalIgnoreCase);
+                        }
+                        finally
+                        {
+                            if (!good)
+                            {
+                                Native.CloseHandle(handle);
+                            }
+                        }
+                        if (!good)
+                        {
+                            throw new InvalidOperationException("remove_failed step=verify error=reopen");
+                        }
+                        return handle;
+                    }
+                    error = Marshal.GetLastWin32Error();
+                    if (error != ErrorSharingViolation)
+                    {
+                        break;
+                    }
+                    Thread.Sleep(200);
+                }
+                if (error != ErrorAccessDenied)
+                {
+                    break;
+                }
+            }
+            throw new InvalidOperationException("remove_failed step=reopen error=" + error.ToString());
         }
 
         private static IntPtr OpenEntry(string path)
@@ -768,6 +876,14 @@ namespace KeelDock.Platform.WindowsConfinement
             {
                 throw new InvalidOperationException("remove_failed step=depth error=0");
             }
+            if (path.Length > MaxPathChars)
+            {
+                throw new InvalidOperationException("remove_failed step=depth error=path");
+            }
+            if (expectedFinal == null && depth == 0)
+            {
+                expectedFinal = path;
+            }
             IntPtr handle = OpenEntry(path);
             try
             {
@@ -786,6 +902,9 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 if ((attributes & AttributeDirectory) != 0)
                 {
+                    Native.CloseHandle(handle);
+                    handle = IntPtr.Zero;
+                    handle = ReopenDirectory(path, here);
                     List<string> names = new List<string>();
                     List<uint> kinds = new List<uint>();
                     ListEntries(handle, names, kinds);
@@ -811,7 +930,10 @@ namespace KeelDock.Platform.WindowsConfinement
             }
             finally
             {
-                Native.CloseHandle(handle);
+                if (handle != IntPtr.Zero)
+                {
+                    Native.CloseHandle(handle);
+                }
             }
         }
 
