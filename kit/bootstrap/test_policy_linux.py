@@ -295,7 +295,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "Run trusted dependency audit",
                 "Prepare offline project inputs",
                 "Re-run positive controls immediately before the first project command",
-                "Run all thirteen offline project gates",
+                "Run all offline project gates",
                 "Merge confinement phase records",
                 "Forced faults must fail closed",
             ],
@@ -304,7 +304,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertLess(source.index("Fetch exact source"), source.index("linux_source_build.py revoke"))
         self.assertLess(source.index("linux_source_build.py revoke"), source.index("Fetch npm tarballs"))
         self.assertLess(source.index("Prepare offline project inputs"), source.index("linux_boundary.py recheck"))
-        self.assertLess(source.index("linux_boundary.py recheck"), source.index("Run all thirteen offline project gates"))
+        self.assertLess(source.index("linux_boundary.py recheck"), source.index("Run all offline project gates"))
         self.assertIn("sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP", source)
         self.assertIn("--synthetic-standin", source)
 

@@ -115,7 +115,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Run trusted dependency audit",
                 "Prepare offline project inputs",
                 "Re-run positive controls immediately before the first project command",
-                "Run all thirteen offline project gates",
+                "Run all offline project gates",
                 "Merge confinement phase records",
                 "Forced faults must fail closed",
             ),
@@ -132,7 +132,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             "Run independent trusted dependency audit",
             "Prepare independent offline project inputs",
             "Re-run independent positive controls before project execution",
-            "Run independent thirteen offline project gates",
+            "Run independent offline project gates",
             "Merge independent confinement records", "Verify unprivileged proof handoff",
             "Publish confinement verdict",
         ))
@@ -147,7 +147,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Fetch npm tarballs by committed lock integrity",
                 "Run trusted dependency audit",
                 "Prepare offline project inputs",
-                "Run all thirteen offline project gates",
+                "Run all offline project gates",
                 "Forced faults must fail closed",
             )),
         )
@@ -195,11 +195,11 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Require trusted Rust licence admission",
                 "Fetch npm tarballs by committed lock integrity",
                 "Prepare offline project inputs",
-                "Run all thirteen offline project gates",
+                "Run all offline project gates",
                 "Require trusted Rust licence admission independently",
                 "Fetch independent npm tarballs by lock integrity",
                 "Prepare independent offline project inputs",
-                "Run independent thirteen offline project gates"):
+                "Run independent offline project gates"):
             match = re.search(
                 r"(?ms)^      - name: " + re.escape(name)
                 + r"\n(.*?)(?=^      - name: |^  linux-source-admission-)",
@@ -210,7 +210,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertIn("Require trusted Rust licence admission", blocks)
         self.assertIn("REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}",
                       blocks["Require trusted Rust licence admission"])
-        self.assertIn("REQUESTED_SOURCE_SHA", blocks["Run all thirteen offline project gates"])
+        self.assertIn("REQUESTED_SOURCE_SHA", blocks["Run all offline project gates"])
         independent_gate = workflow[
             workflow.index("      - name: Revoke verifier token and verify rejection"):
             workflow.index("      - name: Fetch independent npm tarballs by lock integrity")
@@ -225,13 +225,13 @@ class LinuxSourceBuildTests(unittest.TestCase):
                         workflow.index("Prepare offline project inputs"))
         self.assertLess(workflow.index("Require trusted Rust licence admission independently"),
                         workflow.index("Prepare independent offline project inputs"))
-        verifier_gates = workflow[workflow.index("      - name: Run independent thirteen offline project gates"):]
+        verifier_gates = workflow[workflow.index("      - name: Run independent offline project gates"):]
         verifier_gate_step = verifier_gates.split("\n      - name:", 1)[0]
         self.assertIn("REQUESTED_SOURCE_SHA", verifier_gate_step)
         self.assertIn("preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA",
                       verifier_gates)
         self.assertIn("preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA",
-                      blocks["Run all thirteen offline project gates"])
+                      blocks["Run all offline project gates"])
 
     def test_expected_run_assigns_the_plain_verdict_job_and_action_post(self):
         base = {"CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1"}
@@ -889,6 +889,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "CI_MODE": "source", "PRODUCER_RESULT": "success",
             }
             trusted = linux_source_build._verdict_record(env)
+            self.assertEqual(trusted["gates"], 13)
             self.assertTrue(confinement_verdict.run_accepted(trusted))
             with patch.object(linux_source_build.sys, "stdout", io.StringIO()):
                 self.assertEqual(linux_source_build.emit_verdict(env), 0)
@@ -906,7 +907,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             (records / "revocation.json").write_text(json.dumps(receipt), encoding="ascii")
             self.assertEqual(linux_source_build._verdict_record(env)["token_revocation"], "unconfirmed")
 
-    def test_runtime_receipt_records_all_three_stages_without_changing_public_summary_shape(self):
+    def test_runtime_receipt_records_all_three_stages_and_the_public_verdict_reports_sixteen_gates(self):
         with tempfile.TemporaryDirectory() as temporary:
             records = Path(temporary) / "kd-records"
             records.mkdir()
@@ -939,7 +940,9 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "CI_MODE": "source", "PRODUCER_RESULT": "success",
             }
             public_record = linux_source_build._verdict_record(env)
-            self.assertEqual(public_record["gates"], 13)
+            self.assertEqual(public_record["gates"], 16)
+            self.assertEqual(len(selected), 16)
+            self.assertIn(" gates=16 failed=0 ", confinement_verdict.encode_line(public_record))
             self.assertTrue(confinement_verdict.run_accepted(public_record))
             gates["completed_gates"] = list(selected[:-1])
             (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")

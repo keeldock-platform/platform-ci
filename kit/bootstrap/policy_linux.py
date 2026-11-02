@@ -445,7 +445,7 @@ jobs:
             arguments+=(--synthetic-standin)
           fi
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
-      - name: Run all thirteen offline project gates
+      - name: Run all offline project gates
         if: ${{ inputs.mode == 'source' }}
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
@@ -617,7 +617,7 @@ jobs:
             arguments+=(--synthetic-standin)
           fi
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
-      - name: Run independent thirteen offline project gates
+      - name: Run independent offline project gates
         if: ${{ inputs.mode == 'source' }}
         env:
           WORKER_PATH: ${{ steps.verifier-project.outputs.worker_path }}

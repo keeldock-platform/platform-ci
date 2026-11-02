@@ -84,7 +84,7 @@ SOURCE_STEP_NAMES = (
     "Run trusted dependency audit",
     "Prepare offline project inputs",
     "Re-run positive controls immediately before the first project command",
-    "Run all thirteen offline project gates",
+    "Run all offline project gates",
     "Merge confinement phase records",
     "Forced faults must fail closed",
 )
@@ -102,7 +102,7 @@ VERDICT_STEP_NAMES = (
     "Run independent trusted dependency audit",
     "Prepare independent offline project inputs",
     "Re-run independent positive controls before project execution",
-    "Run independent thirteen offline project gates",
+    "Run independent offline project gates",
     "Merge independent confinement records",
     "Verify unprivileged proof handoff",
     "Publish confinement verdict",
@@ -115,7 +115,7 @@ OPTIONAL_VERDICT_SYNTHETIC_STEPS = (
     "Fetch independent npm tarballs by lock integrity",
     "Run independent trusted dependency audit",
     "Prepare independent offline project inputs",
-    "Run independent thirteen offline project gates",
+    "Run independent offline project gates",
 )
 SETTINGS_STEP_NAMES = (
     "Fetch exact public control",
@@ -135,7 +135,7 @@ OPTIONAL_SOURCE_STEPS = frozenset((
     "Fetch npm tarballs by committed lock integrity",
     "Run trusted dependency audit",
     "Prepare offline project inputs",
-    "Run all thirteen offline project gates",
+    "Run all offline project gates",
     "Forced faults must fail closed",
 ))
 
@@ -1892,11 +1892,11 @@ def verify_proof_handoff(environ=None):
     return 0
 
 
-def _verified_source_receipts(records, env):
+def _verified_gate_count(records, env):
     gates = _load_json(records / "gates.json")
     revoke = _load_json(records / "revocation.json")
     if type(gates) is not dict or type(gates.get("selected_gates")) is not list:
-        return False
+        return 0
     selected_gates = tuple(gates["selected_gates"])
     expected_gate_sets = (GATES, GATES + RUNTIME_GATE_NAMES)
     if (set(gates) != {
@@ -1917,8 +1917,8 @@ def _verified_source_receipts(records, env):
             or revoke.get("run_attempt") != env.get("GITHUB_RUN_ATTEMPT")
             or revoke.get("installation_id") != env.get("SOURCE_READER_INSTALLATION_ID")
             or revoke.get("rejected_after_revoke") is not True):
-        return False
-    return True
+        return 0
+    return len(selected_gates)
 
 
 def _verdict_record(environ):
@@ -1942,9 +1942,10 @@ def _verdict_record(environ):
         }
         memory = merged.get("memory_canary", "not-run")
         readable = merged.get("readable_file_canary", "not-run")
-        accepted_source = mode == "source" and _verified_source_receipts(records, env)
+        verified_gates = _verified_gate_count(records, env) if mode == "source" else 0
+        accepted_source = verified_gates > 0
         project = "completed" if accepted_source else "not_started"
-        gate_count = 13 if accepted_source else 0
+        gate_count = verified_gates
         failed = 0
         token_state = "confirmed" if accepted_source else "not-applicable" if mode == "synthetic" else "unconfirmed"
         record = {
