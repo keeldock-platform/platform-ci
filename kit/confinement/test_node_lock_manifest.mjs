@@ -660,6 +660,32 @@ test('refuses inBundle children under a parent that is not inert', () => {
   }
 });
 
+test('refuses bundled children that are not marked optional', () => {
+  for (const flags of [{ optional: undefined }, { optional: false }, { optional: 'true' }]) {
+    for (const name of ['tslib', '@emnapi/core']) {
+      const lock = bundledFixture();
+      Object.assign(lock.packages[`${OXIDE_PARENT}/node_modules/${name}`], flags);
+      assert.notEqual(codeOf(lock, expected), 'accepted', `${name} ${JSON.stringify(flags)}`);
+    }
+  }
+});
+
+test('refuses bundled children whose parent carries any link key or lives under a workspace', () => {
+  const linked = bundledFixture();
+  linked.packages[OXIDE_PARENT].link = false;
+  assert.notEqual(codeOf(linked, expected), 'accepted');
+
+  const nested = bundledFixture();
+  const moved = 'packages/client-api/node_modules/@tailwindcss/oxide-wasm32-wasi';
+  nested.packages[moved] = nested.packages[OXIDE_PARENT];
+  delete nested.packages[OXIDE_PARENT];
+  for (const name of OXIDE_BUNDLED) {
+    nested.packages[`${moved}/node_modules/${name}`] = nested.packages[`${OXIDE_PARENT}/node_modules/${name}`];
+    delete nested.packages[`${OXIDE_PARENT}/node_modules/${name}`];
+  }
+  assert.notEqual(codeOf(nested, expected), 'accepted');
+});
+
 test('refuses undeclared, sourced, and deeper bundled children', () => {
   const undeclared = bundledFixture();
   undeclared.packages[`${OXIDE_PARENT}/node_modules/left-pad`] = { version: '1.0.0', inBundle: true };
