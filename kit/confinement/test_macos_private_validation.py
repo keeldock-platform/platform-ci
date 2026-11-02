@@ -923,7 +923,7 @@ class CoreContractTreeTests(unittest.TestCase):
         self.assertEqual((len(data), len(source), len(inert)), (3, 38, 40))
         self.assertEqual(len(self._batch5_paths()), 81)
         self.assertFalse(data & source or data & inert or source & inert)
-        self.assertEqual(subject.CORE_CONTRACT_BATCH5_CONCERN, "core-build-diagnostic-return")
+        self.assertEqual(subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN, "core-build-diagnostic-return")
         scope = "tools/keeldock" "-tools-sync-license-scope/"
         self.assertEqual(
             {path for path in source if path.startswith(scope)},
@@ -943,20 +943,20 @@ class CoreContractTreeTests(unittest.TestCase):
                 self.assertFalse(subject._runtime_workspace_path(path))
 
     def test_batch5_paths_are_admitted_for_the_two_batch5_concerns_only(self):
-        concern = subject.CORE_CONTRACT_BATCH5_CONCERN
+        concern = subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN
         for path in sorted(self._batch5_paths()):
             with self.subTest(path=path):
                 self.assertEqual(subject._core_contract_expected_mode(path, concern=concern), "100644")
                 self.assertIsNone(subject._core_contract_expected_mode(path))
                 self.assertFalse(subject._core_contract_foundation_path(path))
                 for other in sorted(
-                    subject.CORE_CONTRACT_CONCERNS - subject.CORE_CONTRACT_BATCH5_CONCERNS
+                    subject.CORE_CONTRACT_CONCERNS - subject.CORE_CONTRACT_BUILD_FILE_CONCERNS
                 ):
                     self.assertIsNone(subject._core_contract_expected_mode(path, concern=other))
                 self.assertIsNone(subject._core_contract_expected_mode(path, concern="rules-bootstrap"))
 
     def test_batch5_neighbouring_paths_stay_refused(self):
-        concern = subject.CORE_CONTRACT_BATCH5_CONCERN
+        concern = subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN
         scope = "tools/keeldock" "-tools-sync-license-scope/"
         for path in (
             "crates/host/api/src/entitlements/other.tsv",
@@ -994,7 +994,7 @@ class CoreContractTreeTests(unittest.TestCase):
                 self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
 
     def test_a_batch5_tree_passes_diagnostics_and_is_refused_by_format_return(self):
-        diagnostics = subject.CORE_CONTRACT_BATCH5_CONCERN
+        diagnostics = subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN
         entries = self._four_crate_entries(diagnostics)
         entries.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})
         members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
@@ -1022,10 +1022,10 @@ class CoreContractTreeTests(unittest.TestCase):
 
     def test_batch5_concern_set_is_exactly_diagnostics_and_npm_admission(self):
         self.assertEqual(
-            subject.CORE_CONTRACT_BATCH5_CONCERNS,
+            subject.CORE_CONTRACT_BUILD_FILE_CONCERNS,
             frozenset(("core-build-diagnostic-return", "core-npm-admission-return")),
         )
-        self.assertTrue(subject.CORE_CONTRACT_BATCH5_CONCERNS <= subject.CORE_CONTRACT_CONCERNS)
+        self.assertTrue(subject.CORE_CONTRACT_BUILD_FILE_CONCERNS <= subject.CORE_CONTRACT_CONCERNS)
 
     def test_npm_admission_admits_every_batch5_path_and_still_refuses_unlisted_paths(self):
         concern = "core-npm-admission-return"
@@ -1065,7 +1065,7 @@ class CoreContractTreeTests(unittest.TestCase):
                 ))
 
     def test_build_diagnostics_admits_the_npm_filing_files_as_inert_data(self):
-        concern = subject.CORE_CONTRACT_BATCH5_CONCERN
+        concern = subject.CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN
         for path in (
             "dependency-policy.json",
             "docs/dependencies/dependency-policy.schema.json",
@@ -1223,7 +1223,7 @@ class CoreContractTreeTests(unittest.TestCase):
             "core-rust-format-return", "core-build-diagnostic-return", "core-npm-admission-return",
         ):
             entries = self._four_crate_entries(concern)
-            if concern in subject.CORE_CONTRACT_BATCH5_CONCERNS:
+            if concern in subject.CORE_CONTRACT_BUILD_FILE_CONCERNS:
                 entries.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})
             entries.update({path: ("100644", "a" * 40) for path in listed})
             with self.subTest(concern=concern):

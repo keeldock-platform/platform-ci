@@ -294,9 +294,9 @@ CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES = frozenset((
 CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH = re.compile(
     r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.md\Z"
 )
-CORE_CONTRACT_BATCH5_CONCERN = "core-build-diagnostic-return"
-CORE_CONTRACT_BATCH5_CONCERNS = frozenset((
-    CORE_CONTRACT_BATCH5_CONCERN, CORE_CONTRACT_NPM_ADMISSION_CONCERN,
+CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN = "core-build-diagnostic-return"
+CORE_CONTRACT_BUILD_FILE_CONCERNS = frozenset((
+    CORE_CONTRACT_BUILD_DIAGNOSTIC_CONCERN, CORE_CONTRACT_NPM_ADMISSION_CONCERN,
 ))
 CORE_CONTRACT_BUILD_DATA_FILES = frozenset((
     "crates/host/api/src/entitlements/key_register.tsv",
@@ -2375,7 +2375,7 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
     ):
         return "100644"
     if (
-        concern in CORE_CONTRACT_BATCH5_CONCERNS and type(path) is str
+        concern in CORE_CONTRACT_BUILD_FILE_CONCERNS and type(path) is str
         and (
             path in CORE_CONTRACT_BUILD_DATA_FILES
             or path in CORE_CONTRACT_BUILD_SOURCE_FILES
