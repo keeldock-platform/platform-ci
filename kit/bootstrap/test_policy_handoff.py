@@ -27,7 +27,6 @@ HANDOFF_LANE_FILES = (
     ".github/workflows/lane-h-windows-receiver.yml",
     ".github/workflows/lane-h-linux-fetch-encrypt.yml",
     ".github/workflows/lane-h-capsule-attester.yml",
-    ".github/workflows/attestation-role-signer-probe.yml",
     "kit/handoff/source_free.py",
     "kit/handoff/test_source_free.py",
 )
@@ -37,7 +36,6 @@ WORKFLOW_PATHS = {
     "lane-h-windows-receiver": ".github/workflows/lane-h-windows-receiver.yml",
     "lane-h-linux-fetch-encrypt": ".github/workflows/lane-h-linux-fetch-encrypt.yml",
     "lane-h-capsule-attester": ".github/workflows/lane-h-capsule-attester.yml",
-    "attestation-role-signer-probe": ".github/workflows/attestation-role-signer-probe.yml",
 }
 
 
@@ -339,7 +337,8 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
             text,
         )
         self.assertIn("        options:\n          - synthetic\n          - source\n        default: synthetic\n", text)
-        self.assertIn("        default: windows-source-exec\n", text)
+        self.assertIn("      environment_name:\n        description: Protected environment the source fetch job runs in\n        required: false\n        type: string\npermissions: {}\n", text)
+        self.assertNotIn("default: windows-source-exec", text)
         gate = (
             "((inputs.mode == 'synthetic' && github.ref == 'refs/heads/main') || "
             "(inputs.mode == 'source' && github.ref == 'refs/heads/untrusted'))"
@@ -370,6 +369,37 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
         self.assertEqual(text.count("linux_source_build.py revoke"), 1)
         self.assertIn("skip-token-revoke: true", text)
         self.assertIn("if: ${{ always() && (inputs.mode == 'synthetic' || steps.source-reader-token.outputs.token != '') }}", text)
+
+    def test_the_fetch_job_runs_the_windows_prefix_commands_and_seals_with_the_shared_capsule_cli(self):
+        text = read_ascii(LINUX_FETCH_PATH)
+        self.assertIn("linux_source_build.py windows-preflight", text)
+        self.assertNotIn("linux_source_build.py preflight", text)
+        self.assertIn('"$REQUESTED_ENVIRONMENT_NAME" == "linux-source-read"', text)
+        self.assertEqual(text.count("source_capsule.py seal "), 1)
+        self.assertNotIn("source_capsule.py build", text)
+        for flag in ("--repository", "--source-sha", "--source-repository-id", "--bundle", "--key-record", "--output", "--summary"):
+            self.assertIn(" " + flag + " ", text)
+        self.assertIn("git -C \"$repository\" bundle create \"$bundle\" refs/heads/kd-source", text)
+        self.assertIn("-le 268435448", text)
+        self.assertIn("KD_SOURCE_PREFIX: WINDOWS_SOURCE", text)
+        for key in ("source_sha", "tree_id", "lock_sha256", "manifest_sha256"):
+            self.assertIn(key + "=", text)
+        capsule = text.index("      - name: Build the two receiver-bound source capsules\n")
+        subject = text.index("      - name: Create the linux-fetch-encrypt role statement\n")
+        self.assertLess(capsule, subject)
+        settings = job_block(read_ascii(WINDOWS_ADMISSION_PATH), "settings")
+        self.assertIn("linux_source_build.py windows-snapshot", settings)
+
+    def test_the_receiver_workflow_has_one_job_and_matches_the_caller_inputs(self):
+        receiver = read_ascii(WINDOWS_RECEIVER_PATH)
+        self.assertEqual(job_ids(receiver), ["windows-candidate"])
+        for name in ("profile", "role", "mode", "source_sha"):
+            self.assertIn("      " + name + ":\n        required: ", receiver)
+        caller = read_ascii(WINDOWS_ADMISSION_PATH)
+        for job_id in ("windows-producer", "windows-verifier"):
+            block = job_block(caller, job_id)
+            for name in re.findall(r"(?m)^      ([a-z_]+): ", block.split("    with:\n", 1)[1].split("    permissions:", 1)[0]):
+                self.assertIn("      " + name + ":\n", receiver.split("\njobs:\n", 1)[0])
 
     def test_the_capsule_artifacts_are_one_day_uncompressed_and_named_by_run_and_attempt(self):
         text = read_ascii(LINUX_FETCH_PATH)

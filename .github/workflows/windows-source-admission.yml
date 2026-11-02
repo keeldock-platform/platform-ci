@@ -32,10 +32,9 @@ on:
         required: false
         type: string
       environment_name:
-        description: Protected Windows execution environment
+        description: Protected environment the source fetch job runs in
         required: false
         type: string
-        default: windows-source-exec
 permissions: {}
 cache-mode: none
 jobs:
@@ -92,7 +91,7 @@ jobs:
       - name: Snapshot cache inventory and validate preflight
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -B kit/confinement/linux_source_build.py snapshot
+        run: python3 -B kit/confinement/linux_source_build.py windows-snapshot
       - name: Build audit identity
         id: identity
         env:

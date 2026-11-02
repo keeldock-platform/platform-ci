@@ -19,7 +19,6 @@ WORKFLOW_SHA256 = {
     "lane-h-windows-receiver": "5347fcfdf29c979f7af8c63cee48f77b856fd7cc38d34ad675da75a0b806b448",
     "lane-h-linux-fetch-encrypt": "2385b434657d1dadf7300dbacb36165b58ff8ffe5e6863f34fca5b23bfe1aee3",
     "lane-h-capsule-attester": "99a4c171a5b574c263a8b0ee7ab6743b932410f737b1eee20981ca0e62f9b9ad",
-    "attestation-role-signer-probe": "ba5154846c0ae90fa3dad7caecf5a0a715336247aae67e4ed1b3c35d1aeac2e3",
 }
 CANDIDATE_WORKFLOWS = (
     (

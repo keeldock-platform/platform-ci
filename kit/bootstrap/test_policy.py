@@ -1461,7 +1461,6 @@ class LaneRegistryTests(unittest.TestCase):
                 "lane-h-windows-receiver",
                 "lane-h-linux-fetch-encrypt",
                 "lane-h-capsule-attester",
-                "attestation-role-signer-probe",
                 "linux-source-admission",
                 "core-linux-quick-return",
                 "core-rust-lock-return",
@@ -1484,7 +1483,6 @@ class LaneRegistryTests(unittest.TestCase):
             "lane-h-windows-receiver",
             "lane-h-linux-fetch-encrypt",
             "lane-h-capsule-attester",
-            "attestation-role-signer-probe",
         ):
             self.assertIs(policy.WORKFLOW_KIND_LANES[kind], policy_handoff)
         self.assertEqual(

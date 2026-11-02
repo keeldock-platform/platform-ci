@@ -172,6 +172,23 @@ class PublicTreeTests(unittest.TestCase):
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertEqual(action.count('"test_role_signer.py"'), 2)
 
+    def test_windows_source_run_gate_table_and_capsule_suites_are_registered_and_discovered(self):
+        for name in (
+            "kit/confinement/windows_source_run.ps1",
+            "kit/confinement/test_windows_source_run.py",
+            "kit/confinement/gate_table.py",
+            "kit/confinement/test_confinement_gate_table.py",
+            "kit/handoff/source_capsule.py",
+            "kit/handoff/test_source_capsule.py",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(name, PLATFORM_FILES)
+                self.assertIn(name, PINNED_FILE_SHA256)
+        action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
+        self.assertEqual(action.count('"test_confinement_gate_table.py"'), 2)
+        self.assertEqual(action.count('"test_windows_source_run.py"'), 2)
+        self.assertEqual(action.count('"test_source_capsule.py"'), 1)
+
     def test_linux_source_build_suite_is_registered_and_discovered_at_push_time(self):
         self.assertIn("kit/confinement/linux_source_build.py", PLATFORM_FILES)
         self.assertIn("kit/confinement/test_linux_source_build.py", PLATFORM_FILES)
@@ -257,11 +274,12 @@ class PublicTreeTests(unittest.TestCase):
             '.github/workflows/node-lock-return.yml',
             '.github/workflows/core-rust-format-return.yml',
             '.github/workflows/core-build-diagnostic-return.yml',
-            '.github/workflows/attestation-role-signer-probe.yml',
             '.github/workflows/windows-source-admission.yml',
             '.github/workflows/lane-h-windows-receiver.yml',
             '.github/workflows/lane-h-linux-fetch-encrypt.yml',
             '.github/workflows/lane-h-capsule-attester.yml',
+            'kit/confinement/windows_source_run.ps1',
+            'kit/confinement/test_windows_source_run.py',
             'kit/confinement/foundation_node_feedback.py',
             'kit/confinement/test_foundation_node_feedback.py',
             'kit/confinement/macos_node_contract.py',

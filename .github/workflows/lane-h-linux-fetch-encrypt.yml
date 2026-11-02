@@ -101,13 +101,13 @@ jobs:
             [[ "$KD_REF" == "refs/heads/main" ]]
           else
             [[ "$KD_MODE" == "source" && "$KD_REF" == "refs/heads/untrusted" ]]
-            [[ "$REQUESTED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ && "$REQUESTED_ENVIRONMENT_NAME" == "windows-source-exec" ]]
+            [[ "$REQUESTED_SOURCE_SHA" =~ ^[a-f0-9]{40}$ && "$REQUESTED_ENVIRONMENT_NAME" == "linux-source-read" ]]
           fi
       - name: Repeat preflight in source-read
         if: ${{ inputs.mode == 'source' }}
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -B kit/confinement/linux_source_build.py preflight
+        run: python3 -B kit/confinement/linux_source_build.py windows-preflight
       - name: Read numeric control repository identifier
         run: |
           set -euo pipefail
@@ -236,15 +236,45 @@ jobs:
         id: capsule
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          CHECKOUT_LOCK_SHA256: ${{ steps.checkout.outputs.lock_sha256 }}
+          CHECKOUT_MANIFEST_SHA256: ${{ steps.checkout.outputs.manifest_sha256 }}
         run: |
           set -euo pipefail
-          repository_id="$(cat "$RUNNER_TEMP/control-repository-id.txt")"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
           evidence="$RUNNER_TEMP/role-evidence"
+          if [[ "$KD_MODE" == "source" ]]; then
+            repository="$SOURCE_PATH"
+            source_sha="$REQUESTED_SOURCE_SHA"
+            source_repository_id="$SOURCE_REPOSITORY_ID"
+            lock_sha256="$CHECKOUT_LOCK_SHA256"
+            manifest_sha256="$CHECKOUT_MANIFEST_SHA256"
+          else
+            fixture="kit/confinement/synthetic_project"
+            [[ -d "$fixture" && ! -L "$fixture" ]]
+            repository="$RUNNER_TEMP/synthetic-source"
+            mkdir -p "$repository"
+            cp -R "$fixture/." "$repository/"
+            git -C "$repository" init --quiet
+            git -C "$repository" add --all
+            GIT_AUTHOR_DATE='2000-01-01T00:00:00Z' GIT_COMMITTER_DATE='2000-01-01T00:00:00Z' git -C "$repository" -c user.name=fixture -c user.email=fixture@example.invalid -c commit.gpgsign=false commit --quiet --no-verify -m fixture
+            source_sha="$(git -C "$repository" rev-parse --verify HEAD)"
+            source_repository_id=1
+            lock_sha256="$(sha256sum "$repository/package-lock.json" | awk '{print $1}')"
+            manifest_sha256="$(python3 -B kit/confinement/gate_table.py manifest-digest --root "$repository")"
+          fi
+          [[ "$source_sha" =~ ^[a-f0-9]{40}$ && "$source_repository_id" =~ ^[1-9][0-9]{0,19}$ && "$lock_sha256" =~ ^[a-f0-9]{64}$ && "$manifest_sha256" =~ ^[a-f0-9]{64}$ ]]
+          git -C "$repository" update-ref refs/heads/kd-source "$source_sha"
+          bundle="$RUNNER_TEMP/source.bundle"
+          git -C "$repository" bundle create "$bundle" refs/heads/kd-source
+          [[ "$(stat -c %s "$bundle")" -le 268435448 ]]
+          mkdir -p "$RUNNER_TEMP/source-capsule-summaries"
           for role in producer verifier; do
             selected="$(cat "$evidence/windows-$role-name.txt")"
             mkdir -p "$RUNNER_TEMP/source-capsule-$role"
-            python3 -B kit/handoff/source_capsule.py build --mode "$KD_MODE" --role "$role" --source-path "${SOURCE_PATH:-}" --source-sha "${REQUESTED_SOURCE_SHA:-}" --receiver-record "$evidence/artifacts/$selected/subject.bin" --repository-id "$repository_id" --control-sha "$KD_SHA" --run-id "$KD_RUN_ID" --run-attempt "$KD_RUN_ATTEMPT" --workflow-ref "$KD_WORKFLOW_REF" --output "$RUNNER_TEMP/source-capsule-$role/capsule.bin"
+            python3 -B kit/handoff/source_capsule.py seal --repository "$repository" --source-sha "$source_sha" --source-repository-id "$source_repository_id" --bundle "$bundle" --key-record "$evidence/artifacts/$selected/subject.bin" --output "$RUNNER_TEMP/source-capsule-$role/capsule.bin" --summary "$RUNNER_TEMP/source-capsule-summaries/$role.json"
           done
+          rm -f "$bundle"
+          python3 -B -c 'import json,sys; a,b,c,d,e,f=sys.argv[1:7]; x=json.load(open(a,encoding="ascii")); y=json.load(open(b,encoding="ascii")); ok=x["source_sha"]==y["source_sha"]==c and x["tree_id"]==y["tree_id"] and len(x["tree_id"])==40 and len(d)==64 and len(e)==64; open(f,"a",encoding="ascii").write("source_sha="+x["source_sha"]+"\ntree_id="+x["tree_id"]+"\nlock_sha256="+d+"\nmanifest_sha256="+e+"\n") if ok else sys.exit(1)' "$RUNNER_TEMP/source-capsule-summaries/producer.json" "$RUNNER_TEMP/source-capsule-summaries/verifier.json" "$source_sha" "$lock_sha256" "$manifest_sha256" "$GITHUB_OUTPUT"
       - name: Create the linux-fetch-encrypt role statement
         id: subject
         env:
