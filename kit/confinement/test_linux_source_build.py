@@ -1091,13 +1091,15 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     })
             self.assertEqual(output.getvalue(), "")
 
-    def _gate_over_tree(self, files):
+    def _gate_over_tree(self, files, links=None):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for name, text in files.items():
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding="ascii")
+            for name, target in (links or {}).items():
+                (root / name).symlink_to(target, target_is_directory=True)
             output = io.StringIO()
             with patch.object(linux_source_build.sys, "stdout", output):
                 code = linux_source_build.run_rust_license_gate({
@@ -1105,19 +1107,19 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 })
             return code, output.getvalue()
 
-    def _assert_tree_refused(self, files):
+    def _assert_tree_refused(self, files, links=None):
         with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
-            self._gate_over_tree(files)
+            self._gate_over_tree(files, links)
         self.assertEqual(refused.exception.reason, "lock")
 
     def test_manifests_that_reach_outside_the_root_or_patch_are_refused(self):
         member = '[package]\nname = "inner"\nversion = "0.1.0"\nedition = "2024"\n\n'
         cases = {
             "absolute_path": member + '[dependencies]\nfoo = { path = "/opt/outside/foo" }\n',
-            "parent_path": member + '[dependencies]\nfoo = { path = "../../outside" }\n',
-            "dev_table": member + '[dev-dependencies.foo]\npath = "../../outside"\n',
-            "build_table": member + '[build-dependencies]\nfoo = { path = "../../outside" }\n',
-            "target_table": member + '[target.x86_64-unknown-linux-gnu.dependencies]\nfoo = { path = "../../outside" }\n',
+            "parent_path": member + '[dependencies]\nfoo = { path = "../../../outside" }\n',
+            "dev_table": member + '[dev-dependencies.foo]\npath = "../../../outside"\n',
+            "build_table": member + '[build-dependencies]\nfoo = { path = "../../../outside" }\n',
+            "target_table": member + '[target.x86_64-unknown-linux-gnu.dependencies]\nfoo = { path = "../../../outside" }\n',
             "patch": member + '[patch.crates-io]\nfoo = { path = "vendor/foo" }\n',
             "replace": member + '[replace]\n',
             "unknown_shape": member + '[dependencies]\nfoo = 3\n',
@@ -1133,6 +1135,86 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Cargo.lock": _path_only_lock(1),
                 "Cargo.toml": '[workspace]\nmembers = ["../outside"]\n',
             })
+
+    def test_one_level_up_from_a_nested_manifest_stays_inside_and_passes(self):
+        manifest = (
+            '[package]\nname = "inner"\nversion = "0.1.0"\nedition = "2024"\n\n'
+            '[dependencies]\nfoo = { path = "../../outside" }\n'
+        )
+        self.assertEqual(
+            self._gate_over_tree({
+                "Cargo.lock": _path_only_lock(1), "crates/inner/Cargo.toml": manifest,
+            }),
+            (0, "linux-rust-licence=registry-free locks=1\n"),
+        )
+
+    def test_paths_into_directories_the_walk_skips_are_refused(self):
+        head = '[package]\nname = "inner"\nversion = "0.1.0"\nedition = "2024"\n\n'
+        for name in ("node_modules", "target", ".git", ".kd-cargo-home", ".npm-cache",
+                     ".kd-npm-tarballs", ".kd-other", ".cargo"):
+            with self.subTest(directory=name):
+                self._assert_tree_refused({
+                    "Cargo.lock": _path_only_lock(1),
+                    "Cargo.toml": head + '[dependencies]\nfoo = { path = "' + name + '/x" }\n',
+                })
+        with self.subTest(directory="nested"):
+            self._assert_tree_refused({
+                "Cargo.lock": _path_only_lock(1),
+                "crates/inner/Cargo.toml": head
+                + '[dependencies]\nfoo = { path = "../../node_modules/x" }\n',
+            })
+
+    def test_directory_symlinks_in_the_tree_are_refused(self):
+        self._assert_tree_refused(
+            {"Cargo.lock": _path_only_lock(1), "Cargo.toml": '[workspace]\nmembers = []\n'},
+            links={"loop": "."},
+        )
+
+    def test_manifest_path_resolution_refuses_a_symlink_component(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "real").mkdir()
+            (root / "real" / "lib.rs").write_text("", encoding="ascii")
+            (root / "hop").symlink_to(".", target_is_directory=True)
+            descriptor = self._root_descriptor(root)
+            check = linux_source_build._require_physical_manifest_path
+            check(descriptor, (), "real/lib.rs")
+            check(descriptor, (), "real/missing/lib.rs")
+            check(descriptor, ("real",), "../real/lib.rs")
+            for value in ("hop/real/lib.rs", "hop/../x", "real/../hop/real", "../x"):
+                with self.subTest(value=value):
+                    with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                        check(descriptor, (), value)
+                    self.assertEqual(refused.exception.reason, "lock")
+
+    def test_manifest_parser_behaviour_the_confinement_check_relies_on(self):
+        parse = linux_source_build.cargo_lock_bootstrap._parse_manifest
+        document = parse(
+            b'[package]\nname = "a"\nbuild = false\n\n'
+            b'[workspace]\nmembers = ["crates/*"]\n\n'
+            b'[dependencies]\nfoo = { path = "../foo" }\n\n'
+            b'[dev-dependencies.bar]\npath = "../bar"\n\n'
+            b'[target.x86_64-unknown-linux-gnu.dependencies]\nbaz = { path = "../baz" }\n\n'
+            b'[patch.crates-io]\nfoo = { path = "vendor/foo" }\n\n'
+            b'[[bin]]\nname = "a"\npath = "src/main.rs"\n'
+        )
+        self.assertIs(document["package"]["build"], False)
+        self.assertEqual(document["workspace"]["members"], ["crates/*"])
+        self.assertEqual(document["dependencies"]["foo"], {"path": "../foo"})
+        self.assertEqual(document["dev-dependencies"]["bar"], {"path": "../bar"})
+        target = document["target"]["x86_64-unknown-linux-gnu"]
+        self.assertEqual(target["dependencies"]["baz"], {"path": "../baz"})
+        self.assertEqual(document["patch"]["crates-io"]["foo"], {"path": "vendor/foo"})
+        self.assertEqual(document["bin"], [{"name": "a", "path": "src/main.rs"}])
+        self.assertIn("replace", parse(b"[replace]\n"))
+        refused = (
+            b'a = "x\\y"\n', b'a = """x"""\n', b"[a]\n[a]\n", b"[[patch.unused]]\n",
+            b"", b"a = \x00\n",
+        )
+        for data in refused:
+            with self.subTest(data=data):
+                with self.assertRaises(Exception):
+                    parse(data)
 
     def test_in_root_path_dependencies_and_workspace_members_pass(self):
         files = {

@@ -1628,9 +1628,10 @@ def _open_verified_directory(root_fd, relative_parts, identities):
         raise
 
 
-def _rust_lock_paths(root_fd, file_name="Cargo.lock", limit=32, require_any=True):
-    ignored = {".git", "target", "node_modules", ".kd-cargo-home", ".npm-cache"}
-    root_only_ignored = {".kd-npm-tarballs"}
+def _rust_lock_paths(root_fd, file_name="Cargo.lock", limit=32, require_any=True,
+                     refuse_directory_links=False):
+    ignored = RUST_WALK_IGNORED
+    root_only_ignored = RUST_WALK_ROOT_IGNORED
     paths = []
     root_identity = _directory_identity(os.fstat(root_fd))
     pending = [((), (root_identity,))]
@@ -1659,6 +1660,13 @@ def _rust_lock_paths(root_fd, file_name="Cargo.lock", limit=32, require_any=True
                     if stat.S_ISLNK(metadata.st_mode):
                         if name == file_name:
                             raise SourceBuildRefusal("lock")
+                        if refuse_directory_links:
+                            try:
+                                target = os.stat(name, dir_fd=current)
+                            except OSError:
+                                continue
+                            if stat.S_ISDIR(target.st_mode):
+                                raise SourceBuildRefusal("lock")
                         continue
                     child_parts = relative_parts + (name,)
                     if stat.S_ISDIR(metadata.st_mode):
@@ -1773,18 +1781,57 @@ MANIFEST_DEPENDENCY_TABLES = (
 )
 MANIFEST_TARGET_TABLES = ("lib", "bin", "test", "bench", "example")
 MAX_MANIFEST_FILES = 256
+RUST_WALK_IGNORED = frozenset((".git", "target", "node_modules", ".kd-cargo-home", ".npm-cache"))
+RUST_WALK_ROOT_IGNORED = frozenset((".kd-npm-tarballs",))
 
 
-def _require_confined_manifest_path(directory, value):
+def _skipped_component(component):
+    return (component in RUST_WALK_IGNORED or component in RUST_WALK_ROOT_IGNORED
+            or component == ".cargo" or component.startswith(".kd-"))
+
+
+def _require_physical_manifest_path(root_fd, directory_parts, value):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    stack = [os.dup(root_fd)]
+    try:
+        for component in tuple(directory_parts) + tuple(value.split("/")):
+            if component in ("", "."):
+                continue
+            if component == "..":
+                if len(stack) == 1:
+                    raise SourceBuildRefusal("lock")
+                os.close(stack.pop())
+                continue
+            try:
+                before = os.stat(component, dir_fd=stack[-1], follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if stat.S_ISLNK(before.st_mode):
+                raise SourceBuildRefusal("lock")
+            if not stat.S_ISDIR(before.st_mode):
+                return
+            stack.append(os.open(component, flags, dir_fd=stack[-1]))
+    except OSError:
+        raise SourceBuildRefusal("lock") from None
+    finally:
+        for descriptor in reversed(stack):
+            os.close(descriptor)
+
+
+def _require_confined_manifest_path(root_fd, parts, value):
     if (type(value) is not str or not value or value.startswith("/")
             or "\\" in value or ":" in value or "\x00" in value):
         raise SourceBuildRefusal("lock")
+    directory = "/".join(parts) or "."
     resolved = posixpath.normpath(posixpath.join(directory, value))
     if resolved == ".." or resolved.startswith("../") or resolved.startswith("/"):
         raise SourceBuildRefusal("lock")
+    if any(_skipped_component(item) for item in value.split("/") + resolved.split("/")):
+        raise SourceBuildRefusal("lock")
+    _require_physical_manifest_path(root_fd, parts, value)
 
 
-def _require_confined_manifest(directory, document):
+def _require_confined_manifest(root_fd, parts, document):
     if type(document) is not dict or "patch" in document or "replace" in document:
         raise SourceBuildRefusal("lock")
     tables = [document[name] for name in MANIFEST_DEPENDENCY_TABLES if name in document]
@@ -1807,14 +1854,14 @@ def _require_confined_manifest(directory, document):
                 if type(workspace[key]) is not list:
                     raise SourceBuildRefusal("lock")
                 for item in workspace[key]:
-                    _require_confined_manifest_path(directory, item)
+                    _require_confined_manifest_path(root_fd, parts, item)
     package = document.get("package")
     if package is not None:
         if type(package) is not dict:
             raise SourceBuildRefusal("lock")
         for key in ("workspace", "build"):
             if key in package and type(package[key]) is not bool:
-                _require_confined_manifest_path(directory, package[key])
+                _require_confined_manifest_path(root_fd, parts, package[key])
     for key in MANIFEST_TARGET_TABLES:
         value = document.get(key)
         entries = value if type(value) is list else ([] if value is None else [value])
@@ -1822,7 +1869,7 @@ def _require_confined_manifest(directory, document):
             if type(entry) is not dict:
                 raise SourceBuildRefusal("lock")
             if "path" in entry:
-                _require_confined_manifest_path(directory, entry["path"])
+                _require_confined_manifest_path(root_fd, parts, entry["path"])
     for table in tables:
         if type(table) is not dict:
             raise SourceBuildRefusal("lock")
@@ -1832,18 +1879,18 @@ def _require_confined_manifest(directory, document):
             if type(spec) is not dict:
                 raise SourceBuildRefusal("lock")
             if "path" in spec:
-                _require_confined_manifest_path(directory, spec["path"])
+                _require_confined_manifest_path(root_fd, parts, spec["path"])
 
 
 def _require_confined_manifests(root_fd):
-    candidates = _rust_lock_paths(root_fd, "Cargo.toml", MAX_MANIFEST_FILES, False)
+    candidates = _rust_lock_paths(root_fd, "Cargo.toml", MAX_MANIFEST_FILES, False, True)
     for candidate in candidates:
         data = _read_bounded_cargo_lock(root_fd, candidate)
         try:
             document = cargo_lock_bootstrap._parse_manifest(data)
         except Exception:
             raise SourceBuildRefusal("lock") from None
-        _require_confined_manifest("/".join(candidate[0][:-1]) or ".", document)
+        _require_confined_manifest(root_fd, candidate[0][:-1], document)
 
 
 def run_rust_license_gate(environ=None):
