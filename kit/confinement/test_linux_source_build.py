@@ -247,10 +247,18 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertEqual(source["jobs"]["linux-source-admission-source-read"]["steps"][-1], "Post Mint scoped source-reader token")
         self.assertNotIn("Post Mint scoped source-reader token", synthetic["jobs"]["linux-source-admission-source-read"]["steps"])
 
-    def test_toolchain_versions_are_pinned_and_node_digest_is_a_coordinator_constant(self):
+    def test_toolchain_versions_are_pinned_and_the_node_archive_digest_is_the_official_release_digest(self):
         self.assertEqual(linux_source_build.NODE_VERSION, "24.22.1")
         self.assertEqual(linux_source_build.NPM_VERSION, "11.19.1")
-        self.assertTrue(linux_source_build.NODE_LINUX_TARBALL_SHA256.startswith("COORDINATOR_FILL_"))
+        self.assertRegex(linux_source_build.NODE_LINUX_TARBALL_SHA256, r"\A[a-f0-9]{64}\Z")
+        self.assertEqual(
+            linux_source_build.NODE_LINUX_TARBALL_SHA256,
+            "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6",
+        )
+        source = Path(linux_source_build.__file__).read_text(encoding="utf-8")
+        self.assertIn('"/node-v" + NODE_VERSION + "-linux-x64.tar.xz"', source)
+        self.assertIn('node_archive = root / "node-linux-x64.tar.xz"', source)
+        self.assertNotIn("COORDINATOR_FILL" + "_NODE", linux_source_build.NODE_LINUX_TARBALL_SHA256)
         self.assertEqual(len(linux_source_build.RUST_COMPONENTS), 5)
         for name, url, digest in linux_source_build.RUST_COMPONENTS:
             with self.subTest(component=name):
