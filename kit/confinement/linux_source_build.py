@@ -64,6 +64,7 @@ PROVENANCE_FIELDS = frozenset((
     "accepted_at_ms",
 ))
 IDENTITY_FIELDS = ("source_sha", "base_sha", "control_sha", "reviewed_diff_sha256")
+MANIFEST_WORKSPACE_PATHS = ("packages/host-api", "packages/kernel-i18n")
 MANIFEST_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 MANIFEST_PACKAGE_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$")
 MANIFEST_VERSION_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
@@ -1097,7 +1098,7 @@ def _manifest_digest(source_root):
             raise SourceBuildRefusal("lock")
         workspaces = workspaces.get("packages")
     if (type(workspaces) is not list or len(workspaces) != 1
-            or workspaces[0] not in ("packages/*", "packages/host-api")):
+            or workspaces[0] != "packages/*"):
         raise SourceBuildRefusal("lock")
     root_expected = {"name": root["name"], "version": root["version"], "workspaces": workspaces}
     for group in MANIFEST_GROUPS:
@@ -1106,21 +1107,27 @@ def _manifest_digest(source_root):
     overrides = _manifest_root_overrides(root)
     if overrides is not None:
         root_expected["overrides"] = overrides
-    workspace_path = "packages/host-api"
-    if not any(pattern == workspace_path or pattern == "packages/*" and workspace_path.startswith("packages/")
+    workspace_paths = []
+    for workspace_path in MANIFEST_WORKSPACE_PATHS:
+        if any(pattern == workspace_path or pattern == "packages/*" and workspace_path.startswith("packages/")
                for pattern in workspaces):
+            workspace_paths.append(workspace_path)
+    if len(workspace_paths) != len(MANIFEST_WORKSPACE_PATHS):
         raise SourceBuildRefusal("lock")
-    package = _manifest_json(Path(source_root) / workspace_path / "package.json")
-    if (type(package) is not dict or type(package.get("name")) is not str
-            or type(package.get("version")) is not str
-            or any(key in package for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies"))):
-        raise SourceBuildRefusal("lock")
-    workspace_expected = {"path": workspace_path, "name": package["name"], "version": package["version"]}
-    for group in MANIFEST_GROUPS:
-        if group in package:
-            workspace_expected[group] = package[group]
-    workspace_names = {workspace_expected["name"]}
-    for manifest in (root_expected, workspace_expected):
+    workspace_manifests = []
+    for workspace_path in workspace_paths:
+        package = _manifest_json(Path(source_root) / workspace_path / "package.json")
+        if (type(package) is not dict or type(package.get("name")) is not str
+                or type(package.get("version")) is not str
+                or any(key in package for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies"))):
+            raise SourceBuildRefusal("lock")
+        workspace_expected = {"path": workspace_path, "name": package["name"], "version": package["version"]}
+        for group in MANIFEST_GROUPS:
+            if group in package:
+                workspace_expected[group] = package[group]
+        workspace_manifests.append(workspace_expected)
+    workspace_names = {item["name"] for item in workspace_manifests}
+    for manifest in [root_expected] + workspace_manifests:
         for group in MANIFEST_GROUPS:
             dependencies = manifest.get(group, {})
             if type(dependencies) is not dict or len(dependencies) > 512:
@@ -1134,7 +1141,7 @@ def _manifest_digest(source_root):
                         raise SourceBuildRefusal("lock")
                 elif not MANIFEST_VERSION_RE.fullmatch(spec):
                     raise SourceBuildRefusal("lock")
-    expected = {"root": root_expected, "workspaces": [workspace_expected]}
+    expected = {"root": root_expected, "workspaces": workspace_manifests}
     try:
         encoded = json.dumps(
             expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,

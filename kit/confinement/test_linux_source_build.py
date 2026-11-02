@@ -1024,7 +1024,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         with self.assertRaises(confinement_public_audit.AuditRefusal):
             confinement_public_audit._check_section(bad, job, expected)
 
-    def _write_manifests(self, directory, root_extra=None, workspace_extra=None):
+    def _write_manifests(self, directory, root_extra=None, workspace_extra=None, kernel_extra=None):
         root = {
             "name": "synthetic-root", "version": "1.0.0", "workspaces": ["packages/*"],
             "devDependencies": {"typescript": "6.0.3"},
@@ -1034,8 +1034,12 @@ class LinuxSourceBuildTests(unittest.TestCase):
         package.update(workspace_extra or {})
         base = Path(directory)
         (base / "packages/host-api").mkdir(parents=True)
+        (base / "packages/kernel-i18n").mkdir(parents=True)
+        kernel = {"name": "@synthetic/kernel-i18n", "version": "1.0.0"}
+        kernel.update(kernel_extra or {})
         (base / "package.json").write_text(json.dumps(root), encoding="ascii")
         (base / "packages/host-api/package.json").write_text(json.dumps(package), encoding="ascii")
+        (base / "packages/kernel-i18n/package.json").write_text(json.dumps(kernel), encoding="ascii")
         return base
 
     def test_manifest_digest_binds_the_exact_root_override_and_refuses_everything_else(self):
@@ -1065,6 +1069,58 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 with self.assertRaises(linux_source_build.SourceBuildRefusal):
                     linux_source_build._manifest_digest(base)
 
+    def test_manifest_digest_binds_every_reviewed_workspace_in_the_shared_order(self):
+        self.assertEqual(
+            linux_source_build.MANIFEST_WORKSPACE_PATHS,
+            ("packages/host-api", "packages/kernel-i18n"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = linux_source_build._manifest_digest(self._write_manifests(Path(directory) / "base"))
+        expected = {
+            "root": {
+                "name": "synthetic-root", "version": "1.0.0", "workspaces": ["packages/*"],
+                "devDependencies": {"typescript": "6.0.3"},
+            },
+            "workspaces": [
+                {"path": "packages/host-api", "name": "@synthetic/host-api", "version": "1.0.0"},
+                {"path": "packages/kernel-i18n", "name": "@synthetic/kernel-i18n", "version": "1.0.0"},
+            ],
+        }
+        encoded = json.dumps(
+            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+        ).encode("ascii")
+        self.assertEqual(baseline, hashlib.sha256(encoded).hexdigest())
+        for index, kernel_extra in enumerate((
+            {"version": "1.0.1"}, {"name": "@synthetic/kernel-other"},
+            {"dependencies": {"left-pad": "1.3.0"}}, {"devDependencies": {"typescript": "6.0.3"}},
+        )):
+            with self.subTest(kernel=kernel_extra), tempfile.TemporaryDirectory() as directory:
+                changed = linux_source_build._manifest_digest(
+                    self._write_manifests(Path(directory) / ("k%d" % index), None, None, kernel_extra)
+                )
+                self.assertNotEqual(changed, baseline)
+
+    def test_manifest_digest_refuses_an_unreviewed_kernel_workspace_manifest(self):
+        for index, kernel_extra in enumerate((
+            {"overrides": {"lightningcss": "1.33.0"}}, {"resolutions": {"a": "1.0.0"}},
+            {"bundleDependencies": ["a"]}, {"bundledDependencies": ["a"]},
+            {"dependencies": {"left-pad": "git+https://example.invalid/left-pad.git"}},
+            {"dependencies": {"left-pad": "file:../left-pad"}},
+            {"dependencies": {"Bad Name": "1.0.0"}}, {"version": 1},
+        )):
+            with self.subTest(kernel=kernel_extra), tempfile.TemporaryDirectory() as directory:
+                base = self._write_manifests(Path(directory) / ("k%d" % index), None, None, kernel_extra)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._manifest_digest(base)
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write_manifests(Path(directory) / "missing")
+            (base / "packages/kernel-i18n/package.json").unlink()
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._manifest_digest(base)
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write_manifests(Path(directory) / "narrow", {"workspaces": ["packages/host-api"]})
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._manifest_digest(base)
 
 
 if __name__ == "__main__":
