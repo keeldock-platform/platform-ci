@@ -14,11 +14,14 @@ __all__ = [
     "LinuxLaneRegistryTests",
     "LinuxLanePublicTreeTests",
     "LinuxSourceAdmissionWorkflowTests",
+    "LinuxQuickReturnWorkflowTests",
 ]
 
 ROOT = Path(__file__).resolve().parents[2]
 LINUX_WORKFLOW = ROOT / ".github/workflows/linux-confinement.yml"
 ADMISSION_WORKFLOW = ROOT / ".github/workflows/linux-source-admission.yml"
+QUICK_WORKFLOW = ROOT / ".github/workflows/core-linux-quick-return.yml"
+QUICK_MODULE = ROOT / "kit/confinement/linux_quick_return.py"
 STANDIN = "kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd"
 LINUX_WORKFLOW_SHA256_BEFORE_SPLIT = "f7860a422e818f238232c395a100422ab32e5a6498737a8840d52a362b96b6ae"
 LINUX_LANE_FILES = (
@@ -43,6 +46,9 @@ LINUX_LANE_FILES = (
     "kit/confinement/test_linux_settings.py",
     "kit/confinement/linux_source_build.py",
     "kit/confinement/test_linux_source_build.py",
+    ".github/workflows/core-linux-quick-return.yml",
+    "kit/confinement/linux_quick_return.py",
+    "kit/confinement/test_linux_quick_return.py",
 )
 
 
@@ -114,6 +120,7 @@ class LinuxLaneRegistryTests(unittest.TestCase):
             {
                 "linux-confinement": policy_linux.LINUX_CONFINEMENT_WORKFLOW_TEMPLATE,
                 "linux-source-admission": policy_linux.LINUX_SOURCE_ADMISSION_WORKFLOW_TEMPLATE,
+                "core-linux-quick-return": policy_linux.LINUX_QUICK_RETURN_WORKFLOW_TEMPLATE,
             },
         )
         self.assertEqual(dict(policy_linux.WORKFLOW_SHA256), {})
@@ -125,6 +132,11 @@ class LinuxLaneRegistryTests(unittest.TestCase):
                     ".github/workflows/linux-source-admission.yml",
                     "linux-source-admission",
                     "linux-source-admission-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/core-linux-quick-return.yml",
+                    "core-linux-quick-return",
+                    "core-linux-quick-return-workflow-too-large",
                 ),
             ),
         )
@@ -398,6 +410,254 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertIn("uses: ./", changed)
         with self.assertRaises(PolicyError):
             validate_workflow_text(changed, "platform", "linux-source-admission")
+
+
+class LinuxQuickReturnWorkflowTests(unittest.TestCase):
+    PINNED_UPLOAD = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+    PINNED_MINT = "actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510"
+
+    def setUp(self):
+        self.text = QUICK_WORKFLOW.read_text(encoding="utf-8")
+
+    def jobs(self):
+        parts = re.split(r"(?m)^  (core-linux-quick-return-[a-z-]+):\n", self.text)
+        return {parts[index]: parts[index + 1] for index in range(1, len(parts), 2)}
+
+    def test_template_is_byte_for_byte_the_workflow_and_validates_only_for_the_platform_pool(self):
+        template = policy_linux.LINUX_QUICK_RETURN_WORKFLOW_TEMPLATE
+        self.assertEqual(template.encode("utf-8"), QUICK_WORKFLOW.read_bytes())
+        self.assertTrue(validate_workflow_text(self.text, "platform", "core-linux-quick-return"))
+        for pool in ("connect", "workspace", "data"):
+            with self.assertRaisesRegex(PolicyError, "workflow-kind-pool"):
+                validate_workflow_text(self.text, pool, "core-linux-quick-return")
+        with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
+            validate_workflow_text(self.text, "platform")
+        self.assertIs(policy.WORKFLOW_KIND_LANES["core-linux-quick-return"], policy_linux)
+        self.assertIn(
+            (".github/workflows/core-linux-quick-return.yml", "core-linux-quick-return",
+             "core-linux-quick-return-workflow-too-large"),
+            policy.LANE_CANDIDATE_WORKFLOWS,
+        )
+
+    def test_workflow_is_dispatch_only_and_runs_only_on_the_untrusted_ref(self):
+        self.assertIn("on:\n  workflow_dispatch:\n    inputs:\n", self.text)
+        for forbidden in ("pull_request", "workflow_call", "workflow_run", "push:", "schedule:", "refs/heads/main"):
+            self.assertNotIn(forbidden, self.text)
+        jobs = self.jobs()
+        self.assertEqual(
+            list(jobs),
+            [
+                "core-linux-quick-return-settings",
+                "core-linux-quick-return-unit",
+                "core-linux-quick-return-producer",
+            ],
+        )
+        for name in ("settings", "producer"):
+            header = jobs["core-linux-quick-return-" + name].split("    runs-on:", 1)[0]
+            self.assertIn("github.ref == 'refs/heads/untrusted'", header)
+        self.assertEqual(self.text.count('[[ "$CI_REF" == "refs/heads/untrusted" ]]'), 3)
+        self.assertEqual(self.text.count("runs-on: ubuntu-24.04"), 3)
+        self.assertEqual(self.text.count("cache-mode: none"), 4)
+        self.assertNotIn("latest", self.text)
+        self.assertIn("    permissions: {}\n", jobs["core-linux-quick-return-unit"])
+        for name in ("settings", "producer"):
+            body = jobs["core-linux-quick-return-" + name]
+            self.assertIn("    permissions:\n      actions: read\n      contents: read\n", body)
+            self.assertIn("    environment: linux-source-read\n", body)
+        self.assertNotIn("environment:", jobs["core-linux-quick-return-unit"])
+
+    def test_quick_tier_has_no_verdict_job_and_never_accepts_a_run(self):
+        lowered = self.text.lower()
+        for forbidden in ("verdict", "run_accepted", "verify-handoff", "linux_source_build.py audit",
+                          "confinement_public_audit", "confinement_verdict"):
+            self.assertNotIn(forbidden, lowered)
+        self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", self.text)
+        for name in self.jobs():
+            self.assertFalse(name.endswith(("-verdict", "-audit")), name)
+        module = QUICK_MODULE.read_text(encoding="utf-8")
+        for forbidden in ("run_accepted", "confinement_verdict", "import linux_source_build", "KD-CONFINEMENT"):
+            self.assertNotIn(forbidden, module)
+        self.assertIn("tier=quick admission=never", module)
+        self.assertNotIn("admission=accepted", module)
+        self.assertNotIn("quick", policy_linux.LINUX_SOURCE_ADMISSION_WORKFLOW_TEMPLATE)
+        for path in (ROOT / "kit/confinement").glob("linux_*.py"):
+            if path.name != "linux_quick_return.py":
+                self.assertNotIn("KD-LINUX-QUICK", path.read_text(encoding="utf-8"), path.name)
+
+    def test_quick_tier_uses_its_own_binding_namespace_and_the_shared_reader_settings(self):
+        self.assertNotIn("vars.LINUX_SOURCE_", self.text)
+        self.assertNotIn("inputs.environment_name", self.text)
+        mapped = (
+            ("LINUX_SOURCE_ALLOWED_SHA", "LINUX_QUICK_ALLOWED_SHA"),
+            ("LINUX_SOURCE_ALLOWED_BASE_SHA", "LINUX_QUICK_ALLOWED_BASE_SHA"),
+            ("LINUX_SOURCE_ALLOWED_BASE_BRANCH", "LINUX_QUICK_ALLOWED_BASE_BRANCH"),
+            ("LINUX_SOURCE_ALLOWED_FINGERPRINT", "LINUX_QUICK_ALLOWED_FINGERPRINT"),
+            ("LINUX_SOURCE_ALLOWED_CONTROL_SHA", "LINUX_QUICK_ALLOWED_CONTROL_SHA"),
+            ("LINUX_SOURCE_ENVIRONMENT_NAME", "LINUX_QUICK_ENVIRONMENT_NAME"),
+            ("LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256", "LINUX_QUICK_ACCEPTED_NODE_LOCK_SHA256"),
+            ("LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256", "LINUX_QUICK_ACCEPTED_MANIFEST_SHA256"),
+            ("LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", "LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON"),
+            ("KD_QUICK_ALLOWED_REQUEST_ID", "LINUX_QUICK_ALLOWED_REQUEST_ID"),
+            ("KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT", "LINUX_QUICK_ALLOWED_RECIPIENT_FINGERPRINT"),
+        )
+        for name in ("settings", "producer"):
+            body = self.jobs()["core-linux-quick-return-" + name]
+            for process_name, variable in mapped:
+                with self.subTest(job=name, variable=variable):
+                    self.assertIn("      " + process_name + ": ${{ vars." + variable + " }}\n", body)
+            self.assertIn("      KD_LINUX_TIER: quick\n", body)
+            self.assertIn("      CI_MODE: source\n", body)
+            self.assertIn("      REQUESTED_ENVIRONMENT_NAME: linux-source-read\n", body)
+            self.assertIn("      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}\n", body)
+            self.assertIn("      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}\n", body)
+        self.assertEqual(set(re.findall(r"vars\.([A-Z0-9_]+)", self.text)), {
+            "SOURCE_REPOSITORY_ID", "SOURCE_READER_INSTALLATION_ID", "SOURCE_READER_CLIENT_ID",
+            *(variable for unused, variable in mapped),
+        })
+
+    def test_secrets_stay_out_of_run_blocks_and_arguments(self):
+        self.assertEqual(set(re.findall(r"secrets\.([A-Z_]+)", self.text)), {
+            "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME", "SOURCE_READER_PRIVATE_KEY",
+            "KD_LINUX_LOG_CANARY",
+        })
+        in_run = False
+        for line in self.text.splitlines():
+            if re.match(r"^        run: ", line):
+                self.assertNotIn("secrets.", line)
+                in_run = line.rstrip().endswith("|")
+            elif in_run and line.startswith("          "):
+                self.assertNotIn("secrets.", line)
+            else:
+                in_run = False
+            if "sudo" in line:
+                self.assertNotIn("$KD_CANARY_SECRET", line)
+                self.assertNotIn("SOURCE_READER_PRIVATE_KEY", line)
+        producer = self.jobs()["core-linux-quick-return-producer"]
+        self.assertEqual(producer.count("--preserve-env=KD_CANARY_SECRET"), 2)
+        self.assertEqual(self.text.count("KD_CANARY_SECRET: ${{ secrets.KD_LINUX_LOG_CANARY }}"), 2)
+        self.assertNotIn("KD_CANARY_SECRET", self.jobs()["core-linux-quick-return-settings"])
+        self.assertNotIn("SOURCE_READER_PRIVATE_KEY", self.jobs()["core-linux-quick-return-settings"])
+        self.assertNotIn("SOURCE_READER_PRIVATE_KEY", self.jobs()["core-linux-quick-return-unit"])
+        mint = producer.split("      - name: Mint scoped source-reader token\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("uses: " + self.PINNED_MINT + "\n", mint)
+        self.assertIn("          owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}\n", mint)
+        self.assertIn("          repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}\n", mint)
+
+    def test_every_action_is_pinned_by_full_sha_and_only_two_actions_are_used(self):
+        uses = re.findall(r"(?m)^\s+uses: (\S+)", self.text)
+        self.assertEqual(len(uses), 2)
+        for value in uses:
+            self.assertRegex(value, r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
+        self.assertEqual(sorted(uses), sorted((self.PINNED_UPLOAD, self.PINNED_MINT)))
+        self.assertNotIn("download-artifact", self.text)
+        self.assertNotIn("actions/cache", self.text)
+        self.assertNotIn("actions/checkout", self.text)
+
+    def test_producer_steps_follow_the_required_order_and_encrypt_after_the_gates(self):
+        producer = self.jobs()["core-linux-quick-return-producer"]
+        names = re.findall(r"(?m)^      - name: (.*)$", producer)
+        self.assertEqual(
+            names,
+            [
+                "Fetch exact public control",
+                "Repeat quick preflight before source read",
+                "Record image and fetch pinned Rust and Node toolchains",
+                "Harden runner paths before the proof",
+                "Boundary self-test before source-reader mint",
+                "Mint scoped source-reader token",
+                "Verify selected installation identity",
+                "Fetch exact source and verify binding, tree, signatures and lock provenance",
+                "Revoke source-reader token and verify rejection",
+                "Require trusted Rust licence admission",
+                "Fetch npm tarballs by committed lock integrity",
+                "Run trusted dependency audit",
+                "Prepare offline project inputs",
+                "Re-run positive controls immediately before the first project command",
+                "Run all offline project gates",
+                "Merge confinement phase records",
+                "Encrypt bounded quick return",
+                "Upload the single encrypted member",
+                "Record quick return counts",
+                "Remove staged ciphertext",
+            ],
+        )
+        self.assertLess(producer.index("linux_boundary.py selftest"), producer.index("Mint scoped source-reader token"))
+        self.assertLess(producer.index("Fetch exact source"), producer.index("linux_source_build.py revoke"))
+        self.assertLess(producer.index("linux_source_build.py revoke"), producer.index("Fetch npm tarballs"))
+        self.assertLess(producer.index("linux_boundary.py recheck"), producer.index("Run all offline project gates"))
+        self.assertLess(producer.index("linux_source_build.py gates"), producer.index("linux_quick_return.py encrypt"))
+        self.assertLess(producer.index("linux_quick_return.py encrypt"), producer.index("Upload the single encrypted member"))
+        self.assertIn("if: ${{ always() && steps.gates.outcome != 'skipped' }}", producer)
+        self.assertIn("if: ${{ always() && steps.encrypt.outcome == 'success' }}", producer)
+        self.assertIn("if: ${{ always() && steps.uploader.outcome == 'success' }}", producer)
+        self.assertIn("if: ${{ always() && steps.source-reader-token.outputs.token != '' }}", producer)
+        self.assertNotIn("continue-on-error", self.text)
+        self.assertNotIn("--synthetic-standin", self.text)
+        encrypt = producer.split("      - name: Encrypt bounded quick return\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("sudo -n --preserve-env=", encrypt)
+        self.assertIn('linux_quick_return.py encrypt --reader-uid "$(id -u)" --reader-gid "$(id -g)"', encrypt)
+        self.assertNotIn("secrets.", encrypt)
+        self.assertNotIn("KD_CANARY_SECRET", encrypt)
+
+    def test_one_encrypted_member_is_uploaded_for_one_day_without_overwrite_or_compression(self):
+        self.assertEqual(self.text.count("uses: " + self.PINNED_UPLOAD + " " + chr(35) + " v7.0.2\n"), 1)
+        upload = self.text.split("      - name: Upload the single encrypted member\n", 1)[1].split("      - name:", 1)[0]
+        for line in (
+            "          name: linux-quick-${{ inputs.request_id }}\n",
+            "          path: ${{ runner.temp }}/kd-quick-upload/linux-quick-return-v1.enc\n",
+            "          archive: true\n",
+            "          retention-days: 1\n",
+            "          compression-level: 0\n",
+            "          overwrite: false\n",
+            "          include-hidden-files: false\n",
+            "          if-no-files-found: error\n",
+        ):
+            self.assertIn(line, upload)
+        self.assertEqual(self.text.count("retention-days:"), 1)
+        self.assertEqual(self.text.count("upload-artifact"), 1)
+
+    def test_public_output_is_only_the_fixed_quick_line_and_counts(self):
+        record = self.text.split("      - name: Record quick return counts\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn('line="$(python3 -B kit/confinement/linux_quick_return.py record)"', record)
+        self.assertEqual(record.count("printf '%s\\n' \"$line\""), 2)
+        self.assertIn('>> "$GITHUB_STEP_SUMMARY"', record)
+        module = QUICK_MODULE.read_text(encoding="utf-8")
+        self.assertIn('" tier=quick admission=never"', module)
+        self.assertIn('" gates-selected="', module)
+        self.assertIn('" status=encrypted"', module)
+
+    def test_workflow_uses_only_kit_scripts_that_are_in_the_public_allowlist(self):
+        scripts = sorted(set(re.findall(r"kit/[a-z_/]+\.py", self.text)))
+        self.assertIn("kit/confinement/linux_quick_return.py", scripts)
+        self.assertIn("kit/confinement/test_linux_quick_return.py", scripts)
+        for script in scripts:
+            with self.subTest(script=script):
+                self.assertIn(script, PLATFORM_FILES)
+                self.assertTrue((ROOT / script).is_file())
+        unit = self.jobs()["core-linux-quick-return-unit"]
+        for script in ("test_policy_linux.py", "test_linux_source_build.py", "test_linux_quick_return.py"):
+            self.assertIn("python3 -B kit/", unit)
+            self.assertIn(script, unit)
+
+    def test_mutations_of_the_quick_workflow_are_refused_as_template_mismatches(self):
+        mutations = (
+            self.text.replace("refs/heads/untrusted", "refs/heads/main", 1),
+            self.text.replace("retention-days: 1", "retention-days: 90", 1),
+            self.text.replace("overwrite: false", "overwrite: true", 1),
+            self.text + "\n",
+            self.text.replace("    permissions: {}\n", "    permissions: write-all\n", 1),
+            self.text.replace("      - name: Remove staged ciphertext\n", "      - name: Publish confinement verdict\n        run: echo verdict\n      - name: Remove staged ciphertext\n", 1),
+            self.text.replace("vars.LINUX_QUICK_ALLOWED_SHA", "vars.LINUX_SOURCE_ALLOWED_SHA", 1),
+            self.text.replace("cache-mode: none\n", "", 1),
+            self.text.replace("    environment: linux-source-read\n", "", 1),
+            self.text.replace("workflow_dispatch:\n", "workflow_dispatch:\n  push:\n", 1),
+            self.text + "  extra:\n    runs-on: ubuntu-24.04\n    steps: []\n",
+        )
+        for index, changed in enumerate(mutations):
+            with self.subTest(index=index):
+                self.assertNotEqual(changed, self.text)
+                with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
+                    validate_workflow_text(changed, "platform", "core-linux-quick-return")
 
 
 if __name__ == "__main__":

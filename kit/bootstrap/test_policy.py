@@ -1463,6 +1463,7 @@ class LaneRegistryTests(unittest.TestCase):
                 "lane-h-capsule-attester",
                 "attestation-role-signer-probe",
                 "linux-source-admission",
+                "core-linux-quick-return",
                 "core-rust-lock-return",
                 "core-npm-admission-return",
                 "baselines-prepare",
@@ -1473,6 +1474,7 @@ class LaneRegistryTests(unittest.TestCase):
         self.assertIs(policy.WORKFLOW_KIND_LANES["baselines-prepare"], policy_baselines)
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-confinement"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["linux-source-admission"], policy_linux)
+        self.assertIs(policy.WORKFLOW_KIND_LANES["core-linux-quick-return"], policy_linux)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-native-preflight"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["windows-confinement"], policy_windows)
         self.assertIs(policy.WORKFLOW_KIND_LANES["capsule-vectors"], policy_windows)
@@ -1515,6 +1517,11 @@ class LaneRegistryTests(unittest.TestCase):
                     ".github/workflows/linux-source-admission.yml",
                     "linux-source-admission",
                     "linux-source-admission-workflow-too-large",
+                ),
+                (
+                    ".github/workflows/core-linux-quick-return.yml",
+                    "core-linux-quick-return",
+                    "core-linux-quick-return-workflow-too-large",
                 ),
                 (
                     ".github/workflows/windows-native-preflight.yml",

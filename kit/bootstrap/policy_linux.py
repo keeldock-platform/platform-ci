@@ -671,9 +671,359 @@ jobs:
         run: python3 -B kit/confinement/linux_source_build.py audit
 """
 
+LINUX_QUICK_RETURN_WORKFLOW_TEMPLATE = r"""name: core-linux-quick-return
+run-name: Linux quick source ${{ inputs.source_sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Candidate private source commit
+        required: true
+        type: string
+      base_sha:
+        description: Admitted source base commit
+        required: true
+        type: string
+      base_branch:
+        description: Admitted permanent source branch
+        required: true
+        type: choice
+        options:
+          - main
+          - develop
+          - uat
+      fingerprint:
+        description: Reviewed source diff fingerprint
+        required: true
+        type: string
+      request_id:
+        description: One-use quick request identifier
+        required: true
+        type: string
+      recipient_spki_b64:
+        description: Public recipient key in canonical base64
+        required: true
+        type: string
+permissions: {}
+cache-mode: none
+jobs:
+  core-linux-quick-return-settings:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/untrusted' }}
+    runs-on: ubuntu-24.04
+    environment: linux-source-read
+    timeout-minutes: 15
+    cache-mode: none
+    permissions:
+      actions: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_MODE: source
+      KD_LINUX_TIER: quick
+      CACHE_MODE: none
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_BASE_SHA: ${{ inputs.base_sha }}
+      REQUESTED_BASE_BRANCH: ${{ inputs.base_branch }}
+      REQUESTED_FINGERPRINT: ${{ inputs.fingerprint }}
+      REQUESTED_ENVIRONMENT_NAME: linux-source-read
+      SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+      SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+      SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
+      LINUX_SOURCE_ALLOWED_SHA: ${{ vars.LINUX_QUICK_ALLOWED_SHA }}
+      LINUX_SOURCE_ALLOWED_BASE_SHA: ${{ vars.LINUX_QUICK_ALLOWED_BASE_SHA }}
+      LINUX_SOURCE_ALLOWED_BASE_BRANCH: ${{ vars.LINUX_QUICK_ALLOWED_BASE_BRANCH }}
+      LINUX_SOURCE_ALLOWED_FINGERPRINT: ${{ vars.LINUX_QUICK_ALLOWED_FINGERPRINT }}
+      LINUX_SOURCE_ALLOWED_CONTROL_SHA: ${{ vars.LINUX_QUICK_ALLOWED_CONTROL_SHA }}
+      LINUX_SOURCE_ENVIRONMENT_NAME: ${{ vars.LINUX_QUICK_ENVIRONMENT_NAME }}
+      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_LOCK_SHA256 }}
+      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_MANIFEST_SHA256 }}
+      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON }}
+      KD_QUICK_REQUEST_ID: ${{ inputs.request_id }}
+      KD_QUICK_RECIPIENT_SPKI_B64: ${{ inputs.recipient_spki_b64 }}
+      KD_QUICK_ALLOWED_REQUEST_ID: ${{ vars.LINUX_QUICK_ALLOWED_REQUEST_ID }}
+      KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT: ${{ vars.LINUX_QUICK_ALLOWED_RECIPIENT_FINGERPRINT }}
+    steps:
+      - name: Fetch exact public control
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_REF" == "refs/heads/untrusted" ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$CI_SHA" ]]
+      - name: Validate quick request and binding
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -B kit/confinement/linux_quick_return.py preflight
+          python3 -B kit/confinement/linux_source_build.py preflight
+  core-linux-quick-return-unit:
+    needs: core-linux-quick-return-settings
+    if: ${{ github.event_name == 'workflow_dispatch' && needs.core-linux-quick-return-settings.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    cache-mode: none
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_WORKSPACE: ${{ github.workspace }}
+    steps:
+      - name: Fetch exact public control
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_REF" == "refs/heads/untrusted" ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$CI_SHA" ]]
+      - name: Run unprivileged source-free checks
+        run: |
+          set -euo pipefail
+          python3 -B kit/bootstrap/test_policy.py
+          python3 -B kit/bootstrap/test_policy_linux.py
+          python3 -B kit/bootstrap/test_public_tree.py
+          python3 -B kit/confinement/test_linux_boundary.py
+          python3 -B kit/confinement/test_linux_session.py
+          python3 -B kit/confinement/test_linux_source_build.py
+          python3 -B kit/confinement/test_linux_quick_return.py
+          python3 -B kit/confinement/test_rust_license_gate.py
+          python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
+  core-linux-quick-return-producer:
+    needs:
+      - core-linux-quick-return-settings
+      - core-linux-quick-return-unit
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/untrusted' && needs.core-linux-quick-return-settings.result == 'success' && needs.core-linux-quick-return-unit.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: linux-source-read
+    timeout-minutes: 120
+    cache-mode: none
+    permissions:
+      actions: read
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      CI_REPOSITORY: ${{ github.repository }}
+      CI_REF: ${{ github.ref }}
+      CI_SHA: ${{ github.sha }}
+      CI_SERVER_URL: ${{ github.server_url }}
+      CI_EVENT_NAME: ${{ github.event_name }}
+      CI_MODE: source
+      CI_WORKSPACE: ${{ github.workspace }}
+      KD_LINUX_TIER: quick
+      CACHE_MODE: none
+      REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+      REQUESTED_BASE_SHA: ${{ inputs.base_sha }}
+      REQUESTED_BASE_BRANCH: ${{ inputs.base_branch }}
+      REQUESTED_FINGERPRINT: ${{ inputs.fingerprint }}
+      REQUESTED_ENVIRONMENT_NAME: linux-source-read
+      SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
+      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+      SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+      SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
+      LINUX_SOURCE_ALLOWED_SHA: ${{ vars.LINUX_QUICK_ALLOWED_SHA }}
+      LINUX_SOURCE_ALLOWED_BASE_SHA: ${{ vars.LINUX_QUICK_ALLOWED_BASE_SHA }}
+      LINUX_SOURCE_ALLOWED_BASE_BRANCH: ${{ vars.LINUX_QUICK_ALLOWED_BASE_BRANCH }}
+      LINUX_SOURCE_ALLOWED_FINGERPRINT: ${{ vars.LINUX_QUICK_ALLOWED_FINGERPRINT }}
+      LINUX_SOURCE_ALLOWED_CONTROL_SHA: ${{ vars.LINUX_QUICK_ALLOWED_CONTROL_SHA }}
+      LINUX_SOURCE_ENVIRONMENT_NAME: ${{ vars.LINUX_QUICK_ENVIRONMENT_NAME }}
+      LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_LOCK_SHA256 }}
+      LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256: ${{ vars.LINUX_QUICK_ACCEPTED_MANIFEST_SHA256 }}
+      LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON: ${{ vars.LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON }}
+      KD_QUICK_REQUEST_ID: ${{ inputs.request_id }}
+      KD_QUICK_RECIPIENT_SPKI_B64: ${{ inputs.recipient_spki_b64 }}
+      KD_QUICK_ALLOWED_REQUEST_ID: ${{ vars.LINUX_QUICK_ALLOWED_REQUEST_ID }}
+      KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT: ${{ vars.LINUX_QUICK_ALLOWED_RECIPIENT_FINGERPRINT }}
+    steps:
+      - name: Fetch exact public control
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_SERVER_URL" == "https://github.com" ]]
+          [[ "$CI_REF" == "refs/heads/untrusted" ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git init -q . 2>/dev/null
+          git config core.autocrlf false 2>/dev/null
+          git remote add origin "${CI_SERVER_URL%/}/${CI_REPOSITORY}.git" 2>/dev/null
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF" 2>/dev/null
+          git checkout --quiet --detach FETCH_HEAD 2>/dev/null
+          [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$CI_SHA" ]]
+      - name: Repeat quick preflight before source read
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -B kit/confinement/linux_quick_return.py preflight
+          python3 -B kit/confinement/linux_source_build.py preflight
+      - name: Record image and fetch pinned Rust and Node toolchains
+        id: toolchains
+        run: python3 -B kit/confinement/linux_source_build.py toolchains
+      - name: Harden runner paths before the proof
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B kit/confinement/linux_boundary.py harden --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP"
+      - name: Boundary self-test before source-reader mint
+        id: selftest
+        env:
+          KD_CANARY_SECRET: ${{ secrets.KD_LINUX_LOG_CANARY }}
+          KD_RUST_SYSROOT: ${{ steps.toolchains.outputs.rust_sysroot }}
+        run: |
+          set -euo pipefail
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py selftest "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/selftest.json"
+      - name: Mint scoped source-reader token
+        id: source-reader-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510
+        env:
+          SOURCE_READER_PRIVATE_KEY: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+        with:
+          client-id: ${{ vars.SOURCE_READER_CLIENT_ID }}
+          private-key: ${{ env.SOURCE_READER_PRIVATE_KEY }}
+          owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+          permission-contents: read
+          skip-token-revoke: true
+      - name: Verify selected installation identity
+        env:
+          EXPECTED_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
+          ACTUAL_INSTALLATION_ID: ${{ steps.source-reader-token.outputs.installation-id }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ ]]
+          [[ "$ACTUAL_INSTALLATION_ID" =~ ^[1-9][0-9]{0,18}$ && "$ACTUAL_INSTALLATION_ID" == "$EXPECTED_INSTALLATION_ID" ]]
+          printf '%s\n' "linux-source-installation=verified id=$ACTUAL_INSTALLATION_ID"
+      - name: Fetch exact source and verify binding, tree, signatures and lock provenance
+        id: checkout
+        env:
+          SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
+        run: python3 -B kit/confinement/linux_source_build.py checkout
+      - name: Revoke source-reader token and verify rejection
+        if: ${{ always() && steps.source-reader-token.outputs.token != '' }}
+        env:
+          SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
+        run: python3 -B kit/confinement/linux_source_build.py revoke
+      - name: Require trusted Rust licence admission
+        id: rust-license-gate
+        env:
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
+      - name: Fetch npm tarballs by committed lock integrity
+        id: npm-tarballs
+        env:
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+        run: python3 -B kit/confinement/linux_source_build.py npm-tarballs
+      - name: Run trusted dependency audit
+        env:
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
+        run: python3 -B kit/confinement/linux_source_build.py trusted-audit
+      - name: Prepare offline project inputs
+        id: project-deps
+        env:
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          NPM_TARBALL_INDEX: ${{ steps.npm-tarballs.outputs.tarball_index }}
+          RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
+          EXPECTED_NODE_LOCK_SHA256: ${{ steps.checkout.outputs.lock_sha256 }}
+          EXPECTED_MANIFEST_SHA256: ${{ steps.checkout.outputs.manifest_sha256 }}
+        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
+      - name: Re-run positive controls immediately before the first project command
+        id: recheck
+        env:
+          KD_CANARY_SECRET: ${{ secrets.KD_LINUX_LOG_CANARY }}
+          KD_RUST_SYSROOT: ${{ steps.toolchains.outputs.rust_sysroot }}
+        run: |
+          set -euo pipefail
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
+      - name: Run all offline project gates
+        id: gates
+        env:
+          SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
+          NPM_TARBALL_INDEX: ${{ steps.npm-tarballs.outputs.tarball_index }}
+          RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
+          NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
+          WORKER_PATH: ${{ steps.project-deps.outputs.worker_path }}
+          CARGO_HOME: ${{ steps.project-deps.outputs.cargo_home }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA python3 -B kit/confinement/linux_source_build.py gates
+      - name: Merge confinement phase records
+        if: ${{ always() && steps.selftest.outcome != 'skipped' && steps.recheck.outcome != 'skipped' }}
+        run: |
+          set -euo pipefail
+          sudo -n python3 -B kit/confinement/linux_boundary.py merge --selftest "$RUNNER_TEMP/kd-records/selftest.json" --recheck "$RUNNER_TEMP/kd-records/recheck.json" --out "$RUNNER_TEMP/kd-records/merged.json"
+      - name: Encrypt bounded quick return
+        id: encrypt
+        if: ${{ always() && steps.gates.outcome != 'skipped' }}
+        env:
+          NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
+        run: sudo -n --preserve-env=KD_QUICK_REQUEST_ID,KD_QUICK_RECIPIENT_SPKI_B64,KD_QUICK_ALLOWED_REQUEST_ID,KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT,CI_SHA,REQUESTED_SOURCE_SHA,REQUESTED_BASE_SHA,REQUESTED_BASE_BRANCH,REQUESTED_FINGERPRINT,SOURCE_REPOSITORY_ID,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,RUNNER_TEMP,NODE_BIN,GITHUB_OUTPUT,ImageOS,ImageVersion python3 -B kit/confinement/linux_quick_return.py encrypt --reader-uid "$(id -u)" --reader-gid "$(id -g)"
+      - name: Upload the single encrypted member
+        id: uploader
+        if: ${{ always() && steps.encrypt.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: linux-quick-${{ inputs.request_id }}
+          path: ${{ runner.temp }}/kd-quick-upload/linux-quick-return-v1.enc
+          archive: true
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
+          if-no-files-found: error
+      - name: Record quick return counts
+        if: ${{ always() && steps.uploader.outcome == 'success' }}
+        env:
+          ARTIFACT_ID: ${{ steps.uploader.outputs.artifact-id }}
+          KD_QUICK_GATES_SELECTED: ${{ steps.encrypt.outputs.gates_selected }}
+          KD_QUICK_GATES_PASSED: ${{ steps.encrypt.outputs.gates_passed }}
+          KD_QUICK_GATES_FAILED: ${{ steps.encrypt.outputs.gates_failed }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ATTEMPT" == "1" && "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,18}$ ]]
+          line="$(python3 -B kit/confinement/linux_quick_return.py record)"
+          printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$line"
+      - name: Remove staged ciphertext
+        if: ${{ always() }}
+        run: |
+          set -euo pipefail
+          staged="${RUNNER_TEMP%/}/kd-quick-upload/linux-quick-return-v1.enc"
+          if [[ -e "$staged" || -L "$staged" ]]; then rm -f -- "$staged"; fi
+          staged_dir="${RUNNER_TEMP%/}/kd-quick-upload"
+          if [[ -d "$staged_dir" && ! -L "$staged_dir" ]]; then rmdir -- "$staged_dir"; fi
+"""
+
 WORKFLOW_TEMPLATES = {
     "linux-confinement": LINUX_CONFINEMENT_WORKFLOW_TEMPLATE,
     "linux-source-admission": LINUX_SOURCE_ADMISSION_WORKFLOW_TEMPLATE,
+    "core-linux-quick-return": LINUX_QUICK_RETURN_WORKFLOW_TEMPLATE,
 }
 WORKFLOW_SHA256 = {}
 CANDIDATE_WORKFLOWS = (
@@ -682,6 +1032,11 @@ CANDIDATE_WORKFLOWS = (
         ".github/workflows/linux-source-admission.yml",
         "linux-source-admission",
         "linux-source-admission-workflow-too-large",
+    ),
+    (
+        ".github/workflows/core-linux-quick-return.yml",
+        "core-linux-quick-return",
+        "core-linux-quick-return-workflow-too-large",
     ),
 )
 
