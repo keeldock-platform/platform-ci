@@ -415,6 +415,31 @@ class InputTests(RefusalAssertions):
         self.assert_refused("npm_input_invalid", subject.input_paths, "other-filing")
         self.assert_refused("npm_input_invalid", subject.input_paths, None)
 
+    def test_the_fixture_filing_reads_its_own_request_doc_and_takes_no_overrides(self):
+        world = World()
+        doc = subject.FILINGS[subject.FIXTURE_FILING]["request_doc"]
+        default_doc = subject.FILINGS[subject.DEFAULT_FILING]["request_doc"]
+        self.assertEqual(doc, "docs/dependencies/quick-fixture.md")
+        self.assertEqual(subject.FILINGS[subject.FIXTURE_FILING]["overrides"], {})
+        paths = subject.input_paths(subject.FIXTURE_FILING)
+        self.assertEqual(paths[:3], (".node-version", ".npmrc", "package.json"))
+        self.assertIn(doc, paths)
+        self.assertNotIn(default_doc, paths)
+        self.assertEqual(set(paths) - set(subject.project_paths(subject.FIXTURE_FILING)), {doc, subject.POLICY_FILE})
+        files = {path: data for path, data in world.files.items() if path != default_doc}
+        files[doc] = world.files[default_doc]
+        self.assert_refused("npm_manifest_refused", subject.check_inputs, files, subject.FIXTURE_FILING)
+        root = json.loads(files["package.json"].decode("ascii"))
+        del root["overrides"]
+        files["package.json"] = _json(root) + b"\n"
+        plan = subject.check_inputs(files, subject.FIXTURE_FILING)
+        self.assertEqual(plan["filing"], subject.FIXTURE_FILING)
+        self.assertEqual(plan["overrides"], {})
+        self.assert_refused("npm_input_invalid", subject.check_inputs, files, subject.DEFAULT_FILING)
+        self.assert_refused("npm_manifest_refused", subject.check_inputs, {
+            **world.files, "package.json": files["package.json"],
+        }, subject.DEFAULT_FILING)
+
     def test_missing_extra_empty_or_non_bytes_files_are_refused(self):
         world = World()
         short = dict(world.files)
@@ -2541,6 +2566,8 @@ class SiblingLoadTests(unittest.TestCase):
     def test_the_default_filing_is_registered_with_the_request_profile(self):
         import feedback_request
         self.assertIn(subject.DEFAULT_FILING, feedback_request.NPM_FILING_SELECTORS)
+        self.assertIn(subject.FIXTURE_FILING, feedback_request.NPM_FILING_SELECTORS)
+        self.assertEqual(set(feedback_request.NPM_FILING_SELECTORS), set(subject.FILINGS))
         self.assertEqual(feedback_request.NPM_DEFAULT_FILING, subject.DEFAULT_FILING)
         self.assertEqual(feedback_request.NPM_ADMISSION_MAX_PAYLOAD_BYTES, subject.MAX_BUNDLE_BYTES)
         self.assertEqual(feedback_request.NPM_ADMISSION_MAX_LOCK_BYTES, subject.MAX_LOCK_BYTES)

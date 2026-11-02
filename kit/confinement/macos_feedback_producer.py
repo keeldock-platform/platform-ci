@@ -985,6 +985,7 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
             "source_result": "command_completed"}
 
 
+NPM_FIXTURE_REPOSITORY_ID_ENV = "NPM_FIXTURE_REPOSITORY_ID"
 NPM_PROJECT_DIRECTORY = "feedback-npm-admission"
 NPM_HOME_DIRECTORY = "npm-admission-home"
 NPM_RESOLVE_SECONDS = 900
@@ -1366,6 +1367,13 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
         _refuse("request_invalid")
     request = dispatch["request"]
     selector = feedback_request.request_filing(request)
+    fixture_repository = source_environ.get(NPM_FIXTURE_REPOSITORY_ID_ENV, "")
+    fixture_profile = (
+        type(fixture_repository) is str and fixture_repository != ""
+        and request.get("repository_id") == fixture_repository
+    )
+    if (selector == bootstrap.FIXTURE_FILING) != fixture_profile:
+        _refuse("request_invalid")
     worker_gid = capability.PROBE_PRIMARY_GID
     refusal_type = bootstrap.BootstrapRefusal
     project = worker_storage / NPM_PROJECT_DIRECTORY

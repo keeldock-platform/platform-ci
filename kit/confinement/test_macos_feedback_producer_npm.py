@@ -149,6 +149,38 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         self.assertEqual(evidence["totals"]["packages"], 4)
         self.assertEqual(self.chdirs, [(STORAGE / "feedback-npm-admission").as_posix(), SOURCE.as_posix()])
 
+    def test_the_fixture_filing_and_the_fixture_repository_id_must_agree_before_any_read(self):
+        base = {"SOURCE_REPOSITORY_OWNER": "owner", "SOURCE_REPOSITORY_NAME": "name"}
+        env_name = producer.NPM_FIXTURE_REPOSITORY_ID_ENV
+        self.assertEqual(env_name, "NPM_FIXTURE_REPOSITORY_ID")
+        self.assertEqual(bootstrap.FIXTURE_FILING, "quick-fixture")
+        cases = (
+            ({"workspace": "quick-fixture"}, {}),
+            ({"workspace": "quick-fixture", "repository_id": "5"}, {env_name: ""}),
+            ({"workspace": "quick-fixture", "repository_id": "5"}, {env_name: "6"}),
+            ({"repository_id": "5"}, {env_name: "5"}),
+            ({"workspace": bootstrap.DEFAULT_FILING, "repository_id": "5"}, {env_name: "5"}),
+        )
+        self.read_failure = producer.FeedbackRefusal("manifest_invalid")
+        for changes, extra in cases:
+            with self.subTest(changes=changes, extra=extra):
+                self.events = []
+                self.assertEqual(
+                    self.refusal(dispatch=_dispatch(**changes), source_environ={**base, **extra}),
+                    "request_invalid",
+                )
+                self.assertEqual(self.events, [])
+        for changes, extra in (
+            ({"workspace": "quick-fixture", "repository_id": "5"}, {env_name: "5"}),
+            ({"repository_id": "5"}, {env_name: "6"}),
+            ({"repository_id": "5"}, {}),
+        ):
+            with self.subTest(accepted=changes, extra=extra):
+                self.assertEqual(
+                    self.refusal(dispatch=_dispatch(**changes), source_environ={**base, **extra}),
+                    "manifest_invalid",
+                )
+
     def test_only_the_inert_inputs_reach_the_worker_and_never_the_request_table(self):
         self.execute()
         project = STORAGE / "feedback-npm-admission"

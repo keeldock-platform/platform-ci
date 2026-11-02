@@ -119,10 +119,15 @@ ROOT_NAME = "keeldock" + "-core"
 SCOPE = "@" + "keeldock" + "/"
 WORKSPACE_PATHS = ("packages/host-api", "packages/kernel-i18n")
 DEFAULT_FILING = "contract-ui-batch-a"
+FIXTURE_FILING = "quick-fixture"
 FILINGS = {
     DEFAULT_FILING: {
         "request_doc": "docs/dependencies/ui-npm-admission-batch-a.md",
         "overrides": {"lightningcss": "1.33.0"},
+    },
+    FIXTURE_FILING: {
+        "request_doc": "docs/dependencies/quick-fixture.md",
+        "overrides": {},
     },
 }
 NODE_VERSION_BYTES = (NODE_VERSION + "\n").encode("ascii")
