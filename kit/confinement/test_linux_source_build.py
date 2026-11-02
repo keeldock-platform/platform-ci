@@ -2370,6 +2370,26 @@ class LinuxAuditDetailTests(unittest.TestCase):
         self.assertEqual(self._detail(detached, packages=packages).detail, "audit_consumer_unreached")
 
 
+class QuickTierVerdictTests(unittest.TestCase):
+    def test_the_quick_tier_can_never_emit_a_verdict(self):
+        for mode in ("source", "synthetic", ""):
+            env = {
+                "KD_LINUX_TIER": "quick", "CI_MODE": mode, "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7",
+                "GITHUB_RUN_ATTEMPT": "1", "PRODUCER_RESULT": "success",
+            }
+            with self.subTest(mode=mode):
+                output = io.StringIO()
+                with patch.object(linux_source_build.sys, "stdout", output):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+                        linux_source_build.emit_verdict(env)
+                self.assertEqual(output.getvalue(), "")
+        output = io.StringIO()
+        with patch.dict(os.environ, {"KD_LINUX_TIER": "quick"}), patch.object(linux_source_build.sys, "stdout", output):
+            self.assertEqual(linux_source_build.main(["verdict"]), 1)
+        self.assertEqual(output.getvalue(), "linux-source-build=refused phase=verdict reason=identity\n")
+        self.assertNotIn("KD-CONFINEMENT-VERDICT", output.getvalue())
+
+
 class WindowsSourceBindingTests(unittest.TestCase):
     SOURCE = "a" * 40
     BASE = "b" * 40

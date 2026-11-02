@@ -2642,6 +2642,8 @@ def _verdict_record(environ):
 
 def emit_verdict(environ=None):
     env = os.environ if environ is None else environ
+    if _tier(env) == "quick":
+        raise SourceBuildRefusal("identity")
     unused_audit, verdict, unused_canary = _audit_modules()
     record = _verdict_record(env)
     line = verdict.encode_line(record)
