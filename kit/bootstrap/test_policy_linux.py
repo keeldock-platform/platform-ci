@@ -246,6 +246,35 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertNotIn("KD_CANARY_SECRET", self.jobs()["linux-source-admission-settings"])
         self.assertNotIn("KD_CANARY_SECRET", self.jobs()["linux-source-admission-unit"])
 
+    def test_private_source_owner_and_name_come_from_secrets_and_never_from_variables(self):
+        self.assertNotIn("vars.LINUX_SOURCE_REPOSITORY", self.text)
+        self.assertNotIn("vars.SOURCE_REPOSITORY_OWNER", self.text)
+        self.assertNotIn("vars.SOURCE_REPOSITORY_NAME", self.text)
+        self.assertEqual(self.text.count("secrets.SOURCE_REPOSITORY_OWNER"), 5)
+        self.assertEqual(self.text.count("secrets.SOURCE_REPOSITORY_NAME"), 5)
+        jobs = self.jobs()
+        for name in ("settings", "source-read", "verdict"):
+            body = jobs["linux-source-admission-" + name]
+            with self.subTest(job=name):
+                self.assertIn("      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}\n", body)
+                self.assertIn("      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}\n", body)
+                self.assertIn("    environment:\n      name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}\n", body)
+        for name in ("unit", "audit"):
+            body = jobs["linux-source-admission-" + name]
+            self.assertNotIn("SOURCE_REPOSITORY_OWNER", body)
+            self.assertNotIn("SOURCE_REPOSITORY_NAME", body)
+        mint = jobs["linux-source-admission-source-read"].split("      - name: Mint scoped source-reader token\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("          owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}\n", mint)
+        self.assertIn("          repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}\n", mint)
+        for line in self.text.splitlines():
+            if line.lstrip().startswith("run:") or line.startswith("          "):
+                if "secrets.SOURCE_REPOSITORY" in line:
+                    self.assertTrue(line.lstrip().startswith(("owner:", "repositories:")), line)
+        changed = self.text.replace("secrets.SOURCE_REPOSITORY_OWNER", "vars.LINUX_SOURCE_REPOSITORY_OWNER", 1)
+        self.assertNotEqual(changed, self.text)
+        with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
+            validate_workflow_text(changed, "platform", "linux-source-admission")
+
     def test_source_read_steps_follow_the_required_order(self):
         source = self.jobs()["linux-source-admission-source-read"]
         names = re.findall(r"(?m)^      - name: (.*)$", source)

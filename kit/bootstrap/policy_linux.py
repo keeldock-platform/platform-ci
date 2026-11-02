@@ -169,6 +169,8 @@ jobs:
   linux-source-admission-settings:
     if: ${{ github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') && (inputs.mode == 'source' || (inputs.mode == 'synthetic' && github.ref == 'refs/heads/main')) }}
     runs-on: ubuntu-24.04
+    environment:
+      name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}
     timeout-minutes: 15
     cache-mode: none
     permissions:
@@ -195,8 +197,8 @@ jobs:
       REQUESTED_FINGERPRINT: ${{ inputs.fingerprint }}
       REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}
       SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
-      SOURCE_REPOSITORY_OWNER: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
-      SOURCE_REPOSITORY_NAME: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
+      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
       SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
       SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
       LINUX_SOURCE_ALLOWED_SHA: ${{ vars.LINUX_SOURCE_ALLOWED_SHA }}
@@ -306,8 +308,8 @@ jobs:
       REQUESTED_FINGERPRINT: ${{ inputs.fingerprint }}
       REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}
       SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
-      SOURCE_REPOSITORY_OWNER: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
-      SOURCE_REPOSITORY_NAME: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
+      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
       SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
       SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
       LINUX_SOURCE_ALLOWED_SHA: ${{ vars.LINUX_SOURCE_ALLOWED_SHA }}
@@ -377,8 +379,8 @@ jobs:
         with:
           client-id: ${{ vars.SOURCE_READER_CLIENT_ID }}
           private-key: ${{ env.SOURCE_READER_PRIVATE_KEY }}
-          owner: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
-          repositories: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
+          owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
           permission-contents: read
           skip-token-revoke: true
       - name: Verify selected installation identity
@@ -501,8 +503,8 @@ jobs:
       REQUESTED_FINGERPRINT: ${{ inputs.fingerprint }}
       REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}
       SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
-      SOURCE_REPOSITORY_OWNER: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
-      SOURCE_REPOSITORY_NAME: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
+      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
       SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
       SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
       LINUX_SOURCE_ALLOWED_SHA: ${{ vars.LINUX_SOURCE_ALLOWED_SHA }}
