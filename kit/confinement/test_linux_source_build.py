@@ -1048,6 +1048,8 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 linux_source_build, "_open_project_root", side_effect=lambda: os.open(root, flags)
             ), patch.object(linux_source_build.linux_harness, "CHILD_UID", os.getuid()), patch.object(
                 linux_source_build.linux_harness, "CHILD_GID", os.getgid()
+            ), patch.object(linux_source_build, "GATE_CONFIG_UID", os.getuid()), patch.object(
+                linux_source_build, "GATE_CONFIG_GID", os.getgid()
             ):
                 (worker / ".kd-cargo-home").mkdir()
                 linux_source_build._project_gate_directories(worker, create=True)
@@ -1085,6 +1087,27 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 paths[1].chmod(0o444)
                 with self.assertRaises(linux_source_build.SourceBuildRefusal):
                     linux_source_build._project_gate_directories(worker)
+
+    def test_gate_npm_configs_are_root_owned_and_a_foreign_owner_is_refused(self):
+        self.assertEqual((linux_source_build.GATE_CONFIG_UID, linux_source_build.GATE_CONFIG_GID), (0, 0))
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            for name in (linux_source_build.NPM_USER_CONFIG_NAME, linux_source_build.NPM_GLOBAL_CONFIG_NAME):
+                (home / name).write_text("", encoding="ascii")
+                (home / name).chmod(0o444)
+            descriptor = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with patch.object(linux_source_build, "GATE_CONFIG_UID", os.getuid()), patch.object(
+                    linux_source_build, "GATE_CONFIG_GID", os.getgid()
+                ):
+                    linux_source_build._gate_npm_config_files(descriptor, False)
+                with patch.object(linux_source_build, "GATE_CONFIG_UID", os.getuid() + 1), patch.object(
+                    linux_source_build, "GATE_CONFIG_GID", os.getgid()
+                ):
+                    with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                        linux_source_build._gate_npm_config_files(descriptor, False)
+            finally:
+                os.close(descriptor)
 
     def test_license_gate_refusal_precedes_preparation_and_command_construction(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1907,7 +1930,7 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
 
     def test_provenance_repository_is_bound_to_the_dispatch_identity(self):
         record = self._provenance()
-        for repository in ("other/source", "owner/other", "owner", "Owner/source"):
+        for repository in ("other/source", "owner/other", "owner", "owner/Other", "owner/source/x"):
             with self.subTest(repository=repository), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
                 linux_source_build._validate_provenance_binding(
                     IDENTITY, self._environment(dict(record, context=dict(record["context"], repository=repository))),
@@ -1916,6 +1939,18 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
         with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
             linux_source_build._validate_provenance_binding(
                 {"owner": "owner", "name": "other"}, self._environment(record),
+            )
+        self.assertEqual(refused.exception.reason, "binding")
+        for repository in ("Owner/source", "OWNER/SOURCE", "owner/Source"):
+            with self.subTest(accepted=repository):
+                cased = dict(record, context=dict(record["context"], repository=repository))
+                accepted = linux_source_build._validate_provenance_binding(IDENTITY, self._environment(cased))
+                self.assertEqual(accepted["context"]["repository"], repository)
+        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+            linux_source_build._validate_provenance_binding(
+                {"owner": "Owner", "name": "Other"}, self._environment(dict(
+                    record, context=dict(record["context"], repository="owner/source"),
+                )),
             )
         self.assertEqual(refused.exception.reason, "binding")
         changed = dict(record, context=dict(record["context"], source_sha="e" * 40, base_sha="f" * 40, control_sha="0" * 40))
@@ -2550,14 +2585,12 @@ class LinuxAuditDetailTests(unittest.TestCase):
         seen = {}
 
         def capture(argv, cwd, environ=None, **unused):
-            private = Path(environ["HOME"])
             seen["environ"] = dict(environ)
-            seen["details"] = {
-                name: (private / name).lstat() for name in (
-                    linux_source_build.NPM_USER_CONFIG_NAME, linux_source_build.NPM_GLOBAL_CONFIG_NAME,
-                )
-            }
-            seen["private"] = private
+            seen["private"] = Path(environ["HOME"])
+            seen["details"] = [
+                Path(environ[name]).lstat() for name in ("NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG")
+            ]
+            seen["parent"] = Path(environ["NPM_CONFIG_USERCONFIG"]).parent.lstat()
             return types.SimpleNamespace(returncode=1, stdout=_honoured_report(), stderr=b"")
 
         code, output = self._run_audit(1, _honoured_report(), run=capture)
@@ -2571,11 +2604,12 @@ class LinuxAuditDetailTests(unittest.TestCase):
         global_config = Path(environ["NPM_CONFIG_GLOBALCONFIG"])
         self.assertNotEqual(user, global_config)
         self.assertNotIn("/dev/null", (str(user), str(global_config)))
-        self.assertEqual(user.parent, seen["private"])
-        self.assertEqual(global_config.parent, seen["private"])
+        self.assertEqual(user.parent, global_config.parent)
+        self.assertEqual(user.parent.parent, seen["private"])
+        self.assertEqual(stat.S_IMODE(seen["parent"].st_mode), 0o700)
         self.assertEqual(environ["NPM_CONFIG_UPDATE_NOTIFIER"], "false")
         identities = set()
-        for details in seen["details"].values():
+        for details in seen["details"]:
             self.assertTrue(stat.S_ISREG(details.st_mode))
             self.assertEqual(details.st_size, 0)
             self.assertEqual(stat.S_IMODE(details.st_mode), 0o600)
@@ -2586,32 +2620,22 @@ class LinuxAuditDetailTests(unittest.TestCase):
             {linux_source_build.NPM_USER_CONFIG_NAME, linux_source_build.NPM_GLOBAL_CONFIG_NAME},
         )
 
-    def test_trusted_audit_truncates_old_configs_and_refuses_non_regular_ones(self):
+    def test_trusted_audit_configs_are_created_fresh_and_never_reuse_a_path(self):
         with tempfile.TemporaryDirectory() as directory:
             private = Path(directory)
-            (private / linux_source_build.NPM_USER_CONFIG_NAME).write_text("registry=fixture\n", encoding="ascii")
-            (private / linux_source_build.NPM_USER_CONFIG_NAME).chmod(0o644)
-            user, global_config = linux_source_build._audit_config_files(private)
-            self.assertEqual(Path(user).stat().st_size, 0)
-            self.assertEqual(stat.S_IMODE(Path(user).stat().st_mode), 0o600)
-            self.assertNotEqual(user, global_config)
-        for kind in ("directory", "symlink", "hardlink"):
-            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
-                private = Path(directory)
-                target = private / linux_source_build.NPM_GLOBAL_CONFIG_NAME
-                if kind == "directory":
-                    target.mkdir()
-                elif kind == "symlink":
-                    (private / "elsewhere").write_text("keep\n", encoding="ascii")
-                    target.symlink_to(private / "elsewhere")
-                else:
-                    (private / "elsewhere").write_text("keep\n", encoding="ascii")
-                    os.link(private / "elsewhere", target)
+            first = linux_source_build._audit_config_files(private)
+            second = linux_source_build._audit_config_files(private)
+            self.assertEqual(len({*first, *second}), 4)
+            for path in (*first, *second):
+                self.assertEqual(Path(path).stat().st_size, 0)
+            planted = private / "planted"
+            planted.write_text("keep\n", encoding="ascii")
+            with patch.object(linux_source_build.tempfile, "mkdtemp", return_value=str(private)):
+                (private / linux_source_build.NPM_GLOBAL_CONFIG_NAME).symlink_to(planted)
                 with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
                     linux_source_build._audit_config_files(private)
-                self.assertEqual(refused.exception.detail, "audit_run")
-                if kind != "directory":
-                    self.assertEqual((private / "elsewhere").read_text(encoding="ascii"), "keep\n")
+            self.assertEqual(refused.exception.detail, "audit_run")
+            self.assertEqual(planted.read_text(encoding="ascii"), "keep\n")
 
     def test_trusted_audit_refuses_when_the_two_configs_would_be_one_file(self):
         with patch.object(linux_source_build, "NPM_GLOBAL_CONFIG_NAME", linux_source_build.NPM_USER_CONFIG_NAME), \

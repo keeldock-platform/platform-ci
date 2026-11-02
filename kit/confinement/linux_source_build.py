@@ -96,6 +96,8 @@ LOCKED_VERSION_RE = re.compile(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(?:[-+][0-9A-
 ADVISORY_URL_PREFIX = "https:" + chr(47) * 2 + "github.com" + chr(47) + "advisories" + chr(47)
 NPM_USER_CONFIG_NAME = "user.npmrc"
 NPM_GLOBAL_CONFIG_NAME = "global.npmrc"
+GATE_CONFIG_UID = 0
+GATE_CONFIG_GID = 0
 MAX_AUDIT_VULNERABILITIES = 4096
 MAX_AUDIT_VIA = 64
 MAX_AUDIT_NODES = 1024
@@ -1032,7 +1034,7 @@ def _check_provenance_finding(finding, policy_epoch, fetched_at):
 def _validate_provenance_binding(identity, environ):
     """Check the accepted provenance record against the dispatch identity.
 
-    The record repository must equal the dispatch owner and name. The record source, base and
+    The record repository must equal the dispatch owner and name, ignoring ASCII case. The record source, base and
     control SHAs are shape-checked only, because one admitted lock is refreshed across later
     revisions by design and the lock and manifest digests carry the binding to the content."""
     text = environ.get("LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", "")
@@ -1054,7 +1056,7 @@ def _validate_provenance_binding(identity, environ):
     for name in ("repository", "filing"):
         if type(context[name]) is not str or CONTEXT_TEXT_RE.fullmatch(context[name]) is None:
             raise SourceBuildRefusal("lock")
-    if context["repository"] != identity["owner"] + "/" + identity["name"]:
+    if context["repository"].lower() != (identity["owner"] + "/" + identity["name"]).lower():
         raise SourceBuildRefusal("binding")
     for name in ("source_sha", "base_sha", "control_sha"):
         if type(context[name]) is not str or SOURCE_SHA_RE.fullmatch(context[name]) is None:
@@ -1603,7 +1605,7 @@ def _gate_npm_config_files(home, create):
                 name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=home,
             )
             try:
-                os.fchown(descriptor, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
+                os.fchown(descriptor, GATE_CONFIG_UID, GATE_CONFIG_GID)
                 os.fchmod(descriptor, 0o444)
             finally:
                 os.close(descriptor)
@@ -1614,7 +1616,7 @@ def _gate_npm_config_files(home, create):
             os.close(descriptor)
         if (not stat.S_ISREG(details.st_mode) or details.st_size != 0 or details.st_nlink != 1
                 or stat.S_IMODE(details.st_mode) != 0o444
-                or details.st_uid != linux_harness.CHILD_UID or details.st_gid != linux_harness.CHILD_GID):
+                or details.st_uid != GATE_CONFIG_UID or details.st_gid != GATE_CONFIG_GID):
             raise SourceBuildRefusal("gate")
         identities.add((details.st_dev, details.st_ino))
     if len(identities) != 2:
@@ -2348,27 +2350,22 @@ def _check_audit_report(stdout, allows, packages, now_ms, stderr=b""):
 def _audit_config_files(private):
     paths = []
     identities = set()
-    for name in (NPM_USER_CONFIG_NAME, NPM_GLOBAL_CONFIG_NAME):
-        path = private / name
-        try:
-            existing = path.lstat()
-        except FileNotFoundError:
-            existing = None
-        if existing is not None and (not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1):
-            raise _audit_refuse("audit_run")
-        descriptor = os.open(
-            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600,
-        )
-        try:
-            os.fchmod(descriptor, 0o600)
-            details = os.fstat(descriptor)
-        finally:
-            os.close(descriptor)
-        if (not stat.S_ISREG(details.st_mode) or details.st_size != 0 or details.st_nlink != 1
-                or stat.S_IMODE(details.st_mode) != 0o600 or details.st_uid != os.geteuid()):
-            raise _audit_refuse("audit_run")
-        identities.add((details.st_dev, details.st_ino))
-        paths.append(str(path))
+    try:
+        fresh = Path(tempfile.mkdtemp(prefix="npm-config-", dir=str(private)))
+        for name in (NPM_USER_CONFIG_NAME, NPM_GLOBAL_CONFIG_NAME):
+            path = fresh / name
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                details = os.fstat(descriptor)
+            finally:
+                os.close(descriptor)
+            if (not stat.S_ISREG(details.st_mode) or details.st_size != 0 or details.st_nlink != 1
+                    or stat.S_IMODE(details.st_mode) != 0o600 or details.st_uid != os.geteuid()):
+                raise _audit_refuse("audit_run")
+            identities.add((details.st_dev, details.st_ino))
+            paths.append(str(path))
+    except OSError:
+        raise _audit_refuse("audit_run") from None
     if len(set(paths)) != 2 or len(identities) != 2:
         raise _audit_refuse("audit_run")
     return paths[0], paths[1]
