@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 extern "system" {
     fn WSAStartup(version: u16, data: *mut u8) -> i32;
     fn GetLastError() -> u32;
+    fn SetLastError(code: u32);
     fn CloseHandle(handle: isize) -> i32;
     fn GetCurrentProcess() -> isize;
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
@@ -571,9 +572,9 @@ fn probe_tokenraise() -> String {
 fn probe_tokenpriv() -> String {
     let mut token: isize = 0;
     let opened = unsafe { OpenProcessToken(GetCurrentProcess(), 0x0028, &mut token) };
-    if opened == 0 {
+    if opened == 0 || token == 0 {
         let last = last_error();
-        return format!("adjust=err{}", last);
+        return format!("open=err{}", last);
     }
     let name = wide("SeDebugPrivilege");
     let mut luid: [u32; 2] = [0, 0];
@@ -586,6 +587,9 @@ fn probe_tokenpriv() -> String {
         return format!("adjust=err{}", last);
     }
     let mut state: [u32; 4] = [1, luid[0], luid[1], 2];
+    unsafe {
+        SetLastError(0);
+    }
     let call = unsafe { AdjustTokenPrivileges(token, 0, state.as_mut_ptr() as *mut u8, 16, ptr::null_mut(), ptr::null_mut()) };
     let last = last_error();
     unsafe {

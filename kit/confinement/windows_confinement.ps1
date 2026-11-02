@@ -1021,7 +1021,7 @@ function Get-ChannelAttempts {
     $attempts += @{ Channel = 'process_memory'; Name = 'control-self-memory'; Runs = @('procopen self vmread'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'allowed'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'job-breakaway'; Runs = @('jobbreak'); ControlRuns = @(); Allow = '^spawn=ok$'; Deny = '^spawn=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'job-membership'; Basis = 'harness'; Runs = @('jobmember'); ControlRuns = @('jobmember'); ControlAllow = '^injob=yes$'; Allow = '^injob=no$'; Deny = '^injob=yes$'; Expect = 'contained'; Timeout = 10 }
-    $attempts += @{ Channel = 'boundary_disablement'; Name = 'profile-create'; Runs = @('profile'); ControlRuns = @('profile'); Allow = '^create=ok$'; Deny = '^create=hr80070005$'; Expect = 'denied'; Timeout = 20 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'profile-create'; Runs = @('profile'); ControlRuns = @('profile'); Allow = '^create=ok$'; Deny = '^create=hr80070005$|^create=hr800706d9$'; Expect = 'denied'; Timeout = 20 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'scm-open'; Runs = @('scm'); ControlRuns = @('scm'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'nul-write-dac'; Runs = @('nuldac'); ControlRuns = @(); Allow = '^result=ok$'; Deny = '^result=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'ancestor-write-dac'; Runs = @('dacopen {base}'); ControlRuns = @('dacopen {base}'); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
@@ -1030,7 +1030,7 @@ function Get-ChannelAttempts {
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'symlink'; Runs = @('symlink {scratch_tmp}\kd_att_{rand}.lnk {ro_file}'); ControlRuns = @('symlink {control_tmp}\kd_att_{rand}.lnk {ro_file}'); Allow = '^create=ok$'; Deny = '^create=err(5|1314)$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'hardlink-ro'; Runs = @('hardlink {scratch_tmp}\kd_att_{rand}.lnk {ro_file}'); ControlRuns = @('hardlink {control_tmp}\kd_att_{rand}.lnk {ro_file}'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'integrity-raise'; Runs = @('tokenraise'); ControlRuns = @('tokenraise'); Allow = '^open=ok set=ok$'; Deny = '^open=ok set=err(5|1314)$|^open=err5 set=na$'; Expect = 'denied'; Timeout = 10 }
-    $attempts += @{ Channel = 'boundary_disablement'; Name = 'privilege-enable'; Runs = @('tokenpriv'); ControlRuns = @('tokenpriv'); Allow = '^adjust=ok$'; Deny = '^adjust=err(5|1300)$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'privilege-enable'; Runs = @('tokenpriv'); ControlRuns = @('tokenpriv'); Allow = '^adjust=ok$'; Deny = '^adjust=err1300$|^open=err5$'; Expect = 'denied'; Timeout = 10 }
     return $attempts
 }
 

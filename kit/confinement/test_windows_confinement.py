@@ -140,6 +140,7 @@ DENIAL_CODES = {
     "err10013",
     "err11003",
     "hr80070005",
+    "hr800706d9",
 }
 EXPECTED_SUMMARY = (
     ("rust", "compiled"),
@@ -1543,14 +1544,14 @@ foreach ($case in $cases) {
         "walk": ("scanned=10 found=0", "scanned=10 found=1", "scanned=0 found=usage", "scanned=x found=1"),
         "jobbreak": ("spawn=ok", "spawn=err5", "spawn=err2"),
         "jobmember": ("injob=yes", "injob=no", "injob=err87"),
-        "profile": ("create=ok", "create=hr80070005", "create=hr800700b7", "create=hr80070057"),
+        "profile": ("create=ok", "create=hr80070005", "create=hr800706d9", "create=hr800700b7", "create=hr80070057"),
         "scm": ("open=ok", "open=err5", "open=err1722"),
         "nuldac": ("result=ok", "result=err5", "result=err2"),
         "dacopen": ("open=ok", "open=err5", "open=err2"),
         "symlink": ("create=ok", "create=err5", "create=err1314", "create=err183"),
         "hardlink": ("create=ok", "create=err5", "create=err1314", "create=err183", "create=err17"),
         "tokenraise": ("open=ok set=ok", "open=ok set=err5", "open=ok set=err1314", "open=err5 set=na", "open=err87 set=na", "open=ok set=err87"),
-        "tokenpriv": ("adjust=ok", "adjust=err5", "adjust=err1300", "adjust=err87"),
+        "tokenpriv": ("adjust=ok", "adjust=err5", "adjust=err1300", "adjust=err87", "adjust=err6", "open=err5", "open=err6"),
     }
 
     def attempt_model(self, line, text):
@@ -1944,6 +1945,37 @@ foreach ($case in $cases) {
         self.assertGreaterEqual(4 * 8, 28)
         self.assertIn('format!("create=ok delete=hr{:08x}", removed as u32)', probe)
         self.assertIn('format!("create=ok delete=err{}", removed)', probe)
+
+    def test_profile_create_denies_access_denied_and_the_lpac_rpc_endpoint_failure(self):
+        line = next(item for item in self.channel_attempt_lines() if "Name = 'profile-create'" in item)
+        self.assertIn("Deny = '^create=hr80070005$|^create=hr800706d9$'", line)
+        self.assertIn("Allow = '^create=ok$'", line)
+        self.assertEqual(self.attempt_model(line, "create=hr800706d9"), "denied")
+        self.assertEqual(self.attempt_model(line, "create=hr80070005"), "denied")
+        self.assertEqual(self.attempt_model(line, "create=ok"), "allowed")
+        self.assertEqual(self.attempt_model(line, "create=hr80070057"), "other")
+
+    def test_tokenpriv_probe_reports_open_failures_separately_and_the_attempt_pins_the_forms(self):
+        body = self.probe[self.probe.index("fn probe_tokenpriv"):self.probe.index("fn main")]
+        self.assertIn("OpenProcessToken(GetCurrentProcess(), 0x0028, &mut token)", body)
+        self.assertIn("if opened == 0 || token == 0", body)
+        self.assertIn('format!("open=err{}", last)', body)
+        self.assertLess(body.index('format!("open=err{}", last)'), body.index("AdjustTokenPrivileges"))
+        self.assertIn("SetLastError(0)", body)
+        self.assertIn('String::from("adjust=ok")', body)
+        self.assertIn('format!("adjust=err{}", last)', body)
+        line = next(item for item in self.channel_attempt_lines() if "Name = 'privilege-enable'" in item)
+        self.assertIn("Allow = '^adjust=ok$'", line)
+        self.assertIn("Deny = '^adjust=err1300$|^open=err5$'", line)
+        for text, result in (
+            ("adjust=ok", "allowed"),
+            ("adjust=err1300", "denied"),
+            ("open=err5", "denied"),
+            ("adjust=err6", "other"),
+            ("open=err6", "other"),
+            ("adjust=err5", "other"),
+        ):
+            self.assertEqual(self.attempt_model(line, text), result, text)
 
     def test_pipe_acl_assembly_is_loaded_explicitly_and_the_pipe_works_in_windows_ci(self):
         body = self.function_body("New-TrustedPipe")
