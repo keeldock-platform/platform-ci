@@ -262,7 +262,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_node_lock_receipt.py': '76163ace7dc4e239c16c993de84da44deaf402e42ba4fccb1a28fd8c28fae6b6',
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
     'kit/confinement/macos_core_contract.py': '19cbec8297985ef503433333a3b582cf798066e07836459b66a2bc96f2567faf',
-    'kit/confinement/test_macos_core_contract.py': 'b178f58388ac7ac62005f318131d1d647089346d011cda73ab25d0c06d93167f',
+    'kit/confinement/test_macos_core_contract.py': '4597e35923effdceb10685d05b1dd715dc0899d9ac2f35948b9688fa19e16a58',
     'kit/confinement/linux_source_build.py': '78e52e0eebd6398f16c85cddf24f1019b0132a1ce50c688d65b22949680802f4',
     'kit/confinement/test_linux_source_build.py': '2b006f46e2cbf8bca79a83e494f73474fea285bec33a3fef9938ba6f7003d5be',
     'kit/confinement/rust_license_gate.py': '4896e53baf2b0bd8bc8047c69e50c8c72dff11096ca9225bfa9efad71913dfc6',

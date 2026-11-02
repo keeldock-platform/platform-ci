@@ -520,6 +520,18 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual((cleanup.reason, cleanup.stage, cleanup.diagnostic),
                          ("cleanup_incomplete", "cleanup", "cleanup_summary"))
 
+    def test_verify_controls_token_lists_equal_the_rules_bootstrap_lists(self):
+        import macos_rules_bootstrap as rules_bootstrap
+
+        for name in (
+            "SUMMARY_GUARD_VERIFY_DIRECTORY_CLASSES", "SUMMARY_GUARD_VERIFY_FILE_CLASSES",
+            "SUMMARY_GUARD_VERIFY_FAILURES", "SUMMARY_GUARD_VERIFY_CHECKS", "SUMMARY_GUARD_CHECKS",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(getattr(subject, name), getattr(rules_bootstrap, name))
+        self.assertEqual(len(subject.SUMMARY_GUARD_VERIFY_CHECKS), 84)
+        self.assertEqual(len(rules_bootstrap.SUMMARY_GUARD_VERIFY_CHECKS), 84)
+
     def test_verify_controls_diagnostics_are_closed_mirrored_and_preserved(self):
         class RulesRefusal(Exception):
             def __init__(self, reason, stage, diagnostic):
