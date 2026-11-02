@@ -481,6 +481,76 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                     accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
                 )
 
+    def test_an_inert_kernel_tokens_directory_is_accepted_and_never_copied(self):
+        def add_inert(source):
+            inert = source / "packages/kernel-tokens"
+            (inert / "src").mkdir(parents=True)
+            (inert / "src/tokens.ts").write_text("export const tokens = 1;\n", encoding="ascii")
+            (inert / "README.txt").write_text("inert\n", encoding="ascii")
+
+        self.assertEqual(subject.INERT_PACKAGE_NAME, "kernel-tokens")
+        for mode, kind, tree, options in (
+            ("bootstrap", "lock", "core_node_lock_return", {}),
+            ("verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE,
+             {"accepted_provenance": {"status": "accepted"}, "lock_bytes": b"lock"}),
+        ):
+            with self.subTest(mode=mode):
+                result, producer, unused_contract = self._run(
+                    mode, kind, validated_tree=tree, mutate_source=add_inert, **options,
+                )
+                copied = producer.copies[0][2]
+                self.assertFalse(any("kernel-tokens" in path for path in copied))
+                self.assertEqual(result["stages"], subject.NODE_GATE_NAMES if mode == "verify"
+                                 else subject.NODE_BOOTSTRAP_GATES)
+                if mode == "verify":
+                    self.assertEqual(result["node_reviewed_file_count"], len(copied))
+        self.assertEqual(subject.NODE_WORKSPACE_PACKAGES, ("packages/host-api", "packages/kernel-i18n"))
+        self.assertFalse(any("kernel-tokens" in path for path in subject.BOOTSTRAP_MANIFESTS))
+        self.assertFalse(any("kernel-tokens" in path for path in subject.NODE_REVIEWED_FILES))
+
+    def test_kernel_tokens_never_widens_the_package_listing_beyond_itself(self):
+        def make_inert(source):
+            (source / "packages/kernel-tokens/src").mkdir(parents=True)
+
+        def with_other_package(source):
+            make_inert(source)
+            (source / "packages/third-package/src").mkdir(parents=True)
+
+        def with_stray_file(source):
+            make_inert(source)
+            (source / "packages/stray.txt").touch()
+
+        def with_case_variant(source):
+            make_inert(source)
+            (source / "packages/Kernel-Tokens").mkdir()
+
+        def without_host_api(source):
+            make_inert(source)
+            shutil.rmtree(source / "packages/host-api")
+
+        def inert_is_a_file(source):
+            (source / "packages/kernel-tokens").write_text("x\n", encoding="ascii")
+
+        def inert_with_package_json(source):
+            make_inert(source)
+            (source / "packages/kernel-tokens/package.json").write_text("{}\n", encoding="ascii")
+
+        def inert_with_package_json_directory(source):
+            make_inert(source)
+            (source / "packages/kernel-tokens/package.json").mkdir()
+
+        for mutate in (
+            with_other_package, with_stray_file, with_case_variant, without_host_api,
+            inert_is_a_file, inert_with_package_json, inert_with_package_json_directory,
+        ):
+            with self.subTest(mutation=mutate.__name__, mode="bootstrap"):
+                self._refused("bootstrap", "lock", "core_node_lock_return", mutate)
+            with self.subTest(mutation=mutate.__name__, mode="verify"):
+                self._refused(
+                    "verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE, mutate,
+                    accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+                )
+
     def test_verify_refuses_kernel_sources_outside_the_reviewed_patterns(self):
         def remove_support(source):
             (source / "packages/kernel-i18n/tests/support.ts").unlink()

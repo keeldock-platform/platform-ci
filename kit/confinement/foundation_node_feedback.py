@@ -18,6 +18,7 @@ NODE_GATE_NAMES = (
 NODE_BOOTSTRAP_GATES = ("node_dependency_prepare", "node_dependency_audit")
 FULL_FOUNDATION_GATES = RUST_FOUNDATION_GATES + NODE_GATE_NAMES
 NODE_WORKSPACE_PACKAGES = ("packages/host-api", "packages/kernel-i18n")
+INERT_PACKAGE_NAME = "kernel-tokens"
 BOOTSTRAP_MANIFESTS = (
     "package.json", "packages/host-api/package.json", "packages/kernel-i18n/package.json",
 )
@@ -233,6 +234,24 @@ def _profile_context(mode, dispatch, producer, source_runtime, validated_tree, a
     return profile, request, identity, policy_epoch_ms
 
 
+def _require_inert_package(directory, producer):
+    """The one extra packages entry allowed beside the two workspaces. It is only checked, never
+    copied, read or listed: it must be a real directory without a package.json, so npm cannot
+    treat it as a workspace."""
+    try:
+        if not stat.S_ISDIR(directory.lstat().st_mode):
+            _refuse(producer, "manifest_invalid")
+    except OSError:
+        _refuse(producer, "manifest_invalid")
+    try:
+        (directory / "package.json").lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        _refuse(producer, "manifest_invalid")
+    _refuse(producer, "manifest_invalid")
+
+
 def _reviewed_files(source_runtime, mode, producer, source):
     source_files = getattr(source_runtime, "CORE_CONTRACT_FEEDBACK_FILES", None)
     kernel_files = getattr(source_runtime, "CORE_CONTRACT_KERNEL_FEEDBACK_FILES", None)
@@ -248,7 +267,10 @@ def _reviewed_files(source_runtime, mode, producer, source):
             package_names = sorted(entry.name for entry in iterator)
     except OSError:
         _refuse(producer, "manifest_invalid")
-    if package_names != sorted(path.rsplit("/", 1)[-1] for path in NODE_WORKSPACE_PACKAGES):
+    expected_names = sorted(path.rsplit("/", 1)[-1] for path in NODE_WORKSPACE_PACKAGES)
+    if package_names == sorted(expected_names + [INERT_PACKAGE_NAME]):
+        _require_inert_package(source / "packages" / INERT_PACKAGE_NAME, producer)
+    elif package_names != expected_names:
         _refuse(producer, "manifest_invalid")
     if mode == "bootstrap":
         return BOOTSTRAP_MANIFESTS
