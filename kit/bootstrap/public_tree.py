@@ -147,6 +147,7 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/macos_capability.py",
         "kit/confinement/macos_capability.swift",
         "kit/confinement/test_macos_capability.py",
+        "kit/confinement/test_macos_capability_census.py",
         "kit/confinement/test_macos_descriptors.py",
         "kit/confinement/test_macos_revocation_rule.py",
         "kit/confinement/linux_harness.py",
