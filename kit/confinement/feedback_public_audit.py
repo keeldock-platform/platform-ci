@@ -35,6 +35,10 @@ SETTINGS_PREFIX = b"KD-FEEDBACK-SETTINGS "
 PREPARE_PREFIX = b"KD-FEEDBACK-PREPARE "
 PRODUCER_SUMMARY_PREFIX = b"KD-FEEDBACK-PRODUCER-SUMMARY "
 AUDIT_SUMMARY_PREFIX = b"KD-FEEDBACK-AUDIT-SUMMARY "
+NPM_DIAGNOSTIC_MARKER = b"KD-FEEDBACK-NPM-DIAGNOSTIC"
+NPM_DIAGNOSTIC_LINE_RE = re.compile(
+    rb"KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=(npm_resolve|npm_lock|npm_bundle) reason=([a-z0-9_]{1,40})\Z"
+)
 AUDIT_FAILURE_PHASES = frozenset((
     "request", "identity", "run", "workflow", "history", "jobs",
     "job_surfaces", "check_surfaces", "job_steps", "job_logs",
@@ -376,6 +380,26 @@ def _read_cache_snapshot(log, control_sha, run_id):
     return matches[0].group(3).decode("ascii")
 
 
+def _npm_diagnostic_lines_ok(logs, profile):
+    """Accept no diagnostic line, or exactly one strict closed line in the npm producer log."""
+    keys_by_step = dict(public_audit.CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP)
+    found = 0
+    for name, log in logs.items():
+        for line in log.splitlines():
+            if NPM_DIAGNOSTIC_MARKER not in line:
+                continue
+            body = line
+            if not line.startswith(NPM_DIAGNOSTIC_MARKER) and len(line) > 30 and line[4:5] == b"-" and b"Z " in line[:32]:
+                body = line.split(b"Z ", 1)[1]
+            match = NPM_DIAGNOSTIC_LINE_RE.match(body)
+            if (match is None or name != profile["producer_job"]
+                    or profile["kind"] != feedback_request.NPM_ADMISSION_KIND
+                    or match.group(2).decode("ascii") not in keys_by_step[match.group(1).decode("ascii")]):
+                return False
+            found += 1
+    return found <= 1
+
+
 READINESS_ATTEMPTS = 15
 READINESS_INTERVAL_SECONDS = 10
 READINESS_MAX_SECONDS = 150
@@ -665,6 +689,11 @@ def audit_live(environ=None, api_factory=None, *, now=None, sleep=None, monotoni
             fail("summary_markers")
     except (KeyError, Exception):
         fail("summary_markers")
+    try:
+        if not _npm_diagnostic_lines_ok(logs, profile):
+            fail("producer_evidence")
+    except Exception:
+        fail("producer_evidence")
 
     producer_record = None
     producer_output = None

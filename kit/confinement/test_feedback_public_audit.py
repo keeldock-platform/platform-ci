@@ -771,6 +771,70 @@ class LiveProviderPipelineTests(unittest.TestCase):
                 self.assertEqual(history_queries[0]["created"], ["2026-10-27..2026-10-28"])
                 self.assertEqual(history_queries[0]["page"], ["1"])
 
+    NPM_PROFILE = "core-npm-admission-return"
+    NPM_DIAGNOSTIC = b"KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=npm_resolve reason=eresolve\n"
+    STAMP = b"2026-10-28T04:00:00Z "
+
+    def _npm_diagnostic_audit(self, lines, profile_name=None, job=103):
+        environment, api = self._live(profile_name or self.NPM_PROFILE)
+        for line in lines:
+            api.logs[job] = api.logs[job] + line
+        return self._audit(environment, api)
+
+    def _npm_diagnostic_phase(self, lines, profile_name=None, job=103):
+        with self.assertRaises(subject.FeedbackAuditRefusal) as caught:
+            self._npm_diagnostic_audit(lines, profile_name, job)
+        return caught.exception.phase
+
+    def test_the_npm_producer_log_may_carry_exactly_one_closed_diagnostic_line(self):
+        plain = self._npm_diagnostic_audit([])
+        self.assertTrue(plain.startswith("KD-FEEDBACK-AUDIT {"))
+        for lines in ([self.NPM_DIAGNOSTIC], [self.STAMP + self.NPM_DIAGNOSTIC]):
+            with self.subTest(lines=lines):
+                accepted = self._npm_diagnostic_audit(lines)
+                self.assertEqual(accepted, plain)
+        for step, keys in macos_public_audit.CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP:
+            if step not in ("npm_resolve", "npm_lock", "npm_bundle"):
+                continue
+            for key in keys:
+                line = ("KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=" + step + " reason=" + key + "\n").encode("ascii")
+                with self.subTest(step=step, key=key):
+                    self.assertEqual(self._npm_diagnostic_audit([self.STAMP + line]), plain)
+
+    def test_every_other_diagnostic_line_shape_or_placement_is_refused(self):
+        good = self.NPM_DIAGNOSTIC
+        for lines in (
+            [good, good], [good, self.STAMP + good],
+            [good.replace(b"schema=1", b"schema=2")],
+            [good.replace(b"step=npm_resolve", b"step=npm_version")],
+            [good.replace(b"step=npm_resolve", b"step=npm_inputs reason=npm_stale").replace(b"reason=eresolve", b"")],
+            [good.replace(b"reason=eresolve", b"reason=bogus")],
+            [good.replace(b"reason=eresolve", b"reason=ERESOLVE")],
+            [good.replace(b"reason=eresolve", b"reason=npm_lock_refused")],
+            [good.replace(b"reason=eresolve", b"reason=eresolve extra=1")],
+            [good.replace(b"reason=eresolve", b"reason=")],
+            [good.replace(b"KD-FEEDBACK-NPM-DIAGNOSTIC ", b"KD-FEEDBACK-NPM-DIAGNOSTIC  ")],
+            [b"prefix " + good],
+            [self.STAMP + b"prefix " + good],
+            [good.rstrip(b"\n") + b" \n"],
+            [b"KD-FEEDBACK-NPM-DIAGNOSTIC\n"],
+            [b"KD-FEEDBACK-NPM-DIAGNOSTIC-SUMMARY schema=1\n"],
+        ):
+            with self.subTest(lines=lines):
+                self.assertEqual(self._npm_diagnostic_phase(lines), "producer_evidence")
+
+    def test_the_diagnostic_line_is_refused_in_every_log_but_the_npm_producer_job(self):
+        for job in (101, 102):
+            with self.subTest(job=job):
+                self.assertEqual(self._npm_diagnostic_phase([self.NPM_DIAGNOSTIC], job=job), "producer_evidence")
+        for profile_name in MAIN_PROFILES:
+            if profile_name == self.NPM_PROFILE:
+                continue
+            with self.subTest(profile=profile_name):
+                self.assertEqual(
+                    self._npm_diagnostic_phase([self.NPM_DIAGNOSTIC], profile_name), "producer_evidence",
+                )
+
     def test_failed_producer_still_scans_jobs_checks_annotations_artifact_and_cache(self):
         request, key = _request()
         profile = feedback_request.PROFILES[request["concern"]]

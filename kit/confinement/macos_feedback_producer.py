@@ -996,6 +996,34 @@ NPM_ERROR_CODES = (
     "EINTEGRITY", "ENOVERSIONS",
 )
 NPM_ERROR_CODE_RE = re.compile(rb"^npm (?:error|ERR!) code ([A-Z0-9_]{1,32})\r?$", re.MULTILINE)
+NPM_DIAGNOSTIC_STEPS = ("npm_resolve", "npm_lock", "npm_bundle")
+NPM_DIAGNOSTIC_KEY_RE = re.compile(r"[a-z0-9_]{1,40}\Z")
+NPM_DIAGNOSTIC_PREFIX = "KD-NPM-DIAGNOSTICS schema=1 step="
+NPM_DIAGNOSTIC_MAX_BYTES = 64 * 1024
+NPM_DIAGNOSTIC_MAX_LINES = 400
+NPM_DIAGNOSTIC_LINE_UNITS = 2000
+NPM_DIAGNOSTIC_STDERR_LINES = 200
+NPM_DIAGNOSTIC_STDERR_BYTES = 24 * 1024
+NPM_DIAGNOSTIC_REPORT_READ_BYTES = 1024 * 1024
+NPM_STDERR_LINE_RE = re.compile(r"npm (?:error|warn) ")
+NPM_REPORT_NAME_RE = re.compile(r"[0-9A-Za-z_.-]{1,80}-eresolve-report\.txt\Z")
+NPM_PATH_LINE_RE = re.compile(r"(?:^|[\s\"'=(\[,])(?:/|~/)[A-Za-z0-9._~@-]")
+NPM_CREDENTIAL_PATTERNS = (
+    re.compile(
+        r"(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}"
+        r"|xox[baprs]-[A-Za-z0-9-]{16,}|npm_[A-Za-z0-9]{20,}|AKIA[A-Z0-9]{16}|ASIA[A-Z0-9]{16})"
+        r"(?:$|[^A-Za-z0-9])"
+    ),
+    re.compile(r"-----BEGIN [A-Z0-9 ]{0,64}PRIVATE KEY-----"),
+    re.compile(
+        r"\b(?:authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd"
+        r"|api[_-]?key|private[_-]?key|secret|token|credential)\b\s*[:=]\s*(?:Bearer\s+)?[^\s,;]{8,}",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{24,}={0,2}"),
+    re.compile(r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@", re.IGNORECASE),
+    re.compile(r"_auth(?:Token)?\s*=|_password\s*=", re.IGNORECASE),
+)
 
 
 def _npm_tag(error, step, key):
@@ -1007,10 +1035,178 @@ def _npm_tag(error, step, key):
         pass
 
 
-def _npm_refuse(step, key, reason):
+def _npm_attach(error, payload):
+    try:
+        if type(payload) is bytes and payload:
+            error.npm_diagnostic = payload
+    except BaseException:
+        pass
+
+
+def _npm_refuse(step, key, reason, diagnostic=None):
     refusal = FeedbackRefusal(reason)
     _npm_tag(refusal, step, key)
+    _npm_attach(refusal, diagnostic)
     raise refusal
+
+
+def _npm_credential_like(text):
+    return any(pattern.search(text) is not None for pattern in NPM_CREDENTIAL_PATTERNS)
+
+
+def _npm_section(raw, only_npm_lines, line_limit, byte_limit):
+    """Screen, escape and bound one diagnostic section.
+
+    Returns (lines, omitted, cut). Lines that name an absolute or home path or look like a
+    credential are dropped and counted. Every kept line is escaped by sanitize_diagnostic_stream
+    and clipped to NPM_DIAGNOSTIC_LINE_UNITS, and the section stops at line_limit lines or
+    byte_limit bytes (three bytes of layout per line included)."""
+    if type(raw) is not bytes or not raw:
+        return [], 0, False
+    lines = [line.rstrip("\r") for line in raw.decode("utf-8", "backslashreplace").split("\n")]
+    if lines and lines[-1] == "":
+        lines.pop()
+    if only_npm_lines:
+        lines = [line for line in lines if NPM_STDERR_LINE_RE.match(line) is not None]
+    kept = []
+    omitted = 0
+    for line in lines:
+        if NPM_PATH_LINE_RE.search(line) is not None or _npm_credential_like(line):
+            omitted += 1
+        else:
+            kept.append(line)
+    cut = False
+    if kept:
+        joined, cut = sanitize_diagnostic_stream("\n".join(kept).encode("utf-8"), False)
+        kept = joined.decode("utf-8").split("\n")
+    result = []
+    used = 0
+    for line in kept:
+        clipped = _clip_line_units(line, NPM_DIAGNOSTIC_LINE_UNITS)
+        size = len(clipped.encode("utf-8")) + 3
+        if len(result) >= line_limit or used + size > byte_limit:
+            cut = True
+            break
+        if clipped != line:
+            cut = True
+        result.append(clipped)
+        used += size
+    return result, omitted, cut
+
+
+def _npm_render_section(lines, omitted, cut):
+    rendered = ["  " + line for line in lines]
+    if omitted:
+        rendered.append("  [omitted " + str(omitted) + " lines]")
+    if cut:
+        rendered.append("  [truncated]")
+    return rendered
+
+
+def build_npm_diagnostic_payload(step, key, stderr, report):
+    """Build the bounded KD-NPM-DIAGNOSTICS payload for one failed npm admission step.
+
+    Layout, ASCII structure lines and two-space indented body lines:
+    header line, a stderr: line, the screened npm stderr lines, a report: line, the screened
+    eresolve report text. The header carries only the closed step tag and the closed reason."""
+    if (type(step) is not str or step not in NPM_DIAGNOSTIC_STEPS or type(key) is not str
+            or NPM_DIAGNOSTIC_KEY_RE.match(key) is None):
+        _refuse("payload_invalid")
+    header = NPM_DIAGNOSTIC_PREFIX + step + " reason=" + key + "\n"
+    stderr_lines, stderr_omitted, stderr_cut = _npm_section(
+        stderr, True, NPM_DIAGNOSTIC_STDERR_LINES, NPM_DIAGNOSTIC_STDERR_BYTES,
+    )
+    stderr_rendered = _npm_render_section(stderr_lines, stderr_omitted, stderr_cut)
+    used_bytes = len(header) + len("stderr:\nreport:\n") + sum(
+        len(line.encode("utf-8")) + 1 for line in stderr_rendered
+    )
+    report_lines, report_omitted, report_cut = _npm_section(
+        report, False,
+        max(0, NPM_DIAGNOSTIC_MAX_LINES - 5 - len(stderr_rendered)),
+        max(0, NPM_DIAGNOSTIC_MAX_BYTES - 128 - used_bytes),
+    )
+    report_rendered = _npm_render_section(report_lines, report_omitted, report_cut)
+    text = (header + "stderr:\n" + "".join(line + "\n" for line in stderr_rendered)
+            + "report:\n" + "".join(line + "\n" for line in report_rendered))
+    payload = text.encode("utf-8")
+    if (len(payload) > NPM_DIAGNOSTIC_MAX_BYTES or text.count("\n") > NPM_DIAGNOSTIC_MAX_LINES
+            or UNSAFE_DIAGNOSTIC_RE.search(text) is not None
+            or DISPLAY_UNSAFE_DIAGNOSTIC_RE.search(text) is not None
+            or _npm_credential_like(text)):
+        _refuse("payload_invalid")
+    return payload
+
+
+def _npm_read_prefix(path, worker_uid, limit):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        return None
+    descriptor = None
+    try:
+        before = path.lstat()
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != worker_uid or before.st_nlink != 1
+                or before.st_size <= 0):
+            return None
+        descriptor = os.open(path, os.O_RDONLY | nofollow)
+        opened = os.fstat(descriptor)
+        if ((before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_uid != worker_uid
+                or opened.st_nlink != 1):
+            return None
+        chunks = []
+        total = 0
+        while total < limit:
+            chunk = os.read(descriptor, min(8192, limit - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except BaseException:
+        return None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _npm_read_report(npm_storage, worker_uid):
+    """Return the newest eresolve report under this run's own npm cache, or None."""
+    try:
+        logs = Path(npm_storage) / "cache" / "_logs"
+        info = logs.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != worker_uid:
+            return None
+        names = sorted(name for name in os.listdir(logs) if NPM_REPORT_NAME_RE.fullmatch(name) is not None)
+        if not names:
+            return None
+        return _npm_read_prefix(logs / names[-1], worker_uid, NPM_DIAGNOSTIC_REPORT_READ_BYTES)
+    except BaseException:
+        return None
+
+
+def _npm_capture_diagnostic(step, key, stderr, npm_storage, worker_uid):
+    try:
+        return build_npm_diagnostic_payload(step, key, stderr, _npm_read_report(npm_storage, worker_uid))
+    except BaseException:
+        return None
+
+
+def npm_diagnostic_result(error):
+    """Turn a failed npm step that captured a diagnostic into the producer result, else re-raise."""
+    payload = getattr(error, "npm_diagnostic", None)
+    step = getattr(error, "source_gates_step", None)
+    key = getattr(error, "source_gates_key", None)
+    if (not isinstance(error, FeedbackRefusal) or error.reason == "cleanup_incomplete"
+            or type(payload) is not bytes or not payload
+            or type(step) is not str or step not in NPM_DIAGNOSTIC_STEPS
+            or type(key) is not str or NPM_DIAGNOSTIC_KEY_RE.match(key) is None
+            or not payload.startswith((NPM_DIAGNOSTIC_PREFIX + step + " reason=" + key + "\n").encode("ascii"))):
+        raise error
+    return {"payload_bytes": payload, "expected_manifest": None, "reviewed_rust_paths": None,
+            "source_result": "npm_diagnostic", "npm_diagnostic": (step, key)}
 
 
 def _npm_resolve_reason(result):
@@ -1052,11 +1248,13 @@ def _npm_mapped_reason(reason):
     return "payload_invalid"
 
 
-def _npm_bootstrap_refusal(error, step=None):
+def _npm_bootstrap_refusal(error, step=None, capture=None):
     reason = getattr(error, "reason", None)
     refusal = FeedbackRefusal(_npm_mapped_reason(reason))
     if step is not None and type(reason) is str:
         _npm_tag(refusal, step, reason)
+        if capture is not None:
+            _npm_attach(refusal, capture(step, reason))
     raise refusal
 
 
@@ -1141,6 +1339,11 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
         _npm_tag(error, step, error.reason)
         raise
     step = "npm_config"
+    resolve_stderr = None
+
+    def capture(step_name, key):
+        return _npm_capture_diagnostic(step_name, key, resolve_stderr, npm_storage, worker_uid)
+
     try:
         os.chdir(project)
         _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
@@ -1162,13 +1365,17 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
             step, rust, command, worker_uid, npm_environment, python_executable, capability,
             "feedback_lock", deadline, allow_nonzero_capture=True, timeout=NPM_RESOLVE_SECONDS,
         )
+        resolve_stderr = getattr(result, "stderr", None)
         step = "npm_config"
         _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
         step = "npm_resolve"
         if result.returncode != 0:
-            _npm_refuse(step, _npm_resolve_reason(result), "command_failed")
+            code = _npm_resolve_reason(result)
+            _npm_refuse(step, code, "command_failed", capture(step, code))
     except FeedbackRefusal as error:
         _npm_tag(error, step, error.reason)
+        if step == "npm_resolve" and getattr(error, "source_gates_key", None) == "capture_invalid":
+            _npm_attach(error, capture(step, "capture_invalid"))
         raise
     finally:
         try:
@@ -1182,9 +1389,11 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
         )
         bootstrap.check_lock(lock_bytes, plan)
     except refusal_type as error:
-        _npm_bootstrap_refusal(error, step)
+        _npm_bootstrap_refusal(error, step, capture)
     except FeedbackRefusal as error:
         _npm_tag(error, step, error.reason)
+        if error.reason == "capture_invalid":
+            _npm_attach(error, capture(step, "capture_invalid"))
         raise
     step = "npm_bundle"
     owner = source_environ.get("SOURCE_REPOSITORY_OWNER", "")
@@ -1205,7 +1414,7 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
             fetcher=bootstrap.RegistryFetcher(deadline=deadline),
         )
     except refusal_type as error:
-        _npm_bootstrap_refusal(error, step)
+        _npm_bootstrap_refusal(error, step, capture)
     return {"payload_bytes": bundle, "expected_manifest": None, "reviewed_rust_paths": None,
             "source_result": "command_completed"}
 
@@ -1298,12 +1507,12 @@ def _utf16_units(text):
     return sum(2 if ord(character) > 0xFFFF else 1 for character in text)
 
 
-def _clip_line_units(line):
+def _clip_line_units(line, limit=DIAGNOSTIC_MAX_LINE_UNITS):
     units = 0
     end = 0
     for character in line:
         step = 2 if ord(character) > 0xFFFF else 1
-        if units + step > DIAGNOSTIC_MAX_LINE_UNITS:
+        if units + step > limit:
             break
         units += step
         end += 1

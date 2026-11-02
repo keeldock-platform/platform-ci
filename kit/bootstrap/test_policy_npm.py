@@ -120,6 +120,23 @@ class NpmAdmissionWorkflowPolicyTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, workflow)
 
+    def test_the_producer_step_echoes_at_most_one_strict_closed_diagnostic_line_from_its_stderr(self):
+        workflow = NPM_ADMISSION_WORKFLOW.read_text(encoding="utf-8")
+        blocks = job_blocks(workflow)
+        producer = blocks["core-npm-admission-return"]
+        pattern = ("diagnostic_pattern='^KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 "
+                   "step=npm_(resolve|lock|bundle) reason=[a-z0-9_]{1,40}$'")
+        self.assertEqual(producer.count(pattern), 1)
+        echoed = "printf '%s\\n' \"$diagnostic_line\""
+        self.assertEqual(producer.count(echoed), 1)
+        self.assertLess(producer.index("printf '%s\\n' \"$producer_line\""), producer.index(echoed))
+        self.assertLess(producer.index('diagnostic_line="$(grep -Em 1'), producer.index("trap - EXIT"))
+        self.assertIn('[[ "$(grep -Ec -- "$diagnostic_pattern" "$stderr_file")" -eq 1 ]] || exit 1', producer)
+        for name in ("settings", "prepare", "audit"):
+            self.assertNotIn("KD-FEEDBACK-NPM-DIAGNOSTIC", blocks["core-npm-admission-return-" + name])
+        for forbidden in ('cat "$stderr_file"', 'tail ', 'head ', '>&2'):
+            self.assertNotIn(forbidden, producer)
+
     def test_every_action_is_pinned_to_a_full_commit_and_nothing_else_is_used(self):
         workflow = NPM_ADMISSION_WORKFLOW.read_text(encoding="utf-8")
         uses = re.findall(r"^\s*uses: (.*)$", workflow, flags=re.MULTILINE)

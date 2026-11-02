@@ -1,7 +1,10 @@
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 import unittest
@@ -483,6 +486,442 @@ class NpmAdmissionProducerTests(unittest.TestCase):
                 with self.assertRaises(producer.FeedbackRefusal) as raised:
                     producer._npm_bootstrap_refusal(bootstrap.BootstrapRefusal(reason))
                 self.assertIn(raised.exception.reason, allowed)
+
+    def failure(self, **keywords):
+        with self.assertRaises(producer.FeedbackRefusal) as raised:
+            self.execute(**keywords)
+        return raised.exception
+
+    @staticmethod
+    def sections(payload):
+        lines = payload.decode("utf-8").split("\n")
+        tail = lines.pop()
+        assert tail == ""
+        index = lines.index("report:")
+        return lines[0], lines[2:index], lines[index + 1:]
+
+    def test_a_resolve_failure_carries_one_bounded_diagnostic_and_converts_to_a_producer_result(self):
+        self.resolve = SimpleNamespace(returncode=1, stdout=b"", stderr=(
+            b"npm warn peer x@1.0.0\nnpm error code ERESOLVE\nnpm error While resolving: a@1.0.0\n"
+            b"npm error Found: b@2.0.0\nnpm error Could not resolve dependency:\nunrelated line\n"
+            b"npm error Conflicting peer dependency: c@3.0.0\n"
+        ))
+        with patch.object(producer, "_npm_read_report", return_value=b"While resolving: a@1.0.0\nFound: b@2.0.0\n"):
+            error = self.failure()
+        self.assertEqual(
+            (error.reason, error.source_gates_step, error.source_gates_key),
+            ("command_failed", "npm_resolve", "eresolve"),
+        )
+        header, stderr, report = self.sections(error.npm_diagnostic)
+        self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=eresolve")
+        self.assertEqual(stderr, [
+            "  npm warn peer x@1.0.0", "  npm error code ERESOLVE", "  npm error While resolving: a@1.0.0",
+            "  npm error Found: b@2.0.0", "  npm error Could not resolve dependency:",
+            "  npm error Conflicting peer dependency: c@3.0.0",
+        ])
+        self.assertEqual(report, ["  While resolving: a@1.0.0", "  Found: b@2.0.0"])
+        result = producer.npm_diagnostic_result(error)
+        self.assertEqual(set(result), {
+            "payload_bytes", "expected_manifest", "reviewed_rust_paths", "source_result", "npm_diagnostic",
+        })
+        self.assertEqual(result["payload_bytes"], error.npm_diagnostic)
+        self.assertEqual(result["source_result"], "npm_diagnostic")
+        self.assertEqual(result["npm_diagnostic"], ("npm_resolve", "eresolve"))
+        self.assertIsNone(result["expected_manifest"])
+        self.assertIsNone(result["reviewed_rust_paths"])
+        self.assertEqual(self.chdirs[-1], SOURCE.as_posix())
+
+    def test_the_diagnostic_is_read_from_this_runs_own_npm_cache_logs_directory(self):
+        self.resolve = SimpleNamespace(returncode=1, stdout=b"", stderr=b"npm error code ERESOLVE\n")
+        with patch.object(producer, "_npm_read_report", return_value=None) as reader:
+            self.failure()
+        reader.assert_called_once_with(STORAGE / "npm-admission-home", 501)
+
+    def test_hostile_resolver_output_is_screened_escaped_and_bounded_in_the_diagnostic(self):
+        stderr = b"".join(line + b"\n" for line in (
+            b"npm error code ERESOLVE",
+            b"npm error token: " + b"a" * 16,
+            b"npm error ghp_" + b"A" * 24,
+            b"npm error https://user:pw@host.example/x",
+            b"npm error path /var/folders/xx",
+            b"npm error see ~/.npmrc here",
+            b"npm error \x1b[31mred\x00\x85 end",
+            b"npm error " + b"x" * 5000,
+            b"npm warn bad \xff\xfe bytes",
+            "npm error bidi \u202e text".encode("utf-8"),
+            b"this is not an npm line",
+            b"  npm error indented does not match",
+        ))
+        self.resolve = SimpleNamespace(returncode=1, stdout=b"", stderr=stderr)
+        report = b"Found: a@1\ntoken: abcdefghijklmnop\nnote /mnt/someone/project\nfine line\n"
+        with patch.object(producer, "_npm_read_report", return_value=report):
+            error = self.failure()
+        text = error.npm_diagnostic.decode("utf-8")
+        for leaked in ("ghp_", "token: a", "/var/folders", ".npmrc", "user:pw", "/mnt/someone", "\u202e", "\x1b",
+                       "\x00", "\x85", "not an npm line", "indented does not match", "abcdefghijklmnop"):
+            self.assertNotIn(leaked, text)
+        self.assertIn("\\u{1b}", text)
+        self.assertIn("\\u{00}", text)
+        self.assertIn("\\u{202e}", text)
+        header, stderr_lines, report_lines = self.sections(error.npm_diagnostic)
+        self.assertEqual(max(len(line) for line in stderr_lines), 2002)
+        self.assertEqual(stderr_lines[-2:], ["  [omitted 5 lines]", "  [truncated]"])
+        self.assertEqual(report_lines, ["  Found: a@1", "  fine line", "  [omitted 2 lines]"])
+        self.assertLessEqual(len(error.npm_diagnostic), producer.NPM_DIAGNOSTIC_MAX_BYTES)
+        self.assertLessEqual(text.count("\n"), producer.NPM_DIAGNOSTIC_MAX_LINES)
+        published = repr((error.reason, error.detail, error.source_gates_step, error.source_gates_key, str(error)))
+        self.assertNotIn("ghp_", published)
+
+    def test_a_credential_split_across_lines_fails_closed_to_the_plain_refusal(self):
+        self.resolve = SimpleNamespace(returncode=1, stdout=b"", stderr=b"npm error code ERESOLVE\n")
+        with patch.object(producer, "_npm_read_report", return_value=b"token:\nabcdefghijklmnop\n"):
+            error = self.failure()
+        self.assertEqual((error.reason, error.source_gates_step, error.source_gates_key),
+                         ("command_failed", "npm_resolve", "eresolve"))
+        self.assertIsNone(getattr(error, "npm_diagnostic", None))
+        with self.assertRaises(producer.FeedbackRefusal) as raised:
+            producer.npm_diagnostic_result(error)
+        self.assertIs(raised.exception, error)
+
+    def test_a_failing_diagnostic_builder_leaves_the_plain_refusal_unchanged(self):
+        self.resolve = SimpleNamespace(returncode=1, stdout=b"", stderr=b"npm error code ERESOLVE\n")
+        with patch.object(producer, "build_npm_diagnostic_payload", side_effect=RuntimeError("hostile")):
+            error = self.failure()
+        self.assertEqual((error.reason, error.source_gates_step, error.source_gates_key),
+                         ("command_failed", "npm_resolve", "eresolve"))
+        self.assertFalse(hasattr(error, "npm_diagnostic"))
+
+    def test_a_good_run_has_no_diagnostic_and_never_reads_the_report(self):
+        with patch.object(producer, "_npm_read_report", side_effect=AssertionError("unused")):
+            result = self.execute()
+        self.assertEqual(result["source_result"], "command_completed")
+        self.assertNotIn("npm_diagnostic", result)
+        self.assertTrue(result["payload_bytes"].startswith(b"{"))
+        self.assertFalse(result["payload_bytes"].startswith(b"KD-NPM-DIAGNOSTICS"))
+        lock_bytes, receipt_bytes, evidence_bytes = bootstrap.decode_bundle(result["payload_bytes"])
+        self.assertEqual(lock_bytes, self.world.lock_bytes)
+
+    def test_the_lock_step_failure_carries_a_diagnostic_with_the_resolver_warnings(self):
+        self.resolve = SimpleNamespace(returncode=0, stdout=b"", stderr=b"npm warn deprecated a@1.0.0: old\nnoise\n")
+        other = json.loads(self.world.lock_bytes.decode("ascii"))
+        other["packages"][""]["devDependencies"] = {"alpha-pkg": "1.0.0"}
+        with patch.object(producer, "_npm_read_report", return_value=None):
+            error = self.failure(lock=fixtures._json(other) + b"\n")
+        self.assertEqual((error.reason, error.source_gates_step, error.source_gates_key),
+                         ("payload_invalid", "npm_lock", "npm_lock_refused"))
+        header, stderr, report = self.sections(error.npm_diagnostic)
+        self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused")
+        self.assertEqual(stderr, ["  npm warn deprecated a@1.0.0: old"])
+        self.assertEqual(report, [])
+        self.assertEqual(producer.npm_diagnostic_result(error)["npm_diagnostic"], ("npm_lock", "npm_lock_refused"))
+        self.lock_failure = producer.FeedbackRefusal("capture_invalid")
+        error = self.failure()
+        self.assertEqual((error.reason, error.source_gates_key), ("capture_invalid", "capture_invalid"))
+        self.assertEqual(self.sections(error.npm_diagnostic)[0],
+                         "KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=capture_invalid")
+
+    def test_the_bundle_step_failure_carries_a_diagnostic_with_the_bootstrap_reason(self):
+        def failing(name):
+            raise bootstrap.BootstrapRefusal("npm_network_refused")
+
+        self.fetcher.packument = failing
+        error = self.failure()
+        self.assertEqual((error.reason, error.source_gates_step, error.source_gates_key),
+                         ("command_failed", "npm_bundle", "npm_network_refused"))
+        self.assertEqual(self.sections(error.npm_diagnostic)[0],
+                         "KD-NPM-DIAGNOSTICS schema=1 step=npm_bundle reason=npm_network_refused")
+        self.assertEqual(producer.npm_diagnostic_result(error)["npm_diagnostic"],
+                         ("npm_bundle", "npm_network_refused"))
+
+    def test_a_resolve_capture_failure_keeps_the_report_but_other_runner_failures_carry_nothing(self):
+        self.runner_failures = {"resolve": self.runner_refusal("capture_invalid")}
+        with patch.object(producer, "_npm_read_report", return_value=b"Found: a@1\n"):
+            error = self.failure()
+        header, stderr, report = self.sections(error.npm_diagnostic)
+        self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=capture_invalid")
+        self.assertEqual((stderr, report), ([], ["  Found: a@1"]))
+        for reason, check in (("command_failed", "timeout"), ("command_failed", "spawn_failure"),
+                              ("command_failed", None), ("cleanup_incomplete", None)):
+            with self.subTest(reason=reason, check=check):
+                self.runner_failures = {"resolve": self.runner_refusal(reason, check)}
+                error = self.failure()
+                self.assertEqual(error.reason, reason)
+                self.assertFalse(hasattr(error, "npm_diagnostic"))
+                with self.assertRaises(producer.FeedbackRefusal) as raised:
+                    producer.npm_diagnostic_result(error)
+                self.assertIs(raised.exception, error)
+
+    def test_failures_before_the_resolve_step_and_config_failures_carry_no_diagnostic(self):
+        self.files["package.json"] = b'{"name":"other"}'
+        self.assertFalse(hasattr(self.failure(), "npm_diagnostic"))
+        self.files = dict(self.world.files)
+        self.version = SimpleNamespace(returncode=1, stdout=b"11.19.1\n")
+        self.assertFalse(hasattr(self.failure(), "npm_diagnostic"))
+        self.version = SimpleNamespace(returncode=0, stdout=(bootstrap.NPM_VERSION + "\n").encode("ascii"))
+        for failing_call in (1, 2, 3):
+            self.config_calls = []
+            self.config_failures = {failing_call}
+            self.assertFalse(hasattr(self.failure(), "npm_diagnostic"))
+        self.config_failures = set()
+        self.lock_state = "lock_already_present"
+        self.assertFalse(hasattr(self.failure(), "npm_diagnostic"))
+
+    def test_the_diagnostic_result_converts_only_a_captured_closed_producer_failure(self):
+        good = b"KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=eresolve\nstderr:\nreport:\n"
+
+        def refusal(reason="command_failed", step="npm_resolve", key="eresolve", payload=good):
+            error = producer.FeedbackRefusal(reason)
+            error.source_gates_step = step
+            error.source_gates_key = key
+            error.npm_diagnostic = payload
+            return error
+
+        self.assertEqual(producer.npm_diagnostic_result(refusal())["payload_bytes"], good)
+        hostile = (
+            refusal(reason="cleanup_incomplete"), refusal(step="npm_version"), refusal(step="npm_inputs"),
+            refusal(key="timeout"), refusal(key="ERESOLVE"), refusal(key=None), refusal(payload=None),
+            refusal(payload=b""), refusal(payload=bytearray(good)), refusal(payload=good.replace(b"eresolve", b"e404")),
+            refusal(payload=b"{}"), refusal(payload=b" " + good),
+            ValueError("hostile"),
+        )
+        for error in hostile:
+            with self.subTest(error=repr(error)[:60]):
+                if not isinstance(error, producer.FeedbackRefusal):
+                    error.npm_diagnostic = good
+                with self.assertRaises(Exception) as raised:
+                    producer.npm_diagnostic_result(error)
+                self.assertIs(raised.exception, error)
+
+
+def _stderr(*lines):
+    return b"".join(line + b"\n" for line in lines)
+
+
+class NpmDiagnosticPayloadTests(unittest.TestCase):
+    def sections(self, payload):
+        lines = payload.decode("utf-8").split("\n")
+        self.assertEqual(lines.pop(), "")
+        self.assertEqual(lines[1], "stderr:")
+        self.assertEqual(lines.count("report:"), 1)
+        index = lines.index("report:")
+        for line in lines[2:index] + lines[index + 1:]:
+            self.assertTrue(line.startswith("  "), line)
+        return lines[0], lines[2:index], lines[index + 1:]
+
+    def test_the_header_is_closed_and_only_npm_error_and_warn_lines_are_kept(self):
+        payload = producer.build_npm_diagnostic_payload(
+            "npm_resolve", "eresolve",
+            _stderr(b"npm error code ERESOLVE", b"npm error While resolving: a@1.0.0", b"unrelated", b"npm warn peer b@2",
+                    b"npm ERR! legacy", b"npm info chatter"),
+            b"While resolving: a@1.0.0\nFound: b@2.0.0\n",
+        )
+        header, stderr, report = self.sections(payload)
+        self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=eresolve")
+        self.assertEqual(stderr, ["  npm error code ERESOLVE", "  npm error While resolving: a@1.0.0", "  npm warn peer b@2"])
+        self.assertEqual(report, ["  While resolving: a@1.0.0", "  Found: b@2.0.0"])
+
+    def test_missing_inputs_give_the_bare_fixed_layout(self):
+        for stderr, report in ((None, None), (b"", b""), ("text", "text"), (bytearray(b"npm error x\n"), None)):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(
+                    producer.build_npm_diagnostic_payload("npm_lock", "npm_lock_refused", stderr, report),
+                    b"KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused\nstderr:\nreport:\n",
+                )
+
+    def test_the_step_and_reason_must_be_closed_tokens(self):
+        for step, key in (
+            ("npm_inputs", "eresolve"), ("npm_version", "mismatch"), ("resolve", "eresolve"), ("npm_resolve", ""),
+            ("npm_resolve", "ERESOLVE"), ("npm_resolve", "a" * 41), ("npm_resolve", "x y"), ("npm_resolve", "a\nb"),
+            (None, "eresolve"), ("npm_resolve", None), ("npm_resolve", b"eresolve"), (b"npm_resolve", "eresolve"),
+        ):
+            with self.subTest(step=step, key=key):
+                with self.assertRaises(producer.FeedbackRefusal) as raised:
+                    producer.build_npm_diagnostic_payload(step, key, b"", b"")
+                self.assertEqual(raised.exception.reason, "payload_invalid")
+
+    def test_every_section_is_capped_by_lines_and_bytes_and_marked_truncated(self):
+        many = _stderr(*[b"npm error line " + str(index).encode("ascii") for index in range(1000)])
+        payload = producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", many, None)
+        header, stderr, report = self.sections(payload)
+        self.assertEqual(len(stderr), producer.NPM_DIAGNOSTIC_STDERR_LINES + 1)
+        self.assertEqual(stderr[-1], "  [truncated]")
+        wide = _stderr(*[b"npm error " + b"y" * 1500 for unused in range(100)])
+        stderr = self.sections(producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", wide, None))[1]
+        self.assertLessEqual(sum(len(line.encode("utf-8")) + 1 for line in stderr), producer.NPM_DIAGNOSTIC_STDERR_BYTES)
+        self.assertEqual(stderr[-1], "  [truncated]")
+        for report in (
+            b"".join(b"Found: package-" + str(index).encode("ascii") + b"@1.0.0 needs a peer\n" for index in range(20000)),
+            b"".join(b"a" * 1900 + b"\n" for unused in range(100)),
+            b"line without newline " * 10000,
+        ):
+            payload = producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", many, report)
+            self.assertLessEqual(len(payload), producer.NPM_DIAGNOSTIC_MAX_BYTES)
+            self.assertLessEqual(payload.count(b"\n"), producer.NPM_DIAGNOSTIC_MAX_LINES)
+            self.assertEqual(self.sections(payload)[2][-1], "  [truncated]")
+
+    def test_the_existing_sanitiser_escapes_every_kept_line(self):
+        with patch.object(producer, "sanitize_diagnostic_stream", wraps=producer.sanitize_diagnostic_stream) as spy:
+            payload = producer.build_npm_diagnostic_payload(
+                "npm_bundle", "npm_peer_refused", _stderr(b"npm error a\x1bb"), b"c\x7fd\n",
+            )
+        self.assertEqual(spy.call_count, 2)
+        self.assertEqual(self.sections(payload)[1:], (["  npm error a\\u{1b}b"], ["  c\\u{7f}d"]))
+
+    def test_a_credential_that_spans_lines_is_refused_whole(self):
+        for report in (b"token:\nabcdefghijklmnop\n", b"password =\n  hunter2hunter2\n"):
+            with self.subTest(report=report):
+                with self.assertRaises(producer.FeedbackRefusal) as raised:
+                    producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", b"", report)
+                self.assertEqual(raised.exception.reason, "payload_invalid")
+
+    def test_credential_and_path_screens_match_the_encryptor_screen_shapes(self):
+        samples = (
+            b"npm error " + b"ghp_" + b"A" * 24, b"npm error github_pat_" + b"B" * 24, b"npm error xoxb-" + b"c" * 16,
+            b"npm error npm_" + b"D" * 20, b"npm error AKIA" + b"E" * 16, b"npm error Authorization: Bearer abcdefgh",
+            b"npm error Bearer " + b"f" * 24, b"npm error -----BEGIN RSA PRIVATE KEY-----",
+            b"npm error //registry.example/:_authToken=x", b"npm error https://u:p@host/",
+            b"npm error password=hunter2hunter2", b"npm error api_key: abcdefghij",
+        )
+        for sample in samples:
+            with self.subTest(sample=sample[:24]):
+                payload = producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", _stderr(sample), None)
+                self.assertEqual(self.sections(payload)[1], ["  [omitted 1 lines]"])
+        paths = (b"npm error at /etc/passwd", b"npm error in ~/x", b"npm error (/tmp/a)", b'npm error "/var/x"')
+        for sample in paths:
+            with self.subTest(sample=sample):
+                payload = producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", _stderr(sample), None)
+                self.assertEqual(self.sections(payload)[1], ["  [omitted 1 lines]"])
+        public = (
+            b'npm error   peer react@"^18.0.0" from react-dom@18.2.0', b"npm error node_modules/@scope/pkg",
+            b"npm error See https://registry.npmjs.org/pkg for details", b"npm error Fix the upstream dependency conflict",
+        )
+        for sample in public:
+            with self.subTest(sample=sample):
+                payload = producer.build_npm_diagnostic_payload("npm_resolve", "eresolve", _stderr(sample), None)
+                self.assertEqual(self.sections(payload)[1], ["  " + sample.decode("ascii")])
+
+
+@unittest.skipUnless(sys.platform != "win32", "the eresolve report reader requires POSIX ownership checks")
+class NpmEresolveReportReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.storage = Path(os.path.realpath(self.temporary.name)) / "home"
+        self.logs = self.storage / "cache" / "_logs"
+        self.logs.mkdir(parents=True)
+        self.uid = os.getuid()
+
+    def write(self, name, data):
+        path = self.logs / name
+        path.write_bytes(data)
+        return path
+
+    def test_the_newest_eresolve_report_by_name_is_read_and_other_logs_are_ignored(self):
+        self.write("2026-11-01T10_00_00_000Z-eresolve-report.txt", b"old report\n")
+        self.write("2026-11-02T10_00_00_000Z-eresolve-report.txt", b"new report\n")
+        self.write("2026-11-03T10_00_00_000Z-debug-0.log", b"debug log\n")
+        self.write("2026-11-04T10_00_00_000Z-eresolve-report.txt.bak", b"backup\n")
+        self.assertEqual(producer._npm_read_report(self.storage, self.uid), b"new report\n")
+
+    def test_no_report_or_no_logs_directory_gives_nothing(self):
+        self.assertIsNone(producer._npm_read_report(self.storage, self.uid))
+        self.write("2026-11-02T10_00_00_000Z-debug-0.log", b"debug log\n")
+        self.assertIsNone(producer._npm_read_report(self.storage, self.uid))
+        self.assertIsNone(producer._npm_read_report(self.storage / "missing", self.uid))
+
+    def test_wrong_owner_empty_linked_or_symlinked_files_and_directories_are_not_read(self):
+        name = "2026-11-02T10_00_00_000Z-eresolve-report.txt"
+        self.write(name, b"report\n")
+        self.assertIsNone(producer._npm_read_report(self.storage, self.uid + 1))
+        (self.logs / name).unlink()
+        self.write(name, b"")
+        self.assertIsNone(producer._npm_read_report(self.storage, self.uid))
+        (self.logs / name).unlink()
+        target = self.write("target.txt", b"secret outside the report\n")
+        os.symlink(str(target), str(self.logs / name))
+        self.assertIsNone(producer._npm_read_report(self.storage, self.uid))
+        (self.logs / name).unlink()
+        self.write(name, b"report\n")
+        os.link(str(self.logs / name), str(self.logs / "other-name.txt"))
+        self.assertIsNone(producer._npm_read_report(self.storage, self.uid))
+        (self.logs / "other-name.txt").unlink()
+        self.assertEqual(producer._npm_read_report(self.storage, self.uid), b"report\n")
+        real = self.storage / "cache" / "_real"
+        (self.storage / "cache" / "_logs").rename(real)
+        os.symlink(str(real), str(self.storage / "cache" / "_logs"))
+        self.assertIsNone(producer._npm_read_report(self.storage, self.uid))
+
+    def test_a_large_report_is_read_only_up_to_the_fixed_prefix_bound(self):
+        name = "2026-11-02T10_00_00_000Z-eresolve-report.txt"
+        self.write(name, b"a" * (producer.NPM_DIAGNOSTIC_REPORT_READ_BYTES + 5000))
+        data = producer._npm_read_report(self.storage, self.uid)
+        self.assertEqual(len(data), producer.NPM_DIAGNOSTIC_REPORT_READ_BYTES)
+
+
+@unittest.skipUnless(sys.platform != "win32", "the macOS core contract tests require POSIX paths")
+class NpmDiagnosticPublicLineTests(unittest.TestCase):
+    ARGUMENTS = [
+        "run", "--token-stdin", "--source-sha", "a" * 40, "--base-sha", "b" * 40, "--base-branch", "develop",
+    ]
+
+    def run_main(self, diagnostic, kind="npm_admission"):
+        import macos_core_contract as core
+
+        def execute(arguments, environ, token, lifecycle, feedback_kind=None):
+            lifecycle["token_revocation"] = "confirmed_before_execution"
+            if diagnostic is not None:
+                lifecycle["npm_diagnostic"] = diagnostic
+            return b'{"status":"encrypted"}'
+
+        out, err = io.StringIO(), io.StringIO()
+        with patch.object(core, "_execute", execute):
+            status = core.main(
+                arguments=list(self.ARGUMENTS), environ={}, stdin=io.BytesIO(b"fixture-token\n"),
+                stdout=out, stderr=err, feedback_kind=kind,
+            )
+        return status, out.getvalue(), err.getvalue()
+
+    def test_one_closed_diagnostic_line_follows_the_receipt_on_the_producer_stderr_only(self):
+        status, out, err = self.run_main(("npm_resolve", "eresolve"))
+        self.assertEqual(status, 0)
+        self.assertEqual(out, 'KD-FEEDBACK-PRODUCER {"status":"encrypted"}\n')
+        self.assertEqual(err.splitlines(), [
+            "KD-PRODUCER-TOKEN-REVOCATION confirmed",
+            "KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=npm_resolve reason=eresolve",
+        ])
+
+    def test_no_diagnostic_means_no_extra_line(self):
+        status, out, err = self.run_main(None)
+        self.assertEqual((status, err), (0, "KD-PRODUCER-TOKEN-REVOCATION confirmed\n"))
+
+    def test_only_closed_step_reason_pairs_of_the_npm_admission_kind_are_ever_published(self):
+        for diagnostic, kind in (
+            (("npm_resolve", "bogus"), "npm_admission"), (("npm_inputs", "npm_stale"), "npm_admission"),
+            (("npm_version", "mismatch"), "npm_admission"), (("npm_config", "tool_unavailable"), "npm_admission"),
+            (["npm_resolve", "eresolve"], "npm_admission"), (("npm_resolve",), "npm_admission"),
+            (("npm_resolve", b"eresolve"), "npm_admission"), (("npm_resolve", "eresolve\nforged"), "npm_admission"),
+            ("npm_resolve eresolve", "npm_admission"), (("npm_resolve", "eresolve"), "cargo_lock"),
+            (("npm_resolve", "eresolve"), "build_diagnostics"),
+        ):
+            with self.subTest(diagnostic=diagnostic, kind=kind):
+                status, out, err = self.run_main(diagnostic, kind)
+                self.assertEqual(err, "KD-PRODUCER-TOKEN-REVOCATION confirmed\n")
+
+    def test_every_closed_core_pair_of_the_three_steps_is_a_valid_public_line_and_a_payload_header(self):
+        import macos_core_contract as core
+
+        self.assertEqual(core.NPM_DIAGNOSTIC_STEPS, producer.NPM_DIAGNOSTIC_STEPS)
+        checked = 0
+        for step, keys in core.SOURCE_GATES_NPM_KEYS_BY_STEP:
+            if step not in core.NPM_DIAGNOSTIC_STEPS:
+                continue
+            for key in keys:
+                status, out, err = self.run_main((step, key))
+                self.assertEqual(err.splitlines()[-1], core.NPM_DIAGNOSTIC_LINE_PREFIX + step + " reason=" + key)
+                payload = producer.build_npm_diagnostic_payload(step, key, None, None)
+                self.assertTrue(payload.startswith(producer.NPM_DIAGNOSTIC_PREFIX.encode("ascii") + step.encode("ascii")))
+                checked += 1
+        self.assertEqual(checked, 10 + 4 + 3 + 19)
 
 
 if __name__ == "__main__":

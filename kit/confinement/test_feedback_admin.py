@@ -401,6 +401,58 @@ class FeedbackAdminTests(unittest.TestCase):
         with self.assertRaises(subject.FeedbackAdminRefusal):
             self.create()
 
+    def consume_npm_return(self, plaintext):
+        request = self.create("npm_admission")["request"]
+        evidence, trusted = self.evidence_for(request)
+        gate = self.summary_gate(request)
+
+        def helper(message, *, plaintext_pipe=False):
+            if message["operation"] == "decrypt":
+                return b'{"schema_version":1,"ok":true}\n', bytearray(plaintext)
+            return _fake_helper(message, plaintext_pipe=plaintext_pipe)
+
+        with self.install_collector(evidence), \
+                mock.patch.object(subject.node_lock_receipt, "validate_receipt", return_value=trusted), \
+                mock.patch.object(self.admin, "_run_helper", side_effect=helper):
+            returned = self.admin.consume_return(request["request_id"], object(), manual_summary_review=gate)
+        return request, returned
+
+    def test_an_npm_diagnostic_return_is_written_as_a_diagnostic_and_never_as_an_admission(self):
+        diagnostic = (b"KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=eresolve\n"
+                      b"stderr:\n  npm error code ERESOLVE\nreport:\n  Found: y@2.0.0\n")
+        request, returned = self.consume_npm_return(diagnostic)
+        self.assertEqual(returned["kind"], "npm_admission")
+        self.assertEqual(returned["payload_variant"], "npm_diagnostics")
+        self.assertFalse(returned["bootstrap_lock_consumed"])
+        self.assertTrue(returned["private_output_path"].endswith("-npm-diagnostics.payload"))
+        self.assertEqual(os.path.basename(returned["private_output_path"]),
+                         "return-" + request["request_id"] + "-npm-diagnostics.payload")
+        with open(returned["private_output_path"], "rb") as output:
+            self.assertEqual(output.read(), diagnostic)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.directory, "return-" + request["request_id"] + "-npm-admission.payload")))
+        entry = self._state()["requests"][0]
+        self.assertEqual((entry["status"], entry["key_state"]), ("consumed", "retired"))
+
+    def check_admission_payload(self, plaintext):
+        request, returned = self.consume_npm_return(plaintext)
+        self.assertNotIn("payload_variant", returned)
+        self.assertEqual(set(returned), {
+            "request_id", "kind", "private_output_path", "bootstrap_lock_consumed",
+        })
+        self.assertTrue(returned["private_output_path"].endswith("-npm-admission.payload"))
+        with open(returned["private_output_path"], "rb") as output:
+            self.assertEqual(output.read(), plaintext)
+
+    def test_an_npm_admission_payload_is_still_written_as_an_admission_payload(self):
+        self.check_admission_payload(PLAINTEXT)
+
+    def test_only_a_payload_that_starts_with_the_closed_prefix_is_a_diagnostic(self):
+        self.check_admission_payload(b" KD-NPM-DIAGNOSTICS schema=1 step=npm_resolve reason=eresolve\n")
+
+    def test_a_bundle_shaped_payload_is_written_as_an_admission_payload(self):
+        self.check_admission_payload(b'{"evidence_b64":"AA==","lock_b64":"AA==","receipt_b64":"AA==","schema_version":1}')
+
     def test_summary_job_set_is_ordered_and_must_match_the_reviewed_template(self):
         result = self.create()
         gate = self.summary_gate(result["request"])
@@ -1037,6 +1089,26 @@ class ProfilePayloadLimitTests(unittest.TestCase):
             subject.FeedbackAdmin._release_private_output(
                 stub, -1, {"request_id": "a" * 64}, dict(cargo, max_payload_bytes="1"), b"x",
             )
+
+    def test_the_diagnostic_file_name_is_reserved_for_the_npm_admission_kind_and_its_prefix(self):
+        stub = types.SimpleNamespace(state_directory="/unused")
+        diagnostic = b"KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused\nstderr:\nreport:\n"
+        for kind, profile in feedback_request.PROFILE_BY_KIND.items():
+            for plaintext in (diagnostic, bytearray(diagnostic)):
+                with self.subTest(kind=kind, plaintext=type(plaintext).__name__):
+                    with mock.patch.object(subject, "_create_named"):
+                        path = subject.FeedbackAdmin._release_private_output(
+                            stub, -1, {"request_id": "a" * 64}, profile, plaintext,
+                        )
+                    self.assertEqual(
+                        path.endswith("-npm-diagnostics.payload"),
+                        kind == feedback_request.NPM_ADMISSION_KIND,
+                    )
+        npm = feedback_request.PROFILE_BY_KIND[feedback_request.NPM_ADMISSION_KIND]
+        for plaintext in (b"", b"KD-NPM-DIAGNOSTICS", b"kd-npm-diagnostics ", b'{"schema_version":1}'):
+            with self.subTest(plaintext=plaintext):
+                self.assertFalse(subject._is_npm_diagnostic(npm, plaintext))
+        self.assertTrue(subject._is_npm_diagnostic(npm, diagnostic))
 
 
 class UnsupportedPlatformTests(unittest.TestCase):

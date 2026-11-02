@@ -32,12 +32,17 @@ export const DEVELOPMENT_FEEDBACK_LIMITS = Object.freeze({
   npmAdmissionLockBytes: 1536 * 1024,
   npmAdmissionReceiptBytes: 256 * 1024,
   npmAdmissionEvidenceBytes: 640 * 1024,
+  npmDiagnosticBytes: 64 * 1024,
+  npmDiagnosticLines: 401,
+  npmDiagnosticLineCodeUnits: 2048,
   linuxQuickBytes: 4 * 1024 * 1024 - 64 * 1024,
   linuxQuickLines: 2,
   linuxQuickLineCodeUnits: 4 * 1024 * 1024 - 64 * 1024,
 });
 
 const PROFILE_KINDS = new Set(['lock', 'rust_patch', 'build_diagnostics', 'cargo_lock', 'npm_admission', 'linux_quick']);
+const NPM_DIAGNOSTICS_PREFIX = 'KD-NPM-DIAGNOSTICS ';
+const NPM_DIAGNOSTICS_HEADER = /^KD-NPM-DIAGNOSTICS schema=1 step=npm_(?:resolve|lock|bundle) reason=[a-z0-9_]{1,40}$/u;
 const CARGO_LOCK_FIELDS = Object.freeze(['evidence_b64', 'lock_b64', 'receipt_b64', 'schema_version']);
 const BASE64_TEXT = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const RUST_PATH = /^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*\.rs$/u;
@@ -425,8 +430,34 @@ function validateCargoLockBundle(bytes, kind = 'cargo_lock') {
   if (canonical !== text) reject('invalid_cargo_lock');
 }
 
+function validateNpmDiagnostics(bytes) {
+  if (bytes.byteLength > DEVELOPMENT_FEEDBACK_LIMITS.npmDiagnosticBytes) reject('payload_too_large');
+  const text = decodeText(bytes, DEVELOPMENT_FEEDBACK_LIMITS.npmDiagnosticLines,
+    DEVELOPMENT_FEEDBACK_LIMITS.npmDiagnosticLineCodeUnits);
+  const lines = text.split('\n');
+  if (lines.pop() !== '' || lines.length < 3 || !NPM_DIAGNOSTICS_HEADER.test(lines[0])
+      || lines[1] !== 'stderr:') reject('invalid_payload');
+  let reportIndex = -1;
+  for (let index = 2; index < lines.length; index += 1) {
+    if (lines[index] === 'report:') {
+      if (reportIndex !== -1) reject('invalid_payload');
+      reportIndex = index;
+    } else if (!lines[index].startsWith('  ')) reject('invalid_payload');
+  }
+  if (reportIndex === -1) reject('invalid_payload');
+  validateDiagnosticText(text);
+}
+
 function validatePayload(bytes, profile, options, originalRustFiles) {
   if (!PROFILE_KINDS.has(profile.kind)) reject('unsupported_kind');
+  if (profile.kind === 'npm_admission' && Buffer.from(bytes.subarray(0, NPM_DIAGNOSTICS_PREFIX.length))
+    .toString('latin1') === NPM_DIAGNOSTICS_PREFIX) {
+    if (Object.hasOwn(options, 'expectedManifest') || Object.hasOwn(options, 'reviewedRustPaths')) {
+      reject('invalid_expectation');
+    }
+    validateNpmDiagnostics(bytes);
+    return;
+  }
   if (profile.kind === 'cargo_lock' || profile.kind === 'npm_admission') {
     if (Object.hasOwn(options, 'expectedManifest') || Object.hasOwn(options, 'reviewedRustPaths')) {
       reject('invalid_expectation');
