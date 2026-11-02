@@ -128,6 +128,7 @@ DIAG_MAX_LINES = 20
 DIAG_MAX_CHARS = 200
 DIAG_TAIL_BYTES = 16384
 DIAG_ALPHABET = frozenset(string.ascii_letters + string.digits + " ._:/=+,()'" + chr(34) + "-")
+DIAG_PRINTED = DIAG_ALPHABET | frozenset("?")
 DIAG_TOKEN = re.compile(r"[A-Za-z0-9+/]{33,}")
 DIAG_FORM = re.compile(r"[a-z_]{1,20}")
 
@@ -267,7 +268,7 @@ def fixture_line(phase, form, refusal):
 def diag_line(phase, form, text):
     if phase not in DIAG_PHASES or type(form) is not str or DIAG_FORM.fullmatch(form) is None:
         raise ValueError("diag-line")
-    if type(text) is not str or len(text) > DIAG_MAX_CHARS or any(character not in DIAG_ALPHABET for character in text):
+    if type(text) is not str or len(text) > DIAG_MAX_CHARS or any(character not in DIAG_PRINTED for character in text):
         raise ValueError("diag-line")
     return (
         LINE_PREFIX + "-FIXTURE-DIAG schema=" + str(SCHEMA_VERSION) + " phase=" + phase
