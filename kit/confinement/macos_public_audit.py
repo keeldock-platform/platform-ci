@@ -523,6 +523,33 @@ CORE_CONTRACT_SOURCE_GATES_NODE_PROFILE_REASONS = (
 CORE_CONTRACT_SOURCE_GATES_NODE_OUTCOME_CHECKS = (
     "rust", "stage", "capture", "substage", "verification", "reviewed_files",
 )
+CORE_CONTRACT_SOURCE_GATES_NPM_RESOLVE_CODES = (
+    "eresolve", "ebadengine", "etarget", "enotfound", "etimedout", "econnreset", "e404",
+    "eintegrity", "enoversions", "other",
+)
+CORE_CONTRACT_SOURCE_GATES_NPM_RUNNER_KEYS = ("timeout", "spawn", "runner", "capture_invalid")
+CORE_CONTRACT_SOURCE_GATES_NPM_BUNDLE_REASONS = (
+    "npm_input_invalid", "npm_environment_refused", "npm_manifest_refused", "npm_request_refused",
+    "npm_request_mismatch", "npm_lock_refused", "npm_network_refused", "npm_integrity_mismatch",
+    "npm_package_too_young", "npm_package_deprecated", "npm_licence_refused", "npm_peer_refused",
+    "npm_archive_refused", "npm_advisory_blocked", "npm_advisory_invalid", "npm_evidence_invalid",
+    "npm_stale", "npm_payload_too_large", "npm_policy_refused",
+)
+CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP = (
+    ("npm_inputs", (
+        "npm_input_invalid", "npm_manifest_refused", "npm_request_refused", "npm_request_mismatch",
+        "npm_policy_refused", "npm_stale", "manifest_invalid",
+    )),
+    ("npm_config", (
+        "npm_environment_refused", "npm_input_invalid", "manifest_invalid", "output_unavailable",
+        "tool_unavailable",
+    )),
+    ("npm_version", ("nonzero_exit", "mismatch") + CORE_CONTRACT_SOURCE_GATES_NPM_RUNNER_KEYS),
+    ("npm_resolve",
+     CORE_CONTRACT_SOURCE_GATES_NPM_RESOLVE_CODES + CORE_CONTRACT_SOURCE_GATES_NPM_RUNNER_KEYS),
+    ("npm_lock", ("npm_lock_refused", "npm_payload_too_large", "capture_invalid")),
+    ("npm_bundle", CORE_CONTRACT_SOURCE_GATES_NPM_BUNDLE_REASONS),
+)
 CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTIC_REASONS = {
     "source_gates_payload_invalid": "runner_unavailable",
     "source_gates_payload_capture_invalid": "capture_invalid",
@@ -534,6 +561,12 @@ CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTIC_REASONS = {
     **{
         "source_gates_node_outcome_" + check: "runner_unavailable"
         for check in CORE_CONTRACT_SOURCE_GATES_NODE_OUTCOME_CHECKS
+    },
+    **{
+        "source_gates_" + step + "_" + key:
+            "capture_invalid" if key == "capture_invalid" else "runner_unavailable"
+        for step, keys in CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP
+        for key in keys
     },
 }
 CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS = frozenset(

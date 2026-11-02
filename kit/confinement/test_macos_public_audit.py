@@ -2045,7 +2045,38 @@ class CoreContractReceiptTests(unittest.TestCase):
         self.assertEqual(
             audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS, core_contract.SOURCE_GATES_STEP_DIAGNOSTICS,
         )
-        self.assertEqual(len(audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS), 12)
+        self.assertEqual(len(audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS), 66)
+        self.assertEqual(
+            audit.CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP, core_contract.SOURCE_GATES_NPM_KEYS_BY_STEP,
+        )
+        self.assertEqual(
+            audit.CORE_CONTRACT_SOURCE_GATES_NPM_RESOLVE_CODES, core_contract.SOURCE_GATES_NPM_RESOLVE_CODES,
+        )
+        self.assertEqual(
+            audit.CORE_CONTRACT_SOURCE_GATES_NPM_RUNNER_KEYS, core_contract.SOURCE_GATES_NPM_RUNNER_KEYS,
+        )
+        self.assertEqual(
+            audit.CORE_CONTRACT_SOURCE_GATES_NPM_BUNDLE_REASONS,
+            core_contract.SOURCE_GATES_NPM_BUNDLE_REASONS,
+        )
+        npm_diagnostics = frozenset(
+            diagnostic for diagnostic in audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS
+            if diagnostic.startswith("source_gates_npm_")
+        )
+        self.assertEqual(len(npm_diagnostics), 54)
+        self.assertEqual(
+            npm_diagnostics,
+            frozenset(
+                "source_gates_" + step + "_" + key
+                for step, keys in core_contract.SOURCE_GATES_NPM_KEYS_BY_STEP for key in keys
+            ),
+        )
+        self.assertEqual(
+            {diagnostic for diagnostic, reason in audit.CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.items()
+             if diagnostic in npm_diagnostics and reason == "capture_invalid"},
+            {"source_gates_npm_version_capture_invalid", "source_gates_npm_resolve_capture_invalid",
+             "source_gates_npm_lock_capture_invalid"},
+        )
         self.assertEqual(audit.CORE_CONTRACT_SOURCE_GATES_NODE_PROFILE_REASONS,
                          core_contract.SOURCE_GATES_NODE_PROFILE_REASONS)
         self.assertEqual(audit.CORE_CONTRACT_SOURCE_GATES_NODE_OUTCOME_CHECKS,
@@ -2085,6 +2116,8 @@ class CoreContractReceiptTests(unittest.TestCase):
         for unlisted in (
             "source_gates_payload_private", "source_gates_payload", "source_gates_node_profile",
             "source_gates_node_outcome_", "source_gates_node_outcome_private",
+            "source_gates_npm_resolve_ERESOLVE", "source_gates_npm_resolve", "source_gates_npm_resolve_private",
+            "source_gates_npm_version_eresolve", "source_gates_npm_bundle_manifest_invalid",
         ):
             rejected = core_contract_line({**base, "diagnostic": unlisted}, b"KD-CORE-CONTRACT-REFUSAL ")
             with self.subTest(unlisted=unlisted), self.assertRaises(audit.AuditRefusal):

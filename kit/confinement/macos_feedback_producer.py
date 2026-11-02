@@ -767,7 +767,11 @@ def _run_worker(rust, argv, worker_uid, environment, python_executable, capabili
             _refuse("cleanup_incomplete")
         if getattr(error, "reason", None) == "capture_invalid":
             _refuse("capture_invalid")
-        _refuse("command_failed")
+        refusal = FeedbackRefusal("command_failed")
+        check = getattr(error, "command_check", None)
+        if type(check) is str and check in ("timeout", "spawn_failure"):
+            refusal.command_check = check
+        raise refusal
     stdout_limit = rust.MAX_CAPTURE_BYTES if allow_nonzero_capture else 32_768
     if (type(result.returncode) is not int or type(result.stdout) is not bytes
             or type(result.stderr) is not bytes or len(result.stdout) > stdout_limit
@@ -987,18 +991,73 @@ NPM_RESOLVE_SECONDS = 900
 NPM_VERSION_SECONDS = 30
 
 
-def _npm_bootstrap_refusal(error):
-    reason = getattr(error, "reason", None)
+NPM_ERROR_CODES = (
+    "ERESOLVE", "EBADENGINE", "ETARGET", "ENOTFOUND", "ETIMEDOUT", "ECONNRESET", "E404",
+    "EINTEGRITY", "ENOVERSIONS",
+)
+NPM_ERROR_CODE_RE = re.compile(rb"^npm (?:error|ERR!) code ([A-Z0-9_]{1,32})\r?$", re.MULTILINE)
+
+
+def _npm_tag(error, step, key):
+    try:
+        if getattr(error, "source_gates_step", None) is None:
+            error.source_gates_step = step
+            error.source_gates_key = key
+    except BaseException:
+        pass
+
+
+def _npm_refuse(step, key, reason):
+    refusal = FeedbackRefusal(reason)
+    _npm_tag(refusal, step, key)
+    raise refusal
+
+
+def _npm_resolve_reason(result):
+    stderr = getattr(result, "stderr", None)
+    if type(stderr) is not bytes:
+        return "other"
+    match = NPM_ERROR_CODE_RE.search(stderr)
+    if match is None:
+        return "other"
+    code = match.group(1).decode("ascii", "strict")
+    return code.lower() if code in NPM_ERROR_CODES else "other"
+
+
+def _npm_run_worker(step, *arguments, **keywords):
+    try:
+        return _run_worker(*arguments, **keywords)
+    except FeedbackRefusal as error:
+        if error.reason == "capture_invalid":
+            _npm_tag(error, step, "capture_invalid")
+        elif error.reason == "command_failed":
+            check = getattr(error, "command_check", None)
+            _npm_tag(
+                error, step,
+                "timeout" if check == "timeout" else "spawn" if check == "spawn_failure" else "runner",
+            )
+        raise
+
+
+def _npm_mapped_reason(reason):
     if reason in (
         "npm_input_invalid", "npm_manifest_refused", "npm_request_refused", "npm_request_mismatch",
         "npm_policy_refused",
     ):
-        _refuse("manifest_invalid")
+        return "manifest_invalid"
     if reason == "npm_environment_refused":
-        _refuse("tool_unavailable")
+        return "tool_unavailable"
     if reason in ("npm_network_refused", "npm_stale"):
-        _refuse("command_failed")
-    _refuse("payload_invalid")
+        return "command_failed"
+    return "payload_invalid"
+
+
+def _npm_bootstrap_refusal(error, step=None):
+    reason = getattr(error, "reason", None)
+    refusal = FeedbackRefusal(_npm_mapped_reason(reason))
+    if step is not None and type(reason) is str:
+        _npm_tag(refusal, step, reason)
+    raise refusal
 
 
 def _write_project_files(destination, files, relative_paths, worker_uid, primary_gid):
@@ -1052,10 +1111,14 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
     project = worker_storage / NPM_PROJECT_DIRECTORY
     npm_storage = worker_storage / NPM_HOME_DIRECTORY
     python_executable = host_toolchain["python"]
+    step = "npm_inputs"
     try:
         paths = bootstrap.input_paths(selector)
         files = {path: _read_file(source / path, maximum=bootstrap.MAX_INPUT_BYTES) for path in paths}
         plan = bootstrap.check_inputs(files, selector)
+        now = int(time.time())
+        bootstrap.check_policy_time(plan, now)
+        step = "npm_config"
         _write_project_files(project, files, bootstrap.project_paths(selector), worker_uid, worker_gid)
         _make_worker_directory(npm_storage, worker_uid, worker_gid)
         for name in ("home", "tmp", "cache"):
@@ -1069,38 +1132,61 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
             user_config=user_config, global_config=global_config,
             node_options=contract.NODE_OPTIONS_VALUE,
         )
-        now = int(time.time())
-        bootstrap.check_policy_time(plan, now)
         command = bootstrap.resolve_command(
             node, npm_cli, plan["cutoff_epoch_ms"], user_config, global_config,
         )
     except refusal_type as error:
-        _npm_bootstrap_refusal(error)
+        _npm_bootstrap_refusal(error, step)
+    except FeedbackRefusal as error:
+        _npm_tag(error, step, error.reason)
+        raise
+    step = "npm_config"
     try:
         os.chdir(project)
         _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
-        probe = _run_worker(
-            rust, (str(node), str(npm_cli), "--version"), worker_uid, npm_environment,
+        step = "npm_version"
+        probe = _npm_run_worker(
+            step, rust, (str(node), str(npm_cli), "--version"), worker_uid, npm_environment,
             python_executable, capability, "feedback_lock", deadline,
             allow_nonzero_capture=True, timeout=NPM_VERSION_SECONDS,
         )
-        if probe.returncode != 0 or probe.stdout != (bootstrap.NPM_VERSION + "\n").encode("ascii"):
-            _refuse("tool_unavailable")
+        if probe.returncode != 0:
+            _npm_refuse(step, "nonzero_exit", "tool_unavailable")
+        if probe.stdout != (bootstrap.NPM_VERSION + "\n").encode("ascii"):
+            _npm_refuse(step, "mismatch", "tool_unavailable")
+        step = "npm_config"
         _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
         _npm_lock_absent(contract, project)
-        result = _run_worker(
-            rust, command, worker_uid, npm_environment, python_executable, capability,
+        step = "npm_resolve"
+        result = _npm_run_worker(
+            step, rust, command, worker_uid, npm_environment, python_executable, capability,
             "feedback_lock", deadline, allow_nonzero_capture=True, timeout=NPM_RESOLVE_SECONDS,
         )
+        step = "npm_config"
         _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
+        step = "npm_resolve"
         if result.returncode != 0:
-            _refuse("command_failed")
+            _npm_refuse(step, _npm_resolve_reason(result), "command_failed")
+    except FeedbackRefusal as error:
+        _npm_tag(error, step, error.reason)
+        raise
     finally:
         try:
             os.chdir(source)
         except OSError:
             _refuse("cleanup_incomplete")
-    lock_bytes = _read_worker_file(project / "package-lock.json", worker_uid, bootstrap.MAX_LOCK_BYTES)
+    step = "npm_lock"
+    try:
+        lock_bytes = _read_worker_file(
+            project / "package-lock.json", worker_uid, bootstrap.MAX_LOCK_BYTES,
+        )
+        bootstrap.check_lock(lock_bytes, plan)
+    except refusal_type as error:
+        _npm_bootstrap_refusal(error, step)
+    except FeedbackRefusal as error:
+        _npm_tag(error, step, error.reason)
+        raise
+    step = "npm_bundle"
     owner = source_environ.get("SOURCE_REPOSITORY_OWNER", "")
     name = source_environ.get("SOURCE_REPOSITORY_NAME", "")
     trusted_context = {
@@ -1119,7 +1205,7 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
             fetcher=bootstrap.RegistryFetcher(deadline=deadline),
         )
     except refusal_type as error:
-        _npm_bootstrap_refusal(error)
+        _npm_bootstrap_refusal(error, step)
     return {"payload_bytes": bundle, "expected_manifest": None, "reviewed_rust_paths": None,
             "source_result": "command_completed"}
 

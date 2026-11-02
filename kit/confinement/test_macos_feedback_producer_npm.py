@@ -53,6 +53,9 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         self.config_calls = []
         self.config_failures = set()
         self.lock_state = None
+        self.runner_failures = {}
+        self.lock_failure = None
+        self.read_failure = None
 
         def validate(environment, storage, uid, gid, *, stage, substage):
             self.events.append("config")
@@ -85,9 +88,14 @@ class NpmAdmissionProducerTests(unittest.TestCase):
     def run_worker(self, rust, argv, uid, environment, python, capability, stage, deadline, **keywords):
         self.commands.append((tuple(argv), dict(environment), stage, keywords))
         self.events.append("probe" if tuple(argv)[-1] == "--version" else "resolve")
+        failure = self.runner_failures.get(self.events[-1])
+        if failure is not None:
+            raise failure
         return self.version if tuple(argv)[-1] == "--version" else self.resolve
 
     def read_file(self, path, *, maximum, owner=0):
+        if self.read_failure is not None:
+            raise self.read_failure
         return self.files[path.relative_to(SOURCE).as_posix()]
 
     def execute(self, dispatch=None, *, lock=None, **overrides):
@@ -99,14 +107,19 @@ class NpmAdmissionProducerTests(unittest.TestCase):
             source_environ={"SOURCE_REPOSITORY_OWNER": "owner", "SOURCE_REPOSITORY_NAME": "name"},
         )
         arguments.update(overrides)
+
+        def read_lock(path, uid, maximum):
+            if self.lock_failure is not None:
+                raise self.lock_failure
+            return lock if lock is not None else self.world.lock_bytes
+
         with patch.object(producer, "_read_file", self.read_file), \
                 patch.object(producer, "_make_worker_directory",
                              lambda path, uid, gid: self.directories.append(Path(path).as_posix())), \
                 patch.object(producer, "_write_worker_file",
                              lambda path, payload, uid, gid: self.written.append((Path(path).as_posix(), payload))), \
                 patch.object(producer, "_run_worker", self.run_worker), \
-                patch.object(producer, "_read_worker_file",
-                             lambda path, uid, maximum: lock if lock is not None else self.world.lock_bytes), \
+                patch.object(producer, "_read_worker_file", read_lock), \
                 patch.object(producer.os, "chdir", lambda path: self.chdirs.append(Path(path).as_posix())), \
                 patch.object(bootstrap, "RegistryFetcher", lambda deadline=None: self.fetcher):
             return producer.run_npm_admission_profile(**arguments)
@@ -261,6 +274,207 @@ class NpmAdmissionProducerTests(unittest.TestCase):
             b"2026-06-01T12:00:00.000Z", fixtures._iso(int(time.time()) - 86400).encode("ascii"),
         )
         self.assertEqual(self.refusal(), "payload_invalid")
+
+    def tags(self, **keywords):
+        with self.assertRaises(producer.FeedbackRefusal) as raised:
+            self.execute(**keywords)
+        error = raised.exception
+        return error.reason, getattr(error, "source_gates_step", None), getattr(error, "source_gates_key", None)
+
+    @staticmethod
+    def runner_refusal(reason, check=None):
+        error = producer.FeedbackRefusal(reason)
+        if check is not None:
+            error.command_check = check
+        return error
+
+    def test_input_and_config_steps_are_tagged_with_the_original_reason(self):
+        self.files["package.json"] = b'{"name":"other"}'
+        reason, step, key = self.tags()
+        self.assertEqual((reason, step), ("manifest_invalid", "npm_inputs"))
+        self.assertIn(key, bootstrap.REASONS)
+        self.files = dict(self.world.files)
+        self.files[".npmrc"] = b"registry=other\n"
+        self.assertEqual(self.tags()[:2], ("manifest_invalid", "npm_inputs"))
+        self.files = dict(self.world.files)
+        self.assertEqual(
+            self.tags(dispatch=_dispatch(workspace="other-filing"))[:2], ("manifest_invalid", "npm_inputs"),
+        )
+        self.read_failure = producer.FeedbackRefusal("manifest_invalid")
+        self.assertEqual(self.tags(), ("manifest_invalid", "npm_inputs", "manifest_invalid"))
+        self.read_failure = None
+        with patch.object(producer, "_write_project_files", side_effect=producer.FeedbackRefusal("output_unavailable")):
+            self.assertEqual(self.tags(), ("output_unavailable", "npm_config", "output_unavailable"))
+        for failing_call in (1, 2, 3):
+            self.config_calls = []
+            self.config_failures = {failing_call}
+            self.assertEqual(self.tags(), ("tool_unavailable", "npm_config", "tool_unavailable"))
+        self.config_failures = set()
+        self.lock_state = "lock_already_present"
+        self.assertEqual(self.tags(), ("manifest_invalid", "npm_config", "manifest_invalid"))
+        self.lock_state = "tool_unavailable"
+        self.assertEqual(self.tags(), ("tool_unavailable", "npm_config", "tool_unavailable"))
+
+    def test_the_stale_filing_is_an_inputs_step_refusal(self):
+        stale = bootstrap.BootstrapRefusal("npm_stale")
+        with patch.object(bootstrap, "check_policy_time", side_effect=stale):
+            self.assertEqual(self.tags(), ("command_failed", "npm_inputs", "npm_stale"))
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.written, [])
+
+    def test_the_version_probe_step_is_tagged(self):
+        self.version = SimpleNamespace(returncode=1, stdout=b"11.19.1\n")
+        self.assertEqual(self.tags(), ("tool_unavailable", "npm_version", "nonzero_exit"))
+        self.version = SimpleNamespace(returncode=0, stdout=b"11.0.0\n")
+        self.assertEqual(self.tags(), ("tool_unavailable", "npm_version", "mismatch"))
+        self.version = SimpleNamespace(returncode=0, stdout=(bootstrap.NPM_VERSION + "\n").encode("ascii"))
+        cases = (
+            ("command_failed", "timeout", "timeout"), ("command_failed", "spawn_failure", "spawn"),
+            ("command_failed", None, "runner"), ("command_failed", "helper_failure", "runner"),
+            ("capture_invalid", None, "capture_invalid"),
+        )
+        for reason, check, key in cases:
+            with self.subTest(reason=reason, check=check):
+                self.runner_failures = {"probe": self.runner_refusal(reason, check)}
+                self.assertEqual(self.tags(), (reason, "npm_version", key))
+        self.runner_failures = {"probe": self.runner_refusal("cleanup_incomplete")}
+        self.assertEqual(self.tags()[0], "cleanup_incomplete")
+
+    def test_the_real_runner_wrapper_carries_only_a_timeout_or_spawn_check(self):
+        for check, expected in (("timeout", "timeout"), ("spawn_failure", "spawn_failure"),
+                                ("nonzero_exit", None), ("private", None), (7, None), (None, None)):
+            error = ContractRefusal("version_mismatch")
+            error.command_check = check
+            rust = SimpleNamespace(_run_worker_command=lambda *a, **k: (_ for _ in ()).throw(error))
+            with self.subTest(check=check), self.assertRaises(producer.FeedbackRefusal) as raised:
+                producer._run_worker(
+                    rust, ("a",), 501, {}, "/p", SimpleNamespace(), "feedback_lock", 10 ** 12,
+                )
+            self.assertEqual(raised.exception.reason, "command_failed")
+            self.assertEqual(getattr(raised.exception, "command_check", None), expected)
+
+    def test_resolve_failures_map_allowlisted_npm_codes_to_lowercase_tokens(self):
+        for code in producer.NPM_ERROR_CODES:
+            stderr = b"npm error code " + code.encode("ascii") + b"\nnpm error detail text\n"
+            with self.subTest(code=code):
+                self.resolve = SimpleNamespace(returncode=1, stdout=b"", stderr=stderr)
+                self.assertEqual(self.tags(), ("command_failed", "npm_resolve", code.lower()))
+        self.resolve = SimpleNamespace(
+            returncode=1, stdout=b"", stderr=b"npm warn x\r\nnpm ERR! code ETARGET\r\nnpm error code E404\n",
+        )
+        self.assertEqual(self.tags(), ("command_failed", "npm_resolve", "etarget"))
+
+    def test_resolve_failures_with_unknown_or_missing_codes_map_to_other(self):
+        for stderr in (
+            b"", b"boom", b"npm error code EWEIRD\n", b"npm error code " + b"E" * 33 + b"\n",
+            b"npm error code eresolve\n", b"prefix npm error code ERESOLVE\n",
+            b"npm error code ERESOLVE trailing\n", b"npm error code \xff\xfe\n", b"\x00" * 64,
+        ):
+            with self.subTest(stderr=stderr[:20]):
+                self.resolve = SimpleNamespace(returncode=2, stdout=b"", stderr=stderr)
+                self.assertEqual(self.tags(), ("command_failed", "npm_resolve", "other"))
+        for stderr in (None, "npm error code ERESOLVE\n", bytearray(b"npm error code ERESOLVE\n")):
+            self.resolve = SimpleNamespace(returncode=1, stdout=b"", stderr=stderr)
+            self.assertEqual(self.tags(), ("command_failed", "npm_resolve", "other"))
+
+    def test_resolve_runner_failures_are_tagged(self):
+        cases = (
+            ("command_failed", "timeout", "timeout"), ("command_failed", "spawn_failure", "spawn"),
+            ("command_failed", None, "runner"), ("capture_invalid", None, "capture_invalid"),
+        )
+        for reason, check, key in cases:
+            with self.subTest(reason=reason, check=check):
+                self.runner_failures = {"resolve": self.runner_refusal(reason, check)}
+                self.assertEqual(self.tags(), (reason, "npm_resolve", key))
+
+    def test_hostile_resolver_output_never_reaches_the_published_tags(self):
+        canary = "hostile-canary-7f3a-secret-token"
+        stderr = (
+            "npm error code ERESOLVE\nnpm error " + canary + "\nnpm error code " + canary.upper().replace("-", "_")
+            + "\nnpm error path /private/" + canary + "\n"
+        ).encode("ascii")
+        self.resolve = SimpleNamespace(returncode=1, stdout=canary.encode("ascii"), stderr=stderr)
+        with self.assertRaises(producer.FeedbackRefusal) as raised:
+            self.execute()
+        error = raised.exception
+        published = repr((error.reason, error.detail, error.source_gates_step, error.source_gates_key,
+                          str(error), sorted(vars(error))))
+        self.assertNotIn(canary, published)
+        self.assertNotIn(canary.upper().replace("-", "_"), published)
+        self.assertEqual(error.source_gates_key, "eresolve")
+        self.assertEqual(self.resolve_token(b"npm error code " + canary.upper().replace("-", "_").encode("ascii")), "other")
+        import macos_core_contract as core
+
+        self.assertIn((error.source_gates_step, error.source_gates_key), core.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY)
+        for diagnostic in core.SOURCE_GATES_STEP_DIAGNOSTICS:
+            self.assertNotIn("hostile", diagnostic)
+            self.assertRegex(diagnostic, r"\Asource_gates_[a-z0-9_]+\Z")
+
+    def resolve_token(self, stderr):
+        return producer._npm_resolve_reason(SimpleNamespace(stderr=stderr))
+
+    def test_the_lock_step_is_tagged_with_the_original_reason(self):
+        other = json.loads(self.world.lock_bytes.decode("ascii"))
+        other["packages"][""]["devDependencies"] = {"alpha-pkg": "1.0.0"}
+        self.assertEqual(
+            self.tags(lock=fixtures._json(other) + b"\n"), ("payload_invalid", "npm_lock", "npm_lock_refused"),
+        )
+        reason, step, key = self.tags(lock=b"not a lock")
+        self.assertEqual((reason, step), ("payload_invalid", "npm_lock"))
+        self.assertIn(key, ("npm_lock_refused", "npm_payload_too_large"))
+        self.assertEqual(self.fetcher.calls, [])
+        self.lock_failure = producer.FeedbackRefusal("capture_invalid")
+        self.assertEqual(self.tags(), ("capture_invalid", "npm_lock", "capture_invalid"))
+
+    def test_the_bundle_step_keeps_the_original_bootstrap_reason(self):
+        def failing(name):
+            raise bootstrap.BootstrapRefusal("npm_network_refused")
+
+        self.fetcher.packument = failing
+        self.assertEqual(self.tags(), ("command_failed", "npm_bundle", "npm_network_refused"))
+        self.fetcher = self.world.fetcher()
+        self.assertEqual(
+            self.tags(dispatch=_dispatch(expiry_offset=10 ** 6))[:2], ("command_failed", "npm_bundle"),
+        )
+        self.fetcher = self.world.fetcher()
+        self.fetcher.advisory = json.dumps({"alpha-pkg": [
+            {"id": 1, "severity": "critical", "vulnerable_versions": "<2.0.0"},
+        ]}).encode("ascii")
+        reason, step, key = self.tags()
+        self.assertEqual((reason, step), ("payload_invalid", "npm_bundle"))
+        self.assertIn(key, bootstrap.REASONS)
+
+    def test_bootstrap_reasons_are_preserved_in_the_tag_and_untagged_without_a_step(self):
+        import macos_core_contract as core
+
+        self.assertEqual(set(core.SOURCE_GATES_NPM_BUNDLE_REASONS), set(bootstrap.REASONS))
+        for reason in sorted(bootstrap.REASONS):
+            with self.subTest(reason=reason):
+                self.assertIn(("npm_bundle", reason), core.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY)
+                with self.assertRaises(producer.FeedbackRefusal) as raised:
+                    producer._npm_bootstrap_refusal(bootstrap.BootstrapRefusal(reason), "npm_bundle")
+                self.assertEqual(raised.exception.source_gates_step, "npm_bundle")
+                self.assertEqual(raised.exception.source_gates_key, reason)
+                with self.assertRaises(producer.FeedbackRefusal) as plain:
+                    producer._npm_bootstrap_refusal(bootstrap.BootstrapRefusal(reason))
+                self.assertIsNone(getattr(plain.exception, "source_gates_step", None))
+                self.assertEqual(plain.exception.reason, raised.exception.reason)
+        with self.assertRaises(producer.FeedbackRefusal) as unknown:
+            producer._npm_bootstrap_refusal(Exception("hostile-text"), "npm_bundle")
+        self.assertEqual((unknown.exception.reason, getattr(unknown.exception, "source_gates_step", None)),
+                         ("payload_invalid", None))
+
+    def test_the_producer_tokens_equal_the_core_vocabulary(self):
+        import macos_core_contract as core
+
+        self.assertEqual(
+            core.SOURCE_GATES_NPM_RESOLVE_CODES,
+            tuple(code.lower() for code in producer.NPM_ERROR_CODES) + ("other",),
+        )
+        self.assertEqual(
+            [step for step, keys in core.SOURCE_GATES_NPM_KEYS_BY_STEP],
+            ["npm_inputs", "npm_config", "npm_version", "npm_resolve", "npm_lock", "npm_bundle"],
+        )
 
     def test_reason_mapping_covers_every_bootstrap_reason_with_a_producer_reason(self):
         allowed = {"manifest_invalid", "tool_unavailable", "command_failed", "payload_invalid"}

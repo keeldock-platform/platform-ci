@@ -65,6 +65,37 @@ def _success_record(include_runtime=False):
     return record, versions, gates
 
 
+NPM_RESOLVE_KEYS = (
+    "eresolve", "ebadengine", "etarget", "enotfound", "etimedout", "econnreset", "e404",
+    "eintegrity", "enoversions", "other",
+)
+NPM_RUNNER_KEYS = ("timeout", "spawn", "runner", "capture_invalid")
+NPM_BOOTSTRAP_KEYS = (
+    "npm_input_invalid", "npm_environment_refused", "npm_manifest_refused", "npm_request_refused",
+    "npm_request_mismatch", "npm_lock_refused", "npm_network_refused", "npm_integrity_mismatch",
+    "npm_package_too_young", "npm_package_deprecated", "npm_licence_refused", "npm_peer_refused",
+    "npm_archive_refused", "npm_advisory_blocked", "npm_advisory_invalid", "npm_evidence_invalid",
+    "npm_stale", "npm_payload_too_large", "npm_policy_refused",
+)
+NPM_KEYS_BY_STEP = {
+    "npm_inputs": (
+        "npm_input_invalid", "npm_manifest_refused", "npm_request_refused", "npm_request_mismatch",
+        "npm_policy_refused", "npm_stale", "manifest_invalid",
+    ),
+    "npm_config": (
+        "npm_environment_refused", "npm_input_invalid", "manifest_invalid", "output_unavailable",
+        "tool_unavailable",
+    ),
+    "npm_version": ("nonzero_exit", "mismatch") + NPM_RUNNER_KEYS,
+    "npm_resolve": NPM_RESOLVE_KEYS + NPM_RUNNER_KEYS,
+    "npm_lock": ("npm_lock_refused", "npm_payload_too_large", "capture_invalid"),
+    "npm_bundle": NPM_BOOTSTRAP_KEYS,
+}
+NPM_STEP_DIAGNOSTICS = frozenset(
+    "source_gates_" + step + "_" + key for step, keys in NPM_KEYS_BY_STEP.items() for key in keys
+)
+
+
 class CoreContractTests(unittest.TestCase):
     def test_cli_accepts_only_fixed_run_shape(self):
         args = [
@@ -1172,8 +1203,9 @@ class CoreContractTests(unittest.TestCase):
             "source_gates_node_outcome_" + check
             for check in ("rust", "stage", "capture", "substage", "verification", "reviewed_files")
         }
+        generated |= NPM_STEP_DIAGNOSTICS
         self.assertEqual(subject.SOURCE_GATES_STEP_DIAGNOSTICS, frozenset(generated))
-        self.assertEqual(len(subject.SOURCE_GATES_STEP_DIAGNOSTICS), 12)
+        self.assertEqual(len(subject.SOURCE_GATES_STEP_DIAGNOSTICS), 66)
         self.assertEqual(set(subject.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS), generated)
         self.assertEqual(
             set(subject.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.values()), {"capture_invalid", "runner_unavailable"},
@@ -1181,7 +1213,9 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(
             {name for name, reason in subject.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.items()
              if reason == "capture_invalid"},
-            {"source_gates_payload_capture_invalid", "source_gates_node_profile_capture_invalid"},
+            {"source_gates_payload_capture_invalid", "source_gates_node_profile_capture_invalid",
+             "source_gates_npm_version_capture_invalid", "source_gates_npm_resolve_capture_invalid",
+             "source_gates_npm_lock_capture_invalid"},
         )
         self.assertFalse(subject.SOURCE_GATES_STEP_DIAGNOSTICS & subject.SOURCE_GATES_NODE_DIAGNOSTICS)
         self.assertFalse(subject.SOURCE_GATES_STEP_DIAGNOSTICS & subject.CLEANUP_DIAGNOSTICS)
@@ -1190,10 +1224,11 @@ class CoreContractTests(unittest.TestCase):
         self.assertTrue(subject.SOURCE_GATES_STEP_DIAGNOSTICS <= subject.PRESERVED_SOURCE_DIAGNOSTICS)
         self.assertEqual(
             {key[0] for key in subject.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY},
-            {"payload", "node_profile", "node_outcome"},
+            {"payload", "node_profile", "node_outcome", "npm_inputs", "npm_config", "npm_version",
+             "npm_resolve", "npm_lock", "npm_bundle"},
         )
         for key, diagnostic in subject.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY.items():
-            self.assertRegex(diagnostic, r"\Asource_gates_[a-z_]+\Z")
+            self.assertRegex(diagnostic, r"\Asource_gates_[a-z0-9_]+\Z")
             self.assertIn(diagnostic, subject.DIAGNOSTICS)
 
     def test_node_gate_names_are_refusal_stages(self):
@@ -1221,6 +1256,39 @@ class CoreContractTests(unittest.TestCase):
             self._tagged_error("capture_invalid", "payload", "capture_invalid"),
             "source_gates_payload_capture_invalid", public_reason="capture_invalid",
         )
+
+    def test_npm_steps_publish_their_fixed_step_diagnostic_at_worker_setup(self):
+        self.assertEqual(len(NPM_STEP_DIAGNOSTICS), 54)
+        for step, keys in sorted(NPM_KEYS_BY_STEP.items()):
+            for key in keys:
+                diagnostic = "source_gates_" + step + "_" + key
+                public_reason = "capture_invalid" if key == "capture_invalid" else "runner_unavailable"
+                for reason in ("command_failed", "tool_unavailable", "payload_invalid", "manifest_invalid"):
+                    if public_reason == "capture_invalid":
+                        reason = "capture_invalid"
+                    with self.subTest(step=step, key=key, reason=reason):
+                        self._expect_node_diagnostic(
+                            self._tagged_error(reason, step, key), diagnostic, public_reason=public_reason,
+                        )
+
+    def test_npm_tags_with_a_mismatched_reason_or_unknown_key_keep_the_generic_value(self):
+        for error in (
+            self._tagged_error("command_failed", "npm_resolve", "capture_invalid"),
+            self._tagged_error("capture_invalid", "npm_resolve", "eresolve"),
+            self._tagged_error("command_failed", "npm_resolve", "ERESOLVE"),
+            self._tagged_error("command_failed", "npm_resolve", "other_code"),
+            self._tagged_error("command_failed", "npm_version", "eresolve"),
+            self._tagged_error("payload_invalid", "npm_bundle", "manifest_invalid"),
+            self._tagged_error("payload_invalid", "npm_lock", "npm_peer_refused"),
+            self._tagged_error("manifest_invalid", "npm_inputs", "npm_lock_refused"),
+            self._tagged_error("payload_invalid", "npm", "npm_lock_refused"),
+            self._tagged_error("payload_invalid", "npm_bundle", None),
+        ):
+            with self.subTest(reason=error.reason, step=error.source_gates_step, key=error.source_gates_key):
+                self._expect_node_diagnostic(
+                    error, "source_gates",
+                    public_reason="capture_invalid" if error.reason == "capture_invalid" else "runner_unavailable",
+                )
 
     def test_node_profile_failures_publish_their_fixed_step_diagnostic(self):
         for reason in ("manifest_invalid", "command_failed", "capture_invalid", "output_unavailable"):

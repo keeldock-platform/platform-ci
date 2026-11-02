@@ -118,7 +118,7 @@ class FeedbackFailureTests(unittest.TestCase):
     def test_step_diagnostics_are_accepted_only_with_their_bound_stage_and_reason(self):
         bound = core_contract.SOURCE_GATES_STEP_DIAGNOSTIC_REASONS
         self.assertEqual(subject.STEP_BOUND_DIAGNOSTIC_REASONS, bound)
-        self.assertEqual(len(bound), 12)
+        self.assertEqual(len(bound), 66)
         unavailable = subject._format_record(subject.UNAVAILABLE_RECORD)
         for diagnostic, reason in sorted(bound.items()):
             raw = _line(_record(diagnostic=diagnostic, reason=reason, stage="worker_setup"))
@@ -132,7 +132,9 @@ class FeedbackFailureTests(unittest.TestCase):
                 bad = _line(_record(diagnostic=diagnostic, **{"reason": reason, "stage": "worker_setup", **wrong}))
                 with self.subTest(diagnostic=diagnostic, wrong=wrong):
                     self.assertEqual(subject.normalize_refusal(bad), unavailable)
-        for unlisted in ("source_gates_payload_" + CANARY, "source_gates_node_outcome_", "source_gates_payload"):
+        for unlisted in ("source_gates_payload_" + CANARY, "source_gates_node_outcome_", "source_gates_payload",
+                         "source_gates_npm_resolve_" + CANARY, "source_gates_npm_resolve_ERESOLVE",
+                         "source_gates_npm_resolve"):
             output = subject.normalize_refusal(_line(_record(
                 diagnostic=unlisted, reason="runner_unavailable", stage="worker_setup",
             )))
