@@ -1668,5 +1668,545 @@ class QuickMainTests(unittest.TestCase):
                 self.assertEqual(output.getvalue(), "")
 
 
+WINDOWS_SOURCE_SHA = "cd" * 20
+WINDOWS_ACCEPTED = (
+    "KD-CONFINEMENT-AUDIT schema=1 status=accepted os=windows mode=candidate control-sha=" + CONTROL
+    + " run-id=5000123456 run-attempt=1 verdict=accepted log-canary=absent artifacts=expected"
+    " caches=unchanged"
+)
+WINDOWS_SYNTHETIC_ACCEPTED = WINDOWS_ACCEPTED.replace("mode=candidate", "mode=synthetic")
+WINDOWS_JOB_ORDER = (
+    subject.WINDOWS_SETTINGS_JOB, subject.WINDOWS_PRODUCER_JOB, subject.WINDOWS_VERIFIER_JOB,
+    subject.WINDOWS_LINUX_JOB, subject.WINDOWS_ATTESTER_JOB, subject.WINDOWS_EVIDENCE_JOB,
+)
+WINDOWS_CHECKOUT = ("Checkout reviewed control files", "Post Checkout reviewed control files")
+
+
+def windows_environment(mode="source"):
+    return {
+        "CI_MODE": mode,
+        "CI_REPOSITORY": REPO,
+        "CI_SHA": CONTROL,
+        "CI_REF": "refs/heads/untrusted" if mode == "source" else "refs/heads/main",
+        "GITHUB_RUN_ID": str(RUN_ID),
+        "GITHUB_RUN_ATTEMPT": "1",
+        "REQUESTED_SOURCE_SHA": WINDOWS_SOURCE_SHA if mode == "source" else "",
+    }
+
+
+def windows_job_steps(name, mode):
+    if name == subject.WINDOWS_SETTINGS_JOB:
+        return subject.WINDOWS_SETTINGS_STEPS
+    if name == subject.WINDOWS_EVIDENCE_JOB:
+        return subject.WINDOWS_EVIDENCE_STEPS
+    if name == subject.WINDOWS_PRODUCER_JOB:
+        return ("Set up job", WINDOWS_CHECKOUT[0], "Stage toolchain", WINDOWS_CHECKOUT[1], "Complete job")
+    if name == subject.WINDOWS_VERIFIER_JOB:
+        return ("Set up job", "Prepare", subject.WINDOWS_VERDICT_STEP, "Post cleanup", "Complete job")
+    if name == subject.WINDOWS_ATTESTER_JOB:
+        return ("Set up job", WINDOWS_CHECKOUT[0]) + subject.WINDOWS_ATTESTER_STEPS[1:-1] + (WINDOWS_CHECKOUT[1], "Complete job")
+    return (
+        ("Set up job", WINDOWS_CHECKOUT[0], "Repeat preflight in source-read")
+        + subject.WINDOWS_LINUX_STEPS[1:-1] + (WINDOWS_CHECKOUT[1], "Complete job")
+    )
+
+
+def windows_artifact(identifier, name, size=1000, head_branch="untrusted", **updates):
+    item = {
+        "id": identifier, "name": name, "size_in_bytes": size, "expired": False,
+        "created_at": "2026-11-02T10:00:00Z", "expires_at": "2026-11-03T10:00:00Z",
+        "workflow_run": {"id": RUN_ID, "head_sha": CONTROL, "head_branch": head_branch},
+    }
+    item.update(updates)
+    return item
+
+
+def windows_artifacts(head_branch="untrusted"):
+    suffix = "-" + str(RUN_ID) + "-1-"
+    names = (
+        "role-statement-windows-producer" + suffix + "a1" * 16,
+        "role-statement-windows-verifier" + suffix + "b2" * 16,
+        "role-statement-linux-fetch-encrypt" + suffix + "c3" * 16,
+        "role-statement-capsule-attester" + suffix + "d4" * 16,
+        subject.windows_evidence_name(RUN_ID, 1),
+    )
+    items = [windows_artifact(10 + index, name, head_branch=head_branch) for index, name in enumerate(names)]
+    for index, name in enumerate(subject.windows_capsule_names(RUN_ID, 1)):
+        items.append(windows_artifact(
+            20 + index, name, size=subject.WINDOWS_CAPSULE_BYTES + 300, head_branch=head_branch,
+        ))
+    return items
+
+
+class WindowsApi(FakeApi):
+    def __init__(self, mode="source"):
+        super().__init__("windows", "candidate")
+        self.mode = mode
+        self.expected = subject.windows_expected(windows_environment(mode), subject.cache_inventory_digest([]))
+        branch = "untrusted" if mode == "source" else "main"
+        self.run["path"] = subject.WINDOWS_WORKFLOW_PATH
+        self.run["head_branch"] = branch
+        self.run["display_title"] = self.expected["display_title"]
+        self.jobs = []
+        self.checks = {}
+        self.annotations = {}
+        self.logs = {}
+        names = WINDOWS_JOB_ORDER
+        for index, name in enumerate(names):
+            job_id = 101 + index
+            check_id = 201 + index
+            steps = windows_job_steps(name, mode)
+            self.jobs.append(make_job(job_id, check_id, name, steps, "completed", "success"))
+            self.checks[check_id] = make_check(check_id)
+            self.annotations[check_id] = []
+            self.logs[job_id] = noise_log(name.encode("ascii"))
+        self.jobs.append(make_job(110, 210, subject.WINDOWS_AUDITOR_JOB, (), "in_progress", None))
+        self.logs[110] = b"unused"
+        self.verifier_id = 103
+        self.set_verdict(verdict_record("windows"))
+        if mode == "synthetic":
+            self.set_step(subject.WINDOWS_LINUX_JOB, "Repeat preflight in source-read", "skipped")
+        self.artifacts = windows_artifacts(branch)
+
+    def set_verdict(self, record):
+        self.logs[103] = build_log(stamped_verdict(record))
+
+    def job(self, name):
+        return [job for job in self.jobs if job["name"] == name][0]
+
+    def set_step(self, job_name, step_name, conclusion):
+        for step in self.job(job_name)["steps"]:
+            if step["name"] == step_name:
+                step["conclusion"] = conclusion
+
+
+class WindowsAuditCase(unittest.TestCase):
+    def assert_refused(self, api, phase, expected=None, config=CONFIG):
+        value = api.expected if expected is None else expected
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.audit_windows(api, value, config)
+        self.assertEqual(caught.exception.phase, phase)
+        accepted, line = subject.windows_audit_line(api, value, config)
+        self.assertFalse(accepted)
+        self.assertEqual(line, subject.refusal_line(phase))
+        self.assertNotIn(CANARY, line)
+        self.assertNotIn(chr(35), line)
+
+
+class WindowsAcceptanceTests(WindowsAuditCase):
+    def test_a_complete_source_run_is_accepted(self):
+        api = WindowsApi()
+        self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
+        self.assertEqual(subject.windows_audit_line(api, api.expected, CONFIG), (True, WINDOWS_ACCEPTED))
+        self.assertEqual(
+            subject.decode_audit_line(WINDOWS_ACCEPTED),
+            {"status": "accepted", "os": "windows", "mode": "candidate", "control_sha": CONTROL,
+             "run_id": RUN_ID, "run_attempt": 1},
+        )
+
+    def test_a_complete_synthetic_run_is_accepted_and_also_needs_a_full_run_verdict(self):
+        api = WindowsApi("synthetic")
+        self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_SYNTHETIC_ACCEPTED)
+        api.set_verdict(verdict_record("windows", project_execution="not_started", gates=0, token_revocation="not-applicable"))
+        self.assert_refused(api, "verdict")
+
+    def test_the_synthetic_run_allows_only_the_source_only_linux_steps_to_be_skipped(self):
+        api = WindowsApi("synthetic")
+        api.set_step(subject.WINDOWS_LINUX_JOB, "handoff-revoke-source-token-v1", "skipped")
+        self.assert_refused(api, "job_steps")
+        api = WindowsApi()
+        api.set_step(subject.WINDOWS_LINUX_JOB, "Repeat preflight in source-read", "skipped")
+        self.assert_refused(api, "job_steps")
+
+    def test_the_generic_audit_never_accepts_the_windows_shape_and_the_reverse(self):
+        api = WindowsApi()
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.audit(api, api.expected, CONFIG)
+        self.assertEqual(caught.exception.phase, "request")
+        admission = FakeApi("windows")
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.audit_windows(admission, admission.expected, CONFIG)
+        self.assertEqual(caught.exception.phase, "request")
+
+    def test_expected_json_round_trips_only_through_the_windows_parser(self):
+        api = WindowsApi()
+        raw = json.dumps(api.expected)
+        self.assertEqual(subject.parse_expected(raw, False, True), api.expected)
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.parse_expected(raw)
+        self.assertEqual(caught.exception.phase, "request")
+        with self.assertRaises(subject.AuditRefusal) as caught:
+            subject.parse_expected(raw, True, True)
+        self.assertEqual(caught.exception.phase, "request")
+
+
+class WindowsExpectedTests(WindowsAuditCase):
+    def test_the_expected_shape_is_closed_and_bound_to_the_windows_workflow(self):
+        for field, value in (
+            ("os", "linux"), ("mode", "quick"), ("ci_ref", "develop"), ("run_attempt", 2),
+            ("workflow_path", ".github/workflows/linux-source-admission.yml"),
+            ("verdict_job", subject.WINDOWS_PRODUCER_JOB), ("verdict_step", "Other step"),
+            ("auditor_job", "settings"), ("artifact_names", ()), ("open_jobs", ()),
+            ("artifact_names", ("source-capsule-producer-1-1", "source-capsule-verifier-1-1")),
+            ("cache_digest", "x"), ("control_sha", "z" * 40), ("display_title", "Windows admission source x"),
+            ("repository", "bad repo"),
+        ):
+            api = WindowsApi()
+            api.expected[field] = value
+            with self.subTest(field=field, value=value):
+                self.assert_refused(api, "request")
+        api = WindowsApi()
+        del api.expected["open_jobs"]
+        self.assert_refused(api, "request")
+        api = WindowsApi()
+        api.expected["extra"] = 1
+        self.assert_refused(api, "request")
+
+    def test_synthetic_runs_are_main_only_with_the_fixed_title(self):
+        api = WindowsApi("synthetic")
+        api.expected["ci_ref"] = "untrusted"
+        self.assert_refused(api, "request")
+        api = WindowsApi("synthetic")
+        api.expected["display_title"] = "Windows admission source " + WINDOWS_SOURCE_SHA
+        self.assert_refused(api, "request")
+
+    def test_the_job_set_is_exactly_the_six_jobs_and_the_verdict_step_is_unique(self):
+        api = WindowsApi()
+        del api.expected["jobs"][subject.WINDOWS_PRODUCER_JOB]
+        self.assert_refused(api, "request")
+        api = WindowsApi()
+        api.expected["jobs"]["extra"] = {"steps": ("Set up job", "Complete job"), "optional_steps": ()}
+        self.assert_refused(api, "request")
+        api = WindowsApi()
+        api.expected["jobs"][subject.WINDOWS_VERIFIER_JOB]["steps"] = ("Set up job", "Complete job")
+        self.assert_refused(api, "request")
+        api = WindowsApi()
+        api.expected["jobs"][subject.WINDOWS_PRODUCER_JOB]["steps"] = (
+            "Set up job", "Publish confinement verdict check", "Complete job",
+        )
+        self.assert_refused(api, "request")
+        api = WindowsApi()
+        api.expected["jobs"][subject.WINDOWS_LINUX_JOB]["steps"] = ("Set up job", "Same", "Same", "Complete job")
+        self.assert_refused(api, "request")
+        api = WindowsApi()
+        api.expected["jobs"][subject.WINDOWS_LINUX_JOB]["optional_steps"] = ("Set up job",)
+        self.assert_refused(api, "request")
+
+    def test_the_expected_builder_refuses_incomplete_environments(self):
+        digest = subject.cache_inventory_digest([])
+        for field, value in (
+            ("CI_MODE", "other"), ("GITHUB_RUN_ID", "0"), ("GITHUB_RUN_ATTEMPT", "2"),
+            ("CI_REF", "refs/heads/develop"), ("CI_SHA", "z" * 40), ("REQUESTED_SOURCE_SHA", ""),
+        ):
+            env = windows_environment()
+            env[field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(subject.AuditRefusal) as caught:
+                    subject.windows_expected(env, digest)
+                self.assertEqual(caught.exception.phase, "request")
+        expected = subject.windows_expected(windows_environment("synthetic"), digest)
+        self.assertEqual(expected["display_title"], subject.WINDOWS_SYNTHETIC_TITLE)
+        self.assertEqual(expected["mode"], "synthetic")
+        self.assertEqual(expected["jobs"][subject.WINDOWS_LINUX_JOB]["optional_steps"], subject.WINDOWS_LINUX_SYNTHETIC_SKIPS)
+        source = subject.windows_expected(windows_environment(), digest)
+        self.assertEqual(source["display_title"], subject.WINDOWS_TITLE_PREFIX + WINDOWS_SOURCE_SHA)
+        self.assertEqual(source["jobs"][subject.WINDOWS_LINUX_JOB]["optional_steps"], ())
+        self.assertEqual(source["artifact_names"], subject.windows_capsule_names(RUN_ID, 1))
+
+
+class WindowsJobTests(WindowsAuditCase):
+    def test_every_expected_job_must_have_completed_with_success(self):
+        for name in WINDOWS_JOB_ORDER:
+            for status, conclusion in (("completed", "failure"), ("completed", "cancelled"), ("in_progress", None)):
+                api = WindowsApi()
+                job = api.job(name)
+                job["status"], job["conclusion"] = status, conclusion
+                with self.subTest(job=name, conclusion=conclusion):
+                    self.assert_refused(api, "jobs")
+
+    def test_a_missing_or_extra_job_is_refused(self):
+        api = WindowsApi()
+        api.jobs = [job for job in api.jobs if job["name"] != subject.WINDOWS_ATTESTER_JOB]
+        self.assert_refused(api, "jobs")
+        api = WindowsApi()
+        api.jobs.append(make_job(120, 220, "unexpected", ("Set up job",), "completed", "success"))
+        api.checks[220] = make_check(220)
+        api.annotations[220] = []
+        api.logs[120] = noise_log(b"unexpected")
+        self.assert_refused(api, "jobs")
+
+    def test_open_jobs_need_the_edges_the_required_steps_once_in_order_and_only_successes(self):
+        def set_steps(api, name, steps):
+            api.job(name)["steps"] = [
+                {"number": number, "name": step, "status": "completed", "conclusion": "success"}
+                for number, step in enumerate(steps, start=1)
+            ]
+
+        for name in subject.WINDOWS_OPEN_JOBS:
+            base = windows_job_steps(name, "source")
+            spec = WindowsApi().expected["jobs"][name]["steps"]
+            variants = [("no setup", base[1:]), ("no complete", base[:-1])]
+            for step in spec[1:-1]:
+                index = base.index(step)
+                variants.append(("missing " + step, tuple(item for item in base if item != step)))
+                variants.append(("duplicate " + step, base[:index + 1] + (step,) + base[index + 1:]))
+            if len(spec) > 3:
+                swapped = list(base)
+                first, second = base.index(spec[1]), base.index(spec[2])
+                swapped[first], swapped[second] = swapped[second], swapped[first]
+                variants.append(("reversed", tuple(swapped)))
+            for label, steps in variants:
+                api = WindowsApi()
+                set_steps(api, name, steps)
+                with self.subTest(job=name, label=label):
+                    self.assert_refused(api, "job_steps")
+            api = WindowsApi()
+            api.job(name)["steps"][1]["conclusion"] = "skipped"
+            with self.subTest(job=name, label="skipped"):
+                self.assert_refused(api, "job_steps")
+            api = WindowsApi()
+            api.job(name)["steps"][1]["number"] = 7
+            with self.subTest(job=name, label="number"):
+                self.assert_refused(api, "job_steps")
+            api = WindowsApi()
+            set_steps(api, name, base)
+            with self.subTest(job=name, label="intact"):
+                self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
+
+    def test_closed_jobs_keep_their_exact_step_lists(self):
+        for name in (subject.WINDOWS_SETTINGS_JOB, subject.WINDOWS_EVIDENCE_JOB):
+            api = WindowsApi()
+            api.job(name)["steps"].insert(
+                1, {"number": 2, "name": "Extra", "status": "completed", "conclusion": "success"},
+            )
+            with self.subTest(job=name):
+                self.assert_refused(api, "job_steps")
+
+
+class WindowsVerdictTests(WindowsAuditCase):
+    def test_the_verdict_must_be_one_accepted_windows_run_line_in_the_verdict_step_only(self):
+        for label, record in (
+            ("linux", verdict_record("linux")),
+            ("handoff", verdict_record("windows", handoff="failed")),
+            ("gates", verdict_record("windows", gates=12)),
+            ("failed", verdict_record("windows", gates=13, failed=1)),
+            ("not started", verdict_record("windows", project_execution="not_started", gates=0)),
+            ("revocation", verdict_record("windows", token_revocation="unconfirmed")),
+            ("control", verdict_record("windows", control_sha="cd" * 20)),
+            ("run", verdict_record("windows", run_id=RUN_ID + 1)),
+            ("canary", verdict_record("windows", memory_canary="present")),
+        ):
+            api = WindowsApi()
+            api.set_verdict(record)
+            with self.subTest(label=label):
+                self.assert_refused(api, "verdict")
+        for count in (13, 16):
+            api = WindowsApi()
+            api.set_verdict(verdict_record("windows", gates=count))
+            with self.subTest(gates=count):
+                self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
+
+    def test_a_verdict_line_in_any_other_job_or_a_second_line_is_refused(self):
+        for job_id in (101, 102, 104, 105, 106):
+            api = WindowsApi()
+            api.logs[job_id] = build_log(stamped_verdict(verdict_record("windows")))
+            with self.subTest(job_id=job_id):
+                self.assert_refused(api, "verdict")
+        api = WindowsApi()
+        api.logs[103] = api.logs[103] + stamped_verdict(verdict_record("windows"))
+        self.assert_refused(api, "verdict")
+        api = WindowsApi()
+        api.logs[103] = noise_log(b"verifier")
+        self.assert_refused(api, "verdict")
+
+
+class WindowsArtifactTests(WindowsAuditCase):
+    def test_exactly_the_seven_expected_artifacts_are_accepted(self):
+        self.assertEqual(len(WindowsApi().artifacts), subject.WINDOWS_ARTIFACT_COUNT)
+        api = WindowsApi()
+        for size in (subject.WINDOWS_CAPSULE_BYTES, subject.WINDOWS_CAPSULE_BYTES + subject.WINDOWS_CAPSULE_SLACK_BYTES):
+            for item in api.artifacts[-2:]:
+                item["size_in_bytes"] = size
+            with self.subTest(size=size):
+                self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
+
+    def test_any_other_artifact_set_shape_size_name_or_lifetime_is_refused(self):
+        def change(index, **updates):
+            def apply(items):
+                items[index].update(updates)
+            return apply
+
+        def drop(index):
+            def apply(items):
+                del items[index]
+            return apply
+
+        def add(item):
+            def apply(items):
+                items.append(item)
+            return apply
+
+        suffix = "-" + str(RUN_ID) + "-1-"
+        cases = (
+            ("none", lambda items: items.clear()),
+            ("missing statement", drop(0)),
+            ("missing evidence", drop(4)),
+            ("missing capsule", drop(6)),
+            ("extra", add(windows_artifact(40, "unexpected"))),
+            ("extra statement", add(windows_artifact(41, "role-statement-capsule-attester" + suffix + "e5" * 16))),
+            ("two linux", change(3, name="role-statement-linux-fetch-encrypt" + suffix + "d4" * 16)),
+            ("three windows", change(2, name="role-statement-windows-verifier" + suffix + "c3" * 16)),
+            ("wrong run", change(0, name="role-statement-windows-producer-1-1-" + "a1" * 16)),
+            ("wrong attempt", change(0, name="role-statement-windows-producer-" + str(RUN_ID) + "-2-" + "a1" * 16)),
+            ("bad transfer", change(0, name="role-statement-windows-producer" + suffix + "A1" * 16)),
+            ("duplicate name", change(1, name=windows_artifacts()[0]["name"])),
+            ("expired", change(0, expired=True)),
+            ("expired type", change(0, expired="false")),
+            ("small capsule", change(5, size_in_bytes=subject.WINDOWS_CAPSULE_BYTES - 1)),
+            ("large capsule", change(5, size_in_bytes=subject.WINDOWS_CAPSULE_BYTES + subject.WINDOWS_CAPSULE_SLACK_BYTES + 1)),
+            ("huge statement", change(0, size_in_bytes=subject.WINDOWS_SMALL_ARTIFACT_BYTES + 1)),
+            ("empty statement", change(0, size_in_bytes=0)),
+            ("retention", change(0, expires_at="2026-11-09T10:00:00Z")),
+            ("backwards", change(0, expires_at="2026-11-02T09:00:00Z")),
+            ("time shape", change(0, created_at="yesterday")),
+            ("sha", change(0, workflow_run={"id": RUN_ID, "head_sha": "cd" * 20, "head_branch": "untrusted"})),
+            ("branch", change(0, workflow_run={"id": RUN_ID, "head_sha": CONTROL, "head_branch": "main"})),
+            ("run", change(0, workflow_run={"id": 1, "head_sha": CONTROL, "head_branch": "untrusted"})),
+            ("no run", change(0, workflow_run=None)),
+            ("evidence name", change(4, name="role-signer-production-synthetic-evidence-" + str(RUN_ID) + "-1")),
+            ("capsule name", change(5, name="source-capsule-other-" + str(RUN_ID) + "-1")),
+        )
+        for label, mutate in cases:
+            api = WindowsApi()
+            mutate(api.artifacts)
+            with self.subTest(label=label):
+                self.assert_refused(api, "artifact_inventory")
+
+    def test_the_synthetic_artifacts_must_come_from_main(self):
+        api = WindowsApi("synthetic")
+        self.assertEqual(len(api.artifacts), subject.WINDOWS_ARTIFACT_COUNT)
+        api.artifacts[0]["workflow_run"]["head_branch"] = "untrusted"
+        self.assert_refused(api, "artifact_inventory")
+
+    def test_any_cache_change_is_refused(self):
+        api = WindowsApi()
+        api.caches = [make_cache(1)]
+        self.assert_refused(api, "cache_inventory")
+        api.sync_cache_digest()
+        self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
+
+
+class WindowsCanaryTests(WindowsAuditCase):
+    def test_a_canary_in_any_job_log_is_refused_before_any_other_failure(self):
+        for job_id in (101, 102, 103, 104, 105, 106):
+            api = WindowsApi()
+            api.logs[job_id] = api.logs[job_id] + STAMP + CANARY.encode("ascii") + b"\n"
+            api.artifacts = []
+            with self.subTest(job_id=job_id):
+                self.assert_refused(api, "log_canary")
+
+    def test_an_unreadable_log_counts_as_a_possible_leak(self):
+        api = WindowsApi()
+        api.log_failures.add(102)
+        self.assert_refused(api, "log_canary")
+
+
+class WindowsMainTests(unittest.TestCase):
+    def environment(self, api, **updates):
+        env = {
+            subject.EXPECTED_ENV: json.dumps(api.expected),
+            "CI_MODE": api.mode,
+            "GITHUB_REPOSITORY": REPO,
+            "GITHUB_RUN_ID": str(RUN_ID),
+            "GITHUB_RUN_ATTEMPT": "1",
+            "GITHUB_SHA": CONTROL,
+            "GITHUB_TOKEN": "token-value",
+            subject.WINDOWS_CANARY_ENV: CANARY,
+        }
+        env.update(updates)
+        return env
+
+    def test_main_windows_prints_the_accepted_line_with_the_environment_canary(self):
+        api = WindowsApi()
+        output = io.StringIO()
+        status = subject.main(["windows"], self.environment(api), lambda token, repository: api, output)
+        self.assertEqual(status, 0)
+        self.assertEqual(output.getvalue(), WINDOWS_ACCEPTED + "\n")
+
+    def test_main_windows_synthetic_ignores_the_environment_canary_and_uses_the_stand_in(self):
+        api = WindowsApi("synthetic")
+        output = io.StringIO()
+        env = self.environment(api, **{subject.WINDOWS_CANARY_ENV: ""})
+        status = subject.main(["windows"], env, lambda token, repository: api, output)
+        self.assertEqual(status, 0)
+        self.assertEqual(output.getvalue(), WINDOWS_SYNTHETIC_ACCEPTED + "\n")
+
+    def test_main_windows_refuses_a_missing_or_invalid_canary_in_source_mode(self):
+        for value in ("", "short", "XYZ" * 22):
+            api = WindowsApi()
+            output = io.StringIO()
+            env = self.environment(api, **{subject.WINDOWS_CANARY_ENV: value})
+            with self.subTest(value=value):
+                status = subject.main(["windows"], env, lambda token, repository: api, output)
+                self.assertEqual(status, 1)
+                self.assertEqual(output.getvalue(), subject.refusal_line("log_canary") + "\n")
+
+    def test_main_windows_binds_the_expected_run_to_the_runner_environment(self):
+        api = WindowsApi()
+        for field, value in (
+            ("GITHUB_REPOSITORY", "other/repo"), ("GITHUB_RUN_ID", "1"),
+            ("GITHUB_RUN_ATTEMPT", "2"), ("GITHUB_SHA", "cd" * 20),
+        ):
+            output = io.StringIO()
+            with self.subTest(field=field):
+                status = subject.main(["windows"], self.environment(api, **{field: value}), lambda token, repository: api, output)
+                self.assertEqual(status, 1)
+                self.assertEqual(output.getvalue(), subject.refusal_line("request") + "\n")
+
+    def test_main_rejects_other_arguments_and_the_plain_mode_rejects_the_windows_shape(self):
+        api = WindowsApi()
+        for arguments in (["--windows"], ["windows", "x"], ["Windows"], ["windows-expected", "x"], ["quick", "windows"]):
+            output = io.StringIO()
+            with self.subTest(arguments=arguments):
+                self.assertEqual(subject.main(arguments, self.environment(api), lambda token, repository: api, output), 2)
+                self.assertEqual(output.getvalue(), "")
+        output = io.StringIO()
+        status = subject.main([], self.environment(api), lambda token, repository: api, output)
+        self.assertEqual(status, 1)
+        self.assertEqual(output.getvalue(), subject.refusal_line("request") + "\n")
+
+    def test_windows_expected_writes_the_identity_and_the_cache_digest_to_the_step_output(self):
+        import tempfile
+        api = WindowsApi()
+        api.caches = [make_cache(3)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = directory + "/output.txt"
+            env = windows_environment()
+            env.update({"GITHUB_OUTPUT": path, "GITHUB_TOKEN": "token-value"})
+            output = io.StringIO()
+            status = subject.main(["windows-expected"], env, lambda token, repository: api, output)
+            with open(path, "rt", encoding="ascii") as source:
+                rows = dict(line.rstrip("\n").split("=", 1) for line in source)
+        self.assertEqual(status, 0)
+        self.assertEqual(output.getvalue(), "windows-source-audit-identity=prepared\n")
+        digest = subject.cache_inventory_digest(api.caches)
+        self.assertEqual(rows["cache_digest"], digest)
+        expected = subject.parse_expected(rows["expected"], False, True)
+        self.assertEqual(expected["cache_digest"], digest)
+        self.assertEqual(expected["display_title"], subject.WINDOWS_TITLE_PREFIX + WINDOWS_SOURCE_SHA)
+
+    def test_windows_expected_refuses_without_an_output_file_or_a_valid_environment(self):
+        api = WindowsApi()
+        for env in (
+            dict(windows_environment(), GITHUB_TOKEN="token-value"),
+            dict(windows_environment(), GITHUB_OUTPUT="/nonexistent-directory/output", GITHUB_TOKEN="token-value"),
+            dict(windows_environment("other"), GITHUB_OUTPUT="/nonexistent-directory/output", GITHUB_TOKEN="token-value"),
+        ):
+            output = io.StringIO()
+            status = subject.main(["windows-expected"], env, lambda token, repository: api, output)
+            self.assertEqual(status, 1)
+            self.assertEqual(output.getvalue(), "windows-source-audit-identity=unavailable\n")
+
+
 if __name__ == "__main__":
     unittest.main()
