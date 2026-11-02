@@ -21,6 +21,8 @@ __all__ = [
 
 ROOT = Path(__file__).resolve().parents[2]
 REQUEST = "ab" * 32
+NONCE = "07" * 32
+EXPIRY = "1800003600"
 DER = b"\x30\x82" + bytes(range(256)) * 2
 SPKI = base64.b64encode(DER).decode("ascii")
 FINGERPRINT = hashlib.sha256(DER).hexdigest()
@@ -44,6 +46,7 @@ def environment(**updates):
     values = {
         "KD_QUICK_REQUEST_ID": REQUEST, "KD_QUICK_ALLOWED_REQUEST_ID": REQUEST,
         "KD_QUICK_RECIPIENT_SPKI_B64": SPKI, "KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT": FINGERPRINT,
+        "KD_QUICK_ALLOWED_NONCE": NONCE, "KD_QUICK_ALLOWED_EXPIRY": EXPIRY,
         "CI_SHA": "a" * 40, "REQUESTED_SOURCE_SHA": "b" * 40, "REQUESTED_BASE_SHA": "c" * 40,
         "REQUESTED_BASE_BRANCH": "develop", "REQUESTED_FINGERPRINT": "d" * 64,
         "SOURCE_REPOSITORY_ID": "77", "GITHUB_RUN_ID": "4242", "GITHUB_RUN_ATTEMPT": "1",
@@ -347,6 +350,22 @@ class BindingTests(unittest.TestCase):
             with self.subTest(updates=updates):
                 self.assertEqual(refusal_reason(subject.source_binding, environment(**updates)), "binding")
 
+    def test_context_binding_accepts_only_the_registered_nonce_and_a_bounded_expiry(self):
+        self.assertEqual(subject.context_binding(environment()), (NONCE, int(EXPIRY)))
+        cases = (
+            {"KD_QUICK_ALLOWED_NONCE": ""}, {"KD_QUICK_ALLOWED_NONCE": "AB" * 32},
+            {"KD_QUICK_ALLOWED_NONCE": "07" * 31}, {"KD_QUICK_ALLOWED_EXPIRY": ""},
+            {"KD_QUICK_ALLOWED_EXPIRY": "0"}, {"KD_QUICK_ALLOWED_EXPIRY": "01800003600"},
+            {"KD_QUICK_ALLOWED_EXPIRY": "x"}, {"KD_QUICK_ALLOWED_EXPIRY": str(subject.EXCEPTION_END + 1)},
+        )
+        for updates in cases:
+            with self.subTest(updates=updates):
+                self.assertEqual(refusal_reason(subject.context_binding, environment(**updates)), "request")
+                self.assertEqual(refusal_reason(subject.run_preflight, environment(**updates)), "request")
+        values = environment()
+        del values["KD_QUICK_ALLOWED_NONCE"]
+        self.assertEqual(refusal_reason(subject.context_binding, values), "request")
+
     def test_preflight_prints_one_fixed_line_and_never_the_recipient_key(self):
         line = subject.run_preflight(environment())
         self.assertEqual(
@@ -398,6 +417,20 @@ class CryptoTests(unittest.TestCase):
         self.assertEqual(context["nonce"], "07" * 32)
         self.assertGreater(context["expiry"], record["now"])
         self.assertLess(context["expiry"] - record["now"], 24 * 60 * 60)
+
+    def test_crypto_input_uses_the_bound_expiry_and_refuses_one_outside_the_window(self):
+        binding = subject.source_binding(environment())
+        now = 1800000000
+        record = subject.crypto_input(self.payload(), REQUEST, SPKI, FINGERPRINT, binding, now, NONCE, now + 3600)
+        self.assertEqual(record["context"]["expiry"], now + 3600)
+        for expiry in (now, now - 1, now + 24 * 60 * 60 + 1, subject.EXCEPTION_END + 1, "1800003600", True):
+            with self.subTest(expiry=expiry):
+                self.assertEqual(
+                    refusal_reason(
+                        subject.crypto_input, self.payload(), REQUEST, SPKI, FINGERPRINT, binding, now, NONCE, expiry,
+                    ),
+                    "request",
+                )
 
     def test_crypto_input_refuses_an_unpadded_payload_and_a_bad_nonce(self):
         binding = subject.source_binding(environment())
@@ -523,7 +556,7 @@ class CommandTests(unittest.TestCase):
             with patch.object(subject, "encrypt_payload", return_value=ciphertext) as encrypt:
                 result = subject.run_encrypt(
                     env, ["--reader-uid", str(os.getuid()), "--reader-gid", str(os.getgid())],
-                    clock=lambda: 1800000000.9, randomness=lambda count: b"\x07" * count,
+                    clock=lambda: 1800000000.9,
                 )
             self.assertIsNone(result)
             self.assertEqual(encrypt.call_count, 1)
@@ -531,9 +564,10 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(node, Path(os.sep + "opt" + os.sep + "node-bin") / "node")
             self.assertEqual(helper.name, "feedback_producer_crypto.mjs")
             self.assertEqual(record["now"], 1800000000)
-            self.assertEqual(record["context"]["nonce"], "07" * 32)
+            self.assertEqual(record["context"]["nonce"], NONCE)
+            self.assertEqual(record["context"]["expiry"], int(EXPIRY))
             self.assertEqual(record["context"]["request_id"], REQUEST)
-            document = subject.unframe_payload(base64.b64decode(record["payload_b64"]))
+            document =subject.unframe_payload(base64.b64decode(record["payload_b64"]))
             self.assertEqual(document["gates_passed"], 4)
             self.assertEqual(document["gates"][4]["outcome"], "failed")
             member = Path(directory) / "kd-quick-upload" / "linux-quick-return-v1.enc"

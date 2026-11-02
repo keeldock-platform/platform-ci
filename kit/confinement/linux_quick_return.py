@@ -32,6 +32,8 @@ MIN_GATES = 13
 MAX_GATES = 16
 MAX_RECORD_BYTES = 65536
 CONTEXT_LIFETIME_SECONDS = 23 * 60 * 60
+MAX_CONTEXT_LIFETIME_SECONDS = 24 * 60 * 60
+EXCEPTION_END = 1_800_835_200
 SCREENED = "[screened]"
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
 SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
@@ -118,6 +120,15 @@ def request_binding(environ):
     if fingerprint != environ.get("KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT"):
         raise QuickRefusal("recipient")
     return request_id, encoded, fingerprint
+
+
+def context_binding(environ):
+    nonce = environ.get("KD_QUICK_ALLOWED_NONCE", "")
+    expiry = environ.get("KD_QUICK_ALLOWED_EXPIRY", "")
+    if (HEX64_RE.fullmatch(nonce) is None or DECIMAL_RE.fullmatch(expiry) is None
+            or not 1 <= int(expiry) <= EXCEPTION_END):
+        raise QuickRefusal("request")
+    return nonce, int(expiry)
 
 
 def source_binding(environ):
@@ -367,9 +378,13 @@ def build_payload(records, environ, request_id):
         cap //= 2
 
 
-def crypto_input(payload, request_id, recipient_spki_b64, fingerprint, binding, now, nonce):
+def crypto_input(payload, request_id, recipient_spki_b64, fingerprint, binding, now, nonce, expiry=None):
     if type(payload) is not bytes or len(payload) != PADDED_BYTES or HEX64_RE.fullmatch(nonce) is None:
         raise QuickRefusal("payload")
+    if expiry is None:
+        expiry = now + CONTEXT_LIFETIME_SECONDS
+    if type(expiry) is not int or not now < expiry <= EXCEPTION_END or expiry - now > MAX_CONTEXT_LIFETIME_SECONDS:
+        raise QuickRefusal("request")
     context = {
         "request_id": request_id, "nonce": nonce, "recipient_fingerprint": fingerprint,
         "concern": CONCERN, "kind": KIND, "repository_id": binding["repository_id"],
@@ -377,7 +392,7 @@ def crypto_input(payload, request_id, recipient_spki_b64, fingerprint, binding, 
         "control_sha": binding["control_sha"], "base_branch": binding["base_branch"],
         "reviewed_diff_sha256": binding["reviewed_diff_sha256"], "workflow_ref": WORKFLOW_REF,
         "run_id": binding["run_id"], "producer_job": PRODUCER_JOB, "run_attempt": 1,
-        "expiry": now + CONTEXT_LIFETIME_SECONDS,
+        "expiry": expiry,
     }
     return {
         "schema_version": 1, "kind": KIND,
@@ -470,13 +485,15 @@ def _arguments(arguments, names):
 
 def run_preflight(environ):
     request_id, unused_spki, unused_fingerprint = request_binding(environ)
+    context_binding(environ)
     source_binding(dict(environ, GITHUB_RUN_ATTEMPT="1"))
     return "KD-LINUX-QUICK-PREFLIGHT schema=1 request-id=" + request_id + " tier=quick admission=never status=verified"
 
 
-def run_encrypt(environ, arguments, clock=time.time, randomness=os.urandom):
+def run_encrypt(environ, arguments, clock=time.time):
     ids = _arguments(arguments, ("reader-uid", "reader-gid"))
     request_id, spki, fingerprint = request_binding(environ)
+    nonce, expiry = context_binding(environ)
     binding = source_binding(environ)
     runner_temp = environ.get("RUNNER_TEMP", "")
     node_bin = environ.get("NODE_BIN", "")
@@ -485,7 +502,7 @@ def run_encrypt(environ, arguments, clock=time.time, randomness=os.urandom):
     records = Path(runner_temp) / RECORDS_DIRECTORY
     payload, selected, passed, failed = build_payload(records, environ, request_id)
     now = int(clock())
-    record = crypto_input(payload, request_id, spki, fingerprint, binding, now, randomness(32).hex())
+    record = crypto_input(payload, request_id, spki, fingerprint, binding, now, nonce, expiry)
     helper = Path(__file__).resolve().with_name("feedback_producer_crypto.mjs")
     ciphertext = encrypt_payload(record, Path(node_bin) / "node", helper)
     digest = write_ciphertext(runner_temp, ciphertext, ids["reader-uid"], ids["reader-gid"])
