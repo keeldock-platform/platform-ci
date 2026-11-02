@@ -1091,6 +1091,74 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     })
             self.assertEqual(output.getvalue(), "")
 
+    def _gate_over_tree(self, files):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name, text in files.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="ascii")
+            output = io.StringIO()
+            with patch.object(linux_source_build.sys, "stdout", output):
+                code = linux_source_build.run_rust_license_gate({
+                    "SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40,
+                })
+            return code, output.getvalue()
+
+    def _assert_tree_refused(self, files):
+        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+            self._gate_over_tree(files)
+        self.assertEqual(refused.exception.reason, "lock")
+
+    def test_manifests_that_reach_outside_the_root_or_patch_are_refused(self):
+        member = '[package]\nname = "inner"\nversion = "0.1.0"\nedition = "2024"\n\n'
+        cases = {
+            "absolute_path": member + '[dependencies]\nfoo = { path = "/opt/outside/foo" }\n',
+            "parent_path": member + '[dependencies]\nfoo = { path = "../../outside" }\n',
+            "dev_table": member + '[dev-dependencies.foo]\npath = "../../outside"\n',
+            "build_table": member + '[build-dependencies]\nfoo = { path = "../../outside" }\n',
+            "target_table": member + '[target.x86_64-unknown-linux-gnu.dependencies]\nfoo = { path = "../../outside" }\n',
+            "patch": member + '[patch.crates-io]\nfoo = { path = "vendor/foo" }\n',
+            "replace": member + '[replace]\n',
+            "unknown_shape": member + '[dependencies]\nfoo = 3\n',
+        }
+        for label, manifest in cases.items():
+            with self.subTest(case=label):
+                self._assert_tree_refused({
+                    "Cargo.lock": _path_only_lock(1),
+                    "crates/inner/Cargo.toml": manifest,
+                })
+        with self.subTest(case="workspace_member_outside"):
+            self._assert_tree_refused({
+                "Cargo.lock": _path_only_lock(1),
+                "Cargo.toml": '[workspace]\nmembers = ["../outside"]\n',
+            })
+
+    def test_in_root_path_dependencies_and_workspace_members_pass(self):
+        files = {
+            "Cargo.lock": _path_only_lock(2),
+            "Cargo.toml": '[workspace]\nmembers = ["crates/inner", "crates/sibling"]\n',
+            "crates/inner/Cargo.toml": (
+                '[package]\nname = "inner"\nversion = "0.1.0"\nedition = "2024"\n\n'
+                '[dependencies]\nsibling = { path = "../sibling" }\n'
+            ),
+            "crates/sibling/Cargo.toml": (
+                '[package]\nname = "sibling"\nversion = "0.1.0"\nedition = "2024"\n'
+            ),
+        }
+        self.assertEqual(
+            self._gate_over_tree(files),
+            (0, "linux-rust-licence=registry-free locks=1\n"),
+        )
+
+    def test_tree_without_any_lock_refuses_with_lock(self):
+        self._assert_tree_refused({"Cargo.toml": '[workspace]\nmembers = []\n'})
+
+    def test_gate_receipt_from_trusted_ports_prints_no_counts_line(self):
+        gate = linux_source_build.rust_license_gate
+        with patch.object(gate, "require_lock_admission", return_value=object()):
+            self.assertEqual(self._gate_over_tree({"Cargo.lock": _registry_lock()}), (0, ""))
+
     def test_runtime_gate_receipt_requires_every_selected_stage_to_complete(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

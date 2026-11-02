@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -16,6 +17,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import cargo_lock_bootstrap
 import linux_harness
 import linux_channels
 import linux_probes
@@ -1626,7 +1628,7 @@ def _open_verified_directory(root_fd, relative_parts, identities):
         raise
 
 
-def _rust_lock_paths(root_fd):
+def _rust_lock_paths(root_fd, file_name="Cargo.lock", limit=32, require_any=True):
     ignored = {".git", "target", "node_modules", ".kd-cargo-home", ".npm-cache"}
     root_only_ignored = {".kd-npm-tarballs"}
     paths = []
@@ -1655,7 +1657,7 @@ def _rust_lock_paths(root_fd):
                         continue
                     metadata = os.stat(name, dir_fd=current, follow_symlinks=False)
                     if stat.S_ISLNK(metadata.st_mode):
-                        if name == "Cargo.lock":
+                        if name == file_name:
                             raise SourceBuildRefusal("lock")
                         continue
                     child_parts = relative_parts + (name,)
@@ -1664,12 +1666,12 @@ def _rust_lock_paths(root_fd):
                             raise SourceBuildRefusal("lock")
                         pending.append((child_parts, identities + (_directory_identity(metadata),)))
                         continue
-                    if name != "Cargo.lock":
+                    if name != file_name:
                         continue
                     if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                         raise SourceBuildRefusal("lock")
                     paths.append((child_parts, identities, _stat_identity(metadata)))
-                    if len(paths) > 32:
+                    if len(paths) > limit:
                         raise SourceBuildRefusal("lock")
         except SourceBuildRefusal:
             raise
@@ -1678,7 +1680,7 @@ def _rust_lock_paths(root_fd):
         finally:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
-    if not paths:
+    if not paths and require_any:
         raise SourceBuildRefusal("lock")
     return tuple(sorted(paths, key=lambda item: "/".join(item[0])))
 
@@ -1765,6 +1767,85 @@ def _require_source_root_identity(source, expected_identity):
         os.close(descriptor)
 
 
+MANIFEST_DEPENDENCY_TABLES = (
+    "dependencies", "dev-dependencies", "build-dependencies",
+    "dev_dependencies", "build_dependencies",
+)
+MANIFEST_TARGET_TABLES = ("lib", "bin", "test", "bench", "example")
+MAX_MANIFEST_FILES = 256
+
+
+def _require_confined_manifest_path(directory, value):
+    if (type(value) is not str or not value or value.startswith("/")
+            or "\\" in value or ":" in value or "\x00" in value):
+        raise SourceBuildRefusal("lock")
+    resolved = posixpath.normpath(posixpath.join(directory, value))
+    if resolved == ".." or resolved.startswith("../") or resolved.startswith("/"):
+        raise SourceBuildRefusal("lock")
+
+
+def _require_confined_manifest(directory, document):
+    if type(document) is not dict or "patch" in document or "replace" in document:
+        raise SourceBuildRefusal("lock")
+    tables = [document[name] for name in MANIFEST_DEPENDENCY_TABLES if name in document]
+    target = document.get("target")
+    if target is not None:
+        if type(target) is not dict:
+            raise SourceBuildRefusal("lock")
+        for entry in target.values():
+            if type(entry) is not dict:
+                raise SourceBuildRefusal("lock")
+            tables.extend(entry[name] for name in MANIFEST_DEPENDENCY_TABLES if name in entry)
+    workspace = document.get("workspace")
+    if workspace is not None:
+        if type(workspace) is not dict:
+            raise SourceBuildRefusal("lock")
+        if "dependencies" in workspace:
+            tables.append(workspace["dependencies"])
+        for key in ("members", "exclude", "default-members"):
+            if key in workspace:
+                if type(workspace[key]) is not list:
+                    raise SourceBuildRefusal("lock")
+                for item in workspace[key]:
+                    _require_confined_manifest_path(directory, item)
+    package = document.get("package")
+    if package is not None:
+        if type(package) is not dict:
+            raise SourceBuildRefusal("lock")
+        for key in ("workspace", "build"):
+            if key in package and type(package[key]) is not bool:
+                _require_confined_manifest_path(directory, package[key])
+    for key in MANIFEST_TARGET_TABLES:
+        value = document.get(key)
+        entries = value if type(value) is list else ([] if value is None else [value])
+        for entry in entries:
+            if type(entry) is not dict:
+                raise SourceBuildRefusal("lock")
+            if "path" in entry:
+                _require_confined_manifest_path(directory, entry["path"])
+    for table in tables:
+        if type(table) is not dict:
+            raise SourceBuildRefusal("lock")
+        for spec in table.values():
+            if type(spec) is str:
+                continue
+            if type(spec) is not dict:
+                raise SourceBuildRefusal("lock")
+            if "path" in spec:
+                _require_confined_manifest_path(directory, spec["path"])
+
+
+def _require_confined_manifests(root_fd):
+    candidates = _rust_lock_paths(root_fd, "Cargo.toml", MAX_MANIFEST_FILES, False)
+    for candidate in candidates:
+        data = _read_bounded_cargo_lock(root_fd, candidate)
+        try:
+            document = cargo_lock_bootstrap._parse_manifest(data)
+        except Exception:
+            raise SourceBuildRefusal("lock") from None
+        _require_confined_manifest("/".join(candidate[0][:-1]) or ".", document)
+
+
 def run_rust_license_gate(environ=None):
     env = os.environ if environ is None else environ
     source = Path(env.get("SOURCE_PATH", ""))
@@ -1780,6 +1861,7 @@ def run_rust_license_gate(environ=None):
     all_registry_free = True
     try:
         _require_source_root_identity(source, root_identity)
+        _require_confined_manifests(root_fd)
         for candidate in _rust_lock_paths(root_fd):
             try:
                 lock_bytes = _read_bounded_cargo_lock(root_fd, candidate)
@@ -1804,6 +1886,8 @@ def run_rust_license_gate(environ=None):
                 all_registry_free = False
     finally:
         os.close(root_fd)
+    if lock_count == 0:
+        raise SourceBuildRefusal("lock")
     if all_registry_free:
         sys.stdout.write("linux-rust-licence=registry-free locks=" + str(lock_count) + "\n")
     return 0

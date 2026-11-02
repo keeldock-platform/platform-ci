@@ -446,6 +446,22 @@ class RustLicenseGateTests(unittest.TestCase):
             )
         self.assertEqual(process.requests, [])
 
+    def test_registry_lock_with_trusted_ports_delegates_and_returns_gate_receipt(self):
+        lock = _registry_lock()
+        identity = _identity_for(lock)
+        process = _ProcessPort()
+        ports = _trusted_ports(
+            _LockPort(self.packages), _ConfigPort(self._with_config(identity=identity)),
+            _ArchivePort((self.archive,)), process, _Cancellation(),
+        )
+        receipt = gate.require_lock_admission(lock, identity, ports)
+        self.assertIs(type(receipt), gate.GateReceipt)
+        self.assertEqual(len(process.requests), 2)
+        free = _path_lock(("host-root",))
+        free_receipt = gate.require_lock_admission(free, _identity_for(free), ports)
+        self.assertIs(type(free_receipt), gate.RegistryFreeReceipt)
+        self.assertEqual(len(process.requests), 2)
+
 
 def _path_lock(names, extra_fields="", trailer=""):
     parts = ["version = 4\n"]
@@ -486,9 +502,9 @@ class RegistryFreeAdmissionTests(unittest.TestCase):
 
     def test_core_shaped_path_only_locks_return_sealed_registry_free_receipts(self):
         shapes = (
-            ("keeldock-root", "keeldock-api", "keeldock-core", "keeldock-store"),
-            ("keeldock-fuzz", "keeldock-fuzz-target"),
-            ("rt-a", "rt-b", "rt-c", "rt-d", "rt-e", "rt-f", "rt-g"),
+            ("host-root", "host-api", "host-core", "host-store"),
+            ("fuzz-root", "fuzz-target"),
+            ("runtime-a", "runtime-b", "runtime-c", "runtime-d", "runtime-e", "runtime-f", "runtime-x"),
         )
         for names in shapes:
             lock = _path_lock(names)
@@ -510,7 +526,7 @@ class RegistryFreeAdmissionTests(unittest.TestCase):
                 ("root-app",), extra_fields='checksum = "' + "c" * 64 + '"\n'),
             "git_source": _path_lock(("root-app",), extra_fields=(
                 'source = "git+https://example.invalid/repo?rev=' + "d" * 40
-                + "#" + "d" * 40 + '"\n')),
+                + chr(35) + "d" * 40 + '"\n')),
             "metadata": _path_lock(("root-app",), trailer='\n[metadata]\n'),
             "patch_unused": _path_lock(("root-app",), trailer='\n[[patch.unused]]\n'),
             "duplicate": _path_lock(("root-app", "root-app")),
