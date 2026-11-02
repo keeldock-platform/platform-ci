@@ -19,7 +19,7 @@ __all__ = [
     "CommandTests", "PublicLineTests", "SourceShapeTests",
 ]
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 REQUEST = "ab" * 32
 NONCE = "07" * 32
 EXPIRY = "1800003600"
@@ -500,8 +500,8 @@ class CryptoTests(unittest.TestCase):
             "limit",
         )
 
-    def test_the_encryptor_is_the_reviewed_producer_helper_beside_this_module(self):
-        helper = Path(subject.__file__).resolve().with_name("feedback_producer_crypto.mjs")
+    def test_the_encryptor_is_the_reviewed_producer_helper_in_the_shared_confinement_kit(self):
+        helper = Path(subject.__file__).resolve().parents[1] / "kit" / "confinement" / "feedback_producer_crypto.mjs"
         self.assertTrue(helper.is_file())
 
 

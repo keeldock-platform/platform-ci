@@ -770,7 +770,7 @@ jobs:
           git checkout --quiet --detach FETCH_HEAD 2>/dev/null
           [[ "$(git rev-parse --verify HEAD 2>/dev/null)" == "$CI_SHA" ]]
       - name: Validate quick request and binding
-        run: python3 -B kit/confinement/linux_quick_return.py preflight
+        run: python3 -B core-ci/linux_quick_return.py preflight
       - name: Snapshot cache inventory and validate preflight
         id: snapshot
         env:
@@ -815,7 +815,8 @@ jobs:
           python3 -B kit/confinement/test_linux_boundary.py
           python3 -B kit/confinement/test_linux_session.py
           python3 -B kit/confinement/test_linux_source_build.py
-          python3 -B kit/confinement/test_linux_quick_return.py
+          python3 -B core-ci/test_linux_quick_return.py
+          python3 -B core-ci/test_separation.py
           python3 -B kit/confinement/test_rust_license_gate.py
           python3 -B kit/bootstrap/check_candidate.py --root "$CI_WORKSPACE" --pool platform --sha "$CI_SHA"
   core-linux-quick-return-producer:
@@ -886,7 +887,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 -B kit/confinement/linux_quick_return.py preflight
+          python3 -B core-ci/linux_quick_return.py preflight
           python3 -B kit/confinement/linux_source_build.py preflight
       - name: Record image and fetch pinned Rust and Node toolchains
         id: toolchains
@@ -990,7 +991,7 @@ jobs:
         if: ${{ always() && steps.gates.outcome != 'skipped' }}
         env:
           NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
-        run: sudo -n --preserve-env=KD_QUICK_REQUEST_ID,KD_QUICK_RECIPIENT_SPKI_B64,KD_QUICK_ALLOWED_REQUEST_ID,KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT,KD_QUICK_ALLOWED_NONCE,KD_QUICK_ALLOWED_EXPIRY,CI_SHA,REQUESTED_SOURCE_SHA,REQUESTED_BASE_SHA,REQUESTED_BASE_BRANCH,REQUESTED_FINGERPRINT,SOURCE_REPOSITORY_ID,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,RUNNER_TEMP,NODE_BIN,GITHUB_OUTPUT,ImageOS,ImageVersion python3 -B kit/confinement/linux_quick_return.py encrypt --reader-uid "$(id -u)" --reader-gid "$(id -g)"
+        run: sudo -n --preserve-env=KD_QUICK_REQUEST_ID,KD_QUICK_RECIPIENT_SPKI_B64,KD_QUICK_ALLOWED_REQUEST_ID,KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT,KD_QUICK_ALLOWED_NONCE,KD_QUICK_ALLOWED_EXPIRY,CI_SHA,REQUESTED_SOURCE_SHA,REQUESTED_BASE_SHA,REQUESTED_BASE_BRANCH,REQUESTED_FINGERPRINT,SOURCE_REPOSITORY_ID,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,RUNNER_TEMP,NODE_BIN,GITHUB_OUTPUT,ImageOS,ImageVersion python3 -B core-ci/linux_quick_return.py encrypt --reader-uid "$(id -u)" --reader-gid "$(id -g)"
       - name: Upload the single encrypted member
         id: uploader
         if: ${{ always() && steps.encrypt.outcome == 'success' }}
@@ -1014,7 +1015,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$GITHUB_RUN_ATTEMPT" == "1" && "$ARTIFACT_ID" =~ ^[1-9][0-9]{0,18}$ ]]
-          line="$(python3 -B kit/confinement/linux_quick_return.py record)"
+          line="$(python3 -B core-ci/linux_quick_return.py record)"
           printf '%s\n' "$line" >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$line"
       - name: Remove staged ciphertext

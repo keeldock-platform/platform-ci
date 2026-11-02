@@ -202,25 +202,26 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn("python3 -B kit/confinement/test_linux_source_build.py", unit_job)
         self.assertIn("python3 -B kit/confinement/test_rust_license_gate.py", unit_job)
 
-    def test_linux_quick_return_files_are_registered_and_the_suite_is_discovered_on_linux_only(self):
+    def test_core_ci_files_are_registered_and_the_suite_is_discovered_on_linux_only(self):
         for name in (
             ".github/workflows/core-linux-quick-return.yml",
-            "kit/confinement/linux_quick_return.py",
-            "kit/confinement/test_linux_quick_return.py",
+            "core-ci/linux_quick_return.py",
+            "core-ci/test_linux_quick_return.py",
+            "core-ci/test_separation.py",
         ):
             with self.subTest(name=name):
                 self.assertIn(name, PLATFORM_FILES)
                 self.assertIn(name, PINNED_FILE_SHA256)
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
-        self.assertEqual(action.count('"test_linux_quick_return.py"'), 1)
+        self.assertEqual(action.count('-s "$CI_ACTION_PATH/../../core-ci" -p "test_*.py"'), 1)
         condition = 'if [[ "${RUNNER_OS:-}" == "Linux" ]]; then\n'
         start = action.index(condition)
         end = action.index("\n        fi\n", start)
-        self.assertEqual(action[start:end].count('"test_linux_quick_return.py"'), 1)
+        self.assertEqual(action[start:end].count('-s "$CI_ACTION_PATH/../../core-ci" -p "test_*.py"'), 1)
         macos = action[action.index('"${RUNNER_OS:-}" == "macOS"'):]
-        self.assertNotIn("test_linux_quick_return.py", macos)
+        self.assertNotIn("core-ci", macos)
         workflow = (ROOT / ".github/workflows/core-linux-quick-return.yml").read_text(encoding="utf-8")
-        self.assertIn("python3 -B kit/confinement/test_linux_quick_return.py", workflow)
+        self.assertIn("python3 -B core-ci/test_linux_quick_return.py", workflow)
 
     def test_platform_allowlist_rejects_an_unreviewed_extra_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -308,8 +309,9 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/linux_source_build.py',
             'kit/confinement/test_linux_source_build.py',
             '.github/workflows/core-linux-quick-return.yml',
-            'kit/confinement/linux_quick_return.py',
-            'kit/confinement/test_linux_quick_return.py',
+            'core-ci/linux_quick_return.py',
+            'core-ci/test_linux_quick_return.py',
+            'core-ci/test_separation.py',
             'kit/confinement/rust_license_gate.py',
             'kit/confinement/test_rust_license_gate.py',
             'kit/bootstrap/test_public_tree.py',

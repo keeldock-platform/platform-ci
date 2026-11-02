@@ -503,7 +503,7 @@ def run_encrypt(environ, arguments, clock=time.time):
     payload, selected, passed, failed = build_payload(records, environ, request_id)
     now = int(clock())
     record = crypto_input(payload, request_id, spki, fingerprint, binding, now, nonce, expiry)
-    helper = Path(__file__).resolve().with_name("feedback_producer_crypto.mjs")
+    helper = Path(__file__).resolve().parents[1] / "kit" / "confinement" / "feedback_producer_crypto.mjs"
     ciphertext = encrypt_payload(record, Path(node_bin) / "node", helper)
     digest = write_ciphertext(runner_temp, ciphertext, ids["reader-uid"], ids["reader-gid"])
     _write_output(environ, {

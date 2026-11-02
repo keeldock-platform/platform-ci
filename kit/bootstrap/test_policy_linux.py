@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LINUX_WORKFLOW = ROOT / ".github/workflows/linux-confinement.yml"
 ADMISSION_WORKFLOW = ROOT / ".github/workflows/linux-source-admission.yml"
 QUICK_WORKFLOW = ROOT / ".github/workflows/core-linux-quick-return.yml"
-QUICK_MODULE = ROOT / "kit/confinement/linux_quick_return.py"
+QUICK_MODULE = ROOT / "core-ci/linux_quick_return.py"
 STANDIN = "kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd"
 ENVIRONMENT_LINE = "    environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}\n"
 LINUX_WORKFLOW_SHA256_BEFORE_SPLIT = "f7860a422e818f238232c395a100422ab32e5a6498737a8840d52a362b96b6ae"
@@ -48,8 +48,9 @@ LINUX_LANE_FILES = (
     "kit/confinement/linux_source_build.py",
     "kit/confinement/test_linux_source_build.py",
     ".github/workflows/core-linux-quick-return.yml",
-    "kit/confinement/linux_quick_return.py",
-    "kit/confinement/test_linux_quick_return.py",
+    "core-ci/linux_quick_return.py",
+    "core-ci/test_linux_quick_return.py",
+    "core-ci/test_separation.py",
 )
 
 
@@ -692,7 +693,7 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
 
     def test_public_output_is_only_the_fixed_quick_line_and_counts(self):
         record = self.text.split("      - name: Record quick return counts\n", 1)[1].split("      - name:", 1)[0]
-        self.assertIn('line="$(python3 -B kit/confinement/linux_quick_return.py record)"', record)
+        self.assertIn('line="$(python3 -B core-ci/linux_quick_return.py record)"', record)
         self.assertEqual(record.count("printf '%s\\n' \"$line\""), 2)
         self.assertIn('>> "$GITHUB_STEP_SUMMARY"', record)
         module = QUICK_MODULE.read_text(encoding="utf-8")
@@ -701,15 +702,16 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
         self.assertIn('" status=encrypted"', module)
 
     def test_workflow_uses_only_kit_scripts_that_are_in_the_public_allowlist(self):
-        scripts = sorted(set(re.findall(r"kit/[a-z_/]+\.py", self.text)))
-        self.assertIn("kit/confinement/linux_quick_return.py", scripts)
-        self.assertIn("kit/confinement/test_linux_quick_return.py", scripts)
+        scripts = sorted(set(re.findall(r"(?:kit/[a-z_/]+|core-ci/[a-z_]+)\.py", self.text)))
+        self.assertIn("core-ci/linux_quick_return.py", scripts)
+        self.assertIn("core-ci/test_linux_quick_return.py", scripts)
+        self.assertIn("core-ci/test_separation.py", scripts)
         for script in scripts:
             with self.subTest(script=script):
                 self.assertIn(script, PLATFORM_FILES)
                 self.assertTrue((ROOT / script).is_file())
         unit = self.jobs()["core-linux-quick-return-unit"]
-        for script in ("test_policy_linux.py", "test_linux_source_build.py", "test_linux_quick_return.py"):
+        for script in ("test_policy_linux.py", "test_linux_source_build.py", "test_linux_quick_return.py", "test_separation.py"):
             self.assertIn("python3 -B kit/", unit)
             self.assertIn(script, unit)
 
