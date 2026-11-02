@@ -129,8 +129,12 @@ def verify_control_sha(expected):
 
 def exit_detail(result):
     code = getattr(result, "exit_code", None)
-    if type(code) is int and 0 <= code <= 99:
+    if type(code) is not int:
+        return None
+    if 0 <= code <= 127:
         return code
+    if -127 <= code < 0:
+        return 128 - code
     return None
 
 
@@ -440,6 +444,15 @@ class Boundary:
             outcome.refusal = BoundaryRefusal(outcome.refusal.reason, channel, outcome.refusal.detail)
         return outcome
 
+    def node_binary(self):
+        found = shutil.which("node", path=BASE_ENV["PATH"])
+        if found is None:
+            raise BoundaryRefusal("fixture_incomplete", None, 6)
+        try:
+            return fixtures.resolve_node(os.path.realpath(found))
+        except ValueError:
+            raise BoundaryRefusal("fixture_incomplete", None, 7)
+
     def fixture_outcome(self, form):
         needs_rust = form in fixtures.NEEDS_RUSTC
         sysroot = self.arguments.rust_sysroot
@@ -452,7 +465,12 @@ class Boundary:
         if needs_rust:
             binds.append({"source": sysroot, "target": sysroot, "ro": True})
             rustc = sysroot + "/bin/rustc"
-        environment = fixtures.fixture_env(form, self.nonce, self.tripwires.ports, "/ipc/docker.sock", rustc)
+        node = None
+        if form in fixtures.NEEDS_NODE:
+            node, node_root = self.node_binary()
+            if node_root is not None:
+                binds.append({"source": node_root, "target": node_root, "ro": True})
+        environment = fixtures.fixture_env(form, self.nonce, self.tripwires.ports, "/ipc/docker.sock", rustc, node)
         argv = LAUNCH + fixtures.fixture_argv(form, self.nonce)
         options = {"work": True, "limits": "fixture", "timeout": fixtures.RUN_TIMEOUT[form], "cwd": "/work"}
         self.tripwires.store.clear()

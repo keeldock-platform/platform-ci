@@ -789,9 +789,40 @@ class LinuxBoundaryFixtureDiagnosticTests(unittest.TestCase):
 
     def test_exit_detail_is_bounded(self):
         self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=3)), 3)
-        for code in (-9, 100, None, "x"):
+        self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=127)), 127)
+        for code in (200, -128, None, "x", True):
             self.assertIsNone(boundary.exit_detail(SimpleNamespace(exit_code=code)))
         self.assertIsNone(boundary.exit_detail(SimpleNamespace()))
+
+    def test_signal_deaths_are_reported_with_the_shell_convention(self):
+        self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=-9)), 137)
+        self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=-6)), 134)
+        self.assertEqual(BoundaryRefusal("fixture_incomplete", None, 134).detail, 134)
+        self.assertIsNone(BoundaryRefusal("fixture_incomplete", None, 256).detail)
+
+    def test_node_binary_resolves_symlinks_and_binds_only_outside_usr(self):
+        subject, unused = make()
+        with patch("linux_boundary.shutil.which", return_value="/usr/local/bin/node"), \
+             patch("linux_boundary.os.path.realpath", return_value="/usr/local/n/versions/node/20.1.0/bin/node"):
+            self.assertEqual(subject.node_binary(), ("/usr/local/n/versions/node/20.1.0/bin/node", None))
+        with patch("linux_boundary.shutil.which", return_value="/usr/local/bin/node"), \
+             patch("linux_boundary.os.path.realpath", return_value="/opt/hostedtoolcache/node/20/x64/bin/node"):
+            self.assertEqual(
+                subject.node_binary(),
+                ("/opt/hostedtoolcache/node/20/x64/bin/node", "/opt/hostedtoolcache/node/20/x64/bin"),
+            )
+
+    def test_node_binary_fails_closed_when_absent_or_unsafe(self):
+        subject, unused = make()
+        with patch("linux_boundary.shutil.which", return_value=None):
+            with self.assertRaises(BoundaryRefusal) as raised:
+                subject.node_binary()
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("fixture_incomplete", 6))
+        with patch("linux_boundary.shutil.which", return_value="/usr/bin/node"), \
+             patch("linux_boundary.os.path.realpath", return_value="/opt/odd path/node"):
+            with self.assertRaises(BoundaryRefusal) as raised:
+                subject.node_binary()
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("fixture_incomplete", 7))
 
 
 if __name__ == "__main__":

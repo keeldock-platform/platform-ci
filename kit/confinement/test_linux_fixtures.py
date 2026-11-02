@@ -111,7 +111,8 @@ class LinuxFixtureGenerationTests(unittest.TestCase):
     def test_fixture_environment_has_no_runner_or_secret_names_and_rustc_only_for_rust(self):
         for form in fixtures.FORMS:
             rustc = "/toolchain/bin/rustc" if form in fixtures.NEEDS_RUSTC else None
-            env = fixtures.fixture_env(form, NONCE, PORTS, "/ipc/docker.sock", rustc)
+            node = "/usr/bin/node" if form in fixtures.NEEDS_NODE else None
+            env = fixtures.fixture_env(form, NONCE, PORTS, "/ipc/docker.sock", rustc, node)
             with self.subTest(form=form):
                 self.assertEqual(env["KD_NONCE"], NONCE)
                 self.assertEqual(env["KD_TCP_PORT"], "1111")
@@ -123,6 +124,43 @@ class LinuxFixtureGenerationTests(unittest.TestCase):
                     self.assertNotIn("TOKEN", name)
         with self.assertRaises(ValueError):
             fixtures.fixture_env("build_rs", NONCE, PORTS, "/ipc/docker.sock", None)
+
+    def test_rust_forms_link_with_a_fixed_driver_because_the_alternatives_symlink_is_absent_in_the_root(self):
+        for form in ("build_rs", "proc_macro"):
+            driver = fixtures.fixture_files(form)["/fixtures/" + form + "/run.sh"][0]
+            compiles = [line for line in driver.splitlines() if line.startswith('"$KD_RUSTC"')]
+            with self.subTest(form=form):
+                self.assertEqual(len(compiles), 2 if form == "proc_macro" else 1)
+                for line in compiles:
+                    self.assertIn("-C linker=" + fixtures.LINKER, line)
+                self.assertIn("[ -x " + fixtures.LINKER + " ] || exit 5", driver)
+                self.assertNotIn("alternatives", driver)
+                self.assertIn("|| exit 3", compiles[0])
+        self.assertEqual(fixtures.LINKER, "/usr/bin/gcc")
+
+    def test_npm_driver_uses_the_resolved_node_and_distinct_failure_codes(self):
+        driver = fixtures.fixture_files("npm_postinstall")["/fixtures/npm_postinstall/run.sh"][0]
+        self.assertIn('"$KD_NODE" -p', driver)
+        self.assertIn('ln -s "$KD_NODE" /work/bin/node', driver)
+        self.assertIn("PATH=/work/bin:", driver)
+        for code in ("exit 4", "exit 5", "exit 6", "exit 7"):
+            self.assertIn(code, driver)
+        self.assertTrue(driver.rstrip().endswith('exec sh -c "$script"'))
+
+    def test_node_is_required_only_for_the_npm_form_and_resolution_is_bounded(self):
+        for form in fixtures.FORMS:
+            rustc = "/toolchain/bin/rustc" if form in fixtures.NEEDS_RUSTC else None
+            node = "/usr/bin/node" if form in fixtures.NEEDS_NODE else None
+            env = fixtures.fixture_env(form, NONCE, PORTS, "/ipc/docker.sock", rustc, node)
+            self.assertEqual("KD_NODE" in env, form in fixtures.NEEDS_NODE)
+        with self.assertRaises(ValueError):
+            fixtures.fixture_env("npm_postinstall", NONCE, PORTS, "/ipc/docker.sock", None, None)
+        self.assertEqual(fixtures.resolve_node("/usr/local/bin/node"), ("/usr/local/bin/node", None))
+        self.assertEqual(fixtures.resolve_node("/opt/n/bin/node"), ("/opt/n/bin/node", "/opt/n/bin"))
+        for bad in ("node", "/usr/bin/", "/opt/a b/node", "/opt/../node", "/x/" + "a" * 300, None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    fixtures.resolve_node(bad)
 
     def test_slugs_are_dns_label_safe(self):
         for form in fixtures.FORMS:

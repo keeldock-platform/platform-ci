@@ -121,7 +121,7 @@ NETWORK_CHANNELS = (
     "cache_upload",
 )
 ATTEMPT_LINE = re.compile(r"KDATT ([a-z0-9-]{1,40}) (denied|allowed|contained|na|other)")
-MAX_REFUSAL_DETAIL = 99
+MAX_REFUSAL_DETAIL = 255
 
 
 class BoundaryRefusal(Exception):

@@ -49,6 +49,8 @@ RUN_TIMEOUT = {
     "npm_postinstall": 90,
 }
 NEEDS_RUSTC = ("build_rs", "proc_macro")
+NEEDS_NODE = ("npm_postinstall",)
+LINKER = "/usr/bin/gcc"
 
 SHELL_DRIVER = r"""scratch=/tmp/fx
 mkdir -p "$scratch"
@@ -159,8 +161,12 @@ attempt("output-exfil", exfiltrate, contained=True)
 """
 
 NODE_DRIVER = """cd /fixtures/npm_postinstall || exit 1
+[ -x "$KD_NODE" ] || exit 6
+mkdir -p /work/bin && ln -s "$KD_NODE" /work/bin/node || exit 7
+export PATH=/work/bin:/usr/local/bin:/usr/bin
 export npm_lifecycle_event=postinstall npm_package_name=hostile-fixture INIT_CWD=/work
-script=$(node -p "require('./package.json').scripts.postinstall")
+script=$("$KD_NODE" -p "require('./package.json').scripts.postinstall") || exit 4
+[ -n "$script" ] || exit 5
 exec sh -c "$script"
 """
 
@@ -425,14 +431,16 @@ PROC_MACRO_USER = "hostile::hostile!();\n\nfn main() {}\n"
 
 RUST_BUILD_DRIVER = """cd /work || exit 1
 export TMPDIR=/work HOME=/work
-"$KD_RUSTC" --edition 2021 --crate-type bin -o /work/build_script /fixtures/build_rs/build.rs || exit 3
+[ -x /usr/bin/gcc ] || exit 5
+"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=/usr/bin/gcc -o /work/build_script /fixtures/build_rs/build.rs || exit 3
 /work/build_script
 """
 
 RUST_MACRO_DRIVER = """cd /work || exit 1
 export TMPDIR=/work HOME=/work
-"$KD_RUSTC" --edition 2021 --crate-type proc-macro --crate-name hostile --out-dir /work /fixtures/proc_macro/hostile.rs || exit 3
-"$KD_RUSTC" --edition 2021 --crate-type bin --extern hostile=/work/libhostile.so -o /work/use_hostile /fixtures/proc_macro/use_hostile.rs
+[ -x /usr/bin/gcc ] || exit 5
+"$KD_RUSTC" --edition 2021 --crate-type proc-macro -C linker=/usr/bin/gcc --crate-name hostile --out-dir /work /fixtures/proc_macro/hostile.rs || exit 3
+"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=/usr/bin/gcc --extern hostile=/work/libhostile.so -o /work/use_hostile /fixtures/proc_macro/use_hostile.rs || exit 4
 """
 
 
@@ -491,7 +499,7 @@ def fixture_argv(form, nonce):
     return ["/usr/bin/bash", "/fixtures/" + form + "/run.sh"]
 
 
-def fixture_env(form, nonce, ports, unix_path, rustc=None):
+def fixture_env(form, nonce, ports, unix_path, rustc=None, node=None):
     validate_form(form)
     env = {
         "PATH": "/usr/local/bin:/usr/bin",
@@ -512,7 +520,21 @@ def fixture_env(form, nonce, ports, unix_path, rustc=None):
         if rustc is None:
             raise ValueError("rustc")
         env["KD_RUSTC"] = rustc
+    if form in NEEDS_NODE:
+        if node is None:
+            raise ValueError("node")
+        env["KD_NODE"] = node
     return env
+
+
+def resolve_node(real):
+    if type(real) is not str:
+        raise ValueError("node")
+    if not real.startswith("/") or "/../" in real or real.endswith("/") or len(real) > 300:
+        raise ValueError("node")
+    if not all(part.isalnum() or part in "._/@+=-" for part in real):
+        raise ValueError("node")
+    return real, (None if real.startswith("/usr/") else real.rsplit("/", 1)[0] or None)
 
 
 def control_markers(form, nonce):
