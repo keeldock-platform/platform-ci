@@ -892,6 +892,11 @@ function Register-RemovalRoot([string]$path) {
     [KeelDock.Platform.WindowsConfinement.HandleRemover]::AllowRoot($path)
 }
 
+function Test-NotFoundAttributable([string]$text, [string]$path) {
+    if ($text -cnotmatch '^open=(err2|err3|ENOENT)$') { return $true }
+    if ([string]::IsNullOrEmpty($path)) { return $false }
+    return [bool](Test-Path -LiteralPath $path -PathType Leaf)
+}
 
 function Get-JobLiveness($sandboxes, [int]$waitSeconds) {
     $state = 'none'
@@ -1412,6 +1417,7 @@ function Invoke-ChannelAttempt($sandbox, $attempt, [string]$phase, [bool]$withCo
         if ($runValid -or $attempt.ContainsKey('LeakGuard')) { $result = Get-AttemptResult $run $command $attempt }
         if (-not $runValid -and $result -cne 'allowed') { $result = 'invalid' }
         if ($result -ceq 'not_applicable' -and $attempt.ContainsKey('NaRecheck') -and (Test-PipeListed (($arguments -split ' ')[1]))) { $result = 'other' }
+        if ($result -ceq 'denied' -and [string]$attempt.Name -ceq 'canary-reads' -and -not (Test-NotFoundAttributable (Get-ProbeText ([string]$run.Stdout) $command) (($arguments -split ' ', 2)[1]))) { $result = 'other' }
         $results += $result
         if ($result -cne [string]$attempt.Expect) { Write-DiagLines $label 'stdout' ([string]$run.Stdout) }
     }
@@ -1717,6 +1723,7 @@ function Invoke-FixtureForm($sandbox, [string]$form) {
                 if (($text -ceq 'text=ok') -and (([string]$run.Stdout + "`n" + [string]$run.Stderr) -match '(?m)^(?:\[[A-Za-z0-9_.+-]{1,40} [0-9][A-Za-z0-9_.+-]{0,20}\] )?::debug::kd-fx-marker\s*$')) { $result = 'contained' }
             } else {
                 $result = Get-TextClass $text $attempt
+                if ($result -ceq 'denied' -and [string]$attempt.Name -ceq 'read-canary' -and -not (Test-NotFoundAttributable $text $script:CanaryRunnerTemp)) { $result = 'other' }
             }
         }
         Write-Line ('windows-confinement-fixture-attempt=' + $form + '/' + $attempt.Name + ' result=' + $result + ' expect=' + $attempt.Expect + ' control=fired hang=none informational=' + $informational.ToString().ToLowerInvariant() + ' basis=' + $basis)

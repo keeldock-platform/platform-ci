@@ -2917,6 +2917,13 @@ foreach ($case in $cases) {
         self.assertIn('throw new InvalidOperationException("remove_failed step=depth error=path");', remover)
         self.assertIn('throw new InvalidOperationException("remove_failed step=depth error=0");', remover)
 
+    def test_a_confined_not_found_canary_read_is_attributable_only_while_the_canary_exists(self):
+        body = self.function_body("Test-NotFoundAttributable")
+        self.assertIn("'^open=(err2|err3|ENOENT)$'", body)
+        self.assertIn("Test-Path -LiteralPath $path -PathType Leaf", body)
+        self.assertIn("-ceq 'canary-reads' -and -not (Test-NotFoundAttributable", self.wrapper)
+        self.assertIn("-ceq 'read-canary' -and -not (Test-NotFoundAttributable $text $script:CanaryRunnerTemp)", self.wrapper)
+
     def test_taskreg_variants_are_separate_24_byte_buffers_and_wfp_loads_at_run_time(self):
         probe = self.probe
         task = probe[probe.index("fn probe_taskreg"):probe.index("fn probe_wmi")]
