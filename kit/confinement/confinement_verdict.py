@@ -17,7 +17,11 @@ blocked, every positive control fired both before and after the project phase, b
 absent and the handoff state fits the operating system. A producer cannot assert it independently.
 """
 
+import json
+import os
 import re
+import stat
+import sys
 
 
 SCHEMA_VERSION = 1
@@ -295,3 +299,152 @@ def find_lines(log):
         if candidate.startswith(prefix):
             found.append(candidate)
     return found
+
+
+WINDOWS_RUN_FIELDS = frozenset((
+    "schema_version", "os", "boundary", "role", "mode", "channels", "memory_canary",
+    "readable_file_canary", "handoff", "project_execution", "gates", "failed",
+    "token_revocation", "log_canary",
+))
+WINDOWS_MODES = ("synthetic", "source")
+WINDOWS_PUBLISHER_ROLE = "verifier"
+LOG_CANARY_RESULTS = ("absent", "present")
+MAX_RUN_RECORD_BYTES = 65536
+RUN_OPTIONS = frozenset((
+    "--record", "--control-sha", "--run-id", "--run-attempt", "--role", "--mode",
+))
+READ_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+
+
+def _channel_proved(channels, name):
+    entry = channels.get(name) if type(channels) is dict else None
+    return (type(entry) is dict and entry.get("status") == "blocked"
+            and entry.get("before") is True and entry.get("after") is True)
+
+
+def windows_record(document, control_sha, run_id, run_attempt, role, mode):
+    """Return the verdict record for the private Windows run record, or refuse with a closed reason.
+
+    Only the verifier role publishes. The memory canary can be absent only when the process_memory
+    channel was blocked with both controls fired, and the readable file canary only when the
+    runner_files channel was blocked with both controls fired and the log canary scan found nothing.
+    """
+    if type(document) is not dict or set(document) != WINDOWS_RUN_FIELDS:
+        _refuse("schema")
+    if type(document["schema_version"]) is not int or document["schema_version"] != 1:
+        _refuse("schema")
+    if (not _member(role, (WINDOWS_PUBLISHER_ROLE,)) or document["role"] != role
+            or not _member(mode, WINDOWS_MODES) or document["mode"] != mode):
+        _refuse("value")
+    if document["os"] != "windows" or document["boundary"] != BOUNDARIES["windows"]:
+        _refuse("value")
+    if not _member(document["log_canary"], LOG_CANARY_RESULTS):
+        _refuse("value")
+    channels = document["channels"]
+    if document["memory_canary"] == "absent" and not _channel_proved(channels, "process_memory"):
+        _refuse("inconsistent")
+    if document["readable_file_canary"] == "absent" and (
+            not _channel_proved(channels, "runner_files") or document["log_canary"] != "absent"):
+        _refuse("inconsistent")
+    record = {
+        "os": "windows",
+        "boundary": BOUNDARIES["windows"],
+        "control_sha": control_sha,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "channels": channels,
+        "memory_canary": document["memory_canary"],
+        "readable_file_canary": document["readable_file_canary"],
+        "handoff": document["handoff"],
+        "project_execution": document["project_execution"],
+        "gates": document["gates"],
+        "failed": document["failed"],
+        "token_revocation": document["token_revocation"],
+    }
+    validate_record(record)
+    return record
+
+
+def _unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            _refuse("duplicate")
+        result[key] = value
+    return result
+
+
+def _read_run_record(path):
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            return None
+        descriptor = os.open(path, READ_FLAGS)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_RUN_RECORD_BYTES:
+            _refuse("size")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            payload = stream.read(MAX_RUN_RECORD_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(payload) > MAX_RUN_RECORD_BYTES:
+        _refuse("size")
+    try:
+        return json.loads(
+            payload.decode("ascii", "strict"), object_pairs_hook=_unique_pairs,
+            parse_constant=lambda unused: _refuse("value"),
+        )
+    except VerdictRefusal:
+        raise
+    except (UnicodeError, ValueError, RecursionError):
+        _refuse("malformed")
+
+
+def _refused_text(reason):
+    return "windows-source-verdict=refused reason=" + reason + "\n"
+
+
+def main(arguments=None):
+    actual = sys.argv[1:] if arguments is None else list(arguments)
+    if not actual or actual[0] != "windows-run" or len(actual) % 2 != 1:
+        return 2
+    options = {}
+    for name, value in zip(actual[1::2], actual[2::2]):
+        if name not in RUN_OPTIONS or name in options:
+            return 2
+        options[name] = value
+    if set(options) != RUN_OPTIONS:
+        return 2
+    try:
+        if SHA_RE.fullmatch(options["--control-sha"]) is None:
+            _refuse("value")
+        run_id = _decimal(RUN_ID_RE, options["--run-id"], 1, MAX_RUN_ID)
+        run_attempt = _decimal(ATTEMPT_RE, options["--run-attempt"], 1, 99)
+        document = _read_run_record(options["--record"])
+        if document is None:
+            sys.stdout.write(_refused_text("unavailable"))
+            return 1
+        record = windows_record(
+            document, options["--control-sha"], run_id, run_attempt, options["--role"], options["--mode"],
+        )
+        line = encode_line(record)
+        accepted = run_accepted(record)
+    except VerdictRefusal as error:
+        sys.stdout.write(_refused_text(error.reason))
+        return 1
+    except Exception:
+        sys.stdout.write(_refused_text("malformed"))
+        return 1
+    sys.stdout.write(line + "\n")
+    return 0 if accepted else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

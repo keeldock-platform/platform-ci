@@ -56,7 +56,7 @@ def verdict_record(os_name="linux", **updates):
         "readable_file_canary": "absent",
         "handoff": "not-applicable" if os_name == "linux" else "verified",
         "project_execution": "completed",
-        "gates": 13,
+        "gates": 15,
         "failed": 0,
         "token_revocation": "confirmed",
     }
@@ -563,7 +563,7 @@ class VerdictTests(AuditCase):
             with self.subTest(field=field):
                 self.assert_refused(api, "verdict")
         for updates in (
-            {"gates": 12}, {"failed": 1}, {"project_execution": "failed"},
+            {"gates": 14}, {"failed": 1}, {"project_execution": "failed"},
             {"project_execution": "not_started", "gates": 0},
             {"token_revocation": "unconfirmed"},
         ):
@@ -755,7 +755,7 @@ class CanaryTests(AuditCase):
 
     def test_canary_wins_over_an_invalid_verdict_and_other_phases(self):
         api = FakeApi()
-        api.set_verdict(verdict_record(gates=12))
+        api.set_verdict(verdict_record(gates=14))
         api.set_annotations(201, [dict(ANNOTATION, message="x " + CANARY)])
         self.assert_refused(api, "log_canary")
         api = FakeApi()
@@ -1300,7 +1300,7 @@ QUICK_ACCEPTED = (
 )
 
 
-def quick_count_line(request=QUICK_REQUEST, selected=13, passed=13, failed=0):
+def quick_count_line(request=QUICK_REQUEST, selected=15, passed=15, failed=0):
     return (
         "KD-LINUX-QUICK schema=1 request-id=" + request + " tier=quick admission=never gates-selected="
         + str(selected) + " gates-passed=" + str(passed) + " failed=" + str(failed) + " status=encrypted"
@@ -1548,14 +1548,14 @@ class QuickLogTests(QuickAuditCase):
 
     def test_the_counts_must_agree_with_the_gate_outcome(self):
         cases = (
-            (False, quick_count_line(selected=13, passed=12, failed=0)),
-            (False, quick_count_line(selected=13, passed=13, failed=1)),
-            (False, quick_count_line(selected=12, passed=12, failed=0)),
-            (False, quick_count_line(selected=17, passed=17, failed=0)),
-            (True, quick_count_line(selected=13, passed=4, failed=0)),
-            (True, quick_count_line(selected=13, passed=13, failed=1)),
-            (True, quick_count_line(selected=13, passed=4, failed=2)),
-            (True, quick_count_line(selected=13, passed=13, failed=1)),
+            (False, quick_count_line(selected=15, passed=14, failed=0)),
+            (False, quick_count_line(selected=15, passed=15, failed=1)),
+            (False, quick_count_line(selected=14, passed=14, failed=0)),
+            (False, quick_count_line(selected=19, passed=19, failed=0)),
+            (True, quick_count_line(selected=15, passed=4, failed=0)),
+            (True, quick_count_line(selected=15, passed=15, failed=1)),
+            (True, quick_count_line(selected=15, passed=4, failed=2)),
+            (True, quick_count_line(selected=15, passed=15, failed=1)),
         )
         for failed_gate, line in cases:
             api = QuickApi(failed_gate=failed_gate)
@@ -1973,6 +1973,28 @@ class WindowsJobTests(WindowsAuditCase):
             with self.subTest(job=name, label="intact"):
                 self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
 
+    def test_the_producer_may_show_the_verifier_only_verdict_step_as_skipped_and_nothing_else(self):
+        api = WindowsApi()
+        steps = api.job(subject.WINDOWS_PRODUCER_JOB)["steps"]
+        steps.insert(
+            len(steps) - 1,
+            {"number": len(steps), "name": subject.WINDOWS_VERDICT_STEP, "status": "completed", "conclusion": "skipped"},
+        )
+        steps[-1]["number"] = len(steps)
+        self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
+        self.assertEqual(
+            api.expected["jobs"][subject.WINDOWS_PRODUCER_JOB]["optional_steps"], (subject.WINDOWS_VERDICT_STEP,),
+        )
+        self.assertEqual(api.expected["jobs"][subject.WINDOWS_VERIFIER_JOB]["optional_steps"], ())
+        api = WindowsApi()
+        steps = api.job(subject.WINDOWS_PRODUCER_JOB)["steps"]
+        steps.insert(
+            len(steps) - 1,
+            {"number": len(steps), "name": "Other skipped step", "status": "completed", "conclusion": "skipped"},
+        )
+        steps[-1]["number"] = len(steps)
+        self.assert_refused(api, "job_steps")
+
     def test_closed_jobs_keep_their_exact_step_lists(self):
         for name in (subject.WINDOWS_SETTINGS_JOB, subject.WINDOWS_EVIDENCE_JOB):
             api = WindowsApi()
@@ -1988,8 +2010,8 @@ class WindowsVerdictTests(WindowsAuditCase):
         for label, record in (
             ("linux", verdict_record("linux")),
             ("handoff", verdict_record("windows", handoff="failed")),
-            ("gates", verdict_record("windows", gates=12)),
-            ("failed", verdict_record("windows", gates=13, failed=1)),
+            ("gates", verdict_record("windows", gates=14)),
+            ("failed", verdict_record("windows", gates=15, failed=1)),
             ("not started", verdict_record("windows", project_execution="not_started", gates=0)),
             ("revocation", verdict_record("windows", token_revocation="unconfirmed")),
             ("control", verdict_record("windows", control_sha="cd" * 20)),
@@ -2000,7 +2022,7 @@ class WindowsVerdictTests(WindowsAuditCase):
             api.set_verdict(record)
             with self.subTest(label=label):
                 self.assert_refused(api, "verdict")
-        for count in (13, 16):
+        for count in (15, 18):
             api = WindowsApi()
             api.set_verdict(verdict_record("windows", gates=count))
             with self.subTest(gates=count):

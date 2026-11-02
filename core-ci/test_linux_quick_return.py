@@ -27,7 +27,8 @@ DER = b"\x30\x82" + bytes(range(256)) * 2
 SPKI = base64.b64encode(DER).decode("ascii")
 FINGERPRINT = hashlib.sha256(DER).hexdigest()
 GATES = (
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests",
     "parser_format", "parser_clippy", "parser_replay", "node_dependency_prepare",
     "node_dependency_audit", "typescript_typecheck", "typescript_tests",
 )
@@ -155,7 +156,7 @@ class PayloadTests(unittest.TestCase):
 
     def test_outcome_duration_tail_and_identity_are_recorded_for_a_failed_gate(self):
         document, size, selected, passed, failed = self.build(failed_at=2)
-        self.assertEqual((size, selected, passed, failed), (subject.PADDED_BYTES, 13, 2, 1))
+        self.assertEqual((size, selected, passed, failed), (subject.PADDED_BYTES, 15, 2, 1))
         self.assertEqual(document["tier"], "quick")
         self.assertEqual(document["admission"], "never")
         self.assertEqual(document["concern"], "core-linux-quick-return")
@@ -168,7 +169,7 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(document["base_branch"], "develop")
         self.assertEqual(document["reviewed_diff_sha256"], "d" * 64)
         self.assertEqual(document["image_os"], "ubuntu24")
-        self.assertEqual(document["gates_selected"], 13)
+        self.assertEqual(document["gates_selected"], 15)
         self.assertEqual(document["gates_passed"], 2)
         self.assertEqual(document["gates_failed"], 1)
         gates = document["gates"]
@@ -189,9 +190,9 @@ class PayloadTests(unittest.TestCase):
         for forbidden in ("installation", "owner", "SOURCE_REPOSITORY", "token", "private"):
             self.assertNotIn(forbidden, serialized)
 
-    def test_sixteen_gates_are_reported_when_the_runtime_workspace_ran(self):
+    def test_eighteen_gates_are_reported_when_the_runtime_workspace_ran(self):
         document, size, selected, passed, failed = self.build(runtime=True)
-        self.assertEqual((size, selected, passed, failed), (subject.PADDED_BYTES, 16, 16, 0))
+        self.assertEqual((size, selected, passed, failed), (subject.PADDED_BYTES, 18, 18, 0))
         self.assertEqual([gate["name"] for gate in document["gates"][-3:]], list(RUNTIME_GATES))
 
     def test_tails_are_bounded_utf8_safe_and_report_the_full_size(self):
@@ -208,14 +209,14 @@ class PayloadTests(unittest.TestCase):
     def test_hostile_control_character_tails_still_fit_the_fixed_size(self):
         hostile = b"\x01" * subject.STREAM_TAIL_BYTES
         streams = {}
-        for index in range(16):
+        for index in range(18):
             streams[(index, "stdout")] = hostile
             streams[(index, "stderr")] = hostile
         document, size, selected, passed, failed = self.build(runtime=True, streams=streams)
-        self.assertEqual((size, selected), (subject.PADDED_BYTES, 16))
+        self.assertEqual((size, selected), (subject.PADDED_BYTES, 18))
         total = sum(len(gate["stdout_tail"]) + len(gate["stderr_tail"]) for gate in document["gates"])
         self.assertLess(total, 32 * subject.STREAM_TAIL_BYTES)
-        self.assertEqual([gate["outcome"] for gate in document["gates"]], ["passed"] * 16)
+        self.assertEqual([gate["outcome"] for gate in document["gates"]], ["passed"] * 18)
 
     def test_credential_like_lines_are_screened_before_encryption(self):
         secrets = (
@@ -288,7 +289,7 @@ class PayloadTests(unittest.TestCase):
                 (records / name).unlink()
             payload, selected, passed, failed = subject.build_payload(records, environment(), REQUEST)
         document = subject.unframe_payload(payload)
-        self.assertEqual((selected, passed, failed), (13, 0, 1))
+        self.assertEqual((selected, passed, failed), (15, 0, 1))
         self.assertIsNone(document["boundary"])
         self.assertIsNone(document["revocation"])
         self.assertIsNone(document["gates"][0]["duration_ms"])
@@ -582,7 +583,7 @@ class CommandTests(unittest.TestCase):
             self.assertEqual(
                 lines,
                 [
-                    "gates_selected=13", "gates_passed=4", "gates_failed=1",
+                    "gates_selected=15", "gates_passed=4", "gates_failed=1",
                     "ciphertext_sha256=" + hashlib.sha256(ciphertext).hexdigest(),
                 ],
             )
@@ -652,11 +653,11 @@ class PublicLineTests(unittest.TestCase):
     )
 
     def test_the_public_line_is_fixed_and_carries_only_counts(self):
-        line = subject.quick_line(REQUEST, 13, 12, 1)
+        line = subject.quick_line(REQUEST, 15, 14, 1)
         self.assertEqual(
             line,
             "KD-LINUX-QUICK schema=1 request-id=" + REQUEST
-            + " tier=quick admission=never gates-selected=13 gates-passed=12 failed=1 status=encrypted",
+            + " tier=quick admission=never gates-selected=15 gates-passed=14 failed=1 status=encrypted",
         )
         self.assertRegex(line, self.LINE)
         self.assertTrue(line.isascii())
@@ -664,20 +665,20 @@ class PublicLineTests(unittest.TestCase):
 
     def test_invalid_counts_or_identity_are_refused(self):
         for arguments in (
-            ("short", 13, 13, 0), (REQUEST, 19, 1, 0), (REQUEST, 13, 14, 0), (REQUEST, 13, 1, 14),
-            (REQUEST, 13, -1, 0), (REQUEST, 13, True, 0), (REQUEST, "13", 1, 0), (None, 13, 1, 0),
+            ("short", 15, 15, 0), (REQUEST, 19, 1, 0), (REQUEST, 15, 16, 0), (REQUEST, 15, 1, 16),
+            (REQUEST, 15, -1, 0), (REQUEST, 15, True, 0), (REQUEST, "15", 1, 0), (None, 15, 1, 0),
         ):
             with self.subTest(arguments=arguments):
                 self.assertEqual(refusal_reason(subject.quick_line, *arguments), "invalid")
 
     def test_record_reads_the_counts_from_the_environment_and_prints_the_line(self):
         env = {
-            "KD_QUICK_REQUEST_ID": REQUEST, "KD_QUICK_GATES_SELECTED": "16",
-            "KD_QUICK_GATES_PASSED": "16", "KD_QUICK_GATES_FAILED": "0",
+            "KD_QUICK_REQUEST_ID": REQUEST, "KD_QUICK_GATES_SELECTED": "18",
+            "KD_QUICK_GATES_PASSED": "18", "KD_QUICK_GATES_FAILED": "0",
         }
         output = io.StringIO()
         self.assertEqual(subject.main(["record"], env, output), 0)
-        self.assertEqual(output.getvalue(), subject.quick_line(REQUEST, 16, 16, 0) + "\n")
+        self.assertEqual(output.getvalue(), subject.quick_line(REQUEST, 18, 18, 0) + "\n")
         for name, value in (
             ("KD_QUICK_GATES_SELECTED", "01"), ("KD_QUICK_GATES_PASSED", ""),
             ("KD_QUICK_GATES_FAILED", "x"), ("KD_QUICK_GATES_PASSED", "19"),
@@ -718,7 +719,7 @@ class SourceShapeTests(unittest.TestCase):
 
     def test_stream_budget_fits_the_payload_before_escaping(self):
         self.assertLess(2 * subject.MAX_GATES * subject.STREAM_TAIL_BYTES, subject.MAX_BODY_BYTES)
-        self.assertEqual(subject.MIN_GATES, 13)
+        self.assertEqual(subject.MIN_GATES, 15)
         self.assertEqual(subject.MAX_GATES, 18)
 
 

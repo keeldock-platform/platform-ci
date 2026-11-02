@@ -1,7 +1,12 @@
 """Tests for the closed eleven-channel confinement verdict."""
 
+import contextlib
 import copy
+import io
+import json
+import os
 import re
+import tempfile
 import unittest
 
 import confinement_verdict as subject
@@ -390,6 +395,165 @@ class FindLinesTests(unittest.TestCase):
     def test_non_bytes_logs_are_refused(self):
         with self.assertRaises(subject.VerdictRefusal):
             subject.find_lines(LINUX_LINE)
+
+
+RUN_ID = 40123456789
+
+
+def _run_document(**updates):
+    document = {
+        "schema_version": 1,
+        "os": "windows",
+        "boundary": "lpac-job",
+        "role": "verifier",
+        "mode": "source",
+        "channels": {
+            name: {"status": "blocked", "before": True, "after": True} for name in subject.CHANNELS
+        },
+        "memory_canary": "absent",
+        "readable_file_canary": "absent",
+        "handoff": "verified",
+        "project_execution": "completed",
+        "gates": 15,
+        "failed": 0,
+        "token_revocation": "confirmed",
+        "log_canary": "absent",
+    }
+    document.update(updates)
+    return document
+
+
+def _windows(document, role="verifier", mode="source"):
+    return subject.windows_record(document, SHA, RUN_ID, 1, role, mode)
+
+
+def _windows_reason(document, **keywords):
+    with unittest.TestCase().assertRaises(subject.VerdictRefusal) as caught:
+        _windows(document, **keywords)
+    return caught.exception.reason
+
+
+class WindowsRecordTests(unittest.TestCase):
+    def test_an_accepted_verifier_run_becomes_the_verdict_record(self):
+        record = _windows(_run_document())
+        self.assertEqual(record, _record("windows"))
+        self.assertTrue(subject.run_accepted(record))
+        self.assertEqual(_windows(_run_document(gates=18), mode="source")["gates"], 18)
+        self.assertEqual(_windows(_run_document(mode="synthetic"), mode="synthetic")["os"], "windows")
+
+    def test_only_the_verifier_publishes_and_the_mode_must_match(self):
+        self.assertEqual(_windows_reason(_run_document(role="producer"), role="producer"), "value")
+        self.assertEqual(_windows_reason(_run_document(role="producer")), "value")
+        self.assertEqual(_windows_reason(_run_document(), role="producer"), "value")
+        self.assertEqual(_windows_reason(_run_document(mode="synthetic")), "value")
+        self.assertEqual(_windows_reason(_run_document(), mode="other"), "value")
+
+    def test_the_key_set_and_schema_are_exact(self):
+        extra = _run_document()
+        extra["extra"] = 1
+        missing = _run_document()
+        del missing["log_canary"]
+        self.assertEqual(_windows_reason(extra), "schema")
+        self.assertEqual(_windows_reason(missing), "schema")
+        self.assertEqual(_windows_reason(_run_document(schema_version=2)), "schema")
+        self.assertEqual(_windows_reason(_run_document(schema_version=True)), "schema")
+        self.assertEqual(_windows_reason([]), "schema")
+        self.assertEqual(_windows_reason(_run_document(os="linux")), "value")
+        self.assertEqual(_windows_reason(_run_document(boundary="other")), "value")
+        self.assertEqual(_windows_reason(_run_document(log_canary="unknown")), "value")
+
+    def test_the_canary_mapping_refuses_a_claim_the_channels_do_not_prove(self):
+        for channel, field in (("process_memory", "memory_canary"), ("runner_files", "readable_file_canary")):
+            for entry in (
+                {"status": "observed-leak", "before": True, "after": True},
+                {"status": "not-run", "before": False, "after": False},
+                {"status": "blocked", "before": False, "after": True},
+                {"status": "blocked", "before": True, "after": False},
+            ):
+                document = _run_document()
+                document["channels"][channel] = entry
+                with self.subTest(channel=channel, entry=entry):
+                    self.assertEqual(_windows_reason(document), "inconsistent")
+                    document[field] = "present"
+                    self.assertFalse(subject.confinement_accepted(_windows(document)))
+
+    def test_a_present_log_canary_cannot_leave_the_file_canary_absent(self):
+        self.assertEqual(_windows_reason(_run_document(log_canary="present")), "inconsistent")
+        record = _windows(_run_document(log_canary="present", readable_file_canary="present"))
+        self.assertFalse(subject.confinement_accepted(record))
+
+    def test_drifted_values_are_refused_by_the_record_validation(self):
+        self.assertEqual(_windows_reason(_run_document(handoff="other")), "value")
+        self.assertEqual(_windows_reason(_run_document(gates=True)), "value")
+        self.assertEqual(_windows_reason(_run_document(gates=19)), "value")
+
+
+class WindowsCommandTests(unittest.TestCase):
+    def _run(self, directory, document=None, text=None, **replacements):
+        path = os.path.join(directory, "windows-source-run.json")
+        if text is not None:
+            with open(path, "w", encoding="ascii") as sink:
+                sink.write(text)
+        elif document is not None:
+            with open(path, "w", encoding="ascii") as sink:
+                sink.write(json.dumps(document, separators=(",", ":")) + "\n")
+        arguments = {
+            "--record": path, "--control-sha": SHA, "--run-id": str(RUN_ID), "--run-attempt": "1",
+            "--role": "verifier", "--mode": "source",
+        }
+        arguments.update(replacements)
+        command = ["windows-run"]
+        for name, value in arguments.items():
+            command.extend((name, value))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = subject.main(command)
+        return code, output.getvalue()
+
+    def test_an_accepted_record_prints_only_the_one_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, text = self._run(directory, _run_document())
+        self.assertEqual(code, 0)
+        self.assertEqual(text, subject.encode_line(_record("windows")) + "\n")
+
+    def test_a_refused_or_failed_run_exits_nonzero_with_a_fixed_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, text = self._run(directory, _run_document(role="producer"), **{"--role": "producer"})
+            self.assertEqual((code, text), (1, "windows-source-verdict=refused reason=value\n"))
+            code, text = self._run(directory, _run_document(gates=15, failed=1))
+            self.assertEqual(code, 1)
+            self.assertTrue(text.startswith(subject.LINE_PREFIX))
+            code, text = self._run(directory, _run_document(), **{"--run-id": "0"})
+            self.assertEqual((code, text), (1, "windows-source-verdict=refused reason=value\n"))
+
+    def test_a_missing_oversized_duplicate_or_malformed_file_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, text = self._run(directory)
+            self.assertEqual((code, text), (1, "windows-source-verdict=refused reason=unavailable\n"))
+            big = " " * (subject.MAX_RUN_RECORD_BYTES + 1)
+            code, text = self._run(directory, text=big)
+            self.assertEqual((code, text), (1, "windows-source-verdict=refused reason=size\n"))
+            code, text = self._run(directory, text='{"a":1,"a":2}')
+            self.assertEqual((code, text), (1, "windows-source-verdict=refused reason=duplicate\n"))
+            code, text = self._run(directory, text='{"gates":NaN}')
+            self.assertEqual((code, text), (1, "windows-source-verdict=refused reason=value\n"))
+            code, text = self._run(directory, text="not json")
+            self.assertEqual((code, text), (1, "windows-source-verdict=refused reason=malformed\n"))
+
+    def test_a_symbolic_link_is_not_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "target.json")
+            with open(target, "w", encoding="ascii") as sink:
+                sink.write(json.dumps(_run_document()))
+            link = os.path.join(directory, "link.json")
+            os.symlink(target, link)
+            code, text = self._run(directory, **{"--record": link})
+        self.assertEqual((code, text), (1, "windows-source-verdict=refused reason=unavailable\n"))
+
+    def test_bad_invocations_are_usage_errors(self):
+        self.assertEqual(subject.main([]), 2)
+        self.assertEqual(subject.main(["other"]), 2)
+        self.assertEqual(subject.main(["windows-run", "--record", "x"]), 2)
 
 
 if __name__ == "__main__":

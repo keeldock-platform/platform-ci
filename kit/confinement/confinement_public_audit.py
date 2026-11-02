@@ -127,8 +127,8 @@ QUICK_FRAME_BYTES = 4 * 1024 * 1024 - 64 * 1024 + 470 + 16
 QUICK_ARTIFACT_SLACK_BYTES = 8192
 QUICK_RETENTION_SECONDS = 24 * 60 * 60
 QUICK_RETENTION_SLACK_SECONDS = 600
-QUICK_MIN_GATES = 13
-QUICK_MAX_GATES = 16
+QUICK_MIN_GATES = 15
+QUICK_MAX_GATES = 18
 QUICK_EXPECTED_FIELDS = (
     (EXPECTED_FIELDS - frozenset(("verdict_job", "verdict_step"))) | frozenset(("quick_job", "request_id"))
 )
@@ -872,8 +872,8 @@ WINDOWS_WORKFLOW_PATH = ".github/workflows/windows-source-admission.yml"
 WINDOWS_TITLE_PREFIX = "Windows admission source "
 WINDOWS_SYNTHETIC_TITLE = "Windows admission synthetic synthetic"
 WINDOWS_SETTINGS_JOB = "settings"
-WINDOWS_PRODUCER_JOB = "role-call-windows-producer-v1 / role-windows-receiver-v1"
-WINDOWS_VERIFIER_JOB = "role-call-windows-verifier-v1 / role-windows-receiver-v1"
+WINDOWS_PRODUCER_JOB = "role-call-windows-producer-v1 / role-windows-producer-v1"
+WINDOWS_VERIFIER_JOB = "role-call-windows-verifier-v1 / role-windows-verifier-v1"
 WINDOWS_LINUX_JOB = "role-call-linux-fetch-encrypt-v1 / role-linux-fetch-encrypt-v1"
 WINDOWS_ATTESTER_JOB = "role-call-capsule-attester-v1 / role-capsule-attester-v1"
 WINDOWS_EVIDENCE_JOB = "verify-role-evidence-windows-source"
@@ -1179,7 +1179,7 @@ def windows_expected(environ, cache_digest):
         "display_title": title,
         "jobs": {
             WINDOWS_SETTINGS_JOB: {"steps": WINDOWS_SETTINGS_STEPS, "optional_steps": ()},
-            WINDOWS_PRODUCER_JOB: {"steps": WINDOWS_PRODUCER_STEPS, "optional_steps": ()},
+            WINDOWS_PRODUCER_JOB: {"steps": WINDOWS_PRODUCER_STEPS, "optional_steps": (WINDOWS_VERDICT_STEP,)},
             WINDOWS_VERIFIER_JOB: {"steps": WINDOWS_VERIFIER_STEPS, "optional_steps": ()},
             WINDOWS_LINUX_JOB: {"steps": WINDOWS_LINUX_STEPS, "optional_steps": optional},
             WINDOWS_ATTESTER_JOB: {"steps": WINDOWS_ATTESTER_STEPS, "optional_steps": ()},
