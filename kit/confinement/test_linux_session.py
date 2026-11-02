@@ -454,6 +454,23 @@ class LinuxSessionLaunchTests(unittest.TestCase):
             self.assertEqual((code, timed_out), (0, False))
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
             self.assertEqual(popen.call_args.kwargs["env"], spec["env"])
+            self.assertIs(type(popen.call_args.kwargs["stdin"]), int)
+
+    def test_stdin_is_an_empty_pipe_whose_write_end_is_closed_before_launch(self):
+        process = MagicMock()
+        process.pid = 4321
+        process.wait.return_value = 0
+        closed = []
+        with patch("linux_session.subprocess.Popen", return_value=process) as popen, \
+             patch("linux_session.os.pipe", return_value=(41, 42)), \
+             patch("linux_session.harness._wait_for_stopped_process"), \
+             patch("linux_session.harness._verify_child"), \
+             patch("linux_session.os.kill"), patch("linux_session.os.killpg"), \
+             patch("linux_session.os.close", side_effect=closed.append), \
+             patch("linux_session.os.getpid", return_value=5):
+            session.launch_and_collect(good_spec(), ["/x"], "/tmp", ("a", 11), ("b", 12), True)
+        self.assertEqual(popen.call_args.kwargs["stdin"], 41)
+        self.assertEqual(closed[:2], [42, 41])
 
     def test_timeouts_kill_the_group_and_are_reported(self):
         process = MagicMock()

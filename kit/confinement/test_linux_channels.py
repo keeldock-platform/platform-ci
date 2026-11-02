@@ -491,7 +491,7 @@ class LinuxFixtureDiagnosticLineTests(unittest.TestCase):
         self.assertEqual(self.texts(self.lines(stderr)), ["keep " + "x" * 16 + "?" + "y" * 15])
 
     def test_a_hosted_runner_sysroot_listing_line_is_kept(self):
-        line = "drwxr-xr-x 9 1001 118 4096 Nov  2 04:38 /home/runner/.rustup/toolchains/stable-x86_64-unknown-linux-gnu"
+        line = "drwxr-xr-x 9 1001 118 4096 Nov  2 04:38 /tmp/kd-toolchains/rust/stable-x86_64-unknown-linux-gnu"
         cleaned = channels.diag_clean(line)
         self.assertFalse(channels.diag_unsafe(line, cleaned, NONCE, ()))
         self.assertTrue(channels.diag_unsafe("k" * 33, "k" * 33, NONCE, ()))
