@@ -547,6 +547,12 @@ class CommandTests(unittest.TestCase):
             RUNNER_TEMP=directory, NODE_BIN=os.sep + "opt" + os.sep + "node-bin", GITHUB_OUTPUT=str(output), **updates,
         )
 
+    def fixed_clock(self):
+        original = subject.run_encrypt
+        return patch.object(
+            subject, "run_encrypt", lambda env, arguments: original(env, arguments, clock=lambda: 1800000000.9),
+        )
+
     @POSIX_OUTPUT
     def test_encrypt_builds_the_payload_calls_the_helper_once_and_stages_the_member(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -587,7 +593,7 @@ class CommandTests(unittest.TestCase):
             env = self.staged_environment(directory)
             for reason in ("encryptor", "limit"):
                 output = io.StringIO()
-                with patch.object(subject, "encrypt_payload", side_effect=subject.QuickRefusal(reason)):
+                with self.fixed_clock(), patch.object(subject, "encrypt_payload", side_effect=subject.QuickRefusal(reason)):
                     self.assertEqual(subject.main(self.ARGUMENTS, env, output), 1)
                 self.assertEqual(
                     output.getvalue(),
@@ -601,7 +607,7 @@ class CommandTests(unittest.TestCase):
             write_records(directory)
             env = self.staged_environment(directory)
             output = io.StringIO()
-            with patch.object(subject, "encrypt_payload", side_effect=RuntimeError(SPKI)):
+            with self.fixed_clock(), patch.object(subject, "encrypt_payload", side_effect=RuntimeError(SPKI)):
                 self.assertEqual(subject.main(self.ARGUMENTS, env, output), 1)
             self.assertEqual(
                 output.getvalue(), "KD-LINUX-QUICK-REFUSAL schema=1 tier=quick admission=never reason=invalid\n",
@@ -698,7 +704,7 @@ class SourceShapeTests(unittest.TestCase):
         source = (Path(subject.__file__)).read_text(encoding="utf-8")
         self.assertNotIn(chr(35), source)
         self.assertTrue(source.isascii())
-        imports = set(re.findall(r"(?m)^(?:import|from) ([a-z_]+)", source))
+        imports = set(re.findall(r"(?m)^(?:import|from) ([a-z0-9_]+)", source))
         self.assertEqual(
             imports,
             {"base64", "hashlib", "json", "os", "re", "stat", "subprocess", "sys", "time", "pathlib"},

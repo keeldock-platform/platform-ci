@@ -271,7 +271,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_linux_source_build.py': '243383fbdec3267a9e07a401fcc548221b8e3d9b394ac268ac8aee77916c2421',
     '.github/workflows/core-linux-quick-return.yml': '430fc8fdde43e46e3d57fe445b34854c5ab65a01126fd1e6b9dcaac69528b9cb',
     'kit/confinement/linux_quick_return.py': '48f55433c099a533e0b76146f5b6df1d1e0338b63c5ee3d9a13d5a3d743bdb4a',
-    'kit/confinement/test_linux_quick_return.py': '79f263cdde58a2039fefe11268ed448f35017d6ff6d487e690aa52ad76d72ad4',
+    'kit/confinement/test_linux_quick_return.py': '30cec7a6b51a2d939278e2625adc06a9f5c7f1ea10b282a367e2e093f25a5a9e',
     'kit/confinement/rust_license_gate.py': '4896e53baf2b0bd8bc8047c69e50c8c72dff11096ca9225bfa9efad71913dfc6',
     'kit/confinement/test_rust_license_gate.py': '5c421d6142948a52704fd9a4db72d0761c167ed6a8fea5bae49b633acf53defa',
     '.github/workflows/macos-rust-toolchain-smoke.yml': 'cdf7068f8887c22958d74f3c2cc0a73c5c8c4c41f4eff0b43e16e47f61e58bb7',
