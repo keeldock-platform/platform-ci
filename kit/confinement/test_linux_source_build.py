@@ -706,6 +706,66 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 linux_source_build.validate_dispatch(env, "token")
             duplicate.assert_not_called()
 
+    def test_quick_tier_is_untrusted_and_source_only_and_checks_duplicates_in_its_own_workflow(self):
+        sha = "a" * 40
+        base = {
+            "CI_EVENT_NAME": "workflow_dispatch", "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "CI_SERVER_URL": "https://github.com", "CACHE_MODE": "none",
+            "CI_SHA": sha, "GITHUB_SHA": sha, "KD_LINUX_TIER": "quick",
+        }
+        self.assertEqual(
+            linux_source_build.TIERS["quick"], ("core-linux-quick-return.yml", "Linux quick source "),
+        )
+        self.assertEqual(
+            linux_source_build.TIERS["admission"], ("linux-source-admission.yml", "Linux admission source "),
+        )
+        for ref, mode in (
+            ("refs/heads/main", "source"), ("refs/heads/main", "synthetic"),
+            ("refs/heads/untrusted", "synthetic"),
+        ):
+            with self.subTest(ref=ref, mode=mode), patch.object(
+                linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]
+            ), patch.object(linux_source_build, "_comparison", return_value="ahead"):
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+                    linux_source_build.validate_dispatch(dict(base, CI_REF=ref, CI_MODE=mode), "token")
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+            linux_source_build.validate_dispatch(
+                dict(base, KD_LINUX_TIER="other", CI_REF="refs/heads/untrusted", CI_MODE="source"), "token",
+            )
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(linux_source_build, "_source_inputs", return_value={}), patch.object(
+            linux_source_build, "_verify_environment"
+        ), patch.object(linux_source_build, "_require_no_duplicate") as duplicate:
+            env = dict(base, CI_REF="refs/heads/untrusted", CI_MODE="source")
+            self.assertEqual(linux_source_build.validate_dispatch(env, "token"), "source")
+            duplicate.assert_called_once_with("token", env)
+        calls = []
+
+        def runs(title):
+            def fake(path, token, method="GET", payload=None, expected=(200,)):
+                calls.append(path)
+                status = "queued" if path.endswith("status=queued") else "in_progress"
+                return 200, {"total_count": 1, "workflow_runs": [{
+                    "id": 9, "display_title": title + sha, "status": status, "event": "workflow_dispatch",
+                }]}
+            return fake
+
+        environment = {"GITHUB_RUN_ID": "5", "REQUESTED_SOURCE_SHA": sha, "KD_LINUX_TIER": "quick"}
+        with patch.object(linux_source_build, "_api_request", side_effect=runs("Linux quick source ")):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
+                linux_source_build._require_no_duplicate("token", environment)
+        self.assertTrue(calls[0].startswith(
+            "/repos/" + linux_source_build.REPOSITORY + "/actions/workflows/core-linux-quick-return.yml/runs?"
+        ))
+        with patch.object(linux_source_build, "_api_request", side_effect=runs("Linux admission source ")):
+            self.assertIsNone(linux_source_build._require_no_duplicate("token", environment))
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
+                linux_source_build._require_no_duplicate("token", {"GITHUB_RUN_ID": "5", "REQUESTED_SOURCE_SHA": sha})
+        self.assertTrue(calls[-1].startswith(
+            "/repos/" + linux_source_build.REPOSITORY + "/actions/workflows/linux-source-admission.yml/runs?"
+        ))
+
     def test_default_checkout_environment_reaches_the_source_fetch(self):
         identity = {"owner": "owner", "name": "source", "repository_id": "7", "source_sha": "a" * 40}
         repository = {"id": 7, "private": True, "full_name": "owner/source"}
@@ -803,6 +863,10 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 }), 0)
                 self.assertEqual(directories.call_count, 13)
                 self.assertEqual(session.call_count, 13)
+                durations = json.loads((root / "kd-records" / "gate-durations.json").read_text(encoding="ascii"))
+                self.assertEqual(durations["schema_version"], 1)
+                self.assertEqual(set(durations["durations_ms"]), set(linux_source_build.GATES))
+                self.assertTrue(all(type(value) is int and value >= 0 for value in durations["durations_ms"].values()))
                 self.assertEqual(boundary.identities[0].profile, ".")
                 self.assertEqual(boundary.identities[0].root, str(worker))
                 for invocation in session.call_args_list:

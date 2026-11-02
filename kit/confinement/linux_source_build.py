@@ -25,6 +25,10 @@ import rust_license_gate
 
 REPOSITORY = "keeldock-platform/platform-ci"
 WORKFLOW_PATH = ".github/workflows/linux-source-admission.yml"
+TIERS = {
+    "admission": ("linux-source-admission.yml", "Linux admission source "),
+    "quick": ("core-linux-quick-return.yml", "Linux quick source "),
+}
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
 TOOLCHAIN_ROOT = Path("/tmp/kd-toolchains")
@@ -295,7 +299,15 @@ def _verify_environment(token, name=ENVIRONMENT_NAME):
         raise SourceBuildRefusal("binding")
 
 
+def _tier(environ):
+    tier = environ.get("KD_LINUX_TIER", "admission")
+    if type(tier) is not str or tier not in TIERS:
+        raise SourceBuildRefusal("identity")
+    return tier
+
+
 def validate_dispatch(environ, api_token=None):
+    tier = _tier(environ)
     if (environ.get("CI_EVENT_NAME") != "workflow_dispatch"
             or environ.get("CI_REPOSITORY") != REPOSITORY
             or environ.get("CI_SERVER_URL") != "https://github.com"
@@ -303,7 +315,7 @@ def validate_dispatch(environ, api_token=None):
             or environ.get("CI_SHA") != environ.get("GITHUB_SHA")):
         raise SourceBuildRefusal("identity")
     ref = environ.get("CI_REF", "")
-    if ref not in ("refs/heads/main", "refs/heads/untrusted"):
+    if ref not in ("refs/heads/main", "refs/heads/untrusted") or (tier == "quick" and ref != "refs/heads/untrusted"):
         raise SourceBuildRefusal("identity")
     if api_token is None:
         api_token = environ.get("GITHUB_TOKEN", "")
@@ -321,7 +333,7 @@ def validate_dispatch(environ, api_token=None):
         raise SourceBuildRefusal("freshness")
     mode = environ.get("CI_MODE", "")
     if mode == "synthetic":
-        if ref != "refs/heads/main":
+        if ref != "refs/heads/main" or tier == "quick":
             raise SourceBuildRefusal("identity")
         _verify_environment(api_token)
         return "synthetic"
@@ -336,8 +348,9 @@ def validate_dispatch(environ, api_token=None):
 def _require_no_duplicate(token, environ):
     run_id = environ.get("GITHUB_RUN_ID", "")
     source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
-    title = "Linux admission source " + source_sha
-    base = "/repos/" + REPOSITORY + "/actions/workflows/linux-source-admission.yml/runs?per_page=100&status="
+    workflow_file, title_prefix = TIERS[_tier(environ)]
+    title = title_prefix + source_sha
+    base = "/repos/" + REPOSITORY + "/actions/workflows/" + workflow_file + "/runs?per_page=100&status="
     for active_status in ("queued", "in_progress"):
         status, payload = _api_request(base + active_status, token)
         runs = payload.get("workflow_runs") if type(payload) is dict else None
@@ -1842,6 +1855,7 @@ def run_project_gates(environ=None):
     if selected_gates != expected_gates:
         raise SourceBuildRefusal("gate")
     outcomes = {name: "not-run" for name in selected_gates}
+    durations = {}
     for index, (name, argv) in enumerate(commands):
         project_env = {
             "PATH": str(Path(node_bin)) + ":" + str(Path(rust_root) / "bin") + ":/usr/bin:/bin",
@@ -1858,6 +1872,7 @@ def run_project_gates(environ=None):
             "PYTHONDONTWRITEBYTECODE": "1", "CI": "true",
         }
         nonce = os.urandom(12).hex()
+        started = time.monotonic()
         try:
             _project_gate_directories(worker)
             launch = ("/usr/bin/python3", "-B", "-c", linux_probes.LAUNCHER_SOURCE, *argv)
@@ -1866,8 +1881,10 @@ def run_project_gates(environ=None):
                 limits="fixture", timeout=600, cwd=str(worker),
             )
         except BaseException:
+            durations[name] = int((time.monotonic() - started) * 1000)
             outcomes[name] = "failed"
             break
+        durations[name] = int((time.monotonic() - started) * 1000)
         (records / ("gate-" + str(index) + ".stdout")).write_bytes(result.stdout)
         (records / ("gate-" + str(index) + ".stderr")).write_bytes(result.stderr)
         if result.exit_code == 0 and not result.timed_out:
@@ -1876,6 +1893,10 @@ def run_project_gates(environ=None):
             outcomes[name] = "failed"
             break
     completed_gates = [name for name in selected_gates if outcomes[name] == "passed"]
+    (records / "gate-durations.json").write_text(
+        json.dumps({"schema_version": 1, "durations_ms": durations}, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
     result = {
         "schema_version": 1, "selected_gates": list(selected_gates),
         "completed_gates": completed_gates, "gates": outcomes,
