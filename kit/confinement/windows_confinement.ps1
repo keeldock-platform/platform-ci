@@ -467,6 +467,8 @@ function Get-ProbeValue([string]$text, [string]$key) {
 $NetworkDeniedConnect = @('err10013')
 $NetworkDeniedResolve = @('err10013', 'err11001')
 $NetworkDeniedUdp = @('err10013')
+$NetworkDeniedHostResolve = @('err11003')
+$NetworkDeniedBind = @('err10013')
 $NetworkUnroutableConnect = @('err10047', 'err10051')
 
 function Get-NetworkState([string]$stdout, [string]$name) {
@@ -479,6 +481,8 @@ function Get-NetworkState([string]$stdout, [string]$name) {
         if ($found.Success -and ($NetworkDeniedConnect -ccontains $found.Groups[1].Value)) { return 'blocked' }
         $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
         if ($found.Success -and ($NetworkDeniedResolve -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
+        if ($found.Success -and ($NetworkDeniedHostResolve -ccontains $found.Groups[1].Value)) { return 'blocked_resolve' }
         if ($text -ceq 'resolve=empty') { return 'unroutable' }
         $found = [regex]::Match($text, '^resolve=ok connect=(err[0-9]{1,5})$')
         if ($found.Success -and ($NetworkUnroutableConnect -ccontains $found.Groups[1].Value)) { return 'unroutable' }
@@ -488,12 +492,15 @@ function Get-NetworkState([string]$stdout, [string]$name) {
         if ($text -cmatch '^resolve=ok count=[1-9][0-9]*$') { return 'open' }
         $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
         if ($found.Success -and ($NetworkDeniedResolve -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        if ($found.Success -and ($NetworkDeniedHostResolve -ccontains $found.Groups[1].Value)) { return 'blocked_resolve' }
         return 'unexpected'
     }
     if ($name -ceq 'udp') {
         if ($text -ceq 'send=ok recv=data') { return 'open' }
         $found = [regex]::Match($text, '^send=(err[0-9]{1,5})$')
         if ($found.Success -and ($NetworkDeniedUdp -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        $found = [regex]::Match($text, '^bind=(err[0-9]{1,5})$')
+        if ($found.Success -and ($NetworkDeniedBind -ccontains $found.Groups[1].Value)) { return 'blocked_bind' }
         return 'unexpected'
     }
     return 'unexpected'
@@ -601,9 +608,9 @@ function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
         $specs += @{ Name = 'temp_dir'; Exe = $probe; Arguments = 'tempdir'; Timeout = 30; Quiet = $true; Check = { param($r) $r.ExitCode -eq 0 -and (Test-ContainerTempReport $r.Stdout) } }
         $specs += @{ Name = 'network_tcp_ipv4'; Exe = $probe; Arguments = 'connect 1.1.1.1:443'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -ceq 'blocked' } }
         $specs += @{ Name = 'network_tcp_ipv6'; Exe = $probe; Arguments = 'connect [2606:4700:4700::1111]:443'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -cin @('blocked', 'unroutable') } }
-        $specs += @{ Name = 'network_tcp_host'; Exe = $probe; Arguments = 'connect github.com:443'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -ceq 'blocked' } }
-        $specs += @{ Name = 'network_dns'; Exe = $probe; Arguments = 'dns github.com'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'dns') -ceq 'blocked' } }
-        $specs += @{ Name = 'network_udp'; Exe = $probe; Arguments = 'udp 1.1.1.1:53'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'udp') -ceq 'blocked' } }
+        $specs += @{ Name = 'network_tcp_host'; Exe = $probe; Arguments = 'connect github.com:443'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -cin @('blocked', 'blocked_resolve') } }
+        $specs += @{ Name = 'network_dns'; Exe = $probe; Arguments = 'dns github.com'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'dns') -cin @('blocked', 'blocked_resolve') } }
+        $specs += @{ Name = 'network_udp'; Exe = $probe; Arguments = 'udp 1.1.1.1:53'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'udp') -cin @('blocked', 'blocked_bind') } }
         $specs += @{ Name = 'canary_runner_temp'; Exe = $probe; Arguments = ('read ' + $script:CanaryRunnerTemp); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and (Test-CanaryHidden $r.Stdout) } }
         $specs += @{ Name = 'canary_workspace'; Exe = $probe; Arguments = ('read ' + $script:CanaryWorkspace); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and (Test-CanaryHidden $r.Stdout) } }
         $specs += @{ Name = 'canary_profile'; Exe = $probe; Arguments = ('read ' + $script:CanaryProfile); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and (Test-CanaryHidden $r.Stdout) } }

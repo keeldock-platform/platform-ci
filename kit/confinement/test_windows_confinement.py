@@ -1028,7 +1028,7 @@ foreach ($case in $cases) {
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, body)
         codes = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkDeniedConnect"):wrapper.index("$NetworkUnroutableConnect")]))
-        self.assertEqual(codes, {"err10013", "err11001"})
+        self.assertEqual(codes, {"err10013", "err11001", "err11003"})
         unroutable = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkUnroutableConnect"):wrapper.index("function Get-NetworkState")]))
         self.assertEqual(unroutable, {"err10047", "err10051"})
         specs = self.function_body("Get-StageSpecs")
@@ -1044,6 +1044,10 @@ foreach ($case in $cases) {
             with self.subTest(stage=stage):
                 if stage == "network_tcp_ipv6":
                     self.assertIn("(Get-NetworkState $r.Stdout 'connect') -cin @('blocked', 'unroutable')", line)
+                elif stage in ("network_tcp_host", "network_dns"):
+                    self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -cin @('blocked', 'blocked_resolve')", line)
+                elif stage == "network_udp":
+                    self.assertIn("(Get-NetworkState $r.Stdout 'udp') -cin @('blocked', 'blocked_bind')", line)
                 else:
                     self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -ceq 'blocked'", line)
         self.assertIn(
@@ -1052,6 +1056,136 @@ foreach ($case in $cases) {
         )
         connect = self.probe[self.probe.index("fn probe_connect"):self.probe.index("fn probe_dns")]
         self.assertIn('if last == "none" || last == "err10013" {', connect)
+
+    def network_state_model(self, text, kind):
+        wrapper = self.wrapper
+
+        def names(var):
+            found = re.search(r"^\$" + var + r" = @\((.*)\)$", wrapper, re.M)
+            self.assertIsNotNone(found, var)
+            return re.findall(r"'(err[0-9]+)'", found.group(1))
+
+        connect = names("NetworkDeniedConnect")
+        resolve = names("NetworkDeniedResolve")
+        udp = names("NetworkDeniedUdp")
+        host = names("NetworkDeniedHostResolve")
+        bind = names("NetworkDeniedBind")
+        unroutable = names("NetworkUnroutableConnect")
+        if not text:
+            return "no_output"
+        if text == "wsa=failed":
+            return "wsa_failed"
+        if kind == "connect":
+            if text == "resolve=ok connect=open":
+                return "open"
+            found = re.fullmatch(r"resolve=ok connect=(err[0-9]{1,5})", text)
+            if found and found.group(1) in connect:
+                return "blocked"
+            found = re.fullmatch(r"resolve=(err[0-9]{1,5})", text)
+            if found and found.group(1) in resolve:
+                return "blocked"
+            if found and found.group(1) in host:
+                return "blocked_resolve"
+            if text == "resolve=empty":
+                return "unroutable"
+            found = re.fullmatch(r"resolve=ok connect=(err[0-9]{1,5})", text)
+            if found and found.group(1) in unroutable:
+                return "unroutable"
+            return "unexpected"
+        if kind == "dns":
+            if re.fullmatch(r"resolve=ok count=[1-9][0-9]*", text):
+                return "open"
+            found = re.fullmatch(r"resolve=(err[0-9]{1,5})", text)
+            if found and found.group(1) in resolve:
+                return "blocked"
+            if found and found.group(1) in host:
+                return "blocked_resolve"
+            return "unexpected"
+        if kind == "udp":
+            if text == "send=ok recv=data":
+                return "open"
+            found = re.fullmatch(r"send=(err[0-9]{1,5})", text)
+            if found and found.group(1) in udp:
+                return "blocked"
+            found = re.fullmatch(r"bind=(err[0-9]{1,5})", text)
+            if found and found.group(1) in bind:
+                return "blocked_bind"
+            return "unexpected"
+        return "unexpected"
+
+    def test_lpac_resolve_and_bind_denials_are_accepted_only_on_their_own_stages(self):
+        wrapper = self.wrapper
+        self.assertIn("$NetworkDeniedHostResolve = @('err11003')", wrapper)
+        self.assertIn("$NetworkDeniedBind = @('err10013')", wrapper)
+        body = self.function_body("Get-NetworkState")
+        self.assertEqual(body.count("return 'blocked_resolve'"), 2)
+        self.assertEqual(body.count("return 'blocked_bind'"), 1)
+        self.assertEqual(body.count("$NetworkDeniedHostResolve -ccontains"), 2)
+        self.assertEqual(body.count("$NetworkDeniedBind -ccontains"), 1)
+        self.assertIn("'^bind=(err[0-9]{1,5})$'", body)
+        specs = self.function_body("Get-StageSpecs")
+        confined, control = specs.split("} else {", 1)
+        accepted = {
+            "network_tcp_host": ("connect", "@('blocked', 'blocked_resolve')"),
+            "network_dns": ("dns", "@('blocked', 'blocked_resolve')"),
+            "network_udp": ("udp", "@('blocked', 'blocked_bind')"),
+        }
+        for stage in ("network_tcp_ipv4", "network_tcp_ipv6", "network_tcp_host", "network_dns", "network_udp"):
+            line = re.search(r"Name = '" + stage + r"'.*", confined).group(0)
+            with self.subTest(stage=stage):
+                if stage in accepted:
+                    kind, states = accepted[stage]
+                    self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -cin " + states, line)
+                else:
+                    self.assertNotIn("blocked_", line)
+        self.assertNotIn("blocked_", control)
+        self.assertEqual(wrapper.count("'blocked_resolve'"), 4)
+        self.assertEqual(wrapper.count("'blocked_bind'"), 2)
+        for stage in ("network_control", "network_control_ipv6", "network_control_dns", "network_control_udp"):
+            line = re.search(r"Name = '" + stage + r"'.*", control).group(0)
+            with self.subTest(control=stage):
+                self.assertNotIn("blocked", line)
+        self.assertIn("if ($networkDenied -and $networkControls) { $observed['network'] = 'blocked' }", wrapper)
+        self.assertIn("if ($networkDenied -and -not $networkControls) { $observed['network'] = 'inconclusive' }", wrapper)
+        self.assertIn("if (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'blocked')) { $observed['ipv6'] = 'blocked' }", wrapper)
+
+    def test_network_state_model_accepts_the_observed_lpac_denials_and_refuses_near_misses(self):
+        model = self.network_state_model
+        self.assertEqual(model("resolve=err11003", "connect"), "blocked_resolve")
+        self.assertEqual(model("resolve=err11003", "dns"), "blocked_resolve")
+        self.assertEqual(model("bind=err10013", "udp"), "blocked_bind")
+        self.assertEqual(model("resolve=ok connect=err10013", "connect"), "blocked")
+        self.assertEqual(model("resolve=err11001", "dns"), "blocked")
+        self.assertEqual(model("send=err10013", "udp"), "blocked")
+        for text, kind in (
+            ("resolve=err11003 connect=open", "connect"),
+            ("resolve=ok connect=err11003", "connect"),
+            ("resolve=err11004", "connect"),
+            ("resolve=err11004", "dns"),
+            ("resolve=err11003 ", "dns"),
+            ("resolve=ERR11003", "dns"),
+            ("resolve=err110031", "dns"),
+            ("resolve=ok count=0", "dns"),
+            ("bind=err11001", "udp"),
+            ("bind=err11003", "udp"),
+            ("bind=err10048", "udp"),
+            ("bind=err10013 send=ok", "udp"),
+            ("bind=err10013", "connect"),
+            ("bind=err10013", "dns"),
+            ("send=err11003", "udp"),
+            ("resolve=err11003", "udp"),
+            ("bind=", "udp"),
+            ("bind=err", "udp"),
+        ):
+            with self.subTest(text=text, kind=kind):
+                self.assertEqual(model(text, kind), "unexpected")
+        for text, kind in (
+            ("resolve=err11003", "connect"),
+            ("resolve=err11003", "dns"),
+            ("bind=err10013", "udp"),
+        ):
+            with self.subTest(control=text, kind=kind):
+                self.assertNotEqual(model(text, kind), "open")
 
     def test_network_controls_are_unconfined_and_must_be_open(self):
         specs = self.function_body("Get-StageSpecs")
