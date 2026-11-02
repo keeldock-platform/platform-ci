@@ -1,4 +1,5 @@
 import hashlib
+import re
 import unittest
 from pathlib import Path
 
@@ -8,7 +9,10 @@ from policy import PolicyError, validate_workflow_text
 from public_tree import PLATFORM_FILES, scan_tree
 
 
-__all__ = ["HandoffWorkflowPolicyTests", "HandoffLaneRegistryTests", "HandoffLanePublicTreeTests"]
+__all__ = [
+    "HandoffWorkflowPolicyTests", "HandoffLaneRegistryTests", "WindowsSourceWorkflowTests",
+    "HandoffLanePublicTreeTests",
+]
 
 ROOT = Path(__file__).resolve().parents[2]
 HANDOFF_WORKFLOW = ROOT / ".github/workflows/windows-handoff-synthetic.yml"
@@ -191,6 +195,206 @@ class HandoffLaneRegistryTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 with self.assertRaisesRegex(PolicyError, "workflow-kind"):
                     validate_workflow_text("name: handoff\n", "platform", kind)
+
+
+WINDOWS_ADMISSION_PATH = ROOT / ".github/workflows/windows-source-admission.yml"
+WINDOWS_RECEIVER_PATH = ROOT / ".github/workflows/lane-h-windows-receiver.yml"
+LINUX_FETCH_PATH = ROOT / ".github/workflows/lane-h-linux-fetch-encrypt.yml"
+CAPSULE_ATTESTER_PATH = ROOT / ".github/workflows/lane-h-capsule-attester.yml"
+SOURCE_ADMISSION_PATHS = (
+    WINDOWS_ADMISSION_PATH, WINDOWS_RECEIVER_PATH, LINUX_FETCH_PATH, CAPSULE_ATTESTER_PATH,
+)
+ADMISSION_JOB_IDS = (
+    "settings", "windows-producer", "windows-verifier", "linux-fetch-encrypt",
+    "capsule-attester", "verify-role-evidence", "audit",
+)
+ACTION_USE_PATTERN = re.compile(
+    r"^\s*uses:\s+(?:\./\.github/workflows/[a-z0-9-]+\.yml"
+    r"|[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[a-f0-9]{40}\s+" + chr(35) + r"\s+v[0-9]+\.[0-9]+\.[0-9]+)$"
+)
+SOURCE_READ_ENVIRONMENT = "environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}"
+WINDOWS_ENVIRONMENT = "environment: ${{ inputs.mode == 'source' && 'windows-source-exec' || '' }}"
+
+
+def read_ascii(path):
+    return path.read_text(encoding="ascii")
+
+
+def job_ids(text):
+    return re.findall(r"(?m)^  ([A-Za-z0-9_-]+):\n", text.split("\njobs:\n", 1)[1])
+
+
+def job_block(text, job_id):
+    matched = re.search(
+        r"(?ms)^  " + re.escape(job_id) + r":\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text,
+    )
+    return None if matched is None else matched.group(1)
+
+
+class WindowsSourceWorkflowTests(unittest.TestCase):
+    def test_windows_workflows_reference_no_source_reader_or_source_repository_secret(self):
+        for path in (WINDOWS_ADMISSION_PATH, WINDOWS_RECEIVER_PATH):
+            text = read_ascii(path)
+            with self.subTest(path=path.name):
+                self.assertNotRegex(text, r"secrets\.SOURCE_(READER|REPOSITORY)_")
+                for name in (
+                    "SOURCE_READER_PRIVATE_KEY", "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME",
+                    "linux-source-read", "KD_LINUX_LOG_CANARY", "create-github-app-token",
+                    "secrets: inherit",
+                ):
+                    self.assertNotIn(name, text)
+                self.assertLessEqual(
+                    set(re.findall(r"secrets\.([A-Za-z0-9_]+)", text)), {"KD_WINDOWS_LOG_CANARY"},
+                )
+
+    def test_the_source_secrets_exist_only_in_the_linux_fetch_job_and_its_environment(self):
+        fetch = read_ascii(LINUX_FETCH_PATH)
+        for name in ("SOURCE_READER_PRIVATE_KEY", "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME"):
+            self.assertIn("secrets." + name, fetch)
+        self.assertEqual(fetch.count(SOURCE_READ_ENVIRONMENT), 1)
+        self.assertEqual(fetch.count("environment:"), 1)
+        self.assertNotIn("KD_WINDOWS_LOG_CANARY", fetch)
+        attester = read_ascii(CAPSULE_ATTESTER_PATH)
+        self.assertNotIn("secrets.", attester)
+        self.assertNotIn("environment:", attester)
+        self.assertNotIn("vars.", attester)
+        admission = read_ascii(WINDOWS_ADMISSION_PATH)
+        self.assertEqual(admission.count("environment:"), 1)
+        self.assertEqual(admission.count(WINDOWS_ENVIRONMENT), 1)
+        self.assertIn("windows-source-exec", admission)
+
+    def test_top_level_permissions_are_empty_and_job_permissions_stay_least_privilege(self):
+        for path in SOURCE_ADMISSION_PATHS:
+            text = read_ascii(path)
+            with self.subTest(path=path.name):
+                self.assertEqual(text.count("\npermissions: {}\n"), 1)
+                self.assertLess(text.index("\npermissions: {}\n"), text.index("\njobs:\n"))
+                self.assertEqual(len(re.findall(r"(?m)^permissions:", text)), 1)
+                self.assertLessEqual(
+                    set(re.findall(r"(?m)^\s+([a-z-]+): write$", text)), {"id-token", "attestations"},
+                )
+                for widened in ("write-all", "contents: write", "actions: write", "checks: write", "packages:"):
+                    self.assertNotIn(widened, text)
+
+    def test_every_action_is_pinned_and_every_workflow_call_is_local(self):
+        for path in SOURCE_ADMISSION_PATHS:
+            lines = [line for line in read_ascii(path).splitlines() if re.match(r"\s*uses:", line)]
+            self.assertTrue(lines)
+            for line in lines:
+                with self.subTest(path=path.name, line=line):
+                    self.assertRegex(line, ACTION_USE_PATTERN)
+
+    def test_no_pull_request_trigger_matrix_dynamic_call_or_masked_failure(self):
+        for path in SOURCE_ADMISSION_PATHS:
+            text = read_ascii(path)
+            with self.subTest(path=path.name):
+                for forbidden in ("pull_request", "strategy:", "matrix:", "workflow_run:", "-latest"):
+                    self.assertNotIn(forbidden, text)
+                self.assertIsNone(re.search(r"(?m)^\s*continue-on-error\s*:", text))
+        admission = read_ascii(WINDOWS_ADMISSION_PATH)
+        self.assertIn("\non:\n  workflow_dispatch:\n    inputs:\n", admission)
+        self.assertEqual(admission.count("workflow_dispatch:"), 1)
+
+    def test_the_caller_has_exactly_the_seven_jobs_in_the_designed_dependency_shape(self):
+        text = read_ascii(WINDOWS_ADMISSION_PATH)
+        self.assertEqual(tuple(job_ids(text)), ADMISSION_JOB_IDS)
+        settings = job_block(text, "settings")
+        self.assertNotIn("needs:", settings)
+        self.assertNotIn("environment:", settings)
+        self.assertIn("runs-on: ubuntu-24.04", settings)
+        self.assertIn("KD_SOURCE_PREFIX: WINDOWS_SOURCE", settings)
+        for job_id, role in (("windows-producer", "producer"), ("windows-verifier", "verifier")):
+            block = job_block(text, job_id)
+            with self.subTest(job=job_id):
+                self.assertIn("    needs:\n      - settings\n", block)
+                self.assertIn("uses: ./.github/workflows/lane-h-windows-receiver.yml\n", block)
+                self.assertIn("      profile: candidate\n", block)
+                self.assertIn("      role: " + role + "\n", block)
+                self.assertNotIn("secrets:", block)
+        fetch = job_block(text, "linux-fetch-encrypt")
+        self.assertIn("    needs:\n      - settings\n    if:", fetch)
+        self.assertIn("uses: ./.github/workflows/lane-h-linux-fetch-encrypt.yml\n", fetch)
+        attester = job_block(text, "capsule-attester")
+        self.assertIn("    needs:\n      - settings\n      - linux-fetch-encrypt\n", attester)
+        self.assertIn("uses: ./.github/workflows/lane-h-capsule-attester.yml\n", attester)
+        for block in (fetch, attester):
+            self.assertIn("      profile: candidate\n", block)
+        evidence = job_block(text, "verify-role-evidence")
+        self.assertIn(
+            "    needs:\n      - settings\n      - windows-producer\n      - windows-verifier\n"
+            "      - linux-fetch-encrypt\n      - capsule-attester\n", evidence,
+        )
+        audit = job_block(text, "audit")
+        self.assertIn(
+            "    needs:\n      - settings\n      - windows-producer\n      - windows-verifier\n"
+            "      - linux-fetch-encrypt\n      - capsule-attester\n      - verify-role-evidence\n", audit,
+        )
+        for block in (evidence, audit):
+            self.assertIn("if: ${{ always() && ", block)
+
+    def test_modes_run_on_their_own_refs_and_the_run_title_carries_the_bound_commit(self):
+        text = read_ascii(WINDOWS_ADMISSION_PATH)
+        self.assertIn(
+            "run-name: Windows admission ${{ inputs.mode }} ${{ inputs.mode == 'source' && inputs.source_sha || 'synthetic' }}\n",
+            text,
+        )
+        self.assertIn("        options:\n          - synthetic\n          - source\n        default: synthetic\n", text)
+        self.assertIn("        default: windows-source-exec\n", text)
+        gate = (
+            "((inputs.mode == 'synthetic' && github.ref == 'refs/heads/main') || "
+            "(inputs.mode == 'source' && github.ref == 'refs/heads/untrusted'))"
+        )
+        for job_id in ("settings", "windows-producer", "windows-verifier", "linux-fetch-encrypt", "capsule-attester"):
+            self.assertIn(gate, job_block(text, job_id))
+        for path in (LINUX_FETCH_PATH, CAPSULE_ATTESTER_PATH):
+            role_text = read_ascii(path)
+            self.assertIn("inputs.profile == 'candidate'", role_text)
+            self.assertIn(
+                "((inputs.mode == 'synthetic' && github.ref == 'refs/heads/main') || "
+                "(inputs.mode == 'source' && github.ref == 'refs/heads/untrusted'))", role_text,
+            )
+
+    def test_the_linux_fetch_job_revokes_the_token_for_real_before_any_capsule_is_built(self):
+        text = read_ascii(LINUX_FETCH_PATH)
+        mint = text.index("      - name: Mint scoped source-reader token\n")
+        checkout = text.index("      - name: Fetch exact source and verify binding")
+        revoke = text.index("      - name: handoff-revoke-source-token-v1\n")
+        verify = text.index("      - name: handoff-verify-token-rejection-v1\n")
+        capsule = text.index("      - name: Build the two receiver-bound source capsules\n")
+        self.assertLess(mint, checkout)
+        self.assertLess(checkout, revoke)
+        self.assertLess(revoke, verify)
+        self.assertLess(verify, capsule)
+        self.assertEqual(text.count("handoff-revocation=confirmed"), 1)
+        self.assertGreater(text.index("handoff-revocation=confirmed"), verify)
+        self.assertEqual(text.count("linux_source_build.py revoke"), 1)
+        self.assertIn("skip-token-revoke: true", text)
+        self.assertIn("if: ${{ always() && (inputs.mode == 'synthetic' || steps.source-reader-token.outputs.token != '') }}", text)
+
+    def test_the_capsule_artifacts_are_one_day_uncompressed_and_named_by_run_and_attempt(self):
+        text = read_ascii(LINUX_FETCH_PATH)
+        for role in ("producer", "verifier"):
+            block = text[text.index("      - name: Upload the " + role + " source capsule\n"):]
+            block = block.split("\n      - name: ", 1)[0]
+            with self.subTest(role=role):
+                self.assertIn("name: source-capsule-" + role + "-${{ github.run_id }}-${{ github.run_attempt }}\n", block)
+                self.assertIn("retention-days: 1\n", block)
+                self.assertIn("compression-level: 0\n", block)
+                self.assertIn("if-no-files-found: error\n", block)
+        self.assertEqual(text.count("compression-level: 0"), 2)
+
+    def test_each_role_workflow_has_one_job_one_signing_step_and_the_role_job_name(self):
+        for path, job_id in ((LINUX_FETCH_PATH, "linux-fetch-encrypt"), (CAPSULE_ATTESTER_PATH, "capsule-attester")):
+            text = read_ascii(path)
+            with self.subTest(path=path.name):
+                self.assertEqual(job_ids(text), [job_id])
+                self.assertIn("    name: role-" + job_id + "-v1\n", text)
+                self.assertEqual(text.count("uses: actions/attest@"), 1)
+                self.assertEqual(text.count("workflow_call:"), 1)
+                self.assertIn("      profile:\n        required: true\n        type: string\n", text)
+        caller = read_ascii(WINDOWS_ADMISSION_PATH)
+        for job_id in ("windows-producer", "windows-verifier", "linux-fetch-encrypt", "capsule-attester"):
+            self.assertIn("    name: role-call-" + job_id + "-v1\n", job_block(caller, job_id))
 
 
 class HandoffLanePublicTreeTests(unittest.TestCase):

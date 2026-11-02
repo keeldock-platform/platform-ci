@@ -18,6 +18,13 @@ annotation, artifact and cache records it checks that:
     admitted until a content scan exists
     the repository cache inventory equals the digest taken before the producer jobs ran
 
+The Windows source profile is a separate closed shape selected by the windows argument. It has six
+audited jobs, four of them called workflows whose step lists are matched as required steps in order
+with every other step succeeding, a verdict that must be an accepted full run in both modes, and an
+artifact inventory that is exactly two capsules, four role statements and one evidence bundle, each
+unexpired with one day retention. The windows-expected argument builds the expected description and
+the pre-run cache digest for the later audit job.
+
 The request, configuration, run identity and job listing are checked first, because they decide
 what is scanned. After that the canary scan precedes every other check, so a failed or
 cancelled producer that leaked the canary still refuses with the canary phase. Anything missing, incomplete, paginated short,
@@ -859,6 +866,353 @@ def quick_audit_line(api, expected, config=None):
         return False, refusal_line("unavailable")
 
 
+WINDOWS_MODE = "windows"
+WINDOWS_EXPECTED_ARG = "windows-expected"
+WINDOWS_WORKFLOW_PATH = ".github/workflows/windows-source-admission.yml"
+WINDOWS_TITLE_PREFIX = "Windows admission source "
+WINDOWS_SYNTHETIC_TITLE = "Windows admission synthetic synthetic"
+WINDOWS_SETTINGS_JOB = "settings"
+WINDOWS_PRODUCER_JOB = "role-call-windows-producer-v1 / role-windows-receiver-v1"
+WINDOWS_VERIFIER_JOB = "role-call-windows-verifier-v1 / role-windows-receiver-v1"
+WINDOWS_LINUX_JOB = "role-call-linux-fetch-encrypt-v1 / role-linux-fetch-encrypt-v1"
+WINDOWS_ATTESTER_JOB = "role-call-capsule-attester-v1 / role-capsule-attester-v1"
+WINDOWS_EVIDENCE_JOB = "verify-role-evidence-windows-source"
+WINDOWS_AUDITOR_JOB = "audit"
+WINDOWS_OPEN_JOBS = (
+    WINDOWS_PRODUCER_JOB, WINDOWS_VERIFIER_JOB, WINDOWS_LINUX_JOB, WINDOWS_ATTESTER_JOB,
+)
+WINDOWS_VERDICT_STEP = "Publish confinement verdict"
+WINDOWS_SETTINGS_STEPS = (
+    "Set up job",
+    "Fetch exact public control",
+    "Snapshot cache inventory and validate preflight",
+    "Build audit identity",
+    "Complete job",
+)
+WINDOWS_EVIDENCE_STEPS = (
+    "Set up job",
+    "Checkout reviewed control files",
+    "Collect complete attempt-specific job and artifact evidence",
+    "Retain source-free role evidence",
+    "Apply the exact candidate profile and uniqueness policy",
+    "Post Checkout reviewed control files",
+    "Complete job",
+)
+WINDOWS_PRODUCER_STEPS = ("Set up job", "Complete job")
+WINDOWS_VERIFIER_STEPS = ("Set up job", WINDOWS_VERDICT_STEP, "Complete job")
+WINDOWS_LINUX_STEPS = (
+    "Set up job",
+    "Wait for both exact current-attempt receiver artifacts",
+    "handoff-revoke-source-token-v1",
+    "handoff-verify-token-rejection-v1",
+    "Upload the producer source capsule",
+    "Upload the verifier source capsule",
+    "Complete job",
+)
+WINDOWS_LINUX_SYNTHETIC_SKIPS = (
+    "Repeat preflight in source-read",
+    "Record image and fetch pinned toolchains",
+    "Mint scoped source-reader token",
+    "Verify selected installation identity",
+    "Fetch exact source and verify binding, tree, signatures and lock provenance",
+    "Require trusted Rust licence admission",
+    "Run trusted dependency audit",
+    "Post Mint scoped source-reader token",
+)
+WINDOWS_ATTESTER_STEPS = (
+    "Set up job",
+    "Sign only the capsule-attester role statement",
+    "Upload exact attester subject, predicate, and bundle",
+    "Complete job",
+)
+WINDOWS_EXPECTED_FIELDS = EXPECTED_FIELDS | frozenset(("open_jobs",))
+WINDOWS_CAPSULE_PREFIX = "source-capsule-"
+WINDOWS_CAPSULE_ROLES = ("producer", "verifier")
+WINDOWS_EVIDENCE_PREFIX = "role-signer-candidate-evidence-"
+WINDOWS_CAPSULE_BYTES = 286261248
+WINDOWS_CAPSULE_SLACK_BYTES = 8192
+WINDOWS_SMALL_ARTIFACT_BYTES = 16 * 1024 * 1024
+WINDOWS_RETENTION_SECONDS = 24 * 60 * 60
+WINDOWS_RETENTION_SLACK_SECONDS = 600
+WINDOWS_ARTIFACT_COUNT = 7
+WINDOWS_ROLE_ARTIFACT_RE = re.compile(
+    r"role-statement-(windows-receiver|windows-producer|windows-verifier|linux-fetch-encrypt"
+    r"|capsule-attester)-([1-9][0-9]{0,15})-([1-9][0-9]?)-([a-f0-9]{32})"
+)
+WINDOWS_ROLE_COUNTS = (("windows", 2), ("linux-fetch-encrypt", 1), ("capsule-attester", 1))
+WINDOWS_SYNTHETIC_CANARY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+WINDOWS_CANARY_ENV = "KD_WINDOWS_LOG_CANARY"
+
+
+def windows_capsule_names(run_id, run_attempt):
+    return tuple(
+        WINDOWS_CAPSULE_PREFIX + role + "-" + str(run_id) + "-" + str(run_attempt)
+        for role in WINDOWS_CAPSULE_ROLES
+    )
+
+
+def windows_evidence_name(run_id, run_attempt):
+    return WINDOWS_EVIDENCE_PREFIX + str(run_id) + "-" + str(run_attempt)
+
+
+def _windows_open_spec_ok(name, spec):
+    if (type(spec) is not dict or set(spec) != JOB_FIELDS
+            or not _text_tuple(spec["steps"], 2, 100, LABEL_RE)
+            or not _text_tuple(spec["optional_steps"], 0, 100, LABEL_RE)):
+        return False
+    steps = spec["steps"]
+    return (steps[0] == "Set up job" and steps[-1] == "Complete job"
+            and len(set(steps)) == len(steps)
+            and not set(spec["optional_steps"]) & set(steps))
+
+
+def validate_expected_windows(expected):
+    """Refuse any expected Windows source-run description that is not exactly the closed shape."""
+    if type(expected) is not dict or set(expected) != WINDOWS_EXPECTED_FIELDS:
+        _fail("request")
+    jobs = expected["jobs"]
+    run_id = expected["run_id"]
+    if (type(expected["repository"]) is not str or REPOSITORY_RE.fullmatch(expected["repository"]) is None
+            or not _is(expected["os"], "windows")
+            or type(expected["mode"]) is not str or expected["mode"] not in MODES
+            or type(expected["control_sha"]) is not str or SHA_RE.fullmatch(expected["control_sha"]) is None
+            or not _exact_int(run_id, 1)
+            or not _is(expected["run_attempt"], 1)
+            or not _is(expected["workflow_path"], WINDOWS_WORKFLOW_PATH)
+            or type(expected["ci_ref"]) is not str or expected["ci_ref"] not in CI_REFS
+            or (expected["mode"] == "synthetic" and expected["ci_ref"] != "main")
+            or (expected["mode"] == "synthetic"
+                and not _is(expected["display_title"], WINDOWS_SYNTHETIC_TITLE))
+            or type(expected["display_title"]) is not str
+            or LABEL_RE.fullmatch(expected["display_title"]) is None
+            or (expected["mode"] == "candidate"
+                and (not expected["display_title"].startswith(WINDOWS_TITLE_PREFIX)
+                     or SHA_RE.fullmatch(expected["display_title"][len(WINDOWS_TITLE_PREFIX):]) is None))
+            or not _is(expected["verdict_job"], WINDOWS_VERIFIER_JOB)
+            or not _is(expected["verdict_step"], WINDOWS_VERDICT_STEP)
+            or not _is(expected["auditor_job"], WINDOWS_AUDITOR_JOB)
+            or not _is(expected["artifact_names"], windows_capsule_names(run_id, expected["run_attempt"]))
+            or not _is(expected["open_jobs"], WINDOWS_OPEN_JOBS)
+            or type(expected["cache_digest"]) is not str
+            or DIGEST_RE.fullmatch(expected["cache_digest"]) is None
+            or type(jobs) is not dict
+            or set(jobs) != set(WINDOWS_OPEN_JOBS) | {WINDOWS_SETTINGS_JOB, WINDOWS_EVIDENCE_JOB}):
+        _fail("request")
+    for name, spec in jobs.items():
+        if name in WINDOWS_OPEN_JOBS:
+            if not _windows_open_spec_ok(name, spec):
+                _fail("request")
+            continue
+        if (type(spec) is not dict or set(spec) != JOB_FIELDS
+                or not _text_tuple(spec["steps"], 1, 100, LABEL_RE)
+                or not _text_tuple(spec["optional_steps"], 0, 100, LABEL_RE)
+                or not set(spec["optional_steps"]).issubset(spec["steps"])):
+            _fail("request")
+    verdict_steps = jobs[WINDOWS_VERIFIER_JOB]["steps"]
+    if (verdict_steps.count(WINDOWS_VERDICT_STEP) != 1
+            or WINDOWS_VERDICT_STEP in jobs[WINDOWS_VERIFIER_JOB]["optional_steps"]):
+        _fail("request")
+    for name in (WINDOWS_PRODUCER_JOB, WINDOWS_LINUX_JOB, WINDOWS_ATTESTER_JOB):
+        if any("verdict" in step.lower() for step in jobs[name]["steps"]):
+            _fail("request")
+
+
+def _check_open_steps(job, spec):
+    steps = job["steps"]
+    if (len(steps) < len(spec["steps"]) or len(steps) > 100
+            or steps[0].get("name") != "Set up job" or steps[-1].get("name") != "Complete job"):
+        _fail("job_steps")
+    required = list(spec["steps"])
+    for index, step in enumerate(steps, start=1):
+        if (type(step) is not dict or not _is(step.get("number"), index)
+                or type(step.get("name")) is not str or LABEL_RE.fullmatch(step["name"]) is None
+                or not _is(step.get("status"), "completed")):
+            _fail("job_steps")
+        conclusion = step.get("conclusion")
+        if conclusion != "success" and not (
+                conclusion == "skipped" and step["name"] in spec["optional_steps"]):
+            _fail("job_steps")
+        if required and step["name"] == required[0]:
+            required.pop(0)
+    if required:
+        _fail("job_steps")
+    names = [step["name"] for step in steps]
+    for name in spec["steps"]:
+        if names.count(name) != 1:
+            _fail("job_steps")
+
+
+def _check_windows_jobs(jobs, expected):
+    by_name = _index_jobs(jobs, expected)
+    for name, spec in expected["jobs"].items():
+        job = by_name[name]
+        if job.get("status") != "completed" or job.get("conclusion") != "success":
+            _fail("jobs")
+        if name in expected["open_jobs"]:
+            _guard("job_steps", _check_open_steps, job, spec)
+        else:
+            _guard("job_steps", _check_steps, job, spec)
+    return by_name
+
+
+def _windows_artifact_time_ok(item):
+    lifetime = (_quick_time(item["expires_at"]) - _quick_time(item["created_at"])).total_seconds()
+    return 0 < lifetime <= WINDOWS_RETENTION_SECONDS + WINDOWS_RETENTION_SLACK_SECONDS
+
+
+def _check_windows_artifacts(api, expected):
+    path = ("/repos/" + expected["repository"] + "/actions/runs/" + str(expected["run_id"])
+            + "/artifacts")
+    items = _collect_counted(api, path, "artifacts", MAX_ARTIFACTS)
+    if len(items) != WINDOWS_ARTIFACT_COUNT:
+        _fail("artifact_inventory")
+    run_id = expected["run_id"]
+    attempt = expected["run_attempt"]
+    capsules = set(expected["artifact_names"])
+    evidence = windows_evidence_name(run_id, attempt)
+    seen = set()
+    counts = {"windows": 0, "linux-fetch-encrypt": 0, "capsule-attester": 0}
+    for item in items:
+        if type(item) is not dict or not QUICK_ARTIFACT_FIELDS.issubset(item):
+            _fail("artifact_inventory")
+        name = item["name"]
+        run = item["workflow_run"]
+        size = item["size_in_bytes"]
+        if (type(name) is not str or name in seen or not _exact_int(item["id"], 1)
+                or not _is(item["expired"], False)
+                or type(run) is not dict
+                or not _is(run.get("id"), run_id)
+                or not _is(run.get("head_sha"), expected["control_sha"])
+                or not _is(run.get("head_branch"), expected["ci_ref"])
+                or not _windows_artifact_time_ok(item)):
+            _fail("artifact_inventory")
+        seen.add(name)
+        if name in capsules:
+            if not _exact_int(size, WINDOWS_CAPSULE_BYTES, WINDOWS_CAPSULE_BYTES + WINDOWS_CAPSULE_SLACK_BYTES):
+                _fail("artifact_inventory")
+            continue
+        if not _exact_int(size, 1, WINDOWS_SMALL_ARTIFACT_BYTES):
+            _fail("artifact_inventory")
+        if name == evidence:
+            continue
+        matched = WINDOWS_ROLE_ARTIFACT_RE.fullmatch(name)
+        if (matched is None or matched.group(2) != str(run_id) or matched.group(3) != str(attempt)):
+            _fail("artifact_inventory")
+        role = matched.group(1)
+        counts["windows" if role.startswith("windows-") else role] += 1
+    if (not capsules.issubset(seen) or evidence not in seen
+            or any(counts[kind] != number for kind, number in WINDOWS_ROLE_COUNTS)):
+        _fail("artifact_inventory")
+
+
+def _check_windows_verdict(line, expected):
+    record = confinement_verdict.decode_line(line)
+    if (record["os"] != "windows" or record["control_sha"] != expected["control_sha"]
+            or record["run_id"] != expected["run_id"]
+            or record["run_attempt"] != expected["run_attempt"]
+            or not confinement_verdict.run_accepted(record)):
+        _fail("verdict")
+
+
+def audit_windows(api, expected, config=None):
+    """Return the accepted Windows line, or raise AuditRefusal naming only a closed phase."""
+    _guard("request", validate_expected_windows, expected)
+    resolved = _guard("log_canary", _resolve_config, config)
+    _guard("run", _check_run, api, expected)
+    jobs = _guard("jobs", _list_jobs, api, expected)
+    logs, texts, pending, unscanned = _gather(api, jobs, expected)
+    _scan(logs, texts, resolved)
+    if unscanned:
+        _fail("log_canary")
+    by_name = _guard("jobs", _check_windows_jobs, jobs, expected)
+    if pending:
+        _fail(pending[0])
+    line = _guard("verdict", _verdict_line, logs, by_name, expected)
+    _guard("verdict", _check_windows_verdict, line, expected)
+    if any(VERDICT_PREFIX in text.encode("utf-8", "replace") for text in texts):
+        _fail("annotations")
+    _guard("artifact_inventory", _check_windows_artifacts, api, expected)
+    items = _guard("cache_inventory", _collect_caches, api, expected["repository"])
+    if _guard("cache_inventory", cache_inventory_digest, items) != expected["cache_digest"]:
+        _fail("cache_inventory")
+    return accepted_line(expected)
+
+
+def windows_audit_line(api, expected, config=None):
+    """Return a pair of the accepted flag and the one public line; never raises on a refusal."""
+    try:
+        return True, audit_windows(api, expected, config)
+    except AuditRefusal as error:
+        return False, refusal_line(error.phase)
+    except Exception:
+        return False, refusal_line("unavailable")
+
+
+def windows_expected(environ, cache_digest):
+    """Build the expected Windows run description from the dispatch environment."""
+    mode = environ.get("CI_MODE", "")
+    run_id = environ.get("GITHUB_RUN_ID", "")
+    attempt = environ.get("GITHUB_RUN_ATTEMPT", "")
+    source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
+    ci_ref = environ.get("CI_REF", "")
+    if (mode not in ("source", "synthetic") or re.fullmatch(r"[1-9][0-9]{0,15}", run_id) is None
+            or attempt != "1" or ci_ref not in ("refs/heads/main", "refs/heads/untrusted")
+            or SHA_RE.fullmatch(environ.get("CI_SHA", "")) is None
+            or (mode == "source" and SHA_RE.fullmatch(source_sha) is None)):
+        _fail("request")
+    run_number = int(run_id)
+    if mode == "source":
+        title = WINDOWS_TITLE_PREFIX + source_sha
+        optional = ()
+    else:
+        title = WINDOWS_SYNTHETIC_TITLE
+        optional = WINDOWS_LINUX_SYNTHETIC_SKIPS
+    expected = {
+        "repository": environ.get("CI_REPOSITORY", ""),
+        "os": "windows",
+        "mode": "candidate" if mode == "source" else "synthetic",
+        "control_sha": environ["CI_SHA"],
+        "run_id": run_number,
+        "run_attempt": 1,
+        "workflow_path": WINDOWS_WORKFLOW_PATH,
+        "ci_ref": ci_ref.removeprefix("refs/heads/"),
+        "display_title": title,
+        "jobs": {
+            WINDOWS_SETTINGS_JOB: {"steps": WINDOWS_SETTINGS_STEPS, "optional_steps": ()},
+            WINDOWS_PRODUCER_JOB: {"steps": WINDOWS_PRODUCER_STEPS, "optional_steps": ()},
+            WINDOWS_VERIFIER_JOB: {"steps": WINDOWS_VERIFIER_STEPS, "optional_steps": ()},
+            WINDOWS_LINUX_JOB: {"steps": WINDOWS_LINUX_STEPS, "optional_steps": optional},
+            WINDOWS_ATTESTER_JOB: {"steps": WINDOWS_ATTESTER_STEPS, "optional_steps": ()},
+            WINDOWS_EVIDENCE_JOB: {"steps": WINDOWS_EVIDENCE_STEPS, "optional_steps": ()},
+        },
+        "verdict_job": WINDOWS_VERIFIER_JOB,
+        "verdict_step": WINDOWS_VERDICT_STEP,
+        "auditor_job": WINDOWS_AUDITOR_JOB,
+        "artifact_names": windows_capsule_names(run_number, 1),
+        "open_jobs": WINDOWS_OPEN_JOBS,
+        "cache_digest": cache_digest if DIGEST_RE.fullmatch(cache_digest or "") else "0" * 64,
+    }
+    validate_expected_windows(expected)
+    return expected
+
+
+def _write_windows_expected(env, sink, factory):
+    """Write the expected description and the pre-run cache digest to the step output."""
+    token = env.get("GITHUB_TOKEN", "")
+    repository = env.get("CI_REPOSITORY", "")
+    api = factory(token, repository)
+    digest = snapshot_cache_digest(api, repository)
+    expected = windows_expected(env, digest)
+    encoded = json.dumps(expected, sort_keys=True, separators=(",", ":"))
+    path = env.get("GITHUB_OUTPUT", "")
+    if not path:
+        _fail("request")
+    with open(path, "at", encoding="ascii") as output:
+        output.write("expected=" + encoded + "\n")
+        output.write("cache_digest=" + digest + "\n")
+    sink.write("windows-source-audit-identity=prepared\n")
+
+
 def _unique_object(pairs):
     value = {}
     for key, item in pairs:
@@ -868,8 +1222,10 @@ def _unique_object(pairs):
     return value
 
 
-def parse_expected(raw, quick=False):
+def parse_expected(raw, quick=False, windows=False):
     """Build the expected-run description from its JSON form, converting lists to tuples."""
+    if quick and windows:
+        _fail("request")
     if type(raw) is not str or not raw or len(raw) > MAX_EXPECTED_BYTES:
         _fail("request")
     try:
@@ -886,8 +1242,12 @@ def parse_expected(raw, quick=False):
                 for field in JOB_FIELDS:
                     if type(spec.get(field)) is list:
                         spec[field] = tuple(spec[field])
+    if type(value.get("open_jobs")) is list:
+        value["open_jobs"] = tuple(value["open_jobs"])
     if quick:
         validate_expected_quick(value)
+    elif windows:
+        validate_expected_windows(value)
     else:
         validate_expected(value)
     return value
@@ -954,6 +1314,14 @@ def _default_api_factory(token, repository):
     return Client(token)
 
 
+def _windows_config(environ):
+    value = WINDOWS_SYNTHETIC_CANARY if environ.get("CI_MODE") == "synthetic" else environ.get(WINDOWS_CANARY_ENV, "")
+    try:
+        return log_canary.compute_config(value)
+    except Exception:
+        _fail("log_canary")
+
+
 def main(arguments=None, environ=None, api_factory=None, stdout=None):
     """Workflow entry point: print one public line and exit zero only for an accepted audit."""
     actual = sys.argv[1:] if arguments is None else arguments
@@ -961,19 +1329,34 @@ def main(arguments=None, environ=None, api_factory=None, stdout=None):
     sink = sys.stdout if stdout is None else stdout
     factory = _default_api_factory if api_factory is None else api_factory
     quick = list(actual) == [QUICK_MODE]
-    if actual and not quick:
+    windows = list(actual) == [WINDOWS_MODE]
+    identity = list(actual) == [WINDOWS_EXPECTED_ARG]
+    if actual and not (quick or windows or identity):
         return 2
+    if identity:
+        try:
+            _write_windows_expected(env, sink, factory)
+            return 0
+        except BaseException:
+            sink.write("windows-source-audit-identity=unavailable\n")
+            return 1
     try:
-        expected = parse_expected(env.get(EXPECTED_ENV, ""), quick)
+        expected = parse_expected(env.get(EXPECTED_ENV, ""), quick, windows)
         if (env.get("GITHUB_REPOSITORY") != expected["repository"]
                 or env.get("GITHUB_RUN_ID") != str(expected["run_id"])
                 or env.get("GITHUB_RUN_ATTEMPT") != str(expected["run_attempt"])
                 or env.get("GITHUB_SHA") != expected["control_sha"]):
             _fail("request")
-        runner = quick_audit_line if quick else audit_line
-        accepted, line = runner(
-            factory(env.get("GITHUB_TOKEN", ""), expected["repository"]), expected,
-        )
+        if windows:
+            accepted, line = windows_audit_line(
+                factory(env.get("GITHUB_TOKEN", ""), expected["repository"]), expected,
+                _windows_config(env),
+            )
+        else:
+            runner = quick_audit_line if quick else audit_line
+            accepted, line = runner(
+                factory(env.get("GITHUB_TOKEN", ""), expected["repository"]), expected,
+            )
     except AuditRefusal as error:
         accepted, line = False, refusal_line(error.phase)
     except Exception:

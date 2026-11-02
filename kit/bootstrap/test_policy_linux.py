@@ -711,9 +711,14 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
                 self.assertIn(script, PLATFORM_FILES)
                 self.assertTrue((ROOT / script).is_file())
         unit = self.jobs()["core-linux-quick-return-unit"]
-        for script in ("test_policy_linux.py", "test_linux_source_build.py", "test_linux_quick_return.py", "test_separation.py"):
-            self.assertIn("python3 -B kit/", unit)
-            self.assertIn(script, unit)
+        self.assertIn("python3 -B kit/", unit)
+        for command in (
+            "python3 -B kit/bootstrap/test_policy_linux.py",
+            "python3 -B kit/confinement/test_linux_source_build.py",
+            "python3 -B core-ci/test_linux_quick_return.py",
+            "python3 -B core-ci/test_separation.py",
+        ):
+            self.assertIn(command, unit)
 
     def test_mutations_of_the_quick_workflow_are_refused_as_template_mismatches(self):
         mutations = (

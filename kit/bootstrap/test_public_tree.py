@@ -388,6 +388,8 @@ class PublicTreeTests(unittest.TestCase):
             "kit/baselines/test_baselines_prepare.py",
             "kit/bootstrap/policy_baselines.py",
             "kit/bootstrap/test_policy_baselines.py",
+            "kit/confinement/confinement_public_audit.py",
+            "kit/confinement/macos_public_audit.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))
