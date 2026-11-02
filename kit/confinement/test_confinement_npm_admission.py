@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import tarfile
 import tempfile
 import unittest
@@ -770,6 +771,249 @@ class NpmAdmissionTests(unittest.TestCase):
         self.assertNotIn("HTTP_PROXY", environment)
         self.assertNotIn("npm_config_registry", environment)
         self.assertNotIn("/untrusted/path", environment["PATH"])
+
+
+class NpmLockDetailTests(unittest.TestCase):
+    PATH = "node_modules/sample-package-00"
+
+    def refusal(self, change=None, **keywords):
+        lock, unused_bytes, unused_archives, unused_material = _fixture()
+        if change is not None:
+            change(lock)
+        raw = json.dumps(lock).encode("ascii")
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.parse_lock(raw, **keywords)
+        error = raised.exception
+        self.assertEqual((error.reason, str(error)), ("npm_lock_invalid", "npm_lock_invalid"))
+        self.assertIsNotNone(error.detail)
+        self.assertLessEqual(len(error.detail), subject.DETAIL_MAX_BYTES)
+        self.assertTrue(error.detail.isascii())
+        self.assertIsNotNone(subject.DETAIL_RE.match(error.detail))
+        return error.detail
+
+    def entry(self, **fields):
+        return lambda lock: lock["packages"][self.PATH].update(fields)
+
+    def test_the_lock_level_refusals_name_their_check(self):
+        self.assertEqual(self.refusal(lambda lock: lock.update({"extra": 1})), "root_fields")
+        self.assertEqual(self.refusal(lambda lock: lock.update({"lockfileVersion": 2})), "lockfile_version")
+        self.assertEqual(self.refusal(lambda lock: lock.update({"lockfileVersion": True})), "lockfile_version")
+        self.assertEqual(self.refusal(lambda lock: lock.update({"name": "Bad Name"})), "root_name")
+        self.assertEqual(self.refusal(lambda lock: lock.update({"version": "x"})), "root_version")
+        self.assertEqual(self.refusal(lambda lock: lock.update({"requires": False})), "root_requires")
+        self.assertEqual(self.refusal(internal_names=7), "internal_names")
+        self.assertEqual(self.refusal(internal_names=("Bad Name",)), "internal_names")
+        self.assertEqual(self.refusal(workspace_links={}), "link_config")
+        self.assertEqual(self.refusal(workspace_links=[]), "link_config")
+        self.assertEqual(
+            self.refusal(workspace_links={"node_modules/a": "other/a"}), "link_config:node_modules/a",
+        )
+        self.assertEqual(self.refusal(lambda lock: lock.update({"packages": []})), "packages_shape")
+        self.assertEqual(self.refusal(lambda lock: lock["packages"].pop("")), "packages_shape")
+
+    def test_the_input_and_json_refusals_name_their_check(self):
+        for raw, token in (
+            (b"", "json_size"), (b"{", "json_decode"), (b'{"a":1,"a":2}', "json_decode"),
+            (b'{"a":1.5}', "json_decode"), (b'{"a":NaN}', "json_decode"),
+            (b"\xef\xbb\xbf{}", "json_bom"), (b'{"__proto__":1}', "json_key"),
+            (b'{"a":' + b"9" * 17 + b"}", "json_decode"),
+        ):
+            with self.subTest(raw=raw):
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject.parse_lock(raw)
+                self.assertEqual(raised.exception.detail, token)
+                self.assertEqual(raised.exception.reason, "npm_lock_invalid")
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.parse_lock(b" " * (subject.MAX_LOCK_BYTES + 1))
+        self.assertEqual(raised.exception.detail, "lock_size")
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.parse_lock("text")
+        self.assertEqual(raised.exception.detail, "lock_size")
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.registry_entries("text")
+        self.assertEqual(raised.exception.detail, "lock_type")
+        deep = b"{" + (b'"x":{' * (subject.MAX_JSON_DEPTH + 2)) + b'"x":0' + (b"}" * (subject.MAX_JSON_DEPTH + 3))
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.parse_lock(deep)
+        self.assertIn(raised.exception.detail, ("json_limits", "json_decode"))
+        with self.assertRaises(subject.Refusal) as raised:
+            subject._integrity_bytes("sha1-x")
+        self.assertEqual(raised.exception.detail, "integrity_bytes")
+
+    def test_the_entry_shape_refusals_name_the_lock_path_and_the_field(self):
+        path = self.PATH
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"].update({"weird/path": {}})), "entry_path:weird/path",
+        )
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"].update({"node_modules/a b": {}})),
+            "entry_path:invalid_name",
+        )
+        self.assertEqual(self.refusal(lambda lock: lock["packages"].update({path: "x"})), "entry_shape:" + path)
+        self.assertEqual(self.refusal(self.entry(bogus=1)), "entry_key:" + path + ":bogus")
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"][path].update({"a b\nc": 1})),
+            "entry_key:" + path + ":invalid_name",
+        )
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"][""].update({"bogus": 1})), "entry_key:root:bogus",
+        )
+        self.assertEqual(self.refusal(self.entry(optional="yes")), "entry_bool:" + path + ":optional")
+        self.assertEqual(self.refusal(self.entry(inBundle=True)), "entry_inbundle:" + path)
+        self.assertEqual(self.refusal(self.entry(peerDependenciesMeta=[])), "peer_meta:" + path)
+        self.assertEqual(
+            self.refusal(self.entry(peerDependenciesMeta={"a": {"other": True}})), "peer_meta:" + path + ":a",
+        )
+        self.assertEqual(self.refusal(self.entry(workspaces="x")), "workspaces_shape:" + path)
+        self.assertEqual(self.refusal(self.entry(workspaces=["../x"])), "workspaces_path:" + path)
+        self.assertEqual(self.refusal(self.entry(os="linux")), "entry_list:" + path + ":os")
+        self.assertEqual(self.refusal(self.entry(cpu=[1])), "entry_list:" + path + ":cpu")
+        self.assertEqual(
+            self.refusal(self.entry(bundledDependencies=["a"])), "bundled_deps:" + path + ":bundledDependencies",
+        )
+        self.assertEqual(self.refusal(self.entry(engines=["node >= 14"])), "engines_shape:" + path)
+        self.assertEqual(self.refusal(self.entry(engines={"node": 14})), "engines_shape:" + path)
+        self.assertEqual(self.refusal(self.entry(bin=7)), "bin_shape:" + path)
+        self.assertEqual(self.refusal(self.entry(bin={"x": "../y"})), "bin_value:" + path)
+        self.assertEqual(self.refusal(self.entry(license=7)), "entry_text:" + path + ":license")
+        self.assertEqual(self.refusal(self.entry(deprecated=["x"])), "entry_text:" + path + ":deprecated")
+        self.assertEqual(self.refusal(self.entry(funding=7)), "funding_shape:" + path)
+
+    def test_the_dependency_refusals_name_the_path_field_and_dependency_and_the_spec_scheme(self):
+        path = self.PATH
+
+        def spec(field, name, value):
+            return lambda lock: lock["packages"][path].update({field: {name: value}})
+
+        prefix = "dep_spec:" + path + ":dependencies:"
+        self.assertEqual(
+            self.refusal(spec("dependencies", "string-width-cjs", "npm:string-width@^4.2.0")),
+            prefix + "string-width-cjs scheme:npm",
+        )
+        for value, scheme in (
+            ("git+https:" + chr(47) * 2 + "x.invalid/r.git", "git"), ("file:../x", "file"),
+            ("link:../x", "link"), ("https:" + chr(47) * 2 + "x.invalid/a.tgz", "https"),
+            ("workspace:*", "workspace"), ("a$b", "none"), ("x" * 200, "none"), ("a:b@c", "a"),
+            ("1:" + "a", "other"), (7, "other"),
+        ):
+            with self.subTest(spec=value):
+                self.assertEqual(
+                    self.refusal(spec("dependencies", "dep-a", value)), prefix + "dep-a scheme:" + scheme,
+                )
+        self.assertEqual(
+            self.refusal(spec("peerDependencies", "dep-a", "npm:x@1")),
+            "dep_spec:" + path + ":peerDependencies:dep-a scheme:npm",
+        )
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"][""].update({"dependencies": {"a": "file:x"}})),
+            "dep_spec:root:dependencies:a scheme:file",
+        )
+        self.assertEqual(
+            self.refusal(spec("dependencies", "Bad Name", "1.0.0")), "dep_name:" + path + ":dependencies:invalid_name",
+        )
+        self.assertEqual(
+            self.refusal(spec("dependencies", "@" + "keeldock" + "/x", "1.0.0")),
+            "dep_internal:" + path + ":dependencies:@" + "keeldock" + "/x",
+        )
+        self.assertEqual(self.refusal(self.entry(dependencies=[])), "dep_map:" + path + ":dependencies")
+        self.assertEqual(
+            self.refusal(self.entry(optionalDependencies={"d%d" % index: "1.0.0" for index in range(513)})),
+            "dep_map:" + path + ":optionalDependencies",
+        )
+
+    def test_the_registry_workspace_and_link_refusals_name_the_lock_path(self):
+        path = self.PATH
+        link = "node_modules/" + "@" + "keeldock" + "/host-api"
+        self.assertEqual(self.refusal(self.entry(link=True)), "entry_link:" + path)
+        self.assertEqual(self.refusal(self.entry(version="x")), "entry_version:" + path)
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"][path].pop("version")), "entry_version:" + path,
+        )
+        self.assertEqual(self.refusal(self.entry(integrity="sha1-abc")), "integrity:" + path)
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"][path].pop("integrity")), "integrity:" + path,
+        )
+        self.assertEqual(self.refusal(self.entry(name="string-width")), "entry_name:" + path)
+        self.assertEqual(
+            self.refusal(self.entry(name="string-width-cjs", resolved="x")), "entry_name:" + path,
+        )
+        self.assertEqual(self.refusal(internal_names=("sample-package-00",)), "entry_internal:" + path)
+        self.assertEqual(self.refusal(self.entry(resolved="file:x.tgz")), "resolved_url:" + path)
+        self.assertEqual(self.refusal(self.entry(resolved=7)), "resolved_url:" + path)
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"][""].update({"name": "other-root"})), "root_entry",
+        )
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"][""].update({"link": True})), "root_entry",
+        )
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"]["packages/host-api"].update({"name": "x"})),
+            "workspace_entry:packages/host-api",
+        )
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"].pop("packages/host-api")),
+            "workspace_entry:packages/host-api",
+        )
+        self.assertEqual(
+            self.refusal(lambda lock: lock["packages"][link].update({"resolved": "file:packages/host-api"})),
+            "link_entry:" + link,
+        )
+        self.assertEqual(self.refusal(lambda lock: lock["packages"].pop(link)), "link_entry:" + link)
+
+    def test_a_long_or_hostile_name_is_replaced_or_shortened_and_never_echoed(self):
+        path = "node_modules/" + "a" * 100
+        lock_change = lambda lock: lock["packages"].update({path: {"bogus": 1}})
+        self.assertEqual(self.refusal(lock_change), "entry_key:" + path + ":bogus")
+        long_path = "node_modules/" + "a" * 213
+        detail = self.refusal(lambda lock: lock["packages"].update({long_path: {"x" * 214: 1}}))
+        self.assertLessEqual(len(detail), subject.DETAIL_MAX_BYTES)
+        self.assertTrue(detail.startswith("entry_key:"))
+        for hostile in ("caf" + chr(233), "a" + chr(0x202e) + "b", "a\x00b", "a:b", "a b", "x" * 215):
+            with self.subTest(key=hostile):
+                lock, unused_bytes, unused_archives, unused_material = _fixture()
+                lock["packages"][self.PATH][hostile] = 1
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject.parse_lock(json.dumps(lock).encode("ascii"))
+                self.assertEqual(raised.exception.detail, "entry_key:" + self.PATH + ":invalid_name")
+                self.assertEqual(str(raised.exception), "npm_lock_invalid")
+
+    def test_build_detail_bounds_every_shape_and_keeps_the_grammar(self):
+        build = subject.build_detail
+        self.assertEqual(build("a_b"), "a_b")
+        self.assertEqual(build("a", ("p", "q"), count=3, scheme="npm"), "a:p:q count:3 scheme:npm")
+        self.assertEqual(build("a", ("p",), scheme="NPM"), "a:p scheme:other")
+        self.assertEqual(build("a", ("p",), scheme=7), "a:p scheme:other")
+        self.assertEqual(build("a", ("p",), versions=["1.0.0", "x y", 7]), "a:p found:1.0.0,invalid,invalid")
+        for token in ("", "Bad", "a b", "a\nb", "x" * 33, None, 3, "caf" + chr(233)):
+            with self.subTest(token=token):
+                self.assertIsNone(build(token))
+        self.assertIsNone(build("a", ("p",) * 7))
+        self.assertIsNone(build("a", "pq"))
+        self.assertEqual(build("a", ("p", 7, None, "")), "a:p:invalid_name:invalid_name:invalid_name")
+        short = build("a", ("x" * 214,) * 3, scheme="npm")
+        self.assertLessEqual(len(short), subject.DETAIL_MAX_BYTES)
+        self.assertIsNotNone(subject.DETAIL_RE.match(short))
+        self.assertIn(":..." + "x" * 57, short)
+        for count in range(0, 14):
+            for version_length in (1, 2, 40, 63, 64, 65):
+                text = build("singleton_duplicate", ("@scope/" + "a" * 150,), ["1." + "9" * (version_length - 2)] * count)
+                self.assertLessEqual(len(text), subject.DETAIL_MAX_BYTES)
+                self.assertIsNotNone(subject.DETAIL_RE.match(text))
+                self.assertLessEqual(text.count(",") + 1, subject.DETAIL_MAX_VERSIONS)
+                found = text.partition(" found:")[2]
+                if found:
+                    for version in found.split(","):
+                        self.assertIsNotNone(re.match(r"[0-9A-Za-z.+-]{1,64}\Z", version))
+
+    def test_a_refusal_keeps_its_public_reason_and_drops_an_unsafe_detail(self):
+        for bad in ("a\nb", "caf" + chr(233), "x" * 513, "a b", " a", "A", "", 7, b"x", ["a"]):
+            with self.subTest(detail=bad):
+                error = subject.Refusal("npm_receipt_invalid", bad)
+                self.assertIsNone(error.detail)
+                self.assertEqual((error.reason, str(error), error.args), ("npm_receipt_invalid",) * 2 + (("npm_receipt_invalid",),))
+        error = subject.Refusal("not_a_reason", "root_fields")
+        self.assertEqual((error.reason, str(error), error.detail), ("npm_lock_invalid", "npm_lock_invalid", "root_fields"))
+        self.assertIsNone(subject.Refusal().detail)
 
 
 if __name__ == "__main__":

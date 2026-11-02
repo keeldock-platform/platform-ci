@@ -1008,7 +1008,11 @@ NPM_DIAGNOSTIC_REPORT_READ_BYTES = 1024 * 1024
 NPM_STDERR_LINE_RE = re.compile(r"npm (?:error|warn) ")
 NPM_CHECK_LINE_PREFIX = "  kd-check "
 NPM_CHECK_MAX_BYTES = 512
-NPM_CHECK_RE = re.compile(r"[a-z_]{1,32}(?::[A-Za-z0-9._~@/_-]{1,214})?(?: [a-z]{1,16}:[A-Za-z0-9._~@/:,+-]{1,512})*\Z")
+NPM_CHECK_GRAMMAR = (
+    r"[a-z_]{1,32}(?::[A-Za-z0-9._~@/_-]{1,214}){0,6}"
+    r"(?: [a-z]{1,16}:[A-Za-z0-9._~@/:,+-]{1,512})*\Z"
+)
+NPM_CHECK_RE = re.compile(NPM_CHECK_GRAMMAR)
 NPM_REPORT_NAME_RE = re.compile(r"[0-9A-Za-z_.-]{1,80}-eresolve-report\.txt\Z")
 NPM_PATH_LINE_RE = re.compile(r"(?:^|[\s\"'=(\[,])(?:/|~/)[A-Za-z0-9._~@-]")
 NPM_CREDENTIAL_PATTERNS = (
@@ -1203,11 +1207,15 @@ def _npm_read_report(npm_storage, worker_uid):
 
 def _npm_capture_diagnostic(step, key, stderr, npm_storage, worker_uid, check=None):
     try:
-        return build_npm_diagnostic_payload(
-            step, key, stderr, _npm_read_report(npm_storage, worker_uid), check,
-        )
+        report = _npm_read_report(npm_storage, worker_uid)
     except BaseException:
         return None
+    for candidate in ((check, None) if check is not None else (None,)):
+        try:
+            return build_npm_diagnostic_payload(step, key, stderr, report, candidate)
+        except BaseException:
+            continue
+    return None
 
 
 def npm_diagnostic_result(error):

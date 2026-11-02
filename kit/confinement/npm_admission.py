@@ -113,16 +113,102 @@ REFUSAL_CODES = frozenset((
 ))
 
 
+DETAIL_GRAMMAR = (
+    r"[a-z_]{1,32}(?::[A-Za-z0-9._~@/_-]{1,214}){0,6}"
+    r"(?: [a-z]{1,16}:[A-Za-z0-9._~@/:,+-]{1,512})*\Z"
+)
+DETAIL_RE = re.compile(DETAIL_GRAMMAR)
+DETAIL_MAX_BYTES = 512
+DETAIL_MAX_VERSIONS = 8
+DETAIL_SHORT_SEGMENT = 60
+DETAIL_TOKEN_RE = re.compile(r"[a-z_]{1,32}\Z")
+DETAIL_SEGMENT_RE = re.compile(r"[A-Za-z0-9._~@/_-]{1,214}\Z")
+DETAIL_SCHEME_RE = re.compile(r"[a-z]{1,16}\Z")
+DETAIL_VERSION_RE = re.compile(r"[0-9A-Za-z.+-]{1,64}\Z")
+DETAIL_SPEC_SCHEME_RE = re.compile(r"([a-z]{1,16})[:+]")
+
+
+def _detail_segment(value, limit):
+    if type(value) is not str or DETAIL_SEGMENT_RE.match(value) is None:
+        return "invalid_name"
+    if limit is not None and len(value) > limit:
+        return "..." + value[-(limit - 3):]
+    return value
+
+
+def _detail_text(token, segments, kept, count, scheme, limit):
+    text = token
+    for segment in segments:
+        text += ":" + _detail_segment(segment, limit)
+    if type(count) is int and 0 <= count <= 99999:
+        text += " count:" + str(count)
+    if scheme is not None:
+        text += " scheme:" + (
+            scheme if type(scheme) is str and DETAIL_SCHEME_RE.match(scheme) is not None else "other"
+        )
+    kept = list(kept)
+    while True:
+        rendered = text + (" found:" + ",".join(kept) if kept else "")
+        if len(rendered) <= DETAIL_MAX_BYTES or not kept:
+            return rendered
+        kept.pop()
+
+
+def build_detail(token, segments=(), versions=None, count=None, scheme=None):
+    """Build the bounded, ASCII-only refusal detail: a fixed lowercase token, colon separated
+    subject segments (lock paths, field and package names), then space separated key:value fields.
+    A segment outside the name charset is replaced and never echoed, a long segment is shortened
+    once if the whole text would not fit, and versions are dropped whole until it fits."""
+    if (type(token) is not str or DETAIL_TOKEN_RE.match(token) is None
+            or type(segments) not in (tuple, list)):
+        return None
+    kept = []
+    if versions is not None:
+        for version in versions:
+            kept.append(
+                version if type(version) is str and DETAIL_VERSION_RE.match(version) is not None
+                else "invalid"
+            )
+            if len(kept) >= DETAIL_MAX_VERSIONS:
+                break
+    for limit in (None, DETAIL_SHORT_SEGMENT):
+        text = _detail_text(token, segments, kept, count, scheme, limit)
+        if len(text) <= DETAIL_MAX_BYTES and DETAIL_RE.match(text) is not None:
+            return text
+    return None
+
+
+def spec_scheme(value):
+    if type(value) is not str:
+        return "other"
+    found = DETAIL_SPEC_SCHEME_RE.match(value.lower())
+    if found is not None:
+        return found.group(1)
+    return "none" if ":" not in value else "other"
+
+
+def _lock_path(path):
+    return "root" if path == "" else path
+
+
+def _lock_refuse(token, *segments, scheme=None):
+    raise Refusal("npm_lock_invalid", build_detail(token, segments, scheme=scheme))
+
+
 class Refusal(Exception):
-    def __init__(self, reason="npm_lock_invalid"):
+    def __init__(self, reason="npm_lock_invalid", detail=None):
         if reason not in REFUSAL_CODES:
             reason = "npm_lock_invalid"
         self.reason = reason
+        self.detail = (
+            detail if type(detail) is str and len(detail) <= DETAIL_MAX_BYTES
+            and DETAIL_RE.match(detail) is not None else None
+        )
         super().__init__(reason)
 
 
-def _refuse(reason="npm_lock_invalid"):
-    raise Refusal(reason)
+def _refuse(reason="npm_lock_invalid", detail=None):
+    raise Refusal(reason, detail)
 
 
 def _exact_dict(value, fields):
@@ -205,18 +291,18 @@ def _check_json_bounds(value, reason, depth=0, counter=None):
         counter = [0]
     counter[0] += 1
     if counter[0] > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
-        _refuse(reason)
+        _refuse(reason, build_detail("json_limits"))
     if type(value) is str:
         try:
             encoded = value.encode("utf-8", "strict")
         except UnicodeError:
-            _refuse(reason)
+            _refuse(reason, build_detail("json_string"))
         if len(encoded) > MAX_JSON_STRING_BYTES:
-            _refuse(reason)
+            _refuse(reason, build_detail("json_string"))
     elif type(value) is dict:
         for key, item in value.items():
             if type(key) is not str or key in ("__proto__", "constructor", "prototype"):
-                _refuse(reason)
+                _refuse(reason, build_detail("json_key"))
             _check_json_bounds(key, reason, depth + 1, counter)
             _check_json_bounds(item, reason, depth + 1, counter)
     elif type(value) is list:
@@ -224,19 +310,19 @@ def _check_json_bounds(value, reason, depth=0, counter=None):
             _check_json_bounds(item, reason, depth + 1, counter)
     elif value is None or type(value) in (bool, int):
         if type(value) is int and not _safe_int(value, -MAX_SAFE_INTEGER, MAX_SAFE_INTEGER):
-            _refuse(reason)
+            _refuse(reason, build_detail("json_integer"))
     else:
-        _refuse(reason)
+        _refuse(reason, build_detail("json_type"))
 
 
 def _load_json(data, maximum, reason, ascii_only=False):
     if type(data) is not bytes or not data or len(data) > maximum:
-        _refuse(reason)
+        _refuse(reason, build_detail("json_size"))
     encoding = "ascii" if ascii_only else "utf-8"
     try:
         text = data.decode(encoding, "strict")
         if text.startswith("\ufeff"):
-            _refuse(reason)
+            _refuse(reason, build_detail("json_bom"))
         parsed = json.loads(
             text,
             object_pairs_hook=_unique_json_pairs,
@@ -247,7 +333,7 @@ def _load_json(data, maximum, reason, ascii_only=False):
     except Refusal:
         raise
     except (ValueError, TypeError, UnicodeError, json.JSONDecodeError, RecursionError):
-        _refuse(reason)
+        _refuse(reason, build_detail("json_decode"))
     _check_json_bounds(parsed, reason)
     return parsed
 
@@ -265,7 +351,7 @@ def _valid_integrity(value):
 
 def _integrity_bytes(value):
     if not _valid_integrity(value):
-        _refuse("npm_lock_invalid")
+        _lock_refuse("integrity_bytes")
     return base64.b64decode(value[len("sha512-"):].encode("ascii"), validate=True)
 
 
@@ -329,65 +415,70 @@ def _valid_dependency_spec(value, workspace_allowed):
     return DEPENDENCY_SPEC_RE.fullmatch(value) is not None
 
 
-def _validate_dependency_map(value, workspace_names, extra_internal_names):
+def _validate_dependency_map(value, workspace_names, extra_internal_names, path="", field="dependencies"):
+    where = _lock_path(path)
     if type(value) is not dict or len(value) > 512:
-        _refuse("npm_lock_invalid")
+        _lock_refuse("dep_map", where, field)
     for name, spec in value.items():
         if not _valid_package_name(name):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("dep_name", where, field, name)
         workspace_allowed = name in workspace_names
         if _internal_name(name, extra_internal_names) and not workspace_allowed:
-            _refuse("npm_lock_invalid")
+            _lock_refuse("dep_internal", where, field, name)
         if not _valid_dependency_spec(spec, workspace_allowed):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("dep_spec", where, field, name, scheme=spec_scheme(spec))
 
 
-def _validate_entry_shape(entry, workspace_names, extra_internal_names):
-    if type(entry) is not dict or any(key not in LOCK_ENTRY_FIELDS for key in entry):
-        _refuse("npm_lock_invalid")
+def _validate_entry_shape(entry, workspace_names, extra_internal_names, path=""):
+    where = _lock_path(path)
+    if type(entry) is not dict:
+        _lock_refuse("entry_shape", where)
+    for key in entry:
+        if key not in LOCK_ENTRY_FIELDS:
+            _lock_refuse("entry_key", where, key)
     for key in BOOLEAN_ENTRY_FIELDS:
         if key in entry and type(entry[key]) is not bool:
-            _refuse("npm_lock_invalid")
+            _lock_refuse("entry_bool", where, key)
     if entry.get("inBundle") is True:
-        _refuse("npm_lock_invalid")
+        _lock_refuse("entry_inbundle", where)
     for key in DEPENDENCY_FIELDS:
         if key in entry:
-            _validate_dependency_map(entry[key], workspace_names, extra_internal_names)
+            _validate_dependency_map(entry[key], workspace_names, extra_internal_names, path, key)
     if "peerDependenciesMeta" in entry:
         metadata = entry["peerDependenciesMeta"]
         if type(metadata) is not dict or len(metadata) > 512:
-            _refuse("npm_lock_invalid")
+            _lock_refuse("peer_meta", where)
         for name, options in metadata.items():
             if (not _valid_package_name(name) or type(options) is not dict
                     or (_internal_name(name, extra_internal_names) and name not in workspace_names)
                     or set(options) - {"optional"}
                     or ("optional" in options and type(options["optional"]) is not bool)):
-                _refuse("npm_lock_invalid")
+                _lock_refuse("peer_meta", where, name)
     if "workspaces" in entry:
         workspaces = entry["workspaces"]
         if (type(workspaces) is not list or len(workspaces) > 16
-                or any(type(path) is not str for path in workspaces)
+                or any(type(item) is not str for item in workspaces)
                 or len(set(workspaces)) != len(workspaces)):
-            _refuse("npm_lock_invalid")
-        if any(type(path) is not str or not (
-                path == "packages/*" or _valid_workspace_path(path)) for path in workspaces):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("workspaces_shape", where)
+        if any(type(item) is not str or not (
+                item == "packages/*" or _valid_workspace_path(item)) for item in workspaces):
+            _lock_refuse("workspaces_path", where)
     for key in ("os", "cpu", "libc", "bundledDependencies", "bundleDependencies"):
         if key in entry:
             values = entry[key]
             if (type(values) is not list or len(values) > 128
                     or any(type(item) is not str or len(item) > 128 for item in values)):
-                _refuse("npm_lock_invalid")
+                _lock_refuse("entry_list", where, key)
             if key in ("bundledDependencies", "bundleDependencies"):
                 if values:
-                    _refuse("npm_lock_invalid")
+                    _lock_refuse("bundled_deps", where, key)
     if "engines" in entry:
         engines = entry["engines"]
         if (type(engines) is not dict or len(engines) > 16
                 or any(type(key) is not str or type(value) is not str
                        or len(key) > 64 or len(value) > 128
                        for key, value in engines.items())):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("engines_shape", where)
     if "bin" in entry:
         bins = entry["bin"]
         if type(bins) is str:
@@ -395,40 +486,44 @@ def _validate_entry_shape(entry, workspace_names, extra_internal_names):
         elif type(bins) is dict and len(bins) <= 64:
             values = tuple(bins.values())
             if any(type(key) is not str or len(key) > 128 for key in bins):
-                _refuse("npm_lock_invalid")
+                _lock_refuse("bin_shape", where)
         else:
-            _refuse("npm_lock_invalid")
+            _lock_refuse("bin_shape", where)
         if any(type(value) is not str or len(value) > 512 or "\\" in value
                or value.startswith("/") or ".." in value.split("/") for value in values):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("bin_value", where)
     for key in ("license", "deprecated"):
         if key in entry and (type(entry[key]) is not str or len(entry[key]) > 4096):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("entry_text", where, key)
     if "funding" in entry:
         funding = entry["funding"]
         if type(funding) not in (str, dict, list):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("funding_shape", where)
         if type(funding) is str and len(funding) > 2048:
-            _refuse("npm_lock_invalid")
+            _lock_refuse("funding_shape", where)
 
 
 def parse_lock(lock_bytes, internal_names=(), workspace_links=None):
     if type(lock_bytes) is not bytes or len(lock_bytes) > MAX_LOCK_BYTES:
-        _refuse("npm_lock_invalid")
+        _lock_refuse("lock_size")
     lock = _load_json(lock_bytes, MAX_LOCK_BYTES, "npm_lock_invalid")
     if type(lock) is not dict or set(lock) != LOCK_ROOT_FIELDS:
-        _refuse("npm_lock_invalid")
-    if (not _valid_package_name(lock["name"]) or not _valid_version(lock["version"])
-            or type(lock["lockfileVersion"]) is not int or lock["lockfileVersion"] != 3
-            or type(lock["requires"]) is not bool or lock["requires"] is not True):
-        _refuse("npm_lock_invalid")
+        _lock_refuse("root_fields")
+    if not _valid_package_name(lock["name"]):
+        _lock_refuse("root_name")
+    if not _valid_version(lock["version"]):
+        _lock_refuse("root_version")
+    if type(lock["lockfileVersion"]) is not int or lock["lockfileVersion"] != 3:
+        _lock_refuse("lockfile_version")
+    if type(lock["requires"]) is not bool or lock["requires"] is not True:
+        _lock_refuse("root_requires")
     if type(internal_names) not in (tuple, list, set, frozenset):
-        _refuse("npm_lock_invalid")
+        _lock_refuse("internal_names")
     links = WORKSPACE_LINKS if workspace_links is None else workspace_links
     if type(links) is not dict:
-        _refuse("npm_lock_invalid")
+        _lock_refuse("link_config")
     if not links or len(links) > 16:
-        _refuse("npm_lock_invalid")
+        _lock_refuse("link_config")
     expected_links = {}
     expected_workspace_names_by_path = {}
     expected_workspace_names = set()
@@ -436,71 +531,77 @@ def parse_lock(lock_bytes, internal_names=(), workspace_links=None):
         package_name = _package_name_from_lock_path(link_path)
         if (package_name is None or not _valid_workspace_path(workspace_path)
                 or workspace_path in expected_links.values()):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("link_config", link_path)
         expected_links[link_path] = workspace_path
         expected_workspace_names_by_path[workspace_path] = package_name
         expected_workspace_names.add(package_name)
     extra_internal_names = tuple(internal_names)
     if any(not _valid_package_name(name) for name in extra_internal_names):
-        _refuse("npm_lock_invalid")
+        _lock_refuse("internal_names")
     packages = lock["packages"]
     if (type(packages) is not dict or len(packages) < 1
             or len(packages) > MAX_LOCK_ENTRIES or "" not in packages):
-        _refuse("npm_lock_invalid")
+        _lock_refuse("packages_shape")
     if set(packages) - {"", *expected_links.keys(), *expected_links.values()}:
         for path in packages:
             if path == "" or path in expected_links or path in expected_links.values():
                 continue
             if _package_name_from_lock_path(path) is None:
-                _refuse("npm_lock_invalid")
+                _lock_refuse("entry_path", path)
     root_entry = packages[""]
-    _validate_entry_shape(root_entry, expected_workspace_names, extra_internal_names)
+    _validate_entry_shape(root_entry, expected_workspace_names, extra_internal_names, "")
     if (root_entry.get("name") != lock["name"] or root_entry.get("version") != lock["version"]
             or any(key in root_entry for key in ("resolved", "integrity", "link"))):
-        _refuse("npm_lock_invalid")
+        _lock_refuse("root_entry")
     for workspace_path in expected_links.values():
         entry = packages.get(workspace_path)
         if entry is None:
-            _refuse("npm_lock_invalid")
-        _validate_entry_shape(entry, expected_workspace_names, extra_internal_names)
+            _lock_refuse("workspace_entry", workspace_path)
+        _validate_entry_shape(entry, expected_workspace_names, extra_internal_names, workspace_path)
         if (not _valid_package_name(entry.get("name")) or not _valid_version(entry.get("version"))
                 or entry["name"] != expected_workspace_names_by_path[workspace_path]
                 or any(key in entry for key in ("resolved", "integrity", "link"))):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("workspace_entry", workspace_path)
     for link_path, workspace_path in expected_links.items():
         entry = packages.get(link_path)
         if (type(entry) is not dict or set(entry) != {"resolved", "link"}
                 or entry["resolved"] != workspace_path or entry["link"] is not True):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("link_entry", link_path)
     registry_paths = set()
     for path, entry in packages.items():
         if path == "" or path in expected_links or path in expected_links.values():
             continue
         name = _package_name_from_lock_path(path)
         if name is None or path in registry_paths:
-            _refuse("npm_lock_invalid")
-        _validate_entry_shape(entry, expected_workspace_names, extra_internal_names)
-        if ("link" in entry or not _valid_version(entry.get("version"))
-                or not _valid_integrity(entry.get("integrity"))):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("registry_path", path)
+        _validate_entry_shape(entry, expected_workspace_names, extra_internal_names, path)
+        if "link" in entry:
+            _lock_refuse("entry_link", path)
+        if not _valid_version(entry.get("version")):
+            _lock_refuse("entry_version", path)
+        if not _valid_integrity(entry.get("integrity")):
+            _lock_refuse("integrity", path)
         entry_name = entry.get("name", name)
-        if (entry_name != name or _internal_name(name, extra_internal_names)
-                or type(entry.get("resolved")) is not str
+        if entry_name != name:
+            _lock_refuse("entry_name", path)
+        if _internal_name(name, extra_internal_names):
+            _lock_refuse("entry_internal", path)
+        if (type(entry.get("resolved")) is not str
                 or entry["resolved"] != _canonical_tarball_url(name, entry["version"])):
-            _refuse("npm_lock_invalid")
+            _lock_refuse("resolved_url", path)
         registry_paths.add(path)
     if set(expected_links) - set(packages) or set(expected_links.values()) - set(packages):
-        _refuse("npm_lock_invalid")
-    if any(not _valid_workspace_path(path) for path in packages if path not in ("",)
-           and path not in expected_links and path not in expected_links.values()
-           and not path.startswith("node_modules/")):
-        _refuse("npm_lock_invalid")
+        _lock_refuse("links_missing")
+    for path in packages:
+        if (path not in ("",) and path not in expected_links and path not in expected_links.values()
+                and not path.startswith("node_modules/") and not _valid_workspace_path(path)):
+            _lock_refuse("workspace_path", path)
     return lock
 
 
 def registry_entries(lock, internal_names=(), workspace_links=None):
     if type(lock) is not bytes:
-        _refuse("npm_lock_invalid")
+        _lock_refuse("lock_type")
     lock = parse_lock(lock, internal_names=internal_names, workspace_links=workspace_links)
     links = WORKSPACE_LINKS if workspace_links is None else workspace_links
     entries = []

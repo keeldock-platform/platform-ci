@@ -810,6 +810,106 @@ class LockTests(RefusalAssertions):
         self.assertIsNone(subject.BootstrapRefusal("npm_stale").detail)
 
 
+    def parser_detail(self, change):
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            self.check(change)
+        error = raised.exception
+        self.assertEqual((error.reason, str(error), error.args), ("npm_lock_refused", "npm_lock_refused", ("npm_lock_refused",)))
+        self.assertTrue(error.detail.startswith("shared_parser:npm_lock_invalid"))
+        self.assertLessEqual(len(error.detail), subject.LOCK_DETAIL_MAX_BYTES)
+        self.assertTrue(error.detail.isascii())
+        self.assertIsNotNone(subject.LOCK_DETAIL_RE.match(error.detail))
+        return error.detail
+
+    def test_the_shared_parser_refusal_names_the_parser_check_after_its_reason(self):
+        gamma = "node_modules/gamma-pkg"
+        prefix = "shared_parser:npm_lock_invalid:"
+        self.assertEqual(self.parser_detail(lambda lock: lock.update({"extra": 1})), prefix + "root_fields")
+        self.assertEqual(
+            self.parser_detail(lambda lock: lock.update({"lockfileVersion": 2})), prefix + "lockfile_version",
+        )
+        self.assertEqual(
+            self.parser_detail(lambda lock: lock["packages"][gamma].update({"bogus": 1})),
+            prefix + "entry_key:" + gamma + ":bogus",
+        )
+        self.assertEqual(
+            self.parser_detail(lambda lock: lock["packages"][gamma].update(
+                {"dependencies": {"string-width-cjs": "npm:string-width@^4.2.0"}},
+            )),
+            prefix + "dep_spec:" + gamma + ":dependencies:string-width-cjs scheme:npm",
+        )
+        self.assertEqual(
+            self.parser_detail(lambda lock: lock["packages"][gamma].update({"engines": ["node >= 14"]})),
+            prefix + "engines_shape:" + gamma,
+        )
+        self.assertEqual(
+            self.parser_detail(lambda lock: lock["packages"][gamma].update({"resolved": "file:x.tgz"})),
+            prefix + "resolved_url:" + gamma,
+        )
+        self.assertEqual(
+            self.parser_detail(lambda lock: lock["packages"][gamma].update({"name": "other-pkg"})),
+            prefix + "entry_name:" + gamma,
+        )
+        self.assertEqual(
+            self.parser_detail(lambda lock: lock["packages"][gamma].update({"integrity": "sha1-x"})),
+            prefix + "integrity:" + gamma,
+        )
+        self.assertEqual(
+            self.parser_detail(lambda lock: lock["packages"]["packages/host-api"].update({"name": "x"})),
+            prefix + "workspace_entry:packages/host-api",
+        )
+        link = "node_modules/" + subject.SCOPE + "host-api"
+        self.assertEqual(
+            self.parser_detail(lambda lock: lock["packages"][link].update({"link": False})),
+            prefix + "link_entry:" + link,
+        )
+
+    def test_the_parser_detail_is_composed_only_when_it_is_safe_and_the_reason_stays_closed(self):
+        def raising(reason, detail):
+            def operation():
+                error = adm.Refusal("npm_lock_invalid")
+                error.reason = reason
+                error.detail = detail
+                raise error
+            return operation
+
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            subject._call_adm(raising("npm_lock_invalid", "entry_key:node_modules/a:x"))
+        self.assertEqual(raised.exception.detail, "shared_parser:npm_lock_invalid:entry_key:node_modules/a:x")
+        for bad in (None, "a\nb", "caf" + chr(233), "x" * 600, "A", "a b", 7, b"x"):
+            with self.subTest(detail=bad):
+                with self.assertRaises(subject.BootstrapRefusal) as raised:
+                    subject._call_adm(raising("npm_lock_invalid", bad))
+                self.assertEqual(raised.exception.detail, "shared_parser:npm_lock_invalid")
+                self.assertEqual((raised.exception.reason, str(raised.exception)), ("npm_lock_refused",) * 2)
+        with self.assertRaises(subject.BootstrapRefusal) as raised:
+            subject._call_adm(raising("npm_receipt_invalid", "root_fields"))
+        self.assertEqual(raised.exception.detail, "shared_parser:npm_receipt_invalid:root_fields")
+        self.assertEqual(raised.exception.reason, subject.ADM_REASON_MAP.get("npm_receipt_invalid", "npm_lock_refused"))
+        for bad_reason in ("Bad", "a b", "x" * 41, None, 7):
+            with self.subTest(reason=bad_reason):
+                with self.assertRaises(subject.BootstrapRefusal) as raised:
+                    subject._call_adm(raising(bad_reason, "root_fields"))
+                self.assertIsNone(raised.exception.detail)
+                self.assertEqual((raised.exception.reason, str(raised.exception)), ("npm_lock_refused",) * 2)
+        self.assertEqual(subject._call_adm(lambda: 5), 5)
+
+    def test_the_detail_grammar_is_one_pattern_and_every_output_matches_it(self):
+        self.assertEqual(subject.LOCK_DETAIL_GRAMMAR, adm.DETAIL_GRAMMAR)
+        self.assertEqual(subject.LOCK_DETAIL_RE.pattern, adm.DETAIL_RE.pattern)
+        for name_length in range(1, 215, 13):
+            for count in (0, 1, 7, 8, 9, 40):
+                for version_length in (1, 2, 32, 64, 65):
+                    text = subject.lock_detail(
+                        "singleton_duplicate", "@s/" + "a" * (name_length - 1) if name_length > 3 else "a" * name_length,
+                        ["1." + "9" * max(version_length - 2, 0)] * count, count=count,
+                    )
+                    self.assertIsNotNone(text)
+                    self.assertLessEqual(len(text), subject.LOCK_DETAIL_MAX_BYTES)
+                    self.assertIsNotNone(subject.LOCK_DETAIL_RE.match(text))
+                    self.assertFalse(text.endswith((" ", ":", ",")))
+                    self.assertNotIn("  ", text)
+
 class PeerTests(RefusalAssertions):
     def tree(self, peers, meta=None, extra=None, path="node_modules/a"):
         packages = {

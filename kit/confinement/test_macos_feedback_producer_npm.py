@@ -638,8 +638,9 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         self.assertEqual(result["npm_diagnostic"], ("npm_lock", "npm_lock_refused"))
         self.assertEqual(result["payload_bytes"], error.npm_diagnostic)
 
-    def test_a_lock_refusal_with_an_unsafe_check_keeps_the_plain_refusal(self):
-        for hostile in ("bad\nline", "caf\u00e9", "x" * 600, "direct_missing:a b c"):
+    def test_a_lock_refusal_with_an_unsafe_check_keeps_the_diagnostic_without_the_check(self):
+        self.resolve = SimpleNamespace(returncode=0, stdout=b"", stderr=b"npm warn deprecated a@1.0.0: old\n")
+        for hostile in ("bad\nline", "caf" + chr(233), "x" * 600, "direct_missing:a b c", "direct_missing:x found:"):
             with self.subTest(check=hostile):
                 refusal = bootstrap.BootstrapRefusal("npm_lock_refused", "lock_empty")
                 refusal.detail = hostile
@@ -647,7 +648,42 @@ class NpmAdmissionProducerTests(unittest.TestCase):
                     error = self.failure()
                 self.assertEqual((error.reason, error.source_gates_step, error.source_gates_key),
                                  ("payload_invalid", "npm_lock", "npm_lock_refused"))
-                self.assertFalse(hasattr(error, "npm_diagnostic"))
+                header, stderr, report = self.sections(error.npm_diagnostic)
+                self.assertEqual(header, "KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused")
+                self.assertEqual(stderr, ["  npm warn deprecated a@1.0.0: old"])
+                self.assertNotIn(b"kd-check", error.npm_diagnostic)
+                self.assertEqual(producer.npm_diagnostic_result(error)["npm_diagnostic"], ("npm_lock", "npm_lock_refused"))
+
+    def test_the_public_outcome_does_not_depend_on_whether_the_check_was_kept(self):
+        outcomes = []
+        for check in ("direct_missing:alpha-pkg", "bad\nline"):
+            refusal = bootstrap.BootstrapRefusal("npm_lock_refused", "lock_empty")
+            refusal.detail = check
+            with patch.object(bootstrap, "check_lock", side_effect=refusal):
+                error = self.failure()
+            outcomes.append((
+                error.reason, error.detail, error.source_gates_step, error.source_gates_key, str(error),
+                producer.npm_diagnostic_result(error)["npm_diagnostic"],
+            ))
+        self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_the_capture_retries_once_without_a_rejected_check_and_keeps_the_stderr(self):
+        with patch.object(producer, "_npm_read_report", return_value=None):
+            payload = producer._npm_capture_diagnostic(
+                "npm_lock", "npm_lock_refused", _stderr(b"npm warn peer b@2"), "/s", 501, "bad\nline",
+            )
+        self.assertIsNotNone(payload)
+        self.assertNotIn(b"kd-check", payload)
+        self.assertIn(b"  npm warn peer b@2\n", payload)
+        with patch.object(producer, "_npm_read_report", return_value=None):
+            payload = producer._npm_capture_diagnostic(
+                "npm_lock", "npm_lock_refused", _stderr(b"npm warn peer b@2"), "/s", 501, "lock_empty",
+            )
+        self.assertIn(b"  kd-check lock_empty\n", payload)
+        with patch.object(producer, "_npm_read_report", side_effect=OSError("x")):
+            self.assertIsNone(producer._npm_capture_diagnostic("npm_lock", "npm_lock_refused", None, "/s", 501, "lock_empty"))
+        with patch.object(producer, "_npm_read_report", return_value=None):
+            self.assertIsNone(producer._npm_capture_diagnostic("npm_lock", "BAD KEY", None, "/s", 501, "lock_empty"))
 
     def test_only_the_lock_step_carries_a_check_and_a_refusal_without_one_adds_no_line(self):
         refusal = bootstrap.BootstrapRefusal("npm_lock_refused")
@@ -785,6 +821,42 @@ class NpmDiagnosticPayloadTests(unittest.TestCase):
         ):
             with self.subTest(check=check):
                 self.assertIsNotNone(bootstrap.lock_detail(check.split(":")[0].split(" ")[0]))
+                payload = producer.build_npm_diagnostic_payload("npm_lock", "npm_lock_refused", None, None, check)
+                self.assertEqual(self.sections(payload)[1], ["  kd-check " + check])
+
+    def test_the_producer_and_the_bootstrap_share_one_check_grammar(self):
+        self.assertEqual(producer.NPM_CHECK_GRAMMAR, bootstrap.LOCK_DETAIL_GRAMMAR)
+        self.assertEqual(producer.NPM_CHECK_GRAMMAR, bootstrap.adm.DETAIL_GRAMMAR)
+        self.assertEqual(producer.NPM_CHECK_RE.pattern, bootstrap.LOCK_DETAIL_RE.pattern)
+        self.assertEqual(producer.NPM_CHECK_MAX_BYTES, bootstrap.LOCK_DETAIL_MAX_BYTES)
+
+    def test_every_bootstrap_output_including_truncated_ones_is_accepted_by_the_producer(self):
+        for name_length in (1, 2, 50, 150, 200, 213, 214):
+            for count in (0, 1, 7, 8, 9, 12, 99999):
+                for version_length in (1, 2, 30, 63, 64, 65):
+                    check = bootstrap.lock_detail(
+                        "singleton_duplicate", "a" * name_length,
+                        ["1." + "9" * max(version_length - 2, 0)] * min(count, 12), count=count,
+                    )
+                    self.assertIsNotNone(check)
+                    self.assertLessEqual(len(check), producer.NPM_CHECK_MAX_BYTES)
+                    self.assertIsNotNone(producer.NPM_CHECK_RE.match(check))
+                    payload = producer.build_npm_diagnostic_payload("npm_lock", "npm_lock_refused", None, None, check)
+                    self.assertEqual(self.sections(payload)[1], ["  kd-check " + check])
+
+    def test_every_parser_detail_shape_is_accepted_by_the_payload_validator(self):
+        for check in (
+            "shared_parser:npm_lock_invalid:root_fields",
+            "shared_parser:npm_lock_invalid:entry_key:node_modules/a/node_modules/@s/b:bogus",
+            "shared_parser:npm_lock_invalid:dep_spec:node_modules/@isaacs/cliui:dependencies:string-width-cjs scheme:npm",
+            "shared_parser:npm_lock_invalid:engines_shape:node_modules/a",
+            "shared_parser:npm_lock_invalid:resolved_url:node_modules/a",
+            "shared_parser:npm_lock_invalid:entry_name:node_modules/string-width-cjs",
+            "shared_parser:npm_lock_invalid:entry_key:root:invalid_name",
+            "shared_parser:npm_lock_invalid:workspace_entry:packages/host-api",
+        ):
+            with self.subTest(check=check):
+                self.assertIsNotNone(bootstrap.LOCK_DETAIL_RE.match(check))
                 payload = producer.build_npm_diagnostic_payload("npm_lock", "npm_lock_refused", None, None, check)
                 self.assertEqual(self.sections(payload)[1], ["  kd-check " + check])
 
