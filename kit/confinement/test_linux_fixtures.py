@@ -155,13 +155,34 @@ class LinuxFixtureGenerationTests(unittest.TestCase):
             self.assertEqual("KD_NODE" in env, form in fixtures.NEEDS_NODE)
         with self.assertRaises(ValueError):
             fixtures.fixture_env("npm_postinstall", NONCE, PORTS, "/ipc/docker.sock", None, None)
-        self.assertEqual(fixtures.resolve_node("/usr/local/bin/node"), ("/usr/local/bin/node", None))
-        self.assertEqual(fixtures.resolve_node("/opt/n/bin/node"), ("/opt/n/bin/node", "/opt/n/bin"))
-        for bad in ("node", "/usr/bin/", "/opt/a b/node", "/opt/../node", "/x/" + "a" * 300, None):
+        self.assertEqual(fixtures.resolve_node("/usr/local/bin/node"), "/usr/local/bin/node")
+        self.assertEqual(fixtures.resolve_node("/usr/bin/node"), "/usr/bin/node")
+        for bad in ("node", "/node", "/usr/bin/", "/usr/a b/node", "/usr/../node", "/opt/n/bin/node", "/etc/node", "/usr/" + "a" * 300, None):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     fixtures.resolve_node(bad)
 
+    def test_the_pinned_node_plan_accepts_only_the_pinned_toolchain_tree(self):
+        good = "/tmp/kd-toolchains/node/node-v24.1.0-linux-x64/bin"
+        self.assertEqual(
+            fixtures.pinned_node_plan(good),
+            ("/kd-node/node", {"source": good, "target": "/kd-node", "ro": True, "rec": False}),
+        )
+        reserved = ("/tmp", "/tmp/kd-toolchains", "/etc", "/ipc", "/work", "/fixtures", "/work/bin", "/fixtures/npm_postinstall/bin",
+                    "/ipc/bin", "/tmp/other/bin", "/tmp/kd-toolchains/node/../../x/bin", "/tmp/kd-toolchains/node//bin",
+                    "/tmp/kd-toolchains/node/a b/bin", "/tmp/kd-toolchains/node/x", None)
+        for bad in reserved:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    fixtures.pinned_node_plan(bad)
+        for reserved_path in ("/tmp", "/ipc", "/work", "/fixtures", "/etc", "/dev", "/proc", "/capture"):
+            self.assertFalse(fixtures.NODE_TARGET == reserved_path or fixtures.NODE_TARGET.startswith(reserved_path + "/"))
+
+    def test_rust_drivers_are_built_from_the_linker_constant(self):
+        for form in ("build_rs", "proc_macro"):
+            driver = fixtures.fixture_files(form)["/fixtures/" + form + "/run.sh"][0]
+            self.assertNotIn("@LINKER@", driver)
+            self.assertEqual(driver.count(fixtures.LINKER), driver.count("linker=") + 1)
     def test_slugs_are_dns_label_safe(self):
         for form in fixtures.FORMS:
             self.assertRegex(fixtures.slug(form), r"^[a-z0-9]+$")

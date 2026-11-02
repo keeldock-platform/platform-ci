@@ -51,6 +51,12 @@ RUN_TIMEOUT = {
 NEEDS_RUSTC = ("build_rs", "proc_macro")
 NEEDS_NODE = ("npm_postinstall",)
 LINKER = "/usr/bin/gcc"
+NODE_IMAGE_PREFIX = "/usr/"
+PINNED_NODE_PREFIX = "/tmp/kd-toolchains/node/"
+NODE_TARGET = "/kd-node"
+HOST_NODE_ABSENT = 60
+HOST_NODE_UNSAFE = 61
+HOST_NODE_PINNED_INVALID = 62
 
 SHELL_DRIVER = r"""scratch=/tmp/fx
 mkdir -p "$scratch"
@@ -431,17 +437,17 @@ PROC_MACRO_USER = "hostile::hostile!();\n\nfn main() {}\n"
 
 RUST_BUILD_DRIVER = """cd /work || exit 1
 export TMPDIR=/work HOME=/work
-[ -x /usr/bin/gcc ] || exit 5
-"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=/usr/bin/gcc -o /work/build_script /fixtures/build_rs/build.rs || exit 3
+[ -x @LINKER@ ] || exit 5
+"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=@LINKER@ -o /work/build_script /fixtures/build_rs/build.rs || exit 3
 /work/build_script
-"""
+""".replace("@LINKER@", LINKER)
 
 RUST_MACRO_DRIVER = """cd /work || exit 1
 export TMPDIR=/work HOME=/work
-[ -x /usr/bin/gcc ] || exit 5
-"$KD_RUSTC" --edition 2021 --crate-type proc-macro -C linker=/usr/bin/gcc --crate-name hostile --out-dir /work /fixtures/proc_macro/hostile.rs || exit 3
-"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=/usr/bin/gcc --extern hostile=/work/libhostile.so -o /work/use_hostile /fixtures/proc_macro/use_hostile.rs || exit 4
-"""
+[ -x @LINKER@ ] || exit 5
+"$KD_RUSTC" --edition 2021 --crate-type proc-macro -C linker=@LINKER@ --crate-name hostile --out-dir /work /fixtures/proc_macro/hostile.rs || exit 3
+"$KD_RUSTC" --edition 2021 --crate-type bin -C linker=@LINKER@ --extern hostile=/work/libhostile.so -o /work/use_hostile /fixtures/proc_macro/use_hostile.rs || exit 4
+""".replace("@LINKER@", LINKER)
 
 
 def validate_form(form):
@@ -528,13 +534,21 @@ def fixture_env(form, nonce, ports, unix_path, rustc=None, node=None):
 
 
 def resolve_node(real):
-    if type(real) is not str:
+    if type(real) is not str or len(real) > 300 or not real.startswith(NODE_IMAGE_PREFIX):
         raise ValueError("node")
-    if not real.startswith("/") or "/../" in real or real.endswith("/") or len(real) > 300:
+    if "/../" in real or real.endswith("/") or not all(part.isalnum() or part in "._/@+=-" for part in real):
         raise ValueError("node")
-    if not all(part.isalnum() or part in "._/@+=-" for part in real):
+    return real
+
+
+def pinned_node_plan(directory):
+    if type(directory) is not str or len(directory) > 300:
         raise ValueError("node")
-    return real, (None if real.startswith("/usr/") else real.rsplit("/", 1)[0] or None)
+    if not directory.startswith(PINNED_NODE_PREFIX) or not directory.endswith("/bin"):
+        raise ValueError("node")
+    if "/../" in directory or "//" in directory or not all(part.isalnum() or part in "._/@+=-" for part in directory):
+        raise ValueError("node")
+    return NODE_TARGET + "/node", {"source": directory, "target": NODE_TARGET, "ro": True, "rec": False}
 
 
 def control_markers(form, nonce):

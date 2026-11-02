@@ -228,6 +228,8 @@ class LinuxSessionSpecTests(unittest.TestCase):
             good_spec(files={"/a": [1, 1]}),
             good_spec(binds=[{"source": "/a", "target": "/b"}]),
             good_spec(binds=[{"source": "/a b", "target": "/b", "ro": True}]),
+            good_spec(binds=[{"source": "/a", "target": "/b", "ro": True, "rec": "no"}]),
+            good_spec(binds=[{"source": "/a", "target": "/b", "ro": True, "other": False}]),
             good_spec(limits="huge"),
             good_spec(timeout=0),
             good_spec(timeout=601),
@@ -241,6 +243,10 @@ class LinuxSessionSpecTests(unittest.TestCase):
                 self.assertEqual(raised.exception.reason, 96)
         with self.assertRaises(harness.ProofFailure):
             session.validate_spec([])
+
+    def test_binds_may_opt_out_of_recursion_with_a_boolean_only(self):
+        spec = good_spec(binds=[{"source": "/a", "target": "/b", "ro": True, "rec": False}])
+        self.assertIs(session.validate_spec(spec), spec)
 
     def test_result_parsing_accepts_one_line_and_refuses_everything_else(self):
         reply = {

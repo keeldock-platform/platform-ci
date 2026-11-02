@@ -789,8 +789,9 @@ class LinuxBoundaryFixtureDiagnosticTests(unittest.TestCase):
 
     def test_exit_detail_is_bounded(self):
         self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=3)), 3)
-        self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=127)), 127)
-        for code in (200, -128, None, "x", True):
+        for code in (127, 128, 137, 200, 255):
+            self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=code)), code)
+        for code in (256, -128, None, "x", True):
             self.assertIsNone(boundary.exit_detail(SimpleNamespace(exit_code=code)))
         self.assertIsNone(boundary.exit_detail(SimpleNamespace()))
 
@@ -798,31 +799,107 @@ class LinuxBoundaryFixtureDiagnosticTests(unittest.TestCase):
         self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=-9)), 137)
         self.assertEqual(boundary.exit_detail(SimpleNamespace(exit_code=-6)), 134)
         self.assertEqual(BoundaryRefusal("fixture_incomplete", None, 134).detail, 134)
+        self.assertEqual(BoundaryRefusal("fixture_incomplete", None, 255).detail, 255)
         self.assertIsNone(BoundaryRefusal("fixture_incomplete", None, 256).detail)
 
-    def test_node_binary_resolves_symlinks_and_binds_only_outside_usr(self):
+    def test_node_binary_uses_the_image_node_only_when_its_real_path_is_under_usr_and_never_binds(self):
         subject, unused = make()
         with patch("linux_boundary.shutil.which", return_value="/usr/local/bin/node"), \
              patch("linux_boundary.os.path.realpath", return_value="/usr/local/n/versions/node/20.1.0/bin/node"):
             self.assertEqual(subject.node_binary(), ("/usr/local/n/versions/node/20.1.0/bin/node", None))
-        with patch("linux_boundary.shutil.which", return_value="/usr/local/bin/node"), \
-             patch("linux_boundary.os.path.realpath", return_value="/opt/hostedtoolcache/node/20/x64/bin/node"):
-            self.assertEqual(
-                subject.node_binary(),
-                ("/opt/hostedtoolcache/node/20/x64/bin/node", "/opt/hostedtoolcache/node/20/x64/bin"),
-            )
 
-    def test_node_binary_fails_closed_when_absent_or_unsafe(self):
+    def test_node_binary_fails_closed_with_host_codes_distinct_from_the_driver_codes(self):
         subject, unused = make()
         with patch("linux_boundary.shutil.which", return_value=None):
             with self.assertRaises(BoundaryRefusal) as raised:
                 subject.node_binary()
-        self.assertEqual((raised.exception.reason, raised.exception.detail), ("fixture_incomplete", 6))
-        with patch("linux_boundary.shutil.which", return_value="/usr/bin/node"), \
-             patch("linux_boundary.os.path.realpath", return_value="/opt/odd path/node"):
+        self.assertEqual((raised.exception.reason, raised.exception.detail), ("fixture_incomplete", fixtures.HOST_NODE_ABSENT))
+        for real in ("/opt/hostedtoolcache/node/20/bin/node", "/node", "/etc/node", "/usr/bin/a b"):
+            with patch("linux_boundary.shutil.which", return_value="/usr/bin/node"), \
+                 patch("linux_boundary.os.path.realpath", return_value=real):
+                with self.assertRaises(BoundaryRefusal) as raised:
+                    subject.node_binary()
+            self.assertEqual((raised.exception.reason, raised.exception.detail), ("fixture_incomplete", fixtures.HOST_NODE_UNSAFE))
+        driver = fixtures.fixture_files("npm_postinstall")["/fixtures/npm_postinstall/run.sh"][0]
+        for code in (fixtures.HOST_NODE_ABSENT, fixtures.HOST_NODE_UNSAFE, fixtures.HOST_NODE_PINNED_INVALID):
+            self.assertNotIn("exit " + str(code), driver)
+
+    def test_pinned_node_is_bound_read_only_non_recursively_at_a_fixed_target(self):
+        pinned = "/tmp/kd-toolchains/node/node-v24.1.0-linux-x64/bin"
+        subject, unused = make(node_bin=pinned)
+        with patch("linux_boundary.os.path.realpath", return_value=pinned + "/node"), \
+             patch("linux_boundary.os.access", return_value=True):
+            node, bind = subject.node_binary()
+        self.assertEqual(node, "/kd-node/node")
+        self.assertEqual(bind, {"source": pinned, "target": "/kd-node", "ro": True, "rec": False})
+        with patch("linux_boundary.os.path.realpath", return_value="/elsewhere/node"), \
+             patch("linux_boundary.os.access", return_value=True):
             with self.assertRaises(BoundaryRefusal) as raised:
                 subject.node_binary()
-        self.assertEqual((raised.exception.reason, raised.exception.detail), ("fixture_incomplete", 7))
+        self.assertEqual(raised.exception.detail, fixtures.HOST_NODE_PINNED_INVALID)
+        with patch("linux_boundary.os.path.realpath", return_value=pinned + "/node"), \
+             patch("linux_boundary.os.access", return_value=False):
+            with self.assertRaises(BoundaryRefusal):
+                subject.node_binary()
+        for bad in ("/etc", "/tmp", "/work/bin", "/ipc", "/fixtures/bin", "/tmp/kd-toolchains/node/../../../etc/bin"):
+            bad_subject, unused = make(node_bin=bad)
+            with self.assertRaises(BoundaryRefusal) as raised:
+                bad_subject.node_binary()
+            self.assertEqual(raised.exception.detail, fixtures.HOST_NODE_PINNED_INVALID)
+
+    def run_fixture(self, form, **changes):
+        subject, unused = make(rust_sysroot="/opt/rust", **changes)
+        subject.tripwires = SimpleNamespace(
+            ports={"https4": 1, "udp": 2, "dns_udp": 3, "proxy": 4},
+            store=SimpleNamespace(clear=lambda: None, seen=lambda name, marker: True, snapshot=lambda: []),
+        )
+        subject.ipc_dir = "/ipc-source"
+        lines = b"".join(
+            b"KDATT " + name.encode("ascii") + b" " + (b"contained" if accepted == channels.CONTAINED else b"denied") + b"\n"
+            for name, accepted in fixtures.fixture_rules(form)
+        )
+        calls = []
+
+        def fake_chroot(argv, env, mode="confined", files=None, binds=None, **options):
+            calls.append((env, binds))
+            return result(lines)
+
+        with patch.object(boundary.Boundary, "chroot", side_effect=fake_chroot), \
+             patch.object(boundary.Boundary, "node_binary", return_value=("/kd-node/node", {"source": "/tmp/kd-toolchains/node/n/bin", "target": "/kd-node", "ro": True, "rec": False})):
+            subject.fixture_outcome(form)
+        return calls
+
+    def test_node_environment_and_bind_exist_only_for_the_npm_form(self):
+        for form in fixtures.FORMS:
+            calls = self.run_fixture(form)
+            self.assertEqual(len(calls), 2)
+            for env, binds in calls:
+                with self.subTest(form=form):
+                    self.assertEqual("KD_NODE" in env, form == "npm_postinstall")
+                    targets = [item["target"] for item in binds]
+                    self.assertEqual("/kd-node" in targets, form == "npm_postinstall")
+                    self.assertEqual("/opt/rust" in targets, form in fixtures.NEEDS_RUSTC)
+                    for item in binds:
+                        if item["target"] in ("/kd-node", "/opt/rust"):
+                            self.assertTrue(item["ro"])
+                            self.assertIs(item["rec"], False)
+
+    def test_a_node_lookup_refusal_flows_through_run_fixtures(self):
+        subject, emitter = make(rust_sysroot="/opt/rust")
+        with patch.object(boundary.Boundary, "node_binary", side_effect=BoundaryRefusal("fixture_incomplete", None, fixtures.HOST_NODE_UNSAFE)), \
+             patch.object(boundary.Boundary, "chroot", side_effect=BoundaryRefusal("environment")):
+            completed, first = subject.run_fixtures()
+        output = emitter.stream.getvalue()
+        self.assertEqual(first.reason, "environment")
+        self.assertIn("form=npm_postinstall result=refused reason=fixture_incomplete detail=" + str(fixtures.HOST_NODE_UNSAFE), output)
+        self.assertEqual(completed, 0)
+
+    def test_node_bin_argument_is_optional_and_absolute(self):
+        parser = boundary.build_parser()
+        self.assertIsNone(parser.parse_args(["selftest", "--node-bin", ""]).node_bin)
+        self.assertEqual(parser.parse_args(["selftest", "--node-bin", "/tmp/kd-toolchains/node/x/bin"]).node_bin, "/tmp/kd-toolchains/node/x/bin")
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["selftest", "--node-bin", "relative"])
 
 
 if __name__ == "__main__":

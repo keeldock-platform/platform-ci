@@ -131,7 +131,7 @@ def exit_detail(result):
     code = getattr(result, "exit_code", None)
     if type(code) is not int:
         return None
-    if 0 <= code <= 127:
+    if 0 <= code <= 255:
         return code
     if -127 <= code < 0:
         return 128 - code
@@ -445,13 +445,22 @@ class Boundary:
         return outcome
 
     def node_binary(self):
+        pinned = getattr(self.arguments, "node_bin", None)
+        if pinned:
+            try:
+                node, bind = fixtures.pinned_node_plan(pinned)
+            except ValueError:
+                raise BoundaryRefusal("fixture_incomplete", None, fixtures.HOST_NODE_PINNED_INVALID)
+            if os.path.realpath(pinned + "/node") != pinned + "/node" or not os.access(pinned + "/node", os.X_OK):
+                raise BoundaryRefusal("fixture_incomplete", None, fixtures.HOST_NODE_PINNED_INVALID)
+            return node, bind
         found = shutil.which("node", path=BASE_ENV["PATH"])
         if found is None:
-            raise BoundaryRefusal("fixture_incomplete", None, 6)
+            raise BoundaryRefusal("fixture_incomplete", None, fixtures.HOST_NODE_ABSENT)
         try:
-            return fixtures.resolve_node(os.path.realpath(found))
+            return fixtures.resolve_node(os.path.realpath(found)), None
         except ValueError:
-            raise BoundaryRefusal("fixture_incomplete", None, 7)
+            raise BoundaryRefusal("fixture_incomplete", None, fixtures.HOST_NODE_UNSAFE)
 
     def fixture_outcome(self, form):
         needs_rust = form in fixtures.NEEDS_RUSTC
@@ -463,13 +472,13 @@ class Boundary:
         binds = self.ipc_binds()
         rustc = None
         if needs_rust:
-            binds.append({"source": sysroot, "target": sysroot, "ro": True})
+            binds.append({"source": sysroot, "target": sysroot, "ro": True, "rec": False})
             rustc = sysroot + "/bin/rustc"
         node = None
         if form in fixtures.NEEDS_NODE:
-            node, node_root = self.node_binary()
-            if node_root is not None:
-                binds.append({"source": node_root, "target": node_root, "ro": True})
+            node, node_bind = self.node_binary()
+            if node_bind is not None:
+                binds.append(node_bind)
         environment = fixtures.fixture_env(form, self.nonce, self.tripwires.ports, "/ipc/docker.sock", rustc, node)
         argv = LAUNCH + fixtures.fixture_argv(form, self.nonce)
         options = {"work": True, "limits": "fixture", "timeout": fixtures.RUN_TIMEOUT[form], "cwd": "/work"}
@@ -745,6 +754,7 @@ def build_parser():
     parser.add_argument("--control-sha")
     parser.add_argument("--record")
     parser.add_argument("--rust-sysroot", type=optional_path, default=None)
+    parser.add_argument("--node-bin", type=optional_path, default=None)
     parser.add_argument("--runner-uid", type=int, default=-1)
     parser.add_argument("--runner-home", type=optional_path, default=None)
     parser.add_argument("--runner-temp", type=optional_path, default=None)

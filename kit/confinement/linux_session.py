@@ -340,7 +340,9 @@ def validate_spec(spec):
         if type(entry[0]) is not str or type(entry[1]) is not int:
             raise harness.ProofFailure(96)
     for bind in spec.get("binds", []):
-        if type(bind) is not dict or set(bind) != {"source", "target", "ro"}:
+        if type(bind) is not dict or set(bind) not in ({"source", "target", "ro"}, {"source", "target", "ro", "rec"}):
+            raise harness.ProofFailure(96)
+        if "rec" in bind and type(bind["rec"]) is not bool:
             raise harness.ProofFailure(96)
         if SAFE_PATH.fullmatch(str(bind["source"])) is None or SAFE_PATH.fullmatch(str(bind["target"])) is None:
             raise harness.ProofFailure(96)
@@ -384,7 +386,8 @@ def extend_rootfs(rootfs, spec):
     for bind in spec.get("binds", []):
         target = rootfs + bind["target"]
         os.makedirs(target, mode=0o755, exist_ok=True)
-        harness._mount(bind["source"], target, None, harness.MS_BIND | harness.MS_REC)
+        recursive = 0 if bind.get("rec") is False else harness.MS_REC
+        harness._mount(bind["source"], target, None, harness.MS_BIND | recursive)
         if bind["ro"]:
             harness._mount(None, target, None, harness.MS_BIND | harness.MS_REMOUNT | harness.MS_RDONLY | harness.MS_NOSUID | harness.MS_NODEV)
     write_files(rootfs, spec["files"])
