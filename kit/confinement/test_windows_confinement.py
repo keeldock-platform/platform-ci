@@ -13,8 +13,7 @@ from public_tree import MAX_FILE_BYTES, inspect_text
 
 NATIVE = ROOT / "kit/confinement/windows_confinement.cs"
 WRAPPER = ROOT / "kit/confinement/windows_confinement.ps1"
-RECOVERY = ROOT / "kit/confinement/windows_confinement_recovery.ps1"
-RECOVERY_TEST = ROOT / "kit/confinement/test_windows_confinement_recovery.ps1"
+PROBE = ROOT / "kit/confinement/windows_probe.rs"
 WORKFLOW = ROOT / ".github/workflows/windows-confinement.yml"
 CONFINED_STAGES = (
     "cmd_exec",
@@ -22,7 +21,26 @@ CONFINED_STAGES = (
     "acl_scratch_write",
     "acl_ro_write_denied",
     "acl_downloads_denied",
+    "nul_open",
+    "nul_write_dac",
+    "stdin_eof",
+    "temp_dir",
+    "network_tcp_ipv4",
+    "network_tcp_ipv6",
+    "network_tcp_host",
+    "network_dns",
+    "network_udp",
+    "canary_runner_temp",
+    "canary_workspace",
+    "canary_profile",
+    "canary_scratch_control",
+    "spawn_piped",
+    "spawn_output",
     "acl_downloads_listable",
+    "network_control",
+    "network_control_ipv6",
+    "network_control_dns",
+    "network_control_udp",
     "rustc_version",
     "cargo_version",
     "link_banner",
@@ -30,6 +48,49 @@ CONFINED_STAGES = (
     "rust_test",
     "node_version",
     "node_bindings",
+    "node_child",
+)
+PROBE_COMMANDS = (
+    "wsa",
+    "connect",
+    "dns",
+    "udp",
+    "nul",
+    "nuldac",
+    "write",
+    "read",
+    "list",
+    "stat",
+    "stdin",
+    "spawn",
+    "tempdir",
+    "echo",
+)
+EXPECTED_SUMMARY = (
+    ("rust", "compiled"),
+    ("node", "ran"),
+    ("node_child", "ran"),
+    ("first_failure", "none"),
+    ("lpac", "verified"),
+    ("lpac_basis", "attr"),
+    ("capabilities", "registryRead"),
+    ("job", "verified"),
+    ("acl", "verified"),
+    ("scratch_write", "ok"),
+    ("ro_write", "denied"),
+    ("downloads", "denied"),
+    ("nul_open", "ok"),
+    ("nul_write_dac", "denied"),
+    ("stdin", "eof_pipe"),
+    ("temp_dir", "verified"),
+    ("spawn_piped", "ok"),
+    ("network", "blocked"),
+    ("ipv6", "blocked"),
+    ("ipv6_control", "open"),
+    ("canary", "absent"),
+    ("control_rust", "compiled"),
+    ("control_node", "ran"),
+    ("css_transform", "ok"),
 )
 
 
@@ -38,11 +99,10 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
     def setUpClass(cls):
         cls.native = NATIVE.read_text(encoding="utf-8")
         cls.wrapper = WRAPPER.read_text(encoding="utf-8")
-        cls.recovery = RECOVERY.read_text(encoding="utf-8")
-        cls.recovery_test = RECOVERY_TEST.read_text(encoding="utf-8")
+        cls.probe = PROBE.read_text(encoding="utf-8")
 
     def test_files_pass_the_public_tree_rules(self):
-        for path in (NATIVE, WRAPPER, RECOVERY, RECOVERY_TEST, WORKFLOW):
+        for path in (NATIVE, WRAPPER, PROBE, WORKFLOW):
             with self.subTest(path=path.name):
                 payload = path.read_bytes()
                 self.assertLessEqual(len(payload), MAX_FILE_BYTES)
@@ -57,7 +117,7 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
             "ProcThreadAttributeAllApplicationPackagesPolicy",
             "ProcThreadAttributeHandleList",
             "ProcessCreationAllApplicationPackagesOptOut",
-            "capabilities.CapabilityCount = 0",
+            "capabilities.CapabilityCount = 1",
             "CreateSuspended",
             "JobObjectLimitKillOnJobClose",
             "JobObjectLimitActiveProcess",
@@ -83,14 +143,14 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
             "CreateProcessW(executable",
             "AssignProcessToJobObject(job, process)",
             "ReadJob(job, process, maxProcesses)",
-            "ReadToken(process, confined, profileSid)",
+            "ReadToken(process, confined, profileSid, registryReadSidText, result)",
             "ResumeThread(thread)",
             "WaitForSingleObject(process, (uint)timeoutMs)",
         )
         positions = [self.native.index(item) for item in order]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("Native.TerminateJobObject(job, JobKillExitCode)", self.native)
-        self.assertEqual(self.native.count("handleBuffer = Marshal.AllocHGlobal(IntPtr.Size * 2)"), 1)
+        self.assertEqual(self.native.count("handleBuffer = Marshal.AllocHGlobal(IntPtr.Size * 3)"), 1)
 
     def test_wrapper_pins_exact_toolchains_by_hash_and_allows_only_known_hosts(self):
         self.assertIn("$RustVersion = '1.99.1'", self.wrapper)
@@ -204,10 +264,10 @@ foreach ($case in $cases) {
         return match.group(0)
 
     def test_wrapper_runs_the_control_first_then_the_confined_ladder(self):
-        names = re.findall(r"Name = '([a-z_]+)'; Exe", self.wrapper)
+        names = re.findall(r"Name = '([a-z0-9_]+)'; Exe", self.wrapper)
         self.assertEqual(tuple(names), CONFINED_STAGES)
         control = "$controlOutcomes = Invoke-Ladder $box $false $script:Control"
-        confined = "$confinedOutcomes = Invoke-ConfinedLadder $box $script:Lpac"
+        confined = "$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac"
         self.assertIn(control, self.wrapper)
         self.assertIn(confined, self.wrapper)
         self.assertLess(self.wrapper.index(control), self.wrapper.index(confined))
@@ -267,20 +327,24 @@ foreach ($case in $cases) {
         proof = re.search(r"^ *\$lpacProven = (.+)$", self.function_body("Invoke-Ladder"), re.M)
         self.assertIsNotNone(proof)
         patterns = re.findall(r"\$tokenText -like '([^']+)'", proof.group(1))
-        self.assertEqual(len(patterns), 5)
+        self.assertEqual(len(patterns), 7)
         return all(fnmatch.fnmatchcase(text, pattern) for pattern in patterns)
 
     def test_container_proof_requires_every_token_fact_explicitly(self):
-        good = "appcontainer=1,capabilities=0,integrity=0x1000,lpac=1,sid=match,arap=present,aap=absent"
+        good = "appcontainer=1,capabilities=1,integrity=0x1000,lpac=attr,cap=registryRead,sid=match,aap=absent"
         self.assertTrue(self.token_accepted(good))
         for bad in (
-            good.replace("lpac=1", "lpac=unreadable"),
-            good.replace("lpac=1", "lpac=aap_only"),
-            good.replace("lpac=1", "lpac=0"),
+            good.replace("lpac=attr", "lpac=none"),
+            good.replace("lpac=attr", "lpac=unreadable"),
+            good.replace("lpac=attr", "lpac=aap_only"),
+            good.replace("capabilities=1", "capabilities=0"),
+            good.replace("capabilities=1", "capabilities=2"),
+            good.replace("cap=registryRead", "cap=mismatch"),
             good.replace("sid=match", "sid=mismatch"),
-            good.replace("arap=present", "arap=absent"),
             good.replace("aap=absent", "aap=present"),
             good.replace("appcontainer=1", "appcontainer=0"),
+            good.replace("integrity=0x1000", "integrity=0x2000"),
+            "appcontainer=1,capabilities=0,integrity=0x1000,lpac=1,sid=match,arap=present,aap=absent",
             "appcontainer=0,integrity=0x3000",
             "none",
             "unknown",
@@ -288,15 +352,12 @@ foreach ($case in $cases) {
             with self.subTest(token=bad):
                 self.assertFalse(self.token_accepted(bad))
         for required in (
-            'lpac != "1"',
             'sidState != "match"',
             'applicationPackages != "absent"',
             "TokenAppContainerSid",
             "TokenGroups",
             "TokenRestrictedSids",
             'AllApplicationPackagesSid = "S-1-15-2-1"',
-            'AllRestrictedApplicationPackagesSid = "S-1-15-2-2"',
-            "ReadAllRestrictedApplicationPackagesState",
             "GroupEnabled = 0x00000004",
             "Native.EqualSid(actual, expectedSid)",
         ):
@@ -354,265 +415,8 @@ foreach ($case in $cases) {
             line = next(item for item in environment.splitlines() if "('" + name + "=" in item)
             self.assertIn("$scratch.Tmp", line)
 
-    def test_winsock_catalog_access_is_package_scoped_read_only_and_restored(self):
-        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
-        self.assertIn("WinSock2\\Parameters'", grant)
-        self.assertLess(grant.index("New-CatalogLease"), grant.index("Start-CatalogRecovery"))
-        self.assertLess(grant.index("Start-CatalogRecovery"), grant.index("Add-CatalogRead"))
-        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", grant)
-        self.assertLess(grant.index("Restore-WinsockCatalogAcl"), grant.index("Stop-CatalogRecovery"))
-        self.assertLess(grant.index("Stop-CatalogRecovery"), grant.index("$script:WinsockCatalogLease = $null"))
-        self.assertNotIn("SetAccessControl", grant)
-        add = self.function_body("Add-CatalogRead", self.recovery)
-        self.assertIn("RegistryRights]::ReadKey", add)
-        self.assertIn("RegistryRights]::ChangePermissions", add)
-        self.assertIn("RegistryAccessRule($identity", add)
-        self.assertIn("$security.AddAccessRule($rule)", add)
-        self.assertIn("$writeMask =", add)
-        self.assertIn("-not $entry.IsInherited", add)
-        self.assertLess(add.index("WriteAllText([string]$lease.ArmedFile"), add.index("$key.SetAccessControl($security)"))
-        self.assertIn("Restore-CatalogAcl $lease", self.function_body("Restore-WinsockCatalogAcl", self.recovery))
-        restore = self.function_body("Restore-CatalogAcl", self.recovery)
-        self.assertIn("Restore-CatalogKey", restore)
-        self.assertIn("$index -ge 0; $index--", restore)
-        key_restore = self.function_body("Restore-CatalogKey", self.recovery)
-        self.assertIn("$sddl", key_restore)
-        self.assertIn("$key.SetAccessControl($restore)", key_restore)
-        self.assertIn("GetSecurityDescriptorSddlForm", key_restore)
-        self.assertIn("winsock_restore_readback", key_restore)
-        confined = self.function_body("Invoke-ConfinedLadder")
-        self.assertIn("Grant-WinsockCatalogRead $script:Sid", confined)
-        self.assertIn("finally", confined)
-        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", confined)
-        self.assertIn("Stop-CatalogRecovery $script:WinsockCatalogLease", confined)
-        self.assertIn("$script:WinsockCatalogLease = $null", confined)
-        self.assertIn("$phase = 'winsock_acl'", self.wrapper)
-        self.assertNotIn("internetClient", self.wrapper)
-        self.assertNotIn("internetClient", self.recovery)
-        self.assertNotIn("privateNetworkClientServer", self.wrapper)
-        self.assertIn("capabilities.CapabilityCount = 0", self.native)
-
-    def test_winsock_grants_are_explicit_per_key_over_a_closed_key_set(self):
-        asserted = self.function_body("Assert-CatalogPath", self.recovery)
-        for part in ("Protocol_Catalog9|NameSpace_Catalog5", "Catalog_Entries|Catalog_Entries64", "[0-9]{12}", "-cmatch"):
-            self.assertIn(part, asserted)
-        paths = self.function_body("Get-CatalogKeyPaths", self.recovery)
-        for part in ("'Protocol_Catalog9'", "'NameSpace_Catalog5'", "'Catalog_Entries'", "'Catalog_Entries64'", "Get-CatalogNumberedChildren"):
-            self.assertIn(part, paths)
-        children = self.function_body("Get-CatalogNumberedChildren", self.recovery)
-        self.assertIn("'^[0-9]{12}\\z'", children)
-        lease = self.function_body("New-CatalogLease", self.recovery)
-        self.assertIn("KeyList", lease)
-        self.assertIn("OriginalSddl = (Get-CatalogAclSddl $item)", lease)
-        add = self.function_body("Add-CatalogRead", self.recovery)
-        self.assertIn("foreach ($item in @($lease.KeyList))", add)
-        self.assertIn("InheritanceFlags]::None, [System.Security.AccessControl.PropagationFlags]::None", add)
-        self.assertIn("-ne [string]$item.OriginalSddl", add)
-        self.assertIn("$entry.PropagationFlags -eq", add)
-        self.assertLess(add.index("-ne [string]$item.OriginalSddl"), add.index("$key.SetAccessControl($security)"))
-        watch = self.function_body("Invoke-CatalogWatch", self.recovery)
-        self.assertIn("@($data.KeyList)", watch)
-        self.assertIn("Assert-CatalogPath ([string]$item.Path)", watch)
-
-    def test_confined_ladder_probes_each_granted_catalog_key_before_other_stages(self):
-        probe = self.function_body("Get-WinsockProbeSpecs")
-        for part in ("'winsock_key_'", "Get-NativeProbeArguments", "$script:WinsockCatalogLease", "$r.ExitCode -eq 0", "status=ok"):
-            self.assertIn(part, probe)
-        self.assertNotIn("reg.exe", probe)
-        self.assertNotIn("query HKLM", probe)
-        for name in ("parameters", "protocol_catalog", "namespace_catalog", "protocol_entries64", "namespace_entries64", "protocol_entry", "namespace_entry64"):
-            self.assertIn("Name = '" + name + "'", probe)
-        specs = self.function_body("Get-StageSpecs")
-        self.assertLess(specs.index("Get-WinsockProbeSpecs"), specs.index("Name = 'cmd_exec'"))
-
-    def test_native_registry_probe_uses_full_nt_names_and_a_closed_identifier_set(self):
-        for required in (
-            "NtOpenKey",
-            "ObjectCaseInsensitive",
-            "KeyQueryValue",
-            "\\\\REGISTRY\\\\MACHINE\\\\SYSTEM\\\\CurrentControlSet\\\\Services\\\\WinSock2\\\\Parameters",
-            "\\\\REGISTRY\\\\MACHINE\\\\SYSTEM\\\\CurrentControlSet\\\\Control\\\\Nls\\\\CodePage",
-            "HasNumericSuffix(probeId, \"winsock_protocol_entry_\", 12)",
-            "HasHexSuffix(probeId, \"lpac_discriminator_arap_\", 32)",
-            "HasHexSuffix(probeId, \"lpac_discriminator_aap_\", 32)",
-            "status=",
-            "access_denied",
-            "object_name_not_found",
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, self.native)
-        self.assertIn("IsKnownProbeId($probeId)", self.wrapper)
-        self.assertIn("NativeRegistryProbe]::Probe($ProbeId)", self.wrapper)
-        self.assertIn("ValidateSet('spike', 'compile', 'native-probe')", self.wrapper)
-        self.assertIn("Copy-Item -LiteralPath $PSCommandPath -Destination $layout.NativeProbeScript", self.wrapper)
-        self.assertIn("$script:Layout.NativeProbeScript", self.wrapper)
-        self.assertIn("$script:Layout.NativeProbeSource", self.wrapper)
-        self.assertIn("$script:Layout.NativeProbeRecovery", self.function_body("Test-Acl"))
-        arguments = self.function_body("Get-NativeProbeArguments")
-        self.assertIn("IsKnownProbeId($probeId)", arguments)
-        self.assertIn("-ProbeId ' + $probeId", arguments)
-        self.assertNotIn("ScratchPaths", arguments)
-        self.assertIn('throw new InvalidOperationException("registry_probe_id")', self.native)
-        self.assertNotIn("reg.exe", self.wrapper)
-        self.assertNotIn("query HKLM", self.wrapper)
-
-    def test_package_sid_and_path_shapes_are_checked_in_the_unprivileged_job(self):
-        text = WORKFLOW.read_text(encoding="utf-8")
-        step = text.index("      - name: Check package SID and catalog path shapes without registry access\n")
-        self.assertLess(text.index("      - name: Compile native confinement module\n"), step)
-        self.assertLess(step, text.index("  windows-confinement-spike:\n"))
-        block = text[step:text.index("      - name: Exercise registry recovery after forced cancellation\n")]
-        self.assertIn("test_windows_confinement_recovery.ps1 -Mode sid", block)
-        self.assertNotIn("if:", block)
-        self.assertIn("if ($Mode -eq 'sid') {", self.recovery_test)
-        self.assertNotIn("OpenBaseKey", self.recovery_test.split("if ($Mode -eq 'sid') {", 1)[1].split("exit 0", 1)[0])
-
-    def test_probe_specs_carry_the_same_confinement_fields_as_cmd_exec(self):
-        probe = self.function_body("Get-WinsockProbeSpecs")
-        specs = self.function_body("Get-StageSpecs")
-        cmd_line = re.search(r"Name = 'cmd_exec'.*", specs).group(0)
-        fields = ("Name", "Exe", "Arguments", "Timeout", "Check")
-        cmd_fields = re.findall(r"(\w+) = ", cmd_line.split("Check =", 1)[0] + "Check = ")
-        self.assertEqual(tuple(cmd_fields), fields)
-        spec_lines = [line for line in probe.splitlines() if "$specs += @{" in line]
-        self.assertEqual(len(spec_lines), 2)
-        for line in spec_lines:
-            with self.subTest(line=line):
-                found = re.findall(r"(\w+) = ", line.split("Check =", 1)[0] + "Check = ")
-                self.assertEqual(tuple(found), fields)
-                self.assertNotIn("confined", line.lower())
-        ladder = self.function_body("Invoke-Ladder")
-        self.assertEqual(ladder.count("$sandbox.Run($confined,"), 1)
-        self.assertIn("lpac_default_key_control", probe)
-        self.assertIn("Get-NativeProbeArguments 'lpac_default_key_control'", probe)
-
-    def test_discriminator_stages_follow_the_key_probes_and_precede_the_other_confined_stages(self):
-        specs = self.function_body("Get-StageSpecs")
-        probes = specs.index("Get-WinsockProbeSpecs")
-        discriminator = specs.index("Get-LpacDiscriminatorSpecs")
-        self.assertLess(probes, discriminator)
-        self.assertLess(discriminator, specs.index("Name = 'cmd_exec'"))
-        body = self.function_body("Get-LpacDiscriminatorSpecs")
-        self.assertLess(body.index("lpac_discriminator_arap"), body.index("lpac_discriminator_aap"))
-        lines = [line for line in body.splitlines() if "$specs += @{" in line]
-        self.assertEqual(len(lines), 2)
-        self.assertIn("$arapPath = [string]$lease.ScratchPaths.Arap", body)
-        self.assertIn("$aapPath = [string]$lease.ScratchPaths.Aap", body)
-        self.assertIn("$arapId = 'lpac_discriminator_arap_' + $arapPath.Substring($arapPath.LastIndexOf('\\') + 1)", body)
-        self.assertIn("$aapId = 'lpac_discriminator_aap_' + $aapPath.Substring($aapPath.LastIndexOf('\\') + 1)", body)
-        self.assertIn("$arapArguments = Get-NativeProbeArguments $arapId", body)
-        self.assertIn("$aapArguments = Get-NativeProbeArguments $aapId", body)
-        self.assertIn("Name = $arapName", lines[0])
-        self.assertIn("$arapArguments", lines[0])
-        self.assertIn("status=ok", lines[0])
-        self.assertIn("Name = $aapName", lines[1])
-        self.assertIn("$aapArguments", lines[1])
-        self.assertIn("status=access_denied ntstatus=0xC0000022", lines[1])
-        for line in lines:
-            self.assertIn("Exe = $probeExe", line)
-            self.assertNotIn("query HKLM", line)
-
-    @staticmethod
-    def behaviour_model(arap, aap):
-        if arap is None or aap is None or not arap["ran"] or not aap["ran"]:
-            return "inconclusive"
-        if "status=ok" not in arap["output"]:
-            return "inconclusive"
-        if "status=ok" in aap["output"]:
-            return "not_lpac"
-        if "status=access_denied ntstatus=0xC0000022" in aap["output"]:
-            return "behavioural"
-        return "inconclusive"
-
-    def test_behaviour_verdict_maps_the_three_outcomes(self):
-        body = self.function_body("Get-LpacBehaviour")
-        returns = re.findall(r"return '([a-z_]+)'", body)
-        self.assertEqual(returns, ["inconclusive", "inconclusive", "not_lpac", "behavioural", "inconclusive"])
-        for required in (
-            "-not $arap.Ran -or -not $aap.Ran",
-            "$arap.Stdout -notmatch 'status=ok'",
-            "$aap.Stdout -match 'status=ok'",
-            "$aap.Stdout -match 'status=access_denied ntstatus=0xC0000022'",
-        ):
-            self.assertIn(required, body)
-        readable = {"ran": True, "exit": 0, "output": "native-registry-probe status=ok"}
-        denied = {"ran": True, "exit": 0, "output": "native-registry-probe status=access_denied ntstatus=0xC0000022"}
-        other = {"ran": True, "exit": 0, "output": "native-registry-probe status=object_name_not_found ntstatus=0xC0000034"}
-        not_run = {"ran": False, "exit": 0, "output": ""}
-        self.assertEqual(self.behaviour_model(readable, denied), "behavioural")
-        self.assertEqual(self.behaviour_model(readable, readable), "not_lpac")
-        self.assertEqual(self.behaviour_model(denied, denied), "inconclusive")
-        self.assertEqual(self.behaviour_model(readable, other), "inconclusive")
-        self.assertEqual(self.behaviour_model(readable, not_run), "inconclusive")
-        self.assertEqual(self.behaviour_model(None, denied), "inconclusive")
-
-    def test_token_state_uses_the_behaviour_verdict_without_loosening_the_exit_rule(self):
-        self.assertIn("$lpacBehaviour = Get-LpacBehaviour $confinedOutcomes", self.wrapper)
-        for required in (
-            "if ($lpacBehaviour -eq 'not_lpac') {",
-            "$tokenState = 'not_lpac'",
-            "} elseif ($lpacBehaviour -eq 'behavioural') {",
-            "if ($containerConsistent) {",
-            "$lpacBasis = 'behavioural'",
-            "$tokenState = 'inconclusive'",
-            "' lpac=' + $lpacText + ' lpac_behaviour=' + $lpacBehaviour",
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, self.wrapper)
-        consistent = "$confinedOutcomes[$key].Token -or $confinedOutcomes[$key].AapOnly"
-        self.assertIn(consistent, self.wrapper)
-        self.assertLess(self.wrapper.index("$lpacBehaviour = Get-LpacBehaviour"), self.wrapper.index("windows-confinement-spike=observed"))
-        self.assertIn("-and $tokenState -eq 'verified'", self.wrapper)
-        self.assertIn("Ran = ($result.Failure -eq '' -and $result.Exited -and -not $result.TimedOut)", self.wrapper)
-
-    def test_scratch_discriminator_keys_are_created_restored_and_deleted_through_the_lease(self):
-        lease = self.function_body("New-CatalogLease", self.recovery)
-        self.assertIn("ScratchPaths", lease)
-        self.assertIn("ScratchList", lease)
-        self.assertIn("ConfinementRecoveryTest", lease)
-        create = self.function_body("New-CatalogScratchKey", self.recovery)
-        for required in (
-            "SetAccessRuleProtection($true, $false)",
-            "'S-1-5-18'",
-            "'S-1-5-32-544'",
-            "$readSid",
-            "InheritanceFlags]::None, [System.Security.AccessControl.PropagationFlags]::None",
-            "AreAccessRulesProtected",
-            "-ne ($actual -join ',')",
-            "-cne 'S-1-15-2-1' -and $readSid -cne 'S-1-15-2-2'",
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, create)
-        add = self.function_body("Add-CatalogScratchKeys", self.recovery)
-        self.assertLess(add.index("'S-1-15-2-1'"), add.index("'S-1-15-2-2'"))
-        self.assertLess(add.index("ScratchPaths.Aap"), add.index("ScratchPaths.Arap"))
-        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
-        self.assertLess(grant.index("Start-CatalogRecovery"), grant.index("Add-CatalogScratchKeys"))
-        self.assertLess(grant.index("Add-CatalogScratchKeys"), grant.index("Add-CatalogRead"))
-        self.assertLess(grant.index("Restore-WinsockCatalogAcl"), grant.index("Remove-CatalogScratchKeys"))
-        restore = self.function_body("Restore-WinsockCatalogAcl", self.recovery)
-        self.assertLess(restore.index("Restore-CatalogAcl $lease"), restore.index("Remove-CatalogScratchKeys"))
-        remove = self.function_body("Remove-CatalogScratchKeys", self.recovery)
-        self.assertIn("$index -ge 0; $index--", remove)
-        self.assertIn("DeleteSubKeyTree($path, $false)", remove)
-        self.assertIn("'winsock_scratch_cleanup'", remove)
-        self.assertIn("Assert-ScratchPath $path", remove)
-        start = self.function_body("Start-CatalogRecovery", self.recovery)
-        self.assertIn("ScratchPaths = @($lease.ScratchList)", start)
-        watch = self.function_body("Invoke-CatalogWatch", self.recovery)
-        self.assertIn("Remove-CatalogScratchKeys @($data.ScratchPaths)", watch)
-        self.assertIn("Assert-ScratchPath ([string]$item)", watch)
-        self.assertLess(watch.index("Restore-CatalogAcl $data"), watch.index("Remove-CatalogScratchKeys"))
-        self.assertIn("-cmatch '^SOFTWARE\\\\KeelDock\\\\ConfinementRecoveryTest\\\\[a-f0-9]{32}\\z'", self.function_body("Assert-ScratchPath", self.recovery))
-        for reason in ("'winsock_scratch_create'", "'winsock_scratch_cleanup'"):
-            self.assertIn(reason, grant)
-            self.assertIn(reason, self.wrapper)
-        self.assertIn("Add-CatalogScratchKeys $lease", self.recovery_test)
-        self.assertIn("recovery_test_scratch", self.recovery_test)
-        self.assertIn("-Mode sid", WORKFLOW.read_text(encoding="utf-8"))
-
     def test_only_the_confinement_workflow_loads_the_spike_native_and_wrapper_files(self):
-        names = ("windows_confinement.cs", "windows_confinement.ps1", "windows_confinement_recovery.ps1")
+        names = ("windows_confinement.cs", "windows_confinement.ps1", "windows_probe.rs")
         allowed = {WORKFLOW.resolve()}
         candidates = list((ROOT / ".github").rglob("*.yml")) + list((ROOT / "kit").rglob("action.yml"))
         self.assertGreater(len(candidates), 1)
@@ -637,131 +441,10 @@ foreach ($case in $cases) {
                     with self.subTest(path=path.name, name=name):
                         self.assertNotIn(name, text)
 
-    def test_catalog_restore_is_attempted_even_when_scratch_deletion_fails(self):
-        restore = self.function_body("Restore-WinsockCatalogAcl", self.recovery)
-        first = restore.index("Restore-CatalogAcl $lease")
-        second = restore.index("Remove-CatalogScratchKeys")
-        self.assertLess(first, second)
-        head = restore[:second]
-        self.assertEqual(head.count("} catch {"), 1)
-        self.assertLess(first, head.index("} catch {"))
-        tail = restore[second:]
-        self.assertIn("} catch {", tail)
-        self.assertIn("if (-not $failure) { $failure = [string]$_.Exception.Message }", tail)
-        self.assertIn("if ($failure) { throw $failure }", tail)
-        self.assertEqual(restore.count("throw "), 1)
-        watch = self.function_body("Invoke-CatalogWatch", self.recovery)
-        restore_loop = watch.index("Restore-CatalogAcl $data")
-        scratch_loop = watch.index("Remove-CatalogScratchKeys")
-        self.assertLess(restore_loop, scratch_loop)
-        between = watch[restore_loop:scratch_loop]
-        self.assertNotIn("throw ", between)
-        self.assertNotIn("return", between)
-        self.assertIn("if (-not $restored -or -not $scratchGone) {", watch)
-        self.assertLess(scratch_loop, watch.index("if (-not $restored -or -not $scratchGone) {"))
-        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
-        armed_branch = grant[grant.index("Restore-WinsockCatalogAcl"):grant.index("Remove-CatalogScratchKeys")]
-        self.assertIn("} else {", armed_branch)
-
-    def test_winsock_recovery_survives_forced_parent_exit(self):
-        start = self.function_body("Start-CatalogRecovery", self.recovery)
-        watch = self.function_body("Invoke-CatalogWatch", self.recovery)
-        for required in (
-            "New-ScheduledTaskPrincipal -UserId 'SYSTEM'",
-            "[IO.FileSystemAclExtensions]::Create($info, $security)",
-            "S-1-5-32-544",
-            "Get-FileHash -LiteralPath $copy",
-            "-DeleteExpiredTaskAfter",
-            "$trigger.EndBoundary",
-            "GetFolderPath('CommonApplicationData')",
-            "$shellHome.StartsWith($programFiles",
-            "Contains('\"')",
-            "Copy-Item -LiteralPath $source -Destination $copy",
-            "Register-ScheduledTask",
-            "Start-ScheduledTask",
-            "Test-Path -LiteralPath $ready",
-        ):
-            self.assertIn(required, start)
-        self.assertLess(start.index("Register-ScheduledTask"), start.index("Start-ScheduledTask"))
-        self.assertLess(start.index("Start-ScheduledTask"), start.index("Test-Path -LiteralPath $ready"))
-        self.assertIn("GetProcessById", watch)
-        self.assertIn("ParentStartTicks", watch)
-        self.assertIn("$parent.WaitForExit(250)", watch)
-        self.assertIn("Restore-CatalogAcl $data", watch)
-        self.assertIn("-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $record) 'armed'))", watch)
-        self.assertIn("$child.Kill()", self.recovery_test)
-        self.assertTrue(self.recovery_test.rstrip().endswith("exit 0"))
-        self.assertIn("Get-CatalogAclSddl $Path) -eq $original", self.recovery_test)
-        self.assertIn("-not (Test-Path -LiteralPath $directory)", self.recovery_test)
-        self.assertIn("Remove-CatalogRecoveryFolder $record", watch)
-        self.assertIn("-ne $recordHash", watch)
-        self.assertIn("'recovery_test_leak'", self.recovery_test)
-        self.assertIn("Grant-WinsockCatalogRead 'S-1-15-2-1-1-1-1-1-1-1' $Path -ForceReadbackFailure", self.recovery_test)
-        self.assertIn("-not (Get-ScheduledTask -TaskName $taskName", self.recovery_test)
-        self.assertIn("'^S-1-15-2-(?:[0-9]{1,10}-){6}[0-9]{1,10}\\z'", self.recovery)
-        self.assertIn("$badSids = @('S-1-15-2-1-1-1-1-1-1-1-1', 'S-1-15-2-1-1-1-1-1-1', 'S-1-15-2-1-1-1-1-1-1-12345678901'", self.recovery_test)
-        self.assertIn("'recovery_test_sid'", self.recovery_test)
-        self.assertIn("test_windows_confinement_recovery.ps1 -Mode parent", WORKFLOW.read_text(encoding="utf-8"))
-
-    def test_winsock_errors_use_fixed_reasons_and_verified_rollback(self):
-        grant = self.function_body("Grant-WinsockCatalogRead", self.recovery)
-        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", grant)
-        self.assertIn("throw 'winsock_restore_failed'", grant)
-        self.assertIn("throw $reason", grant)
-        for name in ("Get-CatalogAclSddl", "Add-CatalogRead", "Restore-CatalogAcl", "Start-CatalogRecovery", "Stop-CatalogRecovery"):
-            body = self.function_body(name, self.recovery)
-            self.assertNotRegex(body, r"(?m)^\s*throw\s*$")
-        self.assertIn("if ($phase -eq 'winsock_acl')", self.wrapper)
-        self.assertIn("$reason = 'winsock_registry_error'", self.wrapper)
-        self.assertIn("'winsock_grant_failed'", self.wrapper)
-        self.assertIn("'winsock_restore_failed'", self.wrapper)
-        add = self.function_body("Add-CatalogRead", self.recovery)
-        self.assertIn("if ($ForceReadbackFailure) { throw 'winsock_catalog_readback' }", add)
-        self.assertLess(add.index("$key.SetAccessControl($security)"), add.rindex("if ($ForceReadbackFailure)"))
-        self.assertIn("-ForceReadbackFailure:$ForceReadbackFailure", grant)
-        self.assertIn("Test-Path -LiteralPath ([string]$script:WinsockCatalogLease.ArmedFile)", grant)
-        self.assertLess(grant.index("ArmedFile"), grant.index("Restore-WinsockCatalogAcl"))
-        self.assertIn("Assert-CatalogPath $path", grant)
-        confined = self.function_body("Invoke-ConfinedLadder")
-        self.assertLess(confined.index("Grant-WinsockCatalogRead"), confined.index("$script:phase = 'ladder'"))
-        self.assertIn("-ForceReadbackFailure", self.recovery_test)
-        self.assertIn("recovery_test_lease", self.recovery_test)
-        self.assertIn("Restore-CatalogAcl $lease", self.recovery_test)
-        self.assertIn("$_.Exception.Message -ne 'winsock_restore_failed'", self.recovery_test)
-
-    def test_task_removal_is_confirmed_before_the_recovery_folder_is_deleted(self):
-        stop = self.function_body("Stop-CatalogRecovery", self.recovery)
-        unregister = stop[stop.index("Unregister-ScheduledTask"):]
-        self.assertIn("-ErrorAction Stop", unregister.splitlines()[0])
-        absent = "if (Test-CatalogTaskPresent ([string]$lease.TaskName)) { throw 'winsock_recovery_stop' }"
-        self.assertIn(absent, stop)
-        self.assertLess(stop.index(absent), stop.index("$lease.TaskRegistered = $false"))
-        self.assertLess(stop.index(absent), stop.index("Remove-Item"))
-        self.assertNotIn("Unregister-ScheduledTask -TaskName ([string]$lease.TaskName) -Confirm:$false -ErrorAction SilentlyContinue", stop)
-        remove = self.function_body("Remove-CatalogRecoveryFolder", self.recovery)
-        gone = "if ($present) { return }"
-        self.assertIn(gone, remove)
-        self.assertLess(remove.index("Unregister-ScheduledTask"), remove.index(gone))
-        helper = self.function_body("Test-CatalogTaskPresent", self.recovery)
-        self.assertIn("Get-ScheduledTask -TaskName $taskName -ErrorAction Stop", helper)
-        self.assertIn("CategoryInfo.Category -eq 'ObjectNotFound'", helper)
-        self.assertNotIn("SilentlyContinue", helper)
-        self.assertIn("if ($lease.TaskName -and $lease.RecoveryDirectory) {", stop)
-        self.assertNotIn("Get-ScheduledTask", stop)
-        self.assertLess(remove.index(gone), remove.index("Remove-Item"))
-
-    def test_unarmed_lease_never_restores_the_live_key(self):
-        restore = self.function_body("Restore-WinsockCatalogAcl", self.recovery)
-        self.assertIn("-not (Test-Path -LiteralPath ([string]$lease.ArmedFile))", restore)
-        self.assertNotIn("return", restore)
-        self.assertLess(restore.index("ArmedFile"), restore.index("Restore-CatalogAcl $lease"))
-        confined = self.function_body("Invoke-ConfinedLadder")
-        self.assertIn("Restore-WinsockCatalogAcl $script:WinsockCatalogLease", confined)
-
     def test_scripts_have_no_line_starting_with_an_operator(self):
         starts = re.compile(r"^\s*-(and|or|band|bor|eq|ne|not)\b")
         ends = re.compile(r"(?:-(?:and|or|band|bor|eq|ne)|,|\|)\s*$")
-        for path in (WRAPPER, RECOVERY, RECOVERY_TEST):
+        for path in (WRAPPER,):
             lines = path.read_text(encoding="utf-8").splitlines()
             for number, line in enumerate(lines[1:], 2):
                 if starts.match(line):
@@ -774,7 +457,7 @@ foreach ($case in $cases) {
         self.assertLess(check, text.index("      - name: Compile native confinement module\n"))
         block = text[check:text.index("      - name: Compile native confinement module\n")]
         self.assertIn("[System.Management.Automation.Language.Parser]::ParseFile", block)
-        for name in ("windows_confinement.ps1", "windows_confinement_recovery.ps1", "test_windows_confinement_recovery.ps1"):
+        for name in ("windows_confinement.ps1",):
             self.assertIn("'" + name + "'", block)
         self.assertIn("if ($bad -ne 0) { exit 1 }", block)
         self.assertNotIn("if:", block)
@@ -792,21 +475,25 @@ foreach ($case in $cases) {
         self.assertNotIn("> nul", denied)
         self.assertIn("New-Item -ItemType File -Path (Join-Path $layout.Downloads 'acl_probe.txt')", self.wrapper)
         write_denied = re.search(r"Name = 'acl_ro_write_denied'.*", confined_branch).group(0)
-        self.assertIn("-match 'Access is denied'", write_denied)
-        self.assertIn("copy /y nul ' + $layout.ReadOnly", write_denied)
+        self.assertIn("Exe = $probe", write_denied)
+        self.assertIn("'write ' + $layout.ReadOnly", write_denied)
+        self.assertIn("kd-probe write create=err5", write_denied)
         self.assertIn("-not (Test-Path -LiteralPath ($script:Layout.ReadOnly", write_denied)
         listable = re.search(r"Name = 'acl_downloads_listable'.*", control_branch).group(0)
         self.assertIn("$r.ExitCode -eq 0", listable)
         self.assertIn("dir /b ' + $layout.Downloads", listable)
         self.assertIn("rustc\\.tar\\.gz", listable)
         self.assertIn(
-            "$confinedOutcomes['acl_downloads_denied'].Passed -and $confinedOutcomes['acl_ro_write_denied'].Passed -and $controlOutcomes['acl_downloads_listable'].Passed",
+            "if ((Test-Passed $confinedOutcomes @('acl_downloads_denied')) -and (Test-Passed $controlOutcomes @('acl_downloads_listable'))) { $observed['downloads'] = 'denied' }",
             self.wrapper,
         )
-        self.assertIn("-and $aclNegative -eq 'denied'", self.wrapper)
+        self.assertIn(
+            "if (Test-Passed $confinedOutcomes @('acl_ro_write_denied')) { $observed['ro_write'] = 'denied' }",
+            self.wrapper,
+        )
 
     def test_summary_does_not_overclaim_the_vitest_or_rolldown_steps(self):
-        for required in (" css_transform=", " rolldown=load_only", " vitest=not_run", " rolldown_call=not_run"):
+        for required in ("css_transform = 'ok'", " rolldown=load_only", " vitest=not_run", " rolldown_call=not_run"):
             with self.subTest(required=required):
                 self.assertIn(required, self.wrapper)
         self.assertIn("name=minifies_a_stylesheet result=pass", self.wrapper)
@@ -833,7 +520,7 @@ foreach ($case in $cases) {
         self.assertIn("Grant-Access $script:Lpac.Root $script:Sid 'Modify, Synchronize' $true", self.wrapper)
         self.assertNotIn("'ReadAttributes, Synchronize' $false", self.wrapper)
         grant = self.function_body("Grant-NonPropagating")
-        for required in ("NonPropagatingDacl]::Read", "NonPropagatingDacl]::Write", "AceFlags]::None", "1048704", "InsertAce(0, $ace)"):
+        for required in ("NonPropagatingDacl]::Read", "NonPropagatingDacl]::Write", "AceFlags]::None", "1048704", "InsertAce($index, $ace)"):
             with self.subTest(required=required):
                 self.assertIn(required, grant)
         self.assertNotIn("SetAccessControl", grant)
@@ -858,24 +545,6 @@ foreach ($case in $cases) {
             with self.subTest(required=required):
                 self.assertIn(required, acl)
         self.assertNotIn("$script:Layout.Base,", acl)
-
-    def test_unreadable_container_flag_hedge_is_spike_only_and_never_verifies(self):
-        self.assertEqual(self.native.count("private const bool SpikeAllowUnreadableLpac = true;"), 1)
-        for required in (
-            'lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match"',
-            '&& applicationPackages == "absent")',
-            '(lpac == "1" && restrictedApplicationPackages != "present")',
-            'reported = "aap_only";',
-            '(lpac != "1" && reported != "aap_only")',
-        ):
-            with self.subTest(required=required):
-                self.assertIn(required, self.native)
-        self.assertNotIn('lpac == "0" &&', self.native)
-        self.assertNotIn('restrictedApplicationPackages == "present" && applicationPackages', self.native)
-        self.assertIn("arap=present", self.wrapper)
-        self.assertIn("lpac=aap_only", self.wrapper)
-        self.assertIn("$tokenState = 'aap_only'", self.wrapper)
-        self.assertIn("-and $tokenState -eq 'verified'", self.wrapper)
 
     def test_downloads_are_bounded_by_a_total_deadline(self):
         body = self.function_body("Invoke-Download")
@@ -909,26 +578,31 @@ foreach ($case in $cases) {
         downloads = len(re.findall(r"\bFile = '", self.wrapper))
         attempts = int(re.search(r"\$attempt -ge ([0-9]+)", self.wrapper).group(1))
         per_attempt = int(re.search(r"CancelAfter\(\[TimeSpan\]::FromSeconds\(([0-9]+)\)\)", self.wrapper).group(1))
-        staging_allowance = 600
+        probe_build = int(re.search(r"\$probeEnvironment, ([0-9]+), \[uint32\]32\)", self.wrapper).group(1)) // 1000
+        other_seconds = int(re.search(r"\$script:OtherContainerSeconds = ([0-9]+)", self.wrapper).group(1))
+        staging_allowance = 600 + probe_build + 2 * other_seconds
         worst = ladders + downloads * attempts * per_attempt + staging_allowance
         workflow = WORKFLOW.read_text(encoding="utf-8")
         minutes = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", workflow)]
         self.assertEqual(len(minutes), 2)
+        self.assertEqual(minutes[1], 120)
         self.assertLessEqual(worst, minutes[1] * 60 * 0.8)
 
     def test_wrapper_reports_stable_lines_and_fails_closed(self):
         for required in (
-            "windows-confinement-spike=observed rust=",
+            "windows-confinement-spike=observed",
+            "windows-confinement-null=",
+            "windows-confinement-temp=verified location=scratch_profile inherited_acl=verified label=low",
+            "windows-confinement-probe=built",
             "windows-confinement-spike=refused phase=",
             "windows-confinement-image=recorded",
             "windows-confinement-stage=",
             "windows-confinement-compile=observed result=compiled",
             "windows-confinement-cleanup=",
-            "first_failure=",
-            "control_rust=",
-            "control_node=",
-            "acl_negative=",
-            "ValidateSet('spike', 'compile', 'native-probe')",
+            "first_failure = 'none'",
+            "control_rust = 'compiled'",
+            "control_node = 'ran'",
+            "ValidateSet('spike', 'compile')",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, self.wrapper)
@@ -970,6 +644,533 @@ foreach ($case in $cases) {
         self.assertNotIn("CI_MODE", self.wrapper)
         self.assertNotIn("Assert-RustLicenseAdmission", self.wrapper)
         self.assertNotIn("archive_producer_unavailable", self.wrapper)
+
+    def test_capability_is_exactly_registry_read(self):
+        self.assertEqual(self.native.count("Native.DeriveCapabilitySidsFromName("), 1)
+        self.assertIn('private const string RegistryReadCapability = "registryRead";', self.native)
+        self.assertEqual(self.native.count('"registryRead"'), 1)
+        self.assertIn(
+            "Native.DeriveCapabilitySidsFromName(RegistryReadCapability, out groupSids, out groupCount, out capabilitySids, out capabilityCount)",
+            self.native,
+        )
+        self.assertIn("capabilities.CapabilityCount = 1;", self.native)
+        self.assertIn("capabilities.Capabilities = capabilityArray;", self.native)
+        self.assertIn("Marshal.WriteInt32(capabilityArray, IntPtr.Size, unchecked((int)GroupEnabled));", self.native)
+        self.assertIn("private const uint GroupEnabled = 0x00000004;", self.native)
+        self.assertIn("if (capabilityCount != 1 || capabilitySids == IntPtr.Zero)", self.native)
+        self.assertIn("FreeOne(ref capabilityArray);", self.native)
+        self.assertIn("FreeOne(ref capabilitySid);", self.native)
+        self.assertNotIn("string[] capabilityNames", self.native)
+        for name, text in (("native", self.native), ("wrapper", self.wrapper), ("probe", self.probe)):
+            with self.subTest(source=name):
+                self.assertIsNone(re.search(r"""["']lpac[A-Z]""", text))
+                for forbidden in (
+                    "internetClient",
+                    "privateNetworkClientServer",
+                    "enterpriseAuthentication",
+                    "sharedUserCertificates",
+                    "documentsLibrary",
+                    "picturesLibrary",
+                    "videosLibrary",
+                    "musicLibrary",
+                    "removableStorage",
+                    "DeriveCapabilitySidsFromName",
+                ):
+                    if name == "native" and forbidden == "DeriveCapabilitySidsFromName":
+                        continue
+                    self.assertNotIn(forbidden, text)
+
+    def test_aap_opt_out_attribute_is_kept(self):
+        for required in (
+            "private const uint ProcThreadAttributeAllApplicationPackagesPolicy = 0x0002000f;",
+            "private const uint ProcessCreationAllApplicationPackagesOptOut = 0x00000001;",
+            "Marshal.WriteInt32(policyBuffer, unchecked((int)ProcessCreationAllApplicationPackagesOptOut));",
+            "ProcThreadAttributeAllApplicationPackagesPolicy, policyBuffer, new UIntPtr(4)",
+            "int attributeCount = confined ? 3 : 1;",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.native)
+
+    def test_token_requires_the_noallapppkg_attribute_and_the_exact_capability(self):
+        for forbidden in (
+            "SpikeAllowUnreadableLpac",
+            "aap_only",
+            "AllRestrictedApplicationPackagesSid",
+            "ReadAllRestrictedApplicationPackagesState",
+            "arap=",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, self.native)
+                self.assertNotIn(forbidden, self.wrapper)
+        for required in (
+            "private const int TokenSecurityAttributes = 39;",
+            "private const int TokenIsLessPrivilegedAppContainer = 46;",
+            '"WIN://NOALLAPPPKG"',
+            "string attribute = ReadNoAllAppPkgAttribute(token);",
+            'attribute != "present"',
+            'return "unreadable";',
+            "capabilityCount != 1",
+            "!capabilityMatches",
+            "ReadSidInTokenSet(token, TokenCapabilities, expectedCapabilitySid, false)",
+            'applicationPackages != "absent"',
+            'sidState != "match"',
+            "result.Class46 = class46;",
+            '" lpac=" + (attribute == "present" ? "attr" : "none")',
+            '" cap=" + (capabilityMatches ? RegistryReadCapability : "mismatch")',
+            'throw new InvalidOperationException(text + " attr=" + attribute);',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.native)
+        ladder = self.function_body("Invoke-Ladder")
+        self.assertIn("lpac=attr", ladder)
+        self.assertIn("cap=registryRead", ladder)
+        self.assertNotIn("lpac=1", ladder)
+        self.assertNotIn("arap", ladder)
+
+    def test_null_lease_mask_and_trustee_are_fixed(self):
+        lease = self.native[self.native.index("public sealed class NullDeviceLease"):self.native.index("public sealed class Sandbox")]
+        self.assertIn("private const uint LeaseMask = 0x0012019F;", lease)
+        self.assertIn(r'private const string DevicePath = "\\\\.\\NUL";', lease)
+        self.assertEqual(0x0012019F & (0x00040000 | 0x00080000 | 0x00010000), 0)
+        self.assertIn("entry.AccessPermissions = LeaseMask;", lease)
+        self.assertIn("entry.Trustee.Name = sid;", lease)
+        self.assertIn("Native.ConvertStringSidToSidW(packageSid, out sid)", lease)
+        self.assertIn('!packageSid.StartsWith("S-1-15-2-", StringComparison.Ordinal)', lease)
+        for forbidden in ("S-1-15-2-1", "S-1-15-2-2", "S-1-1-0", "S-1-5-18", "S-1-5-32", "Everyone"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, lease)
+        for required in (
+            "if (after.Count != before.Count + 1)",
+            "if (!SameBytes(after[index], before[index]))",
+            "after.RemoveAt(found);",
+            "attempt < 2",
+            "WriteOriginal(attempt == 1)",
+            "Native.SetKernelObjectSecurity(handle, DaclInformation, copy)",
+            "SameBytes(ReadDescriptor(), original)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, lease)
+        wrapper = self.wrapper
+        self.assertIn("[KeelDock.Platform.WindowsConfinement.NullDeviceLease]::Open($script:Sid)", wrapper)
+        self.assertIn("windows-confinement-null=' + $nullState + ' mask=0x0012019f trustee=package readback=' + $nullReadback", wrapper)
+        self.assertIn("if ($nullState -ne 'applied' -or $nullReadback -ne 'match') { throw 'null_lease' }", wrapper)
+        control = wrapper.index("$controlOutcomes = Invoke-Ladder $box $false $script:Control")
+        opened = wrapper.index("NullDeviceLease]::Open($script:Sid)")
+        temp = wrapper.index("Initialize-ContainerTemp $box")
+        confined = wrapper.index("$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac")
+        self.assertLess(control, opened)
+        self.assertLess(opened, temp)
+        self.assertLess(temp, confined)
+        tail = wrapper[wrapper.index("$nullRestore = 'not_applied'"):]
+        restore = tail.index("$script:NullLease.Restore()")
+        canaries = tail.index("Remove-Canaries")
+        dispose = tail.index("$box.Dispose()")
+        base = tail.index("Remove-Item -LiteralPath $baseDirectory")
+        self.assertLess(restore, canaries)
+        self.assertLess(canaries, dispose)
+        self.assertLess(dispose, base)
+        self.assertIn("if ($nullRestore -eq 'failed') { $cleanup = 'incomplete' }", tail)
+        self.assertIn(
+            "if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or $profileText -ne 'deleted' -or $tempState -ne 'removed') { $exitCode = 1 }",
+            tail,
+        )
+
+    def test_stdin_is_a_closed_pipe_and_the_handle_list_is_three(self):
+        native = self.native
+        self.assertIn("CreateEofStdin(out inRead);", native)
+        self.assertIn("startup.StartupInfo.hStdInput = inRead;", native)
+        self.assertNotIn("hStdInput = IntPtr.Zero", native)
+        self.assertIn("Marshal.WriteIntPtr(handleBuffer, 0, inRead);", native)
+        self.assertIn("Marshal.WriteIntPtr(handleBuffer, IntPtr.Size, outWrite);", native)
+        self.assertIn("Marshal.WriteIntPtr(handleBuffer, IntPtr.Size * 2, errWrite);", native)
+        self.assertNotIn("result.HandleCount = 3;", native)
+        self.assertIn("uint handleListSize = (uint)(IntPtr.Size * 3);", native)
+        self.assertIn("new UIntPtr(handleListSize)", native)
+        self.assertIn("result.HandleCount = MeasureHandleList(handleBuffer, handleListSize, handleListExpected);", native)
+        create = native.index("Native.CreateProcessW(executable")
+        measure = native.index("result.HandleCount = MeasureHandleList(")
+        self.assertLess(create, measure)
+        self.assertLess(measure, native.index("CloseOne(ref outWrite);", measure))
+        self.assertLess(measure, native.index("Native.ResumeThread(thread)"))
+        helper = native[native.index("private static uint MeasureHandleList"):native.index("private static void CreateEofStdin")]
+        for required in (
+            "sizeBytes % (uint)IntPtr.Size",
+            "Marshal.ReadIntPtr(buffer, index * IntPtr.Size)",
+            "entry != expected[index]",
+            "Native.GetHandleInformation(entry, out flags)",
+            "(flags & HandleFlagInherit) == 0",
+            "return 0;",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, helper)
+        self.assertIn("handles_method=list_attr_readback", self.function_body("Invoke-Ladder"))
+        body = native[native.index("private static void CreateEofStdin"):native.index("private static string ReadNoAllAppPkgAttribute")]
+        self.assertIn("attributes.InheritHandle = 1;", body)
+        self.assertIn("Native.SetHandleInformation(write, HandleFlagInherit, 0)", body)
+        self.assertLess(body.index("SetHandleInformation(write"), body.index("Native.CloseHandle(write);"))
+        self.assertIn("CloseOne(ref errWrite);\n                CloseOne(ref inRead);\n\n                result.Failure = \"assign\";", native)
+        self.assertLess(native.index("Native.CreateProcessW(executable"), native.index("CloseOne(ref inRead);"))
+        self.assertIn("$r.HandleCount -eq 3", self.function_body("Get-StageSpecs"))
+        self.assertIn("Handles = ([uint32]$result.HandleCount -eq 3)", self.function_body("Invoke-Ladder"))
+        self.assertIn("' handles=' + $result.HandleCount", self.function_body("Invoke-Ladder"))
+        self.assertIn("if ((Test-Passed $confinedOutcomes @('stdin_eof')) -and $allHandles) { $observed['stdin'] = 'eof_pipe' }", self.wrapper)
+
+    def test_container_temp_is_computed_from_the_scratch_profile_and_cross_checked(self):
+        body = self.function_body("Initialize-ContainerTemp")
+        for required in (
+            "[string]$sandbox.ProfileName",
+            "[string]$script:Lpac.Profile",
+            "(Join-Path $profileRoot 'Packages') $profileName) 'AC') 'Temp'",
+            r"'\\Packages\\KDW[0-9a-f]{32}\\AC\\Temp$'",
+            "if ($expected -notmatch $shape) { throw 'shape' }",
+            "if (-not (Test-PathUnder $expected $script:Lpac.Root)) { throw 'shape' }",
+            "if (-not $inherited) { throw 'acl' }",
+            "if (-not (Test-LowIntegrityLabel $expected)) { throw 'label' }",
+            "Invoke-ConfinedProbe $sandbox 'tempdir' 30",
+            "if (-not (Test-ContainerTempReport ([string]$run.Stdout))) { throw 'identity' }",
+            "windows-confinement-temp=verified location=scratch_profile inherited_acl=verified label=low",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        self.assertLess(body.index("throw 'shape'"), body.index("New-Item -ItemType Directory"))
+        self.assertLess(body.index("New-Item -ItemType Directory"), body.index("Invoke-ConfinedProbe"))
+        self.assertLess(body.index("Invoke-ConfinedProbe"), body.index("throw 'identity'"))
+        for forbidden in ("Grant-Access", "Grant-NonPropagating", "Set-LowIntegrityLabel", "SetAccessControl", "icacls"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, body)
+        report = self.function_body("Test-ContainerTempReport")
+        self.assertIn("'^exists=yes writable=yes path=(.+)$'", report)
+        self.assertIn("(Get-NormalPath $found.Groups[1].Value) -ceq (Get-NormalPath $script:ExpectedTemp)", report)
+        normal = self.function_body("Get-NormalPath")
+        for required in ("'\\\\?\\'", "ToLowerInvariant()", "EndsWith('\\')"):
+            self.assertIn(required, normal)
+        self.assertIn("public string ProfileName", self.native)
+        self.assertIn('profileName = "KDW" + Guid.NewGuid().ToString("N");', self.native)
+        environment = self.function_body("New-StageEnvironment")
+        for name in ("USERPROFILE", "APPDATA", "LOCALAPPDATA"):
+            line = [item for item in environment.splitlines() if "('" + name + "=" in item]
+            self.assertEqual(len(line), 1)
+            self.assertIn("$scratch.Profile", line[0])
+        specs = self.function_body("Get-StageSpecs")
+        stage = re.search(r"Name = 'temp_dir'.*", specs).group(0)
+        self.assertIn("Quiet = $true", stage)
+        self.assertIn("Test-ContainerTempReport $r.Stdout", stage)
+        ladder = self.function_body("Invoke-Ladder")
+        self.assertIn("$quiet = $spec.ContainsKey('Quiet')", ladder)
+        self.assertIn("if (-not $quiet) {", ladder)
+        self.assertIn("} elseif (-not $quiet) {", ladder)
+        self.assertLess(self.wrapper.index("$phase = 'container_temp'"), self.wrapper.index("Initialize-ContainerTemp $box"))
+
+    def test_no_registry_lease_and_no_scheduled_task(self):
+        for name in ("windows_confinement_recovery.ps1", "test_windows_confinement_recovery.ps1"):
+            with self.subTest(removed=name):
+                self.assertFalse((ROOT / "kit/confinement" / name).exists())
+        for path in (NATIVE, WRAPPER, PROBE, WORKFLOW):
+            text = path.read_text(encoding="utf-8")
+            for forbidden in (
+                "schtasks",
+                "ScheduledTask",
+                "Register-ScheduledTask",
+                "HKLM:",
+                "HKCU:",
+                "RegSetKeySecurity",
+                "RegistryAccessRule",
+                "Grant-WinsockCatalogRead",
+                "WinsockCatalog",
+                "NativeRegistryProbe",
+                "NtOpenKey",
+                "reg.exe",
+                "native-probe",
+                "Get-LpacBehaviour",
+                "Invoke-ConfinedLadder",
+            ):
+                with self.subTest(path=path.name, forbidden=forbidden):
+                    self.assertNotIn(forbidden, text)
+        self.assertNotIn("pwsh.exe", self.wrapper)
+        self.assertNotIn("$PSHOME", self.wrapper)
+        self.assertNotIn("windows_confinement_recovery", WORKFLOW.read_text(encoding="utf-8"))
+
+    def test_probe_vocabulary_is_closed(self):
+        text = self.probe
+        self.assertTrue(text.isascii())
+        self.assertNotIn(chr(35), text)
+        start = text.index("let text = match command {")
+        section = text[start:text.index("};", start)]
+        arms = re.findall(r'^\s*"([a-z_]+)" => ', section, re.M)
+        self.assertEqual(sorted(arms), sorted(PROBE_COMMANDS))
+        self.assertIn('_ => String::from("usage"),', section)
+        spawn = text[text.index("fn probe_spawn"):text.index("fn probe_tempdir")]
+        self.assertEqual(re.findall(r'^\s*"([a-z_]+)" => status_text', spawn, re.M), ["inherit", "piped_no_null", "output"])
+        self.assertIn('println!("kd-probe {} {}", command, text);', text)
+        for forbidden in ("LoadLibrary", "CreateNamedPipe", "CreatePipe", "CreateSemaphore", "CreateMutex", "std::io::pipe", "pipe_make", "pipe_open", "pipe_squat", "identity"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, text)
+        specs = self.function_body("Get-StageSpecs")
+        used = set(re.findall(r"Exe = \$probe; Arguments = \(?'([a-z_]+)", specs))
+        self.assertTrue(used)
+        self.assertLessEqual(used, set(PROBE_COMMANDS))
+        fields = ("Name", "Exe", "Arguments", "Timeout", "Check")
+        lines = [line for line in specs.splitlines() if "$specs += @{" in line]
+        self.assertEqual(len(lines), len(CONFINED_STAGES))
+        for line in lines:
+            found = tuple(re.findall(r"(\w+) = ", line.split("Check =", 1)[0] + "Check = "))
+            with self.subTest(line=line.strip()[:60]):
+                self.assertIn(found, (fields, fields[:4] + ("Quiet", "Check")))
+        self.assertIn("-l kernel32 -l ws2_32", self.wrapper)
+        self.assertIn("$phase = 'build_probe'", self.wrapper)
+        self.assertLess(self.wrapper.index("$phase = 'build_probe'"), self.wrapper.index("$phase = 'acl_readback'"))
+        self.assertIn("$layout.ProbeExe = Join-Path $layout.ProbeDir 'kd_probe.exe'", self.wrapper)
+
+    def test_ladder_has_no_copy_nul_and_no_piped_node_child(self):
+        specs = self.function_body("Get-StageSpecs")
+        self.assertNotIn("copy /y nul", specs)
+        self.assertNotIn("copy /y nul", self.wrapper)
+        child = re.search(r"\$NodeChildText = @'\n(.*?)\n'@", self.wrapper, re.S)
+        self.assertIsNotNone(child)
+        child_text = child.group(1)
+        self.assertIn("stdio: 'inherit'", child_text)
+        self.assertIn("spawnSync", child_text)
+        self.assertIn("node:worker_threads", child_text)
+        for forbidden in ("'pipe'", '"pipe"', "fork(", ".spawn(", "exec(", "execSync"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, child_text)
+        bindings = re.search(r"\$NodeTestText = @'\n(.*?)\n'@", self.wrapper, re.S).group(1)
+        self.assertNotIn("'pipe'", bindings)
+        self.assertNotIn("child_process", bindings)
+        for line in specs.splitlines():
+            if "node.exe" in line:
+                with self.subTest(line=line.strip()[:40]):
+                    self.assertNotIn("pipe", line.lower())
+        stage = re.search(r"Name = 'node_child'.*", specs).group(0)
+        self.assertIn("Arguments = $layout.NodeChild", stage)
+        self.assertIn("kd-node-child spawn=ok worker=ok", stage)
+        self.assertIn("Timeout = 60", stage)
+        self.assertIn("$layout.NodeChild = Join-Path $layout.TestDir 'kd_child.js'", self.wrapper)
+
+    def test_no_rust_lld_reference(self):
+        for path in (NATIVE, WRAPPER, PROBE, WORKFLOW):
+            text = path.read_text(encoding="utf-8")
+            with self.subTest(path=path.name):
+                self.assertIsNone(re.search(r"(?i)rust-lld|rust_lld|lld-link|linker-flavor|\blld\b", text))
+        self.assertIn(
+            "RUSTFLAGS=-C linker=' + $layout.MsvcBin + '\\link.exe -C debuginfo=0 -C link-arg=/DEBUG:NONE",
+            self.function_body("New-StageEnvironment"),
+        )
+        self.assertIn("-C linker=' + $layout.MsvcBin + '\\link.exe", self.wrapper)
+
+    def test_summary_line_shape_and_exit_zero_requires_every_token(self):
+        found = re.search(r"\$expectedTokens = \[ordered\]@\{ (.+) \}\n", self.wrapper)
+        self.assertIsNotNone(found)
+        pairs = tuple(re.findall(r"([a-z_0-9]+) = '([A-Za-z_]+)'", found.group(1)))
+        self.assertEqual(pairs, EXPECTED_SUMMARY)
+        for required in (
+            "$summary = 'windows-confinement-spike=observed'",
+            "$summary += ' ' + $key + '=' + $observed[$key]",
+            "if ($observed[$key] -cne $expectedTokens[$key]) { $allExpected = $false }",
+            "Write-Line ($summary + ' rolldown=load_only vitest=not_run rolldown_call=not_run')",
+            "if ($allExpected) { $exitCode = 0 }",
+            "'windows-confinement-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' profile=' + $profileText + ' temp_dir=' + $tempState",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.wrapper)
+        self.assertEqual(self.wrapper.count("$exitCode = 0"), 2)
+        for key, _ in EXPECTED_SUMMARY:
+            with self.subTest(key=key):
+                self.assertIn("$observed['" + key + "'] = ", self.wrapper)
+        ladder = self.function_body("Invoke-Ladder")
+        for required in (
+            "' hang=' + $hang",
+            "' cpu_ms=' + $result.CpuMs",
+            "' peak_process_mib=' + (Get-Mib $result.PeakProcessMemory)",
+            "' peak_job_mib=' + (Get-Mib $result.PeakJobMemory)",
+            "' class46=' + $class46Text",
+            "$hang = 'slow'",
+            "$hang = 'busy'",
+            "([uint64]$result.CpuMs * 10) -ge ([uint64]$result.ElapsedMs * 8)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, ladder)
+        for required in ("private static void ReadCpu(IntPtr job, RunResult result)", "ReadPeaks(job, result);", "ReadCpu(job, result);", "result.CpuMs = "):
+            with self.subTest(required=required):
+                self.assertIn(required, self.native)
+        self.assertEqual(self.wrapper.count("windows-confinement-null="), 1)
+        self.assertIn("mask=0x0012019f", self.wrapper)
+
+    def test_network_blocked_is_a_closed_set_of_denial_codes(self):
+        wrapper = self.wrapper
+        self.assertIn("$NetworkDeniedConnect = @('err10013')", wrapper)
+        self.assertIn("$NetworkDeniedResolve = @('err10013', 'err11001')", wrapper)
+        self.assertIn("$NetworkDeniedUdp = @('err10013')", wrapper)
+        self.assertIn("$NetworkUnroutableConnect = @('err10047', 'err10051')", wrapper)
+        body = self.function_body("Get-NetworkState")
+        for required in (
+            "'wsa=failed'",
+            "if ($text -ceq 'resolve=ok connect=open') { return 'open' }",
+            "'^resolve=ok connect=(err[0-9]{1,5})$'",
+            "'^resolve=(err[0-9]{1,5})$'",
+            "'^resolve=ok count=[1-9][0-9]*$'",
+            "if ($text -ceq 'send=ok recv=data') { return 'open' }",
+            "'^send=(err[0-9]{1,5})$'",
+            "$NetworkDeniedConnect -ccontains",
+            "$NetworkDeniedResolve -ccontains",
+            "$NetworkDeniedUdp -ccontains",
+            "$NetworkUnroutableConnect -ccontains",
+            "if ($text -ceq 'resolve=empty') { return 'unroutable' }",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        self.assertEqual(body.count("return 'blocked'"), 4)
+        self.assertEqual(body.count("return 'unexpected'"), 4)
+        self.assertEqual(body.count("return 'unroutable'"), 2)
+        self.assertNotIn("return 'blocked'\n}", body)
+        self.assertTrue(body.rstrip().endswith("return 'unexpected'\n}"))
+        for forbidden in ("err10061", "err10060", "err10047", "err10051", "err10065", "connect=err'", "-match 'recv"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, body)
+        codes = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkDeniedConnect"):wrapper.index("$NetworkUnroutableConnect")]))
+        self.assertEqual(codes, {"err10013", "err11001"})
+        unroutable = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkUnroutableConnect"):wrapper.index("function Get-NetworkState")]))
+        self.assertEqual(unroutable, {"err10047", "err10051"})
+        specs = self.function_body("Get-StageSpecs")
+        confined = specs.split("} else {", 1)[0]
+        for stage, kind in (
+            ("network_tcp_ipv4", "connect"),
+            ("network_tcp_ipv6", "connect"),
+            ("network_tcp_host", "connect"),
+            ("network_dns", "dns"),
+            ("network_udp", "udp"),
+        ):
+            line = re.search(r"Name = '" + stage + r"'.*", confined).group(0)
+            with self.subTest(stage=stage):
+                if stage == "network_tcp_ipv6":
+                    self.assertIn("(Get-NetworkState $r.Stdout 'connect') -cin @('blocked', 'unroutable')", line)
+                else:
+                    self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -ceq 'blocked'", line)
+        self.assertIn(
+            "fn probe_connect",
+            self.probe,
+        )
+        connect = self.probe[self.probe.index("fn probe_connect"):self.probe.index("fn probe_dns")]
+        self.assertIn('if last == "none" || last == "err10013" {', connect)
+
+    def test_network_controls_are_unconfined_and_must_be_open(self):
+        specs = self.function_body("Get-StageSpecs")
+        confined, control = specs.split("} else {", 1)
+        control = control.split("    }\n    $specs +=", 1)[0]
+        expected = (
+            ("network_control", "connect", "connect 1.1.1.1:443"),
+            ("network_control_ipv6", "connect", "connect [2606:4700:4700::1111]:443"),
+            ("network_control_dns", "dns", "dns github.com"),
+            ("network_control_udp", "udp", "udp 1.1.1.1:53"),
+        )
+        for stage, kind, arguments in expected:
+            line = re.search(r"Name = '" + stage + r"'.*", control).group(0)
+            with self.subTest(stage=stage):
+                self.assertIn("Arguments = '" + arguments + "'", line)
+                if stage == "network_control_ipv6":
+                    self.assertIn("(Get-NetworkState $r.Stdout 'connect') -cin @('open', 'unroutable')", line)
+                else:
+                    self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -ceq 'open'", line)
+                self.assertNotIn(stage, confined)
+        self.assertIn("$networkControls = Test-Passed $controlOutcomes @('network_control', 'network_control_ipv6', 'network_control_dns', 'network_control_udp')", self.wrapper)
+        self.assertIn("if ($networkDenied -and $networkControls) { $observed['network'] = 'blocked' }", self.wrapper)
+        self.assertIn("if ($networkDenied -and -not $networkControls) { $observed['network'] = 'inconclusive' }", self.wrapper)
+        for required in (
+            "if ((Test-Passed $controlOutcomes @('network_control_ipv6'))) { $ipv6Control = Get-NetworkState $controlOutcomes['network_control_ipv6'].Stdout 'connect' }",
+            "if ((Test-Passed $confinedOutcomes @('network_tcp_ipv6'))) { $ipv6Confined = Get-NetworkState $confinedOutcomes['network_tcp_ipv6'].Stdout 'connect' }",
+            "if (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'blocked')) { $observed['ipv6'] = 'blocked' }",
+            "if (($ipv6Control -ceq 'unroutable') -and ($ipv6Confined -cin @('blocked', 'unroutable'))) { $observed['ipv6'] = 'not_applicable' }",
+            "-and -not (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'unroutable'))",
+            "ipv6 = 'blocked'; ipv6_control = 'open'",
+            "if ($observed['ipv6'] -ceq 'not_applicable') { $expectedTokens['ipv6'] = 'not_applicable'; $expectedTokens['ipv6_control'] = 'unroutable' }",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.wrapper)
+
+    def test_ipv6_summary_keys_and_not_applicable_pair_are_consistent(self):
+        found = re.search(r"\$expectedTokens = \[ordered\]@\{ (.+) \}\n", self.wrapper)
+        self.assertIsNotNone(found)
+        keys = [key for key, _ in re.findall(r"([a-z_0-9]+) = '([A-Za-z_]+)'", found.group(1))]
+        self.assertNotIn("control", keys)
+        self.assertEqual(keys.index("ipv6_control"), keys.index("ipv6") + 1)
+        self.assertEqual(keys.index("ipv6"), keys.index("network") + 1)
+        self.assertNotIn("$observed['control']", self.wrapper)
+        self.assertNotIn("$expectedTokens['control']", self.wrapper)
+        self.assertIn("if ($ipv6Control -ceq 'unroutable') { $observed['ipv6_control'] = 'unroutable' }", self.wrapper)
+        self.assertIn("if ($ipv6Control -ceq 'open') { $observed['ipv6_control'] = 'open' }", self.wrapper)
+        self.assertIn("$observed['ipv6_control'] = 'failed'", self.wrapper)
+        self.assertEqual(
+            self.wrapper.count("$expectedTokens['ipv6'] = 'not_applicable'; $expectedTokens['ipv6_control'] = 'unroutable'"),
+            1,
+        )
+
+    def test_dns_denial_code_is_tied_to_names_the_unconfined_control_resolved(self):
+        specs = self.function_body("Get-StageSpecs")
+        confined, control = specs.split("} else {", 1)
+        control = control.split("    }\n    $specs +=", 1)[0]
+        control_names = set(re.findall(r"Arguments = 'dns ([^' ]+)'", control))
+        self.assertEqual(control_names, {"github.com"})
+        confined_dns = re.findall(r"Arguments = 'dns ([^' ]+)'", confined)
+        self.assertEqual(confined_dns, ["github.com"])
+        confined_hosts = re.findall(r"Arguments = 'connect ([A-Za-z][^' :]*):[0-9]+'", confined)
+        self.assertEqual(confined_hosts, ["github.com"])
+        for name in confined_dns + confined_hosts:
+            self.assertIn(name, control_names)
+        self.assertIn("$NetworkDeniedResolve = @('err10013', 'err11001')", self.wrapper)
+        self.assertEqual(self.wrapper.count("$NetworkDeniedResolve -ccontains"), 2)
+        self.assertNotIn("registry.npmjs.org:443", specs)
+
+    def test_lease_ace_check_pins_type_flags_and_size(self):
+        start = self.native.index("private bool IsLeaseAce")
+        body = self.native[start:self.native.index("private void WriteOriginal")]
+        for required in (
+            "ace[0] != 0 || ace[1] != 0",
+            "int sidLength = 8 + (ace[9] * 4);",
+            "BitConverter.ToUInt16(ace, 2) != ace.Length || ace.Length != 8 + sidLength",
+            "BitConverter.ToUInt32(ace, 4) == LeaseMask",
+            "string.Equals(SidText(ace, 8), packageSid, StringComparison.Ordinal)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+
+    def test_a_second_distinct_container_must_be_denied_on_nul_after_the_grant(self):
+        body = self.function_body("Test-OtherContainerNul")
+        for required in (
+            "[KeelDock.Platform.WindowsConfinement.Sandbox]::Create()",
+            "-ceq [string]$script:Sid",
+            "throw 'nul_other_not_distinct'",
+            "throw 'nul_other_control'",
+            "throw 'nul_other_launch'",
+            "throw 'nul_other_not_denied'",
+            "-cnotmatch 'Access is denied'",
+            "windows-confinement-nul-other=denied container=distinct error=5 control=granted",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        self.assertLess(body.index("$first.Run("), body.index("$other.Run("))
+        self.assertIn("$phase = 'nul_other_container'\n        Test-OtherContainerNul $box", self.wrapper)
+        opened = self.wrapper.index("NullDeviceLease]::Open($script:Sid)")
+        other = self.wrapper.index("Test-OtherContainerNul $box")
+        confined = self.wrapper.index("$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac")
+        self.assertLess(opened, other)
+        self.assertLess(other, confined)
+        tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
+        self.assertLess(tail.index("$script:NullLease.Restore()"), tail.index("$script:OtherBox.Dispose()"))
+        self.assertLess(tail.index("$script:OtherBox.Dispose()"), tail.index("Remove-Item -LiteralPath $baseDirectory"))
+
+    def test_temp_probe_failure_prints_a_closed_reason(self):
+        body = self.function_body("Initialize-ContainerTemp")
+        for required in (
+            "$probeReason = 'probe_exit'",
+            "$probeReason = 'probe_launch'",
+            "$probeReason = 'probe_not_exited'",
+            "$probeReason = 'probe_timeout'",
+            "windows-confinement-temp=failed reason=' + $probeReason",
+            "throw $probeReason",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        self.assertNotIn("throw 'probe'", body)
 
 
 if __name__ == "__main__":

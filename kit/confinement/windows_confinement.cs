@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -8,161 +9,6 @@ using Microsoft.Win32.SafeHandles;
 
 namespace KeelDock.Platform.WindowsConfinement
 {
-    public static class NativeRegistryProbe
-    {
-        private const uint KeyQueryValue = 0x0001;
-        private const uint ObjectCaseInsensitive = 0x00000040;
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct UnicodeString
-        {
-            internal ushort Length;
-            internal ushort MaximumLength;
-            internal IntPtr Buffer;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct ObjectAttributes
-        {
-            internal uint Length;
-            internal IntPtr RootDirectory;
-            internal IntPtr ObjectName;
-            internal uint Attributes;
-            internal IntPtr SecurityDescriptor;
-            internal IntPtr SecurityQualityOfService;
-        }
-
-        public static bool IsKnownProbeId(string probeId)
-        {
-            try
-            {
-                ResolvePath(probeId);
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        public static string Probe(string probeId)
-        {
-            string path = ResolvePath(probeId);
-            IntPtr pathBuffer = IntPtr.Zero;
-            IntPtr nameBuffer = IntPtr.Zero;
-            IntPtr attributesBuffer = IntPtr.Zero;
-            IntPtr key = IntPtr.Zero;
-            try
-            {
-                pathBuffer = Marshal.StringToHGlobalUni(path);
-                UnicodeString name = new UnicodeString();
-                name.Length = checked((ushort)(path.Length * 2));
-                name.MaximumLength = checked((ushort)(name.Length + 2));
-                name.Buffer = pathBuffer;
-                nameBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
-                Marshal.StructureToPtr(name, nameBuffer, false);
-                ObjectAttributes attributes = new ObjectAttributes();
-                attributes.Length = (uint)Marshal.SizeOf(typeof(ObjectAttributes));
-                attributes.ObjectName = nameBuffer;
-                attributes.Attributes = ObjectCaseInsensitive;
-                attributesBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(ObjectAttributes)));
-                Marshal.StructureToPtr(attributes, attributesBuffer, false);
-                uint status = Native.NtOpenKey(out key, KeyQueryValue, attributesBuffer);
-                if (status == 0)
-                {
-                    if (key != IntPtr.Zero)
-                    {
-                        Native.NtClose(key);
-                        key = IntPtr.Zero;
-                    }
-                    return "native-registry-probe id=" + probeId + " status=ok";
-                }
-                return "native-registry-probe id=" + probeId + " status=" + StatusName(status) + " ntstatus=0x" + status.ToString("X" + "8");
-            }
-            finally
-            {
-                if (key != IntPtr.Zero)
-                {
-                    Native.NtClose(key);
-                }
-                if (attributesBuffer != IntPtr.Zero)
-                {
-                    Marshal.FreeHGlobal(attributesBuffer);
-                }
-                if (nameBuffer != IntPtr.Zero)
-                {
-                    Marshal.FreeHGlobal(nameBuffer);
-                }
-                if (pathBuffer != IntPtr.Zero)
-                {
-                    Marshal.FreeHGlobal(pathBuffer);
-                }
-            }
-        }
-
-        private static string ResolvePath(string probeId)
-        {
-            if (string.Equals(probeId, "winsock_parameters", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters"; }
-            if (string.Equals(probeId, "winsock_protocol_catalog", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9"; }
-            if (string.Equals(probeId, "winsock_namespace_catalog", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5"; }
-            if (string.Equals(probeId, "winsock_protocol_entries", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries"; }
-            if (string.Equals(probeId, "winsock_protocol_entries64", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64"; }
-            if (string.Equals(probeId, "winsock_namespace_entries", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries"; }
-            if (string.Equals(probeId, "winsock_namespace_entries64", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries64"; }
-            if (HasNumericSuffix(probeId, "winsock_protocol_entry_", 12)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries\\" + probeId.Substring("winsock_protocol_entry_".Length); }
-            if (HasNumericSuffix(probeId, "winsock_protocol_entry64_", 12)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\Protocol_Catalog9\\Catalog_Entries64\\" + probeId.Substring("winsock_protocol_entry64_".Length); }
-            if (HasNumericSuffix(probeId, "winsock_namespace_entry_", 12)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries\\" + probeId.Substring("winsock_namespace_entry_".Length); }
-            if (HasNumericSuffix(probeId, "winsock_namespace_entry64_", 12)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Services\\WinSock2\\Parameters\\NameSpace_Catalog5\\Catalog_Entries64\\" + probeId.Substring("winsock_namespace_entry64_".Length); }
-            if (HasHexSuffix(probeId, "lpac_discriminator_arap_", 32)) { return "\\REGISTRY\\MACHINE\\SOFTWARE\\KeelDock\\ConfinementRecoveryTest\\" + probeId.Substring("lpac_discriminator_arap_".Length); }
-            if (HasHexSuffix(probeId, "lpac_discriminator_aap_", 32)) { return "\\REGISTRY\\MACHINE\\SOFTWARE\\KeelDock\\ConfinementRecoveryTest\\" + probeId.Substring("lpac_discriminator_aap_".Length); }
-            if (string.Equals(probeId, "lpac_default_key_control", StringComparison.Ordinal)) { return "\\REGISTRY\\MACHINE\\SYSTEM\\CurrentControlSet\\Control\\Nls\\CodePage"; }
-            throw new InvalidOperationException("registry_probe_id");
-        }
-
-        private static bool HasNumericSuffix(string value, string prefix, int length)
-        {
-            if (string.IsNullOrEmpty(value) || !value.StartsWith(prefix, StringComparison.Ordinal) || value.Length != prefix.Length + length) { return false; }
-            for (int index = prefix.Length; index < value.Length; ++index)
-            {
-                if (value[index] < '0' || value[index] > '9') { return false; }
-            }
-            return true;
-        }
-
-        private static bool HasHexSuffix(string value, string prefix, int length)
-        {
-            if (string.IsNullOrEmpty(value) || !value.StartsWith(prefix, StringComparison.Ordinal) || value.Length != prefix.Length + length) { return false; }
-            for (int index = prefix.Length; index < value.Length; ++index)
-            {
-                char item = value[index];
-                if (!((item >= '0' && item <= '9') || (item >= 'a' && item <= 'f'))) { return false; }
-            }
-            return true;
-        }
-
-        private static string StatusName(uint status)
-        {
-            switch (status)
-            {
-                case 0xC000000D: return "invalid_parameter";
-                case 0xC0000022: return "access_denied";
-                case 0xC0000034: return "object_name_not_found";
-                case 0xC000003A: return "object_path_not_found";
-                case 0xC000003B: return "object_path_syntax_bad";
-                default: return "ntstatus";
-            }
-        }
-
-        private static class Native
-        {
-            [DllImport("ntdll.dll", ExactSpelling = true)]
-            internal static extern uint NtOpenKey(out IntPtr keyHandle, uint desiredAccess, IntPtr objectAttributes);
-
-            [DllImport("ntdll.dll", ExactSpelling = true)]
-            internal static extern uint NtClose(IntPtr handle);
-        }
-    }
-
     public sealed class RunResult
     {
         public string Failure = "";
@@ -176,6 +22,11 @@ namespace KeelDock.Platform.WindowsConfinement
         public string Token = "none";
         public string Job = "none";
         public bool Truncated;
+        public ulong PeakProcessMemory;
+        public ulong PeakJobMemory;
+        public ulong CpuMs;
+        public uint HandleCount;
+        public string Class46 = "unreadable";
         public string Stdout = "";
         public string Stderr = "";
     }
@@ -222,6 +73,430 @@ namespace KeelDock.Platform.WindowsConfinement
         private static extern bool SetFileSecurityW(string fileName, uint securityInformation, byte[] securityDescriptor);
     }
 
+    public sealed class NullDeviceLease
+    {
+        private const string DevicePath = "\\\\.\\NUL";
+        private const uint LeaseMask = 0x0012019F;
+        private const uint ReadControl = 0x00020000;
+        private const uint WriteDac = 0x00040000;
+        private const uint ShareReadWrite = 0x00000003;
+        private const uint OpenExisting = 3;
+        private const uint SeFileObject = 1;
+        private const uint DaclInformation = 0x00000004;
+        private const uint LabelInformation = 0x00000010;
+        private const uint ProtectedDacl = 0x80000000;
+        private const uint UnprotectedDacl = 0x20000000;
+        private const int DaclFieldOffset = 16;
+        private const int MaxDescriptorBytes = 65536;
+        private static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        private readonly string packageSid;
+        private byte[] original;
+        private bool applied;
+
+        private NullDeviceLease(string packageSid)
+        {
+            this.packageSid = packageSid;
+        }
+
+        public static NullDeviceLease Open(string packageSid)
+        {
+            if (string.IsNullOrEmpty(packageSid) || !packageSid.StartsWith("S-1-15-2-", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("lease_sid");
+            }
+            NullDeviceLease lease = new NullDeviceLease(packageSid);
+            lease.original = lease.ReadDescriptor();
+            return lease;
+        }
+
+        public bool Applied
+        {
+            get { return applied; }
+        }
+
+        public string Apply()
+        {
+            IntPtr sid = IntPtr.Zero;
+            IntPtr handle = IntPtr.Zero;
+            IntPtr descriptor = IntPtr.Zero;
+            IntPtr newAcl = IntPtr.Zero;
+            try
+            {
+                if (!Native.ConvertStringSidToSidW(packageSid, out sid) || sid == IntPtr.Zero)
+                {
+                    return "failed";
+                }
+                handle = OpenHandle(ReadControl | WriteDac);
+                IntPtr dacl;
+                if (QuerySecurity(handle, out descriptor, out dacl) != 0 || dacl == IntPtr.Zero)
+                {
+                    return "failed";
+                }
+                Native.ExplicitAccess entry = new Native.ExplicitAccess();
+                entry.AccessPermissions = LeaseMask;
+                entry.AccessMode = 1;
+                entry.Inheritance = 0;
+                entry.Trustee.MultipleTrustee = IntPtr.Zero;
+                entry.Trustee.MultipleTrusteeOperation = 0;
+                entry.Trustee.TrusteeForm = 0;
+                entry.Trustee.TrusteeType = 0;
+                entry.Trustee.Name = sid;
+                if (Native.SetEntriesInAclW(1, ref entry, dacl, out newAcl) != 0 || newAcl == IntPtr.Zero)
+                {
+                    return "failed";
+                }
+                applied = true;
+                if (Native.SetSecurityInfo(handle, SeFileObject, DaclInformation, IntPtr.Zero, IntPtr.Zero, newAcl, IntPtr.Zero) != 0)
+                {
+                    return "failed";
+                }
+                return "applied";
+            }
+            catch
+            {
+                return "failed";
+            }
+            finally
+            {
+                if (newAcl != IntPtr.Zero)
+                {
+                    Native.LocalFree(newAcl);
+                }
+                if (descriptor != IntPtr.Zero)
+                {
+                    Native.LocalFree(descriptor);
+                }
+                if (sid != IntPtr.Zero)
+                {
+                    Native.LocalFree(sid);
+                }
+                if (handle != IntPtr.Zero)
+                {
+                    Native.CloseHandle(handle);
+                }
+            }
+        }
+
+        public string Readback()
+        {
+            try
+            {
+                List<byte[]> before = ReadAceBlobs(original);
+                List<byte[]> after = ReadAceBlobs(ReadDescriptor());
+                if (after.Count != before.Count + 1)
+                {
+                    return "mismatch";
+                }
+                int found = -1;
+                for (int index = 0; index < after.Count; ++index)
+                {
+                    if (IsLeaseAce(after[index]))
+                    {
+                        if (found >= 0)
+                        {
+                            return "mismatch";
+                        }
+                        found = index;
+                    }
+                }
+                if (found < 0)
+                {
+                    return "mismatch";
+                }
+                after.RemoveAt(found);
+                for (int index = 0; index < after.Count; ++index)
+                {
+                    if (!SameBytes(after[index], before[index]))
+                    {
+                        return "mismatch";
+                    }
+                }
+                return "match";
+            }
+            catch
+            {
+                return "mismatch";
+            }
+        }
+
+        public string Restore()
+        {
+            if (!applied)
+            {
+                return "not_applied";
+            }
+            string state = "failed";
+            for (int attempt = 0; attempt < 2 && state != "verified"; ++attempt)
+            {
+                try
+                {
+                    WriteOriginal(attempt == 1);
+                    if (SameBytes(ReadDescriptor(), original))
+                    {
+                        state = "verified";
+                    }
+                }
+                catch
+                {
+                    state = "failed";
+                }
+            }
+            return state;
+        }
+
+        private bool IsLeaseAce(byte[] ace)
+        {
+            if (ace == null || ace.Length < 12 || ace[0] != 0 || ace[1] != 0)
+            {
+                return false;
+            }
+            int sidLength = 8 + (ace[9] * 4);
+            if (BitConverter.ToUInt16(ace, 2) != ace.Length || ace.Length != 8 + sidLength)
+            {
+                return false;
+            }
+            return BitConverter.ToUInt32(ace, 4) == LeaseMask && string.Equals(SidText(ace, 8), packageSid, StringComparison.Ordinal);
+        }
+
+        private void WriteOriginal(bool kernelStyle)
+        {
+            IntPtr copy = Marshal.AllocHGlobal(original.Length);
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                Marshal.Copy(original, 0, copy, original.Length);
+                handle = OpenHandle(WriteDac);
+                if (kernelStyle)
+                {
+                    if (!Native.SetKernelObjectSecurity(handle, DaclInformation, copy))
+                    {
+                        throw new InvalidOperationException("restore_kernel error=" + Marshal.GetLastWin32Error().ToString());
+                    }
+                    return;
+                }
+                int present;
+                IntPtr dacl;
+                int defaulted;
+                if (!Native.GetSecurityDescriptorDacl(copy, out present, out dacl, out defaulted))
+                {
+                    throw new InvalidOperationException("restore_dacl");
+                }
+                if (present == 0)
+                {
+                    dacl = IntPtr.Zero;
+                }
+                uint control = BitConverter.ToUInt16(original, 2);
+                uint protection = (control & 0x1000) != 0 ? ProtectedDacl : UnprotectedDacl;
+                uint status = Native.SetSecurityInfo(handle, SeFileObject, DaclInformation | protection, IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+                if (status != 0)
+                {
+                    throw new InvalidOperationException("restore_set error=" + status.ToString());
+                }
+            }
+            finally
+            {
+                if (handle != IntPtr.Zero)
+                {
+                    Native.CloseHandle(handle);
+                }
+                Marshal.FreeHGlobal(copy);
+            }
+        }
+
+        private IntPtr OpenHandle(uint access)
+        {
+            IntPtr handle = Native.CreateFileW(DevicePath, access, ShareReadWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            if (handle == InvalidHandle || handle == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("device_open error=" + Marshal.GetLastWin32Error().ToString());
+            }
+            return handle;
+        }
+
+        private static uint QuerySecurity(IntPtr handle, out IntPtr descriptor, out IntPtr dacl)
+        {
+            IntPtr owner;
+            IntPtr group;
+            IntPtr sacl;
+            uint status = Native.GetSecurityInfo(handle, SeFileObject, DaclInformation | LabelInformation, out owner, out group, out dacl, out sacl, out descriptor);
+            if (status == 0 && descriptor != IntPtr.Zero)
+            {
+                return status;
+            }
+            if (descriptor != IntPtr.Zero)
+            {
+                Native.LocalFree(descriptor);
+            }
+            descriptor = IntPtr.Zero;
+            return Native.GetSecurityInfo(handle, SeFileObject, DaclInformation, out owner, out group, out dacl, out sacl, out descriptor);
+        }
+
+        private byte[] ReadDescriptor()
+        {
+            IntPtr handle = OpenHandle(ReadControl);
+            IntPtr descriptor = IntPtr.Zero;
+            try
+            {
+                IntPtr dacl;
+                uint status = QuerySecurity(handle, out descriptor, out dacl);
+                if (status != 0 || descriptor == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("device_read error=" + status.ToString());
+                }
+                uint length = Native.GetSecurityDescriptorLength(descriptor);
+                if (length < 20 || length > MaxDescriptorBytes)
+                {
+                    throw new InvalidOperationException("device_length");
+                }
+                byte[] bytes = new byte[length];
+                Marshal.Copy(descriptor, bytes, 0, (int)length);
+                return bytes;
+            }
+            finally
+            {
+                if (descriptor != IntPtr.Zero)
+                {
+                    Native.LocalFree(descriptor);
+                }
+                Native.CloseHandle(handle);
+            }
+        }
+
+        private static bool SameBytes(byte[] left, byte[] right)
+        {
+            if (left == null || right == null || left.Length != right.Length)
+            {
+                return false;
+            }
+            for (int index = 0; index < left.Length; ++index)
+            {
+                if (left[index] != right[index])
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static string SidText(byte[] data, int offset)
+        {
+            if (offset < 0 || offset + 8 > data.Length)
+            {
+                return "";
+            }
+            int count = data[offset + 1];
+            if (offset + 8 + count * 4 > data.Length)
+            {
+                return "";
+            }
+            ulong authority = 0;
+            for (int index = 2; index < 8; ++index)
+            {
+                authority = (authority << 8) | data[offset + index];
+            }
+            StringBuilder text = new StringBuilder("S-" + data[offset].ToString() + "-" + authority.ToString());
+            for (int index = 0; index < count; ++index)
+            {
+                text.Append("-" + BitConverter.ToUInt32(data, offset + 8 + index * 4).ToString());
+            }
+            return text.ToString();
+        }
+
+        private static List<byte[]> ReadAceBlobs(byte[] data)
+        {
+            List<byte[]> result = new List<byte[]>();
+            if (data == null || data.Length < 20)
+            {
+                return result;
+            }
+            int aclOffset = BitConverter.ToInt32(data, DaclFieldOffset);
+            if (aclOffset <= 0 || aclOffset + 8 > data.Length)
+            {
+                return result;
+            }
+            int count = BitConverter.ToUInt16(data, aclOffset + 4);
+            if (count > 256)
+            {
+                throw new InvalidOperationException("acl_count");
+            }
+            int cursor = aclOffset + 8;
+            for (int index = 0; index < count; ++index)
+            {
+                if (cursor + 8 > data.Length)
+                {
+                    throw new InvalidOperationException("ace_shape");
+                }
+                int size = BitConverter.ToUInt16(data, cursor + 2);
+                if (size < 8 || cursor + size > data.Length)
+                {
+                    throw new InvalidOperationException("ace_shape");
+                }
+                byte[] blob = new byte[size];
+                Buffer.BlockCopy(data, cursor, blob, 0, size);
+                result.Add(blob);
+                cursor += size;
+            }
+            return result;
+        }
+
+        private static class Native
+        {
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct Trustee
+            {
+                internal IntPtr MultipleTrustee;
+                internal uint MultipleTrusteeOperation;
+                internal uint TrusteeForm;
+                internal uint TrusteeType;
+                internal IntPtr Name;
+            }
+
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct ExplicitAccess
+            {
+                internal uint AccessPermissions;
+                internal uint AccessMode;
+                internal uint Inheritance;
+                internal Trustee Trustee;
+            }
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            internal static extern IntPtr CreateFileW(string fileName, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool CloseHandle(IntPtr handle);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            internal static extern IntPtr LocalFree(IntPtr memory);
+
+            [DllImport("advapi32.dll", ExactSpelling = true)]
+            internal static extern uint GetSecurityInfo(IntPtr handle, uint objectType, uint information, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
+
+            [DllImport("advapi32.dll", ExactSpelling = true)]
+            internal static extern uint SetSecurityInfo(IntPtr handle, uint objectType, uint information, IntPtr owner, IntPtr group, IntPtr dacl, IntPtr sacl);
+
+            [DllImport("advapi32.dll", ExactSpelling = true)]
+            internal static extern uint SetEntriesInAclW(uint count, ref ExplicitAccess entries, IntPtr oldAcl, out IntPtr newAcl);
+
+            [DllImport("advapi32.dll", ExactSpelling = true)]
+            internal static extern uint GetSecurityDescriptorLength(IntPtr descriptor);
+
+            [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool GetSecurityDescriptorDacl(IntPtr descriptor, out int present, out IntPtr dacl, out int defaulted);
+
+            [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool SetKernelObjectSecurity(IntPtr handle, uint information, IntPtr descriptor);
+
+            [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool ConvertStringSidToSidW(string text, out IntPtr sid);
+        }
+    }
+
     public sealed class Sandbox : IDisposable
     {
         private const int ErrorInsufficientBuffer = 122;
@@ -230,12 +505,12 @@ namespace KeelDock.Platform.WindowsConfinement
         private const int MaxEnvironmentCharacters = 131072;
         private const int MaxCommandLineCharacters = 32767;
         private const uint TokenQuery = 0x0008;
-        private const bool SpikeAllowUnreadableLpac = true;
+        private const int TokenSecurityAttributes = 39;
+        private const string RegistryReadCapability = "registryRead";
         private const int TokenGroups = 2;
         private const int TokenRestrictedSids = 11;
         private const int TokenAppContainerSid = 31;
         private const string AllApplicationPackagesSid = "S-1-15-2-1";
-        private const string AllRestrictedApplicationPackagesSid = "S-1-15-2-2";
         private const uint GroupEnabled = 0x00000004;
         private const int TokenIntegrityLevel = 25;
         private const int TokenIsAppContainer = 29;
@@ -273,6 +548,11 @@ namespace KeelDock.Platform.WindowsConfinement
         public string SidText
         {
             get { return sidText; }
+        }
+
+        public string ProfileName
+        {
+            get { return profileName; }
         }
 
         public static Sandbox Create()
@@ -350,18 +630,97 @@ namespace KeelDock.Platform.WindowsConfinement
             }
         }
 
+        private static IntPtr DeriveRegistryReadSid()
+        {
+            IntPtr groupSids = IntPtr.Zero;
+            IntPtr capabilitySids = IntPtr.Zero;
+            uint groupCount = 0;
+            uint capabilityCount = 0;
+            if (!Native.DeriveCapabilitySidsFromName(RegistryReadCapability, out groupSids, out groupCount, out capabilitySids, out capabilityCount))
+            {
+                throw new InvalidOperationException("derive_failed error=" + Marshal.GetLastWin32Error().ToString());
+            }
+            try
+            {
+                if (capabilityCount != 1 || capabilitySids == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("derive_count");
+                }
+                IntPtr source = Marshal.ReadIntPtr(capabilitySids);
+                if (source == IntPtr.Zero || !Native.IsValidSid(source))
+                {
+                    throw new InvalidOperationException("derive_sid");
+                }
+                uint length = Native.GetLengthSid(source);
+                if (length == 0 || length > 256)
+                {
+                    throw new InvalidOperationException("derive_length");
+                }
+                IntPtr copy = Marshal.AllocHGlobal((int)length);
+                if (!Native.CopySid(length, copy, source))
+                {
+                    Marshal.FreeHGlobal(copy);
+                    throw new InvalidOperationException("derive_copy");
+                }
+                return copy;
+            }
+            finally
+            {
+                FreeDerived(groupSids, groupCount);
+                FreeDerived(capabilitySids, capabilityCount);
+            }
+        }
+
+        private static void FreeDerived(IntPtr sids, uint count)
+        {
+            if (sids == IntPtr.Zero)
+            {
+                return;
+            }
+            for (uint index = 0; index < count && index < 16; ++index)
+            {
+                IntPtr sid = Marshal.ReadIntPtr(sids, (int)index * IntPtr.Size);
+                if (sid != IntPtr.Zero)
+                {
+                    Native.LocalFree(sid);
+                }
+            }
+            Native.LocalFree(sids);
+        }
+
+        private static string SidToText(IntPtr sid)
+        {
+            IntPtr text;
+            if (!Native.ConvertSidToStringSidW(sid, out text) || text == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("sid_text");
+            }
+            try
+            {
+                return Marshal.PtrToStringUni(text);
+            }
+            finally
+            {
+                Native.LocalFree(text);
+            }
+        }
+
         public RunResult Run(bool confined, string executable, string commandLine, string workingDirectory, string[] environment, int timeoutMs, uint maxProcesses)
         {
             RunResult result = new RunResult();
             IntPtr job = IntPtr.Zero;
             IntPtr process = IntPtr.Zero;
             IntPtr thread = IntPtr.Zero;
+            IntPtr inRead = IntPtr.Zero;
             IntPtr outRead = IntPtr.Zero;
             IntPtr outWrite = IntPtr.Zero;
             IntPtr errRead = IntPtr.Zero;
             IntPtr errWrite = IntPtr.Zero;
             IntPtr attributeBuffer = IntPtr.Zero;
             IntPtr capabilitiesBuffer = IntPtr.Zero;
+            IntPtr capabilityArray = IntPtr.Zero;
+            IntPtr capabilitySid = IntPtr.Zero;
+            string registryReadSidText = "";
             IntPtr policyBuffer = IntPtr.Zero;
             IntPtr handleBuffer = IntPtr.Zero;
             IntPtr environmentBlock = IntPtr.Zero;
@@ -394,6 +753,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 result.Failure = "pipes";
                 CreateCapturePipe(out outRead, out outWrite);
                 CreateCapturePipe(out errRead, out errWrite);
+                CreateEofStdin(out inRead);
 
                 result.Failure = "attributes";
                 int attributeCount = confined ? 3 : 1;
@@ -410,19 +770,27 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 attributeListInitialized = true;
 
-                handleBuffer = Marshal.AllocHGlobal(IntPtr.Size * 2);
-                Marshal.WriteIntPtr(handleBuffer, 0, outWrite);
-                Marshal.WriteIntPtr(handleBuffer, IntPtr.Size, errWrite);
-                if (!Native.UpdateProcThreadAttribute(attributeBuffer, 0, ProcThreadAttributeHandleList, handleBuffer, new UIntPtr((uint)(IntPtr.Size * 2)), IntPtr.Zero, IntPtr.Zero))
+                handleBuffer = Marshal.AllocHGlobal(IntPtr.Size * 3);
+                Marshal.WriteIntPtr(handleBuffer, 0, inRead);
+                Marshal.WriteIntPtr(handleBuffer, IntPtr.Size, outWrite);
+                Marshal.WriteIntPtr(handleBuffer, IntPtr.Size * 2, errWrite);
+                uint handleListSize = (uint)(IntPtr.Size * 3);
+                IntPtr[] handleListExpected = new IntPtr[] { inRead, outWrite, errWrite };
+                if (!Native.UpdateProcThreadAttribute(attributeBuffer, 0, ProcThreadAttributeHandleList, handleBuffer, new UIntPtr(handleListSize), IntPtr.Zero, IntPtr.Zero))
                 {
                     throw new InvalidOperationException();
                 }
                 if (confined)
                 {
+                    capabilitySid = DeriveRegistryReadSid();
+                    registryReadSidText = SidToText(capabilitySid);
+                    capabilityArray = Marshal.AllocHGlobal(IntPtr.Size * 2);
+                    Marshal.WriteIntPtr(capabilityArray, 0, capabilitySid);
+                    Marshal.WriteInt32(capabilityArray, IntPtr.Size, unchecked((int)GroupEnabled));
                     Native.SecurityCapabilities capabilities = new Native.SecurityCapabilities();
                     capabilities.AppContainerSid = profileSid;
-                    capabilities.Capabilities = IntPtr.Zero;
-                    capabilities.CapabilityCount = 0;
+                    capabilities.Capabilities = capabilityArray;
+                    capabilities.CapabilityCount = 1;
                     capabilities.Reserved = 0;
                     int capabilitiesSize = Marshal.SizeOf(typeof(Native.SecurityCapabilities));
                     capabilitiesBuffer = Marshal.AllocHGlobal(capabilitiesSize);
@@ -444,7 +812,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 Native.StartupInfoEx startup = new Native.StartupInfoEx();
                 startup.StartupInfo.cb = (uint)Marshal.SizeOf(typeof(Native.StartupInfoEx));
                 startup.StartupInfo.dwFlags = StartfUseStdHandles;
-                startup.StartupInfo.hStdInput = IntPtr.Zero;
+                startup.StartupInfo.hStdInput = inRead;
                 startup.StartupInfo.hStdOutput = outWrite;
                 startup.StartupInfo.hStdError = errWrite;
                 startup.AttributeList = attributeBuffer;
@@ -460,8 +828,10 @@ namespace KeelDock.Platform.WindowsConfinement
                 process = information.Process;
                 thread = information.Thread;
                 result.Created = true;
+                result.HandleCount = MeasureHandleList(handleBuffer, handleListSize, handleListExpected);
                 CloseOne(ref outWrite);
                 CloseOne(ref errWrite);
+                CloseOne(ref inRead);
 
                 result.Failure = "assign";
                 if (!Native.AssignProcessToJobObject(job, process))
@@ -475,7 +845,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 result.Job = ReadJob(job, process, maxProcesses);
 
                 result.Failure = "token";
-                result.Token = ReadToken(process, confined, profileSid);
+                result.Token = ReadToken(process, confined, profileSid, registryReadSidText, result);
 
                 result.Failure = "readers";
                 outThread = new Thread(Pump);
@@ -510,6 +880,8 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 result.ExitCode = exitCode;
                 result.Exited = true;
+                ReadPeaks(job, result);
+                ReadCpu(job, result);
                 Native.TerminateJobObject(job, JobKillExitCode);
                 result.Failure = "";
             }
@@ -538,6 +910,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 CloseOne(ref outWrite);
                 CloseOne(ref errWrite);
+                CloseOne(ref inRead);
                 bool outJoined = JoinReader(outThread);
                 bool errJoined = JoinReader(errThread);
                 if (outJoined)
@@ -561,6 +934,8 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 FreeOne(ref attributeBuffer);
                 FreeOne(ref capabilitiesBuffer);
+                FreeOne(ref capabilityArray);
+                FreeOne(ref capabilitySid);
                 FreeOne(ref policyBuffer);
                 FreeOne(ref handleBuffer);
                 FreeOne(ref environmentBlock);
@@ -636,7 +1011,172 @@ namespace KeelDock.Platform.WindowsConfinement
             }
         }
 
-        private static string ReadToken(IntPtr process, bool confined, IntPtr expectedSid)
+        private static void ReadPeaks(IntPtr job, RunResult result)
+        {
+            int size = Marshal.SizeOf(typeof(Native.ExtendedLimitInformation));
+            IntPtr buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                uint returned;
+                if (Native.QueryInformationJobObject(job, JobObjectExtendedLimitInformation, buffer, (uint)size, out returned) && returned >= size)
+                {
+                    Native.ExtendedLimitInformation actual = (Native.ExtendedLimitInformation)Marshal.PtrToStructure(buffer, typeof(Native.ExtendedLimitInformation));
+                    result.PeakProcessMemory = actual.PeakProcessMemoryUsed.ToUInt64();
+                    result.PeakJobMemory = actual.PeakJobMemoryUsed.ToUInt64();
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static void ReadCpu(IntPtr job, RunResult result)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(48);
+            try
+            {
+                uint returned;
+                if (Native.QueryInformationJobObject(job, 1, buffer, 48, out returned) && returned >= 16)
+                {
+                    long user = Marshal.ReadInt64(buffer, 0);
+                    long kernel = Marshal.ReadInt64(buffer, 8);
+                    if (user >= 0 && kernel >= 0)
+                    {
+                        result.CpuMs = (ulong)((user + kernel) / 10000);
+                    }
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static uint MeasureHandleList(IntPtr buffer, uint sizeBytes, IntPtr[] expected)
+        {
+            if (buffer == IntPtr.Zero || expected == null || sizeBytes == 0 || (sizeBytes % (uint)IntPtr.Size) != 0)
+            {
+                return 0;
+            }
+            uint count = sizeBytes / (uint)IntPtr.Size;
+            if (count != (uint)expected.Length)
+            {
+                return count;
+            }
+            for (int index = 0; index < expected.Length; ++index)
+            {
+                IntPtr entry = Marshal.ReadIntPtr(buffer, index * IntPtr.Size);
+                uint flags;
+                if (entry == IntPtr.Zero || entry == new IntPtr(-1) || entry != expected[index])
+                {
+                    return 0;
+                }
+                for (int other = 0; other < index; ++other)
+                {
+                    if (expected[other] == entry)
+                    {
+                        return 0;
+                    }
+                }
+                if (!Native.GetHandleInformation(entry, out flags) || (flags & HandleFlagInherit) == 0)
+                {
+                    return 0;
+                }
+            }
+            return count;
+        }
+
+        private static void CreateEofStdin(out IntPtr read)
+        {
+            IntPtr write;
+            Native.SecurityAttributes attributes = new Native.SecurityAttributes();
+            attributes.Length = (uint)Marshal.SizeOf(typeof(Native.SecurityAttributes));
+            attributes.SecurityDescriptor = IntPtr.Zero;
+            attributes.InheritHandle = 1;
+            if (!Native.CreatePipe(out read, out write, ref attributes, 4096))
+            {
+                read = IntPtr.Zero;
+                throw new InvalidOperationException();
+            }
+            bool cleared = Native.SetHandleInformation(write, HandleFlagInherit, 0);
+            Native.CloseHandle(write);
+            if (!cleared)
+            {
+                Native.CloseHandle(read);
+                read = IntPtr.Zero;
+                throw new InvalidOperationException();
+            }
+        }
+
+        private static string ReadNoAllAppPkgAttribute(IntPtr token)
+        {
+            if (IntPtr.Size != 8)
+            {
+                return "unreadable";
+            }
+            uint length = 0;
+            IntPtr buffer = IntPtr.Zero;
+            try
+            {
+                buffer = QueryTokenInformation(token, TokenSecurityAttributes, out length);
+                if (length < 16)
+                {
+                    return "unreadable";
+                }
+                long start = buffer.ToInt64();
+                long end = start + length;
+                uint count = unchecked((uint)Marshal.ReadInt32(buffer, 4));
+                if (count == 0)
+                {
+                    return "absent";
+                }
+                if (count > 64)
+                {
+                    return "unreadable";
+                }
+                long array = Marshal.ReadIntPtr(buffer, 8).ToInt64();
+                if (array < start || array + (long)count * 40 > end)
+                {
+                    return "unreadable";
+                }
+                for (uint index = 0; index < count; ++index)
+                {
+                    IntPtr attribute = new IntPtr(array + (long)index * 40);
+                    int nameBytes = (ushort)Marshal.ReadInt16(attribute, 0);
+                    long namePointer = Marshal.ReadIntPtr(attribute, 8).ToInt64();
+                    if (nameBytes == 0 || nameBytes > 512 || (nameBytes % 2) != 0 || namePointer < start || namePointer + nameBytes > end)
+                    {
+                        return "unreadable";
+                    }
+                    string name = Marshal.PtrToStringUni(new IntPtr(namePointer), nameBytes / 2);
+                    if (string.Equals(name, "WIN://NOALLAPPPKG", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return "present";
+                    }
+                }
+                return "absent";
+            }
+            catch
+            {
+                return "unreadable";
+            }
+            finally
+            {
+                if (buffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(buffer);
+                }
+            }
+        }
+
+        private static string ReadToken(IntPtr process, bool confined, IntPtr expectedSid, string expectedCapabilitySid, RunResult result)
         {
             IntPtr token;
             if (!Native.OpenProcessToken(process, TokenQuery, out token) || token == IntPtr.Zero)
@@ -656,31 +1196,29 @@ namespace KeelDock.Platform.WindowsConfinement
                     return "appcontainer=0 integrity=0x" + integrity.ToString("x4");
                 }
                 uint capabilityCount = ReadCapabilityCount(token);
-                string lpac = "unreadable";
+                bool capabilityMatches = capabilityCount == 1 && !string.IsNullOrEmpty(expectedCapabilitySid)
+                    && ReadSidInTokenSet(token, TokenCapabilities, expectedCapabilitySid, false);
+                string class46 = "unreadable";
                 try
                 {
-                    lpac = ReadTokenDword(token, TokenIsLessPrivilegedAppContainer) == 1 ? "1" : "0";
+                    class46 = ReadTokenDword(token, TokenIsLessPrivilegedAppContainer) == 1 ? "1" : "0";
                 }
                 catch
                 {
-                    lpac = "unreadable";
+                    class46 = "unreadable";
                 }
+                result.Class46 = class46;
+                string attribute = ReadNoAllAppPkgAttribute(token);
                 string sidState = ReadContainerSidMatches(token, expectedSid) ? "match" : "mismatch";
-                string restrictedApplicationPackages = ReadAllRestrictedApplicationPackagesState(token);
                 string applicationPackages = ReadAllApplicationPackagesState(token);
-                string reported = lpac;
-                if (lpac != "1" && SpikeAllowUnreadableLpac && lpac == "unreadable" && sidState == "match"
-                    && applicationPackages == "absent")
-                {
-                    reported = "aap_only";
-                }
                 string text = "appcontainer=" + isAppContainer.ToString() + " capabilities=" + capabilityCount.ToString()
-                    + " integrity=0x" + integrity.ToString("x4") + " lpac=" + reported + " sid=" + sidState
-                    + " arap=" + restrictedApplicationPackages + " aap=" + applicationPackages;
-                if (isAppContainer != 1 || capabilityCount != 0 || integrity != LowIntegrityRid || (lpac != "1" && reported != "aap_only")
-                    || sidState != "match" || (lpac == "1" && restrictedApplicationPackages != "present") || applicationPackages != "absent")
+                    + " integrity=0x" + integrity.ToString("x4") + " lpac=" + (attribute == "present" ? "attr" : "none")
+                    + " cap=" + (capabilityMatches ? RegistryReadCapability : "mismatch") + " sid=" + sidState
+                    + " aap=" + applicationPackages;
+                if (isAppContainer != 1 || capabilityCount != 1 || !capabilityMatches || integrity != LowIntegrityRid
+                    || attribute != "present" || sidState != "match" || applicationPackages != "absent")
                 {
-                    throw new InvalidOperationException(text);
+                    throw new InvalidOperationException(text + " attr=" + attribute);
                 }
                 return text;
             }
@@ -713,13 +1251,6 @@ namespace KeelDock.Platform.WindowsConfinement
         {
             bool inGroups = ReadSidInTokenSet(token, TokenGroups, AllApplicationPackagesSid, false);
             bool inRestrictedSids = ReadSidInTokenSet(token, TokenRestrictedSids, AllApplicationPackagesSid, false);
-            return inGroups || inRestrictedSids ? "present" : "absent";
-        }
-
-        private static string ReadAllRestrictedApplicationPackagesState(IntPtr token)
-        {
-            bool inGroups = ReadSidInTokenSet(token, TokenGroups, AllRestrictedApplicationPackagesSid, true);
-            bool inRestrictedSids = ReadSidInTokenSet(token, TokenRestrictedSids, AllRestrictedApplicationPackagesSid, false);
             return inGroups || inRestrictedSids ? "present" : "absent";
         }
 
@@ -1077,6 +1608,17 @@ namespace KeelDock.Platform.WindowsConfinement
             [DllImport("userenv.dll", CharSet = CharSet.Unicode, PreserveSig = true)]
             internal static extern int DeleteAppContainerProfile(string appContainerName);
 
+            [DllImport("kernelbase.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool DeriveCapabilitySidsFromName(string capabilityName, out IntPtr capabilityGroupSids, out uint capabilityGroupSidCount, out IntPtr capabilitySids, out uint capabilitySidCount);
+
+            [DllImport("advapi32.dll", ExactSpelling = true)]
+            internal static extern uint GetLengthSid(IntPtr sid);
+
+            [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool CopySid(uint destinationLength, IntPtr destination, IntPtr source);
+
             [DllImport("advapi32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
@@ -1157,6 +1699,10 @@ namespace KeelDock.Platform.WindowsConfinement
             [DllImport("kernel32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool GetHandleInformation(IntPtr handle, out uint flags);
 
             [DllImport("kernel32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
