@@ -1369,10 +1369,20 @@ def _locked_packages(lock_bytes):
 
 
 def _manifest_json(path):
+    descriptor = -1
     try:
-        payload = Path(path).read_bytes()
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PACKAGE_JSON_BYTES:
+            raise SourceBuildRefusal("lock")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            payload = source.read(MAX_PACKAGE_JSON_BYTES + 1)
     except OSError:
         raise SourceBuildRefusal("lock") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not payload or len(payload) > MAX_PACKAGE_JSON_BYTES:
         raise SourceBuildRefusal("lock")
 

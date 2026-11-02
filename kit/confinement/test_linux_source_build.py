@@ -2380,6 +2380,42 @@ class LinuxAuditDetailTests(unittest.TestCase):
         self.assertEqual(self._detail(detached, packages=packages).detail, "audit_consumer_unreached")
 
 
+class ManifestReadAndLockGuardTests(unittest.TestCase):
+    def test_manifest_json_reads_only_a_bounded_regular_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            good = root / "package.json"
+            good.write_text('{"name":"x"}', encoding="ascii")
+            self.assertEqual(linux_source_build._manifest_json(good), {"name": "x"})
+            (root / "secret.json").write_text('{"name":"leak"}', encoding="ascii")
+            (root / "link.json").symlink_to(root / "secret.json")
+            (root / "empty.json").write_bytes(b"")
+            (root / "big.json").write_bytes(b" " * (linux_source_build.MAX_PACKAGE_JSON_BYTES + 1))
+            (root / "dir.json").mkdir()
+            (root / "duplicate.json").write_text('{"a":1,"a":2}', encoding="ascii")
+            os.mkfifo(root / "fifo.json")
+            for name in ("link.json", "empty.json", "big.json", "dir.json", "duplicate.json", "fifo.json", "missing.json"):
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+                        linux_source_build._manifest_json(root / name)
+
+    def test_a_tree_with_no_cargo_lock_is_refused_by_the_explicit_guard(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+            with patch.object(linux_source_build, "_open_source_root", return_value=descriptor), patch.object(
+                linux_source_build, "_require_source_root_identity"
+            ), patch.object(linux_source_build, "_require_confined_manifests"), patch.object(
+                linux_source_build, "_rust_lock_paths", return_value=[]
+            ):
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
+                    linux_source_build.run_rust_license_gate(
+                        {"SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40}
+                    )
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+
 class QuickTierVerdictTests(unittest.TestCase):
     def test_the_quick_tier_can_never_emit_a_verdict(self):
         for mode in ("source", "synthetic", ""):
