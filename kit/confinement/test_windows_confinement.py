@@ -676,7 +676,7 @@ foreach ($case in $cases) {
         workflow = WORKFLOW.read_text(encoding="utf-8")
         minutes = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", workflow)]
         self.assertEqual(len(minutes), 2)
-        self.assertEqual(minutes[1], 220)
+        self.assertEqual(minutes[1], 240)
         self.assertLessEqual(worst, minutes[1] * 60 * 0.8)
 
     def channel_attempt_lines(self):
@@ -2387,7 +2387,7 @@ foreach ($case in $cases) {
         wfp = probe[probe.index("fn probe_wfp"):probe.index("fn probe_procpeer")]
         peer = probe[probe.index("fn probe_procpeer"):probe.index("fn main")]
         self.assertIn("vtable_entry(object, 10)", task)
-        self.assertIn("*const u8, *const u8, *const u8, *const u8) -> i32", task)
+        self.assertIn("extern \"system\" fn(*mut u8, *mut u8, *mut u8, *mut u8, *mut u8) -> i32", task)
         self.assertIn('format!("create=ok connect=hr{:08x}", connected as u32)', task)
         self.assertIn("vtable_entry(object, 3)", wmi)
         self.assertIn('SysAllocString(namespace.as_ptr())', wmi)
@@ -2829,8 +2829,8 @@ foreach ($case in $cases) {
         self.assertEqual(budget, 2 * 3 * 243 + 2 * 63 + 2 * 33)
         workflow = WORKFLOW.read_text(encoding="utf-8")
         template = (ROOT / "kit/bootstrap/policy_windows.py").read_text(encoding="utf-8")
-        self.assertIn("    timeout-minutes: 220\n", workflow)
-        self.assertEqual(template.count("    timeout-minutes: 220\n"), 1)
+        self.assertIn("    timeout-minutes: 240\n", workflow)
+        self.assertEqual(template.count("    timeout-minutes: 240\n"), 1)
         self.assertNotIn("    timeout-minutes: 200\n", workflow + template)
 
     def test_leak_guards_run_and_judge_the_confined_attempt_whatever_the_control_and_exit_code(self):
