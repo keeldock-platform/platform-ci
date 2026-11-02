@@ -39,6 +39,7 @@ Refusal line:
     KD-CONFINEMENT-AUDIT schema=1 status=refused phase=<phase> reason=confinement_audit_invalid
 """
 
+import datetime
 import hashlib
 import json
 import os
@@ -108,6 +109,35 @@ REFUSED_RE = re.compile(
     re.escape(AUDIT_PREFIX) + r" schema=1 status=refused phase=([a-z_]{1,24})"
     r" reason=" + REFUSAL_REASON
 )
+
+
+QUICK_MODE = "quick"
+QUICK_WORKFLOW_PATH = ".github/workflows/core-linux-quick-return.yml"
+QUICK_GATES_STEP = "Run all offline project gates"
+QUICK_LINE_STEP = "Record quick return counts"
+QUICK_ARTIFACT_PREFIX = "linux-quick-"
+QUICK_FRAME_BYTES = 4 * 1024 * 1024 - 64 * 1024 + 470 + 16
+QUICK_ARTIFACT_SLACK_BYTES = 8192
+QUICK_RETENTION_SECONDS = 24 * 60 * 60
+QUICK_RETENTION_SLACK_SECONDS = 600
+QUICK_MIN_GATES = 13
+QUICK_MAX_GATES = 16
+QUICK_EXPECTED_FIELDS = (
+    (EXPECTED_FIELDS - frozenset(("verdict_job", "verdict_step"))) | frozenset(("quick_job", "request_id"))
+)
+QUICK_LINE_PREFIX = b"KD-LINUX-QUICK"
+QUICK_COUNT_PREFIX = QUICK_LINE_PREFIX + b" "
+QUICK_COUNT_RE = re.compile(
+    rb"KD-LINUX-QUICK schema=1 request-id=([a-f0-9]{64}) tier=quick admission=never"
+    rb" gates-selected=(0|[1-9][0-9]?) gates-passed=(0|[1-9][0-9]?) failed=(0|[1-9][0-9]?)"
+    rb" status=encrypted"
+)
+QUICK_PREFLIGHT_RE = re.compile(
+    rb"KD-LINUX-QUICK-PREFLIGHT schema=1 request-id=([a-f0-9]{64}) tier=quick admission=never"
+    rb" status=verified"
+)
+QUICK_TIME_RE = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.[0-9]{1,9})?Z")
+QUICK_ARTIFACT_FIELDS = frozenset(("id", "name", "size_in_bytes", "created_at", "expires_at", "expired", "workflow_run"))
 
 
 class AuditRefusal(Exception):
@@ -282,7 +312,7 @@ def _list_jobs(api, expected):
     return _collect_counted(api, path, "jobs", MAX_JOBS)
 
 
-def _check_jobs(jobs, expected):
+def _index_jobs(jobs, expected):
     names = set(expected["jobs"]) | {expected["auditor_job"]}
     if len(jobs) != len(names):
         _fail("jobs")
@@ -306,6 +336,11 @@ def _check_jobs(jobs, expected):
     auditor = by_name[expected["auditor_job"]]
     if auditor.get("status") != "in_progress" or auditor.get("conclusion") is not None:
         _fail("jobs")
+    return by_name
+
+
+def _check_jobs(jobs, expected):
+    by_name = _index_jobs(jobs, expected)
     for name, spec in expected["jobs"].items():
         job = by_name[name]
         if job.get("status") != "completed" or job.get("conclusion") != "success":
@@ -453,14 +488,18 @@ def _check_section(log, job, expected):
     line. Composite actions add nested run headers and start and end markers that do not map to
     job steps, so any such marker refuses.
     """
+    _check_prefix_section(log, job, expected["verdict_step"], VERDICT_PREFIX, ("success",))
+
+
+def _check_prefix_section(log, job, step_name, prefix, conclusions):
     ordinal = None
     eligible = 0
     for step in job["steps"]:
         name = step.get("name")
-        if (step.get("conclusion") != "success" or name in UNSECTIONED_STEPS
+        if (step.get("conclusion") not in conclusions or name in UNSECTIONED_STEPS
                 or name.startswith("Post ")):
             continue
-        if name == expected["verdict_step"]:
+        if name == step_name:
             ordinal = eligible
         eligible += 1
     lines = _stripped_lines(log)
@@ -478,9 +517,10 @@ def _check_section(log, job, expected):
         )
     ]
     end = following[0] if following else len(lines)
-    positions = [index for index, line in enumerate(lines) if line.startswith(VERDICT_PREFIX)]
+    positions = [index for index, line in enumerate(lines) if line.startswith(prefix)]
     if len(positions) != 1 or not start < positions[0] < end:
         _fail("verdict")
+    return lines[positions[0]]
 
 
 def _verdict_line(logs, by_name, expected):
@@ -633,6 +673,192 @@ def audit_line(api, expected, config=None):
         return False, refusal_line("unavailable")
 
 
+def validate_expected_quick(expected):
+    """Refuse any expected quick-run description that is not exactly the closed shape."""
+    if type(expected) is not dict or set(expected) != QUICK_EXPECTED_FIELDS:
+        _fail("request")
+    jobs = expected["jobs"]
+    request_id = expected["request_id"]
+    if (type(expected["repository"]) is not str or REPOSITORY_RE.fullmatch(expected["repository"]) is None
+            or not _is(expected["os"], "linux")
+            or not _is(expected["mode"], QUICK_MODE)
+            or type(expected["control_sha"]) is not str or SHA_RE.fullmatch(expected["control_sha"]) is None
+            or not _exact_int(expected["run_id"], 1)
+            or not _is(expected["run_attempt"], 1)
+            or not _is(expected["workflow_path"], QUICK_WORKFLOW_PATH)
+            or not _is(expected["ci_ref"], "untrusted")
+            or type(expected["display_title"]) is not str
+            or LABEL_RE.fullmatch(expected["display_title"]) is None
+            or type(jobs) is not dict or not 1 <= len(jobs) < MAX_JOBS
+            or type(expected["quick_job"]) is not str or expected["quick_job"] not in jobs
+            or type(expected["auditor_job"]) is not str
+            or LABEL_RE.fullmatch(expected["auditor_job"]) is None
+            or expected["auditor_job"] in jobs
+            or type(request_id) is not str or DIGEST_RE.fullmatch(request_id) is None
+            or type(expected["artifact_names"]) is not tuple
+            or expected["artifact_names"] != (QUICK_ARTIFACT_PREFIX + request_id,)
+            or type(expected["cache_digest"]) is not str
+            or DIGEST_RE.fullmatch(expected["cache_digest"]) is None):
+        _fail("request")
+    for name, spec in jobs.items():
+        if (type(name) is not str or LABEL_RE.fullmatch(name) is None or type(spec) is not dict
+                or set(spec) != JOB_FIELDS
+                or not _text_tuple(spec["steps"], 1, 100, LABEL_RE)
+                or not _text_tuple(spec["optional_steps"], 0, 100, LABEL_RE)
+                or not set(spec["optional_steps"]).issubset(spec["steps"])
+                or any("verdict" in step.lower() for step in spec["steps"])):
+            _fail("request")
+    quick_spec = jobs[expected["quick_job"]]
+    for step in (QUICK_GATES_STEP, QUICK_LINE_STEP):
+        if quick_spec["steps"].count(step) != 1 or step in quick_spec["optional_steps"]:
+            _fail("request")
+
+
+def _check_quick_steps(job, spec):
+    steps = job["steps"]
+    if len(steps) != len(spec["steps"]):
+        _fail("job_steps")
+    gates = None
+    for index, step in enumerate(steps, start=1):
+        name = spec["steps"][index - 1]
+        if (type(step) is not dict or not _is(step.get("number"), index)
+                or not _is(step.get("name"), name) or not _is(step.get("status"), "completed")):
+            _fail("job_steps")
+        conclusion = step.get("conclusion")
+        if name == QUICK_GATES_STEP:
+            if conclusion not in ("success", "failure"):
+                _fail("job_steps")
+            gates = conclusion
+        elif conclusion != "success" and not (conclusion == "skipped" and name in spec["optional_steps"]):
+            _fail("job_steps")
+    return gates
+
+
+def _check_quick_jobs(jobs, expected):
+    by_name = _index_jobs(jobs, expected)
+    outcome = None
+    for name, spec in expected["jobs"].items():
+        job = by_name[name]
+        if job.get("status") != "completed":
+            _fail("jobs")
+        if name == expected["quick_job"]:
+            if job.get("conclusion") not in ("success", "failure"):
+                _fail("jobs")
+            outcome = _guard("job_steps", _check_quick_steps, job, spec)
+            if (job["conclusion"] == "success") != (outcome == "success"):
+                _fail("jobs")
+        else:
+            if job.get("conclusion") != "success":
+                _fail("jobs")
+            _guard("job_steps", _check_steps, job, spec)
+    return by_name, outcome
+
+
+def _check_quick_logs(logs, by_name, expected, outcome):
+    for name in sorted(expected["jobs"]):
+        job = by_name[name]
+        log = logs.get(job["id"])
+        if log is None:
+            _fail("job_logs")
+        if VERDICT_PREFIX in log or confinement_verdict.find_lines(log):
+            _fail("verdict")
+        quick_job = name == expected["quick_job"]
+        for line in _stripped_lines(log):
+            if not line.startswith(QUICK_LINE_PREFIX):
+                continue
+            matched = QUICK_PREFLIGHT_RE.fullmatch(line)
+            if matched is not None:
+                if matched.group(1).decode("ascii") != expected["request_id"]:
+                    _fail("verdict")
+            elif not quick_job or QUICK_COUNT_RE.fullmatch(line) is None:
+                _fail("verdict")
+        if not quick_job:
+            continue
+        line = _check_prefix_section(log, job, QUICK_LINE_STEP, QUICK_COUNT_PREFIX, ("success", "failure"))
+        matched = QUICK_COUNT_RE.fullmatch(line)
+        if matched is None or matched.group(1).decode("ascii") != expected["request_id"]:
+            _fail("verdict")
+        selected, passed, failed = (int(matched.group(index)) for index in (2, 3, 4))
+        if (not QUICK_MIN_GATES <= selected <= QUICK_MAX_GATES or passed + failed > selected
+                or failed > 1 or (failed == 0) != (outcome == "success")
+                or (outcome == "success" and passed != selected)):
+            _fail("verdict")
+
+
+def _quick_time(value):
+    matched = QUICK_TIME_RE.fullmatch(value) if type(value) is str else None
+    if matched is None:
+        _fail("artifact_inventory")
+    return datetime.datetime.strptime(matched.group(1), "%Y-%m-%dT%H:%M:%S")
+
+
+def _check_quick_artifacts(api, expected):
+    path = ("/repos/" + expected["repository"] + "/actions/runs/" + str(expected["run_id"])
+            + "/artifacts")
+    items = _collect_counted(api, path, "artifacts", MAX_ARTIFACTS)
+    if len(items) != 1:
+        _fail("artifact_inventory")
+    item = items[0]
+    if type(item) is not dict or not QUICK_ARTIFACT_FIELDS.issubset(item):
+        _fail("artifact_inventory")
+    run = item["workflow_run"]
+    size = item["size_in_bytes"]
+    if (not _exact_int(item["id"], 1)
+            or not _is(item["name"], expected["artifact_names"][0])
+            or not _is(item["expired"], False)
+            or not _exact_int(size, QUICK_FRAME_BYTES, QUICK_FRAME_BYTES + QUICK_ARTIFACT_SLACK_BYTES)
+            or type(run) is not dict
+            or not _is(run.get("id"), expected["run_id"])
+            or not _is(run.get("head_sha"), expected["control_sha"])
+            or not _is(run.get("head_branch"), expected["ci_ref"])):
+        _fail("artifact_inventory")
+    lifetime = (_quick_time(item["expires_at"]) - _quick_time(item["created_at"])).total_seconds()
+    if not 0 < lifetime <= QUICK_RETENTION_SECONDS + QUICK_RETENTION_SLACK_SECONDS:
+        _fail("artifact_inventory")
+
+
+def quick_accepted_line(expected):
+    return (
+        AUDIT_PREFIX + " schema=" + str(SCHEMA_VERSION) + " status=accepted os=linux mode=quick"
+        + " tier=quick admission=never control-sha=" + expected["control_sha"]
+        + " run-id=" + str(expected["run_id"]) + " run-attempt=" + str(expected["run_attempt"])
+        + " verdict=none log-canary=absent artifacts=expected caches=unchanged"
+    )
+
+
+def audit_quick(api, expected, config=None):
+    """Return the accepted quick line, or raise AuditRefusal naming only a closed phase."""
+    _guard("request", validate_expected_quick, expected)
+    resolved = _guard("log_canary", _resolve_config, config)
+    _guard("run", _check_run, api, expected)
+    jobs = _guard("jobs", _list_jobs, api, expected)
+    logs, texts, pending, unscanned = _gather(api, jobs, expected)
+    _scan(logs, texts, resolved)
+    if unscanned:
+        _fail("log_canary")
+    by_name, outcome = _guard("jobs", _check_quick_jobs, jobs, expected)
+    if pending:
+        _fail(pending[0])
+    _guard("verdict", _check_quick_logs, logs, by_name, expected, outcome)
+    if any(VERDICT_PREFIX in text.encode("utf-8", "replace") for text in texts):
+        _fail("annotations")
+    _guard("artifact_inventory", _check_quick_artifacts, api, expected)
+    items = _guard("cache_inventory", _collect_caches, api, expected["repository"])
+    if _guard("cache_inventory", cache_inventory_digest, items) != expected["cache_digest"]:
+        _fail("cache_inventory")
+    return quick_accepted_line(expected)
+
+
+def quick_audit_line(api, expected, config=None):
+    """Return a pair of the accepted flag and the one public line; never raises on a refusal."""
+    try:
+        return True, audit_quick(api, expected, config)
+    except AuditRefusal as error:
+        return False, refusal_line(error.phase)
+    except Exception:
+        return False, refusal_line("unavailable")
+
+
 def _unique_object(pairs):
     value = {}
     for key, item in pairs:
@@ -642,7 +868,7 @@ def _unique_object(pairs):
     return value
 
 
-def parse_expected(raw):
+def parse_expected(raw, quick=False):
     """Build the expected-run description from its JSON form, converting lists to tuples."""
     if type(raw) is not str or not raw or len(raw) > MAX_EXPECTED_BYTES:
         _fail("request")
@@ -660,7 +886,10 @@ def parse_expected(raw):
                 for field in JOB_FIELDS:
                     if type(spec.get(field)) is list:
                         spec[field] = tuple(spec[field])
-    validate_expected(value)
+    if quick:
+        validate_expected_quick(value)
+    else:
+        validate_expected(value)
     return value
 
 
@@ -731,16 +960,18 @@ def main(arguments=None, environ=None, api_factory=None, stdout=None):
     env = os.environ if environ is None else environ
     sink = sys.stdout if stdout is None else stdout
     factory = _default_api_factory if api_factory is None else api_factory
-    if actual:
+    quick = list(actual) == [QUICK_MODE]
+    if actual and not quick:
         return 2
     try:
-        expected = parse_expected(env.get(EXPECTED_ENV, ""))
+        expected = parse_expected(env.get(EXPECTED_ENV, ""), quick)
         if (env.get("GITHUB_REPOSITORY") != expected["repository"]
                 or env.get("GITHUB_RUN_ID") != str(expected["run_id"])
                 or env.get("GITHUB_RUN_ATTEMPT") != str(expected["run_attempt"])
                 or env.get("GITHUB_SHA") != expected["control_sha"]):
             _fail("request")
-        accepted, line = audit_line(
+        runner = quick_audit_line if quick else audit_line
+        accepted, line = runner(
             factory(env.get("GITHUB_TOKEN", ""), expected["repository"]), expected,
         )
     except AuditRefusal as error:

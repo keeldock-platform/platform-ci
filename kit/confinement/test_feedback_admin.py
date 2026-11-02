@@ -510,6 +510,154 @@ class FeedbackAdminTests(unittest.TestCase):
         self.assertEqual(diagnostic["kind"], "build_diagnostics")
         self.assertNotEqual(diagnostic["recipient_fingerprint"], patch_request["recipient_fingerprint"])
 
+    def test_the_linux_quick_kind_registers_on_the_untrusted_ref_and_is_released_under_its_own_name(self):
+        quick = self.create("linux_quick")["request"]
+        self.assertEqual(quick["kind"], "linux_quick")
+        self.assertEqual(quick["concern"], "core-linux-quick-return")
+        self.assertEqual(quick["workflow_ref"], "refs/heads/untrusted")
+        self.assertEqual(quick["workflow_path"], ".github/workflows/core-linux-quick-return.yml")
+        self.assertEqual(self._state()["requests"][0]["kind"], "linux_quick")
+        profile = feedback_request.PROFILE_BY_KIND["linux_quick"]
+        stub = types.SimpleNamespace(state_directory="/unused")
+        with mock.patch.object(subject, "_create_named") as create:
+            path = subject.FeedbackAdmin._release_private_output(
+                stub, -1, {"request_id": "a" * 64}, profile, b"x" * profile["max_payload_bytes"],
+            )
+        create.assert_called_once()
+        self.assertTrue(path.endswith("-linux-quick.payload"))
+        with mock.patch.object(subject, "_create_named") as create:
+            with self.assertRaises(subject.FeedbackAdminRefusal):
+                subject.FeedbackAdmin._release_private_output(
+                    stub, -1, {"request_id": "a" * 64}, profile, b"x" * (profile["max_payload_bytes"] + 1),
+                )
+        create.assert_not_called()
+
+    def quick_evidence(self, request, *, run_id=RUN_ID):
+        profile = feedback_request.PROFILE_BY_KIND["linux_quick"]
+        fields = __import__("node_lock_receipt").FEEDBACK_CONTEXT_FIELDS
+        context = {name: request[name] for name in fields if name in request}
+        context.update({
+            "run_id": str(run_id), "producer_job": profile["producer_job"], "run_attempt": 1,
+        })
+        return {
+            "kind": "linux_quick",
+            "context": context,
+            "ciphertext": b"KDLEsynthetic quick ciphertext",
+            "run_id": run_id,
+            "artifact_id": ARTIFACT_ID,
+            "artifact_digest": "b" * 64,
+            "ci_repository_id": CI_REPOSITORY_ID,
+            "actor_login": ACTOR_LOGIN,
+            "now": NOW,
+        }
+
+    def test_quick_return_is_collected_decrypted_under_the_rebuilt_context_and_released_once(self):
+        request = self.create("linux_quick")["request"]
+        evidence = self.quick_evidence(request)
+        calls = []
+        module = types.ModuleType("feedback_api")
+
+        def collect(api, collector_request, **kwargs):
+            calls.append((collector_request, dict(kwargs)))
+            return evidence
+
+        module.collect_feedback_evidence = collect
+        messages = []
+
+        def helper(message, *, plaintext_pipe=False):
+            messages.append(dict(message))
+            return _fake_helper(message, plaintext_pipe=plaintext_pipe)
+
+        with mock.patch.dict(sys.modules, {"feedback_api": module}), \
+                mock.patch.object(self.admin, "_run_helper", side_effect=helper):
+            returned = self.admin.consume_return(
+                request["request_id"], object(), manual_summary_review=None, run_id=str(RUN_ID),
+            )
+        self.assertEqual(calls[0][0], request)
+        self.assertEqual(calls[0][1]["run_id"], str(RUN_ID))
+        self.assertEqual(calls[0][1]["run_attempt"], 1)
+        self.assertEqual(returned["kind"], "linux_quick")
+        self.assertFalse(returned["bootstrap_lock_consumed"])
+        self.assertTrue(returned["private_output_path"].endswith("-linux-quick.payload"))
+        with open(returned["private_output_path"], "rb") as output:
+            self.assertEqual(output.read(), PLAINTEXT)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["operation"], "decrypt")
+        self.assertEqual(messages[0]["context"], evidence["context"])
+        self.assertEqual(messages[0]["context"]["nonce"], request["nonce"])
+        self.assertEqual(messages[0]["context"]["expiry"], request["expiry"])
+        self.assertEqual(messages[0]["context"]["workflow_ref"], "refs/heads/untrusted")
+        self.assertEqual(base64.b64decode(messages[0]["envelope_base64"]), evidence["ciphertext"])
+        self.assertEqual(self._state()["requests"][0]["status"], "consumed")
+        with mock.patch.dict(sys.modules, {"feedback_api": module}):
+            with self.assertRaises(subject.FeedbackAdminRefusal):
+                self.admin.consume_return(
+                    request["request_id"], object(), manual_summary_review=None, run_id=str(RUN_ID),
+                )
+
+    def test_quick_return_refuses_each_inconsistent_input_and_keeps_the_request_retryable(self):
+        request = self.create("linux_quick")["request"]
+        good = self.quick_evidence(request)
+        wrong_context = dict(good)
+        wrong_context["context"] = dict(good["context"], nonce="0" * 64)
+        wrong_run = self.quick_evidence(request, run_id=RUN_ID + 1)
+        wrong_actor = dict(good, actor_login="someone-else")
+        extra = dict(good, extra=1)
+        cases = (
+            (good, {"manual_summary_review": self.summary_gate(request), "run_id": str(RUN_ID)}),
+            (good, {"manual_summary_review": None, "run_id": None}),
+            (good, {"manual_summary_review": None, "run_id": RUN_ID}),
+            (good, {"manual_summary_review": None, "run_id": str(RUN_ID), "rust_source_directory": "/x"}),
+            (wrong_context, {"manual_summary_review": None, "run_id": str(RUN_ID)}),
+            (wrong_run, {"manual_summary_review": None, "run_id": str(RUN_ID)}),
+            (wrong_actor, {"manual_summary_review": None, "run_id": str(RUN_ID)}),
+            (extra, {"manual_summary_review": None, "run_id": str(RUN_ID)}),
+        )
+        for evidence, arguments in cases:
+            with self.subTest(arguments=sorted(arguments)), self.install_collector(evidence):
+                with self.assertRaises(subject.FeedbackAdminRefusal):
+                    self.admin.consume_return(request["request_id"], object(), **arguments)
+        self.assertEqual(self._state()["requests"][0]["status"], feedback_request.ACTIVE_STATUS)
+        self.assertEqual(
+            [name for name in os.listdir(self.directory) if name.startswith("return-")], [],
+        )
+
+    def test_a_collector_refusal_for_a_quick_request_releases_nothing(self):
+        request = self.create("linux_quick")["request"]
+        module = types.ModuleType("feedback_api")
+
+        def refuse(api, collector_request, **kwargs):
+            raise RuntimeError("closed")
+
+        module.collect_feedback_evidence = refuse
+        with mock.patch.dict(sys.modules, {"feedback_api": module}):
+            with self.assertRaises(subject.FeedbackAdminRefusal):
+                self.admin.consume_return(
+                    request["request_id"], object(), manual_summary_review=None, run_id=str(RUN_ID),
+                )
+        self.assertEqual(self._state()["requests"][0]["status"], feedback_request.ACTIVE_STATUS)
+
+    def test_other_kinds_refuse_a_run_id_argument_and_keep_the_summary_flow(self):
+        result = self.create()
+        request = result["request"]
+        evidence, trusted = self.evidence_for(request)
+        gate = self.summary_gate(request)
+        with self.install_collector(evidence), \
+                mock.patch.object(subject.node_lock_receipt, "validate_receipt", return_value=trusted):
+            with self.assertRaises(subject.FeedbackAdminRefusal):
+                self.admin.consume_return(
+                    request["request_id"], object(), manual_summary_review=gate, run_id=str(RUN_ID),
+                )
+            returned = self.admin.consume_return(
+                request["request_id"], object(), manual_summary_review=gate,
+            )
+        self.assertEqual(returned["kind"], "lock")
+        diagnostics = self.create("build_diagnostics")["request"]
+        with self.assertRaises(subject.FeedbackAdminRefusal):
+            self.admin.consume_return(
+                diagnostics["request_id"], object(), manual_summary_review=None,
+            )
+
     def test_private_state_directory_rejects_symlink_aliases(self):
         base = os.path.realpath(self.temporary.name)
         real = os.path.join(base, "real-state")

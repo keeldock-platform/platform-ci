@@ -18,6 +18,7 @@ if not sys.platform.startswith("linux"):
 import foundation_node_feedback
 import confinement_public_audit
 import confinement_verdict
+import log_canary
 import linux_source_build
 import macos_core_contract
 
@@ -182,10 +183,13 @@ class LinuxSourceBuildTests(unittest.TestCase):
             )
             job = expected["jobs"]["linux-source-admission-source-read"]
             if mode == "source":
-                self.assertEqual(job["steps"], actual_steps + ("Post Mint scoped source-reader token",))
+                self.assertEqual(
+                    job["steps"],
+                    ("Set up job",) + actual_steps + ("Post Mint scoped source-reader token", "Complete job"),
+                )
                 self.assertNotIn("Require trusted Rust licence admission", job["optional_steps"])
             else:
-                self.assertEqual(job["steps"], actual_steps)
+                self.assertEqual(job["steps"], ("Set up job",) + actual_steps + ("Complete job",))
                 self.assertIn("Require trusted Rust licence admission", job["optional_steps"])
 
     def test_producer_and_independent_verifier_bind_license_gates_before_preparation(self):
@@ -239,14 +243,24 @@ class LinuxSourceBuildTests(unittest.TestCase):
         source = linux_source_build._expected_run({**base, "CI_MODE": "source"}, "b" * 64)
         synthetic = linux_source_build._expected_run({**base, "CI_MODE": "synthetic"}, "b" * 64)
         self.assertEqual(source["verdict_job"], "linux-source-admission-verdict")
-        self.assertEqual(source["jobs"][source["verdict_job"]]["steps"], linux_source_build.VERDICT_STEP_NAMES)
+        edged_verdict = ("Set up job",) + linux_source_build.VERDICT_STEP_NAMES + ("Complete job",)
+        self.assertEqual(source["jobs"][source["verdict_job"]]["steps"], edged_verdict)
+        self.assertEqual(synthetic["jobs"][synthetic["verdict_job"]]["steps"], edged_verdict)
+        for run in (source, synthetic):
+            for name in ("settings", "unit"):
+                steps = run["jobs"]["linux-source-admission-" + name]["steps"]
+                self.assertEqual((steps[0], steps[-1]), ("Set up job", "Complete job"))
         self.assertEqual(source["jobs"][source["verdict_job"]]["optional_steps"], ())
         self.assertEqual(
             synthetic["jobs"][synthetic["verdict_job"]]["optional_steps"],
             linux_source_build.OPTIONAL_VERDICT_SYNTHETIC_STEPS,
         )
-        self.assertEqual(source["jobs"]["linux-source-admission-source-read"]["steps"][-1], "Post Mint scoped source-reader token")
-        self.assertNotIn("Post Mint scoped source-reader token", synthetic["jobs"]["linux-source-admission-source-read"]["steps"])
+        source_steps = source["jobs"]["linux-source-admission-source-read"]["steps"]
+        self.assertEqual(source_steps[0], "Set up job")
+        self.assertEqual(source_steps[-2:], ("Post Mint scoped source-reader token", "Complete job"))
+        synthetic_steps = synthetic["jobs"]["linux-source-admission-source-read"]["steps"]
+        self.assertNotIn("Post Mint scoped source-reader token", synthetic_steps)
+        self.assertEqual((synthetic_steps[0], synthetic_steps[-1]), ("Set up job", "Complete job"))
 
     def test_toolchain_versions_are_pinned_and_the_node_archive_digest_is_the_official_release_digest(self):
         self.assertEqual(linux_source_build.NODE_VERSION, "24.22.1")
@@ -707,6 +721,141 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 linux_source_build.validate_dispatch(env, "token")
             duplicate.assert_not_called()
 
+    def test_quick_tier_is_untrusted_and_source_only_and_checks_duplicates_in_its_own_workflow(self):
+        sha = "a" * 40
+        base = {
+            "CI_EVENT_NAME": "workflow_dispatch", "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "CI_SERVER_URL": "https://github.com", "CACHE_MODE": "none",
+            "CI_SHA": sha, "GITHUB_SHA": sha, "KD_LINUX_TIER": "quick",
+        }
+        self.assertEqual(
+            linux_source_build.TIERS["quick"], ("core-linux-quick-return.yml", "Linux quick source "),
+        )
+        self.assertEqual(
+            linux_source_build.TIERS["admission"], ("linux-source-admission.yml", "Linux admission source "),
+        )
+        for ref, mode in (
+            ("refs/heads/main", "source"), ("refs/heads/main", "synthetic"),
+            ("refs/heads/untrusted", "synthetic"),
+        ):
+            with self.subTest(ref=ref, mode=mode), patch.object(
+                linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]
+            ), patch.object(linux_source_build, "_comparison", return_value="ahead"):
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+                    linux_source_build.validate_dispatch(dict(base, CI_REF=ref, CI_MODE=mode), "token")
+        with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+            linux_source_build.validate_dispatch(
+                dict(base, KD_LINUX_TIER="other", CI_REF="refs/heads/untrusted", CI_MODE="source"), "token",
+            )
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(linux_source_build, "_source_inputs", return_value={}), patch.object(
+            linux_source_build, "_verify_environment"
+        ), patch.object(linux_source_build, "_require_no_duplicate") as duplicate:
+            env = dict(base, CI_REF="refs/heads/untrusted", CI_MODE="source")
+            self.assertEqual(linux_source_build.validate_dispatch(env, "token"), "source")
+            duplicate.assert_called_once_with("token", env)
+        calls = []
+
+        def runs(title):
+            def fake(path, token, method="GET", payload=None, expected=(200,)):
+                calls.append(path)
+                status = "queued" if path.endswith("status=queued") else "in_progress"
+                return 200, {"total_count": 1, "workflow_runs": [{
+                    "id": 9, "display_title": title + sha, "status": status, "event": "workflow_dispatch",
+                }]}
+            return fake
+
+        environment = {"GITHUB_RUN_ID": "5", "REQUESTED_SOURCE_SHA": sha, "KD_LINUX_TIER": "quick"}
+        with patch.object(linux_source_build, "_api_request", side_effect=runs("Linux quick source ")):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
+                linux_source_build._require_no_duplicate("token", environment)
+        self.assertTrue(calls[0].startswith(
+            "/repos/" + linux_source_build.REPOSITORY + "/actions/workflows/core-linux-quick-return.yml/runs?"
+        ))
+        with patch.object(linux_source_build, "_api_request", side_effect=runs("Linux admission source ")):
+            self.assertIsNone(linux_source_build._require_no_duplicate("token", environment))
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
+                linux_source_build._require_no_duplicate("token", {"GITHUB_RUN_ID": "5", "REQUESTED_SOURCE_SHA": sha})
+        self.assertTrue(calls[-1].startswith(
+            "/repos/" + linux_source_build.REPOSITORY + "/actions/workflows/linux-source-admission.yml/runs?"
+        ))
+
+    def test_quick_expected_run_describes_the_quick_workflow_and_never_a_verdict(self):
+        request = "ab" * 32
+        base = {
+            "KD_LINUX_TIER": "quick", "KD_QUICK_REQUEST_ID": request, "CI_SHA": "a" * 40,
+            "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1", "REQUESTED_SOURCE_SHA": "c" * 40,
+            "CI_REF": "refs/heads/untrusted", "CI_MODE": "source",
+        }
+        expected = linux_source_build._expected_run(base, "b" * 64)
+        self.assertEqual(expected["mode"], "quick")
+        self.assertEqual(expected["os"], "linux")
+        self.assertEqual(expected["ci_ref"], "untrusted")
+        self.assertEqual(expected["workflow_path"], ".github/workflows/core-linux-quick-return.yml")
+        self.assertEqual(expected["display_title"], "Linux quick source " + "c" * 40)
+        self.assertEqual(expected["request_id"], request)
+        self.assertEqual(expected["artifact_names"], ("linux-quick-" + request,))
+        self.assertEqual(expected["cache_digest"], "b" * 64)
+        self.assertEqual(expected["quick_job"], "core-linux-quick-return-producer")
+        self.assertEqual(expected["auditor_job"], "core-linux-quick-return-audit")
+        self.assertNotIn("verdict_job", expected)
+        self.assertNotIn("verdict_step", expected)
+        self.assertEqual(
+            sorted(expected["jobs"]),
+            [
+                "core-linux-quick-return-producer", "core-linux-quick-return-settings",
+                "core-linux-quick-return-unit",
+            ],
+        )
+        producer = expected["jobs"]["core-linux-quick-return-producer"]["steps"]
+        self.assertEqual(producer, linux_source_build.QUICK_PRODUCER_STEP_NAMES)
+        self.assertEqual(producer[0], "Set up job")
+        self.assertEqual(producer[-1], "Complete job")
+        self.assertEqual(producer[-2], "Post Mint scoped source-reader token")
+        for spec in expected["jobs"].values():
+            self.assertEqual(spec["optional_steps"], ())
+            self.assertFalse(any("verdict" in step.lower() for step in spec["steps"]))
+        self.assertEqual(
+            confinement_public_audit.parse_expected(json.dumps(expected), True), expected,
+        )
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/core-linux-quick-return.yml").read_text(
+            encoding="utf-8",
+        )
+        producer_text = workflow.split("  core-linux-quick-return-producer:\n", 1)[1].split("  core-linux-quick-return-audit:\n", 1)[0]
+        names = re.findall(r"(?m)^      - name: (.*)$", producer_text)
+        self.assertEqual(["Set up job"] + names + ["Post Mint scoped source-reader token", "Complete job"],
+                         list(producer))
+        settings = workflow.split("  core-linux-quick-return-settings:\n", 1)[1].split("  core-linux-quick-return-unit:\n", 1)[0]
+        self.assertEqual(
+            ["Set up job"] + re.findall(r"(?m)^      - name: (.*)$", settings) + ["Complete job"],
+            list(linux_source_build.QUICK_SETTINGS_STEP_NAMES),
+        )
+        for broken in ({"KD_QUICK_REQUEST_ID": "short"}, {"KD_QUICK_REQUEST_ID": ""}):
+            with self.subTest(broken=broken), self.assertRaises(confinement_public_audit.AuditRefusal):
+                linux_source_build._expected_run({**base, **broken}, "b" * 64)
+        admission = linux_source_build._expected_run(
+            {"CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1", "CI_MODE": "source"}, "b" * 64,
+        )
+        self.assertEqual(admission["mode"], "candidate")
+        self.assertIn("verdict_job", admission)
+
+    def test_quick_audit_runs_the_quick_mode_of_the_public_audit(self):
+        calls = []
+
+        def fake_main(arguments=None, environ=None):
+            calls.append(list(arguments))
+            return 0
+
+        canary = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        for tier, arguments in (("quick", ["quick"]), ("admission", [])):
+            with self.subTest(tier=tier), patch.object(
+                confinement_public_audit, "main", side_effect=fake_main,
+            ), patch.object(log_canary, "PINNED_CONFIG", log_canary.PINNED_CONFIG):
+                code = linux_source_build.run_audit({"KD_LINUX_TIER": tier, "KD_LINUX_LOG_CANARY": canary})
+                self.assertEqual(code, 0)
+                self.assertEqual(calls[-1], arguments)
+
     def test_default_checkout_environment_reaches_the_source_fetch(self):
         identity = {"owner": "owner", "name": "source", "repository_id": "7", "source_sha": "a" * 40}
         repository = {"id": 7, "private": True, "full_name": "owner/source"}
@@ -804,6 +953,10 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 }), 0)
                 self.assertEqual(directories.call_count, 13)
                 self.assertEqual(session.call_count, 13)
+                durations = json.loads((root / "kd-records" / "gate-durations.json").read_text(encoding="ascii"))
+                self.assertEqual(durations["schema_version"], 1)
+                self.assertEqual(set(durations["durations_ms"]), set(linux_source_build.GATES))
+                self.assertTrue(all(type(value) is int and value >= 0 for value in durations["durations_ms"].values()))
                 self.assertEqual(boundary.identities[0].profile, ".")
                 self.assertEqual(boundary.identities[0].root, str(worker))
                 for invocation in session.call_args_list:

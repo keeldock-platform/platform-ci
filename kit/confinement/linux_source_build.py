@@ -25,6 +25,10 @@ import rust_license_gate
 
 REPOSITORY = "keeldock-platform/platform-ci"
 WORKFLOW_PATH = ".github/workflows/linux-source-admission.yml"
+TIERS = {
+    "admission": ("linux-source-admission.yml", "Linux admission source "),
+    "quick": ("core-linux-quick-return.yml", "Linux quick source "),
+}
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
 TOOLCHAIN_ROOT = Path("/tmp/kd-toolchains")
@@ -128,6 +132,46 @@ SETTINGS_STEP_NAMES = (
 UNIT_STEP_NAMES = (
     "Fetch exact public control",
     "Run unprivileged source-free checks",
+)
+QUICK_WORKFLOW_PATH = ".github/workflows/core-linux-quick-return.yml"
+QUICK_JOB_PREFIX = "core-linux-quick-return"
+QUICK_SETTINGS_STEP_NAMES = (
+    "Set up job",
+    "Fetch exact public control",
+    "Validate quick request and binding",
+    "Snapshot cache inventory and validate preflight",
+    "Complete job",
+)
+QUICK_UNIT_STEP_NAMES = (
+    "Set up job",
+    "Fetch exact public control",
+    "Run unprivileged source-free checks",
+    "Complete job",
+)
+QUICK_PRODUCER_STEP_NAMES = (
+    "Set up job",
+    "Fetch exact public control",
+    "Repeat quick preflight before source read",
+    "Record image and fetch pinned Rust and Node toolchains",
+    "Harden runner paths before the proof",
+    "Boundary self-test before source-reader mint",
+    "Mint scoped source-reader token",
+    "Verify selected installation identity",
+    "Fetch exact source and verify binding, tree, signatures and lock provenance",
+    "Revoke source-reader token and verify rejection",
+    "Require trusted Rust licence admission",
+    "Fetch npm tarballs by committed lock integrity",
+    "Run trusted dependency audit",
+    "Prepare offline project inputs",
+    "Re-run positive controls immediately before the first project command",
+    "Run all offline project gates",
+    "Merge confinement phase records",
+    "Encrypt bounded quick return",
+    "Upload the single encrypted member",
+    "Record quick return counts",
+    "Remove staged ciphertext",
+    "Post Mint scoped source-reader token",
+    "Complete job",
 )
 OPTIONAL_SOURCE_STEPS = frozenset((
     "Mint scoped source-reader token",
@@ -295,7 +339,15 @@ def _verify_environment(token, name=ENVIRONMENT_NAME):
         raise SourceBuildRefusal("binding")
 
 
+def _tier(environ):
+    tier = environ.get("KD_LINUX_TIER", "admission")
+    if type(tier) is not str or tier not in TIERS:
+        raise SourceBuildRefusal("identity")
+    return tier
+
+
 def validate_dispatch(environ, api_token=None):
+    tier = _tier(environ)
     if (environ.get("CI_EVENT_NAME") != "workflow_dispatch"
             or environ.get("CI_REPOSITORY") != REPOSITORY
             or environ.get("CI_SERVER_URL") != "https://github.com"
@@ -303,7 +355,7 @@ def validate_dispatch(environ, api_token=None):
             or environ.get("CI_SHA") != environ.get("GITHUB_SHA")):
         raise SourceBuildRefusal("identity")
     ref = environ.get("CI_REF", "")
-    if ref not in ("refs/heads/main", "refs/heads/untrusted"):
+    if ref not in ("refs/heads/main", "refs/heads/untrusted") or (tier == "quick" and ref != "refs/heads/untrusted"):
         raise SourceBuildRefusal("identity")
     if api_token is None:
         api_token = environ.get("GITHUB_TOKEN", "")
@@ -321,7 +373,7 @@ def validate_dispatch(environ, api_token=None):
         raise SourceBuildRefusal("freshness")
     mode = environ.get("CI_MODE", "")
     if mode == "synthetic":
-        if ref != "refs/heads/main":
+        if ref != "refs/heads/main" or tier == "quick":
             raise SourceBuildRefusal("identity")
         _verify_environment(api_token)
         return "synthetic"
@@ -336,8 +388,9 @@ def validate_dispatch(environ, api_token=None):
 def _require_no_duplicate(token, environ):
     run_id = environ.get("GITHUB_RUN_ID", "")
     source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
-    title = "Linux admission source " + source_sha
-    base = "/repos/" + REPOSITORY + "/actions/workflows/linux-source-admission.yml/runs?per_page=100&status="
+    workflow_file, title_prefix = TIERS[_tier(environ)]
+    title = title_prefix + source_sha
+    base = "/repos/" + REPOSITORY + "/actions/workflows/" + workflow_file + "/runs?per_page=100&status="
     for active_status in ("queued", "in_progress"):
         status, payload = _api_request(base + active_status, token)
         runs = payload.get("workflow_runs") if type(payload) is dict else None
@@ -367,7 +420,42 @@ def _audit_modules():
     return confinement_public_audit, confinement_verdict, log_canary
 
 
+def _expected_quick_run(environ, cache_digest):
+    audit, unused_verdict, unused_canary = _audit_modules()
+    request_id = environ.get("KD_QUICK_REQUEST_ID", "")
+    source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
+    expected = {
+        "repository": REPOSITORY,
+        "os": "linux",
+        "mode": "quick",
+        "control_sha": environ.get("CI_SHA", "0" * 40),
+        "run_id": int(environ.get("GITHUB_RUN_ID", "1")) if DECIMAL_RE.fullmatch(environ.get("GITHUB_RUN_ID", "")) else 1,
+        "run_attempt": int(environ.get("GITHUB_RUN_ATTEMPT", "1")) if DECIMAL_RE.fullmatch(environ.get("GITHUB_RUN_ATTEMPT", "")) else 1,
+        "workflow_path": QUICK_WORKFLOW_PATH,
+        "ci_ref": "untrusted",
+        "display_title": TIERS["quick"][1] + source_sha,
+        "jobs": {
+            QUICK_JOB_PREFIX + "-settings": {"steps": QUICK_SETTINGS_STEP_NAMES, "optional_steps": ()},
+            QUICK_JOB_PREFIX + "-unit": {"steps": QUICK_UNIT_STEP_NAMES, "optional_steps": ()},
+            QUICK_JOB_PREFIX + "-producer": {"steps": QUICK_PRODUCER_STEP_NAMES, "optional_steps": ()},
+        },
+        "quick_job": QUICK_JOB_PREFIX + "-producer",
+        "request_id": request_id,
+        "auditor_job": QUICK_JOB_PREFIX + "-audit",
+        "artifact_names": ("linux-quick-" + request_id,),
+        "cache_digest": cache_digest if HEX64_RE.fullmatch(cache_digest or "") else "0" * 64,
+    }
+    audit.validate_expected_quick(expected)
+    return expected
+
+
+def _job_edges(names):
+    return ("Set up job",) + tuple(names) + ("Complete job",)
+
+
 def _expected_run(environ, cache_digest):
+    if _tier(environ) == "quick":
+        return _expected_quick_run(environ, cache_digest)
     audit, unused_verdict, unused_canary = _audit_modules()
     mode = environ.get("CI_MODE", "")
     if mode not in ("source", "synthetic"):
@@ -377,9 +465,10 @@ def _expected_run(environ, cache_digest):
     ci_ref = environ.get("CI_REF", "refs/heads/main").removeprefix("refs/heads/")
     if ci_ref not in ("main", "untrusted"):
         ci_ref = "main"
-    all_steps = list(SOURCE_STEP_NAMES)
+    all_steps = ["Set up job"] + list(SOURCE_STEP_NAMES)
     if mode == "source":
         all_steps.append("Post Mint scoped source-reader token")
+    all_steps.append("Complete job")
         optional = ("Forced faults must fail closed",)
     else:
         optional = tuple(sorted(OPTIONAL_SOURCE_STEPS - {"Forced faults must fail closed"}))
@@ -394,11 +483,11 @@ def _expected_run(environ, cache_digest):
         "ci_ref": ci_ref,
         "display_title": title,
         "jobs": {
-            "linux-source-admission-settings": {"steps": SETTINGS_STEP_NAMES, "optional_steps": ()},
-            "linux-source-admission-unit": {"steps": UNIT_STEP_NAMES, "optional_steps": ()},
+            "linux-source-admission-settings": {"steps": _job_edges(SETTINGS_STEP_NAMES), "optional_steps": ()},
+            "linux-source-admission-unit": {"steps": _job_edges(UNIT_STEP_NAMES), "optional_steps": ()},
             "linux-source-admission-source-read": {"steps": tuple(all_steps), "optional_steps": tuple(optional)},
             "linux-source-admission-verdict": {
-                "steps": VERDICT_STEP_NAMES,
+                "steps": _job_edges(VERDICT_STEP_NAMES),
                 "optional_steps": OPTIONAL_VERDICT_SYNTHETIC_STEPS if mode == "synthetic" else (),
             },
         },
@@ -1842,6 +1931,7 @@ def run_project_gates(environ=None):
     if selected_gates != expected_gates:
         raise SourceBuildRefusal("gate")
     outcomes = {name: "not-run" for name in selected_gates}
+    durations = {}
     for index, (name, argv) in enumerate(commands):
         project_env = {
             "PATH": str(Path(node_bin)) + ":" + str(Path(rust_root) / "bin") + ":/usr/bin:/bin",
@@ -1858,6 +1948,7 @@ def run_project_gates(environ=None):
             "PYTHONDONTWRITEBYTECODE": "1", "CI": "true",
         }
         nonce = os.urandom(12).hex()
+        started = time.monotonic()
         try:
             _project_gate_directories(worker)
             launch = ("/usr/bin/python3", "-B", "-c", linux_probes.LAUNCHER_SOURCE, *argv)
@@ -1866,8 +1957,10 @@ def run_project_gates(environ=None):
                 limits="fixture", timeout=600, cwd=str(worker),
             )
         except BaseException:
+            durations[name] = int((time.monotonic() - started) * 1000)
             outcomes[name] = "failed"
             break
+        durations[name] = int((time.monotonic() - started) * 1000)
         (records / ("gate-" + str(index) + ".stdout")).write_bytes(result.stdout)
         (records / ("gate-" + str(index) + ".stderr")).write_bytes(result.stderr)
         if result.exit_code == 0 and not result.timed_out:
@@ -1876,6 +1969,10 @@ def run_project_gates(environ=None):
             outcomes[name] = "failed"
             break
     completed_gates = [name for name in selected_gates if outcomes[name] == "passed"]
+    (records / "gate-durations.json").write_text(
+        json.dumps({"schema_version": 1, "durations_ms": durations}, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="ascii",
+    )
     result = {
         "schema_version": 1, "selected_gates": list(selected_gates),
         "completed_gates": completed_gates, "gates": outcomes,
@@ -2033,7 +2130,7 @@ def run_audit(environ=None):
             value = SYNTHETIC_LOG_CANARY
         config = log_canary.compute_config(value)
         log_canary.PINNED_CONFIG = config
-        code = audit.main(arguments=[], environ=env)
+        code = audit.main(arguments=["quick"] if _tier(env) == "quick" else [], environ=env)
         return code
     except BaseException:
         sys.stdout.write("KD-CONFINEMENT-AUDIT schema=1 status=refused phase=log_canary reason=confinement_audit_invalid\n")

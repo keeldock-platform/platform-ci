@@ -9,10 +9,12 @@ import unittest
 from unittest.mock import patch
 
 try:
+    from . import confinement_public_audit
     from . import feedback_api
     from . import feedback_request
     from . import macos_public_audit
 except ImportError:
+    import confinement_public_audit
     import feedback_api
     import feedback_request
     import macos_public_audit
@@ -753,6 +755,276 @@ class FeedbackAPIProviderShapeTests(unittest.TestCase):
         self.api.created_offset_seconds = 31
         with self.assertRaises(feedback_api.FeedbackAPIRefusal):
             self._collect()
+
+    def test_a_macos_request_still_needs_main_and_returns_the_receipt_shape(self):
+        evidence = self._collect()
+        self.assertEqual(
+            set(evidence),
+            {"receipt", "api_evidence", "producer_output", "archive_bytes", "ci_repository_id",
+             "actor_login", "artifact_name", "now"},
+        )
+        self.api.run_override = {"head_branch": "untrusted"}
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+        self.api.run_override = {
+            "display_title": feedback_api.QUICK_TITLE_PREFIX + self.request["source_sha"],
+        }
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+    def test_a_macos_request_cannot_use_the_untrusted_ref(self):
+        fields = dict(self.fields)
+        fields["workflow_ref"] = feedback_request.LINUX_QUICK_WORKFLOW_REF
+        with self.assertRaises(feedback_request.RequestRefusal):
+            feedback_request.create_request(fields, now=self.now)
+
+
+_QUICK_ARCHIVES = {}
+
+
+def _quick_archive(member_size):
+    if member_size not in _QUICK_ARCHIVES:
+        profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
+        result = io.BytesIO()
+        with zipfile.ZipFile(result, "w", compression=zipfile.ZIP_STORED) as archive:
+            info = zipfile.ZipInfo(profile["member_name"])
+            info.create_system = 3
+            info.external_attr = 0o600 << 16
+            archive.writestr(info, b"KDLE" + bytes(member_size - 4))
+        _QUICK_ARCHIVES[member_size] = result.getvalue()
+    return _QUICK_ARCHIVES[member_size]
+
+
+class QuickProviderAPI(ProviderShapedAPI):
+    def __init__(self, request, now):
+        self.artifact_branch = "untrusted"
+        self.artifact_name_override = None
+        self.audit_log_override = None
+        self.member_size = feedback_api.QUICK_FRAME_BYTES
+        super().__init__(request, now)
+        self.archive = _quick_archive(self.member_size)
+        self.run_override = {
+            "head_branch": "untrusted",
+            "display_title": feedback_api.QUICK_TITLE_PREFIX + request["source_sha"],
+        }
+        self.producer_conclusion = "success"
+        self._rebuild()
+
+    def _rebuild(self):
+        self.jobs = self._jobs()
+        self.details = self._details()
+        self.logs = self._logs()
+
+    @staticmethod
+    def _archive(request):
+        return b""
+
+    def _job_names(self):
+        profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
+        return (
+            profile["concern"] + "-settings", profile["concern"] + "-unit",
+            profile["producer_job"], profile["auditor_job"],
+        )
+
+    def _jobs(self):
+        jobs = super()._jobs()
+        jobs[2]["conclusion"] = getattr(self, "producer_conclusion", "success")
+        return jobs
+
+    def audit_line(self):
+        return (
+            "KD-CONFINEMENT-AUDIT schema=1 status=accepted os=linux mode=quick tier=quick"
+            + " admission=never control-sha=" + self.request_record["control_sha"]
+            + " run-id=" + str(self.run_id)
+            + " run-attempt=1 verdict=none log-canary=absent artifacts=expected caches=unchanged"
+        )
+
+    def _logs(self):
+        logs = {101 + index: b"trusted fixed job summary\n" for index in range(4)}
+        text = self.audit_log_override
+        if text is None:
+            text = "2026-11-02T10:00:00.1234567Z " + self.audit_line() + "\n"
+        logs[104] = text.encode("ascii")
+        return logs
+
+    def _artifact(self):
+        record = super()._artifact()
+        record["name"] = self.artifact_name_override or (
+            feedback_api.QUICK_ARTIFACT_PREFIX + self.request_record["request_id"]
+        )
+        record["workflow_run"]["head_branch"] = self.artifact_branch
+        return record
+
+
+class QuickEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 1793160000
+        profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
+        self.fields = {
+            "kind": profile["kind"],
+            "concern": profile["concern"],
+            "ci_repository_id": "1",
+            "workflow_path": profile["workflow_path"],
+            "workflow_ref": feedback_request.LINUX_QUICK_WORKFLOW_REF,
+            "repository_id": "2",
+            "source_sha": "a" * 40,
+            "base_sha": "b" * 40,
+            "control_sha": "c" * 40,
+            "base_branch": "develop",
+            "reviewed_diff_sha256": "d" * 64,
+            "recipient_fingerprint": "e" * 64,
+            "nonce": "f" * 64,
+            "expiry": self.now + 3600,
+        }
+        self.request = feedback_request.create_request(self.fields, now=self.now)
+        self.api = QuickProviderAPI(self.request, self.now)
+
+    def _collect(self):
+        return feedback_api.collect_feedback_evidence(
+            self.api, self.request, expected_actor_login="fixture-actor",
+            run_id=str(self.api.run_id), run_attempt=1, now=self.now,
+        )
+
+    def test_constants_equal_the_quick_audit_and_workflow_definitions(self):
+        self.assertEqual(feedback_api.QUICK_BRANCH, "untrusted")
+        self.assertEqual(feedback_api.QUICK_ARTIFACT_PREFIX, confinement_public_audit.QUICK_ARTIFACT_PREFIX)
+        self.assertEqual(feedback_api.QUICK_FRAME_BYTES, confinement_public_audit.QUICK_FRAME_BYTES)
+        self.assertEqual(feedback_api.QUICK_ARTIFACT_SLACK_BYTES, confinement_public_audit.QUICK_ARTIFACT_SLACK_BYTES)
+        self.assertEqual(feedback_api.QUICK_RETENTION_SECONDS, confinement_public_audit.QUICK_RETENTION_SECONDS)
+        self.assertEqual(
+            feedback_api.QUICK_RETENTION_SLACK_SECONDS, confinement_public_audit.QUICK_RETENTION_SLACK_SECONDS,
+        )
+        self.assertEqual(
+            self.request["workflow_path"], confinement_public_audit.QUICK_WORKFLOW_PATH,
+        )
+        expected = {"control_sha": "c" * 40, "run_id": self.api.run_id, "run_attempt": 1}
+        self.assertEqual(
+            self.api.audit_line(), confinement_public_audit.quick_accepted_line(expected),
+        )
+        self.assertEqual(
+            feedback_api._quick_audit_line({"head_sha": "c" * 40, "id": self.api.run_id}),
+            self.api.audit_line().encode("ascii"),
+        )
+
+    def test_a_quick_return_with_correct_evidence_yields_the_rebuilt_context_and_member(self):
+        evidence = self._collect()
+        self.assertEqual(
+            set(evidence),
+            {"kind", "context", "ciphertext", "run_id", "artifact_id", "artifact_digest",
+             "ci_repository_id", "actor_login", "now"},
+        )
+        self.assertEqual(evidence["kind"], "linux_quick")
+        self.assertEqual(evidence["run_id"], self.api.run_id)
+        self.assertEqual(evidence["artifact_id"], self.api.artifact_id)
+        self.assertEqual(evidence["artifact_digest"], hashlib.sha256(self.api.archive).hexdigest())
+        self.assertEqual(evidence["ciphertext"], b"KDLE" + bytes(self.api.member_size - 4))
+        context = evidence["context"]
+        self.assertEqual(set(context), set(feedback_api.node_lock_receipt.FEEDBACK_CONTEXT_FIELDS))
+        self.assertEqual(context["nonce"], self.request["nonce"])
+        self.assertEqual(context["expiry"], self.request["expiry"])
+        self.assertEqual(context["workflow_ref"], "refs/heads/untrusted")
+        self.assertEqual(context["run_id"], str(self.api.run_id))
+        self.assertEqual(context["producer_job"], "core-linux-quick-return-producer")
+        self.assertEqual(context["run_attempt"], 1)
+        self.assertEqual(context["kind"], "linux_quick")
+        self.assertEqual(context["request_id"], self.request["request_id"])
+
+    def test_a_failed_producer_gate_run_is_accepted_when_the_audit_job_passed(self):
+        self.api.producer_conclusion = "failure"
+        self.api.run_override["conclusion"] = "failure"
+        self.api._rebuild()
+        self.assertEqual(self._collect()["kind"], "linux_quick")
+
+    def test_a_wrong_ref_is_refused(self):
+        self.api.run_override["head_branch"] = "main"
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+        self.api.run_override["head_branch"] = "untrusted"
+        self.api.artifact_branch = "main"
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+    def test_a_request_bound_to_main_is_refused(self):
+        fields = dict(self.fields)
+        fields["workflow_ref"] = feedback_request.WORKFLOW_REF
+        with self.assertRaises(feedback_request.RequestRefusal):
+            feedback_request.create_request(fields, now=self.now)
+
+    def test_a_wrong_run_title_is_refused(self):
+        for title in (
+            feedback_api.RUN_TITLE_PREFIX + self.request["request_id"],
+            feedback_api.QUICK_TITLE_PREFIX + "9" * 40,
+            feedback_api.QUICK_TITLE_PREFIX.strip() + self.request["source_sha"],
+        ):
+            with self.subTest(title=title):
+                self.api.run_override["display_title"] = title
+                with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+                    self._collect()
+
+    def test_a_missing_or_altered_audit_line_is_refused(self):
+        line = self.api.audit_line()
+        for text in (
+            "no audit line here\n",
+            line.replace("status=accepted", "status=refused") + "\n",
+            line.replace("c" * 40, "9" * 40) + "\n",
+            line.replace("run-id=" + str(self.api.run_id), "run-id=1") + "\n",
+            line.replace("mode=quick", "mode=candidate") + "\n",
+            line + "\n" + line + "\n",
+            line + "\nKD-CONFINEMENT-AUDIT schema=1 status=refused phase=jobs\n",
+            "KD-CONFINEMENT-AUDIT schema=1 status=refused phase=jobs\n",
+        ):
+            with self.subTest(text=text[:60]):
+                self.api.audit_log_override = text
+                self.api._rebuild()
+                with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+                    self._collect()
+
+    def test_a_wrong_artifact_size_is_refused(self):
+        frame = feedback_api.QUICK_FRAME_BYTES
+        for member_size in (frame - 1000, frame + feedback_api.QUICK_ARTIFACT_SLACK_BYTES):
+            with self.subTest(member_size=member_size):
+                self.api.member_size = member_size
+                self.api.archive = _quick_archive(member_size)
+                with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+                    self._collect()
+
+    def test_a_wrong_artifact_name_digest_or_count_is_refused(self):
+        self.api.artifact_name_override = "feedback-linux_quick-" + self.request["request_id"]
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+        self.api.artifact_name_override = None
+        self.api.extra_artifacts = [dict(self.api._artifact(), id=702)]
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+        self.api.extra_artifacts = []
+        original = self.api._artifact
+        self.api._artifact = lambda: dict(original(), digest="sha256:" + "0" * 64)
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+    def test_a_wrong_job_set_or_a_failed_support_job_is_refused(self):
+        self.api.jobs = self.api.jobs[:3]
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+        self.api._rebuild()
+        for index in (0, 1, 3):
+            with self.subTest(index=index):
+                self.api._rebuild()
+                self.api.jobs[index]["conclusion"] = "failure"
+                self.api.details[101 + index]["conclusion"] = "failure"
+                with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+                    self._collect()
+
+    def test_a_wrong_actor_or_run_attempt_is_refused(self):
+        self.api.actor = "different-actor"
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+        self.api.actor = "fixture-actor"
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            feedback_api.collect_feedback_evidence(
+                self.api, self.request, expected_actor_login="fixture-actor",
+                run_id=str(self.api.run_id), run_attempt=2, now=self.now,
+            )
 
 
 if __name__ == "__main__":

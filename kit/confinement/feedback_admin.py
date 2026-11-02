@@ -26,6 +26,7 @@ except ImportError:
 EXCEPTION_END = feedback_request.EXCEPTION_END
 NODE_VERSION = "v24.22.1"
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
+DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 LABEL_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 RUST_PATH_RE = re.compile(r"^(?:[A-Za-z0-9_-][A-Za-z0-9._-]*/)*[A-Za-z0-9_-][A-Za-z0-9._-]*\.rs$\Z")
 MAX_STATE_BYTES = 2 * 1024 * 1024
@@ -49,6 +50,10 @@ SUMMARY_REVIEW_FIELDS = frozenset((
     "confirmed", "request_id", "protected_repository_id", "protected_ref", "source_sha",
     "control_sha", "run_id", "run_attempt", "artifact_id", "reviewed_at", "ledger_ref",
     "summary_sections",
+))
+QUICK_EVIDENCE_FIELDS = frozenset((
+    "kind", "context", "ciphertext", "run_id", "artifact_id", "artifact_digest",
+    "ci_repository_id", "actor_login", "now",
 ))
 EVIDENCE_FIELDS = frozenset((
     "receipt", "api_evidence", "producer_output", "archive_bytes", "ci_repository_id",
@@ -462,6 +467,16 @@ def _packet_from_bytes(raw, *, now):
     return packet, profile
 
 
+def _quick_context(request, run_id):
+    fields = node_lock_receipt.FEEDBACK_CONTEXT_FIELDS
+    profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
+    context = {name: request[name] for name in fields if name in request}
+    context.update({"run_id": run_id, "producer_job": profile["producer_job"], "run_attempt": 1})
+    if set(context) != set(fields):
+        _refuse()
+    return context
+
+
 class FeedbackAdmin:
     """One-use owner-side administration with template-bound Summary job names.
 
@@ -843,7 +858,7 @@ class FeedbackAdmin:
                     "concern": profile["concern"],
                     "ci_repository_id": str(self.ci_repository_id),
                     "workflow_path": profile["workflow_path"],
-                    "workflow_ref": feedback_request.WORKFLOW_REF,
+                    "workflow_ref": feedback_request.workflow_ref_for_kind(kind),
                     "repository_id": reviewed_fields["repository_id"],
                     "source_sha": reviewed_fields["source_sha"],
                     "base_sha": reviewed_fields["base_sha"],
@@ -1012,13 +1027,94 @@ class FeedbackAdmin:
             "lock" if profile["kind"] == "lock" else "patch" if profile["kind"] == "rust_patch"
             else "cargo-lock" if profile["kind"] == feedback_request.CARGO_LOCK_KIND
             else "npm-admission" if profile["kind"] == feedback_request.NPM_ADMISSION_KIND
+            else "linux-quick" if profile["kind"] == feedback_request.LINUX_QUICK_KIND
             else "diagnostics"
         )
         name = "return-" + request["request_id"] + "-" + suffix + ".payload"
         _create_named(dir_fd, name, plaintext, mode=0o600, limit=MAX_PLAINTEXT_BYTES)
         return os.path.join(self.state_directory, name)
 
-    def consume_return(self, request_id, api_client, *, manual_summary_review,
+    def _check_quick_window(self, request, now):
+        if now >= EXCEPTION_END or now >= request["expiry"]:
+            _refuse()
+
+    def _consume_quick(self, dir_fd, request_id, api_client, manual_summary_review,
+                       rust_source_directory, run_id, state, entry, packet, profile):
+        request = packet["request"]
+        if (manual_summary_review is not None or rust_source_directory is not None
+                or packet["expected_manifest"] is not None or packet["reviewed_rust_paths"]
+                or type(run_id) is not str or DECIMAL_RE.fullmatch(run_id) is None):
+            _refuse()
+        collection_time = self._clock_now()
+        self._check_quick_window(request, collection_time)
+        try:
+            from . import feedback_api
+        except ImportError:
+            import feedback_api
+        evidence = feedback_api.collect_feedback_evidence(
+            api_client, request, expected_actor_login=self.actor_login,
+            run_id=run_id, run_attempt=1, now=collection_time,
+        )
+        now, state, entry, packet, profile = self._refresh_request(dir_fd, request_id)
+        request = packet["request"]
+        self._check_quick_window(request, now)
+        context = _quick_context(request, run_id)
+        if (not _exact_dict(evidence, QUICK_EVIDENCE_FIELDS)
+                or evidence["kind"] != feedback_request.LINUX_QUICK_KIND
+                or evidence["context"] != context
+                or evidence["run_id"] != int(run_id)
+                or evidence["now"] != collection_time
+                or evidence["ci_repository_id"] != self.ci_repository_id
+                or evidence["actor_login"] != self.actor_login
+                or type(evidence["ciphertext"]) is not bytes
+                or not 0 < len(evidence["ciphertext"]) <= MAX_NODE_INPUT_BYTES):
+            _refuse()
+        message = {
+            "operation": "decrypt",
+            "private_key_path": os.path.join(self.state_directory, _key_file(entry["nonce"])),
+            "context": context,
+            "now": now,
+            "envelope_base64": base64.b64encode(evidence["ciphertext"]).decode("ascii"),
+        }
+        stdout, plaintext = self._run_helper(message, plaintext_pipe=True)
+        try:
+            response = _parse_json(stdout, MAX_NODE_PUBLIC_OUTPUT_BYTES)
+            if response != {"schema_version": 1, "ok": True} or not 0 < len(plaintext) <= MAX_PLAINTEXT_BYTES:
+                _refuse()
+            now, state, entry, packet, profile = self._refresh_request(dir_fd, request_id)
+            request = packet["request"]
+            self._check_quick_window(request, now)
+            if context != _quick_context(request, run_id):
+                _refuse()
+            now = self._clock_now()
+            self._check_quick_window(request, now)
+            state = feedback_request.consume_request(state, request_id, now=now)
+            self._write_state(dir_fd, state)
+            entry = next(item for item in state["requests"] if item["request_id"] == request_id)
+            state = self._retire_entry(dir_fd, state, entry)
+            self._check_quick_window(request, self._clock_now())
+            output_path = self._release_private_output(dir_fd, request, profile, plaintext)
+            try:
+                self._check_quick_window(request, self._clock_now())
+            except Exception:
+                try:
+                    _unlink_named(
+                        dir_fd, os.path.basename(output_path), mode=0o600, limit=MAX_PLAINTEXT_BYTES,
+                    )
+                except Exception:
+                    pass
+                _refuse()
+            return {
+                "request_id": request_id,
+                "kind": profile["kind"],
+                "private_output_path": output_path,
+                "bootstrap_lock_consumed": state["bootstrap_lock_consumed"],
+            }
+        finally:
+            if isinstance(plaintext, bytearray):
+                plaintext[:] = b"\x00" * len(plaintext)
+
+    def consume_return(self, request_id, api_client, *, manual_summary_review, run_id=None,
                        rust_source_directory=None):
         """Collect authenticated run evidence, require the manual Summary ledger, then release once."""
         self._now()
@@ -1035,6 +1131,13 @@ class FeedbackAdmin:
             now, state, entry, packet, profile = self._refresh_request(dir_fd, request_id)
             request = packet["request"]
             try:
+                if profile["kind"] == feedback_request.LINUX_QUICK_KIND:
+                    return self._consume_quick(
+                        dir_fd, request_id, api_client, manual_summary_review,
+                        rust_source_directory, run_id, state, entry, packet, profile,
+                    )
+                if run_id is not None:
+                    _refuse()
                 self._validate_summary_claim(manual_summary_review, request, now)
                 collection_time = now
                 try:

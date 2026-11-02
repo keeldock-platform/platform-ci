@@ -15,6 +15,13 @@ const REQUEST_ID = 'e'.repeat(64);
 const NONCE = 'f'.repeat(64);
 const CRYPTO_SCRIPT = fileURLToPath(new URL('./feedback_producer_crypto.mjs', import.meta.url));
 
+const QUICK_BYTES = 4 * 1024 * 1024 - 64 * 1024;
+
+function quickPayload(body = '{"gates":[],"tier":"quick"}', total = QUICK_BYTES) {
+  const header = `KD-LINUX-QUICK-PAYLOAD 1 ${String(body.length).padStart(8, '0')}\n`;
+  return Buffer.from(header + body + ' '.repeat(total - header.length - body.length), 'ascii');
+}
+
 function fixture(kind = 'build_diagnostics') {
   const pair = generateKeyPairSync('rsa', { modulusLength: 3072, publicExponent: 65537 });
   const der = pair.publicKey.export({ format: 'der', type: 'spki' });
@@ -26,6 +33,10 @@ function fixture(kind = 'build_diagnostics') {
       concern: 'core-build-diagnostic-return', producerJob: 'core-build-diagnostic-return',
     },
     cargo_lock: { concern: 'core-rust-lock-return', producerJob: 'core-rust-lock-return' },
+    linux_quick: {
+      concern: 'core-linux-quick-return', producerJob: 'core-linux-quick-return-producer',
+      workflowRef: 'refs/heads/untrusted',
+    },
   };
   const profile = profiles[kind];
   const context = {
@@ -39,7 +50,7 @@ function fixture(kind = 'build_diagnostics') {
     control_sha: CONTROL_SHA,
     base_branch: 'develop',
     reviewed_diff_sha256: DIFF_SHA,
-    workflow_ref: 'refs/heads/main',
+    workflow_ref: profile.workflowRef ?? 'refs/heads/main',
     run_id: '12345',
     producer_job: profile.producerJob,
     run_attempt: 1,
@@ -80,6 +91,8 @@ function fixture(kind = 'build_diagnostics') {
       receipt_b64: Buffer.from('{"schema_version":1}', 'ascii').toString('base64'),
       schema_version: 1,
     }));
+  } else if (kind === 'linux_quick') {
+    payload = quickPayload();
   } else {
     payload = Buffer.from('bounded synthetic diagnostic\n');
   }
@@ -266,4 +279,72 @@ test('producer encrypts a cargo lock bundle under its own profile and refuses ex
   const wrongKind = fixture('cargo_lock');
   wrongKind.input.kind = 'build_diagnostics';
   assert.throws(() => encryptFeedbackPayload(wrongKind.input));
+});
+
+test('producer encrypts the fixed-size Linux quick payload under its own untrusted-ref profile', () => {
+  const value = fixture('linux_quick');
+  assert.equal(value.context.workflow_ref, 'refs/heads/untrusted');
+  assert.equal(Buffer.from(value.input.payload_b64, 'base64').length, QUICK_BYTES);
+  const ciphertext = encryptFeedbackPayload(value.input);
+  assert.equal(ciphertext.subarray(0, 4).toString('ascii'), 'KDLE');
+  assert.equal(ciphertext[5], 6);
+  assert.equal(ciphertext.length, QUICK_BYTES + 486);
+  assert.ok(ciphertext.length <= 4 * 1024 * 1024);
+  assert.equal(ciphertext.includes(Buffer.from('KD-LINUX-QUICK-PAYLOAD')), false);
+
+  const withManifest = fixture('linux_quick');
+  withManifest.input.expected_manifest = { root: {}, workspaces: [] };
+  assert.throws(() => encryptFeedbackPayload(withManifest.input));
+
+  const withPaths = fixture('linux_quick');
+  withPaths.input.reviewed_rust_paths = ['src/lib.rs'];
+  assert.throws(() => encryptFeedbackPayload(withPaths.input));
+
+  const withSources = fixture('linux_quick');
+  withSources.input.original_rust_files_b64 = [];
+  assert.throws(() => encryptFeedbackPayload(withSources.input));
+});
+
+test('producer refuses a Linux quick payload that is oversized, credential-shaped or on the wrong ref', () => {
+  const over = fixture('linux_quick');
+  over.input.payload_b64 = Buffer.alloc(QUICK_BYTES + 1, 0x20).toString('base64');
+  assert.throws(() => encryptFeedbackPayload(over.input), { code: 'invalid_payload' });
+
+  const credential = fixture('linux_quick');
+  credential.input.payload_b64 = quickPayload('{"stderr_tail":"error token=abcdefghijkl"}').toString('base64');
+  assert.throws(() => encryptFeedbackPayload(credential.input), { code: 'credential_like_content' });
+
+  const mainRef = fixture('linux_quick');
+  mainRef.input.context.workflow_ref = 'refs/heads/main';
+  assert.throws(() => encryptFeedbackPayload(mainRef.input), { code: 'invalid_context' });
+
+  const wrongKind = fixture('linux_quick');
+  wrongKind.input.kind = 'build_diagnostics';
+  assert.throws(() => encryptFeedbackPayload(wrongKind.input), { code: 'invalid_context' });
+
+  const diagnosticOnUntrusted = fixture('build_diagnostics');
+  diagnosticOnUntrusted.input.context.workflow_ref = 'refs/heads/untrusted';
+  assert.throws(() => encryptFeedbackPayload(diagnosticOnUntrusted.input), { code: 'invalid_context' });
+
+  const oversizedDiagnostic = fixture('build_diagnostics');
+  oversizedDiagnostic.input.payload_b64 = quickPayload().toString('base64');
+  assert.throws(() => encryptFeedbackPayload(oversizedDiagnostic.input), { code: 'invalid_payload' });
+});
+
+test('CLI encrypts the Linux quick payload from bounded stdin and emits only ciphertext', () => {
+  const value = fixture('linux_quick');
+  const validInput = Buffer.from(JSON.stringify(value.input), 'utf8');
+  assert.ok(validInput.length < 6 * 1024 * 1024);
+  const positive = spawnSync(process.execPath, [CRYPTO_SCRIPT], {
+    input: validInput,
+    timeout: 60_000,
+    maxBuffer: 4 * 1024 * 1024 + 1024,
+    env: { PATH: process.env.PATH ?? '', LANG: 'C', LC_ALL: 'C' },
+  });
+  assert.equal(positive.error, undefined);
+  assert.equal(positive.status, 0);
+  assert.equal(positive.stderr.length, 0);
+  assert.equal(positive.stdout.subarray(0, 4).toString('ascii'), 'KDLE');
+  assert.equal(positive.stdout[5], 6);
+  assert.equal(positive.stdout.length, QUICK_BYTES + 486);
 });

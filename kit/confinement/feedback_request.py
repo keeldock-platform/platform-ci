@@ -7,6 +7,9 @@ import re
 SCHEMA_VERSION = 1
 REQUEST_DOMAIN = "node-feedback-request-v1"
 WORKFLOW_REF = "refs/heads/main"
+LINUX_QUICK_KIND = "linux_quick"
+LINUX_QUICK_WORKFLOW_REF = "refs/heads/untrusted"
+LINUX_QUICK_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024 - 64 * 1024
 CORE_RUST_BOOTSTRAP_BASE_BRANCH = "plan/core-contract-batch4"
 CORE_RUST_BOOTSTRAP_BASE_SHA = "8296d2977a204edd2eafc06ed9e3280bf5480cbf"
 MAX_REQUEST_TTL_SECONDS = 24 * 60 * 60
@@ -58,6 +61,10 @@ _PROFILE_ROWS = (
      ".github/workflows/core-npm-admission-return.yml", "core-npm-admission-return",
      "core-npm-admission-return-audit", "npm-admission-return-v1.enc",
      NPM_ADMISSION_MAX_PAYLOAD_BYTES, NPM_ADMISSION_BUILD_INPUTS),
+    (6, LINUX_QUICK_KIND, "core-linux-quick-return",
+     ".github/workflows/core-linux-quick-return.yml", "core-linux-quick-return-producer",
+     "core-linux-quick-return-audit", "linux-quick-return-v1.enc",
+     LINUX_QUICK_MAX_PAYLOAD_BYTES, ()),
 )
 PROFILES = {
     row[2]: dict(zip(PROFILE_FIELDS, row))
@@ -154,6 +161,11 @@ def request_filing(request):
     return request[WORKSPACE_FIELD]
 
 
+def workflow_ref_for_kind(kind):
+    """Return the one protected ref a request kind may bind; only the Linux quick tier uses untrusted."""
+    return LINUX_QUICK_WORKFLOW_REF if kind == LINUX_QUICK_KIND else WORKFLOW_REF
+
+
 def _selectors_for(kind):
     if kind == CARGO_LOCK_KIND:
         return CARGO_WORKSPACE_SELECTORS
@@ -187,7 +199,7 @@ def _validate_values(values, now):
             or not _valid_decimal(values["repository_id"])
             or values["ci_repository_id"] == values["repository_id"]
             or values["workflow_path"] != profile["workflow_path"]
-            or values["workflow_ref"] != WORKFLOW_REF
+            or values["workflow_ref"] != workflow_ref_for_kind(profile["kind"])
             or type(values["workflow_path"]) is not str
             or type(values["workflow_ref"]) is not str):
         _refuse()
