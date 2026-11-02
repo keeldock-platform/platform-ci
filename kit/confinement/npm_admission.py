@@ -456,7 +456,7 @@ def _inert_bundled_names(entry):
     names = _bundled_names(entry)
     if not names or len(names) > MAX_BUNDLED_NAMES:
         return None
-    if entry.get("optional") is not True and entry.get("devOptional") is not True:
+    if entry.get("optional") is not True:
         return None
     cpu = entry.get("cpu")
     if (type(cpu) is not list or not cpu or len(cpu) > 16
@@ -489,7 +489,31 @@ def _bundled_member_allowed(parts, is_directory, bundled):
     return not any(part.lower() == "node_modules" for part in parts[index:])
 
 
-def _validate_entry_shape(entry, workspace_names, extra_internal_names, path=""):
+def _inbundle_child_allowed(path, entry, packages):
+    if type(entry) is not dict or entry.get("inBundle") is not True:
+        return False
+    name = _package_name_from_lock_path(path)
+    if name is None:
+        return False
+    suffix = "/node_modules/" + name
+    if not path.endswith(suffix):
+        return False
+    parent_path = path[:-len(suffix)]
+    if _package_name_from_lock_path(parent_path) is None:
+        return False
+    parent = packages.get(parent_path)
+    if type(parent) is not dict or parent.get("inBundle") is True or "link" in parent:
+        return False
+    names = _inert_bundled_names(parent)
+    if names is None or name not in names:
+        return False
+    if any(key in entry for key in ("resolved", "integrity", "link", "hasInstallScript")
+           + BUNDLED_FIELDS):
+        return False
+    return _valid_version(entry.get("version")) and entry.get("name", name) == name
+
+
+def _validate_entry_shape(entry, workspace_names, extra_internal_names, path="", allow_inbundle=False):
     where = _lock_path(path)
     if type(entry) is not dict:
         _lock_refuse("entry_shape", where)
@@ -499,7 +523,7 @@ def _validate_entry_shape(entry, workspace_names, extra_internal_names, path="")
     for key in BOOLEAN_ENTRY_FIELDS:
         if key in entry and type(entry[key]) is not bool:
             _lock_refuse("entry_bool", where, key)
-    if entry.get("inBundle") is True:
+    if entry.get("inBundle") is True and not allow_inbundle:
         _lock_refuse("entry_inbundle", where)
     for key in DEPENDENCY_FIELDS:
         if key in entry:
@@ -634,11 +658,18 @@ def parse_lock(lock_bytes, internal_names=(), workspace_links=None):
         name = _package_name_from_lock_path(path)
         if name is None or path in registry_paths:
             _lock_refuse("registry_path", path)
-        _validate_entry_shape(entry, expected_workspace_names, extra_internal_names, path)
+        bundled_child = _inbundle_child_allowed(path, entry, packages)
+        _validate_entry_shape(
+            entry, expected_workspace_names, extra_internal_names, path, allow_inbundle=bundled_child)
         if "link" in entry:
             _lock_refuse("entry_link", path)
         if not _valid_version(entry.get("version")):
             _lock_refuse("entry_version", path)
+        if bundled_child:
+            if _internal_name(name, extra_internal_names):
+                _lock_refuse("entry_internal", path)
+            registry_paths.add(path)
+            continue
         if not _valid_integrity(entry.get("integrity")):
             _lock_refuse("integrity", path)
         entry_name = entry.get("name", name)
@@ -667,6 +698,8 @@ def registry_entries(lock, internal_names=(), workspace_links=None):
     entries = []
     for path, entry in lock["packages"].items():
         if path == "" or path in links or path in links.values():
+            continue
+        if _inbundle_child_allowed(path, entry, lock["packages"]):
             continue
         normalized = dict(entry)
         normalized.setdefault("name", _package_name_from_lock_path(path))

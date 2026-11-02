@@ -377,6 +377,46 @@ function validSha512Integrity(value) {
   return decoded.byteLength === 64 && decoded.toString('base64') === encoded;
 }
 
+const INERT_CPU_TOKENS = new Set([
+  'wasm32', 'loong64', 'mips', 'mipsel', 'ppc', 'ppc64', 'riscv64', 's390', 's390x',
+]);
+const BUNDLED_FIELDS = Object.freeze(['bundledDependencies', 'bundleDependencies']);
+const MAX_BUNDLED_NAMES = 64;
+
+function inertBundledNames(entry) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null;
+  const names = [];
+  for (const key of BUNDLED_FIELDS) {
+    const values = entry[key];
+    if (values === undefined) continue;
+    if (!Array.isArray(values)) return null;
+    names.push(...values);
+  }
+  if (names.length === 0 || names.length > MAX_BUNDLED_NAMES || entry.optional !== true) return null;
+  const cpu = entry.cpu;
+  if (!Array.isArray(cpu) || cpu.length === 0 || cpu.length > 16
+      || cpu.some((token) => typeof token !== 'string' || !INERT_CPU_TOKENS.has(token))) return null;
+  if (names.some((name) => !packageName(name))) return null;
+  return new Set(names);
+}
+
+function bundledChildAllowed(packages, key, entry, workspaceDirectories) {
+  if (entry.inBundle !== true || typeof key !== 'string') return false;
+  const marker = key.lastIndexOf('/node_modules/');
+  if (marker <= 0) return false;
+  const parentPath = key.slice(0, marker);
+  const name = key.slice(marker + '/node_modules/'.length);
+  if (!Object.hasOwn(packages, parentPath) || !nodeModulesPackageName(parentPath, workspaceDirectories)) return false;
+  const parent = packages[parentPath];
+  if (parent === null || typeof parent !== 'object' || Array.isArray(parent)
+      || parent.inBundle === true || parent.link === true) return false;
+  const names = inertBundledNames(parent);
+  if (names === null || !names.has(name)) return false;
+  if (['resolved', 'integrity', 'link', 'hasInstallScript', ...BUNDLED_FIELDS]
+    .some((field) => Object.hasOwn(entry, field))) return false;
+  return exactVersion(entry.version) && (entry.name === undefined || entry.name === name);
+}
+
 function compareDirectPins(actual, expected) {
   for (const group of DEPENDENCY_GROUPS) {
     if (!exactMap(actual[group], expected[group])) reject('direct_pin_mismatch');
@@ -440,6 +480,7 @@ function buildLockInventory(packages, expected, workspaceByPath, workspaceDirect
   for (const key of packageKeys) {
     const entry = packages[key];
     if (key !== '' && entry.link === true) continue;
+    if (key !== '' && bundledChildAllowed(packages, key, entry, workspaceDirectories)) continue;
     let name;
     let version;
     let kind;
@@ -482,7 +523,9 @@ function buildLockInventory(packages, expected, workspaceByPath, workspaceDirect
       }
     }
     const dependencies = [];
+    const bundledNames = inertBundledNames(entry);
     for (const name of [...names].sort()) {
+      if (bundledNames !== null && bundledNames.has(name)) continue;
       const candidates = key === ''
         ? [`node_modules/${name}`]
         : (workspaceByPath.has(key)
@@ -582,10 +625,11 @@ function validateLockManifestUnchecked(lockBytes, expectedInput, includeInventor
       if (!target || entry.resolved !== target || entry.integrity !== undefined) reject('workspace_link_invalid');
       continue;
     }
+    const bundledChild = bundledChildAllowed(packages, key, entry, workspaceDirectories);
     if ((entry.link !== undefined && entry.link !== false)
         || !exactVersion(entry.version)
-        || !validRegistryUrl(entry.resolved, moduleName, entry.version)
-        || !validSha512Integrity(entry.integrity)) {
+        || (!bundledChild && (!validRegistryUrl(entry.resolved, moduleName, entry.version)
+          || !validSha512Integrity(entry.integrity)))) {
       reject('package_source_invalid');
     }
     if (entry.name !== undefined && entry.name !== moduleName) reject('invalid_package');

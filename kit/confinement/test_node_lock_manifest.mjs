@@ -596,3 +596,99 @@ test('limits the platform binary version check to the official lightningcss bina
     assert.equal(codeOf(other.lock, other.expectation), 'accepted', name);
   }
 });
+
+const OXIDE_PARENT = 'node_modules/@tailwindcss/oxide-wasm32-wasi';
+const OXIDE_BUNDLED = [
+  '@napi-rs/wasm-runtime', '@emnapi/core', '@emnapi/runtime', 'tslib',
+  '@tybys/wasm-util', '@emnapi/wasi-threads',
+];
+
+function bundledFixture({ children = true, shape = {} } = {}) {
+  const lock = lockFixture();
+  const dependencies = Object.fromEntries(OXIDE_BUNDLED.map((name) => [name, '^1.0.0']));
+  lock.packages[OXIDE_PARENT] = {
+    version: '4.3.3',
+    resolved: 'https://registry.npmjs.org/@tailwindcss/oxide-wasm32-wasi/-/oxide-wasm32-wasi-4.3.3.tgz',
+    integrity: `sha512-${'A'.repeat(86)}==`,
+    bundleDependencies: [...OXIDE_BUNDLED],
+    cpu: ['wasm32'],
+    dev: true,
+    optional: true,
+    dependencies,
+  };
+  if (children) {
+    for (const name of OXIDE_BUNDLED) {
+      lock.packages[`${OXIDE_PARENT}/node_modules/${name}`] = {
+        version: '1.2.3', dev: true, inBundle: true, optional: true,
+      };
+    }
+  }
+  Object.assign(lock.packages[OXIDE_PARENT], shape);
+  return lock;
+}
+
+test('admits the optional non-host-architecture bundling entry with its bundled children', () => {
+  const lock = bundledFixture();
+  assert.equal(codeOf(lock, expected), 'accepted');
+  const inventory = validateLockManifestInventory(bytes(lock), expected);
+  const names = inventory.packages.map((item) => item.name);
+  assert.ok(names.includes('@tailwindcss/oxide-wasm32-wasi'));
+  assert.equal(names.includes('tslib'), false);
+  assert.equal(inventory.packages.length, 5);
+  const parent = inventory.packages.find((item) => item.name === '@tailwindcss/oxide-wasm32-wasi');
+  assert.deepEqual(parent.dependencies, []);
+});
+
+test('admits the same entry when the lock writes no bundled child entries', () => {
+  const lock = bundledFixture({ children: false });
+  assert.equal(codeOf(lock, expected), 'accepted');
+  assert.equal(validateLockManifestInventory(bytes(lock), expected).packages.length, 5);
+});
+
+test('refuses inBundle children under a parent that is not inert', () => {
+  for (const shape of [
+    { optional: undefined },
+    { optional: false },
+    { cpu: ['x64'] },
+    { cpu: ['wasm32', 'arm64'] },
+    { cpu: undefined },
+    { bundleDependencies: undefined },
+    { bundleDependencies: ['tslib', 'Bad Name'] },
+  ]) {
+    const lock = bundledFixture({ shape });
+    assert.notEqual(codeOf(lock, expected), 'accepted', JSON.stringify(shape));
+  }
+});
+
+test('refuses undeclared, sourced, and deeper bundled children', () => {
+  const undeclared = bundledFixture();
+  undeclared.packages[`${OXIDE_PARENT}/node_modules/left-pad`] = { version: '1.0.0', inBundle: true };
+  assert.notEqual(codeOf(undeclared, expected), 'accepted');
+
+  for (const extra of [
+    { resolved: 'https://registry.npmjs.org/tslib/-/tslib-1.2.3.tgz' },
+    { integrity: `sha512-${'A'.repeat(86)}==` },
+    { link: true },
+    { hasInstallScript: true },
+    { bundleDependencies: ['tslib'] },
+    { name: 'other' },
+  ]) {
+    const lock = bundledFixture();
+    Object.assign(lock.packages[`${OXIDE_PARENT}/node_modules/tslib`], extra);
+    assert.notEqual(codeOf(lock, expected), 'accepted', JSON.stringify(extra));
+  }
+
+  const badVersion = bundledFixture();
+  badVersion.packages[`${OXIDE_PARENT}/node_modules/tslib`].version = '^1.0.0';
+  assert.notEqual(codeOf(badVersion, expected), 'accepted');
+
+  const deeper = bundledFixture();
+  deeper.packages[`${OXIDE_PARENT}/node_modules/@emnapi/core/node_modules/tslib`] = {
+    version: '1.2.3', inBundle: true,
+  };
+  assert.notEqual(codeOf(deeper, expected), 'accepted');
+
+  const wrongParent = bundledFixture();
+  wrongParent.packages['node_modules/tslib'] = { version: '1.2.3', inBundle: true };
+  assert.notEqual(codeOf(wrongParent, expected), 'accepted');
+});

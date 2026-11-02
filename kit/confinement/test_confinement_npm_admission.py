@@ -1039,8 +1039,14 @@ class NpmInertBundledTests(unittest.TestCase):
     def test_the_optional_wasm32_entry_with_bundled_dependencies_is_admitted(self):
         parsed = self.parse(**self.inert())
         self.assertEqual(parsed["packages"][self.PATH]["cpu"], ["wasm32"])
-        parsed = self.parse(**self.inert(optional=False, devOptional=True))
-        self.assertTrue(parsed["packages"][self.PATH]["devOptional"])
+        self.assertEqual(
+            self.refusal_detail(**self.inert(optional=False, devOptional=True)),
+            "bundled_deps:" + self.PATH + ":bundleDependencies",
+        )
+        self.assertEqual(
+            self.refusal_detail(devOptional=True, cpu=["wasm32"], bundleDependencies=["plain-lib"]),
+            "bundled_deps:" + self.PATH + ":bundleDependencies",
+        )
         parsed = self.parse(**self.inert(bundledDependencies=["plain-lib"], bundleDependencies=["x-lib"]))
         self.assertEqual(parsed["packages"][self.PATH]["bundledDependencies"], ["plain-lib"])
 
@@ -1076,6 +1082,100 @@ class NpmInertBundledTests(unittest.TestCase):
             ["wasm32"],
         )
         self.assertIsNotNone(self.refusal_detail(**self.inert(bundleDependencies=["a" * 129])))
+
+    def child_lock(self, parent=None, children=None, extra=None):
+        lock, unused_bytes, unused_archives, unused_material = _fixture()
+        lock["packages"][self.PATH].update(self.inert() if parent is None else parent)
+        if children is None:
+            children = {name: {"version": "1.2.3", "inBundle": True, "optional": True, "dev": True}
+                        for name in self.BUNDLED}
+        for name, entry in children.items():
+            lock["packages"][self.PATH + "/node_modules/" + name] = entry
+        for path, entry in (extra or {}).items():
+            lock["packages"][path] = entry
+        return json.dumps(lock).encode("ascii")
+
+    def child_refusal(self, raw):
+        with self.assertRaises(subject.Refusal) as raised:
+            subject.parse_lock(raw)
+        self.assertEqual(raised.exception.reason, "npm_lock_invalid")
+        return raised.exception.detail
+
+    def test_bundled_children_marked_in_bundle_are_admitted_and_never_fetched(self):
+        raw = self.child_lock()
+        parsed = subject.parse_lock(raw)
+        for name in self.BUNDLED:
+            self.assertTrue(parsed["packages"][self.PATH + "/node_modules/" + name]["inBundle"])
+        paths = [path for path, unused in subject.registry_entries(raw)]
+        self.assertIn(self.PATH, paths)
+        for name in self.BUNDLED:
+            self.assertNotIn(self.PATH + "/node_modules/" + name, paths)
+        self.assertEqual(len(paths), len(subject.registry_entries(self.child_lock(children={}))))
+
+    def test_a_lock_without_bundled_child_entries_is_still_admitted(self):
+        self.assertIn(self.PATH, [path for path, unused in subject.registry_entries(self.child_lock(children={}))])
+
+    def test_in_bundle_children_under_a_parent_that_is_not_inert_refuse(self):
+        for label, parent in {
+            "not optional": self.inert(optional=False),
+            "dev optional only": self.inert(optional=False, devOptional=True),
+            "host cpu": self.inert(cpu=["x64"]),
+            "mixed cpu": self.inert(cpu=["wasm32", "arm64"]),
+            "no bundle list": {"optional": True, "cpu": ["wasm32"]},
+        }.items():
+            with self.subTest(case=label):
+                self.assertIsNotNone(self.child_refusal(self.child_lock(parent=parent)))
+        detail = self.child_refusal(self.child_lock(parent={"optional": True, "cpu": ["wasm32"]}))
+        self.assertEqual(detail, "entry_inbundle:" + self.PATH + "/node_modules/@scope-a/runtime")
+        orphan = {"node_modules/plain-lib": {"version": "1.2.3", "inBundle": True}}
+        self.assertEqual(
+            self.child_refusal(self.child_lock(children={}, extra=orphan)),
+            "entry_inbundle:node_modules/plain-lib",
+        )
+
+    def test_an_undeclared_bundled_child_refuses(self):
+        children = {"left-pad": {"version": "1.2.3", "inBundle": True}}
+        self.assertEqual(
+            self.child_refusal(self.child_lock(children=children)),
+            "entry_inbundle:" + self.PATH + "/node_modules/left-pad",
+        )
+
+    def test_a_bundled_child_with_a_source_script_link_or_bad_shape_refuses(self):
+        for label, extra in {
+            "resolved": {"resolved": "https://registry.npmjs.org/plain-lib/-/plain-lib-1.2.3.tgz"},
+            "integrity": {"integrity": "sha512-" + "A" * 86 + "=="},
+            "link": {"link": True},
+            "install script": {"hasInstallScript": True},
+            "nested bundle list": {"bundleDependencies": ["plain-lib"]},
+            "bad version": {"version": "^1.2.3"},
+            "no version": {"version": None},
+            "other name": {"name": "other-lib"},
+        }.items():
+            with self.subTest(case=label):
+                child = {"version": "1.2.3", "inBundle": True}
+                child.update(extra)
+                if extra.get("version", 0) is None:
+                    del child["version"]
+                self.assertIsNotNone(self.child_refusal(self.child_lock(children={"plain-lib": child})))
+
+    def test_nested_bundled_children_of_a_bundled_child_refuse(self):
+        deeper = {
+            self.PATH + "/node_modules/plain-lib/node_modules/plain-lib": {"version": "1.2.3", "inBundle": True},
+        }
+        raw = self.child_lock(extra=deeper)
+        self.assertEqual(
+            self.child_refusal(raw),
+            "entry_inbundle:" + self.PATH + "/node_modules/plain-lib/node_modules/plain-lib",
+        )
+        scoped = {
+            self.PATH + "/node_modules/@scope-a/runtime/node_modules/plain-lib": {"version": "1.2.3", "inBundle": True},
+        }
+        self.assertIsNotNone(self.child_refusal(self.child_lock(extra=scoped)))
+
+    def test_a_bundled_child_may_not_use_an_internal_name(self):
+        raw = self.child_lock()
+        with self.assertRaises(subject.Refusal):
+            subject.parse_lock(raw, internal_names=("plain-lib",))
 
     def _inert_entry(self, data, **fields):
         entry = {
