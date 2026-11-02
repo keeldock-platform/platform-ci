@@ -361,9 +361,10 @@ jobs:
         env:
           KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic' && 'kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd' || secrets.KD_LINUX_LOG_CANARY }}
           KD_RUST_SYSROOT: ${{ steps.toolchains.outputs.rust_sysroot }}
+          KD_NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
         run: |
           set -euo pipefail
-          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT" --node-bin "$KD_NODE_BIN")
           if [[ "$CI_MODE" == "synthetic" ]]; then
             arguments+=(--synthetic-standin)
           fi
@@ -436,9 +437,10 @@ jobs:
         env:
           KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic' && 'kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd' || secrets.KD_LINUX_LOG_CANARY }}
           KD_RUST_SYSROOT: ${{ steps.toolchains.outputs.rust_sysroot }}
+          KD_NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
         run: |
           set -euo pipefail
-          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT" --node-bin "$KD_NODE_BIN")
           if [[ "$CI_MODE" == "synthetic" ]]; then
             arguments+=(--synthetic-standin)
           fi
@@ -550,9 +552,10 @@ jobs:
         env:
           KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic' && 'kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd' || secrets.KD_LINUX_LOG_CANARY }}
           KD_RUST_SYSROOT: ${{ steps.verifier-toolchain.outputs.rust_sysroot }}
+          KD_NODE_BIN: ${{ steps.verifier-toolchain.outputs.node_bin }}
         run: |
           set -euo pipefail
-          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT" --node-bin "$KD_NODE_BIN")
           if [[ "$CI_MODE" == "synthetic" ]]; then
             arguments+=(--synthetic-standin)
           fi
@@ -607,9 +610,10 @@ jobs:
         env:
           KD_CANARY_SECRET: ${{ inputs.mode == 'synthetic' && 'kd-synthetic-standin-NOT-A-SECRET-0123456789abcdef0123456789abcd' || secrets.KD_LINUX_LOG_CANARY }}
           KD_RUST_SYSROOT: ${{ steps.verifier-toolchain.outputs.rust_sysroot }}
+          KD_NODE_BIN: ${{ steps.verifier-toolchain.outputs.node_bin }}
         run: |
           set -euo pipefail
-          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT" --node-bin "$KD_NODE_BIN")
           if [[ "$CI_MODE" == "synthetic" ]]; then
             arguments+=(--synthetic-standin)
           fi
@@ -901,9 +905,10 @@ jobs:
         env:
           KD_CANARY_SECRET: ${{ secrets.KD_LINUX_LOG_CANARY }}
           KD_RUST_SYSROOT: ${{ steps.toolchains.outputs.rust_sysroot }}
+          KD_NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
         run: |
           set -euo pipefail
-          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT" --node-bin "$KD_NODE_BIN")
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py selftest "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/selftest.json"
       - name: Mint scoped source-reader token
         id: source-reader-token
@@ -966,9 +971,10 @@ jobs:
         env:
           KD_CANARY_SECRET: ${{ secrets.KD_LINUX_LOG_CANARY }}
           KD_RUST_SYSROOT: ${{ steps.toolchains.outputs.rust_sysroot }}
+          KD_NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
         run: |
           set -euo pipefail
-          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT")
+          arguments=(--control-sha "$CI_SHA" --runner-uid "$(id -u)" --runner-home "$HOME" --runner-temp "$RUNNER_TEMP" --rust-sysroot "$KD_RUST_SYSROOT" --node-bin "$KD_NODE_BIN")
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
       - name: Run all offline project gates
         id: gates
