@@ -21,6 +21,8 @@ APP_IDENTIFIER = "org.example.sandboxcapability"
 CHILD_IDENTIFIER = APP_IDENTIFIER + ".CapabilityChild"
 MAX_CAPTURE_BYTES = 65536
 MAX_PROBE_SECONDS = 45
+CENSUS_READ_ATTEMPTS = 3
+CENSUS_READ_RETRY_SECONDS = 0.2
 MAX_RUNNER_ANCESTORS = 16
 MAX_PROCESS_PATH_BYTES = 4096
 MAX_TOOL_PATH_BYTES = 4096
@@ -971,7 +973,7 @@ def _survivor_process_classes(pids, uid, python_executable, additional):
     return tuple(category for category in SURVIVOR_CLASS_ORDER if category in categories)
 
 
-def _probe_uid_process_snapshot(uid, launched_pgid=None, *, include_survivor_classes=False, python_executable=None):
+def _probe_uid_process_snapshot_attempt(uid, launched_pgid=None, *, include_survivor_classes=False, python_executable=None):
     if uid <= 0 or (launched_pgid is not None and launched_pgid <= 0):
         raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
     control_diagnostics = launched_pgid is not None
@@ -987,7 +989,11 @@ def _probe_uid_process_snapshot(uid, launched_pgid=None, *, include_survivor_cla
         raise ProbeFailure(
             "native_preflight_unavailable", cleanup_complete=False, check="probe_process_census"
         ) from None
-    if result.returncode != 0 or result.stderr or len(result.stdout) > MAX_CAPTURE_BYTES:
+    if len(result.stdout) > MAX_CAPTURE_BYTES:
+        oversize = ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+        oversize.census_permanent = True
+        raise oversize
+    if result.returncode != 0 or result.stderr:
         raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
     try:
         output = result.stdout.decode("ascii")
@@ -1065,6 +1071,31 @@ def _probe_uid_process_snapshot(uid, launched_pgid=None, *, include_survivor_cla
     else:
         result = (True, "probe_process_survivor_controls_other_group")
     return result + (survivor_classes,) if include_survivor_classes else result
+
+
+def _probe_uid_process_snapshot(uid, launched_pgid=None, *, include_survivor_classes=False, python_executable=None):
+    if uid <= 0 or (launched_pgid is not None and launched_pgid <= 0):
+        raise ProbeFailure("native_preflight_unavailable", cleanup_complete=False, check="probe_process_census")
+    failure = None
+    for attempt in range(CENSUS_READ_ATTEMPTS):
+        if attempt:
+            time.sleep(CENSUS_READ_RETRY_SECONDS)
+        try:
+            return _probe_uid_process_snapshot_attempt(
+                uid,
+                launched_pgid,
+                include_survivor_classes=include_survivor_classes,
+                python_executable=python_executable,
+            )
+        except ProbeFailure as error:
+            if (
+                error.reason != "native_preflight_unavailable"
+                or error.check != "probe_process_census"
+                or getattr(error, "census_permanent", False)
+            ):
+                raise
+            failure = error
+    raise failure
 
 
 def _probe_uid_processes_present(uid, *, include_survivor_classes=False, python_executable=None):
