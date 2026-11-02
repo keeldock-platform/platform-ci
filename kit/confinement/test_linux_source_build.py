@@ -3,6 +3,7 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1019,6 +1020,71 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     self.assertEqual(launch[:3], ("/usr/bin/python3", "-B", "-c"))
                     self.assertEqual(launch[3], linux_source_build.linux_probes.LAUNCHER_SOURCE)
                     self.assertEqual(launch[4:], ("/usr/bin/true",))
+                    gate_env = invocation.args[3]
+                    for user_name, global_name, notifier_name in (
+                        ("NPM_CONFIG_USERCONFIG", "NPM_CONFIG_GLOBALCONFIG", "NPM_CONFIG_UPDATE_NOTIFIER"),
+                        ("npm_config_userconfig", "npm_config_globalconfig", "npm_config_update_notifier"),
+                    ):
+                        self.assertNotEqual(gate_env[user_name], gate_env[global_name])
+                        self.assertEqual(
+                            Path(gate_env[user_name]), worker / ".home" / linux_source_build.NPM_USER_CONFIG_NAME,
+                        )
+                        self.assertEqual(
+                            Path(gate_env[global_name]), worker / ".home" / linux_source_build.NPM_GLOBAL_CONFIG_NAME,
+                        )
+                        self.assertNotIn("/dev/null", (gate_env[user_name], gate_env[global_name]))
+                        self.assertEqual(gate_env[notifier_name], "false")
+                    self.assertEqual(gate_env["NPM_CONFIG_USERCONFIG"], gate_env["npm_config_userconfig"])
+                    self.assertEqual(gate_env["NPM_CONFIG_GLOBALCONFIG"], gate_env["npm_config_globalconfig"])
+                    self.assertLessEqual(set(gate_env), linux_source_build.linux_session.PROJECT_ENV_NAMES)
+
+    def test_gate_directories_create_two_distinct_empty_owned_npm_configs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "root"
+            worker = root / "source"
+            worker.mkdir(parents=True)
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            with patch.object(linux_source_build, "PROJECT_ROOT", root), patch.object(
+                linux_source_build, "_open_project_root", side_effect=lambda: os.open(root, flags)
+            ), patch.object(linux_source_build.linux_harness, "CHILD_UID", os.getuid()), patch.object(
+                linux_source_build.linux_harness, "CHILD_GID", os.getgid()
+            ):
+                (worker / ".kd-cargo-home").mkdir()
+                linux_source_build._project_gate_directories(worker, create=True)
+                paths = [worker / ".home" / name for name in (
+                    linux_source_build.NPM_USER_CONFIG_NAME, linux_source_build.NPM_GLOBAL_CONFIG_NAME,
+                )]
+                identities = set()
+                for path in paths:
+                    details = path.lstat()
+                    self.assertTrue(stat.S_ISREG(details.st_mode))
+                    self.assertEqual((details.st_size, details.st_nlink, stat.S_IMODE(details.st_mode)), (0, 1, 0o444))
+                    self.assertEqual((details.st_uid, details.st_gid), (os.getuid(), os.getgid()))
+                    identities.add((details.st_dev, details.st_ino))
+                self.assertEqual(len(identities), 2)
+                linux_source_build._project_gate_directories(worker)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._project_gate_directories(worker, create=True)
+                paths[0].chmod(0o644)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._project_gate_directories(worker)
+                paths[0].chmod(0o444)
+                paths[1].unlink()
+                paths[1].symlink_to(paths[0])
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._project_gate_directories(worker)
+                paths[1].unlink()
+                os.link(paths[0], paths[1])
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._project_gate_directories(worker)
+                paths[1].unlink()
+                paths[0].unlink()
+                paths[0].write_text("registry=fixture\n", encoding="ascii")
+                paths[0].chmod(0o444)
+                paths[1].write_text("", encoding="ascii")
+                paths[1].chmod(0o444)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._project_gate_directories(worker)
 
     def test_license_gate_refusal_precedes_preparation_and_command_construction(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1653,6 +1719,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
 
 
 LOCK_SHA = "5" * 64
+IDENTITY = {"owner": "owner", "name": "source"}
 RESOLVER = {"node_version": "24.22.1", "npm_version": "11.19.1"}
 LOCKED = {
     "node_modules/fixture-lib": {"version": "1.5.0", "dev": True},
@@ -1800,7 +1867,7 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
 
     def _refused(self, record):
         with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "lock"):
-            linux_source_build._validate_provenance_binding({}, self._environment(record))
+            linux_source_build._validate_provenance_binding(IDENTITY, self._environment(record))
 
     def test_provenance_shape_matches_the_trusted_receipt_and_evidence_structure(self):
         receipt = _synthetic_receipt()
@@ -1829,14 +1896,33 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
         self.assertLess(
             len(_encode(provenance)), linux_source_build.MAX_PROVENANCE_BYTES,
         )
-        record = linux_source_build._validate_provenance_binding({}, self._environment(provenance))
+        record = linux_source_build._validate_provenance_binding(IDENTITY, self._environment(provenance))
         self.assertEqual(record["advisory"]["findings"][0]["advisory_id"], "9000001")
 
     def test_provenance_accepts_a_clear_advisory_result(self):
         record = self._provenance()
         record["advisory"] = dict(record["advisory"], status="clear", finding_count=0, findings=[])
-        accepted = linux_source_build._validate_provenance_binding({}, self._environment(record))
+        accepted = linux_source_build._validate_provenance_binding(IDENTITY, self._environment(record))
         self.assertEqual(accepted["advisory"]["findings"], [])
+
+    def test_provenance_repository_is_bound_to_the_dispatch_identity(self):
+        record = self._provenance()
+        for repository in ("other/source", "owner/other", "owner", "Owner/source"):
+            with self.subTest(repository=repository), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                linux_source_build._validate_provenance_binding(
+                    IDENTITY, self._environment(dict(record, context=dict(record["context"], repository=repository))),
+                )
+            self.assertEqual(refused.exception.reason, "binding")
+        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+            linux_source_build._validate_provenance_binding(
+                {"owner": "owner", "name": "other"}, self._environment(record),
+            )
+        self.assertEqual(refused.exception.reason, "binding")
+        changed = dict(record, context=dict(record["context"], source_sha="e" * 40, base_sha="f" * 40, control_sha="0" * 40))
+        self.assertEqual(
+            linux_source_build._validate_provenance_binding(IDENTITY, self._environment(changed))["context"]["source_sha"],
+            "e" * 40,
+        )
 
     def test_provenance_refuses_fields_the_trusted_run_cannot_supply(self):
         for name in ("status", "age_status", "generation_attempts", "audit_status", "manifest_sha256"):
@@ -2368,6 +2454,259 @@ class LinuxAuditDetailTests(unittest.TestCase):
             "tool-b": _vulnerability("tool-b", via=["tool-a"], nodes=["node_modules/tool-b"]),
         })
         self.assertEqual(self._detail(detached, packages=packages).detail, "audit_consumer_unreached")
+
+    def test_long_consumer_chain_is_walked_once_and_accepted(self):
+        length = 300
+        entries = {"fixture-lib": _lib()}
+        packages = dict(LOCKED)
+        for index in range(length):
+            name = "tool-" + str(index)
+            target = "fixture-lib" if index == 0 else "tool-" + str(index - 1)
+            entries[name] = _vulnerability(name, via=[target], nodes=["node_modules/" + name])
+            packages["node_modules/" + name] = {"version": "1.0.0", "dev": True}
+        report = _audit_json(entries)
+        self.assertEqual(
+            linux_source_build._check_audit_report(report, [_allow(self.now_ms)], packages, self.now_ms),
+            (length + 1, 1, 1),
+        )
+        with patch.object(
+            linux_source_build, "_audit_reached_from_advisories", wraps=linux_source_build._audit_reached_from_advisories,
+        ) as walk:
+            linux_source_build._check_audit_report(report, [_allow(self.now_ms)], packages, self.now_ms)
+        self.assertEqual(walk.call_count, 1)
+
+    def test_metadata_counts_must_equal_the_entry_severities(self):
+        low_entry = _lib(severity="low", via=[_advisory_via(severity="low")])
+        cases = {
+            "extra_low": _audit_json({"fixture-lib": _lib()}, moderate=1, low=1, total=2),
+            "wrong_bucket": _audit_json({"fixture-lib": low_entry}, moderate=1, low=0),
+            "total_high": _audit_json({"fixture-lib": _lib()}, total=2),
+            "total_low": _audit_json({"fixture-lib": _lib()}, total=0),
+            "total_type": _audit_json({"fixture-lib": _lib()}, total="1"),
+            "total_boolean": _audit_json({"fixture-lib": _lib()}, total=True),
+            "total_negative": _audit_json({"fixture-lib": _lib()}, total=-1),
+        }
+        for label, report in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(self._detail(report).detail, "audit_count")
+        exact = _audit_json({"fixture-lib": low_entry}, moderate=0, low=1, total=1)
+        self.assertEqual(
+            linux_source_build._check_audit_report(exact, [_allow(self.now_ms)], LOCKED, self.now_ms), (1, 1, 1),
+        )
+        without_total = json.loads(_audit_json({"fixture-lib": _lib()}))
+        del without_total["metadata"]["vulnerabilities"]["total"]
+        self.assertEqual(
+            linux_source_build._check_audit_report(
+                json.dumps(without_total).encode("ascii"), [_allow(self.now_ms)], LOCKED, self.now_ms,
+            ),
+            (1, 1, 1),
+        )
+
+    def test_locked_versions_that_are_not_strings_are_refused_by_name(self):
+        for version in (["1.5.0"], {"version": "1.5.0"}, 1, None):
+            listed = dict(LOCKED, **{"node_modules/fixture-lib": {"version": version, "dev": True}})
+            unlisted = dict(LOCKED, **{"node_modules/other/node_modules/fixture-lib": {"version": version, "dev": True}})
+            for label, packages in (("listed", listed), ("unlisted", unlisted)):
+                with self.subTest(version=repr(version), where=label):
+                    self.assertEqual(
+                        self._detail(_honoured_report(), packages=packages).detail, "audit_version_not_allowed",
+                    )
+
+    def test_provenance_refusals_keep_their_own_reason_and_the_provenance_token(self):
+        for reason in ("binding", "registry", "lock", "source"):
+            with self.subTest(reason=reason), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                self._run_audit(1, _honoured_report(), source_inputs=linux_source_build.SourceBuildRefusal(reason))
+            self.assertEqual((refused.exception.reason, refused.exception.detail), (reason, "audit_provenance"))
+        for error in (OSError("x"), ValueError("x"), KeyError("x"), TypeError("x")):
+            with self.subTest(error=type(error).__name__), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                self._run_audit(1, _honoured_report(), source_inputs=error)
+            self.assertEqual((refused.exception.reason, refused.exception.detail), ("lock", "audit_provenance"))
+        code, output = self._run_audit(
+            1, _honoured_report(), entry=_dispatch_audit,
+            source_inputs=linux_source_build.SourceBuildRefusal("binding"),
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(
+            output, "linux-source-build=refused phase=trusted-audit reason=binding detail=audit_provenance\n",
+        )
+        self.assertRegex(output, LINE_PATTERN)
+
+    def test_catch_all_and_non_audit_refusal_lines_carry_no_detail(self):
+        with patch.object(linux_source_build, "checkout_source", side_effect=RuntimeError("fixture-lib")), \
+                patch("sys.stdout", io.StringIO()) as output:
+            self.assertEqual(linux_source_build._dispatch("checkout"), 1)
+        self.assertEqual(output.getvalue(), "linux-source-build=refused phase=checkout reason=invalid\n")
+        counted = linux_source_build.SourceBuildRefusal("lock", "audit_json_trailing", 3)
+        self.assertEqual(counted.count, 3)
+        self.assertEqual(
+            linux_source_build._refusal_line("checkout", counted), "linux-source-build=refused phase=checkout reason=lock\n",
+        )
+        self.assertEqual(
+            linux_source_build._refusal_line("trusted-audit", counted),
+            "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_trailing count=3\n",
+        )
+
+    def _capture_audit(self):
+        seen = {}
+
+        def capture(argv, cwd, environ=None, **unused):
+            private = Path(environ["HOME"])
+            seen["environ"] = dict(environ)
+            seen["details"] = {
+                name: (private / name).lstat() for name in (
+                    linux_source_build.NPM_USER_CONFIG_NAME, linux_source_build.NPM_GLOBAL_CONFIG_NAME,
+                )
+            }
+            seen["private"] = private
+            return types.SimpleNamespace(returncode=1, stdout=_honoured_report(), stderr=b"")
+
+        code, output = self._run_audit(1, _honoured_report(), run=capture)
+        self.assertEqual(code, 0)
+        return seen
+
+    def test_trusted_audit_uses_two_distinct_empty_regular_npm_configs(self):
+        seen = self._capture_audit()
+        environ = seen["environ"]
+        user = Path(environ["NPM_CONFIG_USERCONFIG"])
+        global_config = Path(environ["NPM_CONFIG_GLOBALCONFIG"])
+        self.assertNotEqual(user, global_config)
+        self.assertNotIn("/dev/null", (str(user), str(global_config)))
+        self.assertEqual(user.parent, seen["private"])
+        self.assertEqual(global_config.parent, seen["private"])
+        self.assertEqual(environ["NPM_CONFIG_UPDATE_NOTIFIER"], "false")
+        identities = set()
+        for details in seen["details"].values():
+            self.assertTrue(stat.S_ISREG(details.st_mode))
+            self.assertEqual(details.st_size, 0)
+            self.assertEqual(stat.S_IMODE(details.st_mode), 0o600)
+            identities.add((details.st_dev, details.st_ino))
+        self.assertEqual(len(identities), 2)
+        self.assertEqual(
+            {user.name, global_config.name},
+            {linux_source_build.NPM_USER_CONFIG_NAME, linux_source_build.NPM_GLOBAL_CONFIG_NAME},
+        )
+
+    def test_trusted_audit_truncates_old_configs_and_refuses_non_regular_ones(self):
+        with tempfile.TemporaryDirectory() as directory:
+            private = Path(directory)
+            (private / linux_source_build.NPM_USER_CONFIG_NAME).write_text("registry=fixture\n", encoding="ascii")
+            (private / linux_source_build.NPM_USER_CONFIG_NAME).chmod(0o644)
+            user, global_config = linux_source_build._audit_config_files(private)
+            self.assertEqual(Path(user).stat().st_size, 0)
+            self.assertEqual(stat.S_IMODE(Path(user).stat().st_mode), 0o600)
+            self.assertNotEqual(user, global_config)
+        for kind in ("directory", "symlink", "hardlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                private = Path(directory)
+                target = private / linux_source_build.NPM_GLOBAL_CONFIG_NAME
+                if kind == "directory":
+                    target.mkdir()
+                elif kind == "symlink":
+                    (private / "elsewhere").write_text("keep\n", encoding="ascii")
+                    target.symlink_to(private / "elsewhere")
+                else:
+                    (private / "elsewhere").write_text("keep\n", encoding="ascii")
+                    os.link(private / "elsewhere", target)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                    linux_source_build._audit_config_files(private)
+                self.assertEqual(refused.exception.detail, "audit_run")
+                if kind != "directory":
+                    self.assertEqual((private / "elsewhere").read_text(encoding="ascii"), "keep\n")
+
+    def test_trusted_audit_refuses_when_the_two_configs_would_be_one_file(self):
+        with patch.object(linux_source_build, "NPM_GLOBAL_CONFIG_NAME", linux_source_build.NPM_USER_CONFIG_NAME), \
+                tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                linux_source_build._audit_config_files(Path(directory))
+            self.assertEqual(refused.exception.detail, "audit_run")
+
+
+def _npm11_report(lowered=False):
+    report = json.loads(NPM11_REPORT_PATH.read_text(encoding="ascii"))
+    for entry in report["vulnerabilities"].values():
+        for item in entry["via"]:
+            if type(item) is dict:
+                item["url"] = linux_source_build.ADVISORY_URL_PREFIX + item["url"]
+                if lowered and item["severity"] == "high":
+                    item["severity"] = "moderate"
+        if lowered and entry["severity"] == "high":
+            entry["severity"] = "moderate"
+    if lowered:
+        counts = report["metadata"]["vulnerabilities"]
+        counts.update(moderate=counts["high"], high=0)
+    return json.dumps(report).encode("ascii")
+
+
+def _npm11_allows(now_ms, names=None):
+    report = json.loads(NPM11_REPORT_PATH.read_text(encoding="ascii"))
+    allows = {}
+    for entry in report["vulnerabilities"].values():
+        for item in entry["via"]:
+            if type(item) is dict and (names is None or item["name"] in names):
+                allows[(item["name"], item["url"])] = _allow(
+                    now_ms, name=item["name"], version=NPM11_VERSIONS[item["name"]], severity="moderate",
+                    advisory_id=item["url"], range=item["range"],
+                )
+    return list(allows.values())
+
+
+NPM11_REPORT_PATH = Path(__file__).resolve().parent / "fixtures" / "npm11_audit_report.json"
+NPM11_VERSIONS = {"brace-expansion": "2.0.1", "minimatch": "10.0.1"}
+NPM11_PACKAGES = {
+    "node_modules/brace-expansion": {"version": "2.0.1", "dev": True},
+    "packages/b/node_modules/brace-expansion": {"version": "2.0.1", "dev": True},
+    "node_modules/minimatch": {"version": "10.0.1", "dev": True},
+}
+
+
+class RealNpmReportTests(unittest.TestCase):
+    def setUp(self):
+        self.now_ms = int(time.time()) * 1000
+
+    def _check(self, report, allows):
+        return linux_source_build._check_audit_report(report, allows, NPM11_PACKAGES, self.now_ms)
+
+    def _refusal(self, report, allows):
+        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+            self._check(report, allows)
+        self.assertEqual(refused.exception.reason, "lock")
+        return refused.exception
+
+    def test_the_real_report_has_the_shape_the_checker_reads(self):
+        report = json.loads(_npm11_report())
+        self.assertEqual(set(report), {"auditReportVersion", "vulnerabilities", "metadata"})
+        self.assertEqual(report["auditReportVersion"], 2)
+        self.assertEqual(set(report["vulnerabilities"]), {"brace-expansion", "minimatch"})
+        self.assertEqual(sum(type(item) is dict for entry in report["vulnerabilities"].values() for item in entry["via"]), 19)
+        counts = report["metadata"]["vulnerabilities"]
+        self.assertEqual((counts["high"], counts["total"]), (2, 2))
+
+    def test_the_real_report_is_refused_for_its_high_severity_even_with_every_allow(self):
+        refusal = self._refusal(_npm11_report(), _npm11_allows(self.now_ms))
+        self.assertEqual(refusal.detail, "audit_high")
+
+    def test_the_real_report_shape_is_accepted_with_matching_allows(self):
+        report = _npm11_report(lowered=True)
+        self.assertEqual(self._check(report, _npm11_allows(self.now_ms)), (2, 19, 1))
+
+    def test_the_real_report_shape_is_refused_without_its_allows(self):
+        report = _npm11_report(lowered=True)
+        self.assertEqual(self._refusal(report, []).detail, "audit_advisory_unmatched")
+        partial = _npm11_allows(self.now_ms, names=("brace-expansion",))
+        self.assertEqual(self._refusal(report, partial).detail, "audit_advisory_unmatched")
+        expired = [dict(allow, allow_expires_at_ms=self.now_ms - 1) for allow in _npm11_allows(self.now_ms)]
+        self.assertEqual(self._refusal(report, expired).detail, "audit_allow_expired")
+        runtime = dict(NPM11_PACKAGES, **{"node_modules/minimatch": {"version": "10.0.1"}})
+        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+            linux_source_build._check_audit_report(report, _npm11_allows(self.now_ms), runtime, self.now_ms)
+        self.assertEqual(refused.exception.detail, "audit_nondev")
+
+    def test_the_real_report_exit_code_follows_the_counts(self):
+        report = _npm11_report(lowered=True)
+        self.assertEqual(self._check(report, _npm11_allows(self.now_ms))[2], 1)
+        tampered = json.loads(report)
+        tampered["metadata"]["vulnerabilities"]["total"] = 3
+        self.assertEqual(self._refusal(json.dumps(tampered).encode("ascii"), _npm11_allows(self.now_ms)).detail, "audit_count")
 
 
 if __name__ == "__main__":

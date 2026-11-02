@@ -1065,6 +1065,20 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         )
 
 
+class NodeEnvironmentTests(unittest.TestCase):
+    def test_user_and_global_npm_configs_are_distinct_files_under_the_worker_storage(self):
+        storage = Path("/var/ci/storage")
+        environment = producer._node_environment({"HOME": "/var/ci/home"}, Path("/opt/node/bin/node"), storage)
+        user = Path(environment["npm_config_userconfig"])
+        global_config = Path(environment["npm_config_globalconfig"])
+        self.assertNotEqual(user, global_config)
+        self.assertEqual(user.parent, storage)
+        self.assertEqual(global_config.parent, storage)
+        self.assertNotEqual(str(user), "/dev/null")
+        self.assertNotEqual(str(global_config), "/dev/null")
+        self.assertEqual(environment["npm_config_update_notifier"], "false")
+
+
 class CargoLockProducerTests(unittest.TestCase):
     def setUp(self):
         import cargo_lock_bootstrap

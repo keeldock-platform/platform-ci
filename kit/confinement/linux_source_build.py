@@ -94,6 +94,8 @@ CONTEXT_TEXT_RE = re.compile(r"[A-Za-z0-9._/:-]{1,256}\Z")
 IDENTIFIER_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}\Z")
 LOCKED_VERSION_RE = re.compile(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(?:[-+][0-9A-Za-z.+-]{1,64})?\Z")
 ADVISORY_URL_PREFIX = "https:" + chr(47) * 2 + "github.com" + chr(47) + "advisories" + chr(47)
+NPM_USER_CONFIG_NAME = "user.npmrc"
+NPM_GLOBAL_CONFIG_NAME = "global.npmrc"
 MAX_AUDIT_VULNERABILITIES = 4096
 MAX_AUDIT_VIA = 64
 MAX_AUDIT_NODES = 1024
@@ -1028,6 +1030,11 @@ def _check_provenance_finding(finding, policy_epoch, fetched_at):
 
 
 def _validate_provenance_binding(identity, environ):
+    """Check the accepted provenance record against the dispatch identity.
+
+    The record repository must equal the dispatch owner and name. The record source, base and
+    control SHAs are shape-checked only, because one admitted lock is refreshed across later
+    revisions by design and the lock and manifest digests carry the binding to the content."""
     text = environ.get("LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", "")
     if type(text) is not str or not 0 < len(text) <= MAX_PROVENANCE_BYTES:
         raise SourceBuildRefusal("lock")
@@ -1047,6 +1054,8 @@ def _validate_provenance_binding(identity, environ):
     for name in ("repository", "filing"):
         if type(context[name]) is not str or CONTEXT_TEXT_RE.fullmatch(context[name]) is None:
             raise SourceBuildRefusal("lock")
+    if context["repository"] != identity["owner"] + "/" + identity["name"]:
+        raise SourceBuildRefusal("binding")
     for name in ("source_sha", "base_sha", "control_sha"):
         if type(context[name]) is not str or SOURCE_SHA_RE.fullmatch(context[name]) is None:
             raise SourceBuildRefusal("lock")
@@ -1574,6 +1583,8 @@ def _project_gate_directories(worker, create=False):
                     details = os.fstat(child)
                     if details.st_uid != linux_harness.CHILD_UID or details.st_gid != linux_harness.CHILD_GID:
                         raise SourceBuildRefusal("gate")
+                    if name == ".home":
+                        _gate_npm_config_files(child, create)
                 finally:
                     os.close(child)
         finally:
@@ -1582,6 +1593,32 @@ def _project_gate_directories(worker, create=False):
         raise SourceBuildRefusal("gate") from None
     finally:
         os.close(root)
+
+
+def _gate_npm_config_files(home, create):
+    identities = set()
+    for name in (NPM_USER_CONFIG_NAME, NPM_GLOBAL_CONFIG_NAME):
+        if create:
+            descriptor = os.open(
+                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=home,
+            )
+            try:
+                os.fchown(descriptor, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
+                os.fchmod(descriptor, 0o444)
+            finally:
+                os.close(descriptor)
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=home)
+        try:
+            details = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (not stat.S_ISREG(details.st_mode) or details.st_size != 0 or details.st_nlink != 1
+                or stat.S_IMODE(details.st_mode) != 0o444
+                or details.st_uid != linux_harness.CHILD_UID or details.st_gid != linux_harness.CHILD_GID):
+            raise SourceBuildRefusal("gate")
+        identities.add((details.st_dev, details.st_ino))
+    if len(identities) != 2:
+        raise SourceBuildRefusal("gate")
 
 
 def _prepare_worker_tree(source, tarball_index, environ):
@@ -2132,14 +2169,17 @@ def _audit_nodes_are_dev_only(nodes, packages, name, versions):
             raise _audit_refuse("audit_nodes_shape")
         if entry.get("dev") is not True:
             raise _audit_refuse("audit_nondev")
-        if versions is not None and entry.get("version") not in versions:
+        if versions is not None and (type(entry.get("version")) is not str or entry["version"] not in versions):
             raise _audit_refuse("audit_version_not_allowed")
 
 
 def _audit_versions_are_dev_only(packages, name, versions):
     for path, entry in packages.items():
-        if (type(entry) is dict and _locked_node_name(path) == name
-                and entry.get("version") in versions and entry.get("dev") is not True):
+        if type(entry) is not dict or _locked_node_name(path) != name:
+            continue
+        if type(entry.get("version")) is not str:
+            raise _audit_refuse("audit_version_not_allowed")
+        if entry["version"] in versions and entry.get("dev") is not True:
             raise _audit_refuse("audit_nondev")
 
 
@@ -2246,6 +2286,8 @@ def _check_audit_report(stdout, allows, packages, now_ms, stderr=b""):
         count = counts.get(severity, 0)
         if type(count) is not int or count < 0:
             raise _audit_refuse("audit_count")
+    if "total" in counts and (type(counts["total"]) is not int or counts["total"] < 0):
+        raise _audit_refuse("audit_count")
     if counts.get("high", 0) != 0 or counts.get("critical", 0) != 0:
         raise _audit_refuse("audit_high")
     if (len(vulnerabilities) == 0) != (sum(counts.get(severity, 0) for severity in SEVERITY_RANK) == 0):
@@ -2255,6 +2297,7 @@ def _check_audit_report(stdout, allows, packages, now_ms, stderr=b""):
     matched = 0
     rooted = set()
     consumers = {}
+    tally = dict.fromkeys(SEVERITY_RANK, 0)
     for key, entry in vulnerabilities.items():
         if type(entry) is not dict:
             raise _audit_refuse("audit_entry_shape")
@@ -2265,6 +2308,7 @@ def _check_audit_report(stdout, allows, packages, now_ms, stderr=b""):
             raise _audit_refuse("audit_key_name")
         if type(severity) is not str or severity not in ALLOWABLE_SEVERITIES:
             raise _audit_refuse("audit_severity")
+        tally[severity] += 1
         if type(via) is not list or not 0 < len(via) <= MAX_AUDIT_VIA:
             raise _audit_refuse("audit_via_shape")
         advisory_versions = set()
@@ -2293,9 +2337,41 @@ def _check_audit_report(stdout, allows, packages, now_ms, stderr=b""):
                 raise _audit_refuse("audit_consumer_over_ceiling")
             _audit_nodes_are_dev_only(entry.get("nodes"), packages, key, None)
             consumers[key] = listed
-    if any(name not in _audit_reached_from_advisories(rooted, consumers) for name in consumers):
+    if not consumers.keys() <= _audit_reached_from_advisories(rooted, consumers):
         raise _audit_refuse("audit_consumer_unreached")
+    if (any(counts.get(severity, 0) != tally[severity] for severity in SEVERITY_RANK)
+            or counts.get("total", len(vulnerabilities)) != len(vulnerabilities)):
+        raise _audit_refuse("audit_count")
     return len(vulnerabilities), matched, expected_exit
+
+
+def _audit_config_files(private):
+    paths = []
+    identities = set()
+    for name in (NPM_USER_CONFIG_NAME, NPM_GLOBAL_CONFIG_NAME):
+        path = private / name
+        try:
+            existing = path.lstat()
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and (not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1):
+            raise _audit_refuse("audit_run")
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            details = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if (not stat.S_ISREG(details.st_mode) or details.st_size != 0 or details.st_nlink != 1
+                or stat.S_IMODE(details.st_mode) != 0o600 or details.st_uid != os.geteuid()):
+            raise _audit_refuse("audit_run")
+        identities.add((details.st_dev, details.st_ino))
+        paths.append(str(path))
+    if len(set(paths)) != 2 or len(identities) != 2:
+        raise _audit_refuse("audit_run")
+    return paths[0], paths[1]
 
 
 def run_trusted_audit(environ=None):
@@ -2313,18 +2389,22 @@ def run_trusted_audit(environ=None):
         record = _validate_provenance_binding(identity, env)
         allows = record["advisory"]["findings"]
         valid_until = record["advisory"]["valid_until"]
-    except (SourceBuildRefusal, OSError, ValueError, KeyError, TypeError):
+    except SourceBuildRefusal as refusal:
+        raise SourceBuildRefusal(refusal.reason, "audit_provenance") from None
+    except (OSError, ValueError, KeyError, TypeError):
         raise _audit_refuse("audit_provenance") from None
     if time.time() * 1000 >= valid_until * 1000:
         raise _audit_refuse("audit_advisory_expired")
     private = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-audit"
     private.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
+        user_config, global_config = _audit_config_files(private)
         result = _run(
             (str(node), str(npm), "audit", "--package-lock-only", "--json"), source,
             {"PATH": str(node.parent) + ":/usr/bin:/bin", "HOME": str(private), "TMPDIR": str(private),
-             "LANG": "C", "LC_ALL": "C", "NPM_CONFIG_USERCONFIG": "/dev/null",
-             "NPM_CONFIG_GLOBALCONFIG": "/dev/null", "NPM_CONFIG_CACHE": str(private / "cache")},
+             "LANG": "C", "LC_ALL": "C", "NPM_CONFIG_USERCONFIG": user_config,
+             "NPM_CONFIG_GLOBALCONFIG": global_config, "NPM_CONFIG_UPDATE_NOTIFIER": "false",
+             "NPM_CONFIG_CACHE": str(private / "cache")},
             timeout=120, maximum=4 * 1024 * 1024,
         )
     except Exception:
@@ -2435,10 +2515,14 @@ def run_project_gates(environ=None):
             "CARGO_TARGET_DIR": str(worker / "target"), "CARGO_NET_OFFLINE": "true",
             "CARGO_INCREMENTAL": "0", "NPM_CONFIG_OFFLINE": "true",
             "NPM_CONFIG_CACHE": str(worker / ".npm-cache"),
-            "NPM_CONFIG_USERCONFIG": "/dev/null", "NPM_CONFIG_GLOBALCONFIG": "/dev/null",
+            "NPM_CONFIG_USERCONFIG": str(worker / ".home" / NPM_USER_CONFIG_NAME),
+            "NPM_CONFIG_GLOBALCONFIG": str(worker / ".home" / NPM_GLOBAL_CONFIG_NAME),
+            "NPM_CONFIG_UPDATE_NOTIFIER": "false",
             "npm_config_offline": "true",
-            "npm_config_cache": str(worker / ".npm-cache"), "npm_config_userconfig": "/dev/null",
-            "npm_config_globalconfig": "/dev/null",
+            "npm_config_cache": str(worker / ".npm-cache"),
+            "npm_config_userconfig": str(worker / ".home" / NPM_USER_CONFIG_NAME),
+            "npm_config_globalconfig": str(worker / ".home" / NPM_GLOBAL_CONFIG_NAME),
+            "npm_config_update_notifier": "false",
             "PYTHONDONTWRITEBYTECODE": "1", "CI": "true",
         }
         nonce = os.urandom(12).hex()

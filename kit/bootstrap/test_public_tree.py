@@ -308,6 +308,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_macos_core_contract.py',
             'kit/confinement/linux_source_build.py',
             'kit/confinement/test_linux_source_build.py',
+            'kit/confinement/fixtures/npm11_audit_report.json',
             '.github/workflows/core-linux-quick-return.yml',
             'core-ci/linux_quick_return.py',
             'core-ci/test_linux_quick_return.py',
