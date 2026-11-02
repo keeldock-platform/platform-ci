@@ -14,7 +14,7 @@ LINUX_LINE = (
     "KD-CONFINEMENT-VERDICT schema=1 confinement=accepted os=linux boundary=linux-ns-seccomp-uid"
     " control-sha=" + SHA + " run-id=40123456789 run-attempt=1 " + BLOCKED_TOKENS
     + " memory-canary=absent readable-file-canary=absent handoff=not-applicable"
-    " project-execution=completed gates=13 failed=0 token-revocation=confirmed"
+    " project-execution=completed gates=15 failed=0 token-revocation=confirmed"
 )
 WINDOWS_LINE = (
     LINUX_LINE.replace("os=linux boundary=linux-ns-seccomp-uid", "os=windows boundary=lpac-job")
@@ -36,7 +36,7 @@ def _record(os_name="linux", **updates):
         "readable_file_canary": "absent",
         "handoff": "not-applicable" if os_name == "linux" else "verified",
         "project_execution": "completed",
-        "gates": 13,
+        "gates": 15,
         "failed": 0,
         "token_revocation": "confirmed",
     }
@@ -69,9 +69,9 @@ class VocabularyTests(unittest.TestCase):
         self.assertEqual(subject.CHANNEL_STATUSES, ("blocked", "observed-leak", "not-run"))
         self.assertEqual(subject.CANARY_RESULTS, ("absent", "present", "not-run"))
         self.assertEqual(subject.OPERATING_SYSTEMS, ("linux", "windows"))
-        self.assertEqual(subject.REQUIRED_GATES, 13)
-        self.assertEqual(subject.MAX_GATES, 16)
-        self.assertEqual(subject.ACCEPTED_GATE_COUNTS, (13, 16))
+        self.assertEqual(subject.REQUIRED_GATES, 15)
+        self.assertEqual(subject.MAX_GATES, 18)
+        self.assertEqual(subject.ACCEPTED_GATE_COUNTS, (15, 18))
 
     def test_field_order_covers_every_record_field_once(self):
         self.assertEqual(len(subject.FIELD_ORDER), len(set(subject.FIELD_ORDER)))
@@ -167,8 +167,10 @@ class AcceptanceTests(unittest.TestCase):
             {"project_execution": "not_started", "gates": 0},
             {"project_execution": "failed"},
             {"gates": 12},
+            {"gates": 13},
             {"gates": 14},
-            {"gates": 15},
+            {"gates": 16},
+            {"gates": 17},
             {"failed": 1},
             {"token_revocation": "unconfirmed"},
             {"token_revocation": "not-applicable"},
@@ -179,14 +181,27 @@ class AcceptanceTests(unittest.TestCase):
                 self.assertTrue(subject.confinement_accepted(record))
                 self.assertFalse(subject.run_accepted(record))
 
-    def test_sixteen_gate_run_is_accepted_and_round_trips_through_the_public_line(self):
-        record = _record(gates=16)
+    def test_full_and_runtime_gate_runs_are_accepted_and_round_trip_through_the_public_line(self):
+        record = _record(gates=18)
         self.assertTrue(subject.run_accepted(record))
         line = subject.encode_line(record)
-        self.assertIn(" gates=16 failed=0 ", line)
+        self.assertIn(" gates=18 failed=0 ", line)
         self.assertEqual(subject.decode_line(line), record)
-        self.assertFalse(subject.run_accepted(_record(gates=16, failed=1)))
-        self.assertTrue(subject.run_accepted(_record(gates=13)))
+        self.assertFalse(subject.run_accepted(_record(gates=18, failed=1)))
+        self.assertTrue(subject.run_accepted(_record(gates=15)))
+
+    def test_the_windows_run_uses_the_same_gate_counts_and_still_needs_a_verified_handoff(self):
+        for gates in (15, 18):
+            with self.subTest(gates=gates):
+                self.assertTrue(subject.run_accepted(_record("windows", gates=gates)))
+                line = subject.encode_line(_record("windows", gates=gates))
+                self.assertIn(" gates=" + str(gates) + " failed=0 ", line)
+                self.assertTrue(subject.run_accepted(subject.decode_line(line)))
+        for gates in (13, 14, 16, 17):
+            with self.subTest(gates=gates):
+                self.assertFalse(subject.run_accepted(_record("windows", gates=gates)))
+        self.assertFalse(subject.run_accepted(_record("windows", gates=15, handoff="failed")))
+        self.assertFalse(subject.run_accepted(_record("windows", gates=18, handoff="not-run")))
 
 
 class RecordValidationTests(unittest.TestCase):
@@ -236,7 +251,7 @@ class RecordValidationTests(unittest.TestCase):
             {"run_attempt": 0}, {"run_attempt": 100}, {"run_attempt": 1.0},
             {"memory_canary": "missing"}, {"readable_file_canary": ""},
             {"handoff": "ok"}, {"project_execution": "done"}, {"token_revocation": "yes"},
-            {"gates": 17}, {"gates": -1}, {"gates": True}, {"failed": 17}, {"failed": "0"},
+            {"gates": 19}, {"gates": -1}, {"gates": True}, {"failed": 19}, {"failed": "0"},
         )
         for updates in bad_updates:
             with self.subTest(updates=updates):
@@ -306,7 +321,7 @@ class DecodeTests(unittest.TestCase):
             "os=linux": "os=macos",
             "run-id=40123456789": "run-id=0401",
             "run-attempt=1": "run-attempt=0",
-            "gates=13": "gates=17",
+            "gates=15": "gates=19",
             "failed=0": "failed=01",
             "https=blocked/1/1": "https=blocked/2/1",
             "dns=blocked/1/1": "dns=blocked/1",
