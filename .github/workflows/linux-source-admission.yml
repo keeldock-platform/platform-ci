@@ -35,13 +35,14 @@ on:
         description: Protected source-read environment
         required: false
         type: string
-        default: source-read
+        default: linux-source-read
 permissions: {}
 cache-mode: none
 jobs:
   linux-source-admission-settings:
     if: ${{ github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') && (inputs.mode == 'source' || (inputs.mode == 'synthetic' && github.ref == 'refs/heads/main')) }}
     runs-on: ubuntu-24.04
+    environment: linux-source-read
     timeout-minutes: 15
     cache-mode: none
     permissions:
@@ -68,8 +69,8 @@ jobs:
       REQUESTED_FINGERPRINT: ${{ inputs.fingerprint }}
       REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}
       SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
-      SOURCE_REPOSITORY_OWNER: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
-      SOURCE_REPOSITORY_NAME: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
+      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
       SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
       SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
       LINUX_SOURCE_ALLOWED_SHA: ${{ vars.LINUX_SOURCE_ALLOWED_SHA }}
@@ -154,8 +155,7 @@ jobs:
       - linux-source-admission-unit
     if: ${{ github.event_name == 'workflow_dispatch' && needs.linux-source-admission-settings.result == 'success' && needs.linux-source-admission-unit.result == 'success' && (inputs.mode == 'source' || (inputs.mode == 'synthetic' && github.ref == 'refs/heads/main')) && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
     runs-on: ubuntu-24.04
-    environment:
-      name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}
+    environment: linux-source-read
     timeout-minutes: 120
     cache-mode: none
     permissions:
@@ -179,8 +179,8 @@ jobs:
       REQUESTED_FINGERPRINT: ${{ inputs.fingerprint }}
       REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}
       SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
-      SOURCE_REPOSITORY_OWNER: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
-      SOURCE_REPOSITORY_NAME: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
+      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
       SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
       SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
       LINUX_SOURCE_ALLOWED_SHA: ${{ vars.LINUX_SOURCE_ALLOWED_SHA }}
@@ -250,8 +250,8 @@ jobs:
         with:
           client-id: ${{ vars.SOURCE_READER_CLIENT_ID }}
           private-key: ${{ env.SOURCE_READER_PRIVATE_KEY }}
-          owner: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
-          repositories: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
+          owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+          repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}
           permission-contents: read
           skip-token-revoke: true
       - name: Verify selected installation identity
@@ -316,7 +316,7 @@ jobs:
             arguments+=(--synthetic-standin)
           fi
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
-      - name: Run all thirteen offline project gates
+      - name: Run all offline project gates
         if: ${{ inputs.mode == 'source' }}
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
@@ -348,8 +348,7 @@ jobs:
       - linux-source-admission-source-read
     if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
     runs-on: ubuntu-24.04
-    environment:
-      name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}
+    environment: linux-source-read
     timeout-minutes: 120
     cache-mode: none
     permissions:
@@ -374,8 +373,8 @@ jobs:
       REQUESTED_FINGERPRINT: ${{ inputs.fingerprint }}
       REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}
       SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
-      SOURCE_REPOSITORY_OWNER: ${{ vars.LINUX_SOURCE_REPOSITORY_OWNER }}
-      SOURCE_REPOSITORY_NAME: ${{ vars.LINUX_SOURCE_REPOSITORY_NAME }}
+      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
       SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}
       SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}
       LINUX_SOURCE_ALLOWED_SHA: ${{ vars.LINUX_SOURCE_ALLOWED_SHA }}
@@ -488,7 +487,7 @@ jobs:
             arguments+=(--synthetic-standin)
           fi
           sudo -n --preserve-env=KD_CANARY_SECRET python3 -B kit/confinement/linux_boundary.py recheck "${arguments[@]}" --record "$RUNNER_TEMP/kd-records/recheck.json"
-      - name: Run independent thirteen offline project gates
+      - name: Run independent offline project gates
         if: ${{ inputs.mode == 'source' }}
         env:
           WORKER_PATH: ${{ steps.verifier-project.outputs.worker_path }}
@@ -516,8 +515,7 @@ jobs:
       - linux-source-admission-verdict
     if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
     runs-on: ubuntu-24.04
-    environment:
-      name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}
+    environment: linux-source-read
     timeout-minutes: 15
     cache-mode: none
     permissions:

@@ -116,7 +116,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Run trusted dependency audit",
                 "Prepare offline project inputs",
                 "Re-run positive controls immediately before the first project command",
-                "Run all thirteen offline project gates",
+                "Run all offline project gates",
                 "Merge confinement phase records",
                 "Forced faults must fail closed",
             ),
@@ -133,7 +133,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             "Run independent trusted dependency audit",
             "Prepare independent offline project inputs",
             "Re-run independent positive controls before project execution",
-            "Run independent thirteen offline project gates",
+            "Run independent offline project gates",
             "Merge independent confinement records", "Verify unprivileged proof handoff",
             "Publish confinement verdict",
         ))
@@ -148,7 +148,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Fetch npm tarballs by committed lock integrity",
                 "Run trusted dependency audit",
                 "Prepare offline project inputs",
-                "Run all thirteen offline project gates",
+                "Run all offline project gates",
                 "Forced faults must fail closed",
             )),
         )
@@ -196,11 +196,11 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Require trusted Rust licence admission",
                 "Fetch npm tarballs by committed lock integrity",
                 "Prepare offline project inputs",
-                "Run all thirteen offline project gates",
+                "Run all offline project gates",
                 "Require trusted Rust licence admission independently",
                 "Fetch independent npm tarballs by lock integrity",
                 "Prepare independent offline project inputs",
-                "Run independent thirteen offline project gates"):
+                "Run independent offline project gates"):
             match = re.search(
                 r"(?ms)^      - name: " + re.escape(name)
                 + r"\n(.*?)(?=^      - name: |^  linux-source-admission-)",
@@ -211,7 +211,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertIn("Require trusted Rust licence admission", blocks)
         self.assertIn("REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}",
                       blocks["Require trusted Rust licence admission"])
-        self.assertIn("REQUESTED_SOURCE_SHA", blocks["Run all thirteen offline project gates"])
+        self.assertIn("REQUESTED_SOURCE_SHA", blocks["Run all offline project gates"])
         independent_gate = workflow[
             workflow.index("      - name: Revoke verifier token and verify rejection"):
             workflow.index("      - name: Fetch independent npm tarballs by lock integrity")
@@ -226,13 +226,13 @@ class LinuxSourceBuildTests(unittest.TestCase):
                         workflow.index("Prepare offline project inputs"))
         self.assertLess(workflow.index("Require trusted Rust licence admission independently"),
                         workflow.index("Prepare independent offline project inputs"))
-        verifier_gates = workflow[workflow.index("      - name: Run independent thirteen offline project gates"):]
+        verifier_gates = workflow[workflow.index("      - name: Run independent offline project gates"):]
         verifier_gate_step = verifier_gates.split("\n      - name:", 1)[0]
         self.assertIn("REQUESTED_SOURCE_SHA", verifier_gate_step)
         self.assertIn("preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA",
                       verifier_gates)
         self.assertIn("preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA",
-                      blocks["Run all thirteen offline project gates"])
+                      blocks["Run all offline project gates"])
 
     def test_expected_run_assigns_the_plain_verdict_job_and_action_post(self):
         base = {"CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1"}
@@ -248,10 +248,18 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertEqual(source["jobs"]["linux-source-admission-source-read"]["steps"][-1], "Post Mint scoped source-reader token")
         self.assertNotIn("Post Mint scoped source-reader token", synthetic["jobs"]["linux-source-admission-source-read"]["steps"])
 
-    def test_toolchain_versions_are_pinned_and_node_digest_is_a_coordinator_constant(self):
+    def test_toolchain_versions_are_pinned_and_the_node_archive_digest_is_the_official_release_digest(self):
         self.assertEqual(linux_source_build.NODE_VERSION, "24.22.1")
         self.assertEqual(linux_source_build.NPM_VERSION, "11.19.1")
-        self.assertTrue(linux_source_build.NODE_LINUX_TARBALL_SHA256.startswith("COORDINATOR_FILL_"))
+        self.assertRegex(linux_source_build.NODE_LINUX_TARBALL_SHA256, r"\A[a-f0-9]{64}\Z")
+        self.assertEqual(
+            linux_source_build.NODE_LINUX_TARBALL_SHA256,
+            "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6",
+        )
+        source = Path(linux_source_build.__file__).read_text(encoding="utf-8")
+        self.assertIn('"/node-v" + NODE_VERSION + "-linux-x64.tar.xz"', source)
+        self.assertIn('node_archive = root / "node-linux-x64.tar.xz"', source)
+        self.assertNotIn("COORDINATOR_FILL" + "_NODE", linux_source_build.NODE_LINUX_TARBALL_SHA256)
         self.assertEqual(len(linux_source_build.RUST_COMPONENTS), 5)
         for name, url, digest in linux_source_build.RUST_COMPONENTS:
             with self.subTest(component=name):
@@ -583,7 +591,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             "SOURCE_READER_CLIENT_ID": "client", "LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256": "f" * 64,
             "LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256": "1" * 64,
             "LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": "{}",
-            "LINUX_SOURCE_ENVIRONMENT_NAME": "source-read", "REQUESTED_ENVIRONMENT_NAME": "source-read",
+            "LINUX_SOURCE_ENVIRONMENT_NAME": "linux-source-read", "REQUESTED_ENVIRONMENT_NAME": "linux-source-read",
         }
         with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
@@ -591,7 +599,113 @@ class LinuxSourceBuildTests(unittest.TestCase):
             provenance.assert_not_called()
             env["LINUX_SOURCE_ALLOWED_FINGERPRINT"] = fingerprint
             self.assertEqual(linux_source_build._source_inputs(env)["reviewed_diff_sha256"], fingerprint)
+            self.assertEqual(env["LINUX_SOURCE_ENVIRONMENT_NAME"], linux_source_build.ENVIRONMENT_NAME)
             provenance.assert_called_once()
+            for name, value in (("LINUX_SOURCE_ENVIRONMENT_NAME", "source-read"), ("REQUESTED_ENVIRONMENT_NAME", "source-read")):
+                with self.subTest(name=name):
+                    changed = dict(env, **{name: value})
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._source_inputs(changed)
+            provenance.assert_called_once()
+
+    def _environment_calls(self, environment_updates=None, branch_names=("main", "untrusted"),
+                           listing_updates=None, status=200):
+        environment = {
+            "name": "linux-source-read", "can_admins_bypass": False,
+            "deployment_branch_policy": {"custom_branch_policies": True, "protected_branches": False},
+        }
+        environment.update(environment_updates or {})
+        entries = [{"id": index + 1, "name": name, "type": "branch"} for index, name in enumerate(branch_names)]
+        listing = {"total_count": len(entries), "branch_policies": entries}
+        listing.update(listing_updates or {})
+        calls = []
+
+        def fake(path, token, method="GET", payload=None, expected=(200,)):
+            calls.append((path, method, token))
+            if path.endswith("/deployment-branch-policies?per_page=100"):
+                return 200, listing
+            return status, (environment if status == 200 else None)
+
+        return fake, calls
+
+    def test_environment_readback_accepts_only_the_reviewed_names_and_branch_policy(self):
+        fake, calls = self._environment_calls()
+        with patch.object(linux_source_build, "_api_request", side_effect=fake):
+            self.assertIsNone(linux_source_build._verify_environment("token"))
+        base = "/repos/" + linux_source_build.REPOSITORY + "/environments/linux-source-read"
+        self.assertEqual(calls, [
+            (base, "GET", "token"),
+            (base + "/deployment-branch-policies?per_page=100", "GET", "token"),
+        ])
+        self.assertEqual(linux_source_build.ENVIRONMENT_NAME, "linux-source-read")
+        self.assertEqual(linux_source_build.ENVIRONMENT_BRANCHES, ("main", "untrusted"))
+        fake, calls = self._environment_calls(branch_names=("untrusted", "main"))
+        with patch.object(linux_source_build, "_api_request", side_effect=fake):
+            self.assertIsNone(linux_source_build._verify_environment("token"))
+
+    def test_environment_readback_refuses_every_other_policy_shape(self):
+        refused_policy = {"custom_branch_policies": True, "protected_branches": False}
+        cases = (
+            {"status": 404},
+            {"environment_updates": {"name": "source-read"}},
+            {"environment_updates": {"can_admins_bypass": True}},
+            {"environment_updates": {"can_admins_bypass": None}},
+            {"environment_updates": {"can_admins_bypass": "false"}},
+            {"environment_updates": {"deployment_branch_policy": None}},
+            {"environment_updates": {"deployment_branch_policy": dict(refused_policy, custom_branch_policies=False)}},
+            {"environment_updates": {"deployment_branch_policy": dict(refused_policy, protected_branches=True)}},
+            {"environment_updates": {"deployment_branch_policy": {"custom_branch_policies": True}}},
+            {"branch_names": ("main",)},
+            {"branch_names": ("untrusted",)},
+            {"branch_names": ()},
+            {"branch_names": ("main", "untrusted", "develop")},
+            {"branch_names": ("main", "develop")},
+            {"branch_names": ("main", "main")},
+            {"branch_names": ("main", "untrusted*")},
+            {"listing_updates": {"total_count": 3}},
+            {"listing_updates": {"total_count": "2"}},
+            {"listing_updates": {"branch_policies": "main"}},
+            {"listing_updates": {"branch_policies": [{"name": "main", "type": "tag"}, {"name": "untrusted", "type": "branch"}]}},
+            {"listing_updates": {"branch_policies": [{"name": 7, "type": "branch"}, {"name": "untrusted", "type": "branch"}]}},
+            {"listing_updates": {"branch_policies": ["main", "untrusted"]}},
+        )
+        for index, case in enumerate(cases):
+            with self.subTest(index=index, case=case):
+                fake, calls = self._environment_calls(**case)
+                with patch.object(linux_source_build, "_api_request", side_effect=fake):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._verify_environment("token")
+        with patch.object(linux_source_build, "_api_request", side_effect=AssertionError("no request")):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build._verify_environment("token", "source-read")
+
+    def test_dispatch_reads_back_the_environment_after_binding_and_before_the_duplicate_check(self):
+        sha = "a" * 40
+        env = {
+            "CI_EVENT_NAME": "workflow_dispatch", "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "CI_SERVER_URL": "https://github.com", "CACHE_MODE": "none",
+            "CI_SHA": sha, "GITHUB_SHA": sha, "CI_REF": "refs/heads/untrusted", "CI_MODE": "source",
+        }
+        order = []
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(
+            linux_source_build, "_source_inputs", side_effect=lambda unused: order.append("binding") or {}
+        ), patch.object(
+            linux_source_build, "_verify_environment", side_effect=lambda token: order.append("environment")
+        ), patch.object(
+            linux_source_build, "_require_no_duplicate", side_effect=lambda token, unused: order.append("duplicate")
+        ):
+            self.assertEqual(linux_source_build.validate_dispatch(env, "token"), "source")
+        self.assertEqual(order, ["binding", "environment", "duplicate"])
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(linux_source_build, "_source_inputs", return_value={}), patch.object(
+            linux_source_build, "_verify_environment", side_effect=linux_source_build.SourceBuildRefusal("binding")
+        ), patch.object(linux_source_build, "_require_no_duplicate") as duplicate:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build.validate_dispatch(env, "token")
+            duplicate.assert_not_called()
 
     def test_default_checkout_environment_reaches_the_source_fetch(self):
         identity = {"owner": "owner", "name": "source", "repository_id": "7", "source_sha": "a" * 40}
@@ -808,10 +922,13 @@ class LinuxSourceBuildTests(unittest.TestCase):
             }
             with patch.dict(os.environ, env, clear=True), patch.object(
                 linux_source_build, "_reference_sha", side_effect=[sha, "b" * 40]
-            ) as references, patch.object(linux_source_build, "_comparison", return_value="ahead") as comparison:
+            ) as references, patch.object(linux_source_build, "_comparison", return_value="ahead") as comparison, patch.object(
+                linux_source_build, "_verify_environment"
+            ) as environment:
                 self.assertEqual(linux_source_build.main(["preflight"]), 0)
                 self.assertEqual(references.call_count, 2)
                 comparison.assert_called_once()
+                environment.assert_called_once_with("read-token")
                 output = io.StringIO()
                 with patch.object(linux_source_build.sys, "stdout", output):
                     self.assertEqual(linux_source_build.main(["verdict"]), 0)
@@ -890,6 +1007,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "CI_MODE": "source", "PRODUCER_RESULT": "success",
             }
             trusted = linux_source_build._verdict_record(env)
+            self.assertEqual(trusted["gates"], 13)
             self.assertTrue(confinement_verdict.run_accepted(trusted))
             with patch.object(linux_source_build.sys, "stdout", io.StringIO()):
                 self.assertEqual(linux_source_build.emit_verdict(env), 0)
@@ -907,7 +1025,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             (records / "revocation.json").write_text(json.dumps(receipt), encoding="ascii")
             self.assertEqual(linux_source_build._verdict_record(env)["token_revocation"], "unconfirmed")
 
-    def test_runtime_receipt_records_all_three_stages_without_changing_public_summary_shape(self):
+    def test_runtime_receipt_records_all_three_stages_and_the_public_verdict_reports_sixteen_gates(self):
         with tempfile.TemporaryDirectory() as temporary:
             records = Path(temporary) / "kd-records"
             records.mkdir()
@@ -940,7 +1058,9 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "CI_MODE": "source", "PRODUCER_RESULT": "success",
             }
             public_record = linux_source_build._verdict_record(env)
-            self.assertEqual(public_record["gates"], 13)
+            self.assertEqual(public_record["gates"], 16)
+            self.assertEqual(len(selected), 16)
+            self.assertIn(" gates=16 failed=0 ", confinement_verdict.encode_line(public_record))
             self.assertTrue(confinement_verdict.run_accepted(public_record))
             gates["completed_gates"] = list(selected[:-1])
             (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
@@ -1022,7 +1142,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         with self.assertRaises(confinement_public_audit.AuditRefusal):
             confinement_public_audit._check_section(bad, job, expected)
 
-    def _write_manifests(self, directory, root_extra=None, workspace_extra=None):
+    def _write_manifests(self, directory, root_extra=None, workspace_extra=None, kernel_extra=None):
         root = {
             "name": "synthetic-root", "version": "1.0.0", "workspaces": ["packages/*"],
             "devDependencies": {"typescript": "6.0.3"},
@@ -1032,8 +1152,12 @@ class LinuxSourceBuildTests(unittest.TestCase):
         package.update(workspace_extra or {})
         base = Path(directory)
         (base / "packages/host-api").mkdir(parents=True)
+        (base / "packages/kernel-i18n").mkdir(parents=True)
+        kernel = {"name": "@synthetic/kernel-i18n", "version": "1.0.0"}
+        kernel.update(kernel_extra or {})
         (base / "package.json").write_text(json.dumps(root), encoding="ascii")
         (base / "packages/host-api/package.json").write_text(json.dumps(package), encoding="ascii")
+        (base / "packages/kernel-i18n/package.json").write_text(json.dumps(kernel), encoding="ascii")
         return base
 
     def test_manifest_digest_binds_the_exact_root_override_and_refuses_everything_else(self):
@@ -1063,6 +1187,58 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 with self.assertRaises(linux_source_build.SourceBuildRefusal):
                     linux_source_build._manifest_digest(base)
 
+    def test_manifest_digest_binds_every_reviewed_workspace_in_the_shared_order(self):
+        self.assertEqual(
+            linux_source_build.MANIFEST_WORKSPACE_PATHS,
+            ("packages/host-api", "packages/kernel-i18n"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = linux_source_build._manifest_digest(self._write_manifests(Path(directory) / "base"))
+        expected = {
+            "root": {
+                "name": "synthetic-root", "version": "1.0.0", "workspaces": ["packages/*"],
+                "devDependencies": {"typescript": "6.0.3"},
+            },
+            "workspaces": [
+                {"path": "packages/host-api", "name": "@synthetic/host-api", "version": "1.0.0"},
+                {"path": "packages/kernel-i18n", "name": "@synthetic/kernel-i18n", "version": "1.0.0"},
+            ],
+        }
+        encoded = json.dumps(
+            expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+        ).encode("ascii")
+        self.assertEqual(baseline, hashlib.sha256(encoded).hexdigest())
+        for index, kernel_extra in enumerate((
+            {"version": "1.0.1"}, {"name": "@synthetic/kernel-other"},
+            {"dependencies": {"left-pad": "1.3.0"}}, {"devDependencies": {"typescript": "6.0.3"}},
+        )):
+            with self.subTest(kernel=kernel_extra), tempfile.TemporaryDirectory() as directory:
+                changed = linux_source_build._manifest_digest(
+                    self._write_manifests(Path(directory) / ("k%d" % index), None, None, kernel_extra)
+                )
+                self.assertNotEqual(changed, baseline)
+
+    def test_manifest_digest_refuses_an_unreviewed_kernel_workspace_manifest(self):
+        for index, kernel_extra in enumerate((
+            {"overrides": {"lightningcss": "1.33.0"}}, {"resolutions": {"a": "1.0.0"}},
+            {"bundleDependencies": ["a"]}, {"bundledDependencies": ["a"]},
+            {"dependencies": {"left-pad": "git+https://example.invalid/left-pad.git"}},
+            {"dependencies": {"left-pad": "file:../left-pad"}},
+            {"dependencies": {"Bad Name": "1.0.0"}}, {"version": 1},
+        )):
+            with self.subTest(kernel=kernel_extra), tempfile.TemporaryDirectory() as directory:
+                base = self._write_manifests(Path(directory) / ("k%d" % index), None, None, kernel_extra)
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build._manifest_digest(base)
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write_manifests(Path(directory) / "missing")
+            (base / "packages/kernel-i18n/package.json").unlink()
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._manifest_digest(base)
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write_manifests(Path(directory) / "narrow", {"workspaces": ["packages/host-api"]})
+            with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                linux_source_build._manifest_digest(base)
 
 
 if __name__ == "__main__":

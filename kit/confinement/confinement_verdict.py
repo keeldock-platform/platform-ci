@@ -24,6 +24,9 @@ SCHEMA_VERSION = 1
 LINE_PREFIX = "KD-CONFINEMENT-VERDICT"
 MAX_LINE_BYTES = 1024
 REQUIRED_GATES = 13
+RUNTIME_GATES = 3
+MAX_GATES = REQUIRED_GATES + RUNTIME_GATES
+ACCEPTED_GATE_COUNTS = (REQUIRED_GATES, MAX_GATES)
 MAX_RUN_ID = 9007199254740991
 CHANNELS = (
     "https",
@@ -121,7 +124,7 @@ def validate_record(record):
         _refuse("value")
     if (record["os"] == "linux") != (record["handoff"] == "not-applicable"):
         _refuse("inconsistent")
-    if not _exact_int(record["gates"], 0, REQUIRED_GATES) or not _exact_int(record["failed"], 0, REQUIRED_GATES):
+    if not _exact_int(record["gates"], 0, MAX_GATES) or not _exact_int(record["failed"], 0, MAX_GATES):
         _refuse("value")
     if record["failed"] > record["gates"]:
         _refuse("inconsistent")
@@ -148,7 +151,7 @@ def run_accepted(record):
     """True only when the boundary is proved and every project gate ran and passed."""
     return (confinement_accepted(record)
             and record["project_execution"] == "completed"
-            and record["gates"] == REQUIRED_GATES
+            and record["gates"] in ACCEPTED_GATE_COUNTS
             and record["failed"] == 0
             and record["token_revocation"] == "confirmed")
 
@@ -267,8 +270,8 @@ def decode_line(raw):
         "readable_file_canary": fields["readable-file-canary"],
         "handoff": fields["handoff"],
         "project_execution": fields["project-execution"],
-        "gates": _decimal(COUNT_RE, fields["gates"], 0, REQUIRED_GATES),
-        "failed": _decimal(COUNT_RE, fields["failed"], 0, REQUIRED_GATES),
+        "gates": _decimal(COUNT_RE, fields["gates"], 0, MAX_GATES),
+        "failed": _decimal(COUNT_RE, fields["failed"], 0, MAX_GATES),
         "token_revocation": fields["token-revocation"],
     }
     validate_record(record)

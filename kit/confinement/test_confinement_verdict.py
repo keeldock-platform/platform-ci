@@ -70,6 +70,8 @@ class VocabularyTests(unittest.TestCase):
         self.assertEqual(subject.CANARY_RESULTS, ("absent", "present", "not-run"))
         self.assertEqual(subject.OPERATING_SYSTEMS, ("linux", "windows"))
         self.assertEqual(subject.REQUIRED_GATES, 13)
+        self.assertEqual(subject.MAX_GATES, 16)
+        self.assertEqual(subject.ACCEPTED_GATE_COUNTS, (13, 16))
 
     def test_field_order_covers_every_record_field_once(self):
         self.assertEqual(len(subject.FIELD_ORDER), len(set(subject.FIELD_ORDER)))
@@ -165,6 +167,8 @@ class AcceptanceTests(unittest.TestCase):
             {"project_execution": "not_started", "gates": 0},
             {"project_execution": "failed"},
             {"gates": 12},
+            {"gates": 14},
+            {"gates": 15},
             {"failed": 1},
             {"token_revocation": "unconfirmed"},
             {"token_revocation": "not-applicable"},
@@ -174,6 +178,15 @@ class AcceptanceTests(unittest.TestCase):
                 record = _record(**updates)
                 self.assertTrue(subject.confinement_accepted(record))
                 self.assertFalse(subject.run_accepted(record))
+
+    def test_sixteen_gate_run_is_accepted_and_round_trips_through_the_public_line(self):
+        record = _record(gates=16)
+        self.assertTrue(subject.run_accepted(record))
+        line = subject.encode_line(record)
+        self.assertIn(" gates=16 failed=0 ", line)
+        self.assertEqual(subject.decode_line(line), record)
+        self.assertFalse(subject.run_accepted(_record(gates=16, failed=1)))
+        self.assertTrue(subject.run_accepted(_record(gates=13)))
 
 
 class RecordValidationTests(unittest.TestCase):
@@ -223,7 +236,7 @@ class RecordValidationTests(unittest.TestCase):
             {"run_attempt": 0}, {"run_attempt": 100}, {"run_attempt": 1.0},
             {"memory_canary": "missing"}, {"readable_file_canary": ""},
             {"handoff": "ok"}, {"project_execution": "done"}, {"token_revocation": "yes"},
-            {"gates": 14}, {"gates": -1}, {"gates": True}, {"failed": 14}, {"failed": "0"},
+            {"gates": 17}, {"gates": -1}, {"gates": True}, {"failed": 17}, {"failed": "0"},
         )
         for updates in bad_updates:
             with self.subTest(updates=updates):
@@ -293,7 +306,7 @@ class DecodeTests(unittest.TestCase):
             "os=linux": "os=macos",
             "run-id=40123456789": "run-id=0401",
             "run-attempt=1": "run-attempt=0",
-            "gates=13": "gates=14",
+            "gates=13": "gates=17",
             "failed=0": "failed=01",
             "https=blocked/1/1": "https=blocked/2/1",
             "dns=blocked/1/1": "dns=blocked/1",

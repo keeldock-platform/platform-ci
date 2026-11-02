@@ -31,7 +31,7 @@ TOOLCHAIN_ROOT = Path("/tmp/kd-toolchains")
 PROJECT_ROOT = Path("/tmp/kd-project-worker")
 NODE_VERSION = "24.22.1"
 NPM_VERSION = "11.19.1"
-NODE_LINUX_TARBALL_SHA256 = "COORDINATOR_FILL_NODE_LINUX_TARBALL_24_22_1_SHA256"
+NODE_LINUX_TARBALL_SHA256 = "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6"
 SYNTHETIC_LOG_CANARY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 SOURCE_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
@@ -39,6 +39,8 @@ IMAGE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 OWNER_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
+ENVIRONMENT_NAME = "linux-source-read"
+ENVIRONMENT_BRANCHES = ("main", "untrusted")
 GATES = (
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
     "parser_format", "parser_clippy", "parser_replay", "node_dependency_prepare",
@@ -64,6 +66,7 @@ PROVENANCE_FIELDS = frozenset((
     "accepted_at_ms",
 ))
 IDENTITY_FIELDS = ("source_sha", "base_sha", "control_sha", "reviewed_diff_sha256")
+MANIFEST_WORKSPACE_PATHS = ("packages/host-api", "packages/kernel-i18n")
 MANIFEST_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 MANIFEST_PACKAGE_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$")
 MANIFEST_VERSION_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
@@ -84,7 +87,7 @@ SOURCE_STEP_NAMES = (
     "Run trusted dependency audit",
     "Prepare offline project inputs",
     "Re-run positive controls immediately before the first project command",
-    "Run all thirteen offline project gates",
+    "Run all offline project gates",
     "Merge confinement phase records",
     "Forced faults must fail closed",
 )
@@ -102,7 +105,7 @@ VERDICT_STEP_NAMES = (
     "Run independent trusted dependency audit",
     "Prepare independent offline project inputs",
     "Re-run independent positive controls before project execution",
-    "Run independent thirteen offline project gates",
+    "Run independent offline project gates",
     "Merge independent confinement records",
     "Verify unprivileged proof handoff",
     "Publish confinement verdict",
@@ -115,7 +118,7 @@ OPTIONAL_VERDICT_SYNTHETIC_STEPS = (
     "Fetch independent npm tarballs by lock integrity",
     "Run independent trusted dependency audit",
     "Prepare independent offline project inputs",
-    "Run independent thirteen offline project gates",
+    "Run independent offline project gates",
 )
 SETTINGS_STEP_NAMES = (
     "Fetch exact public control",
@@ -135,7 +138,7 @@ OPTIONAL_SOURCE_STEPS = frozenset((
     "Fetch npm tarballs by committed lock integrity",
     "Run trusted dependency audit",
     "Prepare offline project inputs",
-    "Run all thirteen offline project gates",
+    "Run all offline project gates",
     "Forced faults must fail closed",
 ))
 
@@ -249,7 +252,7 @@ def _source_inputs(environ):
             or HEX64_RE.fullmatch(environ["LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256"]) is None):
         raise SourceBuildRefusal("binding")
     if (environ.get("REQUESTED_ENVIRONMENT_NAME") != environ["LINUX_SOURCE_ENVIRONMENT_NAME"]
-            or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", environ["LINUX_SOURCE_ENVIRONMENT_NAME"]) is None):
+            or environ["LINUX_SOURCE_ENVIRONMENT_NAME"] != ENVIRONMENT_NAME):
         raise SourceBuildRefusal("binding")
     identity = {
         "source_sha": source_sha,
@@ -263,6 +266,33 @@ def _source_inputs(environ):
     }
     _validate_provenance_binding(identity, environ)
     return identity
+
+
+def _verify_environment(token, name=ENVIRONMENT_NAME):
+    if name != ENVIRONMENT_NAME:
+        raise SourceBuildRefusal("binding")
+    path = "/repos/" + REPOSITORY + "/environments/" + name
+    status, environment = _api_request(path, token, expected=(200, 404))
+    policy = environment.get("deployment_branch_policy") if type(environment) is dict else None
+    if (status != 200 or type(environment) is not dict or environment.get("name") != name
+            or environment.get("can_admins_bypass") is not False
+            or type(policy) is not dict
+            or policy.get("custom_branch_policies") is not True
+            or policy.get("protected_branches") is not False):
+        raise SourceBuildRefusal("binding")
+    status, listing = _api_request(path + "/deployment-branch-policies?per_page=100", token)
+    entries = listing.get("branch_policies") if type(listing) is dict else None
+    if (type(entries) is not list or len(entries) > 100
+            or type(listing.get("total_count")) is not int or listing["total_count"] != len(entries)):
+        raise SourceBuildRefusal("binding")
+    names = []
+    for entry in entries:
+        if (type(entry) is not dict or entry.get("type") != "branch"
+                or type(entry.get("name")) is not str):
+            raise SourceBuildRefusal("binding")
+        names.append(entry["name"])
+    if sorted(names) != sorted(ENVIRONMENT_BRANCHES):
+        raise SourceBuildRefusal("binding")
 
 
 def validate_dispatch(environ, api_token=None):
@@ -293,10 +323,12 @@ def validate_dispatch(environ, api_token=None):
     if mode == "synthetic":
         if ref != "refs/heads/main":
             raise SourceBuildRefusal("identity")
+        _verify_environment(api_token)
         return "synthetic"
     if mode != "source":
         raise SourceBuildRefusal("identity")
     identity = _source_inputs(environ)
+    _verify_environment(api_token)
     _require_no_duplicate(api_token, environ)
     return "source"
 
@@ -1097,7 +1129,7 @@ def _manifest_digest(source_root):
             raise SourceBuildRefusal("lock")
         workspaces = workspaces.get("packages")
     if (type(workspaces) is not list or len(workspaces) != 1
-            or workspaces[0] not in ("packages/*", "packages/host-api")):
+            or workspaces[0] != "packages/*"):
         raise SourceBuildRefusal("lock")
     root_expected = {"name": root["name"], "version": root["version"], "workspaces": workspaces}
     for group in MANIFEST_GROUPS:
@@ -1106,21 +1138,27 @@ def _manifest_digest(source_root):
     overrides = _manifest_root_overrides(root)
     if overrides is not None:
         root_expected["overrides"] = overrides
-    workspace_path = "packages/host-api"
-    if not any(pattern == workspace_path or pattern == "packages/*" and workspace_path.startswith("packages/")
+    workspace_paths = []
+    for workspace_path in MANIFEST_WORKSPACE_PATHS:
+        if any(pattern == workspace_path or pattern == "packages/*" and workspace_path.startswith("packages/")
                for pattern in workspaces):
+            workspace_paths.append(workspace_path)
+    if len(workspace_paths) != len(MANIFEST_WORKSPACE_PATHS):
         raise SourceBuildRefusal("lock")
-    package = _manifest_json(Path(source_root) / workspace_path / "package.json")
-    if (type(package) is not dict or type(package.get("name")) is not str
-            or type(package.get("version")) is not str
-            or any(key in package for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies"))):
-        raise SourceBuildRefusal("lock")
-    workspace_expected = {"path": workspace_path, "name": package["name"], "version": package["version"]}
-    for group in MANIFEST_GROUPS:
-        if group in package:
-            workspace_expected[group] = package[group]
-    workspace_names = {workspace_expected["name"]}
-    for manifest in (root_expected, workspace_expected):
+    workspace_manifests = []
+    for workspace_path in workspace_paths:
+        package = _manifest_json(Path(source_root) / workspace_path / "package.json")
+        if (type(package) is not dict or type(package.get("name")) is not str
+                or type(package.get("version")) is not str
+                or any(key in package for key in ("overrides", "resolutions", "bundleDependencies", "bundledDependencies"))):
+            raise SourceBuildRefusal("lock")
+        workspace_expected = {"path": workspace_path, "name": package["name"], "version": package["version"]}
+        for group in MANIFEST_GROUPS:
+            if group in package:
+                workspace_expected[group] = package[group]
+        workspace_manifests.append(workspace_expected)
+    workspace_names = {item["name"] for item in workspace_manifests}
+    for manifest in [root_expected] + workspace_manifests:
         for group in MANIFEST_GROUPS:
             dependencies = manifest.get(group, {})
             if type(dependencies) is not dict or len(dependencies) > 512:
@@ -1134,7 +1172,7 @@ def _manifest_digest(source_root):
                         raise SourceBuildRefusal("lock")
                 elif not MANIFEST_VERSION_RE.fullmatch(spec):
                     raise SourceBuildRefusal("lock")
-    expected = {"root": root_expected, "workspaces": [workspace_expected]}
+    expected = {"root": root_expected, "workspaces": workspace_manifests}
     try:
         encoded = json.dumps(
             expected, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
@@ -1892,11 +1930,11 @@ def verify_proof_handoff(environ=None):
     return 0
 
 
-def _verified_source_receipts(records, env):
+def _verified_gate_count(records, env):
     gates = _load_json(records / "gates.json")
     revoke = _load_json(records / "revocation.json")
     if type(gates) is not dict or type(gates.get("selected_gates")) is not list:
-        return False
+        return 0
     selected_gates = tuple(gates["selected_gates"])
     expected_gate_sets = (GATES, GATES + RUNTIME_GATE_NAMES)
     if (set(gates) != {
@@ -1917,8 +1955,8 @@ def _verified_source_receipts(records, env):
             or revoke.get("run_attempt") != env.get("GITHUB_RUN_ATTEMPT")
             or revoke.get("installation_id") != env.get("SOURCE_READER_INSTALLATION_ID")
             or revoke.get("rejected_after_revoke") is not True):
-        return False
-    return True
+        return 0
+    return len(selected_gates)
 
 
 def _verdict_record(environ):
@@ -1942,9 +1980,10 @@ def _verdict_record(environ):
         }
         memory = merged.get("memory_canary", "not-run")
         readable = merged.get("readable_file_canary", "not-run")
-        accepted_source = mode == "source" and _verified_source_receipts(records, env)
+        verified_gates = _verified_gate_count(records, env) if mode == "source" else 0
+        accepted_source = verified_gates > 0
         project = "completed" if accepted_source else "not_started"
-        gate_count = 13 if accepted_source else 0
+        gate_count = verified_gates
         failed = 0
         token_state = "confirmed" if accepted_source else "not-applicable" if mode == "synthetic" else "unconfirmed"
         record = {

@@ -190,7 +190,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/untrusted'", source)
         self.assertIn("inputs.mode == 'source'", source)
         self.assertIn("inputs.mode == 'synthetic' && github.ref == 'refs/heads/main'", source)
-        self.assertIn("name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}", source)
+        self.assertIn("    environment: linux-source-read\n", source)
         self.assertIn("REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}", source)
         self.assertIn("LINUX_SOURCE_ENVIRONMENT_NAME: ${{ vars.LINUX_SOURCE_ENVIRONMENT_NAME }}", source)
         self.assertNotIn("pull_request:", self.text)
@@ -246,6 +246,51 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertNotIn("KD_CANARY_SECRET", self.jobs()["linux-source-admission-settings"])
         self.assertNotIn("KD_CANARY_SECRET", self.jobs()["linux-source-admission-unit"])
 
+    def test_private_source_owner_and_name_come_from_secrets_and_never_from_variables(self):
+        self.assertNotIn("vars.LINUX_SOURCE_REPOSITORY", self.text)
+        self.assertNotIn("vars.SOURCE_REPOSITORY_OWNER", self.text)
+        self.assertNotIn("vars.SOURCE_REPOSITORY_NAME", self.text)
+        self.assertEqual(self.text.count("secrets.SOURCE_REPOSITORY_OWNER"), 5)
+        self.assertEqual(self.text.count("secrets.SOURCE_REPOSITORY_NAME"), 5)
+        jobs = self.jobs()
+        for name in ("settings", "source-read", "verdict"):
+            body = jobs["linux-source-admission-" + name]
+            with self.subTest(job=name):
+                self.assertIn("      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}\n", body)
+                self.assertIn("      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}\n", body)
+                self.assertIn("    environment: linux-source-read\n", body)
+        for name in ("unit", "audit"):
+            body = jobs["linux-source-admission-" + name]
+            self.assertNotIn("SOURCE_REPOSITORY_OWNER", body)
+            self.assertNotIn("SOURCE_REPOSITORY_NAME", body)
+        mint = jobs["linux-source-admission-source-read"].split("      - name: Mint scoped source-reader token\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("          owner: ${{ secrets.SOURCE_REPOSITORY_OWNER }}\n", mint)
+        self.assertIn("          repositories: ${{ secrets.SOURCE_REPOSITORY_NAME }}\n", mint)
+        for line in self.text.splitlines():
+            if line.lstrip().startswith("run:") or line.startswith("          "):
+                if "secrets.SOURCE_REPOSITORY" in line:
+                    self.assertTrue(line.lstrip().startswith(("owner:", "repositories:")), line)
+        changed = self.text.replace("secrets.SOURCE_REPOSITORY_OWNER", "vars.LINUX_SOURCE_REPOSITORY_OWNER", 1)
+        self.assertNotEqual(changed, self.text)
+        with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
+            validate_workflow_text(changed, "platform", "linux-source-admission")
+
+    def test_every_job_binds_the_linux_environment_and_the_input_defaults_to_it(self):
+        jobs = self.jobs()
+        for name in ("settings", "source-read", "verdict", "audit"):
+            with self.subTest(job=name):
+                body = jobs["linux-source-admission-" + name]
+                self.assertEqual(body.count("    environment: linux-source-read\n"), 1)
+                self.assertNotIn("environment_name ||", body)
+        self.assertNotIn("environment:", jobs["linux-source-admission-unit"])
+        self.assertEqual(self.text.count("environment: linux-source-read"), 4)
+        self.assertEqual(self.text.count("environment:"), 4)
+        self.assertNotIn("'none'", self.text)
+        self.assertIn("        description: Protected source-read environment\n        required: false\n        type: string\n        default: linux-source-read\n", self.text)
+        self.assertNotIn("default: source-read", self.text)
+        self.assertIn("REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}", self.text)
+        self.assertIn('ENVIRONMENT_NAME = "linux-source-read"', (ROOT / "kit/confinement/linux_source_build.py").read_text(encoding="utf-8"))
+
     def test_source_read_steps_follow_the_required_order(self):
         source = self.jobs()["linux-source-admission-source-read"]
         names = re.findall(r"(?m)^      - name: (.*)$", source)
@@ -266,7 +311,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "Run trusted dependency audit",
                 "Prepare offline project inputs",
                 "Re-run positive controls immediately before the first project command",
-                "Run all thirteen offline project gates",
+                "Run all offline project gates",
                 "Merge confinement phase records",
                 "Forced faults must fail closed",
             ],
@@ -275,7 +320,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertLess(source.index("Fetch exact source"), source.index("linux_source_build.py revoke"))
         self.assertLess(source.index("linux_source_build.py revoke"), source.index("Fetch npm tarballs"))
         self.assertLess(source.index("Prepare offline project inputs"), source.index("linux_boundary.py recheck"))
-        self.assertLess(source.index("linux_boundary.py recheck"), source.index("Run all thirteen offline project gates"))
+        self.assertLess(source.index("linux_boundary.py recheck"), source.index("Run all offline project gates"))
         self.assertIn("sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP", source)
         self.assertIn("--synthetic-standin", source)
 
@@ -301,7 +346,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertNotIn("verdict_record", verdict)
         self.assertNotIn("needs.linux-source-admission-source-read.outputs", verdict)
         self.assertIn("PRODUCER_RESULT: ${{ needs.linux-source-admission-source-read.result }}", verdict)
-        self.assertIn("name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}", verdict)
+        self.assertIn("    environment: linux-source-read\n", verdict)
         self.assertIn("linux_boundary.py selftest", verdict)
         self.assertIn("linux_boundary.py recheck", verdict)
         self.assertIn("linux_boundary.py merge", verdict)
