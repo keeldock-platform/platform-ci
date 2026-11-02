@@ -73,7 +73,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn("$reason -cnotmatch '^[a-z][a-z0-9_]{0,40}$'", self.runner)
         self.assertNotIn("Get-CleanText $reason", self.runner)
         self.assertNotIn("ExitCode.ToString", self.runner)
-        gate_line = re.search(r"Write-Line \('windows-source-gate=' \+ \$index \+ ' id=' \+ \$gate.Id \+ ' result=' \+ \$result \+ ' hang=' \+ \$hang\)", self.runner)
+        gate_line = re.search(r"Write-Line \('windows-source-gate=' \+ \$index \+ ' id=' \+ \$gate.Id \+ ' result=' \+ \$result \+ ' hang=' \+ \$hang \+ \$causeText\)", self.runner)
         self.assertIsNotNone(gate_line)
 
     def test_gates_run_confined_with_a_boundary_proof_and_the_hang_guard(self):
@@ -128,6 +128,18 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertGreaterEqual(3145728, 10000 * (53 + 240 + 1))
         self.assertIn("$MaxManifestEntries = 10000", self.runner)
         self.assertIn("--full-tree', $bound['source_sha']) $script:Layout.Private 300 $ListingLimit", self.runner)
+
+    def test_a_failed_gate_carries_one_closed_cause_and_never_a_number_or_output(self):
+        function = self.runner.split("function Get-GateCause", 1)[1].split("\n}\n", 1)[0]
+        for token in ("return 'launch'", "return 'timeout'", "return 'limit'", "return 'signal'", "return 'exit'"):
+            self.assertIn(token, function)
+        self.assertEqual(set(re.findall(r"return '([a-z]+)'", function)), {"launch", "timeout", "limit", "signal", "exit"})
+        self.assertNotRegex(function, r"Write-Line|\.Stdout|\.Stderr")
+        self.assertIn("$causeText = ' cause=' + $script:GateCause", self.runner)
+        self.assertIn("if (-not $passed) {", self.runner)
+        self.assertIn("@('timeout', 'limit', 'signal', 'exit', 'launch') -ccontains $script:GateCause", self.runner)
+        self.assertIn("$gateText += ' cause=' + $script:GateCause", self.runner)
+        self.assertNotRegex(self.runner, r"' cause=' \+ \[string\]\$run\.ExitCode")
 
     def test_key_is_destroyed_before_any_project_step_and_again_in_cleanup(self):
         order = [self.runner.index(token) for token in (

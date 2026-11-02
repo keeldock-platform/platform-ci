@@ -6,6 +6,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -2444,6 +2445,30 @@ def _gate_commands(project, rust_root, node_bin):
         raise SourceBuildRefusal("gate") from None
 
 
+PROJECT_GATE_LIMITS = "project"
+PROJECT_GATE_TIMEOUT_SECONDS = 1800
+GATE_CAUSES = ("timeout", "limit", "signal", "exit", "launch")
+LIMIT_SIGNALS = (signal.SIGXCPU, signal.SIGXFSZ, signal.SIGKILL)
+
+
+def _gate_cause(result):
+    if getattr(result, "timed_out", False) is True:
+        return "timeout"
+    code = getattr(result, "exit_code", None)
+    if type(code) is int and code < 0:
+        if -code in LIMIT_SIGNALS:
+            return "limit"
+        return "signal"
+    return "exit"
+
+
+def _gate_refusal_line(completed, failed, gate, cause):
+    line = "linux-project-gates=refused completed=" + str(completed) + " failed=" + str(failed)
+    if gate in GATES + RUNTIME_GATE_NAMES and cause in GATE_CAUSES:
+        line += " gate=" + gate + " cause=" + cause
+    return line + "\n"
+
+
 def run_project_gates(environ=None):
     env = os.environ if environ is None else environ
     worker = Path(env.get("WORKER_PATH", ""))
@@ -2464,6 +2489,7 @@ def run_project_gates(environ=None):
         raise SourceBuildRefusal("gate")
     outcomes = {name: "not-run" for name in selected_gates}
     durations = {}
+    failure = (None, None)
     for index, (name, argv) in enumerate(commands):
         project_env = {
             "PATH": str(Path(node_bin)) + ":" + str(Path(rust_root) / "bin") + ":/usr/bin:/bin",
@@ -2490,11 +2516,12 @@ def run_project_gates(environ=None):
             launch = ("/usr/bin/python3", "-B", "-c", linux_probes.LAUNCHER_SOURCE, *argv)
             result = linux_session.run_host(
                 str(env.get("RUNNER_TEMP", "/tmp")), nonce, launch, project_env, {},
-                limits="fixture", timeout=600, cwd=str(worker),
+                limits=PROJECT_GATE_LIMITS, timeout=PROJECT_GATE_TIMEOUT_SECONDS, cwd=str(worker),
             )
         except BaseException:
             durations[name] = int((time.monotonic() - started) * 1000)
             outcomes[name] = "failed"
+            failure = (name, "launch")
             break
         durations[name] = int((time.monotonic() - started) * 1000)
         (records / ("gate-" + str(index) + ".stdout")).write_bytes(result.stdout)
@@ -2503,6 +2530,7 @@ def run_project_gates(environ=None):
             outcomes[name] = "passed"
         else:
             outcomes[name] = "failed"
+            failure = (name, _gate_cause(result))
             break
     completed_gates = [name for name in selected_gates if outcomes[name] == "passed"]
     (records / "gate-durations.json").write_text(
@@ -2517,7 +2545,7 @@ def run_project_gates(environ=None):
     }
     (records / "gates.json").write_text(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n", encoding="ascii")
     if result["failed"] or result["gate_count"] != len(selected_gates):
-        sys.stdout.write("linux-project-gates=refused completed=" + str(result["gate_count"]) + " failed=" + str(result["failed"]) + "\n")
+        sys.stdout.write(_gate_refusal_line(result["gate_count"], result["failed"], failure[0], failure[1]))
         return 1
     sys.stdout.write("linux-project-gates=passed gates=" + str(len(selected_gates)) + " failed=0 offline=true\n")
     return 0

@@ -1,8 +1,10 @@
+import contextlib
 import hashlib
 import io
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -1118,6 +1120,78 @@ class LinuxSourceBuildTests(unittest.TestCase):
                         linux_source_build._gate_npm_config_files(descriptor, False)
             finally:
                 os.close(descriptor)
+
+    def _run_gates_with_second_gate(self, second):
+        outputs = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worker = root / "source"
+            worker.mkdir()
+            (worker / "Cargo.lock").write_text(_path_only_lock(4), encoding="ascii")
+            commands = tuple((name, ("/usr/bin/true",)) for name in linux_source_build.GATES)
+            first = types.SimpleNamespace(exit_code=0, timed_out=False, stdout=b"", stderr=b"")
+            calls = []
+
+            def host(*arguments, **keywords):
+                calls.append(keywords)
+                if len(calls) == 2:
+                    if isinstance(second, BaseException):
+                        raise second
+                    return second
+                return first
+
+            with patch.object(linux_source_build, "_project_gate_directories"), patch.object(
+                linux_source_build, "_gate_commands", return_value=commands,
+            ), patch.object(linux_source_build, "_runtime_workspace_present", return_value=False), patch.object(
+                linux_source_build.linux_session, "run_host", side_effect=host,
+            ):
+                sink = io.StringIO()
+                with contextlib.redirect_stdout(sink):
+                    code = linux_source_build.run_project_gates({
+                        "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
+                        "CARGO_HOME": str(worker / ".kd-cargo-home"),
+                        "RUST_ROOT": "/rust", "NODE_BIN": "/node", "REQUESTED_SOURCE_SHA": "a" * 40,
+                    })
+                outputs.append((code, sink.getvalue(), calls))
+        return outputs[0]
+
+    def test_real_gates_run_with_the_project_limits_and_the_long_timeout(self):
+        code, unused_text, calls = self._run_gates_with_second_gate(
+            types.SimpleNamespace(exit_code=0, timed_out=False, stdout=b"", stderr=b""))
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 15)
+        for keywords in calls:
+            self.assertEqual(keywords["limits"], "project")
+            self.assertEqual(keywords["timeout"], 1800)
+        self.assertEqual(linux_source_build.PROJECT_GATE_TIMEOUT_SECONDS, 1800)
+
+    def test_a_failed_gate_names_itself_and_one_fixed_cause_and_never_leaks_output(self):
+        secret = b"kd-secret-/home/runner/work-exit-code-137"
+        for cause, result in (
+            ("timeout", types.SimpleNamespace(exit_code=None, timed_out=True, stdout=secret, stderr=secret)),
+            ("limit", types.SimpleNamespace(exit_code=-signal.SIGXCPU, timed_out=False, stdout=secret, stderr=secret)),
+            ("limit", types.SimpleNamespace(exit_code=-signal.SIGXFSZ, timed_out=False, stdout=secret, stderr=secret)),
+            ("limit", types.SimpleNamespace(exit_code=-signal.SIGKILL, timed_out=False, stdout=secret, stderr=secret)),
+            ("signal", types.SimpleNamespace(exit_code=-signal.SIGSEGV, timed_out=False, stdout=secret, stderr=secret)),
+            ("exit", types.SimpleNamespace(exit_code=101, timed_out=False, stdout=secret, stderr=secret)),
+            ("exit", types.SimpleNamespace(exit_code=None, timed_out=False, stdout=secret, stderr=secret)),
+            ("launch", OSError("/home/runner/secret path 137")),
+        ):
+            with self.subTest(cause=cause, result=repr(result)):
+                code, text, unused_calls = self._run_gates_with_second_gate(result)
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    text, "linux-project-gates=refused completed=2 failed=1 gate=clippy cause=" + cause + "\n")
+                for forbidden in ("kd-secret", "/home", "137", "101", "secret"):
+                    self.assertNotIn(forbidden, text)
+
+    def test_the_refusal_line_adds_only_public_gate_names_and_closed_causes(self):
+        line = linux_source_build._gate_refusal_line
+        self.assertEqual(line(3, 1, "format", "exit"), "linux-project-gates=refused completed=3 failed=1 gate=format cause=exit\n")
+        self.assertEqual(line(3, 1, "runtime_tests", "limit"), "linux-project-gates=refused completed=3 failed=1 gate=runtime_tests cause=limit\n")
+        for gate, cause in (("evil gate", "exit"), ("format", "137"), (None, None), ("format", None)):
+            self.assertEqual(line(2, 1, gate, cause), "linux-project-gates=refused completed=2 failed=1\n")
+        self.assertEqual(linux_source_build.GATE_CAUSES, ("timeout", "limit", "signal", "exit", "launch"))
 
     def test_license_gate_refusal_precedes_preparation_and_command_construction(self):
         with tempfile.TemporaryDirectory() as temporary:

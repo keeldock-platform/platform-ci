@@ -38,7 +38,16 @@ FIXTURE_LIMITS = (
     (resource.RLIMIT_NOFILE, (256, 256)),
     (resource.RLIMIT_CORE, (0, 0)),
 )
-LIMIT_PROFILES = {"probe": PROBE_LIMITS, "fixture": FIXTURE_LIMITS}
+PROJECT_LIMITS = (
+    (resource.RLIMIT_CPU, (3600, 3600)),
+    (resource.RLIMIT_FSIZE, (4294967296, 4294967296)),
+    (resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
+    (resource.RLIMIT_NPROC, (1024, 1024)),
+    (resource.RLIMIT_NOFILE, (4096, 4096)),
+    (resource.RLIMIT_CORE, (0, 0)),
+)
+MAX_TIMEOUT_SECONDS = {"probe": 600, "fixture": 600, "project": 1800}
+LIMIT_PROFILES = {"probe": PROBE_LIMITS, "fixture": FIXTURE_LIMITS, "project": PROJECT_LIMITS}
 CONFINED_UNSHARE = tuple(harness.UNSHARE_ARGUMENTS)
 OPEN_UNSHARE = ("--mount", "--pid", "--fork", "--ipc", "--propagation", "private", "--kill-child=KILL")
 HOST_UNSHARE = ("--mount", "--pid", "--fork", "--ipc", "--net", "--propagation", "private", "--kill-child=KILL")
@@ -348,7 +357,7 @@ def validate_spec(spec):
             raise harness.ProofFailure(96)
     if spec.get("limits") not in LIMIT_PROFILES:
         raise harness.ProofFailure(96)
-    if type(spec.get("timeout")) is not int or not 1 <= spec["timeout"] <= 600:
+    if type(spec.get("timeout")) is not int or not 1 <= spec["timeout"] <= MAX_TIMEOUT_SECONDS[spec["limits"]]:
         raise harness.ProofFailure(96)
     if spec.get("fault") is not None and spec["fault"] not in FAULTS:
         raise harness.ProofFailure(96)

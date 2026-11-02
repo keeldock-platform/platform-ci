@@ -153,7 +153,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/untrusted' && needs.core-linux-quick-return-settings.result == 'success' && needs.core-linux-quick-return-unit.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: linux-source-read
-    timeout-minutes: 120
+    timeout-minutes: 350
     cache-mode: none
     permissions:
       actions: read

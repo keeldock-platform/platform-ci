@@ -36,6 +36,7 @@ $script:LogCanary = ''
 $script:LogNeedles = @()
 $script:Deadline = [DateTime]::UtcNow.AddMinutes(285)
 $script:GateFailure = 0
+$script:GateCause = ''
 $script:RefusalReason = ''
 $script:PublicLinePattern = '^(windows-source|windows-confinement|capsule-decrypt|capsule-destroy)[a-z-]*=[ -~]{0,480}$'
 
@@ -675,6 +676,17 @@ function Test-GateBoundary($run) {
     return ((Test-LpacTokenText $tokenText) -and ($jobText -like 'assigned,*'))
 }
 
+function Get-GateCause($run, [bool]$boundary) {
+    if ($run.Failure -ne '' -or -not $run.Exited) { return 'launch' }
+    if ($run.TimedOut) { return 'timeout' }
+    $code = [uint32]$run.ExitCode
+    if ($code -eq 0x4b44574b -or $code -eq 0xC0000044 -or $code -eq 0xC000012D -or $code -eq 0xC0000017) { return 'limit' }
+    if ($code -ge 0xC0000000) { return 'signal' }
+    if ($code -ne 0) { return 'exit' }
+    if (-not $boundary) { return 'launch' }
+    return 'exit'
+}
+
 function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsDirectory) {
     $environment = New-GateEnvironment
     $outcome = @{ Count = 0; Failed = 0; Canary = 'absent'; Boundary = 'verified'; Failure = 0 }
@@ -707,7 +719,12 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         $passed = ($boundary -and -not $run.TimedOut -and $run.ExitCode -eq 0)
         $result = 'failed'
         if ($passed) { $result = 'passed' }
-        Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=' + $result + ' hang=' + $hang)
+        $causeText = ''
+        if (-not $passed) {
+            $script:GateCause = Get-GateCause $run $boundary
+            $causeText = ' cause=' + $script:GateCause
+        }
+        Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=' + $result + ' hang=' + $hang + $causeText)
         if ($run.Truncated -or (Test-LogCanary $combined)) {
             $outcome.Canary = 'present'
             $outcome.Failure = $index
@@ -1112,7 +1129,10 @@ try {
     if ($script:RefusalReason.Length -gt 0 -and $script:RefusalReason -cne $reason -and $script:RefusalReason -cmatch '^[a-z][a-z0-9_]{0,40}$') { $detailText = ' detail=' + $script:RefusalReason }
     $safePhase = [regex]::Replace([string]$phase, '[^A-Za-z0-9_]', '_')
     $gateText = ''
-    if ($phase -ceq 'gates' -and $script:GateFailure -gt 0) { $gateText = ' gate=' + $script:GateFailure }
+    if ($phase -ceq 'gates' -and $script:GateFailure -gt 0) {
+        $gateText = ' gate=' + $script:GateFailure
+        if (@('timeout', 'limit', 'signal', 'exit', 'launch') -ccontains $script:GateCause) { $gateText += ' cause=' + $script:GateCause }
+    }
     $refusal = 'windows-source-run=refused phase=' + $safePhase + ' reason=' + $reason + $detailText + $gateText
 }
 

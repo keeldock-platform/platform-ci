@@ -264,7 +264,7 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    '.github/workflows/linux-source-admission.yml': '8465b75fb0136ac9356651fa9d9d679503fe18ce186f93bb9d8d775ba95acf5c',
+    '.github/workflows/linux-source-admission.yml': '488b731331465e849a557c615deb37cf85f495ac691ad6cd395cbe5dd80f1940',
     'kit/bootstrap/action.yml': '6f74d40c68445852183a539bd2dc8f43e93809d3e22e1c4188ad4efe896041e3',
     'kit/confinement/release_tool_ledger.py': 'e9a4f50f806fad3d5ae7c7323adfc3024eaaa1f564a8725e9ef7281fa01c6657',
     'kit/confinement/release_tool_ledger.json': '2c0004d1e83780d780c501b794a15e6c6928f8aa352dcfab46fe389fe871dc0b',
@@ -303,9 +303,9 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
     'kit/confinement/macos_core_contract.py': '025f1955fa43888b6a43bacf4186f6a8efab5e52e3ec1569355dd5e9614f25ac',
     'kit/confinement/test_macos_core_contract.py': '5b65c9958d6de802bfeec7ee750b90a75ed4165deb23b74177e1812fd459a927',
-    'kit/confinement/linux_source_build.py': 'e0365110fa323317650ac43156ffcbfe982306c10fbdf231176692b427900a36',
-    'kit/confinement/test_linux_source_build.py': '45dc26f210244006b789a257279a352ba5f35105406eef46453f5d4d2e631e97',
-    '.github/workflows/core-linux-quick-return.yml': '403ea482707d36ddd0b4c012dee17a22bf9e9cb9f0e66fa38a6b9890a830b68e',
+    'kit/confinement/linux_source_build.py': 'bb8846064b7c95aa9e63896020281d1e74e87ea00b9f2e925c7fa274a3827404',
+    'kit/confinement/test_linux_source_build.py': 'b9edac6201001943475747f107792056175ce3c1e75eda24404714012bf6d299',
+    '.github/workflows/core-linux-quick-return.yml': '3f6e90950f263a94e673d8b29a5b5f3352c9a00e79accce53b001528451d1795',
     'core-ci/linux_quick_return.py': '6322fa0a98dae99054e20f2f73dc11ad8c48922b5e5c747f7163108626668923',
     'core-ci/test_linux_quick_return.py': '9060cee407ca43f36787e26fd5459727e905b6fc8463114842d93719ad04df71',
     'kit/confinement/fixtures/npm11_audit_report.json': 'fa181d1de0aff938377cd7ffb1217a1f620599b6e0808ae75a7da3c97bbe4baa',
@@ -339,8 +339,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/windows_confinement.cs': '9edf6e88ef5df5ec460ba2eab6f4a666c6fd24c03a41ad3531aada12fe8f6259',
     'kit/confinement/windows_confinement.ps1': 'ed96b8f9040fc3c8cb0c8c83ce27778af87ebf55f3a215885e4d49963b15debc',
     'kit/confinement/test_windows_confinement.py': '1db7d58ba92264012547fc46e474a9d9cf685c427908614bf127df6f2559e92e',
-    'kit/confinement/windows_source_run.ps1': '690ea007a2a9fde7ada6fe8d031189f04828ed7b0a13e716543574da9ba64572',
-    'kit/confinement/test_windows_source_run.py': 'f30a5c36261dc36eb9d929b52216e13df0d15105e16c993df5382024118fe398',
+    'kit/confinement/windows_source_run.ps1': 'f923c83f282e49ae0aad3d775c035c84a4bd338791adac088301417d5c1a4054',
+    'kit/confinement/test_windows_source_run.py': 'aacf2f0aa0aed5dd884f5b3840b76c70a8464f88ec6889c754d84eba3a833d4a',
     'kit/confinement/windows_probe.rs': '1a9a98ebc92e8b7681850ddb1ce80d63ebc56d07ad61320b2fedbaafa01fe9ff',
     'kit/confinement/macos_source_reader.py': 'd3fbda5c68ac7d21761e946b0f546607b19c23ccb725e453f3fffef3321c0d70',
     'kit/confinement/test_macos_source_reader.py': 'ed8e9b850f7d3a80346ad4a6efc182b28ff9c22fa669eda241f2c5feb3ccf806',

@@ -283,7 +283,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && needs.linux-source-admission-settings.result == 'success' && needs.linux-source-admission-unit.result == 'success' && (inputs.mode == 'source' || (inputs.mode == 'synthetic' && github.ref == 'refs/heads/main')) && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
     runs-on: ubuntu-24.04
     environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}
-    timeout-minutes: 120
+    timeout-minutes: 350
     cache-mode: none
     permissions:
       actions: read
@@ -478,7 +478,7 @@ jobs:
     if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted') }}
     runs-on: ubuntu-24.04
     environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}
-    timeout-minutes: 120
+    timeout-minutes: 350
     cache-mode: none
     permissions:
       actions: read
@@ -830,7 +830,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/untrusted' && needs.core-linux-quick-return-settings.result == 'success' && needs.core-linux-quick-return-unit.result == 'success' }}
     runs-on: ubuntu-24.04
     environment: linux-source-read
-    timeout-minutes: 120
+    timeout-minutes: 350
     cache-mode: none
     permissions:
       actions: read

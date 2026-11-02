@@ -163,8 +163,33 @@ class LinuxSessionPureTests(unittest.TestCase):
         finally:
             listener.close()
 
+    def test_the_project_profile_has_its_own_limits_and_the_other_profiles_are_unchanged(self):
+        rl = session.resource
+        inf = rl.RLIM_INFINITY
+        self.assertEqual(session.PROJECT_LIMITS, (
+            (rl.RLIMIT_CPU, (3600, 3600)), (rl.RLIMIT_FSIZE, (4294967296, 4294967296)),
+            (rl.RLIMIT_AS, (inf, inf)), (rl.RLIMIT_NPROC, (1024, 1024)),
+            (rl.RLIMIT_NOFILE, (4096, 4096)), (rl.RLIMIT_CORE, (0, 0)),
+        ))
+        self.assertEqual(session.FIXTURE_LIMITS, (
+            (rl.RLIMIT_CPU, (120, 120)), (rl.RLIMIT_FSIZE, (67108864, 67108864)),
+            (rl.RLIMIT_AS, (inf, inf)), (rl.RLIMIT_NPROC, (256, 256)),
+            (rl.RLIMIT_NOFILE, (256, 256)), (rl.RLIMIT_CORE, (0, 0)),
+        ))
+        self.assertEqual(session.PROBE_LIMITS, (
+            (rl.RLIMIT_CPU, (20, 20)), (rl.RLIMIT_FSIZE, (4194304, 4194304)),
+            (rl.RLIMIT_AS, (1073741824, 1073741824)), (rl.RLIMIT_NPROC, (64, 64)),
+            (rl.RLIMIT_NOFILE, (64, 64)), (rl.RLIMIT_CORE, (0, 0)),
+        ))
+        self.assertIs(session.LIMIT_PROFILES["project"], session.PROJECT_LIMITS)
+        self.assertIs(session.LIMIT_PROFILES["fixture"], session.FIXTURE_LIMITS)
+        self.assertIs(session.LIMIT_PROFILES["probe"], session.PROBE_LIMITS)
+        self.assertEqual(session.MAX_TIMEOUT_SECONDS, {"probe": 600, "fixture": 600, "project": 1800})
+        session.validate_spec(good_spec(limits="project", timeout=1800))
+        session.validate_spec(good_spec(limits="fixture", timeout=600))
+
     def test_limit_profiles_and_unshare_argument_sets(self):
-        self.assertEqual(set(session.LIMIT_PROFILES), {"probe", "fixture"})
+        self.assertEqual(set(session.LIMIT_PROFILES), {"probe", "fixture", "project"})
         self.assertIn("--net", session.CONFINED_UNSHARE)
         self.assertIn("--pid", session.CONFINED_UNSHARE)
         self.assertNotIn("--net", session.OPEN_UNSHARE)
@@ -281,6 +306,9 @@ class LinuxSessionSpecTests(unittest.TestCase):
             good_spec(limits="huge"),
             good_spec(timeout=0),
             good_spec(timeout=601),
+            good_spec(limits="fixture", timeout=601),
+            good_spec(limits="project", timeout=1801),
+            good_spec(limits="project", timeout=0),
             good_spec(fault="other"),
             good_spec(rootfs="relative"),
         )
