@@ -313,6 +313,8 @@ class PublicTreeTests(unittest.TestCase):
             'core-ci/test_linux_quick_return.py',
             'core-ci/test_separation.py',
             'kit/confinement/rust_license_gate.py',
+            'kit/confinement/cargo_lock_receipt.py',
+            'kit/confinement/test_cargo_lock_receipt.py',
             'kit/confinement/test_rust_license_gate.py',
             'kit/bootstrap/test_public_tree.py',
             '.github/workflows/macos-rust-toolchain-smoke.yml',

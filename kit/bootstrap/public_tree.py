@@ -337,7 +337,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_release_build_verify.py': '08c8b7dcb28307d8470cab9675202bcc206492261d20dec70064232c197f2579',
     'kit/confinement/cargo_vendor_verify.py': '31d346c8e66eeac9c8625ecc62fb314ff2feb87914a4030f7e8ad138277cbed2',
     'kit/confinement/test_cargo_vendor_verify.py': '6d7a02f56a81d3b9930b7d5d5e9e38334662ccd144b89d0b56597c11a1c394fc',
-    'kit/bootstrap/test_public_tree.py': 'adb8b799b649b8dcfce19fbf0c4df9c680371e0529001578350861f022884e9a',
+    'kit/bootstrap/test_public_tree.py': '2808cfe084a60c0ca5db337032c2ced39ebe7f7700a5a4f2798f0bf6bbcce4b7',
     'kit/confinement/release_evidence.py': '2609b125bf2d3cbde256e2e4229c576fc0de1c5da898faf206807205dee49ae2',
     'kit/confinement/test_confinement_cargo_lock_bootstrap.py': '73133ce9967097231a6f2b944fe11f3fc460f7183ff3de61bb5844c2b928ed5c',
     'kit/confinement/cargo_lock_bootstrap.py': '9e138ea3cb8befa770d091f9270e0e523ec7772d6ce5eda06a45d56bc28d17e2',
