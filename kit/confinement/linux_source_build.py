@@ -1776,6 +1776,8 @@ def run_rust_license_gate(environ=None):
     except SourceBuildRefusal:
         raise SourceBuildRefusal("binding") from None
     root_identity = _directory_identity(os.fstat(root_fd))
+    lock_count = 0
+    all_registry_free = True
     try:
         _require_source_root_identity(source, root_identity)
         for candidate in _rust_lock_paths(root_fd):
@@ -1794,11 +1796,16 @@ def run_rust_license_gate(environ=None):
                 source_sha, relative, str(source.joinpath(*relative_parts)),
                 hashlib.sha256(lock_bytes).hexdigest(),
             )
-            rust_license_gate.require_configured_control(
+            receipt = rust_license_gate.require_lock_admission(
                 lock_bytes, identity, rust_license_gate.TRUSTED_PORTS,
             )
+            lock_count += 1
+            if type(receipt) is not rust_license_gate.RegistryFreeReceipt:
+                all_registry_free = False
     finally:
         os.close(root_fd)
+    if all_registry_free:
+        sys.stdout.write("linux-rust-licence=registry-free locks=" + str(lock_count) + "\n")
     return 0
 
 

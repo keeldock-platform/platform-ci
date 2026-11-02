@@ -23,69 +23,25 @@ import linux_source_build
 import macos_core_contract
 
 
-class _SyntheticTrustedLicenseBoundary:
-    def __init__(self, control_root):
-        self.gate = linux_source_build.rust_license_gate
-        self.source_sha = "a" * 40
-        self.packages = (self.gate.Package("serde", "1.0.1", "b" * 64),)
-        self.archive = self.gate.ArchivePackage(
-            self.packages[0], self.packages[0].checksum, "MIT", "MIT", True,
-            (("LICENSE-MIT", "d" * 64),),
-        )
-        self.checker = control_root / "checker.fixture"
-        self.deny = control_root / "cargo-deny.fixture"
-        self.policy = control_root / "deny-policy.fixture"
-        self.checker.write_bytes(b"synthetic checker identity")
-        self.deny.write_bytes(b"synthetic cargo-deny identity")
-        self.policy.write_bytes(b"synthetic reviewed policy identity")
-        self.identities = []
-        self.requests = []
-        self.cleaned = []
+def _path_only_lock(count, prefix="member"):
+    names = [prefix + "-" + str(index) for index in range(count)]
+    text = "version = 4\n"
+    for index, name in enumerate(names):
+        text += '\n[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n'
+        if index == 0 and count > 1:
+            text += "dependencies = [\n"
+            for dependency in names[1:]:
+                text += ' "' + dependency + '",\n'
+            text += "]\n"
+    return text
 
-    def ports(self):
-        return self.gate._validated_ports(self.gate.TrustedPorts(
-            self, self, self, self, self, None,
-        ))
 
-    def validate(self, lock_bytes, identity):
-        if hashlib.sha256(lock_bytes).hexdigest() != identity.lock_sha256:
-            raise self.gate.LicenseGateRefusal("lock")
-        self.identities.append(identity)
-        return self.gate._validated_lock(identity, self.packages)
-
-    def for_identity(self, identity):
-        if identity.source_sha != self.source_sha:
-            raise self.gate.LicenseGateRefusal("identity")
-        return self.gate._validated_config(self.gate.GateConfig(
-            identity, "2" * 40, str(self.checker), self._digest(self.checker),
-            str(self.deny), str(self.checker.parent), self._digest(self.deny),
-            "a" * 64, str(self.policy), self._digest(self.policy),
-            True, True,
-            self.gate._cargo_deny_argv_sha256(identity, str(self.policy)),
-            True, True, "e" * 40, int(time.time()), True, True, None,
-        ))
-
-    def verify_complete(self, lock_bytes, identity, lock_packages):
-        del lock_bytes, lock_packages
-        return self.gate._validated_archives(identity, (self.archive,), "f" * 64)
-
-    def cancelled(self):
-        return False
-
-    def run(self, request):
-        self.requests.append(request)
-        output = (b"result=conditional-pass authenticated=no\n"
-                  if request.argv == ("--stdin-protocol",) else b"")
-        return self.gate._process_result(
-            request, (0, False, False, output, b""), request.executable_sha256,
-        )
-
-    def cleanup(self, request, result):
-        self.cleaned.append((request, result))
-
-    @staticmethod
-    def _digest(path):
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+def _registry_lock():
+    return _path_only_lock(1) + (
+        '\n[[package]]\nname = "serde"\nversion = "1.0.1"\nsource = "'
+        + linux_source_build.rust_license_gate.cargo_lock_receipt.REGISTRY_SOURCE
+        + '"\nchecksum = "' + "b" * 64 + '"\n'
+    )
 
 
 class LinuxSourceBuildTests(unittest.TestCase):
@@ -1022,16 +978,15 @@ class LinuxSourceBuildTests(unittest.TestCase):
             root = Path(temporary)
             worker = root / "source"
             worker.mkdir()
-            (worker / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
-            control_root = root / "control"
-            control_root.mkdir()
-            boundary = _SyntheticTrustedLicenseBoundary(control_root)
+            (worker / "Cargo.lock").write_text(_path_only_lock(4), encoding="ascii")
+            source_sha = "a" * 40
             commands = tuple(
                 (name, ("/usr/bin/true",)) for name in linux_source_build.GATES
             )
             with patch.object(
-                linux_source_build.rust_license_gate, "TRUSTED_PORTS", boundary.ports(),
-            ), patch.object(
+                linux_source_build.rust_license_gate, "require_lock_admission",
+                wraps=linux_source_build.rust_license_gate.require_lock_admission,
+            ) as admission, patch.object(
                 linux_source_build, "_project_gate_directories",
             ) as directories, patch.object(
                 linux_source_build, "_gate_commands", return_value=commands,
@@ -1047,7 +1002,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
                     "CARGO_HOME": str(worker / ".kd-cargo-home"),
                     "RUST_ROOT": "/rust", "NODE_BIN": "/node",
-                    "REQUESTED_SOURCE_SHA": boundary.source_sha,
+                    "REQUESTED_SOURCE_SHA": source_sha,
                 }), 0)
                 self.assertEqual(directories.call_count, 13)
                 self.assertEqual(session.call_count, 13)
@@ -1055,8 +1010,9 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 self.assertEqual(durations["schema_version"], 1)
                 self.assertEqual(set(durations["durations_ms"]), set(linux_source_build.GATES))
                 self.assertTrue(all(type(value) is int and value >= 0 for value in durations["durations_ms"].values()))
-                self.assertEqual(boundary.identities[0].profile, ".")
-                self.assertEqual(boundary.identities[0].root, str(worker))
+                identity = admission.call_args_list[0].args[1]
+                self.assertEqual(identity.profile, ".")
+                self.assertEqual(identity.root, str(worker))
                 for invocation in session.call_args_list:
                     launch = invocation.args[2]
                     self.assertEqual(launch[:3], ("/usr/bin/python3", "-B", "-c"))
@@ -1068,40 +1024,92 @@ class LinuxSourceBuildTests(unittest.TestCase):
             root = Path(temporary)
             worker = root / "source"
             worker.mkdir()
-            (worker / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            (worker / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
             with patch.object(linux_source_build.rust_license_gate, "TRUSTED_PORTS", None), patch.object(
                 linux_source_build, "_project_gate_directories",
             ) as prepare, patch.object(linux_source_build, "_gate_commands") as construct, patch.object(
                 linux_source_build.linux_session, "run_host",
             ) as execute:
-                with self.assertRaises(linux_source_build.rust_license_gate.LicenseGateRefusal):
+                with self.assertRaises(linux_source_build.rust_license_gate.LicenseGateRefusal) as refused:
                     linux_source_build.run_project_gates({
                         "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
                         "CARGO_HOME": str(worker / ".kd-cargo-home"),
                         "RUST_ROOT": "/rust", "NODE_BIN": "/node",
                         "REQUESTED_SOURCE_SHA": "a" * 40,
                     })
+            self.assertEqual(refused.exception.reason, "archive_producer_unavailable")
             prepare.assert_not_called()
             construct.assert_not_called()
             execute.assert_not_called()
+
+    def test_empty_lock_refuses_with_lock_before_preparation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            worker = root / "source"
+            worker.mkdir()
+            (worker / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            with patch.object(
+                linux_source_build, "_project_gate_directories",
+            ) as prepare, patch.object(linux_source_build, "_gate_commands") as construct:
+                with self.assertRaises(linux_source_build.rust_license_gate.LicenseGateRefusal) as refused:
+                    linux_source_build.run_project_gates({
+                        "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
+                        "CARGO_HOME": str(worker / ".kd-cargo-home"),
+                        "RUST_ROOT": "/rust", "NODE_BIN": "/node",
+                        "REQUESTED_SOURCE_SHA": "a" * 40,
+                    })
+            self.assertEqual(refused.exception.reason, "lock")
+            prepare.assert_not_called()
+            construct.assert_not_called()
+
+    def test_registry_free_license_gate_prints_one_counts_only_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Cargo.lock").write_text(_path_only_lock(4), encoding="ascii")
+            (root / "fuzz").mkdir()
+            (root / "fuzz" / "Cargo.lock").write_text(
+                _path_only_lock(2, "fuzz"), encoding="ascii")
+            (root / "runtime").mkdir()
+            (root / "runtime" / "Cargo.lock").write_text(
+                _path_only_lock(7, "runtime"), encoding="ascii")
+            output = io.StringIO()
+            with patch.object(linux_source_build.sys, "stdout", output):
+                self.assertEqual(linux_source_build.run_rust_license_gate({
+                    "SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40,
+                }), 0)
+            self.assertEqual(output.getvalue(), "linux-rust-licence=registry-free locks=3\n")
+
+    def test_registry_lock_license_gate_refuses_without_the_counts_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
+            output = io.StringIO()
+            with patch.object(linux_source_build.sys, "stdout", output):
+                with self.assertRaises(linux_source_build.rust_license_gate.LicenseGateRefusal):
+                    linux_source_build.run_rust_license_gate({
+                        "SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40,
+                    })
+            self.assertEqual(output.getvalue(), "")
 
     def test_runtime_gate_receipt_requires_every_selected_stage_to_complete(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             worker = root / "source"
             worker.mkdir()
-            (worker / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            (worker / "Cargo.lock").write_text(_path_only_lock(4), encoding="ascii")
             runtime = worker / "runtime"
             runtime.mkdir(parents=True)
             (runtime / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
-            (runtime / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            (runtime / "Cargo.lock").write_text(_path_only_lock(7, "runtime"), encoding="ascii")
+            source_sha = "a" * 40
             commands = tuple(
                 (name, ("/usr/bin/true",))
                 for name in linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES
             )
-            (root / "control").mkdir()
-            boundary = _SyntheticTrustedLicenseBoundary(root / "control")
-            with patch.object(linux_source_build.rust_license_gate, "TRUSTED_PORTS", boundary.ports()), patch.object(
+            with patch.object(
+                linux_source_build.rust_license_gate, "require_lock_admission",
+                wraps=linux_source_build.rust_license_gate.require_lock_admission,
+            ) as admission, patch.object(
                 linux_source_build, "_project_gate_directories"
             ), patch.object(
                 linux_source_build, "_gate_commands", return_value=commands
@@ -1111,7 +1119,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 result = linux_source_build.run_project_gates({
                     "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
                     "CARGO_HOME": str(worker / ".kd-cargo-home"), "RUST_ROOT": "/rust", "NODE_BIN": "/node",
-                    "REQUESTED_SOURCE_SHA": boundary.source_sha,
+                    "REQUESTED_SOURCE_SHA": source_sha,
                 })
             self.assertEqual(result, 0)
             receipt = json.loads((Path(temporary) / "kd-records" / "gates.json").read_text(encoding="ascii"))
@@ -1119,9 +1127,10 @@ class LinuxSourceBuildTests(unittest.TestCase):
             self.assertEqual(receipt["completed_gates"], receipt["selected_gates"])
             self.assertEqual(receipt["gate_count"], 16)
             self.assertEqual(
-                [(item.source_sha, item.profile, item.root) for item in boundary.identities],
-                [(boundary.source_sha, ".", str(worker)),
-                 (boundary.source_sha, "runtime", str(runtime))],
+                sorted((call.args[1].source_sha, call.args[1].profile, call.args[1].root)
+                       for call in admission.call_args_list),
+                sorted([(source_sha, ".", str(worker)),
+                        (source_sha, "runtime", str(runtime))]),
             )
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "the shared launcher stop uses Linux process facilities")

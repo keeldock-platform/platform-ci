@@ -7,6 +7,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
+import cargo_lock_receipt
 import rust_license_gate as gate
 
 
@@ -444,6 +445,100 @@ class RustLicenseGateTests(unittest.TestCase):
                 ),
             )
         self.assertEqual(process.requests, [])
+
+
+def _path_lock(names, extra_fields="", trailer=""):
+    parts = ["version = 4\n"]
+    for index, name in enumerate(names):
+        block = '\n[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n'
+        if index == 0:
+            block += extra_fields
+        if index == 0 and len(names) > 1:
+            block += "dependencies = [\n"
+            for dependency in names[1:]:
+                block += ' "' + dependency + '",\n'
+            block += "]\n"
+        parts.append(block)
+    parts.append(trailer)
+    return "".join(parts).encode("ascii")
+
+
+def _registry_lock():
+    return _path_lock(("root-app",), trailer=(
+        '\n[[package]]\nname = "serde"\nversion = "1.0.1"\nsource = "'
+        + cargo_lock_receipt.REGISTRY_SOURCE + '"\nchecksum = "' + "b" * 64 + '"\n'
+    ))
+
+
+def _identity_for(lock_bytes, profile="fixture-profile"):
+    return gate.Identity(
+        "a" * 40, profile, "/synthetic/root", hashlib.sha256(lock_bytes).hexdigest(),
+    )
+
+
+class RegistryFreeAdmissionTests(unittest.TestCase):
+    def _reason(self, lock_bytes, identity=None):
+        with self.assertRaises(gate.LicenseGateRefusal) as raised:
+            gate.require_lock_admission(
+                lock_bytes, identity or _identity_for(lock_bytes), gate.TRUSTED_PORTS,
+            )
+        return raised.exception.reason
+
+    def test_core_shaped_path_only_locks_return_sealed_registry_free_receipts(self):
+        shapes = (
+            ("keeldock-root", "keeldock-api", "keeldock-core", "keeldock-store"),
+            ("keeldock-fuzz", "keeldock-fuzz-target"),
+            ("rt-a", "rt-b", "rt-c", "rt-d", "rt-e", "rt-f", "rt-g"),
+        )
+        for names in shapes:
+            lock = _path_lock(names)
+            identity = _identity_for(lock)
+            with self.subTest(packages=len(names)):
+                receipt = gate.require_lock_admission(lock, identity, gate.TRUSTED_PORTS)
+                self.assertIs(type(receipt), gate.RegistryFreeReceipt)
+                self.assertEqual(receipt.workspace_package_count, len(names))
+                self.assertEqual(receipt.identity, identity)
+                self.assertIs(receipt.seal, gate._SEAL)
+
+    def test_registry_package_without_trusted_ports_refuses_producer_unavailable(self):
+        self.assertIsNone(gate.TRUSTED_PORTS)
+        self.assertEqual(self._reason(_registry_lock()), "archive_producer_unavailable")
+
+    def test_unsupported_lock_shapes_refuse_with_lock(self):
+        cases = {
+            "checksum_without_source": _path_lock(
+                ("root-app",), extra_fields='checksum = "' + "c" * 64 + '"\n'),
+            "git_source": _path_lock(("root-app",), extra_fields=(
+                'source = "git+https://example.invalid/repo?rev=' + "d" * 40
+                + "#" + "d" * 40 + '"\n')),
+            "metadata": _path_lock(("root-app",), trailer='\n[metadata]\n'),
+            "patch_unused": _path_lock(("root-app",), trailer='\n[[patch.unused]]\n'),
+            "duplicate": _path_lock(("root-app", "root-app")),
+            "empty": b"version = 4\n",
+        }
+        for label, lock in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(self._reason(lock), "lock")
+
+    def test_lock_hash_mismatch_and_bad_shape_refuse(self):
+        lock = _path_lock(("root-app",))
+        mismatch = gate.Identity("a" * 40, "fixture-profile", "/synthetic/root", "0" * 64)
+        self.assertEqual(self._reason(lock, mismatch), "lock")
+        self.assertEqual(self._reason(b"", _identity_for(b"")), "lock")
+        self.assertEqual(self._reason(lock, object()), "lock")
+
+    def test_registry_free_receipt_is_refused_by_both_receipt_validators(self):
+        lock = _path_lock(("root-app",))
+        identity = _identity_for(lock)
+        receipt = gate.require_lock_admission(lock, identity, gate.TRUSTED_PORTS)
+        package = gate.Package("serde", "1.0.1", "b" * 64)
+        with self.assertRaises(gate.LicenseGateRefusal):
+            gate.require_gate_receipt(receipt, identity, (package,))
+        with self.assertRaises(gate.LicenseGateRefusal):
+            gate.require_vendor_gate_receipt(
+                receipt, identity.source_sha, identity.profile, identity.lock_sha256,
+                (package,),
+            )
 
 
 if __name__ == "__main__":

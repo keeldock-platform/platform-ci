@@ -7,6 +7,8 @@ import os
 import re
 import time
 
+import cargo_lock_receipt
+
 
 UNSET = "UNSET"
 TRUSTED_PORTS = None
@@ -168,6 +170,15 @@ class GateReceipt:
     cargo_deny_sha256: str
     cargo_deny_qualification_sha256: str
     advisory_database_commit: str
+    seal: object
+
+
+@dataclass(frozen=True)
+class RegistryFreeReceipt:
+    """Sealed proof that a lock has only path packages; it never authorises vendoring."""
+
+    identity: Identity
+    workspace_package_count: int
     seal: object
 
 
@@ -670,3 +681,23 @@ def require_configured_control(lock_bytes, identity, ports=None):
     return require_rust_license_gate(
         lock_bytes, identity, ports,
     )
+
+
+def require_lock_admission(lock_bytes, identity, ports=None):
+    """Admit a lock with no registry packages; otherwise defer to the configured control."""
+    if (type(lock_bytes) is not bytes or not lock_bytes or len(lock_bytes) > MAX_LOCK_BYTES
+            or not _identity_shape_valid(identity)
+            or not hmac.compare_digest(
+                hashlib.sha256(lock_bytes).hexdigest(), identity.lock_sha256,
+            )):
+        _refuse("lock")
+    try:
+        parsed = cargo_lock_receipt.parse_cargo_lock(lock_bytes)
+    except cargo_lock_receipt.Refusal:
+        _refuse("lock")
+    packages = parsed["packages"]
+    if not packages:
+        _refuse("lock")
+    if any(package.get("source") is not None for package in packages):
+        return require_configured_control(lock_bytes, identity, ports)
+    return RegistryFreeReceipt(identity, len(packages), _SEAL)
