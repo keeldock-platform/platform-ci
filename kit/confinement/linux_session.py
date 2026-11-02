@@ -366,6 +366,19 @@ def write_files(base, files):
         os.chmod(target, mode)
 
 
+def make_tree(base, relative):
+    parts = [part for part in relative.split("/") if part]
+    if not parts or any(part in (".", "..") for part in parts):
+        raise harness.ProofFailure(96)
+    path = base
+    for part in parts:
+        path = os.path.join(path, part)
+        if not os.path.isdir(path):
+            os.mkdir(path, 0o755)
+            os.chmod(path, 0o755)
+    return path
+
+
 def extend_rootfs(rootfs, spec):
     if spec.get("fault") == "usr-writable":
         harness._mount(None, os.path.join(rootfs, "usr"), None, harness.MS_BIND | harness.MS_REMOUNT | harness.MS_NOSUID | harness.MS_NODEV)
@@ -384,8 +397,7 @@ def extend_rootfs(rootfs, spec):
             "size=96m,mode=0700,uid=" + str(harness.CHILD_UID) + ",gid=" + str(harness.CHILD_GID),
         )
     for bind in spec.get("binds", []):
-        target = rootfs + bind["target"]
-        os.makedirs(target, mode=0o755, exist_ok=True)
+        target = make_tree(rootfs, bind["target"])
         recursive = 0 if bind.get("rec") is False else harness.MS_REC
         harness._mount(bind["source"], target, None, harness.MS_BIND | recursive)
         if bind["ro"]:

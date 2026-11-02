@@ -1,5 +1,6 @@
 import ast
 import json
+import re
 import unittest
 
 import linux_channels as channels
@@ -128,14 +129,14 @@ class LinuxFixtureGenerationTests(unittest.TestCase):
     def test_rust_forms_link_with_a_fixed_driver_because_the_alternatives_symlink_is_absent_in_the_root(self):
         for form in ("build_rs", "proc_macro"):
             driver = fixtures.fixture_files(form)["/fixtures/" + form + "/run.sh"][0]
-            compiles = [line for line in driver.splitlines() if line.startswith('"$KD_RUSTC"')]
+            compiles = [line for line in driver.splitlines() if line.startswith('"$KD_RUSTC"') and "--crate-type" in line]
             with self.subTest(form=form):
                 self.assertEqual(len(compiles), 2 if form == "proc_macro" else 1)
                 for line in compiles:
                     self.assertIn("-C linker=" + fixtures.LINKER, line)
                 self.assertIn("[ -x " + fixtures.LINKER + " ] || exit 5", driver)
                 self.assertNotIn("alternatives", driver)
-                self.assertIn("|| exit 3", compiles[0])
+                self.assertIn("|| fail " + ("macro" if form == "proc_macro" else "compile") + " 3 /work/rustc.err", compiles[0])
         self.assertEqual(fixtures.LINKER, "/usr/bin/gcc")
 
     def test_npm_driver_uses_the_resolved_node_and_distinct_failure_codes(self):
@@ -183,6 +184,51 @@ class LinuxFixtureGenerationTests(unittest.TestCase):
             driver = fixtures.fixture_files(form)["/fixtures/" + form + "/run.sh"][0]
             self.assertNotIn("@LINKER@", driver)
             self.assertEqual(driver.count(fixtures.LINKER), driver.count("linker=") + 1)
+
+    def test_rust_drivers_name_each_early_stage_with_a_distinct_exit_code(self):
+        for form in ("build_rs", "proc_macro"):
+            driver = fixtures.fixture_files(form)["/fixtures/" + form + "/run.sh"][0]
+            with self.subTest(form=form):
+                self.assertIn("|| exit 5", driver)
+                self.assertIn('[ -x "$KD_RUSTC" ] || fail rustc-missing 8 /work/rustc.err', driver)
+                self.assertIn("--version >/work/rustc.ver 2>/work/rustc.err || fail rustc-version 9 /work/rustc.err", driver)
+                self.assertLess(driver.index("|| exit 5"), driver.index("rustc-missing"))
+                self.assertLess(driver.index("rustc-missing"), driver.index("rustc-version"))
+                self.assertLess(driver.index("rustc-version"), driver.index("--crate-type"))
+        self.assertIn("|| fail use 4 /dev/null", fixtures.fixture_files("proc_macro")["/fixtures/proc_macro/run.sh"][0])
+        codes = {fixtures.HOST_NODE_ABSENT, fixtures.HOST_NODE_UNSAFE, fixtures.HOST_NODE_PINNED_INVALID}
+        self.assertFalse(codes & {3, 4, 5, 6, 7, 8, 9})
+
+    def test_rust_failure_report_is_bounded_and_written_only_under_the_scratch_area(self):
+        for form in ("build_rs", "proc_macro"):
+            driver = fixtures.fixture_files(form)["/fixtures/" + form + "/run.sh"][0]
+            with self.subTest(form=form):
+                body = driver[driver.index("fail() {"):driver.index("}\n", driver.index("fail() {"))]
+                self.assertIn("head -n 4 >&2", body)
+                self.assertIn('head -n 5 "$3" >&2', body)
+                self.assertIn('tail -n 6 "$3" >&2', body)
+                self.assertEqual(body.count("echo "), 3)
+                self.assertLessEqual(1 + 1 + 4 + 5 + 1 + 6, channels.DIAG_MAX_LINES - 1)
+                self.assertIn('exit "$2"', body)
+                for target in re.findall(r"[0-9]?>(/[^ ]+)", driver):
+                    self.assertTrue(target.startswith("/work/"), target)
+                for forbidden in ("curl", "wget", "rustup", "sudo", "mount"):
+                    self.assertNotIn(forbidden, driver)
+
+    def test_npm_driver_reports_limits_and_node_version_on_stderr_before_the_lifecycle_run(self):
+        driver = fixtures.fixture_files("npm_postinstall")["/fixtures/npm_postinstall/run.sh"][0]
+        self.assertIn('echo "kd-diag limits nproc=$(ulimit -u) nofile=$(ulimit -n) as=$(ulimit -v) stack=$(ulimit -s)" >&2', driver)
+        self.assertIn('echo "kd-diag node=$("$KD_NODE" --version 2>&1 | head -n 1)" >&2', driver)
+        self.assertLess(driver.index("kd-diag limits"), driver.index('"$KD_NODE" -p'))
+        self.assertTrue(driver.rstrip().endswith('exec sh -c "$script"'))
+
+    def test_node_fixture_spawns_without_pipes_and_counts_a_blocked_spawn_as_denied(self):
+        script = fixtures.NODE_SCRIPT
+        self.assertIn('{ timeout: 5000, stdio: "ignore" }', script)
+        self.assertNotIn('stdio: "pipe"', script)
+        self.assertIn('done(result.error.code === "ENOENT" ? "na" : outcome(result.error));', script)
+        self.assertEqual(script.count("spawnSync("), 1)
+
     def test_slugs_are_dns_label_safe(self):
         for form in fixtures.FORMS:
             self.assertRegex(fixtures.slug(form), r"^[a-z0-9]+$")
