@@ -243,6 +243,28 @@ CORE_CONTRACT_NPM_POLICY_PATH = "dependency-policy.json"
 CORE_CONTRACT_INERT_DEPENDENCY_FILES = frozenset((
     CORE_CONTRACT_NPM_POLICY_PATH, "docs/dependencies/dependency-policy.schema.json",
 ))
+CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES = frozenset((
+    "packages/kernel-tokens/CONTRACT.md",
+    "packages/kernel-tokens/README.md",
+    "packages/kernel-tokens/src/consumers.ts",
+    "packages/kernel-tokens/src/contrast-pairs.json",
+    "packages/kernel-tokens/src/contrast-pairs.schema.json",
+    "packages/kernel-tokens/src/contrast.ts",
+    "packages/kernel-tokens/src/css.ts",
+    "packages/kernel-tokens/src/forced-colors.json",
+    "packages/kernel-tokens/src/forced-colors.schema.json",
+    "packages/kernel-tokens/src/forced-colour-exceptions.json",
+    "packages/kernel-tokens/src/generator.ts",
+    "packages/kernel-tokens/src/index.ts",
+    "packages/kernel-tokens/src/resolve.ts",
+    "packages/kernel-tokens/src/schema.ts",
+    "packages/kernel-tokens/src/tokens.json",
+    "packages/kernel-tokens/src/tokens.schema.json",
+    "packages/kernel-tokens/src/types.ts",
+    "packages/kernel-tokens/src/validation.ts",
+    "packages/kernel-tokens/tests/cli.test.ts",
+    "packages/kernel-tokens/tools/generate.ts",
+))
 CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH = re.compile(
     r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.md\Z"
 )
@@ -2322,6 +2344,7 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
         return "100644"
     if type(path) is str and (
         path in CORE_CONTRACT_INERT_DEPENDENCY_FILES
+        or path in CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES
         or CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH.fullmatch(path) is not None
     ):
         return "100644"

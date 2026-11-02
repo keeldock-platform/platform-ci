@@ -1118,6 +1118,134 @@ class CoreContractTreeTests(unittest.TestCase):
         entries.update({path: ("100644", "a" * 40) for path in extra})
         return entries
 
+    @staticmethod
+    def _kernel_tokens_paths():
+        return sorted(subject.CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES)
+
+    def test_kernel_tokens_inert_files_are_the_exact_twenty_paths(self):
+        paths = subject.CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES
+        self.assertIs(type(paths), frozenset)
+        self.assertEqual(len(paths), 20)
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertTrue(path.startswith("packages/kernel-tokens/"))
+                self.assertTrue(path.isascii())
+                self.assertNotIn("*", path)
+                self.assertNotIn("..", path)
+        self.assertIn("packages/kernel-tokens/tools/generate.ts", paths)
+        self.assertIn("packages/kernel-tokens/tests/cli.test.ts", paths)
+        self.assertNotIn("packages/kernel-tokens/package.json", paths)
+        self.assertNotIn("packages/kernel-tokens/tsconfig.json", paths)
+
+    def test_kernel_tokens_files_are_admitted_for_every_core_concern(self):
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            for path in self._kernel_tokens_paths():
+                with self.subTest(concern=concern, path=path):
+                    self.assertEqual(
+                        subject._core_contract_expected_mode(path, concern=concern), "100644",
+                    )
+        for concern in ("core-bootstrap", "rules-bootstrap", "unknown", None):
+            for path in self._kernel_tokens_paths():
+                with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_unlisted_kernel_tokens_paths_are_refused_for_every_core_concern(self):
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            for path in (
+                "packages/kernel-tokens/src/extra.ts",
+                "packages/kernel-tokens/package.json",
+                "packages/kernel-tokens/tsconfig.json",
+                "packages/kernel-tokens/CHANGELOG.md",
+                "packages/kernel-tokens/tests/extra.test.ts",
+                "packages/kernel-tokens/tools/other.ts",
+                "packages/kernel-tokens/src/tokens.json.bak",
+                "packages/kernel-tokens/src/nested/tokens.json",
+                "packages/kernel-tokens/src/Tokens.json",
+                "packages/kernel-tokens/",
+                "packages/kernel-tokens",
+                "packages/kernel-tokens/dist/index.js",
+                "packages/kernel-tokens/node_modules/x/index.js",
+                "packages/kernel-tokens-extra/README.md",
+                "packages/other/src/tokens.json",
+                "sub/packages/kernel-tokens/README.md",
+            ):
+                with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_kernel_tokens_files_are_not_node_project_inputs(self):
+        paths = set(self._kernel_tokens_paths())
+        reviewed = (
+            set(subject.CORE_CONTRACT_FEEDBACK_FILES)
+            | set(subject.CORE_CONTRACT_FOUNDATION_FILES)
+            | set(subject.CORE_CONTRACT_KERNEL_FEEDBACK_FILES)
+        )
+        self.assertEqual(paths & reviewed, set())
+        for path in sorted(paths):
+            with self.subTest(path=path):
+                self.assertFalse(subject._core_contract_foundation_path(path))
+                self.assertIsNone(subject._core_contract_ts_source_name(path))
+                self.assertIsNone(subject._core_contract_ts_test_name(path))
+        found = subject._core_contract_pattern_paths(paths)
+        for name in sorted(found):
+            with self.subTest(pattern=name):
+                self.assertEqual(found[name], set())
+        for package_path in ("packages/host-api", "packages/kernel-i18n"):
+            self.assertFalse(any(path.startswith(package_path + "/") for path in paths))
+
+    def test_kernel_tokens_files_do_not_change_pattern_counts_or_foundation_detection(self):
+        for concern in ("core-rust-format-return", "core-build-diagnostic-return"):
+            entries = self._four_crate_entries(concern)
+            baseline = subject._core_contract_pattern_paths(entries)
+            entries.update({path: ("100644", "a" * 40) for path in self._kernel_tokens_paths()})
+            with self.subTest(concern=concern):
+                self.assertEqual(subject._core_contract_pattern_paths(entries), baseline)
+                self.assertEqual(
+                    {path for path in entries if subject._core_contract_foundation_path(path)}
+                    & set(self._kernel_tokens_paths()),
+                    set(),
+                )
+        plain = {
+            path: entry for path, entry in self._required_core_contract_entries("core-contract").items()
+        }
+        plain.update({path: ("100644", "a" * 40) for path in self._kernel_tokens_paths()})
+        self.assertFalse(any(
+            subject._core_contract_foundation_path(path)
+            for path in plain if path not in subject.CORE_CONTRACT_ROOT_FILES
+        ))
+
+    def test_kernel_tokens_tree_passes_and_unlisted_or_non_regular_entries_are_refused(self):
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        listed = self._kernel_tokens_paths()
+        for concern in (
+            "core-rust-format-return", "core-build-diagnostic-return", "core-npm-admission-return",
+        ):
+            entries = self._four_crate_entries(concern)
+            if concern in subject.CORE_CONTRACT_BATCH5_CONCERNS:
+                entries.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})
+            entries.update({path: ("100644", "a" * 40) for path in listed})
+            with self.subTest(concern=concern):
+                marker, unused_blob = self._validate_feedback_tree(
+                    entries, concern, workspace_text=self._workspace_text(members),
+                )
+                expected_marker = subject.CORE_CONTRACT_TREE_BY_CONCERN[concern]
+                if concern == "core-build-diagnostic-return":
+                    expected_marker = subject.CORE_CONTRACT_PACKAGE_LOCK_TREE
+                self.assertEqual(marker, expected_marker)
+            for path, mode in (
+                (listed[0], "100755"),
+                (listed[-1], "100755"),
+                (listed[0], "120000"),
+                (listed[1], "160000"),
+                ("packages/kernel-tokens/src/extra.ts", "100644"),
+                ("packages/kernel-tokens/package.json", "100644"),
+            ):
+                changed = dict(entries)
+                changed[path] = (mode, "a" * 40)
+                with self.subTest(concern=concern, path=path, mode=mode):
+                    self.assertEqual(self._refused_check(
+                        changed, concern, workspace_text=self._workspace_text(members),
+                    ), "path_mode")
+
     def test_four_crate_two_package_tree_is_admitted_by_format_return_and_diagnostics(self):
         for concern, tree in (
             ("core-rust-format-return", "core_rust_format_return"),
