@@ -886,6 +886,11 @@ class LinuxBoundaryFixtureDiagnosticTests(unittest.TestCase):
 
     def test_a_node_lookup_refusal_flows_through_run_fixtures(self):
         subject, emitter = make(rust_sysroot="/opt/rust")
+        subject.tripwires = SimpleNamespace(
+            ports={"https4": 1, "udp": 2, "dns_udp": 3, "proxy": 4},
+            store=SimpleNamespace(clear=lambda: None, seen=lambda name, marker: True, snapshot=lambda: []),
+        )
+        subject.ipc_dir = "/ipc-source"
         with patch.object(boundary.Boundary, "node_binary", side_effect=BoundaryRefusal("fixture_incomplete", None, fixtures.HOST_NODE_UNSAFE)), \
              patch.object(boundary.Boundary, "chroot", side_effect=BoundaryRefusal("environment")):
             completed, first = subject.run_fixtures()
