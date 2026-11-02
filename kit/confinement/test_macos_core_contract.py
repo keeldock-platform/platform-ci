@@ -916,13 +916,27 @@ class CoreContractTests(unittest.TestCase):
         line = feedback_failure.REFUSAL_PREFIX + payload + b"\n"
         return attached, record, feedback_failure.normalize_refusal(line) == line
 
+    NODE_STAGE_BY_SUBSTAGE = (
+        ("runtime_version", "node_dependency_prepare"), ("npm_version", "node_dependency_prepare"),
+        ("lock_generation", "node_dependency_prepare"), ("lock_validation", "node_dependency_prepare"),
+        ("bulk_audit", "node_dependency_audit"), ("npm_ci", "node_dependency_audit"),
+        ("typecheck", "typescript_typecheck"), ("tests", "typescript_tests"),
+    )
+
+    def _expected_node_stage(self, expected):
+        for substage, stage in self.NODE_STAGE_BY_SUBSTAGE:
+            if expected.startswith("source_gates_node_" + substage + "_"):
+                return stage
+        return "worker_setup"
+
     def _expect_node_diagnostic(self, error, expected, public_reason="runner_unavailable"):
         attached, record, normalized = self._published_node_refusal(error)
+        expected_stage = self._expected_node_stage(expected)
         self.assertEqual(attached.diagnostic, expected)
-        self.assertEqual((attached.reason, attached.stage), (public_reason, "worker_setup"))
+        self.assertEqual((attached.reason, attached.stage), (public_reason, expected_stage))
         self.assertEqual(
             (record["reason"], record["stage"], record["diagnostic"]),
-            (public_reason, "worker_setup", expected),
+            (public_reason, expected_stage, expected),
         )
         self.assertTrue(normalized)
 
@@ -1007,10 +1021,12 @@ class CoreContractTests(unittest.TestCase):
         )
 
     def test_every_listed_node_combination_publishes_its_bound_value(self):
+        stage_for = dict(self.NODE_STAGE_BY_SUBSTAGE)
         for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
             for reason in reasons:
                 error = real_node_contract.NodeContractRefusal(
                     reason, substage=None if substage == "none" else substage,
+                    stage=stage_for.get(substage, "node_dependency_prepare"),
                 )
                 expected = "source_gates_node_" + substage + "_" + reason
                 with self.subTest(diagnostic=expected):
@@ -1023,10 +1039,70 @@ class CoreContractTests(unittest.TestCase):
             for check in subject.SOURCE_GATES_NODE_COMMAND_CHECKS:
                 error = real_node_contract.NodeContractRefusal(
                     "command_failed", substage=substage, command_check=check,
+                    stage=stage_for[substage],
                 )
                 expected = "source_gates_node_" + substage + "_command_" + check
                 with self.subTest(diagnostic=expected):
                     self._expect_node_diagnostic(error, expected)
+
+    def test_node_substage_values_bind_to_exactly_one_node_stage(self):
+        stage_for = dict(self.NODE_STAGE_BY_SUBSTAGE)
+        self.assertEqual(subject.SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE, stage_for)
+        self.assertEqual(
+            set(stage_for.values()),
+            {"node_dependency_prepare", "node_dependency_audit", "typescript_typecheck",
+             "typescript_tests"},
+        )
+        self.assertEqual(set(stage_for.values()), set(foundation_tests.subject.NODE_GATE_NAMES))
+        generated = {}
+        for substage, reasons in subject.SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE:
+            if substage in stage_for:
+                for reason in reasons:
+                    generated["source_gates_node_" + substage + "_" + reason] = stage_for[substage]
+        for substage in subject.SOURCE_GATES_NODE_COMMAND_SUBSTAGES:
+            for check in subject.SOURCE_GATES_NODE_COMMAND_CHECKS:
+                generated["source_gates_node_" + substage + "_command_" + check] = stage_for[substage]
+        self.assertEqual(subject.SOURCE_GATES_NODE_DIAGNOSTIC_STAGES, generated)
+        self.assertEqual(len(generated), 90 - 10)
+        self.assertTrue(set(generated) <= subject.SOURCE_GATES_NODE_DIAGNOSTICS)
+        for diagnostic in subject.SOURCE_GATES_NODE_DIAGNOSTICS - set(generated):
+            self.assertTrue(diagnostic.startswith("source_gates_node_none_"), msg=diagnostic)
+
+    def test_node_substage_refusals_keep_worker_setup_without_a_known_substage(self):
+        refusal = real_node_contract.NodeContractRefusal
+        for stage in sorted(real_node_contract.STAGES):
+            for reason in ("invalid_input", "tool_unavailable", "capture_invalid"):
+                with self.subTest(stage=stage, reason=reason):
+                    self._expect_node_diagnostic(
+                        refusal(reason, stage=stage), "source_gates_node_none_" + reason,
+                        public_reason="capture_invalid" if reason == "capture_invalid"
+                        else "runner_unavailable",
+                    )
+
+    def test_node_substage_refusal_at_a_disagreeing_stage_keeps_the_generic_value(self):
+        refusal = real_node_contract.NodeContractRefusal
+        stage_for = dict(self.NODE_STAGE_BY_SUBSTAGE)
+        for substage, bound in sorted(stage_for.items()):
+            for stage in sorted(real_node_contract.STAGES - {bound}):
+                with self.subTest(substage=substage, stage=stage):
+                    self._expect_node_diagnostic(
+                        refusal("command_failed", stage=stage, substage=substage, command_check="timeout"),
+                        "source_gates",
+                    )
+        refused = subject._toolchain_refusal(
+            refusal("command_failed", stage="typescript_tests", substage="tests", command_check="timeout"),
+            "worker_setup",
+        )
+        self.assertEqual(
+            (refused.reason, refused.stage, refused.diagnostic),
+            ("runner_unavailable", "typescript_tests", "source_gates_node_tests_command_timeout"),
+        )
+        other = subject._toolchain_refusal(
+            refusal("command_failed", stage="typescript_tests", substage="tests", command_check="timeout"),
+            "toolchain_install",
+        )
+        self.assertEqual((other.reason, other.stage), ("toolchain_install_failed", "toolchain_install"))
+        self.assertEqual(other.diagnostic, "unavailable")
 
     def test_unlisted_node_combinations_keep_the_generic_source_gates_value(self):
         refusal = real_node_contract.NodeContractRefusal

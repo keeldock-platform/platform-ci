@@ -208,6 +208,26 @@ SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
     },
 }
 SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(SOURCE_GATES_NODE_DIAGNOSTIC_REASONS)
+SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE = {
+    "runtime_version": "node_dependency_prepare", "npm_version": "node_dependency_prepare",
+    "lock_generation": "node_dependency_prepare", "lock_validation": "node_dependency_prepare",
+    "bulk_audit": "node_dependency_audit", "npm_ci": "node_dependency_audit",
+    "typecheck": "typescript_typecheck", "tests": "typescript_tests",
+}
+SOURCE_GATES_NODE_DIAGNOSTIC_STAGES = {
+    **{
+        "source_gates_node_" + substage + "_" + reason: SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
+        for substage, reasons in SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
+        if substage in SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE
+        for reason in reasons
+    },
+    **{
+        "source_gates_node_" + substage + "_command_" + check:
+            SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
+        for substage in SOURCE_GATES_NODE_COMMAND_SUBSTAGES
+        for check in SOURCE_GATES_NODE_COMMAND_CHECKS
+    },
+}
 SOURCE_GATES_NODE_PROFILE_REASONS = (
     "manifest_invalid", "command_failed", "capture_invalid", "output_unavailable",
 )
@@ -1394,20 +1414,28 @@ def _toolchain_refusal(error, stage):
             return Refusal("cleanup_incomplete", "cleanup", diagnostic=diagnostic)
         return Refusal("cleanup_incomplete", "cleanup")
     node_diagnostic = None
+    node_stage = None
     if stage == "worker_setup":
         node_diagnostic = _node_refusal_diagnostic(error)
         if node_diagnostic is None:
             node_diagnostic = _source_gates_step_diagnostic(error)
+        elif node_diagnostic in SOURCE_GATES_NODE_DIAGNOSTIC_STAGES:
+            node_stage = SOURCE_GATES_NODE_DIAGNOSTIC_STAGES[node_diagnostic]
+            if getattr(error, "stage", None) != node_stage:
+                node_diagnostic = None
+                node_stage = None
     expected_reason = None
     if node_diagnostic is not None:
         expected_reason = SOURCE_GATES_NODE_DIAGNOSTIC_REASONS.get(
             node_diagnostic, SOURCE_GATES_STEP_DIAGNOSTIC_REASONS.get(node_diagnostic),
         )
     if reason == "capture_invalid":
-        return Refusal(
-            "capture_invalid", stage,
-            diagnostic=node_diagnostic if expected_reason == "capture_invalid" else None,
-        )
+        if expected_reason == "capture_invalid":
+            return Refusal(
+                "capture_invalid", stage if node_stage is None else node_stage,
+                diagnostic=node_diagnostic,
+            )
+        return Refusal("capture_invalid", stage)
     if reason == "version_mismatch":
         return Refusal("toolchain_version_mismatch", "toolchain_install")
     if stage == "observer":
@@ -1418,10 +1446,12 @@ def _toolchain_refusal(error, stage):
         return Refusal("source_diff_mismatch", "source_diff")
     if stage == "toolchain_install":
         return Refusal("toolchain_install_failed", "toolchain_install")
-    return Refusal(
-        "runner_unavailable", "worker_setup",
-        diagnostic=node_diagnostic if expected_reason == "runner_unavailable" else None,
-    )
+    if expected_reason == "runner_unavailable":
+        return Refusal(
+            "runner_unavailable", "worker_setup" if node_stage is None else node_stage,
+            diagnostic=node_diagnostic,
+        )
+    return Refusal("runner_unavailable", "worker_setup")
 
 
 def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha256, deadline, lifecycle,

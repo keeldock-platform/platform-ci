@@ -496,6 +496,27 @@ CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
 CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(
     CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS
 )
+CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE = {
+    "runtime_version": "node_dependency_prepare", "npm_version": "node_dependency_prepare",
+    "lock_generation": "node_dependency_prepare", "lock_validation": "node_dependency_prepare",
+    "bulk_audit": "node_dependency_audit", "npm_ci": "node_dependency_audit",
+    "typecheck": "typescript_typecheck", "tests": "typescript_tests",
+}
+CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_STAGES = {
+    **{
+        "source_gates_node_" + substage + "_" + reason:
+            CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
+        for substage, reasons in CORE_CONTRACT_SOURCE_GATES_NODE_REASONS_BY_SUBSTAGE
+        if substage in CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE
+        for reason in reasons
+    },
+    **{
+        "source_gates_node_" + substage + "_command_" + check:
+            CORE_CONTRACT_SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE[substage]
+        for substage in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_SUBSTAGES
+        for check in CORE_CONTRACT_SOURCE_GATES_NODE_COMMAND_CHECKS
+    },
+}
 CORE_CONTRACT_SOURCE_GATES_NODE_PROFILE_REASONS = (
     "manifest_invalid", "command_failed", "capture_invalid", "output_unavailable",
 )
@@ -1712,7 +1733,9 @@ def _core_contract_refusal_diagnostic_matches(value):
     diagnostic = value["diagnostic"]
     if diagnostic in CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTICS:
         return (
-            value["stage"] == "worker_setup"
+            value["stage"] == CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_STAGES.get(
+                diagnostic, "worker_setup",
+            )
             and value["reason"] == CORE_CONTRACT_SOURCE_GATES_NODE_DIAGNOSTIC_REASONS[diagnostic]
         )
     if diagnostic in CORE_CONTRACT_SOURCE_GATES_STEP_DIAGNOSTICS:
