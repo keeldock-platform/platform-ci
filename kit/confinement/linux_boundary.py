@@ -532,7 +532,7 @@ class Boundary:
             lines = channels.fixture_diag_lines(self.phase, form, stderr, self.nonce, needles, header)
             lines = tuple(lines)
         except (ValueError, TypeError, UnicodeError):
-            self.emitter.emit(channels.LINE_PREFIX + "-FIXTURE-DIAG schema=" + str(channels.SCHEMA_VERSION) + " phase=selftest form=unknown stream=stderr line=unavailable")
+            self.emitter.emit(channels.diag_line(self.phase, "unknown", "unavailable"))
             return
         for line in lines:
             self.emitter.emit(line)
