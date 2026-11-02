@@ -582,7 +582,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             "SOURCE_READER_CLIENT_ID": "client", "LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256": "f" * 64,
             "LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256": "1" * 64,
             "LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON": "{}",
-            "LINUX_SOURCE_ENVIRONMENT_NAME": "source-read", "REQUESTED_ENVIRONMENT_NAME": "source-read",
+            "LINUX_SOURCE_ENVIRONMENT_NAME": "linux-source-read", "REQUESTED_ENVIRONMENT_NAME": "linux-source-read",
         }
         with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
@@ -590,7 +590,113 @@ class LinuxSourceBuildTests(unittest.TestCase):
             provenance.assert_not_called()
             env["LINUX_SOURCE_ALLOWED_FINGERPRINT"] = fingerprint
             self.assertEqual(linux_source_build._source_inputs(env)["reviewed_diff_sha256"], fingerprint)
+            self.assertEqual(env["LINUX_SOURCE_ENVIRONMENT_NAME"], linux_source_build.ENVIRONMENT_NAME)
             provenance.assert_called_once()
+            for name, value in (("LINUX_SOURCE_ENVIRONMENT_NAME", "source-read"), ("REQUESTED_ENVIRONMENT_NAME", "source-read")):
+                with self.subTest(name=name):
+                    changed = dict(env, **{name: value})
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._source_inputs(changed)
+            provenance.assert_called_once()
+
+    def _environment_calls(self, environment_updates=None, branch_names=("main", "untrusted"),
+                           listing_updates=None, status=200):
+        environment = {
+            "name": "linux-source-read", "can_admins_bypass": False,
+            "deployment_branch_policy": {"custom_branch_policies": True, "protected_branches": False},
+        }
+        environment.update(environment_updates or {})
+        entries = [{"id": index + 1, "name": name, "type": "branch"} for index, name in enumerate(branch_names)]
+        listing = {"total_count": len(entries), "branch_policies": entries}
+        listing.update(listing_updates or {})
+        calls = []
+
+        def fake(path, token, method="GET", payload=None, expected=(200,)):
+            calls.append((path, method, token))
+            if path.endswith("/deployment-branch-policies?per_page=100"):
+                return 200, listing
+            return status, (environment if status == 200 else None)
+
+        return fake, calls
+
+    def test_environment_readback_accepts_only_the_reviewed_names_and_branch_policy(self):
+        fake, calls = self._environment_calls()
+        with patch.object(linux_source_build, "_api_request", side_effect=fake):
+            self.assertIsNone(linux_source_build._verify_environment("token"))
+        base = "/repos/" + linux_source_build.REPOSITORY + "/environments/linux-source-read"
+        self.assertEqual(calls, [
+            (base, "GET", "token"),
+            (base + "/deployment-branch-policies?per_page=100", "GET", "token"),
+        ])
+        self.assertEqual(linux_source_build.ENVIRONMENT_NAME, "linux-source-read")
+        self.assertEqual(linux_source_build.ENVIRONMENT_BRANCHES, ("main", "untrusted"))
+        fake, calls = self._environment_calls(branch_names=("untrusted", "main"))
+        with patch.object(linux_source_build, "_api_request", side_effect=fake):
+            self.assertIsNone(linux_source_build._verify_environment("token"))
+
+    def test_environment_readback_refuses_every_other_policy_shape(self):
+        refused_policy = {"custom_branch_policies": True, "protected_branches": False}
+        cases = (
+            {"status": 404},
+            {"environment_updates": {"name": "source-read"}},
+            {"environment_updates": {"can_admins_bypass": True}},
+            {"environment_updates": {"can_admins_bypass": None}},
+            {"environment_updates": {"can_admins_bypass": "false"}},
+            {"environment_updates": {"deployment_branch_policy": None}},
+            {"environment_updates": {"deployment_branch_policy": dict(refused_policy, custom_branch_policies=False)}},
+            {"environment_updates": {"deployment_branch_policy": dict(refused_policy, protected_branches=True)}},
+            {"environment_updates": {"deployment_branch_policy": {"custom_branch_policies": True}}},
+            {"branch_names": ("main",)},
+            {"branch_names": ("untrusted",)},
+            {"branch_names": ()},
+            {"branch_names": ("main", "untrusted", "develop")},
+            {"branch_names": ("main", "develop")},
+            {"branch_names": ("main", "main")},
+            {"branch_names": ("main", "untrusted*")},
+            {"listing_updates": {"total_count": 3}},
+            {"listing_updates": {"total_count": "2"}},
+            {"listing_updates": {"branch_policies": "main"}},
+            {"listing_updates": {"branch_policies": [{"name": "main", "type": "tag"}, {"name": "untrusted", "type": "branch"}]}},
+            {"listing_updates": {"branch_policies": [{"name": 7, "type": "branch"}, {"name": "untrusted", "type": "branch"}]}},
+            {"listing_updates": {"branch_policies": ["main", "untrusted"]}},
+        )
+        for index, case in enumerate(cases):
+            with self.subTest(index=index, case=case):
+                fake, calls = self._environment_calls(**case)
+                with patch.object(linux_source_build, "_api_request", side_effect=fake):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._verify_environment("token")
+        with patch.object(linux_source_build, "_api_request", side_effect=AssertionError("no request")):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build._verify_environment("token", "source-read")
+
+    def test_dispatch_reads_back_the_environment_after_binding_and_before_the_duplicate_check(self):
+        sha = "a" * 40
+        env = {
+            "CI_EVENT_NAME": "workflow_dispatch", "CI_REPOSITORY": linux_source_build.REPOSITORY,
+            "CI_SERVER_URL": "https://github.com", "CACHE_MODE": "none",
+            "CI_SHA": sha, "GITHUB_SHA": sha, "CI_REF": "refs/heads/untrusted", "CI_MODE": "source",
+        }
+        order = []
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(
+            linux_source_build, "_source_inputs", side_effect=lambda unused: order.append("binding") or {}
+        ), patch.object(
+            linux_source_build, "_verify_environment", side_effect=lambda token: order.append("environment")
+        ), patch.object(
+            linux_source_build, "_require_no_duplicate", side_effect=lambda token, unused: order.append("duplicate")
+        ):
+            self.assertEqual(linux_source_build.validate_dispatch(env, "token"), "source")
+        self.assertEqual(order, ["binding", "environment", "duplicate"])
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(linux_source_build, "_source_inputs", return_value={}), patch.object(
+            linux_source_build, "_verify_environment", side_effect=linux_source_build.SourceBuildRefusal("binding")
+        ), patch.object(linux_source_build, "_require_no_duplicate") as duplicate:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build.validate_dispatch(env, "token")
+            duplicate.assert_not_called()
 
     def test_default_checkout_environment_reaches_the_source_fetch(self):
         identity = {"owner": "owner", "name": "source", "repository_id": "7", "source_sha": "a" * 40}
@@ -807,10 +913,13 @@ class LinuxSourceBuildTests(unittest.TestCase):
             }
             with patch.dict(os.environ, env, clear=True), patch.object(
                 linux_source_build, "_reference_sha", side_effect=[sha, "b" * 40]
-            ) as references, patch.object(linux_source_build, "_comparison", return_value="ahead") as comparison:
+            ) as references, patch.object(linux_source_build, "_comparison", return_value="ahead") as comparison, patch.object(
+                linux_source_build, "_verify_environment"
+            ) as environment:
                 self.assertEqual(linux_source_build.main(["preflight"]), 0)
                 self.assertEqual(references.call_count, 2)
                 comparison.assert_called_once()
+                environment.assert_called_once_with("read-token")
                 output = io.StringIO()
                 with patch.object(linux_source_build.sys, "stdout", output):
                     self.assertEqual(linux_source_build.main(["verdict"]), 0)

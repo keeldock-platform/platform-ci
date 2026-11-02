@@ -224,7 +224,7 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
-    '.github/workflows/linux-source-admission.yml': '2d86de53ae6a26a9823c6d0e018587da0f47fbd4aecb4d98385df6972904a775',
+    '.github/workflows/linux-source-admission.yml': '895745bfad32c4fb782dbf5ac92b833c495abc146a960974e37f4d4155905372',
     'kit/bootstrap/action.yml': '8aae0e79ddc70dae5849c6a7579a8a56a37173da07bfa75bbcd3087dd666fee2',
     'kit/confinement/release_tool_ledger.py': 'e9a4f50f806fad3d5ae7c7323adfc3024eaaa1f564a8725e9ef7281fa01c6657',
     'kit/confinement/release_tool_ledger.json': '2c0004d1e83780d780c501b794a15e6c6928f8aa352dcfab46fe389fe871dc0b',
@@ -263,8 +263,8 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
     'kit/confinement/macos_core_contract.py': '63b223dc054bbb3cf13d2d749fff76459b6de5dc3869b09c3886009c6d4b4390',
     'kit/confinement/test_macos_core_contract.py': '02592b64799bf75ce285e859d862a5b7749b9c42475e790c3562be8321fa363a',
-    'kit/confinement/linux_source_build.py': '07c6176fce8746261a9c58f672db588a339423b5f886b3958667b6813243bdd6',
-    'kit/confinement/test_linux_source_build.py': 'f83b71957c6b61f66dc61e36e8356f4ae0f31a7d168dda7baedb75523cbc5041',
+    'kit/confinement/linux_source_build.py': '4c2ca8a2979fad33c27923375a39e70713ef810bd82972af7e1313653488ec8f',
+    'kit/confinement/test_linux_source_build.py': 'd093187cddcc26d2f3fa3958ffc399dff80be4ba436cd969dd671ee2cb6bf0a8',
     'kit/confinement/rust_license_gate.py': '4896e53baf2b0bd8bc8047c69e50c8c72dff11096ca9225bfa9efad71913dfc6',
     'kit/confinement/test_rust_license_gate.py': '5c421d6142948a52704fd9a4db72d0761c167ed6a8fea5bae49b633acf53defa',
     '.github/workflows/macos-rust-toolchain-smoke.yml': 'cdf7068f8887c22958d74f3c2cc0a73c5c8c4c41f4eff0b43e16e47f61e58bb7',

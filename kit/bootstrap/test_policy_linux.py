@@ -190,7 +190,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/untrusted'", source)
         self.assertIn("inputs.mode == 'source'", source)
         self.assertIn("inputs.mode == 'synthetic' && github.ref == 'refs/heads/main'", source)
-        self.assertIn("name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}", source)
+        self.assertIn("    environment: linux-source-read\n", source)
         self.assertIn("REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}", source)
         self.assertIn("LINUX_SOURCE_ENVIRONMENT_NAME: ${{ vars.LINUX_SOURCE_ENVIRONMENT_NAME }}", source)
         self.assertNotIn("pull_request:", self.text)
@@ -258,7 +258,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
             with self.subTest(job=name):
                 self.assertIn("      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}\n", body)
                 self.assertIn("      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}\n", body)
-                self.assertIn("    environment:\n      name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}\n", body)
+                self.assertIn("    environment: linux-source-read\n", body)
         for name in ("unit", "audit"):
             body = jobs["linux-source-admission-" + name]
             self.assertNotIn("SOURCE_REPOSITORY_OWNER", body)
@@ -274,6 +274,22 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertNotEqual(changed, self.text)
         with self.assertRaisesRegex(PolicyError, "workflow-template-mismatch"):
             validate_workflow_text(changed, "platform", "linux-source-admission")
+
+    def test_every_job_binds_the_linux_environment_and_the_input_defaults_to_it(self):
+        jobs = self.jobs()
+        for name in ("settings", "source-read", "verdict", "audit"):
+            with self.subTest(job=name):
+                body = jobs["linux-source-admission-" + name]
+                self.assertEqual(body.count("    environment: linux-source-read\n"), 1)
+                self.assertNotIn("environment_name ||", body)
+        self.assertNotIn("environment:", jobs["linux-source-admission-unit"])
+        self.assertEqual(self.text.count("environment: linux-source-read"), 4)
+        self.assertEqual(self.text.count("environment:"), 4)
+        self.assertNotIn("'none'", self.text)
+        self.assertIn("        description: Protected source-read environment\n        required: false\n        type: string\n        default: linux-source-read\n", self.text)
+        self.assertNotIn("default: source-read", self.text)
+        self.assertIn("REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}", self.text)
+        self.assertIn('ENVIRONMENT_NAME = "linux-source-read"', (ROOT / "kit/confinement/linux_source_build.py").read_text(encoding="utf-8"))
 
     def test_source_read_steps_follow_the_required_order(self):
         source = self.jobs()["linux-source-admission-source-read"]
@@ -330,7 +346,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertNotIn("verdict_record", verdict)
         self.assertNotIn("needs.linux-source-admission-source-read.outputs", verdict)
         self.assertIn("PRODUCER_RESULT: ${{ needs.linux-source-admission-source-read.result }}", verdict)
-        self.assertIn("name: ${{ inputs.mode == 'source' && inputs.environment_name || 'none' }}", verdict)
+        self.assertIn("    environment: linux-source-read\n", verdict)
         self.assertIn("linux_boundary.py selftest", verdict)
         self.assertIn("linux_boundary.py recheck", verdict)
         self.assertIn("linux_boundary.py merge", verdict)

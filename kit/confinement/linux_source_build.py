@@ -39,6 +39,8 @@ IMAGE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 OWNER_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
+ENVIRONMENT_NAME = "linux-source-read"
+ENVIRONMENT_BRANCHES = ("main", "untrusted")
 GATES = (
     "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
     "parser_format", "parser_clippy", "parser_replay", "node_dependency_prepare",
@@ -250,7 +252,7 @@ def _source_inputs(environ):
             or HEX64_RE.fullmatch(environ["LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256"]) is None):
         raise SourceBuildRefusal("binding")
     if (environ.get("REQUESTED_ENVIRONMENT_NAME") != environ["LINUX_SOURCE_ENVIRONMENT_NAME"]
-            or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", environ["LINUX_SOURCE_ENVIRONMENT_NAME"]) is None):
+            or environ["LINUX_SOURCE_ENVIRONMENT_NAME"] != ENVIRONMENT_NAME):
         raise SourceBuildRefusal("binding")
     identity = {
         "source_sha": source_sha,
@@ -264,6 +266,33 @@ def _source_inputs(environ):
     }
     _validate_provenance_binding(identity, environ)
     return identity
+
+
+def _verify_environment(token, name=ENVIRONMENT_NAME):
+    if name != ENVIRONMENT_NAME:
+        raise SourceBuildRefusal("binding")
+    path = "/repos/" + REPOSITORY + "/environments/" + name
+    status, environment = _api_request(path, token, expected=(200, 404))
+    policy = environment.get("deployment_branch_policy") if type(environment) is dict else None
+    if (status != 200 or type(environment) is not dict or environment.get("name") != name
+            or environment.get("can_admins_bypass") is not False
+            or type(policy) is not dict
+            or policy.get("custom_branch_policies") is not True
+            or policy.get("protected_branches") is not False):
+        raise SourceBuildRefusal("binding")
+    status, listing = _api_request(path + "/deployment-branch-policies?per_page=100", token)
+    entries = listing.get("branch_policies") if type(listing) is dict else None
+    if (type(entries) is not list or len(entries) > 100
+            or type(listing.get("total_count")) is not int or listing["total_count"] != len(entries)):
+        raise SourceBuildRefusal("binding")
+    names = []
+    for entry in entries:
+        if (type(entry) is not dict or entry.get("type") != "branch"
+                or type(entry.get("name")) is not str):
+            raise SourceBuildRefusal("binding")
+        names.append(entry["name"])
+    if sorted(names) != sorted(ENVIRONMENT_BRANCHES):
+        raise SourceBuildRefusal("binding")
 
 
 def validate_dispatch(environ, api_token=None):
@@ -294,10 +323,12 @@ def validate_dispatch(environ, api_token=None):
     if mode == "synthetic":
         if ref != "refs/heads/main":
             raise SourceBuildRefusal("identity")
+        _verify_environment(api_token)
         return "synthetic"
     if mode != "source":
         raise SourceBuildRefusal("identity")
     identity = _source_inputs(environ)
+    _verify_environment(api_token)
     _require_no_duplicate(api_token, environ)
     return "source"
 
