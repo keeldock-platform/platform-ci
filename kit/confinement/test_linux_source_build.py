@@ -667,6 +667,8 @@ class LinuxSourceBuildTests(unittest.TestCase):
         refused = (
             "", "repos/x", "/", "/repos//x", "/repos/x/", "/repos/../x", "/repos/x/..", "/repos/./x",
             "/repos/%2e%2e/x", "/repos/%2E%2e/x", "/repos/x\\y", "/repos/x\x00", None, 7,
+            "/repos/x%2Fy", "/repos/x%5Cy", "/repos/x%00", "/repos/x?a#b", "/repos/x y", "/repos/x\n",
+            "/repos/caf\u00e9", "/repos/x?a?b", "/repos/x;y", "/repos/x:y", "/repos/x@y", "/repos/x+y",
         )
         for path in refused:
             with self.subTest(path=path):
@@ -674,6 +676,14 @@ class LinuxSourceBuildTests(unittest.TestCase):
         with patch.object(linux_source_build.urllib.request, "build_opener", side_effect=AssertionError("no request")):
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "network"):
                 linux_source_build._api_request("/repos/../x", "token")
+
+    def test_owner_and_name_patterns_refuse_a_leading_dot_and_odd_characters(self):
+        for value in ("owner", "_owner", "o.w-n_er", "a" * 100, "7"):
+            with self.subTest(value=value):
+                self.assertIsNotNone(linux_source_build.OWNER_RE.fullmatch(value))
+        for value in ("", ".", "..", ".hidden", "-x", "a" * 101, "a/b", "a b", "a%2e", "a\n", "café"):
+            with self.subTest(value=value):
+                self.assertIsNone(linux_source_build.OWNER_RE.fullmatch(value))
 
     def test_comparison_sends_the_range_to_the_api_and_refuses_non_commit_values(self):
         base = "a" * 40
@@ -705,7 +715,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             ])
             for bad_base, bad_head in (("main", head), (base, "../x"), (base[:-1], head), (None, head), (base, 7)):
                 with self.subTest(base=bad_base, head=bad_head):
-                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "network"):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
                         linux_source_build._comparison("token", linux_source_build.REPOSITORY, bad_base, bad_head)
             self.assertEqual(len(requests), 1)
 

@@ -48,7 +48,8 @@ SOURCE_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
 IMAGE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
-OWNER_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
+OWNER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\Z")
+API_PATH_RE = re.compile(r"/[A-Za-z0-9._~/?&=-]*\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 ENVIRONMENT_NAME = "linux-source-read"
 ENVIRONMENT_BRANCHES = ("main", "untrusted")
@@ -260,10 +261,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _safe_api_path(path):
-    if type(path) is not str or not path.startswith("/") or "\\" in path or "\x00" in path:
+    if type(path) is not str or API_PATH_RE.fullmatch(path) is None or path.count("?") > 1:
         return False
     parts = path[1:].split("?", 1)[0].split("/")
-    return all(urllib.parse.unquote(part) not in ("", ".", "..") for part in parts)
+    return all(part not in ("", ".", "..") for part in parts)
 
 
 def _api_request(path, token, method="GET", payload=None, expected=(200,)):
@@ -317,7 +318,7 @@ def _reference_sha(token, repository, branch):
 def _comparison(token, repository, base, head):
     if (type(base) is not str or SOURCE_SHA_RE.fullmatch(base) is None
             or type(head) is not str or SOURCE_SHA_RE.fullmatch(head) is None):
-        raise SourceBuildRefusal("network")
+        raise SourceBuildRefusal("binding")
     status, payload = _api_request(
         "/repos/" + repository + "/compare/" + base + "..." + head, token,
         expected=(200, 404),
