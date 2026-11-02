@@ -971,7 +971,9 @@ class LinuxBoundaryFixtureStderrDiagnosticTests(unittest.TestCase):
 
     def test_a_malformed_evidence_pair_is_also_contained(self):
         subject, emitter = self.scaffold()
-        subject.emit_diagnostic("build_rs", BoundaryRefusal("fixture_incomplete", None, 3, ("only-one",)))
+        refusal = BoundaryRefusal("fixture_incomplete", None, 3, ("kd-host exit=3", b"error\n"))
+        refusal.evidence = ("only-one",)
+        subject.emit_diagnostic("build_rs", refusal)
         self.assertEqual(len(self.diag_lines(emitter)), 1)
         self.assertTrue(self.diag_lines(emitter)[0].endswith("line=unavailable"))
 
