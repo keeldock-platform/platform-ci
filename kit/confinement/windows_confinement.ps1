@@ -16,6 +16,9 @@ $componentNameObserved = $null
 $script:NullLease = $null
 $script:ExpectedTemp = $null
 $script:ProfileFolder = $null
+$script:OtherBox = $null
+$script:OtherFolder = $null
+$script:OtherContainerSeconds = 30
 $script:Canaries = @()
 $script:CanaryRunnerTemp = ''
 $script:CanaryWorkspace = ''
@@ -461,13 +464,35 @@ function Get-ProbeValue([string]$text, [string]$key) {
     return 'none'
 }
 
+$NetworkDeniedConnect = @('err10013')
+$NetworkDeniedResolve = @('err10013', 'err11001')
+$NetworkDeniedUdp = @('err10013')
+
 function Get-NetworkState([string]$stdout, [string]$name) {
     $text = Get-ProbeText $stdout $name
     if ($text.Length -eq 0) { return 'no_output' }
-    if ($text -match 'wsa=failed') { return 'wsa_failed' }
-    if ($text -match 'connect=open' -or $text -match 'recv=data') { return 'open' }
-    if ($text -match 'resolve=ok count=[1-9]') { return 'open' }
-    return 'blocked'
+    if ($text -ceq 'wsa=failed') { return 'wsa_failed' }
+    if ($name -ceq 'connect') {
+        if ($text -ceq 'resolve=ok connect=open') { return 'open' }
+        $found = [regex]::Match($text, '^resolve=ok connect=(err[0-9]{1,5})$')
+        if ($found.Success -and ($NetworkDeniedConnect -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
+        if ($found.Success -and ($NetworkDeniedResolve -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        return 'unexpected'
+    }
+    if ($name -ceq 'dns') {
+        if ($text -cmatch '^resolve=ok count=[1-9][0-9]*$') { return 'open' }
+        $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
+        if ($found.Success -and ($NetworkDeniedResolve -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        return 'unexpected'
+    }
+    if ($name -ceq 'udp') {
+        if ($text -ceq 'send=ok recv=data') { return 'open' }
+        $found = [regex]::Match($text, '^send=(err[0-9]{1,5})$')
+        if ($found.Success -and ($NetworkDeniedUdp -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        return 'unexpected'
+    }
+    return 'unexpected'
 }
 
 function Test-CanaryHidden([string]$stdout) {
@@ -515,9 +540,35 @@ function Initialize-ContainerTemp($sandbox) {
     if (-not $inherited) { throw 'acl' }
     if (-not (Test-LowIntegrityLabel $expected)) { throw 'label' }
     $run = Invoke-ConfinedProbe $sandbox 'tempdir' 30
-    if ($run.Failure -ne '' -or -not $run.Exited -or $run.TimedOut -or $run.ExitCode -ne 0) { throw 'probe' }
+    if ($run.Failure -ne '' -or -not $run.Exited -or $run.TimedOut -or $run.ExitCode -ne 0) {
+        $probeReason = 'probe_exit'
+        if ($run.Failure -ne '') { $probeReason = 'probe_launch' }
+        elseif (-not $run.Exited) { $probeReason = 'probe_not_exited' }
+        elseif ($run.TimedOut) { $probeReason = 'probe_timeout' }
+        $probeFailure = Get-Token ([string]$run.Failure) '^[a-z_]{0,24}$'
+        $probeCode = '0x' + ([uint32]$run.ExitCode).ToString('x8')
+        Write-Line ('windows-confinement-temp=failed reason=' + $probeReason + ' failure=' + $probeFailure + ' create_error=' + $run.CreateError + ' exit=' + $probeCode)
+        throw $probeReason
+    }
     if (-not (Test-ContainerTempReport ([string]$run.Stdout))) { throw 'identity' }
     Write-Line 'windows-confinement-temp=verified location=scratch_profile inherited_acl=verified label=low'
+}
+
+function Test-OtherContainerNul($first) {
+    $other = [KeelDock.Platform.WindowsConfinement.Sandbox]::Create()
+    $script:OtherBox = $other
+    $script:OtherFolder = Join-Path (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)) 'Packages') $other.ProfileName
+    if (([string]$other.SidText -ceq [string]$script:Sid) -or ([string]$other.ProfileName -ceq [string]$first.ProfileName)) { throw 'nul_other_not_distinct' }
+    $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $commandLine = '"' + $cmd + '" /d /c echo x>NUL'
+    $environment = New-StageEnvironment $script:Lpac 'target-nul-other'
+    $seconds = $script:OtherContainerSeconds
+    $granted = $first.Run($true, $cmd, $commandLine, $script:Lpac.Root, $environment, ($seconds * 1000), [uint32]32)
+    if ($granted.Failure -ne '' -or -not $granted.Exited -or $granted.TimedOut -or $granted.ExitCode -ne 0) { throw 'nul_other_control' }
+    $denied = $other.Run($true, $cmd, $commandLine, (Join-Path $env:SystemRoot 'System32'), $environment, ($seconds * 1000), [uint32]32)
+    if ($denied.Failure -ne '' -or -not $denied.Exited -or $denied.TimedOut) { throw 'nul_other_launch' }
+    if ($denied.ExitCode -eq 0 -or (($denied.Stdout + $denied.Stderr) -cnotmatch 'Access is denied')) { throw 'nul_other_not_denied' }
+    Write-Line 'windows-confinement-nul-other=denied container=distinct error=5 control=granted'
 }
 
 function Remove-Canaries {
@@ -558,6 +609,9 @@ function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
     } else {
         $specs += @{ Name = 'acl_downloads_listable'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.Downloads); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'rustc\.tar\.gz' } }
         $specs += @{ Name = 'network_control'; Exe = $probe; Arguments = 'connect 1.1.1.1:443'; Timeout = 40; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -ceq 'open' } }
+        $specs += @{ Name = 'network_control_ipv6'; Exe = $probe; Arguments = 'connect [2606:4700:4700::1111]:443'; Timeout = 40; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -ceq 'open' } }
+        $specs += @{ Name = 'network_control_dns'; Exe = $probe; Arguments = 'dns github.com'; Timeout = 30; Check = { param($r) (Get-NetworkState $r.Stdout 'dns') -ceq 'open' } }
+        $specs += @{ Name = 'network_control_udp'; Exe = $probe; Arguments = 'udp 1.1.1.1:53'; Timeout = 30; Check = { param($r) (Get-NetworkState $r.Stdout 'udp') -ceq 'open' } }
     }
     $specs += @{ Name = 'rustc_version'; Exe = ($layout.RustBin + '\rustc.exe'); Arguments = '--version --verbose'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match '(?m)^rustc 1\.99\.1 ' -and $r.Stdout -match '(?m)^host: x86_64-pc-windows-msvc' } }
     $specs += @{ Name = 'cargo_version'; Exe = ($layout.RustBin + '\cargo.exe'); Arguments = '--version'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match '(?m)^cargo (0\.100\.0|1\.99\.[01]) ' } }
@@ -596,7 +650,7 @@ function Invoke-Ladder($sandbox, [bool]$confined, [hashtable]$scratch) {
         }
         $verdict = 'failed'
         if ($passed) { $verdict = 'ok' }
-        Write-Line ('windows-confinement-stage=' + $spec.Name + ' confined=' + $confined.ToString().ToLowerInvariant() + ' result=' + $verdict + ' exit=' + $exitText + ' status=' + (Get-StatusName ([uint32]$result.ExitCode)) + ' ms=' + $result.ElapsedMs + ' timed_out=' + $result.TimedOut.ToString().ToLowerInvariant() + ' hang=' + $hang + ' failure=' + $failureText + ' create_error=' + $result.CreateError + ' job=' + $jobText + ' token=' + $tokenText + ' handles=' + $result.HandleCount + ' cpu_ms=' + $result.CpuMs + ' peak_process_mib=' + (Get-Mib $result.PeakProcessMemory) + ' peak_job_mib=' + (Get-Mib $result.PeakJobMemory) + ' class46=' + $class46Text)
+        Write-Line ('windows-confinement-stage=' + $spec.Name + ' confined=' + $confined.ToString().ToLowerInvariant() + ' result=' + $verdict + ' exit=' + $exitText + ' status=' + (Get-StatusName ([uint32]$result.ExitCode)) + ' ms=' + $result.ElapsedMs + ' timed_out=' + $result.TimedOut.ToString().ToLowerInvariant() + ' hang=' + $hang + ' failure=' + $failureText + ' create_error=' + $result.CreateError + ' job=' + $jobText + ' token=' + $tokenText + ' handles=' + $result.HandleCount + ' handles_method=list_attr_readback cpu_ms=' + $result.CpuMs + ' peak_process_mib=' + (Get-Mib $result.PeakProcessMemory) + ' peak_job_mib=' + (Get-Mib $result.PeakJobMemory) + ' class46=' + $class46Text)
         if (-not $passed) {
             if ($result.Detail) { Write-DiagLines $spec.Name 'detail' $result.Detail }
             if (-not $quiet) {
@@ -836,6 +890,9 @@ try {
         $phase = 'container_temp'
         Initialize-ContainerTemp $box
 
+        $phase = 'nul_other_container'
+        Test-OtherContainerNul $box
+
         $phase = 'ladder'
         $confinedOutcomes = Invoke-Ladder $box $true $script:Lpac
 
@@ -887,7 +944,10 @@ try {
         $observed['spawn_piped'] = 'failed'
         if (Test-Passed $confinedOutcomes @('spawn_piped', 'spawn_output')) { $observed['spawn_piped'] = 'ok' }
         $observed['network'] = 'failed'
-        if ((Test-Passed $confinedOutcomes @('network_tcp_ipv4', 'network_tcp_ipv6', 'network_tcp_host', 'network_dns', 'network_udp')) -and (Test-Passed $controlOutcomes @('network_control'))) { $observed['network'] = 'blocked' }
+        $networkDenied = Test-Passed $confinedOutcomes @('network_tcp_ipv4', 'network_tcp_ipv6', 'network_tcp_host', 'network_dns', 'network_udp')
+        $networkControls = Test-Passed $controlOutcomes @('network_control', 'network_control_ipv6', 'network_control_dns', 'network_control_udp')
+        if ($networkDenied -and $networkControls) { $observed['network'] = 'blocked' }
+        if ($networkDenied -and -not $networkControls) { $observed['network'] = 'inconclusive' }
         $observed['canary'] = 'failed'
         if (Test-Passed $confinedOutcomes @('canary_runner_temp', 'canary_workspace', 'canary_profile', 'canary_scratch_control')) { $observed['canary'] = 'absent' }
         $observed['control_rust'] = 'failed'
@@ -949,6 +1009,19 @@ try {
     $profileState = 'failed'
 }
 if ($profileState -eq 'failed') { $cleanup = 'incomplete' }
+
+try {
+    if ($script:OtherBox -ne $null) {
+        $script:OtherBox.Dispose()
+        if (-not $script:OtherBox.CleanupComplete) { $cleanup = 'incomplete' }
+        if ($script:OtherFolder -and (Test-Path -LiteralPath $script:OtherFolder)) {
+            Remove-Item -LiteralPath $script:OtherFolder -Recurse -Force -ErrorAction Stop
+        }
+        if ($script:OtherFolder -and (Test-Path -LiteralPath $script:OtherFolder)) { $cleanup = 'incomplete' }
+    }
+} catch {
+    $cleanup = 'incomplete'
+}
 
 $tempState = 'removed'
 try {

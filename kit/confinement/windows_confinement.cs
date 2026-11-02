@@ -247,7 +247,12 @@ namespace KeelDock.Platform.WindowsConfinement
 
         private bool IsLeaseAce(byte[] ace)
         {
-            if (ace == null || ace.Length < 12 || ace[0] != 0)
+            if (ace == null || ace.Length < 12 || ace[0] != 0 || ace[1] != 0)
+            {
+                return false;
+            }
+            int sidLength = 8 + (ace[9] * 4);
+            if (BitConverter.ToUInt16(ace, 2) != ace.Length || ace.Length != 8 + sidLength)
             {
                 return false;
             }
@@ -769,8 +774,9 @@ namespace KeelDock.Platform.WindowsConfinement
                 Marshal.WriteIntPtr(handleBuffer, 0, inRead);
                 Marshal.WriteIntPtr(handleBuffer, IntPtr.Size, outWrite);
                 Marshal.WriteIntPtr(handleBuffer, IntPtr.Size * 2, errWrite);
-                result.HandleCount = 3;
-                if (!Native.UpdateProcThreadAttribute(attributeBuffer, 0, ProcThreadAttributeHandleList, handleBuffer, new UIntPtr((uint)(IntPtr.Size * 3)), IntPtr.Zero, IntPtr.Zero))
+                uint handleListSize = (uint)(IntPtr.Size * 3);
+                IntPtr[] handleListExpected = new IntPtr[] { inRead, outWrite, errWrite };
+                if (!Native.UpdateProcThreadAttribute(attributeBuffer, 0, ProcThreadAttributeHandleList, handleBuffer, new UIntPtr(handleListSize), IntPtr.Zero, IntPtr.Zero))
                 {
                     throw new InvalidOperationException();
                 }
@@ -822,6 +828,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 process = information.Process;
                 thread = information.Thread;
                 result.Created = true;
+                result.HandleCount = MeasureHandleList(handleBuffer, handleListSize, handleListExpected);
                 CloseOne(ref outWrite);
                 CloseOne(ref errWrite);
                 CloseOne(ref inRead);
@@ -1050,6 +1057,40 @@ namespace KeelDock.Platform.WindowsConfinement
             {
                 Marshal.FreeHGlobal(buffer);
             }
+        }
+
+        private static uint MeasureHandleList(IntPtr buffer, uint sizeBytes, IntPtr[] expected)
+        {
+            if (buffer == IntPtr.Zero || expected == null || sizeBytes == 0 || (sizeBytes % (uint)IntPtr.Size) != 0)
+            {
+                return 0;
+            }
+            uint count = sizeBytes / (uint)IntPtr.Size;
+            if (count != (uint)expected.Length)
+            {
+                return count;
+            }
+            for (int index = 0; index < expected.Length; ++index)
+            {
+                IntPtr entry = Marshal.ReadIntPtr(buffer, index * IntPtr.Size);
+                uint flags;
+                if (entry == IntPtr.Zero || entry == new IntPtr(-1) || entry != expected[index])
+                {
+                    return 0;
+                }
+                for (int other = 0; other < index; ++other)
+                {
+                    if (expected[other] == entry)
+                    {
+                        return 0;
+                    }
+                }
+                if (!Native.GetHandleInformation(entry, out flags) || (flags & HandleFlagInherit) == 0)
+                {
+                    return 0;
+                }
+            }
+            return count;
         }
 
         private static void CreateEofStdin(out IntPtr read)
@@ -1658,6 +1699,10 @@ namespace KeelDock.Platform.WindowsConfinement
             [DllImport("kernel32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool GetHandleInformation(IntPtr handle, out uint flags);
 
             [DllImport("kernel32.dll", SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]

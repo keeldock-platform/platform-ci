@@ -44,7 +44,11 @@ fn probe_connect(target: &str) -> String {
     for address in addresses.iter().take(2) {
         match TcpStream::connect_timeout(address, Duration::from_secs(8)) {
             Ok(_) => return String::from("resolve=ok connect=open"),
-            Err(error) => last = code(&error),
+            Err(error) => {
+                if last == "none" || last == "err10013" {
+                    last = code(&error);
+                }
+            }
         }
     }
     format!("resolve=ok connect={}", last)

@@ -38,6 +38,9 @@ CONFINED_STAGES = (
     "spawn_output",
     "acl_downloads_listable",
     "network_control",
+    "network_control_ipv6",
+    "network_control_dns",
+    "network_control_udp",
     "rustc_version",
     "cargo_version",
     "link_banner",
@@ -574,7 +577,8 @@ foreach ($case in $cases) {
         attempts = int(re.search(r"\$attempt -ge ([0-9]+)", self.wrapper).group(1))
         per_attempt = int(re.search(r"CancelAfter\(\[TimeSpan\]::FromSeconds\(([0-9]+)\)\)", self.wrapper).group(1))
         probe_build = int(re.search(r"\$probeEnvironment, ([0-9]+), \[uint32\]32\)", self.wrapper).group(1)) // 1000
-        staging_allowance = 600 + probe_build
+        other_seconds = int(re.search(r"\$script:OtherContainerSeconds = ([0-9]+)", self.wrapper).group(1))
+        staging_allowance = 600 + probe_build + 2 * other_seconds
         worst = ladders + downloads * attempts * per_attempt + staging_allowance
         workflow = WORKFLOW.read_text(encoding="utf-8")
         minutes = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", workflow)]
@@ -776,8 +780,27 @@ foreach ($case in $cases) {
         self.assertIn("Marshal.WriteIntPtr(handleBuffer, 0, inRead);", native)
         self.assertIn("Marshal.WriteIntPtr(handleBuffer, IntPtr.Size, outWrite);", native)
         self.assertIn("Marshal.WriteIntPtr(handleBuffer, IntPtr.Size * 2, errWrite);", native)
-        self.assertIn("result.HandleCount = 3;", native)
-        self.assertIn("new UIntPtr((uint)(IntPtr.Size * 3))", native)
+        self.assertNotIn("result.HandleCount = 3;", native)
+        self.assertIn("uint handleListSize = (uint)(IntPtr.Size * 3);", native)
+        self.assertIn("new UIntPtr(handleListSize)", native)
+        self.assertIn("result.HandleCount = MeasureHandleList(handleBuffer, handleListSize, handleListExpected);", native)
+        create = native.index("Native.CreateProcessW(executable")
+        measure = native.index("result.HandleCount = MeasureHandleList(")
+        self.assertLess(create, measure)
+        self.assertLess(measure, native.index("CloseOne(ref outWrite);", measure))
+        self.assertLess(measure, native.index("Native.ResumeThread(thread)"))
+        helper = native[native.index("private static uint MeasureHandleList"):native.index("private static void CreateEofStdin")]
+        for required in (
+            "sizeBytes % (uint)IntPtr.Size",
+            "Marshal.ReadIntPtr(buffer, index * IntPtr.Size)",
+            "entry != expected[index]",
+            "Native.GetHandleInformation(entry, out flags)",
+            "(flags & HandleFlagInherit) == 0",
+            "return 0;",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, helper)
+        self.assertIn("handles_method=list_attr_readback", self.function_body("Invoke-Ladder"))
         body = native[native.index("private static void CreateEofStdin"):native.index("private static string ReadNoAllAppPkgAttribute")]
         self.assertIn("attributes.InheritHandle = 1;", body)
         self.assertIn("Native.SetHandleInformation(write, HandleFlagInherit, 0)", body)
@@ -969,6 +992,126 @@ foreach ($case in $cases) {
                 self.assertIn(required, self.native)
         self.assertEqual(self.wrapper.count("windows-confinement-null="), 1)
         self.assertIn("mask=0x0012019f", self.wrapper)
+
+    def test_network_blocked_is_a_closed_set_of_denial_codes(self):
+        wrapper = self.wrapper
+        self.assertIn("$NetworkDeniedConnect = @('err10013')", wrapper)
+        self.assertIn("$NetworkDeniedResolve = @('err10013', 'err11001')", wrapper)
+        self.assertIn("$NetworkDeniedUdp = @('err10013')", wrapper)
+        body = self.function_body("Get-NetworkState")
+        for required in (
+            "'wsa=failed'",
+            "if ($text -ceq 'resolve=ok connect=open') { return 'open' }",
+            "'^resolve=ok connect=(err[0-9]{1,5})$'",
+            "'^resolve=(err[0-9]{1,5})$'",
+            "'^resolve=ok count=[1-9][0-9]*$'",
+            "if ($text -ceq 'send=ok recv=data') { return 'open' }",
+            "'^send=(err[0-9]{1,5})$'",
+            "$NetworkDeniedConnect -ccontains",
+            "$NetworkDeniedResolve -ccontains",
+            "$NetworkDeniedUdp -ccontains",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        self.assertEqual(body.count("return 'blocked'"), 4)
+        self.assertEqual(body.count("return 'unexpected'"), 4)
+        self.assertNotIn("return 'blocked'\n}", body)
+        self.assertTrue(body.rstrip().endswith("return 'unexpected'\n}"))
+        for forbidden in ("err10061", "err10060", "err10051", "err10065", "connect=err'", "-match 'recv"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, body)
+        codes = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkDeniedConnect"):wrapper.index("function Get-NetworkState")]))
+        self.assertEqual(codes, {"err10013", "err11001"})
+        specs = self.function_body("Get-StageSpecs")
+        confined = specs.split("} else {", 1)[0]
+        for stage, kind in (
+            ("network_tcp_ipv4", "connect"),
+            ("network_tcp_ipv6", "connect"),
+            ("network_tcp_host", "connect"),
+            ("network_dns", "dns"),
+            ("network_udp", "udp"),
+        ):
+            line = re.search(r"Name = '" + stage + r"'.*", confined).group(0)
+            with self.subTest(stage=stage):
+                self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -ceq 'blocked'", line)
+        self.assertIn(
+            "fn probe_connect",
+            self.probe,
+        )
+        connect = self.probe[self.probe.index("fn probe_connect"):self.probe.index("fn probe_dns")]
+        self.assertIn('if last == "none" || last == "err10013" {', connect)
+
+    def test_network_controls_are_unconfined_and_must_be_open(self):
+        specs = self.function_body("Get-StageSpecs")
+        confined, control = specs.split("} else {", 1)
+        control = control.split("    }\n    $specs +=", 1)[0]
+        expected = (
+            ("network_control", "connect", "connect 1.1.1.1:443"),
+            ("network_control_ipv6", "connect", "connect [2606:4700:4700::1111]:443"),
+            ("network_control_dns", "dns", "dns github.com"),
+            ("network_control_udp", "udp", "udp 1.1.1.1:53"),
+        )
+        for stage, kind, arguments in expected:
+            line = re.search(r"Name = '" + stage + r"'.*", control).group(0)
+            with self.subTest(stage=stage):
+                self.assertIn("Arguments = '" + arguments + "'", line)
+                self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -ceq 'open'", line)
+                self.assertNotIn(stage, confined)
+        self.assertIn("$networkControls = Test-Passed $controlOutcomes @('network_control', 'network_control_ipv6', 'network_control_dns', 'network_control_udp')", self.wrapper)
+        self.assertIn("if ($networkDenied -and $networkControls) { $observed['network'] = 'blocked' }", self.wrapper)
+        self.assertIn("if ($networkDenied -and -not $networkControls) { $observed['network'] = 'inconclusive' }", self.wrapper)
+
+    def test_lease_ace_check_pins_type_flags_and_size(self):
+        start = self.native.index("private bool IsLeaseAce")
+        body = self.native[start:self.native.index("private void WriteOriginal")]
+        for required in (
+            "ace[0] != 0 || ace[1] != 0",
+            "int sidLength = 8 + (ace[9] * 4);",
+            "BitConverter.ToUInt16(ace, 2) != ace.Length || ace.Length != 8 + sidLength",
+            "BitConverter.ToUInt32(ace, 4) == LeaseMask",
+            "string.Equals(SidText(ace, 8), packageSid, StringComparison.Ordinal)",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+
+    def test_a_second_distinct_container_must_be_denied_on_nul_after_the_grant(self):
+        body = self.function_body("Test-OtherContainerNul")
+        for required in (
+            "[KeelDock.Platform.WindowsConfinement.Sandbox]::Create()",
+            "-ceq [string]$script:Sid",
+            "throw 'nul_other_not_distinct'",
+            "throw 'nul_other_control'",
+            "throw 'nul_other_launch'",
+            "throw 'nul_other_not_denied'",
+            "-cnotmatch 'Access is denied'",
+            "windows-confinement-nul-other=denied container=distinct error=5 control=granted",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        self.assertLess(body.index("$first.Run("), body.index("$other.Run("))
+        self.assertIn("$phase = 'nul_other_container'\n        Test-OtherContainerNul $box", self.wrapper)
+        opened = self.wrapper.index("NullDeviceLease]::Open($script:Sid)")
+        other = self.wrapper.index("Test-OtherContainerNul $box")
+        confined = self.wrapper.index("$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac")
+        self.assertLess(opened, other)
+        self.assertLess(other, confined)
+        tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
+        self.assertLess(tail.index("$script:NullLease.Restore()"), tail.index("$script:OtherBox.Dispose()"))
+        self.assertLess(tail.index("$script:OtherBox.Dispose()"), tail.index("Remove-Item -LiteralPath $baseDirectory"))
+
+    def test_temp_probe_failure_prints_a_closed_reason(self):
+        body = self.function_body("Initialize-ContainerTemp")
+        for required in (
+            "$probeReason = 'probe_exit'",
+            "$probeReason = 'probe_launch'",
+            "$probeReason = 'probe_not_exited'",
+            "$probeReason = 'probe_timeout'",
+            "windows-confinement-temp=failed reason=' + $probeReason",
+            "throw $probeReason",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        self.assertNotIn("throw 'probe'", body)
 
 
 if __name__ == "__main__":
