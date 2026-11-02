@@ -467,6 +467,7 @@ function Get-ProbeValue([string]$text, [string]$key) {
 $NetworkDeniedConnect = @('err10013')
 $NetworkDeniedResolve = @('err10013', 'err11001')
 $NetworkDeniedUdp = @('err10013')
+$NetworkUnroutableConnect = @('err10047', 'err10051', 'err10065')
 
 function Get-NetworkState([string]$stdout, [string]$name) {
     $text = Get-ProbeText $stdout $name
@@ -478,6 +479,9 @@ function Get-NetworkState([string]$stdout, [string]$name) {
         if ($found.Success -and ($NetworkDeniedConnect -ccontains $found.Groups[1].Value)) { return 'blocked' }
         $found = [regex]::Match($text, '^resolve=(err[0-9]{1,5})$')
         if ($found.Success -and ($NetworkDeniedResolve -ccontains $found.Groups[1].Value)) { return 'blocked' }
+        if ($text -ceq 'resolve=empty') { return 'unroutable' }
+        $found = [regex]::Match($text, '^resolve=ok connect=(err[0-9]{1,5})$')
+        if ($found.Success -and ($NetworkUnroutableConnect -ccontains $found.Groups[1].Value)) { return 'unroutable' }
         return 'unexpected'
     }
     if ($name -ceq 'dns') {
@@ -596,7 +600,7 @@ function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
         $specs += @{ Name = 'stdin_eof'; Exe = $probe; Arguments = 'stdin'; Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.HandleCount -eq 3 -and $r.Stdout -match '(?m)^kd-probe stdin result=eof\s*$' } }
         $specs += @{ Name = 'temp_dir'; Exe = $probe; Arguments = 'tempdir'; Timeout = 30; Quiet = $true; Check = { param($r) $r.ExitCode -eq 0 -and (Test-ContainerTempReport $r.Stdout) } }
         $specs += @{ Name = 'network_tcp_ipv4'; Exe = $probe; Arguments = 'connect 1.1.1.1:443'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -ceq 'blocked' } }
-        $specs += @{ Name = 'network_tcp_ipv6'; Exe = $probe; Arguments = 'connect [2606:4700:4700::1111]:443'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -ceq 'blocked' } }
+        $specs += @{ Name = 'network_tcp_ipv6'; Exe = $probe; Arguments = 'connect [2606:4700:4700::1111]:443'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -cin @('blocked', 'unroutable') } }
         $specs += @{ Name = 'network_tcp_host'; Exe = $probe; Arguments = 'connect registry.npmjs.org:443'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -ceq 'blocked' } }
         $specs += @{ Name = 'network_dns'; Exe = $probe; Arguments = 'dns github.com'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'dns') -ceq 'blocked' } }
         $specs += @{ Name = 'network_udp'; Exe = $probe; Arguments = 'udp 1.1.1.1:53'; Timeout = 60; Check = { param($r) (Get-NetworkState $r.Stdout 'udp') -ceq 'blocked' } }
@@ -609,7 +613,7 @@ function Get-StageSpecs([bool]$confined, [hashtable]$scratch) {
     } else {
         $specs += @{ Name = 'acl_downloads_listable'; Exe = $cmd; Arguments = ('/d /c dir /b ' + $layout.Downloads); Timeout = 30; Check = { param($r) $r.ExitCode -eq 0 -and $r.Stdout -match 'rustc\.tar\.gz' } }
         $specs += @{ Name = 'network_control'; Exe = $probe; Arguments = 'connect 1.1.1.1:443'; Timeout = 40; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -ceq 'open' } }
-        $specs += @{ Name = 'network_control_ipv6'; Exe = $probe; Arguments = 'connect [2606:4700:4700::1111]:443'; Timeout = 40; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -ceq 'open' } }
+        $specs += @{ Name = 'network_control_ipv6'; Exe = $probe; Arguments = 'connect [2606:4700:4700::1111]:443'; Timeout = 40; Check = { param($r) (Get-NetworkState $r.Stdout 'connect') -cin @('open', 'unroutable') } }
         $specs += @{ Name = 'network_control_dns'; Exe = $probe; Arguments = 'dns github.com'; Timeout = 30; Check = { param($r) (Get-NetworkState $r.Stdout 'dns') -ceq 'open' } }
         $specs += @{ Name = 'network_control_udp'; Exe = $probe; Arguments = 'udp 1.1.1.1:53'; Timeout = 30; Check = { param($r) (Get-NetworkState $r.Stdout 'udp') -ceq 'open' } }
     }
@@ -944,7 +948,17 @@ try {
         $observed['spawn_piped'] = 'failed'
         if (Test-Passed $confinedOutcomes @('spawn_piped', 'spawn_output')) { $observed['spawn_piped'] = 'ok' }
         $observed['network'] = 'failed'
-        $networkDenied = Test-Passed $confinedOutcomes @('network_tcp_ipv4', 'network_tcp_ipv6', 'network_tcp_host', 'network_dns', 'network_udp')
+        $ipv6Control = 'failed'
+        if ((Test-Passed $controlOutcomes @('network_control_ipv6'))) { $ipv6Control = Get-NetworkState $controlOutcomes['network_control_ipv6'].Stdout 'connect' }
+        $ipv6Confined = 'failed'
+        if ((Test-Passed $confinedOutcomes @('network_tcp_ipv6'))) { $ipv6Confined = Get-NetworkState $confinedOutcomes['network_tcp_ipv6'].Stdout 'connect' }
+        $observed['ipv6'] = 'failed'
+        $observed['control'] = 'failed'
+        if ($ipv6Control -ceq 'open') { $observed['control'] = 'open' }
+        if ($ipv6Control -ceq 'unroutable') { $observed['control'] = 'unroutable' }
+        if (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'blocked')) { $observed['ipv6'] = 'blocked' }
+        if (($ipv6Control -ceq 'unroutable') -and ($ipv6Confined -cin @('blocked', 'unroutable'))) { $observed['ipv6'] = 'not_applicable' }
+        $networkDenied = (Test-Passed $confinedOutcomes @('network_tcp_ipv4', 'network_tcp_ipv6', 'network_tcp_host', 'network_dns', 'network_udp')) -and -not (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'unroutable'))
         $networkControls = Test-Passed $controlOutcomes @('network_control', 'network_control_ipv6', 'network_control_dns', 'network_control_udp')
         if ($networkDenied -and $networkControls) { $observed['network'] = 'blocked' }
         if ($networkDenied -and -not $networkControls) { $observed['network'] = 'inconclusive' }
@@ -956,7 +970,8 @@ try {
         if (Test-Passed $controlOutcomes @('node_version', 'node_bindings')) { $observed['control_node'] = 'ran' }
         $observed['css_transform'] = 'failed'
         if ($confinedOutcomes['node_bindings'].Stdout -match 'name=minifies_a_stylesheet result=pass') { $observed['css_transform'] = 'ok' }
-        $expectedTokens = [ordered]@{ rust = 'compiled'; node = 'ran'; node_child = 'ran'; first_failure = 'none'; lpac = 'verified'; lpac_basis = 'attr'; capabilities = 'registryRead'; job = 'verified'; acl = 'verified'; scratch_write = 'ok'; ro_write = 'denied'; downloads = 'denied'; nul_open = 'ok'; nul_write_dac = 'denied'; stdin = 'eof_pipe'; temp_dir = 'verified'; spawn_piped = 'ok'; network = 'blocked'; canary = 'absent'; control_rust = 'compiled'; control_node = 'ran'; css_transform = 'ok' }
+        $expectedTokens = [ordered]@{ rust = 'compiled'; node = 'ran'; node_child = 'ran'; first_failure = 'none'; lpac = 'verified'; lpac_basis = 'attr'; capabilities = 'registryRead'; job = 'verified'; acl = 'verified'; scratch_write = 'ok'; ro_write = 'denied'; downloads = 'denied'; nul_open = 'ok'; nul_write_dac = 'denied'; stdin = 'eof_pipe'; temp_dir = 'verified'; spawn_piped = 'ok'; network = 'blocked'; ipv6 = 'blocked'; control = 'open'; canary = 'absent'; control_rust = 'compiled'; control_node = 'ran'; css_transform = 'ok' }
+        if ($observed['ipv6'] -ceq 'not_applicable') { $expectedTokens['ipv6'] = 'not_applicable'; $expectedTokens['control'] = 'unroutable' }
         $summary = 'windows-confinement-spike=observed'
         $allExpected = $true
         foreach ($key in $expectedTokens.Keys) {

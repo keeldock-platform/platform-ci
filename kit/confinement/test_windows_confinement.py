@@ -583,6 +583,7 @@ foreach ($case in $cases) {
         workflow = WORKFLOW.read_text(encoding="utf-8")
         minutes = [int(value) for value in re.findall(r"timeout-minutes: ([0-9]+)", workflow)]
         self.assertEqual(len(minutes), 2)
+        self.assertEqual(minutes[1], 120)
         self.assertLessEqual(worst, minutes[1] * 60 * 0.8)
 
     def test_wrapper_reports_stable_lines_and_fails_closed(self):
@@ -998,6 +999,7 @@ foreach ($case in $cases) {
         self.assertIn("$NetworkDeniedConnect = @('err10013')", wrapper)
         self.assertIn("$NetworkDeniedResolve = @('err10013', 'err11001')", wrapper)
         self.assertIn("$NetworkDeniedUdp = @('err10013')", wrapper)
+        self.assertIn("$NetworkUnroutableConnect = @('err10047', 'err10051', 'err10065')", wrapper)
         body = self.function_body("Get-NetworkState")
         for required in (
             "'wsa=failed'",
@@ -1010,18 +1012,23 @@ foreach ($case in $cases) {
             "$NetworkDeniedConnect -ccontains",
             "$NetworkDeniedResolve -ccontains",
             "$NetworkDeniedUdp -ccontains",
+            "$NetworkUnroutableConnect -ccontains",
+            "if ($text -ceq 'resolve=empty') { return 'unroutable' }",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, body)
         self.assertEqual(body.count("return 'blocked'"), 4)
         self.assertEqual(body.count("return 'unexpected'"), 4)
+        self.assertEqual(body.count("return 'unroutable'"), 2)
         self.assertNotIn("return 'blocked'\n}", body)
         self.assertTrue(body.rstrip().endswith("return 'unexpected'\n}"))
-        for forbidden in ("err10061", "err10060", "err10051", "err10065", "connect=err'", "-match 'recv"):
+        for forbidden in ("err10061", "err10060", "err10047", "err10051", "err10065", "connect=err'", "-match 'recv"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, body)
-        codes = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkDeniedConnect"):wrapper.index("function Get-NetworkState")]))
+        codes = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkDeniedConnect"):wrapper.index("$NetworkUnroutableConnect")]))
         self.assertEqual(codes, {"err10013", "err11001"})
+        unroutable = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkUnroutableConnect"):wrapper.index("function Get-NetworkState")]))
+        self.assertEqual(unroutable, {"err10047", "err10051", "err10065"})
         specs = self.function_body("Get-StageSpecs")
         confined = specs.split("} else {", 1)[0]
         for stage, kind in (
@@ -1033,7 +1040,10 @@ foreach ($case in $cases) {
         ):
             line = re.search(r"Name = '" + stage + r"'.*", confined).group(0)
             with self.subTest(stage=stage):
-                self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -ceq 'blocked'", line)
+                if stage == "network_tcp_ipv6":
+                    self.assertIn("(Get-NetworkState $r.Stdout 'connect') -cin @('blocked', 'unroutable')", line)
+                else:
+                    self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -ceq 'blocked'", line)
         self.assertIn(
             "fn probe_connect",
             self.probe,
@@ -1055,11 +1065,25 @@ foreach ($case in $cases) {
             line = re.search(r"Name = '" + stage + r"'.*", control).group(0)
             with self.subTest(stage=stage):
                 self.assertIn("Arguments = '" + arguments + "'", line)
-                self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -ceq 'open'", line)
+                if stage == "network_control_ipv6":
+                    self.assertIn("(Get-NetworkState $r.Stdout 'connect') -cin @('open', 'unroutable')", line)
+                else:
+                    self.assertIn("(Get-NetworkState $r.Stdout '" + kind + "') -ceq 'open'", line)
                 self.assertNotIn(stage, confined)
         self.assertIn("$networkControls = Test-Passed $controlOutcomes @('network_control', 'network_control_ipv6', 'network_control_dns', 'network_control_udp')", self.wrapper)
         self.assertIn("if ($networkDenied -and $networkControls) { $observed['network'] = 'blocked' }", self.wrapper)
         self.assertIn("if ($networkDenied -and -not $networkControls) { $observed['network'] = 'inconclusive' }", self.wrapper)
+        for required in (
+            "if ((Test-Passed $controlOutcomes @('network_control_ipv6'))) { $ipv6Control = Get-NetworkState $controlOutcomes['network_control_ipv6'].Stdout 'connect' }",
+            "if ((Test-Passed $confinedOutcomes @('network_tcp_ipv6'))) { $ipv6Confined = Get-NetworkState $confinedOutcomes['network_tcp_ipv6'].Stdout 'connect' }",
+            "if (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'blocked')) { $observed['ipv6'] = 'blocked' }",
+            "if (($ipv6Control -ceq 'unroutable') -and ($ipv6Confined -cin @('blocked', 'unroutable'))) { $observed['ipv6'] = 'not_applicable' }",
+            "-and -not (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'unroutable'))",
+            "ipv6 = 'blocked'; control = 'open'",
+            "if ($observed['ipv6'] -ceq 'not_applicable') { $expectedTokens['ipv6'] = 'not_applicable'; $expectedTokens['control'] = 'unroutable' }",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, self.wrapper)
 
     def test_lease_ace_check_pins_type_flags_and_size(self):
         start = self.native.index("private bool IsLeaseAce")
