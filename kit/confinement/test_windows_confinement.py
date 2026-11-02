@@ -85,6 +85,8 @@ EXPECTED_SUMMARY = (
     ("temp_dir", "verified"),
     ("spawn_piped", "ok"),
     ("network", "blocked"),
+    ("ipv6", "blocked"),
+    ("ipv6_control", "open"),
     ("canary", "absent"),
     ("control_rust", "compiled"),
     ("control_node", "ran"),
@@ -959,7 +961,7 @@ foreach ($case in $cases) {
     def test_summary_line_shape_and_exit_zero_requires_every_token(self):
         found = re.search(r"\$expectedTokens = \[ordered\]@\{ (.+) \}\n", self.wrapper)
         self.assertIsNotNone(found)
-        pairs = tuple(re.findall(r"([a-z_]+) = '([A-Za-z_]+)'", found.group(1)))
+        pairs = tuple(re.findall(r"([a-z_0-9]+) = '([A-Za-z_]+)'", found.group(1)))
         self.assertEqual(pairs, EXPECTED_SUMMARY)
         for required in (
             "$summary = 'windows-confinement-spike=observed'",
@@ -999,7 +1001,7 @@ foreach ($case in $cases) {
         self.assertIn("$NetworkDeniedConnect = @('err10013')", wrapper)
         self.assertIn("$NetworkDeniedResolve = @('err10013', 'err11001')", wrapper)
         self.assertIn("$NetworkDeniedUdp = @('err10013')", wrapper)
-        self.assertIn("$NetworkUnroutableConnect = @('err10047', 'err10051', 'err10065')", wrapper)
+        self.assertIn("$NetworkUnroutableConnect = @('err10047', 'err10051')", wrapper)
         body = self.function_body("Get-NetworkState")
         for required in (
             "'wsa=failed'",
@@ -1028,7 +1030,7 @@ foreach ($case in $cases) {
         codes = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkDeniedConnect"):wrapper.index("$NetworkUnroutableConnect")]))
         self.assertEqual(codes, {"err10013", "err11001"})
         unroutable = set(re.findall(r"err[0-9]+", wrapper[wrapper.index("$NetworkUnroutableConnect"):wrapper.index("function Get-NetworkState")]))
-        self.assertEqual(unroutable, {"err10047", "err10051", "err10065"})
+        self.assertEqual(unroutable, {"err10047", "err10051"})
         specs = self.function_body("Get-StageSpecs")
         confined = specs.split("} else {", 1)[0]
         for stage, kind in (
@@ -1079,11 +1081,44 @@ foreach ($case in $cases) {
             "if (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'blocked')) { $observed['ipv6'] = 'blocked' }",
             "if (($ipv6Control -ceq 'unroutable') -and ($ipv6Confined -cin @('blocked', 'unroutable'))) { $observed['ipv6'] = 'not_applicable' }",
             "-and -not (($ipv6Control -ceq 'open') -and ($ipv6Confined -ceq 'unroutable'))",
-            "ipv6 = 'blocked'; control = 'open'",
-            "if ($observed['ipv6'] -ceq 'not_applicable') { $expectedTokens['ipv6'] = 'not_applicable'; $expectedTokens['control'] = 'unroutable' }",
+            "ipv6 = 'blocked'; ipv6_control = 'open'",
+            "if ($observed['ipv6'] -ceq 'not_applicable') { $expectedTokens['ipv6'] = 'not_applicable'; $expectedTokens['ipv6_control'] = 'unroutable' }",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, self.wrapper)
+
+    def test_ipv6_summary_keys_and_not_applicable_pair_are_consistent(self):
+        found = re.search(r"\$expectedTokens = \[ordered\]@\{ (.+) \}\n", self.wrapper)
+        self.assertIsNotNone(found)
+        keys = [key for key, _ in re.findall(r"([a-z_0-9]+) = '([A-Za-z_]+)'", found.group(1))]
+        self.assertNotIn("control", keys)
+        self.assertEqual(keys.index("ipv6_control"), keys.index("ipv6") + 1)
+        self.assertEqual(keys.index("ipv6"), keys.index("network") + 1)
+        self.assertNotIn("$observed['control']", self.wrapper)
+        self.assertNotIn("$expectedTokens['control']", self.wrapper)
+        self.assertIn("if ($ipv6Control -ceq 'unroutable') { $observed['ipv6_control'] = 'unroutable' }", self.wrapper)
+        self.assertIn("if ($ipv6Control -ceq 'open') { $observed['ipv6_control'] = 'open' }", self.wrapper)
+        self.assertIn("$observed['ipv6_control'] = 'failed'", self.wrapper)
+        self.assertEqual(
+            self.wrapper.count("$expectedTokens['ipv6'] = 'not_applicable'; $expectedTokens['ipv6_control'] = 'unroutable'"),
+            1,
+        )
+
+    def test_dns_denial_code_is_tied_to_names_the_unconfined_control_resolved(self):
+        specs = self.function_body("Get-StageSpecs")
+        confined, control = specs.split("} else {", 1)
+        control = control.split("    }\n    $specs +=", 1)[0]
+        control_names = set(re.findall(r"Arguments = 'dns ([^' ]+)'", control))
+        self.assertEqual(control_names, {"github.com"})
+        confined_dns = re.findall(r"Arguments = 'dns ([^' ]+)'", confined)
+        self.assertEqual(confined_dns, ["github.com"])
+        confined_hosts = re.findall(r"Arguments = 'connect ([A-Za-z][^' :]*):[0-9]+'", confined)
+        self.assertEqual(confined_hosts, ["github.com"])
+        for name in confined_dns + confined_hosts:
+            self.assertIn(name, control_names)
+        self.assertIn("$NetworkDeniedResolve = @('err10013', 'err11001')", self.wrapper)
+        self.assertEqual(self.wrapper.count("$NetworkDeniedResolve -ccontains"), 2)
+        self.assertNotIn("registry.npmjs.org:443", specs)
 
     def test_lease_ace_check_pins_type_flags_and_size(self):
         start = self.native.index("private bool IsLeaseAce")
