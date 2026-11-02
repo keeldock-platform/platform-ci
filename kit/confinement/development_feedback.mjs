@@ -51,6 +51,7 @@ const PRIVATE_KEY_HEADER = /-----BEGIN [A-Z0-9 ]{0,64}PRIVATE KEY-----/u;
 const CREDENTIAL_ASSIGNMENT = /\b(?:authorization|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|api[_-]?key|private[_-]?key|secret|token|credential)\b\s*[:=]\s*(?:Bearer\s+)?[^\s,;]{8,}/iu;
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/-]{24,}={0,2}/u;
 const CREDENTIAL_URL = /\b[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/iu;
+const BIDI_CONTROL = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
 const TYPED_ARRAY_PROTO = Object.getPrototypeOf(Uint8Array.prototype);
 const VIEW_BUFFER = Object.getOwnPropertyDescriptor(TYPED_ARRAY_PROTO, 'buffer').get;
@@ -444,7 +445,7 @@ function validateNpmDiagnostics(bytes) {
       reportIndex = index;
     } else if (!lines[index].startsWith('  ')) reject('invalid_payload');
   }
-  if (reportIndex === -1) reject('invalid_payload');
+  if (reportIndex === -1 || BIDI_CONTROL.test(text)) reject('invalid_payload');
   validateDiagnosticText(text);
 }
 

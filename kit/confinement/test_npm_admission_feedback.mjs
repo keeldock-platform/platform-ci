@@ -191,6 +191,21 @@ test('the npm diagnostic payload is a closed variant of the npm admission kind o
   assert.throws(() => validate(payload, { reviewedRustPaths: ['src/lib.rs'] }), DevelopmentFeedbackError);
 });
 
+test('an npm diagnostic that carries a bidirectional control character is refused', () => {
+  const marks = ['؜', '‎', '‏', '‪', '‫', '‬', '‭', '‮',
+    '⁦', '⁧', '⁨', '⁩'];
+  for (const mark of marks) {
+    for (const parts of [
+      { stderr: [`  npm error a${mark}b`], report: [] },
+      { stderr: [], report: [`  Found: a${mark}b`] },
+    ]) {
+      assert.throws(() => validate(diagnostics(parts)), (error) => refusalCode(error) === 'invalid_payload');
+    }
+  }
+  const plain = diagnostics({ stderr: ['  npm error café 中'], report: ['  Found: ü@1.0.0'] });
+  assert.deepEqual(validate(plain), plain);
+});
+
 test('a lock diagnostic with a kd-check line is accepted, encrypted and decrypted unchanged', () => {
   const header = 'KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused';
   const checks = [
