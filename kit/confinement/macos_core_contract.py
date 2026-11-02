@@ -53,15 +53,18 @@ FEEDBACK_TREE_LABELS = {
     "core-npm-admission-return": "core_npm_admission_return",
 }
 LOCKED_FOUNDATION_TREE = "core_build_diagnostic_return_with_package_lock"
+API_FEATURE_GATE_NAMES = ("api_feature_clippy", "api_feature_tests")
+API_FEATURE_NAME = "dev-uat-policy-import"
 GATE_NAMES = (
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests",
 )
 PARSER_GATE_NAMES = ("parser_format", "parser_clippy", "parser_replay")
 RUNTIME_GATE_NAMES = ("runtime_format", "runtime_clippy", "runtime_tests")
 SOURCE_GATE_STAGES = GATE_NAMES + PARSER_GATE_NAMES + RUNTIME_GATE_NAMES
 TEST_GATE_STAGES = frozenset((
-    "workspace_tests", "api_tests", "mock_tests", "conformance_tests", "parser_replay",
-    "runtime_tests",
+    "workspace_tests", "api_tests", "api_feature_tests", "mock_tests", "conformance_tests",
+    "parser_replay", "runtime_tests",
 ))
 SUITE_NAMES = (
     "core.static", "core.host-api", "core.mock-host", "core.conformance",
@@ -108,8 +111,9 @@ REASONS = frozenset((
 STAGES = frozenset((
     "arguments", "context", "host", "source_validation", "source_lease", "source_tree",
     "source_diff", "toolchain_install", "worker_setup", "summary_guard", "observer",
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
-    "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy",
+    "api_feature_tests", "mock_tests", "conformance_tests", "parser_format", "parser_clippy",
+    "parser_replay",
     "runtime_format", "runtime_clippy", "runtime_tests",
     "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
     "cleanup", "receipt", "internal",
@@ -838,6 +842,12 @@ def _source_commands(source, tool_paths, *, include_parser=False, include_runtim
                               "--workspace", "--all-targets", "--locked")),
         ("api_tests", (cargo, "test", "--offline", "--manifest-path",
                         str(source / "crates/host/api/Cargo.toml"), "--all-targets", "--locked")),
+        ("api_feature_clippy", (cargo, "clippy", "--offline", "--manifest-path",
+                                 str(source / "crates/host/api/Cargo.toml"), "--all-targets",
+                                 "--features", API_FEATURE_NAME, "--locked", "--", "-D", "warnings")),
+        ("api_feature_tests", (cargo, "test", "--offline", "--manifest-path",
+                                str(source / "crates/host/api/Cargo.toml"), "--all-targets",
+                                "--features", API_FEATURE_NAME, "--locked")),
         ("mock_tests", (cargo, "test", "--offline", "--manifest-path",
                          str(source / "crates/host/mock/Cargo.toml"), "--all-targets", "--locked")),
         ("conformance_tests", (cargo, "test", "--offline", "--manifest-path",

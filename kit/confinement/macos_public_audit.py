@@ -363,9 +363,9 @@ CORE_CONTRACT_REFUSAL_REASONS = frozenset((
 CORE_CONTRACT_REFUSAL_STAGES = frozenset((
     "arguments", "context", "host", "source_validation", "source_lease", "source_tree",
     "source_diff", "toolchain_install", "worker_setup", "summary_guard", "observer",
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests",
-    "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
-    "runtime_format", "runtime_clippy", "runtime_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy",
+    "api_feature_tests", "mock_tests", "conformance_tests", "parser_format", "parser_clippy",
+    "parser_replay", "runtime_format", "runtime_clippy", "runtime_tests",
     "node_dependency_prepare", "node_dependency_audit", "typescript_typecheck", "typescript_tests",
     "cleanup", "receipt", "internal",
 ))
@@ -417,12 +417,13 @@ CORE_CONTRACT_GATE_DIAGNOSTICS = frozenset((
     "source_gate_capture_invalid", "source_gate_capture_overflow",
 ))
 CORE_CONTRACT_GATE_STAGES = frozenset((
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
-    "parser_format", "parser_clippy", "parser_replay",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests", "parser_format", "parser_clippy", "parser_replay",
     "runtime_format", "runtime_clippy", "runtime_tests",
 ))
 CORE_CONTRACT_BASE_GATE_NAMES = (
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests",
 )
 CORE_CONTRACT_RUNTIME_GATE_NAMES = (
     "runtime_format", "runtime_clippy", "runtime_tests",

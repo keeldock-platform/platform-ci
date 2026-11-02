@@ -1220,7 +1220,7 @@ class CoreContractTests(unittest.TestCase):
             with self.subTest(field=name), self.assertRaises(subject.Refusal):
                 subject._validate_review_gate(request, binding, altered, runtime)
 
-    def test_rust_commands_are_fixed_offline_and_cover_all_six_gates(self):
+    def test_rust_commands_are_fixed_offline_and_cover_all_eight_gates(self):
         with tempfile.TemporaryDirectory() as temporary:
             test_root = Path(temporary)
             source = test_root / "source"
@@ -1238,8 +1238,41 @@ class CoreContractTests(unittest.TestCase):
                 self.assertIn("--offline", argv)
                 self.assertIn("--locked", argv)
         self.assertIn(str(source / "crates/host/api/Cargo.toml"), commands[3][1])
-        self.assertIn(str(source / "crates/host/mock/Cargo.toml"), commands[4][1])
-        self.assertIn(str(source / "crates/host/conformance/Cargo.toml"), commands[5][1])
+        self.assertIn(str(source / "crates/host/mock/Cargo.toml"), commands[6][1])
+        self.assertIn(str(source / "crates/host/conformance/Cargo.toml"), commands[7][1])
+
+    def test_api_feature_gates_follow_api_tests_and_pass_the_dev_feature_exactly(self):
+        import macos_feedback_producer as producer_module
+
+        with tempfile.TemporaryDirectory() as temporary:
+            test_root = Path(temporary)
+            source = test_root / "source"
+            tool_paths = {"cargo": test_root / "toolchain" / "bin" / "cargo"}
+            commands = dict(subject._source_commands(source, tool_paths))
+        cargo = str(tool_paths["cargo"])
+        manifest = str(source / "crates/host/api/Cargo.toml")
+        self.assertEqual(commands["api_feature_clippy"], (
+            cargo, "clippy", "--offline", "--manifest-path", manifest, "--all-targets",
+            "--features", "dev-uat-policy-import", "--locked", "--", "-D", "warnings",
+        ))
+        self.assertEqual(commands["api_feature_tests"], (
+            cargo, "test", "--offline", "--manifest-path", manifest, "--all-targets",
+            "--features", "dev-uat-policy-import", "--locked",
+        ))
+        self.assertEqual(subject.API_FEATURE_GATE_NAMES, ("api_feature_clippy", "api_feature_tests"))
+        self.assertEqual(
+            subject.GATE_NAMES[3:6], ("api_tests", "api_feature_clippy", "api_feature_tests"),
+        )
+        for stage in subject.API_FEATURE_GATE_NAMES:
+            self.assertIn(stage, subject.SOURCE_GATE_STAGES)
+            self.assertIn(stage, subject.STAGES)
+            self.assertIn(stage, real_rust.SOURCE_COMMAND_STAGES)
+        self.assertIn("api_feature_tests", subject.TEST_GATE_STAGES)
+        self.assertNotIn("api_feature_clippy", subject.TEST_GATE_STAGES)
+        self.assertEqual(subject._gate_command_seconds("api_feature_tests"), 300)
+        self.assertEqual(subject._gate_command_seconds("api_feature_clippy"), 120)
+        self.assertEqual(foundation_tests.subject.RUST_GATE_NAMES, subject.GATE_NAMES)
+        self.assertEqual(producer_module.DIAGNOSTIC_BASE_GATES, subject.GATE_NAMES)
 
     def test_runtime_commands_are_fixed_locked_offline_and_cover_all_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1824,8 +1857,8 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(subject.MAX_TEST_COMMAND_SECONDS, 300)
         self.assertEqual(
             subject.TEST_GATE_STAGES,
-            frozenset(("workspace_tests", "api_tests", "mock_tests", "conformance_tests",
-                       "parser_replay", "runtime_tests")),
+            frozenset(("workspace_tests", "api_tests", "api_feature_tests", "mock_tests",
+                       "conformance_tests", "parser_replay", "runtime_tests")),
         )
         self.assertLessEqual(subject.TEST_GATE_STAGES, frozenset(subject.SOURCE_GATE_STAGES))
         self.assertLess(subject.MAX_TEST_COMMAND_SECONDS, subject.MAX_TOTAL_SECONDS)
@@ -1957,7 +1990,7 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(validated["suites"], [
             "core.static", "core.host-api", "core.mock-host", "core.conformance",
         ])
-        self.assertEqual(validated["gate_count"], 6)
+        self.assertEqual(validated["gate_count"], 8)
         self.assertEqual(validated["selected_gates"], list(subject.GATE_NAMES))
         self.assertEqual(validated["completed_gates"], list(subject.GATE_NAMES))
         self.assertEqual(validated["suite_count"], 4)
@@ -1974,7 +2007,7 @@ class CoreContractTests(unittest.TestCase):
             runtime_record, _binding(), _request(), _lease_record(), DIFF_SHA256,
             runtime_versions, runtime_gates, True, True,
         )
-        self.assertEqual(runtime_validated["gate_count"], 9)
+        self.assertEqual(runtime_validated["gate_count"], 11)
         self.assertEqual(runtime_validated["selected_gates"],
                          list(subject.GATE_NAMES + subject.RUNTIME_GATE_NAMES))
         self.assertEqual(runtime_validated["completed_gates"], runtime_validated["selected_gates"])

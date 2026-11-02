@@ -383,7 +383,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         self.assertTrue(payload.startswith(
             b"KD-BUILD-DIAGNOSTICS schema=1 stage=workspace_tests stdout_truncated=true "
             b"stderr_truncated=true exit=9 selected_gates=format,clippy,workspace_tests,api_tests,"
-            b"mock_tests,conformance_tests completed_gates=format,clippy\n"
+            b"api_feature_clippy,api_feature_tests,mock_tests,conformance_tests completed_gates=format,clippy\n"
         ))
         self.assertIn(stdout_prefix, payload)
         self.assertIn(stderr_prefix, payload)
@@ -413,7 +413,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             payload,
             b"KD-BUILD-DIAGNOSTICS schema=1 stage=workspace_tests stdout_truncated=false "
             b"stderr_truncated=false exit=124 selected_gates=format,clippy,workspace_tests,api_tests,"
-            b"mock_tests,conformance_tests completed_gates=format,clippy\n"
+            b"api_feature_clippy,api_feature_tests,mock_tests,conformance_tests completed_gates=format,clippy\n"
             b"stdout:\n\nstderr:\nkd-gate-timeout limit_seconds=300\n",
         )
 

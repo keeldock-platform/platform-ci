@@ -327,7 +327,8 @@ class RustToolchainContractTests(unittest.TestCase):
                 returncode=0, stdout=b"x" * (rust.MAX_CAPTURE_BYTES + 1), stderr=b"",
             ), "capture_invalid", "capture_overflow"),
         )
-        for stage in ("format", "runtime_format", "runtime_clippy", "runtime_tests"):
+        for stage in ("format", "api_feature_clippy", "api_feature_tests", "runtime_format",
+                      "runtime_clippy", "runtime_tests"):
             self.assertIn(stage, rust.SOURCE_COMMAND_STAGES)
             for case_name, outcome, expected_reason, expected_check in cases:
                 calls = []

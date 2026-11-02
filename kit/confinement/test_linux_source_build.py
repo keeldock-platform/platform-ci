@@ -90,7 +90,8 @@ class _SyntheticTrustedLicenseBoundary:
 class LinuxSourceBuildTests(unittest.TestCase):
     def test_gate_order_matches_the_shared_macos_contracts(self):
         expected = (
-            macos_core_contract.GATE_NAMES
+            tuple(name for name in macos_core_contract.GATE_NAMES
+                  if name not in macos_core_contract.API_FEATURE_GATE_NAMES)
             + macos_core_contract.PARSER_GATE_NAMES
             + foundation_node_feedback.NODE_GATE_NAMES
         )

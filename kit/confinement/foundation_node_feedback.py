@@ -7,7 +7,8 @@ import time
 
 
 RUST_GATE_NAMES = (
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
+    "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
+    "mock_tests", "conformance_tests",
 )
 PARSER_GATE_NAMES = ("parser_format", "parser_clippy", "parser_replay")
 RUST_FOUNDATION_GATES = RUST_GATE_NAMES + PARSER_GATE_NAMES
