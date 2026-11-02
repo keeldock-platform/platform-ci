@@ -449,6 +449,10 @@ def _expected_quick_run(environ, cache_digest):
     return expected
 
 
+def _job_edges(names):
+    return ("Set up job",) + tuple(names) + ("Complete job",)
+
+
 def _expected_run(environ, cache_digest):
     if _tier(environ) == "quick":
         return _expected_quick_run(environ, cache_digest)
@@ -461,9 +465,10 @@ def _expected_run(environ, cache_digest):
     ci_ref = environ.get("CI_REF", "refs/heads/main").removeprefix("refs/heads/")
     if ci_ref not in ("main", "untrusted"):
         ci_ref = "main"
-    all_steps = list(SOURCE_STEP_NAMES)
+    all_steps = ["Set up job"] + list(SOURCE_STEP_NAMES)
     if mode == "source":
         all_steps.append("Post Mint scoped source-reader token")
+    all_steps.append("Complete job")
         optional = ("Forced faults must fail closed",)
     else:
         optional = tuple(sorted(OPTIONAL_SOURCE_STEPS - {"Forced faults must fail closed"}))
@@ -478,11 +483,11 @@ def _expected_run(environ, cache_digest):
         "ci_ref": ci_ref,
         "display_title": title,
         "jobs": {
-            "linux-source-admission-settings": {"steps": SETTINGS_STEP_NAMES, "optional_steps": ()},
-            "linux-source-admission-unit": {"steps": UNIT_STEP_NAMES, "optional_steps": ()},
+            "linux-source-admission-settings": {"steps": _job_edges(SETTINGS_STEP_NAMES), "optional_steps": ()},
+            "linux-source-admission-unit": {"steps": _job_edges(UNIT_STEP_NAMES), "optional_steps": ()},
             "linux-source-admission-source-read": {"steps": tuple(all_steps), "optional_steps": tuple(optional)},
             "linux-source-admission-verdict": {
-                "steps": VERDICT_STEP_NAMES,
+                "steps": _job_edges(VERDICT_STEP_NAMES),
                 "optional_steps": OPTIONAL_VERDICT_SYNTHETIC_STEPS if mode == "synthetic" else (),
             },
         },

@@ -182,10 +182,13 @@ class LinuxSourceBuildTests(unittest.TestCase):
             )
             job = expected["jobs"]["linux-source-admission-source-read"]
             if mode == "source":
-                self.assertEqual(job["steps"], actual_steps + ("Post Mint scoped source-reader token",))
+                self.assertEqual(
+                    job["steps"],
+                    ("Set up job",) + actual_steps + ("Post Mint scoped source-reader token", "Complete job"),
+                )
                 self.assertNotIn("Require trusted Rust licence admission", job["optional_steps"])
             else:
-                self.assertEqual(job["steps"], actual_steps)
+                self.assertEqual(job["steps"], ("Set up job",) + actual_steps + ("Complete job",))
                 self.assertIn("Require trusted Rust licence admission", job["optional_steps"])
 
     def test_producer_and_independent_verifier_bind_license_gates_before_preparation(self):
@@ -239,14 +242,24 @@ class LinuxSourceBuildTests(unittest.TestCase):
         source = linux_source_build._expected_run({**base, "CI_MODE": "source"}, "b" * 64)
         synthetic = linux_source_build._expected_run({**base, "CI_MODE": "synthetic"}, "b" * 64)
         self.assertEqual(source["verdict_job"], "linux-source-admission-verdict")
-        self.assertEqual(source["jobs"][source["verdict_job"]]["steps"], linux_source_build.VERDICT_STEP_NAMES)
+        edged_verdict = ("Set up job",) + linux_source_build.VERDICT_STEP_NAMES + ("Complete job",)
+        self.assertEqual(source["jobs"][source["verdict_job"]]["steps"], edged_verdict)
+        self.assertEqual(synthetic["jobs"][synthetic["verdict_job"]]["steps"], edged_verdict)
+        for run in (source, synthetic):
+            for name in ("settings", "unit"):
+                steps = run["jobs"]["linux-source-admission-" + name]["steps"]
+                self.assertEqual((steps[0], steps[-1]), ("Set up job", "Complete job"))
         self.assertEqual(source["jobs"][source["verdict_job"]]["optional_steps"], ())
         self.assertEqual(
             synthetic["jobs"][synthetic["verdict_job"]]["optional_steps"],
             linux_source_build.OPTIONAL_VERDICT_SYNTHETIC_STEPS,
         )
-        self.assertEqual(source["jobs"]["linux-source-admission-source-read"]["steps"][-1], "Post Mint scoped source-reader token")
-        self.assertNotIn("Post Mint scoped source-reader token", synthetic["jobs"]["linux-source-admission-source-read"]["steps"])
+        source_steps = source["jobs"]["linux-source-admission-source-read"]["steps"]
+        self.assertEqual(source_steps[0], "Set up job")
+        self.assertEqual(source_steps[-2:], ("Post Mint scoped source-reader token", "Complete job"))
+        synthetic_steps = synthetic["jobs"]["linux-source-admission-source-read"]["steps"]
+        self.assertNotIn("Post Mint scoped source-reader token", synthetic_steps)
+        self.assertEqual((synthetic_steps[0], synthetic_steps[-1]), ("Set up job", "Complete job"))
 
     def test_toolchain_versions_are_pinned_and_the_node_archive_digest_is_the_official_release_digest(self):
         self.assertEqual(linux_source_build.NODE_VERSION, "24.22.1")
