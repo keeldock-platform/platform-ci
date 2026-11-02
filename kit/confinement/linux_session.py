@@ -65,7 +65,7 @@ PROJECT_ENV_NAMES = frozenset((
     "CARGO_TARGET_DIR", "CARGO_NET_OFFLINE", "CARGO_INCREMENTAL", "RUSTC", "RUSTDOC",
     "RUSTFMT", "NODE", "NPM_CONFIG_OFFLINE", "NPM_CONFIG_CACHE", "NPM_CONFIG_USERCONFIG",
     "NPM_CONFIG_GLOBALCONFIG", "npm_config_offline", "npm_config_cache", "npm_config_userconfig",
-    "npm_config_globalconfig",
+    "npm_config_globalconfig", "NPM_CONFIG_UPDATE_NOTIFIER", "npm_config_update_notifier",
 ))
 PROJECT_ENV_SECRET_PARTS = ("TOKEN", "SECRET", "PASSWORD", "PRIVATE_KEY", "CREDENTIAL")
 
