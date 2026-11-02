@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 import shutil
 import sys
 import tempfile
@@ -930,13 +931,14 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         self.assertEqual((caught.exception.check, str(caught.exception)),
                          ("reviewed_files", "node reviewed files invalid"))
 
-    def test_node_stderr_cut_never_leaves_a_partial_utf8_sequence_and_marks_truncation(self):
+    def test_node_stderr_cut_keeps_head_and_tail_without_partial_utf8_and_marks_truncation(self):
         metadata = b"node_reason=command_failed node_substage=tests\n"
         room = 32_768 - len(metadata)
         character = "⎯".encode("utf-8")
-        for filler, tail, kept in (
-            (room - 1, character, 0), (room - 2, character, 0), (room - 3, character + b"zz", 3),
-            (room - 3, character, None), (room, b"", None),
+        marker_re = re.compile(rb"\n\[\.\.\. ([0-9]+) bytes omitted \.\.\.\]\n")
+        for filler, tail in (
+            (room - 1, character), (room - 2, character), (room - 3, character + b"zz"),
+            (room - 3, character), (room, b""), (room + 5, b""), (40_000, b"end of run\n"),
         ):
             raw = b"a" * filler + tail
             with self.subTest(filler=room - filler, tail=len(tail)):
@@ -946,11 +948,31 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                 ))
                 self.assertTrue(outcome["stderr"].startswith(metadata))
                 self.assertLessEqual(len(outcome["stderr"]), 32_768)
-                outcome["stderr"].decode("utf-8", "strict")
+                body = outcome["stderr"][len(metadata):]
+                body.decode("utf-8", "strict")
                 cut = len(raw) > room
                 self.assertEqual(outcome["stderr_truncated"], cut)
-                if kept is not None:
-                    self.assertEqual(len(outcome["stderr"]) - len(metadata) - filler, kept)
+                if not cut:
+                    self.assertEqual(body, raw)
+                    continue
+                marker = marker_re.search(body)
+                head, kept_tail = body[:marker.start()], body[marker.end():]
+                self.assertTrue(raw.startswith(head))
+                self.assertTrue(raw.endswith(kept_tail))
+                self.assertEqual(int(marker.group(1)), len(raw) - len(head) - len(kept_tail))
+                self.assertGreater(len(head), 16_000)
+                self.assertGreater(len(kept_tail), 16_000)
+                if tail:
+                    self.assertTrue(body.endswith(tail[-3:]))
+
+    def test_head_tail_cut_helper_is_a_no_op_when_the_data_fits(self):
+        self.assertEqual(subject._cut_head_tail(b"abc", 3), b"abc")
+        self.assertEqual(subject._cut_head_tail(b"", 0), b"")
+        self.assertEqual(subject._cut_head_tail(b"a" * 10, 20), b"a" * 10)
+        self.assertEqual(subject._cut_head_tail(b"a" * 200, 64), b"")
+        self.assertEqual(subject._trim_leading_utf8(b"\x8e\xafz"), b"z")
+        self.assertEqual(subject._trim_leading_utf8(b"\x80\x80\x80\x80z"), b"\x80z")
+        self.assertEqual(subject._trim_leading_utf8(b"abc"), b"abc")
 
     def test_trim_incomplete_utf8_matches_the_producer_helper(self):
         producer_spec = importlib.util.spec_from_file_location(

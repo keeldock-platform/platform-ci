@@ -50,9 +50,11 @@ SOURCE_COMMAND_STAGES = frozenset((
 DIAGNOSTIC_STREAM_LIMIT = 32_768
 COMMAND_CAPTURE_SCRIPT = '''\
 import os, selectors, subprocess, sys
-limit = 32768
-out = bytearray()
-err = bytearray()
+head_limit = 16320
+ring_limit = 16320
+tail_keep = 16256
+out = [bytearray(), bytearray(), 0]
+err = [bytearray(), bytearray(), 0]
 out_overflow = 0
 err_overflow = 0
 process = None
@@ -60,8 +62,8 @@ try:
     process = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, close_fds=True)
     selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, (1, out))
-    selector.register(process.stderr, selectors.EVENT_READ, (2, err))
+    selector.register(process.stdout, selectors.EVENT_READ, out)
+    selector.register(process.stderr, selectors.EVENT_READ, err)
     while selector.get_map():
         for key, unused_mask in selector.select():
             chunk = os.read(key.fileobj.fileno(), 4096)
@@ -69,14 +71,16 @@ try:
                 selector.unregister(key.fileobj)
                 key.fileobj.close()
             else:
-                remaining = max(0, limit - len(key.data[1]))
-                if remaining:
-                    key.data[1].extend(chunk[:remaining])
-                if len(chunk) > remaining:
-                    if key.data[0] == 1:
-                        out_overflow = 1
-                    else:
-                        err_overflow = 1
+                state = key.data
+                state[2] += len(chunk)
+                room = head_limit - len(state[0])
+                if room > 0:
+                    state[0].extend(chunk[:room])
+                    chunk = chunk[room:]
+                if chunk:
+                    state[1].extend(chunk)
+                    if len(state[1]) > ring_limit:
+                        del state[1][:len(state[1]) - ring_limit]
     status = process.wait()
 except BaseException:
     status = 256
@@ -92,14 +96,29 @@ def trim_incomplete_utf8(buf):
             if need > back:
                 del buf[size - back:]
         break
-if out_overflow == 1:
-    trim_incomplete_utf8(out)
-if err_overflow == 1:
-    trim_incomplete_utf8(err)
+def trim_leading_utf8(buf):
+    drop = 0
+    while drop < 3 and drop < len(buf) and buf[drop] & 192 == 128:
+        drop += 1
+    del buf[:drop]
+def finish(state):
+    head, tail, total = state
+    if total <= head_limit + ring_limit:
+        return bytes(head) + bytes(tail), 0
+    del tail[:len(tail) - tail_keep]
+    trim_incomplete_utf8(head)
+    trim_leading_utf8(tail)
+    marker = ("\\n[... %d bytes omitted ...]\\n" % (total - len(head) - len(tail))).encode("ascii")
+    return bytes(head) + marker + bytes(tail), 1
+out_data, out_cut = finish(out)
+err_data, err_cut = finish(err)
+if out_overflow != 2:
+    out_overflow = out_cut
+err_overflow = err_cut
 if status < 0:
     status = 256
 header = ("KD-CAPTURE 1 %d %d %d %d %d\\n"
-          % (status, len(out), len(err), out_overflow, err_overflow)).encode("ascii")
+          % (status, len(out_data), len(err_data), out_overflow, err_overflow)).encode("ascii")
 def write_all(fd, data):
     offset = 0
     while offset < len(data):
@@ -109,8 +128,8 @@ def write_all(fd, data):
         offset += count
 try:
     write_all(1, header)
-    write_all(1, out)
-    write_all(2, err)
+    write_all(1, out_data)
+    write_all(2, err_data)
 except BaseException:
     raise SystemExit(2)
 '''
