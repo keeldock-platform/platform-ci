@@ -429,6 +429,66 @@ def _validate_dependency_map(value, workspace_names, extra_internal_names, path=
             _lock_refuse("dep_spec", where, field, name, scheme=spec_scheme(spec))
 
 
+HOST_CPU_TOKENS = frozenset(("x64", "arm64", "ia32", "arm"))
+INERT_CPU_TOKENS = frozenset((
+    "wasm32", "loong64", "mips", "mipsel", "ppc", "ppc64", "riscv64", "s390", "s390x",
+))
+BUNDLED_FIELDS = ("bundledDependencies", "bundleDependencies")
+MAX_BUNDLED_NAMES = 64
+MAX_BUNDLED_NAME_LENGTH = 214
+
+
+def _bundled_names(entry):
+    names = []
+    for key in BUNDLED_FIELDS:
+        values = entry.get(key)
+        if values is None:
+            continue
+        if type(values) is not list:
+            return None
+        names.extend(values)
+    return names
+
+
+def _inert_bundled_names(entry):
+    if type(entry) is not dict:
+        return None
+    names = _bundled_names(entry)
+    if not names or len(names) > MAX_BUNDLED_NAMES:
+        return None
+    if entry.get("optional") is not True and entry.get("devOptional") is not True:
+        return None
+    cpu = entry.get("cpu")
+    if (type(cpu) is not list or not cpu or len(cpu) > 16
+            or any(type(token) is not str or token not in INERT_CPU_TOKENS for token in cpu)):
+        return None
+    if any(type(name) is not str or len(name) > MAX_BUNDLED_NAME_LENGTH
+           or not _valid_package_name(name) for name in names):
+        return None
+    return frozenset(names)
+
+
+def _bundled_member_allowed(parts, is_directory, bundled):
+    if bundled is None:
+        return False
+    if len(parts) == 2:
+        return is_directory
+    if parts[1] != "node_modules":
+        return False
+    name = parts[2]
+    index = 3
+    if name.startswith("@"):
+        if len(parts) == 3:
+            return is_directory and any(item.startswith(name + "/") for item in bundled)
+        name = name + "/" + parts[3]
+        index = 4
+    if name not in bundled:
+        return False
+    if len(parts) == index and not is_directory:
+        return False
+    return not any(part.lower() == "node_modules" for part in parts[index:])
+
+
 def _validate_entry_shape(entry, workspace_names, extra_internal_names, path=""):
     where = _lock_path(path)
     if type(entry) is not dict:
@@ -470,7 +530,7 @@ def _validate_entry_shape(entry, workspace_names, extra_internal_names, path="")
                     or any(type(item) is not str or len(item) > 128 for item in values)):
                 _lock_refuse("entry_list", where, key)
             if key in ("bundledDependencies", "bundleDependencies"):
-                if values:
+                if values and _inert_bundled_names(entry) is None:
                     _lock_refuse("bundled_deps", where, key)
     if "engines" in entry:
         engines = entry["engines"]
@@ -775,7 +835,7 @@ def _manifest_scripts(data, name, version):
     return scripts, manifest.get("gypfile", True)
 
 
-def _inspect_tarball(name, version, integrity, data, internal_names=()):
+def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=None):
     if (not _valid_package_name(name) or not _valid_version(version)
             or _internal_name(name, internal_names) or not _valid_integrity(integrity)
             or type(data) is not bytes
@@ -826,7 +886,8 @@ def _inspect_tarball(name, version, integrity, data, internal_names=()):
                     _refuse("npm_archive_invalid")
                 folded.add(folded_relative)
                 parts = relative.split("/")
-                if any(part.lower() == "node_modules" for part in parts[1:]):
+                if (any(part.lower() == "node_modules" for part in parts[1:])
+                        and not _bundled_member_allowed(parts, is_directory, bundled)):
                     _refuse("npm_archive_invalid")
                 for index in range(1, len(parts) + 1):
                     spelling = "/".join(parts[:index])
@@ -915,7 +976,9 @@ def verify_tarball(entry, data, internal_names=()):
         _refuse("npm_archive_invalid")
     if "resolved" in entry and entry["resolved"] != _canonical_tarball_url(name, version):
         _refuse("npm_archive_invalid")
-    return _inspect_tarball(name, version, entry["integrity"], data, internal_names)
+    return _inspect_tarball(
+        name, version, entry["integrity"], data, internal_names, _inert_bundled_names(entry),
+    )
 
 
 def read_bounded_file(path, maximum=MAX_TARBALL_BYTES):

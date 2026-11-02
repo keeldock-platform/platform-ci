@@ -1415,10 +1415,17 @@ def collect_evidence(lock, entries, plan, *, run_id, run_attempt, now, expiry, f
             version = entry["version"]
             manifest, published = _packument_version(packument, name, version)
             data = fetcher.tarball(name, version)
-            archive = _call_adm(adm.verify_tarball, {
+            archive_entry = {
                 "name": name, "version": version, "integrity": entry["integrity"],
                 "resolved": entry["resolved"],
-            }, data, internal_names=plan["internal_names"])
+            }
+            for field in ("optional", "devOptional", "cpu", "bundledDependencies",
+                          "bundleDependencies"):
+                if field in entry:
+                    archive_entry[field] = entry[field]
+            archive = _call_adm(
+                adm.verify_tarball, archive_entry, data, internal_names=plan["internal_names"],
+            )
             archive_manifest = _archive_manifest(data)
             archive_licence = licence_text(
                 archive_manifest.get("license", archive_manifest.get("licenses")),

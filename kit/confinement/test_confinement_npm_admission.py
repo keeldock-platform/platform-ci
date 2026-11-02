@@ -1016,5 +1016,125 @@ class NpmLockDetailTests(unittest.TestCase):
         self.assertIsNone(subject.Refusal().detail)
 
 
+class NpmInertBundledTests(unittest.TestCase):
+    PATH = "node_modules/sample-package-00"
+    BUNDLED = ["@scope-a/runtime", "plain-lib"]
+
+    def parse(self, **fields):
+        lock, unused_bytes, unused_archives, unused_material = _fixture()
+        lock["packages"][self.PATH].update(fields)
+        return subject.parse_lock(json.dumps(lock).encode("ascii"))
+
+    def refusal_detail(self, **fields):
+        with self.assertRaises(subject.Refusal) as raised:
+            self.parse(**fields)
+        self.assertEqual(raised.exception.reason, "npm_lock_invalid")
+        return raised.exception.detail
+
+    def inert(self, **fields):
+        values = {"optional": True, "cpu": ["wasm32"], "bundleDependencies": list(self.BUNDLED)}
+        values.update(fields)
+        return values
+
+    def test_the_optional_wasm32_entry_with_bundled_dependencies_is_admitted(self):
+        parsed = self.parse(**self.inert())
+        self.assertEqual(parsed["packages"][self.PATH]["cpu"], ["wasm32"])
+        parsed = self.parse(**self.inert(optional=False, devOptional=True))
+        self.assertTrue(parsed["packages"][self.PATH]["devOptional"])
+        parsed = self.parse(**self.inert(bundledDependencies=["plain-lib"], bundleDependencies=["x-lib"]))
+        self.assertEqual(parsed["packages"][self.PATH]["bundledDependencies"], ["plain-lib"])
+
+    def test_each_inert_condition_failing_still_refuses_with_the_same_detail(self):
+        expected = "bundled_deps:" + self.PATH + ":bundleDependencies"
+        cases = {
+            "not optional": self.inert(optional=False),
+            "optional absent": {"cpu": ["wasm32"], "bundleDependencies": list(self.BUNDLED)},
+            "cpu absent": {"optional": True, "bundleDependencies": list(self.BUNDLED)},
+            "cpu empty": self.inert(cpu=[]),
+            "x64": self.inert(cpu=["x64"]),
+            "arm64": self.inert(cpu=["arm64"]),
+            "ia32": self.inert(cpu=["ia32"]),
+            "arm": self.inert(cpu=["arm"]),
+            "mixed": self.inert(cpu=["wasm32", "x64"]),
+            "negated": self.inert(cpu=["!wasm32"]),
+            "negated host": self.inert(cpu=["!x64"]),
+            "unknown token": self.inert(cpu=["quantum"]),
+            "any token": self.inert(cpu=["any"]),
+            "invalid name": self.inert(bundleDependencies=["Bad Name"]),
+            "uppercase name": self.inert(bundleDependencies=["UPPER"]),
+            "path name": self.inert(bundleDependencies=["../evil"]),
+            "too many names": self.inert(bundleDependencies=["lib-%02d" % item for item in range(65)]),
+        }
+        for label, fields in cases.items():
+            with self.subTest(case=label):
+                self.assertEqual(self.refusal_detail(**fields), expected)
+
+    def test_bundled_name_bounds_refuse(self):
+        sixty_four = ["lib-%02d" % item for item in range(64)]
+        self.assertEqual(
+            self.parse(**self.inert(bundleDependencies=sixty_four))["packages"][self.PATH]["cpu"],
+            ["wasm32"],
+        )
+        self.assertIsNotNone(self.refusal_detail(**self.inert(bundleDependencies=["a" * 129])))
+
+    def _inert_entry(self, data, **fields):
+        entry = {
+            "name": "sample", "version": "1.0.0", "integrity": _sri(data),
+            "optional": True, "cpu": ["wasm32"], "bundleDependencies": list(self.BUNDLED),
+        }
+        entry.update(fields)
+        return entry
+
+    def _bundled_tarball(self, extra=()):
+        members = (
+            ("package/node_modules/plain-lib/package.json", b"{}"),
+            ("package/node_modules/@scope-a/runtime/index.js", b"synthetic"),
+        )
+        return _tarball("sample", "1.0.0", extra=members + tuple(extra))
+
+    def test_the_archive_of_an_inert_entry_may_carry_its_declared_bundled_tree(self):
+        data = self._bundled_tarball()
+        report = subject.verify_tarball(self._inert_entry(data), data)
+        self.assertEqual(report["file_count"], 3)
+
+    def test_the_archive_tree_is_refused_unless_the_entry_is_inert(self):
+        data = self._bundled_tarball()
+        for label, fields in (
+                ("x64", {"cpu": ["x64"]}), ("mixed", {"cpu": ["wasm32", "arm64"]}),
+                ("not optional", {"optional": False}), ("no cpu", {"cpu": None})):
+            with self.subTest(case=label):
+                entry = self._inert_entry(data, **fields)
+                if fields.get("cpu", 0) is None:
+                    del entry["cpu"]
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject.verify_tarball(entry, data)
+                self.assertEqual(raised.exception.reason, "npm_archive_invalid")
+        plain = {"name": "sample", "version": "1.0.0", "integrity": _sri(data)}
+        with self.assertRaises(subject.Refusal):
+            subject.verify_tarball(plain, data)
+
+    def test_the_archive_tree_must_match_the_declared_names_and_stay_flat(self):
+        for path in (
+                "package/node_modules/other-lib/package.json",
+                "package/node_modules/plain-lib/node_modules/inner/package.json",
+                "package/node_modules/@scope-a/other/index.js",
+                "package/node_modules/plain-lib",
+                "package/lib/node_modules/plain-lib/package.json"):
+            with self.subTest(path=path):
+                data = _tarball("sample", "1.0.0", extra=((path, b"synthetic"),))
+                with self.assertRaises(subject.Refusal) as raised:
+                    subject.verify_tarball(self._inert_entry(data), data)
+                self.assertEqual(raised.exception.reason, "npm_archive_invalid")
+
+    def test_an_inert_archive_keeps_every_other_archive_check(self):
+        data = self._bundled_tarball()
+        entry = self._inert_entry(data, integrity=_sri(b"other"))
+        with self.assertRaises(subject.Refusal):
+            subject.verify_tarball(entry, data)
+        escaping = _tarball("sample", "1.0.0", extra=(("package/../escape", b"x"),))
+        with self.assertRaises(subject.Refusal):
+            subject.verify_tarball(self._inert_entry(escaping), escaping)
+
+
 if __name__ == "__main__":
     unittest.main()

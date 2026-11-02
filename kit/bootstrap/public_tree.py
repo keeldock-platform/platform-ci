@@ -343,7 +343,7 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/core-npm-admission-return.yml': 'd223f706e69f9a615247ed4ec42f5c207c256c164301630d2e2c460bec1512f6',
     'kit/bootstrap/policy_npm.py': 'b90f491d403204afc7193bcb22de9a47faf72e6c06b1926976c041257362aaef',
     'kit/bootstrap/test_policy_npm.py': '54cb41fda7c5104e656c758514aed562264038cf1db5a1c0f7bafad761201182',
-    'kit/confinement/npm_admission_bootstrap.py': '69c97870d852721a010c4f7968c91615c6279a2169242741ce1e9b053584859a',
+    'kit/confinement/npm_admission_bootstrap.py': '4b40f0327fc362acb510119b6d907fc776e4e79bd618f3349f85d6bb58d0f2a3',
     'kit/confinement/test_confinement_npm_admission_bootstrap.py': 'c4f729aede2f4eda8a4f0853fe3f891379c06e8023b26f548a2e90720d289ef7',
     'kit/confinement/npm_semver.py': '0f6207724ea97a793d9c64175a5e9245f138e0fb4b057ab776c67d1722b1c26f',
     'kit/confinement/test_confinement_npm_semver.py': 'de0caa828a3af80166ee7cd1946276ef251504be8c967bc4b2cac046f8e65395',
