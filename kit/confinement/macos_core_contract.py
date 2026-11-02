@@ -1047,6 +1047,15 @@ def _run_privilege_probe(worker_uid, home, host_toolchain, reviewed):
         raise Refusal("runner_unavailable", "worker_setup", diagnostic="worker_privilege_census") from None
 
 
+def _npm_feedback_result(producer, error):
+    step = getattr(error, "source_gates_step", None)
+    key = getattr(error, "source_gates_key", None)
+    if (type(step) is not str or type(key) is not str or step not in NPM_DIAGNOSTIC_STEPS
+            or (step, key) not in SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY):
+        raise error
+    return producer.npm_diagnostic_result(error)
+
+
 def _run_inside_source(source, original_cwd, command):
     try:
         os.chdir(source)
@@ -1767,7 +1776,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                                 ),
                             )
                         except producer.FeedbackRefusal as npm_error:
-                            feedback_result = producer.npm_diagnostic_result(npm_error)
+                            feedback_result = _npm_feedback_result(producer, npm_error)
                     else:
                         feedback_result = _run_inside_source(
                             source,

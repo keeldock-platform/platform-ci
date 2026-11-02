@@ -124,7 +124,7 @@ class NpmAdmissionWorkflowPolicyTests(unittest.TestCase):
         workflow = NPM_ADMISSION_WORKFLOW.read_text(encoding="utf-8")
         blocks = job_blocks(workflow)
         producer = blocks["core-npm-admission-return"]
-        pattern = ("diagnostic_pattern='^KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 "
+        pattern = ("diagnostic_pattern='^KD-FEEDBACK-NPM-DIAGNOS''TIC schema=1 "
                    "step=npm_(resolve|lock|bundle) reason=[a-z0-9_]{1,40}$'")
         self.assertEqual(producer.count(pattern), 1)
         echoed = "printf '%s\\n' \"$diagnostic_line\""
@@ -132,6 +132,7 @@ class NpmAdmissionWorkflowPolicyTests(unittest.TestCase):
         self.assertLess(producer.index("printf '%s\\n' \"$producer_line\""), producer.index(echoed))
         self.assertLess(producer.index('diagnostic_line="$(grep -Em 1'), producer.rindex("trap - EXIT"))
         self.assertIn('[[ "$(grep -Ec -- "$diagnostic_pattern" "$stderr_file")" -eq 1 ]] || exit 1', producer)
+        self.assertNotIn("KD-FEEDBACK-NPM-DIAGNOSTIC", producer)
         for name in ("settings", "prepare", "audit"):
             self.assertNotIn("KD-FEEDBACK-NPM-DIAGNOSTIC", blocks["core-npm-admission-return-" + name])
         for forbidden in ('cat "$stderr_file"', 'tail ', 'head ', '>&2'):

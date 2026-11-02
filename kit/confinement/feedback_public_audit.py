@@ -381,16 +381,19 @@ def _read_cache_snapshot(log, control_sha, run_id):
 
 
 def _npm_diagnostic_lines_ok(logs, profile):
-    """Accept no diagnostic line, or exactly one strict closed line in the npm producer log."""
+    """Accept no diagnostic line, or exactly one strict closed line in the npm producer log.
+
+    Only log lines whose content starts with the marker count, so the echoed step script is ignored.
+    """
     keys_by_step = dict(public_audit.CORE_CONTRACT_SOURCE_GATES_NPM_KEYS_BY_STEP)
     found = 0
     for name, log in logs.items():
         for line in log.splitlines():
-            if NPM_DIAGNOSTIC_MARKER not in line:
-                continue
             body = line
             if not line.startswith(NPM_DIAGNOSTIC_MARKER) and len(line) > 30 and line[4:5] == b"-" and b"Z " in line[:32]:
                 body = line.split(b"Z ", 1)[1]
+            if not body.startswith(NPM_DIAGNOSTIC_MARKER):
+                continue
             match = NPM_DIAGNOSTIC_LINE_RE.match(body)
             if (match is None or name != profile["producer_job"]
                     or profile["kind"] != feedback_request.NPM_ADMISSION_KIND

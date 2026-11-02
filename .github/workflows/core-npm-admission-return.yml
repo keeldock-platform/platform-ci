@@ -439,7 +439,7 @@ jobs:
           IFS= read -r publish_line < "$publish_file"
           [[ "$publish_line" == KD-FEEDBACK-PUBLISHER\ * ]] || exit 1
           IFS= read -r producer_line < "$stdout_file" || exit 1
-          diagnostic_pattern='^KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=npm_(resolve|lock|bundle) reason=[a-z0-9_]{1,40}$'
+          diagnostic_pattern='^KD-FEEDBACK-NPM-DIAGNOS''TIC schema=1 step=npm_(resolve|lock|bundle) reason=[a-z0-9_]{1,40}$'
           diagnostic_line=""
           if grep -Eq -- "$diagnostic_pattern" "$stderr_file"; then
             [[ "$(grep -Ec -- "$diagnostic_pattern" "$stderr_file")" -eq 1 ]] || exit 1

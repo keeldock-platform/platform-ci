@@ -801,6 +801,46 @@ class LiveProviderPipelineTests(unittest.TestCase):
                 with self.subTest(step=step, key=key):
                     self.assertEqual(self._npm_diagnostic_audit([self.STAMP + line]), plain)
 
+    ESC = b"\x1b"
+
+    def _echoed_producer_script(self):
+        workflow = (Path(__file__).resolve().parents[2] / ".github/workflows/core-npm-admission-return.yml")
+        lines = workflow.read_text(encoding="utf-8").splitlines()
+        start = lines.index("      - name: Run and publish encrypted feedback")
+        begin = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |") + 1
+        end = next((i for i in range(begin, len(lines)) if lines[i].startswith("      - name:")), len(lines))
+        script = [line[10:] for line in lines[begin:end] if line.strip()]
+        legacy = "diagnostic_pattern='^KD-FEEDBACK-NPM-DIAGNOSTIC schema=1 step=npm_(resolve|lock|bundle) reason=[a-z0-9_]{1,40}$'"
+        script.insert(3, legacy)
+        out = [self.STAMP + b"\x23\x23[group]Run set -euo pipefail\n"]
+        for line in script:
+            out.append(self.STAMP + self.ESC + b"[36;1m" + line.encode("utf-8") + self.ESC + b"[0m\n")
+        out.append(self.STAMP + b"shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}\n")
+        out.append(self.STAMP + b"\x23\x23[endgroup]\n")
+        return out
+
+    def test_the_echoed_producer_step_script_is_not_a_diagnostic_line(self):
+        echoed = self._echoed_producer_script()
+        self.assertTrue(any(b"KD-FEEDBACK-NPM-DIAGNOSTIC" in line for line in echoed))
+        plain = self._npm_diagnostic_audit([])
+        for real in ([], [self.NPM_DIAGNOSTIC], [self.STAMP + self.NPM_DIAGNOSTIC]):
+            with self.subTest(real=real):
+                self.assertEqual(self._npm_diagnostic_audit(echoed + real), plain)
+                self.assertEqual(self._npm_diagnostic_audit(real + echoed), plain)
+        two = [self.NPM_DIAGNOSTIC, self.STAMP + self.NPM_DIAGNOSTIC]
+        malformed = [self.NPM_DIAGNOSTIC.replace(b"reason=eresolve", b"reason=bogus"),
+                     self.STAMP + self.NPM_DIAGNOSTIC.replace(b"schema=1", b"schema=2")]
+        for real in (two, malformed[:1], malformed[1:]):
+            with self.subTest(real=real):
+                self.assertEqual(self._npm_diagnostic_phase(echoed + real), "producer_evidence")
+
+    def test_a_marker_that_does_not_start_the_log_content_is_not_a_diagnostic_line(self):
+        good = self.NPM_DIAGNOSTIC
+        plain = self._npm_diagnostic_audit([])
+        for lines in ([b"prefix " + good], [self.STAMP + b"prefix " + good]):
+            with self.subTest(lines=lines):
+                self.assertEqual(self._npm_diagnostic_audit(lines), plain)
+
     def test_every_other_diagnostic_line_shape_or_placement_is_refused(self):
         good = self.NPM_DIAGNOSTIC
         for lines in (
@@ -814,8 +854,6 @@ class LiveProviderPipelineTests(unittest.TestCase):
             [good.replace(b"reason=eresolve", b"reason=eresolve extra=1")],
             [good.replace(b"reason=eresolve", b"reason=")],
             [good.replace(b"KD-FEEDBACK-NPM-DIAGNOSTIC ", b"KD-FEEDBACK-NPM-DIAGNOSTIC  ")],
-            [b"prefix " + good],
-            [self.STAMP + b"prefix " + good],
             [good.rstrip(b"\n") + b" \n"],
             [b"KD-FEEDBACK-NPM-DIAGNOSTIC\n"],
             [b"KD-FEEDBACK-NPM-DIAGNOSTIC-SUMMARY schema=1\n"],

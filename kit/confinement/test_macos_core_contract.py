@@ -2306,6 +2306,41 @@ class CoreContractTests(unittest.TestCase):
             "source_runtime_bootstrap_bootstrap_not_approved",
         )
 
+    def test_an_npm_refusal_becomes_a_diagnostic_only_for_a_pair_in_the_closed_table(self):
+        converted = []
+
+        class FakeProducer:
+            @staticmethod
+            def npm_diagnostic_result(error):
+                converted.append(error)
+                return {"source_result": "npm_diagnostic"}
+
+        def refusal(step, key):
+            error = RuntimeError("npm")
+            error.source_gates_step = step
+            error.source_gates_key = key
+            return error
+
+        for step, key in (("npm_resolve", "eresolve"), ("npm_lock", "npm_lock_refused"),
+                          ("npm_bundle", "capture_invalid")):
+            if (step, key) not in subject.SOURCE_GATES_STEP_DIAGNOSTICS_BY_KEY:
+                continue
+            with self.subTest(step=step, key=key):
+                error = refusal(step, key)
+                self.assertEqual(subject._npm_feedback_result(FakeProducer, error),
+                                 {"source_result": "npm_diagnostic"})
+                self.assertIs(converted[-1], error)
+        converted.clear()
+        for step, key in (("npm_resolve", "not_in_the_table"), ("npm_lock", "eresolve"),
+                          ("npm_version", "mismatch"), ("payload", "payload_invalid"),
+                          ("npm_bundle", ["x"]), (None, None), (["npm_lock"], "npm_lock_refused")):
+            error = refusal(step, key)
+            with self.subTest(step=step, key=key):
+                with self.assertRaises(RuntimeError) as raised:
+                    subject._npm_feedback_result(FakeProducer, error)
+                self.assertIs(raised.exception, error)
+        self.assertEqual(converted, [])
+
     def test_source_lease_open_unknown_exception_class_uses_only_fixed_type_labels(self):
         class CustomTypeError(TypeError):
             pass
