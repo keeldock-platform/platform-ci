@@ -221,41 +221,25 @@ ADM_REASON_MAP = {
 }
 
 
-LOCK_DETAIL_MAX_BYTES = 512
-LOCK_DETAIL_RE = re.compile(r"[A-Za-z0-9._~@/:,+ _-]{1,512}\Z")
-LOCK_DETAIL_TOKEN_RE = re.compile(r"[a-z_]{1,32}\Z")
-LOCK_DETAIL_NAME_RE = re.compile(r"[A-Za-z0-9._~@/_-]{1,214}\Z")
+LOCK_DETAIL_MAX_BYTES = adm.DETAIL_MAX_BYTES
+LOCK_DETAIL_GRAMMAR = adm.DETAIL_GRAMMAR
+LOCK_DETAIL_RE = re.compile(LOCK_DETAIL_GRAMMAR)
 LOCK_DETAIL_REASON_RE = re.compile(r"[a-z_]{1,40}\Z")
-LOCK_DETAIL_VERSION_RE = re.compile(r"[0-9A-Za-z.+-]{1,64}\Z")
-LOCK_DETAIL_MAX_VERSIONS = 8
+LOCK_DETAIL_MAX_VERSIONS = adm.DETAIL_MAX_VERSIONS
+
+
+def _valid_lock_detail(text):
+    return type(text) is str and len(text) <= LOCK_DETAIL_MAX_BYTES and LOCK_DETAIL_RE.match(text) is not None
 
 
 def lock_detail(token, subject=None, versions=None, count=None):
     """Build the bounded, ASCII-only check identifier carried by one lock refusal.
 
     The token is a fixed lowercase word, the subject an npm name or lock path and the versions
-    semver-shaped strings. Anything outside those shapes is replaced or dropped, never echoed."""
-    if type(token) is not str or LOCK_DETAIL_TOKEN_RE.match(token) is None:
-        return None
-    text = token
-    if subject is not None:
-        valid = type(subject) is str and LOCK_DETAIL_NAME_RE.match(subject) is not None
-        text += ":" + (subject if valid else "invalid_name")
-    if count is not None and type(count) is int and 0 <= count <= 99999:
-        text += " count:" + str(count)
-    if versions is not None:
-        kept = []
-        for version in versions:
-            if type(version) is str and LOCK_DETAIL_VERSION_RE.match(version) is not None:
-                kept.append(version)
-            else:
-                kept.append("invalid")
-            if len(kept) >= LOCK_DETAIL_MAX_VERSIONS:
-                break
-        if kept:
-            text += " found:" + ",".join(kept)
-    text = text[:LOCK_DETAIL_MAX_BYTES]
-    return text if LOCK_DETAIL_RE.match(text) is not None else None
+    semver-shaped strings. Anything outside those shapes is replaced or dropped, never echoed,
+    and versions are dropped whole until the text fits, so the result always matches the grammar."""
+    text = adm.build_detail(token, () if subject is None else (subject,), versions, count)
+    return text if _valid_lock_detail(text) else None
 
 
 class BootstrapRefusal(Exception):
@@ -265,7 +249,7 @@ class BootstrapRefusal(Exception):
         if reason not in REASONS:
             reason = "npm_input_invalid"
         self.reason = reason
-        self.detail = detail if type(detail) is str and LOCK_DETAIL_RE.match(detail) is not None else None
+        self.detail = detail if _valid_lock_detail(detail) else None
         super().__init__(reason)
 
 
@@ -281,6 +265,11 @@ def _call_adm(function, *arguments, **keywords):
         detail = None
         if type(shared) is str and LOCK_DETAIL_REASON_RE.match(shared) is not None:
             detail = lock_detail("shared_parser", shared)
+            token = getattr(error, "detail", None)
+            if detail is not None and _valid_lock_detail(token):
+                combined = detail + ":" + token
+                if _valid_lock_detail(combined):
+                    detail = combined
         raise BootstrapRefusal(ADM_REASON_MAP.get(shared, "npm_lock_refused"), detail) from None
 
 

@@ -191,6 +191,41 @@ test('the npm diagnostic payload is a closed variant of the npm admission kind o
   assert.throws(() => validate(payload, { reviewedRustPaths: ['src/lib.rs'] }), DevelopmentFeedbackError);
 });
 
+test('a lock diagnostic with a kd-check line is accepted, encrypted and decrypted unchanged', () => {
+  const header = 'KD-NPM-DIAGNOSTICS schema=1 step=npm_lock reason=npm_lock_refused';
+  const checks = [
+    'direct_missing:alpha-pkg count:1 found:1.0.1',
+    'shared_parser:npm_lock_invalid:root_fields',
+    'shared_parser:npm_lock_invalid:dep_spec:node_modules/@isaacs/cliui:dependencies:string-width-cjs scheme:npm',
+    'shared_parser:npm_lock_invalid:entry_key:node_modules/a/node_modules/@s/b:invalid_name',
+  ];
+  for (const check of checks) {
+    const payload = diagnostics({
+      header,
+      stderr: [`  kd-check ${check}`, '  npm warn deprecated a@1.0.0: old'],
+      report: [],
+    });
+    assert.deepEqual(validate(payload), payload);
+    const context = contextFor(PROFILE);
+    const envelope = encryptDevelopmentFeedback({
+      payloadBytes: payload,
+      context,
+      recipientPublicKey: recipient.publicKey,
+      now: NOW,
+    });
+    assert.deepEqual(decryptDevelopmentFeedback({
+      envelope,
+      context,
+      recipientPrivateKey: recipient.privateKey,
+      now: NOW,
+    }), payload);
+  }
+  assert.throws(
+    () => validate(diagnostics({ header, stderr: ['kd-check lock_empty'], report: [] })),
+    (error) => refusalCode(error) === 'invalid_payload',
+  );
+});
+
 test('a diagnostic payload is never accepted as a bundle and a bundle never as a diagnostic', () => {
   const bundleBytes = bundle();
   assert.notEqual(bundleBytes.subarray(0, 19).toString('latin1'), 'KD-NPM-DIAGNOSTICS ');
