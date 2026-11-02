@@ -28,6 +28,17 @@ MAX_JOBS = 16
 MAX_ARTIFACT_AGE_SECONDS = 24 * 60 * 60
 MAX_CAPACITY_NOTICES = 64
 MAX_MARKER_BYTES = 16 * 1024
+QUICK_BRANCH = "untrusted"
+QUICK_TITLE_PREFIX = "Linux quick source "
+QUICK_ARTIFACT_PREFIX = "linux-quick-"
+QUICK_JOB_SUFFIXES = ("-settings", "-unit")
+QUICK_FRAME_BYTES = 4 * 1024 * 1024 - 64 * 1024 + 470 + 16
+QUICK_ARTIFACT_SLACK_BYTES = 8192
+QUICK_RETENTION_SECONDS = 24 * 60 * 60
+QUICK_RETENTION_SLACK_SECONDS = 600
+QUICK_RUN_CONCLUSIONS = ("success", "failure")
+QUICK_MAGIC = b"KDLE"
+AUDIT_LINE_PREFIX = b"KD-CONFINEMENT-AUDIT"
 HISTORY_API_REASONS = ("status", "schema", "pagination", "unavailable")
 HISTORY_FAILURE_PHASES = frozenset(
     "history_all_api_" + reason for reason in HISTORY_API_REASONS
@@ -191,7 +202,8 @@ def _feedback_job_steps_success(detail, job_name, profile, request, log):
     return skipped_fallback == 1 and fallback_name_count == 1
 
 
-def _check_run(api, request, profile, expected_actor_login, run_id, run_attempt):
+def _check_run(api, request, profile, expected_actor_login, run_id, run_attempt, *,
+               branch="main", title=None, conclusions=("success",)):
     if (type(run_id) is not str or DECIMAL_RE.fullmatch(run_id) is None
             or type(run_attempt) is not int or run_attempt != 1
             or type(expected_actor_login) is not str or ACTOR_RE.fullmatch(expected_actor_login) is None):
@@ -205,10 +217,10 @@ def _check_run(api, request, profile, expected_actor_login, run_id, run_attempt)
             or not _safe_int(run.get("run_attempt"), 1) or run["run_attempt"] != run_attempt
             or run.get("head_sha") != request["control_sha"]
             or run.get("path") != profile["workflow_path"]
-            or run.get("head_branch") != "main"
+            or run.get("head_branch") != branch
             or run.get("event") != "workflow_dispatch"
-            or run.get("status") != "completed" or run.get("conclusion") != "success"
-            or run.get("display_title") != RUN_TITLE_PREFIX + request["request_id"]
+            or run.get("status") != "completed" or run.get("conclusion") not in conclusions
+            or run.get("display_title") != (RUN_TITLE_PREFIX + request["request_id"] if title is None else title)
             or actor.get("login") != expected_actor_login
             or not _safe_int(repository.get("id"), 1)
             or str(repository["id"]) != request["ci_repository_id"]
@@ -616,12 +628,162 @@ def _receipt_from_marker(log, expected, run, producer, artifact, producer_record
     return receipt
 
 
+def _quick_audit_line(run):
+    return (
+        "KD-CONFINEMENT-AUDIT schema=1 status=accepted os=linux mode=quick tier=quick"
+        + " admission=never control-sha=" + run["head_sha"] + " run-id=" + str(run["id"])
+        + " run-attempt=1 verdict=none log-canary=absent artifacts=expected caches=unchanged"
+    ).encode("ascii")
+
+
+def _check_quick_audit_log(log, run):
+    if type(log) is not bytes or len(log) > public_audit.MAX_LOG_BYTES:
+        _refuse()
+    expected = _quick_audit_line(run)
+    seen = 0
+    for raw in log.split(b"\n"):
+        line = raw.rstrip(b"\r")
+        stamp = re.match(MARKER_TIME, line)
+        line = line[stamp.end():]
+        if line.startswith(AUDIT_LINE_PREFIX):
+            if line != expected:
+                _refuse()
+            seen += 1
+    if seen != 1:
+        _refuse()
+
+
+def _quick_jobs(api, run, profile):
+    run_id = str(run["id"])
+    path = "/repos/" + API_REPOSITORY + "/actions/runs/" + run_id + "/attempts/1/jobs"
+    jobs = public_audit._read_counted_collection(
+        api, path, "jobs", MAX_JOBS, public_audit._validate_job_record,
+    )
+    names = (
+        [profile["concern"] + suffix for suffix in QUICK_JOB_SUFFIXES]
+        + [profile["producer_job"], profile["auditor_job"]]
+    )
+    if len(jobs) != len(names) or sorted(job.get("name") for job in jobs) != sorted(names):
+        _refuse()
+    audit_log = None
+    for job in jobs:
+        detail, unused_check, unused_steps = public_audit._job_detail(
+            api, job, run_id, "1", run["head_sha"], job["name"],
+        )
+        allowed = ("success", "failure") if job["name"] == profile["producer_job"] else ("success",)
+        if detail.get("conclusion") not in allowed:
+            _refuse()
+        if job["name"] == profile["auditor_job"]:
+            audit_log = api.log_text(job["id"])
+            public_audit.inspect_public_bytes(audit_log, run["head_sha"])
+    _check_quick_audit_log(audit_log, run)
+
+
+def _quick_artifact(api, request, profile, run, now):
+    path = "/repos/" + API_REPOSITORY + "/actions/runs/" + str(run["id"]) + "/artifacts"
+    artifacts = public_audit._read_counted_collection(
+        api, path, "artifacts", public_audit.MAX_ARTIFACT_ITEMS, public_audit._validate_artifact,
+    )
+    if len(artifacts) != 1:
+        _refuse()
+    artifact = artifacts[0]
+    workflow_run = artifact.get("workflow_run")
+    repository_id = run["repository"]["id"]
+    size = artifact.get("size_in_bytes")
+    if (not _exact_dict(artifact, RAW_ARTIFACT_FIELDS)
+            or type(artifact.get("node_id")) is not str or len(artifact["node_id"]) > 128
+            or type(artifact.get("url")) is not str or len(artifact["url"]) > 2048
+            or type(artifact.get("archive_download_url")) is not str
+            or len(artifact["archive_download_url"]) > 2048
+            or type(artifact.get("updated_at")) is not str
+            or not _exact_dict(workflow_run, {
+                "id", "repository_id", "head_repository_id", "head_branch", "head_sha",
+            })
+            or workflow_run.get("id") != run["id"]
+            or workflow_run.get("repository_id") != repository_id
+            or workflow_run.get("head_repository_id") != repository_id
+            or workflow_run.get("head_sha") != run["head_sha"]
+            or workflow_run.get("head_branch") != QUICK_BRANCH
+            or artifact.get("name") != QUICK_ARTIFACT_PREFIX + request["request_id"]
+            or artifact.get("expired") is not False
+            or not _safe_int(artifact.get("id"), 1)
+            or not _safe_int(size, QUICK_FRAME_BYTES)
+            or size > QUICK_FRAME_BYTES + QUICK_ARTIFACT_SLACK_BYTES):
+        _refuse()
+    public_audit._validate_api_url(
+        artifact["url"],
+        "/repos/" + API_REPOSITORY + "/actions/artifacts/" + str(artifact["id"]),
+    )
+    public_audit._validate_api_url(
+        artifact["archive_download_url"],
+        "/repos/" + API_REPOSITORY + "/actions/artifacts/" + str(artifact["id"]) + "/zip",
+    )
+    _iso_utc_epoch(artifact["updated_at"])
+    created = _iso_utc_epoch(artifact.get("created_at"))
+    expires = _iso_utc_epoch(artifact.get("expires_at"))
+    if (created > now or expires <= now or expires <= created
+            or expires - created > QUICK_RETENTION_SECONDS + QUICK_RETENTION_SLACK_SECONDS):
+        _refuse()
+    digest = _artifact_digest(artifact.get("digest"))
+    archive = _download_archive(api, artifact["id"])
+    if len(archive) != size or hashlib.sha256(archive).hexdigest() != digest:
+        _refuse()
+    member = node_lock_receipt.validate_ciphertext_archive(
+        archive, member_name=profile["member_name"],
+    )
+    if member[:4] != QUICK_MAGIC or len(member) > len(archive):
+        _refuse()
+    return artifact["id"], digest, member
+
+
+def _quick_context(request, run_id):
+    fields = node_lock_receipt.FEEDBACK_CONTEXT_FIELDS
+    profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
+    context = {name: request[name] for name in fields if name in request}
+    context.update({
+        "run_id": str(run_id), "producer_job": profile["producer_job"], "run_attempt": 1,
+    })
+    if set(context) != set(fields):
+        _refuse()
+    return context
+
+
+def _collect_quick_evidence(api, request, profile, expected_actor_login, run_id, run_attempt, now):
+    if (request["workflow_ref"] != feedback_request.LINUX_QUICK_WORKFLOW_REF
+            or request["kind"] != feedback_request.LINUX_QUICK_KIND
+            or request["concern"] != profile["concern"]):
+        _refuse()
+    run = _check_run(
+        api, request, profile, expected_actor_login, run_id, run_attempt,
+        branch=QUICK_BRANCH, title=QUICK_TITLE_PREFIX + request["source_sha"],
+        conclusions=QUICK_RUN_CONCLUSIONS,
+    )
+    _quick_jobs(api, run, profile)
+    artifact_id, digest, member = _quick_artifact(api, request, profile, run, now)
+    return {
+        "kind": feedback_request.LINUX_QUICK_KIND,
+        "context": _quick_context(request, run["id"]),
+        "ciphertext": member,
+        "run_id": run["id"],
+        "artifact_id": artifact_id,
+        "artifact_digest": digest,
+        "ci_repository_id": int(request["ci_repository_id"]),
+        "actor_login": run["actor"]["login"],
+        "now": now,
+    }
+
+
 def collect_feedback_evidence(api, request, *, expected_actor_login, run_id, run_attempt, now):
     """Collect complete authenticated evidence for an already-completed feedback run."""
     try:
         profile = feedback_request.validate_request(request, now=now)
-        if (not _safe_int(now, 1) or not isinstance(api, public_audit.GitHubAPI)
-                or request["workflow_ref"] != feedback_request.WORKFLOW_REF):
+        if not _safe_int(now, 1) or not isinstance(api, public_audit.GitHubAPI):
+            _refuse()
+        if profile["kind"] == feedback_request.LINUX_QUICK_KIND:
+            return _collect_quick_evidence(
+                api, request, profile, expected_actor_login, run_id, run_attempt, now,
+            )
+        if request["workflow_ref"] != feedback_request.WORKFLOW_REF:
             _refuse()
         run_record = _check_run(api, request, profile, expected_actor_login, run_id, run_attempt)
         history = _history(api, request, profile, run_record, expected_actor_login, now)
