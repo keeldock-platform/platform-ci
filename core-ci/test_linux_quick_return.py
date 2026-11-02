@@ -664,7 +664,7 @@ class PublicLineTests(unittest.TestCase):
 
     def test_invalid_counts_or_identity_are_refused(self):
         for arguments in (
-            ("short", 13, 13, 0), (REQUEST, 17, 1, 0), (REQUEST, 13, 14, 0), (REQUEST, 13, 1, 14),
+            ("short", 13, 13, 0), (REQUEST, 19, 1, 0), (REQUEST, 13, 14, 0), (REQUEST, 13, 1, 14),
             (REQUEST, 13, -1, 0), (REQUEST, 13, True, 0), (REQUEST, "13", 1, 0), (None, 13, 1, 0),
         ):
             with self.subTest(arguments=arguments):
@@ -680,7 +680,7 @@ class PublicLineTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), subject.quick_line(REQUEST, 16, 16, 0) + "\n")
         for name, value in (
             ("KD_QUICK_GATES_SELECTED", "01"), ("KD_QUICK_GATES_PASSED", ""),
-            ("KD_QUICK_GATES_FAILED", "x"), ("KD_QUICK_GATES_PASSED", "17"),
+            ("KD_QUICK_GATES_FAILED", "x"), ("KD_QUICK_GATES_PASSED", "19"),
         ):
             with self.subTest(name=name, value=value):
                 output = io.StringIO()
@@ -719,7 +719,7 @@ class SourceShapeTests(unittest.TestCase):
     def test_stream_budget_fits_the_payload_before_escaping(self):
         self.assertLess(2 * subject.MAX_GATES * subject.STREAM_TAIL_BYTES, subject.MAX_BODY_BYTES)
         self.assertEqual(subject.MIN_GATES, 13)
-        self.assertEqual(subject.MAX_GATES, 16)
+        self.assertEqual(subject.MAX_GATES, 18)
 
 
 if __name__ == "__main__":

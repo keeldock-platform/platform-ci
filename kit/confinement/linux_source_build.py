@@ -18,6 +18,7 @@ import urllib.request
 from pathlib import Path
 
 import cargo_lock_bootstrap
+import gate_table
 import linux_harness
 import linux_channels
 import linux_probes
@@ -31,6 +32,10 @@ TIERS = {
     "admission": ("linux-source-admission.yml", "Linux admission source "),
     "quick": ("core-linux-quick-return.yml", "Linux quick source "),
 }
+LINUX_SOURCE_PREFIX = "LINUX_SOURCE"
+WINDOWS_SOURCE_PREFIX = "WINDOWS_SOURCE"
+SOURCE_PREFIXES = (LINUX_SOURCE_PREFIX, WINDOWS_SOURCE_PREFIX)
+WINDOWS_TIER = ("windows-source-admission.yml", "Windows admission source ")
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
 TOOLCHAIN_ROOT = Path("/tmp/kd-toolchains")
@@ -43,17 +48,14 @@ SOURCE_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
 IMAGE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\Z")
 FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
-OWNER_RE = re.compile(r"[A-Za-z0-9_.-]{1,100}\Z")
+OWNER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\Z")
+API_PATH_RE = re.compile(r"/[A-Za-z0-9._~/?&=-]*\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 ENVIRONMENT_NAME = "linux-source-read"
 ENVIRONMENT_BRANCHES = ("main", "untrusted")
-GATES = (
-    "format", "clippy", "workspace_tests", "api_tests", "mock_tests", "conformance_tests",
-    "parser_format", "parser_clippy", "parser_replay", "node_dependency_prepare",
-    "node_dependency_audit", "typescript_typecheck", "typescript_tests",
-)
-RUNTIME_GATE_NAMES = ("runtime_format", "runtime_clippy", "runtime_tests")
-RUNTIME_ROOT_FILES = ("runtime/Cargo.toml", "runtime/Cargo.lock")
+GATES = gate_table.GATES
+RUNTIME_GATE_NAMES = gate_table.RUNTIME_GATE_NAMES
+RUNTIME_ROOT_FILES = gate_table.RUNTIME_ROOT_FILES
 MAX_LOCK_DIRECTORIES = 100000
 MAX_DIRECTORY_ENTRIES = 8192
 MAX_TREE_ENTRIES = 1000000
@@ -259,10 +261,10 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def _safe_api_path(path):
-    if type(path) is not str or not path.startswith("/") or "\\" in path or "\x00" in path:
+    if type(path) is not str or API_PATH_RE.fullmatch(path) is None or path.count("?") > 1:
         return False
     parts = path[1:].split("?", 1)[0].split("/")
-    return all(urllib.parse.unquote(part) not in ("", ".", "..") for part in parts)
+    return all(part not in ("", ".", "..") for part in parts)
 
 
 def _api_request(path, token, method="GET", payload=None, expected=(200,)):
@@ -316,7 +318,7 @@ def _reference_sha(token, repository, branch):
 def _comparison(token, repository, base, head):
     if (type(base) is not str or SOURCE_SHA_RE.fullmatch(base) is None
             or type(head) is not str or SOURCE_SHA_RE.fullmatch(head) is None):
-        raise SourceBuildRefusal("network")
+        raise SourceBuildRefusal("binding")
     status, payload = _api_request(
         "/repos/" + repository + "/compare/" + base + "..." + head, token,
         expected=(200, 404),
@@ -327,7 +329,9 @@ def _comparison(token, repository, base, head):
     return state if state in ("ahead", "behind", "identical", "diverged") else "unavailable"
 
 
-def _source_inputs(environ):
+def _source_inputs(environ, prefix=LINUX_SOURCE_PREFIX):
+    if type(prefix) is not str or prefix not in SOURCE_PREFIXES:
+        raise SourceBuildRefusal("binding")
     source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
     base_sha = environ.get("REQUESTED_BASE_SHA", "")
     base_branch = environ.get("REQUESTED_BASE_BRANCH", "")
@@ -338,19 +342,19 @@ def _source_inputs(environ):
             or HEX64_RE.fullmatch(fingerprint) is None or SOURCE_SHA_RE.fullmatch(control_sha) is None):
         raise SourceBuildRefusal("binding")
     values = {
-        "LINUX_SOURCE_ALLOWED_SHA": source_sha,
-        "LINUX_SOURCE_ALLOWED_BASE_SHA": base_sha,
-        "LINUX_SOURCE_ALLOWED_BASE_BRANCH": base_branch,
-        "LINUX_SOURCE_ALLOWED_FINGERPRINT": fingerprint,
-        "LINUX_SOURCE_ALLOWED_CONTROL_SHA": control_sha,
+        prefix + "_ALLOWED_SHA": source_sha,
+        prefix + "_ALLOWED_BASE_SHA": base_sha,
+        prefix + "_ALLOWED_BASE_BRANCH": base_branch,
+        prefix + "_ALLOWED_FINGERPRINT": fingerprint,
+        prefix + "_ALLOWED_CONTROL_SHA": control_sha,
     }
     if any(environ.get(name) != value for name, value in values.items()):
         raise SourceBuildRefusal("binding")
     for name in (
         "SOURCE_REPOSITORY_ID", "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME",
         "SOURCE_READER_INSTALLATION_ID", "SOURCE_READER_CLIENT_ID",
-        "LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256", "LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256",
-        "LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", "LINUX_SOURCE_ENVIRONMENT_NAME",
+        prefix + "_ACCEPTED_NODE_LOCK_SHA256", prefix + "_ACCEPTED_MANIFEST_SHA256",
+        prefix + "_ACCEPTED_NODE_PROVENANCE_JSON", prefix + "_ENVIRONMENT_NAME",
     ):
         if not environ.get(name):
             raise SourceBuildRefusal("binding")
@@ -358,11 +362,11 @@ def _source_inputs(environ):
             or DECIMAL_RE.fullmatch(environ["SOURCE_READER_INSTALLATION_ID"]) is None
             or not OWNER_RE.fullmatch(environ["SOURCE_REPOSITORY_OWNER"])
             or not OWNER_RE.fullmatch(environ["SOURCE_REPOSITORY_NAME"])
-            or HEX64_RE.fullmatch(environ["LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256"]) is None
-            or HEX64_RE.fullmatch(environ["LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256"]) is None):
+            or HEX64_RE.fullmatch(environ[prefix + "_ACCEPTED_NODE_LOCK_SHA256"]) is None
+            or HEX64_RE.fullmatch(environ[prefix + "_ACCEPTED_MANIFEST_SHA256"]) is None):
         raise SourceBuildRefusal("binding")
-    if (environ.get("REQUESTED_ENVIRONMENT_NAME") != environ["LINUX_SOURCE_ENVIRONMENT_NAME"]
-            or environ["LINUX_SOURCE_ENVIRONMENT_NAME"] != ENVIRONMENT_NAME):
+    if (environ.get("REQUESTED_ENVIRONMENT_NAME") != environ[prefix + "_ENVIRONMENT_NAME"]
+            or environ[prefix + "_ENVIRONMENT_NAME"] != ENVIRONMENT_NAME):
         raise SourceBuildRefusal("binding")
     identity = {
         "source_sha": source_sha,
@@ -374,7 +378,7 @@ def _source_inputs(environ):
         "owner": environ["SOURCE_REPOSITORY_OWNER"],
         "name": environ["SOURCE_REPOSITORY_NAME"],
     }
-    _validate_provenance_binding(identity, environ)
+    _validate_provenance_binding(identity, environ, prefix)
     return identity
 
 
@@ -412,8 +416,13 @@ def _tier(environ):
     return tier
 
 
-def validate_dispatch(environ, api_token=None):
-    tier = _tier(environ)
+def validate_dispatch(environ, api_token=None, prefix=LINUX_SOURCE_PREFIX):
+    if type(prefix) is not str or prefix not in SOURCE_PREFIXES:
+        raise SourceBuildRefusal("identity")
+    windows = prefix == WINDOWS_SOURCE_PREFIX
+    if windows and "KD_LINUX_TIER" in environ:
+        raise SourceBuildRefusal("identity")
+    tier = "admission" if windows else _tier(environ)
     if (environ.get("CI_EVENT_NAME") != "workflow_dispatch"
             or environ.get("CI_REPOSITORY") != REPOSITORY
             or environ.get("CI_SERVER_URL") != "https://github.com"
@@ -445,16 +454,25 @@ def validate_dispatch(environ, api_token=None):
         return "synthetic"
     if mode != "source":
         raise SourceBuildRefusal("identity")
+    if windows:
+        if ref != "refs/heads/untrusted":
+            raise SourceBuildRefusal("identity")
+        _source_inputs(environ, prefix=prefix)
+        _verify_environment(api_token)
+        _require_no_duplicate(api_token, environ, workflow=WINDOWS_TIER)
+        return "source"
     identity = _source_inputs(environ)
     _verify_environment(api_token)
     _require_no_duplicate(api_token, environ)
     return "source"
 
 
-def _require_no_duplicate(token, environ):
+def _require_no_duplicate(token, environ, workflow=None):
     run_id = environ.get("GITHUB_RUN_ID", "")
     source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
-    workflow_file, title_prefix = TIERS[_tier(environ)]
+    if workflow is not None and workflow != WINDOWS_TIER:
+        raise SourceBuildRefusal("duplicate")
+    workflow_file, title_prefix = TIERS[_tier(environ)] if workflow is None else workflow
     title = title_prefix + source_sha
     base = "/repos/" + REPOSITORY + "/actions/workflows/" + workflow_file + "/runs?per_page=100&status="
     for active_status in ("queued", "in_progress"):
@@ -693,6 +711,39 @@ def repeat_preflight(environ=None):
         return 1
     except Exception:
         sys.stdout.write("linux-source-preflight=refused reason=invalid\n")
+        return 1
+
+
+def windows_snapshot(environ=None):
+    env = os.environ if environ is None else environ
+    try:
+        audit, unused_verdict, unused_canary = _audit_modules()
+        token = env.get("GITHUB_TOKEN", "")
+        api = audit._default_api_factory(token, REPOSITORY)
+        digest = audit.cache_inventory_digest(audit._collect_caches(api, REPOSITORY))
+        _write_output(env, {"cache_digest": digest})
+        state = validate_dispatch(env, token, WINDOWS_SOURCE_PREFIX)
+        sys.stdout.write("windows-source-settings=verified mode=" + state + " cache=snapped\n")
+        return 0
+    except SourceBuildRefusal as error:
+        sys.stdout.write("windows-source-settings=refused reason=" + error.reason + "\n")
+        return 1
+    except Exception:
+        sys.stdout.write("windows-source-settings=refused reason=invalid\n")
+        return 1
+
+
+def windows_preflight(environ=None):
+    env = os.environ if environ is None else environ
+    try:
+        mode = validate_dispatch(env, None, WINDOWS_SOURCE_PREFIX)
+        sys.stdout.write("windows-source-preflight=verified mode=" + mode + " cache-mode=none\n")
+        return 0
+    except SourceBuildRefusal as error:
+        sys.stdout.write("windows-source-preflight=refused reason=" + error.reason + "\n")
+        return 1
+    except Exception:
+        sys.stdout.write("windows-source-preflight=refused reason=invalid\n")
         return 1
 
 
@@ -1027,8 +1078,10 @@ def _check_provenance_finding(finding, policy_epoch, fetched_at):
         raise SourceBuildRefusal("lock")
 
 
-def _validate_provenance_binding(identity, environ):
-    text = environ.get("LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", "")
+def _validate_provenance_binding(identity, environ, prefix=LINUX_SOURCE_PREFIX):
+    if type(prefix) is not str or prefix not in SOURCE_PREFIXES:
+        raise SourceBuildRefusal("lock")
+    text = environ.get(prefix + "_ACCEPTED_NODE_PROVENANCE_JSON", "")
     if type(text) is not str or not 0 < len(text) <= MAX_PROVENANCE_BYTES:
         raise SourceBuildRefusal("lock")
     try:
@@ -1061,7 +1114,7 @@ def _validate_provenance_binding(identity, environ):
     if (type(record["schema_version"]) is not int or record["schema_version"] != 1
             or any(type(record[name]) is not str or HEX64_RE.fullmatch(record[name]) is None
                    for name in ("receipt_sha256", "evidence_sha256", "lock_sha256"))
-            or record["lock_sha256"] != environ.get("LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256")
+            or record["lock_sha256"] != environ.get(prefix + "_ACCEPTED_NODE_LOCK_SHA256")
             or resolver["node_version"] != NODE_VERSION or resolver["npm_version"] != NPM_VERSION
             or type(record["minimum_age_seconds"]) is not int
             or record["minimum_age_seconds"] != MINIMUM_AGE_SECONDS
@@ -1316,10 +1369,20 @@ def _locked_packages(lock_bytes):
 
 
 def _manifest_json(path):
+    descriptor = -1
     try:
-        payload = Path(path).read_bytes()
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PACKAGE_JSON_BYTES:
+            raise SourceBuildRefusal("lock")
+        with os.fdopen(descriptor, "rb") as source:
+            descriptor = -1
+            payload = source.read(MAX_PACKAGE_JSON_BYTES + 1)
     except OSError:
         raise SourceBuildRefusal("lock") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if not payload or len(payload) > MAX_PACKAGE_JSON_BYTES:
         raise SourceBuildRefusal("lock")
 
@@ -2379,31 +2442,14 @@ def _runtime_workspace_present(project):
 
 
 def _gate_commands(project, rust_root, node_bin):
-    cargo = str(Path(rust_root) / "bin" / "cargo")
-    npm = str(Path(node_bin) / "npm")
-    commands = (
-        ("format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", str(project / "Cargo.toml"), "--all", "--", "--check")),
-        ("clippy", (cargo, "clippy", "--offline", "--manifest-path", str(project / "Cargo.toml"), "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
-        ("workspace_tests", (cargo, "test", "--offline", "--manifest-path", str(project / "Cargo.toml"), "--workspace", "--all-targets", "--locked")),
-        ("api_tests", (cargo, "test", "--offline", "--manifest-path", str(project / "crates/host/api/Cargo.toml"), "--all-targets", "--locked")),
-        ("mock_tests", (cargo, "test", "--offline", "--manifest-path", str(project / "crates/host/mock/Cargo.toml"), "--all-targets", "--locked")),
-        ("conformance_tests", (cargo, "test", "--offline", "--manifest-path", str(project / "crates/host/conformance/Cargo.toml"), "--all-targets", "--locked")),
-        ("parser_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", str(project / "fuzz/Cargo.toml"), "--all", "--", "--check")),
-        ("parser_clippy", (cargo, "clippy", "--offline", "--manifest-path", str(project / "fuzz/Cargo.toml"), "--all-targets", "--locked", "--", "-D", "warnings")),
-        ("parser_replay", (cargo, "run", "--locked", "--offline", "--manifest-path", str(project / "fuzz/Cargo.toml"))),
-        ("node_dependency_prepare", (str(Path(node_bin) / "node"), npm, "--offline", "--ignore-scripts", "--audit=false", "--fund=false", "ci", "--workspaces=true", "--include-workspace-root")),
-        ("node_dependency_audit", (str(Path(node_bin) / "node"), npm, "--offline", "ls", "--all", "--workspaces=true", "--include-workspace-root")),
-        ("typescript_typecheck", (str(Path(node_bin) / "node"), npm, "--offline", "run", "typecheck", "--workspaces", "--ignore-scripts")),
-        ("typescript_tests", (str(Path(node_bin) / "node"), npm, "--offline", "run", "test", "--workspaces", "--ignore-scripts")),
-    )
-    if not _runtime_workspace_present(project):
-        return commands
-    runtime_manifest = str(project / "runtime/Cargo.toml")
-    return commands + (
-        ("runtime_format", (cargo, "--locked", "--offline", "fmt", "--manifest-path", runtime_manifest, "--all", "--", "--check")),
-        ("runtime_clippy", (cargo, "clippy", "--offline", "--manifest-path", runtime_manifest, "--workspace", "--all-targets", "--locked", "--", "-D", "warnings")),
-        ("runtime_tests", (cargo, "test", "--offline", "--manifest-path", runtime_manifest, "--workspace", "--all-targets", "--locked")),
-    )
+    try:
+        return gate_table.render(
+            gate_table.gate_templates(_runtime_workspace_present(project)),
+            str(project), str(Path(rust_root) / "bin" / "cargo"),
+            str(Path(node_bin) / "node"), str(Path(node_bin) / "npm"),
+        )
+    except gate_table.GateTableRefusal:
+        raise SourceBuildRefusal("gate") from None
 
 
 def run_project_gates(environ=None):
@@ -2607,6 +2653,8 @@ def _verdict_record(environ):
 
 def emit_verdict(environ=None):
     env = os.environ if environ is None else environ
+    if _tier(env) == "quick":
+        raise SourceBuildRefusal("identity")
     unused_audit, verdict, unused_canary = _audit_modules()
     record = _verdict_record(env)
     line = verdict.encode_line(record)
@@ -2636,6 +2684,8 @@ def _dispatch(command):
         "snapshot": snapshot_and_preflight,
         "audit-expected": write_audit_identity,
         "preflight": repeat_preflight,
+        "windows-snapshot": windows_snapshot,
+        "windows-preflight": windows_preflight,
         "toolchains": prepare_toolchains,
         "mint-verifier-token": mint_verifier_token,
         "checkout": checkout_source,
