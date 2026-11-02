@@ -46,6 +46,11 @@ CALLER_PROFILES = {
         "name": "windows-source-admission",
         "ref": "refs/heads/main",
     },
+    "candidate": {
+        "path": ".github/workflows/windows-source-admission.yml",
+        "name": "windows-source-admission",
+        "ref": "refs/heads/untrusted",
+    },
 }
 PINNED_WORKFLOW_SHA256 = {
     ".github/workflows/windows-source-admission.yml": "9783b15773e7ac970aaf83eabe0a6ac333fca31d258553f2066e8aab7e79ca3a",
@@ -756,7 +761,8 @@ def validate_workflow_graph(root, profile):
         raise Refusal("caller-trigger-shape")
     if "on:\n  workflow_dispatch:\npermissions: {}\n" not in caller:
         raise Refusal("caller-extra-trigger")
-    if "refs/heads/main" not in caller or "matrix:" in caller or "strategy:" in caller:
+    if ("refs/heads/main" not in caller or CALLER_PROFILES[profile]["ref"] not in caller
+            or "matrix:" in caller or "strategy:" in caller):
         raise Refusal("caller-guard-shape")
     if "source-read" in caller or "secrets: inherit" in caller:
         raise Refusal("caller-source-path")
@@ -1498,7 +1504,7 @@ def validate_run_metadata(document, profile, repository, run_id, run_attempt, he
         raise Refusal("run-head-sha-mismatch")
     if document.get("path") != profile_data["path"] or document.get("event") != "workflow_dispatch":
         raise Refusal("run-workflow-identity")
-    if document.get("head_branch") != "main":
+    if document.get("head_branch") != profile_data["ref"][len("refs/heads/"):]:
         raise Refusal("run-ref-mismatch")
     api_repository = document.get("repository")
     if type(api_repository) is not dict or api_repository.get("full_name") != repository:

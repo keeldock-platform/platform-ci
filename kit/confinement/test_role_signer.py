@@ -641,7 +641,7 @@ class KeyRecordAndPredicateTests(unittest.TestCase):
 
 class WorkflowAndJobMappingTests(unittest.TestCase):
     def test_checked_in_caller_and_role_graphs_have_exact_pins(self):
-        for profile in subject.CALLER_PROFILES:
+        for profile in ("probe", "production-synthetic"):
             with self.subTest(profile=profile):
                 result = subject.verify_workflow_bytes(ROOT, profile)
                 self.assertEqual(
@@ -1824,6 +1824,140 @@ class CertificatePinTests(unittest.TestCase):
                     subject.resolve_certificate_pins("probe", value)
         with self.assertRaisesRegex(subject.Refusal, "certificate-profile-unresolved"):
             subject.resolve_certificate_pins("unknown", CONTROL_SHA)
+
+
+class CandidateProfileTests(unittest.TestCase):
+    UNTRUSTED = "refs/heads/untrusted"
+
+    def _expected(self, profile, ref, role="windows-receiver"):
+        return subject.certificate_expectations(
+            profile, REPOSITORY, ref, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, 8150001, 99101,
+            role, subject.ROLE_RUNNERS[role], dict(DIGEST_PINS),
+        )
+
+    def _certificate(self, expected):
+        certificate = {field: expected[field] for field in CERTIFICATE_FIELDS}
+        certificate["sourceRepositoryIdentifier"] = "8150001"
+        certificate["sourceRepositoryOwnerIdentifier"] = "99101"
+        return certificate
+
+    def test_candidate_is_the_windows_caller_on_untrusted_and_inherits_the_pins(self):
+        candidate = subject.CALLER_PROFILES["candidate"]
+        production = subject.CALLER_PROFILES["production-synthetic"]
+        self.assertEqual(set(subject.CALLER_PROFILES), {"probe", "production-synthetic", "candidate"})
+        self.assertEqual(candidate["path"], production["path"])
+        self.assertEqual(candidate["name"], production["name"])
+        self.assertEqual(candidate["ref"], self.UNTRUSTED)
+        self.assertEqual(production["ref"], "refs/heads/main")
+        for table in (subject.API_JOB_NAME_PINS, subject.API_LINUX_STEP_NAME_PINS,
+                      subject.API_LINUX_STEP_ORDINAL_PINS):
+            self.assertEqual(table["candidate"], table["production-synthetic"])
+        self.assertEqual(
+            set(subject.resolve_certificate_pins("candidate", CONTROL_SHA)), set(subject.ROLE_ORDER),
+        )
+
+    def test_certificate_expectations_follow_the_candidate_ref_for_every_role(self):
+        for role in subject.ROLE_ORDER:
+            with self.subTest(role=role):
+                expected = self._expected("candidate", self.UNTRUSTED, role)
+                self.assertEqual(expected["githubWorkflowRef"], self.UNTRUSTED)
+                self.assertEqual(expected["sourceRepositoryRef"], self.UNTRUSTED)
+                self.assertEqual(expected["githubWorkflowName"], "windows-source-admission")
+                self.assertTrue(expected["buildSignerURI"].endswith(
+                    "/" + subject.ROLE_PATHS[role] + "@" + self.UNTRUSTED))
+                self.assertTrue(expected["buildConfigURI"].endswith(
+                    "/.github/workflows/windows-source-admission.yml@" + self.UNTRUSTED))
+                with self.assertRaisesRegex(subject.Refusal, "profile-repository-ref"):
+                    self._expected("candidate", "refs/heads/main", role)
+                with self.assertRaisesRegex(subject.Refusal, "profile-repository-ref"):
+                    self._expected("production-synthetic", self.UNTRUSTED, role)
+                with self.assertRaisesRegex(subject.Refusal, "profile-repository-ref"):
+                    self._expected("probe", self.UNTRUSTED, role)
+
+    def test_a_main_certificate_cannot_satisfy_the_candidate_and_the_reverse(self):
+        candidate = self._expected("candidate", self.UNTRUSTED)
+        production = self._expected("production-synthetic", "refs/heads/main")
+        self.assertTrue(subject.validate_certificate(self._certificate(candidate), candidate))
+        self.assertTrue(subject.validate_certificate(self._certificate(production), production))
+        with self.assertRaises(subject.Refusal):
+            subject.validate_certificate(self._certificate(production), candidate)
+        with self.assertRaises(subject.Refusal):
+            subject.validate_certificate(self._certificate(candidate), production)
+
+    def test_predicates_bind_the_candidate_profile_and_the_untrusted_ref(self):
+        workflow_ref = REPOSITORY + "/" + subject.CALLER_PROFILES["candidate"]["path"] + "@" + self.UNTRUSTED
+        record = subject.make_key_record(8150001, CONTROL_SHA, RUN_ID, RUN_ATTEMPT, workflow_ref, now=FIXTURE_NOW)
+        predicate = subject.make_predicate(
+            "candidate", "windows-receiver", REPOSITORY, CONTROL_SHA, self.UNTRUSTED,
+            RUN_ID, RUN_ATTEMPT, record, record,
+        )
+        self.assertEqual(predicate["profile"], "candidate")
+        self.assertEqual(predicate["controlRef"], self.UNTRUSTED)
+        for profile, ref in (("candidate", "refs/heads/main"), ("production-synthetic", self.UNTRUSTED),
+                             ("probe", self.UNTRUSTED)):
+            with self.subTest(profile=profile, ref=ref):
+                with self.assertRaisesRegex(subject.Refusal, "profile-ref"):
+                    subject.make_predicate(
+                        profile, "windows-receiver", REPOSITORY, CONTROL_SHA, ref,
+                        RUN_ID, RUN_ATTEMPT, record, record,
+                    )
+        main_record = subject.make_key_record(
+            8150001, CONTROL_SHA, RUN_ID, RUN_ATTEMPT,
+            REPOSITORY + "/" + subject.CALLER_PROFILES["candidate"]["path"] + "@refs/heads/main", now=FIXTURE_NOW,
+        )
+        with self.assertRaises(subject.Refusal):
+            subject.make_predicate(
+                "candidate", "windows-receiver", REPOSITORY, CONTROL_SHA, self.UNTRUSTED,
+                RUN_ID, RUN_ATTEMPT, main_record, main_record,
+            )
+
+    def test_run_metadata_requires_the_branch_of_the_profile(self):
+        def document(branch):
+            return {
+                "id": int(RUN_ID), "run_attempt": int(RUN_ATTEMPT), "head_sha": CONTROL_SHA,
+                "path": subject.CALLER_PROFILES["candidate"]["path"], "event": "workflow_dispatch",
+                "head_branch": branch, "repository": {"id": 8150001, "full_name": REPOSITORY},
+                "status": "in_progress", "conclusion": None,
+            }
+
+        self.assertTrue(subject.validate_run_metadata(
+            document("untrusted"), "candidate", REPOSITORY, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, 8150001))
+        self.assertTrue(subject.validate_run_metadata(
+            document("main"), "production-synthetic", REPOSITORY, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, 8150001))
+        for profile, branch in (("candidate", "main"), ("candidate", "feature"), ("candidate", "untrusted/x"),
+                                ("candidate", ""), ("production-synthetic", "untrusted")):
+            with self.subTest(profile=profile, branch=branch):
+                with self.assertRaisesRegex(subject.Refusal, "run-ref-mismatch"):
+                    subject.validate_run_metadata(
+                        document(branch), profile, REPOSITORY, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, 8150001)
+
+    def test_caller_workflow_must_name_the_untrusted_ref_for_the_candidate_profile(self):
+        relative = subject.CALLER_PROFILES["candidate"]["path"]
+        original = (ROOT / relative).read_text(encoding="ascii")
+        main_guard = "github.ref == 'refs/heads/main'"
+        both_guard = "(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/untrusted')"
+        self.assertIn(main_guard, original)
+        candidate_caller = original.replace(main_guard, both_guard).replace(
+            "profile: production-synthetic", "profile: candidate")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in set(subject.ROLE_PATHS.values()):
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_bytes((ROOT / name).read_bytes())
+            (root / relative).write_text(candidate_caller, encoding="ascii")
+            pins = {
+                name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                for name in set(subject.ROLE_PATHS.values()) | {relative}
+            }
+            result = subject.verify_workflow_bytes(root, "candidate", pins)
+            self.assertEqual(set(result), set(pins))
+            with self.assertRaisesRegex(subject.Refusal, "role-fixed-input"):
+                subject.verify_workflow_bytes(root, "production-synthetic", pins)
+            (root / relative).write_text(original.replace(
+                "profile: production-synthetic", "profile: candidate"), encoding="ascii")
+            pins[relative] = hashlib.sha256((root / relative).read_bytes()).hexdigest()
+            with self.assertRaisesRegex(subject.Refusal, "caller-guard-shape"):
+                subject.verify_workflow_bytes(root, "candidate", pins)
 
 
 if __name__ == "__main__":
