@@ -309,7 +309,11 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         for line in self.text.splitlines():
             if "secrets.KD_LINUX_LOG_CANARY" in line:
                 self.assertIn("inputs.mode == 'synthetic'", line)
-        self.assertIn("      - name: Mint scoped source-reader token\n        if: ${{ inputs.mode == 'source' }}", self.text)
+        source_read = self.jobs()["linux-source-admission-source-read"]
+        mint_marker = "      - name: Mint scoped source-reader token\n"
+        self.assertEqual(source_read.count(mint_marker), 1)
+        mint_block = source_read.split(mint_marker, 1)[1].split("      - name:", 1)[0]
+        self.assertIn("\n        if: ${{ inputs.mode == 'source' }}\n", "\n" + mint_block)
 
     def test_source_read_steps_follow_the_required_order(self):
         source = self.jobs()["linux-source-admission-source-read"]
