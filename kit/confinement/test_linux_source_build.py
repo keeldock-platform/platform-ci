@@ -2028,7 +2028,7 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
         self._audit_refused(_audit_json({"fixture-lib": wide, "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"])}))
 
     def _run_audit(self, returncode, stdout, allows=None, valid_until=None, entry=None, missing_node=False,
-                   source_inputs=None, check_lock=None, run=None):
+                   source_inputs=None, check_lock=None, run=None, stderr=b""):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "source").mkdir()
@@ -2038,7 +2038,7 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
                 (root / "bin/node").write_bytes(b"")
             (root / "bin/npm").write_bytes(b"")
             env = {"SOURCE_PATH": str(root / "source"), "NODE_BIN": str(root / "bin"), "RUNNER_TEMP": str(root)}
-            result = types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=b"")
+            result = types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
             record = {"advisory": {
                 "findings": [_allow(self.now_ms)] if allows is None else allows,
                 "valid_until": self.now + 3600 if valid_until is None else valid_until,
@@ -2099,11 +2099,11 @@ class LinuxAuditDetailTests(unittest.TestCase):
         self.now = int(time.time())
         self.now_ms = self.now * 1000
 
-    def _detail(self, report, allows=None, packages=None, now_ms=None):
+    def _detail(self, report, allows=None, packages=None, now_ms=None, stderr=b""):
         with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
             linux_source_build._check_audit_report(
                 report, [_allow(self.now_ms)] if allows is None else allows,
-                LOCKED if packages is None else packages, self.now_ms if now_ms is None else now_ms,
+                LOCKED if packages is None else packages, self.now_ms if now_ms is None else now_ms, stderr,
             )
         self.assertEqual(refused.exception.reason, "lock")
         return refused.exception
@@ -2123,7 +2123,12 @@ class LinuxAuditDetailTests(unittest.TestCase):
             "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"]),
         }, low=1, moderate=1)
         return {
-            "audit_json": (b"not json", None, None, None),
+            "audit_json_empty": (b" \n\t", None, None, None),
+            "audit_json_utf8": (b'{"fixture-marker": "\xff"}', None, None, None),
+            "audit_json_prefix": (b"not json", None, None, None),
+            "audit_json_trailing": (b'{"fixture-marker": 1}\n{}', None, None, None),
+            "audit_json_duplicate": (b'{"fixture-marker": 1, "fixture-marker": 2}', None, None, None),
+            "audit_json_syntax": (b'{"fixture-marker": }', None, None, None),
             "audit_top_keys": (json.dumps(dict(good, extra={})).encode("ascii"), None, None, None),
             "audit_version": (json.dumps(dict(good, auditReportVersion=1)).encode("ascii"), None, None, None),
             "audit_entry_shape": (json.dumps(dict(good, vulnerabilities=[])).encode("ascii"), None, None, None),
@@ -2166,8 +2171,66 @@ class LinuxAuditDetailTests(unittest.TestCase):
             with self.subTest(token=token), self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
                 self._run_audit(**arguments)
             self.assertEqual(refused.exception.detail, token)
-        covered = set(self._report_cases()) | set(cases) | {"audit_unclassified", "audit_unexpected"}
+        covered = set(self._report_cases()) | set(cases) | {
+            "audit_json_not_object", "audit_unclassified", "audit_unexpected",
+        }
         self.assertEqual(covered, set(linux_source_build.AUDIT_DETAILS))
+
+    def _json_line(self, stdout, stderr=b""):
+        code, output = self._run_audit(1, stdout, entry=_dispatch_audit, stderr=stderr)
+        self.assertEqual(code, 1)
+        for word in ("fixture-marker", "fixture-stderr", "leak"):
+            self.assertNotIn(word, output)
+        return output
+
+    def test_empty_audit_output_counts_stderr_lines_only(self):
+        prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_empty"
+        self.assertEqual(self._json_line(b" \n\t"), prefix + " count=0\n")
+        self.assertEqual(
+            self._json_line(b"", b"fixture-stderr one\n\n  \nfixture-stderr two\nleak\n"), prefix + " count=3\n",
+        )
+        many = b"fixture-stderr\n" * 150
+        self.assertEqual(self._json_line(b"\n", many), prefix + " count=99\n")
+
+    def test_non_utf8_audit_output_is_named_by_shape(self):
+        self.assertEqual(
+            self._json_line(b'{"fixture-marker": "\xff"}', b"fixture-stderr\n"),
+            "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_utf8\n",
+        )
+
+    def test_audit_output_not_starting_with_an_object_is_named_by_shape(self):
+        line = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_prefix\n"
+        for stdout in (b"fixture-marker is not json", b"\n  [1]", b"npm warn fixture-marker\n{}"):
+            with self.subTest(stdout=stdout):
+                self.assertEqual(self._json_line(stdout, b"fixture-stderr\n"), line)
+
+    def test_audit_output_with_data_after_the_first_value_counts_lines(self):
+        prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_trailing"
+        self.assertEqual(self._json_line(b'{"fixture-marker": 1} fixture-marker'), prefix + " count=1\n")
+        self.assertEqual(self._json_line(b'{"fixture-marker": 1}\n\nfixture-marker\n{}\n'), prefix + " count=2\n")
+        self.assertEqual(self._json_line(b'{}\n' + b"fixture-marker\n" * 150), prefix + " count=99\n")
+
+    def test_audit_output_with_a_duplicate_key_is_named_by_shape(self):
+        line = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_duplicate\n"
+        for stdout in (
+            b'{"fixture-marker": 1, "fixture-marker": 2}',
+            b'{"vulnerabilities": {"fixture-marker": 1, "fixture-marker": 2}}',
+        ):
+            with self.subTest(stdout=stdout):
+                self.assertEqual(self._json_line(stdout), line)
+
+    def test_audit_output_that_fails_to_decode_is_named_by_shape(self):
+        line = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_syntax\n"
+        for stdout in (b'{"fixture-marker": }', b'{"fixture-marker": NaN}', b'{"fixture-marker": 1', b'{"a":' * 100000):
+            with self.subTest(stdout=stdout[:24]):
+                self.assertEqual(self._json_line(stdout), line)
+
+    def test_audit_output_that_decodes_to_a_non_object_is_named_by_shape(self):
+        with patch.object(linux_source_build.json.JSONDecoder, "raw_decode", return_value=(["fixture-marker"], 2)):
+            self.assertEqual(
+                self._json_line(b"{}"),
+                "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_not_object\n",
+            )
 
     def test_top_level_key_count_is_reported_and_bounded(self):
         good = json.loads(_honoured_report())
@@ -2196,7 +2259,7 @@ class LinuxAuditDetailTests(unittest.TestCase):
         self.assertEqual(
             output, "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_top_keys count=3\n",
         )
-        refusal = linux_source_build.SourceBuildRefusal("lock", "audit_json")
+        refusal = linux_source_build.SourceBuildRefusal("lock", "audit_json_syntax")
         self.assertEqual(linux_source_build._refusal_line("checkout", refusal), "linux-source-build=refused phase=checkout reason=lock\n")
         self.assertEqual(
             linux_source_build._refusal_line("trusted-audit", linux_source_build.SourceBuildRefusal("lock")),

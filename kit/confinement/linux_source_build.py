@@ -216,7 +216,9 @@ OPTIONAL_SOURCE_STEPS = frozenset((
 
 
 AUDIT_DETAILS = frozenset((
-    "audit_toolchain", "audit_provenance", "audit_run", "audit_exit", "audit_json",
+    "audit_toolchain", "audit_provenance", "audit_run", "audit_exit",
+    "audit_json_empty", "audit_json_utf8", "audit_json_prefix", "audit_json_trailing",
+    "audit_json_duplicate", "audit_json_syntax", "audit_json_not_object",
     "audit_top_keys", "audit_version", "audit_meta", "audit_count", "audit_high",
     "audit_limit", "audit_entry_shape", "audit_key_name", "audit_severity",
     "audit_via_shape", "audit_via_unknown", "audit_advisory_unmatched",
@@ -953,11 +955,26 @@ def _signer_keys(payload):
     return b"".join(accepted), fingerprints
 
 
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+JSON_WHITESPACE = " \t\n\r"
+
+
+def _reject_json_constant(unused):
+    raise ValueError
+
+
+def _nonempty_lines(data, separator):
+    return min(sum(1 for line in data.split(separator) if line.strip()), MAX_DETAIL_COUNT)
+
+
 def _unique_json_pairs(items):
     result = {}
     for key, value in items:
         if key in result:
-            raise ValueError
+            raise _DuplicateJsonKey
         result[key] = value
     return result
 
@@ -966,7 +983,7 @@ def _strict_json_loads(text):
     return json.loads(
         text,
         object_pairs_hook=_unique_json_pairs,
-        parse_constant=lambda unused: (_ for _ in ()).throw(ValueError()),
+        parse_constant=_reject_json_constant,
     )
 
 
@@ -2155,7 +2172,7 @@ def _audit_reached_from_advisories(rooted, consumers):
     return reached
 
 
-def _check_audit_report(stdout, allows, packages, now_ms):
+def _check_audit_report(stdout, allows, packages, now_ms, stderr=b""):
     """Match one strict npm audit report against the findings the trusted run allowed.
 
     Every vulnerability that names an advisory must match an allowed finding on the locked
@@ -2166,12 +2183,27 @@ def _check_audit_report(stdout, allows, packages, now_ms):
     Anything else refuses with a fixed detail token and never a name or value. Returns the
     counts of vulnerabilities and matched advisories and the exit code npm gives such a
     report: one when any low, moderate, high or critical count is above zero, else zero."""
+    if not stdout.strip():
+        raise _audit_refuse("audit_json_empty", _nonempty_lines(stderr, b"\n"))
     try:
-        report = _strict_json_loads(stdout.decode("utf-8", "strict"))
-    except (UnicodeError, ValueError, TypeError, RecursionError):
-        raise _audit_refuse("audit_json") from None
+        text = stdout.decode("utf-8", "strict")
+    except UnicodeError:
+        raise _audit_refuse("audit_json_utf8") from None
+    start = len(text) - len(text.lstrip(JSON_WHITESPACE))
+    if text[start:start + 1] != "{":
+        raise _audit_refuse("audit_json_prefix")
+    try:
+        report, end = json.JSONDecoder(
+            object_pairs_hook=_unique_json_pairs, parse_constant=_reject_json_constant,
+        ).raw_decode(text, start)
+    except _DuplicateJsonKey:
+        raise _audit_refuse("audit_json_duplicate") from None
+    except (ValueError, RecursionError, TypeError):
+        raise _audit_refuse("audit_json_syntax") from None
+    if text[end:].strip(JSON_WHITESPACE):
+        raise _audit_refuse("audit_json_trailing", _nonempty_lines(text[end:], "\n"))
     if type(report) is not dict:
-        raise _audit_refuse("audit_json")
+        raise _audit_refuse("audit_json_not_object")
     unexpected = set(report) - {"auditReportVersion", "vulnerabilities", "metadata"}
     if unexpected:
         raise _audit_refuse("audit_top_keys", len(unexpected))
@@ -2283,7 +2315,7 @@ def run_trusted_audit(environ=None):
     except (SourceBuildRefusal, OSError, ValueError, KeyError, TypeError):
         raise _audit_refuse("audit_lock_changed") from None
     found, matched, expected_exit = _check_audit_report(
-        result.stdout, allows, locked["packages"], int(time.time() * 1000),
+        result.stdout, allows, locked["packages"], int(time.time() * 1000), result.stderr,
     )
     if result.returncode != expected_exit:
         raise _audit_refuse("audit_exit_mismatch")
