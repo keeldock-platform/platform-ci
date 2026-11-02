@@ -883,7 +883,7 @@ foreach ($case in $cases) {
         self.assertLess(dispose, base)
         self.assertIn("if ($nullRestore -eq 'failed') { $cleanup = 'incomplete' }", tail)
         self.assertIn(
-            "if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified') { $exitCode = 1 }",
+            "if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }",
             tail,
         )
 
@@ -986,7 +986,6 @@ foreach ($case in $cases) {
                 "HKLM:",
                 "HKCU:",
                 "RegSetKeySecurity",
-                "RegistryAccessRule",
                 "Grant-WinsockCatalogRead",
                 "WinsockCatalog",
                 "NativeRegistryProbe",
@@ -1028,7 +1027,7 @@ foreach ($case in $cases) {
             found = tuple(re.findall(r"(\w+) = ", line.split("Check =", 1)[0] + "Check = "))
             with self.subTest(line=line.strip()[:60]):
                 self.assertIn(found, (fields, fields[:4] + ("Quiet", "Check")))
-        self.assertIn("-l kernel32 -l ws2_32 -l advapi32 -l userenv -o", self.wrapper)
+        self.assertIn("-l kernel32 -l ws2_32 -l advapi32 -l userenv -o ' + $probeBuilt", self.wrapper)
         self.assertIn("$phase = 'build_probe'", self.wrapper)
         self.assertLess(self.wrapper.index("$phase = 'build_probe'"), self.wrapper.index("$phase = 'acl_readback'"))
         self.assertIn("$layout.ProbeExe = Join-Path $layout.ProbeDir 'kd_probe.exe'", self.wrapper)
@@ -1564,6 +1563,9 @@ foreach ($case in $cases) {
             return "allowed"
         if re.search(deny, text):
             return "contained" if expect == "contained" else "denied"
+        na = re.search(r"NaPattern = '([^']*)'", line)
+        if na and re.search(na.group(1), text):
+            return "not_applicable"
         return "other"
 
     def test_attempt_classifier_matches_the_python_model_for_every_attempt_under_pwsh(self):
@@ -1799,7 +1801,7 @@ foreach ($case in $cases) {
         for reason in ("control_not_fired", "channel_leak", "attempt_unexpected", "attempt_incomplete", "fixture_incomplete"):
             with self.subTest(reason=reason):
                 self.assertIn("'" + reason + "'", attempt)
-        self.assertIn("$outcome.Result = 'na'", attempt)
+        self.assertIn("$outcome.Result = 'not_applicable'", attempt)
         self.assertIn("if ($controlRuns -eq 0) {", attempt)
         self.assertLess(attempt.index("Invoke-ChannelRun $sandbox $false"), attempt.index("Invoke-ChannelRun $sandbox $true"))
         run = self.function_body("Invoke-ChannelRun")
@@ -1830,7 +1832,9 @@ foreach ($case in $cases) {
         for forbidden in ("SetAccessControl", "Set-Acl", "Grant-Access", "Grant-NonPropagating", "icacls", "AddAccessRule"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, context)
-        self.assertEqual(context.count("CreateSubKey('Software\\KeelDock\\Canary')"), 1)
+        self.assertEqual(context.count("New-RegistryCanary $hive"), 1)
+        self.assertEqual(self.function_body("New-RegistryCanary").count("$hive.CreateSubKey($path)"), 1)
+        self.assertIn("$path = 'Software\\KeelDock\\Canary'", self.function_body("New-RegistryCanary"))
         self.assertIn("[Microsoft.Win32.Registry]::CurrentUser, [Microsoft.Win32.Registry]::LocalMachine", context)
         removal = self.function_body("Remove-ChannelFixtures")
         self.assertIn("DeleteSubKeyTree('Software\\KeelDock', $false)", removal)
@@ -1839,12 +1843,120 @@ foreach ($case in $cases) {
         self.assertIn("[System.Net.IPAddress]::Loopback, 0", context)
         self.assertIn("Software\\\\KeelDock\\\\Canary", self.probe)
         self.assertIn("Software\\\\KeelDock\\\\Att", self.probe)
-        for shape in ("channel_env", "channel_file", "channel_host", "channel_registry", "channel_needle"):
+        for shape in ("channel_env", "channel_file", "channel_registry", "channel_needle"):
             with self.subTest(shape=shape):
                 self.assertIn("throw '" + shape + "'", self.wrapper)
         tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
         self.assertLess(tail.index("Remove-Canaries"), tail.index("Remove-ChannelFixtures"))
         self.assertLess(tail.index("Remove-ChannelFixtures"), tail.index("$box.Dispose()"))
+
+    def test_registry_canary_has_an_explicit_protected_acl_and_is_read_back(self):
+        body = self.function_body("New-RegistryCanary")
+        for required in (
+            "SetAccessRuleProtection($true, $false)",
+            "@('S-1-5-18', 'S-1-5-32-544', [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)",
+            "$key.SetAccessControl($security)",
+            "GetAccessControl([System.Security.AccessControl.AccessControlSections]::Access)",
+            "if (-not $readback.AreAccessRulesProtected) { throw 'channel_registry' }",
+            "if ($rules.Count -ne $allowed.Count) { throw 'channel_registry' }",
+            "$rule.IsInherited",
+            "$allowed -cnotcontains $sidText",
+            "StartsWith('S-1-15-2-'",
+            "StartsWith('S-1-15-3-'",
+            "RegistryRights]::FullControl) { throw 'channel_registry' }",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, body)
+        self.assertEqual(body.count("$security.AddAccessRule($rule)"), 1)
+        self.assertLess(body.index("$key.SetAccessControl($security)"), body.index("GetAccessControl("))
+        self.assertLess(body.index("$key.SetAccessControl($security)"), body.index("$key.SetValue('canary', $value)"))
+        for forbidden in ("S-1-15-2-1'", "S-1-1-0", "AllRestricted"):
+            self.assertNotIn(forbidden, body)
+        self.assertNotIn("RegistryAccessRule", self.wrapper.replace(body, ""))
+        for path in (NATIVE, PROBE, WORKFLOW):
+            self.assertNotIn("RegistryAccessRule", path.read_text(encoding="utf-8"))
+
+    def test_cleanup_asserts_no_container_process_is_alive_before_removing_trees(self):
+        count = self.function_body("Get-ContainerProcessCount")
+        self.assertIn("Test-PathUnder $path $base", count)
+        tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
+        check = tail.index("Get-ContainerProcessCount $baseDirectory")
+        self.assertLess(check, tail.index("Remove-ReparsePoints $script:ProfileFolder"))
+        self.assertLess(check, tail.index("Remove-TreeNoFollow $script:ProfileFolder"))
+        self.assertLess(check, tail.index("Remove-TreeNoFollow $baseDirectory"))
+        self.assertGreaterEqual(tail.count("$processState -eq 'none'"), 5)
+        self.assertIn("' processes=' + $processState", tail)
+        self.assertIn("if ($processState -ne 'none') { $cleanup = 'incomplete' }", tail)
+        self.assertEqual(len(re.findall(r"(?m)^try \{\n    Remove-(?:Canaries|ChannelFixtures)\n\} catch \{", tail)), 2)
+
+    def test_hosts_are_current_and_only_the_cache_endpoint_may_be_not_applicable(self):
+        wrapper = self.wrapper
+        self.assertNotIn("artifactcache", wrapper)
+        self.assertIn("Get-ChannelHost 'ACTIONS_CACHE_URL' $resultsHost", wrapper)
+        self.assertIn("results-receiver.actions.githubusercontent.com", wrapper)
+        self.assertNotIn("throw 'channel_host'", wrapper)
+        lines = self.channel_attempt_lines()
+        optional = {
+            re.search(r"Channel = '([a-z_]+)'; Name = '([a-z0-9-]+)'", line).groups()
+            for line in lines
+            if "Optional = $true" in line
+        }
+        self.assertEqual(
+            optional,
+            {("runner_ipc", "pipe-runner-open"), ("runner_files", "diag-read"), ("cache_upload", "endpoint-post")},
+        )
+        na = {re.search(r"Name = '([a-z0-9-]+)'", line).group(1) for line in lines if "NaPattern" in line}
+        self.assertEqual(na, {"pipe-runner-open"})
+        pipe = next(line for line in lines if "Name = 'pipe-runner-open'" in line)
+        self.assertIn("NaPattern = '^open=err(2|231)$'", pipe)
+        self.assertNotIn("231", re.search(r"Deny = '([^']*)'", pipe).group(1))
+        attempt = self.function_body("Invoke-ChannelAttempt")
+        self.assertIn("$attempt.ContainsKey('NaPattern') -or $optional", attempt)
+        self.assertIn("'not_applicable'", self.function_body("Get-AttemptResult"))
+
+    def test_harness_invariants_and_console_attempt_are_labelled_and_never_boundary_evidence(self):
+        lines = self.channel_attempt_lines()
+        basis = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            for line in lines
+            if "Basis = 'harness'" in line
+        }
+        self.assertEqual(basis, {"proxy-env-http", "env-hunt", "stdout-markers", "job-membership"})
+        for line in lines:
+            if "envhunt" in line:
+                self.assertIn("Expect = 'contained'", line)
+        informational = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
+            for line in lines
+            if "Informational = $true" in line
+        }
+        self.assertEqual(informational, {"named-pipe-local", "conout-open"})
+        self.assertIn("' basis=' + $basis", self.function_body("Invoke-ChannelPhase"))
+
+    def test_probe_buffers_and_deletes_are_exact(self):
+        probe = self.probe
+        raise_body = probe[probe.index("fn probe_tokenraise"):probe.index("fn probe_tokenpriv")]
+        self.assertIn("let mut buffer: [usize; 4]", raise_body)
+        self.assertNotIn("[u8; 12]", raise_body)
+        self.assertIn("buffer.as_mut_ptr().wrapping_add(2) as usize", raise_body)
+        self.assertIn(", 28)", raise_body)
+        self.assertGreaterEqual(4 * 8, 28)
+        self.assertIn('format!("create=ok delete=hr{:08x}", removed as u32)', probe)
+        self.assertIn('format!("create=ok delete=err{}", removed)', probe)
+
+    def test_pipe_acl_assembly_is_loaded_explicitly_and_the_pipe_works_in_windows_ci(self):
+        body = self.function_body("New-TrustedPipe")
+        self.assertLess(body.index("Add-Type -AssemblyName System.IO.Pipes.AccessControl"), body.index("New-Object System.IO.Pipes.PipeSecurity"))
+        if sys.platform != "win32" or shutil.which("pwsh") is None:
+            self.skipTest("the pipe check runs in Windows CI")
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            + body
+            + "\n$pipe = New-TrustedPipe ('kd-trusted-' + [Guid]::NewGuid().ToString('N').Substring(0, 12))\n"
+            "$pipe.Dispose()\n"
+            "Write-Output 'pipe=ok'\n"
+        )
+        self.assertIn("pipe=ok", self.run_pwsh(script))
 
     def test_the_scratch_needle_differs_from_the_needle_planted_outside_the_container(self):
         wrapper = self.wrapper
@@ -1859,7 +1971,7 @@ foreach ($case in $cases) {
         self.assertNotIn("scratch_needle", outside)
         self.assertIn("Join-Path $script:Control.Root 'kd_walk_control.txt'), $script:CanaryNeedle", wrapper)
         context = self.function_body("Initialize-ChannelContext")
-        self.assertIn("$key.SetValue('canary', $script:CanaryNeedle)", context)
+        self.assertIn("New-RegistryCanary $hive $script:CanaryNeedle", context)
 
     def test_probe_commands_are_bounded_and_never_write_runner_command_files(self):
         probe = self.probe
@@ -1899,7 +2011,11 @@ foreach ($case in $cases) {
         self.assertNotIn("Remove-Item", self.wrapper)
         tree = self.function_body("Remove-TreeNoFollow")
         self.assertLess(tree.index("[System.IO.Directory]::Delete($path, $false) } else"), tree.index("foreach ($child in"))
-        self.assertIn("[System.IO.File]::SetAttributes($path, [System.IO.FileAttributes]::Normal)", tree)
+        self.assertNotIn("FileAttributes]::Normal", tree)
+        self.assertNotIn("FileAttributes]::Directory", tree)
+        self.assertEqual(tree.count("($attributes -band (-bnot 1))"), 2)
+        self.assertIn("if ($linkType -cne 'HardLink')", tree)
+        self.assertLess(tree.index("$linkType = "), tree.index("[System.IO.File]::Delete($path)\n}"))
         self.assertIn("Remove-TreeNoFollow $item", self.function_body("Remove-Canaries"))
         tail = self.wrapper[self.wrapper.index("$nullRestore = 'not_applied'"):]
         self.assertLess(tail.index("Remove-ReparsePoints $script:ProfileFolder"), tail.index("$box.Dispose()"))

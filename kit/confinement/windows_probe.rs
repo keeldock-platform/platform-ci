@@ -387,9 +387,12 @@ fn probe_regcreate(id: &str) -> String {
     if status != 0 {
         return format!("create=err{}", status);
     }
-    unsafe {
+    let removed = unsafe {
         RegCloseKey(key);
-        RegDeleteKeyW(root, sub.as_ptr());
+        RegDeleteKeyW(root, sub.as_ptr())
+    };
+    if removed != 0 {
+        return format!("create=ok delete=err{}", removed);
     }
     String::from("create=ok")
 }
@@ -507,9 +510,12 @@ fn probe_profile() -> String {
     if hr < 0 {
         return format!("create=hr{:08x}", hr as u32);
     }
-    unsafe {
+    let removed = unsafe {
         FreeSid(sid);
-        DeleteAppContainerProfile(name.as_ptr());
+        DeleteAppContainerProfile(name.as_ptr())
+    };
+    if removed < 0 {
+        return format!("create=ok delete=hr{:08x}", removed as u32);
     }
     String::from("create=ok")
 }
@@ -547,9 +553,10 @@ fn probe_tokenraise() -> String {
         let last = last_error();
         return format!("open=err{} set=na", last);
     }
-    let mut sid: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x20, 0, 0];
-    let mut label: [usize; 2] = [sid.as_mut_ptr() as usize, 0x20];
-    let done = unsafe { SetTokenInformation(token, 25, label.as_mut_ptr() as *mut u8, 28) };
+    let mut buffer: [usize; 4] = [0, 0x20, 0x1000_0000_0000_0101, 0x2000];
+    let sid_address = buffer.as_mut_ptr().wrapping_add(2) as usize;
+    buffer[0] = sid_address;
+    let done = unsafe { SetTokenInformation(token, 25, buffer.as_mut_ptr() as *mut u8, 28) };
     let state = if done != 0 {
         String::from("ok")
     } else {
