@@ -217,7 +217,8 @@ OPTIONAL_SOURCE_STEPS = frozenset((
 
 AUDIT_DETAILS = frozenset((
     "audit_toolchain", "audit_provenance", "audit_run", "audit_exit",
-    "audit_json_empty", "audit_json_utf8", "audit_json_prefix", "audit_json_trailing",
+    "audit_json_empty", "audit_json_empty_stderr_json", "audit_json_empty_stderr_text",
+    "audit_json_utf8", "audit_json_prefix", "audit_json_trailing",
     "audit_json_duplicate", "audit_json_syntax", "audit_json_not_object",
     "audit_top_keys", "audit_version", "audit_meta", "audit_count", "audit_high",
     "audit_limit", "audit_entry_shape", "audit_key_name", "audit_severity",
@@ -960,6 +961,19 @@ class _DuplicateJsonKey(ValueError):
 
 
 JSON_WHITESPACE = " \t\n\r"
+
+
+JSON_NON_OBJECT_STARTS = '["-0123456789tfn'
+
+
+def _lines_before_object(text):
+    count = 0
+    for line in text.split("\n"):
+        if line.lstrip(JSON_WHITESPACE).startswith("{"):
+            return min(count, MAX_DETAIL_COUNT)
+        if line.strip():
+            count += 1
+    return 0
 
 
 def _reject_json_constant(unused):
@@ -2184,18 +2198,29 @@ def _check_audit_report(stdout, allows, packages, now_ms, stderr=b""):
     counts of vulnerabilities and matched advisories and the exit code npm gives such a
     report: one when any low, moderate, high or critical count is above zero, else zero."""
     if not stdout.strip():
-        raise _audit_refuse("audit_json_empty", _nonempty_lines(stderr, b"\n"))
+        if not stderr.strip():
+            raise _audit_refuse("audit_json_empty")
+        detail = "audit_json_empty_stderr_json" if stderr.lstrip(b" \t\n\r")[:1] == b"{" else "audit_json_empty_stderr_text"
+        raise _audit_refuse(detail, _nonempty_lines(stderr, b"\n"))
     try:
         text = stdout.decode("utf-8", "strict")
     except UnicodeError:
         raise _audit_refuse("audit_json_utf8") from None
     start = len(text) - len(text.lstrip(JSON_WHITESPACE))
-    if text[start:start + 1] != "{":
-        raise _audit_refuse("audit_json_prefix")
+    decoder = json.JSONDecoder(object_pairs_hook=_unique_json_pairs, parse_constant=_reject_json_constant)
+    first = text[start:start + 1]
+    if first and first in JSON_NON_OBJECT_STARTS:
+        try:
+            unused, end = decoder.raw_decode(text, start)
+        except (ValueError, RecursionError, TypeError):
+            pass
+        else:
+            if not text[end:].strip(JSON_WHITESPACE):
+                raise _audit_refuse("audit_json_not_object")
+    if first != "{":
+        raise _audit_refuse("audit_json_prefix", _lines_before_object(text))
     try:
-        report, end = json.JSONDecoder(
-            object_pairs_hook=_unique_json_pairs, parse_constant=_reject_json_constant,
-        ).raw_decode(text, start)
+        report, end = decoder.raw_decode(text, start)
     except _DuplicateJsonKey:
         raise _audit_refuse("audit_json_duplicate") from None
     except (ValueError, RecursionError, TypeError):

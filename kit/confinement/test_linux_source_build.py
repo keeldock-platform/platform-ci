@@ -2129,6 +2129,7 @@ class LinuxAuditDetailTests(unittest.TestCase):
             "audit_json_trailing": (b'{"fixture-marker": 1}\n{}', None, None, None),
             "audit_json_duplicate": (b'{"fixture-marker": 1, "fixture-marker": 2}', None, None, None),
             "audit_json_syntax": (b'{"fixture-marker": }', None, None, None),
+            "audit_json_not_object": (b"[]", None, None, None),
             "audit_top_keys": (json.dumps(dict(good, extra={})).encode("ascii"), None, None, None),
             "audit_version": (json.dumps(dict(good, auditReportVersion=1)).encode("ascii"), None, None, None),
             "audit_entry_shape": (json.dumps(dict(good, vulnerabilities=[])).encode("ascii"), None, None, None),
@@ -2172,7 +2173,7 @@ class LinuxAuditDetailTests(unittest.TestCase):
                 self._run_audit(**arguments)
             self.assertEqual(refused.exception.detail, token)
         covered = set(self._report_cases()) | set(cases) | {
-            "audit_json_not_object", "audit_unclassified", "audit_unexpected",
+            "audit_json_empty_stderr_json", "audit_json_empty_stderr_text", "audit_unclassified", "audit_unexpected",
         }
         self.assertEqual(covered, set(linux_source_build.AUDIT_DETAILS))
 
@@ -2183,14 +2184,24 @@ class LinuxAuditDetailTests(unittest.TestCase):
             self.assertNotIn(word, output)
         return output
 
-    def test_empty_audit_output_counts_stderr_lines_only(self):
+    def test_empty_audit_output_is_split_by_the_shape_of_stderr(self):
         prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_empty"
-        self.assertEqual(self._json_line(b" \n\t"), prefix + " count=0\n")
+        for stderr in (b"", b" \n\t\n"):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(self._json_line(b" \n\t", stderr), prefix + "\n")
+        self.assertEqual(self._json_line(b""), prefix + "\n")
         self.assertEqual(
-            self._json_line(b"", b"fixture-stderr one\n\n  \nfixture-stderr two\nleak\n"), prefix + " count=3\n",
+            self._json_line(b"", b'\n  {"fixture-stderr": 1}\n\n'), prefix + "_stderr_json count=1\n",
         )
-        many = b"fixture-stderr\n" * 150
-        self.assertEqual(self._json_line(b"\n", many), prefix + " count=99\n")
+        self.assertEqual(
+            self._json_line(b"", b'{\n"fixture-stderr": 1,\n"leak": 2\n}\n'), prefix + "_stderr_json count=4\n",
+        )
+        self.assertEqual(
+            self._json_line(b"", b"fixture-stderr one\n\n  \nfixture-stderr two\nleak\n"), prefix + "_stderr_text count=3\n",
+        )
+        self.assertEqual(self._json_line(b"\n", b"[fixture-stderr]\n"), prefix + "_stderr_text count=1\n")
+        self.assertEqual(self._json_line(b"\n", b"fixture-stderr\n" * 150), prefix + "_stderr_text count=99\n")
+        self.assertEqual(self._json_line(b"\n", b'{"fixture-stderr": 1}\n' * 150), prefix + "_stderr_json count=99\n")
 
     def test_non_utf8_audit_output_is_named_by_shape(self):
         self.assertEqual(
@@ -2198,11 +2209,16 @@ class LinuxAuditDetailTests(unittest.TestCase):
             "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_utf8\n",
         )
 
-    def test_audit_output_not_starting_with_an_object_is_named_by_shape(self):
-        line = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_prefix\n"
-        for stdout in (b"fixture-marker is not json", b"\n  [1]", b"npm warn fixture-marker\n{}"):
-            with self.subTest(stdout=stdout):
-                self.assertEqual(self._json_line(stdout, b"fixture-stderr\n"), line)
+    def test_audit_output_not_starting_with_an_object_counts_lines_before_one(self):
+        prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_prefix"
+        cases = (
+            (b"fixture-marker is not json", 0), (b"\n  [1", 0), (b"npm warn fixture-marker\n{}", 1),
+            (b"fixture-marker\n\n  \nleak\n  {", 2), (b"fixture-marker\n" * 150 + b"{}", 99),
+            (b"fixture-marker\nleak\n", 0),
+        )
+        for stdout, count in cases:
+            with self.subTest(stdout=stdout[:24]):
+                self.assertEqual(self._json_line(stdout, b"fixture-stderr\n"), prefix + " count=" + str(count) + "\n")
 
     def test_audit_output_with_data_after_the_first_value_counts_lines(self):
         prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_trailing"
@@ -2225,12 +2241,15 @@ class LinuxAuditDetailTests(unittest.TestCase):
             with self.subTest(stdout=stdout[:24]):
                 self.assertEqual(self._json_line(stdout), line)
 
-    def test_audit_output_that_decodes_to_a_non_object_is_named_by_shape(self):
-        with patch.object(linux_source_build.json.JSONDecoder, "raw_decode", return_value=(["fixture-marker"], 2)):
-            self.assertEqual(
-                self._json_line(b"{}"),
-                "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_not_object\n",
-            )
+    def test_audit_output_that_is_one_non_object_value_is_named_by_shape(self):
+        line = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_not_object\n"
+        for stdout in (b"[]", b'"fixture-marker"', b'  ["fixture-marker"]\n', b"-1", b"12.5", b"null", b"true", b"false"):
+            with self.subTest(stdout=stdout):
+                self.assertEqual(self._json_line(stdout, b"fixture-stderr\n"), line)
+        prefix = "linux-source-build=refused phase=trusted-audit reason=lock detail=audit_json_prefix"
+        self.assertEqual(self._json_line(b"[] fixture-marker"), prefix + " count=0\n")
+        self.assertEqual(self._json_line(b'["fixture-marker"]\n{}'), prefix + " count=1\n")
+        self.assertEqual(self._json_line(b'[{"fixture-marker": 1, "fixture-marker": 2}]'), prefix + " count=0\n")
 
     def test_top_level_key_count_is_reported_and_bounded(self):
         good = json.loads(_honoured_report())
@@ -2239,7 +2258,7 @@ class LinuxAuditDetailTests(unittest.TestCase):
         wide = {"key" + str(index): index for index in range(150)}
         capped = self._detail(json.dumps(dict(good, **wide)).encode("ascii"))
         self.assertEqual(capped.count, linux_source_build.MAX_DETAIL_COUNT)
-        self.assertIsNone(self._detail(b"not json").count)
+        self.assertEqual(self._detail(b"not json").count, 0)
 
     def test_public_line_carries_only_a_token_for_the_audit_phase(self):
         cases = {
