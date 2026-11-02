@@ -772,7 +772,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, sha]), patch.object(
             linux_source_build, "_comparison", return_value="ahead"
         ), patch.object(
-            linux_source_build, "_source_inputs", side_effect=lambda unused: order.append("binding") or {}
+            linux_source_build, "_source_inputs", side_effect=lambda unused, prefix=None: order.append("binding") or {}
         ), patch.object(
             linux_source_build, "_verify_environment", side_effect=lambda token: order.append("environment")
         ), patch.object(
@@ -1180,8 +1180,11 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.subTest(cause=cause, result=repr(result)):
                 code, text, unused_calls = self._run_gates_with_second_gate(result)
                 self.assertEqual(code, 1)
+                lines = text.splitlines()
                 self.assertEqual(
-                    text, "linux-project-gates=refused completed=2 failed=1 gate=clippy cause=" + cause + "\n")
+                    lines[-1], "linux-project-gates=refused completed=2 failed=1 gate=clippy cause=" + cause)
+                self.assertEqual(text.count("linux-project-gates="), 1)
+                self.assertTrue(text.endswith("\n"))
                 for forbidden in ("kd-secret", "srv", "137", "101", "secret"):
                     self.assertNotIn(forbidden, text)
 

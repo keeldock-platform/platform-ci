@@ -304,7 +304,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/macos_core_contract.py': '025f1955fa43888b6a43bacf4186f6a8efab5e52e3ec1569355dd5e9614f25ac',
     'kit/confinement/test_macos_core_contract.py': '5b65c9958d6de802bfeec7ee750b90a75ed4165deb23b74177e1812fd459a927',
     'kit/confinement/linux_source_build.py': 'bb8846064b7c95aa9e63896020281d1e74e87ea00b9f2e925c7fa274a3827404',
-    'kit/confinement/test_linux_source_build.py': '12f7ee846c88b0a9baaf9d6d180caf231f416de4cbfae46e223b5628f444456c',
+    'kit/confinement/test_linux_source_build.py': '8df167315d2da32594056bec8bfed1d624c273f79d8e4158a15a65270d90ea04',
     '.github/workflows/core-linux-quick-return.yml': '3f6e90950f263a94e673d8b29a5b5f3352c9a00e79accce53b001528451d1795',
     'core-ci/linux_quick_return.py': '6322fa0a98dae99054e20f2f73dc11ad8c48922b5e5c747f7163108626668923',
     'core-ci/test_linux_quick_return.py': '9060cee407ca43f36787e26fd5459727e905b6fc8463114842d93719ad04df71',
