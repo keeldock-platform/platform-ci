@@ -928,7 +928,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertNotIn("console", script)
         probe = self.function_body("Invoke-NpmLinkTargetProbe")
         self.assertTrue(probe.split("\n", 1)[1].startswith("    if ($script:RunMode -cne 'synthetic') { return }\n"))
-        self.assertIn("$argv = [string[]]@($node, '-e', $NpmLinkTargetScript)", probe)
+        self.assertIn("$argv = [string[]]@($node, '-e', $NpmLinkTargetScript.Replace('MAXLINKS', [string]$MaxNpmLinks))", probe)
         self.assertIn("$argv = [string[]]@($node, '-e', $NpmLinkTargetScript.Replace('MAXLINKS', [string]$MaxNpmLinks))", probe)
         self.assertNotIn("Write-Line", probe)
         steps = self.function_body("Invoke-NpmLinkSteps")
