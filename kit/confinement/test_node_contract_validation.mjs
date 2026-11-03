@@ -193,14 +193,14 @@ function acceptedProvenance(lockBytes, policyEpochMs, source = identity, generat
   base_sha: 'b'.repeat(40),
   control_sha: 'c'.repeat(40),
   reviewed_diff_sha256: 'd'.repeat(64),
-}) {
+}, manifest = expectedManifest) {
   return {
     schema_version: 1,
     status: 'accepted',
     generation_identity: generation,
     accepted_source_identity: source,
     lock_sha256: sha256(lockBytes),
-    manifest_sha256: sha256(Buffer.from(canonicalJson(expectedManifest), 'ascii')),
+    manifest_sha256: sha256(Buffer.from(canonicalJson(manifest), 'ascii')),
     node_version: NODE_CONTRACT_POLICY.nodeVersion,
     npm_version: NODE_CONTRACT_POLICY.npmVersion,
     release_age_days: NODE_CONTRACT_POLICY.releaseAgeDays,
@@ -382,6 +382,192 @@ hostedTest('provenance binds lock, manifest, and current source while allowing t
     mode: 'verify', lockBytes, manifest: changedManifest, policyEpochMs,
     accepted: acceptedProvenance(lockBytes, policyEpochMs),
   }), (error) => error instanceof NodeContractError && error.code === 'manifest_invalid');
+});
+
+const ALLOW_DAY_MS = 24 * 60 * 60 * 1000;
+const ALLOW_TTL_MS = 90 * ALLOW_DAY_MS;
+
+const productionManifest = Object.freeze({
+  root: Object.freeze({
+    ...expectedManifest.root,
+    dependencies: Object.freeze({ 'fixture-prod': '1.0.0' }),
+  }),
+  workspaces: expectedManifest.workspaces,
+});
+
+function allowLockFixture({ dev = true, productionConsumer = false } = {}) {
+  const lock = JSON.parse(lockFixture().toString('utf8'));
+  if (dev) lock.packages['node_modules/typescript'].dev = true;
+  if (productionConsumer) {
+    lock.packages[''].dependencies = { 'fixture-prod': '1.0.0' };
+    lock.packages['node_modules/fixture-prod'] = {
+      version: '1.0.0',
+      resolved: 'https://registry.npmjs.org/fixture-prod/-/fixture-prod-1.0.0.tgz',
+      integrity: `sha512-${'A'.repeat(86)}==`,
+      dependencies: { typescript: '6.0.3' },
+    };
+  }
+  return Buffer.from(`${JSON.stringify(lock)}\n`, 'utf8');
+}
+
+function recordedFinding(policyEpochMs, overrides = {}) {
+  return {
+    name: 'typescript',
+    version: '6.0.3',
+    severity: 'moderate',
+    advisory_id: '1244012',
+    range: '<6.0.4',
+    allow_justification_sha256: 'e'.repeat(64),
+    allow_expires_at_ms: policyEpochMs + (60 * ALLOW_DAY_MS),
+    allow_removal_condition: 'upstream-release',
+    ...overrides,
+  };
+}
+
+function allowedProvenance(lockBytes, policyEpochMs, findings, manifest = expectedManifest) {
+  return {
+    ...acceptedProvenance(lockBytes, policyEpochMs, identity, undefined, manifest),
+    schema_version: 2,
+    audit_status: 'allowed_findings',
+    allowed_findings: findings,
+  };
+}
+
+function advisoryBody(items) {
+  return JSON.stringify({ typescript: items });
+}
+
+const recordedAdvisory = Object.freeze({ id: 1244012, severity: 'moderate', vulnerable_versions: '<6.0.4' });
+
+function allowCase({
+  lockBytes = allowLockFixture(),
+  policyEpochMs = Date.now() - (30 * ALLOW_DAY_MS),
+  findings,
+  accepted,
+  manifest = expectedManifest,
+  items = [recordedAdvisory],
+} = {}) {
+  return validate({
+    mode: 'verify', lockBytes, policyEpochMs, manifest,
+    accepted: accepted ?? allowedProvenance(
+      lockBytes, policyEpochMs, findings ?? [recordedFinding(policyEpochMs)], manifest,
+    ),
+    responseBody: advisoryBody(items),
+  });
+}
+
+function refusedWith(code) {
+  return (error) => error instanceof NodeContractError && error.code === code;
+}
+
+hostedTest('verify honours exactly one recorded development-only allow and reports counts only', async () => {
+  const { result } = await allowCase();
+  assert.equal(result.status, 'passed');
+  assert.equal(result.audit_status, 'allowed_findings');
+  assert.equal(result.finding_count, 1);
+  assert.equal(result.allowed_count, 1);
+  assert.equal(result.advisory_count, 1);
+  assert.equal(Object.hasOwn(result, 'allowed_findings'), false);
+  const policyEpochMs = Date.now() - (30 * ALLOW_DAY_MS);
+  const github = await allowCase({
+    policyEpochMs,
+    findings: [recordedFinding(policyEpochMs, { advisory_id: 'GHSA-aaaa-bbbb-cccc' })],
+    items: [{ ...recordedAdvisory, id: 7, github_advisory_id: 'GHSA-aaaa-bbbb-cccc' }],
+  });
+  assert.equal(github.result.allowed_count, 1);
+  const lower = await allowCase({ items: [{ ...recordedAdvisory, severity: 'low' }] });
+  assert.equal(lower.result.audit_status, 'allowed_findings');
+  const clean = await allowCase({ items: [] });
+  assert.equal(clean.result.audit_status, 'passed');
+  assert.equal(clean.result.finding_count, 0);
+  assert.equal(clean.result.allowed_count, 0);
+});
+
+hostedTest('a recorded allow never covers another advisory id, version or higher severity', async () => {
+  await assert.rejects(allowCase({ items: [{ ...recordedAdvisory, id: 1244013 }] }),
+    refusedWith('vulnerable_dependency'));
+  await assert.rejects(allowCase({ items: [{ id: 'GHSA-aaaa-bbbb-cccc', severity: 'moderate', vulnerable_versions: '<6.0.4' }] }),
+    refusedWith('vulnerable_dependency'));
+  const policyEpochMs = Date.now() - (30 * ALLOW_DAY_MS);
+  await assert.rejects(allowCase({ policyEpochMs, findings: [recordedFinding(policyEpochMs, { version: '6.0.2' })] }),
+    refusedWith('vulnerable_dependency'));
+  await assert.rejects(allowCase({ policyEpochMs, findings: [recordedFinding(policyEpochMs, { name: 'other-package' })] }),
+    refusedWith('vulnerable_dependency'));
+  for (const severity of ['high', 'critical']) {
+    await assert.rejects(allowCase({ items: [{ ...recordedAdvisory, severity }] }),
+      refusedWith('vulnerable_dependency'));
+  }
+  await assert.rejects(allowCase({ policyEpochMs, findings: [recordedFinding(policyEpochMs, { severity: 'low' })] }),
+    refusedWith('vulnerable_dependency'));
+  const { severity, ...withoutSeverity } = recordedAdvisory;
+  assert.equal(severity, 'moderate');
+  await assert.rejects(allowCase({ items: [withoutSeverity] }), refusedWith('vulnerable_dependency'));
+});
+
+hostedTest('a recorded allow refuses a package that is not development-only or is reachable from production', async () => {
+  await assert.rejects(allowCase({ lockBytes: allowLockFixture({ dev: false }) }),
+    refusedWith('vulnerable_dependency'));
+  await assert.rejects(allowCase({
+    lockBytes: allowLockFixture({ productionConsumer: true }),
+    manifest: productionManifest,
+  }), refusedWith('vulnerable_dependency'));
+});
+
+hostedTest('a recorded allow refuses once expired at the advisory fetch time and beyond the policy ceiling', async () => {
+  const policyEpochMs = Date.now() - (80 * ALLOW_DAY_MS);
+  await assert.rejects(allowCase({
+    policyEpochMs,
+    findings: [recordedFinding(policyEpochMs, { allow_expires_at_ms: policyEpochMs + (79 * ALLOW_DAY_MS) })],
+  }), refusedWith('vulnerable_dependency'));
+  const recentEpochMs = Date.now() - (30 * ALLOW_DAY_MS);
+  for (const expires of [recentEpochMs + ALLOW_TTL_MS + 1, recentEpochMs, recentEpochMs - 1]) {
+    await assert.rejects(allowCase({
+      policyEpochMs: recentEpochMs,
+      findings: [recordedFinding(recentEpochMs, { allow_expires_at_ms: expires })],
+    }), refusedWith('accepted_provenance_invalid'));
+  }
+  const ceiling = await allowCase({
+    policyEpochMs: recentEpochMs,
+    findings: [recordedFinding(recentEpochMs, { allow_expires_at_ms: recentEpochMs + ALLOW_TTL_MS })],
+  });
+  assert.equal(ceiling.result.allowed_count, 1);
+});
+
+hostedTest('a finding that is not recorded refuses even beside a recorded one', async () => {
+  await assert.rejects(allowCase({
+    items: [recordedAdvisory, { id: 999, severity: 'low', vulnerable_versions: '>=6.0.0' }],
+  }), refusedWith('vulnerable_dependency'));
+});
+
+hostedTest('only the versioned accepted provenance carries allows and a candidate cannot add one', async () => {
+  const lockBytes = allowLockFixture();
+  const policyEpochMs = Date.now() - (30 * ALLOW_DAY_MS);
+  await assert.rejects(allowCase({ lockBytes, policyEpochMs, accepted: acceptedProvenance(lockBytes, policyEpochMs) }),
+    refusedWith('vulnerable_dependency'));
+  const finding = recordedFinding(policyEpochMs);
+  const mutations = [
+    { ...acceptedProvenance(lockBytes, policyEpochMs), allowed_findings: [finding] },
+    { ...allowedProvenance(lockBytes, policyEpochMs, [finding]), audit_status: 'passed' },
+    { ...allowedProvenance(lockBytes, policyEpochMs, [finding]), schema_version: 1 },
+    allowedProvenance(lockBytes, policyEpochMs, []),
+    allowedProvenance(lockBytes, policyEpochMs, [finding, finding]),
+    allowedProvenance(lockBytes, policyEpochMs, Array.from({ length: 17 }, (unused, index) => (
+      recordedFinding(policyEpochMs, { advisory_id: String(index + 1) })))),
+    allowedProvenance(lockBytes, policyEpochMs, [{ ...finding, consumers: ['typescript'] }]),
+    allowedProvenance(lockBytes, policyEpochMs, [{ ...finding, severity: 'high' }]),
+    allowedProvenance(lockBytes, policyEpochMs, [{ ...finding, version: '^6.0.0' }]),
+    allowedProvenance(lockBytes, policyEpochMs, [{ ...finding, allow_expires_at_ms: String(finding.allow_expires_at_ms) }]),
+  ];
+  for (const accepted of mutations) {
+    await assert.rejects(allowCase({ lockBytes, policyEpochMs, accepted }), refusedWith('accepted_provenance_invalid'));
+  }
+  const { allowed_findings: dropped, ...withoutList } = allowedProvenance(lockBytes, policyEpochMs, [finding]);
+  assert.equal(dropped.length, 1);
+  await assert.rejects(allowCase({ lockBytes, policyEpochMs, accepted: withoutList }),
+    refusedWith('accepted_provenance_invalid'));
+  await assert.rejects(validate({
+    lockBytes, responseBody: advisoryBody([recordedAdvisory]),
+  }), refusedWith('vulnerable_dependency'));
 });
 
 hostedTest('bootstrap rejects a policy epoch outside the request window before contacting npm registry', async () => {

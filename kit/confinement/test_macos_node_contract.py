@@ -97,14 +97,42 @@ def _provenance(lock_bytes, policy_epoch_ms, accepted_identity, generation_ident
     }
 
 
+def _finding(policy_epoch_ms, **overrides):
+    finding = {
+        "name": "minimatch",
+        "version": "10.2.6",
+        "severity": "moderate",
+        "advisory_id": "1244012",
+        "range": "<10.2.7",
+        "allow_justification_sha256": "e" * 64,
+        "allow_expires_at_ms": policy_epoch_ms + 60 * subject.DAY_MS,
+        "allow_removal_condition": "upstream-release",
+    }
+    finding.update(overrides)
+    return finding
+
+
+def _allowed_provenance(lock_bytes, policy_epoch_ms, accepted_identity, generation_identity, findings):
+    record = _provenance(lock_bytes, policy_epoch_ms, accepted_identity, generation_identity)
+    record.update({
+        "schema_version": 2,
+        "audit_status": "allowed_findings",
+        "allowed_findings": findings,
+    })
+    return record
+
+
 class WorkerHarness:
     def __init__(self, project, *, lock_bytes=None, failure=None, audit_reason=None,
-                 mutate_config_after=None):
+                 mutate_config_after=None, finding_count=0, allowed_count=0, audit_status=None):
         self.project = Path(project)
         self.lock_bytes = lock_bytes or _lock_bytes()
         self.failure = failure
         self.audit_reason = audit_reason
         self.mutate_config_after = mutate_config_after
+        self.finding_count = finding_count
+        self.allowed_count = allowed_count
+        self.audit_status = audit_status or ("allowed_findings" if allowed_count else "passed")
         self.calls = []
         self.requests = []
 
@@ -149,11 +177,13 @@ class WorkerHarness:
                 "age_status": "passed",
                 "generation_attempts": 1,
                 "audit_endpoint": subject.AUDIT_ENDPOINT,
-                "audit_status": "passed",
+                "audit_status": self.audit_status,
                 "package_count": 4,
                 "remote_package_count": 1,
                 "remote_version_count": 1,
-                "advisory_count": 0,
+                "advisory_count": self.finding_count,
+                "finding_count": self.finding_count,
+                "allowed_count": self.allowed_count,
             }
             output = {"schema_version": 1, "status": "passed", "result": result}
             return self._result(stdout=(json.dumps(output, separators=(",", ":")) + "\n").encode("ascii"))
@@ -484,6 +514,115 @@ class MacOSNodeContractTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.reason, "accepted_provenance_invalid")
         self.assertEqual(runner.calls, [])
+
+    def _verify(self, provenance, runner, lock_bytes):
+        self.install_committed_lock(lock_bytes)
+        return subject.run_node_contract(
+            "verify", project=self.project, worker_storage=self.storage,
+            worker_uid=self.uid, worker_gid=self.gid, node_executable=self.node,
+            npm_cli=self.npm, tool_cache_root=self.cache, expected_manifest=_manifest(),
+            source_identity=_identity("5"), run_worker=runner, deadline=time.monotonic() + 600,
+            accepted_lock=lock_bytes, accepted_provenance=provenance,
+        )
+
+    def _allow_case(self, findings=None):
+        lock_bytes = _lock_bytes()
+        policy_epoch_ms = int(time.time() * 1000) - 30 * subject.DAY_MS
+        if findings is None:
+            findings = [_finding(policy_epoch_ms)]
+        provenance = _allowed_provenance(lock_bytes, policy_epoch_ms, _identity("5"), _identity("a"),
+                                         findings)
+        return lock_bytes, policy_epoch_ms, provenance
+
+    def test_verify_passes_recorded_allows_verbatim_to_the_helper_and_accepts_counts(self):
+        lock_bytes, unused, provenance = self._allow_case()
+        (self.project / "dependency-policy.json").write_bytes(b'{"development_advisory_allows":[]}\n')
+        runner = WorkerHarness(self.project, lock_bytes=lock_bytes, finding_count=1, allowed_count=1)
+        output = self._verify(provenance, runner, lock_bytes)
+        self.assertEqual(output["status"], "passed")
+        self.assertEqual(output["accepted_provenance"], provenance)
+        self.assertEqual(runner.requests[0]["accepted_provenance"], provenance)
+        self.assertEqual(set(runner.requests[0]), {
+            "schema_version", "mode", "lock_base64", "expected_manifest", "source_identity",
+            "npm_cli_path", "generation_proof", "accepted_provenance", "policy_epoch_ms", "now_ms",
+            "deadline_ms",
+        })
+        self.assertEqual(set(output["audit_summary"]), {
+            "package_count", "remote_package_count", "remote_version_count", "advisory_count",
+        })
+
+    def test_verify_refuses_malformed_or_widened_allow_records_before_any_command(self):
+        lock_bytes, policy_epoch_ms, provenance = self._allow_case()
+        finding = _finding(policy_epoch_ms)
+        variants = []
+        for overrides in (
+            {"allow_expires_at_ms": policy_epoch_ms + subject.MAX_ALLOW_TTL_MS + 1},
+            {"allow_expires_at_ms": policy_epoch_ms},
+            {"allow_expires_at_ms": True},
+            {"severity": "high"},
+            {"severity": "critical"},
+            {"version": "^10.2.6"},
+            {"name": "Minimatch"},
+            {"advisory_id": ""},
+            {"allow_justification_sha256": "E" * 64},
+            {"allow_removal_condition": "has space"},
+            {"range": ""},
+        ):
+            variants.append([_finding(policy_epoch_ms, **overrides)])
+        variants.append([dict(finding, consumers=["fixture"])])
+        variants.append([finding, dict(finding)])
+        variants.append([])
+        variants.append([_finding(policy_epoch_ms, advisory_id=str(index)) for index in range(1, 18)])
+        records = [
+            _allowed_provenance(lock_bytes, policy_epoch_ms, _identity("5"), _identity("a"), item)
+            for item in variants
+        ]
+        records.append(dict(provenance, audit_status="passed"))
+        records.append(dict(provenance, schema_version=1))
+        records.append(dict(_provenance(lock_bytes, policy_epoch_ms, _identity("5"), _identity("a")),
+                            allowed_findings=[finding]))
+        records.append({key: value for key, value in provenance.items() if key != "allowed_findings"})
+        for record in records:
+            with self.subTest(record=record):
+                self.storage = Path(tempfile.mkdtemp(dir=self.root)).resolve(strict=True)
+                runner = WorkerHarness(self.project, lock_bytes=lock_bytes)
+                with self.assertRaises(subject.NodeContractRefusal) as caught:
+                    self._verify(record, runner, lock_bytes)
+                self.assertEqual(caught.exception.reason, "accepted_provenance_invalid")
+                self.assertEqual(runner.calls, [])
+
+    def test_helper_allowed_counts_must_fit_the_recorded_allows(self):
+        lock_bytes, policy_epoch_ms, provenance = self._allow_case()
+        plain = _provenance(lock_bytes, policy_epoch_ms, _identity("5"), _identity("a"))
+        for record, counts in (
+            (plain, {"finding_count": 1, "allowed_count": 1}),
+            (provenance, {"finding_count": 2, "allowed_count": 2}),
+            (provenance, {"finding_count": 0, "allowed_count": 1}),
+            (provenance, {"finding_count": 1, "allowed_count": 0}),
+            (provenance, {"finding_count": 1, "allowed_count": 1, "audit_status": "passed"}),
+            (provenance, {"finding_count": 0, "allowed_count": 0, "audit_status": "allowed_findings"}),
+        ):
+            with self.subTest(counts=counts, schema=record["schema_version"]):
+                self.storage = Path(tempfile.mkdtemp(dir=self.root)).resolve(strict=True)
+                runner = WorkerHarness(self.project, lock_bytes=lock_bytes, **counts)
+                with self.assertRaises(subject.NodeContractRefusal) as caught:
+                    self._verify(record, runner, lock_bytes)
+                self.assertEqual(caught.exception.reason, "capture_invalid")
+                self.assertEqual(caught.exception.substage, "bulk_audit")
+
+    def test_bootstrap_never_accepts_allowed_findings_from_the_helper(self):
+        runner = WorkerHarness(self.project, finding_count=1, allowed_count=1)
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self.call("bootstrap", runner, policy_epoch_ms=int(time.time() * 1000) - 10_000)
+        self.assertEqual(caught.exception.reason, "capture_invalid")
+
+    def test_unrecorded_finding_refusal_keeps_the_vulnerable_dependency_reason(self):
+        lock_bytes, unused, provenance = self._allow_case()
+        runner = WorkerHarness(self.project, lock_bytes=lock_bytes, audit_reason="vulnerable_dependency")
+        with self.assertRaises(subject.NodeContractRefusal) as caught:
+            self._verify(provenance, runner, lock_bytes)
+        self.assertEqual(caught.exception.reason, "vulnerable_dependency")
+        self.assertEqual(caught.exception.completed_stages, ("node_dependency_prepare",))
 
     def _bootstrap_with_worker_error(self, error, at):
         self.storage = Path(tempfile.mkdtemp(dir=self.root)).resolve(strict=True)
