@@ -76,6 +76,7 @@ PROJECT_ENV_NAMES = frozenset((
     "RUSTFMT", "NODE", "NPM_CONFIG_OFFLINE", "NPM_CONFIG_CACHE", "NPM_CONFIG_USERCONFIG",
     "NPM_CONFIG_GLOBALCONFIG", "npm_config_offline", "npm_config_cache", "npm_config_userconfig",
     "npm_config_globalconfig", "NPM_CONFIG_UPDATE_NOTIFIER", "npm_config_update_notifier",
+    "PLAYWRIGHT_BROWSERS_PATH", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
 ))
 PROJECT_ENV_SECRET_PARTS = ("TOKEN", "SECRET", "PASSWORD", "PRIVATE_KEY", "CREDENTIAL")
 
@@ -393,6 +394,8 @@ def validate_spec(spec):
         raise harness.ProofFailure(96)
     if type(spec.get("timeout")) is not int or not 1 <= spec["timeout"] <= MAX_TIMEOUT_SECONDS[spec["limits"]]:
         raise harness.ProofFailure(96)
+    if "loopback" in spec and (spec["loopback"] is not True or spec["view"] != "host" or spec["limits"] != "project"):
+        raise harness.ProofFailure(96)
     if spec.get("fault") is not None and spec["fault"] not in FAULTS:
         raise harness.ProofFailure(96)
     if type(spec.get("rootfs")) is not str or SAFE_PATH.fullmatch(spec["rootfs"]) is None:
@@ -475,6 +478,8 @@ def launch_and_collect(spec, argv, cwd, out, err, chrooted):
     limits = LIMIT_PROFILES[spec["limits"]]
     filter_on = confined and not keep_root and spec.get("fault") != "uid-root"
     preexec = functools.partial(harness._drop_child, limits, filter_on, drop)
+    if spec.get("loopback") is True:
+        preexec = functools.partial(harness._drop_child, limits, filter_on, drop, True)
     extra = None
     pass_fds = ()
     if spec.get("extra_fd"):
@@ -565,11 +570,19 @@ def inside_host(spec):
     err_path, err_writer, err_reader = harness._write_capture(base, "err-" + nonce)
     code = None
     timed_out = False
+    loopback = spec.get("loopback") is True
+    if loopback:
+        harness._disable_loopback_ipv6()
+        harness._set_loopback(True)
     try:
         code, timed_out = launch_and_collect(spec, spec["argv"], spec.get("cwd", "/"), (out_path, out_writer), (err_path, err_writer), False)
     finally:
-        stdout = read_capture(out_reader)
-        stderr = read_capture(err_reader)
+        try:
+            if loopback:
+                harness._set_loopback(False)
+        finally:
+            stdout = read_capture(out_reader)
+            stderr = read_capture(err_reader)
     harness._verify_netns()
     require_usr_readonly("/usr")
     readback = {
@@ -737,7 +750,7 @@ def run_chroot(workdir, nonce, argv, env, mode, files, binds=(), work=False, lim
     return _spawn(workdir, spec, arguments)
 
 
-def run_host(workdir, nonce, argv, env, files, limits="probe", timeout=30, cwd="/", host_pids=False):
+def run_host(workdir, nonce, argv, env, files, limits="probe", timeout=30, cwd="/", host_pids=False, loopback=False):
     spec = {
         "mode": "confined",
         "view": "host",
@@ -754,6 +767,8 @@ def run_host(workdir, nonce, argv, env, files, limits="probe", timeout=30, cwd="
         "fault": None,
         "cwd": cwd,
     }
+    if loopback:
+        spec["loopback"] = True
     return _spawn(workdir, spec, HOST_SHARED_PID_UNSHARE if host_pids else HOST_UNSHARE)
 
 

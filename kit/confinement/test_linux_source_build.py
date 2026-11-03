@@ -13,6 +13,7 @@ import tempfile
 import time
 import types
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -1679,10 +1680,10 @@ class LinuxSourceBuildTests(unittest.TestCase):
             (records / "merged.json").chmod(0o600)
             gates = {
                 "schema_version": 1,
-                "selected_gates": list(linux_source_build.GATES),
-                "completed_gates": list(linux_source_build.GATES),
-                "gates": {name: "passed" for name in linux_source_build.GATES},
-                "gate_count": 15,
+                "selected_gates": list(linux_source_build.GATES + linux_source_build.BROWSER_GATE_NAMES),
+                "completed_gates": list(linux_source_build.GATES + linux_source_build.BROWSER_GATE_NAMES),
+                "gates": {name: "passed" for name in linux_source_build.GATES + linux_source_build.BROWSER_GATE_NAMES},
+                "gate_count": 16,
                 "failed": 0,
             }
             receipt = {
@@ -1727,7 +1728,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             }
             (records / "merged.json").write_text(json.dumps(merged), encoding="ascii")
             (records / "merged.json").chmod(0o600)
-            selected = linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES
+            selected = linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES + linux_source_build.BROWSER_GATE_NAMES
             gates = {
                 "schema_version": 1,
                 "selected_gates": list(selected),
@@ -1750,7 +1751,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             }
             public_record = linux_source_build._verdict_record(env)
             self.assertEqual(public_record["gates"], 18)
-            self.assertEqual(len(selected), 18)
+            self.assertEqual(len(selected), 19)
             self.assertIn(" gates=18 failed=0 ", confinement_verdict.encode_line(public_record))
             self.assertTrue(confinement_verdict.run_accepted(public_record))
             gates["completed_gates"] = list(selected[:-1])
@@ -3668,6 +3669,355 @@ class WindowsSourceBindingTests(unittest.TestCase):
         with patch.object(linux_source_build.gate_table, "render", side_effect=gate_table.GateTableRefusal("tool")):
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "gate"):
                 linux_source_build._gate_commands(Path("/work"), "/rust", "/node")
+
+
+def _browser_zip(path, entries):
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, data, mode in entries:
+            info = zipfile.ZipInfo(name)
+            info.external_attr = mode << 16
+            archive.writestr(info, data)
+
+
+class LinuxBrowserTierTests(unittest.TestCase):
+    def test_the_pinned_chromium_matches_the_playwright_release_and_is_hash_verified(self):
+        subject = linux_source_build
+        self.assertEqual(subject.PLAYWRIGHT_VERSION, "1.64.1")
+        self.assertEqual(subject.BROWSER_REVISION, "1248")
+        self.assertEqual(subject.BROWSER_VERSION, "156.0.8078.4")
+        self.assertEqual(subject.BROWSER_DIRECTORY, "chromium_headless_shell-1248")
+        self.assertEqual(
+            subject.BROWSER_ARCHIVE_URL,
+            "https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.4/linux64/"
+            "chrome-headless-shell-linux64.zip",
+        )
+        self.assertRegex(subject.BROWSER_ARCHIVE_SHA256, r"[a-f0-9]{64}\Z")
+        self.assertEqual(
+            subject.BROWSER_ARCHIVE_SHA256, "c3e50596aef52c58f8fda3c6b3411c33d34c88b177b3ed1c2243359fd3b8ba20",
+        )
+        self.assertEqual(subject.BROWSER_PACKAGE_DIRECTORY, "chrome-headless-shell-linux64")
+        self.assertEqual(subject.BROWSER_EXECUTABLE, "chrome-headless-shell")
+        self.assertEqual(subject.BROWSER_MARKER, "INSTALLATION_COMPLETE")
+
+    def test_the_system_packages_are_pinned_by_name_sorted_and_unique(self):
+        packages = linux_source_build.BROWSER_APT_PACKAGES
+        self.assertEqual(list(packages), sorted(set(packages)))
+        for name in packages:
+            self.assertRegex(name, r"[a-z0-9][a-z0-9.+-]{1,60}\Z")
+        for required in ("libnss3", "libnspr4", "libgbm1", "libasound2t64", "libxkbcommon0"):
+            self.assertIn(required, packages)
+        for absent in ("xvfb", "libgtk-3-0t64", "wget", "xdg-utils"):
+            self.assertNotIn(absent, packages)
+
+    def test_system_packages_install_in_the_trusted_phase_with_a_clean_environment(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            return types.SimpleNamespace(returncode=0)
+
+        with patch.object(linux_source_build.subprocess, "run", side_effect=run):
+            linux_source_build._install_browser_packages()
+        self.assertEqual(len(calls), 2)
+        update, install = calls
+        self.assertEqual(update[0][-1], "update")
+        self.assertFalse(update[1]["check"])
+        self.assertTrue(install[1]["check"])
+        self.assertEqual(install[0][:2], ["/usr/bin/sudo", "-n"])
+        self.assertIn("DEBIAN_FRONTEND=noninteractive", install[0])
+        separator = install[0].index("--")
+        self.assertEqual(tuple(install[0][separator + 1:]), linux_source_build.BROWSER_APT_PACKAGES)
+        self.assertIn("--no-install-recommends", install[0][:separator])
+        for argv, kwargs in calls:
+            self.assertEqual(set(kwargs["env"]), {"PATH", "LANG", "LC_ALL"})
+            self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+            self.assertEqual(kwargs["timeout"], linux_source_build.BROWSER_APT_TIMEOUT_SECONDS)
+            self.assertNotIn("http", " ".join(argv))
+
+    def test_a_failed_package_index_refresh_is_tolerated_but_a_failed_install_refuses(self):
+        outcomes = [subprocess.CalledProcessError(100, "apt"), types.SimpleNamespace(returncode=0)]
+        with patch.object(linux_source_build.subprocess, "run", side_effect=outcomes):
+            linux_source_build._install_browser_packages()
+        outcomes = [types.SimpleNamespace(returncode=0), subprocess.CalledProcessError(100, "apt")]
+        with patch.object(linux_source_build.subprocess, "run", side_effect=outcomes):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "toolchain"):
+                linux_source_build._install_browser_packages()
+        with patch.object(linux_source_build.subprocess, "run", side_effect=OSError("missing")):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "toolchain"):
+                linux_source_build._install_browser_packages()
+
+    def test_the_archive_extracts_regular_files_only_under_the_pinned_directory(self):
+        package = linux_source_build.BROWSER_PACKAGE_DIRECTORY
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "browser.zip"
+            _browser_zip(archive, (
+                (package + "/chrome-headless-shell", b"binary", 0o100755),
+                (package + "/locales/en-US.pak", b"data", 0o100600),
+                (package + "/empty/", b"", 0o40755),
+            ))
+            root = linux_source_build._extract_browser_archive(str(archive), str(Path(temporary) / "out"))
+            executable = root / package / "chrome-headless-shell"
+            self.assertEqual(executable.read_bytes(), b"binary")
+            self.assertEqual(stat.S_IMODE(executable.stat().st_mode), 0o755)
+            self.assertEqual(stat.S_IMODE((root / package / "locales" / "en-US.pak").stat().st_mode), 0o644)
+            self.assertTrue((root / package / "empty").is_dir())
+
+    def test_the_archive_refuses_links_escapes_foreign_roots_missing_binary_and_oversize(self):
+        package = linux_source_build.BROWSER_PACKAGE_DIRECTORY
+        good = (package + "/chrome-headless-shell", b"binary", 0o100755)
+        cases = {
+            "symlink": (good, (package + "/link", b"chrome-headless-shell", 0o120777)),
+            "escape": (good, (package + "/../escape", b"x", 0o100644)),
+            "absolute": (good, ("/" + package + "/absolute", b"x", 0o100644)),
+            "foreign_root": (good, ("other/file", b"x", 0o100644)),
+            "device": (good, (package + "/node", b"", 0o20666)),
+            "missing_binary": ((package + "/locales/en-US.pak", b"data", 0o100644),),
+            "not_executable": ((package + "/chrome-headless-shell", b"binary", 0o100644),),
+        }
+        for label, entries in cases.items():
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as temporary:
+                archive = Path(temporary) / "browser.zip"
+                _browser_zip(archive, entries)
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "toolchain"):
+                    linux_source_build._extract_browser_archive(str(archive), str(Path(temporary) / "out"))
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "browser.zip"
+            _browser_zip(archive, (good, (package + "/second", b"two", 0o100644)))
+            for name, value in (("BROWSER_UNPACKED_MAX_BYTES", 8), ("BROWSER_MAX_MEMBERS", 1)):
+                with self.subTest(limit=name), patch.object(linux_source_build, name, value):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "toolchain"):
+                        linux_source_build._extract_browser_archive(str(archive), str(Path(temporary) / name))
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "browser.zip"
+            archive.write_bytes(b"not a zip")
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "toolchain"):
+                linux_source_build._extract_browser_archive(str(archive), str(Path(temporary) / "out"))
+
+    def test_preparation_downloads_the_pin_extracts_read_only_inputs_and_marks_the_install(self):
+        package = linux_source_build.BROWSER_PACKAGE_DIRECTORY
+        order = []
+
+        def download(url, expected, destination, maximum):
+            order.append("download")
+            self.assertEqual(url, linux_source_build.BROWSER_ARCHIVE_URL)
+            self.assertEqual(expected, linux_source_build.BROWSER_ARCHIVE_SHA256)
+            self.assertEqual(maximum, linux_source_build.BROWSER_ARCHIVE_MAX_BYTES)
+            _browser_zip(destination, ((package + "/chrome-headless-shell", b"binary", 0o100755),))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(
+                linux_source_build, "_install_browser_packages", side_effect=lambda: order.append("packages")
+            ), patch.object(linux_source_build, "_download", side_effect=download):
+                browsers = linux_source_build._prepare_browser(root)
+            self.assertEqual(order, ["packages", "download"])
+            self.assertEqual(browsers, root / "browsers")
+            directory = browsers / linux_source_build.BROWSER_DIRECTORY
+            self.assertTrue((directory / package / "chrome-headless-shell").is_file())
+            self.assertEqual((directory / "INSTALLATION_COMPLETE").read_bytes(), b"")
+            self.assertFalse((root / "chrome-headless-shell-linux64.zip").exists())
+
+    def test_the_toolchain_step_provisions_the_browser_only_when_the_tier_flag_is_set(self):
+        source = Path(linux_source_build.__file__).read_text(encoding="utf-8")
+        body = source[source.index("def prepare_toolchains"):source.index("def _run(")]
+        self.assertIn('env.get(BROWSER_FLAG_ENV) == "1"', body)
+        self.assertLess(body.index("_prepare_browser(root)"), body.index("os.chmod(root, 0o755)"))
+        self.assertIn('"browser_root=" + str(browser_root)', body)
+
+    def test_the_installed_browser_check_accepts_only_the_trusted_layout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            toolchains = Path(temporary) / "toolchains"
+            browsers = toolchains / "browsers"
+            directory = browsers / linux_source_build.BROWSER_DIRECTORY
+            executable = directory / linux_source_build.BROWSER_PACKAGE_DIRECTORY / "chrome-headless-shell"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"binary")
+            executable.chmod(0o755)
+            with patch.object(linux_source_build, "TOOLCHAIN_ROOT", toolchains):
+                self.assertFalse(linux_source_build._browser_installed(str(browsers)))
+                (directory / "INSTALLATION_COMPLETE").write_bytes(b"")
+                self.assertTrue(linux_source_build._browser_installed(str(browsers)))
+                self.assertFalse(linux_source_build._browser_installed(str(Path(temporary) / "elsewhere")))
+                self.assertFalse(linux_source_build._browser_installed(""))
+                executable.chmod(0o644)
+                self.assertFalse(linux_source_build._browser_installed(str(browsers)))
+                executable.chmod(0o755)
+                moved = executable.with_name("real")
+                executable.rename(moved)
+                executable.symlink_to(moved)
+                self.assertFalse(linux_source_build._browser_installed(str(browsers)))
+
+    def test_evidence_counts_only_regular_png_files_below_the_reports_directory(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Path(temporary) / "worker"
+            phase = worker / "docs" / "reports" / "phase-one"
+            phase.mkdir(parents=True)
+            (phase / "frame-a.png").write_bytes(b"12345")
+            (phase / "frame-b.png").write_bytes(b"123")
+            (phase / "notes.txt").write_bytes(b"ignored")
+            outside = Path(temporary) / "outside"
+            outside.mkdir()
+            (outside / "leak.png").write_bytes(b"leak")
+            (worker / "docs" / "reports" / "linked").symlink_to(outside)
+            (phase / "linked.png").symlink_to(outside / "leak.png")
+            self.assertEqual(linux_source_build._browser_evidence(worker), (2, 8))
+            (worker / "docs" / "reports").rename(worker / "docs" / "moved")
+            (worker / "docs" / "reports").symlink_to(worker / "docs" / "moved")
+            self.assertEqual(linux_source_build._browser_evidence(worker), (0, 0))
+            self.assertEqual(linux_source_build._browser_evidence(Path(temporary) / "absent"), (0, 0))
+
+    def test_gate_commands_add_the_browser_gate_last_and_only_when_asked(self):
+        plain = linux_source_build._gate_commands(Path("/work"), "/rust", "/node")
+        self.assertEqual(tuple(name for name, argv in plain), linux_source_build.GATES)
+        browser = linux_source_build._gate_commands(Path("/work"), "/rust", "/node", True)
+        self.assertEqual(
+            tuple(name for name, argv in browser), linux_source_build.GATES + linux_source_build.BROWSER_GATE_NAMES,
+        )
+        self.assertEqual(dict(browser)["ui_kit_browser"], (
+            "/node/node", "/node/npm", "--offline", "run", "test:browser",
+            "--workspace=packages/kernel-ui-kit", "--ignore-scripts",
+        ))
+
+    def _run_with_browser(self, temporary, browser_root, installed=True):
+        root = Path(temporary)
+        worker = root / "source"
+        worker.mkdir()
+        (worker / "Cargo.lock").write_text(_path_only_lock(4), encoding="ascii")
+        evidence = worker / "docs" / "reports" / "phase"
+        evidence.mkdir(parents=True)
+        (evidence / "frame.png").write_bytes(b"png")
+
+        def commands(project, rust_root, node_bin, browser=False):
+            names = linux_source_build.GATES + (linux_source_build.BROWSER_GATE_NAMES if browser else ())
+            return tuple((name, ("/usr/bin/true",)) for name in names)
+
+        environment = {
+            "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
+            "CARGO_HOME": str(worker / ".kd-cargo-home"), "RUST_ROOT": "/rust", "NODE_BIN": "/node",
+            "REQUESTED_SOURCE_SHA": "a" * 40,
+        }
+        if browser_root is not None:
+            environment["BROWSER_ROOT"] = browser_root
+        with patch.object(
+            linux_source_build.rust_license_gate, "require_lock_admission",
+            wraps=linux_source_build.rust_license_gate.require_lock_admission,
+        ), patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(
+            linux_source_build, "_project_gate_directories",
+        ), patch.object(
+            linux_source_build, "_gate_commands", side_effect=commands,
+        ), patch.object(
+            linux_source_build, "_runtime_workspace_present", return_value=False,
+        ), patch.object(
+            linux_source_build, "_browser_installed", return_value=installed,
+        ), patch.object(
+            linux_source_build.linux_session, "run_host",
+            return_value=types.SimpleNamespace(exit_code=0, timed_out=False, stdout=b"", stderr=b""),
+        ) as session, patch.object(linux_source_build.sys, "stdout", io.StringIO()):
+            code = linux_source_build.run_project_gates(environment)
+        return code, session, root / "kd-records"
+
+    def test_the_browser_gate_alone_gets_loopback_the_browser_path_and_no_download(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            code, session, records = self._run_with_browser(temporary, "/tmp/kd-toolchains/browsers")
+            self.assertEqual(code, 0)
+            self.assertEqual(session.call_count, 16)
+            for position, invocation in enumerate(session.call_args_list):
+                environment = invocation.args[3]
+                if position == 15:
+                    self.assertEqual(environment["PLAYWRIGHT_BROWSERS_PATH"], "/tmp/kd-toolchains/browsers")
+                    self.assertEqual(environment["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"], "1")
+                    self.assertIs(invocation.kwargs["loopback"], True)
+                    self.assertEqual(invocation.kwargs["limits"], "project")
+                    self.assertEqual(invocation.kwargs["timeout"], 1800)
+                else:
+                    self.assertFalse([key for key in environment if key.startswith("PLAYWRIGHT")])
+                    self.assertNotIn("loopback", invocation.kwargs)
+                self.assertLessEqual(set(environment), linux_source_build.linux_session.PROJECT_ENV_NAMES)
+            receipt = json.loads((records / "gates.json").read_text(encoding="ascii"))
+            self.assertEqual(receipt["selected_gates"][-1], "ui_kit_browser")
+            self.assertEqual(receipt["gate_count"], 16)
+            evidence = json.loads((records / "browser-evidence.json").read_text(encoding="ascii"))
+            self.assertEqual(evidence, {"bytes": 3, "files": 1, "schema_version": 1})
+
+    def test_without_a_provisioned_browser_no_browser_gate_runs_and_no_evidence_is_written(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            code, session, records = self._run_with_browser(temporary, None)
+            self.assertEqual(code, 0)
+            self.assertEqual(session.call_count, 15)
+            for invocation in session.call_args_list:
+                self.assertNotIn("loopback", invocation.kwargs)
+                self.assertFalse([key for key in invocation.args[3] if key.startswith("PLAYWRIGHT")])
+            self.assertFalse((records / "browser-evidence.json").exists())
+            receipt = json.loads((records / "gates.json").read_text(encoding="ascii"))
+            self.assertEqual(receipt["selected_gates"], list(linux_source_build.GATES))
+
+    def test_an_untrusted_browser_root_refuses_before_any_gate_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "gate"):
+                self._run_with_browser(temporary, "/tmp/other", installed=False)
+            self.assertFalse((Path(temporary) / "kd-records" / "gates.json").exists())
+            self.assertFalse((Path(temporary) / "kd-records" / "browser-evidence.json").exists())
+
+    def test_a_failed_browser_gate_is_named_in_the_refusal_line(self):
+        self.assertEqual(
+            linux_source_build._gate_refusal_line(15, 1, "ui_kit_browser", "exit"),
+            "linux-project-gates=refused completed=15 failed=1 gate=ui_kit_browser cause=exit\n",
+        )
+
+    def test_the_verified_count_requires_the_browser_gate_and_reports_the_shared_contract_count(self):
+        names = {
+            "base": linux_source_build.GATES,
+            "runtime": linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES,
+        }
+        browser = linux_source_build.BROWSER_GATE_NAMES
+        cases = (
+            (names["base"], 0), (names["runtime"], 0),
+            (names["base"] + browser, 15), (names["runtime"] + browser, 18),
+            (browser + names["base"], 0),
+        )
+        for selected, expected in cases:
+            with self.subTest(selected=len(selected), expected=expected), tempfile.TemporaryDirectory() as temporary:
+                records = Path(temporary) / "kd-records"
+                records.mkdir()
+                gates = {
+                    "schema_version": 1, "selected_gates": list(selected), "completed_gates": list(selected),
+                    "gates": {name: "passed" for name in selected}, "gate_count": len(selected), "failed": 0,
+                }
+                receipt = {
+                    "schema_version": 1, "status": "confirmed", "control_sha": "a" * 40,
+                    "run_id": "7", "run_attempt": "1", "installation_id": "19", "rejected_after_revoke": True,
+                }
+                (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
+                (records / "revocation.json").write_text(json.dumps(receipt), encoding="ascii")
+                environment = {
+                    "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1",
+                    "SOURCE_READER_INSTALLATION_ID": "19",
+                }
+                self.assertEqual(linux_source_build._verified_gate_count(records, environment), expected)
+
+    def test_only_the_admission_workflow_provisions_and_passes_the_browser(self):
+        root = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+        admission = (root / "linux-source-admission.yml").read_text(encoding="utf-8")
+        quick = (root / "core-linux-quick-return.yml").read_text(encoding="utf-8")
+        self.assertEqual(admission.count('KD_BROWSER_TIER: "1"'), 2)
+        self.assertEqual(admission.count("BROWSER_ROOT: ${{ steps."), 2)
+        self.assertEqual(admission.count("REQUESTED_SOURCE_SHA,BROWSER_ROOT python3"), 2)
+        self.assertIn("BROWSER_ROOT: ${{ steps.toolchains.outputs.browser_root }}", admission)
+        self.assertIn("BROWSER_ROOT: ${{ steps.verifier-toolchain.outputs.browser_root }}", admission)
+        for forbidden in ("BROWSER_ROOT", "KD_BROWSER_TIER", "PLAYWRIGHT"):
+            self.assertNotIn(forbidden, quick)
+        for step in ("Record image and fetch pinned Rust and Node toolchains",
+                     "Record verifier image and fetch pinned toolchains"):
+            block = admission[admission.index("      - name: " + step):].split("\n      - name:", 1)[0]
+            self.assertIn('KD_BROWSER_TIER: "1"', block)
+
+    def test_the_session_environment_allows_exactly_the_two_browser_variables(self):
+        allowed = linux_source_build.linux_session.PROJECT_ENV_NAMES
+        self.assertIn("PLAYWRIGHT_BROWSERS_PATH", allowed)
+        self.assertIn("PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", allowed)
+        self.assertEqual(sorted(name for name in allowed if "PLAYWRIGHT" in name), [
+            "PLAYWRIGHT_BROWSERS_PATH", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD",
+        ])
 
 
 if __name__ == "__main__":

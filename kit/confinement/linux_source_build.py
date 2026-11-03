@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 import cargo_lock_bootstrap
@@ -44,6 +45,39 @@ PROJECT_ROOT = Path("/tmp/kd-project-worker")
 NODE_VERSION = "24.22.1"
 NPM_VERSION = "11.19.1"
 NODE_LINUX_TARBALL_SHA256 = "6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6"
+BROWSER_FLAG_ENV = "KD_BROWSER_TIER"
+BROWSER_ROOT_ENV = "BROWSER_ROOT"
+BROWSER_ROOT_NAME = "browsers"
+PLAYWRIGHT_VERSION = "1.64.1"
+BROWSER_REVISION = "1248"
+BROWSER_VERSION = "156.0.8078.4"
+BROWSER_ARCHIVE_URL = (
+    "https://storage.googleapis.com/chrome-for-testing-public/" + BROWSER_VERSION
+    + "/linux64/chrome-headless-shell-linux64.zip"
+)
+BROWSER_ARCHIVE_SHA256 = "c3e50596aef52c58f8fda3c6b3411c33d34c88b177b3ed1c2243359fd3b8ba20"
+BROWSER_ARCHIVE_MAX_BYTES = 192 * 1024 * 1024
+BROWSER_UNPACKED_MAX_BYTES = 512 * 1024 * 1024
+BROWSER_MAX_MEMBERS = 1024
+BROWSER_DIRECTORY = "chromium_headless_shell-" + BROWSER_REVISION
+BROWSER_PACKAGE_DIRECTORY = "chrome-headless-shell-linux64"
+BROWSER_EXECUTABLE = "chrome-headless-shell"
+BROWSER_MARKER = "INSTALLATION_COMPLETE"
+BROWSER_APT_PACKAGES = (
+    "fonts-liberation", "libasound2t64", "libatk-bridge2.0-0t64", "libatk1.0-0t64",
+    "libatspi2.0-0t64", "libcairo2", "libcups2t64", "libdbus-1-3", "libdrm2", "libfontconfig1",
+    "libfreetype6", "libgbm1", "libglib2.0-0t64", "libnspr4", "libnss3", "libpango-1.0-0",
+    "libx11-6", "libxcb1", "libxcomposite1", "libxdamage1", "libxext6", "libxfixes3",
+    "libxkbcommon0", "libxrandr2",
+)
+BROWSER_APT_COMMAND = (
+    "/usr/bin/sudo", "-n", "/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "/usr/bin/apt-get",
+    "-o", "Acquire::Retries=3",
+)
+BROWSER_APT_TIMEOUT_SECONDS = 900
+BROWSER_EVIDENCE_ROOT = ("docs", "reports")
+BROWSER_EVIDENCE_LIMIT = 4096
+BROWSER_EVIDENCE_NAME = "browser-evidence.json"
 SYNTHETIC_LOG_CANARY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 SOURCE_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
@@ -60,6 +94,7 @@ ENVIRONMENT_NAME = "linux-source-read"
 ENVIRONMENT_BRANCHES = ("main", "untrusted")
 GATES = gate_table.GATES
 RUNTIME_GATE_NAMES = gate_table.RUNTIME_GATE_NAMES
+BROWSER_GATE_NAMES = gate_table.BROWSER_GATE_NAMES
 RUNTIME_ROOT_FILES = gate_table.RUNTIME_ROOT_FILES
 MAX_LOCK_DIRECTORIES = 100000
 MAX_DIRECTORY_ENTRIES = 8192
@@ -1002,6 +1037,112 @@ def _extract_tar(archive_path, destination, mode):
     return root
 
 
+def _extract_browser_archive(archive_path, destination):
+    root = Path(destination).resolve()
+    os.makedirs(root, mode=0o755, exist_ok=True)
+    try:
+        archive = zipfile.ZipFile(archive_path)
+    except (OSError, zipfile.BadZipFile):
+        raise SourceBuildRefusal("toolchain") from None
+    with archive:
+        members = archive.infolist()
+        if not members or len(members) > BROWSER_MAX_MEMBERS:
+            raise SourceBuildRefusal("toolchain")
+        total = 0
+        for member in members:
+            name = member.filename
+            if not _safe_tar_member(name) or name.split("/", 1)[0] != BROWSER_PACKAGE_DIRECTORY:
+                raise SourceBuildRefusal("toolchain")
+            target = root.joinpath(*name.rstrip("/").split("/"))
+            if member.is_dir():
+                target.mkdir(mode=0o755, parents=True, exist_ok=True)
+                continue
+            mode = member.external_attr >> 16
+            if stat.S_IFMT(mode) not in (0, stat.S_IFREG):
+                raise SourceBuildRefusal("toolchain")
+            total += member.file_size
+            if total > BROWSER_UNPACKED_MAX_BYTES:
+                raise SourceBuildRefusal("toolchain")
+            target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            with archive.open(member) as stream, open(target, "xb") as sink:
+                shutil.copyfileobj(stream, sink, 1024 * 1024)
+            os.chmod(target, 0o755 if mode & stat.S_IXUSR else 0o644)
+    executable = root / BROWSER_PACKAGE_DIRECTORY / BROWSER_EXECUTABLE
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        raise SourceBuildRefusal("toolchain")
+    return root
+
+
+def _install_browser_packages():
+    environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
+    for argv, required in (
+        (BROWSER_APT_COMMAND + ("update",), False),
+        (BROWSER_APT_COMMAND + ("install", "--yes", "--no-install-recommends", "--") + BROWSER_APT_PACKAGES, True),
+    ):
+        try:
+            subprocess.run(
+                list(argv), env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=BROWSER_APT_TIMEOUT_SECONDS, check=required, close_fds=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            if required:
+                raise SourceBuildRefusal("toolchain") from None
+
+
+def _prepare_browser(root):
+    browsers = Path(root) / BROWSER_ROOT_NAME
+    browsers.mkdir(mode=0o755)
+    _install_browser_packages()
+    archive = Path(root) / "chrome-headless-shell-linux64.zip"
+    _download(BROWSER_ARCHIVE_URL, BROWSER_ARCHIVE_SHA256, str(archive), BROWSER_ARCHIVE_MAX_BYTES)
+    directory = browsers / BROWSER_DIRECTORY
+    _extract_browser_archive(str(archive), str(directory))
+    with open(directory / BROWSER_MARKER, "xb"):
+        pass
+    archive.unlink()
+    return browsers
+
+
+def _browser_installed(browser_root):
+    try:
+        if Path(browser_root) != TOOLCHAIN_ROOT / BROWSER_ROOT_NAME:
+            return False
+        executable = Path(browser_root) / BROWSER_DIRECTORY / BROWSER_PACKAGE_DIRECTORY / BROWSER_EXECUTABLE
+        marker = Path(browser_root) / BROWSER_DIRECTORY / BROWSER_MARKER
+        for path in (Path(browser_root), executable, marker):
+            if path.is_symlink():
+                return False
+        return executable.is_file() and marker.is_file() and os.access(executable, os.X_OK)
+    except OSError:
+        return False
+
+
+def _browser_evidence(worker):
+    files = 0
+    size = 0
+    entries = 0
+    root = Path(worker).joinpath(*BROWSER_EVIDENCE_ROOT)
+    if any(Path(worker).joinpath(*BROWSER_EVIDENCE_ROOT[:count]).is_symlink()
+           for count in range(1, len(BROWSER_EVIDENCE_ROOT) + 1)):
+        return 0, 0
+    for current, directories, names in os.walk(root, followlinks=False):
+        directories[:] = [name for name in directories if not os.path.islink(os.path.join(current, name))]
+        for name in names:
+            entries += 1
+            if entries > BROWSER_EVIDENCE_LIMIT:
+                return files, size
+            path = Path(current) / name
+            if name.endswith(".png") and not path.is_symlink():
+                try:
+                    details = path.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(details.st_mode):
+                    files += 1
+                    size += details.st_size
+    return files, size
+
+
 def prepare_toolchains(environ=None):
     env = os.environ if environ is None else environ
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
@@ -1050,6 +1191,7 @@ def prepare_toolchains(environ=None):
     if node_binary is None:
         raise SourceBuildRefusal("toolchain")
     npm_manifest = node_binary.parent.parent / "lib" / "node_modules" / "npm" / "package.json"
+    browser_root = _prepare_browser(root) if env.get(BROWSER_FLAG_ENV) == "1" else None
     rustc = root / "rust" / "bin" / "rustc"
     cargo = root / "rust" / "bin" / "cargo"
     try:
@@ -1075,6 +1217,8 @@ def prepare_toolchains(environ=None):
             sink.write("rust_sysroot=" + str(root / "rust") + "\n")
             sink.write("node_root=" + str(node_root) + "\n")
             sink.write("node_bin=" + str(node_binary.parent) + "\n")
+            if browser_root is not None:
+                sink.write("browser_root=" + str(browser_root) + "\n")
     sys.stdout.write(image_line + " toolchains=hash-verified\n")
     return 0
 
@@ -2574,10 +2718,10 @@ def _runtime_workspace_present(project):
     return all(present)
 
 
-def _gate_commands(project, rust_root, node_bin):
+def _gate_commands(project, rust_root, node_bin, browser=False):
     try:
         return gate_table.render(
-            gate_table.gate_templates(_runtime_workspace_present(project)),
+            gate_table.gate_templates(_runtime_workspace_present(project), browser),
             str(project), str(Path(rust_root) / "bin" / "cargo"),
             str(Path(node_bin) / "node"), str(Path(node_bin) / "npm"),
         )
@@ -2635,7 +2779,7 @@ def _gate_cause(result):
 
 def _gate_refusal_line(completed, failed, gate, cause):
     line = "linux-project-gates=refused completed=" + str(completed) + " failed=" + str(failed)
-    if gate in GATES + RUNTIME_GATE_NAMES and cause in GATE_CAUSES:
+    if gate in GATES + RUNTIME_GATE_NAMES + BROWSER_GATE_NAMES and cause in GATE_CAUSES:
         line += " gate=" + gate + " cause=" + cause
     return line + "\n"
 
@@ -2653,9 +2797,14 @@ def run_project_gates(environ=None):
     run_rust_license_gate(license_environment)
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     records.mkdir(mode=0o700, parents=True, exist_ok=True)
-    commands = _gate_commands(worker, rust_root, node_bin)
+    browser_root = env.get(BROWSER_ROOT_ENV, "")
+    browser = bool(browser_root)
+    if browser and not _browser_installed(browser_root):
+        raise SourceBuildRefusal("gate")
+    commands = _gate_commands(worker, rust_root, node_bin, browser)
     selected_gates = tuple(name for name, unused_argv in commands)
     expected_gates = GATES + (RUNTIME_GATE_NAMES if _runtime_workspace_present(worker) else ())
+    expected_gates += BROWSER_GATE_NAMES if browser else ()
     if selected_gates != expected_gates:
         raise SourceBuildRefusal("gate")
     outcomes = {name: "not-run" for name in selected_gates}
@@ -2685,6 +2834,10 @@ def run_project_gates(environ=None):
             "npm_config_update_notifier": "false",
             "PYTHONDONTWRITEBYTECODE": "1", "CI": "true",
         }
+        browser_gate = name in BROWSER_GATE_NAMES
+        if browser_gate:
+            project_env["PLAYWRIGHT_BROWSERS_PATH"] = browser_root
+            project_env["PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD"] = "1"
         nonce = os.urandom(12).hex()
         started = time.monotonic()
         try:
@@ -2693,6 +2846,7 @@ def run_project_gates(environ=None):
             result = linux_session.run_host(
                 str(env.get("RUNNER_TEMP", "/tmp")), nonce, launch, project_env, {},
                 limits=PROJECT_GATE_LIMITS, timeout=PROJECT_GATE_TIMEOUT_SECONDS, cwd=str(worker),
+                **({"loopback": True} if browser_gate else {}),
             )
         except BaseException:
             durations[name] = int((time.monotonic() - started) * 1000)
@@ -2708,6 +2862,15 @@ def run_project_gates(environ=None):
             outcomes[name] = "failed"
             failure = (name, _gate_cause(result))
             break
+    if browser and outcomes[BROWSER_GATE_NAMES[0]] != "not-run":
+        evidence_files, evidence_bytes = _browser_evidence(worker)
+        (records / BROWSER_EVIDENCE_NAME).write_text(
+            json.dumps(
+                {"schema_version": 1, "files": evidence_files, "bytes": evidence_bytes},
+                sort_keys=True, separators=(",", ":"),
+            ) + "\n",
+            encoding="ascii",
+        )
     completed_gates = [name for name in selected_gates if outcomes[name] == "passed"]
     (records / "gate-durations.json").write_text(
         json.dumps({"schema_version": 1, "durations_ms": durations}, sort_keys=True, separators=(",", ":")) + "\n",
@@ -2773,7 +2936,7 @@ def _verified_gate_count(records, env):
     if type(gates) is not dict or type(gates.get("selected_gates")) is not list:
         return 0
     selected_gates = tuple(gates["selected_gates"])
-    expected_gate_sets = (GATES, GATES + RUNTIME_GATE_NAMES)
+    expected_gate_sets = (GATES + BROWSER_GATE_NAMES, GATES + RUNTIME_GATE_NAMES + BROWSER_GATE_NAMES)
     if (set(gates) != {
                 "schema_version", "selected_gates", "completed_gates", "gates", "gate_count", "failed",
             }
@@ -2793,7 +2956,7 @@ def _verified_gate_count(records, env):
             or revoke.get("installation_id") != env.get("SOURCE_READER_INSTALLATION_ID")
             or revoke.get("rejected_after_revoke") is not True):
         return 0
-    return len(selected_gates)
+    return len(selected_gates) - len(BROWSER_GATE_NAMES)
 
 
 def _verdict_record(environ):

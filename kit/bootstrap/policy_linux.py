@@ -338,6 +338,8 @@ jobs:
         run: python3 -B kit/confinement/linux_source_build.py preflight
       - name: Record image and fetch pinned Rust and Node toolchains
         id: toolchains
+        env:
+          KD_BROWSER_TIER: "1"
         run: |
           set -euo pipefail
           if [[ "$CI_MODE" == "source" ]]; then
@@ -454,8 +456,9 @@ jobs:
           NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
           WORKER_PATH: ${{ steps.project-deps.outputs.worker_path }}
           CARGO_HOME: ${{ steps.project-deps.outputs.cargo_home }}
+          BROWSER_ROOT: ${{ steps.toolchains.outputs.browser_root }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA python3 -B kit/confinement/linux_source_build.py gates
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge confinement phase records
         if: ${{ always() && steps.selftest.outcome != 'skipped' && steps.recheck.outcome != 'skipped' }}
         run: |
@@ -531,6 +534,8 @@ jobs:
         run: python3 -B kit/confinement/linux_source_build.py preflight
       - name: Record verifier image and fetch pinned toolchains
         id: verifier-toolchain
+        env:
+          KD_BROWSER_TIER: "1"
         run: |
           set -euo pipefail
           if [[ "$CI_MODE" == "source" ]]; then
@@ -623,10 +628,11 @@ jobs:
         env:
           WORKER_PATH: ${{ steps.verifier-project.outputs.worker_path }}
           CARGO_HOME: ${{ steps.verifier-project.outputs.cargo_home }}
+          BROWSER_ROOT: ${{ steps.verifier-toolchain.outputs.browser_root }}
           RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
           NODE_BIN: ${{ steps.verifier-toolchain.outputs.node_bin }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA python3 -B kit/confinement/linux_source_build.py gates
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge independent confinement records
         if: ${{ always() && steps.verifier-selftest.outcome != 'skipped' && steps.verifier-recheck.outcome != 'skipped' }}
         run: |

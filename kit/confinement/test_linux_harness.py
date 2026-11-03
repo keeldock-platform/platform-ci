@@ -2,12 +2,14 @@ import ast
 import ctypes
 import errno
 import io
+import os
 import signal
 import socket
 import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from types import SimpleNamespace
@@ -794,6 +796,226 @@ from test_linux_channels import *
 from test_linux_fixtures import *
 from test_linux_session import *
 from test_linux_settings import *
+
+
+class LoopbackProfileTests(unittest.TestCase):
+    ARCH = AUDIT_ARCH_NATIVE
+    FLAGS = harness.SOCK_NONBLOCK | harness.SOCK_CLOEXEC
+
+    @staticmethod
+    def _evaluate(rules, architecture, number, domain=0, kind=0, protocol=0):
+        data = struct.pack("<IIQ6Q", number, architecture, 0, domain, kind, protocol, 0, 0, 0)
+        accumulator = 0
+        pc = 0
+        for _ in range(256):
+            code, yes, no, value = rules[pc]
+            if code == 0x20:
+                accumulator = struct.unpack_from("<I", data, value)[0]
+                pc += 1
+            elif code == 0x15:
+                pc += 1 + (yes if accumulator == value else no)
+            elif code == 0x45:
+                pc += 1 + (yes if accumulator & value else no)
+            elif code == 0x54:
+                accumulator &= value
+                pc += 1
+            elif code == 0x06:
+                return value
+            else:
+                raise AssertionError("unexpected-filter-instruction")
+        raise AssertionError("filter-did-not-return")
+
+    def _loopback(self, *arguments, **keywords):
+        return self._evaluate(harness.LOOPBACK_SOCKET_FILTER, *arguments, **keywords)
+
+    def _base(self, *arguments, **keywords):
+        return self._evaluate(SOCKET_FILTER, *arguments, **keywords)
+
+    def test_the_base_filter_is_unchanged_and_the_loopback_filter_adds_exactly_one_rule(self):
+        rule = harness.INET_SOCKET_RULE
+        self.assertEqual(len(rule), 11)
+        self.assertEqual(
+            SOCKET_FILTER, harness.SOCKET_FILTER_HEAD + harness.SOCKETPAIR_RULE + harness.SOCKET_FILTER_TAIL,
+        )
+        self.assertEqual(len(SOCKET_FILTER), 70)
+        self.assertEqual(len(harness.LOOPBACK_SOCKET_FILTER), 81)
+        self.assertEqual(harness.LOOPBACK_SOCKET_FILTER[:15], SOCKET_FILTER[:15])
+        self.assertEqual(harness.LOOPBACK_SOCKET_FILTER[15:26], rule)
+        self.assertEqual(harness.LOOPBACK_SOCKET_FILTER[26:], SOCKET_FILTER[15:])
+        self.assertEqual(harness.LOOPBACK_SOCKET_FILTER[-1], (0x06, 0, 0, SECCOMP_ALLOW))
+        self.assertLess(len(harness.LOOPBACK_SOCKET_FILTER), 4096)
+
+    def test_the_new_rule_jump_offsets_land_on_the_right_instructions(self):
+        rule = harness.INET_SOCKET_RULE
+        self.assertEqual(rule[0], (0x15, 0, 10, 41))
+        self.assertEqual(0 + 1 + rule[0][2], len(rule))
+        self.assertEqual(2 + 1 + rule[2][2], 9)
+        self.assertEqual(5 + 1 + rule[5][2], 9)
+        self.assertEqual(7 + 1 + rule[7][1], 10)
+        self.assertEqual(8 + 1 + rule[8][1], 10)
+        self.assertEqual(rule[9], (0x06, 0, 0, SECCOMP_DENY))
+        self.assertEqual(rule[10], (0x06, 0, 0, SECCOMP_ALLOW))
+        self.assertEqual(
+            (rule[2][3], rule[5][3], rule[7][3], rule[8][3]), (socket.AF_INET, socket.SOCK_STREAM, 0, socket.IPPROTO_TCP),
+        )
+        self.assertEqual((rule[1][3], rule[3][3], rule[6][3]), (16, 24, 32))
+        for index, (code, yes, no, value) in enumerate(harness.LOOPBACK_SOCKET_FILTER):
+            if code in (0x15, 0x45):
+                self.assertLess(index + 1 + max(yes, no), len(harness.LOOPBACK_SOCKET_FILTER))
+
+    def test_the_loopback_filter_allows_only_inet_tcp_stream_sockets(self):
+        for extra in (0, harness.SOCK_NONBLOCK, harness.SOCK_CLOEXEC, self.FLAGS):
+            for protocol in (0, socket.IPPROTO_TCP):
+                with self.subTest(extra=extra, protocol=protocol):
+                    self.assertEqual(
+                        self._loopback(self.ARCH, 41, socket.AF_INET, socket.SOCK_STREAM | extra, protocol),
+                        SECCOMP_ALLOW,
+                    )
+        self.assertEqual(
+            self._loopback(self.ARCH, 41, socket.AF_INET | (1 << 32), socket.SOCK_STREAM, 0), SECCOMP_ALLOW,
+        )
+
+    def test_the_loopback_filter_denies_every_other_socket_domain_type_and_protocol(self):
+        for domain in (0, socket.AF_UNIX, socket.AF_INET6, 16, 17, 40, 3, 0x7FFFFFFF, 0xFFFFFFFF, 2 | (1 << 32) | 1):
+            with self.subTest(domain=domain):
+                self.assertEqual(self._loopback(self.ARCH, 41, domain, socket.SOCK_STREAM, 0), SECCOMP_DENY)
+                self.assertEqual(self._loopback(self.ARCH, 41, domain, socket.SOCK_DGRAM, 0), SECCOMP_DENY)
+        for kind in (0, 2, 3, 4, 5, 6, 10, 2 | self.FLAGS, 3 | harness.SOCK_CLOEXEC, 1 | 0x100, 1 | 0x40000,
+                     0x7FFFFFFF, 0xFFFFFFFF, harness.SOCK_CLOEXEC, self.FLAGS):
+            with self.subTest(kind=kind):
+                self.assertEqual(self._loopback(self.ARCH, 41, socket.AF_INET, kind, 0), SECCOMP_DENY)
+        for protocol in (1, 2, 17, 33, 47, 58, 132, 136, 255, 262, 0x100, 0x7FFFFFFF, 0xFFFFFFFF):
+            with self.subTest(protocol=protocol):
+                self.assertEqual(
+                    self._loopback(self.ARCH, 41, socket.AF_INET, socket.SOCK_STREAM, protocol), SECCOMP_DENY,
+                )
+        for architecture in (0x40000003, 0xC00000B7, 0, 0xFFFFFFFF):
+            self.assertEqual(self._loopback(architecture, 41, socket.AF_INET, socket.SOCK_STREAM, 0), SECCOMP_DENY)
+        self.assertEqual(
+            self._loopback(self.ARCH, COMPAT_SYSCALL_BIT | 41, socket.AF_INET, socket.SOCK_STREAM, 0), SECCOMP_DENY,
+        )
+
+    def test_the_base_filter_still_denies_inet_sockets_for_every_gate_but_the_browser_gate(self):
+        for kind in (socket.SOCK_STREAM, socket.SOCK_STREAM | self.FLAGS, socket.SOCK_DGRAM):
+            for protocol in (0, socket.IPPROTO_TCP):
+                with self.subTest(kind=kind, protocol=protocol):
+                    self.assertEqual(self._base(self.ARCH, 41, socket.AF_INET, kind, protocol), SECCOMP_DENY)
+                    self.assertEqual(self._base(self.ARCH, 41, socket.AF_INET6, kind, protocol), SECCOMP_DENY)
+
+    def test_the_loopback_filter_keeps_socketpair_ring_and_mount_denials_identical(self):
+        for number in range(512):
+            if number == 41:
+                continue
+            for domain, kind in ((0, 0), (socket.AF_UNIX, 1), (socket.AF_UNIX, 5), (socket.AF_UNIX, 2),
+                                 (socket.AF_INET, 1), (socket.AF_INET6, 1)):
+                with self.subTest(number=number, domain=domain, kind=kind):
+                    self.assertEqual(
+                        self._loopback(self.ARCH, number, domain, kind), self._base(self.ARCH, number, domain, kind),
+                    )
+        for number in (101, 155, 161, 165, 166, 248, 249, 250, 272, 298, 308, 310, 311, 321, 323, 425, 426, 427,
+                       428, 429, 430, 431, 432, 433, 438, 442):
+            self.assertEqual(self._loopback(self.ARCH, number, socket.AF_INET, 1, 0), SECCOMP_DENY)
+        self.assertEqual(self._loopback(self.ARCH, 53, socket.AF_UNIX, 1), SECCOMP_ALLOW)
+        self.assertEqual(self._loopback(self.ARCH, 53, socket.AF_UNIX, 5), SECCOMP_ALLOW)
+        self.assertEqual(self._loopback(self.ARCH, 53, socket.AF_UNIX, 2), SECCOMP_DENY)
+        self.assertEqual(self._loopback(self.ARCH, 53, socket.AF_INET, 1), SECCOMP_DENY)
+
+    def test_the_child_installs_the_loopback_filter_only_when_asked(self):
+        libc = SimpleNamespace(prctl=lambda *arguments: 0)
+        with patch("linux_harness.ctypes.CDLL", return_value=libc), \
+             patch("linux_harness._install_socket_filter") as install, patch("linux_harness.os.close"):
+            _drop_child((), True, False, True)
+            install.assert_called_once_with(harness.LOOPBACK_SOCKET_FILTER)
+        with patch("linux_harness.ctypes.CDLL", return_value=libc), \
+             patch("linux_harness._install_socket_filter") as install, patch("linux_harness.os.close"):
+            _drop_child((), True, False)
+            install.assert_called_once_with()
+        with patch("linux_harness.ctypes.CDLL", return_value=libc), \
+             patch("linux_harness._install_socket_filter") as install, patch("linux_harness.os.close"):
+            _drop_child((), False, False, True)
+            install.assert_not_called()
+
+    def test_the_loopback_program_is_installed_with_exact_readback(self):
+        before = {"NoNewPrivs": ["1"], "Seccomp": ["0"], "Seccomp_filters": ["0"]}
+        after = {"NoNewPrivs": ["1"], "Seccomp": ["2"], "Seccomp_filters": ["1"]}
+        installed = []
+
+        def install(option, mode, pointer, unused1, unused2):
+            program = ctypes.cast(pointer, ctypes.POINTER(SockFprog)).contents
+            installed.append(tuple((item.code, item.jt, item.jf, item.k) for item in program.filter[:program.len]))
+            return 0
+
+        with patch("linux_harness.sys.platform", "linux"), \
+             patch("linux_harness.os.uname", return_value=SimpleNamespace(machine="x86_64")), \
+             patch("linux_harness._read_status", side_effect=[before, after]), \
+             patch("linux_harness.ctypes.CDLL", return_value=SimpleNamespace(prctl=install)):
+            _install_socket_filter(harness.LOOPBACK_SOCKET_FILTER)
+        self.assertEqual(installed, [harness.LOOPBACK_SOCKET_FILTER])
+
+    def _interface(self, flags):
+        state = {"flags": flags, "calls": []}
+
+        def ioctl(descriptor, request, argument):
+            state["calls"].append(request)
+            if request == harness.SIOCSIFFLAGS:
+                name, value = struct.unpack_from("16sH", argument)
+                self.assertEqual(name.rstrip(b"\0"), b"lo")
+                state["flags"] = value
+            return struct.pack("16sH22x", b"lo", state["flags"])
+
+        return state, ioctl
+
+    def test_loopback_is_raised_and_lowered_on_the_named_interface_only(self):
+        probe = SimpleNamespace(fileno=lambda: 5, close=lambda: None)
+        state, ioctl = self._interface(0x8)
+        with patch("linux_harness.socket.socket", return_value=probe), patch("linux_harness.fcntl.ioctl", side_effect=ioctl):
+            harness._set_loopback(True)
+            self.assertEqual(state["flags"], 0x9)
+            harness._set_loopback(False)
+            self.assertEqual(state["flags"], 0x8)
+        self.assertEqual(state["calls"].count(harness.SIOCSIFFLAGS), 2)
+        self.assertEqual(harness.SIOCSIFFLAGS, 0x8914)
+
+    def test_loopback_changes_that_do_not_take_effect_or_fail_refuse(self):
+        probe = SimpleNamespace(fileno=lambda: 5, close=lambda: None)
+        state, ioctl = self._interface(0x8)
+
+        def ignore(descriptor, request, argument):
+            if request == harness.SIOCSIFFLAGS:
+                return argument
+            return ioctl(descriptor, request, argument)
+
+        with patch("linux_harness.socket.socket", return_value=probe), patch("linux_harness.fcntl.ioctl", side_effect=ignore):
+            with self.assertRaises(ProofFailure) as raised:
+                harness._set_loopback(True)
+            self.assertEqual(raised.exception.reason, 58)
+        with patch("linux_harness.socket.socket", return_value=probe), \
+             patch("linux_harness.fcntl.ioctl", side_effect=OSError(errno.EPERM, "denied")):
+            with self.assertRaises(ProofFailure) as raised:
+                harness._set_loopback(True)
+            self.assertEqual(raised.exception.reason, 57)
+
+    def test_loopback_ipv6_is_disabled_or_absent_and_anything_else_refuses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = os.path.join(temporary, "disable_ipv6")
+            with patch.object(harness, "LOOPBACK_IPV6_SYSCTL", target):
+                harness._disable_loopback_ipv6()
+            with open(target, "rt", encoding="ascii") as source:
+                self.assertEqual(source.read(), "1")
+            with patch.object(harness, "LOOPBACK_IPV6_SYSCTL", os.path.join(temporary, "absent", "disable_ipv6")):
+                harness._disable_loopback_ipv6()
+            with patch.object(harness, "LOOPBACK_IPV6_SYSCTL", temporary):
+                with self.assertRaises(ProofFailure) as raised:
+                    harness._disable_loopback_ipv6()
+                self.assertEqual(raised.exception.reason, 57)
+            with patch.object(harness, "LOOPBACK_IPV6_SYSCTL", target), patch.object(harness, "_read_sysctl", return_value="0"):
+                with self.assertRaises(ProofFailure) as raised:
+                    harness._disable_loopback_ipv6()
+                self.assertEqual(raised.exception.reason, 57)
+
+    def test_the_loopback_failure_reasons_are_public_inner_refusal_reasons(self):
+        for reason in (57, 58):
+            self.assertIn(reason, harness.INNER_REFUSAL_REASONS)
 
 
 if __name__ == "__main__":

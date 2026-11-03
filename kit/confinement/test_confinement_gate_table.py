@@ -69,6 +69,48 @@ class GateSetTests(unittest.TestCase):
                     gate_table.gate_templates(value)
 
 
+class BrowserGateTests(unittest.TestCase):
+    def test_the_browser_gate_is_opt_in_and_outside_the_shared_gate_sets(self):
+        self.assertEqual(gate_table.BROWSER_GATE_NAMES, ("ui_kit_browser",))
+        self.assertEqual(gate_table.BROWSER_WORKSPACE, "packages/kernel-ui-kit")
+        self.assertNotIn("ui_kit_browser", gate_table.GATES + gate_table.RUNTIME_GATE_NAMES)
+        self.assertEqual(gate_table.REQUIRED_GATES, 15)
+        self.assertEqual(gate_table.MAX_GATES, 18)
+        self.assertEqual(gate_table.selected_gate_names(False), gate_table.GATES)
+        self.assertEqual(
+            gate_table.selected_gate_names(False, True), gate_table.GATES + gate_table.BROWSER_GATE_NAMES,
+        )
+        self.assertEqual(
+            gate_table.selected_gate_names(True, True),
+            gate_table.GATES + gate_table.RUNTIME_GATE_NAMES + gate_table.BROWSER_GATE_NAMES,
+        )
+        for value in (None, 1, "yes", 0):
+            with self.subTest(value=value):
+                with self.assertRaises(gate_table.GateTableRefusal):
+                    gate_table.gate_templates(False, value)
+
+    def test_the_browser_gate_runs_the_workspace_script_offline_without_lifecycle_scripts(self):
+        rendered = dict(gate_table.render(gate_table.gate_templates(False, True), *LINUX_ARGUMENTS))
+        self.assertEqual(rendered["ui_kit_browser"], (
+            "/node/bin/node", "/node/bin/npm", "--offline", "run", "test:browser",
+            "--workspace=packages/kernel-ui-kit", "--ignore-scripts",
+        ))
+        self.assertEqual(
+            tuple(name for name, unused in gate_table.gate_templates(True, True))[-1], "ui_kit_browser",
+        )
+
+    def test_neither_the_windows_emit_nor_the_shared_emit_carries_the_browser_gate(self):
+        for selection in ("base", "runtime"):
+            for arguments in (["emit", selection], ["emit", selection, "windows"]):
+                with self.subTest(arguments=arguments):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(gate_table.main(arguments), 0)
+                    names = [entry["name"] for entry in json.loads(output.getvalue())["gates"]]
+                    self.assertNotIn("ui_kit_browser", names)
+                    self.assertEqual(len(names), 15 if selection == "base" else 18)
+
+
 class RenderTests(unittest.TestCase):
     def test_linux_rendering_is_the_exact_historical_argv_with_the_feature_gates(self):
         by_name = dict(_render(True))

@@ -16,7 +16,7 @@ import linux_session as session
 from linux_channels import BoundaryRefusal
 
 
-__all__ = ["LinuxSessionPureTests", "LinuxSessionBindTargetTests", "LinuxSessionSpecTests", "LinuxSessionLaunchTests", "LinuxSeccompNumberTests"]
+__all__ = ["LinuxSessionPureTests", "LinuxSessionBindTargetTests", "LinuxSessionSpecTests", "LinuxSessionLaunchTests", "LinuxSessionLoopbackTests", "LinuxSeccompNumberTests"]
 
 NONCE = "0123456789abcdef01234567"
 MOUNTINFO = (
@@ -554,6 +554,104 @@ class LinuxSessionLaunchTests(unittest.TestCase):
         self.assertEqual(kwargs["env"], {"KD_CONTROL": "token", "A": "b"})
         self.assertNotIn("preexec_fn", kwargs)
 
+
+
+class LinuxSessionLoopbackTests(unittest.TestCase):
+    def host_spec(self, **changes):
+        return good_spec(view="host", limits="project", timeout=5, **changes)
+
+    def test_loopback_is_accepted_only_for_a_confined_host_view_project_gate(self):
+        self.assertIs(session.validate_spec(self.host_spec(loopback=True))["loopback"], True)
+        session.validate_spec(self.host_spec())
+        for value in (False, None, 1, 0, "yes", "true", [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(harness.ProofFailure) as raised:
+                    session.validate_spec(self.host_spec(loopback=value))
+                self.assertEqual(raised.exception.reason, 96)
+        for changes in ({"view": "chroot"}, {"limits": "probe"}, {"limits": "fixture"}, {"mode": "open", "view": "chroot"}):
+            with self.subTest(changes=changes):
+                spec = self.host_spec(loopback=True)
+                spec.update(changes)
+                with self.assertRaises(harness.ProofFailure) as raised:
+                    session.validate_spec(spec)
+                self.assertEqual(raised.exception.reason, 96)
+
+    def test_run_host_marks_the_spec_only_when_loopback_is_asked(self):
+        with patch("linux_session._spawn") as spawn:
+            session.run_host("/tmp", NONCE, ["/x"], {}, {}, limits="project")
+            session.run_host("/tmp", NONCE, ["/x"], {}, {}, limits="project", loopback=True)
+        self.assertNotIn("loopback", spawn.call_args_list[0].args[1])
+        self.assertIs(spawn.call_args_list[1].args[1]["loopback"], True)
+        self.assertIs(spawn.call_args_list[1].args[2], session.HOST_UNSHARE)
+        self.assertIn("--net", session.HOST_UNSHARE)
+
+    def test_the_launcher_selects_the_loopback_filter_only_for_a_marked_spec(self):
+        for changes, expected in (({}, (session.PROJECT_LIMITS, True, True)),
+                                  ({"loopback": True}, (session.PROJECT_LIMITS, True, True, True))):
+            spec = self.host_spec(**changes)
+            process = MagicMock()
+            process.pid = 4321
+            process.wait.return_value = 0
+            with self.subTest(changes=changes), \
+                 patch("linux_session.subprocess.Popen", return_value=process) as popen, \
+                 patch("linux_session.harness._wait_for_stopped_process"), \
+                 patch("linux_session.verify_dropped"), \
+                 patch("linux_session.os.kill"), patch("linux_session.os.killpg"), \
+                 patch("linux_session.os.close"), patch("linux_session.os.getpid", return_value=5):
+                session.launch_and_collect(spec, ["/x"], "/tmp", ("a", 11), ("b", 12), False)
+            preexec = popen.call_args.kwargs["preexec_fn"]
+            self.assertEqual(preexec.args, expected)
+            self.assertIs(preexec.func, harness._drop_child)
+
+    def run_inside_host(self, spec, launch_effect=None):
+        events = []
+
+        def launch(*arguments):
+            events.append("launch")
+            if launch_effect is not None:
+                raise launch_effect
+            return 0, False
+
+        patches = (
+            patch("linux_session.write_files"), patch("linux_session.os.makedirs"),
+            patch("linux_session.harness._mount"), patch("linux_session.minimal_dev"),
+            patch("linux_session.harden_host_usr"),
+            patch("linux_session.harness._write_capture", return_value=("path", 1, 2)),
+            patch("linux_session.launch_and_collect", side_effect=launch),
+            patch("linux_session.read_capture", side_effect=lambda reader: events.append("read") or b""),
+            patch("linux_session.harness._verify_netns", side_effect=lambda: events.append("verify")),
+            patch("linux_session.require_usr_readonly"),
+            patch("linux_session.harness._read_sysctl", return_value="1"),
+            patch("linux_session.harness._disable_loopback_ipv6", side_effect=lambda: events.append("ipv6")),
+            patch("linux_session.harness._set_loopback", side_effect=lambda up: events.append(("loopback", up))),
+        )
+        for item in patches:
+            item.start()
+        try:
+            error = None
+            try:
+                session.inside_host(spec)
+            except OSError as caught:
+                error = caught
+        finally:
+            for item in reversed(patches):
+                item.stop()
+        return events, error
+
+    def test_loopback_is_raised_before_the_launch_and_lowered_before_the_namespace_verification(self):
+        events, error = self.run_inside_host(self.host_spec(loopback=True))
+        self.assertIsNone(error)
+        self.assertEqual(events, ["ipv6", ("loopback", True), "launch", ("loopback", False), "read", "read", "verify"])
+
+    def test_a_host_session_without_loopback_never_touches_the_interface(self):
+        events, error = self.run_inside_host(self.host_spec())
+        self.assertIsNone(error)
+        self.assertEqual(events, ["launch", "read", "read", "verify"])
+
+    def test_loopback_is_lowered_even_when_the_launch_fails(self):
+        events, error = self.run_inside_host(self.host_spec(loopback=True), launch_effect=OSError("boom"))
+        self.assertIsInstance(error, OSError)
+        self.assertEqual(events, ["ipv6", ("loopback", True), "launch", ("loopback", False), "read", "read"])
 
 
 class LinuxSeccompNumberTests(unittest.TestCase):

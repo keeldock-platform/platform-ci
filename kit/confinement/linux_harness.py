@@ -51,6 +51,8 @@ PR_SET_NO_NEW_PRIVS = 38
 PR_CAPBSET_DROP = 24
 SIOCGIFFLAGS = 0x8913
 IFF_UP = 0x1
+SIOCSIFFLAGS = 0x8914
+LOOPBACK_IPV6_SYSCTL = "/proc/sys/net/ipv6/conf/lo/disable_ipv6"
 NETLINK_ROUTE = 0
 SOL_NETLINK = 270
 NETLINK_GET_STRICT_CHK = 12
@@ -90,6 +92,10 @@ BPF_AND_K = 0x54
 BPF_RET_K = 0x06
 SECCOMP_ARGUMENT_ZERO_OFFSET = 16
 SECCOMP_ARGUMENT_ONE_OFFSET = 24
+SECCOMP_ARGUMENT_TWO_OFFSET = 32
+SOCKET_SYSCALL = 41
+AF_INET = 2
+IPPROTO_TCP = 6
 SOCKET_SYSCALLS = (41, 425, 426, 427)
 EXTRA_DENIED_SYSCALLS = (101, 155, 161, 165, 166, 248, 249, 250, 272, 298, 308, 310, 311, 321, 323, 428, 429, 430, 431, 432, 433, 438, 442)
 DENIED_SYSCALLS = SOCKET_SYSCALLS + EXTRA_DENIED_SYSCALLS
@@ -104,17 +110,33 @@ SOCKETPAIR_RULE = (
     (BPF_RET_K, 0, 0, SECCOMP_DENY),
     (BPF_RET_K, 0, 0, SECCOMP_ALLOW),
 )
-SOCKET_FILTER = (
+INET_SOCKET_RULE = (
+    (BPF_JEQ_K, 0, 10, SOCKET_SYSCALL),
+    (BPF_LD_W_ABS, 0, 0, SECCOMP_ARGUMENT_ZERO_OFFSET),
+    (BPF_JEQ_K, 0, 6, AF_INET),
+    (BPF_LD_W_ABS, 0, 0, SECCOMP_ARGUMENT_ONE_OFFSET),
+    (BPF_AND_K, 0, 0, SOCK_FLAGS_CLEAR_MASK),
+    (BPF_JEQ_K, 0, 3, SOCK_STREAM),
+    (BPF_LD_W_ABS, 0, 0, SECCOMP_ARGUMENT_TWO_OFFSET),
+    (BPF_JEQ_K, 2, 0, 0),
+    (BPF_JEQ_K, 1, 0, IPPROTO_TCP),
+    (BPF_RET_K, 0, 0, SECCOMP_DENY),
+    (BPF_RET_K, 0, 0, SECCOMP_ALLOW),
+)
+SOCKET_FILTER_HEAD = (
     (0x20, 0, 0, 4),
     (0x15, 1, 0, AUDIT_ARCH_NATIVE),
     (0x06, 0, 0, SECCOMP_DENY),
     (0x20, 0, 0, 0),
     (0x45, 0, 1, COMPAT_SYSCALL_BIT),
     (0x06, 0, 0, SECCOMP_DENY),
-) + SOCKETPAIR_RULE + tuple(instruction for number in DENIED_SYSCALLS for instruction in (
+)
+SOCKET_FILTER_TAIL = tuple(instruction for number in DENIED_SYSCALLS for instruction in (
     (0x15, 0, 1, number),
     (0x06, 0, 0, SECCOMP_DENY),
 )) + ((0x06, 0, 0, SECCOMP_ALLOW),)
+SOCKET_FILTER = SOCKET_FILTER_HEAD + SOCKETPAIR_RULE + SOCKET_FILTER_TAIL
+LOOPBACK_SOCKET_FILTER = SOCKET_FILTER_HEAD + SOCKETPAIR_RULE + INET_SOCKET_RULE + SOCKET_FILTER_TAIL
 
 
 class SockFilter(ctypes.Structure):
@@ -192,14 +214,15 @@ def _filter_count(status):
     return int(values[0])
 
 
-def _install_socket_filter():
+def _install_socket_filter(rules=None):
     if sys.platform != "linux" or os.uname().machine != "x86_64" or ctypes.sizeof(ctypes.c_void_p) != 8:
         raise ProofFailure(88)
     before = _read_status(os.getpid())
     if before["NoNewPrivs"] != ["1"] or before["Seccomp"] not in (["0"], ["2"]):
         raise ProofFailure(88)
     expected_count = _filter_count(before) + 1
-    instructions = (SockFilter * len(SOCKET_FILTER))(*(SockFilter(*item) for item in SOCKET_FILTER))
+    rules = SOCKET_FILTER if rules is None else rules
+    instructions = (SockFilter * len(rules))(*(SockFilter(*item) for item in rules))
     program = SockFprog(len(instructions), instructions)
     libc = ctypes.CDLL(None, use_errno=True)
     if libc.prctl(PR_SET_SECCOMP, 2, ctypes.byref(program), 0, 0) != 0:
@@ -322,7 +345,7 @@ CHILD_LIMITS = (
 )
 
 
-def _drop_child(limits=None, socket_filter=True, drop_privileges=True):
+def _drop_child(limits=None, socket_filter=True, drop_privileges=True, loopback=False):
     libc = ctypes.CDLL(None, use_errno=True)
     if drop_privileges:
         for capability in range(64):
@@ -336,7 +359,10 @@ def _drop_child(limits=None, socket_filter=True, drop_privileges=True):
         os.setresgid(CHILD_GID, CHILD_GID, CHILD_GID)
         os.setresuid(CHILD_UID, CHILD_UID, CHILD_UID)
     if socket_filter:
-        _install_socket_filter()
+        if loopback:
+            _install_socket_filter(LOOPBACK_SOCKET_FILTER)
+        else:
+            _install_socket_filter()
     for key, limit in (CHILD_LIMITS if limits is None else limits):
         resource.setrlimit(key, limit)
     os.close(0)
@@ -720,6 +746,36 @@ def _set_sysctl(path, value):
             raise ProofFailure(43)
     except OSError:
         raise ProofFailure(44)
+
+
+def _disable_loopback_ipv6():
+    path = LOOPBACK_IPV6_SYSCTL
+    try:
+        with open(path, "wt", encoding="ascii") as target:
+            target.write("1")
+        value = _read_sysctl(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ProofFailure(57) from None
+    if value != "1":
+        raise ProofFailure(57)
+
+
+def _set_loopback(up):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        request = struct.pack("16sH22x", b"lo", 0)
+        flags = struct.unpack_from("16sH", fcntl.ioctl(probe.fileno(), SIOCGIFFLAGS, request))[1]
+        flags = flags | IFF_UP if up else flags & ~IFF_UP
+        fcntl.ioctl(probe.fileno(), SIOCSIFFLAGS, struct.pack("16sH22x", b"lo", flags))
+        after = struct.unpack_from("16sH", fcntl.ioctl(probe.fileno(), SIOCGIFFLAGS, request))[1]
+    except (OSError, struct.error):
+        raise ProofFailure(57) from None
+    finally:
+        probe.close()
+    if bool(after & IFF_UP) != bool(up):
+        raise ProofFailure(58)
 
 
 def _make_rootfs(rootfs):

@@ -28,6 +28,8 @@ NODE_GATE_NAMES = (
 )
 GATES = RUST_GATE_NAMES + PARSER_GATE_NAMES + NODE_GATE_NAMES
 RUNTIME_GATE_NAMES = ("runtime_format", "runtime_clippy", "runtime_tests")
+BROWSER_GATE_NAMES = ("ui_kit_browser",)
+BROWSER_WORKSPACE = "packages/kernel-ui-kit"
 RUNTIME_ROOT_FILES = ("runtime/Cargo.toml", "runtime/Cargo.lock")
 REQUIRED_GATES = len(GATES)
 MAX_GATES = REQUIRED_GATES + len(RUNTIME_GATE_NAMES)
@@ -108,17 +110,27 @@ def _runtime_table():
     )
 
 
-def gate_templates(include_runtime):
-    if type(include_runtime) is not bool:
+def _browser_table():
+    return (
+        ("ui_kit_browser", _node(
+            "--offline", "run", "test:browser", "--workspace=" + BROWSER_WORKSPACE, "--ignore-scripts",
+        )),
+    )
+
+
+def gate_templates(include_runtime, include_browser=False):
+    if type(include_runtime) is not bool or type(include_browser) is not bool:
         raise GateTableRefusal("selection")
     table = _table()
     if include_runtime:
         table = table + _runtime_table()
+    if include_browser:
+        table = table + _browser_table()
     return table
 
 
-def selected_gate_names(include_runtime):
-    return tuple(name for name, unused_argv in gate_templates(include_runtime))
+def selected_gate_names(include_runtime, include_browser=False):
+    return tuple(name for name, unused_argv in gate_templates(include_runtime, include_browser))
 
 
 def _text(value, reason):
