@@ -143,6 +143,71 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn("$gateText += ' cause=' + $script:GateCause", self.runner)
         self.assertNotRegex(self.runner, r"' cause=' \+ \[string\]\$run\.ExitCode")
 
+    def test_gate_diagnostics_are_synthetic_only_scanned_first_closed_and_never_in_source_mode(self):
+        diag = re.compile(re.search(r"DiagLinePattern = '([^']+)'", self.runner).group(1))
+        public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
+        for accepted in (
+            "windows-source-gate-diag id=format exit=0xc0000142",
+            "windows-source-gate-diag id=clippy_runtime exit=0x00000001",
+            "windows-source-gate-diag-line error: example output",
+            "windows-source-gate-diag-line ",
+            "windows-source-gate-diag-line " + "a" * 300,
+        ):
+            with self.subTest(accepted=accepted[:48]):
+                self.assertIsNotNone(diag.fullmatch(accepted))
+                self.assertIsNone(public.fullmatch(accepted))
+        for refused in (
+            "windows-source-gate-diag id=Format exit=0xc0000142",
+            "windows-source-gate-diag id=format exit=0xC0000142",
+            "windows-source-gate-diag id=format exit=0x1",
+            "windows-source-gate-diag id=format exit=0xc0000142 extra",
+            "windows-source-gate-diag-line " + "a" * 301,
+            "windows-source-gate-diag-line \x01",
+            "windows-source-gate-diag-line " + chr(233),
+            "windows-source-gate-diag-linex",
+            "windows-source-gate=1 id=format result=failed hang=none cause=signal",
+        ):
+            with self.subTest(refused=refused[:48]):
+                self.assertIsNone(diag.fullmatch(refused))
+        self.assertNotRegex(self.runner, r"Write-Line \('windows-source-gate-diag")
+        self.assertEqual(self.runner.count("$script:RunMode = "), 2)
+        self.assertIn("$script:RunMode = ''\n", self.runner)
+        self.assertIn("\n            $script:RunMode = $runMode\n", self.runner)
+        self.assertLess(self.runner.index("@('synthetic', 'source') -cnotcontains $runMode) { throw 'control' }"),
+                        self.runner.index("$script:RunMode = $runMode"))
+        for name in ("Write-SyntheticDiag", "Write-GateDiag"):
+            with self.subTest(function=name):
+                body = self.runner.split("function " + name, 1)[1].split("\n}\n", 1)[0]
+                self.assertIn("\n    if ($script:RunMode -cne 'synthetic') { return }\n", body)
+        self.assertEqual(len(re.findall(r"Write-GateDiag\b", self.runner)), 2)
+        call = "if (-not $passed -and $script:RunMode -ceq 'synthetic') { Write-GateDiag $gate.Id $run }"
+        self.assertEqual(self.runner.count(call), 1)
+        canary = self.runner.index("if ($run.Truncated -or (Test-LogCanary $combined)) {")
+        self.assertLess(self.runner.index("Write-Line ('windows-source-gate=' + $index"), canary)
+        self.assertLess(canary, self.runner.index(call))
+        self.assertLess(self.runner.index(call), self.runner.index("if (-not $boundary) {"))
+        emit = self.runner.split("function Write-GateDiag", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("' exit=0x' + ([uint32]$run.ExitCode).ToString('x8')", emit)
+        self.assertLess(emit.index("$run.Stderr) $DiagStderrLines"), emit.index("$run.Stdout) $DiagStdoutLines"))
+        for token in ("$DiagStderrLines = 40", "$DiagStdoutLines = 20", "$DiagLineLimit = 300"):
+            self.assertIn(token, self.runner)
+        clean = self.runner.split("function Get-DiagLineText", 1)[1].split("\n}\n", 1)[0]
+        for token in ("$script:Redactions", "'[^ -~]', '?'", "'kd-confinement'", "$value.Substring(0, $DiagLineLimit)"):
+            self.assertIn(token, clean)
+        self.assertNotIn("Write-Line", clean)
+        self.assertNotIn("windows-source-gate-diag", self.workflow)
+
+    def test_a_failed_gate_reported_at_cleanup_names_its_cause_only_in_synthetic_mode(self):
+        catch = self.runner.split("} catch {\n    $reason = ", 1)[1].split("$refusal = ", 1)[0]
+        self.assertIn("if ($phase -ceq 'gates' -and $script:GateFailure -gt 0) {", catch)
+        self.assertIn(
+            "} elseif ($script:RunMode -ceq 'synthetic' -and $phase -ceq 'cleanup_links' -and $script:GateFailure -gt 0) {",
+            catch,
+        )
+        self.assertEqual(catch.count("$gateText = ' gate=' + $script:GateFailure"), 2)
+        self.assertLess(catch.index("-ceq 'gates'"), catch.index("-ceq 'cleanup_links'"))
+        self.assertLess(self.runner.index("$phase = 'cleanup_links'"), self.runner.index("if ($gateOutcome.Failed -ne 0) { throw $script:RefusalReason }"))
+
     def test_key_is_destroyed_before_any_project_step_and_again_in_cleanup(self):
         order = [self.runner.index(token) for token in (
             "$phase = 'decrypt'", "$phase = 'materialize'", "$phase = 'npm_tarballs'", "$phase = 'gates'")]

@@ -37,8 +37,10 @@ $script:LogNeedles = @()
 $script:Deadline = [DateTime]::UtcNow.AddMinutes(285)
 $script:GateFailure = 0
 $script:GateCause = ''
+$script:RunMode = ''
 $script:RefusalReason = ''
 $script:PublicLinePattern = '^(windows-source|windows-confinement|capsule-decrypt|capsule-destroy)[a-z-]*=[ -~]{0,480}$'
+$script:DiagLinePattern = '^windows-source-gate-diag( id=[a-z][a-z_]{2,40} exit=0x[0-9a-f]{8}|-line [ -~]{0,300})$'
 
 $NpmVersion = '11.19.1'
 $GateTableScript = 'gate_table.py'
@@ -48,6 +50,9 @@ $MaxGateCount = 18
 $GateTableManifestCommand = 'manifest-digest'
 $GateLongSeconds = 900
 $GateShortSeconds = 300
+$DiagStderrLines = 40
+$DiagStdoutLines = 20
+$DiagLineLimit = 300
 $GateLongPattern = '(^|_)(clippy|tests|replay|prepare|typecheck)$'
 $MaxManifestEntries = 10000
 $MaxTarballs = 6000
@@ -74,6 +79,48 @@ $FrameDriverReasons = @('key_unavailable', 'input_invalid', 'capsule_invalid', '
 
 function Write-Line([string]$text) {
     if ($text -cmatch $script:PublicLinePattern) { [Console]::Out.WriteLine($text) }
+}
+
+function Write-SyntheticDiag([string]$text) {
+    if ($script:RunMode -cne 'synthetic') { return }
+    if ($text -cmatch $script:DiagLinePattern) { [Console]::Out.WriteLine($text) }
+}
+
+function Get-DiagTail([string]$text, [int]$count) {
+    $lines = @()
+    foreach ($line in (([string]$text).Replace("`r", '') -split "`n")) {
+        if ($line.Trim().Length -gt 0) { $lines += $line }
+    }
+    if ($lines.Count -gt $count) { $lines = @($lines[($lines.Count - $count)..($lines.Count - 1)]) }
+    return $lines
+}
+
+function Get-DiagLineText([string]$line) {
+    $value = [string]$line
+    foreach ($item in $script:Redactions) {
+        if (-not [string]::IsNullOrEmpty($item) -and $item.Length -gt 3) {
+            $value = [regex]::Replace($value, [regex]::Escape($item), 'ROOT', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        }
+    }
+    $value = [regex]::Replace($value, '[^ -~]', '?')
+    $value = [regex]::Replace($value, 'kd-confinement', '?', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    if ($value.Length -gt $DiagLineLimit) { $value = $value.Substring(0, $DiagLineLimit) }
+    return $value
+}
+
+function Write-GateDiag([string]$id, $run) {
+    if ($script:RunMode -cne 'synthetic') { return }
+    try {
+        Write-SyntheticDiag ('windows-source-gate-diag id=' + $id + ' exit=0x' + ([uint32]$run.ExitCode).ToString('x8'))
+        foreach ($line in @(Get-DiagTail ([string]$run.Stderr) $DiagStderrLines)) {
+            Write-SyntheticDiag ('windows-source-gate-diag-line ' + (Get-DiagLineText ([string]$line)))
+        }
+        foreach ($line in @(Get-DiagTail ([string]$run.Stdout) $DiagStdoutLines)) {
+            Write-SyntheticDiag ('windows-source-gate-diag-line ' + (Get-DiagLineText ([string]$line)))
+        }
+    } catch {
+        return
+    }
 }
 
 function Get-LibraryText {
@@ -733,6 +780,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
             $script:RefusalReason = 'log_canary'
             return $outcome
         }
+        if (-not $passed -and $script:RunMode -ceq 'synthetic') { Write-GateDiag $gate.Id $run }
         if (-not $boundary) {
             $outcome.Boundary = 'failed'
             $outcome.Failure = $index
@@ -772,6 +820,7 @@ try {
             $runMode = [string]$env:CI_MODE
             if ($env:CI_EVENT_NAME -ne 'workflow_dispatch') { throw 'control' }
             if (@('producer', 'verifier') -cnotcontains $role -or @('synthetic', 'source') -cnotcontains $runMode) { throw 'control' }
+            $script:RunMode = $runMode
             $expectedRef = 'refs/heads/main'
             if ($runMode -ceq 'source') { $expectedRef = 'refs/heads/untrusted' }
             if ($env:CI_REF -cne $expectedRef) { throw 'control' }
@@ -1131,6 +1180,9 @@ try {
     $safePhase = [regex]::Replace([string]$phase, '[^A-Za-z0-9_]', '_')
     $gateText = ''
     if ($phase -ceq 'gates' -and $script:GateFailure -gt 0) {
+        $gateText = ' gate=' + $script:GateFailure
+        if (@('timeout', 'limit', 'signal', 'exit', 'launch', 'deadline') -ccontains $script:GateCause) { $gateText += ' cause=' + $script:GateCause }
+    } elseif ($script:RunMode -ceq 'synthetic' -and $phase -ceq 'cleanup_links' -and $script:GateFailure -gt 0) {
         $gateText = ' gate=' + $script:GateFailure
         if (@('timeout', 'limit', 'signal', 'exit', 'launch', 'deadline') -ccontains $script:GateCause) { $gateText += ' cause=' + $script:GateCause }
     }
