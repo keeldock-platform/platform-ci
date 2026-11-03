@@ -48,7 +48,7 @@ $script:FinalPathText = ''
 $script:VolumeBoundary = 'denied'
 $script:NpmLinks = @()
 $script:NpmLockDigest = ''
-$script:NpmLinkLeases = @()
+$script:NpmLinkShim = $null
 
 $NpmVersion = '11.19.1'
 $GateTableScript = 'gate_table.py'
@@ -76,7 +76,10 @@ $GateTablePlatform = 'windows'
 $NpmSteppedGate = 'node_dependency_prepare'
 $MaxNpmLinks = 64
 $MaxLockBytes = 33554432
-$NpmLinkLeaseMask = 1179784
+$NpmLinkShimFile = 'windows_npm_link_shim.cjs'
+$NpmLinkShimSha256 = '1f0befd03b49a55c554f2064658545f731f9f01db64ed7ffadfb33cc6f055adb'
+$NpmLinkShimGates = @('node_dependency_audit')
+$MaxNpmLinkMapBytes = 65536
 $MountManagerRungs = @('device', 'volume', 'drive_link', 'mpm_link', 'global_dir')
 $MountManagerKinds = @{ device = 'mountmgr'; volume = 'volume'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
 $MountManagerSourceRungs = 2
@@ -984,8 +987,9 @@ function Invoke-NpmLinkProbe($sandbox, [string]$project, [string]$target) {
 
 function Invoke-NpmLinkTargetProbe($sandbox, [string]$project, [string]$node, [string[]]$environment) {
     if ($script:RunMode -cne 'synthetic') { return }
+    if ($null -eq $script:NpmLinkShim) { return }
     try {
-        $argv = [string[]]@($node, '-e', $NpmLinkTargetScript.Replace('MAXLINKS', [string]$MaxNpmLinks))
+        $argv = [string[]]@($node, '--require', [string]$script:Layout.NpmLinkShim, '-e', $NpmLinkTargetScript.Replace('MAXLINKS', [string]$MaxNpmLinks))
         $run = $sandbox.Run($true, $node, (ConvertTo-CommandLine $argv), $project, $environment, ($MountManagerProbeSeconds * 1000), [uint32]32)
         Write-ProbeDiag 'npm_link_targets' $run
     } catch {
@@ -1005,111 +1009,43 @@ function Invoke-NpmReparseProbe($sandbox, [string]$project, [string]$stage) {
     }
 }
 
-function Get-AclHex($acl) {
-    $bytes = New-Object byte[] $acl.BinaryLength
-    $acl.GetBinaryForm($bytes, 0)
-    return [Convert]::ToHexString($bytes)
-}
-
-function Read-NpmLinkAcl([string]$project, [string]$link, [string]$target) {
-    $bytes = [byte[]][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadLinkDacl($project, $link, $target)
-    $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($bytes, 0)
-    if ($null -eq $descriptor.DiscretionaryAcl) { throw 'npm_link_lease' }
-    return , $descriptor
-}
-
-function Get-NpmLinkPrior($acl) {
-    $prior = 'none'
-    foreach ($entry in $acl) {
-        if ($entry -isnot [System.Security.AccessControl.CommonAce] -or $entry.AceQualifier -ne [System.Security.AccessControl.AceQualifier]::AccessAllowed) { continue }
-        if ($entry.SecurityIdentifier.Value -cne $script:Sid -or ([int]$entry.AceFlags -band 8) -ne 0 -or ($entry.AccessMask -band 128) -eq 0) { continue }
-        if (([int]$entry.AceFlags -band 16) -ne 0) { $prior = 'inherited' } elseif ($prior -cne 'inherited') { $prior = 'explicit' }
-    }
-    return $prior
-}
-
-function Test-NpmLinkLease([string]$project, [string]$link, [string]$target, [byte[]]$original, [int]$index) {
-    try {
-        $read = Read-NpmLinkAcl $project $link $target
-        $current = $read.DiscretionaryAcl
-        $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($original, 0)
-        $before = $descriptor.DiscretionaryAcl
-        if ($null -eq $before -or $current.Count -ne ($before.Count + 1)) { return 'mismatch' }
-        if ($read.ControlFlags -ne $descriptor.ControlFlags) { return 'control_mismatch' }
-        $entry = $current[$index]
-        if ($entry -isnot [System.Security.AccessControl.CommonAce] -or $entry.AceQualifier -ne [System.Security.AccessControl.AceQualifier]::AccessAllowed -or $entry.IsCallback) { return 'mismatch' }
-        if ([int]$entry.AceFlags -ne 0 -or $entry.AccessMask -ne $NpmLinkLeaseMask -or $entry.SecurityIdentifier.Value -cne $script:Sid) { return 'mismatch' }
-        $current.RemoveAce($index)
-        if ((Get-AclHex $current) -cne (Get-AclHex $before)) { return 'mismatch' }
-        return 'match'
-    } catch {
-        return 'mismatch'
-    }
-}
-
-function Grant-NpmLinkLeases([string]$project) {
-    $priors = @()
+function Initialize-NpmLinkShim([string]$project) {
+    $shim = [string]$script:Layout.NpmLinkShim
+    $mapPath = [string]$script:Layout.NpmLinkMap
+    if ((Get-FileSha256 $shim) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }
+    if (Test-Path -LiteralPath $mapPath) { throw 'npm_link_shim' }
+    $entries = @()
     foreach ($link in @($script:NpmLinks)) {
-        try {
-            $original = [byte[]][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadLinkDacl($project, [string]$link.Link, [string]$link.Target)
-            $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($original, 0)
-            if ($null -eq $descriptor.DiscretionaryAcl) { throw 'npm_link_lease' }
-            $priors += Get-NpmLinkPrior $descriptor.DiscretionaryAcl
-            $identity = New-Object System.Security.Principal.SecurityIdentifier($script:Sid)
-            $ace = New-Object System.Security.AccessControl.CommonAce([System.Security.AccessControl.AceFlags]::None, [System.Security.AccessControl.AceQualifier]::AccessAllowed, $NpmLinkLeaseMask, $identity, $false, $null)
-            $index = 0
-            while ($index -lt $descriptor.DiscretionaryAcl.Count) {
-                $existing = $descriptor.DiscretionaryAcl[$index]
-                $explicitDeny = ($existing -is [System.Security.AccessControl.CommonAce]) -and ($existing.AceQualifier -eq [System.Security.AccessControl.AceQualifier]::AccessDenied) -and (([int]$existing.AceFlags -band 16) -eq 0)
-                if (-not $explicitDeny) { break }
-                $index += 1
-            }
-            $descriptor.DiscretionaryAcl.InsertAce($index, $ace)
-            $updated = New-Object byte[] $descriptor.BinaryLength
-            $descriptor.GetBinaryForm($updated, 0)
-            $script:NpmLinkLeases = @($script:NpmLinkLeases) + @(@{ Link = [string]$link.Link; Target = [string]$link.Target; Original = $original })
-            [KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$link.Link, [string]$link.Target, $updated)
-        } catch {
-            Write-SyntheticDiag ('windows-source-probe-line npm_link_lease ' + (Get-DiagLineText ([string]$_.Exception.Message)))
-            throw 'npm_link_lease'
+        $linkRelative = ([string]$link.Link).Replace('/', '\')
+        $targetRelative = ([string]$link.Target).Replace('/', '\')
+        $entry = [ordered]@{ link = (Join-Path $project $linkRelative); target = (Join-Path $project $targetRelative) }
+        foreach ($value in @([string]$entry.link, [string]$entry.target)) {
+            if ($value -cnotmatch '^[A-Za-z]:\\[A-Za-z0-9@._\\-]+$' -or $value -match '(^|\\)\.\.?(\\|$)' -or $value.Length -gt 1000) { throw 'npm_link_shim' }
         }
-        $readback = Test-NpmLinkLease $project ([string]$link.Link) ([string]$link.Target) $original $index
-        if ($readback -cne 'match') {
-            Write-SyntheticDiag ('windows-source-probe-line npm_link_lease readback=' + $readback)
-            throw 'npm_link_lease'
-        }
+        $entries += $entry
     }
-    $prior = 'none'
-    if ($priors.Count -gt 0) { $prior = [string]$priors[0] }
-    foreach ($item in $priors) {
-        if ([string]$item -cne $prior) { $prior = 'mixed' }
-    }
-    Write-Line ('windows-source-npm-link-lease=applied count=' + @($script:NpmLinkLeases).Count + ' readback=match prior=' + $prior)
+    if ($entries.Count -lt 1 -or $entries.Count -gt $MaxNpmLinks) { throw 'npm_link_shim' }
+    $json = ConvertTo-Json -InputObject ([ordered]@{ schema_version = 1; links = [object[]]$entries }) -Depth 4 -Compress
+    [IO.File]::WriteAllText($mapPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    [IO.File]::SetAttributes($mapPath, [IO.FileAttributes]::ReadOnly)
+    if (([IO.File]::GetAttributes($mapPath) -band [IO.FileAttributes]::ReadOnly) -eq 0) { throw 'npm_link_shim' }
+    $bytes = [byte[]][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadNoFollow($mapPath, $MaxNpmLinkMapBytes)
+    if ([Text.Encoding]::ASCII.GetString($bytes) -cne $json) { throw 'npm_link_shim' }
+    $digest = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    $script:NpmLinkShim = @{ Count = $entries.Count; Sha256 = $digest; Environment = [string[]]@(('KD_NPM_LINK_MAP=' + $mapPath), ('KD_NPM_LINK_MAP_SHA256=' + $digest)) }
+    Write-Line ('windows-source-npm-link-shim=loaded links=' + $entries.Count + ' map_sha256=' + $digest)
 }
 
-function Restore-NpmLinkLeases([string]$project) {
-    $state = 'not_applied'
-    $leases = @($script:NpmLinkLeases)
-    for ($leaseIndex = $leases.Count - 1; $leaseIndex -ge 0; $leaseIndex--) {
-        $lease = $leases[$leaseIndex]
-        $linkState = 'failed'
-        try {
-            if (-not [KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$lease.Link, [string]$lease.Target)) {
-                $openError = [KeelDock.Platform.WindowsConfinement.JunctionMaker]::OpenNoFollowError($project, [string]$lease.Link)
-                if ($openError -eq 2 -or $openError -eq 3) { $linkState = 'gone' }
-            } else {
-                [KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$lease.Link, [string]$lease.Target, [byte[]]$lease.Original)
-                $after = Read-NpmLinkAcl $project ([string]$lease.Link) ([string]$lease.Target)
-                $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor(([byte[]]$lease.Original), 0)
-                if ((Get-AclHex $after.DiscretionaryAcl) -ceq (Get-AclHex $descriptor.DiscretionaryAcl) -and $after.ControlFlags -eq $descriptor.ControlFlags) { $linkState = 'verified' }
-            }
-        } catch {
-            $linkState = 'failed'
-        }
-        if ($linkState -ceq 'failed') { $state = 'failed' }
-        elseif ($state -cne 'failed') { $state = 'verified' }
-    }
-    return $state
+function Add-NpmLinkShim([string[]]$argv) {
+    if ($null -eq $script:NpmLinkShim) { return , $argv }
+    $node = [string]$script:Layout.NodeDir + '\node.exe'
+    if ($argv.Count -lt 3 -or $argv[0] -cne $node -or $argv[1] -cne [string]$script:Layout.NpmCli) { throw 'npm_link_shim' }
+    return , ([string[]](@($argv[0], '--require', [string]$script:Layout.NpmLinkShim) + @($argv[1..($argv.Count - 1)])))
+}
+
+function Get-NpmLinkShimEnvironment([string[]]$environment) {
+    if ($null -eq $script:NpmLinkShim) { return , $environment }
+    return , ([string[]](@($environment) + @($script:NpmLinkShim.Environment)))
 }
 
 function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$environment, $first) {
@@ -1132,16 +1068,16 @@ function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$envir
     Write-Line ('windows-source-npm-links=created count=' + $created + ' verified=' + $verified)
     if ($verified -ne @($script:NpmLinks).Count) { throw 'npm_link' }
     if ($created -gt 0) { Invoke-NpmReparseProbe $sandbox $project 'before' }
-    if ($created -gt 0) { Grant-NpmLinkLeases $project }
-    if ($created -gt 0) { Invoke-NpmReparseProbe $sandbox $project 'after' }
+    if ($created -gt 0) { Initialize-NpmLinkShim $project }
+    $shimEnvironment = [string[]](Get-NpmLinkShimEnvironment $environment)
     if ($created -gt 0) { Invoke-NpmLinkProbe $sandbox $project ([string]@($script:NpmLinks)[0].Target) }
-    if ($created -gt 0) { Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $environment }
+    if ($created -gt 0) { Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $shimEnvironment }
     $remaining = (Get-RemainingSeconds) - 900
     if ($remaining -lt 60) { throw 'deadline' }
     $seconds = Get-GateSeconds $gate.Id
     if ($seconds -gt $remaining) { $seconds = $remaining }
-    $then = [string[]]$gate.Then
-    $second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $environment, ($seconds * 1000), [uint32]32)
+    $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))
+    $second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), [uint32]32)
     $merged = New-Object KeelDock.Platform.WindowsConfinement.RunResult
     foreach ($field in @('Failure', 'Detail', 'Created', 'CreateError', 'TimedOut', 'Exited', 'ExitCode', 'ElapsedMs', 'Token', 'Job', 'PeakProcessMemory', 'PeakJobMemory', 'CpuMs', 'HandleCount', 'Class46')) {
         $merged.$field = $second.$field
@@ -1302,9 +1238,15 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
             return $outcome
         }
         if ($seconds -gt $remaining) { $seconds = $remaining }
-        $exe = [string]$gate.Argv[0]
-        $commandLine = ConvertTo-CommandLine $gate.Argv
-        $run = $sandbox.Run($true, $exe, $commandLine, $project, $environment, ($seconds * 1000), [uint32]32)
+        $argv = [string[]]$gate.Argv
+        $gateEnvironment = $environment
+        if ($NpmLinkShimGates -ccontains $gate.Id) {
+            $argv = [string[]](Add-NpmLinkShim $argv)
+            $gateEnvironment = [string[]](Get-NpmLinkShimEnvironment $environment)
+        }
+        $exe = [string]$argv[0]
+        $commandLine = ConvertTo-CommandLine $argv
+        $run = $sandbox.Run($true, $exe, $commandLine, $project, $gateEnvironment, ($seconds * 1000), [uint32]32)
         if ($null -ne $gate.Then) { $run = Invoke-NpmLinkSteps $sandbox $gate $project $environment $run }
         $outcome.Count += 1
         $combined = [string]$run.Stdout + "`n" + [string]$run.Stderr
@@ -1453,6 +1395,9 @@ try {
             $layout.RustBin = Join-Path $layout.RustPrefix 'bin'
             $layout.NodeDir = Join-Path $layout.ReadOnly 'node'
             $layout.NpmCli = Join-Path $layout.NodeDir 'node_modules\npm\bin\npm-cli.js'
+            $layout.ShimDir = Join-Path $layout.ReadOnly 'shim'
+            $layout.NpmLinkShim = Join-Path $layout.ShimDir 'npm_link_shim.cjs'
+            $layout.NpmLinkMap = Join-Path $layout.ShimDir 'npm_link_map.json'
             $layout.MsvcBin = Join-Path $layout.ReadOnly 'msvc\bin'
             $layout.MsvcLib = Join-Path $layout.ReadOnly 'msvc\lib'
             $layout.SdkUcrt = Join-Path $layout.ReadOnly 'sdk\ucrt'
@@ -1494,7 +1439,7 @@ try {
                 }
             }
             New-Item -ItemType Directory -Force -Path $script:Lpac.Project | Out-Null
-            foreach ($directory in @($layout.RustPrefix, $layout.NodeDir, $layout.ProbeDir, $layout.TestDir, $layout.Tarballs)) {
+            foreach ($directory in @($layout.RustPrefix, $layout.NodeDir, $layout.ProbeDir, $layout.TestDir, $layout.Tarballs, $layout.ShimDir)) {
                 New-Item -ItemType Directory -Force -Path $directory | Out-Null
             }
             $encoding = New-Object System.Text.UTF8Encoding($false)
@@ -1548,6 +1493,11 @@ try {
             if (-not (Test-Path -LiteralPath $layout.NpmCli -PathType Leaf)) { throw 'npm_layout' }
             $npmPackage = Get-Content -LiteralPath (Join-Path $layout.NodeDir 'node_modules\npm\package.json') -Raw | ConvertFrom-Json
             if ([string]$npmPackage.version -cne $NpmVersion) { throw 'npm_version' }
+            $shimSource = Join-Path $PSScriptRoot $NpmLinkShimFile
+            if ((Get-FileSha256 $shimSource) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }
+            Copy-Item -LiteralPath $shimSource -Destination $layout.NpmLinkShim
+            [IO.File]::SetAttributes($layout.NpmLinkShim, [IO.FileAttributes]::ReadOnly)
+            if ((Get-FileSha256 $layout.NpmLinkShim) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }
 
             $phase = 'stage_msvc'
             Copy-Tree $msvcBinSource $layout.MsvcBin
@@ -1784,14 +1734,6 @@ if ($Mode -eq 'run' -and $libraryLoaded) {
     }
     if ($mountRestore -eq 'failed') { $cleanup = 'incomplete' }
 
-    $linkRestore = 'not_applied'
-    try {
-        if (@($script:NpmLinkLeases).Count -gt 0) { $linkRestore = Restore-NpmLinkLeases ([string]$script:Lpac.Project) }
-    } catch {
-        $linkRestore = 'failed'
-    }
-    if ($linkRestore -eq 'failed') { $cleanup = 'incomplete' }
-
     $processState = 'none'
     try {
         $processState = Get-JobLiveness @($box, $script:OtherBox) 10
@@ -1892,14 +1834,14 @@ if ($Mode -eq 'run' -and $libraryLoaded) {
 
     $profileText = 'deleted'
     if (@('deleted_by_api', 'removed_manually') -cnotcontains $profileState) { $profileText = $profileState }
-    $cleanupLine = 'windows-source-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' mountmgr_restore=' + $mountRestore + ' key=' + $keyCleanup + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' npm_link_restore=' + $linkRestore + ' processes=' + $processState + ' liveness=job'
+    $cleanupLine = 'windows-source-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' mountmgr_restore=' + $mountRestore + ' key=' + $keyCleanup + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' processes=' + $processState + ' liveness=job'
     if ($refusal) {
         Write-Line $refusal
         Write-Line $cleanupLine
         exit 1
     }
     Write-Line $cleanupLine
-    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or @('verified', 'not_applied') -cnotcontains $mountRestore -or @('verified', 'not_applied') -cnotcontains $linkRestore -or $keyCleanup -ne 'destroyed' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }
+    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or @('verified', 'not_applied') -cnotcontains $mountRestore -or $keyCleanup -ne 'destroyed' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }
     exit $exitCode
 }
 

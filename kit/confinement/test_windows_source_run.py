@@ -1,3 +1,4 @@
+import hashlib
 import re
 import sys
 import unittest
@@ -7,12 +8,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "kit/bootstrap"))
 
-from public_tree import ACTION_VERSION_COMMENT_PATTERN, MAX_FILE_BYTES, inspect_text
+from public_tree import ACTION_VERSION_COMMENT_PATTERN, MAX_FILE_BYTES, PINNED_FILE_SHA256, PLATFORM_FILES, inspect_text
 
 RUNNER = ROOT / "kit/confinement/windows_source_run.ps1"
 FRAME = ROOT / "kit/confinement/capsule_frame.ps1"
 LIBRARY = ROOT / "kit/confinement/windows_confinement.ps1"
 WORKFLOW = ROOT / ".github/workflows/lane-h-windows-receiver.yml"
+SHIM = ROOT / "kit/confinement/windows_npm_link_shim.cjs"
 
 
 class WindowsSourceRunTests(unittest.TestCase):
@@ -31,7 +33,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         return re.findall(r"'([^']+)'", found.group(1))
 
     def test_files_pass_the_public_tree_rules(self):
-        for path in (RUNNER, FRAME, WORKFLOW, Path(__file__)):
+        for path in (RUNNER, FRAME, WORKFLOW, SHIM, Path(__file__)):
             with self.subTest(path=path.name):
                 payload = path.read_bytes()
                 self.assertLessEqual(len(payload), MAX_FILE_BYTES)
@@ -78,7 +80,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIsNotNone(gate_line)
 
     def test_gates_run_confined_with_a_boundary_proof_and_the_hang_guard(self):
-        self.assertIn("$sandbox.Run($true, $exe, $commandLine, $project, $environment", self.runner)
+        self.assertIn("$sandbox.Run($true, $exe, $commandLine, $project, $gateEnvironment", self.runner)
         self.assertIn("[uint32]$run.HandleCount -ne 3", self.runner)
         self.assertIn("Test-LpacTokenText $tokenText", self.runner)
         self.assertIn("([uint64]$run.CpuMs * 10) -ge ([uint64]$run.ElapsedMs * 8)", self.runner)
@@ -646,7 +648,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         for name in sorted(used):
             with self.subTest(layout=name):
                 self.assertEqual(self.layout_root(name), "ReadOnly")
-        for name in ("RustPrefix", "NpmCli", "Tarballs", "ProbeDir", "ProbeExe", "TestDir", "NodeTest"):
+        for name in ("RustPrefix", "NpmCli", "Tarballs", "ProbeDir", "ProbeExe", "TestDir", "NodeTest", "ShimDir", "NpmLinkShim", "NpmLinkMap"):
             with self.subTest(layout=name):
                 self.assertEqual(self.layout_root(name), "ReadOnly")
         for name in ("Downloads", "Private", "Base"):
@@ -836,7 +838,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-confinement-mountmgr-rung=device state=applied error=0 readback=match finalpath=ok",
             "windows-confinement-mountmgr-rung=global_dir state=failed error=5 readback=na finalpath=na",
             "windows-source-npm-links=created count=1 verified=1",
-            "windows-source-npm-link-lease=applied count=2 readback=match prior=inherited",
+            "windows-source-npm-link-shim=loaded links=2 map_sha256=" + "0" * 64,
             "windows-source-npm-reify=verified hidden_lock=present",
         ):
             with self.subTest(line=line[:60]):
@@ -929,12 +931,13 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(script.count("MAXLINKS"), 1)
         self.assertNotIn("console", script)
         probe = self.function_body("Invoke-NpmLinkTargetProbe")
-        self.assertTrue(probe.split("\n", 1)[1].startswith("    if ($script:RunMode -cne 'synthetic') { return }\n"))
-        self.assertIn("$argv = [string[]]@($node, '-e', $NpmLinkTargetScript.Replace('MAXLINKS', [string]$MaxNpmLinks))", probe)
-        self.assertIn("$argv = [string[]]@($node, '-e', $NpmLinkTargetScript.Replace('MAXLINKS', [string]$MaxNpmLinks))", probe)
+        self.assertTrue(probe.split("\n", 1)[1].startswith(
+            "    if ($script:RunMode -cne 'synthetic') { return }\n    if ($null -eq $script:NpmLinkShim) { return }\n"))
+        self.assertIn("$argv = [string[]]@($node, '--require', [string]$script:Layout.NpmLinkShim, '-e', $NpmLinkTargetScript.Replace('MAXLINKS', [string]$MaxNpmLinks))", probe)
+        self.assertNotIn("$argv = [string[]]@($node, '-e',", probe)
         self.assertNotIn("Write-Line", probe)
         steps = self.function_body("Invoke-NpmLinkSteps")
-        call = "    if ($created -gt 0) { Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $environment }\n"
+        call = "    if ($created -gt 0) { Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $shimEnvironment }\n"
         self.assertIn("Invoke-NpmLinkProbe $sandbox $project ([string]@($script:NpmLinks)[0].Target) }\n" + call, steps)
         self.assertLess(steps.index(call), steps.index("$second = $sandbox.Run("))
         diag = re.compile(re.search(r"DiagLinePattern = '([^']+)'", self.runner).group(1))
@@ -965,90 +968,218 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(self.runner.count(".Restore()"), 2)
 
-    def test_the_npm_link_lease_grants_read_attributes_only_on_each_junction_reads_back_and_restores_in_reverse(self):
-        self.assertIn("\n$NpmLinkLeaseMask = 1179784\n", self.runner)
-        self.assertEqual(1179784, 0x00100000 | 0x00020000 | 0x80 | 0x8)
-        self.assertEqual(1179784 & (0x2 | 0x4 | 0x10 | 0x100 | 0x40 | 0x10000 | 0x40000 | 0x80000), 0)
-        self.assertIn("\n$script:NpmLinkLeases = @()\n", self.runner)
-        grant = self.function_body("Grant-NpmLinkLeases")
-        order = (
-            "[KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadLinkDacl($project, [string]$link.Link, [string]$link.Target)",
-            "$priors += Get-NpmLinkPrior $descriptor.DiscretionaryAcl",
-            "CommonAce([System.Security.AccessControl.AceFlags]::None, [System.Security.AccessControl.AceQualifier]::AccessAllowed, $NpmLinkLeaseMask, $identity, $false, $null)",
-            "$descriptor.DiscretionaryAcl.InsertAce($index, $ace)",
-            "$script:NpmLinkLeases = @($script:NpmLinkLeases) + @(@{ Link = [string]$link.Link; Target = [string]$link.Target; Original = $original })",
-            "[KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$link.Link, [string]$link.Target, $updated)",
-            "Write-SyntheticDiag ('windows-source-probe-line npm_link_lease ' + (Get-DiagLineText ([string]$_.Exception.Message)))",
-            "$readback = Test-NpmLinkLease $project ([string]$link.Link) ([string]$link.Target) $original $index\n        if ($readback -cne 'match') {\n            Write-SyntheticDiag ('windows-source-probe-line npm_link_lease readback=' + $readback)\n            throw 'npm_link_lease'\n        }",
-            "Write-Line ('windows-source-npm-link-lease=applied count=' + @($script:NpmLinkLeases).Count + ' readback=match prior=' + $prior)",
-        )
-        positions = [grant.index(item) for item in order]
-        self.assertEqual(positions, sorted(positions))
-        self.assertEqual(grant.count("Write-Line"), 1)
-        self.assertEqual(grant.count("throw 'npm_link_lease'"), 3)
-        self.assertIn("(([int]$existing.AceFlags -band 16) -eq 0)", grant)
-        self.assertNotIn("RunMode", grant)
-        test = self.function_body("Test-NpmLinkLease")
-        for token in (
-            "$read = Read-NpmLinkAcl $project $link $target\n        $current = $read.DiscretionaryAcl",
-            "if ($null -eq $before -or $current.Count -ne ($before.Count + 1)) { return 'mismatch' }\n        if ($read.ControlFlags -ne $descriptor.ControlFlags) { return 'control_mismatch' }",
-            "$entry.AceQualifier -ne [System.Security.AccessControl.AceQualifier]::AccessAllowed -or $entry.IsCallback) { return 'mismatch' }",
-            "if ([int]$entry.AceFlags -ne 0 -or $entry.AccessMask -ne $NpmLinkLeaseMask -or $entry.SecurityIdentifier.Value -cne $script:Sid) { return 'mismatch' }",
-            "$current.RemoveAce($index)",
-            "if ((Get-AclHex $current) -cne (Get-AclHex $before)) { return 'mismatch' }",
-        ):
-            with self.subTest(token=token[:60]):
-                self.assertIn(token, test)
-        self.assertEqual(test.count("return 'match'"), 1)
-        self.assertTrue(self.function_body("Read-NpmLinkAcl").endswith("\n    return , $descriptor"))
-        self.assertEqual(set(re.findall(r"return '([a-z_]+)'", test)), {"match", "mismatch", "control_mismatch"})
-        self.assertLess(test.index("return 'control_mismatch'"), test.index("$current.RemoveAce($index)"))
-        prior = self.function_body("Get-NpmLinkPrior")
-        self.assertIn("([int]$entry.AceFlags -band 8) -ne 0 -or ($entry.AccessMask -band 128) -eq 0) { continue }", prior)
-        self.assertEqual(set(re.findall(r"\$prior = '([a-z]+)'", prior)), {"none", "inherited", "explicit"})
-        restore = self.function_body("Restore-NpmLinkLeases")
-        for token in (
-            "for ($leaseIndex = $leases.Count - 1; $leaseIndex -ge 0; $leaseIndex--) {",
-            "if (-not [KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$lease.Link, [string]$lease.Target)) {",
-            "[KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$lease.Link, [string]$lease.Target, [byte[]]$lease.Original)",
-            "$openError = [KeelDock.Platform.WindowsConfinement.JunctionMaker]::OpenNoFollowError($project, [string]$lease.Link)\n                if ($openError -eq 2 -or $openError -eq 3) { $linkState = 'gone' }\n            } else {",
-            "if ((Get-AclHex $after.DiscretionaryAcl) -ceq (Get-AclHex $descriptor.DiscretionaryAcl) -and $after.ControlFlags -eq $descriptor.ControlFlags) { $linkState = 'verified' }",
-            "if ($linkState -ceq 'failed') { $state = 'failed' }",
-        ):
-            with self.subTest(token=token[:60]):
-                self.assertIn(token, restore)
-        self.assertEqual(restore.count("$linkState = 'gone'"), 1)
-        self.assertEqual(restore.count("$linkState = 'verified'"), 1)
-        self.assertEqual(restore.count("$linkState = 'failed'"), 2)
-        self.assertLess(restore.index("        $linkState = 'failed'\n        try {"), restore.index("OpenNoFollowError("))
-        self.assertNotIn("elseif ($linkState", restore)
+    def test_the_junction_acl_lease_is_removed_with_its_cleanup_token(self):
+        for token in ("NpmLinkLease", "Grant-NpmLinkLeases", "Restore-NpmLinkLeases", "Test-NpmLinkLease", "Read-NpmLinkAcl",
+                      "Get-NpmLinkPrior", "Get-AclHex", "ReadLinkDacl", "WriteLinkDacl", "OpenNoFollowError", "npm_link_lease",
+                      "npm-link-lease", "npm_link_restore", "$linkRestore", "'after'"):
+            with self.subTest(token=token):
+                self.assertNotIn(token, self.runner)
+        native = (ROOT / "kit/confinement/windows_confinement.cs").read_text(encoding="utf-8")
+        self.assertNotIn("npm_link_lease", native)
+        native = native[native.index("public static class JunctionMaker"):]
+        for token in ("ReadLinkDacl", "WriteLinkDacl", "OpenNoFollowError", "GetKernelObjectSecurity", "SetKernelObjectSecurity",
+                      "WriteDac", "ReadControl", "DaclSecurityInformation", "MaxDescriptorBytes"):
+            with self.subTest(native=token):
+                self.assertNotIn(token, native)
         tail = self.runner[self.runner.index("$nullRestore = 'not_applied'"):]
-        call = "        if (@($script:NpmLinkLeases).Count -gt 0) { $linkRestore = Restore-NpmLinkLeases ([string]$script:Lpac.Project) }\n"
-        self.assertIn(call, tail)
-        self.assertIn("    if ($linkRestore -eq 'failed') { $cleanup = 'incomplete' }\n", tail)
-        order = ("$leases[$leaseIndex].Restore()", call, "Get-JobLiveness", "Remove-WithinRoots $baseDirectory",
-                 "' links=' + $linksState + ' npm_link_restore=' + $linkRestore + ' processes=' + $processState")
-        positions = [tail.index(item) for item in order]
-        self.assertEqual(positions, sorted(positions))
-        self.assertIn("-or @('verified', 'not_applied') -cnotcontains $linkRestore -or", tail)
-        self.assertEqual(self.runner.count("Restore-NpmLinkLeases"), 2)
-        self.assertEqual(self.runner.count("Grant-NpmLinkLeases"), 2)
+        self.assertIn("' temp_dir=' + $tempState + ' links=' + $linksState + ' processes=' + $processState + ' liveness=job'", tail)
+        self.assertIn("-cnotcontains $mountRestore -or $keyCleanup -ne 'destroyed' -or", tail)
 
-    def test_the_reparse_probe_runs_confined_on_the_first_junction_before_and_after_the_lease(self):
+    def test_the_npm_link_shim_is_staged_read_only_from_the_pinned_file(self):
+        self.assertIn("\n$NpmLinkShimFile = 'windows_npm_link_shim.cjs'\n", self.runner)
+        pinned = re.search(r"^\$NpmLinkShimSha256 = '([0-9a-f]{64})'$", self.runner, re.M).group(1)
+        self.assertEqual(hashlib.sha256(SHIM.read_bytes()).hexdigest(), pinned)
+        self.assertEqual(PINNED_FILE_SHA256["kit/confinement/windows_npm_link_shim.cjs"], pinned)
+        self.assertIn("kit/confinement/windows_npm_link_shim.cjs", PLATFORM_FILES)
+        self.assertIn("\n$NpmLinkShimGates = @('node_dependency_audit')\n", self.runner)
+        self.assertIn("\n$MaxNpmLinkMapBytes = 65536\n", self.runner)
+        self.assertIn("\n$script:NpmLockDigest = ''\n$script:NpmLinkShim = $null\n", self.runner)
+        for token in (
+            "$layout.ShimDir = Join-Path $layout.ReadOnly 'shim'\n",
+            "$layout.NpmLinkShim = Join-Path $layout.ShimDir 'npm_link_shim.cjs'\n",
+            "$layout.NpmLinkMap = Join-Path $layout.ShimDir 'npm_link_map.json'\n",
+            "foreach ($directory in @($layout.RustPrefix, $layout.NodeDir, $layout.ProbeDir, $layout.TestDir, $layout.Tarballs, $layout.ShimDir)) {\n",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertEqual(self.runner.count(token), 1)
+        stage = (
+            "            if ([string]$npmPackage.version -cne $NpmVersion) { throw 'npm_version' }\n"
+            "            $shimSource = Join-Path $PSScriptRoot $NpmLinkShimFile\n"
+            "            if ((Get-FileSha256 $shimSource) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }\n"
+            "            Copy-Item -LiteralPath $shimSource -Destination $layout.NpmLinkShim\n"
+            "            [IO.File]::SetAttributes($layout.NpmLinkShim, [IO.FileAttributes]::ReadOnly)\n"
+            "            if ((Get-FileSha256 $layout.NpmLinkShim) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }\n"
+            "\n            $phase = 'stage_msvc'\n"
+        )
+        self.assertEqual(self.runner.count(stage), 1)
+        self.assertLess(self.runner.index(stage), self.runner.index("$phase = 'gates'\n"))
+
+    def test_the_npm_link_map_is_written_read_only_from_the_verified_plan_and_announced_without_paths(self):
+        body = self.function_body("Initialize-NpmLinkShim")
+        order = (
+            "    $shim = [string]$script:Layout.NpmLinkShim\n    $mapPath = [string]$script:Layout.NpmLinkMap\n",
+            "if ((Get-FileSha256 $shim) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }",
+            "if (Test-Path -LiteralPath $mapPath) { throw 'npm_link_shim' }",
+            "foreach ($link in @($script:NpmLinks)) {",
+            "$linkRelative = ([string]$link.Link).Replace('/', '\\')",
+            "$targetRelative = ([string]$link.Target).Replace('/', '\\')",
+            "$entry = [ordered]@{ link = (Join-Path $project $linkRelative); target = (Join-Path $project $targetRelative) }",
+            r"if ($value -cnotmatch '^[A-Za-z]:\\[A-Za-z0-9@._\\-]+$' -or $value -match '(^|\\)\.\.?(\\|$)' -or $value.Length -gt 1000) { throw 'npm_link_shim' }",
+            "if ($entries.Count -lt 1 -or $entries.Count -gt $MaxNpmLinks) { throw 'npm_link_shim' }",
+            "$json = ConvertTo-Json -InputObject ([ordered]@{ schema_version = 1; links = [object[]]$entries }) -Depth 4 -Compress",
+            "[IO.File]::WriteAllText($mapPath, $json, (New-Object System.Text.UTF8Encoding($false)))",
+            "[IO.File]::SetAttributes($mapPath, [IO.FileAttributes]::ReadOnly)",
+            "if (([IO.File]::GetAttributes($mapPath) -band [IO.FileAttributes]::ReadOnly) -eq 0) { throw 'npm_link_shim' }",
+            "$bytes = [byte[]][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadNoFollow($mapPath, $MaxNpmLinkMapBytes)",
+            "if ([Text.Encoding]::ASCII.GetString($bytes) -cne $json) { throw 'npm_link_shim' }",
+            "$digest = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()",
+            "$script:NpmLinkShim = @{ Count = $entries.Count; Sha256 = $digest; Environment = [string[]]@(('KD_NPM_LINK_MAP=' + $mapPath), ('KD_NPM_LINK_MAP_SHA256=' + $digest)) }",
+            "Write-Line ('windows-source-npm-link-shim=loaded links=' + $entries.Count + ' map_sha256=' + $digest)",
+        )
+        positions = [body.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(body.count("throw 'npm_link_shim'"), 6)
+        self.assertEqual(body.count("Write-Line"), 1)
+        self.assertNotIn("RunMode", body)
+        self.assertEqual(self.runner.count("KD_NPM_LINK_MAP"), 2)
+        self.assertEqual(self.runner.count("Initialize-NpmLinkShim"), 2)
+        public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
+        self.assertIsNotNone(public.fullmatch("windows-source-npm-link-shim=loaded links=2 map_sha256=" + "a" * 64))
+        add = self.function_body("Add-NpmLinkShim")
+        for token in (
+            "    if ($null -eq $script:NpmLinkShim) { return , $argv }\n",
+            "    $node = [string]$script:Layout.NodeDir + '\\node.exe'\n",
+            "    if ($argv.Count -lt 3 -or $argv[0] -cne $node -or $argv[1] -cne [string]$script:Layout.NpmCli) { throw 'npm_link_shim' }\n",
+            "    return , ([string[]](@($argv[0], '--require', [string]$script:Layout.NpmLinkShim) + @($argv[1..($argv.Count - 1)])))",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, add)
+        environment = self.function_body("Get-NpmLinkShimEnvironment")
+        self.assertIn("    if ($null -eq $script:NpmLinkShim) { return , $environment }\n", environment)
+        self.assertIn("    return , ([string[]](@($environment) + @($script:NpmLinkShim.Environment)))", environment)
+        self.assertEqual(self.runner.count("Add-NpmLinkShim"), 3)
+        self.assertEqual(self.runner.count("Get-NpmLinkShimEnvironment"), 3)
+        self.assertEqual(self.runner.count("'--require'"), 2)
+        self.assertIn("    if ($script:RunMode -cne 'synthetic') { return }\n    if ($null -eq $script:NpmLinkShim) { return }\n",
+                      self.function_body("Invoke-NpmLinkTargetProbe"))
+
+    def test_the_npm_link_shim_preload_reads_only_its_hashed_map_and_never_writes_spawns_or_connects(self):
+        shim = SHIM.read_text(encoding="ascii")
+        self.assertEqual(re.findall(r"require\('([a-z:]+)'\)", shim), ["node:fs", "node:path", "node:crypto"])
+        self.assertEqual(shim.count("require("), 3)
+        for forbidden in ("writeFile", "appendFile", "WriteStream", "writeSync", "child_process", "spawn", "exec", "fork",
+                          "node:net", "node:http", "node:https", "node:dgram", "node:tls", "node:dns", "fetch", "WebSocket",
+                          "Worker", "symlink", "unlink", "rmSync", "rmdir", "mkdir", "rename", "chmod", "chown", "utimes",
+                          "openSync", "fs.open", "copyFile", "cpSync", "truncate", "process.binding", "eval(", "Function(",
+                          "import(", "console", "process.stdout", "process.stderr", "process.exit", "setTimeout",
+                          "setInterval", "module.exports", "globalThis"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, shim)
+        self.assertEqual(set(re.findall(r"\bfs\.([A-Za-z]+)", shim)),
+                         {"readFileSync", "constants", "promises", "Stats", "lstat", "lstatSync", "readlink", "readlinkSync"})
+        self.assertEqual(shim.count("readFileSync"), 1)
+        self.assertEqual(set(re.findall(r"\bpromises\.([A-Za-z]+)", shim)), {"lstat", "readlink"})
+        self.assertIn("const MAP_VARIABLE = 'KD_NPM_LINK_MAP';\nconst HASH_VARIABLE = 'KD_NPM_LINK_MAP_SHA256';\n", shim)
+        self.assertIn("const refuse = (reason) => {\n  throw new Error('npm_link_shim refused ' + reason);\n};\n", shim)
+        self.assertLess(shim.index("const links = loadMap();"), shim.index("\nfs.lstat = "))
+
+    def test_the_npm_link_shim_refuses_a_missing_mismatched_or_malformed_map_before_wrapping(self):
+        shim = SHIM.read_text(encoding="ascii")
+        load = shim[shim.index("const loadMap = "):shim.index("const links = loadMap();")]
+        order = (
+            "  const mapPath = process.env[MAP_VARIABLE];\n  const expected = process.env[HASH_VARIABLE];\n"
+            "  delete process.env[MAP_VARIABLE];\n  delete process.env[HASH_VARIABLE];\n",
+            "|| !PRINTABLE.test(mapPath) || !path.isAbsolute(mapPath)) refuse('map_path');",
+            "if (typeof expected !== 'string' || !HEX.test(expected)) refuse('map_hash');",
+            "const payload = fs.readFileSync(mapPath);",
+            "if (payload.length < 2 || payload.length > MAX_MAP_BYTES) refuse('map_size');",
+            "const actual = crypto.createHash('sha256').update(payload).digest('hex');",
+            "if (actual !== expected) refuse('map_hash');",
+            "if (!PRINTABLE.test(text)) refuse('map_text');",
+            "map = JSON.parse(text);",
+            "refuse('map_json');",
+            "if (!plainObject(map) || !keysAre(map, 'links,schema_version') || map.schema_version !== 1",
+            "|| !Array.isArray(map.links)) refuse('map_shape');",
+            "if (map.links.length < 1 || map.links.length > MAX_LINKS) refuse('map_count');",
+            "if (!plainObject(entry) || !keysAre(entry, 'link,target')) refuse('map_entry');",
+            "if (!windowsPath(entry.link) || !windowsPath(entry.target) || !LINK_TAIL.test(entry.link)) refuse('map_path');",
+            "if (project.length < 3 || !target.startsWith(project + '\\\\') || target.includes(MODULES)",
+            "|| target.endsWith('\\\\node_modules') || links.has(key)) refuse('map_entry');",
+            "links.set(key, entry.target);",
+            "  return links;\n",
+        )
+        positions = [load.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(len(re.findall(r"refuse\('([a-z_]+)'\)", load)), 11)
+        self.assertEqual(sorted(set(re.findall(r"refuse\('([a-z_]+)'\)", load))),
+                         ["map_count", "map_entry", "map_hash", "map_json", "map_path", "map_shape", "map_size", "map_text"])
+        self.assertIn("const MAX_MAP_BYTES = 65536;\nconst MAX_LINKS = 64;\n", shim)
+        self.assertIn(r"if (!/^[A-Za-z]:\\/.test(value)) return false;", shim)
+        self.assertIn("if (!SEGMENT.test(segment) || DOTS.test(segment)) return false;", shim)
+        self.assertIn("return path.win32.normalize(value) === value;", shim)
+        self.assertIn(r"const LINK_TAIL = /\\node_modules\\(?:@[a-z0-9][a-z0-9._-]{0,99}\\)?[a-z0-9][a-z0-9._-]{0,99}$/;", shim)
+        self.assertIn("&& Object.getPrototypeOf(value) === Object.prototype;", shim)
+        guard = "for (const item of [realLstat, realLstatSync, realReadlink, realReadlinkSync, realPromiseLstat, realPromiseReadlink]) {\n  if (typeof item !== 'function') refuse('fs_shape');\n}\n"
+        self.assertIn(guard, shim)
+        self.assertLess(shim.index(guard), shim.index("\nfs.lstat = "))
+
+    def test_the_npm_link_shim_wraps_exactly_six_functions_and_passes_every_unlisted_path_through(self):
+        shim = SHIM.read_text(encoding="ascii")
+        assigned = re.findall(r"^((?:fs|promises)\.[A-Za-z]+) = (?:async )?function ([A-Za-z]+)\(", shim, re.M)
+        self.assertEqual(assigned, [
+            ("fs.lstat", "lstat"), ("fs.lstatSync", "lstatSync"), ("promises.lstat", "lstat"),
+            ("fs.readlink", "readlink"), ("fs.readlinkSync", "readlinkSync"), ("promises.readlink", "readlink")])
+        self.assertEqual(len(re.findall(r"^(?:fs|promises)\.[A-Za-z]+ = ", shim, re.M)), 6)
+        bodies = re.split(r"\n(?=(?:fs|promises)\.[A-Za-z]+ = )", shim)[1:]
+        self.assertEqual(len(bodies), 6)
+        passes = (
+            ("realLstat", "  if (target === undefined || typeof done !== 'function' || bigintRequested(options)) {\n    return Reflect.apply(realLstat, this, arguments);\n  }\n  process.nextTick(done, null, linkStats(target));\n"),
+            ("realLstatSync", "  if (target === undefined || bigintRequested(options)) return Reflect.apply(realLstatSync, this, arguments);\n  return linkStats(target);\n"),
+            ("realPromiseLstat", "  if (target === undefined || bigintRequested(options)) return Reflect.apply(realPromiseLstat, this, arguments);\n  return linkStats(target);\n"),
+            ("realReadlink", "  if (value === undefined || typeof done !== 'function') return Reflect.apply(realReadlink, this, arguments);\n  process.nextTick(done, null, value);\n"),
+            ("realReadlinkSync", "  if (value === undefined) return Reflect.apply(realReadlinkSync, this, arguments);\n  return value;\n"),
+            ("realPromiseReadlink", "  if (value === undefined) return Reflect.apply(realPromiseReadlink, this, arguments);\n  return value;\n"),
+        )
+        for body, (real, tail) in zip(bodies, passes):
+            with self.subTest(real=real):
+                self.assertTrue(body.split("\n", 2)[1] == "  const target = lookup(candidate);")
+                self.assertIn(tail, body)
+                self.assertEqual(body.count("Reflect.apply("), 1)
+                self.assertEqual(body.count("Reflect.apply(" + real + ", this, arguments)"), 1)
+        lookup = shim[shim.index("const lookup = "):shim.index("const bigintRequested = ")]
+        self.assertIn("  if (typeof candidate !== 'string' || candidate.length < 4 || candidate.length > MAX_PATH_LENGTH) return undefined;\n", lookup)
+        self.assertIn("  return links.get(path.win32.resolve(candidate).toLowerCase());\n", lookup)
+        self.assertIn("const key = entry.link.toLowerCase();", shim)
+        self.assertIn("const LINK_MODE = (typeof constants.S_IFLNK === 'number' ? constants.S_IFLNK : 0o120000) | 0o666;\n", shim)
+        self.assertEqual(0o120000, 0xA000)
+        stats = shim[shim.index("const linkStats = "):shim.index("const linkValue = ")]
+        for token in (
+            "const stats = Object.create(STATS_PROTOTYPE);",
+            "mode: LINK_MODE, nlink: 1,",
+            "size: Buffer.byteLength(target, 'utf8'),",
+            "['isSymbolicLink', true], ['isDirectory', false], ['isFile', false], ['isBlockDevice', false],",
+            "['isCharacterDevice', false], ['isFIFO', false], ['isSocket', false],",
+            "Object.defineProperty(stats, name, { value: () => answer, writable: true, enumerable: false, configurable: true });",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, stats)
+        value = shim[shim.index("const linkValue = "):shim.index("\nfs.lstat = ")]
+        self.assertIn("if (encoding === undefined || encoding === null || encoding === 'utf8' || encoding === 'utf-8') return target;", value)
+        self.assertIn("if (encoding === 'buffer') return Buffer.from(target, 'utf8');\n  return undefined;", value)
+
+    def test_the_reparse_probe_runs_confined_once_on_the_first_junction_before_the_shim(self):
         probe = self.function_body("Invoke-NpmReparseProbe")
         self.assertTrue(probe.split("\n", 1)[1].startswith("    if ($script:RunMode -cne 'synthetic') { return }\n"))
         self.assertIn("$relative = ([string]@($script:NpmLinks)[0].Link).Replace('/', '\\')", probe)
         self.assertIn("$run = Invoke-ConfinedProbe $sandbox ('reparse ' + $link) $MountManagerProbeSeconds", probe)
         self.assertNotIn("Write-Line", probe)
-        self.assertEqual(self.runner.count("Invoke-NpmReparseProbe $sandbox $project '"), 2)
+        self.assertEqual(self.runner.count("Invoke-NpmReparseProbe $sandbox $project '"), 1)
         diag = re.compile(re.search(r"DiagLinePattern = '([^']+)'", self.runner).group(1))
         for line in (
             "windows-source-probe id=npm_reparse_before exit=0x00000000",
-            "windows-source-probe id=npm_reparse_after exit=0x00000000",
             "windows-source-probe-line kd-probe reparse open0=ok openra=ok openrc=ok follow=ok basic0=ok basicra=ok get0=ok getra=ok trust=0 cause=none",
+            "windows-source-probe-line kd-probe reparse open0=ok openra=ok openrc=ok follow=ok basic0=ok basicra=ok get0=err5 getra=err5 trust=0 cause=fsctl_policy",
             "windows-source-probe-line kd-probe reparse open0=err5 openra=err5 openrc=err5 follow=ok basic0=na basicra=na get0=na getra=na trust=1 cause=open_policy",
-            "windows-source-probe-line npm_link_lease npm_link_lease step=open error=5",
-            "windows-source-probe-line npm_link_lease readback=control_mismatch",
         ):
             with self.subTest(line=line[:60]):
                 self.assertIsNotNone(diag.fullmatch(line))
@@ -1072,9 +1203,21 @@ class WindowsSourceRunTests(unittest.TestCase):
                       "if ($argument -cmatch '\\{[a-z_]*\\}') { throw 'gate_plan' }", "$argument.Replace('/', '\\')"):
             self.assertIn(token, expand)
         gates = self.function_body("Invoke-SourceGates")
-        run = "        $run = $sandbox.Run($true, $exe, $commandLine, $project, $environment, ($seconds * 1000), [uint32]32)\n"
+        shim = (
+            "        $argv = [string[]]$gate.Argv\n"
+            "        $gateEnvironment = $environment\n"
+            "        if ($NpmLinkShimGates -ccontains $gate.Id) {\n"
+            "            $argv = [string[]](Add-NpmLinkShim $argv)\n"
+            "            $gateEnvironment = [string[]](Get-NpmLinkShimEnvironment $environment)\n"
+            "        }\n"
+            "        $exe = [string]$argv[0]\n"
+            "        $commandLine = ConvertTo-CommandLine $argv\n"
+        )
+        run = "        $run = $sandbox.Run($true, $exe, $commandLine, $project, $gateEnvironment, ($seconds * 1000), [uint32]32)\n"
         stepped = "        if ($null -ne $gate.Then) { $run = Invoke-NpmLinkSteps $sandbox $gate $project $environment $run }\n"
-        self.assertIn(run + stepped + "        $outcome.Count += 1\n", gates)
+        self.assertIn(shim + run + stepped + "        $outcome.Count += 1\n", gates)
+        self.assertNotIn("$gate.Argv[0]", gates)
+        self.assertEqual(re.findall(r"^\$NpmLinkShimGates = (.*)$", self.runner, re.M), ["@('node_dependency_audit')"])
 
     def test_the_stepped_npm_gate_runs_trusted_links_between_two_confined_steps_and_rechecks_the_lock(self):
         steps = self.function_body("Invoke-NpmLinkSteps")
@@ -1085,11 +1228,13 @@ class WindowsSourceRunTests(unittest.TestCase):
             "Write-Line ('windows-source-npm-links=created count=' + $created + ' verified=' + $verified)",
             "if ($verified -ne @($script:NpmLinks).Count) { throw 'npm_link' }",
             "    if ($created -gt 0) { Invoke-NpmReparseProbe $sandbox $project 'before' }\n",
-            "    if ($created -gt 0) { Grant-NpmLinkLeases $project }\n",
-            "    if ($created -gt 0) { Invoke-NpmReparseProbe $sandbox $project 'after' }\n",
+            "    if ($created -gt 0) { Initialize-NpmLinkShim $project }\n",
+            "    $shimEnvironment = [string[]](Get-NpmLinkShimEnvironment $environment)\n",
             "Invoke-NpmLinkProbe $sandbox $project",
+            "Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $shimEnvironment",
             "if ($remaining -lt 60) { throw 'deadline' }",
-            "$second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $environment, ($seconds * 1000), [uint32]32)",
+            "    $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))\n",
+            "$second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), [uint32]32)",
             "$merged.Stdout = [string]$first.Stdout + \"`n\" + [string]$second.Stdout",
             "$merged.Truncated = [bool]($first.Truncated -or $second.Truncated)",
             "if (-not (Test-GateBoundary $second) -or $second.TimedOut -or $second.ExitCode -ne 0) { return $merged }",
@@ -1218,7 +1363,8 @@ class WindowsSourceRunTests(unittest.TestCase):
     def test_source_mode_runs_the_same_gates_with_only_the_designed_lease_default(self):
         self.assertEqual(self.runner.count("$runMode -cne 'synthetic'"), 2)
         self.assertEqual(self.runner.count("$MountManagerSourceRungs"), 2)
-        for name in ("Invoke-NpmLinkSteps", "Get-GatePlan", "Expand-GateArgv", "Get-NpmLinkPlan", "Initialize-NpmTarballs"):
+        for name in ("Invoke-NpmLinkSteps", "Get-GatePlan", "Expand-GateArgv", "Get-NpmLinkPlan", "Initialize-NpmTarballs",
+                     "Initialize-NpmLinkShim", "Add-NpmLinkShim", "Get-NpmLinkShimEnvironment"):
             with self.subTest(function=name):
                 self.assertNotIn("RunMode", self.function_body(name))
                 self.assertNotIn("$runMode", self.function_body(name))

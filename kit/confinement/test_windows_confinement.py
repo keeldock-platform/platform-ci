@@ -1490,64 +1490,11 @@ foreach ($case in $cases) {
         positions = [create.index(item) for item in order]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("foreach (IntPtr item in held)", create)
-        self.assertEqual(maker.count("FlagBackupSemantics | FlagOpenReparsePoint"), 6)
-        self.assertEqual(maker.count("ShareRead | ShareWrite, IntPtr.Zero, OpenExisting"), 5)
+        self.assertEqual(maker.count("FlagBackupSemantics | FlagOpenReparsePoint"), 4)
+        self.assertEqual(maker.count("ShareRead | ShareWrite, IntPtr.Zero, OpenExisting"), 3)
         for forbidden in ("CreateSymbolicLink", "DeleteFileW", "RemoveDirectoryW", "ShareDelete", "File.Delete", "Directory.Delete", "Process.Start", "MoveFile"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, maker)
-
-    def test_junction_dacl_io_opens_the_verified_junction_itself_and_never_its_target(self):
-        maker = self.native[self.native.index("public static class JunctionMaker"):]
-        for required in (
-            "private const uint ReadControl = 0x00020000;",
-            "private const uint WriteDac = 0x00040000;",
-            "private const uint DaclSecurityInformation = 0x00000004;",
-            "private const int MaxDescriptorBytes = 65536;",
-            "internal static extern bool GetKernelObjectSecurity(IntPtr handle, uint information, byte[] descriptor, uint length, out uint needed);",
-            "internal static extern bool SetKernelObjectSecurity(IntPtr handle, uint information, byte[] descriptor);",
-        ):
-            with self.subTest(required=required[:60]):
-                self.assertIn(required, maker)
-        opened = maker[maker.index("private static IntPtr OpenLink("):maker.index("public static byte[] ReadNoFollow(")]
-        order = (
-            "held.Add(OpenVerified(root, false));",
-            "held.Add(OpenVerified(Join(root, linkParts, index), false));",
-            'Native.CreateFileW("\\\\\\\\?\\\\" + link, access | FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero)',
-            "ReadInformation(handle, out attributes, out links, out size);",
-            '(attributes & AttributeDirectory) == 0 || (attributes & AttributeReparsePoint) == 0 || !ReadsBack(handle, "\\\\??\\\\" + target)',
-            "return handle;",
-        )
-        positions = [opened.index(item) for item in order]
-        self.assertEqual(positions, sorted(positions))
-        self.assertNotIn("OpenVerified(Join(root, linkParts, index), true)", opened)
-        read = maker[maker.index("public static byte[] ReadLinkDacl("):maker.index("public static void WriteLinkDacl(")]
-        self.assertIn("handle = OpenLink(projectRoot, linkRelative, targetRelative, ReadControl, held);", read)
-        self.assertIn("if (first || error != 122 || needed < 20 || needed > MaxDescriptorBytes)", read)
-        self.assertEqual(read.count("Native.GetKernelObjectSecurity(handle, DaclSecurityInformation, "), 2)
-        write = maker[maker.index("public static void WriteLinkDacl("):maker.index("public static int OpenNoFollowError(")]
-        self.assertIn("handle = OpenLink(projectRoot, linkRelative, targetRelative, ReadControl | WriteDac, held);", write)
-        self.assertIn("Native.SetKernelObjectSecurity(handle, DaclSecurityInformation, descriptor)", write)
-        self.assertIn("descriptor.Length < 20 || descriptor.Length > MaxDescriptorBytes", write)
-        self.assertNotIn("SetSecurityInfo", maker)
-        self.assertNotIn("SetFileSecurity", maker)
-        self.assertNotIn("WriteOwner", maker)
-        for body in (read, write):
-            self.assertIn("foreach (IntPtr item in held)", body)
-        probe = maker[maker.index("public static int OpenNoFollowError("):maker.index("private static IntPtr OpenLink(")]
-        order = (
-            "string root = Root(projectRoot);",
-            "string[] linkParts = Parts(linkRelative);",
-            "IntPtr held = OpenVerified(root, false);",
-            'Native.CreateFileW("\\\\\\\\?\\\\" + link, FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero)',
-            "return Marshal.GetLastWin32Error();",
-            "Native.CloseHandle(handle);\n                return 0;",
-            "Native.CloseHandle(held);",
-        )
-        positions = [probe.index(item) for item in order]
-        self.assertEqual(positions, sorted(positions))
-        for forbidden in ("WriteDac", "ReadControl", "GenericWrite", "CreateDirectoryW", "SetKernelObjectSecurity"):
-            with self.subTest(forbidden=forbidden):
-                self.assertNotIn(forbidden, probe)
 
     def test_reparse_probe_separates_zero_access_attribute_and_fsctl_denials_and_reports_redirection_trust(self):
         probe = self.probe

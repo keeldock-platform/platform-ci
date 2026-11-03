@@ -397,6 +397,7 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/windows_confinement.cs",
             "kit/confinement/windows_confinement.ps1",
             "kit/confinement/windows_probe.rs",
+            "kit/confinement/windows_npm_link_shim.cjs",
             "kit/confinement/test_windows_confinement.py",
             "kit/confinement/macos_source_reader.py",
             "kit/confinement/test_macos_source_reader.py",

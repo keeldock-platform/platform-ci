@@ -2428,10 +2428,6 @@ namespace KeelDock.Platform.WindowsConfinement
         private const uint FileReadData = 0x00000001;
         private const uint FileReadAttributes = 0x00000080;
         private const uint Synchronize = 0x00100000;
-        private const uint ReadControl = 0x00020000;
-        private const uint WriteDac = 0x00040000;
-        private const uint DaclSecurityInformation = 0x00000004;
-        private const int MaxDescriptorBytes = 65536;
         private const uint ShareRead = 0x00000001;
         private const uint ShareWrite = 0x00000002;
         private const uint OpenExisting = 3;
@@ -2560,127 +2556,6 @@ namespace KeelDock.Platform.WindowsConfinement
                     Native.CloseHandle(item);
                 }
             }
-        }
-
-        public static byte[] ReadLinkDacl(string projectRoot, string linkRelative, string targetRelative)
-        {
-            List<IntPtr> held = new List<IntPtr>();
-            IntPtr handle = IntPtr.Zero;
-            try
-            {
-                handle = OpenLink(projectRoot, linkRelative, targetRelative, ReadControl, held);
-                uint needed;
-                bool first = Native.GetKernelObjectSecurity(handle, DaclSecurityInformation, null, 0, out needed);
-                int error = Marshal.GetLastWin32Error();
-                if (first || error != 122 || needed < 20 || needed > MaxDescriptorBytes)
-                {
-                    throw new InvalidOperationException("npm_link_lease step=read_size error=" + error.ToString());
-                }
-                byte[] buffer = new byte[needed];
-                if (!Native.GetKernelObjectSecurity(handle, DaclSecurityInformation, buffer, needed, out needed))
-                {
-                    throw new InvalidOperationException("npm_link_lease step=read error=" + Marshal.GetLastWin32Error().ToString());
-                }
-                return buffer;
-            }
-            finally
-            {
-                if (handle != IntPtr.Zero)
-                {
-                    Native.CloseHandle(handle);
-                }
-                foreach (IntPtr item in held)
-                {
-                    Native.CloseHandle(item);
-                }
-            }
-        }
-
-        public static void WriteLinkDacl(string projectRoot, string linkRelative, string targetRelative, byte[] descriptor)
-        {
-            if (descriptor == null || descriptor.Length < 20 || descriptor.Length > MaxDescriptorBytes)
-            {
-                throw new InvalidOperationException("npm_link_lease step=write_shape error=0");
-            }
-            List<IntPtr> held = new List<IntPtr>();
-            IntPtr handle = IntPtr.Zero;
-            try
-            {
-                handle = OpenLink(projectRoot, linkRelative, targetRelative, ReadControl | WriteDac, held);
-                if (!Native.SetKernelObjectSecurity(handle, DaclSecurityInformation, descriptor))
-                {
-                    throw new InvalidOperationException("npm_link_lease step=write error=" + Marshal.GetLastWin32Error().ToString());
-                }
-            }
-            finally
-            {
-                if (handle != IntPtr.Zero)
-                {
-                    Native.CloseHandle(handle);
-                }
-                foreach (IntPtr item in held)
-                {
-                    Native.CloseHandle(item);
-                }
-            }
-        }
-
-        public static int OpenNoFollowError(string projectRoot, string linkRelative)
-        {
-            string root = Root(projectRoot);
-            string[] linkParts = Parts(linkRelative);
-            string link = Join(root, linkParts, linkParts.Length);
-            IntPtr held = OpenVerified(root, false);
-            try
-            {
-                IntPtr handle = Native.CreateFileW("\\\\?\\" + link, FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero);
-                if (handle == InvalidHandle || handle == IntPtr.Zero)
-                {
-                    return Marshal.GetLastWin32Error();
-                }
-                Native.CloseHandle(handle);
-                return 0;
-            }
-            finally
-            {
-                Native.CloseHandle(held);
-            }
-        }
-
-        private static IntPtr OpenLink(string projectRoot, string linkRelative, string targetRelative, uint access, List<IntPtr> held)
-        {
-            string root = Root(projectRoot);
-            string[] linkParts = Parts(linkRelative);
-            string[] targetParts = Parts(targetRelative);
-            string target = Join(root, targetParts, targetParts.Length);
-            string link = Join(root, linkParts, linkParts.Length);
-            held.Add(OpenVerified(root, false));
-            for (int index = 1; index < linkParts.Length; ++index)
-            {
-                held.Add(OpenVerified(Join(root, linkParts, index), false));
-            }
-            IntPtr handle = Native.CreateFileW("\\\\?\\" + link, access | FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero);
-            if (handle == InvalidHandle || handle == IntPtr.Zero)
-            {
-                throw new InvalidOperationException("npm_link_lease step=open error=" + Marshal.GetLastWin32Error().ToString());
-            }
-            try
-            {
-                uint attributes;
-                uint links;
-                ulong size;
-                ReadInformation(handle, out attributes, out links, out size);
-                if ((attributes & AttributeDirectory) == 0 || (attributes & AttributeReparsePoint) == 0 || !ReadsBack(handle, "\\??\\" + target))
-                {
-                    throw new InvalidOperationException("npm_link_lease step=shape error=0");
-                }
-            }
-            catch
-            {
-                Native.CloseHandle(handle);
-                throw;
-            }
-            return handle;
         }
 
         public static byte[] ReadNoFollow(string path, int maxBytes)
@@ -2955,14 +2830,6 @@ namespace KeelDock.Platform.WindowsConfinement
 
             [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
             internal static extern uint GetFinalPathNameByHandleW(IntPtr handle, StringBuilder path, uint length, uint flags);
-
-            [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
-            [return: MarshalAs(UnmanagedType.Bool)]
-            internal static extern bool GetKernelObjectSecurity(IntPtr handle, uint information, byte[] descriptor, uint length, out uint needed);
-
-            [DllImport("advapi32.dll", ExactSpelling = true, SetLastError = true)]
-            [return: MarshalAs(UnmanagedType.Bool)]
-            internal static extern bool SetKernelObjectSecurity(IntPtr handle, uint information, byte[] descriptor);
 
             [DllImport("kernel32.dll", EntryPoint = "ReadFile", ExactSpelling = true, SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
