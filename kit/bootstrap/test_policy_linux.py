@@ -696,12 +696,12 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets.", encrypt)
         self.assertNotIn("KD_CANARY_SECRET", encrypt)
 
-    def test_one_encrypted_member_is_uploaded_for_one_day_without_overwrite_or_compression(self):
+    def test_the_encrypted_upload_directory_is_uploaded_for_one_day_without_overwrite_or_compression(self):
         self.assertEqual(self.text.count("uses: " + self.PINNED_UPLOAD + " " + chr(35) + " v7.0.2\n"), 1)
         upload = self.text.split("      - name: Upload the single encrypted member\n", 1)[1].split("      - name:", 1)[0]
         for line in (
             "          name: linux-quick-${{ inputs.request_id }}\n",
-            "          path: ${{ runner.temp }}/kd-quick-upload/linux-quick-return-v1.enc\n",
+            "          path: ${{ runner.temp }}/kd-quick-upload/\n",
             "          archive: true\n",
             "          retention-days: 1\n",
             "          compression-level: 0\n",

@@ -1362,11 +1362,11 @@ class ScreensReturnTests(unittest.TestCase):
     def test_part_frames_are_bound_to_the_manifest_the_request_and_their_hashes(self):
         manifest, frames = _screens_set(SCREEN_FILES)
 
-        def with_part(index, **changes):
-            body = subject._unframe_screens_part(frames[index], subject.MAX_PLAINTEXT_BYTES)
+        def with_part(position, **changes):
+            body = subject._unframe_screens_part(frames[position], subject.MAX_PLAINTEXT_BYTES)
             body.update(changes)
             changed = list(frames)
-            changed[index] = _screens_frame(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("ascii"))
+            changed[position] = _screens_frame(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("ascii"))
             return changed
 
         for name, changed in (
