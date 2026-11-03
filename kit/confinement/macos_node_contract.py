@@ -39,6 +39,17 @@ PROVENANCE_KEYS = (
     "cutoff_epoch_ms", "age_status", "generation_attempts", "audit_endpoint", "audit_status",
     "accepted_at_ms",
 )
+PROVENANCE_KEYS_WITH_ALLOWS = PROVENANCE_KEYS + ("allowed_findings",)
+FINDING_KEYS = (
+    "name", "version", "severity", "advisory_id", "range", "allow_justification_sha256",
+    "allow_expires_at_ms", "allow_removal_condition",
+)
+MAX_ALLOW_TTL_MS = 90 * DAY_MS
+MAX_ALLOWED_FINDINGS = 16
+ALLOWABLE_SEVERITIES = frozenset(("info", "low", "moderate"))
+PACKAGE_NAME_RE = re.compile(r"(?:@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*\Z")
+LOCKED_VERSION_RE = re.compile(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(?:[-+][0-9A-Za-z.+-]{1,64})?\Z")
+IDENTIFIER_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}\Z")
 NODE_ERROR_CODES = frozenset({
     "invalid_input", "limit_exceeded", "manifest_invalid", "lock_missing", "toolchain_mismatch",
     "accepted_provenance_invalid", "audit_unavailable", "audit_response_invalid",
@@ -115,26 +126,65 @@ def _valid_identity(value):
     return dict(identity)
 
 
+def _valid_allowed_findings(value, policy_epoch_ms):
+    if type(value) is not list or not 0 < len(value) <= MAX_ALLOWED_FINDINGS:
+        _refuse("accepted_provenance_invalid")
+    seen = set()
+    for item in value:
+        finding = _safe_object(item, FINDING_KEYS, code="accepted_provenance_invalid")
+        expires = finding["allow_expires_at_ms"]
+        if (type(finding["name"]) is not str or len(finding["name"]) > 214
+                or PACKAGE_NAME_RE.fullmatch(finding["name"]) is None
+                or type(finding["version"]) is not str
+                or LOCKED_VERSION_RE.fullmatch(finding["version"]) is None
+                or type(finding["severity"]) is not str or finding["severity"] not in ALLOWABLE_SEVERITIES
+                or type(finding["advisory_id"]) is not str
+                or IDENTIFIER_RE.fullmatch(finding["advisory_id"]) is None
+                or type(finding["range"]) is not str or not 0 < len(finding["range"]) <= 1024
+                or type(finding["allow_removal_condition"]) is not str
+                or IDENTIFIER_RE.fullmatch(finding["allow_removal_condition"]) is None
+                or type(finding["allow_justification_sha256"]) is not str
+                or SHA64.fullmatch(finding["allow_justification_sha256"]) is None
+                or type(expires) is not int
+                or not policy_epoch_ms < expires <= policy_epoch_ms + MAX_ALLOW_TTL_MS):
+            _refuse("accepted_provenance_invalid")
+        key = (finding["name"], finding["version"], finding["advisory_id"])
+        if key in seen:
+            _refuse("accepted_provenance_invalid")
+        seen.add(key)
+    return len(value)
+
+
 def _validate_accepted_provenance(value, identity, lock_bytes, manifest_sha256, now_ms):
-    record = _safe_object(value, PROVENANCE_KEYS, code="accepted_provenance_invalid")
+    with_allows = type(value) is dict and "allowed_findings" in value
+    record = _safe_object(value, PROVENANCE_KEYS_WITH_ALLOWS if with_allows else PROVENANCE_KEYS,
+                          code="accepted_provenance_invalid")
     _valid_identity(record["generation_identity"])
     accepted_identity = _valid_identity(record["accepted_source_identity"])
     lock_digest = hashlib.sha256(lock_bytes).hexdigest()
-    if (type(record["schema_version"]) is not int or record["schema_version"] != 1
+    if (type(record["schema_version"]) is not int or record["schema_version"] != (2 if with_allows else 1)
+            or record["audit_status"] != ("allowed_findings" if with_allows else "passed")
             or record["status"] != "accepted"
             or accepted_identity != identity or record["lock_sha256"] != lock_digest
             or record["manifest_sha256"] != manifest_sha256
             or record["node_version"] != NODE_VERSION or record["npm_version"] != NPM_VERSION
             or record["release_age_days"] != RELEASE_AGE_DAYS or record["age_status"] != "passed"
             or record["generation_attempts"] != 1 or record["audit_endpoint"] != AUDIT_ENDPOINT
-            or record["audit_status"] != "passed"
             or type(record["policy_epoch_ms"]) is not int or not 0 < record["policy_epoch_ms"]
             or type(record["cutoff_epoch_ms"]) is not int
             or record["cutoff_epoch_ms"] != record["policy_epoch_ms"] - RELEASE_AGE_DAYS * DAY_MS
             or type(record["accepted_at_ms"]) is not int
             or not record["policy_epoch_ms"] <= record["accepted_at_ms"] <= now_ms):
         _refuse("accepted_provenance_invalid")
+    if with_allows:
+        _valid_allowed_findings(record["allowed_findings"], record["policy_epoch_ms"])
     return dict(record)
+
+
+def _allowed_finding_limit(provenance):
+    if type(provenance) is dict and type(provenance.get("allowed_findings")) is list:
+        return len(provenance["allowed_findings"])
+    return 0
 
 
 def _validate_expectation(value):
@@ -516,7 +566,8 @@ def _is_refusal_document(raw):
     return type(output) is dict and output.get("status") == "refused"
 
 
-def _validate_gate_result(raw, lock_bytes, manifest_sha256, mode, policy_epoch_ms, *, stage):
+def _validate_gate_result(raw, lock_bytes, manifest_sha256, mode, policy_epoch_ms, *, stage,
+                          allowed_limit=0):
     output = _strict_json(raw, 8192, stage=stage, substage="bulk_audit")
     if type(output) is not dict or type(output.get("schema_version")) is not int or output["schema_version"] != 1:
         _refuse("capture_invalid", stage=stage, substage="bulk_audit")
@@ -536,8 +587,11 @@ def _validate_gate_result(raw, lock_bytes, manifest_sha256, mode, policy_epoch_m
         "schema_version", "status", "mode", "lock_sha256", "manifest_sha256", "node_version", "npm_version",
         "release_age_days", "policy_epoch_ms", "cutoff_epoch_ms", "age_status", "generation_attempts",
         "audit_endpoint", "audit_status", "package_count", "remote_package_count", "remote_version_count",
-        "advisory_count",
+        "advisory_count", "finding_count", "allowed_count",
     }
+    if (type(allowed_limit) is not int or not 0 <= allowed_limit <= MAX_ALLOWED_FINDINGS
+            or allowed_limit and mode != "verify"):
+        _refuse("capture_invalid", stage=stage, substage="bulk_audit")
     if (type(result) is not dict or set(result) != expected_keys
             or type(result["schema_version"]) is not int or result["schema_version"] != 1
             or result["status"] != "passed" or result["mode"] != mode
@@ -549,10 +603,13 @@ def _validate_gate_result(raw, lock_bytes, manifest_sha256, mode, policy_epoch_m
             or result["release_age_days"] != RELEASE_AGE_DAYS or result["age_status"] != "passed"
             or type(result["generation_attempts"]) is not int or result["generation_attempts"] != 1
             or result["audit_endpoint"] != AUDIT_ENDPOINT
-            or result["audit_status"] != "passed"
             or any(type(result[key]) is not int or result[key] < 0 for key in (
                 "policy_epoch_ms", "cutoff_epoch_ms", "package_count", "remote_package_count",
-                "remote_version_count", "advisory_count"))
+                "remote_version_count", "advisory_count", "finding_count", "allowed_count"))
+            or result["allowed_count"] > allowed_limit
+            or result["allowed_count"] > result["finding_count"]
+            or (result["finding_count"] == 0) != (result["allowed_count"] == 0)
+            or result["audit_status"] != ("allowed_findings" if result["allowed_count"] else "passed")
             or result["cutoff_epoch_ms"] != result["policy_epoch_ms"] - RELEASE_AGE_DAYS * DAY_MS):
         _refuse("capture_invalid", stage=stage, substage="bulk_audit")
     return dict(result)
@@ -686,7 +743,8 @@ def _run_node_contract(
                              substage="bulk_audit")
         audit_result = _validate_gate_result(audited.stdout, lock_bytes, manifest_sha256, mode,
                                              policy_epoch_ms,
-                                             stage="node_dependency_audit")
+                                             stage="node_dependency_audit",
+                                             allowed_limit=_allowed_finding_limit(accepted))
         if audited.returncode != 0:
             _capture_failure(audited, "audit_response_invalid", stage="node_dependency_audit",
                              substage="bulk_audit")

@@ -35,6 +35,24 @@ const HASH40 = /^[a-f0-9]{40}$/u;
 const HASH64 = /^[a-f0-9]{64}$/u;
 const PACKAGE_NAME = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/u;
 const IDENTITY_KEYS = Object.freeze(['source_sha', 'base_sha', 'control_sha', 'reviewed_diff_sha256']);
+const PROVENANCE_KEYS = Object.freeze([
+  'schema_version', 'status', 'generation_identity', 'accepted_source_identity', 'lock_sha256',
+  'manifest_sha256', 'node_version', 'npm_version', 'release_age_days', 'policy_epoch_ms',
+  'cutoff_epoch_ms', 'age_status', 'generation_attempts', 'audit_endpoint', 'audit_status',
+  'accepted_at_ms',
+]);
+const PROVENANCE_KEYS_WITH_ALLOWS = Object.freeze([...PROVENANCE_KEYS, 'allowed_findings']);
+const FINDING_KEYS = Object.freeze([
+  'name', 'version', 'severity', 'advisory_id', 'range', 'allow_justification_sha256',
+  'allow_expires_at_ms', 'allow_removal_condition',
+]);
+const MAX_ALLOW_TTL_MS = 90 * DAY_MS;
+const MAX_ALLOWED_FINDINGS = 16;
+const SEVERITY_RANK = Object.freeze({ info: 0, low: 1, moderate: 2, high: 3, critical: 4 });
+const ALLOWABLE_SEVERITY_RANK = Object.freeze({ info: 0, low: 1, moderate: 2 });
+const IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/u;
+const LOCKED_VERSION = /^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(?:[-+][0-9A-Za-z.+-]{1,64})?$/u;
+const PRODUCTION_EDGE_GROUPS = Object.freeze(['dependencies', 'optionalDependencies', 'peerDependencies']);
 const ERROR_CODES = new Set([
   'invalid_input', 'limit_exceeded', 'manifest_invalid', 'lock_missing', 'toolchain_mismatch',
   'accepted_provenance_invalid', 'audit_unavailable', 'audit_response_invalid',
@@ -256,22 +274,60 @@ function validateGenerationProof(input, sourceIdentity, lockSha256, expectedMani
   return proof;
 }
 
+function validateAllowedFindings(input, policyEpochMs) {
+  if (!Array.isArray(input) || input.length < 1 || input.length > MAX_ALLOWED_FINDINGS) {
+    reject('accepted_provenance_invalid');
+  }
+  const seen = new Set();
+  const findings = [];
+  for (const item of input) {
+    const finding = exactKeys(item, FINDING_KEYS, 'accepted_provenance_invalid');
+    const expires = finding.allow_expires_at_ms;
+    if (typeof finding.name !== 'string' || finding.name.length > 214 || !PACKAGE_NAME.test(finding.name)
+        || typeof finding.version !== 'string' || !LOCKED_VERSION.test(finding.version)
+        || typeof finding.severity !== 'string' || !Object.hasOwn(ALLOWABLE_SEVERITY_RANK, finding.severity)
+        || typeof finding.advisory_id !== 'string' || !IDENTIFIER.test(finding.advisory_id)
+        || typeof finding.range !== 'string' || finding.range.length < 1 || finding.range.length > 1024
+        || typeof finding.allow_removal_condition !== 'string'
+        || !IDENTIFIER.test(finding.allow_removal_condition)
+        || typeof finding.allow_justification_sha256 !== 'string'
+        || !HASH64.test(finding.allow_justification_sha256)
+        || !safeInteger(expires, 1) || expires <= policyEpochMs || expires > policyEpochMs + MAX_ALLOW_TTL_MS) {
+      reject('accepted_provenance_invalid');
+    }
+    const key = JSON.stringify([finding.name, finding.version, finding.advisory_id]);
+    if (seen.has(key)) reject('accepted_provenance_invalid');
+    seen.add(key);
+    findings.push(Object.freeze({
+      name: finding.name,
+      version: finding.version,
+      severity: finding.severity,
+      advisoryId: finding.advisory_id,
+      expiresAtMs: expires,
+    }));
+  }
+  return Object.freeze(findings);
+}
+
 function validateAcceptedProvenance(input, sourceIdentity, lockSha256, expectedManifestSha256, nowMs) {
-  const provenance = exactKeys(input, [
-    'schema_version', 'status', 'generation_identity', 'accepted_source_identity', 'lock_sha256',
-    'manifest_sha256', 'node_version', 'npm_version', 'release_age_days', 'policy_epoch_ms',
-    'cutoff_epoch_ms', 'age_status', 'generation_attempts', 'audit_endpoint', 'audit_status',
-    'accepted_at_ms',
-  ], 'accepted_provenance_invalid');
+  const withAllows = input !== null && typeof input === 'object' && !Array.isArray(input)
+    && Object.hasOwn(input, 'allowed_findings');
+  const provenance = exactKeys(
+    input, withAllows ? PROVENANCE_KEYS_WITH_ALLOWS : PROVENANCE_KEYS, 'accepted_provenance_invalid',
+  );
   validIdentity(provenance.generation_identity);
   const acceptedIdentity = validIdentity(provenance.accepted_source_identity);
-  if (provenance.schema_version !== 1 || provenance.status !== 'accepted'
+  if (provenance.schema_version !== (withAllows ? 2 : 1)
+      || provenance.audit_status !== (withAllows ? 'allowed_findings' : 'passed')) {
+    reject('accepted_provenance_invalid');
+  }
+  if (provenance.status !== 'accepted'
       || provenance.lock_sha256 !== lockSha256 || provenance.node_version !== NODE_CONTRACT_POLICY.nodeVersion
       || provenance.manifest_sha256 !== expectedManifestSha256
       || provenance.npm_version !== NODE_CONTRACT_POLICY.npmVersion
       || provenance.release_age_days !== NODE_CONTRACT_POLICY.releaseAgeDays
       || provenance.age_status !== 'passed' || provenance.generation_attempts !== 1
-      || provenance.audit_endpoint !== NODE_CONTRACT_POLICY.auditEndpoint || provenance.audit_status !== 'passed'
+      || provenance.audit_endpoint !== NODE_CONTRACT_POLICY.auditEndpoint
       || !safeInteger(provenance.policy_epoch_ms, 1) || !safeInteger(provenance.cutoff_epoch_ms)
       || provenance.cutoff_epoch_ms !== provenance.policy_epoch_ms - 7 * DAY_MS
       || !safeInteger(provenance.accepted_at_ms) || provenance.accepted_at_ms < provenance.policy_epoch_ms
@@ -282,7 +338,10 @@ function validateAcceptedProvenance(input, sourceIdentity, lockSha256, expectedM
       || acceptedIdentity.reviewed_diff_sha256 !== sourceIdentity.reviewed_diff_sha256) {
     reject('accepted_provenance_invalid');
   }
-  return provenance;
+  const allows = withAllows
+    ? validateAllowedFindings(provenance.allowed_findings, provenance.policy_epoch_ms)
+    : Object.freeze([]);
+  return { provenance, allows };
 }
 
 function packageNameFromLocation(location) {
@@ -440,13 +499,78 @@ async function fetchBounded(fetchImpl, url, options, maximum, deadlineMs, nowMs,
   }
 }
 
-function validateAdvisories(advisories, inventory, semver) {
+function resolveDependency(packages, from, name) {
+  let current = from;
+  for (let guard = 0; guard < 4096; guard += 1) {
+    const candidate = `${current ? `${current}/` : ''}node_modules/${name}`;
+    if (Object.hasOwn(packages, candidate)) return candidate;
+    if (!current) return null;
+    const index = current.lastIndexOf('/node_modules/');
+    current = index >= 0 ? current.slice(0, index) : '';
+  }
+  return null;
+}
+
+function productionReach(packages, workspacePaths) {
+  const seen = new Set();
+  const stack = ['', ...workspacePaths];
+  while (stack.length > 0) {
+    const path = stack.pop();
+    if (seen.has(path)) continue;
+    seen.add(path);
+    const entry = Object.hasOwn(packages, path) ? packages[path] : null;
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    if (entry.link === true && typeof entry.resolved === 'string') stack.push(entry.resolved);
+    for (const group of PRODUCTION_EDGE_GROUPS) {
+      const edges = entry[group];
+      if (edges === null || typeof edges !== 'object' || Array.isArray(edges)) continue;
+      for (const dependency of Object.keys(edges)) {
+        const target = resolveDependency(packages, path, dependency);
+        if (target !== null) stack.push(target);
+      }
+    }
+  }
+  return seen;
+}
+
+function advisoryIdentifiers(item) {
+  const identifiers = new Set();
+  if (typeof item.id === 'string' || safeInteger(item.id)) identifiers.add(String(item.id));
+  if (typeof item.github_advisory_id === 'string') identifiers.add(item.github_advisory_id);
+  return identifiers;
+}
+
+function recordedAllow(item, name, version, allowContext) {
+  const severity = item.severity;
+  if (typeof severity !== 'string' || !Object.hasOwn(ALLOWABLE_SEVERITY_RANK, severity)) return null;
+  const identifiers = advisoryIdentifiers(item);
+  const allow = allowContext.allows.find((candidate) => candidate.name === name
+    && candidate.version === version && identifiers.has(candidate.advisoryId)
+    && SEVERITY_RANK[severity] <= SEVERITY_RANK[candidate.severity]
+    && candidate.expiresAtMs > allowContext.fetchedMs);
+  if (!allow) return null;
+  if (allowContext.reach === null) {
+    allowContext.reach = productionReach(allowContext.packages, allowContext.workspacePaths);
+  }
+  let located = false;
+  for (const [location, entry] of Object.entries(allowContext.packages)) {
+    if (packageNameFromLocation(location) !== name || entry === null || typeof entry !== 'object'
+        || entry.version !== version) continue;
+    if (entry.dev !== true || allowContext.reach.has(location)) return null;
+    located = true;
+  }
+  return located ? allow : null;
+}
+
+function validateAdvisories(advisories, inventory, semver, allowContext) {
   if (advisories === null || typeof advisories !== 'object' || Array.isArray(advisories)
       || Object.getPrototypeOf(advisories) !== null) reject('audit_response_invalid');
   const requested = new Set(Object.keys(inventory.body));
   const keys = Object.keys(advisories);
   if (keys.some((name) => !requested.has(name))) reject('audit_response_invalid');
   let count = 0;
+  let findings = 0;
+  const used = new Set();
   for (const name of keys) {
     const items = advisories[name];
     if (!Array.isArray(items)) reject('audit_response_invalid');
@@ -465,15 +589,21 @@ function validateAdvisories(advisories, inventory, semver) {
         let vulnerable;
         try { vulnerable = semver.satisfies(version, range, { includePrerelease: true }); }
         catch { reject('audit_response_invalid'); }
-        if (vulnerable) reject('vulnerable_dependency');
+        if (!vulnerable) continue;
+        const allow = recordedAllow(item, name, version, allowContext);
+        if (allow === null) reject('vulnerable_dependency');
+        findings += 1;
+        used.add(allow);
       }
     }
   }
-  return count;
+  return { advisoryCount: count, findingCount: findings, allowedCount: used.size };
 }
 
-async function auditInventory(inventory, { fetchImpl, semver, deadlineMs, nowMs, signal }) {
-  if (inventory.remoteVersionCount === 0) return 0;
+async function auditInventory(inventory, {
+  fetchImpl, semver, deadlineMs, nowMs, signal, allows, packages, workspacePaths,
+}) {
+  if (inventory.remoteVersionCount === 0) return { advisoryCount: 0, findingCount: 0, allowedCount: 0 };
   if (typeof fetchImpl !== 'function') reject('audit_unavailable');
   const body = JSON.stringify(inventory.body);
   let responseBytes;
@@ -488,8 +618,11 @@ async function auditInventory(inventory, { fetchImpl, semver, deadlineMs, nowMs,
     if (error instanceof NodeContractError) throw error;
     reject('audit_unavailable');
   }
+  const fetchedMs = nowMs();
   const parsed = parseStrictBytes(responseBytes, NODE_CONTRACT_LIMITS.auditResponseBytes);
-  return validateAdvisories(parsed, inventory, semver);
+  return validateAdvisories(parsed, inventory, semver, {
+    allows, packages, workspacePaths, fetchedMs, reach: null,
+  });
 }
 
 function sha256(bytes) {
@@ -527,6 +660,7 @@ export async function validateNodeDependencyLock({
   catch { reject('manifest_invalid'); }
   const expectedManifestSha256 = manifestDigest(expectedManifest);
   let provenance;
+  let allows = Object.freeze([]);
   if (mode === 'bootstrap') {
     if (acceptedProvenance !== null && acceptedProvenance !== undefined) reject('invalid_input');
     if (!safeInteger(policyEpochMs, 1)) reject('invalid_input');
@@ -536,15 +670,18 @@ export async function validateNodeDependencyLock({
   } else {
     if (generationProof !== null && generationProof !== undefined) reject('invalid_input');
     if (policyEpochMs !== null && policyEpochMs !== undefined) reject('invalid_input');
-    provenance = validateAcceptedProvenance(
+    ({ provenance, allows } = validateAcceptedProvenance(
       acceptedProvenance, sourceIdentity, lockSha256, expectedManifestSha256, nowMs,
-    );
+    ));
   }
 
   const lock = parseStrictBytes(lockBytes, 4 * 1024 * 1024 - 64 * 1024, 'manifest_invalid');
   const inventory = publicRemoteInventory(lock, expectedManifest);
   const semver = loadSemver(npmCliPath);
-  const advisoryCount = await auditInventory(inventory, { fetchImpl, semver, deadlineMs, nowMs: Date.now, signal });
+  const audit = await auditInventory(inventory, {
+    fetchImpl, semver, deadlineMs, nowMs: Date.now, signal, allows,
+    packages: lock.packages, workspacePaths: expectedManifest.workspaces.map((item) => item.path),
+  });
   return Object.freeze({
     schema_version: 1,
     status: 'passed',
@@ -559,11 +696,13 @@ export async function validateNodeDependencyLock({
     age_status: 'passed',
     generation_attempts: 1,
     audit_endpoint: NODE_CONTRACT_POLICY.auditEndpoint,
-    audit_status: 'passed',
+    audit_status: audit.allowedCount > 0 ? 'allowed_findings' : 'passed',
     package_count: manifestResult.packageCount,
     remote_package_count: inventory.remotePackageCount,
     remote_version_count: inventory.remoteVersionCount,
-    advisory_count: advisoryCount,
+    advisory_count: audit.advisoryCount,
+    finding_count: audit.findingCount,
+    allowed_count: audit.allowedCount,
   });
 }
 
