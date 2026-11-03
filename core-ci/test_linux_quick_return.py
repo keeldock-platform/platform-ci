@@ -814,11 +814,13 @@ class ScreensTests(unittest.TestCase):
     def test_write_screens_stages_numbered_members_once_and_refuses_bad_input(self):
         with tempfile.TemporaryDirectory() as directory:
             members = [b"KDLE" + b"a" * 8, b"KDLE" + b"b" * 8]
+            self.assertEqual(refusal_reason(subject.write_screens, directory, members, os.getuid(), os.getgid()), "output")
+            subject.write_ciphertext(directory, b"KDLE" + b"v" * 8, os.getuid(), os.getgid())
             self.assertEqual(subject.write_screens(directory, members, os.getuid(), os.getgid()), 2)
-            staged = Path(directory) / "kd-screens-upload"
+            staged = Path(directory) / "kd-quick-upload"
             self.assertEqual(
                 sorted(path.name for path in staged.iterdir()),
-                ["linux-quick-screens-00-v1.enc", "linux-quick-screens-01-v1.enc"],
+                ["linux-quick-return-v1.enc", "linux-quick-screens-00-v1.enc", "linux-quick-screens-01-v1.enc"],
             )
             self.assertEqual((staged / "linux-quick-screens-01-v1.enc").read_bytes(), members[1])
             self.assertEqual(
@@ -868,14 +870,8 @@ class ScreensCommandTests(unittest.TestCase):
                 self.assertEqual(record["kind"], "linux_quick")
                 self.assertEqual(record["context"]["nonce"], NONCE)
                 self.assertEqual(record["context"]["request_id"], REQUEST)
-            staged = Path(directory) / "kd-screens-upload"
-            self.assertEqual(
-                sorted(path.name for path in staged.iterdir()),
-                [subject.SCREENS_MEMBER_FORMAT % index for index in range(screens["parts"])],
-            )
-            self.assertEqual(
-                (Path(directory) / "kd-quick-upload").iterdir().__next__().name, "linux-quick-return-v1.enc",
-            )
+            staged = Path(directory) / "kd-quick-upload"
+            self.assertEqual(sorted(path.name for path in staged.iterdir()), ["linux-quick-return-v1.enc"] + [subject.SCREENS_MEMBER_FORMAT % index for index in range(screens["parts"])])
             lines = Path(env["GITHUB_OUTPUT"]).read_text(encoding="ascii").splitlines()
             self.assertEqual(lines[-1], "screens_parts=" + str(screens["parts"]))
 
@@ -890,7 +886,7 @@ class ScreensCommandTests(unittest.TestCase):
             self.assertEqual(encrypt.call_count, 1)
             verdict = subject.unframe_payload(base64.b64decode(encrypt.call_args.args[0]["payload_b64"]))
             self.assertEqual(verdict["screens"], {"status": "refused"})
-            self.assertFalse((Path(directory) / "kd-screens-upload").exists())
+            self.assertEqual(sorted(path.name for path in (Path(directory) / "kd-quick-upload").iterdir()), ["linux-quick-return-v1.enc"])
             lines = Path(env["GITHUB_OUTPUT"]).read_text(encoding="ascii").splitlines()
             self.assertFalse(any(line.startswith("screens_parts=") for line in lines))
 
@@ -912,7 +908,7 @@ class ScreensCommandTests(unittest.TestCase):
                 subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
             verdict = subject.unframe_payload(base64.b64decode(calls[-1]["payload_b64"]))
             self.assertEqual(verdict["screens"], {"status": "refused"})
-            self.assertFalse((Path(directory) / "kd-screens-upload").exists())
+            self.assertEqual(sorted(path.name for path in (Path(directory) / "kd-quick-upload").iterdir()), ["linux-quick-return-v1.enc"])
 
     @POSIX_OUTPUT
     def test_without_a_worker_path_or_pngs_the_verdict_says_none(self):
@@ -923,7 +919,7 @@ class ScreensCommandTests(unittest.TestCase):
                 subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
             verdict = subject.unframe_payload(base64.b64decode(encrypt.call_args.args[0]["payload_b64"]))
             self.assertEqual(verdict["screens"], {"status": "none"})
-            self.assertFalse((Path(directory) / "kd-screens-upload").exists())
+            self.assertEqual(sorted(path.name for path in (Path(directory) / "kd-quick-upload").iterdir()), ["linux-quick-return-v1.enc"])
 
 
 class PublicLineTests(unittest.TestCase):
@@ -945,7 +941,7 @@ class PublicLineTests(unittest.TestCase):
 
     def test_invalid_counts_or_identity_are_refused(self):
         for arguments in (
-            ("short", 15, 15, 0), (REQUEST, 19, 1, 0), (REQUEST, 15, 16, 0), (REQUEST, 15, 1, 16),
+            ("short", 15, 15, 0), (REQUEST, 20, 1, 0), (REQUEST, 15, 16, 0), (REQUEST, 15, 1, 16),
             (REQUEST, 15, -1, 0), (REQUEST, 15, True, 0), (REQUEST, "15", 1, 0), (None, 15, 1, 0),
         ):
             with self.subTest(arguments=arguments):
@@ -961,7 +957,7 @@ class PublicLineTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), subject.quick_line(REQUEST, 18, 18, 0) + "\n")
         for name, value in (
             ("KD_QUICK_GATES_SELECTED", "01"), ("KD_QUICK_GATES_PASSED", ""),
-            ("KD_QUICK_GATES_FAILED", "x"), ("KD_QUICK_GATES_PASSED", "19"),
+            ("KD_QUICK_GATES_FAILED", "x"), ("KD_QUICK_GATES_PASSED", "20"),
         ):
             with self.subTest(name=name, value=value):
                 output = io.StringIO()
@@ -1000,7 +996,7 @@ class SourceShapeTests(unittest.TestCase):
     def test_stream_budget_fits_the_payload_before_escaping(self):
         self.assertLess(2 * subject.MAX_GATES * subject.STREAM_TAIL_BYTES, subject.MAX_BODY_BYTES)
         self.assertEqual(subject.MIN_GATES, 15)
-        self.assertEqual(subject.MAX_GATES, 18)
+        self.assertEqual(subject.MAX_GATES, 19)
 
 
 if __name__ == "__main__":

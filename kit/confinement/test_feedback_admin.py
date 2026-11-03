@@ -647,6 +647,75 @@ class FeedbackAdminTests(unittest.TestCase):
                     request["request_id"], object(), manual_summary_review=None, run_id=str(RUN_ID),
                 )
 
+    def consume_with_screens(self, verdict_screens, parts, mutate_frames=None):
+        request = self.create("linux_quick")["request"]
+        evidence = self.quick_evidence(request)
+        evidence["ciphertext"] = b"KDLEverdict"
+        manifest, frames = _screens_set(SCREEN_FILES, request_id=request["request_id"])
+        if verdict_screens == "ok":
+            verdict_screens = manifest
+        if mutate_frames is not None:
+            frames = mutate_frames(frames)
+        verdict = _screens_frame(json.dumps({"screens": verdict_screens}).encode("ascii"))
+        if parts:
+            evidence["screens"] = [b"KDLEpart" + bytes([index]) for index in range(len(frames))]
+        module = types.ModuleType("feedback_api")
+        module.collect_feedback_evidence = lambda api, collector_request, **kwargs: evidence
+        by_envelope = {b"KDLEverdict": verdict}
+        for index, frame in enumerate(frames):
+            by_envelope[b"KDLEpart" + bytes([index])] = frame
+
+        def helper(message, *, plaintext_pipe=False):
+            return b'{"schema_version":1,"ok":true}\n', bytearray(by_envelope[base64.b64decode(message["envelope_base64"])])
+
+        with mock.patch.dict(sys.modules, {"feedback_api": module}), \
+                mock.patch.object(subject, "SCREENS_PART_BYTES", 100), \
+                mock.patch.object(self.admin, "_run_helper", side_effect=helper):
+            returned = self.admin.consume_return(
+                request["request_id"], object(), manual_summary_review=None, run_id=str(RUN_ID),
+            )
+        return request, verdict, returned
+
+    def test_an_ok_screens_block_is_decrypted_checked_and_written_beside_the_verdict(self):
+        request, verdict, returned = self.consume_with_screens("ok", True)
+        with open(returned["private_output_path"], "rb") as output:
+            self.assertEqual(output.read(), verdict)
+        name = "return-" + request["request_id"] + "-linux-quick-screens"
+        self.assertEqual(returned["screens_directory"], name)
+        root = os.path.join(self.directory, name)
+        for path, data in SCREEN_FILES:
+            with open(os.path.join(root, *path.split("/")), "rb") as source:
+                self.assertEqual(source.read(), data)
+        self.assertEqual(self._state()["requests"][0]["status"], "consumed")
+
+    def assert_screens_skipped(self, block, parts, mutate=None):
+        request, verdict, returned = self.consume_with_screens(block, parts, mutate)
+        self.assertNotIn("screens_directory", returned)
+        with open(returned["private_output_path"], "rb") as output:
+            self.assertEqual(output.read(), verdict)
+        self.assertFalse(os.path.exists(os.path.join(
+            self.directory, "return-" + request["request_id"] + "-linux-quick-screens",
+        )))
+        self.assertEqual(self._state()["requests"][0]["status"], "consumed")
+
+    def test_a_none_or_refused_screens_block_never_fails_the_verdict(self):
+        self.assert_screens_skipped({"status": "none"}, False)
+
+    def test_a_refused_screens_block_with_or_without_parts_never_fails_the_verdict(self):
+        self.assert_screens_skipped({"status": "refused"}, True)
+
+    def test_an_ok_block_without_returned_parts_never_fails_the_verdict(self):
+        self.assert_screens_skipped("ok", False)
+
+    def test_a_corrupt_part_never_fails_the_verdict(self):
+        self.assert_screens_skipped("ok", True, lambda frames: [frames[0][:-1] + b"!"] + frames[1:])
+
+    def test_a_missing_part_never_fails_the_verdict(self):
+        self.assert_screens_skipped("ok", True, lambda frames: frames[:-1])
+
+    def test_a_garbage_manifest_never_fails_the_verdict(self):
+        self.assert_screens_skipped({"status": "ok", "files": "x"}, True)
+
     def test_quick_return_refuses_each_inconsistent_input_and_keeps_the_request_retryable(self):
         request = self.create("linux_quick")["request"]
         good = self.quick_evidence(request)

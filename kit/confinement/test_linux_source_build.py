@@ -3995,7 +3995,7 @@ class LinuxBrowserTierTests(unittest.TestCase):
                 }
                 self.assertEqual(linux_source_build._verified_gate_count(records, environment), expected)
 
-    def test_only_the_admission_workflow_provisions_and_passes_the_browser(self):
+    def test_the_admission_and_quick_workflows_provision_and_pass_the_browser(self):
         root = Path(__file__).resolve().parents[2] / ".github" / "workflows"
         admission = (root / "linux-source-admission.yml").read_text(encoding="utf-8")
         quick = (root / "core-linux-quick-return.yml").read_text(encoding="utf-8")
@@ -4004,8 +4004,17 @@ class LinuxBrowserTierTests(unittest.TestCase):
         self.assertEqual(admission.count("REQUESTED_SOURCE_SHA,BROWSER_ROOT python3"), 2)
         self.assertIn("BROWSER_ROOT: ${{ steps.toolchains.outputs.browser_root }}", admission)
         self.assertIn("BROWSER_ROOT: ${{ steps.verifier-toolchain.outputs.browser_root }}", admission)
-        for forbidden in ("BROWSER_ROOT", "KD_BROWSER_TIER", "PLAYWRIGHT"):
-            self.assertNotIn(forbidden, quick)
+        self.assertEqual(quick.count('KD_BROWSER_TIER: "1"'), 1)
+        self.assertEqual(quick.count("BROWSER_ROOT: ${{ steps.toolchains.outputs.browser_root }}"), 1)
+        self.assertEqual(quick.count("REQUESTED_SOURCE_SHA,BROWSER_ROOT python3"), 1)
+        self.assertNotIn("PLAYWRIGHT", quick)
+        quick_block = quick[quick.index("      - name: Record image and fetch pinned Rust and Node toolchains"):].split("\n      - name:", 1)[0]
+        self.assertIn('KD_BROWSER_TIER: "1"', quick_block)
+        encrypt = quick[quick.index("      - name: Encrypt bounded quick return"):].split("\n      - name:", 1)[0]
+        self.assertIn("WORKER_PATH: ${{ steps.project-deps.outputs.worker_path }}", encrypt)
+        self.assertIn("ImageVersion,WORKER_PATH python3", encrypt)
+        upload = quick[quick.index("      - name: Upload the single encrypted member"):].split("\n      - name:", 1)[0]
+        self.assertIn("path: ${{ runner.temp }}/kd-quick-upload/\n", upload)
         for step in ("Record image and fetch pinned Rust and Node toolchains",
                      "Record verifier image and fetch pinned toolchains"):
             block = admission[admission.index("      - name: " + step):].split("\n      - name:", 1)[0]

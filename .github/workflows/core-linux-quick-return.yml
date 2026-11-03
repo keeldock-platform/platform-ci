@@ -218,6 +218,8 @@ jobs:
           python3 -B kit/confinement/linux_source_build.py preflight
       - name: Record image and fetch pinned Rust and Node toolchains
         id: toolchains
+        env:
+          KD_BROWSER_TIER: "1"
         run: python3 -B kit/confinement/linux_source_build.py toolchains
       - name: Harden runner paths before the proof
         run: |
@@ -308,8 +310,9 @@ jobs:
           NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
           WORKER_PATH: ${{ steps.project-deps.outputs.worker_path }}
           CARGO_HOME: ${{ steps.project-deps.outputs.cargo_home }}
+          BROWSER_ROOT: ${{ steps.toolchains.outputs.browser_root }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA python3 -B kit/confinement/linux_source_build.py gates
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge confinement phase records
         if: ${{ always() && steps.selftest.outcome != 'skipped' && steps.recheck.outcome != 'skipped' }}
         run: |
@@ -320,14 +323,15 @@ jobs:
         if: ${{ always() && steps.gates.outcome != 'skipped' }}
         env:
           NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}
-        run: sudo -n --preserve-env=KD_QUICK_REQUEST_ID,KD_QUICK_RECIPIENT_SPKI_B64,KD_QUICK_ALLOWED_REQUEST_ID,KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT,KD_QUICK_ALLOWED_NONCE,KD_QUICK_ALLOWED_EXPIRY,CI_SHA,REQUESTED_SOURCE_SHA,REQUESTED_BASE_SHA,REQUESTED_BASE_BRANCH,REQUESTED_FINGERPRINT,SOURCE_REPOSITORY_ID,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,RUNNER_TEMP,NODE_BIN,GITHUB_OUTPUT,ImageOS,ImageVersion python3 -B core-ci/linux_quick_return.py encrypt --reader-uid "$(id -u)" --reader-gid "$(id -g)"
+          WORKER_PATH: ${{ steps.project-deps.outputs.worker_path }}
+        run: sudo -n --preserve-env=KD_QUICK_REQUEST_ID,KD_QUICK_RECIPIENT_SPKI_B64,KD_QUICK_ALLOWED_REQUEST_ID,KD_QUICK_ALLOWED_RECIPIENT_FINGERPRINT,KD_QUICK_ALLOWED_NONCE,KD_QUICK_ALLOWED_EXPIRY,CI_SHA,REQUESTED_SOURCE_SHA,REQUESTED_BASE_SHA,REQUESTED_BASE_BRANCH,REQUESTED_FINGERPRINT,SOURCE_REPOSITORY_ID,GITHUB_RUN_ID,GITHUB_RUN_ATTEMPT,RUNNER_TEMP,NODE_BIN,GITHUB_OUTPUT,ImageOS,ImageVersion,WORKER_PATH python3 -B core-ci/linux_quick_return.py encrypt --reader-uid "$(id -u)" --reader-gid "$(id -g)"
       - name: Upload the single encrypted member
         id: uploader
         if: ${{ always() && steps.encrypt.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux-quick-${{ inputs.request_id }}
-          path: ${{ runner.temp }}/kd-quick-upload/linux-quick-return-v1.enc
+          path: ${{ runner.temp }}/kd-quick-upload/
           archive: true
           retention-days: 1
           compression-level: 0
@@ -351,10 +355,8 @@ jobs:
         if: ${{ always() }}
         run: |
           set -euo pipefail
-          staged="${RUNNER_TEMP%/}/kd-quick-upload/linux-quick-return-v1.enc"
-          if [[ -e "$staged" || -L "$staged" ]]; then rm -f -- "$staged"; fi
           staged_dir="${RUNNER_TEMP%/}/kd-quick-upload"
-          if [[ -d "$staged_dir" && ! -L "$staged_dir" ]]; then rmdir -- "$staged_dir"; fi
+          if [[ -d "$staged_dir" && ! -L "$staged_dir" ]]; then rm -rf -- "$staged_dir"; fi
   core-linux-quick-return-audit:
     needs:
       - core-linux-quick-return-settings

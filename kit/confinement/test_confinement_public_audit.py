@@ -1643,7 +1643,7 @@ class QuickLogTests(QuickAuditCase):
             (False, quick_count_line(selected=15, passed=14, failed=0)),
             (False, quick_count_line(selected=15, passed=15, failed=1)),
             (False, quick_count_line(selected=14, passed=14, failed=0)),
-            (False, quick_count_line(selected=19, passed=19, failed=0)),
+            (False, quick_count_line(selected=20, passed=20, failed=0)),
             (True, quick_count_line(selected=15, passed=4, failed=0)),
             (True, quick_count_line(selected=15, passed=15, failed=1)),
             (True, quick_count_line(selected=15, passed=4, failed=2)),
@@ -1670,7 +1670,7 @@ class QuickLogTests(QuickAuditCase):
 class QuickArtifactTests(QuickAuditCase):
     def test_exactly_one_named_unexpired_one_day_artifact_of_the_fixed_size_is_required(self):
         floor = subject.QUICK_FRAME_BYTES
-        ceiling = floor + subject.QUICK_ARTIFACT_SLACK_BYTES
+        ceiling = (floor + subject.QUICK_ARTIFACT_SLACK_BYTES) * (1 + subject.QUICK_SCREENS_MAX_PARTS)
         cases = (
             ("none", []),
             ("two", [quick_artifact(), quick_artifact(id=78, name="other")]),
@@ -1696,7 +1696,7 @@ class QuickArtifactTests(QuickAuditCase):
             api.artifacts = artifacts
             with self.subTest(label=label):
                 self.assert_refused(api, "artifact_inventory")
-        for size in (floor, ceiling):
+        for size in (floor, floor + subject.QUICK_ARTIFACT_SLACK_BYTES, 3 * floor, ceiling):
             api = QuickApi()
             api.artifacts = [quick_artifact(size_in_bytes=size)]
             with self.subTest(size=size):

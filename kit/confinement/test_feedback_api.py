@@ -990,6 +990,62 @@ class QuickEvidenceTests(unittest.TestCase):
                 with self.assertRaises(feedback_api.FeedbackAPIRefusal):
                     self._collect()
 
+    def _multi_archive(self, names=None, parts=2, compression=zipfile.ZIP_STORED, size=None):
+        profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
+        names = names or [profile["member_name"]] + [feedback_api.QUICK_SCREENS_MEMBER % index for index in range(parts)]
+        size = feedback_api.QUICK_FRAME_BYTES if size is None else size
+        result = io.BytesIO()
+        with zipfile.ZipFile(result, "w", compression=compression) as archive:
+            for index, name in enumerate(names):
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = 0o600 << 16
+                info.compress_type = compression
+                archive.writestr(info, b"KDLE" + bytes([index]) * (size - 4))
+        return result.getvalue()
+
+    def test_screens_members_are_returned_in_part_order_beside_the_verdict(self):
+        self.api.archive = self._multi_archive(parts=2)
+        evidence = self._collect()
+        self.assertEqual(evidence["ciphertext"][4], 0)
+        self.assertEqual([part[4] for part in evidence["screens"]], [1, 2])
+        self.assertEqual(evidence["artifact_digest"], hashlib.sha256(self.api.archive).hexdigest())
+        self.api.archive = _quick_archive(self.api.member_size)
+        self.assertNotIn("screens", self._collect())
+
+    def test_screens_members_outside_the_fixed_set_are_refused(self):
+        profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
+        part = feedback_api.QUICK_SCREENS_MEMBER
+        verdict = profile["member_name"]
+        for label, names in (
+            ("gap", [verdict, part % 0, part % 2]),
+            ("start", [verdict, part % 1, part % 2]),
+            ("duplicate", [verdict, part % 0, part % 0]),
+            ("no_verdict", [part % 0, part % 1, part % 2]),
+            ("other_name", [verdict, part % 0, "extra.enc"]),
+            ("nested", [verdict, "a/" + part % 0, part % 1]),
+        ):
+            with self.subTest(label=label):
+                self.api.archive = self._multi_archive(names=names)
+                with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+                    self._collect()
+
+    def test_screens_members_must_be_stored_frames_of_the_exact_size(self):
+        self.api.archive = self._multi_archive(compression=zipfile.ZIP_DEFLATED)
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+        self.api.archive = self._multi_archive(size=feedback_api.QUICK_FRAME_BYTES - 1)
+        with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+            self._collect()
+
+    def test_the_part_count_is_bounded_and_equals_the_audit_bound(self):
+        self.assertEqual(feedback_api.QUICK_SCREENS_MAX_PARTS, confinement_public_audit.QUICK_SCREENS_MAX_PARTS)
+        self.assertEqual(feedback_api.QUICK_SCREENS_MAX_PARTS, 17)
+        with patch.object(feedback_api, "QUICK_SCREENS_MAX_PARTS", 1):
+            self.api.archive = self._multi_archive(parts=2)
+            with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+                feedback_api._quick_multi_members(self.api.archive, "linux-quick-return-v1.enc")
+
     def test_a_wrong_artifact_name_digest_or_count_is_refused(self):
         self.api.artifact_name_override = "feedback-linux_quick-" + self.request["request_id"]
         with self.assertRaises(feedback_api.FeedbackAPIRefusal):

@@ -2,10 +2,12 @@
 
 import datetime
 import hashlib
+import io
 import json
 import re
 import urllib.parse
 import urllib.request
+import zipfile
 
 try:
     from . import feedback_request
@@ -34,6 +36,9 @@ QUICK_ARTIFACT_PREFIX = "linux-quick-"
 QUICK_JOB_SUFFIXES = ("-settings", "-unit")
 QUICK_FRAME_BYTES = 4 * 1024 * 1024 - 64 * 1024 + 470 + 16
 QUICK_ARTIFACT_SLACK_BYTES = 8192
+QUICK_SCREENS_MAX_PARTS = 17
+QUICK_SCREENS_MEMBER = "linux-quick-screens-%02d-v1.enc"
+QUICK_ARCHIVE_LIMIT = (QUICK_FRAME_BYTES + QUICK_ARTIFACT_SLACK_BYTES) * (1 + QUICK_SCREENS_MAX_PARTS)
 QUICK_RETENTION_SECONDS = 24 * 60 * 60
 QUICK_RETENTION_SLACK_SECONDS = 600
 QUICK_RUN_CONCLUSIONS = ("success", "failure")
@@ -480,7 +485,7 @@ def _artifact_digest(value):
     return digest
 
 
-def _download_archive(api, artifact_id):
+def _download_archive(api, artifact_id, limit=node_lock_receipt.MAX_ARCHIVE_BYTES):
     path = "/repos/" + API_REPOSITORY + "/actions/artifacts/" + str(artifact_id) + "/zip"
     request = urllib.request.Request(
         public_audit.API_ORIGIN + path,
@@ -505,7 +510,7 @@ def _download_archive(api, artifact_id):
         headers={"Accept": "application/zip", "Accept-Encoding": "identity", "User-Agent": "feedback-api-collector"},
         method="GET",
     )
-    archive, blob_headers = api._open(blob_request, node_lock_receipt.MAX_ARCHIVE_BYTES)
+    archive, blob_headers = api._open(blob_request, limit)
     if (blob_headers.get_content_type() not in ("application/zip", "application/octet-stream")
             or blob_headers.get("Content-Encoding", "identity").lower() != "identity"):
         _refuse()
@@ -679,6 +684,34 @@ def _quick_jobs(api, run, profile):
     _check_quick_audit_log(audit_log, run)
 
 
+def _quick_multi_members(archive, member_name):
+    """Return the verdict member and the numbered screens members of one bounded archive."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive), "r") as bundle:
+            entries = bundle.infolist()
+            parts = len(entries) - 1
+            if not 1 <= parts <= QUICK_SCREENS_MAX_PARTS:
+                _refuse()
+            expected = [member_name] + [QUICK_SCREENS_MEMBER % index for index in range(parts)]
+            if sorted(entry.filename for entry in entries) != sorted(expected):
+                _refuse()
+            members = {}
+            for entry in entries:
+                if (entry.filename != entry.orig_filename or entry.is_dir()
+                        or entry.compress_type != zipfile.ZIP_STORED or entry.flag_bits & 0x1
+                        or entry.file_size != QUICK_FRAME_BYTES or entry.compress_size != QUICK_FRAME_BYTES):
+                    _refuse()
+                data = bundle.read(entry)
+                if len(data) != QUICK_FRAME_BYTES or data[:4] != QUICK_MAGIC:
+                    _refuse()
+                members[entry.filename] = data
+    except FeedbackAPIRefusal:
+        raise
+    except Exception:
+        raise FeedbackAPIRefusal() from None
+    return members[member_name], [members[QUICK_SCREENS_MEMBER % index] for index in range(parts)]
+
+
 def _quick_artifact(api, request, profile, run, now):
     path = "/repos/" + API_REPOSITORY + "/actions/runs/" + str(run["id"]) + "/artifacts"
     artifacts = public_audit._read_counted_collection(
@@ -708,7 +741,7 @@ def _quick_artifact(api, request, profile, run, now):
             or artifact.get("expired") is not False
             or not _safe_int(artifact.get("id"), 1)
             or not _safe_int(size, QUICK_FRAME_BYTES)
-            or size > QUICK_FRAME_BYTES + QUICK_ARTIFACT_SLACK_BYTES):
+            or size > (QUICK_FRAME_BYTES + QUICK_ARTIFACT_SLACK_BYTES) * (1 + QUICK_SCREENS_MAX_PARTS)):
         _refuse()
     public_audit._validate_api_url(
         artifact["url"],
@@ -725,15 +758,19 @@ def _quick_artifact(api, request, profile, run, now):
             or expires - created > QUICK_RETENTION_SECONDS + QUICK_RETENTION_SLACK_SECONDS):
         _refuse()
     digest = _artifact_digest(artifact.get("digest"))
-    archive = _download_archive(api, artifact["id"])
+    archive = _download_archive(api, artifact["id"], QUICK_ARCHIVE_LIMIT)
     if len(archive) != size or hashlib.sha256(archive).hexdigest() != digest:
         _refuse()
-    member = node_lock_receipt.validate_ciphertext_archive(
-        archive, member_name=profile["member_name"],
-    )
+    if size <= QUICK_FRAME_BYTES + QUICK_ARTIFACT_SLACK_BYTES:
+        member = node_lock_receipt.validate_ciphertext_archive(
+            archive, member_name=profile["member_name"],
+        )
+        screens = []
+    else:
+        member, screens = _quick_multi_members(archive, profile["member_name"])
     if member[:4] != QUICK_MAGIC or len(member) != QUICK_FRAME_BYTES:
         _refuse()
-    return artifact["id"], digest, member
+    return artifact["id"], digest, member, screens
 
 
 def _quick_context(request, run_id):
@@ -759,8 +796,8 @@ def _collect_quick_evidence(api, request, profile, expected_actor_login, run_id,
         conclusions=QUICK_RUN_CONCLUSIONS,
     )
     _quick_jobs(api, run, profile)
-    artifact_id, digest, member = _quick_artifact(api, request, profile, run, now)
-    return {
+    artifact_id, digest, member, screens = _quick_artifact(api, request, profile, run, now)
+    evidence = {
         "kind": feedback_request.LINUX_QUICK_KIND,
         "context": _quick_context(request, run["id"]),
         "ciphertext": member,
@@ -771,6 +808,9 @@ def _collect_quick_evidence(api, request, profile, expected_actor_login, run_id,
         "actor_login": run["actor"]["login"],
         "now": now,
     }
+    if screens:
+        evidence["screens"] = screens
+    return evidence
 
 
 def collect_feedback_evidence(api, request, *, expected_actor_login, run_id, run_attempt, now):

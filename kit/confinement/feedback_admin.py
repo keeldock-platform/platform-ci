@@ -1204,6 +1204,41 @@ class FeedbackAdmin:
         if now >= EXCEPTION_END or now >= request["expiry"]:
             _refuse()
 
+    def _decrypt_screens(self, evidence, verdict, context, entry, request_id):
+        """Return the checked (path, bytes) pairs of an ok screens block, or None. Any absent,
+        refused or malformed block is skipped and never fails the verdict consumption."""
+        try:
+            frames = evidence.get("screens")
+            document = _unframe_screens_part(verdict, MAX_PLAINTEXT_BYTES)
+            manifest = document.get("screens") if type(document) is dict else None
+            if (frames is None or type(manifest) is not dict or manifest.get("status") != "ok"
+                    or type(frames) is not list or not 1 <= len(frames) <= SCREENS_MAX_PARTS
+                    or len(frames) != manifest.get("parts")):
+                return None
+            decrypted = []
+            for frame in frames:
+                if type(frame) is not bytes or not 0 < len(frame) <= MAX_NODE_INPUT_BYTES:
+                    return None
+                message = {
+                    "operation": "decrypt",
+                    "private_key_path": os.path.join(self.state_directory, _key_file(entry["nonce"])),
+                    "context": context,
+                    "now": self._clock_now(),
+                    "envelope_base64": base64.b64encode(frame).decode("ascii"),
+                }
+                stdout, plain = self._run_helper(message, plaintext_pipe=True)
+                try:
+                    if (_parse_json(stdout, MAX_NODE_PUBLIC_OUTPUT_BYTES) != {"schema_version": 1, "ok": True}
+                            or not 0 < len(plain) <= MAX_PLAINTEXT_BYTES):
+                        return None
+                    decrypted.append(bytes(plain))
+                finally:
+                    if isinstance(plain, bytearray):
+                        plain[:] = b"\x00" * len(plain)
+            return assemble_screens(manifest, decrypted, request_id)
+        except Exception:
+            return None
+
     def _consume_quick(self, dir_fd, request_id, api_client, manual_summary_review,
                        rust_source_directory, run_id, state, entry, packet, profile):
         request = packet["request"]
@@ -1225,7 +1260,8 @@ class FeedbackAdmin:
         request = packet["request"]
         self._check_quick_window(request, now)
         context = _quick_context(request, run_id)
-        if (not _exact_dict(evidence, QUICK_EVIDENCE_FIELDS)
+        if (not _exact_dict(
+                evidence, QUICK_EVIDENCE_FIELDS | (frozenset(("screens",)) if "screens" in evidence else frozenset()))
                 or evidence["kind"] != feedback_request.LINUX_QUICK_KIND
                 or evidence["context"] != context
                 or evidence["run_id"] != int(run_id)
@@ -1247,6 +1283,7 @@ class FeedbackAdmin:
             response = _parse_json(stdout, MAX_NODE_PUBLIC_OUTPUT_BYTES)
             if response != {"schema_version": 1, "ok": True} or not 0 < len(plaintext) <= MAX_PLAINTEXT_BYTES:
                 _refuse()
+            screen_files = self._decrypt_screens(evidence, plaintext, context, entry, request_id)
             now, state, entry, packet, profile = self._refresh_request(dir_fd, request_id)
             request = packet["request"]
             self._check_quick_window(request, now)
@@ -1270,12 +1307,21 @@ class FeedbackAdmin:
                 except Exception:
                     pass
                 _refuse()
-            return {
+            screens_directory = None
+            if screen_files:
+                try:
+                    screens_directory = write_screens_directory(dir_fd, request_id, screen_files)
+                except Exception:
+                    screens_directory = None
+            result = {
                 "request_id": request_id,
                 "kind": profile["kind"],
                 "private_output_path": output_path,
                 "bootstrap_lock_consumed": state["bootstrap_lock_consumed"],
             }
+            if screens_directory is not None:
+                result["screens_directory"] = screens_directory
+            return result
         finally:
             if isinstance(plaintext, bytearray):
                 plaintext[:] = b"\x00" * len(plaintext)

@@ -29,7 +29,7 @@ MAX_CIPHERTEXT_BYTES = 4 * 1024 * 1024
 MAX_NODE_INPUT_BYTES = 6 * 1024 * 1024
 STREAM_TAIL_BYTES = 64 * 1024
 MIN_GATES = 15
-MAX_GATES = 18
+MAX_GATES = 19
 MAX_RECORD_BYTES = 65536
 CONTEXT_LIFETIME_SECONDS = 23 * 60 * 60
 MAX_CONTEXT_LIFETIME_SECONDS = 24 * 60 * 60
@@ -78,7 +78,6 @@ SCREENS_MAX_AREA = 64_000_000
 SCREENS_MIN_FILE_BYTES = 45
 SCREENS_PART_BYTES = 3_000_000
 SCREENS_MAX_PARTS = -(-SCREENS_MAX_BYTES // SCREENS_PART_BYTES)
-SCREENS_UPLOAD_DIRECTORY = "kd-screens-upload"
 SCREENS_MEMBER_FORMAT = "linux-quick-screens-%02d-v1.enc"
 SCREENS_PHASE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 SCREENS_NAME_RE = re.compile(
@@ -648,8 +647,7 @@ def write_screens(runner_temp, ciphertexts, uid, gid):
     parent_fd = directory_fd = -1
     try:
         parent_fd = os.open(str(runner_temp), os.O_RDONLY | directory_flag | nofollow)
-        os.mkdir(SCREENS_UPLOAD_DIRECTORY, 0o700, dir_fd=parent_fd)
-        directory_fd = os.open(SCREENS_UPLOAD_DIRECTORY, os.O_RDONLY | directory_flag | nofollow, dir_fd=parent_fd)
+        directory_fd = os.open(UPLOAD_DIRECTORY, os.O_RDONLY | directory_flag | nofollow, dir_fd=parent_fd)
         os.fchown(directory_fd, uid, gid)
         os.fchmod(directory_fd, 0o700)
         for index, data in enumerate(ciphertexts):
