@@ -52,6 +52,7 @@ FINGERPRINT_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}\Z")
 OWNER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\Z")
 API_PATH_RE = re.compile(r"/[A-Za-z0-9._~/?&=-]*\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
+SOURCE_TOKEN_RE = re.compile(r"[\x21\x23-\x2b\x2d-\x39\x3b-\x7e]{20,4096}\Z")
 ENVIRONMENT_NAME = "linux-source-read"
 ENVIRONMENT_BRANCHES = ("main", "untrusted")
 GATES = gate_table.GATES
@@ -626,6 +627,14 @@ SIGN_KEY_MARKERS = (
 )
 
 
+def _valid_source_token(value):
+    return type(value) is str and SOURCE_TOKEN_RE.fullmatch(value) is not None
+
+
+def _mask_line(token):
+    return "::add-mask::" + token.replace("%", "%25") + "\n"
+
+
 def _token_refusal(stage):
     sys.stdout.write("linux-verifier-token-diag stage=" + stage + "\n")
     sys.stdout.flush()
@@ -719,8 +728,10 @@ def mint_verifier_token(environ=None):
         payload={"repositories": [identity["name"]], "permissions": {"contents": "read"}}, expected=(201,),
     )
     token = issued.get("token") if type(issued) is dict else None
-    if type(token) is not str or re.fullmatch(r"[A-Za-z0-9_]{20,1024}", token) is None:
+    if not _valid_source_token(token):
         raise _token_refusal("issue")
+    sys.stdout.write(_mask_line(token))
+    sys.stdout.flush()
     permissions = issued.get("permissions")
     if (type(permissions) is not dict or permissions.get("contents") != "read"
             or set(permissions) - {"contents", "metadata"}
@@ -732,8 +743,6 @@ def mint_verifier_token(environ=None):
             or type(entries[0]) is not dict or entries[0].get("id") != int(identity["repository_id"])
             or entries[0].get("name") != identity["name"]):
         raise _token_refusal("repositories")
-    sys.stdout.write("::add-mask::" + token + "\n")
-    sys.stdout.flush()
     _write_output(env, {"token": token, "installation_id": installation_id})
     sys.stdout.write("linux-verifier-token=issued installation=verified scope=one-repository\n")
     return 0
@@ -1309,7 +1318,7 @@ def checkout_source(environ=None):
     env = os.environ if environ is None else environ
     identity = _source_inputs(env)
     token = env.get("SOURCE_READER_TOKEN", "")
-    if not token or len(token) > 4096:
+    if not _valid_source_token(token):
         raise SourceBuildRefusal("token")
     source_root = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-source-checkout"
     shutil.rmtree(source_root, ignore_errors=True)
@@ -1394,7 +1403,7 @@ def checkout_source(environ=None):
 def revoke_token(environ=None):
     env = os.environ if environ is None else environ
     token = env.get("SOURCE_READER_TOKEN", "")
-    if not token:
+    if not _valid_source_token(token):
         raise SourceBuildRefusal("revocation")
     status, unused = _api_request("/installation/token", token, method="DELETE", expected=(204,))
     if status != 204:

@@ -265,6 +265,165 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertNotIn("--config-path", self.runner)
         self.assertNotIn("CLIPPY_CONF_DIR", self.runner)
 
+    def function_body(self, name):
+        return self.runner.split("function " + name, 1)[1].split("\n}\n", 1)[0]
+
+    def test_probe_lines_share_the_synthetic_diag_pattern_and_never_the_public_one(self):
+        diag = re.compile(re.search(r"DiagLinePattern = '([^']+)'", self.runner).group(1))
+        public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
+        for accepted in (
+            "windows-source-probe id=cargo_version exit=0x00000000",
+            "windows-source-probe id=cargo_fmt_verbose exit=0xc0000142",
+            "windows-source-probe-line error: example output",
+            "windows-source-probe-line tool_configs rustfmt.toml=wrote clippy.toml=present",
+            "windows-source-probe-line absent id=cargo_fmt_exe_version",
+            "windows-source-probe-line ",
+            "windows-source-probe-line " + "a" * 300,
+            "windows-source-gate-diag id=format exit=0x00000001",
+        ):
+            with self.subTest(accepted=accepted[:48]):
+                self.assertIsNotNone(diag.fullmatch(accepted))
+                self.assertIsNone(public.fullmatch(accepted))
+        for refused in (
+            "windows-source-probe id=Cargo exit=0x00000000",
+            "windows-source-probe id=cargo_version exit=0x0",
+            "windows-source-probe id=cargo_version exit=0xC0000142",
+            "windows-source-probe id=cargo_version exit=0x00000000 extra",
+            "windows-source-probe-line " + "a" * 301,
+            "windows-source-probe-line \x01",
+            "windows-source-probe-line " + chr(233),
+            "windows-source-probe-linex",
+            "windows-source-probes id=cargo_version exit=0x00000000",
+            "windows-source-probe=1",
+            "windows-source-probe",
+        ):
+            with self.subTest(refused=refused[:48]):
+                self.assertIsNone(diag.fullmatch(refused))
+        self.assertNotRegex(self.runner, r"Write-Line \('windows-source-probe")
+
+    def test_the_probe_matrix_has_fixed_ids_and_the_exact_commands_with_the_staged_binaries(self):
+        body = self.function_body("Get-SourceProbes")
+        ids = re.findall(r"@\{ Id = '([^']+)'", body)
+        self.assertEqual(ids, [
+            "cargo_version", "cargo_fmt_version", "cargo_fmt_exe_version", "rustfmt_version",
+            "cargo_metadata", "rustfmt_file_check", "cargo_fmt_verbose",
+        ])
+        for name in ids:
+            self.assertRegex(name, r"^[a-z][a-z_]{2,40}$")
+        for token in (
+            "$cargo = Join-Path $rustBin 'cargo.exe'",
+            "$rustfmt = Join-Path $rustBin 'rustfmt.exe'",
+            "$cargoFmt = Join-Path $rustBin 'cargo-fmt.exe'",
+            "$manifest = Join-Path $project 'Cargo.toml'",
+            "$library = Join-Path $project 'crates\\host\\api\\src\\lib.rs'",
+            "Argv = [string[]]@($cargo, '--version') }",
+            "Argv = [string[]]@($cargo, 'fmt', '--version') }",
+            "Needs = $cargoFmt; Extra = $none; Argv = [string[]]@($cargoFmt, '--version') }",
+            "Argv = [string[]]@($rustfmt, '--version') }",
+            "Argv = [string[]]@($cargo, 'metadata', '--format-version', '1', '--offline', '--no-deps', '--manifest-path', $manifest) }",
+            "Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $library) }",
+            "Extra = [string[]]@('RUST_BACKTRACE=1'); Argv = [string[]]@($cargo, 'fmt', '--verbose', '--', '--check') }",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, body)
+        self.assertEqual(self.runner.count("RUST_BACKTRACE=1"), 1)
+        self.assertEqual(body.count("Extra = $none"), 6)
+        self.assertEqual(len(re.findall(r"Needs = '';", body)), 5)
+        self.assertIn("Get-GatePlan $project ($layout.RustBin + '\\cargo.exe')", self.runner)
+        synthetic = ROOT / "kit/confinement/synthetic_project"
+        self.assertTrue((synthetic / "Cargo.toml").is_file())
+        self.assertTrue((synthetic / "crates/host/api/src/lib.rs").is_file())
+        self.assertIn('edition = "2024"', (synthetic / "crates/host/api/Cargo.toml").read_text(encoding="utf-8"))
+
+    def test_the_probe_matrix_runs_only_in_synthetic_mode_right_before_the_gates_and_never_changes_them(self):
+        call = "$phase = 'gates'\n            Invoke-SourceProbes $box $project $layout.RustBin\n            $gateOutcome = Invoke-SourceGates $box $plan $project $recordsDirectory\n"
+        self.assertEqual(self.runner.count(call), 1)
+        self.assertEqual(len(re.findall(r"Invoke-SourceProbes\b", self.runner)), 2)
+        self.assertEqual(len(re.findall(r"Get-SourceProbes\b", self.runner)), 2)
+        self.assertEqual(len(re.findall(r"Write-ProbeDiag\b", self.runner)), 2)
+        order = [self.runner.index(token) for token in (
+            "Initialize-ToolConfigs $project\n", "$tarballs = Initialize-NpmTarballs $project",
+            "$phase = 'gate_plan'", "$plan = Get-GatePlan", "$phase = 'gates'\n            Invoke-SourceProbes",
+            "$gateOutcome = Invoke-SourceGates")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(len(set(order)), 6)
+        for name in ("Invoke-SourceProbes", "Write-ProbeDiag"):
+            body = self.function_body(name)
+            with self.subTest(function=name):
+                self.assertTrue(body.split("\n", 1)[1].startswith("    if ($script:RunMode -cne 'synthetic') { return }\n"))
+        probes = self.function_body("Invoke-SourceProbes")
+        self.assertLess(probes.index("-cne 'synthetic'"), probes.index("$sandbox.Run("))
+        self.assertEqual(probes.count("$sandbox.Run("), 1)
+        self.assertNotIn("'source'", probes)
+        self.assertEqual(probes.count("'synthetic'"), 1)
+        for name in ("Invoke-SourceProbes", "Write-ProbeDiag", "Get-SourceProbes"):
+            body = self.function_body(name)
+            with self.subTest(function=name):
+                for forbidden in (
+                    "$outcome", "$script:GateFailure", "$script:RefusalReason", "$script:GateCause", "throw",
+                    "Grant-", "Set-LowIntegrityLabel", "Write-Line", "[Console]", "$exitCode", "$script:Redactions =",
+                    "Remove-", "WriteAllText", "New-Item",
+                ):
+                    self.assertNotIn(forbidden, body)
+        for name in ("Invoke-SourceProbes", "Write-ProbeDiag"):
+            body = self.function_body(name)
+            self.assertIn("} catch {\n        return\n    }", body)
+        self.assertEqual(len(re.findall(r"(?m)^\s*Grant-Access ", self.runner)), 2)
+
+    def test_each_probe_is_bounded_in_time_and_uses_the_gate_launcher_and_environment(self):
+        for token in ("$ProbeSeconds = 60\n", "$ProbeStderrLines = 20\n", "$ProbeStdoutLines = 10\n"):
+            self.assertIn("\n" + token, self.runner)
+        self.assertLessEqual(int(re.search(r"\n\$ProbeSeconds = ([0-9]+)\n", self.runner).group(1)), 60)
+        probes = self.function_body("Invoke-SourceProbes")
+        for token in (
+            "$environment = New-GateEnvironment\n",
+            "$remaining = (Get-RemainingSeconds) - 900\n",
+            "if ($remaining -lt 60) { return }\n",
+            "$seconds = $ProbeSeconds\n",
+            "if ($seconds -gt $remaining) { $seconds = $remaining }\n",
+            "$probeEnvironment = [string[]]($environment + $probe.Extra)\n",
+            "$run = $sandbox.Run($true, [string]$probe.Argv[0], (ConvertTo-CommandLine $probe.Argv), $project, $probeEnvironment, ($seconds * 1000), [uint32]32)\n",
+            "Write-ProbeDiag $probe.Id $run\n",
+        ):
+            with self.subTest(token=token[:50]):
+                self.assertIn(token, probes)
+        self.assertEqual(probes.count("New-GateEnvironment"), 1)
+        self.assertNotIn("Start-Process", probes)
+        self.assertNotIn("Invoke-TrustedProcess", probes)
+
+    def test_probe_output_is_sanitised_bounded_and_suppressed_whole_on_any_canary_hit(self):
+        body = self.function_body("Write-ProbeDiag")
+        self.assertIn("if ($run.Truncated -or (Test-LogCanary ([string]$run.Stdout + \"`n\" + [string]$run.Stderr))) { return }\n", body)
+        self.assertIn("$code = [uint32]$run.ExitCode\n", body)
+        self.assertIn("$lines = @('windows-source-probe id=' + $id + ' exit=0x' + $code.ToString('x8'))\n", body)
+        self.assertIn("Get-DiagTail ([string]$run.Stderr) $ProbeStderrLines", body)
+        self.assertIn("Get-DiagTail ([string]$run.Stdout) $ProbeStdoutLines", body)
+        self.assertEqual(body.count("(Get-DiagLineText ([string]$line))"), 2)
+        self.assertEqual(body.count("windows-source-probe-line "), 2)
+        self.assertLess(body.index("$run.Stderr) $ProbeStderrLines"), body.index("$run.Stdout) $ProbeStdoutLines"))
+        rescan = body.index("if (Test-LogCanary $line) { return }")
+        printing = body.index("Write-SyntheticDiag $line")
+        self.assertLess(body.index("$run.Truncated"), rescan)
+        self.assertLess(rescan, printing)
+        self.assertEqual(body.count("Write-SyntheticDiag"), 1)
+        self.assertEqual(self.runner.count("$run.ExitCode).ToString("), 1)
+        writer = self.function_body("Write-SyntheticDiag")
+        self.assertIn("-not (Test-LogCanary $text)", writer)
+        self.assertIn("if ($script:LogNeedles.Count -eq 0) { return $true }", self.runner)
+
+    def test_the_tool_config_step_reports_whether_it_wrote_or_found_each_file_in_one_synthetic_line(self):
+        function = self.function_body("Initialize-ToolConfigs")
+        self.assertIn("$script:ToolConfigState = @()\n", function)
+        self.assertIn("$script:ToolConfigState += ($names[1] + '=wrote')", function)
+        self.assertIn("} else {\n            $script:ToolConfigState += ($names[1] + '=present')", function)
+        self.assertLess(function.index("WriteAllText"), function.index("'=wrote'"))
+        self.assertEqual(self.runner.count("$script:ToolConfigState = @()\n"), 2)
+        probes = self.function_body("Invoke-SourceProbes")
+        line = "Write-SyntheticDiag ('windows-source-probe-line tool_configs ' + ($script:ToolConfigState -join ' '))\n"
+        self.assertIn(line, probes)
+        self.assertLess(probes.index(line), probes.index("foreach ($probe in"))
+        self.assertEqual(self.runner.count("tool_configs '"), 1)
+
     def layout_parent(self):
         return dict(re.findall(r"\$layout\.([A-Za-z]+) = Join-Path \$layout\.([A-Za-z]+) ", self.runner))
 

@@ -40,7 +40,8 @@ $script:GateCause = ''
 $script:RunMode = ''
 $script:RefusalReason = ''
 $script:PublicLinePattern = '^(windows-source|windows-confinement|capsule-decrypt|capsule-destroy)[a-z-]*=[ -~]{0,480}$'
-$script:DiagLinePattern = '^windows-source-gate-diag( id=[a-z][a-z_]{2,40} exit=0x[0-9a-f]{8}|-line [ -~]{0,300})$'
+$script:DiagLinePattern = '^windows-source-(?:gate-diag|probe)( id=[a-z][a-z_]{2,40} exit=0x[0-9a-f]{8}|-line [ -~]{0,300})$'
+$script:ToolConfigState = @()
 
 $NpmVersion = '11.19.1'
 $GateTableScript = 'gate_table.py'
@@ -53,6 +54,9 @@ $GateShortSeconds = 300
 $DiagStderrLines = 40
 $DiagStdoutLines = 20
 $DiagLineLimit = 300
+$ProbeSeconds = 60
+$ProbeStderrLines = 20
+$ProbeStdoutLines = 10
 $GateLongPattern = '(^|_)(clippy|tests|replay|prepare|typecheck)$'
 $MaxManifestEntries = 10000
 $MaxTarballs = 6000
@@ -121,6 +125,70 @@ function Write-GateDiag([string]$id, $run) {
         }
         foreach ($line in @(Get-DiagTail ([string]$run.Stdout) $DiagStdoutLines)) {
             Write-SyntheticDiag ('windows-source-gate-diag-line ' + (Get-DiagLineText ([string]$line)))
+        }
+    } catch {
+        return
+    }
+}
+
+function Write-ProbeDiag([string]$id, $run) {
+    if ($script:RunMode -cne 'synthetic') { return }
+    try {
+        if ($run.Truncated -or (Test-LogCanary ([string]$run.Stdout + "`n" + [string]$run.Stderr))) { return }
+        $code = [uint32]$run.ExitCode
+        $lines = @('windows-source-probe id=' + $id + ' exit=0x' + $code.ToString('x8'))
+        foreach ($line in @(Get-DiagTail ([string]$run.Stderr) $ProbeStderrLines)) {
+            $lines += ('windows-source-probe-line ' + (Get-DiagLineText ([string]$line)))
+        }
+        foreach ($line in @(Get-DiagTail ([string]$run.Stdout) $ProbeStdoutLines)) {
+            $lines += ('windows-source-probe-line ' + (Get-DiagLineText ([string]$line)))
+        }
+        foreach ($line in $lines) {
+            if (Test-LogCanary $line) { return }
+        }
+        foreach ($line in $lines) {
+            Write-SyntheticDiag $line
+        }
+    } catch {
+        return
+    }
+}
+
+function Get-SourceProbes([string]$project, [string]$rustBin) {
+    $cargo = Join-Path $rustBin 'cargo.exe'
+    $rustfmt = Join-Path $rustBin 'rustfmt.exe'
+    $cargoFmt = Join-Path $rustBin 'cargo-fmt.exe'
+    $manifest = Join-Path $project 'Cargo.toml'
+    $library = Join-Path $project 'crates\host\api\src\lib.rs'
+    $none = [string[]]@()
+    return @(
+        @{ Id = 'cargo_version'; Needs = ''; Extra = $none; Argv = [string[]]@($cargo, '--version') },
+        @{ Id = 'cargo_fmt_version'; Needs = ''; Extra = $none; Argv = [string[]]@($cargo, 'fmt', '--version') },
+        @{ Id = 'cargo_fmt_exe_version'; Needs = $cargoFmt; Extra = $none; Argv = [string[]]@($cargoFmt, '--version') },
+        @{ Id = 'rustfmt_version'; Needs = ''; Extra = $none; Argv = [string[]]@($rustfmt, '--version') },
+        @{ Id = 'cargo_metadata'; Needs = ''; Extra = $none; Argv = [string[]]@($cargo, 'metadata', '--format-version', '1', '--offline', '--no-deps', '--manifest-path', $manifest) },
+        @{ Id = 'rustfmt_file_check'; Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $library) },
+        @{ Id = 'cargo_fmt_verbose'; Needs = ''; Extra = [string[]]@('RUST_BACKTRACE=1'); Argv = [string[]]@($cargo, 'fmt', '--verbose', '--', '--check') }
+    )
+}
+
+function Invoke-SourceProbes($sandbox, [string]$project, [string]$rustBin) {
+    if ($script:RunMode -cne 'synthetic') { return }
+    try {
+        Write-SyntheticDiag ('windows-source-probe-line tool_configs ' + ($script:ToolConfigState -join ' '))
+        $environment = New-GateEnvironment
+        foreach ($probe in @(Get-SourceProbes $project $rustBin)) {
+            $remaining = (Get-RemainingSeconds) - 900
+            if ($remaining -lt 60) { return }
+            if ($probe.Needs.Length -gt 0 -and -not (Test-Path -LiteralPath $probe.Needs -PathType Leaf)) {
+                Write-SyntheticDiag ('windows-source-probe-line absent id=' + $probe.Id)
+                continue
+            }
+            $seconds = $ProbeSeconds
+            if ($seconds -gt $remaining) { $seconds = $remaining }
+            $probeEnvironment = [string[]]($environment + $probe.Extra)
+            $run = $sandbox.Run($true, [string]$probe.Argv[0], (ConvertTo-CommandLine $probe.Argv), $project, $probeEnvironment, ($seconds * 1000), [uint32]32)
+            Write-ProbeDiag $probe.Id $run
         }
     } catch {
         return
@@ -559,6 +627,7 @@ function Remove-SourceConfigFiles([string]$project) {
 
 function Initialize-ToolConfigs([string]$project) {
     $encoding = New-Object System.Text.UTF8Encoding($false)
+    $script:ToolConfigState = @()
     foreach ($names in @(@('.rustfmt.toml', 'rustfmt.toml'), @('.clippy.toml', 'clippy.toml'))) {
         $present = $false
         foreach ($name in $names) {
@@ -572,6 +641,9 @@ function Initialize-ToolConfigs([string]$project) {
         }
         if (-not $present) {
             [IO.File]::WriteAllText((Join-Path $project $names[1]), '', $encoding)
+            $script:ToolConfigState += ($names[1] + '=wrote')
+        } else {
+            $script:ToolConfigState += ($names[1] + '=present')
         }
     }
 }
@@ -1144,6 +1216,7 @@ try {
             Write-Line ('windows-source-gate-plan=ready gates=' + $plan.Count)
 
             $phase = 'gates'
+            Invoke-SourceProbes $box $project $layout.RustBin
             $gateOutcome = Invoke-SourceGates $box $plan $project $recordsDirectory
             $script:GateFailure = [int]$gateOutcome.Failure
 
