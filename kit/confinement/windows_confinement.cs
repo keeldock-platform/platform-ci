@@ -79,6 +79,8 @@ namespace KeelDock.Platform.WindowsConfinement
         private const uint NulMask = 0x0012019F;
         private const string MountManagerPath = "\\\\.\\MountPointManager";
         private const uint MountManagerMask = 0x00120089;
+        private const string VolumePrefix = "\\\\.\\";
+        private const uint VolumeMask = 0x00100080;
         private const string GlobalDirectoryPath = "\\GLOBAL??";
         private const string MountManagerLinkPath = "\\GLOBAL??\\MountPointManager";
         private const uint LinkQueryMask = 0x00020001;
@@ -135,6 +137,10 @@ namespace KeelDock.Platform.WindowsConfinement
             else if (kind == "mountmgr" && drive.Length == 0)
             {
                 lease = new DeviceLease(packageSid, MountManagerPath, MountManagerMask, KindFile);
+            }
+            else if (kind == "volume" && IsDriveLetter(drive))
+            {
+                lease = new DeviceLease(packageSid, VolumePrefix + drive.ToUpperInvariant() + ":", VolumeMask, KindFile);
             }
             else if (kind == "drive_link" && IsDriveLetter(drive))
             {

@@ -622,9 +622,67 @@ fn device_state(path: &str, access: u32) -> String {
     String::from("ok")
 }
 
-fn probe_finalpath(dir: &str) -> String {
+fn volume_device(handle: isize) -> Option<Vec<u16>> {
+    let mut buffer = vec![0u16; 32768];
+    let length = unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 2) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return None;
+    }
+    let slash = b'\\' as u16;
+    let mut count = 0;
+    let mut end = length;
+    for (index, value) in buffer[..length].iter().enumerate() {
+        if *value == slash {
+            count += 1;
+            if count == 3 {
+                end = index;
+                break;
+            }
+        }
+    }
+    if count < 2 || end < 9 {
+        return None;
+    }
+    Some(buffer[..end].to_vec())
+}
+
+fn mount_query(device: &Option<Vec<u16>>, code: u32) -> String {
+    let name = match device {
+        Some(value) => value,
+        None => return String::from("na"),
+    };
+    let path = wide("\\\\.\\MountPointManager");
+    let handle = unsafe { CreateFileW(path.as_ptr(), 0, 3, ptr::null_mut(), 3, 0, 0) };
+    if handle == -1 {
+        return format!("err{}", last_error());
+    }
+    let bytes = name.len() * 2;
+    let mut input: Vec<u8> = Vec::with_capacity(32 + bytes);
+    if code == 0x006D_0030 {
+        push_u16(&mut input, bytes);
+    } else {
+        input.extend_from_slice(&[0u8; 16]);
+        input.extend_from_slice(&24u32.to_le_bytes());
+        push_u16(&mut input, bytes);
+        push_u16(&mut input, 0);
+    }
+    push_text(&mut input, name);
+    let mut output = vec![0u8; 65536];
+    let mut returned: u32 = 0;
+    let done = unsafe { DeviceIoControl(handle, code, input.as_mut_ptr(), input.len() as u32, output.as_mut_ptr(), output.len() as u32, &mut returned, ptr::null_mut()) };
+    let state = if done == 0 { format!("err{}", last_error()) } else { String::from("ok") };
+    unsafe {
+        CloseHandle(handle);
+    }
+    state
+}
+
+fn probe_finalpath(dir: &str, drive: &str) -> String {
     if let Err(reason) = plain_path(dir) {
         return format!("open0=usage_{}", reason);
+    }
+    if !drive.is_empty() && (drive.len() != 1 || !drive.chars().all(|value| value.is_ascii_alphabetic())) {
+        return String::from("open0=usage_drive");
     }
     let opened = open_directory(dir, 0);
     let read_attributes = open_directory(dir, 0x0010_0080);
@@ -635,6 +693,10 @@ fn probe_finalpath(dir: &str) -> String {
     let ra_dos = match read_attributes {
         Ok(handle) => final_name(handle, 0),
         Err(_) => String::from("na"),
+    };
+    let volume = match opened {
+        Ok(handle) => volume_device(handle),
+        Err(_) => None,
     };
     for item in [&opened, &read_attributes] {
         if let Ok(handle) = item {
@@ -661,6 +723,14 @@ fn probe_finalpath(dir: &str) -> String {
         " n_nt={} n_guid={} n_none={} o_dos={} o_nt={} mpm={} mpmr={} qdd={} canon={}",
         names[1], names[2], names[3], names[4], names[5], mpm, mpmr, qdd, canon
     ));
+    let letter = if drive.is_empty() { dir[..1].to_ascii_uppercase() } else { drive.to_ascii_uppercase() };
+    let volume_path = format!("\\\\.\\{}:", letter);
+    let vol = device_state(&volume_path, 0x0000_0080);
+    let volr = device_state(&volume_path, 0x8000_0000);
+    let voldac = device_state(&volume_path, 0x0004_0000);
+    let qdvp = mount_query(&volume, 0x006D_0030);
+    let qpts = mount_query(&volume, 0x006D_0008);
+    line.push_str(&format!(" vol={} volr={} voldac={} qdvp={} qpts={}", vol, volr, voldac, qdvp, qpts));
     line
 }
 
@@ -1021,7 +1091,7 @@ fn main() {
         "scm" => probe_scm(),
         "symlink" => probe_symlink(first, second),
         "hardlink" => probe_hardlink(first, second),
-        "finalpath" => probe_finalpath(first),
+        "finalpath" => probe_finalpath(first, second),
         "junction" => probe_junction(first, second, third),
         "mountmgr" => probe_mountmgr(first),
         "objdac" => probe_objdac(first, second),
