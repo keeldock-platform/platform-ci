@@ -545,7 +545,7 @@ CORE_CONTRACT_TREE_BY_CONCERN = {
     "core-rust-lock-return": "core_rust_lock_return",
     "core-npm-admission-return": "core_npm_admission_return",
 }
-CORE_CONTRACT_RULES_TAG_PATTERN = re.compile(r"tag v(?:2\.0\.0|3\.0\.0)\Z")
+CORE_CONTRACT_RULES_TAG_PATTERN = re.compile(r"tag v(?:2\.0\.0|3\.0\.0|4\.0\.0)\Z")
 CORE_CONTRACT_RUST_POLICY_FILES = frozenset((
     "deny.toml", "dependency-policy.toml", "supply-chain/audits.toml",
     "supply-chain/config.toml", "supply-chain/imports.lock",
@@ -567,6 +567,22 @@ CORE_CONTRACT_RULES_V3_CHANGED_PATHS = frozenset((
     RULES_DIRECTORY + "/rules/shared/rust.md",
     RULES_DIRECTORY + "/rules/shared/source-execution-confinement.md",
     RULES_DIRECTORY + "/rules/shared/supply-chain.md",
+))
+CORE_CONTRACT_RULES_V4_LOCK_OBJECT = "ea502d669da414b7180fddb1796cec2828e69561"
+CORE_CONTRACT_RULES_V4_ADDED_RULE = RULES_DIRECTORY + "/rules/node-test-processes.md"
+CORE_CONTRACT_RULES_V4_CHANGED_PATHS = frozenset((
+    RULES_LOCK_PATH,
+    CORE_CONTRACT_RULES_V4_ADDED_RULE,
+    RULES_DIRECTORY + "/rules/shared/agents-and-orchestration.md",
+    RULES_DIRECTORY + "/rules/shared/ci-and-admission.md",
+    RULES_DIRECTORY + "/rules/shared/source-execution-confinement.md",
+))
+CORE_CONTRACT_REPOSITORY_RULE_PATTERN = re.compile(
+    re.escape(RULES_DIRECTORY) + r"/rules/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)\.md\Z"
+)
+CORE_CONTRACT_PACKAGE_VITEST_FILES = frozenset((
+    "packages/host-api/vitest.config.ts",
+    "packages/kernel-i18n/vitest.config.ts",
 ))
 RUNTIME_WORKSPACE_DIRECTORY = "runtime"
 RUNTIME_ROOT_MANIFEST_PATH = RUNTIME_WORKSPACE_DIRECTORY + "/Cargo.toml"
@@ -2199,6 +2215,9 @@ def _core_contract_admin_mode(path):
         return "100644"
     if path.startswith(RULES_DIRECTORY + "/hooks/shared/") and path.endswith(".sh"):
         return "100755"
+    repository_rule = CORE_CONTRACT_REPOSITORY_RULE_PATTERN.fullmatch(path)
+    if repository_rule is not None and repository_rule.group(1) != "shared":
+        return "100644"
     return None
 
 
@@ -2431,6 +2450,7 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
         path in CORE_CONTRACT_INERT_DEPENDENCY_FILES
         or path in CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES
         or path in CORE_CONTRACT_KERNEL_UI_KIT_FILES
+        or path in CORE_CONTRACT_PACKAGE_VITEST_FILES
         or CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH.fullmatch(path) is not None
     ):
         return "100644"
@@ -2835,17 +2855,29 @@ def _core_contract_policy_matches_base(base_entries, entries):
     }
     if policy_paths == base_policy_paths:
         return True
+    if base_policy_paths.get(signer_path) != policy_paths.get(signer_path):
+        return False
+    base_lock = base_policy_paths.get(RULES_LOCK_PATH)
+    candidate_lock = policy_paths.get(RULES_LOCK_PATH)
     if (
-        base_policy_paths.get(RULES_LOCK_PATH) != ("100644", CORE_CONTRACT_RULES_V2_LOCK_OBJECT)
-        or policy_paths.get(RULES_LOCK_PATH) != ("100644", CORE_CONTRACT_RULES_V3_LOCK_OBJECT)
-        or base_policy_paths.get(signer_path) != policy_paths.get(signer_path)
+        base_lock == ("100644", CORE_CONTRACT_RULES_V2_LOCK_OBJECT)
+        and candidate_lock == ("100644", CORE_CONTRACT_RULES_V3_LOCK_OBJECT)
     ):
+        expected_changes = CORE_CONTRACT_RULES_V3_CHANGED_PATHS
+    elif (
+        base_lock == ("100644", CORE_CONTRACT_RULES_V3_LOCK_OBJECT)
+        and candidate_lock == ("100644", CORE_CONTRACT_RULES_V4_LOCK_OBJECT)
+        and CORE_CONTRACT_RULES_V4_ADDED_RULE not in base_policy_paths
+        and policy_paths.get(CORE_CONTRACT_RULES_V4_ADDED_RULE, (None,))[0] == "100644"
+    ):
+        expected_changes = CORE_CONTRACT_RULES_V4_CHANGED_PATHS
+    else:
         return False
     changed_paths = {
         path for path in set(base_policy_paths) | set(policy_paths)
         if base_policy_paths.get(path) != policy_paths.get(path)
     }
-    return changed_paths == CORE_CONTRACT_RULES_V3_CHANGED_PATHS
+    return changed_paths == expected_changes
 
 
 def _core_contract_rust_policy_matches(entries):

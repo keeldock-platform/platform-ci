@@ -2667,6 +2667,243 @@ class CoreContractTreeTests(unittest.TestCase):
         self.assertFalse(subject._core_contract_policy_matches_base(base, changed_rules))
         self.assertFalse(subject._core_contract_policy_matches_base(base, added_rules))
 
+    @staticmethod
+    def _repository_rule(name):
+        return subject.RULES_DIRECTORY + "/rules/" + name + ".md"
+
+    def test_repository_rule_files_are_admitted_as_data_for_every_core_concern(self):
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            for name in ("node-test-processes", "other-rule", "a", "rule-2-b"):
+                with self.subTest(concern=concern, name=name):
+                    self.assertEqual(
+                        subject._core_contract_expected_mode(
+                            self._repository_rule(name), concern=concern,
+                        ), "100644",
+                    )
+        for concern in ("core-bootstrap", "rules-bootstrap", "unknown", None):
+            with self.subTest(concern=concern):
+                self.assertIsNone(subject._core_contract_expected_mode(
+                    self._repository_rule("node-test-processes"), concern=concern,
+                ))
+        self.assertEqual(
+            subject.CORE_CONTRACT_RULES_V4_ADDED_RULE, self._repository_rule("node-test-processes"),
+        )
+
+    def test_repository_rule_files_refuse_near_misses_for_every_core_concern(self):
+        directory = subject.RULES_DIRECTORY
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            for path in (
+                directory + "/rules/shared.md",
+                directory + "/rules/nested/rule.md",
+                directory + "/rules/nested/deeper/rule.md",
+                directory + "/rules/Upper.md",
+                directory + "/rules/-rule.md",
+                directory + "/rules/rule-.md",
+                directory + "/rules/rule--name.md",
+                directory + "/rules/rule_name.md",
+                directory + "/rules/1rule.md",
+                directory + "/rules/.md",
+                directory + "/rules/rule.sh",
+                directory + "/rules/rule.md.bak",
+                directory + "/rules/rule.markdown",
+                directory + "/rules/rule.md/",
+                directory + "/rules//rule.md",
+                directory + "/rules/../rule.md",
+                directory + "/rules/rule.json",
+                directory + "/rule/rule.md",
+                directory + "/hooks/rule.md",
+                directory + "/rule.md",
+                "sub/" + directory + "/rules/rule.md",
+                directory[1:] + "/rules/rule.md",
+                "runtime/" + directory + "/rules/rule.md",
+                directory + "/rules/shared",
+                directory + "/rules/shared/",
+            ):
+                with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_repository_rule_files_never_enter_the_shared_manifest_scope(self):
+        shared = directory = subject.RULES_DIRECTORY + "/rules/shared/"
+        self.assertEqual(subject._core_contract_admin_mode(shared + "rust.md"), "100644")
+        self.assertEqual(
+            subject._core_contract_admin_mode(self._repository_rule("node-test-processes")),
+            "100644",
+        )
+        self.assertFalse(self._repository_rule("node-test-processes").startswith(directory))
+        self.assertIsNone(subject._core_contract_admin_mode(shared[:-1] + ".md"))
+        self.assertIsNone(subject._core_contract_admin_mode(
+            subject.RULES_DIRECTORY + "/rules/nested/" + "rust.md",
+        ))
+        self.assertEqual(subject._core_contract_admin_mode(
+            subject.RULES_DIRECTORY + "/hooks/shared/guard.sh",
+        ), "100755")
+        self.assertIsNone(subject._core_contract_admin_mode(
+            subject.RULES_DIRECTORY + "/hooks/other.sh",
+        ))
+
+    def test_package_vitest_configs_are_the_two_exact_paths_for_every_core_concern(self):
+        configs = subject.CORE_CONTRACT_PACKAGE_VITEST_FILES
+        self.assertIs(type(configs), frozenset)
+        self.assertEqual(
+            sorted(configs),
+            ["packages/host-api/vitest.config.ts", "packages/kernel-i18n/vitest.config.ts"],
+        )
+        self.assertEqual(configs & subject.CORE_CONTRACT_KERNEL_UI_KIT_FILES, frozenset())
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            for path in sorted(configs):
+                with self.subTest(concern=concern, path=path):
+                    self.assertEqual(
+                        subject._core_contract_expected_mode(path, concern=concern), "100644",
+                    )
+                    self.assertFalse(subject._core_contract_foundation_path(path))
+        for concern in ("core-bootstrap", "rules-bootstrap", "unknown", None):
+            for path in sorted(configs):
+                with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_package_vitest_configs_refuse_unlisted_members_levels_and_names(self):
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            for path in (
+                "packages/other/vitest.config.ts",
+                "packages/kernel-tokens/vitest.config.ts",
+                "packages/host-api/vitest.config.js",
+                "packages/host-api/vitest.config.mts",
+                "packages/host-api/vitest.workspace.ts",
+                "packages/host-api/Vitest.config.ts",
+                "packages/host-api/src/vitest.config.ts",
+                "packages/host-api/tests/vitest.config.ts",
+                "packages/host-api/nested/vitest.config.ts",
+                "packages/kernel-i18n/vitest.config.ts.bak",
+                "packages/kernel-i18n/vitest.config.ts/",
+                "packages/kernel-i18n//vitest.config.ts",
+                "packages/vitest.config.ts",
+                "packages/host-api-extra/vitest.config.ts",
+                "sub/packages/host-api/vitest.config.ts",
+                "vitest.config.ts",
+            ):
+                with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_repository_rule_and_vitest_files_are_admitted_in_the_npm_trees_and_only_as_regular_data(self):
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        added = [self._repository_rule("node-test-processes")] + sorted(
+            subject.CORE_CONTRACT_PACKAGE_VITEST_FILES
+        )
+        for concern in (
+            "core-rust-format-return", "core-build-diagnostic-return", "core-npm-admission-return",
+        ):
+            entries = self._four_crate_entries(concern)
+            entries.update({path: ("100644", "a" * 40) for path in added})
+            with self.subTest(concern=concern):
+                marker, unused_blob = self._validate_feedback_tree(
+                    entries, concern, workspace_text=self._workspace_text(members),
+                )
+                self.assertEqual(marker, subject.CORE_CONTRACT_TREE_BY_CONCERN[concern]
+                                 if concern != "core-build-diagnostic-return"
+                                 else subject.CORE_CONTRACT_PACKAGE_LOCK_TREE)
+            for path, mode in (
+                (added[0], "100755"),
+                (added[0], "120000"),
+                (added[1], "100755"),
+                (added[2], "120000"),
+                (added[1], "160000"),
+                (self._repository_rule("Bad"), "100644"),
+                (self._repository_rule("nested/rule"), "100644"),
+                ("packages/other/vitest.config.ts", "100644"),
+            ):
+                changed = dict(entries)
+                changed[path] = (mode, "a" * 40)
+                with self.subTest(concern=concern, path=path, mode=mode):
+                    self.assertEqual(self._refused_check(
+                        changed, concern, workspace_text=self._workspace_text(members),
+                    ), "path_mode")
+
+    def test_rules_manifest_accepts_the_v4_tag_and_no_neighbouring_tag(self):
+        digest = hashlib.sha256(b"fixture").hexdigest()
+        rules_file = subject.RULES_DIRECTORY + "/rules/shared/rust.md"
+        hooks_file = subject.RULES_DIRECTORY + "/hooks/shared/check-shared-lock.sh"
+        payload = (
+            "format 3\n"
+            "profile full\n"
+            "tag v4.0.0\n"
+            "signature verified\n"
+            "file AGENTS.md " + digest + "\n"
+            "file " + rules_file + " " + digest + "\n"
+            "file " + hooks_file + " " + digest + "\n"
+        ).encode("ascii")
+        self.assertEqual(
+            set(subject._rules_file_manifest(payload)), {"AGENTS.md", rules_file, hooks_file},
+        )
+        for tag in (b"tag v4.0.1", b"tag v5.0.0", b"tag v4.0", b"tag v1.0.0", b"tag v14.0.0"):
+            with self.subTest(tag=tag):
+                with self.assertRaises(subject.Refusal) as refusal:
+                    subject._rules_file_manifest(payload.replace(b"tag v4.0.0", tag))
+                self.assertEqual(refusal.exception.core_check, "rules_manifest")
+
+    def _v4_policy(self):
+        signer = "/".join(subject.SIGNER_PATH_PARTS)
+        settings = subject.RULES_DIRECTORY + "/settings.json"
+        base = {
+            path: ("100644", "a" * 40)
+            for path in subject.CORE_CONTRACT_RULES_V4_CHANGED_PATHS
+            if path != subject.CORE_CONTRACT_RULES_V4_ADDED_RULE
+        }
+        base[subject.RULES_LOCK_PATH] = ("100644", subject.CORE_CONTRACT_RULES_V3_LOCK_OBJECT)
+        base[signer] = ("100644", "c" * 40)
+        base[settings] = ("100644", "d" * 40)
+        candidate = dict(base)
+        for path in subject.CORE_CONTRACT_RULES_V4_CHANGED_PATHS:
+            candidate[path] = ("100644", "b" * 40)
+        candidate[subject.RULES_LOCK_PATH] = ("100644", subject.CORE_CONTRACT_RULES_V4_LOCK_OBJECT)
+        return base, candidate, signer, settings
+
+    def test_core_contract_policy_allows_only_the_pinned_v3_to_v4_rules_sync(self):
+        base, candidate, signer, settings = self._v4_policy()
+        self.assertEqual(
+            subject.CORE_CONTRACT_RULES_V4_LOCK_OBJECT, "ea502d669da414b7180fddb1796cec2828e69561",
+        )
+        self.assertEqual(len(subject.CORE_CONTRACT_RULES_V4_CHANGED_PATHS), 5)
+        self.assertTrue(subject._core_contract_policy_matches_base(base, candidate))
+        self.assertTrue(subject._core_contract_policy_matches_base(candidate, dict(candidate)))
+        changed_settings = dict(candidate)
+        changed_settings[settings] = ("100644", "e" * 40)
+        changed_signer = dict(candidate)
+        changed_signer[signer] = ("100644", "e" * 40)
+        added_shared = dict(candidate)
+        added_shared[subject.RULES_DIRECTORY + "/rules/shared/extra.md"] = ("100644", "f" * 40)
+        added_repository = dict(candidate)
+        added_repository[self._repository_rule("extra-rule")] = ("100644", "f" * 40)
+        executable_rule = dict(candidate)
+        executable_rule[subject.CORE_CONTRACT_RULES_V4_ADDED_RULE] = ("100755", "b" * 40)
+        removed_change = dict(candidate)
+        removed_change[subject.RULES_DIRECTORY + "/rules/shared/ci-and-admission.md"] = (
+            base[subject.RULES_DIRECTORY + "/rules/shared/ci-and-admission.md"]
+        )
+        wrong_lock = dict(candidate)
+        wrong_lock[subject.RULES_LOCK_PATH] = ("100644", "e" * 40)
+        executable_lock = dict(candidate)
+        executable_lock[subject.RULES_LOCK_PATH] = (
+            "100755", subject.CORE_CONTRACT_RULES_V4_LOCK_OBJECT,
+        )
+        for name, changed in (
+            ("settings", changed_settings), ("signer", changed_signer),
+            ("added_shared", added_shared), ("added_repository", added_repository),
+            ("executable_rule", executable_rule), ("removed_change", removed_change),
+            ("wrong_lock", wrong_lock), ("executable_lock", executable_lock),
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(subject._core_contract_policy_matches_base(base, changed))
+        preexisting = dict(base)
+        preexisting[subject.CORE_CONTRACT_RULES_V4_ADDED_RULE] = ("100644", "a" * 40)
+        with self.subTest(name="preexisting_rule"):
+            self.assertFalse(subject._core_contract_policy_matches_base(preexisting, candidate))
+        with self.subTest(name="reversed"):
+            self.assertFalse(subject._core_contract_policy_matches_base(candidate, base))
+        with self.subTest(name="v2_base"):
+            v2_base = dict(base)
+            v2_base[subject.RULES_LOCK_PATH] = ("100644", subject.CORE_CONTRACT_RULES_V2_LOCK_OBJECT)
+            self.assertFalse(subject._core_contract_policy_matches_base(v2_base, candidate))
+
 
 class CoreContractLeaseTests(unittest.TestCase):
     def test_core_contract_uses_read_only_worker_lease_and_strict_cleanup(self):
