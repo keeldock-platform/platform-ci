@@ -1742,7 +1742,7 @@ def _raise_first_refusal(refusals):
             carried = getattr(item, "details", ())
             carried = tuple(carried) if type(carried) in (tuple, list) else ()
             for detail in (getattr(item, "detail", None),) + carried:
-                if (_valid_lock_detail(detail) and len(merged) < MAX_COLLECTED_REFUSALS
+                if (detail is not None and len(merged) < MAX_COLLECTED_REFUSALS
                         and detail not in merged):
                     merged.append(detail)
         first.details = tuple(merged)

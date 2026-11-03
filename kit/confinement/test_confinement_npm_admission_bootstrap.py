@@ -2322,7 +2322,7 @@ class BundleDetailTests(RefusalAssertions):
         refusal = subject.BootstrapRefusal("npm_archive_refused", "archive_manifest:total_utils@1.0.0:name_mismatch")
         self.assertTrue(subject._continues_after(refusal))
 
-    def test_only_valid_tuple_or_list_details_are_merged_into_the_first_refusal(self):
+    def test_only_tuple_or_list_details_are_merged_and_invalid_items_are_kept_for_the_producer_to_refuse(self):
         first = subject.BootstrapRefusal("npm_archive_refused", "deprecated:pkg-00@1.0.0")
         second = subject.BootstrapRefusal("npm_archive_refused", "deprecated:pkg-01@1.0.0")
         second.details = ("deprecated:pkg-02@1.0.0", "bad detail with spaces", 7, None, "x" * 600)
@@ -2337,6 +2337,7 @@ class BundleDetailTests(RefusalAssertions):
         self.assertIs(raised.exception, first)
         self.assertEqual(first.details, (
             "deprecated:pkg-00@1.0.0", "deprecated:pkg-01@1.0.0", "deprecated:pkg-02@1.0.0",
+            "bad detail with spaces", 7, "x" * 600,
             "deprecated:pkg-03@1.0.0", "deprecated:pkg-05@1.0.0", "deprecated:pkg-06@1.0.0",
             "deprecated:pkg-07@1.0.0",
         ))
