@@ -1400,6 +1400,8 @@ class ScreensReturnTests(unittest.TestCase):
                 manifest, frames = _screens_set([("01-tokens/frame-one--light--rest.png", data)])
                 self.assert_refused(self.assemble, manifest, frames)
 
+    @unittest.skipUnless(os.name == "posix" and subject.fcntl is not None,
+                         "owner filesystem wrapper requires POSIX semantics")
     def test_write_creates_one_private_tree_once_and_never_outside_it(self):
         with tempfile.TemporaryDirectory() as directory:
             dir_fd = os.open(directory, os.O_RDONLY)
@@ -1418,6 +1420,8 @@ class ScreensReturnTests(unittest.TestCase):
             finally:
                 os.close(dir_fd)
 
+    @unittest.skipUnless(os.name == "posix" and subject.fcntl is not None,
+                         "owner filesystem wrapper requires POSIX semantics")
     def test_a_partly_written_tree_is_removed_so_a_retry_can_write_it_again(self):
         with tempfile.TemporaryDirectory() as directory:
             dir_fd = os.open(directory, os.O_RDONLY)
@@ -1439,6 +1443,8 @@ class ScreensReturnTests(unittest.TestCase):
             finally:
                 os.close(dir_fd)
 
+    @unittest.skipUnless(os.name == "posix" and subject.fcntl is not None,
+                         "owner filesystem wrapper requires POSIX semantics")
     def test_write_refuses_bad_names_bytes_counts_and_a_planted_link_before_writing(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
             dir_fd = os.open(directory, os.O_RDONLY)

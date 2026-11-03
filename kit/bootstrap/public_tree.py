@@ -356,7 +356,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/feedback_producer_crypto.mjs': 'dd023247587eba82cb631160516641658b88f1c4584c0471247048a8c87be3aa',
     'kit/confinement/test_feedback_producer_crypto.mjs': '2661534fe1d6d41661e6a056dc03c7800dc146d2d042584841a0799123e868e0',
     'kit/confinement/feedback_admin.py': 'd9f6d9ca2f6bcdeffd38f92e57b127025af5433cf1c3480df3c6e7a2c5edc692',
-    'kit/confinement/test_feedback_admin.py': '536db70b4bc33c9f1f0f786f1e41c01ca8d1f7fad025fae6ba3978754ed4f95b',
+    'kit/confinement/test_feedback_admin.py': '6896a7dab1e4ca201285237406dce61206cec685c1125e485bd5d8bfcbc8bd2c',
     'kit/confinement/feedback_admin_crypto.mjs': '205bd0c24c7c57675b4fae124a0bf10ae61d44bf00d53735d92a5b5490095b7a',
     'kit/confinement/test_feedback_admin_crypto.mjs': 'd705361166a158b8bbf9495e3b3a55b3e355df3aab7351762f216f1e64f40659',
     'kit/confinement/test_feedback_admin_integration.py': 'a668a1d799fe7eb10fa174a4a5141e914724968196be055f6a3f7e6b67fc5ae8',
