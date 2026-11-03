@@ -452,6 +452,17 @@ class ApiIdentityTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(audit.AuditRefusal):
                 audit._validate_log_location(url)
 
+    def test_the_api_token_shape_is_the_header_safe_issued_token_shape(self):
+        self.assertEqual(audit.TOKEN_RE.pattern, r"[!-~]{1,4096}\Z")
+        for token in ("t" * 32, "ghs_" + "A1" * 18, "a", "x" * 4096, "a.b-c_d/e+f=g~h!"):
+            with self.subTest(length=len(token)):
+                self.assertIsNotNone(audit.TOKEN_RE.fullmatch(token))
+                self.assertEqual(audit.GitHubAPI(token)._token, token)
+        for token in ("", "x" * 4097, "a b", "a\tb", "a\nb", "a\rb", "caf" + chr(233), None, 5, b"token"):
+            with self.subTest(token=repr(token)[:20]):
+                with self.assertRaises(audit.AuditRefusal):
+                    audit.GitHubAPI(token)
+
     def test_job_log_download_does_not_forward_api_token_to_blob(self):
         class RedirectAndBlob:
             def __init__(self):

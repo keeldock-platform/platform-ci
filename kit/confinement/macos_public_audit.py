@@ -164,7 +164,7 @@ ACTIVE_WORKFLOW_RUN_STATUSES = frozenset(
 )
 KNOWN_WORKFLOW_RUN_STATUSES = ACTIVE_WORKFLOW_RUN_STATUSES | {"completed"}
 CONTROL_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
-TOKEN_RE = re.compile(r"[A-Za-z0-9_./-]{20,512}\Z")
+TOKEN_RE = re.compile(r"[!-~]{1,4096}\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 HEX_DIGEST_RE = re.compile(r"[a-f0-9]{64}\Z")
 CACHE_PROOF_CLIENT_MARKER_RE = re.compile(
