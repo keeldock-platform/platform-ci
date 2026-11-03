@@ -1523,7 +1523,26 @@ foreach ($case in $cases) {
         ):
             with self.subTest(required=required[:60]):
                 self.assertIn(required, finalpath)
-        self.assertTrue(finalpath.rstrip().endswith("qdvp, qpts));\n    line\n}"))
+        for required in (
+            "let volrd = device_state(&volume_path, 0x0010_0001);",
+            "let volown = device_state(&volume_path, 0x0008_0000);",
+            "let controls = volume_controls(&volume_path);",
+            '" volrd={} volown={} volusn={} volusnu={} volenum={} volntfs={} volbmp={}",',
+            "volrd, volown, controls[0], controls[1], controls[2], controls[3], controls[4]",
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, finalpath)
+        self.assertTrue(finalpath.rstrip().endswith("controls[3], controls[4]\n    ));\n    line\n}"))
+        controls = probe[probe.index("fn volume_controls"):probe.index("fn probe_finalpath")]
+        self.assertIn("CreateFileW(name.as_ptr(), 0x0010_0080, 3, ptr::null_mut(), 3, 0, 0)", controls)
+        self.assertEqual(
+            re.findall(r"\((0x[0-9A-F_]+), ", controls),
+            ["0x0009_00F4", "0x0009_03AB", "0x0009_00B3", "0x0009_0064", "0x0009_006F"])
+        self.assertIn('results.push(if done != 0 || error == 234 { String::from("ok") } else { format!("err{}", error) });', controls)
+        self.assertIn('return vec![String::from("na"); 5];', controls)
+        for forbidden in ("println", "{:?}", "display()", "to_string_lossy", "0x0009_0018", "0x0009_0020", "0x0009_0050", "0x0009_00BB"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, controls)
         self.assertIn('"finalpath" => probe_finalpath(first, second),', probe)
         helpers = probe[probe.index("fn volume_device"):probe.index("fn probe_finalpath")]
         for required in (

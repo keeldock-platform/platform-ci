@@ -677,6 +677,38 @@ fn mount_query(device: &Option<Vec<u16>>, code: u32) -> String {
     state
 }
 
+fn volume_controls(path: &str) -> Vec<String> {
+    let name = wide(path);
+    let handle = unsafe { CreateFileW(name.as_ptr(), 0x0010_0080, 3, ptr::null_mut(), 3, 0, 0) };
+    if handle == -1 {
+        return vec![String::from("na"); 5];
+    }
+    let mut unprivileged = vec![0u8; 40];
+    unprivileged[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    let mut enumerate = vec![0u8; 24];
+    enumerate[16..24].copy_from_slice(&i64::MAX.to_le_bytes());
+    let controls: [(u32, Vec<u8>); 5] = [
+        (0x0009_00F4, Vec::new()),
+        (0x0009_03AB, unprivileged),
+        (0x0009_00B3, enumerate),
+        (0x0009_0064, Vec::new()),
+        (0x0009_006F, vec![0u8; 8]),
+    ];
+    let mut results = Vec::with_capacity(5);
+    for (code, mut input) in controls {
+        let mut output = vec![0u8; 4096];
+        let mut returned: u32 = 0;
+        let pointer = if input.is_empty() { ptr::null_mut() } else { input.as_mut_ptr() };
+        let done = unsafe { DeviceIoControl(handle, code, pointer, input.len() as u32, output.as_mut_ptr(), output.len() as u32, &mut returned, ptr::null_mut()) };
+        let error = if done == 0 { last_error() } else { 0 };
+        results.push(if done != 0 || error == 234 { String::from("ok") } else { format!("err{}", error) });
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    results
+}
+
 fn probe_finalpath(dir: &str, drive: &str) -> String {
     if let Err(reason) = plain_path(dir) {
         return format!("open0=usage_{}", reason);
@@ -731,6 +763,13 @@ fn probe_finalpath(dir: &str, drive: &str) -> String {
     let qdvp = mount_query(&volume, 0x006D_0030);
     let qpts = mount_query(&volume, 0x006D_0008);
     line.push_str(&format!(" vol={} volr={} voldac={} qdvp={} qpts={}", vol, volr, voldac, qdvp, qpts));
+    let volrd = device_state(&volume_path, 0x0010_0001);
+    let volown = device_state(&volume_path, 0x0008_0000);
+    let controls = volume_controls(&volume_path);
+    line.push_str(&format!(
+        " volrd={} volown={} volusn={} volusnu={} volenum={} volntfs={} volbmp={}",
+        volrd, volown, controls[0], controls[1], controls[2], controls[3], controls[4]
+    ));
     line
 }
 

@@ -63,7 +63,7 @@ $DiagLineLimit = 300
 $ProbeSeconds = 60
 $ProbeCargoCheckSeconds = 180
 $NodeRealpathScript = "f=require('fs');f.realpathSync.native('.');f.promises.realpath('.').then(()=>process.stdout.write('realpath=ok'),(e)=>{process.stdout.write('realpath='+e.code);process.exitCode=1})"
-$NpmLinkTargetScript = "f=require('fs');p=require('path');s=String.fromCharCode(32);a=require(p.join(p.dirname(process.execPath),'node_modules','npm','node_modules','@npmcli','arborist','lib','realpath.js'));c=(g)=>{try{return(g()?'ok':'no')}catch(e){return(e.code||'err')}};k=JSON.parse(f.readFileSync('package-lock.json','utf8')).packages;q=(j,l,t)=>a(l,new(Map),new(Map),0).then((r)=>(r===t?'ok':'no'),(e)=>(e.code||'err')).then((r)=>['kd-probe','npmlink','index='+j,'lstat='+c(()=>f.lstatSync(l).isSymbolicLink()),'readlink='+c(()=>p.resolve(p.dirname(l),f.readlinkSync(l))===t),'stat='+c(()=>f.statSync(l).isDirectory()),'native='+c(()=>f.realpathSync.native(l)===t),'pkg='+c(()=>JSON.parse(f.readFileSync(p.join(l,'package.json'),'utf8')).version),'arborist='+r].join(s));Promise.all(Object.keys(k).filter((n)=>k[n].link).map((n,j)=>q(j,p.resolve(n),p.resolve(k[n].resolved)))).then((x)=>process.stdout.write(x.join(String.fromCharCode(10))+String.fromCharCode(10)))"
+$NpmLinkTargetScript = "f=require('fs');p=require('path');s=String.fromCharCode(32);a=require(p.join(p.dirname(process.execPath),'node_modules','npm','node_modules','@npmcli','arborist','lib','realpath.js'));c=(g)=>{try{return(g()?'ok':'no')}catch(e){return(e.code||'err')}};k=JSON.parse(f.readFileSync('package-lock.json','utf8')).packages;q=(j,l,t)=>a(l,new(Map),new(Map),0).then((r)=>(r===t?'ok':'no'),(e)=>(e.code||'err')).then((r)=>['kd-probe','npmlink','index='+j,'lstat='+c(()=>f.lstatSync(l).isSymbolicLink()),'readlink='+c(()=>p.resolve(p.dirname(l),f.readlinkSync(l))===t),'stat='+c(()=>f.statSync(l).isDirectory()),'native='+c(()=>f.realpathSync.native(l)===t),'pkg='+c(()=>JSON.parse(f.readFileSync(p.join(l,'package.json'),'utf8')).version),'arborist='+r].join(s));Promise.all(Object.keys(k).filter((n)=>k[n].link).slice(0,MAXLINKS).map((n,j)=>q(j,p.resolve(n),p.resolve(k[n].resolved)))).then((x)=>process.stdout.write(x.join(String.fromCharCode(10))+String.fromCharCode(10)))"
 $ProbeStderrLines = 20
 $ProbeStdoutLines = 10
 $GateLongPattern = '(^|_)(clippy|tests|replay|prepare|typecheck)$'
@@ -79,6 +79,8 @@ $MountManagerRungs = @('device', 'volume', 'drive_link', 'mpm_link', 'global_dir
 $MountManagerKinds = @{ device = 'mountmgr'; volume = 'volume'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
 $MountManagerSourceRungs = 2
 $MountManagerProbeSeconds = 30
+$VolumeBoundaryTokens = @('volr', 'volrd', 'voldac', 'volown', 'volusn', 'volusnu', 'volenum', 'volntfs', 'volbmp')
+$VolumeControlTokens = @('volusn', 'volusnu', 'volenum', 'volntfs', 'volbmp')
 $RequiredFunctions = @(
     'Get-CleanText', 'Get-Token', 'Write-DiagLines', 'Invoke-Download', 'Assert-Sha256', 'Assert-Sri', 'Invoke-Tar', 'Copy-Tree',
     'Grant-Access', 'Set-LowIntegrityLabel', 'Test-LowIntegrityLabel', 'Grant-NonPropagating', 'Get-SidRules', 'New-ScratchSet',
@@ -259,10 +261,25 @@ function Invoke-FinalPathProbe($sandbox, [bool]$confined, [string]$id) {
     $text = Get-ProbeText ([string]$run.Stdout) 'finalpath'
     if ($confined) {
         $script:FinalPathText = $text
-        if ((Get-ProbeValue $text 'volr') -ceq 'ok' -or (Get-ProbeValue $text 'voldac') -ceq 'ok') { $script:VolumeBoundary = 'breached' }
+        foreach ($key in $VolumeBoundaryTokens) {
+            if ((Get-ProbeValue $text $key) -ceq 'ok') { $script:VolumeBoundary = 'breached' }
+        }
     }
     if ((Get-ProbeValue $text 'n_dos') -ceq 'ok' -and (Get-ProbeValue $text 'canon') -ceq 'ok') { return 'ok' }
     return 'denied'
+}
+
+function Test-VolumeBoundaryClean([string]$text) {
+    if ((Get-ProbeValue $text 'vol') -cne 'ok') { return $false }
+    foreach ($key in $VolumeBoundaryTokens) {
+        $value = Get-ProbeValue $text $key
+        if ($VolumeControlTokens -ccontains $key) {
+            if ($value -cne 'err5') { return $false }
+        } elseif ($value -cnotmatch '^err[0-9]{1,10}$') {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Get-MountManagerDetail {
@@ -278,6 +295,7 @@ function Get-MountManagerDetail {
         $denied = 'unknown'
         foreach ($pair in @('mpm=mountmgr', 'vol=volume', 'qdvp=query', 'n_dos=name', 'canon=canon')) {
             $parts = $pair.Split([char]61)
+            if ($parts[0] -ceq 'vol' -and $script:MountState.Volume -cne 'leased') { continue }
             if ($values[$parts[0]] -cne 'ok') {
                 $denied = $parts[1]
                 break
@@ -325,6 +343,7 @@ function Invoke-MountManagerLadder($sandbox) {
             if ($rung -ceq 'volume') { $state.Volume = 'leased' }
             if ($rung -cne 'device' -and $rung -cne 'volume') { $script:Channel.LeaseObjects = @($script:Channel.LeaseObjects) + @(($kind + ' ' + $leaseDrive).Trim()) }
             $finalPath = Invoke-FinalPathProbe $sandbox $true ('finalpath_' + $rung)
+            if ($rung -ceq 'volume' -and -not (Test-VolumeBoundaryClean $script:FinalPathText)) { $finalPath = 'unproven' }
             $state.FinalPath = $finalPath
         }
         Write-Line ('windows-confinement-mountmgr-rung=' + $rung + ' state=' + $rungState + ' error=' + $rungError + ' readback=' + $rungReadback + ' finalpath=' + $finalPath)
@@ -964,7 +983,7 @@ function Invoke-NpmLinkProbe($sandbox, [string]$project, [string]$target) {
 function Invoke-NpmLinkTargetProbe($sandbox, [string]$project, [string]$node, [string[]]$environment) {
     if ($script:RunMode -cne 'synthetic') { return }
     try {
-        $argv = [string[]]@($node, '-e', $NpmLinkTargetScript)
+        $argv = [string[]]@($node, '-e', $NpmLinkTargetScript.Replace('MAXLINKS', [string]$MaxNpmLinks))
         $run = $sandbox.Run($true, $node, (ConvertTo-CommandLine $argv), $project, $environment, ($MountManagerProbeSeconds * 1000), [uint32]32)
         Write-ProbeDiag 'npm_link_targets' $run
     } catch {
