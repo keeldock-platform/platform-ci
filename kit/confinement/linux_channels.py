@@ -59,6 +59,7 @@ ATTEMPT_RULES = {
     "runner_ipc": (
         ("unix-path", DENIED),
         ("unix-abstract", DENIED),
+        ("unix-pair-connect", DENIED),
         ("fd-inventory", DENIED),
     ),
     "raw_logs": (
@@ -66,6 +67,8 @@ ATTEMPT_RULES = {
         ("tty-open", DENIED),
         ("syslog-socket", DENIED),
         ("journal-socket", DENIED),
+        ("syslog-pair", DENIED),
+        ("journal-pair", DENIED),
     ),
     "artifact_upload": (
         ("env-hunt", DENIED),

@@ -154,6 +154,16 @@ def run_runner_ipc():
             sock.connect(chr(0) + cfg["abstract_name"])
             sock.sendall(("a-" + nonce).encode())
 
+    def unix_pair_connect():
+        first, second = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            first.settimeout(1)
+            first.connect(cfg["unix_path"])
+            first.sendall(("s-" + nonce).encode())
+        finally:
+            first.close()
+            second.close()
+
     def inventory():
         leaked = []
         for number in range(3, 256):
@@ -167,6 +177,7 @@ def run_runner_ipc():
 
     attempt("unix-path", unix_path)
     attempt("unix-abstract", unix_abstract)
+    attempt("unix-pair-connect", unix_pair_connect, accepted=NET_DENIED + (errno.EISCONN,))
     attempt("fd-inventory", inventory)
 
 
@@ -189,10 +200,23 @@ def run_raw_logs():
                 sock.send(("kd-log-" + nonce).encode())
         return action
 
+    def pair_datagram(path):
+        def action():
+            first, second = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+            try:
+                first.connect(path)
+                first.send(("kd-log-" + nonce).encode())
+            finally:
+                first.close()
+                second.close()
+        return action
+
     attempt("stdout-markers", markers, contained=True)
     attempt("tty-open", terminal, accepted=FS_DENIED)
     attempt("syslog-socket", datagram("/dev/log"))
     attempt("journal-socket", datagram("/run/systemd/journal/socket"))
+    attempt("syslog-pair", pair_datagram("/dev/log"))
+    attempt("journal-pair", pair_datagram("/run/systemd/journal/socket"))
 
 
 def hunt():

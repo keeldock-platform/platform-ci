@@ -673,8 +673,19 @@ def _issue_shape(issued, token):
     return " present=" + present + " type=" + kind + " length=" + _length_bucket(length) + " classes=" + classes
 
 
+TOKEN_DISCARD_RESULTS = ("deleted", "failed", "skipped")
+
+
+def _discard_result_line(result):
+    if result not in TOKEN_DISCARD_RESULTS:
+        result = "failed"
+    sys.stdout.write("linux-verifier-token-discard=" + result + "\n")
+    sys.stdout.flush()
+
+
 def _discard_issued_token(token, masked=False):
     if type(token) is not str or HEADER_TOKEN_RE.fullmatch(token) is None:
+        _discard_result_line("skipped")
         return
     if not masked:
         sys.stdout.write(_mask_line(token))
@@ -682,7 +693,9 @@ def _discard_issued_token(token, masked=False):
     try:
         _api_request("/installation/token", token, method="DELETE", expected=(204,))
     except Exception:
+        _discard_result_line("failed")
         return
+    _discard_result_line("deleted")
 
 
 def _token_refusal(stage, detail=""):
@@ -2577,6 +2590,36 @@ PROJECT_GATE_TIMEOUT_SECONDS = 1800
 GATE_CAUSES = ("timeout", "limit", "signal", "exit", "launch", "deadline")
 PROJECT_GATE_BUDGET_SECONDS = 330 * 60
 LIMIT_SIGNALS = (signal.SIGXCPU, signal.SIGXFSZ, signal.SIGKILL)
+JOB_WORKER_NAME = "Runner.Worker"
+JOB_ANCESTOR_LIMIT = 32
+
+
+def _job_elapsed_seconds(proc_root="/proc"):
+    """Return the seconds since this job's runner worker process started.
+
+    The worker starts when the job starts, so the gate budget counts from the job start and
+    not from the gates step. Any ancestor that cannot be read refuses the gates.
+    """
+    try:
+        root = Path(proc_root)
+        pid = os.getppid()
+        for unused in range(JOB_ANCESTOR_LIMIT):
+            if type(pid) is not int or pid <= 1:
+                break
+            record = (root / str(pid) / "stat").read_text(encoding="ascii")
+            name = record[record.index("(") + 1:record.rindex(")")]
+            fields = record[record.rindex(")") + 2:].split()
+            if name == JOB_WORKER_NAME:
+                started = int(fields[19]) / os.sysconf("SC_CLK_TCK")
+                uptime = float((root / "uptime").read_text(encoding="ascii").split()[0])
+                elapsed = uptime - started
+                if elapsed < 0:
+                    break
+                return elapsed
+            pid = int(fields[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    raise SourceBuildRefusal("gate")
 
 
 def _gate_cause(result):
@@ -2618,9 +2661,10 @@ def run_project_gates(environ=None):
     outcomes = {name: "not-run" for name in selected_gates}
     durations = {}
     failure = (None, None)
+    job_elapsed = _job_elapsed_seconds()
     budget_started = time.monotonic()
     for index, (name, argv) in enumerate(commands):
-        if PROJECT_GATE_BUDGET_SECONDS - (time.monotonic() - budget_started) < PROJECT_GATE_TIMEOUT_SECONDS:
+        if PROJECT_GATE_BUDGET_SECONDS - job_elapsed - (time.monotonic() - budget_started) < PROJECT_GATE_TIMEOUT_SECONDS:
             failure = (name, "deadline")
             break
         project_env = {

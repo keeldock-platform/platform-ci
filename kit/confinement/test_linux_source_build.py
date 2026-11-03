@@ -1005,7 +1005,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with patch.object(
                 linux_source_build.rust_license_gate, "require_lock_admission",
                 wraps=linux_source_build.rust_license_gate.require_lock_admission,
-            ) as admission, patch.object(
+            ) as admission, patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(
                 linux_source_build, "_project_gate_directories",
             ) as directories, patch.object(
                 linux_source_build, "_gate_commands", return_value=commands,
@@ -1145,7 +1145,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     return second
                 return first
 
-            with patch.object(linux_source_build, "_project_gate_directories"), patch.object(
+            with patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(linux_source_build, "_project_gate_directories"), patch.object(
                 linux_source_build, "_gate_commands", return_value=commands,
             ), patch.object(linux_source_build, "_runtime_workspace_present", return_value=False), patch.object(
                 linux_source_build.linux_session, "run_host", side_effect=host,
@@ -1193,7 +1193,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 for forbidden in ("kd-secret", "srv", "137", "101", "secret"):
                     self.assertNotIn(forbidden, text)
 
-    def _run_gates_with_clock(self, advance_after_first):
+    def _run_gates_with_clock(self, advance_after_first, job_elapsed=0.0):
         clock = [0.0]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1209,7 +1209,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     clock[0] += advance_after_first
                 return types.SimpleNamespace(exit_code=0, timed_out=False, stdout=b"", stderr=b"")
 
-            with patch.object(linux_source_build, "_project_gate_directories"), patch.object(
+            with patch.object(linux_source_build, "_job_elapsed_seconds", return_value=job_elapsed), patch.object(linux_source_build, "_project_gate_directories"), patch.object(
                 linux_source_build, "_gate_commands", return_value=commands,
             ), patch.object(linux_source_build, "_runtime_workspace_present", return_value=False), patch.object(
                 linux_source_build.linux_session, "run_host", side_effect=host,
@@ -1239,6 +1239,58 @@ class LinuxSourceBuildTests(unittest.TestCase):
         code, text, calls = self._run_gates_with_clock(budget - timeout)
         self.assertEqual((code, calls), (0, 15))
         self.assertIn("linux-project-gates=passed", text)
+
+    def _proc_tree(self, root, processes, uptime="5000.25 9000.00"):
+        for pid, (name, parent, start_ticks) in processes.items():
+            directory = root / str(pid)
+            directory.mkdir()
+            fields = ["S", str(parent)] + ["0"] * 17 + [str(start_ticks)] + ["0"] * 10
+            (directory / "stat").write_text(str(pid) + " (" + name + ") " + " ".join(fields) + "\n", encoding="ascii")
+        (root / "uptime").write_text(uptime + "\n", encoding="ascii")
+
+    def test_the_gate_budget_counts_from_the_runner_worker_start(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._proc_tree(root, {
+                40: ("python3", 30, 480000), 30: ("sudo", 20, 470000), 20: ("bash) (x", 10, 460000),
+                10: ("Runner.Worker", 1, 440000),
+            })
+            with patch.object(linux_source_build.os, "getppid", return_value=30), patch.object(
+                linux_source_build.os, "sysconf", return_value=100,
+            ):
+                self.assertAlmostEqual(linux_source_build._job_elapsed_seconds(str(root)), 600.25)
+        refusing = (
+            {30: ("sudo", 20, 1), 20: ("bash", 1, 1)},
+            {30: ("sudo", 20, 1), 20: ("bash", 30, 1)},
+            {30: ("Runner.Worker", 1, 600000)},
+            {30: ("Runner.Worker", 1, "x")},
+            {30: ("Runner.Workers", 1, 1)},
+            {},
+        )
+        for processes in refusing:
+            with self.subTest(processes=processes):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    self._proc_tree(root, processes)
+                    with patch.object(linux_source_build.os, "getppid", return_value=30), patch.object(
+                        linux_source_build.os, "sysconf", return_value=100,
+                    ):
+                        with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                            linux_source_build._job_elapsed_seconds(str(root))
+        source = Path(linux_source_build.__file__).read_text(encoding="ascii")
+        body = source[source.index("def run_project_gates("):source.index("for index, (name, argv) in enumerate(commands):")]
+        self.assertIn("    job_elapsed = _job_elapsed_seconds()\n    budget_started = time.monotonic()\n", body)
+        self.assertIn(
+            "if PROJECT_GATE_BUDGET_SECONDS - job_elapsed - (time.monotonic() - budget_started) < PROJECT_GATE_TIMEOUT_SECONDS:",
+            source)
+        self.assertLess(body.index("run_rust_license_gate(license_environment)"), body.index("job_elapsed = _job_elapsed_seconds()"))
+
+    def test_time_already_spent_by_the_job_before_the_gates_shortens_the_budget(self):
+        budget = linux_source_build.PROJECT_GATE_BUDGET_SECONDS
+        timeout = linux_source_build.PROJECT_GATE_TIMEOUT_SECONDS
+        code, text, calls = self._run_gates_with_clock(0, float(budget - timeout + 1))
+        self.assertEqual((code, calls), (1, 0))
+        self.assertEqual(text.splitlines()[-1], "linux-project-gates=refused completed=0 failed=0 gate=format cause=deadline")
 
     def test_the_refusal_line_adds_only_public_gate_names_and_closed_causes(self):
         line = linux_source_build._gate_refusal_line
@@ -1488,7 +1540,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with patch.object(
                 linux_source_build.rust_license_gate, "require_lock_admission",
                 wraps=linux_source_build.rust_license_gate.require_lock_admission,
-            ) as admission, patch.object(
+            ) as admission, patch.object(linux_source_build, "_job_elapsed_seconds", return_value=0.0), patch.object(
                 linux_source_build, "_project_gate_directories"
             ), patch.object(
                 linux_source_build, "_gate_commands", return_value=commands
@@ -1891,13 +1943,14 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     diag = stage + shape + "\n"
                     if header_safe:
                         mask = linux_source_build._mask_line(bad)
-                        self.assertEqual(text, mask + diag)
+                        discard = "linux-verifier-token-discard=" + ("deleted" if delete_reply == (204, None) else "failed") + "\n"
+                        self.assertEqual(text, mask + discard + diag)
                         self.assertEqual(len(calls), 3)
                         self.assertEqual(calls[2][:3], ("/installation/token", bad, "DELETE"))
                         self.assertEqual(calls[2][3], mask)
                         self.assertNotIn(bad, diag)
                     else:
-                        self.assertEqual(text, diag)
+                        self.assertEqual(text, "linux-verifier-token-discard=skipped\n" + diag)
                         self.assertEqual(len(calls), 2)
         for issued, shape in (
             ({"permissions": permissions}, " present=no type=other length=0 classes=none"),
@@ -1907,8 +1960,35 @@ class LinuxSourceBuildTests(unittest.TestCase):
         ):
             with self.subTest(issued=repr(issued)[:20]):
                 text, calls, refusal = self.run_refused_mint([installation, (201, issued)])
-                self.assertEqual(text, stage + shape + "\n")
+                self.assertEqual(text, "linux-verifier-token-discard=skipped\n" + stage + shape + "\n")
                 self.assertEqual(len(calls), 2)
+
+    def test_the_discard_reports_one_fixed_token_free_result_line(self):
+        self.assertEqual(linux_source_build.TOKEN_DISCARD_RESULTS, ("deleted", "failed", "skipped"))
+        token = "ghs_" + "ab-cd.ef" * 5
+        for reply, masked, expected in (
+            ((204, None), True, "deleted"), (RuntimeError("boom"), True, "failed"),
+            (linux_source_build.SourceBuildRefusal("network"), True, "failed"), ((204, None), False, "deleted"),
+        ):
+            with self.subTest(expected=expected, masked=masked):
+                transcript = io.StringIO()
+                with patch.object(linux_source_build, "_api_request", side_effect=[reply] if isinstance(reply, BaseException) else None,
+                                  return_value=reply) as api, patch.object(linux_source_build.sys, "stdout", transcript):
+                    self.assertIsNone(linux_source_build._discard_issued_token(token, masked))
+                prefix = "" if masked else linux_source_build._mask_line(token)
+                self.assertEqual(transcript.getvalue(), prefix + "linux-verifier-token-discard=" + expected + "\n")
+                self.assertEqual(api.call_args[0][:2], ("/installation/token", token))
+        for bad in (None, 7, "", "a b", "x" * 4097):
+            with self.subTest(bad=repr(bad)[:12]):
+                transcript = io.StringIO()
+                with patch.object(linux_source_build, "_api_request") as api, patch.object(linux_source_build.sys, "stdout", transcript):
+                    linux_source_build._discard_issued_token(bad)
+                self.assertEqual(transcript.getvalue(), "linux-verifier-token-discard=skipped\n")
+                api.assert_not_called()
+        transcript = io.StringIO()
+        with patch.object(linux_source_build.sys, "stdout", transcript):
+            linux_source_build._discard_result_line("revoked " + token)
+        self.assertEqual(transcript.getvalue(), "linux-verifier-token-discard=failed\n")
 
     def test_length_buckets_are_a_closed_vocabulary(self):
         for length, bucket in (
@@ -1941,7 +2021,8 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.subTest(case=name):
                 text, calls, refusal = self.run_refused_mint(replies)
                 self.assertEqual(refusal.reason, "token")
-                self.assertEqual(text, mask + "linux-verifier-token-diag stage=" + stage + "\n")
+                discard = "linux-verifier-token-discard=" + ("deleted" if replies[-1] == (204, None) else "failed") + "\n"
+                self.assertEqual(text, mask + discard + "linux-verifier-token-diag stage=" + stage + "\n")
                 self.assertEqual(text.count(token.replace("%", "%25")), 1)
                 self.assertEqual(len(calls), expected_calls)
                 self.assertEqual(calls[-1][:3], ("/installation/token", token, "DELETE"))
@@ -1950,7 +2031,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             installation, good, linux_source_build.SourceBuildRefusal("network"), (204, None),
         ])
         self.assertEqual(refusal.reason, "network")
-        self.assertEqual(text, mask)
+        self.assertEqual(text, mask + "linux-verifier-token-discard=deleted\n")
         self.assertEqual(len(calls), 4)
         self.assertEqual(calls[-1][:3], ("/installation/token", token, "DELETE"))
 
@@ -1967,7 +2048,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.subTest(error=name):
                 text, calls, raised = self.run_refused_mint([installation, good, error, (204, None)], expected=type(error))
                 self.assertIs(raised, error)
-                self.assertEqual(text, mask)
+                self.assertEqual(text, mask + "linux-verifier-token-discard=deleted\n")
                 self.assertEqual(len(calls), 4)
                 self.assertEqual(calls[-1][:3], ("/installation/token", token, "DELETE"))
                 self.assertEqual(calls[-1][3], mask)
@@ -1975,7 +2056,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             [installation, good, RuntimeError("boom"), OSError("delete failed")], expected=RuntimeError,
         )
         self.assertEqual(str(raised), "boom")
-        self.assertEqual(text, mask)
+        self.assertEqual(text, mask + "linux-verifier-token-discard=failed\n")
         self.assertEqual(len(calls), 4)
 
     def test_checkout_refuses_an_unsafe_token_before_any_request(self):

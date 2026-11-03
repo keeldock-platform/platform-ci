@@ -329,6 +329,39 @@ class LinuxProbeSourceTests(unittest.TestCase):
                     self.assertIn('"' + name + '"', probes.PROBE_SOURCE)
             self.assertIn('"' + channel + '"', probes.PROBE_SOURCE)
 
+    def test_socketpair_routes_are_pinned_attempts_in_raw_logs_and_runner_ipc(self):
+        self.assertEqual(
+            [name for name, accepted in channels.ATTEMPT_RULES["raw_logs"]],
+            ["stdout-markers", "tty-open", "syslog-socket", "journal-socket", "syslog-pair", "journal-pair"],
+        )
+        self.assertEqual(
+            [name for name, accepted in channels.ATTEMPT_RULES["runner_ipc"]],
+            ["unix-path", "unix-abstract", "unix-pair-connect", "fd-inventory"],
+        )
+        for channel, name in (("raw_logs", "syslog-pair"), ("raw_logs", "journal-pair"), ("runner_ipc", "unix-pair-connect")):
+            with self.subTest(name=name):
+                self.assertEqual(dict(channels.ATTEMPT_RULES[channel])[name], channels.DENIED)
+        self.assertEqual(sum(len(rules) for rules in channels.ATTEMPT_RULES.values()), 44)
+        body = probes.PROBE_BODY
+        raw = body[body.index("def run_raw_logs():"):body.index("def hunt():")]
+        self.assertIn("socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)", raw)
+        self.assertIn('attempt("syslog-pair", pair_datagram("/dev/log"))', raw)
+        self.assertIn('attempt("journal-pair", pair_datagram("/run/systemd/journal/socket"))', raw)
+        self.assertLess(raw.index('attempt("journal-socket"'), raw.index('attempt("syslog-pair"'))
+        ipc = body[body.index("def run_runner_ipc():"):body.index("def run_raw_logs():")]
+        self.assertIn("socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)", ipc)
+        self.assertIn('first.connect(cfg["unix_path"])', ipc)
+        self.assertIn('attempt("unix-pair-connect", unix_pair_connect, accepted=NET_DENIED + (errno.EISCONN,))', ipc)
+        self.assertNotIn("SOCK_DGRAM", ipc)
+        self.assertEqual(body.count('("s-" + nonce)'), 1)
+        self.assertNotIn(("runner_ipc", "s-" + NONCE), channels.control_markers("runner_ipc", NONCE, False))
+        self.assertEqual(channels.parse_attempts(passing("raw_logs"))[-2:], [("syslog-pair", "denied"), ("journal-pair", "denied")])
+        self.assertEqual(channels.judge_attempts(channels.ATTEMPT_RULES["raw_logs"], passing("raw_logs")), "ok")
+        leaked = passing("raw_logs").replace(b"KDATT journal-pair denied", b"KDATT journal-pair allowed")
+        self.assertEqual(channels.judge_attempts(channels.ATTEMPT_RULES["raw_logs"], leaked), "leak")
+        stale = passing("runner_ipc").replace(b"KDATT unix-pair-connect denied\n", b"")
+        self.assertEqual(channels.judge_attempts(channels.ATTEMPT_RULES["runner_ipc"], stale), "incomplete")
+
     def test_probe_program_never_contains_a_comment_marker_or_secret_material(self):
         for source in (probes.PROBE_SOURCE, probes.LAUNCHER_SOURCE):
             self.assertNotIn(chr(35), source)
