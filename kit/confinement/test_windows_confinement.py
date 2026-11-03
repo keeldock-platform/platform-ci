@@ -1494,7 +1494,8 @@ foreach ($case in $cases) {
         probe = self.probe
         finalpath = probe[probe.index("fn probe_finalpath"):probe.index("fn push_u16")]
         for required in (
-            "if !plain_path(dir) {",
+            "if let Err(reason) = plain_path(dir) {",
+            'return format!("open0=usage_{}", reason);',
             "open_directory(dir, 0)",
             "open_directory(dir, 0x0010_0080)",
             "[0u32, 2, 1, 4, 8, 10]",
@@ -1511,7 +1512,10 @@ foreach ($case in $cases) {
         for forbidden in ("display()", "{:?}", "to_string_lossy", "dir)", "target)"):
             self.assertNotIn(forbidden, finalpath.replace("plain_path(dir)", "").replace("canonicalize(dir)", ""))
         plain = probe[probe.index("fn plain_path"):probe.index("fn open_directory")]
-        self.assertIn(r'b"\\_.@-".contains(value)', plain)
+        self.assertIn(r'b"\\_.@-".contains(&value)', plain)
+        self.assertIn("let rest = &path[3..];", plain)
+        self.assertIn("bytes[1] != b':'", plain)
+        self.assertEqual(re.findall(r'return Err\("([a-z]+)"\);', plain), ["short", "long", "root", "char", "empty", "dot"])
         self.assertIn('part == "." || part == ".."', plain)
         junction = probe[probe.index("fn probe_junction"):probe.index("fn probe_mountmgr")]
         order = (
@@ -1526,7 +1530,11 @@ foreach ($case in $cases) {
         positions = [junction.index(item) for item in order]
         self.assertEqual(positions, sorted(positions))
         self.assertIn('(mode != "" && mode != "new")', junction)
-        self.assertEqual(len(re.findall(r'format!\("mkdir=', junction)), 4)
+        self.assertEqual(len(re.findall(r'format!\("mkdir=', junction)), 5)
+        self.assertIn('return format!("mkdir=usage_{} open=na fsctl=na readback=na remove=na", usage);', junction)
+        for required in ('format!("link_{}", reason)', 'format!("target_{}", reason)', 'String::from("args")', 'link.eq_ignore_ascii_case(target)'):
+            with self.subTest(required=required):
+                self.assertIn(required, junction)
         mountmgr = probe[probe.index("fn probe_mountmgr"):probe.index("fn probe_objdac")]
         self.assertIn('"dac" => 0x0004_0000,', mountmgr)
         self.assertIn('"write" => 0x4000_0000,', mountmgr)
@@ -1755,7 +1763,7 @@ foreach ($case in $cases) {
             "mkdir=ok open=ok fsctl=ok readback=err13 remove=err5",
             "mkdir=ok open=err5 fsctl=na readback=na remove=ok",
             "mkdir=err5 open=na fsctl=na readback=na remove=na",
-            "mkdir=usage open=na fsctl=na readback=na remove=na",
+            "mkdir=usage_link_char open=na fsctl=na readback=na remove=na",
         ),
         "mountmgr": ("open=ok", "open=err5", "open=err2", "open=usage"),
         "objdac": ("open=ok", "open=err5", "open=err2", "open=proc_err", "open=usage"),

@@ -560,16 +560,28 @@ fn probe_hardlink(link: &str, existing: &str) -> String {
     }
 }
 
-fn plain_path(path: &str) -> bool {
+fn plain_path(path: &str) -> Result<(), &'static str> {
     let bytes = path.as_bytes();
-    bytes.len() >= 4
-        && bytes.len() <= 400
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && bytes[2] == b'\\'
-        && bytes.iter().all(|value| value.is_ascii_alphanumeric() || b"\\_.@-".contains(value))
-        && !path.contains("\\\\")
-        && !path.split('\\').any(|part| part == "." || part == "..")
+    if bytes.len() < 4 {
+        return Err("short");
+    }
+    if bytes.len() > 400 {
+        return Err("long");
+    }
+    if !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return Err("root");
+    }
+    let rest = &path[3..];
+    if !rest.bytes().all(|value| value.is_ascii_alphanumeric() || b"\\_.@-".contains(&value)) {
+        return Err("char");
+    }
+    if rest.split('\\').any(|part| part.is_empty()) {
+        return Err("empty");
+    }
+    if rest.split('\\').any(|part| part == "." || part == "..") {
+        return Err("dot");
+    }
+    Ok(())
 }
 
 fn open_directory(path: &str, access: u32) -> Result<isize, u32> {
@@ -611,8 +623,8 @@ fn device_state(path: &str, access: u32) -> String {
 }
 
 fn probe_finalpath(dir: &str) -> String {
-    if !plain_path(dir) {
-        return String::from("open0=usage");
+    if let Err(reason) = plain_path(dir) {
+        return format!("open0=usage_{}", reason);
     }
     let opened = open_directory(dir, 0);
     let read_attributes = open_directory(dir, 0x0010_0080);
@@ -671,8 +683,17 @@ fn remove_state(path: &[u16]) -> String {
 }
 
 fn probe_junction(link: &str, target: &str, mode: &str) -> String {
-    if !plain_path(link) || !plain_path(target) || (mode != "" && mode != "new") || link == target {
-        return String::from("mkdir=usage open=na fsctl=na readback=na remove=na");
+    let usage = if let Err(reason) = plain_path(link) {
+        format!("link_{}", reason)
+    } else if let Err(reason) = plain_path(target) {
+        format!("target_{}", reason)
+    } else if (mode != "" && mode != "new") || link.eq_ignore_ascii_case(target) {
+        String::from("args")
+    } else {
+        String::new()
+    };
+    if !usage.is_empty() {
+        return format!("mkdir=usage_{} open=na fsctl=na readback=na remove=na", usage);
     }
     let link_name = wide(link);
     let target_name = wide(target);
