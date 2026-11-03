@@ -134,9 +134,21 @@ function Write-GateDiag([string]$id, $run) {
 function Write-ProbeDiag([string]$id, $run) {
     if ($script:RunMode -cne 'synthetic') { return }
     try {
-        if ($run.Truncated -or (Test-LogCanary ([string]$run.Stdout + "`n" + [string]$run.Stderr))) { return }
+        if ($run.Truncated -or (Test-LogCanary ([string]$run.Stdout + "`n" + [string]$run.Stderr))) {
+            Write-SyntheticDiag ('windows-source-probe-line suppressed id=' + $id)
+            return
+        }
         $code = [uint32]$run.ExitCode
         $lines = @('windows-source-probe id=' + $id + ' exit=0x' + $code.ToString('x8'))
+        $failure = Get-Token ([string]$run.Failure) '^[a-z_]{0,40}$'
+        if ($failure.Length -eq 0) { $failure = 'none' }
+        $started = 'false'
+        if ($run.Created) { $started = 'true' }
+        $timedOut = 'false'
+        if ($run.TimedOut) { $timedOut = 'true' }
+        $exited = 'false'
+        if ($run.Exited) { $exited = 'true' }
+        $lines += ('windows-source-probe-line state started=' + $started + ' failure=' + $failure + ' create_error=' + ([uint32]$run.CreateError).ToString() + ' timed_out=' + $timedOut + ' exited=' + $exited)
         foreach ($line in @(Get-DiagTail ([string]$run.Stderr) $ProbeStderrLines)) {
             $lines += ('windows-source-probe-line ' + (Get-DiagLineText ([string]$line)))
         }
@@ -144,7 +156,10 @@ function Write-ProbeDiag([string]$id, $run) {
             $lines += ('windows-source-probe-line ' + (Get-DiagLineText ([string]$line)))
         }
         foreach ($line in $lines) {
-            if (Test-LogCanary $line) { return }
+            if (Test-LogCanary $line) {
+                Write-SyntheticDiag ('windows-source-probe-line suppressed id=' + $id)
+                return
+            }
         }
         foreach ($line in $lines) {
             Write-SyntheticDiag $line
@@ -160,15 +175,17 @@ function Get-SourceProbes([string]$project, [string]$rustBin) {
     $cargoFmt = Join-Path $rustBin 'cargo-fmt.exe'
     $manifest = Join-Path $project 'Cargo.toml'
     $library = Join-Path $project 'crates\host\api\src\lib.rs'
+    $rustfmtConfig = Join-Path $project 'rustfmt.toml'
     $none = [string[]]@()
     return @(
         @{ Id = 'cargo_version'; Needs = ''; Extra = $none; Argv = [string[]]@($cargo, '--version') },
         @{ Id = 'cargo_fmt_version'; Needs = ''; Extra = $none; Argv = [string[]]@($cargo, 'fmt', '--version') },
         @{ Id = 'cargo_fmt_exe_version'; Needs = $cargoFmt; Extra = $none; Argv = [string[]]@($cargoFmt, '--version') },
         @{ Id = 'rustfmt_version'; Needs = ''; Extra = $none; Argv = [string[]]@($rustfmt, '--version') },
-        @{ Id = 'cargo_metadata'; Needs = ''; Extra = $none; Argv = [string[]]@($cargo, 'metadata', '--format-version', '1', '--offline', '--no-deps', '--manifest-path', $manifest) },
+        @{ Id = 'cargo_metadata'; Needs = ''; Extra = $none; Argv = [string[]]@($cargo, 'metadata', '--locked', '--format-version', '1', '--offline', '--no-deps', '--manifest-path', $manifest) },
         @{ Id = 'rustfmt_file_check'; Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $library) },
-        @{ Id = 'cargo_fmt_verbose'; Needs = ''; Extra = [string[]]@('RUST_BACKTRACE=1'); Argv = [string[]]@($cargo, 'fmt', '--verbose', '--', '--check') }
+        @{ Id = 'rustfmt_file_check_config'; Needs = $rustfmtConfig; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', '--config-path', $rustfmtConfig, $library) },
+        @{ Id = 'cargo_fmt_verbose'; Needs = ''; Extra = [string[]]@('RUST_BACKTRACE=1'); Argv = [string[]]@($cargo, '--locked', '--offline', 'fmt', '--manifest-path', $manifest, '--all', '--verbose', '--', '--check') }
     )
 }
 
@@ -191,6 +208,7 @@ function Invoke-SourceProbes($sandbox, [string]$project, [string]$rustBin) {
             Write-ProbeDiag $probe.Id $run
         }
     } catch {
+        try { Write-SyntheticDiag 'windows-source-probe-line aborted' } catch { return }
         return
     }
 }

@@ -1835,37 +1835,126 @@ class LinuxSourceBuildTests(unittest.TestCase):
         )
         output.assert_called_once_with(env, {"token": token, "installation_id": "19"})
 
-    @unittest.skipUnless(hasattr(os, "memfd_create"), "the verifier key descriptor uses memfd_create, which only Linux provides")
-    def test_verifier_refuses_an_issued_token_of_an_unsafe_shape_without_masking_or_using_it(self):
+    def run_refused_mint(self, replies):
         identity = {"owner": "KeelDock", "name": "private-source", "repository_id": "41"}
         env = {
             "SOURCE_READER_CLIENT_ID": "Iv1.abc123", "SOURCE_READER_INSTALLATION_ID": "19",
             "SOURCE_READER_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\n" + _FIXTURE_BODY + "\n-----END PRIVATE KEY-----\n",
         }
-        permissions = {"contents": "read", "metadata": "read"}
-        for bad in (
-            "", None, 7, "a" * 19, "a" * 4097, "a" * 10 + " " + "a" * 10, "a" * 10 + "\t" + "a" * 10,
-            "a" * 10 + "\n" + "a" * 10, "a" * 10 + chr(1) + "a" * 10, "a" * 10 + ":" + "a" * 10,
-            "a" * 10 + "," + "a" * 10, "a" * 10 + '"' + "a" * 10, "a" * 10 + chr(233) + "a" * 10,
-        ):
-            with self.subTest(bad=repr(bad)[:24]):
-                transcript = io.StringIO()
-                with patch.object(linux_source_build, "_source_inputs", return_value=identity), patch.object(
-                    linux_source_build.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=b"s" * 256)
-                ), patch.object(linux_source_build, "_api_request", side_effect=[
-                    (200, {"id": 19, "account": {"login": "keeldock"}}),
-                    (201, {"token": bad, "permissions": permissions}),
-                ]) as api, patch.object(linux_source_build, "_write_output") as output, patch.object(
-                    linux_source_build.sys, "stdout", transcript
-                ):
-                    with self.assertRaises(linux_source_build.SourceBuildRefusal) as raised:
-                        linux_source_build.mint_verifier_token(env)
-                self.assertEqual(raised.exception.reason, "token")
-                self.assertEqual(transcript.getvalue(), "linux-verifier-token-diag stage=issue\n")
-                self.assertEqual(api.call_count, 2)
-                output.assert_not_called()
+        transcript = io.StringIO()
+        calls = []
+        queue = list(replies)
 
-    def test_checkout_and_revoke_refuse_a_token_of_an_unsafe_shape_before_any_request(self):
+        def api(path, bearer, **keywords):
+            calls.append((path, bearer, keywords.get("method"), transcript.getvalue()))
+            reply = queue.pop(0)
+            if isinstance(reply, BaseException):
+                raise reply
+            return reply
+
+        with patch.object(linux_source_build, "_source_inputs", return_value=identity), patch.object(
+            linux_source_build.subprocess, "run", return_value=types.SimpleNamespace(returncode=0, stdout=b"s" * 256)
+        ), patch.object(linux_source_build, "_api_request", side_effect=api), patch.object(
+            linux_source_build, "_write_output"
+        ) as output, patch.object(linux_source_build.sys, "stdout", transcript):
+            with self.assertRaises(linux_source_build.SourceBuildRefusal) as raised:
+                linux_source_build.mint_verifier_token(env)
+        output.assert_not_called()
+        return transcript.getvalue(), calls, raised.exception
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "the verifier key descriptor uses memfd_create, which only Linux provides")
+    def test_an_unsafe_issued_token_is_refused_with_a_token_free_shape_line_and_revoked_when_header_safe(self):
+        installation = (200, {"id": 19, "account": {"login": "keeldock"}})
+        permissions = {"contents": "read", "metadata": "read"}
+        stage = "linux-verifier-token-diag stage=issue"
+        cases = (
+            ("a" * 19, " present=yes type=str length=1-19 classes=letters", True),
+            ("ab:cd" + "e" * 20, " present=yes type=str length=20-255 classes=letters,other", True),
+            ("A9_-." + "," * 20, " present=yes type=str length=20-255 classes=letters,digits,underscore,dash,dot,other", True),
+            ("a" * 300 + ":", " present=yes type=str length=256-1024 classes=letters,other", True),
+            ("a" * 2000 + ":", " present=yes type=str length=1025-4096 classes=letters,other", True),
+            ("a" * 4097, " present=yes type=str length=4097+ classes=letters", False),
+            ("a" * 10 + " " + "a" * 10, " present=yes type=str length=20-255 classes=letters,other", False),
+            ("a" * 10 + chr(233) + "a" * 10, " present=yes type=str length=20-255 classes=letters,other", False),
+            ("", " present=yes type=str length=0 classes=none", False),
+            (None, " present=yes type=other length=0 classes=none", False),
+            (7, " present=yes type=other length=0 classes=none", False),
+        )
+        for bad, shape, header_safe in cases:
+            with self.subTest(shape=shape):
+                for delete_reply in ((204, None), linux_source_build.SourceBuildRefusal("network"), RuntimeError("boom")):
+                    replies = [installation, (201, {"token": bad, "permissions": permissions})]
+                    if header_safe:
+                        replies.append(delete_reply)
+                    text, calls, refusal = self.run_refused_mint(replies)
+                    self.assertEqual(refusal.reason, "token")
+                    diag = stage + shape + "\n"
+                    if header_safe:
+                        mask = linux_source_build._mask_line(bad)
+                        self.assertEqual(text, mask + diag)
+                        self.assertEqual(len(calls), 3)
+                        self.assertEqual(calls[2][:3], ("/installation/token", bad, "DELETE"))
+                        self.assertEqual(calls[2][3], mask)
+                        self.assertNotIn(bad, diag)
+                    else:
+                        self.assertEqual(text, diag)
+                        self.assertEqual(len(calls), 2)
+        for issued, shape in (
+            ({"permissions": permissions}, " present=no type=other length=0 classes=none"),
+            ([], " present=no type=other length=0 classes=none"),
+            (None, " present=no type=other length=0 classes=none"),
+            ({"token": None}, " present=yes type=other length=0 classes=none"),
+        ):
+            with self.subTest(issued=repr(issued)[:20]):
+                text, calls, refusal = self.run_refused_mint([installation, (201, issued)])
+                self.assertEqual(text, stage + shape + "\n")
+                self.assertEqual(len(calls), 2)
+
+    def test_length_buckets_are_a_closed_vocabulary(self):
+        for length, bucket in (
+            (0, "0"), (1, "1-19"), (19, "1-19"), (20, "20-255"), (255, "20-255"), (256, "256-1024"),
+            (1024, "256-1024"), (1025, "1025-4096"), (4096, "1025-4096"), (4097, "4097+"), (100000, "4097+"),
+        ):
+            with self.subTest(length=length):
+                self.assertEqual(linux_source_build._length_bucket(length), bucket)
+        self.assertEqual(linux_source_build._token_classes("aZ09_-.~"), "letters,digits,underscore,dash,dot,other")
+        self.assertEqual(linux_source_build._token_classes("-"), "dash")
+        self.assertEqual(linux_source_build._token_classes(""), "none")
+
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "the verifier key descriptor uses memfd_create, which only Linux provides")
+    def test_a_refusal_after_the_token_was_issued_makes_a_best_effort_delete_and_never_logs_the_token(self):
+        token = "ghs_" + "ab-cd.ef" * 5
+        installation = (200, {"id": 19, "account": {"login": "keeldock"}})
+        good = (201, {"token": token, "permissions": {"contents": "read", "metadata": "read"}})
+        bad_permissions = (201, {"token": token, "permissions": {"contents": "write"}})
+        one_repository = (200, {"total_count": 1, "repositories": [{"id": 41, "name": "private-source"}]})
+        two_repositories = (200, {"total_count": 2, "repositories": [{"id": 41, "name": "private-source"}]})
+        mask = linux_source_build._mask_line(token)
+        for name, replies, stage, expected_calls in (
+            ("permissions", [installation, bad_permissions, (204, None)], "permissions", 3),
+            ("permissions_delete_refused", [installation, bad_permissions, linux_source_build.SourceBuildRefusal("network")], "permissions", 3),
+            ("permissions_delete_error", [installation, bad_permissions, OSError("down")], "permissions", 3),
+            ("repositories", [installation, good, two_repositories, (204, None)], "repositories", 4),
+            ("repositories_delete_refused", [installation, good, two_repositories, RuntimeError("boom")], "repositories", 4),
+            ("repositories_wrong_id", [installation, good, (200, {"total_count": 1, "repositories": [{"id": 5, "name": "x"}]}), (204, None)], "repositories", 4),
+        ):
+            with self.subTest(case=name):
+                text, calls, refusal = self.run_refused_mint(replies)
+                self.assertEqual(refusal.reason, "token")
+                self.assertEqual(text, mask + "linux-verifier-token-diag stage=" + stage + "\n")
+                self.assertEqual(text.count(token.replace("%", "%25")), 1)
+                self.assertEqual(len(calls), expected_calls)
+                self.assertEqual(calls[-1][:3], ("/installation/token", token, "DELETE"))
+                self.assertEqual(calls[-1][3], mask)
+        text, calls, refusal = self.run_refused_mint([
+            installation, good, linux_source_build.SourceBuildRefusal("network"), (204, None),
+        ])
+        self.assertEqual(refusal.reason, "network")
+        self.assertEqual(text, mask)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(calls[-1][:3], ("/installation/token", token, "DELETE"))
+
+    def test_checkout_refuses_an_unsafe_token_before_any_request(self):
         identity = {"owner": "owner", "name": "source", "repository_id": "7", "source_sha": "a" * 40}
         for bad in ("", "short", "a" * 4097, "a" * 10 + " " + "a" * 10, "a" * 10 + ":" + "a" * 10, "a" * 10 + chr(233) + "a" * 10):
             with self.subTest(bad=repr(bad)[:24]):
@@ -1875,27 +1964,37 @@ class LinuxSourceBuildTests(unittest.TestCase):
                     with self.assertRaises(linux_source_build.SourceBuildRefusal) as raised:
                         linux_source_build.checkout_source({"SOURCE_READER_TOKEN": bad, "RUNNER_TEMP": temporary})
                     self.assertEqual(raised.exception.reason, "token")
+                    api.assert_not_called()
+                    git.assert_not_called()
+                    self.assertFalse((Path(temporary) / "kd-source-checkout").exists())
+
+    def test_revoke_tries_any_header_safe_token_and_refuses_the_rest_before_any_request(self):
+        for bad in (
+            "", "a" * 4097, "a" * 10 + " " + "a" * 10, "a" * 10 + "\t" + "a" * 10, "a" * 10 + "\n",
+            "a" * 10 + chr(0) + "a" * 10, "a" * 10 + chr(127) + "a" * 10, "a" * 10 + chr(233) + "a" * 10, None,
+        ):
+            with self.subTest(refused=repr(bad)[:24]):
+                with tempfile.TemporaryDirectory() as temporary, patch.object(linux_source_build, "_api_request") as api:
                     with self.assertRaises(linux_source_build.SourceBuildRefusal) as raised:
                         linux_source_build.revoke_token({"SOURCE_READER_TOKEN": bad, "RUNNER_TEMP": temporary})
                     self.assertEqual(raised.exception.reason, "revocation")
                     api.assert_not_called()
-                    git.assert_not_called()
-                    self.assertFalse((Path(temporary) / "kd-source-checkout").exists())
                     self.assertFalse((Path(temporary) / "kd-records").exists())
-
-    def test_revoke_accepts_a_long_token_with_dashes_and_dots(self):
-        token = "v2.ab-cd." + "ef-gh.ij" * 30
-        with tempfile.TemporaryDirectory() as temporary:
-            with patch.object(linux_source_build, "_api_request", side_effect=[(204, {}), (401, {})]) as api:
-                self.assertEqual(linux_source_build.revoke_token({"SOURCE_READER_TOKEN": token, "RUNNER_TEMP": temporary}), 0)
-            self.assertEqual(api.call_args_list[0].args[:2], ("/installation/token", token))
-            self.assertEqual(api.call_args_list[1].args[:2], ("/installation/repositories?per_page=1", token))
+        for token in ("x", "short", "a:b", "a,b", '"quoted"', "a" * 4096, "v2.ab-cd." + "ef-gh.ij" * 30, "ghs_" + "T" * 36):
+            with self.subTest(accepted=repr(token)[:24]):
+                with tempfile.TemporaryDirectory() as temporary:
+                    with patch.object(linux_source_build, "_api_request", side_effect=[(204, {}), (401, {})]) as api:
+                        self.assertEqual(linux_source_build.revoke_token({"SOURCE_READER_TOKEN": token, "RUNNER_TEMP": temporary}), 0)
+                    self.assertEqual(api.call_args_list[0].args[:2], ("/installation/token", token))
+                    self.assertEqual(api.call_args_list[1].args[:2], ("/installation/repositories?per_page=1", token))
 
     def test_the_old_alphanumeric_token_shape_is_gone_from_the_kit(self):
         source = Path(linux_source_build.__file__).read_text(encoding="ascii")
         self.assertNotIn("{20,1024}", source)
+        self.assertNotIn("len(token)", source)
         self.assertEqual(source.count("SOURCE_TOKEN_RE.fullmatch("), 1)
-        self.assertEqual(source.count("_valid_source_token("), 4)
+        self.assertEqual(source.count("HEADER_TOKEN_RE.fullmatch("), 2)
+        self.assertIn('HEADER_TOKEN_RE = re.compile(r"[!-~]{1,4096}\\Z")', source)
         self.assertEqual(source.count('"::add-mask::"'), 1)
 
     def test_verifier_key_forms_are_canonicalised_to_one_wrapped_pem(self):
@@ -1947,7 +2046,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         }
         self.assertEqual(set(linux_source_build.TOKEN_STAGES), expected)
         source = Path(linux_source_build.__file__).read_text(encoding="ascii")
-        literals = set(re.findall(r'_token_refusal\("([a-z_]+)"\)', source))
+        literals = set(re.findall(r'_token_refusal\("([a-z_]+)"[,)]', source))
         self.assertTrue(literals <= expected)
         self.assertEqual(literals | {"sign_key", "sign_exec"}, expected)
         for text, stage in (

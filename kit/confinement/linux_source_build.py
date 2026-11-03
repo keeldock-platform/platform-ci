@@ -53,6 +53,9 @@ OWNER_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,99}\Z")
 API_PATH_RE = re.compile(r"/[A-Za-z0-9._~/?&=-]*\Z")
 DECIMAL_RE = re.compile(r"[1-9][0-9]{0,18}\Z")
 SOURCE_TOKEN_RE = re.compile(r"[\x21\x23-\x2b\x2d-\x39\x3b-\x7e]{20,4096}\Z")
+HEADER_TOKEN_RE = re.compile(r"[!-~]{1,4096}\Z")
+LENGTH_BUCKETS = ((0, "0"), (19, "1-19"), (255, "20-255"), (1024, "256-1024"), (4096, "1025-4096"))
+TOKEN_CLASS_NAMES = ("letters", "digits", "underscore", "dash", "dot", "other")
 ENVIRONMENT_NAME = "linux-source-read"
 ENVIRONMENT_BRANCHES = ("main", "untrusted")
 GATES = gate_table.GATES
@@ -635,8 +638,55 @@ def _mask_line(token):
     return "::add-mask::" + token.replace("%", "%25") + "\n"
 
 
-def _token_refusal(stage):
-    sys.stdout.write("linux-verifier-token-diag stage=" + stage + "\n")
+def _length_bucket(length):
+    for limit, name in LENGTH_BUCKETS:
+        if length <= limit:
+            return name
+    return "4097+"
+
+
+def _token_classes(value):
+    found = set()
+    for character in value:
+        if "a" <= character <= "z" or "A" <= character <= "Z":
+            found.add("letters")
+        elif "0" <= character <= "9":
+            found.add("digits")
+        elif character == "_":
+            found.add("underscore")
+        elif character == "-":
+            found.add("dash")
+        elif character == ".":
+            found.add("dot")
+        else:
+            found.add("other")
+    names = [name for name in TOKEN_CLASS_NAMES if name in found]
+    return ",".join(names) if names else "none"
+
+
+def _issue_shape(issued, token):
+    present = "yes" if type(issued) is dict and "token" in issued else "no"
+    if type(token) is str:
+        kind, length, classes = "str", len(token), _token_classes(token)
+    else:
+        kind, length, classes = "other", 0, "none"
+    return " present=" + present + " type=" + kind + " length=" + _length_bucket(length) + " classes=" + classes
+
+
+def _discard_issued_token(token, masked=False):
+    if type(token) is not str or HEADER_TOKEN_RE.fullmatch(token) is None:
+        return
+    if not masked:
+        sys.stdout.write(_mask_line(token))
+        sys.stdout.flush()
+    try:
+        _api_request("/installation/token", token, method="DELETE", expected=(204,))
+    except Exception:
+        return
+
+
+def _token_refusal(stage, detail=""):
+    sys.stdout.write("linux-verifier-token-diag stage=" + stage + detail + "\n")
     sys.stdout.flush()
     return SourceBuildRefusal("token")
 
@@ -729,19 +779,26 @@ def mint_verifier_token(environ=None):
     )
     token = issued.get("token") if type(issued) is dict else None
     if not _valid_source_token(token):
-        raise _token_refusal("issue")
+        _discard_issued_token(token)
+        raise _token_refusal("issue", _issue_shape(issued, token))
     sys.stdout.write(_mask_line(token))
     sys.stdout.flush()
     permissions = issued.get("permissions")
     if (type(permissions) is not dict or permissions.get("contents") != "read"
             or set(permissions) - {"contents", "metadata"}
             or any(value != "read" for value in permissions.values())):
+        _discard_issued_token(token, True)
         raise _token_refusal("permissions")
-    unused, repositories = _api_request("/installation/repositories?per_page=100", token)
+    try:
+        unused, repositories = _api_request("/installation/repositories?per_page=100", token)
+    except SourceBuildRefusal:
+        _discard_issued_token(token, True)
+        raise
     entries = repositories.get("repositories") if type(repositories) is dict else None
     if (type(entries) is not list or len(entries) != 1 or repositories.get("total_count") != 1
             or type(entries[0]) is not dict or entries[0].get("id") != int(identity["repository_id"])
             or entries[0].get("name") != identity["name"]):
+        _discard_issued_token(token, True)
         raise _token_refusal("repositories")
     _write_output(env, {"token": token, "installation_id": installation_id})
     sys.stdout.write("linux-verifier-token=issued installation=verified scope=one-repository\n")
@@ -1403,7 +1460,7 @@ def checkout_source(environ=None):
 def revoke_token(environ=None):
     env = os.environ if environ is None else environ
     token = env.get("SOURCE_READER_TOKEN", "")
-    if not _valid_source_token(token):
+    if type(token) is not str or HEADER_TOKEN_RE.fullmatch(token) is None:
         raise SourceBuildRefusal("revocation")
     status, unused = _api_request("/installation/token", token, method="DELETE", expected=(204,))
     if status != 204:
