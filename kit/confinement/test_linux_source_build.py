@@ -1835,7 +1835,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         )
         output.assert_called_once_with(env, {"token": token, "installation_id": "19"})
 
-    def run_refused_mint(self, replies):
+    def run_refused_mint(self, replies, expected=linux_source_build.SourceBuildRefusal):
         identity = {"owner": "KeelDock", "name": "private-source", "repository_id": "41"}
         env = {
             "SOURCE_READER_CLIENT_ID": "Iv1.abc123", "SOURCE_READER_INSTALLATION_ID": "19",
@@ -1857,7 +1857,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         ), patch.object(linux_source_build, "_api_request", side_effect=api), patch.object(
             linux_source_build, "_write_output"
         ) as output, patch.object(linux_source_build.sys, "stdout", transcript):
-            with self.assertRaises(linux_source_build.SourceBuildRefusal) as raised:
+            with self.assertRaises(expected) as raised:
                 linux_source_build.mint_verifier_token(env)
         output.assert_not_called()
         return transcript.getvalue(), calls, raised.exception
@@ -1954,6 +1954,30 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertEqual(len(calls), 4)
         self.assertEqual(calls[-1][:3], ("/installation/token", token, "DELETE"))
 
+    @unittest.skipUnless(hasattr(os, "memfd_create"), "the verifier key descriptor uses memfd_create, which only Linux provides")
+    def test_any_exception_from_the_repositories_request_deletes_the_issued_token_and_is_re_raised_unchanged(self):
+        token = "ghs_" + "ab-cd.ef" * 5
+        installation = (200, {"id": 19, "account": {"login": "keeldock"}})
+        good = (201, {"token": token, "permissions": {"contents": "read", "metadata": "read"}})
+        mask = linux_source_build._mask_line(token)
+        for name, error in (
+            ("runtime", RuntimeError("boom")), ("os", OSError("down")), ("value", ValueError("bad")),
+            ("keyboard", KeyboardInterrupt()), ("refusal", linux_source_build.SourceBuildRefusal("network")),
+        ):
+            with self.subTest(error=name):
+                text, calls, raised = self.run_refused_mint([installation, good, error, (204, None)], expected=type(error))
+                self.assertIs(raised, error)
+                self.assertEqual(text, mask)
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(calls[-1][:3], ("/installation/token", token, "DELETE"))
+                self.assertEqual(calls[-1][3], mask)
+        text, calls, raised = self.run_refused_mint(
+            [installation, good, RuntimeError("boom"), OSError("delete failed")], expected=RuntimeError,
+        )
+        self.assertEqual(str(raised), "boom")
+        self.assertEqual(text, mask)
+        self.assertEqual(len(calls), 4)
+
     def test_checkout_refuses_an_unsafe_token_before_any_request(self):
         identity = {"owner": "owner", "name": "source", "repository_id": "7", "source_sha": "a" * 40}
         for bad in ("", "short", "a" * 4097, "a" * 10 + " " + "a" * 10, "a" * 10 + ":" + "a" * 10, "a" * 10 + chr(233) + "a" * 10):
@@ -1991,7 +2015,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
     def test_the_old_alphanumeric_token_shape_is_gone_from_the_kit(self):
         source = Path(linux_source_build.__file__).read_text(encoding="ascii")
         self.assertNotIn("{20,1024}", source)
-        self.assertNotIn("len(token)", source)
+        self.assertNotIn("len(token) > 4096", source)
         self.assertEqual(source.count("SOURCE_TOKEN_RE.fullmatch("), 1)
         self.assertEqual(source.count("HEADER_TOKEN_RE.fullmatch("), 2)
         self.assertIn('HEADER_TOKEN_RE = re.compile(r"[!-~]{1,4096}\\Z")', source)

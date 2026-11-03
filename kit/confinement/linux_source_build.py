@@ -791,7 +791,7 @@ def mint_verifier_token(environ=None):
         raise _token_refusal("permissions")
     try:
         unused, repositories = _api_request("/installation/repositories?per_page=100", token)
-    except SourceBuildRefusal:
+    except BaseException:
         _discard_issued_token(token, True)
         raise
     entries = repositories.get("repositories") if type(repositories) is dict else None
