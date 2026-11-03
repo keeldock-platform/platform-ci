@@ -857,13 +857,30 @@ class WindowsSourceRunTests(unittest.TestCase):
                 self.assertIn(token, ladder)
         probe = self.function_body("Invoke-FinalPathProbe")
         self.assertIn("    if ($confined) {\n        $script:FinalPathText = $text\n", probe)
-        self.assertIn("if ((Get-ProbeValue $text 'volr') -ceq 'ok' -or (Get-ProbeValue $text 'voldac') -ceq 'ok') { $script:VolumeBoundary = 'breached' }", probe)
+        self.assertIn("        foreach ($key in $VolumeBoundaryTokens) {\n            if ((Get-ProbeValue $text $key) -ceq 'ok') { $script:VolumeBoundary = 'breached' }\n        }\n", probe)
+        self.assertIn("\n$VolumeBoundaryTokens = @('volr', 'volrd', 'voldac', 'volown', 'volusn', 'volusnu', 'volenum', 'volntfs', 'volbmp')\n", self.runner)
+        self.assertIn("\n$VolumeControlTokens = @('volusn', 'volusnu', 'volenum', 'volntfs', 'volbmp')\n", self.runner)
+        clean = self.function_body("Test-VolumeBoundaryClean")
+        for token in (
+            "if ((Get-ProbeValue $text 'vol') -cne 'ok') { return $false }",
+            "foreach ($key in $VolumeBoundaryTokens) {",
+            "if ($VolumeControlTokens -ccontains $key) {\n            if ($value -cne 'err5') { return $false }\n        } elseif ($value -cnotmatch '^err[0-9]{1,10}$') {\n            return $false\n        }",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, clean)
+        self.assertTrue(clean.endswith("    return $true"))
+        self.assertEqual(clean.count("return $true"), 1)
+        gate = "            if ($rung -ceq 'volume' -and -not (Test-VolumeBoundaryClean $script:FinalPathText)) { $finalPath = 'unproven' }\n"
+        self.assertIn("            $finalPath = Invoke-FinalPathProbe $sandbox $true ('finalpath_' + $rung)\n" + gate + "            $state.FinalPath = $finalPath\n", ladder)
+        self.assertEqual(self.runner.count("Test-VolumeBoundaryClean"), 2)
         self.assertLess(probe.index("$script:VolumeBoundary = 'breached'"), probe.index("return 'ok'"))
         self.assertIn("\n$script:FinalPathText = ''\n$script:VolumeBoundary = 'denied'\n", self.runner)
         self.assertEqual(self.runner.count("$script:VolumeBoundary = 'breached'"), 1)
         detail = self.function_body("Get-MountManagerDetail")
         self.assertIn("foreach ($key in @('mpm', 'vol', 'qdvp', 'qpts', 'n_dos', 'canon')) {", detail)
         self.assertIn("foreach ($pair in @('mpm=mountmgr', 'vol=volume', 'qdvp=query', 'n_dos=name', 'canon=canon')) {", detail)
+        self.assertIn("if ($parts[0] -ceq 'vol' -and $script:MountState.Volume -cne 'leased') { continue }", detail)
+        self.assertLess(detail.index("{ continue }"), detail.index("$denied = $parts[1]"))
         self.assertIn("if ($values['n_dos'] -cne 'ok' -or $values['canon'] -cne 'ok') {", detail)
         self.assertNotIn("Write-Line", detail)
         main = self.runner.index("$script:MountState = Invoke-MountManagerLadder $box")
@@ -892,6 +909,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-confinement-mountmgr-detail=none mpm=ok vol=err5 qdvp=ok qpts=ok n_dos=ok canon=ok volume_boundary=denied",
             "windows-confinement-mountmgr-detail=volume mpm=ok vol=err5 qdvp=err5 qpts=err5 n_dos=err5 canon=err5 volume_boundary=denied",
             "windows-confinement-mountmgr-rung=volume state=applied error=0 readback=match finalpath=ok",
+            "windows-confinement-mountmgr-rung=volume state=applied error=0 readback=match finalpath=unproven",
         ):
             with self.subTest(line=line[:60]):
                 self.assertIsNotNone(public.fullmatch(line))
@@ -905,12 +923,13 @@ class WindowsSourceRunTests(unittest.TestCase):
             re.findall(r"'([a-z]+)='\+", script),
             ["index", "lstat", "readlink", "stat", "native", "pkg", "arborist"])
         self.assertIn("['kd-probe','npmlink',", script)
-        self.assertIn("filter((n)=>k[n].link)", script)
+        self.assertIn("filter((n)=>k[n].link).slice(0,MAXLINKS).map(", script)
+        self.assertEqual(script.count("MAXLINKS"), 1)
         self.assertNotIn("console", script)
         probe = self.function_body("Invoke-NpmLinkTargetProbe")
         self.assertTrue(probe.split("\n", 1)[1].startswith("    if ($script:RunMode -cne 'synthetic') { return }\n"))
         self.assertIn("$argv = [string[]]@($node, '-e', $NpmLinkTargetScript)", probe)
-        self.assertIn("$run = $sandbox.Run($true, $node, (ConvertTo-CommandLine $argv), $project, $environment, ($MountManagerProbeSeconds * 1000), [uint32]32)", probe)
+        self.assertIn("$argv = [string[]]@($node, '-e', $NpmLinkTargetScript.Replace('MAXLINKS', [string]$MaxNpmLinks))", probe)
         self.assertNotIn("Write-Line", probe)
         steps = self.function_body("Invoke-NpmLinkSteps")
         call = "    if ($created -gt 0) { Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $environment }\n"
