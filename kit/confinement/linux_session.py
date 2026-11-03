@@ -68,6 +68,7 @@ PASSWD_TEXT = "root:x:0:0:root:/root:/usr/sbin/nologin\nkdproject:x:62000:62000:
 GROUP_TEXT = "root:x:0:\nkdproject:x:62000:\n"
 CRLF = bytes((13, 10))
 SAFE_PATH = re.compile(r"/[A-Za-z0-9._/@+=-]{0,400}")
+LISTENER_JOIN_SECONDS = 2
 PROJECT_ENV_NAMES = frozenset((
     "PATH", "LANG", "LC_ALL", "HOME", "TMP", "TMPDIR", "CI",
     "PYTHONDONTWRITEBYTECODE", "PYTHONNOUSERSITE", "CARGO_HOME", "RUSTUP_HOME",
@@ -151,16 +152,20 @@ class Listener:
         except OSError:
             self.sock.close()
             raise
+        self.family = family
         self.address = self.sock.getsockname()
+        self.stopping = threading.Event()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def _loop(self):
-        while True:
+        while not self.stopping.is_set():
             try:
                 if self.kind == socket.SOCK_STREAM:
                     client, unused = self.sock.accept()
                     with client:
+                        if self.stopping.is_set():
+                            return
                         client.settimeout(1)
                         try:
                             data = client.recv(2048)
@@ -175,6 +180,8 @@ class Listener:
                                 pass
                 else:
                     data, sender = self.sock.recvfrom(2048)
+                    if self.stopping.is_set():
+                        return
                     self.store.record(self.name, data)
                     answer = self.reply(data) if self.reply is not None else b""
                     if answer:
@@ -184,12 +191,39 @@ class Listener:
                             pass
             except OSError:
                 return
+            except Exception:
+                if self.stopping.is_set():
+                    return
+                raise
+
+    def _wake(self):
+        try:
+            if self.kind == socket.SOCK_STREAM:
+                waker = socket.socket(self.family, socket.SOCK_STREAM)
+            else:
+                waker = socket.socket(self.family, socket.SOCK_DGRAM)
+        except OSError:
+            return
+        try:
+            waker.settimeout(1)
+            if self.kind == socket.SOCK_STREAM:
+                waker.connect(self.address)
+            else:
+                waker.sendto(b"kd-stop", self.address)
+        except OSError:
+            pass
+        finally:
+            waker.close()
 
     def close(self):
+        self.stopping.set()
         try:
             self.sock.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
+        if self.thread is not threading.current_thread():
+            self._wake()
+            self.thread.join(LISTENER_JOIN_SECONDS)
         try:
             self.sock.close()
         except OSError:

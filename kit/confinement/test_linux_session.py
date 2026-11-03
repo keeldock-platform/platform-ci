@@ -2,6 +2,7 @@ import base64
 import inspect
 import json
 import os
+import shutil
 import socket
 import stat
 import subprocess
@@ -162,6 +163,37 @@ class LinuxSessionPureTests(unittest.TestCase):
             self.assertTrue(store.seen("proxy", "c-abc"))
         finally:
             listener.close()
+
+    def test_closing_a_listener_ends_its_thread_before_returning_for_every_socket_kind(self):
+        store = session.EventStore()
+        directory = tempfile.mkdtemp(prefix="kd-listener-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        cases = (
+            ("tcp", socket.AF_INET, socket.SOCK_STREAM, ("127.0.0.1", 0)),
+            ("udp", socket.AF_INET, socket.SOCK_DGRAM, ("127.0.0.1", 0)),
+            ("unix", socket.AF_UNIX, socket.SOCK_STREAM, os.path.join(directory, "kd.sock")),
+            ("abstract", socket.AF_UNIX, socket.SOCK_STREAM, chr(0) + "kd-listener-" + NONCE),
+        )
+        for name, family, kind, address in cases:
+            with self.subTest(name=name):
+                listener = session.Listener(name, family, kind, address, None, store)
+                self.assertTrue(listener.thread.is_alive())
+                listener.close()
+                self.assertFalse(listener.thread.is_alive())
+                self.assertTrue(listener.stopping.is_set())
+        self.assertEqual(store.snapshot(), [])
+
+    def test_a_listener_that_is_stopping_swallows_late_errors_and_otherwise_still_raises(self):
+        store = session.EventStore()
+        listener = session.Listener("udp", socket.AF_INET, socket.SOCK_DGRAM, ("127.0.0.1", 0), None, store)
+        listener.close()
+        self.assertFalse(listener.thread.is_alive())
+        text = inspect.getsource(session.Listener._loop)
+        self.assertIn("while not self.stopping.is_set():", text)
+        self.assertIn("except Exception:\n                if self.stopping.is_set():\n                    return\n                raise", text)
+        self.assertIn("daemon=True", inspect.getsource(session.Listener.__init__))
+        self.assertIn("self.thread.join(LISTENER_JOIN_SECONDS)", inspect.getsource(session.Listener.close))
+        self.assertGreater(session.LISTENER_JOIN_SECONDS, 0)
 
     def test_the_project_profile_has_its_own_limits_and_the_other_profiles_are_unchanged(self):
         rl = session.resource

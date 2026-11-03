@@ -818,5 +818,14 @@ def main(argv=None):
         return 1
 
 
+def finish(code):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+    os._exit(0 if code is None else int(code))
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    finish(main())

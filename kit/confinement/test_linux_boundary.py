@@ -439,6 +439,38 @@ class LinuxBoundaryCommandTests(unittest.TestCase):
                 with open(root_output, encoding="ascii") as source:
                     self.assertTrue(json.load(source)["accepted"])
 
+    def test_the_process_flushes_both_streams_and_exits_without_interpreter_teardown(self):
+        order = []
+
+        class Stream:
+            def __init__(self, name):
+                self.name = name
+
+            def flush(self):
+                order.append("flush-" + self.name)
+
+        with patch("linux_boundary.sys.stdout", Stream("out")), patch("linux_boundary.sys.stderr", Stream("err")):
+            with patch("linux_boundary.os._exit", side_effect=lambda code: order.append(("exit", code))):
+                boundary.finish(1)
+                boundary.finish(None)
+        self.assertEqual(order, ["flush-out", "flush-err", ("exit", 1), "flush-out", "flush-err", ("exit", 0)])
+
+    def test_a_failed_flush_never_blocks_the_exit(self):
+        class Broken:
+            def flush(self):
+                raise BrokenPipeError()
+
+        with patch("linux_boundary.sys.stdout", Broken()), patch("linux_boundary.sys.stderr", Broken()):
+            with patch("linux_boundary.os._exit") as leave:
+                boundary.finish(2)
+        leave.assert_called_once_with(2)
+
+    def test_the_entry_point_leaves_through_finish_so_no_daemon_thread_races_the_shutdown(self):
+        with open(boundary.__file__, "rt", encoding="utf-8") as source:
+            text = source.read()
+        self.assertTrue(text.endswith('if __name__ == "__main__":\n    finish(main())\n'))
+        self.assertNotIn("raise SystemExit(main())", text)
+
     def test_command_line_requires_a_record_path_and_a_runner_uid_and_validates_paths(self):
         out = io.StringIO()
         with patch("linux_boundary.sys.stdout", out):
