@@ -557,6 +557,25 @@ function Remove-SourceConfigFiles([string]$project) {
     if ($locks -lt 1) { throw 'lock' }
 }
 
+function Initialize-ToolConfigs([string]$project) {
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    foreach ($names in @(@('.rustfmt.toml', 'rustfmt.toml'), @('.clippy.toml', 'clippy.toml'))) {
+        $present = $false
+        foreach ($name in $names) {
+            $path = Join-Path $project $name
+            if (Test-Path -LiteralPath $path) {
+                if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'tool_config' }
+                $item = Get-Item -LiteralPath $path -Force
+                if (([int]$item.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'tool_config' }
+                $present = $true
+            }
+        }
+        if (-not $present) {
+            [IO.File]::WriteAllText((Join-Path $project $names[1]), '', $encoding)
+        }
+    }
+}
+
 function Remove-WithinRoots([string]$path) {
     $roots = @($script:Layout.Base, $script:ProfileFolder, $script:OtherFolder, $script:TrapDirectory)
     foreach ($canary in @($script:Canaries)) { $roots += [string]$canary }
@@ -730,9 +749,9 @@ function Test-GateBoundary($run) {
 function Get-GateCause($run, [bool]$boundary) {
     if ($run.Failure -ne '' -or -not $run.Exited) { return 'launch' }
     if ($run.TimedOut) { return 'timeout' }
-    $code = [uint32]$run.ExitCode
-    if ($code -eq 0x4b44574b -or $code -eq 0xC0000044 -or $code -eq 0xC000012D -or $code -eq 0xC0000017) { return 'limit' }
-    if ($code -ge 0xC0000000) { return 'signal' }
+    $code = [uint64][uint32]$run.ExitCode
+    if ($code -eq 1262769995 -or $code -eq 3221225540 -or $code -eq 3221225773 -or $code -eq 3221225495) { return 'limit' }
+    if ($code -ge 3221225472) { return 'signal' }
     if ($code -ne 0) { return 'exit' }
     if (-not $boundary) { return 'launch' }
     return 'exit'
@@ -1110,6 +1129,9 @@ try {
             Remove-WithinRoots $decryptDirectory
             Remove-WithinRoots (Join-Path $layout.Private 'repo')
             if ((Test-Path -LiteralPath $decryptDirectory) -or (Test-Path -LiteralPath (Join-Path $layout.Private 'repo'))) { throw 'private_cleanup' }
+
+            $phase = 'tool_configs'
+            Initialize-ToolConfigs $project
 
             $phase = 'npm_tarballs'
             $tarballs = Initialize-NpmTarballs $project

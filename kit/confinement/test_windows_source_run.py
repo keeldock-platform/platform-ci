@@ -220,6 +220,100 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertLess(catch.index("-ceq 'gates'"), catch.index("-ceq 'cleanup_links'"))
         self.assertLess(self.runner.index("$phase = 'cleanup_links'"), self.runner.index("if ($gateOutcome.Failed -ne 0) { throw $script:RefusalReason }"))
 
+    def test_a_normal_nonzero_exit_is_exit_and_only_ntstatus_codes_are_signal_or_limit(self):
+        function = self.runner.split("function Get-GateCause", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("$code = [uint64][uint32]$run.ExitCode", function)
+        self.assertIsNone(re.search(r"0[xX][0-9A-Fa-f]", function))
+        limit_line = re.search(r"if \(([^\n]*)\) \{ return 'limit' \}", function).group(1)
+        limits = {int(value) for value in re.findall(r"\$code -eq ([0-9]+)", limit_line)}
+        self.assertEqual(limits, {0x4b44574b, 0xC0000044, 0xC000012D, 0xC0000017})
+        threshold = int(re.search(r"\$code -ge ([0-9]+)\) \{ return 'signal' \}", function).group(1))
+        self.assertEqual(threshold, 0xC0000000)
+
+        def classify(code):
+            if code in limits:
+                return "limit"
+            if code >= threshold:
+                return "signal"
+            return "exit"
+
+        for code, expected in (
+            (1, "exit"), (2, "exit"), (101, "exit"), (255, "exit"), (0x7FFFFFFF, "exit"), (0xBFFFFFFF, "exit"),
+            (0xC0000005, "signal"), (0xC0000142, "signal"), (0xC0000409, "signal"), (0xFFFFFFFF, "signal"),
+            (0xC0000044, "limit"), (0xC000012D, "limit"), (0xC0000017, "limit"), (0x4b44574b, "limit"),
+        ):
+            with self.subTest(code=code):
+                self.assertEqual(classify(code), expected)
+        self.assertLess(function.index("return 'timeout'"), function.index("return 'limit'"))
+        self.assertLess(function.index("return 'limit'"), function.index("return 'signal'"))
+        self.assertLess(function.index("return 'signal'"), function.index("if ($code -ne 0) { return 'exit' }"))
+
+    def test_empty_tool_configs_stop_the_formatter_and_linter_probing_ancestor_directories(self):
+        function = self.runner.split("function Initialize-ToolConfigs", 1)[1].split("\n}\n", 1)[0]
+        for token in (
+            "'.rustfmt.toml', 'rustfmt.toml'", "'.clippy.toml', 'clippy.toml'",
+            "[IO.File]::WriteAllText((Join-Path $project $names[1]), '', $encoding)",
+            "-PathType Leaf)) { throw 'tool_config' }", "[IO.FileAttributes]::ReparsePoint",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, function)
+        self.assertEqual(self.runner.count("Initialize-ToolConfigs $project\n"), 1)
+        order = [self.runner.index(token) for token in (
+            "Write-Line ('windows-source-tree=verified", "$phase = 'tool_configs'", "$phase = 'npm_tarballs'",
+            "$phase = 'gate_plan'", "$phase = 'gates'")]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn("--config-path", self.runner)
+        self.assertNotIn("CLIPPY_CONF_DIR", self.runner)
+
+    def layout_parent(self):
+        return dict(re.findall(r"\$layout\.([A-Za-z]+) = Join-Path \$layout\.([A-Za-z]+) ", self.runner))
+
+    def layout_root(self, name):
+        parents = self.layout_parent()
+        for unused in range(16):
+            if name not in parents:
+                return name
+            name = parents[name]
+        self.fail("layout cycle")
+
+    def test_every_directory_the_gate_environment_references_is_under_a_granted_root(self):
+        self.assertEqual(len(re.findall(r"(?m)^\s*Grant-Access ", self.runner)), 2)
+        self.assertIn("Grant-Access $layout.ReadOnly $script:Sid 'ReadAndExecute, Synchronize' $true\n", self.runner)
+        self.assertIn("Grant-Access $script:Lpac.Root $script:Sid 'Modify, Synchronize' $true\n", self.runner)
+        self.assertIn("ReadOnly = (Join-Path $baseDirectory 'ro')", self.runner)
+        self.assertIn("$script:Lpac = New-ScratchSet (Join-Path $baseDirectory 'scratch')", self.runner)
+        self.assertIn("$script:Lpac.Project = Join-Path $script:Lpac.Root 'project'", self.runner)
+        stage = self.library.split("function New-StageEnvironment", 1)[1].split("\n}\n", 1)[0]
+        gate = self.runner.split("function New-GateEnvironment", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("$base = New-StageEnvironment $script:Lpac 'target'", gate)
+        self.assertIn("StartsWith('KD_', [StringComparison]::Ordinal)", gate)
+        self.assertIn("$root = $script:Lpac.Root", gate)
+        lines = [line for line in stage.splitlines() if "('KD_" not in line]
+        stage_text = "\n".join(lines)
+        used = set(re.findall(r"\$layout\.([A-Za-z]+)", stage_text + gate))
+        self.assertEqual(used, {"RustBin", "NodeDir", "MsvcBin", "MsvcLib", "SdkUcrt", "SdkUm"})
+        for name in sorted(used):
+            with self.subTest(layout=name):
+                self.assertEqual(self.layout_root(name), "ReadOnly")
+        for name in ("RustPrefix", "NpmCli", "Tarballs", "ProbeDir", "ProbeExe", "TestDir", "NodeTest"):
+            with self.subTest(layout=name):
+                self.assertEqual(self.layout_root(name), "ReadOnly")
+        for name in ("Downloads", "Private", "Base"):
+            self.assertNotIn("$layout." + name, stage_text + gate)
+        self.assertNotIn("$script:Control", gate + stage_text)
+        scratch_fields = set(re.findall(r"\$scratch\.([A-Za-z]+)", stage_text))
+        self.assertEqual(scratch_fields, {"Tmp", "Profile", "CargoHome", "Root"})
+        constructor = self.library.split("function New-ScratchSet", 1)[1].split("\n}\n", 1)[0]
+        for field in ("Tmp", "Profile", "CargoHome", "Crate"):
+            self.assertIsNotNone(re.search(field + r" = \(Join-Path \$root '[a-z-]+'\)", constructor), field)
+        self.assertIn("Root = $root", constructor)
+        self.assertIn("('CARGO_TARGET_DIR=' + (Join-Path $scratch.Root $targetName))", stage)
+        for name in re.findall(r"\(Join-Path \$root '([A-Za-z.-]+)'\)", gate):
+            self.assertRegex(name, r"^(npm-cache|empty-user\.npmrc|empty-global\.npmrc|npm-prefix)$")
+        self.assertEqual(set(re.findall(r"\$env:([A-Za-z]+)", stage_text + gate)), {"SystemRoot", "SystemDrive"})
+        self.assertIn("Get-GatePlan $project ($layout.RustBin + '\\cargo.exe') ($layout.NodeDir + '\\node.exe') $layout.NpmCli", self.runner)
+        self.assertIn("$project = $script:Lpac.Project", self.runner)
+
     def test_key_is_destroyed_before_any_project_step_and_again_in_cleanup(self):
         order = [self.runner.index(token) for token in (
             "$phase = 'decrypt'", "$phase = 'materialize'", "$phase = 'npm_tarballs'", "$phase = 'gates'")]
