@@ -169,8 +169,12 @@ function Write-ProbeDiag([string]$id, $run) {
     }
 }
 
-function Get-SourceProbes([string]$project, [string]$rustBin) {
+function Get-SourceProbes([string]$project, [string]$rustBin, [string]$stdinFile) {
     $cargo = Join-Path $rustBin 'cargo.exe'
+    $rustc = Join-Path $rustBin 'rustc.exe'
+    $cmd = Join-Path ([string]$env:SystemRoot) 'System32\cmd.exe'
+    $apiManifest = Join-Path $project 'crates\host\api\Cargo.toml'
+    $relativeLibrary = 'crates\host\api\src\lib.rs'
     $rustfmt = Join-Path $rustBin 'rustfmt.exe'
     $cargoFmt = Join-Path $rustBin 'cargo-fmt.exe'
     $manifest = Join-Path $project 'Cargo.toml'
@@ -185,7 +189,11 @@ function Get-SourceProbes([string]$project, [string]$rustBin) {
         @{ Id = 'cargo_metadata'; Needs = ''; Extra = $none; Argv = [string[]]@($cargo, 'metadata', '--locked', '--format-version', '1', '--offline', '--no-deps', '--manifest-path', $manifest) },
         @{ Id = 'rustfmt_file_check'; Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $library) },
         @{ Id = 'rustfmt_file_check_config'; Needs = $rustfmtConfig; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', '--config-path', $rustfmtConfig, $library) },
-        @{ Id = 'cargo_fmt_verbose'; Needs = ''; Extra = [string[]]@('RUST_BACKTRACE=1'); Argv = [string[]]@($cargo, '--locked', '--offline', 'fmt', '--manifest-path', $manifest, '--all', '--verbose', '--', '--check') }
+        @{ Id = 'cargo_fmt_verbose'; Needs = ''; Extra = [string[]]@('RUST_BACKTRACE=1'); Argv = [string[]]@($cargo, '--locked', '--offline', 'fmt', '--manifest-path', $manifest, '--all', '--verbose', '--', '--check') },
+        @{ Id = 'rustfmt_stdin_check'; Needs = $stdinFile; Extra = $none; Argv = [string[]]@($cmd, '/d', '/s', '/c', ('type ' + $stdinFile + ' | ' + $rustfmt + ' --edition 2024 --check')) },
+        @{ Id = 'rustfmt_relative_check'; Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $relativeLibrary) },
+        @{ Id = 'rustc_version'; Needs = ''; Extra = $none; Argv = [string[]]@($rustc, '-vV') },
+        @{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = $none; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) }
     )
 }
 
@@ -194,7 +202,9 @@ function Invoke-SourceProbes($sandbox, [string]$project, [string]$rustBin) {
     try {
         Write-SyntheticDiag ('windows-source-probe-line tool_configs ' + ($script:ToolConfigState -join ' '))
         $environment = New-GateEnvironment
-        foreach ($probe in @(Get-SourceProbes $project $rustBin)) {
+        $stdinFile = Join-Path $script:Lpac.Root 'kd-stdin-input.rs'
+        try { Copy-Item -LiteralPath (Join-Path $project 'crates\host\api\src\lib.rs') -Destination $stdinFile -Force -ErrorAction Stop } catch { $stdinFile = Join-Path $script:Lpac.Root 'kd-stdin-missing.rs' }
+        foreach ($probe in @(Get-SourceProbes $project $rustBin $stdinFile)) {
             $remaining = (Get-RemainingSeconds) - 900
             if ($remaining -lt 60) { return }
             if ($probe.Needs.Length -gt 0 -and -not (Test-Path -LiteralPath $probe.Needs -PathType Leaf)) {
@@ -851,15 +861,18 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
     $environment = New-GateEnvironment
     $outcome = @{ Count = 0; Failed = 0; Canary = 'absent'; Boundary = 'verified'; Failure = 0 }
     $index = 0
+    $keepGoing = ($script:RunMode -ceq 'synthetic')
     foreach ($gate in $plan) {
         $index += 1
         $seconds = Get-GateSeconds $gate.Id
         $remaining = (Get-RemainingSeconds) - 900
         if ($remaining -lt 60) {
-            $outcome.Failure = $index
             $outcome.Failed += 1
-            $script:RefusalReason = 'deadline'
-            $script:GateCause = 'deadline'
+            if ($outcome.Failure -eq 0) {
+                $outcome.Failure = $index
+                $script:RefusalReason = 'deadline'
+                $script:GateCause = 'deadline'
+            }
             Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=not_run hang=none cause=deadline')
             return $outcome
         }
@@ -881,14 +894,16 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         $result = 'failed'
         if ($passed) { $result = 'passed' }
         $causeText = ''
+        $gateCause = ''
         if (-not $passed) {
-            $script:GateCause = Get-GateCause $run $boundary
-            $causeText = ' cause=' + $script:GateCause
+            $gateCause = Get-GateCause $run $boundary
+            if ($outcome.Failure -eq 0) { $script:GateCause = $gateCause }
+            $causeText = ' cause=' + $gateCause
         }
         Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=' + $result + ' hang=' + $hang + $causeText)
         if ($run.Truncated -or (Test-LogCanary $combined)) {
             $outcome.Canary = 'present'
-            $outcome.Failure = $index
+            if ($outcome.Failure -eq 0) { $outcome.Failure = $index }
             $outcome.Failed += 1
             $script:RefusalReason = 'log_canary'
             return $outcome
@@ -896,16 +911,21 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         if (-not $passed -and $script:RunMode -ceq 'synthetic') { Write-GateDiag $gate.Id $run }
         if (-not $boundary) {
             $outcome.Boundary = 'failed'
-            $outcome.Failure = $index
+            if ($outcome.Failure -eq 0) {
+                $outcome.Failure = $index
+                $script:RefusalReason = 'boundary'
+            }
             $outcome.Failed += 1
-            $script:RefusalReason = 'boundary'
-            return $outcome
+            if (-not ($keepGoing -and -not $run.Created)) { return $outcome }
+            continue
         }
         if (-not $passed) {
-            $outcome.Failure = $index
+            if ($outcome.Failure -eq 0) {
+                $outcome.Failure = $index
+                $script:RefusalReason = 'gate'
+            }
             $outcome.Failed += 1
-            $script:RefusalReason = 'gate'
-            return $outcome
+            if (-not $keepGoing) { return $outcome }
         }
     }
     return $outcome
@@ -1259,7 +1279,7 @@ try {
             $fileCanary = 'present'
             if ((Test-ChannelRecord $channelsBefore 'runner_files') -and (Test-ChannelRecord $channelsAfter 'runner_files') -and $gateOutcome.Canary -ceq 'absent') { $fileCanary = 'absent' }
             $projectExecution = 'failed'
-            if ($gateOutcome.Failed -eq 0 -and $gateOutcome.Count -eq $plan.Count) { $projectExecution = 'completed' }
+            if ($gateOutcome.Failed -eq 0 -and $gateOutcome.Failure -eq 0 -and $gateOutcome.Count -eq $plan.Count) { $projectExecution = 'completed' }
             $record = [ordered]@{
                 schema_version = 1
                 os = 'windows'
@@ -1277,7 +1297,7 @@ try {
                 log_canary = [string]$gateOutcome.Canary
             }
             Write-PrivateRecord $record
-            if ($gateOutcome.Failed -ne 0) { throw $script:RefusalReason }
+            if ($gateOutcome.Failed -ne 0 -or $gateOutcome.Failure -ne 0) { throw $script:RefusalReason }
             if (-not $channelsAllBlocked) { $script:RefusalReason = 'channels_after'; throw 'boundary' }
             $summary = 'windows-source-run=observed role=' + $role + ' mode=' + $runMode + ' lpac=verified capabilities=registryRead job=verified acl=verified channels_before=blocked channels_after=blocked channel_controls=fired fixtures=contained handoff=verified key=destroyed tree=verified lock=match manifest=match gates=' + $gateOutcome.Count + ' failed=0 log_canary=absent project_execution=completed'
             Write-Line $summary

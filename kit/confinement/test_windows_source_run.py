@@ -136,7 +136,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             self.assertIn(token, function)
         self.assertEqual(set(re.findall(r"return '([a-z]+)'", function)), {"launch", "timeout", "limit", "signal", "exit"})
         self.assertNotRegex(function, r"Write-Line|\.Stdout|\.Stderr")
-        self.assertIn("$causeText = ' cause=' + $script:GateCause", self.runner)
+        self.assertIn("$causeText = ' cause=' + $gateCause", self.runner)
         self.assertIn("if (-not $passed) {", self.runner)
         self.assertIn("@('timeout', 'limit', 'signal', 'exit', 'launch', 'deadline') -ccontains $script:GateCause", self.runner)
         self.assertIn("result=not_run hang=none cause=deadline", self.runner)
@@ -218,7 +218,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         )
         self.assertEqual(catch.count("$gateText = ' gate=' + $script:GateFailure"), 2)
         self.assertLess(catch.index("-ceq 'gates'"), catch.index("-ceq 'cleanup_links'"))
-        self.assertLess(self.runner.index("$phase = 'cleanup_links'"), self.runner.index("if ($gateOutcome.Failed -ne 0) { throw $script:RefusalReason }"))
+        self.assertLess(self.runner.index("$phase = 'cleanup_links'"), self.runner.index("if ($gateOutcome.Failed -ne 0 -or $gateOutcome.Failure -ne 0) { throw $script:RefusalReason }"))
 
     def test_a_normal_nonzero_exit_is_exit_and_only_ntstatus_codes_are_signal_or_limit(self):
         function = self.runner.split("function Get-GateCause", 1)[1].split("\n}\n", 1)[0]
@@ -315,6 +315,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(ids, [
             "cargo_version", "cargo_fmt_version", "cargo_fmt_exe_version", "rustfmt_version",
             "cargo_metadata", "rustfmt_file_check", "rustfmt_file_check_config", "cargo_fmt_verbose",
+            "rustfmt_stdin_check", "rustfmt_relative_check", "rustc_version", "cargo_check_api",
         ])
         for name in ids:
             self.assertRegex(name, r"^[a-z][a-z_]{2,40}$")
@@ -337,8 +338,8 @@ class WindowsSourceRunTests(unittest.TestCase):
             with self.subTest(token=token[:60]):
                 self.assertIn(token, body)
         self.assertEqual(self.runner.count("RUST_BACKTRACE=1"), 1)
-        self.assertEqual(body.count("Extra = $none"), 7)
-        self.assertEqual(len(re.findall(r"Needs = '';", body)), 5)
+        self.assertEqual(body.count("Extra = $none"), 11)
+        self.assertEqual(len(re.findall(r"Needs = '';", body)), 6)
         self.assertIn("Get-GatePlan $project ($layout.RustBin + '\\cargo.exe')", self.runner)
         synthetic = ROOT / "kit/confinement/synthetic_project"
         self.assertTrue((synthetic / "Cargo.toml").is_file())
@@ -503,6 +504,85 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn("Needs = $rustfmtConfig;", config)
         self.assertIn("$rustfmtConfig = Join-Path $project 'rustfmt.toml'", body)
         self.assertIn("'rustfmt.toml'", self.function_body("Initialize-ToolConfigs"))
+
+    def test_synthetic_mode_alone_keeps_running_the_remaining_gates_after_a_failure(self):
+        body = self.function_body("Invoke-SourceGates")
+        self.assertEqual(body.count("$keepGoing = ($script:RunMode -ceq 'synthetic')\n"), 1)
+        self.assertEqual(body.count("$keepGoing"), 3)
+        self.assertEqual(body.count("            if (-not $keepGoing) { return $outcome }\n"), 1)
+        self.assertEqual(body.count("            if (-not ($keepGoing -and -not $run.Created)) { return $outcome }\n            continue\n"), 1)
+        self.assertEqual(body.count("return $outcome"), 5)
+        self.assertEqual(body.count("'synthetic'"), 2)
+        self.assertNotIn("'source'", body)
+        self.assertEqual(self.runner.count("$keepGoing"), 3)
+        canary = body.split("if ($run.Truncated -or (Test-LogCanary $combined)) {", 1)[1].split("\n        }\n", 1)[0]
+        self.assertTrue(canary.rstrip().endswith("return $outcome"))
+        self.assertNotIn("$keepGoing", canary)
+        deadline = body.split("if ($remaining -lt 60) {", 1)[1].split("\n        }\n", 1)[0]
+        self.assertTrue(deadline.rstrip().endswith("return $outcome"))
+        self.assertNotIn("$keepGoing", deadline)
+        gate = body.split("            $script:RefusalReason = 'gate'\n", 1)[1]
+        self.assertTrue(gate.startswith("            }\n            $outcome.Failed += 1\n            if (-not $keepGoing) { return $outcome }\n        }\n    }\n    return $outcome"))
+        self.assertIn("Write-GateDiag $gate.Id $run }", body)
+
+    def test_a_later_gate_cannot_mask_an_earlier_failure_in_the_recorded_result(self):
+        body = self.function_body("Invoke-SourceGates")
+        first = re.findall(
+            r"if \(\$outcome\.Failure -eq 0\) \{\n\s+\$outcome\.Failure = \$index\n\s+\$script:RefusalReason = '([a-z]+)'\n", body)
+        self.assertEqual(first, ["deadline", "boundary", "gate"])
+        self.assertEqual(body.count("$outcome.Failure = $index"), 4)
+        self.assertEqual(body.count("if ($outcome.Failure -eq 0)"), 5)
+        self.assertEqual(body.count("$outcome.Failed += 1"), 4)
+        self.assertEqual(body.count("$script:GateCause = "), 2)
+        self.assertIn("            if ($outcome.Failure -eq 0) { $script:GateCause = $gateCause }\n", body)
+        self.assertIn("            $gateCause = Get-GateCause $run $boundary\n", body)
+        self.assertIn("            $script:RefusalReason = 'log_canary'\n            return $outcome\n", body)
+        self.assertNotIn("$outcome.Failure = 0", body)
+        self.assertNotIn("$outcome.Failed = ", body)
+        self.assertNotIn("$outcome.Failed -= ", body)
+        self.assertEqual(self.runner.count("$script:GateFailure = [int]$gateOutcome.Failure\n"), 1)
+
+    def test_the_final_result_is_refused_whenever_any_gate_failed_and_cleanup_still_runs(self):
+        refuse = "if ($gateOutcome.Failed -ne 0 -or $gateOutcome.Failure -ne 0) { throw $script:RefusalReason }\n"
+        self.assertEqual(self.runner.count(refuse), 1)
+        self.assertEqual(self.runner.count("windows-source-run=observed"), 1)
+        self.assertLess(self.runner.index(refuse), self.runner.index("windows-source-run=observed"))
+        self.assertLess(self.runner.index("Write-PrivateRecord $record\n"), self.runner.index(refuse))
+        self.assertIn("if ($gateOutcome.Failed -eq 0 -and $gateOutcome.Failure -eq 0 -and $gateOutcome.Count -eq $plan.Count) { $projectExecution = 'completed' }", self.runner)
+        self.assertIn("failed = [int]$gateOutcome.Failed\n", self.runner)
+        self.assertIn("failed=0 log_canary=absent project_execution=completed'", self.runner)
+        cleanup = self.runner.index("$cleanupLine = 'windows-source-cleanup='")
+        emit = "    if ($refusal) {\n        Write-Line $refusal\n        Write-Line $cleanupLine\n        exit 1\n    }\n"
+        self.assertEqual(self.runner.count(emit), 1)
+        self.assertLess(cleanup, self.runner.index(emit))
+        self.assertLess(self.runner.index("$refusal = 'windows-source-run=refused phase='"), cleanup)
+
+    def test_the_added_probes_are_fixed_ids_with_the_exact_commands_and_synthetic_only(self):
+        body = self.function_body("Get-SourceProbes")
+        ids = re.findall(r"@\{ Id = '([^']+)'", body)
+        self.assertEqual(ids[-4:], ["rustfmt_stdin_check", "rustfmt_relative_check", "rustc_version", "cargo_check_api"])
+        self.assertEqual(len(ids), len(set(ids)))
+        for token in (
+            "$rustc = Join-Path $rustBin 'rustc.exe'\n",
+            "$cmd = Join-Path ([string]$env:SystemRoot) 'System32\\cmd.exe'\n",
+            "$apiManifest = Join-Path $project 'crates\\host\\api\\Cargo.toml'\n",
+            "$relativeLibrary = 'crates\\host\\api\\src\\lib.rs'\n",
+            "@{ Id = 'rustfmt_stdin_check'; Needs = $stdinFile; Extra = $none; Argv = [string[]]@($cmd, '/d', '/s', '/c', ('type ' + $stdinFile + ' | ' + $rustfmt + ' --edition 2024 --check')) },\n",
+            "@{ Id = 'rustfmt_relative_check'; Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $relativeLibrary) },\n",
+            "@{ Id = 'rustc_version'; Needs = ''; Extra = $none; Argv = [string[]]@($rustc, '-vV') },\n",
+            "@{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = $none; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) }\n",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertEqual(body.count(token), 1)
+        self.assertEqual(self.runner.count("function Get-SourceProbes([string]$project, [string]$rustBin, [string]$stdinFile) {\n"), 1)
+        self.assertNotIn("--config-path", "".join(item for item in body.splitlines(True) if "rustfmt_stdin_check" in item or "rustfmt_relative_check" in item))
+        probes = self.function_body("Invoke-SourceProbes")
+        self.assertIn("$stdinFile = Join-Path $script:Lpac.Root 'kd-stdin-input.rs'\n", probes)
+        self.assertIn("foreach ($probe in @(Get-SourceProbes $project $rustBin $stdinFile)) {\n", probes)
+        self.assertEqual(probes.count("Copy-Item "), 1)
+        self.assertLess(probes.index("-cne 'synthetic'"), probes.index("Copy-Item "))
+        self.assertLess(probes.index("Copy-Item "), probes.index("$sandbox.Run("))
+        self.assertEqual(len(re.findall(r"Get-SourceProbes\b", self.runner)), 2)
 
     def layout_parent(self):
         return dict(re.findall(r"\$layout\.([A-Za-z]+) = Join-Path \$layout\.([A-Za-z]+) ", self.runner))
