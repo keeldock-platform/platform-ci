@@ -1902,6 +1902,106 @@ class BareJobLogTests(unittest.TestCase):
             self.parse(unlabeled_linux_log(messages))
 
 
+def real_format_run_block(script, output):
+    return (
+        [LOG_MARK + "[group]Run set -euo pipefail", "\x1b[36;1mset -euo pipefail\x1b[0m"]
+        + ["\x1b[36;1m" + line + "\x1b[0m" for line in script]
+        + ["shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}", "env:",
+           "  GH_TOKEN: ***", "  KD_PROFILE: candidate", "  KD_MODE: synthetic",
+           LOG_MARK + "[endgroup]"]
+        + list(output)
+    )
+
+
+def real_format_candidate_messages():
+    messages = [
+        "Current runner version: '2.338.2'",
+        LOG_MARK + "[group]Runner Image Provisioner",
+        "Hosted Compute Agent",
+        LOG_MARK + "[endgroup]",
+        LOG_MARK + "[group] Inputs",
+        "  SOURCE_READER_TOKEN: ",
+        LOG_MARK + "[endgroup]",
+        "pages=wrapped kind=jobs count=1",
+    ]
+    messages += real_format_run_block(
+        ['if [[ "$KD_MODE" == "source" ]]; then',
+         "  python3 -B kit/confinement/linux_source_build.py revoke",
+         "else",
+         "  printf '%s\\n' '" + REVOKE_OUTPUT + "'",
+         "fi"],
+        [REVOKE_OUTPUT])
+    messages += real_format_run_block(
+        ['if [[ "$KD_MODE" == "source" ]]; then',
+         '  receipt="$RUNNER_TEMP/kd-records/revocation.json"',
+         "else",
+         "  printf '%s\\n' '" + REJECTION_OUTPUT + "'",
+         "fi",
+         "printf '%s\\n' '" + CONFIRMED_LINE + "'"],
+        [REJECTION_OUTPUT, CONFIRMED_LINE])
+    messages += [LOG_MARK + "[group]Run actions/attest@" + "0" * 40, "with:",
+                 LOG_MARK + "[endgroup]", "Post job cleanup."]
+    return messages
+
+
+class RealFormatCandidateJobLogTests(unittest.TestCase):
+    NAMES = subject.API_LINUX_STEP_NAME_PINS["candidate"]
+
+    def parse(self, text, profile="candidate"):
+        return subject.parse_linux_log_sections(
+            text, UNLABELED_JOB, self.NAMES, subject.LINUX_STEP_LOG_MARKERS_BY_PROFILE[profile])
+
+    def test_script_lines_indented_inside_an_if_block_still_find_both_steps(self):
+        messages = real_format_candidate_messages()
+        for text in (bare_linux_log(messages), unlabeled_linux_log(messages)):
+            parsed = self.parse(text)
+            self.assertEqual(parsed["sections"]["revoke-source-token"], REVOKE_OUTPUT)
+            self.assertEqual(parsed["sections"]["verify-token-rejection"],
+                             REJECTION_OUTPUT + "\n" + CONFIRMED_LINE)
+            self.assertEqual(parsed["other"][0].splitlines().count(CONFIRMED_LINE), 0)
+            self.assertIn("Post job cleanup.", parsed["other"][0])
+
+    def test_the_probe_markers_also_match_their_indented_else_branch_lines(self):
+        parsed = subject.parse_linux_log_sections(
+            bare_linux_log(real_format_candidate_messages()), UNLABELED_JOB,
+            subject.API_LINUX_STEP_NAME_PINS["probe"],
+            subject.LINUX_STEP_LOG_MARKERS_BY_PROFILE["probe"])
+        self.assertEqual(parsed["sections"]["revoke-source-token"], REVOKE_OUTPUT)
+        self.assertEqual(parsed["sections"]["verify-token-rejection"],
+                         REJECTION_OUTPUT + "\n" + CONFIRMED_LINE)
+
+    def test_surrounding_whitespace_is_ignored_but_nothing_else_is(self):
+        messages = real_format_candidate_messages()
+        marker = "python3 -B kit/confinement/linux_source_build.py revoke"
+        padded = [line.replace("  " + marker, "\t " + marker + " \t") for line in messages]
+        self.assertEqual(self.parse(bare_linux_log(padded))["sections"],
+                         self.parse(bare_linux_log(messages))["sections"])
+        for variant in (marker + " --extra", "echo " + marker, marker.replace("-B ", "")):
+            changed = [line.replace(marker, variant) for line in messages]
+            with self.assertRaisesRegex(subject.Refusal, "linux-log-section-missing"):
+                self.parse(bare_linux_log(changed))
+
+    def test_a_timestamp_only_line_is_an_empty_message_and_other_lines_still_need_stamps(self):
+        messages = real_format_candidate_messages()
+        messages.insert(3, "")
+        rows = bare_linux_log(messages).split("\n")
+        rows[3] = rows[3].rstrip(" ")
+        self.assertRegex(rows[3], r"Z\Z")
+        parsed = self.parse("\n".join(rows))
+        self.assertEqual(parsed["sections"]["revoke-source-token"], REVOKE_OUTPUT)
+        self.assertEqual(parsed["other"][0].splitlines()[3], "")
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-timestamp"):
+            self.parse("\n".join(rows) + "no timestamp here\n")
+
+    def test_an_indented_duplicate_block_is_still_ambiguous(self):
+        messages = real_format_candidate_messages()
+        duplicate = real_format_run_block(
+            ["if true; then", "  python3 -B kit/confinement/linux_source_build.py revoke", "fi"],
+            ["unrelated=true"])
+        with self.assertRaisesRegex(subject.Refusal, "linux-log-section-ambiguous"):
+            self.parse(bare_linux_log(messages + duplicate))
+
+
 class JobLogFallbackTests(unittest.TestCase):
     ROUTE = "repos/keeldock-platform/platform-ci/actions/jobs/42/logs"
     VIEW = ("gh", "run", "view", "1", "--repo", "keeldock-platform/platform-ci",

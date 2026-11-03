@@ -2844,7 +2844,7 @@ def parse_linux_log_sections(log_text, job_name, step_names, markers=None):
         if len(fields) != 3 or fields[0] != job_name:
             raise Refusal("linux-log-format")
         stamped = _without_mark(fields[2])
-        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z)[ \t]+(.*)", stamped)
+        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z)(?:[ \t]+(.*))?", stamped)
         if match is None:
             raise Refusal("linux-log-timestamp")
         try:
@@ -2852,7 +2852,7 @@ def parse_linux_log_sections(log_text, job_name, step_names, markers=None):
         except ValueError:
             raise Refusal("linux-log-timestamp")
         labels.append(fields[1])
-        messages.append(CONTROL_BYTES.sub(_caret_form, match.group(2)))
+        messages.append(CONTROL_BYTES.sub(_caret_form, match.group(2) or ""))
     if messages and all(label == UNLABELED_LOG_STEP for label in labels):
         return _marker_log_sections(messages, step_names, markers)
     for label, message in zip(labels, messages):
@@ -2890,7 +2890,8 @@ def _marker_log_sections(messages, step_names, markers=None):
     claimed = {}
     for step_id in step_names:
         marker = markers.get(step_id)
-        found = [number for number, block in enumerate(blocks) if marker in block["script"]]
+        found = [number for number, block in enumerate(blocks)
+                 if marker is not None and marker in [line.strip() for line in block["script"]]]
         if marker is None or not found:
             raise Refusal("linux-log-section-missing")
         if len(found) != 1:
