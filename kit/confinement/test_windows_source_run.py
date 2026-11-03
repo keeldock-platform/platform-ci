@@ -356,12 +356,13 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(self.runner.count(call), 1)
         self.assertEqual(len(re.findall(r"Invoke-SourceProbes\b", self.runner)), 2)
         self.assertEqual(len(re.findall(r"Get-SourceProbes\b", self.runner)), 2)
-        self.assertEqual(len(re.findall(r"Write-ProbeDiag\b", self.runner)), 5)
+        self.assertEqual(len(re.findall(r"Write-ProbeDiag\b", self.runner)), 6)
         for name, call in (
             ("Invoke-SourceProbes", "Write-ProbeDiag $probe.Id $run"),
             ("Invoke-FinalPathProbe", "Write-ProbeDiag $id $run"),
             ("Test-OtherContainerFinalPath", "Write-ProbeDiag 'finalpath_other' $run"),
             ("Invoke-NpmLinkProbe", "Write-ProbeDiag 'npm_link_probe' $run"),
+            ("Invoke-NpmLinkTargetProbe", "Write-ProbeDiag 'npm_link_targets' $run"),
         ):
             with self.subTest(caller=name):
                 self.assertEqual(self.function_body(name).count("Write-ProbeDiag"), 1)
@@ -746,11 +747,11 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(self.workflow.count("uses: actions/attest@"), 1)
 
     def test_the_mount_manager_ladder_is_fixed_ordered_and_escalates_only_in_synthetic_mode(self):
-        self.assertIn("\n$MountManagerRungs = @('device', 'drive_link', 'mpm_link', 'global_dir')\n", self.runner)
+        self.assertIn("\n$MountManagerRungs = @('device', 'volume', 'drive_link', 'mpm_link', 'global_dir')\n", self.runner)
         self.assertIn(
-            "\n$MountManagerKinds = @{ device = 'mountmgr'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }\n",
+            "\n$MountManagerKinds = @{ device = 'mountmgr'; volume = 'volume'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }\n",
             self.runner)
-        self.assertIn("\n$MountManagerSourceRungs = 1\n", self.runner)
+        self.assertIn("\n$MountManagerSourceRungs = 2\n", self.runner)
         self.assertIn("\n$MountManagerProbeSeconds = 30\n", self.runner)
         ladder = self.function_body("Invoke-MountManagerLadder")
         self.assertIn("    $limit = $MountManagerSourceRungs\n    if ($script:RunMode -ceq 'synthetic') { $limit = $MountManagerRungs.Count }\n", ladder)
@@ -775,7 +776,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertTrue(ladder.endswith("    }\n    return $state"))
         self.assertIn("if ($rungState -ceq 'applied' -and $rungReadback -ceq 'match') {", ladder)
-        for rung in ("device", "drive_link", "mpm_link", "global_dir", "none", "control", "other"):
+        for rung in ("device", "volume", "drive_link", "mpm_link", "global_dir", "none", "control", "other"):
             self.assertRegex("finalpath_" + rung, r"^[a-z][a-z_]{2,40}$")
         probe = self.function_body("Invoke-FinalPathProbe")
         for token in (
@@ -841,6 +842,85 @@ class WindowsSourceRunTests(unittest.TestCase):
                 self.assertIsNone(diag.fullmatch(line))
         for line in ("windows-source-probe id=finalpath_device exit=0x00000000", "windows-source-probe id=npm_link_probe exit=0x00000000",
                      "windows-source-probe-line npm_link npm_link step=fsctl error=5"):
+            with self.subTest(line=line[:60]):
+                self.assertIsNotNone(diag.fullmatch(line))
+
+    def test_the_volume_rung_is_read_attributes_only_names_the_denied_object_and_keeps_the_negative_controls(self):
+        ladder = self.function_body("Invoke-MountManagerLadder")
+        for token in (
+            "$state = @{ State = 'insufficient'; Rung = 'none'; Objects = 0; Readback = 'match'; FinalPath = 'denied'; Other = 'unknown'; Volume = 'none' }",
+            "if ($rung -ceq 'drive_link' -or $rung -ceq 'volume') { $leaseDrive = $drive }",
+            "if ($rung -ceq 'volume') { $state.Volume = 'leased' }",
+            "if ($rung -cne 'device' -and $rung -cne 'volume') { $script:Channel.LeaseObjects = @($script:Channel.LeaseObjects) + @(($kind + ' ' + $leaseDrive).Trim()) }",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, ladder)
+        probe = self.function_body("Invoke-FinalPathProbe")
+        self.assertIn("    if ($confined) {\n        $script:FinalPathText = $text\n", probe)
+        self.assertIn("if ((Get-ProbeValue $text 'volr') -ceq 'ok' -or (Get-ProbeValue $text 'voldac') -ceq 'ok') { $script:VolumeBoundary = 'breached' }", probe)
+        self.assertLess(probe.index("$script:VolumeBoundary = 'breached'"), probe.index("return 'ok'"))
+        self.assertIn("\n$script:FinalPathText = ''\n$script:VolumeBoundary = 'denied'\n", self.runner)
+        self.assertEqual(self.runner.count("$script:VolumeBoundary = 'breached'"), 1)
+        detail = self.function_body("Get-MountManagerDetail")
+        self.assertIn("foreach ($key in @('mpm', 'vol', 'qdvp', 'qpts', 'n_dos', 'canon')) {", detail)
+        self.assertIn("foreach ($pair in @('mpm=mountmgr', 'vol=volume', 'qdvp=query', 'n_dos=name', 'canon=canon')) {", detail)
+        self.assertIn("if ($values['n_dos'] -cne 'ok' -or $values['canon'] -cne 'ok') {", detail)
+        self.assertNotIn("Write-Line", detail)
+        main = self.runner.index("$script:MountState = Invoke-MountManagerLadder $box")
+        steps = (
+            "            if ($script:MountState.Readback -cne 'match') { throw 'mountmgr_readback' }\n",
+            "            Write-Line (Get-MountManagerDetail)\n",
+            "            if ($script:VolumeBoundary -cne 'denied') { throw 'mountmgr_volume' }\n",
+            "            if ($script:MountState.State -cne 'applied' -and $runMode -cne 'synthetic') { throw ('mountmgr_' + $script:MountState.State) }\n",
+        )
+        positions = [self.runner.index(item, main) for item in steps]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(self.runner.count("Get-MountManagerDetail"), 2)
+        other = self.function_body("Test-OtherContainerFinalPath")
+        for token in (
+            "$drive = ([string]$script:Layout.Base).Substring(0, 1)",
+            "('\"' + $exe + '\" finalpath ' + $container + ' ' + $drive)",
+            "$volume = Get-ProbeValue $text 'vol'",
+            "-or $volume -cnotmatch '^(ok|err[0-9]{1,10})$') { return 'unknown' }",
+            "if ($volume -ceq 'ok' -and $script:MountState.Volume -ceq 'leased') { return 'granted' }",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, other)
+        self.assertLess(other.index("$script:MountState.Volume -ceq 'leased'"), other.index("    return 'denied'"))
+        public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
+        for line in (
+            "windows-confinement-mountmgr-detail=none mpm=ok vol=err5 qdvp=ok qpts=ok n_dos=ok canon=ok volume_boundary=denied",
+            "windows-confinement-mountmgr-detail=volume mpm=ok vol=err5 qdvp=err5 qpts=err5 n_dos=err5 canon=err5 volume_boundary=denied",
+            "windows-confinement-mountmgr-rung=volume state=applied error=0 readback=match finalpath=ok",
+        ):
+            with self.subTest(line=line[:60]):
+                self.assertIsNotNone(public.fullmatch(line))
+
+    def test_the_npm_link_target_probe_runs_npm_realpath_confined_and_prints_only_fixed_tokens(self):
+        script = re.search(r'^\$NpmLinkTargetScript = "([^"]+)"$', self.runner, re.M).group(1)
+        self.assertIsNone(re.search(r"[\s\"$`]", script))
+        self.assertIn("'@npmcli','arborist','lib','realpath.js'", script)
+        self.assertIn("a(l,new(Map),new(Map),0)", script)
+        self.assertEqual(
+            re.findall(r"'([a-z]+)='\+", script),
+            ["index", "lstat", "readlink", "stat", "native", "pkg", "arborist"])
+        self.assertIn("['kd-probe','npmlink',", script)
+        self.assertIn("filter((n)=>k[n].link)", script)
+        self.assertNotIn("console", script)
+        probe = self.function_body("Invoke-NpmLinkTargetProbe")
+        self.assertTrue(probe.split("\n", 1)[1].startswith("    if ($script:RunMode -cne 'synthetic') { return }\n"))
+        self.assertIn("$argv = [string[]]@($node, '-e', $NpmLinkTargetScript)", probe)
+        self.assertIn("$run = $sandbox.Run($true, $node, (ConvertTo-CommandLine $argv), $project, $environment, ($MountManagerProbeSeconds * 1000), [uint32]32)", probe)
+        self.assertNotIn("Write-Line", probe)
+        steps = self.function_body("Invoke-NpmLinkSteps")
+        call = "    if ($created -gt 0) { Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $environment }\n"
+        self.assertIn("Invoke-NpmLinkProbe $sandbox $project ([string]@($script:NpmLinks)[0].Target) }\n" + call, steps)
+        self.assertLess(steps.index(call), steps.index("$second = $sandbox.Run("))
+        diag = re.compile(re.search(r"DiagLinePattern = '([^']+)'", self.runner).group(1))
+        for line in (
+            "windows-source-probe id=npm_link_targets exit=0x00000000",
+            "windows-source-probe-line kd-probe npmlink index=0 lstat=ok readlink=ok stat=ok native=ok pkg=ok arborist=ok",
+        ):
             with self.subTest(line=line[:60]):
                 self.assertIsNotNone(diag.fullmatch(line))
 

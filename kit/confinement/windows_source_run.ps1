@@ -44,6 +44,8 @@ $script:DiagLinePattern = '^windows-source-(?:gate-diag|probe)( id=[a-z][a-z_]{2
 $script:ToolConfigState = @()
 $script:MountLeases = @()
 $script:MountState = $null
+$script:FinalPathText = ''
+$script:VolumeBoundary = 'denied'
 $script:NpmLinks = @()
 $script:NpmLockDigest = ''
 
@@ -61,6 +63,7 @@ $DiagLineLimit = 300
 $ProbeSeconds = 60
 $ProbeCargoCheckSeconds = 180
 $NodeRealpathScript = "f=require('fs');f.realpathSync.native('.');f.promises.realpath('.').then(()=>process.stdout.write('realpath=ok'),(e)=>{process.stdout.write('realpath='+e.code);process.exitCode=1})"
+$NpmLinkTargetScript = "f=require('fs');p=require('path');s=String.fromCharCode(32);a=require(p.join(p.dirname(process.execPath),'node_modules','npm','node_modules','@npmcli','arborist','lib','realpath.js'));c=(g)=>{try{return(g()?'ok':'no')}catch(e){return(e.code||'err')}};k=JSON.parse(f.readFileSync('package-lock.json','utf8')).packages;q=(j,l,t)=>a(l,new(Map),new(Map),0).then((r)=>(r===t?'ok':'no'),(e)=>(e.code||'err')).then((r)=>['kd-probe','npmlink','index='+j,'lstat='+c(()=>f.lstatSync(l).isSymbolicLink()),'readlink='+c(()=>p.resolve(p.dirname(l),f.readlinkSync(l))===t),'stat='+c(()=>f.statSync(l).isDirectory()),'native='+c(()=>f.realpathSync.native(l)===t),'pkg='+c(()=>JSON.parse(f.readFileSync(p.join(l,'package.json'),'utf8')).version),'arborist='+r].join(s));Promise.all(Object.keys(k).filter((n)=>k[n].link).map((n,j)=>q(j,p.resolve(n),p.resolve(k[n].resolved)))).then((x)=>process.stdout.write(x.join(String.fromCharCode(10))+String.fromCharCode(10)))"
 $ProbeStderrLines = 20
 $ProbeStdoutLines = 10
 $GateLongPattern = '(^|_)(clippy|tests|replay|prepare|typecheck)$'
@@ -72,9 +75,9 @@ $GateTablePlatform = 'windows'
 $NpmSteppedGate = 'node_dependency_prepare'
 $MaxNpmLinks = 64
 $MaxLockBytes = 33554432
-$MountManagerRungs = @('device', 'drive_link', 'mpm_link', 'global_dir')
-$MountManagerKinds = @{ device = 'mountmgr'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
-$MountManagerSourceRungs = 1
+$MountManagerRungs = @('device', 'volume', 'drive_link', 'mpm_link', 'global_dir')
+$MountManagerKinds = @{ device = 'mountmgr'; volume = 'volume'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
+$MountManagerSourceRungs = 2
 $MountManagerProbeSeconds = 30
 $RequiredFunctions = @(
     'Get-CleanText', 'Get-Token', 'Write-DiagLines', 'Invoke-Download', 'Assert-Sha256', 'Assert-Sri', 'Invoke-Tar', 'Copy-Tree',
@@ -254,8 +257,34 @@ function Invoke-FinalPathProbe($sandbox, [bool]$confined, [string]$id) {
     Write-ProbeDiag $id $run
     if (-not (Test-ChannelRunValid $run $confined)) { return 'denied' }
     $text = Get-ProbeText ([string]$run.Stdout) 'finalpath'
+    if ($confined) {
+        $script:FinalPathText = $text
+        if ((Get-ProbeValue $text 'volr') -ceq 'ok' -or (Get-ProbeValue $text 'voldac') -ceq 'ok') { $script:VolumeBoundary = 'breached' }
+    }
     if ((Get-ProbeValue $text 'n_dos') -ceq 'ok' -and (Get-ProbeValue $text 'canon') -ceq 'ok') { return 'ok' }
     return 'denied'
+}
+
+function Get-MountManagerDetail {
+    $text = [string]$script:FinalPathText
+    $values = @{}
+    foreach ($key in @('mpm', 'vol', 'qdvp', 'qpts', 'n_dos', 'canon')) {
+        $value = Get-ProbeValue $text $key
+        if ($value -cnotmatch '^(ok|na|err[0-9]{1,10})$') { $value = 'unknown' }
+        $values[$key] = $value
+    }
+    $denied = 'none'
+    if ($values['n_dos'] -cne 'ok' -or $values['canon'] -cne 'ok') {
+        $denied = 'unknown'
+        foreach ($pair in @('mpm=mountmgr', 'vol=volume', 'qdvp=query', 'n_dos=name', 'canon=canon')) {
+            $parts = $pair.Split([char]61)
+            if ($values[$parts[0]] -cne 'ok') {
+                $denied = $parts[1]
+                break
+            }
+        }
+    }
+    return ('windows-confinement-mountmgr-detail=' + $denied + ' mpm=' + $values['mpm'] + ' vol=' + $values['vol'] + ' qdvp=' + $values['qdvp'] + ' qpts=' + $values['qpts'] + ' n_dos=' + $values['n_dos'] + ' canon=' + $values['canon'] + ' volume_boundary=' + $script:VolumeBoundary)
 }
 
 function Invoke-MountManagerLadder($sandbox) {
@@ -263,7 +292,7 @@ function Invoke-MountManagerLadder($sandbox) {
     if ($script:RunMode -ceq 'synthetic') { $limit = $MountManagerRungs.Count }
     $drive = ([string]$script:Layout.Base).Substring(0, 1)
     if ($drive -cnotmatch '^[A-Za-z]$') { throw 'mountmgr_drive' }
-    $state = @{ State = 'insufficient'; Rung = 'none'; Objects = 0; Readback = 'match'; FinalPath = 'denied'; Other = 'unknown' }
+    $state = @{ State = 'insufficient'; Rung = 'none'; Objects = 0; Readback = 'match'; FinalPath = 'denied'; Other = 'unknown'; Volume = 'none' }
     [void](Invoke-FinalPathProbe $sandbox $false 'finalpath_control')
     $state.FinalPath = Invoke-FinalPathProbe $sandbox $true 'finalpath_none'
     if ($state.FinalPath -ceq 'ok') {
@@ -274,7 +303,7 @@ function Invoke-MountManagerLadder($sandbox) {
         $rung = [string]$MountManagerRungs[$index]
         $kind = [string]$MountManagerKinds[$rung]
         $leaseDrive = ''
-        if ($rung -ceq 'drive_link') { $leaseDrive = $drive }
+        if ($rung -ceq 'drive_link' -or $rung -ceq 'volume') { $leaseDrive = $drive }
         $rungState = 'failed'
         $rungError = [uint64]0
         $rungReadback = 'na'
@@ -293,7 +322,8 @@ function Invoke-MountManagerLadder($sandbox) {
         if ($rungState -ceq 'applied' -and $rungReadback -ceq 'match') {
             $state.Objects += 1
             $state.Rung = $rung
-            if ($rung -cne 'device') { $script:Channel.LeaseObjects = @($script:Channel.LeaseObjects) + @(($kind + ' ' + $leaseDrive).Trim()) }
+            if ($rung -ceq 'volume') { $state.Volume = 'leased' }
+            if ($rung -cne 'device' -and $rung -cne 'volume') { $script:Channel.LeaseObjects = @($script:Channel.LeaseObjects) + @(($kind + ' ' + $leaseDrive).Trim()) }
             $finalPath = Invoke-FinalPathProbe $sandbox $true ('finalpath_' + $rung)
             $state.FinalPath = $finalPath
         }
@@ -323,7 +353,8 @@ function Test-OtherContainerFinalPath {
     try {
         Copy-Item -LiteralPath $script:Layout.ProbeExe -Destination $exe
         $environment = New-StageEnvironment $script:Lpac 'target-mountmgr-other'
-        $run = $script:OtherBox.Run($true, $exe, ('"' + $exe + '" finalpath ' + $container), $container, $environment, ($MountManagerProbeSeconds * 1000), [uint32]32)
+        $drive = ([string]$script:Layout.Base).Substring(0, 1)
+        $run = $script:OtherBox.Run($true, $exe, ('"' + $exe + '" finalpath ' + $container + ' ' + $drive), $container, $environment, ($MountManagerProbeSeconds * 1000), [uint32]32)
     } catch {
         return 'unknown'
     }
@@ -332,8 +363,10 @@ function Test-OtherContainerFinalPath {
     $text = Get-ProbeText ([string]$run.Stdout) 'finalpath'
     $device = Get-ProbeValue $text 'mpmr'
     $name = Get-ProbeValue $text 'n_dos'
-    if ($device -cnotmatch '^(ok|err[0-9]{1,10})$' -or $name -cnotmatch '^(ok|na|err[0-9]{1,10})$') { return 'unknown' }
+    $volume = Get-ProbeValue $text 'vol'
+    if ($device -cnotmatch '^(ok|err[0-9]{1,10})$' -or $name -cnotmatch '^(ok|na|err[0-9]{1,10})$' -or $volume -cnotmatch '^(ok|err[0-9]{1,10})$') { return 'unknown' }
     if ($device -ceq 'ok' -or $name -ceq 'ok') { return 'granted' }
+    if ($volume -ceq 'ok' -and $script:MountState.Volume -ceq 'leased') { return 'granted' }
     return 'denied'
 }
 
@@ -928,6 +961,17 @@ function Invoke-NpmLinkProbe($sandbox, [string]$project, [string]$target) {
     }
 }
 
+function Invoke-NpmLinkTargetProbe($sandbox, [string]$project, [string]$node, [string[]]$environment) {
+    if ($script:RunMode -cne 'synthetic') { return }
+    try {
+        $argv = [string[]]@($node, '-e', $NpmLinkTargetScript)
+        $run = $sandbox.Run($true, $node, (ConvertTo-CommandLine $argv), $project, $environment, ($MountManagerProbeSeconds * 1000), [uint32]32)
+        Write-ProbeDiag 'npm_link_targets' $run
+    } catch {
+        return
+    }
+}
+
 function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$environment, $first) {
     if (-not (Test-GateBoundary $first) -or $first.TimedOut -or $first.ExitCode -ne 0) { return $first }
     $created = 0
@@ -948,6 +992,7 @@ function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$envir
     Write-Line ('windows-source-npm-links=created count=' + $created + ' verified=' + $verified)
     if ($verified -ne @($script:NpmLinks).Count) { throw 'npm_link' }
     if ($created -gt 0) { Invoke-NpmLinkProbe $sandbox $project ([string]@($script:NpmLinks)[0].Target) }
+    if ($created -gt 0) { Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $environment }
     $remaining = (Get-RemainingSeconds) - 900
     if ($remaining -lt 60) { throw 'deadline' }
     $seconds = Get-GateSeconds $gate.Id
@@ -1422,6 +1467,8 @@ try {
             if ($nullState -ne 'applied' -or $nullReadback -ne 'match') { throw 'null_lease' }
             $script:MountState = Invoke-MountManagerLadder $box
             if ($script:MountState.Readback -cne 'match') { throw 'mountmgr_readback' }
+            Write-Line (Get-MountManagerDetail)
+            if ($script:VolumeBoundary -cne 'denied') { throw 'mountmgr_volume' }
             if ($script:MountState.State -cne 'applied' -and $runMode -cne 'synthetic') { throw ('mountmgr_' + $script:MountState.State) }
 
             $phase = 'container_temp'

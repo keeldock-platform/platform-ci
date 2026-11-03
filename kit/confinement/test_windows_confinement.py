@@ -1417,10 +1417,13 @@ foreach ($case in $cases) {
 
     def test_device_lease_kinds_are_a_closed_table_with_read_only_masks(self):
         lease = self.native[self.native.index("public sealed class DeviceLease"):self.native.index("public static class HandleRemover")]
-        self.assertEqual(re.findall(r'kind == "([a-z_]+)"', lease), ["nul", "mountmgr", "drive_link", "mpm_link", "global_dir"])
+        self.assertEqual(re.findall(r'kind == "([a-z_]+)"', lease), ["nul", "mountmgr", "volume", "drive_link", "mpm_link", "global_dir"])
         self.assertEqual(lease.count('throw new InvalidOperationException("lease_kind");'), 2)
         for required in (
             "private const uint MountManagerMask = 0x00120089;",
+            "private const uint VolumeMask = 0x00100080;",
+            r'private const string VolumePrefix = "\\\\.\\";',
+            'lease = new DeviceLease(packageSid, VolumePrefix + drive.ToUpperInvariant() + ":", VolumeMask, KindFile);',
             r'private const string MountManagerPath = "\\\\.\\MountPointManager";',
             r'private const string GlobalDirectoryPath = "\\GLOBAL??";',
             r'private const string MountManagerLinkPath = "\\GLOBAL??\\MountPointManager";',
@@ -1443,6 +1446,8 @@ foreach ($case in $cases) {
         file_write = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000
         self.assertEqual(0x00120089 & file_write, 0)
         self.assertEqual(0x00120089 & 0x1, 0x1)
+        self.assertEqual(0x00100080 & (file_write | 0x1 | 0x8 | 0x20 | 0x20000), 0)
+        self.assertEqual(0x00100080, 0x00100000 | 0x80)
         owner_bits = 0x10000 | 0x40000 | 0x80000
         self.assertEqual(0x00020001 & (owner_bits | 0x2), 0)
         self.assertEqual(0x00020003 & (owner_bits | 0x4 | 0x8), 0)
@@ -1506,9 +1511,34 @@ foreach ($case in $cases) {
             'format!("open0={} openra={} n_dos={}", handle_state(&opened), handle_state(&read_attributes), names[0])',
             'line.push_str(&format!(" ra_dos={}", ra_dos));',
             '" n_nt={} n_guid={} n_none={} o_dos={} o_nt={} mpm={} mpmr={} qdd={} canon={}",',
+            "fn probe_finalpath(dir: &str, drive: &str) -> String {",
+            'return String::from("open0=usage_drive");',
+            "Ok(handle) => volume_device(handle),",
+            "let vol = device_state(&volume_path, 0x0000_0080);",
+            "let volr = device_state(&volume_path, 0x8000_0000);",
+            "let voldac = device_state(&volume_path, 0x0004_0000);",
+            "let qdvp = mount_query(&volume, 0x006D_0030);",
+            "let qpts = mount_query(&volume, 0x006D_0008);",
+            'line.push_str(&format!(" vol={} volr={} voldac={} qdvp={} qpts={}", vol, volr, voldac, qdvp, qpts));',
         ):
             with self.subTest(required=required[:60]):
                 self.assertIn(required, finalpath)
+        self.assertTrue(finalpath.rstrip().endswith("qdvp, qpts));\n    line\n}"))
+        self.assertIn('"finalpath" => probe_finalpath(first, second),', probe)
+        helpers = probe[probe.index("fn volume_device"):probe.index("fn probe_finalpath")]
+        for required in (
+            "GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 2)",
+            "if count == 3 {",
+            r'let path = wide("\\\\.\\MountPointManager");',
+            "CreateFileW(path.as_ptr(), 0, 3, ptr::null_mut(), 3, 0, 0)",
+            "if code == 0x006D_0030 {",
+            "input.extend_from_slice(&24u32.to_le_bytes());",
+            'let state = if done == 0 { format!("err{}", last_error()) } else { String::from("ok") };',
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, helpers)
+        for forbidden in ("display()", "{:?}", "to_string_lossy", "println"):
+            self.assertNotIn(forbidden, helpers)
         for forbidden in ("display()", "{:?}", "to_string_lossy", "dir)", "target)"):
             self.assertNotIn(forbidden, finalpath.replace("plain_path(dir)", "").replace("canonicalize(dir)", ""))
         plain = probe[probe.index("fn plain_path"):probe.index("fn open_directory")]
