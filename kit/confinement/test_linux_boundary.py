@@ -152,13 +152,14 @@ class LinuxBoundaryDecisionTests(unittest.TestCase):
 
 
 class LinuxBoundaryPhaseTests(unittest.TestCase):
-    def phase(self, phase="selftest", fixtures_result=(5, None), outcomes=None, memory="absent", readable="absent"):
+    def phase(self, phase="selftest", fixtures_result=(5, None), outcomes=None, memory="absent", readable="absent", loopback=None):
         subject, emitter = make()
         subject.memory_canary = memory
         subject.readable_canary = readable
         subject.scope = "3"
         table = outcomes or {}
         with patch.object(boundary.Boundary, "run_channel", side_effect=lambda channel: table.get(channel, blocked(channel))), \
+             patch.object(boundary.Boundary, "loopback_proof", return_value=loopback), \
              patch.object(boundary.Boundary, "run_fixtures", side_effect=lambda: realistic(subject, fixtures_result)):
             record, refusal = boundary.run_phase(subject, phase, phase == "selftest")
         return record, refusal, emitter.stream.getvalue().splitlines()
@@ -214,6 +215,58 @@ class LinuxBoundaryPhaseTests(unittest.TestCase):
             record, refusal, output = self.phase(memory=memory, readable=readable)
             self.assertEqual(refusal.reason, "canary_present")
             self.assertTrue(output[-1].endswith("project-execution=not_started"))
+
+    def test_a_failed_loopback_proof_refuses_the_selftest_and_names_the_detail(self):
+        failure = BoundaryRefusal("readback_failed", None, 86)
+        record, refusal, output = self.phase(loopback=failure)
+        self.assertIs(refusal, failure)
+        self.assertEqual(record["result"], "refused")
+        self.assertTrue(output[-1].endswith("project-execution=not_started"))
+        first = BoundaryRefusal("fixture_allowed")
+        record, refusal, output = self.phase(fixtures_result=(4, first), loopback=failure)
+        self.assertIs(refusal, first)
+
+    def test_the_loopback_proof_runs_one_cycle_in_the_selftest_only(self):
+        subject, unused = make()
+        with patch.object(boundary.Boundary, "run_channel", side_effect=lambda channel: blocked(channel)), \
+             patch.object(boundary.Boundary, "run_fixtures", side_effect=lambda: realistic(subject, (5, None))), \
+             patch.object(boundary.Boundary, "loopback_proof", return_value=None) as proof:
+            boundary.run_phase(subject, "selftest", True)
+            self.assertEqual(proof.call_count, 1)
+            boundary.run_phase(subject, "recheck", False)
+            self.assertEqual(proof.call_count, 1)
+
+    def test_the_loopback_proof_runs_the_probe_through_the_loopback_host_session(self):
+        subject, unused = make()
+        subject.workdir = "/work"
+        reply = SimpleNamespace(exit_code=0, timed_out=False, stdout=boundary.LOOPBACK_PROBE_OUTPUT, stderr=b"", readback={})
+        with patch.object(session, "run_host", return_value=reply) as run:
+            self.assertIsNone(subject.loopback_proof())
+        arguments_seen = run.call_args
+        self.assertIs(arguments_seen.kwargs["loopback"], True)
+        self.assertEqual(arguments_seen.kwargs["limits"], "project")
+        self.assertEqual(arguments_seen.args[2][-1], boundary.LOOPBACK_PROBE_SOURCE)
+        self.assertEqual(arguments_seen.args[2][3], probes.LAUNCHER_SOURCE)
+        for bad in (
+            SimpleNamespace(exit_code=4, timed_out=False, stdout=boundary.LOOPBACK_PROBE_OUTPUT, stderr=b"", readback={}),
+            SimpleNamespace(exit_code=0, timed_out=True, stdout=boundary.LOOPBACK_PROBE_OUTPUT, stderr=b"", readback={}),
+            SimpleNamespace(exit_code=0, timed_out=False, stdout=b"", stderr=b"", readback={}),
+        ):
+            with patch.object(session, "run_host", return_value=bad):
+                refusal = subject.loopback_proof()
+            self.assertEqual((refusal.reason, refusal.detail), ("readback_failed", 57))
+        with patch.object(session, "run_host", side_effect=BoundaryRefusal("session_failed", None, 86)):
+            self.assertEqual(subject.loopback_proof().detail, 86)
+        with patch.object(session, "run_host", side_effect=harness.ProofFailure(58)):
+            refusal = subject.loopback_proof()
+        self.assertEqual((refusal.reason, refusal.detail), ("readback_failed", 58))
+
+    def test_the_loopback_probe_checks_the_tcp_cycle_the_denied_families_and_ipv6_off(self):
+        source = boundary.LOOPBACK_PROBE_SOURCE
+        for needle in ("127.0.0.1", "socketpair", "AF_INET6", "AF_UNIX", "AF_NETLINK", "SOCK_DGRAM", "disable_ipv6"):
+            self.assertIn(needle, source)
+        self.assertNotIn(chr(35), source)
+        self.assertEqual(boundary.LOOPBACK_PROBE_OUTPUT, b"loopback-ok\n")
 
     def test_public_output_stays_inside_the_closed_vocabulary(self):
         record, refusal, output = self.phase(outcomes={"https": boundary.Outcome("observed-leak", True, BoundaryRefusal("channel_leak", "https", 7))})
@@ -1059,13 +1112,15 @@ class LinuxBoundaryFixtureStderrDiagnosticTests(unittest.TestCase):
         for phase, expected in (("selftest", 2), ("recheck", 0)):
             subject, emitter = self.scaffold()
             with self.subTest(phase=phase), self.refusing(evidence), \
-                 patch.object(boundary.Boundary, "run_channel", side_effect=lambda channel: blocked(channel)):
+                 patch.object(boundary.Boundary, "run_channel", side_effect=lambda channel: blocked(channel)), \
+                 patch.object(boundary.Boundary, "loopback_proof", return_value=None):
                 boundary.run_phase(subject, phase, True)
                 self.assertEqual(subject.phase, phase)
                 self.assertEqual(len(self.diag_lines(emitter)), expected)
             subject, emitter = self.scaffold()
             with self.subTest(phase=phase, fixtures=False), self.refusing(evidence), \
-                 patch.object(boundary.Boundary, "run_channel", side_effect=lambda channel: blocked(channel)):
+                 patch.object(boundary.Boundary, "run_channel", side_effect=lambda channel: blocked(channel)), \
+                 patch.object(boundary.Boundary, "loopback_proof", return_value=None):
                 boundary.run_phase(subject, phase, False)
                 self.assertEqual(self.diag_lines(emitter), [])
 

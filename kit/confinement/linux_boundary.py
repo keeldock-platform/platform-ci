@@ -42,6 +42,49 @@ FAULTS = {
 }
 PROCESS_VM_READV = 310
 WORKER_NAMES = ("Runner.Worker", "Runner.Listener")
+LOOPBACK_PROBE_SOURCE = """
+import errno
+import socket
+import sys
+
+def denied(family, kind):
+    try:
+        socket.socket(family, kind).close()
+    except OSError as error:
+        return error.errno == errno.EPERM
+    return False
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(("127.0.0.1", 0))
+server.listen(1)
+client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client.connect(server.getsockname())
+peer, unused = server.accept()
+client.sendall(b"k")
+if peer.recv(1) != b"k":
+    sys.exit(3)
+pair = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+pair[0].close()
+pair[1].close()
+checks = (
+    denied(socket.AF_INET, socket.SOCK_DGRAM),
+    denied(socket.AF_INET6, socket.SOCK_STREAM),
+    denied(socket.AF_UNIX, socket.SOCK_STREAM),
+    denied(socket.AF_NETLINK, socket.SOCK_RAW),
+)
+if not all(checks):
+    sys.exit(4)
+try:
+    with open("/proc/sys/net/ipv6/conf/lo/disable_ipv6", "rt") as source:
+        if source.read().strip() != "1":
+            sys.exit(5)
+except FileNotFoundError:
+    pass
+sys.stdout.write("loopback-ok" + chr(10))
+"""
+LOOPBACK_PROBE_OUTPUT = b"loopback-ok" + bytes((10,))
+LOOPBACK_PROBE_DETAIL = 57
+LOOPBACK_PROBE_TIMEOUT_SECONDS = 60
 
 
 class Emitter:
@@ -537,6 +580,22 @@ class Boundary:
         for line in lines:
             self.emitter.emit(line)
 
+    def loopback_proof(self):
+        argv = ("/usr/bin/python3", "-B", "-c", probes.LAUNCHER_SOURCE, "/usr/bin/python3", "-B", "-c", LOOPBACK_PROBE_SOURCE)
+        environment = {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+        try:
+            result = session.run_host(
+                self.workdir, self.nonce, argv, environment, {}, limits="project",
+                timeout=LOOPBACK_PROBE_TIMEOUT_SECONDS, loopback=True,
+            )
+        except BoundaryRefusal as refusal:
+            return refusal
+        except harness.ProofFailure as failure:
+            return BoundaryRefusal("readback_failed", None, failure.reason)
+        if result.exit_code != 0 or result.timed_out or result.stdout != LOOPBACK_PROBE_OUTPUT:
+            return BoundaryRefusal("readback_failed", None, LOOPBACK_PROBE_DETAIL)
+        return None
+
     def run_fixtures(self):
         first = None
         completed = 0
@@ -575,6 +634,9 @@ def run_phase(boundary, phase, with_fixtures):
             )
             if failure is not None and refusal is None:
                 refusal = failure
+            loopback_failure = boundary.loopback_proof()
+            if loopback_failure is not None and refusal is None:
+                refusal = loopback_failure
         outcome = boundary.run_channel(channel)
         outcomes[channel] = outcome
         record["channels"][channel] = {"status": outcome.status, "control": outcome.control}

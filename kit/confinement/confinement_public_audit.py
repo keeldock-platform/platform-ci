@@ -130,6 +130,7 @@ QUICK_RETENTION_SLACK_SECONDS = 600
 QUICK_MIN_GATES = 15
 QUICK_MAX_GATES = 19
 QUICK_SCREENS_MAX_PARTS = 17
+QUICK_FULL_MEMBERS = 1 + QUICK_SCREENS_MAX_PARTS
 QUICK_EXPECTED_FIELDS = (
     (EXPECTED_FIELDS - frozenset(("verdict_job", "verdict_step"))) | frozenset(("quick_job", "request_id"))
 )
@@ -843,9 +844,12 @@ def _check_quick_artifacts(api, expected):
     if (not _exact_int(item["id"], 1)
             or not _is(item["name"], expected["artifact_names"][0])
             or not _is(item["expired"], False)
-            or not _exact_int(
-                size, QUICK_FRAME_BYTES,
-                (QUICK_FRAME_BYTES + QUICK_ARTIFACT_SLACK_BYTES) * (1 + QUICK_SCREENS_MAX_PARTS),
+            or not (
+                _exact_int(size, QUICK_FRAME_BYTES, QUICK_FRAME_BYTES + QUICK_ARTIFACT_SLACK_BYTES)
+                or _exact_int(
+                    size, QUICK_FULL_MEMBERS * QUICK_FRAME_BYTES,
+                    QUICK_FULL_MEMBERS * (QUICK_FRAME_BYTES + QUICK_ARTIFACT_SLACK_BYTES),
+                )
             )
             or type(run) is not dict
             or not _is(run.get("id"), expected["run_id"])

@@ -129,16 +129,19 @@ FILINGS = {
     DEFAULT_FILING: {
         "request_doc": "docs/dependencies/ui-npm-admission-batch-a.md",
         "workspaces": WORKSPACE_PATHS,
+        "member_edges": (),
         "overrides": {"lightningcss": "1.33.0"},
     },
     UI_BATCH_B_FILING: {
         "request_doc": "docs/dependencies/ui-npm-admission-batch-b.md",
         "workspaces": WORKSPACE_PATHS + UI_KIT_WORKSPACE_PATHS,
+        "member_edges": ((UI_KIT_WORKSPACE_PATHS[1], UI_KIT_WORKSPACE_PATHS[0]),),
         "overrides": {"lightningcss": "1.33.0"},
     },
     FIXTURE_FILING: {
         "request_doc": "docs/dependencies/quick-fixture.md",
         "workspaces": WORKSPACE_PATHS,
+        "member_edges": (),
         "overrides": {},
     },
 }
@@ -632,17 +635,19 @@ def check_inputs(files, selector):
         _refuse("npm_policy_refused")
     direct = dict(root_direct)
     workspaces = []
-    workspace_names = frozenset(_scoped_name(path) for path in filing["workspaces"])
     for path in filing["workspaces"]:
+        allowed_edges = frozenset(
+            _scoped_name(target) for source, target in filing["member_edges"] if source == path
+        )
         manifest = _manifest(files[path + "/package.json"])
-        groups = _check_workspace(manifest, path, internal, workspace_names)
+        groups = _check_workspace(manifest, path, internal, allowed_edges)
         workspaces.append({
             "path": path, "name": manifest["name"], "version": manifest["version"],
             "dependencies": groups["dependencies"], "devDependencies": groups["devDependencies"],
         })
         for group in groups.values():
             for name, version in group.items():
-                if name in workspace_names:
+                if name in allowed_edges:
                     continue
                 if direct.setdefault(name, version) != version:
                     _refuse("npm_manifest_refused")
@@ -650,7 +655,7 @@ def check_inputs(files, selector):
     for item in workspaces:
         for group in ("dependencies", "devDependencies"):
             for name, spec in item[group].items():
-                if name in workspace_versions and (name == item["name"] or spec != workspace_versions[name]):
+                if name in workspace_versions and spec != workspace_versions[name]:
                     _refuse("npm_manifest_refused")
     rows = parse_request_doc(files[filing["request_doc"]])
     for name, version in sorted(direct.items()):

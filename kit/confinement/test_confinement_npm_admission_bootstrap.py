@@ -628,6 +628,55 @@ class UiKitFilingTests(RefusalAssertions):
         files["package.json"] = _json(root) + b"\n"
         self.assert_refused("npm_manifest_refused", subject.check_inputs, files, subject.UI_BATCH_B_FILING)
 
+    def test_only_the_second_batch_names_one_member_edge_and_every_other_edge_is_refused(self):
+        self.assertEqual(subject.FILINGS[subject.UI_BATCH_B_FILING]["member_edges"], ((self.KIT, self.ICONS),))
+        self.assertEqual(subject.FILINGS[subject.DEFAULT_FILING]["member_edges"], ())
+        self.assertEqual(subject.FILINGS[subject.FIXTURE_FILING]["member_edges"], ())
+        world = World()
+        for name, owner, dependency in (
+            ("reverse", self.ICONS, self.KIT),
+            ("host_to_icons", "packages/host-api", self.ICONS),
+            ("kit_to_host", self.KIT, "packages/host-api"),
+            ("kit_to_i18n", self.KIT, "packages/kernel-i18n"),
+            ("i18n_to_kit", "packages/kernel-i18n", self.KIT),
+        ):
+            for group in ("dependencies", "devDependencies"):
+                with self.subTest(name=name, group=group):
+                    files = self.files_for(world)
+                    manifest = json.loads(files[owner + "/package.json"].decode("ascii"))
+                    manifest[group] = dict(manifest.get(group, {}), **{_workspace_name(dependency): ROOT_VERSION})
+                    files[owner + "/package.json"] = _json(manifest) + b"\n"
+                    self.assert_refused(
+                        "npm_manifest_refused", subject.check_inputs, files, subject.UI_BATCH_B_FILING,
+                    )
+
+    def filing_files(self, world, filing):
+        files = dict(world.files)
+        if filing == subject.FIXTURE_FILING:
+            default_doc = subject.FILINGS[subject.DEFAULT_FILING]["request_doc"]
+            files = {path: data for path, data in files.items() if path != default_doc}
+            files[subject.FILINGS[filing]["request_doc"]] = world.files[default_doc]
+            root = json.loads(files["package.json"].decode("ascii"))
+            del root["overrides"]
+            files["package.json"] = _json(root) + b"\n"
+        return files
+
+    def test_the_first_batch_and_the_fixture_filing_keep_the_strict_rule_for_member_dependencies(self):
+        world = World()
+        for filing in (subject.DEFAULT_FILING, subject.FIXTURE_FILING):
+            self.assertEqual(subject.check_inputs(self.filing_files(world, filing), filing)["filing"], filing)
+            for owner, dependency in (
+                ("packages/host-api", "packages/kernel-i18n"), ("packages/kernel-i18n", "packages/host-api"),
+            ):
+                with self.subTest(filing=filing, owner=owner):
+                    files = self.filing_files(world, filing)
+                    manifest = json.loads(files[owner + "/package.json"].decode("ascii"))
+                    manifest["dependencies"] = dict(
+                        manifest.get("dependencies", {}), **{_workspace_name(dependency): ROOT_VERSION},
+                    )
+                    files[owner + "/package.json"] = _json(manifest) + b"\n"
+                    self.assert_refused("npm_manifest_refused", subject.check_inputs, files, filing)
+
     def test_the_member_sets_are_closed_per_filing(self):
         world = World()
         files = self.files_for(world)

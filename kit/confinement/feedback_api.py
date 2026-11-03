@@ -684,32 +684,52 @@ def _quick_jobs(api, run, profile):
     _check_quick_audit_log(audit_log, run)
 
 
+def _quick_member_bytes(bundle, entry):
+    if (entry.filename != entry.orig_filename or entry.is_dir() or entry.flag_bits & 0x1
+            or entry.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+            or entry.file_size != QUICK_FRAME_BYTES
+            or entry.compress_size <= 0 or entry.compress_size > node_lock_receipt.MAX_MEMBER_BYTES
+            or (entry.compress_type == zipfile.ZIP_STORED and entry.compress_size != QUICK_FRAME_BYTES)):
+        raise ValueError
+    with bundle.open(entry) as source:
+        data = source.read(QUICK_FRAME_BYTES + 1)
+    if len(data) != QUICK_FRAME_BYTES or data[:4] != QUICK_MAGIC:
+        raise ValueError
+    return data
+
+
 def _quick_multi_members(archive, member_name):
-    """Return the verdict member and the numbered screens members of one bounded archive."""
+    """Return the verdict member and the screens members of one bounded archive.
+
+    Only a defective verdict member or an unknown name refuses the evidence; a defective
+    screens member drops the screens and leaves the verdict untouched.
+    """
+    screens_names = [QUICK_SCREENS_MEMBER % index for index in range(QUICK_SCREENS_MAX_PARTS)]
     try:
         with zipfile.ZipFile(io.BytesIO(archive), "r") as bundle:
             entries = bundle.infolist()
+            names = [entry.filename for entry in entries]
+            if (len(entries) > 1 + QUICK_SCREENS_MAX_PARTS or len(set(names)) != len(names)
+                    or member_name not in names
+                    or any(name != member_name and name not in screens_names for name in names)):
+                _refuse()
+            by_name = {entry.filename: entry for entry in entries}
+            try:
+                member = _quick_member_bytes(bundle, by_name[member_name])
+            except Exception:
+                raise FeedbackAPIRefusal() from None
             parts = len(entries) - 1
-            if not 1 <= parts <= QUICK_SCREENS_MAX_PARTS:
-                _refuse()
-            expected = [member_name] + [QUICK_SCREENS_MEMBER % index for index in range(parts)]
-            if sorted(entry.filename for entry in entries) != sorted(expected):
-                _refuse()
-            members = {}
-            for entry in entries:
-                if (entry.filename != entry.orig_filename or entry.is_dir()
-                        or entry.compress_type != zipfile.ZIP_STORED or entry.flag_bits & 0x1
-                        or entry.file_size != QUICK_FRAME_BYTES or entry.compress_size != QUICK_FRAME_BYTES):
-                    _refuse()
-                data = bundle.read(entry)
-                if len(data) != QUICK_FRAME_BYTES or data[:4] != QUICK_MAGIC:
-                    _refuse()
-                members[entry.filename] = data
+            try:
+                if parts < 1 or sorted(name for name in names if name != member_name) != sorted(screens_names[:parts]):
+                    raise ValueError
+                screens = [_quick_member_bytes(bundle, by_name[name]) for name in screens_names[:parts]]
+            except Exception:
+                screens = []
     except FeedbackAPIRefusal:
         raise
     except Exception:
         raise FeedbackAPIRefusal() from None
-    return members[member_name], [members[QUICK_SCREENS_MEMBER % index] for index in range(parts)]
+    return member, screens
 
 
 def _quick_artifact(api, request, profile, run, now):

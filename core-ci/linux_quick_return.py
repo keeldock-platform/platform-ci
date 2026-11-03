@@ -88,6 +88,7 @@ PNG_HEADER_CHUNK = b"\x00\x00\x00\rIHDR"
 PNG_END_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 PNG_COLOUR_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
 SCREENS_PART_KIND = "screens-part"
+SCREENS_FILLER_KIND = "screens-filler"
 
 
 class QuickRefusal(Exception):
@@ -341,6 +342,18 @@ def screens_parts(files, request_id):
             raise QuickRefusal("screens")
         bodies.append(body)
     return manifest, bodies
+
+
+def pad_screens_bodies(bodies, request_id):
+    """Return exactly SCREENS_MAX_PARTS bodies: the real parts first, then fixed filler parts."""
+    if type(bodies) is not list or len(bodies) > SCREENS_MAX_PARTS:
+        raise QuickRefusal("screens")
+    padded = list(bodies)
+    for index in range(len(bodies), SCREENS_MAX_PARTS):
+        padded.append(json.dumps({
+            "schema_version": 1, "kind": SCREENS_FILLER_KIND, "request_id": request_id, "index": index,
+        }, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii"))
+    return padded
 
 
 def _gate_records(records):
@@ -698,7 +711,11 @@ def run_encrypt(environ, arguments, clock=time.time):
     worker = environ.get("WORKER_PATH", "")
     if worker:
         try:
-            screens, bodies = screens_parts(collect_screens(worker), request_id)
+            try:
+                screens, bodies = screens_parts(collect_screens(worker), request_id)
+            except QuickRefusal:
+                screens, bodies = {"status": "refused"}, []
+            bodies = pad_screens_bodies(bodies, request_id)
             part_ciphertexts = [
                 encrypt_payload(
                     crypto_input(frame_payload(body), request_id, spki, fingerprint, binding, now, nonce, expiry),

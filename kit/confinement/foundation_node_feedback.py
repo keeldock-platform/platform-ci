@@ -280,6 +280,49 @@ def _require_inert_package(directory, producer):
     _refuse(producer, "manifest_invalid")
 
 
+def _ui_kit_verify_files(source, source_runtime, producer):
+    kit_files = getattr(source_runtime, "CORE_CONTRACT_KERNEL_UI_KIT_FILES", None)
+    gated = getattr(source_runtime, "CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES", None)
+    if (type(kit_files) is not frozenset or type(gated) is not frozenset or not gated
+            or not gated.issubset(kit_files)):
+        _refuse(producer, "manifest_invalid")
+    discovered = set()
+    try:
+        for package_path in UI_KIT_WORKSPACE_PACKAGES:
+            for folder in ("src", "tests"):
+                directory = source / package_path / folder
+                if not stat.S_ISDIR(directory.lstat().st_mode):
+                    _refuse(producer, "manifest_invalid")
+                for current, directories, names in os.walk(directory, followlinks=False, onerror=_raise_walk):
+                    if any(os.path.islink(os.path.join(current, name)) for name in directories):
+                        _refuse(producer, "manifest_invalid")
+                    for name in names:
+                        path = os.path.join(current, name)
+                        if not stat.S_ISREG(os.lstat(path).st_mode):
+                            _refuse(producer, "manifest_invalid")
+                        discovered.add(os.path.relpath(path, source).replace(os.sep, "/"))
+        selected = set()
+        for path in sorted(kit_files):
+            try:
+                info = (source / path).lstat()
+            except FileNotFoundError:
+                if path in gated:
+                    _refuse(producer, "manifest_invalid")
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                _refuse(producer, "manifest_invalid")
+            selected.add(path)
+    except OSError:
+        _refuse(producer, "manifest_invalid")
+    if not discovered.issubset(kit_files):
+        _refuse(producer, "manifest_invalid")
+    return selected
+
+
+def _raise_walk(error):
+    raise error
+
+
 def _reviewed_files(source_runtime, mode, producer, source):
     source_files = getattr(source_runtime, "CORE_CONTRACT_FEEDBACK_FILES", None)
     kernel_files = getattr(source_runtime, "CORE_CONTRACT_KERNEL_FEEDBACK_FILES", None)
@@ -300,8 +343,7 @@ def _reviewed_files(source_runtime, mode, producer, source):
     ui_kit = any(name in package_names for name in kit_names)
     if ui_kit:
         kit_files = getattr(source_runtime, "CORE_CONTRACT_KERNEL_UI_KIT_FILES", None)
-        if (mode != "bootstrap" or type(kit_files) is not frozenset
-                or not set(UI_KIT_BOOTSTRAP_MANIFESTS).issubset(kit_files)):
+        if type(kit_files) is not frozenset or not set(UI_KIT_BOOTSTRAP_MANIFESTS).issubset(kit_files):
             _refuse(producer, "manifest_invalid")
         expected_names = sorted(expected_names + kit_names)
     if package_names == sorted(expected_names + [INERT_PACKAGE_NAME]):
@@ -338,7 +380,8 @@ def _reviewed_files(source_runtime, mode, producer, source):
             or len(matched["ts_tests"]) > source_runtime.MAX_CORE_CONTRACT_TS_TESTS
             or not required_ts.issubset(selected)):
         _refuse(producer, "manifest_invalid")
-    return tuple(sorted(NODE_REVIEWED_FILES | selected))
+    kit_selected = _ui_kit_verify_files(source, source_runtime, producer) if ui_kit else set()
+    return tuple(sorted(NODE_REVIEWED_FILES | selected | kit_selected))
 
 
 def _node_environment(storage, node, contract):

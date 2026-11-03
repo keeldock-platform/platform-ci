@@ -3721,7 +3721,7 @@ class LinuxBrowserTierTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         update, install = calls
         self.assertEqual(update[0][-1], "update")
-        self.assertFalse(update[1]["check"])
+        self.assertTrue(update[1]["check"])
         self.assertTrue(install[1]["check"])
         self.assertEqual(install[0][:2], ["/usr/bin/sudo", "-n"])
         self.assertIn("DEBIAN_FRONTEND=noninteractive", install[0])
@@ -3734,10 +3734,12 @@ class LinuxBrowserTierTests(unittest.TestCase):
             self.assertEqual(kwargs["timeout"], linux_source_build.BROWSER_APT_TIMEOUT_SECONDS)
             self.assertNotIn("http", " ".join(argv))
 
-    def test_a_failed_package_index_refresh_is_tolerated_but_a_failed_install_refuses(self):
+    def test_a_failed_package_index_refresh_or_a_failed_install_refuses(self):
         outcomes = [subprocess.CalledProcessError(100, "apt"), types.SimpleNamespace(returncode=0)]
-        with patch.object(linux_source_build.subprocess, "run", side_effect=outcomes):
-            linux_source_build._install_browser_packages()
+        with patch.object(linux_source_build.subprocess, "run", side_effect=outcomes) as run:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "toolchain"):
+                linux_source_build._install_browser_packages()
+        self.assertEqual(run.call_count, 1)
         outcomes = [types.SimpleNamespace(returncode=0), subprocess.CalledProcessError(100, "apt")]
         with patch.object(linux_source_build.subprocess, "run", side_effect=outcomes):
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "toolchain"):
@@ -3847,25 +3849,6 @@ class LinuxBrowserTierTests(unittest.TestCase):
                 executable.symlink_to(moved)
                 self.assertFalse(linux_source_build._browser_installed(str(browsers)))
 
-    def test_evidence_counts_only_regular_png_files_below_the_reports_directory(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            worker = Path(temporary) / "worker"
-            phase = worker / "docs" / "reports" / "phase-one"
-            phase.mkdir(parents=True)
-            (phase / "frame-a.png").write_bytes(b"12345")
-            (phase / "frame-b.png").write_bytes(b"123")
-            (phase / "notes.txt").write_bytes(b"ignored")
-            outside = Path(temporary) / "outside"
-            outside.mkdir()
-            (outside / "leak.png").write_bytes(b"leak")
-            (worker / "docs" / "reports" / "linked").symlink_to(outside)
-            (phase / "linked.png").symlink_to(outside / "leak.png")
-            self.assertEqual(linux_source_build._browser_evidence(worker), (2, 8))
-            (worker / "docs" / "reports").rename(worker / "docs" / "moved")
-            (worker / "docs" / "reports").symlink_to(worker / "docs" / "moved")
-            self.assertEqual(linux_source_build._browser_evidence(worker), (0, 0))
-            self.assertEqual(linux_source_build._browser_evidence(Path(temporary) / "absent"), (0, 0))
-
     def test_gate_commands_add_the_browser_gate_last_and_only_when_asked(self):
         plain = linux_source_build._gate_commands(Path("/work"), "/rust", "/node")
         self.assertEqual(tuple(name for name, argv in plain), linux_source_build.GATES)
@@ -3878,14 +3861,11 @@ class LinuxBrowserTierTests(unittest.TestCase):
             "--workspace=packages/kernel-ui-kit", "--ignore-scripts",
         ))
 
-    def _run_with_browser(self, temporary, browser_root, installed=True):
+    def _run_with_browser(self, temporary, browser_root, installed=True, kit=True):
         root = Path(temporary)
         worker = root / "source"
         worker.mkdir()
         (worker / "Cargo.lock").write_text(_path_only_lock(4), encoding="ascii")
-        evidence = worker / "docs" / "reports" / "phase"
-        evidence.mkdir(parents=True)
-        (evidence / "frame.png").write_bytes(b"png")
 
         def commands(project, rust_root, node_bin, browser=False):
             names = linux_source_build.GATES + (linux_source_build.BROWSER_GATE_NAMES if browser else ())
@@ -3909,6 +3889,8 @@ class LinuxBrowserTierTests(unittest.TestCase):
             linux_source_build, "_runtime_workspace_present", return_value=False,
         ), patch.object(
             linux_source_build, "_browser_installed", return_value=installed,
+        ), patch.object(
+            linux_source_build, "_ui_kit_workspace_present", return_value=kit,
         ), patch.object(
             linux_source_build.linux_session, "run_host",
             return_value=types.SimpleNamespace(exit_code=0, timed_out=False, stdout=b"", stderr=b""),
@@ -3936,10 +3918,8 @@ class LinuxBrowserTierTests(unittest.TestCase):
             receipt = json.loads((records / "gates.json").read_text(encoding="ascii"))
             self.assertEqual(receipt["selected_gates"][-1], "ui_kit_browser")
             self.assertEqual(receipt["gate_count"], 16)
-            evidence = json.loads((records / "browser-evidence.json").read_text(encoding="ascii"))
-            self.assertEqual(evidence, {"bytes": 3, "files": 1, "schema_version": 1})
 
-    def test_without_a_provisioned_browser_no_browser_gate_runs_and_no_evidence_is_written(self):
+    def test_without_a_provisioned_browser_no_browser_gate_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
             code, session, records = self._run_with_browser(temporary, None)
             self.assertEqual(code, 0)
@@ -3947,16 +3927,49 @@ class LinuxBrowserTierTests(unittest.TestCase):
             for invocation in session.call_args_list:
                 self.assertNotIn("loopback", invocation.kwargs)
                 self.assertFalse([key for key in invocation.args[3] if key.startswith("PLAYWRIGHT")])
-            self.assertFalse((records / "browser-evidence.json").exists())
             receipt = json.loads((records / "gates.json").read_text(encoding="ascii"))
             self.assertEqual(receipt["selected_gates"], list(linux_source_build.GATES))
+
+    def test_a_core_tree_without_the_ui_kit_runs_no_browser_gate_even_with_a_browser_root(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            code, session, records = self._run_with_browser(temporary, "/tmp/kd-toolchains/browsers", kit=False)
+            self.assertEqual(code, 0)
+            self.assertEqual(session.call_count, 15)
+            for invocation in session.call_args_list:
+                self.assertNotIn("loopback", invocation.kwargs)
+                self.assertFalse([key for key in invocation.args[3] if key.startswith("PLAYWRIGHT")])
+            receipt = json.loads((records / "gates.json").read_text(encoding="ascii"))
+            self.assertEqual(receipt["selected_gates"], list(linux_source_build.GATES))
+            self.assertEqual(receipt["gate_count"], 15)
+
+    def test_the_ui_kit_workspace_is_present_only_with_its_regular_package_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            worker = Path(temporary) / "worker"
+            worker.mkdir()
+            self.assertFalse(linux_source_build._ui_kit_workspace_present(worker))
+            (worker / "packages").mkdir()
+            self.assertFalse(linux_source_build._ui_kit_workspace_present(worker))
+            (worker / "packages" / "kernel-ui-kit").mkdir()
+            self.assertFalse(linux_source_build._ui_kit_workspace_present(worker))
+            manifest = worker / "packages" / "kernel-ui-kit" / "package.json"
+            manifest.write_bytes(b"{}")
+            self.assertTrue(linux_source_build._ui_kit_workspace_present(worker))
+            manifest.unlink()
+            manifest.mkdir()
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "gate"):
+                linux_source_build._ui_kit_workspace_present(worker)
+            manifest.rmdir()
+            outside = Path(temporary) / "outside.json"
+            outside.write_bytes(b"{}")
+            manifest.symlink_to(outside)
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "gate"):
+                linux_source_build._ui_kit_workspace_present(worker)
 
     def test_an_untrusted_browser_root_refuses_before_any_gate_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "gate"):
                 self._run_with_browser(temporary, "/tmp/other", installed=False)
             self.assertFalse((Path(temporary) / "kd-records" / "gates.json").exists())
-            self.assertFalse((Path(temporary) / "kd-records" / "browser-evidence.json").exists())
 
     def test_a_failed_browser_gate_is_named_in_the_refusal_line(self):
         self.assertEqual(
@@ -3964,16 +3977,16 @@ class LinuxBrowserTierTests(unittest.TestCase):
             "linux-project-gates=refused completed=15 failed=1 gate=ui_kit_browser cause=exit\n",
         )
 
-    def test_the_verified_count_requires_the_browser_gate_and_reports_the_shared_contract_count(self):
+    def test_the_verified_count_accepts_all_four_gate_sets_and_reports_the_shared_contract_count(self):
         names = {
             "base": linux_source_build.GATES,
             "runtime": linux_source_build.GATES + linux_source_build.RUNTIME_GATE_NAMES,
         }
         browser = linux_source_build.BROWSER_GATE_NAMES
         cases = (
-            (names["base"], 0), (names["runtime"], 0),
+            (names["base"], 15), (names["runtime"], 18),
             (names["base"] + browser, 15), (names["runtime"] + browser, 18),
-            (browser + names["base"], 0),
+            (browser + names["base"], 0), (names["base"][:-1], 0), (names["base"] + names["runtime"], 0),
         )
         for selected, expected in cases:
             with self.subTest(selected=len(selected), expected=expected), tempfile.TemporaryDirectory() as temporary:

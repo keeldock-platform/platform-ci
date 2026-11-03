@@ -359,7 +359,10 @@ class FeedbackAdminTests(unittest.TestCase):
         source_directory = os.path.join(self.temporary.name, "reviewed-source")
         helper_messages = []
 
+        self.helper_calls = 0
+
         def helper(message, *, plaintext_pipe=False):
+            self.helper_calls += 1
             helper_messages.append(dict(message))
             return _fake_helper(message, plaintext_pipe=plaintext_pipe)
 
@@ -406,7 +409,10 @@ class FeedbackAdminTests(unittest.TestCase):
         evidence, trusted = self.evidence_for(request)
         gate = self.summary_gate(request)
 
+        self.helper_calls = 0
+
         def helper(message, *, plaintext_pipe=False):
+            self.helper_calls += 1
             if message["operation"] == "decrypt":
                 return b'{"schema_version":1,"ok":true}\n', bytearray(plaintext)
             return _fake_helper(message, plaintext_pipe=plaintext_pipe)
@@ -616,7 +622,10 @@ class FeedbackAdminTests(unittest.TestCase):
         module.collect_feedback_evidence = collect
         messages = []
 
+        self.helper_calls = 0
+
         def helper(message, *, plaintext_pipe=False):
+            self.helper_calls += 1
             messages.append(dict(message))
             return _fake_helper(message, plaintext_pipe=plaintext_pipe)
 
@@ -647,7 +656,7 @@ class FeedbackAdminTests(unittest.TestCase):
                     request["request_id"], object(), manual_summary_review=None, run_id=str(RUN_ID),
                 )
 
-    def consume_with_screens(self, verdict_screens, parts, mutate_frames=None):
+    def consume_with_screens(self, verdict_screens, parts, mutate_frames=None, mutate_fillers=None, pad=True):
         request = self.create("linux_quick")["request"]
         evidence = self.quick_evidence(request)
         evidence["ciphertext"] = b"KDLEverdict"
@@ -656,6 +665,10 @@ class FeedbackAdminTests(unittest.TestCase):
             verdict_screens = manifest
         if mutate_frames is not None:
             frames = mutate_frames(frames)
+        real_count = len(frames)
+        if pad:
+            fillers = [_screens_filler_frame(index, request["request_id"]) for index in range(real_count, subject.SCREENS_MAX_PARTS)]
+            frames = frames + (fillers if mutate_fillers is None else mutate_fillers(fillers))
         verdict = _screens_frame(json.dumps({"screens": verdict_screens}).encode("ascii"))
         if parts:
             evidence["screens"] = [b"KDLEpart" + bytes([index]) for index in range(len(frames))]
@@ -665,7 +678,10 @@ class FeedbackAdminTests(unittest.TestCase):
         for index, frame in enumerate(frames):
             by_envelope[b"KDLEpart" + bytes([index])] = frame
 
+        self.helper_calls = 0
+
         def helper(message, *, plaintext_pipe=False):
+            self.helper_calls += 1
             return b'{"schema_version":1,"ok":true}\n', bytearray(by_envelope[base64.b64decode(message["envelope_base64"])])
 
         with mock.patch.dict(sys.modules, {"feedback_api": module}), \
@@ -681,15 +697,15 @@ class FeedbackAdminTests(unittest.TestCase):
         with open(returned["private_output_path"], "rb") as output:
             self.assertEqual(output.read(), verdict)
         name = "return-" + request["request_id"] + "-linux-quick-screens"
-        self.assertEqual(returned["screens_directory"], name)
+        self.assertEqual(returned["screens_directory"], os.path.join(self.directory, name))
         root = os.path.join(self.directory, name)
         for path, data in SCREEN_FILES:
             with open(os.path.join(root, *path.split("/")), "rb") as source:
                 self.assertEqual(source.read(), data)
         self.assertEqual(self._state()["requests"][0]["status"], "consumed")
 
-    def assert_screens_skipped(self, block, parts, mutate=None):
-        request, verdict, returned = self.consume_with_screens(block, parts, mutate)
+    def assert_screens_skipped(self, block, parts, mutate=None, mutate_fillers=None):
+        request, verdict, returned = self.consume_with_screens(block, parts, mutate, mutate_fillers)
         self.assertNotIn("screens_directory", returned)
         with open(returned["private_output_path"], "rb") as output:
             self.assertEqual(output.read(), verdict)
@@ -712,6 +728,31 @@ class FeedbackAdminTests(unittest.TestCase):
 
     def test_a_missing_part_never_fails_the_verdict(self):
         self.assert_screens_skipped("ok", True, lambda frames: frames[:-1])
+
+    def test_every_filler_part_is_decrypted_checked_and_discarded(self):
+        request, verdict, returned = self.consume_with_screens("ok", True)
+        self.assertEqual(self.helper_calls, 1 + subject.SCREENS_MAX_PARTS)
+        name = os.path.join(self.directory, "return-" + request["request_id"] + "-linux-quick-screens")
+        written = sorted(
+            os.path.relpath(os.path.join(base, item), name)
+            for base, unused, items in os.walk(name) for item in items
+        )
+        self.assertEqual(written, sorted(path for path, data in SCREEN_FILES))
+
+    def test_a_none_block_with_only_filler_parts_decrypts_nothing_beyond_the_verdict(self):
+        self.assert_screens_skipped({"status": "none"}, True)
+        self.assertEqual(self.helper_calls, 1)
+
+    def test_a_tampered_filler_part_never_fails_the_verdict(self):
+        request_id = SCREENS_REQUEST
+        for label, change in (
+            ("kind", lambda fillers: [_screens_filler_frame(0, request_id, kind="screens-part")] + fillers[1:]),
+            ("extra", lambda fillers: [_screens_filler_frame(0, request_id, extra={"x": 1})] + fillers[1:]),
+            ("too_many", lambda fillers: fillers + [fillers[-1]]),
+            ("garbage", lambda fillers: [b"x" * subject.MAX_PLAINTEXT_BYTES] + fillers[1:]),
+        ):
+            with self.subTest(label=label):
+                self.assert_screens_skipped("ok", True, mutate_fillers=change)
 
     def test_a_garbage_manifest_never_fails_the_verdict(self):
         self.assert_screens_skipped({"status": "ok", "files": "x"}, True)
@@ -878,7 +919,10 @@ class FeedbackAdminTests(unittest.TestCase):
                 stage_trace.append("receipt")
             return trusted
 
+        self.helper_calls = 0
+
         def helper(message, *, plaintext_pipe=False):
+            self.helper_calls += 1
             with trace_lock:
                 stage_trace.append("decrypt")
             return _fake_helper(message, plaintext_pipe=plaintext_pipe)
@@ -1201,6 +1245,12 @@ class UnsupportedPlatformTests(unittest.TestCase):
 SCREENS_REQUEST = "ab" * 32
 
 
+def _screens_filler_frame(index, request_id, kind="screens-filler", extra=None):
+    body = {"schema_version": 1, "kind": kind, "request_id": request_id, "index": index}
+    body.update(extra or {})
+    return _screens_frame(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("ascii"))
+
+
 def _png(width=2, height=3, colour=2, depth=8, filler=b"", end=True):
     header = width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes((depth, colour, 0, 0, 0))
     return (
@@ -1365,6 +1415,27 @@ class ScreensReturnTests(unittest.TestCase):
                 self.assertEqual(sorted(os.listdir(root)), ["01-tokens", "02-states"])
                 self.assertEqual(os.listdir(directory), [name])
                 self.assert_refused(subject.write_screens_directory, dir_fd, SCREENS_REQUEST, sorted(SCREEN_FILES))
+            finally:
+                os.close(dir_fd)
+
+    def test_a_partly_written_tree_is_removed_so_a_retry_can_write_it_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                real = subject._create_named
+                calls = []
+
+                def flaky(*arguments, **options):
+                    calls.append(arguments)
+                    if len(calls) == 2:
+                        raise OSError("disk full")
+                    return real(*arguments, **options)
+
+                with mock.patch.object(subject, "_create_named", side_effect=flaky):
+                    self.assert_refused(subject.write_screens_directory, dir_fd, SCREENS_REQUEST, sorted(SCREEN_FILES))
+                self.assertEqual(os.listdir(directory), [])
+                name = subject.write_screens_directory(dir_fd, SCREENS_REQUEST, sorted(SCREEN_FILES))
+                self.assertEqual(os.listdir(directory), [name])
             finally:
                 os.close(dir_fd)
 

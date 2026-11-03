@@ -848,8 +848,18 @@ class ScreensCommandTests(unittest.TestCase):
             WORKER_PATH=str(worker),
         )
 
+
+    def last_verdict(self, encrypt):
+        return subject.unframe_payload(base64.b64decode(encrypt.call_args_list[-1].args[0]["payload_b64"]))
+
+    def staged_names(self, directory):
+        return sorted(path.name for path in (Path(directory) / "kd-quick-upload").iterdir())
+
+    def all_members(self):
+        return ["linux-quick-return-v1.enc"] + [subject.SCREENS_MEMBER_FORMAT % index for index in range(subject.SCREENS_MAX_PARTS)]
+
     @POSIX_OUTPUT
-    def test_encrypt_returns_the_verdict_and_one_encrypted_member_per_part(self):
+    def test_encrypt_always_returns_the_verdict_and_exactly_seventeen_screens_members(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as worker:
             write_records(directory)
             first = png_bytes(filler=b"a" * 40)
@@ -865,33 +875,35 @@ class ScreensCommandTests(unittest.TestCase):
             screens = verdict["screens"]
             self.assertEqual(screens["status"], "ok")
             self.assertEqual((screens["count"], screens["bytes"]), (2, len(first) + len(second)))
-            self.assertEqual(len(records), screens["parts"] + 1)
+            self.assertLess(screens["parts"], subject.SCREENS_MAX_PARTS)
+            self.assertEqual(len(records), subject.SCREENS_MAX_PARTS + 1)
             for record in records:
                 self.assertEqual(record["kind"], "linux_quick")
                 self.assertEqual(record["context"]["nonce"], NONCE)
                 self.assertEqual(record["context"]["request_id"], REQUEST)
-            staged = Path(directory) / "kd-quick-upload"
-            self.assertEqual(sorted(path.name for path in staged.iterdir()), ["linux-quick-return-v1.enc"] + [subject.SCREENS_MEMBER_FORMAT % index for index in range(screens["parts"])])
+            kinds = [
+                subject.unframe_payload(base64.b64decode(record["payload_b64"]))["kind"] for record in records[:-1]
+            ]
+            self.assertEqual(kinds, [subject.SCREENS_PART_KIND] * screens["parts"]
+                             + [subject.SCREENS_FILLER_KIND] * (subject.SCREENS_MAX_PARTS - screens["parts"]))
+            self.assertEqual(self.staged_names(directory), self.all_members())
             lines = Path(env["GITHUB_OUTPUT"]).read_text(encoding="ascii").splitlines()
-            self.assertEqual(lines[-1], "screens_parts=" + str(screens["parts"]))
+            self.assertEqual(lines[-1], "screens_parts=" + str(subject.SCREENS_MAX_PARTS))
 
     @POSIX_OUTPUT
-    def test_a_hostile_screen_set_degrades_to_a_refused_marker_without_losing_the_verdict(self):
+    def test_a_hostile_screen_set_degrades_to_a_refused_marker_with_seventeen_fillers(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as worker:
             write_records(directory)
             write_screen(worker, "01-tokens", FRAME_ONE, b"not a png at all")
             env = self.environment_for(directory, worker)
             with patch.object(subject, "encrypt_payload", return_value=b"KDLE" + b"z" * 8) as encrypt:
                 subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
-            self.assertEqual(encrypt.call_count, 1)
-            verdict = subject.unframe_payload(base64.b64decode(encrypt.call_args.args[0]["payload_b64"]))
-            self.assertEqual(verdict["screens"], {"status": "refused"})
-            self.assertEqual(sorted(path.name for path in (Path(directory) / "kd-quick-upload").iterdir()), ["linux-quick-return-v1.enc"])
-            lines = Path(env["GITHUB_OUTPUT"]).read_text(encoding="ascii").splitlines()
-            self.assertFalse(any(line.startswith("screens_parts=") for line in lines))
+            self.assertEqual(encrypt.call_count, subject.SCREENS_MAX_PARTS + 1)
+            self.assertEqual(self.last_verdict(encrypt)["screens"], {"status": "refused"})
+            self.assertEqual(self.staged_names(directory), self.all_members())
 
     @POSIX_OUTPUT
-    def test_a_failed_part_encryption_also_degrades_to_the_refused_marker(self):
+    def test_a_failed_part_encryption_degrades_to_the_refused_marker_without_parts(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as worker:
             write_records(directory)
             write_screen(worker, "01-tokens", FRAME_ONE, png_bytes())
@@ -908,18 +920,43 @@ class ScreensCommandTests(unittest.TestCase):
                 subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
             verdict = subject.unframe_payload(base64.b64decode(calls[-1]["payload_b64"]))
             self.assertEqual(verdict["screens"], {"status": "refused"})
-            self.assertEqual(sorted(path.name for path in (Path(directory) / "kd-quick-upload").iterdir()), ["linux-quick-return-v1.enc"])
+            self.assertEqual(self.staged_names(directory), ["linux-quick-return-v1.enc"])
 
     @POSIX_OUTPUT
-    def test_without_a_worker_path_or_pngs_the_verdict_says_none(self):
+    def test_with_a_worker_path_and_no_pngs_the_verdict_says_none_and_all_parts_are_fillers(self):
         with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as worker:
             write_records(directory)
             env = self.environment_for(directory, worker)
             with patch.object(subject, "encrypt_payload", return_value=b"KDLE" + b"z" * 8) as encrypt:
                 subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
-            verdict = subject.unframe_payload(base64.b64decode(encrypt.call_args.args[0]["payload_b64"]))
-            self.assertEqual(verdict["screens"], {"status": "none"})
-            self.assertEqual(sorted(path.name for path in (Path(directory) / "kd-quick-upload").iterdir()), ["linux-quick-return-v1.enc"])
+            self.assertEqual(self.last_verdict(encrypt)["screens"], {"status": "none"})
+            self.assertEqual(encrypt.call_count, subject.SCREENS_MAX_PARTS + 1)
+            self.assertEqual(self.staged_names(directory), self.all_members())
+
+    @POSIX_OUTPUT
+    def test_without_a_worker_path_only_the_verdict_member_is_returned(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as worker:
+            write_records(directory)
+            env = self.environment_for(directory, worker)
+            del env["WORKER_PATH"]
+            with patch.object(subject, "encrypt_payload", return_value=b"KDLE" + b"z" * 8) as encrypt:
+                subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
+            self.assertEqual(encrypt.call_count, 1)
+            self.assertEqual(self.last_verdict(encrypt)["screens"], {"status": "none"})
+            self.assertEqual(self.staged_names(directory), ["linux-quick-return-v1.enc"])
+
+    def test_filler_parts_are_fixed_closed_records_that_pad_to_the_part_bound(self):
+        self.assertEqual(len(subject.pad_screens_bodies([], REQUEST)), subject.SCREENS_MAX_PARTS)
+        real = [b"{}", b"{}"]
+        padded = subject.pad_screens_bodies(real, REQUEST)
+        self.assertEqual(len(padded), subject.SCREENS_MAX_PARTS)
+        self.assertEqual(padded[:2], real)
+        for index, body in enumerate(padded[2:], start=2):
+            self.assertEqual(json.loads(body.decode("ascii")), {
+                "schema_version": 1, "kind": "screens-filler", "request_id": REQUEST, "index": index,
+            })
+            self.assertEqual(len(subject.frame_payload(body)), subject.PADDED_BYTES)
+        self.assertEqual(refusal_reason(subject.pad_screens_bodies, [b"{}"] * (subject.SCREENS_MAX_PARTS + 1), REQUEST), "screens")
 
 
 class PublicLineTests(unittest.TestCase):

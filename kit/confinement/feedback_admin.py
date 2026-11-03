@@ -502,6 +502,8 @@ SCREENS_FRAME_DIGITS = 8
 SCREENS_PART_FIELDS = frozenset((
     "schema_version", "kind", "request_id", "index", "count", "sha256", "data_b64",
 ))
+SCREENS_FILLER_KIND = "screens-filler"
+SCREENS_FILLER_FIELDS = frozenset(("schema_version", "kind", "request_id", "index"))
 SCREENS_MANIFEST_FIELDS = frozenset((
     "status", "schema_version", "count", "bytes", "parts", "stream_sha256", "files",
 ))
@@ -570,6 +572,18 @@ def _unframe_screens_part(data, padded_bytes):
         _refuse()
 
 
+def _screens_filler_is_valid(frame, index, request_id):
+    """True when the frame is the fixed filler record for this position, which is then discarded."""
+    try:
+        record = _unframe_screens_part(frame, MAX_PLAINTEXT_BYTES)
+    except Exception:
+        return False
+    return (_exact_dict(record, SCREENS_FILLER_FIELDS) and record["schema_version"] == 1
+            and type(record["schema_version"]) is int and record["kind"] == SCREENS_FILLER_KIND
+            and record["request_id"] == request_id and type(record["index"]) is int
+            and record["index"] == index)
+
+
 def assemble_screens(manifest, frames, request_id):
     """Check the decrypted part frames against the manifest and return (path, bytes) pairs."""
     files = validate_screens_manifest(manifest)
@@ -607,6 +621,41 @@ def assemble_screens(manifest, frames, request_id):
     return result
 
 
+def _remove_screens_directory(dir_fd, name):
+    """Best-effort removal of a directory this module created, so a partial write cannot block a retry."""
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root = os.open(name, directory_flags, dir_fd=dir_fd)
+    except OSError:
+        return
+    try:
+        for phase in os.listdir(root):
+            try:
+                phase_fd = os.open(phase, directory_flags, dir_fd=root)
+            except OSError:
+                continue
+            try:
+                for item in os.listdir(phase_fd):
+                    try:
+                        os.unlink(item, dir_fd=phase_fd)
+                    except OSError:
+                        pass
+            finally:
+                os.close(phase_fd)
+            try:
+                os.rmdir(phase, dir_fd=root)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    finally:
+        os.close(root)
+    try:
+        os.rmdir(name, dir_fd=dir_fd)
+    except OSError:
+        pass
+
+
 def write_screens_directory(dir_fd, request_id, files):
     """Create the evidence directory below dir_fd and write every checked file once. Each path is
     revalidated against the exact shape, so no name can leave the directory."""
@@ -621,8 +670,11 @@ def write_screens_directory(dir_fd, request_id, files):
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     name = SCREENS_DIRECTORY_PREFIX + request_id + SCREENS_DIRECTORY_SUFFIX
     opened = []
+    created = False
+    failed = False
     try:
         os.mkdir(name, 0o700, dir_fd=dir_fd)
+        created = True
         root = os.open(name, directory_flags, dir_fd=dir_fd)
         opened.append(root)
         phases = {}
@@ -634,11 +686,15 @@ def write_screens_directory(dir_fd, request_id, files):
                 opened.append(phases[phase])
             _create_named(phases[phase], filename, data, mode=0o600, limit=SCREENS_MAX_FILE_BYTES)
         os.fsync(root)
-    except OSError:
-        _refuse()
+    except Exception:
+        failed = True
     finally:
         for descriptor in opened:
             os.close(descriptor)
+    if failed:
+        if created:
+            _remove_screens_directory(dir_fd, name)
+        _refuse()
     return name
 
 
@@ -1212,8 +1268,8 @@ class FeedbackAdmin:
             document = _unframe_screens_part(verdict, MAX_PLAINTEXT_BYTES)
             manifest = document.get("screens") if type(document) is dict else None
             if (frames is None or type(manifest) is not dict or manifest.get("status") != "ok"
-                    or type(frames) is not list or not 1 <= len(frames) <= SCREENS_MAX_PARTS
-                    or len(frames) != manifest.get("parts")):
+                    or type(manifest.get("parts")) is not int or type(frames) is not list
+                    or not 1 <= manifest["parts"] <= len(frames) <= SCREENS_MAX_PARTS):
                 return None
             decrypted = []
             for frame in frames:
@@ -1235,7 +1291,11 @@ class FeedbackAdmin:
                 finally:
                     if isinstance(plain, bytearray):
                         plain[:] = b"\x00" * len(plain)
-            return assemble_screens(manifest, decrypted, request_id)
+            parts = manifest["parts"]
+            for index in range(parts, len(decrypted)):
+                if not _screens_filler_is_valid(decrypted[index], index, request_id):
+                    return None
+            return assemble_screens(manifest, decrypted[:parts], request_id)
         except Exception:
             return None
 
@@ -1310,7 +1370,9 @@ class FeedbackAdmin:
             screens_directory = None
             if screen_files:
                 try:
-                    screens_directory = write_screens_directory(dir_fd, request_id, screen_files)
+                    screens_directory = os.path.join(
+                        self.state_directory, write_screens_directory(dir_fd, request_id, screen_files),
+                    )
                 except Exception:
                     screens_directory = None
             result = {

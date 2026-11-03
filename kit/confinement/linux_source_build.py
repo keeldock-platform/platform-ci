@@ -75,9 +75,7 @@ BROWSER_APT_COMMAND = (
     "-o", "Acquire::Retries=3",
 )
 BROWSER_APT_TIMEOUT_SECONDS = 900
-BROWSER_EVIDENCE_ROOT = ("docs", "reports")
-BROWSER_EVIDENCE_LIMIT = 4096
-BROWSER_EVIDENCE_NAME = "browser-evidence.json"
+BROWSER_WORKSPACE_PATHS = ("packages", "packages/kernel-ui-kit", "packages/kernel-ui-kit/package.json")
 SYNTHETIC_LOG_CANARY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 SOURCE_SHA_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX64_RE = re.compile(r"[a-f0-9]{64}\Z")
@@ -1075,18 +1073,17 @@ def _extract_browser_archive(archive_path, destination):
 
 def _install_browser_packages():
     environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C", "LC_ALL": "C"}
-    for argv, required in (
-        (BROWSER_APT_COMMAND + ("update",), False),
-        (BROWSER_APT_COMMAND + ("install", "--yes", "--no-install-recommends", "--") + BROWSER_APT_PACKAGES, True),
+    for argv in (
+        BROWSER_APT_COMMAND + ("update",),
+        BROWSER_APT_COMMAND + ("install", "--yes", "--no-install-recommends", "--") + BROWSER_APT_PACKAGES,
     ):
         try:
             subprocess.run(
                 list(argv), env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, timeout=BROWSER_APT_TIMEOUT_SECONDS, check=required, close_fds=True,
+                stderr=subprocess.PIPE, timeout=BROWSER_APT_TIMEOUT_SECONDS, check=True, close_fds=True,
             )
         except (OSError, subprocess.SubprocessError):
-            if required:
-                raise SourceBuildRefusal("toolchain") from None
+            raise SourceBuildRefusal("toolchain") from None
 
 
 def _prepare_browser(root):
@@ -1115,32 +1112,6 @@ def _browser_installed(browser_root):
         return executable.is_file() and marker.is_file() and os.access(executable, os.X_OK)
     except OSError:
         return False
-
-
-def _browser_evidence(worker):
-    files = 0
-    size = 0
-    entries = 0
-    root = Path(worker).joinpath(*BROWSER_EVIDENCE_ROOT)
-    if any(Path(worker).joinpath(*BROWSER_EVIDENCE_ROOT[:count]).is_symlink()
-           for count in range(1, len(BROWSER_EVIDENCE_ROOT) + 1)):
-        return 0, 0
-    for current, directories, names in os.walk(root, followlinks=False):
-        directories[:] = [name for name in directories if not os.path.islink(os.path.join(current, name))]
-        for name in names:
-            entries += 1
-            if entries > BROWSER_EVIDENCE_LIMIT:
-                return files, size
-            path = Path(current) / name
-            if name.endswith(".png") and not path.is_symlink():
-                try:
-                    details = path.lstat()
-                except OSError:
-                    continue
-                if stat.S_ISREG(details.st_mode):
-                    files += 1
-                    size += details.st_size
-    return files, size
 
 
 def prepare_toolchains(environ=None):
@@ -2718,6 +2689,22 @@ def _runtime_workspace_present(project):
     return all(present)
 
 
+def _ui_kit_workspace_present(project):
+    for relative_path in BROWSER_WORKSPACE_PATHS:
+        try:
+            info = (project / relative_path).lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise SourceBuildRefusal("gate") from None
+        if relative_path == BROWSER_WORKSPACE_PATHS[-1]:
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise SourceBuildRefusal("gate")
+        elif not stat.S_ISDIR(info.st_mode):
+            raise SourceBuildRefusal("gate")
+    return True
+
+
 def _gate_commands(project, rust_root, node_bin, browser=False):
     try:
         return gate_table.render(
@@ -2798,9 +2785,9 @@ def run_project_gates(environ=None):
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     records.mkdir(mode=0o700, parents=True, exist_ok=True)
     browser_root = env.get(BROWSER_ROOT_ENV, "")
-    browser = bool(browser_root)
-    if browser and not _browser_installed(browser_root):
+    if browser_root and not _browser_installed(browser_root):
         raise SourceBuildRefusal("gate")
+    browser = bool(browser_root) and _ui_kit_workspace_present(worker)
     commands = _gate_commands(worker, rust_root, node_bin, browser)
     selected_gates = tuple(name for name, unused_argv in commands)
     expected_gates = GATES + (RUNTIME_GATE_NAMES if _runtime_workspace_present(worker) else ())
@@ -2862,15 +2849,6 @@ def run_project_gates(environ=None):
             outcomes[name] = "failed"
             failure = (name, _gate_cause(result))
             break
-    if browser and outcomes[BROWSER_GATE_NAMES[0]] != "not-run":
-        evidence_files, evidence_bytes = _browser_evidence(worker)
-        (records / BROWSER_EVIDENCE_NAME).write_text(
-            json.dumps(
-                {"schema_version": 1, "files": evidence_files, "bytes": evidence_bytes},
-                sort_keys=True, separators=(",", ":"),
-            ) + "\n",
-            encoding="ascii",
-        )
     completed_gates = [name for name in selected_gates if outcomes[name] == "passed"]
     (records / "gate-durations.json").write_text(
         json.dumps({"schema_version": 1, "durations_ms": durations}, sort_keys=True, separators=(",", ":")) + "\n",
@@ -2936,7 +2914,9 @@ def _verified_gate_count(records, env):
     if type(gates) is not dict or type(gates.get("selected_gates")) is not list:
         return 0
     selected_gates = tuple(gates["selected_gates"])
-    expected_gate_sets = (GATES + BROWSER_GATE_NAMES, GATES + RUNTIME_GATE_NAMES + BROWSER_GATE_NAMES)
+    expected_gate_sets = (
+        GATES, GATES + RUNTIME_GATE_NAMES, GATES + BROWSER_GATE_NAMES, GATES + RUNTIME_GATE_NAMES + BROWSER_GATE_NAMES,
+    )
     if (set(gates) != {
                 "schema_version", "selected_gates", "completed_gates", "gates", "gate_count", "failed",
             }
@@ -2956,7 +2936,7 @@ def _verified_gate_count(records, env):
             or revoke.get("installation_id") != env.get("SOURCE_READER_INSTALLATION_ID")
             or revoke.get("rejected_after_revoke") is not True):
         return 0
-    return len(selected_gates) - len(BROWSER_GATE_NAMES)
+    return len(selected_gates) - (len(BROWSER_GATE_NAMES) if selected_gates[-1:] == BROWSER_GATE_NAMES else 0)
 
 
 def _verdict_record(environ):

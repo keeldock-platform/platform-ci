@@ -215,6 +215,7 @@ def _runtime():
         CORE_CONTRACT_FEEDBACK_FILES=validation.CORE_CONTRACT_FEEDBACK_FILES,
         CORE_CONTRACT_KERNEL_FEEDBACK_FILES=validation.CORE_CONTRACT_KERNEL_FEEDBACK_FILES,
         CORE_CONTRACT_KERNEL_UI_KIT_FILES=validation.CORE_CONTRACT_KERNEL_UI_KIT_FILES,
+        CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES=validation.CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES,
         _core_contract_pattern_paths=validation._core_contract_pattern_paths,
         MAX_CORE_CONTRACT_TS_SOURCES=validation.MAX_CORE_CONTRACT_TS_SOURCES,
         MAX_CORE_CONTRACT_TS_TESTS=validation.MAX_CORE_CONTRACT_TS_TESTS,
@@ -490,7 +491,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                     accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
                 )
 
-    def test_the_ui_kit_pair_is_accepted_for_bootstrap_only_and_never_alone(self):
+    def test_the_ui_kit_pair_is_accepted_for_bootstrap_and_never_alone(self):
         def add_pair(source):
             for name in ("kernel-icons", "kernel-ui-kit"):
                 (source / "packages" / name).mkdir(parents=True)
@@ -530,6 +531,75 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                     "verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE, mutate,
                     accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
                 )
+
+    def _kit_tree(self, with_companions=True, skip=None, extra=None, link=None):
+        def mutate(source):
+            paths = set(validation.CORE_CONTRACT_KERNEL_UI_KIT_FILES)
+            if not with_companions:
+                paths = set(validation.CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES)
+            paths.discard(skip)
+            for relative in sorted(paths | ({extra} if extra else set())):
+                target = source / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.touch()
+            for name in ("kernel-icons", "kernel-ui-kit"):
+                (source / "packages" / name).mkdir(parents=True, exist_ok=True)
+            if link is not None:
+                (source / link[0]).symlink_to(link[1])
+        return mutate
+
+    def test_verify_copies_the_ui_kit_files_beside_the_reviewed_typescript(self):
+        result, producer, unused_contract = self._run(
+            "verify", "build_diagnostics", validated_tree=subject.PACKAGE_LOCK_TREE,
+            accepted_provenance={"status": "accepted"}, lock_bytes=b"lock", mutate_source=self._kit_tree(),
+        )
+        copied = producer.copies[0][2]
+        self.assertEqual(
+            set(copied),
+            subject.NODE_REVIEWED_FILES | set(KERNEL_TS_PATHS) | validation.CORE_CONTRACT_KERNEL_UI_KIT_FILES,
+        )
+        self.assertEqual(list(copied), sorted(copied))
+        self.assertEqual(result["node_reviewed_file_count"], len(copied))
+        self.assertLessEqual(len(copied), subject.MAX_NODE_REVIEWED_FILES)
+        self.assertEqual(result["stages"], subject.NODE_GATE_NAMES)
+
+    def test_verify_copies_only_the_ui_kit_companions_that_exist(self):
+        result, producer, unused_contract = self._run(
+            "verify", "build_diagnostics", validated_tree=subject.PACKAGE_LOCK_TREE,
+            accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+            mutate_source=self._kit_tree(with_companions=False),
+        )
+        copied = set(producer.copies[0][2])
+        self.assertTrue(validation.CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES.issubset(copied))
+        self.assertFalse(validation.CORE_CONTRACT_KERNEL_UI_KIT_COMPANION_FILES & copied)
+
+    def test_verify_refuses_a_ui_kit_tree_that_misses_a_gated_file_or_adds_an_unlisted_one(self):
+        gated = "packages/kernel-ui-kit/src/index.ts"
+        cases = (
+            ("missing_gated", self._kit_tree(skip=gated)),
+            ("unlisted_source", self._kit_tree(extra="packages/kernel-ui-kit/src/unlisted.ts")),
+            ("unlisted_test", self._kit_tree(extra="packages/kernel-icons/tests/unlisted.test.tsx")),
+            ("linked_file", self._kit_tree(link=("packages/kernel-ui-kit/src/linked.ts", "index.ts"))),
+            ("linked_directory", self._kit_tree(link=("packages/kernel-ui-kit/src/linked", "components"))),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                self._refused(
+                    "verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE, mutate,
+                    accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+                )
+
+    def test_verify_refuses_the_ui_kit_when_the_validator_does_not_supply_the_gated_files(self):
+        runtime = _runtime()
+        del runtime.CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES
+        with patch.object(sys.modules[__name__], "_runtime", return_value=runtime):
+            with self.assertRaises(FeedbackRefusal) as caught:
+                self._run(
+                    "verify", "build_diagnostics", validated_tree=subject.PACKAGE_LOCK_TREE,
+                    accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+                    mutate_source=self._kit_tree(),
+                )
+        self.assertEqual(caught.exception.reason, "manifest_invalid")
 
     def test_bootstrap_refuses_the_ui_kit_pair_when_the_validator_does_not_supply_its_files(self):
         runtime = _runtime()

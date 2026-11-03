@@ -3,6 +3,7 @@ import hashlib
 from email.message import Message
 import io
 import json
+import random
 import urllib.parse
 import zipfile
 import unittest
@@ -1001,7 +1002,8 @@ class QuickEvidenceTests(unittest.TestCase):
                 info.create_system = 3
                 info.external_attr = 0o600 << 16
                 info.compress_type = compression
-                archive.writestr(info, b"KDLE" + bytes([index]) * (size - 4))
+                body = random.Random(index).randbytes(size - 4) if compression == zipfile.ZIP_DEFLATED else bytes([index]) * (size - 4)
+                archive.writestr(info, b"KDLE" + body)
         return result.getvalue()
 
     def test_screens_members_are_returned_in_part_order_beside_the_verdict(self):
@@ -1013,28 +1015,54 @@ class QuickEvidenceTests(unittest.TestCase):
         self.api.archive = _quick_archive(self.api.member_size)
         self.assertNotIn("screens", self._collect())
 
-    def test_screens_members_outside_the_fixed_set_are_refused(self):
+    def test_names_outside_the_fixed_set_refuse_the_whole_evidence(self):
         profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
         part = feedback_api.QUICK_SCREENS_MEMBER
         verdict = profile["member_name"]
         for label, names in (
-            ("gap", [verdict, part % 0, part % 2]),
-            ("start", [verdict, part % 1, part % 2]),
             ("duplicate", [verdict, part % 0, part % 0]),
             ("no_verdict", [part % 0, part % 1, part % 2]),
             ("other_name", [verdict, part % 0, "extra.enc"]),
             ("nested", [verdict, "a/" + part % 0, part % 1]),
+            ("beyond_the_bound", [verdict, part % 0, part % feedback_api.QUICK_SCREENS_MAX_PARTS]),
         ):
             with self.subTest(label=label):
                 self.api.archive = self._multi_archive(names=names)
                 with self.assertRaises(feedback_api.FeedbackAPIRefusal):
                     self._collect()
 
-    def test_screens_members_must_be_stored_frames_of_the_exact_size(self):
-        self.api.archive = self._multi_archive(compression=zipfile.ZIP_DEFLATED)
+    def test_a_defective_screens_set_drops_only_the_screens(self):
+        profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
+        part = feedback_api.QUICK_SCREENS_MEMBER
+        verdict = profile["member_name"]
+        for label, names in (("gap", [verdict, part % 0, part % 2]), ("start", [verdict, part % 1, part % 2])):
+            with self.subTest(label=label):
+                self.api.archive = self._multi_archive(names=names)
+                evidence = self._collect()
+                self.assertNotIn("screens", evidence)
+                self.assertEqual(evidence["ciphertext"][4], 0)
+        archive = self._multi_archive(parts=2)
+        with patch.object(feedback_api, "_quick_member_bytes", side_effect=[b"vvvv", b"pppp", ValueError()]):
+            self.assertEqual(feedback_api._quick_multi_members(archive, verdict), (b"vvvv", []))
+        member, screens = feedback_api._quick_multi_members(archive, verdict)
+        self.assertEqual((member[4], [item[4] for item in screens]), (0, [1, 2]))
+
+    def test_a_defective_verdict_member_refuses_the_whole_evidence(self):
+        profile = feedback_request.PROFILE_BY_KIND[feedback_request.LINUX_QUICK_KIND]
+        self.api.archive = self._multi_archive(size=feedback_api.QUICK_FRAME_BYTES - 1)
         with self.assertRaises(feedback_api.FeedbackAPIRefusal):
             self._collect()
-        self.api.archive = self._multi_archive(size=feedback_api.QUICK_FRAME_BYTES - 1)
+        with patch.object(feedback_api, "_quick_member_bytes", side_effect=ValueError()):
+            with self.assertRaises(feedback_api.FeedbackAPIRefusal):
+                feedback_api._quick_multi_members(self._multi_archive(parts=1), profile["member_name"])
+
+    def test_screens_members_may_be_deflated_and_are_inflated_within_the_bound(self):
+        self.api.archive = self._multi_archive(compression=zipfile.ZIP_DEFLATED)
+        evidence = self._collect()
+        self.assertEqual(len(evidence["screens"]), 2)
+        self.assertEqual(evidence["ciphertext"][:4], b"KDLE")
+        self.assertEqual(len(evidence["ciphertext"]), feedback_api.QUICK_FRAME_BYTES)
+        self.api.archive = self._multi_archive(compression=zipfile.ZIP_DEFLATED, size=feedback_api.QUICK_FRAME_BYTES - 1)
         with self.assertRaises(feedback_api.FeedbackAPIRefusal):
             self._collect()
 
