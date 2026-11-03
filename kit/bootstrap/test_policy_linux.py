@@ -260,6 +260,28 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertNotIn("KD_CANARY_SECRET", self.jobs()["linux-source-admission-settings"])
         self.assertNotIn("KD_CANARY_SECRET", self.jobs()["linux-source-admission-unit"])
 
+    def test_every_job_that_mints_a_verifier_token_has_both_source_reader_ids_in_job_scope(self):
+        found = []
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            if "linux_source_build.py mint-verifier-token" not in text:
+                continue
+            parts = re.split(r"(?m)^  ([A-Za-z0-9_-]+):\n", text.split("\njobs:\n", 1)[1])
+            for index in range(1, len(parts), 2):
+                job = parts[index + 1]
+                if "linux_source_build.py mint-verifier-token" not in job:
+                    continue
+                found.append((path.name, parts[index]))
+                head = job.split("    steps:\n", 1)[0]
+                for name in ("SOURCE_READER_CLIENT_ID", "SOURCE_READER_INSTALLATION_ID"):
+                    with self.subTest(workflow=path.name, job=parts[index], variable=name):
+                        self.assertIn("      " + name + ": ${{ vars." + name + " }}\n", head)
+        self.assertEqual(found, [("linux-source-admission.yml", "linux-source-admission-verdict")])
+        template = policy_linux.LINUX_SOURCE_ADMISSION_WORKFLOW_TEMPLATE
+        verdict = template.split("\n  linux-source-admission-verdict:\n", 1)[1].split("    steps:\n", 1)[0]
+        self.assertIn("      SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}\n", verdict)
+        self.assertIn("      SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}\n", verdict)
+
     def test_private_source_owner_and_name_come_from_secrets_and_never_from_variables(self):
         self.assertNotIn("vars.LINUX_SOURCE_REPOSITORY", self.text)
         self.assertNotIn("vars.SOURCE_REPOSITORY_OWNER", self.text)

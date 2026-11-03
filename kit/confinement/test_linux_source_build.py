@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import hashlib
 import io
@@ -1753,6 +1754,40 @@ class LinuxSourceBuildTests(unittest.TestCase):
         ]):
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
                 linux_source_build.mint_verifier_token(env)
+
+    def test_verifier_key_forms_are_normalised_and_a_refusal_names_only_a_closed_stage(self):
+        pem = "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----"
+        encoded = base64.b64encode(pem.encode("ascii")).decode("ascii")
+        self.assertEqual(linux_source_build._app_key_pem(pem), pem + "\n")
+        self.assertEqual(linux_source_build._app_key_pem("  " + pem + "\n\n"), pem + "\n")
+        self.assertEqual(linux_source_build._app_key_pem(encoded), pem + "\n")
+        self.assertEqual(linux_source_build._app_key_pem(pem.replace("\n", "\\n")), pem + "\n")
+        for bad in ("", "not a key", "!!!!", "-----BEGIN " + "A" * 17000, base64.b64encode(b"plain text").decode("ascii")):
+            with self.subTest(bad=bad[:12]):
+                self.assertEqual(linux_source_build._app_key_pem(bad), "")
+        identity = {"owner": "KeelDock", "name": "private-source", "repository_id": "41"}
+        env = {
+            "SOURCE_READER_CLIENT_ID": "Iv1.abc123", "SOURCE_READER_INSTALLATION_ID": "19",
+            "SOURCE_READER_PRIVATE_KEY": "not a key",
+        }
+        with patch.object(linux_source_build, "_source_inputs", return_value=identity):
+            transcript = io.StringIO()
+            with patch.object(linux_source_build.sys, "stdout", transcript):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal) as raised:
+                    linux_source_build.mint_verifier_token(env)
+            self.assertEqual(raised.exception.reason, "token")
+            self.assertEqual(transcript.getvalue(), "linux-verifier-token-diag stage=key_format\n")
+            transcript = io.StringIO()
+            with patch.object(linux_source_build.sys, "stdout", transcript):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                    linux_source_build.mint_verifier_token({
+                        "SOURCE_READER_INSTALLATION_ID": "19", "SOURCE_READER_PRIVATE_KEY": pem,
+                    })
+            self.assertEqual(transcript.getvalue(), "linux-verifier-token-diag stage=input\n")
+        source = Path(linux_source_build.__file__).read_text(encoding="ascii")
+        self.assertEqual(set(re.findall(r'_token_refusal\("([a-z_]+)"\)', source)), {
+            "input", "key_format", "key_write", "sign", "installation", "issue", "permissions", "repositories",
+        })
 
     def test_shared_auditor_rejects_verdict_outside_the_plain_run_step(self):
         expected = linux_source_build._expected_run({

@@ -610,17 +610,43 @@ def _write_output(environ, values):
             sink.write(key + "=" + value + "\n")
 
 
+APP_KEY_BASE64_RE = re.compile(r"[A-Za-z0-9+/]{1,22000}={0,2}\Z")
+
+
+def _token_refusal(stage):
+    sys.stdout.write("linux-verifier-token-diag stage=" + stage + "\n")
+    sys.stdout.flush()
+    return SourceBuildRefusal("token")
+
+
+def _app_key_pem(raw):
+    value = raw.strip()
+    if not value.startswith("-----BEGIN "):
+        compact = "".join(value.split())
+        if APP_KEY_BASE64_RE.fullmatch(compact) is None:
+            return ""
+        try:
+            value = base64.b64decode(compact, validate=True).decode("ascii").strip()
+        except (ValueError, UnicodeError):
+            return ""
+    if "\n" not in value and "\\n" in value:
+        value = value.replace("\\n", "\n")
+    if not value.startswith("-----BEGIN ") or len(value) > 16384:
+        return ""
+    return value + "\n"
+
+
 def mint_verifier_token(environ=None):
     env = os.environ if environ is None else environ
     identity = _source_inputs(env)
     client_id = env.get("SOURCE_READER_CLIENT_ID", "")
     installation_id = env.get("SOURCE_READER_INSTALLATION_ID", "")
-    private_key = env.get("SOURCE_READER_PRIVATE_KEY", "")
+    private_key = _app_key_pem(env.get("SOURCE_READER_PRIVATE_KEY", ""))
     if (re.fullmatch(r"[A-Za-z0-9_.-]{3,100}", client_id) is None
-            or DECIMAL_RE.fullmatch(installation_id) is None
-            or not private_key.startswith("-----BEGIN ")
-            or len(private_key) > 16384):
-        raise SourceBuildRefusal("token")
+            or DECIMAL_RE.fullmatch(installation_id) is None):
+        raise _token_refusal("input")
+    if not private_key:
+        raise _token_refusal("key_format")
     now = int(time.time())
     header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=")
     claims = json.dumps({"iat": now - 60, "exp": now + 540, "iss": client_id}, separators=(",", ":")).encode("ascii")
@@ -631,7 +657,7 @@ def mint_verifier_token(environ=None):
         descriptor = os.memfd_create("kd-app-key", os.MFD_CLOEXEC)
         key_bytes = private_key.encode("ascii")
         if os.write(descriptor, key_bytes) != len(key_bytes):
-            raise SourceBuildRefusal("token")
+            raise _token_refusal("key_write")
         os.lseek(descriptor, 0, os.SEEK_SET)
         signed = subprocess.run(
             ["/usr/bin/openssl", "dgst", "-sha256", "-sign", "/proc/self/fd/" + str(descriptor)],
@@ -640,37 +666,37 @@ def mint_verifier_token(environ=None):
             env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
         )
     except (OSError, UnicodeError, subprocess.SubprocessError):
-        raise SourceBuildRefusal("token") from None
+        raise _token_refusal("sign") from None
     finally:
         if descriptor >= 0:
             os.close(descriptor)
     if signed.returncode != 0 or len(signed.stdout) < 64 or len(signed.stdout) > 1024:
-        raise SourceBuildRefusal("token")
+        raise _token_refusal("sign")
     jwt = signing_input.decode("ascii") + "." + base64.urlsafe_b64encode(signed.stdout).rstrip(b"=").decode("ascii")
     unused, installation = _api_request("/app/installations/" + installation_id, jwt)
     account = installation.get("account") if type(installation) is dict else None
     if (type(installation) is not dict or installation.get("id") != int(installation_id)
             or type(account) is not dict or type(account.get("login")) is not str
             or account["login"].lower() != identity["owner"].lower()):
-        raise SourceBuildRefusal("token")
+        raise _token_refusal("installation")
     unused, issued = _api_request(
         "/app/installations/" + installation_id + "/access_tokens", jwt, method="POST",
         payload={"repositories": [identity["name"]], "permissions": {"contents": "read"}}, expected=(201,),
     )
     token = issued.get("token") if type(issued) is dict else None
     if type(token) is not str or re.fullmatch(r"[A-Za-z0-9_]{20,1024}", token) is None:
-        raise SourceBuildRefusal("token")
+        raise _token_refusal("issue")
     permissions = issued.get("permissions")
     if (type(permissions) is not dict or permissions.get("contents") != "read"
             or set(permissions) - {"contents", "metadata"}
             or any(value != "read" for value in permissions.values())):
-        raise SourceBuildRefusal("token")
+        raise _token_refusal("permissions")
     unused, repositories = _api_request("/installation/repositories?per_page=100", token)
     entries = repositories.get("repositories") if type(repositories) is dict else None
     if (type(entries) is not list or len(entries) != 1 or repositories.get("total_count") != 1
             or type(entries[0]) is not dict or entries[0].get("id") != int(identity["repository_id"])
             or entries[0].get("name") != identity["name"]):
-        raise SourceBuildRefusal("token")
+        raise _token_refusal("repositories")
     sys.stdout.write("::add-mask::" + token + "\n")
     sys.stdout.flush()
     _write_output(env, {"token": token, "installation_id": installation_id})
