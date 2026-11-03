@@ -90,6 +90,11 @@ LENGTH_BUCKETS = ((0, "0"), (19, "1-19"), (255, "20-255"), (1024, "256-1024"), (
 TOKEN_CLASS_NAMES = ("letters", "digits", "underscore", "dash", "dot", "other")
 ENVIRONMENT_NAME = "linux-source-read"
 ENVIRONMENT_BRANCHES = ("main", "untrusted")
+SOURCE_IDENTITY_NAMES = (
+    "SOURCE_REPOSITORY_ID", "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME",
+    "SOURCE_READER_INSTALLATION_ID", "SOURCE_READER_CLIENT_ID",
+)
+SOURCE_HELD_NAMES = SOURCE_IDENTITY_NAMES + ("SOURCE_READER_PRIVATE_KEY", "SOURCE_READER_TOKEN")
 GATES = gate_table.GATES
 RUNTIME_GATE_NAMES = gate_table.RUNTIME_GATE_NAMES
 BROWSER_GATE_NAMES = gate_table.BROWSER_GATE_NAMES
@@ -378,9 +383,11 @@ def _environment_prefix(environ):
     return value
 
 
-def _source_inputs(environ, prefix=None):
-    if prefix is None:
-        prefix = _environment_prefix(environ)
+def _request_binding(environ, prefix):
+    """Check the dispatch request against the reviewed allow-list variables only.
+
+    It reads no source repository identity, reader identity or secret, so the environment-free
+    Windows settings job can run it; the full binding is _source_inputs."""
     if type(prefix) is not str or prefix not in SOURCE_PREFIXES:
         raise SourceBuildRefusal("binding")
     source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
@@ -402,33 +409,54 @@ def _source_inputs(environ, prefix=None):
     if any(environ.get(name) != value for name, value in values.items()):
         raise SourceBuildRefusal("binding")
     for name in (
-        "SOURCE_REPOSITORY_ID", "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME",
-        "SOURCE_READER_INSTALLATION_ID", "SOURCE_READER_CLIENT_ID",
         prefix + "_ACCEPTED_NODE_LOCK_SHA256", prefix + "_ACCEPTED_MANIFEST_SHA256",
         prefix + "_ACCEPTED_NODE_PROVENANCE_JSON", prefix + "_ENVIRONMENT_NAME",
     ):
         if not environ.get(name):
             raise SourceBuildRefusal("binding")
-    if (DECIMAL_RE.fullmatch(environ["SOURCE_REPOSITORY_ID"]) is None
-            or DECIMAL_RE.fullmatch(environ["SOURCE_READER_INSTALLATION_ID"]) is None
-            or not OWNER_RE.fullmatch(environ["SOURCE_REPOSITORY_OWNER"])
-            or not OWNER_RE.fullmatch(environ["SOURCE_REPOSITORY_NAME"])
-            or HEX64_RE.fullmatch(environ[prefix + "_ACCEPTED_NODE_LOCK_SHA256"]) is None
+    if (HEX64_RE.fullmatch(environ[prefix + "_ACCEPTED_NODE_LOCK_SHA256"]) is None
             or HEX64_RE.fullmatch(environ[prefix + "_ACCEPTED_MANIFEST_SHA256"]) is None):
         raise SourceBuildRefusal("binding")
     if (environ.get("REQUESTED_ENVIRONMENT_NAME") != environ[prefix + "_ENVIRONMENT_NAME"]
             or environ[prefix + "_ENVIRONMENT_NAME"] != ENVIRONMENT_NAME):
         raise SourceBuildRefusal("binding")
-    identity = {
+    return {
         "source_sha": source_sha,
         "base_sha": base_sha,
         "base_branch": base_branch,
         "reviewed_diff_sha256": fingerprint,
         "control_sha": control_sha,
-        "repository_id": environ["SOURCE_REPOSITORY_ID"],
-        "owner": environ["SOURCE_REPOSITORY_OWNER"],
-        "name": environ["SOURCE_REPOSITORY_NAME"],
     }
+
+
+def _settings_binding(environ, prefix):
+    """Bind a Windows settings dispatch without the source identity.
+
+    The settings job has no environment, so it must hold no source repository identity, reader
+    identity, reader key or reader token; any such name in its environment is refused. The
+    source-read fetch job repeats the full _source_inputs binding before any token is minted."""
+    if prefix != WINDOWS_SOURCE_PREFIX:
+        raise SourceBuildRefusal("binding")
+    if any(name in environ for name in SOURCE_HELD_NAMES):
+        raise SourceBuildRefusal("binding")
+    return _request_binding(environ, prefix)
+
+
+def _source_inputs(environ, prefix=None):
+    if prefix is None:
+        prefix = _environment_prefix(environ)
+    identity = _request_binding(environ, prefix)
+    for name in SOURCE_IDENTITY_NAMES:
+        if not environ.get(name):
+            raise SourceBuildRefusal("binding")
+    if (DECIMAL_RE.fullmatch(environ["SOURCE_REPOSITORY_ID"]) is None
+            or DECIMAL_RE.fullmatch(environ["SOURCE_READER_INSTALLATION_ID"]) is None
+            or not OWNER_RE.fullmatch(environ["SOURCE_REPOSITORY_OWNER"])
+            or not OWNER_RE.fullmatch(environ["SOURCE_REPOSITORY_NAME"])):
+        raise SourceBuildRefusal("binding")
+    identity["repository_id"] = environ["SOURCE_REPOSITORY_ID"]
+    identity["owner"] = environ["SOURCE_REPOSITORY_OWNER"]
+    identity["name"] = environ["SOURCE_REPOSITORY_NAME"]
     _validate_provenance_binding(identity, environ, prefix)
     return identity
 
@@ -467,7 +495,7 @@ def _tier(environ):
     return tier
 
 
-def validate_dispatch(environ, api_token=None, prefix=LINUX_SOURCE_PREFIX):
+def validate_dispatch(environ, api_token=None, prefix=LINUX_SOURCE_PREFIX, source_identity=True):
     if type(prefix) is not str or prefix not in SOURCE_PREFIXES:
         raise SourceBuildRefusal("identity")
     windows = prefix == WINDOWS_SOURCE_PREFIX
@@ -475,6 +503,12 @@ def validate_dispatch(environ, api_token=None, prefix=LINUX_SOURCE_PREFIX):
         raise SourceBuildRefusal("identity")
     if not windows and "KD_SOURCE_PREFIX" in environ:
         raise SourceBuildRefusal("identity")
+    if source_identity is not True and source_identity is not False:
+        raise SourceBuildRefusal("identity")
+    if not source_identity and not windows:
+        raise SourceBuildRefusal("identity")
+    if not source_identity and any(name in environ for name in SOURCE_HELD_NAMES):
+        raise SourceBuildRefusal("binding")
     tier = "admission" if windows else _tier(environ)
     if (environ.get("CI_EVENT_NAME") != "workflow_dispatch"
             or environ.get("CI_REPOSITORY") != REPOSITORY
@@ -510,7 +544,10 @@ def validate_dispatch(environ, api_token=None, prefix=LINUX_SOURCE_PREFIX):
     if windows:
         if ref != "refs/heads/untrusted":
             raise SourceBuildRefusal("identity")
-        _source_inputs(environ, prefix=prefix)
+        if source_identity:
+            _source_inputs(environ, prefix=prefix)
+        else:
+            _settings_binding(environ, prefix)
         _verify_environment(api_token)
         _require_no_duplicate(api_token, environ, workflow=WINDOWS_TIER)
         return "source"
@@ -911,7 +948,7 @@ def windows_snapshot(environ=None):
         api = audit._default_api_factory(token, REPOSITORY)
         digest = audit.cache_inventory_digest(audit._collect_caches(api, REPOSITORY))
         _write_output(env, {"cache_digest": digest})
-        state = validate_dispatch(env, token, WINDOWS_SOURCE_PREFIX)
+        state = validate_dispatch(env, token, WINDOWS_SOURCE_PREFIX, source_identity=False)
         sys.stdout.write("windows-source-settings=verified mode=" + state + " cache=snapped\n")
         return 0
     except SourceBuildRefusal as error:
@@ -925,7 +962,7 @@ def windows_snapshot(environ=None):
 def windows_preflight(environ=None):
     env = os.environ if environ is None else environ
     try:
-        mode = validate_dispatch(env, None, WINDOWS_SOURCE_PREFIX)
+        mode = validate_dispatch(env, None, WINDOWS_SOURCE_PREFIX, source_identity=True)
         sys.stdout.write("windows-source-preflight=verified mode=" + mode + " cache-mode=none\n")
         return 0
     except SourceBuildRefusal as error:

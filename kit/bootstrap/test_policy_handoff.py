@@ -261,6 +261,39 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
         self.assertEqual(admission.count(WINDOWS_ENVIRONMENT), 1)
         self.assertIn("windows-source-exec", admission)
 
+    def test_the_settings_job_never_holds_the_source_identity_and_the_fetch_job_rebinds_it(self):
+        settings = job_block(read_ascii(WINDOWS_ADMISSION_PATH), "settings")
+        for name in (
+            "SOURCE_REPOSITORY_ID", "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME",
+            "SOURCE_READER_INSTALLATION_ID", "SOURCE_READER_CLIENT_ID", "SOURCE_READER_PRIVATE_KEY",
+            "SOURCE_READER_TOKEN", "vars.SOURCE_", "secrets.", "environment:", "source-read",
+        ):
+            with self.subTest(name=name):
+                self.assertNotIn(name, settings)
+        self.assertEqual(
+            set(re.findall(r"vars\.([A-Z0-9_]+)", settings)),
+            {
+                "WINDOWS_SOURCE_ENVIRONMENT_NAME", "WINDOWS_SOURCE_ALLOWED_SHA",
+                "WINDOWS_SOURCE_ALLOWED_BASE_SHA", "WINDOWS_SOURCE_ALLOWED_BASE_BRANCH",
+                "WINDOWS_SOURCE_ALLOWED_FINGERPRINT", "WINDOWS_SOURCE_ALLOWED_CONTROL_SHA",
+                "WINDOWS_SOURCE_ACCEPTED_NODE_LOCK_SHA256", "WINDOWS_SOURCE_ACCEPTED_MANIFEST_SHA256",
+                "WINDOWS_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON",
+            },
+        )
+        fetch = read_ascii(LINUX_FETCH_PATH)
+        for name in (
+            "SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}",
+            "SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}",
+            "SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}",
+            "SOURCE_READER_INSTALLATION_ID: ${{ vars.SOURCE_READER_INSTALLATION_ID }}",
+            "SOURCE_READER_CLIENT_ID: ${{ vars.SOURCE_READER_CLIENT_ID }}",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(fetch.count("      " + name + "\n"), 1)
+        preflight = fetch.index("        run: python3 -B kit/confinement/linux_source_build.py windows-preflight\n")
+        self.assertLess(fetch.index(SOURCE_READ_ENVIRONMENT), preflight)
+        self.assertLess(preflight, fetch.index("      - name: Mint scoped source-reader token\n"))
+
     def test_top_level_permissions_are_empty_and_job_permissions_stay_least_privilege(self):
         for path in SOURCE_ADMISSION_PATHS:
             text = read_ascii(path)

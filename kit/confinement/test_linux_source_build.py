@@ -3609,6 +3609,7 @@ class WindowsSourceBindingTests(unittest.TestCase):
                     self.assertEqual(function(environment), 0)
                 self.assertEqual(output.getvalue(), name + "=verified mode=source" + suffix + "\n")
                 self.assertEqual(dispatch.call_args.args[2], "WINDOWS_SOURCE")
+                self.assertEqual(dispatch.call_args.kwargs, {"source_identity": True})
             for error, reason in (
                 (linux_source_build.SourceBuildRefusal("binding"), "binding"), (ValueError("x"), "invalid"),
             ):
@@ -3632,6 +3633,7 @@ class WindowsSourceBindingTests(unittest.TestCase):
                     self.assertEqual(linux_source_build.windows_snapshot(environment), 0)
                 self.assertEqual(output.getvalue(), "windows-source-settings=verified mode=synthetic cache=snapped\n")
                 self.assertEqual(dispatch.call_args.args, (environment, "token", "WINDOWS_SOURCE"))
+                self.assertEqual(dispatch.call_args.kwargs, {"source_identity": False})
             self.assertEqual(sink.read_text(encoding="ascii"), "cache_digest=" + "e" * 64 + "\n")
             with patch.object(linux_source_build, "_audit_modules", side_effect=ValueError("x")):
                 output = io.StringIO()
@@ -3647,6 +3649,183 @@ class WindowsSourceBindingTests(unittest.TestCase):
                 self.assertEqual(linux_source_build.main([command]), 0)
                 target.assert_called_once_with()
         self.assertEqual(linux_source_build.main(["windows-unknown"]), 2)
+
+    def _settings_environment(self):
+        environment = self._environment()
+        for name in linux_source_build.SOURCE_IDENTITY_NAMES:
+            del environment[name]
+        return environment
+
+    def test_the_held_names_are_the_source_identity_and_the_reader_credentials(self):
+        self.assertEqual(linux_source_build.SOURCE_IDENTITY_NAMES, (
+            "SOURCE_REPOSITORY_ID", "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME",
+            "SOURCE_READER_INSTALLATION_ID", "SOURCE_READER_CLIENT_ID",
+        ))
+        self.assertEqual(
+            linux_source_build.SOURCE_HELD_NAMES,
+            linux_source_build.SOURCE_IDENTITY_NAMES + ("SOURCE_READER_PRIVATE_KEY", "SOURCE_READER_TOKEN"),
+        )
+
+    def test_the_settings_binding_checks_the_request_without_any_source_identity(self):
+        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
+            binding = linux_source_build._settings_binding(self._settings_environment(), "WINDOWS_SOURCE")
+            provenance.assert_not_called()
+        self.assertEqual(binding, {
+            "source_sha": self.SOURCE, "base_sha": self.BASE, "base_branch": "main",
+            "reviewed_diff_sha256": self.FINGERPRINT, "control_sha": self.CONTROL,
+        })
+        for name in ("repository_id", "owner", "name"):
+            self.assertNotIn(name, binding)
+
+    def test_the_settings_binding_refuses_any_held_source_name_even_when_empty(self):
+        for name in linux_source_build.SOURCE_HELD_NAMES:
+            for value in ("", "7", "owner"):
+                environment = self._settings_environment()
+                environment[name] = value
+                with self.subTest(name=name, value=value), patch.object(
+                    linux_source_build, "_validate_provenance_binding"
+                ) as provenance:
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._settings_binding(environment, "WINDOWS_SOURCE")
+                    provenance.assert_not_called()
+
+    def test_the_settings_binding_is_windows_only(self):
+        for prefix in ("LINUX_SOURCE", "", None, "windows_source", 5):
+            with self.subTest(prefix=prefix):
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                    linux_source_build._settings_binding(self._settings_environment(), prefix)
+
+    def test_the_settings_binding_still_checks_every_request_name(self):
+        for suffix in (
+            "_ALLOWED_SHA", "_ALLOWED_BASE_SHA", "_ALLOWED_BASE_BRANCH", "_ALLOWED_FINGERPRINT",
+            "_ALLOWED_CONTROL_SHA", "_ACCEPTED_NODE_LOCK_SHA256", "_ACCEPTED_MANIFEST_SHA256",
+            "_ACCEPTED_NODE_PROVENANCE_JSON", "_ENVIRONMENT_NAME",
+        ):
+            changes = ("missing", "empty") if suffix == "_ACCEPTED_NODE_PROVENANCE_JSON" else ("missing", "empty", "other")
+            for change in changes:
+                environment = self._settings_environment()
+                name = "WINDOWS_SOURCE" + suffix
+                if change == "missing":
+                    del environment[name]
+                elif change == "empty":
+                    environment[name] = ""
+                else:
+                    environment[name] = "x" * 3
+                with self.subTest(name=name, change=change):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._settings_binding(environment, "WINDOWS_SOURCE")
+        for name, value in (
+            ("REQUESTED_SOURCE_SHA", "e" * 40), ("REQUESTED_BASE_SHA", "e" * 40),
+            ("REQUESTED_BASE_BRANCH", "develop"), ("REQUESTED_FINGERPRINT", "e" * 64),
+            ("REQUESTED_ENVIRONMENT_NAME", "windows-source-exec"), ("CI_SHA", "e" * 40),
+        ):
+            environment = self._settings_environment()
+            environment[name] = value
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                    linux_source_build._settings_binding(environment, "WINDOWS_SOURCE")
+
+    def test_the_fetch_job_binding_still_requires_the_full_source_identity(self):
+        for name in linux_source_build.SOURCE_IDENTITY_NAMES:
+            for change in ("missing", "empty"):
+                environment = self._environment()
+                if change == "missing":
+                    del environment[name]
+                else:
+                    environment[name] = ""
+                with self.subTest(name=name, change=change), patch.object(
+                    linux_source_build, "_validate_provenance_binding"
+                ) as provenance:
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
+                    provenance.assert_not_called()
+        for name, value in (
+            ("SOURCE_REPOSITORY_ID", "07"), ("SOURCE_READER_INSTALLATION_ID", "x"),
+            ("SOURCE_REPOSITORY_OWNER", "-owner"), ("SOURCE_REPOSITORY_NAME", "a/b"),
+        ):
+            environment = self._environment()
+            environment[name] = value
+            with self.subTest(name=name), patch.object(linux_source_build, "_validate_provenance_binding"):
+                with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                    linux_source_build._source_inputs(environment, prefix="WINDOWS_SOURCE")
+        with patch.object(linux_source_build, "_validate_provenance_binding") as provenance:
+            identity = linux_source_build._source_inputs(self._environment(), prefix="WINDOWS_SOURCE")
+        self.assertEqual(
+            (identity["repository_id"], identity["owner"], identity["name"]), ("7", "owner", "source"),
+        )
+        self.assertIs(provenance.call_args.args[0], identity)
+
+    def test_a_windows_settings_source_dispatch_binds_the_request_but_not_the_source(self):
+        order = []
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, self.CONTROL]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(
+            linux_source_build, "_source_inputs", side_effect=AssertionError("no source identity in settings")
+        ), patch.object(
+            linux_source_build, "_settings_binding",
+            side_effect=lambda environ, prefix: order.append(("settings", prefix)) or {},
+        ), patch.object(
+            linux_source_build, "_verify_environment", side_effect=lambda token: order.append("environment")
+        ), patch.object(
+            linux_source_build, "_require_no_duplicate",
+            side_effect=lambda token, environ, workflow: order.append(workflow),
+        ):
+            env = self._dispatch_environment("refs/heads/untrusted", "source")
+            self.assertEqual(
+                linux_source_build.validate_dispatch(env, "token", "WINDOWS_SOURCE", source_identity=False),
+                "source",
+            )
+        self.assertEqual(
+            order, [("settings", "WINDOWS_SOURCE"), "environment", linux_source_build.WINDOWS_TIER],
+        )
+
+    def test_a_windows_settings_source_dispatch_runs_on_the_real_settings_names(self):
+        environment = dict(self._settings_environment(), **self._dispatch_environment("refs/heads/untrusted", "source"))
+        environment["KD_SOURCE_PREFIX"] = "WINDOWS_SOURCE"
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, self.CONTROL]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ), patch.object(
+            linux_source_build, "_validate_provenance_binding", side_effect=AssertionError("no provenance in settings")
+        ), patch.object(linux_source_build, "_verify_environment") as verified, patch.object(
+            linux_source_build, "_require_no_duplicate"
+        ) as duplicate:
+            self.assertEqual(
+                linux_source_build.validate_dispatch(
+                    environment, "token", "WINDOWS_SOURCE", source_identity=False,
+                ),
+                "source",
+            )
+        verified.assert_called_once_with("token")
+        duplicate.assert_called_once_with("token", environment, workflow=linux_source_build.WINDOWS_TIER)
+        with patch.object(linux_source_build, "_reference_sha", side_effect=["b" * 40, self.CONTROL]), patch.object(
+            linux_source_build, "_comparison", return_value="ahead"
+        ):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                linux_source_build.validate_dispatch(environment, "token", "WINDOWS_SOURCE")
+
+    def test_a_settings_dispatch_refuses_held_names_before_any_network_read(self):
+        for mode, ref in (("source", "refs/heads/untrusted"), ("synthetic", "refs/heads/main")):
+            for name in linux_source_build.SOURCE_HELD_NAMES:
+                environment = dict(self._dispatch_environment(ref, mode), **{name: ""})
+                with self.subTest(mode=mode, name=name), patch.object(
+                    linux_source_build, "_reference_sha", side_effect=AssertionError("network")
+                ):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build.validate_dispatch(
+                            environment, "token", "WINDOWS_SOURCE", source_identity=False,
+                        )
+
+    def test_only_a_windows_dispatch_may_skip_the_source_identity_and_only_by_a_boolean(self):
+        environment = self._dispatch_environment("refs/heads/main", "synthetic")
+        with patch.object(linux_source_build, "_reference_sha", side_effect=AssertionError("network")):
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+                linux_source_build.validate_dispatch(environment, "token", "LINUX_SOURCE", source_identity=False)
+            for value in (None, 0, 1, "false", "", []):
+                with self.subTest(value=value):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "identity"):
+                        linux_source_build.validate_dispatch(
+                            environment, "token", "WINDOWS_SOURCE", source_identity=value,
+                        )
 
     def test_gate_commands_render_the_shared_table_including_the_feature_gates(self):
         commands = linux_source_build._gate_commands(Path("/work"), "/rust", "/node")
