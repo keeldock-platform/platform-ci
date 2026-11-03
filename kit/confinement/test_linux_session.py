@@ -603,7 +603,7 @@ class LinuxSessionLoopbackTests(unittest.TestCase):
             self.assertEqual(preexec.args, expected)
             self.assertIs(preexec.func, harness._drop_child)
 
-    def run_inside_host(self, spec, launch_effect=None):
+    def run_inside_host(self, spec, launch_effect=None, restore_effect=None):
         events = []
 
         def launch(*arguments):
@@ -611,6 +611,11 @@ class LinuxSessionLoopbackTests(unittest.TestCase):
             if launch_effect is not None:
                 raise launch_effect
             return 0, False
+
+        def restore():
+            events.append("restore")
+            if restore_effect is not None:
+                raise restore_effect
 
         patches = (
             patch("linux_session.write_files"), patch("linux_session.os.makedirs"),
@@ -624,6 +629,7 @@ class LinuxSessionLoopbackTests(unittest.TestCase):
             patch("linux_session.harness._read_sysctl", return_value="1"),
             patch("linux_session.harness._disable_loopback_ipv6", side_effect=lambda: events.append("ipv6")),
             patch("linux_session.harness._set_loopback", side_effect=lambda up: events.append(("loopback", up))),
+            patch("linux_session.harness._restore_loopback", side_effect=restore),
         )
         for item in patches:
             item.start()
@@ -631,7 +637,7 @@ class LinuxSessionLoopbackTests(unittest.TestCase):
             error = None
             try:
                 session.inside_host(spec)
-            except OSError as caught:
+            except (OSError, harness.ProofFailure) as caught:
                 error = caught
         finally:
             for item in reversed(patches):
@@ -641,7 +647,7 @@ class LinuxSessionLoopbackTests(unittest.TestCase):
     def test_loopback_is_raised_before_the_launch_and_lowered_before_the_namespace_verification(self):
         events, error = self.run_inside_host(self.host_spec(loopback=True))
         self.assertIsNone(error)
-        self.assertEqual(events, ["ipv6", ("loopback", True), "launch", ("loopback", False), "read", "read", "verify"])
+        self.assertEqual(events, ["ipv6", ("loopback", True), "launch", ("loopback", False), "restore", "read", "read", "verify"])
 
     def test_a_host_session_without_loopback_never_touches_the_interface(self):
         events, error = self.run_inside_host(self.host_spec())
@@ -651,7 +657,15 @@ class LinuxSessionLoopbackTests(unittest.TestCase):
     def test_loopback_is_lowered_even_when_the_launch_fails(self):
         events, error = self.run_inside_host(self.host_spec(loopback=True), launch_effect=OSError("boom"))
         self.assertIsInstance(error, OSError)
-        self.assertEqual(events, ["ipv6", ("loopback", True), "launch", ("loopback", False), "read", "read"])
+        self.assertEqual(events, ["ipv6", ("loopback", True), "launch", ("loopback", False), "restore", "read", "read"])
+
+    def test_a_loopback_restore_refusal_stops_the_session_before_the_namespace_verification(self):
+        for reason in (55, 93):
+            with self.subTest(reason=reason):
+                events, error = self.run_inside_host(self.host_spec(loopback=True), restore_effect=harness.ProofFailure(reason))
+                self.assertIsInstance(error, harness.ProofFailure)
+                self.assertEqual(error.reason, reason)
+                self.assertEqual(events, ["ipv6", ("loopback", True), "launch", ("loopback", False), "restore", "read", "read"])
 
 
 class LinuxSeccompNumberTests(unittest.TestCase):

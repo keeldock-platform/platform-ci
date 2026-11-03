@@ -37,7 +37,8 @@ CHILD_GID = 62000
 MAX_CAPTURE = 8192
 MAX_PROBE_SECONDS = 10
 INNER_REFUSAL_REASONS = (
-    20, 21, 22, 23, 24, 25, 26, 27, 45, 46, 47, 48, 51, 52, 53,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 45, 46, 47, 48, 49, 50, 51, 52, 53,
     57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78,
     79, 80, 81, 85, 86, 87, 88, 89, 90, 98,
 )
@@ -56,11 +57,22 @@ LOOPBACK_IPV6_SYSCTL = "/proc/sys/net/ipv6/conf/lo/disable_ipv6"
 NETLINK_ROUTE = 0
 SOL_NETLINK = 270
 NETLINK_GET_STRICT_CHK = 12
+RTM_NEWADDR = 20
+RTM_DELADDR = 21
+RTM_GETADDR = 22
+RTM_NEWROUTE = 24
 RTM_GETROUTE = 26
 NLM_F_REQUEST = 1
 NLM_F_MULTI = 2
 NLM_F_DUMP = 0x300
+NLM_F_ACK = 4
+NLM_F_CAPPED = 0x100
+NLMSG_ERROR = 2
 NLMSG_DONE = 3
+IFA_ADDRESS = 1
+IFA_LOCAL = 2
+LOOPBACK_IPV4 = bytes((127, 0, 0, 1))
+LOOPBACK_IPV4_PREFIX = 8
 ROUTE_CHANGE_GROUPS = sum(1 << (group - 1) for group in (1, 5, 7, 8, 9, 11, 19))
 MAX_ROUTE_DUMP_BYTES = 65536
 MAX_ROUTE_DUMP_SECONDS = 2
@@ -814,10 +826,38 @@ def _make_rootfs(rootfs):
     return rootfs
 
 
+def _restore_loopback():
+    try:
+        index = socket.if_nametoindex("lo")
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_ROUTE) as control:
+            control.settimeout(MAX_ROUTE_DUMP_SECONDS)
+            control.bind((0, 0))
+            port_id, groups = control.getsockname()
+            if not 0 < port_id <= 0xffffffff or groups != 0:
+                raise ProofFailure(55)
+            payload = struct.pack("=BBBBI", socket.AF_INET, LOOPBACK_IPV4_PREFIX, 0, 0, index)
+            payload += struct.pack("=HH", 8, IFA_LOCAL) + LOOPBACK_IPV4 + struct.pack("=HH", 8, IFA_ADDRESS) + LOOPBACK_IPV4
+            request = struct.pack("=IHHII", 16 + len(payload), RTM_DELADDR, NLM_F_REQUEST | NLM_F_ACK, 1, port_id) + payload
+            if control.sendto(request, (0, 0)) != len(request):
+                raise ProofFailure(55)
+            data, ancillary, flags, sender = control.recvmsg(MAX_ROUTE_DUMP_BYTES, 0)
+    except (OSError, ValueError, struct.error):
+        raise ProofFailure(55) from None
+    if ancillary or flags or sender != (0, 0) or len(data) < 20:
+        raise ProofFailure(55)
+    length, kind, message_flags, reply_sequence, recipient = struct.unpack_from("=IHHII", data)
+    if kind != NLMSG_ERROR or reply_sequence != 1 or recipient != port_id:
+        raise ProofFailure(55)
+    if struct.unpack_from("=i", data, 16)[0] != 0:
+        raise ProofFailure(93)
+    if length != 36 or len(data) != 36 or message_flags not in (0, NLM_F_CAPPED) or data[20:] != request[:16]:
+        raise ProofFailure(55)
+
+
 def _verify_interfaces_down():
     interfaces = tuple(socket.if_nameindex())
     if tuple(name for _, name in interfaces) != ("lo",):
-        raise ProofFailure(57)
+        raise ProofFailure(11)
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         request = struct.pack("16sH22x", b"lo", 0)
@@ -825,7 +865,7 @@ def _verify_interfaces_down():
     finally:
         probe.close()
     if flags & IFF_UP:
-        raise ProofFailure(58)
+        raise ProofFailure(12)
     return interfaces, flags
 
 
@@ -844,19 +884,34 @@ def _verify_proc_routes():
         raise ProofFailure(87)
 
 
-def _require_empty_route_dump(probe, family, sequence, port_id):
-    payload = struct.pack("=BBBBBBBBI", family, 0, 0, 0, 0, 0, 0, 0, 0)
-    request = struct.pack("=IHHII", 16 + len(payload), RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, sequence, port_id) + payload
+def _require_empty_dump(probe, request_kind, object_kind, payload, sequence, port_id, populated_reason):
+    request = struct.pack("=IHHII", 16 + len(payload), request_kind, NLM_F_REQUEST | NLM_F_DUMP, sequence, port_id) + payload
     if probe.sendto(request, (0, 0)) != len(request):
-        raise ProofFailure(86)
+        raise ProofFailure(14)
     data, ancillary, flags, sender = probe.recvmsg(MAX_ROUTE_DUMP_BYTES, 0)
-    if ancillary or flags or sender != (0, 0) or len(data) != 20:
-        raise ProofFailure(86)
+    if ancillary or flags or sender != (0, 0):
+        raise ProofFailure(15)
+    if len(data) >= 16 and struct.unpack_from("=H", data, 4)[0] == object_kind:
+        raise ProofFailure(populated_reason)
+    if len(data) != 20:
+        raise ProofFailure(18)
     length, kind, message_flags, reply_sequence, recipient = struct.unpack_from("=IHHII", data)
     if (length, kind, message_flags, reply_sequence, recipient) != (20, NLMSG_DONE, NLM_F_MULTI, sequence, port_id):
-        raise ProofFailure(86)
+        raise ProofFailure(18)
     if struct.unpack_from("=i", data, 16)[0] != 0:
-        raise ProofFailure(86)
+        raise ProofFailure(19)
+
+
+def _require_empty_route_dump(probe, family, sequence, port_id):
+    payload = struct.pack("=BBBBBBBBI", family, 0, 0, 0, 0, 0, 0, 0, 0)
+    populated_reason = 16 if family == socket.AF_INET else 17
+    _require_empty_dump(probe, RTM_GETROUTE, RTM_NEWROUTE, payload, sequence, port_id, populated_reason)
+
+
+def _require_empty_address_dump(probe, family, sequence, port_id):
+    payload = struct.pack("=BBBBI", family, 0, 0, 0, 0)
+    populated_reason = 49 if family == socket.AF_INET else 50
+    _require_empty_dump(probe, RTM_GETADDR, RTM_NEWADDR, payload, sequence, port_id, populated_reason)
 
 
 def _verify_netns():
@@ -867,21 +922,25 @@ def _verify_netns():
             probe.bind((0, ROUTE_CHANGE_GROUPS))
             port_id, groups = probe.getsockname()
             if not 0 < port_id <= 0xffffffff or groups != ROUTE_CHANGE_GROUPS:
-                raise ProofFailure(86)
+                raise ProofFailure(10)
             interfaces = _verify_interfaces_down()
             _verify_proc_routes()
             for sequence, family in enumerate((socket.AF_INET, socket.AF_INET6), start=1):
                 _require_empty_route_dump(probe, family, sequence, port_id)
+            for sequence, family in enumerate((socket.AF_INET, socket.AF_INET6), start=3):
+                _require_empty_address_dump(probe, family, sequence, port_id)
             if _verify_interfaces_down() != interfaces:
-                raise ProofFailure(86)
+                raise ProofFailure(13)
             probe.setblocking(False)
             try:
                 probe.recvmsg(MAX_ROUTE_DUMP_BYTES, 0)
             except BlockingIOError as error:
                 if error.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
-                    raise ProofFailure(86) from None
+                    raise ProofFailure(29) from None
+            except OSError:
+                raise ProofFailure(29) from None
             else:
-                raise ProofFailure(86)
+                raise ProofFailure(28)
     except (OSError, ValueError, struct.error):
         raise ProofFailure(86) from None
 

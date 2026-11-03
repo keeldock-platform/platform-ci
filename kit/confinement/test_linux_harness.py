@@ -17,7 +17,7 @@ import urllib.error
 from unittest.mock import MagicMock, Mock, call, patch
 
 import linux_harness as harness
-from linux_harness import DENIED_SYSCALLS, AUDIT_ARCH_NATIVE, CHILD_SOURCE, MAX_PROBE_SECONDS, PROBES, SECCOMP_ALLOW, SECCOMP_DENY, SOCKET_FILTER, UNSHARE_ARGUMENTS, COMPAT_SYSCALL_BIT, ProofFailure, SockFprog, _drop_child, _enter_rootfs_and_launch, _expected_denial, _inside, _install_socket_filter, _run_probe, _supervise_child_process, _verify_child, _verify_netns, _verify_proc_routes, _require_empty_route_dump, ROUTE_CHANGE_GROUPS, advance_supervision, outcome, valid_sha
+from linux_harness import DENIED_SYSCALLS, AUDIT_ARCH_NATIVE, CHILD_SOURCE, MAX_PROBE_SECONDS, PROBES, SECCOMP_ALLOW, SECCOMP_DENY, SOCKET_FILTER, UNSHARE_ARGUMENTS, COMPAT_SYSCALL_BIT, ProofFailure, SockFprog, _drop_child, _enter_rootfs_and_launch, _expected_denial, _inside, _install_socket_filter, _run_probe, _supervise_child_process, _verify_child, _verify_netns, _verify_proc_routes, _require_empty_address_dump, _require_empty_route_dump, ROUTE_CHANGE_GROUPS, advance_supervision, outcome, valid_sha
 
 
 class HarnessPolicyTests(unittest.TestCase):
@@ -64,38 +64,72 @@ class HarnessPolicyTests(unittest.TestCase):
             self.assertEqual(struct.unpack_from("=BBBBBBBBI", request, 16), (family, 0, 0, 0, 0, 0, 0, 0, 0))
             probe.recvmsg.assert_called_once_with(65536, 0)
 
+    def test_address_dump_requests_every_interface_and_requires_exact_completion(self):
+        for family in (socket.AF_INET, socket.AF_INET6):
+            probe = Mock()
+            probe.sendto.return_value = 24
+            probe.recvmsg.return_value = (struct.pack("=IHHIIi", 20, 3, 2, 3, 19, 0), [], 0, (0, 0))
+            self.assertIsNone(_require_empty_address_dump(probe, family, 3, 19))
+            request, target = probe.sendto.call_args.args
+            self.assertEqual(target, (0, 0))
+            self.assertEqual(len(request), 24)
+            self.assertEqual(struct.unpack_from("=IHHII", request), (24, 22, 0x301, 3, 19))
+            self.assertEqual(struct.unpack_from("=BBBBI", request, 16), (family, 0, 0, 0, 0))
+            probe.recvmsg.assert_called_once_with(65536, 0)
+
     def test_route_dump_refuses_malformed_partial_interrupted_or_filtered_messages(self):
         done = struct.pack("=IHHIIi", 20, 3, 2, 1, 19, 0)
-        packets = [b"", done[:15], done[:19], done + b"x", done + done]
+        packets = [(b"", 18), (done[:15], 18), (done[:19], 18), (done + b"x", 18), (done + done, 18)]
         for offset in range(len(done)):
             for bit in range(8):
                 packet = bytearray(done)
                 packet[offset] ^= 1 << bit
-                packets.append(bytes(packet))
-        for kind in (1, 2, 4, 16, 17, 20, 21, 24, 25, 32, 33):
-            packets.append(struct.pack("=IHHIIi", 20, kind, 2, 1, 19, 0))
+                packets.append((bytes(packet), 19 if offset >= 16 else 18))
+        for kind in (1, 2, 4, 16, 17, 20, 21, 25, 32, 33):
+            packets.append((struct.pack("=IHHIIi", 20, kind, 2, 1, 19, 0), 18))
+        packets.append((struct.pack("=IHHIIi", 20, 24, 2, 1, 19, 0), 16))
         for flags in (0, 1, 0x12, 0x22, 0x102, 0x202):
-            packets.append(struct.pack("=IHHIIi", 20, 3, flags, 1, 19, 0))
-        for packet in packets:
+            packets.append((struct.pack("=IHHIIi", 20, 3, flags, 1, 19, 0), 18))
+        for packet, reason in packets:
             probe = Mock()
             probe.sendto.return_value = 28
             probe.recvmsg.return_value = (packet, [], 0, (0, 0))
             with self.assertRaises(ProofFailure) as raised:
                 _require_empty_route_dump(probe, socket.AF_INET, 1, 19)
-            self.assertEqual(raised.exception.reason, 86)
+            self.assertEqual(raised.exception.reason, reason)
 
-    def test_every_route_object_refuses_including_alternate_tables_and_unreachable(self):
-        for family in (socket.AF_INET, socket.AF_INET6):
+    def test_every_route_object_refuses_with_its_family_reason_including_alternate_tables(self):
+        for family, reason in ((socket.AF_INET, 16), (socket.AF_INET6, 17)):
             for table in (1, 253, 254, 255, 1000):
                 for kind in (1, 2, 6, 7, 8, 9):
                     payload = struct.pack("=BBBBBBBBI", family, 0, 0, 0, min(table, 255), 2, 0, kind, 0)
                     payload += struct.pack("=HHI", 8, 15, table)
                     route = struct.pack("=IHHII", 16 + len(payload), 24, 2, 1, 19) + payload
-                    probe = Mock()
-                    probe.sendto.return_value = 28
-                    probe.recvmsg.return_value = (route, [], 0, (0, 0))
-                    with self.assertRaises(ProofFailure):
-                        _require_empty_route_dump(probe, family, 1, 19)
+                    for packet in (route, route + struct.pack("=IHHIIi", 20, 3, 2, 1, 19, 0)):
+                        probe = Mock()
+                        probe.sendto.return_value = 28
+                        probe.recvmsg.return_value = (packet, [], 0, (0, 0))
+                        with self.assertRaises(ProofFailure) as raised:
+                            _require_empty_route_dump(probe, family, 1, 19)
+                        self.assertEqual(raised.exception.reason, reason)
+
+    def test_every_address_object_refuses_with_its_family_reason(self):
+        for family, reason in ((socket.AF_INET, 49), (socket.AF_INET6, 50)):
+            payload = struct.pack("=BBBBI", family, 8, 0x80, 254, 1) + struct.pack("=HH", 8, 2) + bytes((127, 0, 0, 1))
+            address = struct.pack("=IHHII", 16 + len(payload), 20, 2, 3, 19) + payload
+            for packet in (address, address + struct.pack("=IHHIIi", 20, 3, 2, 3, 19, 0)):
+                probe = Mock()
+                probe.sendto.return_value = 24
+                probe.recvmsg.return_value = (packet, [], 0, (0, 0))
+                with self.assertRaises(ProofFailure) as raised:
+                    _require_empty_address_dump(probe, family, 3, 19)
+                self.assertEqual(raised.exception.reason, reason)
+        probe = Mock()
+        probe.sendto.return_value = 24
+        probe.recvmsg.return_value = (struct.pack("=IHHIIi", 20, 24, 2, 3, 19, 0), [], 0, (0, 0))
+        with self.assertRaises(ProofFailure) as raised:
+            _require_empty_address_dump(probe, socket.AF_INET, 3, 19)
+        self.assertEqual(raised.exception.reason, 18)
 
     def test_route_dump_refuses_wrong_sender_truncation_and_ancillary_data(self):
         done = struct.pack("=IHHIIi", 20, 3, 2, 1, 19, 0)
@@ -103,38 +137,48 @@ class HarnessPolicyTests(unittest.TestCase):
             probe = Mock()
             probe.sendto.return_value = 28
             probe.recvmsg.return_value = (done, ancillary, flags, sender)
-            with self.assertRaises(ProofFailure):
+            with self.assertRaises(ProofFailure) as raised:
                 _require_empty_route_dump(probe, socket.AF_INET, 1, 19)
-        probe = Mock()
-        probe.sendto.return_value = 27
-        with self.assertRaises(ProofFailure):
-            _require_empty_route_dump(probe, socket.AF_INET, 1, 19)
-        probe.recvmsg.assert_not_called()
+            self.assertEqual(raised.exception.reason, 15)
+        for dump in (_require_empty_route_dump, _require_empty_address_dump):
+            probe = Mock()
+            probe.sendto.return_value = 27
+            with self.assertRaises(ProofFailure) as raised:
+                dump(probe, socket.AF_INET, 1, 19)
+            self.assertEqual(raised.exception.reason, 14)
+            probe.recvmsg.assert_not_called()
 
-    def test_sentinel_cross_check_requires_both_dumps_and_quiet_mutation_subscription(self):
+    def test_sentinel_cross_check_requires_every_dump_and_quiet_mutation_subscription(self):
         zero = "0" * 32
         sentinel = f"{zero} 00 {zero} 00 {zero} ffffffff 00000001 00000000 00200200 lo\n"
         done4 = (struct.pack("=IHHIIi", 20, 3, 2, 1, 19, 0), [], 0, (0, 0))
         done6 = (struct.pack("=IHHIIi", 20, 3, 2, 2, 19, 0), [], 0, (0, 0))
+        address4 = (struct.pack("=IHHIIi", 20, 3, 2, 3, 19, 0), [], 0, (0, 0))
+        address6 = (struct.pack("=IHHIIi", 20, 3, 2, 4, 19, 0), [], 0, (0, 0))
         mutation = (struct.pack("=IHHIIi", 20, 16, 0, 0, 0, 0), [], 0, (0, 1))
         empty = BlockingIOError(errno.EAGAIN, "empty")
+        dumps = [done4, done6, address4, address6]
         cases = (
-            ("complete", [done4, done6, empty], None),
+            ("complete", dumps + [empty], None),
             ("timeout-first", [TimeoutError()], 86),
             ("timeout-second", [done4, TimeoutError()], 86),
+            ("timeout-address", [done4, done6, TimeoutError()], 86),
             ("overflow", [done4, OSError(errno.ENOBUFS, "overflow")], 86),
-            ("changed-before-dump", [mutation], 86),
-            ("changed-between-dumps", [done4, mutation], 86),
-            ("changed-after-dumps", [done4, done6, mutation], 86),
-            ("late-overflow", [done4, done6, OSError(errno.ENOBUFS, "overflow")], 86),
-            ("wrong-final-error", [done4, done6, BlockingIOError(errno.EPERM, "denied")], 86),
-            ("duplicate-completion", [done4, done6, done6], 86),
+            ("changed-before-dump", [mutation], 15),
+            ("changed-between-dumps", [done4, mutation], 15),
+            ("changed-before-address-dump", [done4, done6, mutation], 15),
+            ("changed-between-address-dumps", [done4, done6, address4, mutation], 15),
+            ("changed-after-dumps", dumps + [mutation], 28),
+            ("late-overflow", dumps + [OSError(errno.ENOBUFS, "overflow")], 29),
+            ("wrong-final-error", dumps + [BlockingIOError(errno.EPERM, "denied")], 29),
+            ("duplicate-completion", dumps + [address6], 28),
+            ("stale-completion", [done4, done6, done6], 18),
         )
         for label, packets, reason in cases:
             probe = MagicMock()
             probe.__enter__.return_value = probe
             probe.getsockname.return_value = (19, ROUTE_CHANGE_GROUPS)
-            probe.sendto.return_value = 28
+            probe.sendto.side_effect = lambda request, target: len(request)
             probe.recvmsg.side_effect = packets
             def route_file(path, mode, encoding=None):
                 return io.StringIO("Iface Destination Gateway Flags RefCnt Use Metric Mask MTU Window IRTT\n" if path == "/proc/net/route" else sentinel)
@@ -145,7 +189,9 @@ class HarnessPolicyTests(unittest.TestCase):
                  patch("linux_harness.open", create=True, side_effect=route_file):
                 if reason is None:
                     self.assertIsNone(_verify_netns())
-                    self.assertEqual(probe.sendto.call_count, 2)
+                    requests = [item.args[0] for item in probe.sendto.call_args_list]
+                    self.assertEqual([struct.unpack_from("=HxxI", request, 4) for request in requests], [(26, 1), (26, 2), (22, 3), (22, 4)])
+                    self.assertEqual([request[16] for request in requests], [socket.AF_INET, socket.AF_INET6] * 2)
                     probe.settimeout.assert_called_once_with(2)
                     probe.setsockopt.assert_called_once_with(270, 12, 1)
                     probe.bind.assert_called_once_with((0, 0x405d1))
@@ -157,7 +203,13 @@ class HarnessPolicyTests(unittest.TestCase):
             probe.__exit__.assert_called_once()
 
     def test_route_cross_check_refuses_interface_mutations_and_setup_errors(self):
-        for states in ((ProofFailure(57),), (ProofFailure(58),), ((((1, "lo"),), 0), (((2, "lo"),), 0)), ((((1, "lo"),), 0), ProofFailure(58))):
+        for states, reason in (
+            ((ProofFailure(11),), 11),
+            ((ProofFailure(12),), 12),
+            (((((1, "lo"),), 0), (((2, "lo"),), 0)), 13),
+            (((((1, "lo"),), 0), (((1, "lo"),), 1)), 13),
+            (((((1, "lo"),), 0), ProofFailure(12)), 12),
+        ):
             probe = MagicMock()
             probe.__enter__.return_value = probe
             probe.getsockname.return_value = (19, ROUTE_CHANGE_GROUPS)
@@ -165,9 +217,21 @@ class HarnessPolicyTests(unittest.TestCase):
                  patch("linux_harness.socket.socket", return_value=probe), \
                  patch("linux_harness._verify_interfaces_down", side_effect=states), \
                  patch("linux_harness._verify_proc_routes"), \
-                 patch("linux_harness._require_empty_route_dump"):
-                with self.assertRaises(ProofFailure):
+                 patch("linux_harness._require_empty_route_dump"), \
+                 patch("linux_harness._require_empty_address_dump"):
+                with self.assertRaises(ProofFailure) as raised:
                     _verify_netns()
+                self.assertEqual(raised.exception.reason, reason)
+        for identity in ((19, 0), (0, ROUTE_CHANGE_GROUPS), (0x100000000, ROUTE_CHANGE_GROUPS), (19, ROUTE_CHANGE_GROUPS | 2)):
+            probe = MagicMock()
+            probe.__enter__.return_value = probe
+            probe.getsockname.return_value = identity
+            with patch("linux_harness.socket.AF_NETLINK", 16, create=True), \
+                 patch("linux_harness.socket.socket", return_value=probe), \
+                 patch("linux_harness._verify_interfaces_down", side_effect=AssertionError("interfaces-before-identity")):
+                with self.assertRaises(ProofFailure) as raised:
+                    _verify_netns()
+                self.assertEqual(raised.exception.reason, 10)
         for operation in ("settimeout", "setsockopt", "bind", "getsockname"):
             probe = MagicMock()
             probe.__enter__.return_value = probe
@@ -176,6 +240,26 @@ class HarnessPolicyTests(unittest.TestCase):
                 with self.assertRaises(ProofFailure) as raised:
                     _verify_netns()
                 self.assertEqual(raised.exception.reason, 86)
+
+    def test_interface_readback_names_extra_interfaces_and_a_raised_loopback_apart(self):
+        probe = SimpleNamespace(fileno=lambda: 5, close=lambda: None)
+        for names, flags, reason in (
+            (((1, "lo"),), 0x8, None),
+            (((1, "lo"), (2, "eth0")), 0x8, 11),
+            ((), 0x8, 11),
+            (((2, "dummy"),), 0x8, 11),
+            (((1, "lo"),), 0x9, 12),
+        ):
+            with self.subTest(names=names, flags=flags), \
+                 patch("linux_harness.socket.if_nameindex", return_value=list(names)), \
+                 patch("linux_harness.socket.socket", return_value=probe), \
+                 patch("linux_harness.fcntl.ioctl", return_value=struct.pack("16sH22x", b"lo", flags)):
+                if reason is None:
+                    self.assertEqual(harness._verify_interfaces_down(), (names, flags))
+                else:
+                    with self.assertRaises(ProofFailure) as raised:
+                        harness._verify_interfaces_down()
+                    self.assertEqual(raised.exception.reason, reason)
 
     def test_public_probe_set_is_fixed_and_linux_only(self):
         self.assertEqual(
@@ -253,6 +337,9 @@ class HarnessPolicyTests(unittest.TestCase):
         cases = (
             ("known-boundary", 1, b"inner=refused reason=53\n", b"", 53),
             ("ipv4-route", 1, b"inner=refused reason=85\n", b"", 85),
+            ("ipv4-local-route", 1, b"inner=refused reason=16\n", b"", 16),
+            ("ipv4-loopback-address", 1, b"inner=refused reason=49\n", b"", 49),
+            ("restore-reason-stays-outside", 1, b"inner=refused reason=93\n", b"", 82),
             ("ipv6-null-route", 1, b"inner=refused reason=86\n", b"", 86),
             ("ipv6-other-route", 1, b"inner=refused reason=87\n", b"", 87),
             ("known-generic", 1, b"inner=refused reason=98\n", b"", 98),
@@ -1016,6 +1103,120 @@ class LoopbackProfileTests(unittest.TestCase):
     def test_the_loopback_failure_reasons_are_public_inner_refusal_reasons(self):
         for reason in (57, 58):
             self.assertIn(reason, harness.INNER_REFUSAL_REASONS)
+
+    def test_every_namespace_readback_check_has_its_own_public_inner_refusal_reason(self):
+        reasons = (10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 28, 29, 49, 50, 81, 85, 86, 87)
+        self.assertEqual(len(set(reasons)), len(reasons))
+        self.assertEqual(len(set(harness.INNER_REFUSAL_REASONS)), len(harness.INNER_REFUSAL_REASONS))
+        for reason in reasons:
+            line = ("inner=refused reason=" + str(reason) + "\n").encode("ascii")
+            self.assertIn(reason, harness.INNER_REFUSAL_REASONS)
+            self.assertLessEqual(len(line), harness.MAX_INNER_REFUSAL_BYTES)
+            self.assertEqual(harness.INNER_REFUSAL_LINES[line], reason)
+            self.assertEqual(outcome(False, reason), "linux-confinement=refused reason=" + str(reason))
+        for reason in (55, 93):
+            self.assertNotIn(reason, harness.INNER_REFUSAL_REASONS)
+
+    def _restore_control(self, reply, identity=(19, 0)):
+        control = MagicMock()
+        control.__enter__.return_value = control
+        control.getsockname.return_value = identity
+        control.sendto.side_effect = lambda request, target: len(request)
+        control.recvmsg.side_effect = lambda size, flags: reply(control.sendto.call_args.args[0])
+        return control
+
+    def _ack(self, request, error=0, flags=0x100, length=36, sequence=1, port=19, kind=2, echo=None):
+        echoed = request[:16] if echo is None else echo
+        return struct.pack("=IHHIIi", length, kind, flags, sequence, port, error) + echoed
+
+    def _restore(self, control, index=1):
+        with patch("linux_harness.socket.AF_NETLINK", 16, create=True), \
+             patch("linux_harness.socket.if_nametoindex", return_value=index) as lookup, \
+             patch("linux_harness.socket.socket", return_value=control) as opened:
+            result = harness._restore_loopback()
+        return result, lookup, opened
+
+    def test_loopback_restore_deletes_exactly_the_kernel_loopback_address_and_requires_its_ack(self):
+        address = bytes((127, 0, 0, 1))
+        for flags in (0, 0x100):
+            control = self._restore_control(lambda request: (self._ack(request, flags=flags), [], 0, (0, 0)))
+            result, lookup, opened = self._restore(control, index=1)
+            self.assertIsNone(result)
+            lookup.assert_called_once_with("lo")
+            opened.assert_called_once_with(16, socket.SOCK_RAW, 0)
+            control.settimeout.assert_called_once_with(2)
+            control.bind.assert_called_once_with((0, 0))
+            request, target = control.sendto.call_args.args
+            self.assertEqual(target, (0, 0))
+            self.assertEqual(len(request), 40)
+            self.assertEqual(struct.unpack_from("=IHHII", request), (40, 21, 5, 1, 19))
+            self.assertEqual(struct.unpack_from("=BBBBI", request, 16), (socket.AF_INET, 8, 0, 0, 1))
+            self.assertEqual(request[24:], struct.pack("=HH", 8, 2) + address + struct.pack("=HH", 8, 1) + address)
+            control.recvmsg.assert_called_once_with(65536, 0)
+            control.__exit__.assert_called_once()
+
+    def test_loopback_restore_refuses_a_kernel_refusal_and_every_unexpected_reply(self):
+        cases = (
+            ("address-absent", lambda request: (self._ack(request, error=-errno.EADDRNOTAVAIL, flags=0, length=60, echo=request), [], 0, (0, 0)), 93),
+            ("not-permitted", lambda request: (self._ack(request, error=-errno.EPERM, flags=0, length=60, echo=request), [], 0, (0, 0)), 93),
+            ("positive-error", lambda request: (self._ack(request, error=1), [], 0, (0, 0)), 93),
+            ("wrong-kind", lambda request: (self._ack(request, kind=3), [], 0, (0, 0)), 55),
+            ("address-echo", lambda request: (self._ack(request, kind=20), [], 0, (0, 0)), 55),
+            ("wrong-sequence", lambda request: (self._ack(request, sequence=2), [], 0, (0, 0)), 55),
+            ("wrong-port", lambda request: (self._ack(request, port=20), [], 0, (0, 0)), 55),
+            ("short", lambda request: (self._ack(request)[:19], [], 0, (0, 0)), 55),
+            ("header-only", lambda request: (self._ack(request)[:20], [], 0, (0, 0)), 55),
+            ("wrong-length-field", lambda request: (self._ack(request, length=40), [], 0, (0, 0)), 55),
+            ("trailing", lambda request: (self._ack(request) + b"x", [], 0, (0, 0)), 55),
+            ("second-message", lambda request: (self._ack(request) + self._ack(request), [], 0, (0, 0)), 55),
+            ("unexpected-flags", lambda request: (self._ack(request, flags=0x200), [], 0, (0, 0)), 55),
+            ("wrong-echo", lambda request: (self._ack(request, echo=bytes(16)), [], 0, (0, 0)), 55),
+            ("ancillary", lambda request: (self._ack(request), [(1, 2, b"x")], 0, (0, 0)), 55),
+            ("truncated", lambda request: (self._ack(request), [], 0x20, (0, 0)), 55),
+            ("multicast", lambda request: (self._ack(request), [], 0, (0, 1)), 55),
+            ("foreign-sender", lambda request: (self._ack(request), [], 0, (7, 0)), 55),
+        )
+        for label, reply, reason in cases:
+            with self.subTest(case=label):
+                control = self._restore_control(reply)
+                with self.assertRaises(ProofFailure) as raised:
+                    self._restore(control)
+                self.assertEqual(raised.exception.reason, reason)
+
+    def test_loopback_restore_refuses_socket_failures_and_a_foreign_identity(self):
+        def timeout(request):
+            raise TimeoutError()
+
+        for identity in ((19, 1), (0, 0), (0x100000000, 0)):
+            control = self._restore_control(lambda request: (self._ack(request), [], 0, (0, 0)), identity)
+            with self.assertRaises(ProofFailure) as raised:
+                self._restore(control)
+            self.assertEqual(raised.exception.reason, 55)
+            control.sendto.assert_not_called()
+        control = self._restore_control(timeout)
+        with self.assertRaises(ProofFailure) as raised:
+            self._restore(control)
+        self.assertEqual(raised.exception.reason, 55)
+        for operation in ("settimeout", "bind", "getsockname"):
+            control = self._restore_control(lambda request: (self._ack(request), [], 0, (0, 0)))
+            getattr(control, operation).side_effect = OSError(errno.EPERM, "denied")
+            with self.assertRaises(ProofFailure) as raised:
+                self._restore(control)
+            self.assertEqual(raised.exception.reason, 55)
+            control.sendto.assert_not_called()
+        control = self._restore_control(lambda request: (self._ack(request), [], 0, (0, 0)))
+        control.sendto.side_effect = lambda request, target: len(request) - 1
+        with self.assertRaises(ProofFailure) as raised:
+            self._restore(control)
+        self.assertEqual(raised.exception.reason, 55)
+        control.recvmsg.assert_not_called()
+        with patch("linux_harness.socket.AF_NETLINK", 16, create=True), \
+             patch("linux_harness.socket.if_nametoindex", side_effect=OSError(errno.ENODEV, "absent")), \
+             patch("linux_harness.socket.socket") as opened:
+            with self.assertRaises(ProofFailure) as raised:
+                harness._restore_loopback()
+        self.assertEqual(raised.exception.reason, 55)
+        opened.assert_not_called()
 
 
 if __name__ == "__main__":

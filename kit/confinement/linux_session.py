@@ -580,6 +580,7 @@ def inside_host(spec):
         try:
             if loopback:
                 harness._set_loopback(False)
+                harness._restore_loopback()
         finally:
             stdout = read_capture(out_reader)
             stderr = read_capture(err_reader)
