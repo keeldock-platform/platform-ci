@@ -83,23 +83,27 @@ function Write-Line([string]$text) {
 
 function Write-SyntheticDiag([string]$text) {
     if ($script:RunMode -cne 'synthetic') { return }
-    if ($text -cmatch $script:DiagLinePattern) { [Console]::Out.WriteLine($text) }
+    if ($text -cmatch $script:DiagLinePattern -and -not (Test-LogCanary $text)) { [Console]::Out.WriteLine($text) }
 }
 
 function Get-DiagTail([string]$text, [int]$count) {
-    $lines = @()
+    $queue = New-Object 'System.Collections.Generic.Queue[string]'
     foreach ($line in (([string]$text).Replace("`r", '') -split "`n")) {
-        if ($line.Trim().Length -gt 0) { $lines += $line }
+        if ($line.Trim().Length -gt 0) {
+            $queue.Enqueue([string]$line)
+            if ($queue.Count -gt $count) { [void]$queue.Dequeue() }
+        }
     }
-    if ($lines.Count -gt $count) { $lines = @($lines[($lines.Count - $count)..($lines.Count - 1)]) }
-    return $lines
+    return $queue.ToArray()
 }
 
 function Get-DiagLineText([string]$line) {
     $value = [string]$line
     foreach ($item in $script:Redactions) {
         if (-not [string]::IsNullOrEmpty($item) -and $item.Length -gt 3) {
-            $value = [regex]::Replace($value, [regex]::Escape($item), 'ROOT', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            foreach ($form in @($item, $item.Replace('\', '/'), $item.Replace('\', '\\'))) {
+                $value = [regex]::Replace($value, [regex]::Escape($form), 'ROOT', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            }
         }
     }
     $value = [regex]::Replace($value, '[^ -~]', '?')

@@ -73,6 +73,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn("$reason -cnotmatch '^[a-z][a-z0-9_]{0,40}$'", self.runner)
         self.assertNotIn("Get-CleanText $reason", self.runner)
         self.assertNotIn("ExitCode.ToString", self.runner)
+        self.assertIn("$run.ExitCode).ToString(", self.runner.split("function Write-GateDiag", 1)[1].split("\n}\n", 1)[0])
         gate_line = re.search(r"Write-Line \('windows-source-gate=' \+ \$index \+ ' id=' \+ \$gate.Id \+ ' result=' \+ \$result \+ ' hang=' \+ \$hang \+ \$causeText\)", self.runner)
         self.assertIsNotNone(gate_line)
 
@@ -182,19 +183,30 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(len(re.findall(r"Write-GateDiag\b", self.runner)), 2)
         call = "if (-not $passed -and $script:RunMode -ceq 'synthetic') { Write-GateDiag $gate.Id $run }"
         self.assertEqual(self.runner.count(call), 1)
+        result_line = self.runner.index("Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=' + $result")
         canary = self.runner.index("if ($run.Truncated -or (Test-LogCanary $combined)) {")
-        self.assertLess(self.runner.index("Write-Line ('windows-source-gate=' + $index"), canary)
+        boundary = self.runner.index("if (-not $boundary) {\n            $outcome.Boundary = 'failed'")
+        self.assertLess(result_line, canary)
         self.assertLess(canary, self.runner.index(call))
-        self.assertLess(self.runner.index(call), self.runner.index("if (-not $boundary) {"))
+        self.assertLess(self.runner.index(call), boundary)
+        self.assertGreater(boundary, self.runner.index("function Invoke-SourceGates"))
         emit = self.runner.split("function Write-GateDiag", 1)[1].split("\n}\n", 1)[0]
         self.assertIn("' exit=0x' + ([uint32]$run.ExitCode).ToString('x8')", emit)
+        self.assertEqual(self.runner.count("$run.ExitCode).ToString("), 1)
         self.assertLess(emit.index("$run.Stderr) $DiagStderrLines"), emit.index("$run.Stdout) $DiagStdoutLines"))
         for token in ("$DiagStderrLines = 40", "$DiagStdoutLines = 20", "$DiagLineLimit = 300"):
             self.assertIn(token, self.runner)
         clean = self.runner.split("function Get-DiagLineText", 1)[1].split("\n}\n", 1)[0]
-        for token in ("$script:Redactions", "'[^ -~]', '?'", "'kd-confinement'", "$value.Substring(0, $DiagLineLimit)"):
+        for token in ("$script:Redactions", "'[^ -~]', '?'", "'kd-confinement'", "$value.Substring(0, $DiagLineLimit)",
+                      "$item.Replace('\\', '/')", "$item.Replace('\\', '\\\\')"):
             self.assertIn(token, clean)
         self.assertNotIn("Write-Line", clean)
+        tail = self.runner.split("function Get-DiagTail", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("System.Collections.Generic.Queue[string]", tail)
+        self.assertIn("$queue.Dequeue()", tail)
+        self.assertNotIn("+=", tail)
+        writer = self.runner.split("function Write-SyntheticDiag", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("-not (Test-LogCanary $text)", writer)
         self.assertNotIn("windows-source-gate-diag", self.workflow)
 
     def test_a_failed_gate_reported_at_cleanup_names_its_cause_only_in_synthetic_mode(self):

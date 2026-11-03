@@ -610,7 +610,20 @@ def _write_output(environ, values):
             sink.write(key + "=" + value + "\n")
 
 
-APP_KEY_BASE64_RE = re.compile(r"[A-Za-z0-9+/]{1,22000}={0,2}\Z")
+TOKEN_STAGES = (
+    "input", "key_format", "key_write", "sign_exec", "sign_key", "sign_size",
+    "installation", "issue", "permissions", "repositories",
+)
+APP_KEY_MARKERS = (
+    ("-----BEGIN RSA PRIVATE KEY-----", "-----END RSA PRIVATE KEY-----"),
+    ("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"),
+)
+APP_KEY_MAX_RAW = 32768
+APP_KEY_MAX_DER = 8192
+SIGN_KEY_MARKERS = (
+    b"unable to load", b"could not read", b"no start line", b"bad decrypt",
+    b"decoder routines", b"pem routines", b"asn1 encoding routines",
+)
 
 
 def _token_refusal(stage):
@@ -620,20 +633,36 @@ def _token_refusal(stage):
 
 
 def _app_key_pem(raw):
-    value = raw.strip()
-    if not value.startswith("-----BEGIN "):
-        compact = "".join(value.split())
-        if APP_KEY_BASE64_RE.fullmatch(compact) is None:
+    if type(raw) is not str or len(raw) > APP_KEY_MAX_RAW:
+        return ""
+    for begin, end in APP_KEY_MARKERS:
+        start = raw.find(begin)
+        if start < 0:
+            continue
+        stop = raw.find(end, start + len(begin))
+        if stop < 0:
             return ""
+        body = raw[start + len(begin):stop]
+        body = body.replace("\\\\n", "").replace("\\n", "").replace("\\r", "")
+        compact = "".join(body.split())
         try:
-            value = base64.b64decode(compact, validate=True).decode("ascii").strip()
+            der = base64.b64decode(compact, validate=True)
         except (ValueError, UnicodeError):
             return ""
-    if "\n" not in value and "\\n" in value:
-        value = value.replace("\\n", "\n")
-    if not value.startswith("-----BEGIN ") or len(value) > 16384:
-        return ""
-    return value + "\n"
+        if not der or len(der) > APP_KEY_MAX_DER or der[0] != 0x30:
+            return ""
+        encoded = base64.b64encode(der).decode("ascii")
+        rows = [encoded[offset:offset + 64] for offset in range(0, len(encoded), 64)]
+        return begin + "\n" + "\n".join(rows) + "\n" + end + "\n"
+    return ""
+
+
+def _sign_failure_stage(signed):
+    errors = getattr(signed, "stderr", b"")
+    text = errors.lower() if type(errors) is bytes else b""
+    if any(marker in text for marker in SIGN_KEY_MARKERS):
+        return "sign_key"
+    return "sign_exec"
 
 
 def mint_verifier_token(environ=None):
@@ -654,24 +683,30 @@ def mint_verifier_token(environ=None):
     signing_input = header + b"." + payload
     descriptor = -1
     try:
-        descriptor = os.memfd_create("kd-app-key", os.MFD_CLOEXEC)
-        key_bytes = private_key.encode("ascii")
-        if os.write(descriptor, key_bytes) != len(key_bytes):
-            raise _token_refusal("key_write")
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        signed = subprocess.run(
-            ["/usr/bin/openssl", "dgst", "-sha256", "-sign", "/proc/self/fd/" + str(descriptor)],
-            input=signing_input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=15, check=False, pass_fds=(descriptor,),
-            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
-        )
-    except (OSError, UnicodeError, subprocess.SubprocessError):
-        raise _token_refusal("sign") from None
+        try:
+            descriptor = os.memfd_create("kd-app-key", os.MFD_CLOEXEC)
+            key_bytes = private_key.encode("ascii")
+            if os.write(descriptor, key_bytes) != len(key_bytes):
+                raise _token_refusal("key_write")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+        except (OSError, UnicodeError):
+            raise _token_refusal("key_write") from None
+        try:
+            signed = subprocess.run(
+                ["/usr/bin/openssl", "dgst", "-sha256", "-sign", "/proc/self/fd/" + str(descriptor)],
+                input=signing_input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=15, check=False, pass_fds=(descriptor,),
+                env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise _token_refusal("sign_exec") from None
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if signed.returncode != 0 or len(signed.stdout) < 64 or len(signed.stdout) > 1024:
-        raise _token_refusal("sign")
+    if signed.returncode != 0 or not signed.stdout:
+        raise _token_refusal(_sign_failure_stage(signed))
+    if len(signed.stdout) < 64 or len(signed.stdout) > 1024:
+        raise _token_refusal("sign_size")
     jwt = signing_input.decode("ascii") + "." + base64.urlsafe_b64encode(signed.stdout).rstrip(b"=").decode("ascii")
     unused, installation = _api_request("/app/installations/" + installation_id, jwt)
     account = installation.get("account") if type(installation) is dict else None

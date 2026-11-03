@@ -29,6 +29,9 @@ import macos_core_contract
 import npm_admission_bootstrap
 
 
+_FIXTURE_BODY = base64.b64encode(b"\x30\x0b" + b"fixture-der").decode("ascii")
+
+
 def _path_only_lock(count, prefix="member"):
     names = [prefix + "-" + str(index) for index in range(count)]
     text = "version = 4\n"
@@ -1727,7 +1730,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         identity = {"owner": "KeelDock", "name": "private-source", "repository_id": "41"}
         env = {
             "SOURCE_READER_CLIENT_ID": "Iv1.abc123", "SOURCE_READER_INSTALLATION_ID": "19",
-            "SOURCE_READER_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n",
+            "SOURCE_READER_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\n" + _FIXTURE_BODY + "\n-----END PRIVATE KEY-----\n",
         }
         installation = {"id": 19, "account": {"login": "keeldock"}}
         issued = {"token": token, "permissions": {"contents": "read", "metadata": "read"}}
@@ -1741,7 +1744,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with patch.object(linux_source_build.sys, "stdout", transcript):
                 self.assertEqual(linux_source_build.mint_verifier_token(env), 0)
             self.assertIn("::add-mask::" + token, transcript.getvalue())
-            self.assertNotIn("fixture", transcript.getvalue())
+            self.assertNotIn(_FIXTURE_BODY, transcript.getvalue())
             output.assert_called_once_with(env, {"token": token, "installation_id": "19"})
             self.assertEqual(api.call_args_list[1].args[0], "/app/installations/19/access_tokens")
             self.assertEqual(api.call_args_list[1].kwargs["payload"], {
@@ -1755,39 +1758,103 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
                 linux_source_build.mint_verifier_token(env)
 
-    def test_verifier_key_forms_are_normalised_and_a_refusal_names_only_a_closed_stage(self):
-        pem = "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----"
-        encoded = base64.b64encode(pem.encode("ascii")).decode("ascii")
-        self.assertEqual(linux_source_build._app_key_pem(pem), pem + "\n")
-        self.assertEqual(linux_source_build._app_key_pem("  " + pem + "\n\n"), pem + "\n")
-        self.assertEqual(linux_source_build._app_key_pem(encoded), pem + "\n")
-        self.assertEqual(linux_source_build._app_key_pem(pem.replace("\n", "\\n")), pem + "\n")
-        for bad in ("", "not a key", "!!!!", "-----BEGIN " + "A" * 17000, base64.b64encode(b"plain text").decode("ascii")):
-            with self.subTest(bad=bad[:12]):
+    def test_verifier_key_forms_are_canonicalised_to_one_wrapped_pem(self):
+        der = b"\x30\x82" + bytes(range(1, 120))
+        encoded = base64.b64encode(der).decode("ascii")
+        rows = [encoded[offset:offset + 64] for offset in range(0, len(encoded), 64)]
+        for label in ("PRIVATE KEY", "RSA PRIVATE KEY"):
+            canonical = "-----BEGIN " + label + "-----\n" + "\n".join(rows) + "\n-----END " + label + "-----\n"
+            begin, end = "-----BEGIN " + label + "-----", "-----END " + label + "-----"
+            forms = {
+                "plain": canonical,
+                "padded": "  \n" + canonical + "\n  ",
+                "bom": chr(65279) + canonical,
+                "quoted": '"' + canonical.strip() + '"',
+                "crlf": canonical.replace("\n", "\r\n"),
+                "escaped": canonical.strip().replace("\n", "\\n"),
+                "escaped_crlf": canonical.strip().replace("\n", "\\r\\n"),
+                "double_escaped": canonical.strip().replace("\n", "\\\\n"),
+                "spaces": canonical.strip().replace("\n", " "),
+                "one_line": begin + encoded + end,
+            }
+            for name, value in forms.items():
+                with self.subTest(label=label, form=name):
+                    self.assertEqual(linux_source_build._app_key_pem(value), canonical)
+        for line in canonical.splitlines()[1:-1]:
+            self.assertLessEqual(len(line), 64)
+        certificate = "-----BEGIN CERTIFICATE-----\n" + encoded + "\n-----END CERTIFICATE-----\n"
+        public = "-----BEGIN PUBLIC KEY-----\n" + encoded + "\n-----END PUBLIC KEY-----\n"
+        wrong_start = base64.b64encode(b"\x31" + b"a" * 40).decode("ascii")
+        oversized = base64.b64encode(b"\x30" + b"a" * 9000).decode("ascii")
+        for name, bad in {
+            "empty": "", "not_a_key": "not a key", "certificate": certificate, "public": public,
+            "plain_base64_of_pem": base64.b64encode(canonical.encode("ascii")).decode("ascii"),
+            "no_end": "-----BEGIN PRIVATE KEY-----\n" + encoded,
+            "bad_base64": "-----BEGIN PRIVATE KEY-----\n@@@@\n-----END PRIVATE KEY-----\n",
+            "empty_body": "-----BEGIN PRIVATE KEY-----\n-----END PRIVATE KEY-----\n",
+            "wrong_der_start": "-----BEGIN PRIVATE KEY-----\n" + wrong_start + "\n-----END PRIVATE KEY-----\n",
+            "oversized_der": "-----BEGIN PRIVATE KEY-----\n" + oversized + "\n-----END PRIVATE KEY-----\n",
+            "oversized_raw": "-----BEGIN PRIVATE KEY-----\n" + "A" * 33000,
+            "non_ascii": "-----BEGIN PRIVATE KEY-----\n" + chr(233) + encoded + "\n-----END PRIVATE KEY-----\n",
+        }.items():
+            with self.subTest(refused=name):
                 self.assertEqual(linux_source_build._app_key_pem(bad), "")
+
+    def test_a_token_refusal_names_one_stage_from_a_closed_vocabulary_and_never_prints_openssl_text(self):
+        expected = {
+            "input", "key_format", "key_write", "sign_exec", "sign_key", "sign_size",
+            "installation", "issue", "permissions", "repositories",
+        }
+        self.assertEqual(set(linux_source_build.TOKEN_STAGES), expected)
+        source = Path(linux_source_build.__file__).read_text(encoding="ascii")
+        literals = set(re.findall(r'_token_refusal\("([a-z_]+)"\)', source))
+        self.assertTrue(literals <= expected)
+        self.assertEqual(literals | {"sign_key", "sign_exec"}, expected)
+        for text, stage in (
+            (b"Could not read private key from /proc/self/fd/5", "sign_key"),
+            (b"error:1E08010C:DECODER routines::unsupported", "sign_key"),
+            (b"Bad decrypt", "sign_key"),
+            (b"no start line", "sign_key"),
+            (b"", "sign_exec"),
+            (b"unrelated failure", "sign_exec"),
+        ):
+            with self.subTest(stderr=text[:12]):
+                signed = types.SimpleNamespace(returncode=1, stdout=b"", stderr=text)
+                self.assertEqual(linux_source_build._sign_failure_stage(signed), stage)
+        self.assertEqual(linux_source_build._sign_failure_stage(types.SimpleNamespace(returncode=1, stdout=b"")), "sign_exec")
         identity = {"owner": "KeelDock", "name": "private-source", "repository_id": "41"}
+        key = "-----BEGIN PRIVATE KEY-----\n" + _FIXTURE_BODY + "\n-----END PRIVATE KEY-----\n"
         env = {
             "SOURCE_READER_CLIENT_ID": "Iv1.abc123", "SOURCE_READER_INSTALLATION_ID": "19",
-            "SOURCE_READER_PRIVATE_KEY": "not a key",
+            "SOURCE_READER_PRIVATE_KEY": key,
         }
-        with patch.object(linux_source_build, "_source_inputs", return_value=identity):
-            transcript = io.StringIO()
-            with patch.object(linux_source_build.sys, "stdout", transcript):
-                with self.assertRaises(linux_source_build.SourceBuildRefusal) as raised:
-                    linux_source_build.mint_verifier_token(env)
-            self.assertEqual(raised.exception.reason, "token")
-            self.assertEqual(transcript.getvalue(), "linux-verifier-token-diag stage=key_format\n")
-            transcript = io.StringIO()
-            with patch.object(linux_source_build.sys, "stdout", transcript):
-                with self.assertRaises(linux_source_build.SourceBuildRefusal):
-                    linux_source_build.mint_verifier_token({
-                        "SOURCE_READER_INSTALLATION_ID": "19", "SOURCE_READER_PRIVATE_KEY": pem,
-                    })
-            self.assertEqual(transcript.getvalue(), "linux-verifier-token-diag stage=input\n")
-        source = Path(linux_source_build.__file__).read_text(encoding="ascii")
-        self.assertEqual(set(re.findall(r'_token_refusal\("([a-z_]+)"\)', source)), {
-            "input", "key_format", "key_write", "sign", "installation", "issue", "permissions", "repositories",
-        })
+        cases = (
+            (dict(env, SOURCE_READER_PRIVATE_KEY="not a key"), None, "key_format"),
+            (dict(env, SOURCE_READER_PRIVATE_KEY=key.replace(_FIXTURE_BODY, chr(233) + _FIXTURE_BODY)), None, "key_format"),
+            ({"SOURCE_READER_INSTALLATION_ID": "19", "SOURCE_READER_PRIVATE_KEY": key}, None, "input"),
+            (env, types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"unable to load Private Key"), "sign_key"),
+            (env, types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom"), "sign_exec"),
+            (env, types.SimpleNamespace(returncode=0, stdout=b"", stderr=b""), "sign_exec"),
+            (env, types.SimpleNamespace(returncode=0, stdout=b"s" * 10, stderr=b""), "sign_size"),
+            (env, types.SimpleNamespace(returncode=0, stdout=b"s" * 2000, stderr=b""), "sign_size"),
+        )
+        for values, signed, stage in cases:
+            with self.subTest(stage=stage):
+                transcript = io.StringIO()
+                with patch.object(linux_source_build, "_source_inputs", return_value=identity), patch.object(
+                    linux_source_build.sys, "stdout", transcript
+                ):
+                    if signed is None:
+                        with self.assertRaises(linux_source_build.SourceBuildRefusal) as raised:
+                            linux_source_build.mint_verifier_token(values)
+                    elif not hasattr(os, "memfd_create"):
+                        continue
+                    else:
+                        with patch.object(linux_source_build.subprocess, "run", return_value=signed):
+                            with self.assertRaises(linux_source_build.SourceBuildRefusal) as raised:
+                                linux_source_build.mint_verifier_token(values)
+                self.assertEqual(raised.exception.reason, "token")
+                self.assertEqual(transcript.getvalue(), "linux-verifier-token-diag stage=" + stage + "\n")
 
     def test_shared_auditor_rejects_verdict_outside_the_plain_run_step(self):
         expected = linux_source_build._expected_run({
