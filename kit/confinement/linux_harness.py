@@ -77,16 +77,32 @@ SECCOMP_DENY = 0x00050000 | errno.EPERM
 SECCOMP_ALLOW = 0x7FFF0000
 SOCKETPAIR_SYSCALL = 53
 AF_UNIX = 1
+SOCK_STREAM = 1
+SOCK_DGRAM = 2
+SOCK_RAW = 3
+SOCK_SEQPACKET = 5
+SOCK_NONBLOCK = 0x800
+SOCK_CLOEXEC = 0x80000
+SOCK_FLAGS_CLEAR_MASK = 0xFFFFFFFF & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)
+BPF_LD_W_ABS = 0x20
+BPF_JEQ_K = 0x15
+BPF_AND_K = 0x54
+BPF_RET_K = 0x06
 SECCOMP_ARGUMENT_ZERO_OFFSET = 16
+SECCOMP_ARGUMENT_ONE_OFFSET = 24
 SOCKET_SYSCALLS = (41, 425, 426, 427)
 EXTRA_DENIED_SYSCALLS = (101, 155, 161, 165, 166, 248, 249, 250, 272, 298, 308, 310, 311, 321, 323, 428, 429, 430, 431, 432, 433, 438, 442)
 DENIED_SYSCALLS = SOCKET_SYSCALLS + EXTRA_DENIED_SYSCALLS
 SOCKETPAIR_RULE = (
-    (0x15, 0, 4, SOCKETPAIR_SYSCALL),
-    (0x20, 0, 0, SECCOMP_ARGUMENT_ZERO_OFFSET),
-    (0x15, 0, 1, AF_UNIX),
-    (0x06, 0, 0, SECCOMP_ALLOW),
-    (0x06, 0, 0, SECCOMP_DENY),
+    (BPF_JEQ_K, 0, 8, SOCKETPAIR_SYSCALL),
+    (BPF_LD_W_ABS, 0, 0, SECCOMP_ARGUMENT_ZERO_OFFSET),
+    (BPF_JEQ_K, 0, 4, AF_UNIX),
+    (BPF_LD_W_ABS, 0, 0, SECCOMP_ARGUMENT_ONE_OFFSET),
+    (BPF_AND_K, 0, 0, SOCK_FLAGS_CLEAR_MASK),
+    (BPF_JEQ_K, 2, 0, SOCK_STREAM),
+    (BPF_JEQ_K, 1, 0, SOCK_SEQPACKET),
+    (BPF_RET_K, 0, 0, SECCOMP_DENY),
+    (BPF_RET_K, 0, 0, SECCOMP_ALLOW),
 )
 SOCKET_FILTER = (
     (0x20, 0, 0, 4),
@@ -350,21 +366,23 @@ def _require_socket_policy():
     pair = (ctypes.c_int * 2)()
     calls = [(41, (family, kind, 0)) for family in (1, 2, 10, 16, 17, 40, 0x7fffffff) for kind in (1, 2, 3, 5)]
     calls += [(41, (40 | (1 << 32), 1, 0)), (41, (40, 1 | 0x80000 | 0x800, 0))]
-    calls += [(53, (family, 1, 0, ctypes.addressof(pair))) for family in (0, 2, 10, 16, 17, 40, 0x7fffffff, 40 | (1 << 32))]
+    calls += [(53, (family, kind, 0, ctypes.addressof(pair))) for family in (0, 2, 10, 16, 17, 40, 0x7fffffff, 40 | (1 << 32)) for kind in (1, 5)]
+    calls += [(53, (1, kind, 0, ctypes.addressof(pair))) for kind in (0, 2, 3, 4, 6, 2 | 0x80000, 2 | 0x800, 3 | 0x80000, 1 | 0x100, 5 | 0x100, 1 | 0x40000, 0xffffffff)]
     calls += [(number, (0, 0, 0, 0, 0, 0)) for number in (425, 426, 427)]
     calls += [(0x40000000 | number, (0, 0, 0, 0, 0, 0)) for number in (41, 53, 425, 426, 427)]
-    calls += [(0x40000000 | 53, (1, 1, 0, ctypes.addressof(pair)))]
+    calls += [(0x40000000 | 53, (1, kind, 0, ctypes.addressof(pair))) for kind in (1, 5)]
     for number, arguments in calls:
         ctypes.set_errno(0)
         result = libc.syscall(ctypes.c_long(number), *(ctypes.c_long(value) for value in arguments))
         if result != -1 or ctypes.get_errno() != errno.EPERM:
             raise RuntimeError("socket-policy")
-    try:
-        first, second = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-    except OSError:
-        raise RuntimeError("socket-policy")
-    first.close()
-    second.close()
+    for kind in (socket.SOCK_STREAM, socket.SOCK_SEQPACKET):
+        try:
+            first, second = socket.socketpair(socket.AF_UNIX, kind)
+        except OSError:
+            raise RuntimeError("socket-policy")
+        first.close()
+        second.close()
 
 def _require_process_denials():
     for path in ("/proc/1/environ", "/proc/1/fd"):

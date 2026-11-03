@@ -552,6 +552,7 @@ class LinuxSeccompNumberTests(unittest.TestCase):
 
     def test_filter_has_one_compare_and_deny_pair_per_denied_syscall(self):
         start = 6 + len(harness.SOCKETPAIR_RULE)
+        self.assertEqual(start, 15)
         self.assertEqual(harness.SOCKET_FILTER[6:start], harness.SOCKETPAIR_RULE)
         pairs = [
             (harness.SOCKET_FILTER[index][3], harness.SOCKET_FILTER[index + 1][3])
@@ -561,18 +562,25 @@ class LinuxSeccompNumberTests(unittest.TestCase):
         self.assertTrue(all(value == harness.SECCOMP_DENY for unused, value in pairs))
         self.assertEqual(harness.SOCKET_FILTER[-1][3], harness.SECCOMP_ALLOW)
         self.assertLess(len(harness.SOCKET_FILTER), 4096)
-        self.assertEqual(len(harness.SOCKET_FILTER), 66)
+        self.assertEqual(len(harness.SOCKET_FILTER), 70)
 
-    def test_socketpair_rule_allows_only_the_unix_domain_and_denies_every_other(self):
+    def test_socketpair_rule_allows_only_unix_stream_and_seqpacket_with_the_two_flag_bits_cleared(self):
         rule = harness.SOCKETPAIR_RULE
-        self.assertEqual(len(rule), 5)
-        self.assertEqual(rule[0], (0x15, 0, 4, 53))
+        self.assertEqual(len(rule), 9)
+        self.assertEqual(rule[0], (0x15, 0, 8, 53))
         self.assertEqual(rule[1], (0x20, 0, 0, harness.SECCOMP_ARGUMENT_ZERO_OFFSET))
         self.assertEqual(harness.SECCOMP_ARGUMENT_ZERO_OFFSET, 16)
-        self.assertEqual(rule[2], (0x15, 0, 1, harness.AF_UNIX))
+        self.assertEqual(rule[2], (0x15, 0, 4, harness.AF_UNIX))
         self.assertEqual(harness.AF_UNIX, 1)
-        self.assertEqual(rule[3], (0x06, 0, 0, harness.SECCOMP_ALLOW))
-        self.assertEqual(rule[4], (0x06, 0, 0, harness.SECCOMP_DENY))
+        self.assertEqual(rule[3], (0x20, 0, 0, harness.SECCOMP_ARGUMENT_ONE_OFFSET))
+        self.assertEqual(harness.SECCOMP_ARGUMENT_ONE_OFFSET, 24)
+        self.assertEqual(rule[4], (0x54, 0, 0, 0xFFF7F7FF))
+        self.assertEqual(harness.SOCK_FLAGS_CLEAR_MASK, 0xFFFFFFFF & ~(0x800 | 0x80000))
+        self.assertEqual(rule[5], (0x15, 2, 0, harness.SOCK_STREAM))
+        self.assertEqual(rule[6], (0x15, 1, 0, harness.SOCK_SEQPACKET))
+        self.assertEqual((harness.SOCK_STREAM, harness.SOCK_SEQPACKET), (1, 5))
+        self.assertEqual(rule[7], (0x06, 0, 0, harness.SECCOMP_DENY))
+        self.assertEqual(rule[8], (0x06, 0, 0, harness.SECCOMP_ALLOW))
 
 
 if __name__ == "__main__":
