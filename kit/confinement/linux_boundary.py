@@ -78,7 +78,7 @@ try:
     with open("/proc/sys/net/ipv6/conf/lo/disable_ipv6", "rt") as source:
         if source.read().strip() != "1":
             sys.exit(5)
-except FileNotFoundError:
+except (FileNotFoundError, PermissionError):
     pass
 sys.stdout.write("loopback-ok" + chr(10))
 """

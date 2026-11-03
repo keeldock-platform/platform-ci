@@ -2787,7 +2787,9 @@ def run_project_gates(environ=None):
     browser_root = env.get(BROWSER_ROOT_ENV, "")
     if browser_root and not _browser_installed(browser_root):
         raise SourceBuildRefusal("gate")
-    browser = bool(browser_root) and _ui_kit_workspace_present(worker)
+    browser = _ui_kit_workspace_present(worker)
+    if browser and not browser_root:
+        raise SourceBuildRefusal("gate")
     commands = _gate_commands(worker, rust_root, node_bin, browser)
     selected_gates = tuple(name for name, unused_argv in commands)
     expected_gates = GATES + (RUNTIME_GATE_NAMES if _runtime_workspace_present(worker) else ())

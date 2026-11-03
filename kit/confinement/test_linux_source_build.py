@@ -3921,7 +3921,7 @@ class LinuxBrowserTierTests(unittest.TestCase):
 
     def test_without_a_provisioned_browser_no_browser_gate_runs(self):
         with tempfile.TemporaryDirectory() as temporary:
-            code, session, records = self._run_with_browser(temporary, None)
+            code, session, records = self._run_with_browser(temporary, None, kit=False)
             self.assertEqual(code, 0)
             self.assertEqual(session.call_count, 15)
             for invocation in session.call_args_list:
@@ -3969,6 +3969,12 @@ class LinuxBrowserTierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "gate"):
                 self._run_with_browser(temporary, "/tmp/other", installed=False)
+            self.assertFalse((Path(temporary) / "kd-records" / "gates.json").exists())
+
+    def test_a_core_tree_with_the_ui_kit_but_no_browser_root_refuses_before_any_gate_runs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "gate"):
+                self._run_with_browser(temporary, None, kit=True)
             self.assertFalse((Path(temporary) / "kd-records" / "gates.json").exists())
 
     def test_a_failed_browser_gate_is_named_in_the_refusal_line(self):
