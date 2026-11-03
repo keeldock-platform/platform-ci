@@ -39,6 +39,10 @@ WORKSPACE_MANIFEST = PROJECT + "/Cargo.toml"
 MAX_ARGUMENT_BYTES = 4096
 NAME_RE = re.compile(r"[a-z][a-z_]{0,62}\Z")
 EMIT_SELECTIONS = ("base", "runtime")
+EMIT_PLATFORMS = ("windows",)
+NPM_PREPARE_FLAGS = ("--offline", "--ignore-scripts", "--audit=false", "--fund=false")
+NPM_WORKSPACE_FLAGS = ("--workspaces=true", "--include-workspace-root")
+WINDOWS_STEPPED_GATE = "node_dependency_prepare"
 
 
 class GateTableRefusal(ValueError):
@@ -86,10 +90,7 @@ def _table():
         ("parser_format", _format(fuzz)),
         ("parser_clippy", _clippy(fuzz, "--all-targets")),
         ("parser_replay", (CARGO, "run", "--locked", "--offline", "--manifest-path", fuzz)),
-        ("node_dependency_prepare", _node(
-            "--offline", "--ignore-scripts", "--audit=false", "--fund=false", "ci",
-            "--workspaces=true", "--include-workspace-root",
-        )),
+        ("node_dependency_prepare", _node(*NPM_PREPARE_FLAGS, "ci", *NPM_WORKSPACE_FLAGS)),
         ("node_dependency_audit", _node(
             "--offline", "ls", "--all", "--workspaces=true", "--include-workspace-root",
         )),
@@ -165,8 +166,28 @@ def render(templates, project, cargo, node, npm, separator="/"):
     return tuple(rendered)
 
 
-def emit_json(include_runtime):
-    table = [{"name": name, "argv": list(argv)} for name, argv in gate_templates(include_runtime)]
+def windows_prepare_steps():
+    """Return the two confined npm steps Windows runs for the stepped gate.
+
+    The trusted harness creates the lockfile workspace junctions between the steps, because the
+    container cannot create a junction. The first step validates the lock without writing, and the
+    second installs over the links the harness made, with the same flags as the shared gate.
+    """
+    return (
+        _node(*NPM_PREPARE_FLAGS, "ci", "--dry-run", *NPM_WORKSPACE_FLAGS),
+        _node(*NPM_PREPARE_FLAGS, "install", "--no-save", *NPM_WORKSPACE_FLAGS),
+    )
+
+
+def emit_json(include_runtime, platform=None):
+    if platform is not None and platform not in EMIT_PLATFORMS:
+        raise GateTableRefusal("platform")
+    table = []
+    for name, argv in gate_templates(include_runtime):
+        if platform == "windows" and name == WINDOWS_STEPPED_GATE:
+            table.append({"name": name, "steps": [list(step) for step in windows_prepare_steps()]})
+        else:
+            table.append({"name": name, "argv": list(argv)})
     return json.dumps(
         {"schema_version": SCHEMA_VERSION, "gates": table}, sort_keys=True, separators=(",", ":"),
     )
@@ -299,6 +320,9 @@ def main(arguments=None):
     actual = sys.argv[1:] if arguments is None else list(arguments)
     if len(actual) == 2 and actual[0] == "emit" and actual[1] in EMIT_SELECTIONS:
         sys.stdout.write(emit_json(actual[1] == "runtime") + "\n")
+        return 0
+    if len(actual) == 3 and actual[0] == "emit" and actual[1] in EMIT_SELECTIONS and actual[2] in EMIT_PLATFORMS:
+        sys.stdout.write(emit_json(actual[1] == "runtime", actual[2]) + "\n")
         return 0
     if len(actual) == 3 and actual[0] == "manifest-digest" and actual[1] == "--root":
         try:

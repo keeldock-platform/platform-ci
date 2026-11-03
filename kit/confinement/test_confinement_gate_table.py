@@ -228,8 +228,58 @@ class EmitTests(unittest.TestCase):
                 rebuilt = tuple((entry["name"], tuple(entry["argv"])) for entry in value["gates"])
                 self.assertEqual(rebuilt, gate_table.gate_templates(include_runtime))
 
+    def test_windows_emits_the_stepped_npm_gate_with_the_same_name_count_order_and_flags(self):
+        for selection, include_runtime in (("base", False), ("runtime", True)):
+            with self.subTest(selection=selection):
+                code, text = self._emit(["emit", selection, "windows"])
+                self.assertEqual(code, 0)
+                self.assertEqual(text.count("\n"), 1)
+                value = json.loads(text)
+                self.assertEqual(set(value), {"schema_version", "gates"})
+                self.assertEqual(value["schema_version"], 1)
+                self.assertEqual(
+                    [entry["name"] for entry in value["gates"]],
+                    list(gate_table.selected_gate_names(include_runtime)),
+                )
+                shared = dict(gate_table.gate_templates(include_runtime))
+                stepped = [entry["name"] for entry in value["gates"] if "steps" in entry]
+                self.assertEqual(stepped, [gate_table.WINDOWS_STEPPED_GATE])
+                for entry in value["gates"]:
+                    if entry["name"] == gate_table.WINDOWS_STEPPED_GATE:
+                        self.assertEqual(set(entry), {"name", "steps"})
+                        self.assertEqual(
+                            tuple(tuple(step) for step in entry["steps"]), gate_table.windows_prepare_steps(),
+                        )
+                    else:
+                        self.assertEqual(set(entry), {"name", "argv"})
+                        self.assertEqual(tuple(entry["argv"]), shared[entry["name"]])
+        dry_run, install = gate_table.windows_prepare_steps()
+        self.assertEqual(dry_run, (
+            "{node}", "{npm}", "--offline", "--ignore-scripts", "--audit=false", "--fund=false", "ci", "--dry-run",
+            "--workspaces=true", "--include-workspace-root",
+        ))
+        self.assertEqual(install, (
+            "{node}", "{npm}", "--offline", "--ignore-scripts", "--audit=false", "--fund=false", "install",
+            "--no-save", "--workspaces=true", "--include-workspace-root",
+        ))
+        prepare = dict(gate_table.gate_templates(False))[gate_table.WINDOWS_STEPPED_GATE]
+        for step in (dry_run, install):
+            with self.subTest(step=step[6]):
+                kept = [item for item in step if item not in ("ci", "install", "--dry-run", "--no-save")]
+                self.assertEqual(kept, [item for item in prepare if item != "ci"])
+        rendered = gate_table.render(
+            (("prepare_check", dry_run), ("prepare_install", install)), *WINDOWS_ARGUMENTS, separator="\\",
+        )
+        self.assertEqual(rendered[0][1][:2], ("C:\\node\\node.exe", "C:\\node\\node_modules\\npm\\bin\\npm-cli.js"))
+        self.assertEqual(rendered[1][1][-4:], ("install", "--no-save", "--workspaces=true", "--include-workspace-root"))
+        self.assertEqual(gate_table.emit_json(False), gate_table.emit_json(False, None))
+        with self.assertRaises(gate_table.GateTableRefusal):
+            gate_table.emit_json(False, "linux")
+
     def test_emit_refuses_other_arguments(self):
-        for arguments in ([], ["emit"], ["emit", "all"], ["show", "base"], ["emit", "base", "x"]):
+        for arguments in ([], ["emit"], ["emit", "all"], ["show", "base"], ["emit", "base", "x"],
+                          ["emit", "base", "linux"], ["emit", "all", "windows"], ["emit", "base", "windows", "x"],
+                          ["emit", "base", "Windows"]):
             with self.subTest(arguments=arguments):
                 code, text = self._emit(arguments)
                 self.assertEqual(code, 2)

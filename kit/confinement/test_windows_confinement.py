@@ -86,6 +86,10 @@ PROBE_COMMANDS = (
     "scm",
     "symlink",
     "hardlink",
+    "finalpath",
+    "junction",
+    "mountmgr",
+    "objdac",
     "tokenraise",
     "tokenpriv",
     "taskreg",
@@ -131,6 +135,11 @@ CHANNEL_ATTEMPTS = {
         "hkcu-write",
         "symlink",
         "hardlink-ro",
+        "junction-ro",
+        "junction-scratch",
+        "mountmgr-write-dac",
+        "mountmgr-write",
+        "globalq-write-dac",
         "integrity-raise",
         "privilege-enable",
         "task-register",
@@ -866,11 +875,13 @@ foreach ($case in $cases) {
         self.assertNotIn("arap", ladder)
 
     def test_null_lease_mask_and_trustee_are_fixed(self):
-        lease = self.native[self.native.index("public sealed class NullDeviceLease"):self.native.index("public sealed class Sandbox")]
-        self.assertIn("private const uint LeaseMask = 0x0012019F;", lease)
-        self.assertIn(r'private const string DevicePath = "\\\\.\\NUL";', lease)
+        lease = self.native[self.native.index("public sealed class DeviceLease"):self.native.index("public sealed class Sandbox")]
+        self.assertIn("private const uint NulMask = 0x0012019F;", lease)
+        self.assertIn(r'private const string NulPath = "\\\\.\\NUL";', lease)
         self.assertEqual(0x0012019F & (0x00040000 | 0x00080000 | 0x00010000), 0)
-        self.assertIn("entry.AccessPermissions = LeaseMask;", lease)
+        self.assertIn('if (kind == "nul" && drive.Length == 0)', lease)
+        self.assertIn("lease = new DeviceLease(packageSid, NulPath, NulMask, KindFile);", lease)
+        self.assertIn("entry.AccessPermissions = leaseMask;", lease)
         self.assertIn("entry.Trustee.Name = sid;", lease)
         self.assertIn("Native.ConvertStringSidToSidW(packageSid, out sid)", lease)
         self.assertIn('!packageSid.StartsWith("S-1-15-2-", StringComparison.Ordinal)', lease)
@@ -889,11 +900,12 @@ foreach ($case in $cases) {
             with self.subTest(required=required):
                 self.assertIn(required, lease)
         wrapper = self.wrapper
-        self.assertIn("[KeelDock.Platform.WindowsConfinement.NullDeviceLease]::Open($script:Sid)", wrapper)
+        self.assertIn("[KeelDock.Platform.WindowsConfinement.DeviceLease]::Open('nul', $script:Sid, '')", wrapper)
+        self.assertNotIn("NullDeviceLease", wrapper + self.native)
         self.assertIn("windows-confinement-null=' + $nullState + ' mask=0x0012019f trustee=package readback=' + $nullReadback", wrapper)
         self.assertIn("if ($nullState -ne 'applied' -or $nullReadback -ne 'match') { throw 'null_lease' }", wrapper)
         control = wrapper.index("$controlOutcomes = Invoke-Ladder $box $false $script:Control")
-        opened = wrapper.index("NullDeviceLease]::Open($script:Sid)")
+        opened = wrapper.index("DeviceLease]::Open('nul', $script:Sid, '')")
         temp = wrapper.index("Initialize-ContainerTemp $box")
         confined = wrapper.index("$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac")
         self.assertLess(control, opened)
@@ -1397,11 +1409,170 @@ foreach ($case in $cases) {
             "ace[0] != 0 || ace[1] != 0",
             "int sidLength = 8 + (ace[9] * 4);",
             "BitConverter.ToUInt16(ace, 2) != ace.Length || ace.Length != 8 + sidLength",
-            "BitConverter.ToUInt32(ace, 4) == LeaseMask",
+            "BitConverter.ToUInt32(ace, 4) == leaseMask",
             "string.Equals(SidText(ace, 8), packageSid, StringComparison.Ordinal)",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, body)
+
+    def test_device_lease_kinds_are_a_closed_table_with_read_only_masks(self):
+        lease = self.native[self.native.index("public sealed class DeviceLease"):self.native.index("public static class HandleRemover")]
+        self.assertEqual(re.findall(r'kind == "([a-z_]+)"', lease), ["nul", "mountmgr", "drive_link", "mpm_link", "global_dir"])
+        self.assertEqual(lease.count('throw new InvalidOperationException("lease_kind");'), 2)
+        for required in (
+            "private const uint MountManagerMask = 0x00120089;",
+            r'private const string MountManagerPath = "\\\\.\\MountPointManager";',
+            r'private const string GlobalDirectoryPath = "\\GLOBAL??";',
+            r'private const string MountManagerLinkPath = "\\GLOBAL??\\MountPointManager";',
+            "private const uint LinkQueryMask = 0x00020001;",
+            "private const uint DirectoryQueryMask = 0x00020003;",
+            "private const uint SeKernelObject = 6;",
+            "lease = new DeviceLease(packageSid, MountManagerPath, MountManagerMask, KindFile);",
+            r'lease = new DeviceLease(packageSid, GlobalDirectoryPath + "\\" + drive.ToUpperInvariant() + ":", LinkQueryMask, KindLink);',
+            "lease = new DeviceLease(packageSid, MountManagerLinkPath, LinkQueryMask, KindLink);",
+            "lease = new DeviceLease(packageSid, GlobalDirectoryPath, DirectoryQueryMask, KindDirectory);",
+            "get { return objectKind == KindFile ? SeFileObject : SeKernelObject; }",
+            "Native.NtOpenDirectoryObject(out handle, access, ref attributes)",
+            "Native.NtOpenSymbolicLinkObject(out handle, access, ref attributes)",
+            "lastError = Native.RtlNtStatusToDosError(status);",
+            "return drive.Length == 1 && ",
+            "lease.original = lease.ReadDescriptor();",
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, lease)
+        file_write = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x10000 | 0x40000 | 0x80000
+        self.assertEqual(0x00120089 & file_write, 0)
+        self.assertEqual(0x00120089 & 0x1, 0x1)
+        owner_bits = 0x10000 | 0x40000 | 0x80000
+        self.assertEqual(0x00020001 & (owner_bits | 0x2), 0)
+        self.assertEqual(0x00020003 & (owner_bits | 0x4 | 0x8), 0)
+        self.assertEqual(lease.count("SetSecurityInfo(handle, SecurityObjectType, "), 2)
+        self.assertEqual(lease.count("GetSecurityInfo(handle, SecurityObjectType, "), 2)
+        self.assertNotIn("SetSecurityInfo(handle, SeFileObject", lease)
+        self.assertEqual(lease.count("lastError = "), 6)
+
+    def test_trusted_junctions_are_created_without_following_inside_the_project_and_read_back(self):
+        maker = self.native[self.native.index("public static class JunctionMaker"):]
+        for required in (
+            "private const uint FlagOpenReparsePoint = 0x00200000;",
+            "private const uint ReparseTagMountPoint = 0xA0000003;",
+            "private const uint FsctlSetReparsePoint = 0x000900A4;",
+            "private const uint FsctlGetReparsePoint = 0x000900A8;",
+            "private const int MaxComponents = 8;",
+            r'string substitute = "\\??\\" + target;',
+            "(attributes & AttributeDirectory) == 0 || (attributes & AttributeReparsePoint) != 0",
+            r'string.Equals(FinalPath(handle), "\\\\?\\" + path, StringComparison.OrdinalIgnoreCase)',
+            'throw new InvalidOperationException("npm_link step=overlap error=0");',
+            'part.StartsWith(".", StringComparison.Ordinal) || part.EndsWith(".", StringComparison.Ordinal)',
+            "(attributes & (AttributeDirectory | AttributeReparsePoint)) != 0 || links != 1 || size > (ulong)maxBytes",
+            'throw new InvalidOperationException("read_grew");',
+            "return string.Equals(found, substitute, StringComparison.Ordinal);",
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, maker)
+        create = maker[maker.index("public static string Create("):maker.index("public static bool Verify(")]
+        order = (
+            "held.Add(OpenVerified(root, false));",
+            "held.Add(OpenVerified(Join(root, targetParts, index), false));",
+            "held.Add(OpenVerified(Join(root, linkParts, index), true));",
+            'Native.CreateDirectoryW("\\\\\\\\?\\\\" + link, IntPtr.Zero)',
+            "RequirePlainDirectory(handle, link);",
+            "Native.DeviceIoControl(handle, FsctlSetReparsePoint, data",
+            "if (!ReadsBack(handle, substitute))",
+            'return "verified";',
+        )
+        positions = [create.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("foreach (IntPtr item in held)", create)
+        self.assertEqual(maker.count("FlagBackupSemantics | FlagOpenReparsePoint"), 4)
+        self.assertEqual(maker.count("ShareRead | ShareWrite, IntPtr.Zero, OpenExisting"), 3)
+        for forbidden in ("CreateSymbolicLink", "DeleteFileW", "RemoveDirectoryW", "ShareDelete", "File.Delete", "Directory.Delete", "Process.Start", "MoveFile"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, maker)
+
+    def test_finalpath_junction_and_object_probes_print_only_fixed_tokens(self):
+        probe = self.probe
+        finalpath = probe[probe.index("fn probe_finalpath"):probe.index("fn push_u16")]
+        for required in (
+            "if !plain_path(dir) {",
+            "open_directory(dir, 0)",
+            "open_directory(dir, 0x0010_0080)",
+            "[0u32, 2, 1, 4, 8, 10]",
+            r'device_state("\\\\.\\MountPointManager", 0)',
+            r'device_state("\\\\.\\MountPointManager", 0x8000_0000)',
+            "QueryDosDeviceW(device.as_ptr()",
+            "fs::canonicalize(dir)",
+            'format!("open0={} openra={} n_dos={}", handle_state(&opened), handle_state(&read_attributes), names[0])',
+            'line.push_str(&format!(" ra_dos={}", ra_dos));',
+            '" n_nt={} n_guid={} n_none={} o_dos={} o_nt={} mpm={} mpmr={} qdd={} canon={}",',
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, finalpath)
+        for forbidden in ("display()", "{:?}", "to_string_lossy", "dir)", "target)"):
+            self.assertNotIn(forbidden, finalpath.replace("plain_path(dir)", "").replace("canonicalize(dir)", ""))
+        plain = probe[probe.index("fn plain_path"):probe.index("fn open_directory")]
+        self.assertIn(r'b"\\_.@-".contains(value)', plain)
+        self.assertIn('part == "." || part == ".."', plain)
+        junction = probe[probe.index("fn probe_junction"):probe.index("fn probe_mountmgr")]
+        order = (
+            "CreateDirectoryW(link_name.as_ptr(), ptr::null_mut())",
+            "CreateFileW(link_name.as_ptr(), 0x4000_0000, 0, ptr::null_mut(), 3, 0x0220_0000, 0)",
+            r'format!("\\??\\{}", target)',
+            "0xA000_0003u32.to_le_bytes()",
+            "DeviceIoControl(handle, 0x0009_00A4,",
+            "DeviceIoControl(handle, 0x0009_00A8,",
+            "let removed = remove_state(&link_name);\n    finish(",
+        )
+        positions = [junction.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('(mode != "" && mode != "new")', junction)
+        self.assertEqual(len(re.findall(r'format!\("mkdir=', junction)), 4)
+        mountmgr = probe[probe.index("fn probe_mountmgr"):probe.index("fn probe_objdac")]
+        self.assertIn('"dac" => 0x0004_0000,', mountmgr)
+        self.assertIn('"write" => 0x4000_0000,', mountmgr)
+        objdac = probe[probe.index("fn probe_objdac"):probe.index("fn probe_tokenraise")]
+        for required in (
+            "GetModuleHandleW(library.as_ptr())",
+            r'b"NtOpenDirectoryObject\0"',
+            r'b"NtOpenSymbolicLinkObject\0"',
+            r'b"RtlNtStatusToDosError\0"',
+            "[48, 0, unicode.as_ptr() as u64, 0x40, 0, 0]",
+            "open(&mut handle, 0x0004_0000, attributes.as_ptr())",
+            'format!("open=err{}", convert(status))',
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, objdac)
+        self.assertNotIn("LoadLibrary", objdac)
+        self.assertNotIn("-l ntdll", self.wrapper)
+
+    def test_junction_and_mount_manager_attempts_are_pinned(self):
+        lines = {
+            re.search(r"Name = '([a-z0-9-]+)'", line).group(1): line
+            for line in self.channel_attempt_lines()
+        }
+        junction = lines["junction-ro"]
+        for required in (
+            "Runs = @('junction {scratch_tmp}\\kd_att_{rand} {ro_dir}')",
+            "ControlRuns = @('junction {control_tmp}\\kd_att_{rand} {ro_dir}')",
+            "ControlAllow = '^mkdir=ok open=ok fsctl=ok readback=ok remove=ok$'",
+            "Deny = '^mkdir=ok open=ok fsctl=err(5|1314) readback=na remove=ok$'",
+            "Expect = 'denied'",
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, junction)
+        self.assertNotIn("Informational", junction)
+        self.assertNotIn("Optional", junction)
+        scratch = lines["junction-scratch"]
+        self.assertIn("Informational = $true; Runs = @('junction {scratch_tmp}\\kd_att_{rand}l {scratch_tmp}\\kd_att_{rand}t new'); ControlRuns = @()", scratch)
+        self.assertNotIn("LeakGuard", scratch)
+        for name, command in (("mountmgr-write-dac", "mountmgr dac"), ("mountmgr-write", "mountmgr write")):
+            with self.subTest(attempt=name):
+                self.assertIn("Runs = @('" + command + "'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'", lines[name])
+        self.assertIn("Optional = $true; Runs = @('objdac {lease_object}'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'", lines["globalq-write-dac"])
+        context = self.function_body("Initialize-ChannelContext")
+        self.assertIn("ro_dir = [string](Split-Path -Parent $script:Layout.NodeTest)", context)
+        self.assertIn("LeaseObjects = @(); Scalars = $scalars", context)
+        self.assertIn("'{lease_object}' = @($script:Channel.LeaseObjects | Where-Object { $_ })", self.function_body("Expand-ChannelRun"))
 
     def test_a_second_distinct_container_must_be_denied_on_nul_after_the_grant(self):
         body = self.function_body("Test-OtherContainerNul")
@@ -1419,7 +1590,7 @@ foreach ($case in $cases) {
                 self.assertIn(required, body)
         self.assertLess(body.index("$first.Run("), body.index("$other.Run("))
         self.assertIn("$phase = 'nul_other_container'\n        Test-OtherContainerNul $box", self.wrapper)
-        opened = self.wrapper.index("NullDeviceLease]::Open($script:Sid)")
+        opened = self.wrapper.index("DeviceLease]::Open('nul', $script:Sid, '')")
         other = self.wrapper.index("Test-OtherContainerNul $box")
         confined = self.wrapper.index("$confinedOutcomes = Invoke-Ladder $box $true $script:Lpac")
         self.assertLess(opened, other)
@@ -1575,6 +1746,19 @@ foreach ($case in $cases) {
         "dacopen": ("open=ok", "open=err5", "open=err2"),
         "symlink": ("create=ok", "create=err5", "create=err1314", "create=err183"),
         "hardlink": ("create=ok", "create=err5", "create=err1314", "create=err183", "create=err17"),
+        "junction": (
+            "mkdir=ok open=ok fsctl=err5 readback=na remove=ok",
+            "mkdir=ok open=ok fsctl=err1314 readback=na remove=ok",
+            "mkdir=ok open=ok fsctl=err87 readback=na remove=ok",
+            "mkdir=ok open=ok fsctl=err5 readback=na remove=err5",
+            "mkdir=ok open=ok fsctl=ok readback=ok remove=ok",
+            "mkdir=ok open=ok fsctl=ok readback=err13 remove=err5",
+            "mkdir=ok open=err5 fsctl=na readback=na remove=ok",
+            "mkdir=err5 open=na fsctl=na readback=na remove=na",
+            "mkdir=usage open=na fsctl=na readback=na remove=na",
+        ),
+        "mountmgr": ("open=ok", "open=err5", "open=err2", "open=usage"),
+        "objdac": ("open=ok", "open=err5", "open=err2", "open=proc_err", "open=usage"),
         "tokenraise": ("open=ok set=ok", "open=ok set=err5", "open=ok set=err1314", "open=err5 set=na", "open=err87 set=na", "open=ok set=err87"),
         "tokenpriv": ("adjust=ok", "adjust=err5", "adjust=err1300", "adjust=err87", "adjust=err6", "open=err5", "open=err6"),
         "taskreg": ("create=ok connect=ok", "create=ok connect=hr80070005", "create=ok connect=hr800706d9", "create=hr80040154", "create=ok connect=hr80041003"),
@@ -1674,6 +1858,21 @@ foreach ($case in $cases) {
         self.assertEqual(results[("boundary_disablement/wfp", "open=err1722")], "other")
         self.assertEqual(results[("boundary_disablement/wfp", "open=ok")], "allowed")
         self.assertEqual(results[("boundary_disablement/profile-create", "create=ok")], "allowed")
+        self.assertEqual(results[("boundary_disablement/junction-ro", "mkdir=ok open=ok fsctl=err5 readback=na remove=ok")], "denied")
+        self.assertEqual(results[("boundary_disablement/junction-ro", "mkdir=ok open=ok fsctl=err1314 readback=na remove=ok")], "denied")
+        self.assertEqual(results[("boundary_disablement/junction-ro", "mkdir=ok open=ok fsctl=err87 readback=na remove=ok")], "other")
+        self.assertEqual(results[("boundary_disablement/junction-ro", "mkdir=ok open=ok fsctl=err5 readback=na remove=err5")], "other")
+        self.assertEqual(results[("boundary_disablement/junction-ro", "mkdir=ok open=ok fsctl=ok readback=ok remove=ok")], "allowed")
+        self.assertEqual(results[("boundary_disablement/junction-ro", "mkdir=ok open=ok fsctl=ok readback=err13 remove=err5")], "allowed")
+        self.assertEqual(results[("boundary_disablement/junction-ro", "mkdir=ok open=err5 fsctl=na readback=na remove=ok")], "other")
+        self.assertEqual(results[("boundary_disablement/junction-scratch", "mkdir=ok open=ok fsctl=err5 readback=na remove=ok")], "denied")
+        self.assertEqual(results[("boundary_disablement/junction-scratch", "mkdir=ok open=ok fsctl=ok readback=ok remove=ok")], "allowed")
+        self.assertEqual(results[("boundary_disablement/mountmgr-write-dac", "open=err5")], "denied")
+        self.assertEqual(results[("boundary_disablement/mountmgr-write-dac", "open=ok")], "allowed")
+        self.assertEqual(results[("boundary_disablement/mountmgr-write", "open=err2")], "other")
+        self.assertEqual(results[("boundary_disablement/globalq-write-dac", "open=err5")], "denied")
+        self.assertEqual(results[("boundary_disablement/globalq-write-dac", "open=ok")], "allowed")
+        self.assertEqual(results[("boundary_disablement/globalq-write-dac", "open=proc_err")], "other")
 
     def test_expansion_of_channel_runs_skips_unresolved_placeholders_under_pwsh(self):
         if shutil.which("pwsh") is None:
@@ -1736,6 +1935,10 @@ foreach ($case in $cases) {
             "control-self-memory",
             "job-breakaway",
             "nul-write-dac",
+            "junction-scratch",
+            "mountmgr-write-dac",
+            "mountmgr-write",
+            "globalq-write-dac",
         }
         expect_allowed = {"named-pipe-local", "walk-control-scratch", "control-self-memory", "control-peer-memory"}
 
@@ -1986,7 +2189,7 @@ foreach ($case in $cases) {
         }
         self.assertEqual(
             optional,
-            {("runner_ipc", "pipe-runner-open"), ("runner_files", "diag-read"), ("cache_upload", "endpoint-post")},
+            {("runner_ipc", "pipe-runner-open"), ("runner_files", "diag-read"), ("cache_upload", "endpoint-post"), ("boundary_disablement", "globalq-write-dac")},
         )
         na = {re.search(r"Name = '([a-z0-9-]+)'", line).group(1) for line in lines if "NaPattern" in line}
         self.assertEqual(na, {"pipe-runner-open", "control-peer-memory"})
@@ -2116,7 +2319,7 @@ foreach ($case in $cases) {
             for line in lines
             if "Informational = $true" in line
         }
-        self.assertEqual(informational, {"named-pipe-local", "conout-open", "task-register", "wmi", "wfp"})
+        self.assertEqual(informational, {"named-pipe-local", "conout-open", "task-register", "wmi", "wfp", "junction-scratch"})
         leak_guarded = {
             re.search(r"Name = '([a-z0-9-]+)'", line).group(1)
             for line in lines

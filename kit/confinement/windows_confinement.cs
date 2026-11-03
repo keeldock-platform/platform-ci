@@ -73,39 +73,85 @@ namespace KeelDock.Platform.WindowsConfinement
         private static extern bool SetFileSecurityW(string fileName, uint securityInformation, byte[] securityDescriptor);
     }
 
-    public sealed class NullDeviceLease
+    public sealed class DeviceLease
     {
-        private const string DevicePath = "\\\\.\\NUL";
-        private const uint LeaseMask = 0x0012019F;
+        private const string NulPath = "\\\\.\\NUL";
+        private const uint NulMask = 0x0012019F;
+        private const string MountManagerPath = "\\\\.\\MountPointManager";
+        private const uint MountManagerMask = 0x00120089;
+        private const string GlobalDirectoryPath = "\\GLOBAL??";
+        private const string MountManagerLinkPath = "\\GLOBAL??\\MountPointManager";
+        private const uint LinkQueryMask = 0x00020001;
+        private const uint DirectoryQueryMask = 0x00020003;
         private const uint ReadControl = 0x00020000;
         private const uint WriteDac = 0x00040000;
         private const uint ShareReadWrite = 0x00000003;
         private const uint OpenExisting = 3;
         private const uint SeFileObject = 1;
+        private const uint SeKernelObject = 6;
+        private const uint ObjectCaseInsensitive = 0x00000040;
         private const uint DaclInformation = 0x00000004;
         private const uint LabelInformation = 0x00000010;
         private const uint ProtectedDacl = 0x80000000;
         private const uint UnprotectedDacl = 0x20000000;
         private const int DaclFieldOffset = 16;
         private const int MaxDescriptorBytes = 65536;
+        private const int KindFile = 0;
+        private const int KindLink = 1;
+        private const int KindDirectory = 2;
         private static readonly IntPtr InvalidHandle = new IntPtr(-1);
 
         private readonly string packageSid;
+        private readonly string objectPath;
+        private readonly uint leaseMask;
+        private readonly int objectKind;
         private byte[] original;
         private bool applied;
+        private uint lastError;
 
-        private NullDeviceLease(string packageSid)
+        private DeviceLease(string packageSid, string objectPath, uint leaseMask, int objectKind)
         {
             this.packageSid = packageSid;
+            this.objectPath = objectPath;
+            this.leaseMask = leaseMask;
+            this.objectKind = objectKind;
         }
 
-        public static NullDeviceLease Open(string packageSid)
+        public static DeviceLease Open(string kind, string packageSid, string drive)
         {
             if (string.IsNullOrEmpty(packageSid) || !packageSid.StartsWith("S-1-15-2-", StringComparison.Ordinal))
             {
                 throw new InvalidOperationException("lease_sid");
             }
-            NullDeviceLease lease = new NullDeviceLease(packageSid);
+            if (kind == null || drive == null)
+            {
+                throw new InvalidOperationException("lease_kind");
+            }
+            DeviceLease lease;
+            if (kind == "nul" && drive.Length == 0)
+            {
+                lease = new DeviceLease(packageSid, NulPath, NulMask, KindFile);
+            }
+            else if (kind == "mountmgr" && drive.Length == 0)
+            {
+                lease = new DeviceLease(packageSid, MountManagerPath, MountManagerMask, KindFile);
+            }
+            else if (kind == "drive_link" && IsDriveLetter(drive))
+            {
+                lease = new DeviceLease(packageSid, GlobalDirectoryPath + "\\" + drive.ToUpperInvariant() + ":", LinkQueryMask, KindLink);
+            }
+            else if (kind == "mpm_link" && drive.Length == 0)
+            {
+                lease = new DeviceLease(packageSid, MountManagerLinkPath, LinkQueryMask, KindLink);
+            }
+            else if (kind == "global_dir" && drive.Length == 0)
+            {
+                lease = new DeviceLease(packageSid, GlobalDirectoryPath, DirectoryQueryMask, KindDirectory);
+            }
+            else
+            {
+                throw new InvalidOperationException("lease_kind");
+            }
             lease.original = lease.ReadDescriptor();
             return lease;
         }
@@ -113,6 +159,11 @@ namespace KeelDock.Platform.WindowsConfinement
         public bool Applied
         {
             get { return applied; }
+        }
+
+        public uint Error
+        {
+            get { return lastError; }
         }
 
         public string Apply()
@@ -125,16 +176,19 @@ namespace KeelDock.Platform.WindowsConfinement
             {
                 if (!Native.ConvertStringSidToSidW(packageSid, out sid) || sid == IntPtr.Zero)
                 {
+                    lastError = (uint)Marshal.GetLastWin32Error();
                     return "failed";
                 }
                 handle = OpenHandle(ReadControl | WriteDac);
                 IntPtr dacl;
-                if (QuerySecurity(handle, out descriptor, out dacl) != 0 || dacl == IntPtr.Zero)
+                uint status = QuerySecurity(handle, out descriptor, out dacl);
+                if (status != 0 || dacl == IntPtr.Zero)
                 {
+                    lastError = status;
                     return "failed";
                 }
                 Native.ExplicitAccess entry = new Native.ExplicitAccess();
-                entry.AccessPermissions = LeaseMask;
+                entry.AccessPermissions = leaseMask;
                 entry.AccessMode = 1;
                 entry.Inheritance = 0;
                 entry.Trustee.MultipleTrustee = IntPtr.Zero;
@@ -142,13 +196,17 @@ namespace KeelDock.Platform.WindowsConfinement
                 entry.Trustee.TrusteeForm = 0;
                 entry.Trustee.TrusteeType = 0;
                 entry.Trustee.Name = sid;
-                if (Native.SetEntriesInAclW(1, ref entry, dacl, out newAcl) != 0 || newAcl == IntPtr.Zero)
+                status = Native.SetEntriesInAclW(1, ref entry, dacl, out newAcl);
+                if (status != 0 || newAcl == IntPtr.Zero)
                 {
+                    lastError = status;
                     return "failed";
                 }
                 applied = true;
-                if (Native.SetSecurityInfo(handle, SeFileObject, DaclInformation, IntPtr.Zero, IntPtr.Zero, newAcl, IntPtr.Zero) != 0)
+                status = Native.SetSecurityInfo(handle, SecurityObjectType, DaclInformation, IntPtr.Zero, IntPtr.Zero, newAcl, IntPtr.Zero);
+                if (status != 0)
                 {
+                    lastError = status;
                     return "failed";
                 }
                 return "applied";
@@ -245,6 +303,16 @@ namespace KeelDock.Platform.WindowsConfinement
             return state;
         }
 
+        private uint SecurityObjectType
+        {
+            get { return objectKind == KindFile ? SeFileObject : SeKernelObject; }
+        }
+
+        private static bool IsDriveLetter(string drive)
+        {
+            return drive.Length == 1 && ((drive[0] >= 'A' && drive[0] <= 'Z') || (drive[0] >= 'a' && drive[0] <= 'z'));
+        }
+
         private bool IsLeaseAce(byte[] ace)
         {
             if (ace == null || ace.Length < 12 || ace[0] != 0 || ace[1] != 0)
@@ -256,7 +324,7 @@ namespace KeelDock.Platform.WindowsConfinement
             {
                 return false;
             }
-            return BitConverter.ToUInt32(ace, 4) == LeaseMask && string.Equals(SidText(ace, 8), packageSid, StringComparison.Ordinal);
+            return BitConverter.ToUInt32(ace, 4) == leaseMask && string.Equals(SidText(ace, 8), packageSid, StringComparison.Ordinal);
         }
 
         private void WriteOriginal(bool kernelStyle)
@@ -288,7 +356,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
                 uint control = BitConverter.ToUInt16(original, 2);
                 uint protection = (control & 0x1000) != 0 ? ProtectedDacl : UnprotectedDacl;
-                uint status = Native.SetSecurityInfo(handle, SeFileObject, DaclInformation | protection, IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
+                uint status = Native.SetSecurityInfo(handle, SecurityObjectType, DaclInformation | protection, IntPtr.Zero, IntPtr.Zero, dacl, IntPtr.Zero);
                 if (status != 0)
                 {
                     throw new InvalidOperationException("restore_set error=" + status.ToString());
@@ -306,20 +374,65 @@ namespace KeelDock.Platform.WindowsConfinement
 
         private IntPtr OpenHandle(uint access)
         {
-            IntPtr handle = Native.CreateFileW(DevicePath, access, ShareReadWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            if (objectKind != KindFile)
+            {
+                return OpenObject(access);
+            }
+            IntPtr handle = Native.CreateFileW(objectPath, access, ShareReadWrite, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
             if (handle == InvalidHandle || handle == IntPtr.Zero)
             {
-                throw new InvalidOperationException("device_open error=" + Marshal.GetLastWin32Error().ToString());
+                lastError = (uint)Marshal.GetLastWin32Error();
+                throw new InvalidOperationException("device_open error=" + lastError.ToString());
             }
             return handle;
         }
 
-        private static uint QuerySecurity(IntPtr handle, out IntPtr descriptor, out IntPtr dacl)
+        private IntPtr OpenObject(uint access)
+        {
+            IntPtr text = Marshal.StringToHGlobalUni(objectPath);
+            IntPtr name = IntPtr.Zero;
+            try
+            {
+                Native.UnicodeString unicode = new Native.UnicodeString();
+                unicode.Length = (ushort)(objectPath.Length * 2);
+                unicode.MaximumLength = (ushort)(objectPath.Length * 2 + 2);
+                unicode.Buffer = text;
+                name = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Native.UnicodeString)));
+                Marshal.StructureToPtr(unicode, name, false);
+                Native.ObjectAttributes attributes = new Native.ObjectAttributes();
+                attributes.Length = (uint)Marshal.SizeOf(typeof(Native.ObjectAttributes));
+                attributes.RootDirectory = IntPtr.Zero;
+                attributes.ObjectName = name;
+                attributes.Attributes = ObjectCaseInsensitive;
+                attributes.SecurityDescriptor = IntPtr.Zero;
+                attributes.SecurityQualityOfService = IntPtr.Zero;
+                IntPtr handle;
+                int status = objectKind == KindDirectory
+                    ? Native.NtOpenDirectoryObject(out handle, access, ref attributes)
+                    : Native.NtOpenSymbolicLinkObject(out handle, access, ref attributes);
+                if (status < 0 || handle == IntPtr.Zero)
+                {
+                    lastError = Native.RtlNtStatusToDosError(status);
+                    throw new InvalidOperationException("object_open error=" + lastError.ToString());
+                }
+                return handle;
+            }
+            finally
+            {
+                if (name != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(name);
+                }
+                Marshal.FreeHGlobal(text);
+            }
+        }
+
+        private uint QuerySecurity(IntPtr handle, out IntPtr descriptor, out IntPtr dacl)
         {
             IntPtr owner;
             IntPtr group;
             IntPtr sacl;
-            uint status = Native.GetSecurityInfo(handle, SeFileObject, DaclInformation | LabelInformation, out owner, out group, out dacl, out sacl, out descriptor);
+            uint status = Native.GetSecurityInfo(handle, SecurityObjectType, DaclInformation | LabelInformation, out owner, out group, out dacl, out sacl, out descriptor);
             if (status == 0 && descriptor != IntPtr.Zero)
             {
                 return status;
@@ -329,7 +442,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 Native.LocalFree(descriptor);
             }
             descriptor = IntPtr.Zero;
-            return Native.GetSecurityInfo(handle, SeFileObject, DaclInformation, out owner, out group, out dacl, out sacl, out descriptor);
+            return Native.GetSecurityInfo(handle, SecurityObjectType, DaclInformation, out owner, out group, out dacl, out sacl, out descriptor);
         }
 
         private byte[] ReadDescriptor()
@@ -461,6 +574,25 @@ namespace KeelDock.Platform.WindowsConfinement
                 internal Trustee Trustee;
             }
 
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct UnicodeString
+            {
+                internal ushort Length;
+                internal ushort MaximumLength;
+                internal IntPtr Buffer;
+            }
+
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct ObjectAttributes
+            {
+                internal uint Length;
+                internal IntPtr RootDirectory;
+                internal IntPtr ObjectName;
+                internal uint Attributes;
+                internal IntPtr SecurityDescriptor;
+                internal IntPtr SecurityQualityOfService;
+            }
+
             [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
             internal static extern IntPtr CreateFileW(string fileName, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
 
@@ -494,6 +626,15 @@ namespace KeelDock.Platform.WindowsConfinement
             [DllImport("advapi32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool ConvertStringSidToSidW(string text, out IntPtr sid);
+
+            [DllImport("ntdll.dll", ExactSpelling = true)]
+            internal static extern int NtOpenSymbolicLinkObject(out IntPtr handle, uint access, ref ObjectAttributes attributes);
+
+            [DllImport("ntdll.dll", ExactSpelling = true)]
+            internal static extern int NtOpenDirectoryObject(out IntPtr handle, uint access, ref ObjectAttributes attributes);
+
+            [DllImport("ntdll.dll", ExactSpelling = true)]
+            internal static extern uint RtlNtStatusToDosError(int status);
         }
     }
 
@@ -2272,6 +2413,439 @@ namespace KeelDock.Platform.WindowsConfinement
             [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]
             internal static extern bool CreateProcessW(string applicationName, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes, [MarshalAs(UnmanagedType.Bool)] bool inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory, ref StartupInfoEx startupInfo, ref ProcessInformation processInformation);
+        }
+    }
+
+    public static class JunctionMaker
+    {
+        private const uint GenericWrite = 0x40000000;
+        private const uint FileReadData = 0x00000001;
+        private const uint FileReadAttributes = 0x00000080;
+        private const uint Synchronize = 0x00100000;
+        private const uint ShareRead = 0x00000001;
+        private const uint ShareWrite = 0x00000002;
+        private const uint OpenExisting = 3;
+        private const uint FlagBackupSemantics = 0x02000000;
+        private const uint FlagOpenReparsePoint = 0x00200000;
+        private const uint AttributeDirectory = 0x00000010;
+        private const uint AttributeReparsePoint = 0x00000400;
+        private const uint ReparseTagMountPoint = 0xA0000003;
+        private const uint FsctlSetReparsePoint = 0x000900A4;
+        private const uint FsctlGetReparsePoint = 0x000900A8;
+        private const int ErrorFileNotFound = 2;
+        private const int ErrorPathNotFound = 3;
+        private const int MaxReparseBytes = 16384;
+        private const int MaxComponents = 8;
+        private const int MaxComponentChars = 100;
+        private const int FinalPathChars = 32768;
+        private const int InformationBytes = 52;
+        private static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        public static string Create(string projectRoot, string linkRelative, string targetRelative)
+        {
+            string root = Root(projectRoot);
+            string[] linkParts = Parts(linkRelative);
+            string[] targetParts = Parts(targetRelative);
+            string target = Join(root, targetParts, targetParts.Length);
+            string link = Join(root, linkParts, linkParts.Length);
+            if (target.StartsWith(link + "\\", StringComparison.OrdinalIgnoreCase) || link.StartsWith(target + "\\", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(link, target, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("npm_link step=overlap error=0");
+            }
+            List<IntPtr> held = new List<IntPtr>();
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                held.Add(OpenVerified(root, false));
+                for (int index = 1; index <= targetParts.Length; ++index)
+                {
+                    held.Add(OpenVerified(Join(root, targetParts, index), false));
+                }
+                for (int index = 1; index < linkParts.Length; ++index)
+                {
+                    held.Add(OpenVerified(Join(root, linkParts, index), true));
+                }
+                if (!Native.CreateDirectoryW("\\\\?\\" + link, IntPtr.Zero))
+                {
+                    throw new InvalidOperationException("npm_link step=mkdir error=" + Marshal.GetLastWin32Error().ToString());
+                }
+                handle = Native.CreateFileW("\\\\?\\" + link, GenericWrite | FileReadAttributes | Synchronize, 0, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero);
+                if (handle == InvalidHandle || handle == IntPtr.Zero)
+                {
+                    handle = IntPtr.Zero;
+                    throw new InvalidOperationException("npm_link step=open error=" + Marshal.GetLastWin32Error().ToString());
+                }
+                RequirePlainDirectory(handle, link);
+                string substitute = "\\??\\" + target;
+                byte[] data = MountPointData(substitute, target);
+                uint returned;
+                if (!Native.DeviceIoControl(handle, FsctlSetReparsePoint, data, (uint)data.Length, null, 0, out returned, IntPtr.Zero))
+                {
+                    throw new InvalidOperationException("npm_link step=fsctl error=" + Marshal.GetLastWin32Error().ToString());
+                }
+                if (!ReadsBack(handle, substitute))
+                {
+                    throw new InvalidOperationException("npm_link step=readback error=0");
+                }
+                return "verified";
+            }
+            finally
+            {
+                if (handle != IntPtr.Zero)
+                {
+                    Native.CloseHandle(handle);
+                }
+                foreach (IntPtr item in held)
+                {
+                    Native.CloseHandle(item);
+                }
+            }
+        }
+
+        public static bool Verify(string projectRoot, string linkRelative, string targetRelative)
+        {
+            List<IntPtr> held = new List<IntPtr>();
+            IntPtr handle = IntPtr.Zero;
+            try
+            {
+                string root = Root(projectRoot);
+                string[] linkParts = Parts(linkRelative);
+                string[] targetParts = Parts(targetRelative);
+                string target = Join(root, targetParts, targetParts.Length);
+                string link = Join(root, linkParts, linkParts.Length);
+                held.Add(OpenVerified(root, false));
+                for (int index = 1; index < linkParts.Length; ++index)
+                {
+                    held.Add(OpenVerified(Join(root, linkParts, index), false));
+                }
+                handle = Native.CreateFileW("\\\\?\\" + link, FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero);
+                if (handle == InvalidHandle || handle == IntPtr.Zero)
+                {
+                    handle = IntPtr.Zero;
+                    return false;
+                }
+                uint attributes;
+                uint links;
+                ulong size;
+                ReadInformation(handle, out attributes, out links, out size);
+                if ((attributes & AttributeDirectory) == 0 || (attributes & AttributeReparsePoint) == 0)
+                {
+                    return false;
+                }
+                return ReadsBack(handle, "\\??\\" + target);
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                if (handle != IntPtr.Zero)
+                {
+                    Native.CloseHandle(handle);
+                }
+                foreach (IntPtr item in held)
+                {
+                    Native.CloseHandle(item);
+                }
+            }
+        }
+
+        public static byte[] ReadNoFollow(string path, int maxBytes)
+        {
+            if (string.IsNullOrEmpty(path) || path.Length < 4 || path[1] != ':' || path[2] != '\\' || maxBytes < 1)
+            {
+                throw new InvalidOperationException("read_path");
+            }
+            IntPtr handle = Native.CreateFileW("\\\\?\\" + path, FileReadData | FileReadAttributes | Synchronize, ShareRead, IntPtr.Zero, OpenExisting, FlagOpenReparsePoint, IntPtr.Zero);
+            if (handle == InvalidHandle || handle == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("read_open error=" + Marshal.GetLastWin32Error().ToString());
+            }
+            try
+            {
+                uint attributes;
+                uint links;
+                ulong size;
+                ReadInformation(handle, out attributes, out links, out size);
+                if ((attributes & (AttributeDirectory | AttributeReparsePoint)) != 0 || links != 1 || size > (ulong)maxBytes)
+                {
+                    throw new InvalidOperationException("read_shape");
+                }
+                byte[] buffer = new byte[(int)size];
+                int offset = 0;
+                while (offset < buffer.Length)
+                {
+                    uint got;
+                    if (!Native.ReadFile(handle, buffer, offset, (uint)(buffer.Length - offset), out got) || got == 0)
+                    {
+                        throw new InvalidOperationException("read_data");
+                    }
+                    offset += (int)got;
+                }
+                byte[] extra = new byte[1];
+                uint more;
+                if (!Native.ReadFile(handle, extra, 0, 1, out more) || more != 0)
+                {
+                    throw new InvalidOperationException("read_grew");
+                }
+                return buffer;
+            }
+            finally
+            {
+                Native.CloseHandle(handle);
+            }
+        }
+
+        private static string Root(string projectRoot)
+        {
+            if (string.IsNullOrEmpty(projectRoot) || projectRoot.Length < 4 || projectRoot.Length > 400 || projectRoot[1] != ':' || projectRoot[2] != '\\' || projectRoot.EndsWith("\\", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException("npm_link step=root error=0");
+            }
+            char drive = projectRoot[0];
+            if (!((drive >= 'A' && drive <= 'Z') || (drive >= 'a' && drive <= 'z')))
+            {
+                throw new InvalidOperationException("npm_link step=root error=0");
+            }
+            foreach (string part in projectRoot.Substring(3).Split('\\'))
+            {
+                if (part.Length == 0 || part == "." || part == ".." || !SafeText(part, "_.-"))
+                {
+                    throw new InvalidOperationException("npm_link step=root error=0");
+                }
+            }
+            return projectRoot;
+        }
+
+        private static string[] Parts(string relative)
+        {
+            if (string.IsNullOrEmpty(relative) || relative.Length > 200)
+            {
+                throw new InvalidOperationException("npm_link step=path error=0");
+            }
+            string[] parts = relative.Split('/');
+            if (parts.Length > MaxComponents)
+            {
+                throw new InvalidOperationException("npm_link step=path error=0");
+            }
+            foreach (string part in parts)
+            {
+                if (part.Length == 0 || part.Length > MaxComponentChars || part.StartsWith(".", StringComparison.Ordinal) || part.EndsWith(".", StringComparison.Ordinal) || !SafeText(part, "@._-"))
+                {
+                    throw new InvalidOperationException("npm_link step=path error=0");
+                }
+            }
+            return parts;
+        }
+
+        private static bool SafeText(string text, string extra)
+        {
+            foreach (char value in text)
+            {
+                bool plain = (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z') || (value >= '0' && value <= '9');
+                if (!plain && extra.IndexOf(value) < 0)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static string Join(string root, string[] parts, int count)
+        {
+            StringBuilder text = new StringBuilder(root);
+            for (int index = 0; index < count; ++index)
+            {
+                text.Append('\\');
+                text.Append(parts[index]);
+            }
+            return text.ToString();
+        }
+
+        private static IntPtr OpenVerified(string path, bool create)
+        {
+            string extended = "\\\\?\\" + path;
+            IntPtr handle = Native.CreateFileW(extended, FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero);
+            if (handle == InvalidHandle || handle == IntPtr.Zero)
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (!create || (error != ErrorFileNotFound && error != ErrorPathNotFound))
+                {
+                    throw new InvalidOperationException("npm_link step=open_parent error=" + error.ToString());
+                }
+                if (!Native.CreateDirectoryW(extended, IntPtr.Zero))
+                {
+                    throw new InvalidOperationException("npm_link step=mkdir_parent error=" + Marshal.GetLastWin32Error().ToString());
+                }
+                handle = Native.CreateFileW(extended, FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero);
+                if (handle == InvalidHandle || handle == IntPtr.Zero)
+                {
+                    throw new InvalidOperationException("npm_link step=open_parent error=" + Marshal.GetLastWin32Error().ToString());
+                }
+            }
+            try
+            {
+                RequirePlainDirectory(handle, path);
+            }
+            catch
+            {
+                Native.CloseHandle(handle);
+                throw;
+            }
+            return handle;
+        }
+
+        private static void RequirePlainDirectory(IntPtr handle, string path)
+        {
+            uint attributes;
+            uint links;
+            ulong size;
+            ReadInformation(handle, out attributes, out links, out size);
+            if ((attributes & AttributeDirectory) == 0 || (attributes & AttributeReparsePoint) != 0)
+            {
+                throw new InvalidOperationException("npm_link step=shape error=0");
+            }
+            if (!string.Equals(FinalPath(handle), "\\\\?\\" + path, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("npm_link step=redirected error=0");
+            }
+        }
+
+        private static string FinalPath(IntPtr handle)
+        {
+            StringBuilder buffer = new StringBuilder(FinalPathChars);
+            uint length = Native.GetFinalPathNameByHandleW(handle, buffer, (uint)FinalPathChars, 0);
+            if (length == 0 || length >= FinalPathChars)
+            {
+                throw new InvalidOperationException("npm_link step=final error=" + Marshal.GetLastWin32Error().ToString());
+            }
+            return buffer.ToString();
+        }
+
+        private static void ReadInformation(IntPtr handle, out uint attributes, out uint links, out ulong size)
+        {
+            IntPtr buffer = Marshal.AllocHGlobal(InformationBytes);
+            try
+            {
+                if (!Native.GetFileInformationByHandle(handle, buffer))
+                {
+                    throw new InvalidOperationException("npm_link step=query error=" + Marshal.GetLastWin32Error().ToString());
+                }
+                attributes = unchecked((uint)Marshal.ReadInt32(buffer, 0));
+                ulong high = unchecked((uint)Marshal.ReadInt32(buffer, 32));
+                ulong low = unchecked((uint)Marshal.ReadInt32(buffer, 36));
+                size = (high << 32) | low;
+                links = unchecked((uint)Marshal.ReadInt32(buffer, 40));
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static byte[] MountPointData(string substitute, string print)
+        {
+            byte[] substituteBytes = Encoding.Unicode.GetBytes(substitute);
+            byte[] printBytes = Encoding.Unicode.GetBytes(print);
+            int pathBytes = substituteBytes.Length + 2 + printBytes.Length + 2;
+            if (16 + pathBytes > MaxReparseBytes)
+            {
+                throw new InvalidOperationException("npm_link step=length error=0");
+            }
+            byte[] data = new byte[16 + pathBytes];
+            WriteUInt32(data, 0, ReparseTagMountPoint);
+            WriteUInt16(data, 4, 8 + pathBytes);
+            WriteUInt16(data, 6, 0);
+            WriteUInt16(data, 8, 0);
+            WriteUInt16(data, 10, substituteBytes.Length);
+            WriteUInt16(data, 12, substituteBytes.Length + 2);
+            WriteUInt16(data, 14, printBytes.Length);
+            Buffer.BlockCopy(substituteBytes, 0, data, 16, substituteBytes.Length);
+            Buffer.BlockCopy(printBytes, 0, data, 16 + substituteBytes.Length + 2, printBytes.Length);
+            return data;
+        }
+
+        private static bool ReadsBack(IntPtr handle, string substitute)
+        {
+            byte[] output = new byte[MaxReparseBytes];
+            uint returned;
+            if (!Native.DeviceIoControl(handle, FsctlGetReparsePoint, null, 0, output, (uint)output.Length, out returned, IntPtr.Zero))
+            {
+                return false;
+            }
+            if (returned < 16 || returned > output.Length || BitConverter.ToUInt32(output, 0) != ReparseTagMountPoint)
+            {
+                return false;
+            }
+            int offset = BitConverter.ToUInt16(output, 8);
+            int length = BitConverter.ToUInt16(output, 10);
+            if ((offset % 2) != 0 || (length % 2) != 0 || 16 + offset + length > (int)returned)
+            {
+                return false;
+            }
+            string found = Encoding.Unicode.GetString(output, 16 + offset, length);
+            return string.Equals(found, substitute, StringComparison.Ordinal);
+        }
+
+        private static void WriteUInt32(byte[] data, int offset, uint value)
+        {
+            byte[] bytes = BitConverter.GetBytes(value);
+            Buffer.BlockCopy(bytes, 0, data, offset, 4);
+        }
+
+        private static void WriteUInt16(byte[] data, int offset, int value)
+        {
+            if (value < 0 || value > 65535)
+            {
+                throw new InvalidOperationException("npm_link step=length error=0");
+            }
+            byte[] bytes = BitConverter.GetBytes((ushort)value);
+            Buffer.BlockCopy(bytes, 0, data, offset, 2);
+        }
+
+        private static class Native
+        {
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            internal static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool CreateDirectoryW(string name, IntPtr security);
+
+            [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool DeviceIoControl(IntPtr handle, uint code, byte[] input, uint inputSize, byte[] output, uint outputSize, out uint returned, IntPtr overlapped);
+
+            [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool GetFileInformationByHandle(IntPtr handle, IntPtr information);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            internal static extern uint GetFinalPathNameByHandleW(IntPtr handle, StringBuilder path, uint length, uint flags);
+
+            [DllImport("kernel32.dll", EntryPoint = "ReadFile", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool ReadFileCore(IntPtr handle, IntPtr buffer, uint count, out uint read, IntPtr overlapped);
+
+            internal static bool ReadFile(IntPtr handle, byte[] buffer, int offset, uint count, out uint read)
+            {
+                GCHandle pinned = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+                try
+                {
+                    IntPtr start = new IntPtr(pinned.AddrOfPinnedObject().ToInt64() + offset);
+                    return ReadFileCore(handle, start, count, out read, IntPtr.Zero);
+                }
+                finally
+                {
+                    pinned.Free();
+                }
+            }
+
+            [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool CloseHandle(IntPtr handle);
         }
     }
 }

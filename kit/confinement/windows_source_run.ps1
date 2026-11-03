@@ -42,6 +42,10 @@ $script:RefusalReason = ''
 $script:PublicLinePattern = '^(windows-source|windows-confinement|capsule-decrypt|capsule-destroy)[a-z-]*=[ -~]{0,480}$'
 $script:DiagLinePattern = '^windows-source-(?:gate-diag|probe)( id=[a-z][a-z_]{2,40} exit=0x[0-9a-f]{8}|-line [ -~]{0,300})$'
 $script:ToolConfigState = @()
+$script:MountLeases = @()
+$script:MountState = $null
+$script:NpmLinks = @()
+$script:NpmLockDigest = ''
 
 $NpmVersion = '11.19.1'
 $GateTableScript = 'gate_table.py'
@@ -63,6 +67,14 @@ $MaxManifestEntries = 10000
 $MaxTarballs = 6000
 $CaptureLimit = 1048576
 $ListingLimit = 3145728
+$GateTablePlatform = 'windows'
+$NpmSteppedGate = 'node_dependency_prepare'
+$MaxNpmLinks = 64
+$MaxLockBytes = 33554432
+$MountManagerRungs = @('device', 'drive_link', 'mpm_link', 'global_dir')
+$MountManagerKinds = @{ device = 'mountmgr'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
+$MountManagerSourceRungs = 1
+$MountManagerProbeSeconds = 30
 $RequiredFunctions = @(
     'Get-CleanText', 'Get-Token', 'Write-DiagLines', 'Invoke-Download', 'Assert-Sha256', 'Assert-Sri', 'Invoke-Tar', 'Copy-Tree',
     'Grant-Access', 'Set-LowIntegrityLabel', 'Test-LowIntegrityLabel', 'Grant-NonPropagating', 'Get-SidRules', 'New-ScratchSet',
@@ -70,7 +82,7 @@ $RequiredFunctions = @(
     'Initialize-ContainerTemp', 'Test-OtherContainerNul', 'Remove-TreeNoFollow', 'Remove-ReparsePoints', 'Get-JobLiveness',
     'Write-CleanupDetail', 'Register-RemovalRoot', 'Remove-Canaries', 'Initialize-LinkFixtures', 'Initialize-ChannelContext', 'Remove-ChannelFixtures',
     'Test-LpacTokenText', 'Invoke-ChannelPhase', 'Get-ChannelBlockedCount', 'Get-ChannelControlState', 'Initialize-FixtureSources',
-    'Invoke-FixturePhase', 'Get-StatusName'
+    'Invoke-FixturePhase', 'Get-StatusName', 'Get-ProbeText', 'Get-ProbeValue', 'Test-ChannelRunValid'
 )
 $LibraryVariables = @(
     'RustVersion', 'RustTarget', 'RustDate', 'NodeVersion', 'ExpectedRustComponents', 'Downloads', 'NodeDownload', 'AllowedHosts',
@@ -226,6 +238,100 @@ function Invoke-SourceProbes($sandbox, [string]$project, [string]$rustBin) {
         try { Write-SyntheticDiag 'windows-source-probe-line aborted' } catch { return }
         return
     }
+}
+
+function Invoke-FinalPathProbe($sandbox, [bool]$confined, [string]$id) {
+    $exe = $script:Layout.ProbeExe
+    $arguments = 'finalpath ' + $script:Lpac.Root
+    if ($confined) {
+        $run = Invoke-ConfinedProbe $sandbox $arguments $MountManagerProbeSeconds
+    } else {
+        $run = $sandbox.Run($false, $exe, ('"' + $exe + '" ' + $arguments), $script:Control.Root, (New-StageEnvironment $script:Control 'target-probe'), ($MountManagerProbeSeconds * 1000), [uint32]32)
+    }
+    Write-ProbeDiag $id $run
+    if (-not (Test-ChannelRunValid $run $confined)) { return 'denied' }
+    $text = Get-ProbeText ([string]$run.Stdout) 'finalpath'
+    if ((Get-ProbeValue $text 'n_dos') -ceq 'ok' -and (Get-ProbeValue $text 'canon') -ceq 'ok') { return 'ok' }
+    return 'denied'
+}
+
+function Invoke-MountManagerLadder($sandbox) {
+    $limit = $MountManagerSourceRungs
+    if ($script:RunMode -ceq 'synthetic') { $limit = $MountManagerRungs.Count }
+    $drive = ([string]$script:Layout.Base).Substring(0, 1)
+    if ($drive -cnotmatch '^[A-Za-z]$') { throw 'mountmgr_drive' }
+    $state = @{ State = 'insufficient'; Rung = 'none'; Objects = 0; Readback = 'match'; FinalPath = 'denied'; Other = 'unknown' }
+    [void](Invoke-FinalPathProbe $sandbox $false 'finalpath_control')
+    $state.FinalPath = Invoke-FinalPathProbe $sandbox $true 'finalpath_none'
+    if ($state.FinalPath -ceq 'ok') {
+        $state.State = 'applied'
+        return $state
+    }
+    for ($index = 0; $index -lt $limit; $index++) {
+        $rung = [string]$MountManagerRungs[$index]
+        $kind = [string]$MountManagerKinds[$rung]
+        $leaseDrive = ''
+        if ($rung -ceq 'drive_link') { $leaseDrive = $drive }
+        $rungState = 'failed'
+        $rungError = [uint64]0
+        $rungReadback = 'na'
+        $finalPath = 'na'
+        try {
+            $lease = [KeelDock.Platform.WindowsConfinement.DeviceLease]::Open($kind, $script:Sid, $leaseDrive)
+            $script:MountLeases = @($script:MountLeases) + @($lease)
+            $rungState = [string]$lease.Apply()
+            $rungError = [uint64]$lease.Error
+            if ($rungState -ceq 'applied') { $rungReadback = [string]$lease.Readback() }
+        } catch {
+            $rungState = 'failed'
+            $found = [regex]::Match([string]$_.Exception.Message, 'error=([0-9]{1,10})')
+            if ($found.Success) { $rungError = [uint64]$found.Groups[1].Value }
+        }
+        if ($rungState -ceq 'applied' -and $rungReadback -ceq 'match') {
+            $state.Objects += 1
+            $state.Rung = $rung
+            if ($rung -cne 'device') { $script:Channel.LeaseObjects = @($script:Channel.LeaseObjects) + @(($kind + ' ' + $leaseDrive).Trim()) }
+            $finalPath = Invoke-FinalPathProbe $sandbox $true ('finalpath_' + $rung)
+            $state.FinalPath = $finalPath
+        }
+        Write-Line ('windows-confinement-mountmgr-rung=' + $rung + ' state=' + $rungState + ' error=' + $rungError + ' readback=' + $rungReadback + ' finalpath=' + $finalPath)
+        if ($rungState -cne 'applied') {
+            $state.State = 'failed'
+            return $state
+        }
+        if ($rungReadback -cne 'match') {
+            $state.State = 'failed'
+            $state.Readback = 'mismatch'
+            return $state
+        }
+        if ($finalPath -ceq 'ok') {
+            $state.State = 'applied'
+            return $state
+        }
+    }
+    return $state
+}
+
+function Test-OtherContainerFinalPath {
+    if ($null -eq $script:OtherBox -or [string]::IsNullOrEmpty($script:OtherFolder)) { return 'unknown' }
+    $container = Join-Path $script:OtherFolder 'AC'
+    if (-not (Test-Path -LiteralPath $container -PathType Container)) { return 'unknown' }
+    $exe = Join-Path $container 'kd_probe_other.exe'
+    try {
+        Copy-Item -LiteralPath $script:Layout.ProbeExe -Destination $exe
+        $environment = New-StageEnvironment $script:Lpac 'target-mountmgr-other'
+        $run = $script:OtherBox.Run($true, $exe, ('"' + $exe + '" finalpath ' + $container), $container, $environment, ($MountManagerProbeSeconds * 1000), [uint32]32)
+    } catch {
+        return 'unknown'
+    }
+    Write-ProbeDiag 'finalpath_other' $run
+    if (-not (Test-ChannelRunValid $run $true)) { return 'unknown' }
+    $text = Get-ProbeText ([string]$run.Stdout) 'finalpath'
+    $device = Get-ProbeValue $text 'mpm'
+    $name = Get-ProbeValue $text 'n_dos'
+    if ($device -cnotmatch '^(ok|err[0-9]{1,10})$' -or $name -cnotmatch '^(ok|na|err[0-9]{1,10})$') { return 'unknown' }
+    if ($device -ceq 'ok' -or $name -ceq 'ok') { return 'granted' }
+    return 'denied'
 }
 
 function Get-LibraryText {
@@ -730,9 +836,17 @@ function Initialize-NpmTarballs([string]$project) {
     New-Item -ItemType Directory -Force -Path $script:Layout.Tarballs | Out-Null
     $mapping = @{}
     $count = 0
+    $links = @()
     foreach ($key in @($lock['packages'].Keys)) {
         $entry = $lock['packages'][$key]
-        if ([string]$key -eq '' -or $entry -isnot [System.Collections.IDictionary] -or $entry['link'] -eq $true) { continue }
+        if ([string]$key -eq '' -or $entry -isnot [System.Collections.IDictionary]) { continue }
+        if ($entry.ContainsKey('link')) {
+            if ($entry['link'] -isnot [bool]) { throw 'npm_link' }
+            if ($entry['link']) {
+                $links += @{ Key = [string]$key; Resolved = $entry['resolved'] }
+                continue
+            }
+        }
         $resolved = $entry['resolved']
         if ($null -eq $resolved) { continue }
         $uri = $null
@@ -757,9 +871,116 @@ function Initialize-NpmTarballs([string]$project) {
         $entry['resolved'] = $mapping[$resolved]
     }
     if ($count -lt 1) { throw 'npm_lock' }
+    $script:NpmLinks = @(Get-NpmLinkPlan $lock['packages'] $links)
     $json = ConvertTo-Json -InputObject $lock -Depth 100 -Compress
     [IO.File]::WriteAllText($lockPath, ($json + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+    $script:NpmLockDigest = Get-NoFollowDigest $lockPath
     return $count
+}
+
+function Get-NoFollowDigest([string]$path) {
+    $bytes = [KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadNoFollow($path, $MaxLockBytes)
+    return [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData([byte[]]$bytes)).ToLowerInvariant()
+}
+
+function Test-NpmLinkPath([string]$path, [int]$maximum) {
+    if ($path.Length -lt 1 -or $path.Length -gt 200 -or $path -cnotmatch '^[A-Za-z0-9@._/-]+$') { return $false }
+    $parts = $path.Split('/')
+    if ($parts.Count -gt $maximum) { return $false }
+    foreach ($part in $parts) {
+        if ($part.Length -eq 0 -or $part.Length -gt 100 -or $part.StartsWith('.') -or $part.EndsWith('.')) { return $false }
+        if ($part -imatch $ReservedNames) { return $false }
+    }
+    return $true
+}
+
+function Get-NpmLinkPlan($packages, $links) {
+    $items = @($links)
+    if ($items.Count -gt $MaxNpmLinks) { throw 'npm_link' }
+    $plan = @()
+    $seen = New-Object System.Collections.Hashtable([StringComparer]::OrdinalIgnoreCase)
+    foreach ($link in $items) {
+        $key = [string]$link.Key
+        $resolved = $link.Resolved
+        if ($key -cnotmatch '^node_modules/(?:@[a-z0-9][a-z0-9._-]{0,99}/)?[a-z0-9][a-z0-9._-]{0,99}$' -or -not (Test-NpmLinkPath $key 3)) { throw 'npm_link' }
+        if ($resolved -isnot [string] -or -not (Test-NpmLinkPath $resolved 8)) { throw 'npm_link' }
+        if (@($resolved.Split('/')) -icontains 'node_modules') { throw 'npm_link' }
+        if (-not $packages.ContainsKey($resolved) -or $packages[$resolved] -isnot [System.Collections.IDictionary] -or $packages[$resolved].ContainsKey('link')) { throw 'npm_link' }
+        if ($seen.ContainsKey($key)) { throw 'npm_link' }
+        $seen[$key] = $true
+        $plan += @{ Link = $key; Target = $resolved }
+    }
+    return $plan
+}
+
+function Invoke-NpmLinkProbe($sandbox, [string]$project, [string]$target) {
+    if ($script:RunMode -cne 'synthetic') { return }
+    try {
+        $link = Join-Path $project 'node_modules\kd-probe-link'
+        $destination = Join-Path $project ($target.Replace('/', '\'))
+        $run = Invoke-ConfinedProbe $sandbox ('junction ' + $link + ' ' + $destination) $MountManagerProbeSeconds
+        Write-ProbeDiag 'npm_link_probe' $run
+    } catch {
+        return
+    }
+}
+
+function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$environment, $first) {
+    if (-not (Test-GateBoundary $first) -or $first.TimedOut -or $first.ExitCode -ne 0) { return $first }
+    $created = 0
+    foreach ($link in @($script:NpmLinks)) {
+        try {
+            $state = [string][KeelDock.Platform.WindowsConfinement.JunctionMaker]::Create($project, [string]$link.Link, [string]$link.Target)
+        } catch {
+            Write-SyntheticDiag ('windows-source-probe-line npm_link ' + (Get-DiagLineText ([string]$_.Exception.Message)))
+            throw 'npm_link'
+        }
+        if ($state -cne 'verified') { throw 'npm_link' }
+        $created += 1
+    }
+    $verified = 0
+    foreach ($link in @($script:NpmLinks)) {
+        if ([KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$link.Link, [string]$link.Target)) { $verified += 1 }
+    }
+    Write-Line ('windows-source-npm-links=created count=' + $created + ' verified=' + $verified)
+    if ($verified -ne @($script:NpmLinks).Count) { throw 'npm_link' }
+    if ($created -gt 0) { Invoke-NpmLinkProbe $sandbox $project ([string]@($script:NpmLinks)[0].Target) }
+    $remaining = (Get-RemainingSeconds) - 900
+    if ($remaining -lt 60) { throw 'deadline' }
+    $seconds = Get-GateSeconds $gate.Id
+    if ($seconds -gt $remaining) { $seconds = $remaining }
+    $then = [string[]]$gate.Then
+    $second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $environment, ($seconds * 1000), [uint32]32)
+    $merged = New-Object KeelDock.Platform.WindowsConfinement.RunResult
+    foreach ($field in @('Failure', 'Detail', 'Created', 'CreateError', 'TimedOut', 'Exited', 'ExitCode', 'ElapsedMs', 'Token', 'Job', 'PeakProcessMemory', 'PeakJobMemory', 'CpuMs', 'HandleCount', 'Class46')) {
+        $merged.$field = $second.$field
+    }
+    $merged.Stdout = [string]$first.Stdout + "`n" + [string]$second.Stdout
+    $merged.Stderr = [string]$first.Stderr + "`n" + [string]$second.Stderr
+    $merged.Truncated = [bool]($first.Truncated -or $second.Truncated)
+    if (-not (Test-GateBoundary $second) -or $second.TimedOut -or $second.ExitCode -ne 0) { return $merged }
+    foreach ($link in @($script:NpmLinks)) {
+        if (-not [KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$link.Link, [string]$link.Target)) { throw 'npm_link' }
+    }
+    if ((Get-NoFollowDigest (Join-Path $project 'package-lock.json')) -cne $script:NpmLockDigest) { throw 'npm_lock_changed' }
+    return $merged
+}
+
+function Expand-GateArgv($argv, [string]$cargo, [string]$node, [string]$npm, [string]$project) {
+    $items = @($argv)
+    if ($items.Count -lt 2 -or $items.Count -gt 64) { throw 'gate_plan' }
+    $expanded = @()
+    foreach ($item in $items) {
+        $argument = [string]$item
+        if ($argument.Length -gt 400 -or $argument -cnotmatch '^[ -~]+$') { throw 'gate_plan' }
+        $withProject = $argument.StartsWith('{project}', [StringComparison]::Ordinal)
+        if ($withProject -and $argument.Length -gt 9 -and $argument[9] -ne '/') { throw 'gate_plan' }
+        $argument = $argument.Replace('{cargo}', $cargo).Replace('{node}', $node).Replace('{npm}', $npm).Replace('{project}', $project)
+        if ($argument -cmatch '\{[a-z_]*\}') { throw 'gate_plan' }
+        if ($withProject) { $argument = $argument.Replace('/', '\') }
+        $expanded += $argument
+    }
+    return $expanded
 }
 
 function Get-GatePlan([string]$project, [string]$cargo, [string]$node, [string]$npm) {
@@ -772,33 +993,34 @@ function Get-GatePlan([string]$project, [string]$cargo, [string]$node, [string]$
         $selection = 'runtime'
         $expectedCount = $MaxGateCount
     }
-    $result = Invoke-TrustedProcess $python @('-B', $gateScript, $GateTableEmitCommand, $selection) $PSScriptRoot (Get-TrustedEnvironment $python $script:Layout.Private) 120 65536
+    $result = Invoke-TrustedProcess $python @('-B', $gateScript, $GateTableEmitCommand, $selection, $GateTablePlatform) $PSScriptRoot (Get-TrustedEnvironment $python $script:Layout.Private) 120 65536
     if ($result.TimedOut -or $result.ExitCode -ne 0) { throw 'gate_plan' }
     $plan = [string]$result.Stdout | ConvertFrom-Json -AsHashtable
     if ($plan.Keys.Count -ne 2 -or $plan['schema_version'] -ne 1 -or $plan['gates'] -isnot [System.Collections.IEnumerable]) { throw 'gate_plan' }
     $gates = @()
     $names = @{}
+    $stepped = 0
     foreach ($gate in @($plan['gates'])) {
         if ($gate -isnot [System.Collections.IDictionary] -or $gate.Keys.Count -ne 2) { throw 'gate_plan' }
         $name = [string]$gate['name']
         if ($name -cnotmatch '^[a-z][a-z_]{2,40}$' -or $names.ContainsKey($name)) { throw 'gate_plan' }
         $names[$name] = $true
-        $argv = @($gate['argv'])
-        if ($argv.Count -lt 2 -or $argv.Count -gt 64) { throw 'gate_plan' }
-        $expanded = @()
-        foreach ($item in $argv) {
-            $argument = [string]$item
-            if ($argument.Length -gt 400 -or $argument -cnotmatch '^[ -~]+$') { throw 'gate_plan' }
-            $withProject = $argument.StartsWith('{project}', [StringComparison]::Ordinal)
-            if ($withProject -and $argument.Length -gt 9 -and $argument[9] -ne '/') { throw 'gate_plan' }
-            $argument = $argument.Replace('{cargo}', $cargo).Replace('{node}', $node).Replace('{npm}', $npm).Replace('{project}', $project)
-            if ($argument -cmatch '\{[a-z_]*\}') { throw 'gate_plan' }
-            if ($withProject) { $argument = $argument.Replace('/', '\') }
-            $expanded += $argument
+        $then = $null
+        if ($gate.ContainsKey('steps')) {
+            $steps = @($gate['steps'])
+            if ($name -cne $NpmSteppedGate -or $steps.Count -ne 2) { throw 'gate_plan' }
+            $argv = @($steps[0])
+            $then = [string[]](Expand-GateArgv @($steps[1]) $cargo $node $npm $project)
+            $stepped += 1
+        } elseif ($gate.ContainsKey('argv')) {
+            if ($name -ceq $NpmSteppedGate) { throw 'gate_plan' }
+            $argv = @($gate['argv'])
+        } else {
+            throw 'gate_plan'
         }
-        $gates += @{ Id = $name; Argv = [string[]]$expanded }
+        $gates += @{ Id = $name; Argv = [string[]](Expand-GateArgv $argv $cargo $node $npm $project); Then = $then }
     }
-    if ($gates.Count -ne $expectedCount) { throw 'gate_plan' }
+    if ($gates.Count -ne $expectedCount -or $stepped -ne 1) { throw 'gate_plan' }
     return $gates
 }
 
@@ -856,7 +1078,7 @@ function Get-GateCause($run, [bool]$boundary) {
     if ($run.TimedOut) { return 'timeout' }
     $code = [uint64][uint32]$run.ExitCode
     if ($code -eq 1262769995 -or $code -eq 3221225540 -or $code -eq 3221225773 -or $code -eq 3221225495) { return 'limit' }
-    if ($code -ge 3221225472) { return 'signal' }
+    if ($code -ge 3221225472 -and $code -le 3489660927) { return 'signal' }
     if ($code -ne 0) { return 'exit' }
     if (-not $boundary) { return 'launch' }
     return 'exit'
@@ -886,6 +1108,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         $exe = [string]$gate.Argv[0]
         $commandLine = ConvertTo-CommandLine $gate.Argv
         $run = $sandbox.Run($true, $exe, $commandLine, $project, $environment, ($seconds * 1000), [uint32]32)
+        if ($null -ne $gate.Then) { $run = Invoke-NpmLinkSteps $sandbox $gate $project $environment $run }
         $outcome.Count += 1
         $combined = [string]$run.Stdout + "`n" + [string]$run.Stderr
         [IO.File]::WriteAllText((Join-Path $recordsDirectory ('gate-' + $index + '.stdout')), [string]$run.Stdout, (New-Object System.Text.UTF8Encoding($false)))
@@ -1182,18 +1405,24 @@ try {
             if ($aclState -ne 'verified') { throw 'acl_readback' }
 
             $phase = 'null_lease'
-            $script:NullLease = [KeelDock.Platform.WindowsConfinement.NullDeviceLease]::Open($script:Sid)
+            $script:NullLease = [KeelDock.Platform.WindowsConfinement.DeviceLease]::Open('nul', $script:Sid, '')
             $nullState = [string]$script:NullLease.Apply()
             $nullReadback = 'mismatch'
             if ($nullState -eq 'applied') { $nullReadback = [string]$script:NullLease.Readback() }
             Write-Line ('windows-confinement-null=' + $nullState + ' mask=0x0012019f trustee=package readback=' + $nullReadback)
             if ($nullState -ne 'applied' -or $nullReadback -ne 'match') { throw 'null_lease' }
+            $script:MountState = Invoke-MountManagerLadder $box
+            if ($script:MountState.Readback -cne 'match') { throw 'mountmgr_readback' }
+            if ($script:MountState.State -cne 'applied' -and $runMode -cne 'synthetic') { throw ('mountmgr_' + $script:MountState.State) }
 
             $phase = 'container_temp'
             Initialize-ContainerTemp $box
 
             $phase = 'nul_other_container'
             Test-OtherContainerNul $box
+            $script:MountState.Other = Test-OtherContainerFinalPath
+            Write-Line ('windows-confinement-mountmgr=' + $script:MountState.State + ' rung=' + $script:MountState.Rung + ' objects=' + $script:MountState.Objects + ' readback=' + $script:MountState.Readback + ' finalpath=' + $script:MountState.FinalPath + ' other=' + $script:MountState.Other)
+            if ($script:MountState.Objects -gt 0 -and $script:MountState.Other -cne 'denied' -and $runMode -cne 'synthetic') { throw 'mountmgr_other' }
 
             $phase = 'channels_before'
             $channelsBefore = Invoke-ChannelPhase $box 'selftest' $true
@@ -1343,6 +1572,19 @@ if ($Mode -eq 'run' -and $libraryLoaded) {
     }
     if ($nullRestore -eq 'failed') { $cleanup = 'incomplete' }
 
+    $mountRestore = 'not_applied'
+    try {
+        $leases = @($script:MountLeases)
+        for ($leaseIndex = $leases.Count - 1; $leaseIndex -ge 0; $leaseIndex--) {
+            $leaseRestore = [string]$leases[$leaseIndex].Restore()
+            if ($leaseRestore -cne 'verified' -and $leaseRestore -cne 'not_applied') { $mountRestore = 'failed' }
+            elseif ($leaseRestore -ceq 'verified' -and $mountRestore -cne 'failed') { $mountRestore = 'verified' }
+        }
+    } catch {
+        $mountRestore = 'failed'
+    }
+    if ($mountRestore -eq 'failed') { $cleanup = 'incomplete' }
+
     $processState = 'none'
     try {
         $processState = Get-JobLiveness @($box, $script:OtherBox) 10
@@ -1443,14 +1685,14 @@ if ($Mode -eq 'run' -and $libraryLoaded) {
 
     $profileText = 'deleted'
     if (@('deleted_by_api', 'removed_manually') -cnotcontains $profileState) { $profileText = $profileState }
-    $cleanupLine = 'windows-source-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' key=' + $keyCleanup + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' processes=' + $processState + ' liveness=job'
+    $cleanupLine = 'windows-source-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' mountmgr_restore=' + $mountRestore + ' key=' + $keyCleanup + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' processes=' + $processState + ' liveness=job'
     if ($refusal) {
         Write-Line $refusal
         Write-Line $cleanupLine
         exit 1
     }
     Write-Line $cleanupLine
-    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or $keyCleanup -ne 'destroyed' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }
+    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or @('verified', 'not_applied') -cnotcontains $mountRestore -or $keyCleanup -ne 'destroyed' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }
     exit $exitCode
 }
 

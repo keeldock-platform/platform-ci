@@ -227,19 +227,23 @@ class WindowsSourceRunTests(unittest.TestCase):
         limit_line = re.search(r"if \(([^\n]*)\) \{ return 'limit' \}", function).group(1)
         limits = {int(value) for value in re.findall(r"\$code -eq ([0-9]+)", limit_line)}
         self.assertEqual(limits, {0x4b44574b, 0xC0000044, 0xC000012D, 0xC0000017})
-        threshold = int(re.search(r"\$code -ge ([0-9]+)\) \{ return 'signal' \}", function).group(1))
-        self.assertEqual(threshold, 0xC0000000)
+        found = re.search(r"\$code -ge ([0-9]+) -and \$code -le ([0-9]+)\) \{ return 'signal' \}", function)
+        self.assertIsNotNone(found)
+        low, high = int(found.group(1)), int(found.group(2))
+        self.assertEqual((low, high), (0xC0000000, 0xCFFFFFFF))
+        self.assertEqual(function.count("return 'signal'"), 1)
 
         def classify(code):
             if code in limits:
                 return "limit"
-            if code >= threshold:
+            if low <= code <= high:
                 return "signal"
             return "exit"
 
         for code, expected in (
             (1, "exit"), (2, "exit"), (101, "exit"), (255, "exit"), (0x7FFFFFFF, "exit"), (0xBFFFFFFF, "exit"),
-            (0xC0000005, "signal"), (0xC0000142, "signal"), (0xC0000409, "signal"), (0xFFFFFFFF, "signal"),
+            (0xC0000005, "signal"), (0xC0000142, "signal"), (0xC0000409, "signal"), (0xCFFFFFFF, "signal"),
+            (0xD0000000, "exit"), (0xFFFFF030, "exit"), (0xFFFFFFFF, "exit"),
             (0xC0000044, "limit"), (0xC000012D, "limit"), (0xC0000017, "limit"), (0x4b44574b, "limit"),
         ):
             with self.subTest(code=code):
@@ -351,7 +355,16 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(self.runner.count(call), 1)
         self.assertEqual(len(re.findall(r"Invoke-SourceProbes\b", self.runner)), 2)
         self.assertEqual(len(re.findall(r"Get-SourceProbes\b", self.runner)), 2)
-        self.assertEqual(len(re.findall(r"Write-ProbeDiag\b", self.runner)), 2)
+        self.assertEqual(len(re.findall(r"Write-ProbeDiag\b", self.runner)), 5)
+        for name, call in (
+            ("Invoke-SourceProbes", "Write-ProbeDiag $probe.Id $run"),
+            ("Invoke-FinalPathProbe", "Write-ProbeDiag $id $run"),
+            ("Test-OtherContainerFinalPath", "Write-ProbeDiag 'finalpath_other' $run"),
+            ("Invoke-NpmLinkProbe", "Write-ProbeDiag 'npm_link_probe' $run"),
+        ):
+            with self.subTest(caller=name):
+                self.assertEqual(self.function_body(name).count("Write-ProbeDiag"), 1)
+                self.assertIn(call, self.function_body(name))
         order = [self.runner.index(token) for token in (
             "Initialize-ToolConfigs $project\n", "$tarballs = Initialize-NpmTarballs $project",
             "$phase = 'gate_plan'", "$plan = Get-GatePlan", "$phase = 'gates'\n            Invoke-SourceProbes",
@@ -692,7 +705,7 @@ class WindowsSourceRunTests(unittest.TestCase):
 
     def test_exit_zero_requires_verified_cleanup_and_destroyed_key(self):
         tail = self.runner[self.runner.index("if ($cleanup -ne 'verified'"):]
-        for token in ("$nullRestore -ne 'verified'", "$keyCleanup -ne 'destroyed'", "$tempState -ne 'removed'", "$processState -ne 'none'"):
+        for token in ("$nullRestore -ne 'verified'", "@('verified', 'not_applied') -cnotcontains $mountRestore", "$keyCleanup -ne 'destroyed'", "$tempState -ne 'removed'", "$processState -ne 'none'"):
             self.assertIn(token, tail)
 
     def test_deadline_stops_gates_before_the_job_timeout(self):
@@ -730,6 +743,273 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(self.workflow.count("Publish confinement verdict"), 1)
         self.assertNotIn("KD-CONFINEMENT-VERDICT", self.workflow)
         self.assertEqual(self.workflow.count("uses: actions/attest@"), 1)
+
+    def test_the_mount_manager_ladder_is_fixed_ordered_and_escalates_only_in_synthetic_mode(self):
+        self.assertIn("\n$MountManagerRungs = @('device', 'drive_link', 'mpm_link', 'global_dir')\n", self.runner)
+        self.assertIn(
+            "\n$MountManagerKinds = @{ device = 'mountmgr'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }\n",
+            self.runner)
+        self.assertIn("\n$MountManagerSourceRungs = 1\n", self.runner)
+        self.assertIn("\n$MountManagerProbeSeconds = 30\n", self.runner)
+        ladder = self.function_body("Invoke-MountManagerLadder")
+        self.assertIn("    $limit = $MountManagerSourceRungs\n    if ($script:RunMode -ceq 'synthetic') { $limit = $MountManagerRungs.Count }\n", ladder)
+        self.assertEqual(ladder.count("$limit = "), 2)
+        self.assertNotIn("'source'", ladder)
+        order = (
+            "[void](Invoke-FinalPathProbe $sandbox $false 'finalpath_control')",
+            "$state.FinalPath = Invoke-FinalPathProbe $sandbox $true 'finalpath_none'",
+            "for ($index = 0; $index -lt $limit; $index++) {",
+            "$rung = [string]$MountManagerRungs[$index]",
+            "$lease = [KeelDock.Platform.WindowsConfinement.DeviceLease]::Open($kind, $script:Sid, $leaseDrive)",
+            "$script:MountLeases = @($script:MountLeases) + @($lease)",
+            "$rungState = [string]$lease.Apply()",
+            "if ($rungState -ceq 'applied') { $rungReadback = [string]$lease.Readback() }",
+            "$finalPath = Invoke-FinalPathProbe $sandbox $true ('finalpath_' + $rung)",
+            "Write-Line ('windows-confinement-mountmgr-rung=' + $rung + ' state=' + $rungState + ' error=' + $rungError + ' readback=' + $rungReadback + ' finalpath=' + $finalPath)",
+            "        if ($rungState -cne 'applied') {\n            $state.State = 'failed'\n            return $state\n        }\n",
+            "            $state.Readback = 'mismatch'\n            return $state\n",
+            "        if ($finalPath -ceq 'ok') {\n            $state.State = 'applied'\n            return $state\n        }\n",
+        )
+        positions = [ladder.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertTrue(ladder.endswith("    }\n    return $state"))
+        self.assertIn("if ($rungState -ceq 'applied' -and $rungReadback -ceq 'match') {", ladder)
+        for rung in ("device", "drive_link", "mpm_link", "global_dir", "none", "control", "other"):
+            self.assertRegex("finalpath_" + rung, r"^[a-z][a-z_]{2,40}$")
+        probe = self.function_body("Invoke-FinalPathProbe")
+        for token in (
+            "$arguments = 'finalpath ' + $script:Lpac.Root",
+            "$run = Invoke-ConfinedProbe $sandbox $arguments $MountManagerProbeSeconds",
+            "$run = $sandbox.Run($false, $exe,",
+            "Write-ProbeDiag $id $run",
+            "if (-not (Test-ChannelRunValid $run $confined)) { return 'denied' }",
+            "if ((Get-ProbeValue $text 'n_dos') -ceq 'ok' -and (Get-ProbeValue $text 'canon') -ceq 'ok') { return 'ok' }",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, probe)
+        self.assertNotIn("Write-Line", probe)
+        main = self.runner.index("$phase = 'null_lease'")
+        steps = (
+            "if ($nullState -ne 'applied' -or $nullReadback -ne 'match') { throw 'null_lease' }\n",
+            "            $script:MountState = Invoke-MountManagerLadder $box\n",
+            "            if ($script:MountState.Readback -cne 'match') { throw 'mountmgr_readback' }\n",
+            "            if ($script:MountState.State -cne 'applied' -and $runMode -cne 'synthetic') { throw ('mountmgr_' + $script:MountState.State) }\n",
+            "$phase = 'container_temp'",
+            "$phase = 'channels_before'",
+        )
+        positions = [self.runner.index(item, main) for item in steps]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(self.runner.count("Invoke-MountManagerLadder $box"), 1)
+
+    def test_the_mount_manager_summary_has_a_per_sid_negative_control_and_fixed_tokens(self):
+        other = self.function_body("Test-OtherContainerFinalPath")
+        for token in (
+            "if ($null -eq $script:OtherBox -or [string]::IsNullOrEmpty($script:OtherFolder)) { return 'unknown' }",
+            "$container = Join-Path $script:OtherFolder 'AC'",
+            "Copy-Item -LiteralPath $script:Layout.ProbeExe -Destination $exe",
+            "$run = $script:OtherBox.Run($true, $exe,",
+            "Write-ProbeDiag 'finalpath_other' $run",
+            "if (-not (Test-ChannelRunValid $run $true)) { return 'unknown' }",
+            "if ($device -ceq 'ok' -or $name -ceq 'ok') { return 'granted' }",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, other)
+        self.assertTrue(other.endswith("    return 'denied'"))
+        self.assertEqual(set(re.findall(r"return '([a-z]+)'", other)), {"unknown", "granted", "denied"})
+        self.assertIn(
+            "            Test-OtherContainerNul $box\n            $script:MountState.Other = Test-OtherContainerFinalPath\n", self.runner)
+        summary = ("Write-Line ('windows-confinement-mountmgr=' + $script:MountState.State + ' rung=' + $script:MountState.Rung"
+                   " + ' objects=' + $script:MountState.Objects + ' readback=' + $script:MountState.Readback + ' finalpath='"
+                   " + $script:MountState.FinalPath + ' other=' + $script:MountState.Other)")
+        self.assertEqual(self.runner.count(summary), 1)
+        self.assertIn(
+            "if ($script:MountState.Objects -gt 0 -and $script:MountState.Other -cne 'denied' -and $runMode -cne 'synthetic') { throw 'mountmgr_other' }",
+            self.runner)
+        public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
+        diag = re.compile(re.search(r"DiagLinePattern = '([^']+)'", self.runner).group(1))
+        for line in (
+            "windows-confinement-mountmgr=applied rung=device objects=1 readback=match finalpath=ok other=denied",
+            "windows-confinement-mountmgr=insufficient rung=global_dir objects=4 readback=match finalpath=denied other=unknown",
+            "windows-confinement-mountmgr-rung=device state=applied error=0 readback=match finalpath=ok",
+            "windows-confinement-mountmgr-rung=global_dir state=failed error=5 readback=na finalpath=na",
+            "windows-source-npm-links=created count=1 verified=1",
+        ):
+            with self.subTest(line=line[:60]):
+                self.assertIsNotNone(public.fullmatch(line))
+                self.assertIsNone(diag.fullmatch(line))
+        for line in ("windows-source-probe id=finalpath_device exit=0x00000000", "windows-source-probe id=npm_link_probe exit=0x00000000",
+                     "windows-source-probe-line npm_link npm_link step=fsctl error=5"):
+            with self.subTest(line=line[:60]):
+                self.assertIsNotNone(diag.fullmatch(line))
+
+    def test_the_mount_manager_leases_are_restored_in_reverse_before_the_profile_and_reported(self):
+        tail = self.runner[self.runner.index("$nullRestore = 'not_applied'"):]
+        for token in (
+            "    $mountRestore = 'not_applied'\n",
+            "        $leases = @($script:MountLeases)\n",
+            "        for ($leaseIndex = $leases.Count - 1; $leaseIndex -ge 0; $leaseIndex--) {\n",
+            "            $leaseRestore = [string]$leases[$leaseIndex].Restore()\n",
+            "            if ($leaseRestore -cne 'verified' -and $leaseRestore -cne 'not_applied') { $mountRestore = 'failed' }\n",
+            "        $mountRestore = 'failed'\n",
+            "    if ($mountRestore -eq 'failed') { $cleanup = 'incomplete' }\n",
+            "' null_restore=' + $nullRestore + ' mountmgr_restore=' + $mountRestore + ' key=' + $keyCleanup",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, tail)
+        order = ("$script:NullLease.Restore()", "$leases[$leaseIndex].Restore()", "Get-JobLiveness", "$box.Dispose()",
+                 "$script:OtherBox.Dispose()", "Remove-WithinRoots $baseDirectory", "$cleanupLine = 'windows-source-cleanup='")
+        positions = [tail.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(self.runner.count(".Restore()"), 2)
+
+    def test_the_gate_plan_requires_exactly_the_windows_stepped_npm_gate(self):
+        plan = self.function_body("Get-GatePlan")
+        for token in (
+            "@('-B', $gateScript, $GateTableEmitCommand, $selection, $GateTablePlatform)",
+            "if ($name -cne $NpmSteppedGate -or $steps.Count -ne 2) { throw 'gate_plan' }",
+            "$then = [string[]](Expand-GateArgv @($steps[1]) $cargo $node $npm $project)",
+            "if ($name -ceq $NpmSteppedGate) { throw 'gate_plan' }",
+            "Argv = [string[]](Expand-GateArgv $argv $cargo $node $npm $project); Then = $then",
+            "if ($gates.Count -ne $expectedCount -or $stepped -ne 1) { throw 'gate_plan' }",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, plan)
+        self.assertIn("\n$GateTablePlatform = 'windows'\n", self.runner)
+        self.assertIn("\n$NpmSteppedGate = 'node_dependency_prepare'\n", self.runner)
+        expand = self.function_body("Expand-GateArgv")
+        for token in ("if ($items.Count -lt 2 -or $items.Count -gt 64) { throw 'gate_plan' }",
+                      "if ($argument -cmatch '\\{[a-z_]*\\}') { throw 'gate_plan' }", "$argument.Replace('/', '\\')"):
+            self.assertIn(token, expand)
+        gates = self.function_body("Invoke-SourceGates")
+        run = "        $run = $sandbox.Run($true, $exe, $commandLine, $project, $environment, ($seconds * 1000), [uint32]32)\n"
+        stepped = "        if ($null -ne $gate.Then) { $run = Invoke-NpmLinkSteps $sandbox $gate $project $environment $run }\n"
+        self.assertIn(run + stepped + "        $outcome.Count += 1\n", gates)
+
+    def test_the_stepped_npm_gate_runs_trusted_links_between_two_confined_steps_and_rechecks_the_lock(self):
+        steps = self.function_body("Invoke-NpmLinkSteps")
+        order = (
+            "if (-not (Test-GateBoundary $first) -or $first.TimedOut -or $first.ExitCode -ne 0) { return $first }",
+            "[KeelDock.Platform.WindowsConfinement.JunctionMaker]::Create($project, [string]$link.Link, [string]$link.Target)",
+            "if ([KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$link.Link, [string]$link.Target)) { $verified += 1 }",
+            "Write-Line ('windows-source-npm-links=created count=' + $created + ' verified=' + $verified)",
+            "if ($verified -ne @($script:NpmLinks).Count) { throw 'npm_link' }",
+            "Invoke-NpmLinkProbe $sandbox $project",
+            "if ($remaining -lt 60) { throw 'deadline' }",
+            "$second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $environment, ($seconds * 1000), [uint32]32)",
+            "$merged.Stdout = [string]$first.Stdout + \"`n\" + [string]$second.Stdout",
+            "$merged.Truncated = [bool]($first.Truncated -or $second.Truncated)",
+            "if (-not (Test-GateBoundary $second) -or $second.TimedOut -or $second.ExitCode -ne 0) { return $merged }",
+            "if (-not [KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$link.Link, [string]$link.Target)) { throw 'npm_link' }",
+            "if ((Get-NoFollowDigest (Join-Path $project 'package-lock.json')) -cne $script:NpmLockDigest) { throw 'npm_lock_changed' }",
+            "\n    return $merged",
+        )
+        positions = [steps.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(steps.count("Write-Line"), 1)
+        self.assertEqual(steps.count("$sandbox.Run("), 1)
+        for field in ("Failure", "Created", "TimedOut", "Exited", "ExitCode", "Token", "Job", "HandleCount", "CpuMs", "ElapsedMs"):
+            self.assertIsNotNone(re.search(r"'" + field + r"'", steps), field)
+        self.assertNotIn("'Stdout', ", steps)
+        tarballs = self.function_body("Initialize-NpmTarballs")
+        for token in (
+            "if ($entry['link'] -isnot [bool]) { throw 'npm_link' }",
+            "$links += @{ Key = [string]$key; Resolved = $entry['resolved'] }",
+            "$script:NpmLinks = @(Get-NpmLinkPlan $lock['packages'] $links)",
+            "$script:NpmLockDigest = Get-NoFollowDigest $lockPath",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, tarballs)
+        self.assertLess(tarballs.index("WriteAllText($lockPath"), tarballs.index("$script:NpmLockDigest = Get-NoFollowDigest $lockPath"))
+        self.assertIn("[KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadNoFollow($path, $MaxLockBytes)", self.function_body("Get-NoFollowDigest"))
+        probe = self.function_body("Invoke-NpmLinkProbe")
+        self.assertTrue(probe.split("\n", 1)[1].startswith("    if ($script:RunMode -cne 'synthetic') { return }\n"))
+        self.assertIn("$link = Join-Path $project 'node_modules\\kd-probe-link'", probe)
+        self.assertNotIn("Write-Line", probe)
+        self.assertEqual(self.runner.count("Remove-WithinRoots $baseDirectory"), 1)
+
+    def link_plan_model(self):
+        plan = self.function_body("Get-NpmLinkPlan")
+        key_pattern = re.search(r"if \(\$key -cnotmatch '([^']+)'", plan).group(1)
+        path_pattern = re.search(r"\$path -cnotmatch '([^']+)'", self.function_body("Test-NpmLinkPath")).group(1)
+        reserved = re.search(r"^\$ReservedNames = '([^']+)'$", self.runner, re.M).group(1)
+        self.assertIn("if ($items.Count -gt $MaxNpmLinks) { throw 'npm_link' }", plan)
+        self.assertIn("\n$MaxNpmLinks = 64\n", self.runner)
+        self.assertIn("if (@($resolved.Split('/')) -icontains 'node_modules') { throw 'npm_link' }", plan)
+        self.assertIn("$packages[$resolved].ContainsKey('link')", plan)
+        self.assertIn("(Test-NpmLinkPath $key 3)", plan)
+        self.assertIn("(Test-NpmLinkPath $resolved 8)", plan)
+
+        def path_ok(path, maximum):
+            if len(path) < 1 or len(path) > 200 or re.search(path_pattern, path) is None:
+                return False
+            parts = path.split("/")
+            if len(parts) > maximum:
+                return False
+            for part in parts:
+                if not part or len(part) > 100 or part.startswith(".") or part.endswith("."):
+                    return False
+                if re.search(reserved, part, re.I):
+                    return False
+            return True
+
+        def accepted(key, resolved, packages):
+            if re.search(key_pattern, key) is None or not path_ok(key, 3):
+                return False
+            if type(resolved) is not str or not path_ok(resolved, 8):
+                return False
+            if "node_modules" in [part.lower() for part in resolved.split("/")]:
+                return False
+            return resolved in packages and "link" not in packages[resolved]
+
+        return accepted
+
+    def test_link_validation_accepts_only_lockfile_workspace_links_inside_the_project(self):
+        accepted = self.link_plan_model()
+        packages = {
+            "packages/kernel-i18n": {"name": "fixture-kernel-i18n"},
+            "packages/linked": {"link": True},
+            "node_modules/y": {"version": "1.0.0"},
+        }
+        for key, resolved in (
+            ("node_modules/fixture-kernel-i18n", "packages/kernel-i18n"),
+            ("node_modules/@synthetic/kernel-i18n", "packages/kernel-i18n"),
+        ):
+            with self.subTest(key=key):
+                self.assertTrue(accepted(key, resolved, packages))
+        for key, resolved in (
+            ("node_modules/x", "../outside"),
+            ("node_modules/x", "packages/../kernel-i18n"),
+            ("node_modules/x", "./packages/kernel-i18n"),
+            ("node_modules/x", "C:/x"),
+            ("node_modules/x", "/packages/kernel-i18n"),
+            ("node_modules/x", "packages\\kernel-i18n"),
+            ("node_modules/x", "packages/kernel-i18n/"),
+            ("node_modules/x", "packages/missing"),
+            ("node_modules/x", "packages/linked"),
+            ("node_modules/x", "node_modules/y"),
+            ("node_modules/x", 5),
+            ("node_modules/x", None),
+            ("packages/a/node_modules/x", "packages/kernel-i18n"),
+            ("node_modules/../x", "packages/kernel-i18n"),
+            ("node_modules/X", "packages/kernel-i18n"),
+            ("node_modules/con", "packages/kernel-i18n"),
+            ("node_modules/x.", "packages/kernel-i18n"),
+            ("node_modules/x y", "packages/kernel-i18n"),
+            ("node_modules", "packages/kernel-i18n"),
+            ("node_modules/@scope", "packages/kernel-i18n"),
+            ("node_modules/a/b/c", "packages/kernel-i18n"),
+            ("/node_modules/x", "packages/kernel-i18n"),
+        ):
+            with self.subTest(key=key, resolved=resolved):
+                self.assertFalse(accepted(key, resolved, packages))
+
+    def test_source_mode_runs_the_same_gates_with_only_the_designed_lease_default(self):
+        self.assertEqual(self.runner.count("$runMode -cne 'synthetic'"), 2)
+        self.assertEqual(self.runner.count("$MountManagerSourceRungs"), 2)
+        for name in ("Invoke-NpmLinkSteps", "Get-GatePlan", "Expand-GateArgv", "Get-NpmLinkPlan", "Initialize-NpmTarballs"):
+            with self.subTest(function=name):
+                self.assertNotIn("RunMode", self.function_body(name))
+                self.assertNotIn("$runMode", self.function_body(name))
 
 
 if __name__ == "__main__":

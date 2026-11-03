@@ -1130,6 +1130,7 @@ function Initialize-ChannelContext {
         control_tmp = [string]$script:Control.Tmp
         control_root = [string]$script:Control.Root
         ro_file = [string]$script:Layout.NodeTest
+        ro_dir = [string](Split-Path -Parent $script:Layout.NodeTest)
         needle = [string]$script:CanaryNeedle
         scratch_needle = [string]$script:CanaryScratchNeedle
         harness_pid = [string]$harnessPid
@@ -1137,7 +1138,7 @@ function Initialize-ChannelContext {
         results_ip = $resultsIp
         cache_ip = $cacheIp
     }
-    $script:Channel = @{ Pids = $pids; RunnerPipes = $runnerPipes; Drives = $drives; Scalars = $scalars }
+    $script:Channel = @{ Pids = $pids; RunnerPipes = $runnerPipes; Drives = $drives; LeaseObjects = @(); Scalars = $scalars }
     $diagState = 'absent'
     if (([string]$scalars['diag_file']).Length -gt 0) { $diagState = 'present' }
     Write-Line ('windows-confinement-channel-fixtures=ready targets=' + $pids.Count + ' runner_pipes=' + $runnerPipes.Count + ' drives=' + $drives.Count + ' diag=' + $diagState + ' results_host=' + $hostSource + ' cache_host=' + $cacheSource + ' results_ip=' + [string]($resultsIp.Length -gt 0) + ' cache_ip=' + [string]($cacheIp.Length -gt 0))
@@ -1206,7 +1207,7 @@ function Test-ChannelRunValid($run, [bool]$confined) {
 
 function Expand-ChannelRun([string]$template) {
     $items = @($template)
-    $multiple = [ordered]@{ '{pid}' = $script:Channel.Pids; '{runner_pipe}' = $script:Channel.RunnerPipes; '{drive}' = $script:Channel.Drives }
+    $multiple = [ordered]@{ '{pid}' = $script:Channel.Pids; '{runner_pipe}' = $script:Channel.RunnerPipes; '{drive}' = $script:Channel.Drives; '{lease_object}' = @($script:Channel.LeaseObjects | Where-Object { $_ }) }
     foreach ($token in $multiple.Keys) {
         $values = @($multiple[$token])
         $next = @()
@@ -1332,6 +1333,11 @@ function Get-ChannelAttempts {
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'hkcu-write'; Runs = @('regcreate hkcu'); ControlRuns = @('regcreate hkcu'); Allow = '^create=ok$'; ConfinedAllow = '^create=ok( delete=(err[0-9]+|hr[0-9a-f]{8}))?$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'symlink'; Runs = @('symlink {scratch_tmp}\kd_att_{rand}.lnk {ro_file}'); ControlRuns = @('symlink {control_tmp}\kd_att_{rand}.lnk {ro_file}'); Allow = '^create=ok$'; Deny = '^create=err(5|1314)$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'hardlink-ro'; Runs = @('hardlink {scratch_tmp}\kd_att_{rand}.lnk {ro_file}'); ControlRuns = @('hardlink {control_tmp}\kd_att_{rand}.lnk {ro_file}'); Allow = '^create=ok$'; Deny = '^create=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'junction-ro'; Runs = @('junction {scratch_tmp}\kd_att_{rand} {ro_dir}'); ControlRuns = @('junction {control_tmp}\kd_att_{rand} {ro_dir}'); ControlAllow = '^mkdir=ok open=ok fsctl=ok readback=ok remove=ok$'; Allow = '^mkdir=ok open=ok fsctl=ok readback=(ok|err[0-9]+) remove=(ok|err[0-9]+)$'; Deny = '^mkdir=ok open=ok fsctl=err(5|1314) readback=na remove=ok$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'junction-scratch'; Informational = $true; Runs = @('junction {scratch_tmp}\kd_att_{rand}l {scratch_tmp}\kd_att_{rand}t new'); ControlRuns = @(); Allow = '^mkdir=ok open=ok fsctl=ok readback=(ok|err[0-9]+) remove=(ok|err[0-9]+)$'; Deny = '^mkdir=ok open=ok fsctl=err(5|1314) readback=na remove=ok$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'mountmgr-write-dac'; Runs = @('mountmgr dac'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'mountmgr-write'; Runs = @('mountmgr write'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
+    $attempts += @{ Channel = 'boundary_disablement'; Name = 'globalq-write-dac'; Optional = $true; Runs = @('objdac {lease_object}'); ControlRuns = @(); Allow = '^open=ok$'; Deny = '^open=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'integrity-raise'; Runs = @('tokenraise'); ControlRuns = @('tokenraise'); Allow = '^open=ok set=ok$'; Deny = '^open=ok set=err(5|1314)$|^open=err5 set=na$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'privilege-enable'; Runs = @('tokenpriv'); ControlRuns = @('tokenpriv'); Allow = '^adjust=ok$'; Deny = '^adjust=err1300$|^open=err5$'; Expect = 'denied'; Timeout = 10 }
     $attempts += @{ Channel = 'boundary_disablement'; Name = 'task-register'; Informational = $true; LeakGuard = $true; Runs = @('taskreg'); ControlRuns = @('taskreg'); Allow = '^create=ok connect=ok$'; Deny = '^create=ok connect=hr80070005$'; Expect = 'denied'; Timeout = 30 }
@@ -2082,7 +2088,7 @@ try {
         $controlOutcomes = Invoke-Ladder $box $false $script:Control
 
         $phase = 'null_lease'
-        $script:NullLease = [KeelDock.Platform.WindowsConfinement.NullDeviceLease]::Open($script:Sid)
+        $script:NullLease = [KeelDock.Platform.WindowsConfinement.DeviceLease]::Open('nul', $script:Sid, '')
         $nullState = [string]$script:NullLease.Apply()
         $nullReadback = 'mismatch'
         if ($nullState -eq 'applied') { $nullReadback = [string]$script:NullLease.Readback() }

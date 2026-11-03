@@ -39,6 +39,13 @@ extern "system" {
     fn SysFreeString(text: *mut u16);
     fn LoadLibraryExW(name: *const u16, file: isize, flags: u32) -> isize;
     fn GetProcAddress(module: isize, name: *const u8) -> usize;
+    fn GetModuleHandleW(name: *const u16) -> isize;
+    fn CreateFileW(name: *const u16, access: u32, share: u32, security: *mut u8, creation: u32, flags: u32, template: isize) -> isize;
+    fn GetFinalPathNameByHandleW(handle: isize, buffer: *mut u16, length: u32, flags: u32) -> u32;
+    fn QueryDosDeviceW(name: *const u16, target: *mut u16, length: u32) -> u32;
+    fn CreateDirectoryW(path: *const u16, security: *mut u8) -> i32;
+    fn RemoveDirectoryW(path: *const u16) -> i32;
+    fn DeviceIoControl(handle: isize, code: u32, input: *mut u8, input_size: u32, output: *mut u8, output_size: u32, returned: *mut u32, overlapped: *mut u8) -> i32;
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -553,6 +560,224 @@ fn probe_hardlink(link: &str, existing: &str) -> String {
     }
 }
 
+fn plain_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 4
+        && bytes.len() <= 400
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && bytes.iter().all(|value| value.is_ascii_alphanumeric() || b"\\_.@-".contains(value))
+        && !path.contains("\\\\")
+        && !path.split('\\').any(|part| part == "." || part == "..")
+}
+
+fn open_directory(path: &str, access: u32) -> Result<isize, u32> {
+    let name = wide(path);
+    let handle = unsafe { CreateFileW(name.as_ptr(), access, 7, ptr::null_mut(), 3, 0x0200_0000, 0) };
+    if handle == -1 {
+        Err(last_error())
+    } else {
+        Ok(handle)
+    }
+}
+
+fn final_name(handle: isize, flags: u32) -> String {
+    let mut buffer = vec![0u16; 32768];
+    let length = unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, flags) };
+    if length == 0 || length as usize >= buffer.len() {
+        return format!("err{}", last_error());
+    }
+    String::from("ok")
+}
+
+fn handle_state(opened: &Result<isize, u32>) -> String {
+    match opened {
+        Ok(_) => String::from("ok"),
+        Err(value) => format!("err{}", value),
+    }
+}
+
+fn device_state(path: &str, access: u32) -> String {
+    let name = wide(path);
+    let handle = unsafe { CreateFileW(name.as_ptr(), access, 3, ptr::null_mut(), 3, 0, 0) };
+    if handle == -1 {
+        return format!("err{}", last_error());
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    String::from("ok")
+}
+
+fn probe_finalpath(dir: &str) -> String {
+    if !plain_path(dir) {
+        return String::from("open0=usage");
+    }
+    let opened = open_directory(dir, 0);
+    let read_attributes = open_directory(dir, 0x0010_0080);
+    let names: Vec<String> = match opened {
+        Ok(handle) => [0u32, 2, 1, 4, 8, 10].iter().map(|flags| final_name(handle, *flags)).collect(),
+        Err(_) => vec![String::from("na"); 6],
+    };
+    let ra_dos = match read_attributes {
+        Ok(handle) => final_name(handle, 0),
+        Err(_) => String::from("na"),
+    };
+    for item in [&opened, &read_attributes] {
+        if let Ok(handle) = item {
+            unsafe {
+                CloseHandle(*handle);
+            }
+        }
+    }
+    let mpm = device_state("\\\\.\\MountPointManager", 0);
+    let mpmr = device_state("\\\\.\\MountPointManager", 0x8000_0000);
+    let device = wide(&format!("{}:", &dir[..1]));
+    let mut target = vec![0u16; 4096];
+    let count = unsafe { QueryDosDeviceW(device.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+    let qdd = if count == 0 { format!("err{}", last_error()) } else { String::from("ok") };
+    let canon = match fs::canonicalize(dir) {
+        Ok(_) => String::from("ok"),
+        Err(error) => code(&error),
+    };
+    let mut line = format!("open0={} openra={} n_dos={}", handle_state(&opened), handle_state(&read_attributes), names[0]);
+    if ra_dos != names[0] {
+        line.push_str(&format!(" ra_dos={}", ra_dos));
+    }
+    line.push_str(&format!(
+        " n_nt={} n_guid={} n_none={} o_dos={} o_nt={} mpm={} mpmr={} qdd={} canon={}",
+        names[1], names[2], names[3], names[4], names[5], mpm, mpmr, qdd, canon
+    ));
+    line
+}
+
+fn push_u16(data: &mut Vec<u8>, value: usize) {
+    data.extend_from_slice(&(value as u16).to_le_bytes());
+}
+
+fn push_text(data: &mut Vec<u8>, text: &[u16]) {
+    for value in text {
+        data.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn remove_state(path: &[u16]) -> String {
+    if unsafe { RemoveDirectoryW(path.as_ptr()) } == 0 {
+        format!("err{}", last_error())
+    } else {
+        String::from("ok")
+    }
+}
+
+fn probe_junction(link: &str, target: &str, mode: &str) -> String {
+    if !plain_path(link) || !plain_path(target) || (mode != "" && mode != "new") || link == target {
+        return String::from("mkdir=usage open=na fsctl=na readback=na remove=na");
+    }
+    let link_name = wide(link);
+    let target_name = wide(target);
+    if mode == "new" && unsafe { CreateDirectoryW(target_name.as_ptr(), ptr::null_mut()) } == 0 {
+        return format!("mkdir=err{} open=na fsctl=na readback=na remove=na", last_error());
+    }
+    let finish = |text: String| -> String {
+        if mode == "new" {
+            unsafe {
+                RemoveDirectoryW(target_name.as_ptr());
+            }
+        }
+        text
+    };
+    if unsafe { CreateDirectoryW(link_name.as_ptr(), ptr::null_mut()) } == 0 {
+        return finish(format!("mkdir=err{} open=na fsctl=na readback=na remove=na", last_error()));
+    }
+    let handle = unsafe { CreateFileW(link_name.as_ptr(), 0x4000_0000, 0, ptr::null_mut(), 3, 0x0220_0000, 0) };
+    if handle == -1 {
+        let opened = last_error();
+        let removed = remove_state(&link_name);
+        return finish(format!("mkdir=ok open=err{} fsctl=na readback=na remove={}", opened, removed));
+    }
+    let substitute: Vec<u16> = format!("\\??\\{}", target).encode_utf16().collect();
+    let print: Vec<u16> = target.encode_utf16().collect();
+    let path_bytes = (substitute.len() + 1 + print.len() + 1) * 2;
+    let mut data: Vec<u8> = Vec::with_capacity(16 + path_bytes);
+    data.extend_from_slice(&0xA000_0003u32.to_le_bytes());
+    push_u16(&mut data, 8 + path_bytes);
+    push_u16(&mut data, 0);
+    push_u16(&mut data, 0);
+    push_u16(&mut data, substitute.len() * 2);
+    push_u16(&mut data, (substitute.len() + 1) * 2);
+    push_u16(&mut data, print.len() * 2);
+    push_text(&mut data, &substitute);
+    push_u16(&mut data, 0);
+    push_text(&mut data, &print);
+    push_u16(&mut data, 0);
+    let mut returned: u32 = 0;
+    let set = unsafe { DeviceIoControl(handle, 0x0009_00A4, data.as_mut_ptr(), data.len() as u32, ptr::null_mut(), 0, &mut returned, ptr::null_mut()) };
+    let fsctl = if set == 0 { format!("err{}", last_error()) } else { String::from("ok") };
+    let readback = if set == 0 {
+        String::from("na")
+    } else {
+        let mut output = vec![0u8; 16384];
+        let got = unsafe { DeviceIoControl(handle, 0x0009_00A8, ptr::null_mut(), 0, output.as_mut_ptr(), output.len() as u32, &mut returned, ptr::null_mut()) };
+        if got == 0 {
+            format!("err{}", last_error())
+        } else if returned >= 4 && output[..4] == 0xA000_0003u32.to_le_bytes() {
+            String::from("ok")
+        } else {
+            String::from("err13")
+        }
+    };
+    unsafe {
+        CloseHandle(handle);
+    }
+    let removed = remove_state(&link_name);
+    finish(format!("mkdir=ok open=ok fsctl={} readback={} remove={}", fsctl, readback, removed))
+}
+
+fn probe_mountmgr(mode: &str) -> String {
+    let access: u32 = match mode {
+        "dac" => 0x0004_0000,
+        "write" => 0x4000_0000,
+        _ => return String::from("open=usage"),
+    };
+    format!("open={}", device_state("\\\\.\\MountPointManager", access))
+}
+
+fn probe_objdac(kind: &str, drive: &str) -> String {
+    let (name, directory) = match kind {
+        "drive_link" if drive.len() == 1 && drive.chars().all(|value| value.is_ascii_alphabetic()) => (format!("\\GLOBAL??\\{}:", drive.to_ascii_uppercase()), false),
+        "mpm_link" if drive.is_empty() => (String::from("\\GLOBAL??\\MountPointManager"), false),
+        "global_dir" if drive.is_empty() => (String::from("\\GLOBAL??"), true),
+        _ => return String::from("open=usage"),
+    };
+    let library = wide("ntdll.dll");
+    let module = unsafe { GetModuleHandleW(library.as_ptr()) };
+    if module == 0 {
+        return format!("open=load_err{}", last_error());
+    }
+    let symbol: &[u8] = if directory { &b"NtOpenDirectoryObject\0"[..] } else { &b"NtOpenSymbolicLinkObject\0"[..] };
+    let open_address = unsafe { GetProcAddress(module, symbol.as_ptr()) };
+    let convert_address = unsafe { GetProcAddress(module, b"RtlNtStatusToDosError\0".as_ptr()) };
+    if open_address == 0 || convert_address == 0 {
+        return String::from("open=proc_err");
+    }
+    let open: extern "system" fn(*mut isize, u32, *const u64) -> i32 = unsafe { std::mem::transmute(open_address) };
+    let convert: extern "system" fn(i32) -> u32 = unsafe { std::mem::transmute(convert_address) };
+    let text = wide(&name);
+    let bytes = ((text.len() - 1) * 2) as u64;
+    let unicode: [u64; 2] = [bytes | ((bytes + 2) << 16), text.as_ptr() as u64];
+    let attributes: [u64; 6] = [48, 0, unicode.as_ptr() as u64, 0x40, 0, 0];
+    let mut handle: isize = 0;
+    let status = open(&mut handle, 0x0004_0000, attributes.as_ptr());
+    if status < 0 {
+        return format!("open=err{}", convert(status));
+    }
+    unsafe {
+        CloseHandle(handle);
+    }
+    String::from("open=ok")
+}
+
 fn probe_tokenraise() -> String {
     let mut token: isize = 0;
     let opened = unsafe { OpenProcessToken(GetCurrentProcess(), 0x0088, &mut token) };
@@ -775,6 +1000,10 @@ fn main() {
         "scm" => probe_scm(),
         "symlink" => probe_symlink(first, second),
         "hardlink" => probe_hardlink(first, second),
+        "finalpath" => probe_finalpath(first),
+        "junction" => probe_junction(first, second, third),
+        "mountmgr" => probe_mountmgr(first),
+        "objdac" => probe_objdac(first, second),
         "tokenraise" => probe_tokenraise(),
         "tokenpriv" => probe_tokenpriv(),
         "taskreg" => probe_taskreg(),
