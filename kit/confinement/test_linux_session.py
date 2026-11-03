@@ -535,8 +535,11 @@ class LinuxSeccompNumberTests(unittest.TestCase):
     }
 
     def test_denied_syscalls_are_exactly_the_reviewed_x86_64_numbers(self):
-        self.assertEqual(sorted(harness.DENIED_SYSCALLS), sorted(self.SYSCALL_NUMBERS.values()))
+        unconditional = {name: number for name, number in self.SYSCALL_NUMBERS.items() if name != "socketpair"}
+        self.assertEqual(sorted(harness.DENIED_SYSCALLS), sorted(unconditional.values()))
         self.assertEqual(len(set(harness.DENIED_SYSCALLS)), len(harness.DENIED_SYSCALLS))
+        self.assertNotIn(self.SYSCALL_NUMBERS["socketpair"], harness.DENIED_SYSCALLS)
+        self.assertEqual(harness.SOCKETPAIR_SYSCALL, self.SYSCALL_NUMBERS["socketpair"])
         required = (
             "ptrace", "process_vm_readv", "process_vm_writev", "pidfd_getfd", "mount", "umount2", "pivot_root",
             "move_mount", "open_tree", "fsopen", "fsmount", "fsconfig", "mount_setattr", "chroot", "unshare",
@@ -544,16 +547,32 @@ class LinuxSeccompNumberTests(unittest.TestCase):
         )
         for name in required:
             self.assertIn(self.SYSCALL_NUMBERS[name], harness.DENIED_SYSCALLS, name)
+        for name in ("socket", "io_uring_setup", "io_uring_enter", "io_uring_register"):
+            self.assertIn(self.SYSCALL_NUMBERS[name], harness.DENIED_SYSCALLS, name)
 
     def test_filter_has_one_compare_and_deny_pair_per_denied_syscall(self):
+        start = 6 + len(harness.SOCKETPAIR_RULE)
+        self.assertEqual(harness.SOCKET_FILTER[6:start], harness.SOCKETPAIR_RULE)
         pairs = [
             (harness.SOCKET_FILTER[index][3], harness.SOCKET_FILTER[index + 1][3])
-            for index in range(6, len(harness.SOCKET_FILTER) - 1, 2)
+            for index in range(start, len(harness.SOCKET_FILTER) - 1, 2)
         ]
         self.assertEqual([number for number, unused in pairs], list(harness.DENIED_SYSCALLS))
         self.assertTrue(all(value == harness.SECCOMP_DENY for unused, value in pairs))
         self.assertEqual(harness.SOCKET_FILTER[-1][3], harness.SECCOMP_ALLOW)
         self.assertLess(len(harness.SOCKET_FILTER), 4096)
+        self.assertEqual(len(harness.SOCKET_FILTER), 66)
+
+    def test_socketpair_rule_allows_only_the_unix_domain_and_denies_every_other(self):
+        rule = harness.SOCKETPAIR_RULE
+        self.assertEqual(len(rule), 5)
+        self.assertEqual(rule[0], (0x15, 0, 4, 53))
+        self.assertEqual(rule[1], (0x20, 0, 0, harness.SECCOMP_ARGUMENT_ZERO_OFFSET))
+        self.assertEqual(harness.SECCOMP_ARGUMENT_ZERO_OFFSET, 16)
+        self.assertEqual(rule[2], (0x15, 0, 1, harness.AF_UNIX))
+        self.assertEqual(harness.AF_UNIX, 1)
+        self.assertEqual(rule[3], (0x06, 0, 0, harness.SECCOMP_ALLOW))
+        self.assertEqual(rule[4], (0x06, 0, 0, harness.SECCOMP_DENY))
 
 
 if __name__ == "__main__":

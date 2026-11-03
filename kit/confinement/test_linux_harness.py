@@ -503,32 +503,75 @@ class HarnessPolicyTests(unittest.TestCase):
                 self.assertFalse(_expected_denial(kind, OSError(value, "opaque")))
         self.assertFalse(_expected_denial("dns", socket.gaierror(socket.EAI_AGAIN, "opaque")))
 
-    def test_filter_denies_socket_and_ring_syscalls_in_every_supported_entry(self):
-        def evaluate(architecture, number):
-            data = struct.pack("<IIQ6Q", number, architecture, 0, *([0] * 6))
-            accumulator = 0
-            pc = 0
-            for _ in range(128):
-                code, yes, no, value = SOCKET_FILTER[pc]
-                if code == 0x20:
-                    accumulator = struct.unpack_from("<I", data, value)[0]
-                    pc += 1
-                elif code == 0x15:
-                    pc += 1 + (yes if accumulator == value else no)
-                elif code == 0x45:
-                    pc += 1 + (yes if accumulator & value else no)
-                elif code == 0x06:
-                    return value
-                else:
-                    self.fail("unexpected-filter-instruction")
-            self.fail("filter-did-not-return")
+    @staticmethod
+    def _evaluate_filter(architecture, number, domain=0):
+        data = struct.pack("<IIQ6Q", number, architecture, 0, domain, *([0] * 5))
+        accumulator = 0
+        pc = 0
+        for _ in range(128):
+            code, yes, no, value = SOCKET_FILTER[pc]
+            if code == 0x20:
+                accumulator = struct.unpack_from("<I", data, value)[0]
+                pc += 1
+            elif code == 0x15:
+                pc += 1 + (yes if accumulator == value else no)
+            elif code == 0x45:
+                pc += 1 + (yes if accumulator & value else no)
+            elif code == 0x06:
+                return value
+            else:
+                raise AssertionError("unexpected-filter-instruction")
+        raise AssertionError("filter-did-not-return")
 
+    def test_filter_denies_socket_and_ring_syscalls_in_every_supported_entry(self):
+        evaluate = self._evaluate_filter
         for number in range(512):
-            expected = SECCOMP_DENY if number in DENIED_SYSCALLS else SECCOMP_ALLOW
+            expected = SECCOMP_DENY if number in DENIED_SYSCALLS or number == harness.SOCKETPAIR_SYSCALL else SECCOMP_ALLOW
             self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, number), expected)
             self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, COMPAT_SYSCALL_BIT | number), SECCOMP_DENY)
             for architecture in (0x40000003, 0xC00000B7, 0, 0xFFFFFFFF):
                 self.assertEqual(evaluate(architecture, number), SECCOMP_DENY)
+
+    def test_filter_allows_socketpair_only_for_the_unix_domain(self):
+        evaluate = self._evaluate_filter
+        number = harness.SOCKETPAIR_SYSCALL
+        self.assertEqual(number, 53)
+        self.assertEqual(harness.AF_UNIX, socket.AF_UNIX)
+        self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, number, socket.AF_UNIX), SECCOMP_ALLOW)
+        self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, number, socket.AF_UNIX | (1 << 32)), SECCOMP_ALLOW)
+        for domain in (0, socket.AF_INET, socket.AF_INET6, 16, 17, 40, 3, 0x7FFFFFFF, 0xFFFFFFFF, 40 | (1 << 32)):
+            with self.subTest(domain=domain):
+                self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, number, domain), SECCOMP_DENY)
+        self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, COMPAT_SYSCALL_BIT | number, socket.AF_UNIX), SECCOMP_DENY)
+        for architecture in (0x40000003, 0xC00000B7, 0, 0xFFFFFFFF):
+            self.assertEqual(evaluate(architecture, number, socket.AF_UNIX), SECCOMP_DENY)
+
+    def test_filter_still_denies_socket_in_every_domain_including_the_unix_domain(self):
+        evaluate = self._evaluate_filter
+        for domain in (0, socket.AF_UNIX, socket.AF_INET, socket.AF_INET6, 16, 17, 40, 0x7FFFFFFF):
+            with self.subTest(domain=domain):
+                self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, 41, domain), SECCOMP_DENY)
+        for number in (425, 426, 427):
+            self.assertEqual(evaluate(AUDIT_ARCH_NATIVE, number, socket.AF_UNIX), SECCOMP_DENY)
+
+    def test_filter_layout_and_jump_offsets_are_exact(self):
+        self.assertEqual(len(SOCKET_FILTER), 6 + 5 + 2 * len(DENIED_SYSCALLS) + 1)
+        self.assertEqual(SOCKET_FILTER[6:11], harness.SOCKETPAIR_RULE)
+        self.assertEqual(
+            harness.SOCKETPAIR_RULE,
+            (
+                (0x15, 0, 4, 53),
+                (0x20, 0, 0, 16),
+                (0x15, 0, 1, 1),
+                (0x06, 0, 0, SECCOMP_ALLOW),
+                (0x06, 0, 0, SECCOMP_DENY),
+            ),
+        )
+        self.assertEqual(6 + 1 + SOCKET_FILTER[6][2], 11)
+        for index, (code, yes, no, value) in enumerate(SOCKET_FILTER):
+            if code in (0x15, 0x45):
+                self.assertLess(index + 1 + max(yes, no), len(SOCKET_FILTER))
+        self.assertEqual(SOCKET_FILTER[-1], (0x06, 0, 0, SECCOMP_ALLOW))
 
     def test_filter_installation_requires_success_and_exact_readback(self):
         before = {"NoNewPrivs": ["1"], "Seccomp": ["0"], "Seccomp_filters": ["0"]}
@@ -636,12 +679,22 @@ class HarnessPolicyTests(unittest.TestCase):
             ctypes.set_errno(errno.EPERM)
             return -1
 
-        scope = {"ctypes": ctypes, "errno": errno}
+        ends = (Mock(), Mock())
+        fake_socket = SimpleNamespace(AF_UNIX=1, SOCK_STREAM=1, socketpair=Mock(return_value=ends))
+        scope = {"ctypes": ctypes, "errno": errno, "socket": fake_socket}
         exec(compile(ast.Module(body=[node], type_ignores=[]), "synthetic", "exec"), scope)
         with patch("ctypes.CDLL", return_value=SimpleNamespace(syscall=syscall)):
             scope["_require_socket_policy"]()
         self.assertEqual({arguments[0] for number, arguments in calls if number == 41}, {1, 2, 10, 16, 17, 40, 0x7fffffff, 40 | (1 << 32)})
+        self.assertEqual({arguments[0] for number, arguments in calls if number == 53}, {0, 2, 10, 16, 17, 40, 0x7fffffff, 40 | (1 << 32)})
+        self.assertEqual(
+            [arguments[0] for number, arguments in calls if number == COMPAT_SYSCALL_BIT | 53],
+            [0, 1],
+        )
         self.assertEqual({number for number, _ in calls}, {41, 53, 425, 426, 427, *(COMPAT_SYSCALL_BIT | number for number in (41, 53, 425, 426, 427))})
+        fake_socket.socketpair.assert_called_once_with(1, 1)
+        for end in ends:
+            end.close.assert_called_once_with()
         for result, error in ((0, errno.EPERM), (-1, errno.EAFNOSUPPORT), (-1, errno.EINVAL)):
             def wrong_denial(*args):
                 ctypes.set_errno(error)
@@ -649,6 +702,14 @@ class HarnessPolicyTests(unittest.TestCase):
             with patch("ctypes.CDLL", return_value=SimpleNamespace(syscall=wrong_denial)):
                 with self.assertRaises(RuntimeError):
                     scope["_require_socket_policy"]()
+        refused_pair = SimpleNamespace(
+            AF_UNIX=1, SOCK_STREAM=1,
+            socketpair=Mock(side_effect=PermissionError(errno.EPERM, "opaque")),
+        )
+        scope["socket"] = refused_pair
+        with patch("ctypes.CDLL", return_value=SimpleNamespace(syscall=syscall)):
+            with self.assertRaisesRegex(RuntimeError, "socket-policy"):
+                scope["_require_socket_policy"]()
 
     def test_capture_verification_requires_exact_identity_and_write_only_regular_files(self):
         nonce = "c" * 24

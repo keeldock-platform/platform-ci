@@ -75,9 +75,19 @@ AUDIT_ARCH_NATIVE = 0xC000003E
 COMPAT_SYSCALL_BIT = 0x40000000
 SECCOMP_DENY = 0x00050000 | errno.EPERM
 SECCOMP_ALLOW = 0x7FFF0000
-SOCKET_SYSCALLS = (41, 53, 425, 426, 427)
+SOCKETPAIR_SYSCALL = 53
+AF_UNIX = 1
+SECCOMP_ARGUMENT_ZERO_OFFSET = 16
+SOCKET_SYSCALLS = (41, 425, 426, 427)
 EXTRA_DENIED_SYSCALLS = (101, 155, 161, 165, 166, 248, 249, 250, 272, 298, 308, 310, 311, 321, 323, 428, 429, 430, 431, 432, 433, 438, 442)
 DENIED_SYSCALLS = SOCKET_SYSCALLS + EXTRA_DENIED_SYSCALLS
+SOCKETPAIR_RULE = (
+    (0x15, 0, 4, SOCKETPAIR_SYSCALL),
+    (0x20, 0, 0, SECCOMP_ARGUMENT_ZERO_OFFSET),
+    (0x15, 0, 1, AF_UNIX),
+    (0x06, 0, 0, SECCOMP_ALLOW),
+    (0x06, 0, 0, SECCOMP_DENY),
+)
 SOCKET_FILTER = (
     (0x20, 0, 0, 4),
     (0x15, 1, 0, AUDIT_ARCH_NATIVE),
@@ -85,7 +95,7 @@ SOCKET_FILTER = (
     (0x20, 0, 0, 0),
     (0x45, 0, 1, COMPAT_SYSCALL_BIT),
     (0x06, 0, 0, SECCOMP_DENY),
-) + tuple(instruction for number in DENIED_SYSCALLS for instruction in (
+) + SOCKETPAIR_RULE + tuple(instruction for number in DENIED_SYSCALLS for instruction in (
     (0x15, 0, 1, number),
     (0x06, 0, 0, SECCOMP_DENY),
 )) + ((0x06, 0, 0, SECCOMP_ALLOW),)
@@ -340,14 +350,21 @@ def _require_socket_policy():
     pair = (ctypes.c_int * 2)()
     calls = [(41, (family, kind, 0)) for family in (1, 2, 10, 16, 17, 40, 0x7fffffff) for kind in (1, 2, 3, 5)]
     calls += [(41, (40 | (1 << 32), 1, 0)), (41, (40, 1 | 0x80000 | 0x800, 0))]
-    calls += [(53, (1, 1, 0, ctypes.addressof(pair)))]
+    calls += [(53, (family, 1, 0, ctypes.addressof(pair))) for family in (0, 2, 10, 16, 17, 40, 0x7fffffff, 40 | (1 << 32))]
     calls += [(number, (0, 0, 0, 0, 0, 0)) for number in (425, 426, 427)]
     calls += [(0x40000000 | number, (0, 0, 0, 0, 0, 0)) for number in (41, 53, 425, 426, 427)]
+    calls += [(0x40000000 | 53, (1, 1, 0, ctypes.addressof(pair)))]
     for number, arguments in calls:
         ctypes.set_errno(0)
         result = libc.syscall(ctypes.c_long(number), *(ctypes.c_long(value) for value in arguments))
         if result != -1 or ctypes.get_errno() != errno.EPERM:
             raise RuntimeError("socket-policy")
+    try:
+        first, second = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError:
+        raise RuntimeError("socket-policy")
+    first.close()
+    second.close()
 
 def _require_process_denials():
     for path in ("/proc/1/environ", "/proc/1/fd"):

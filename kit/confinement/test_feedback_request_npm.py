@@ -178,6 +178,8 @@ class NpmAdmissionProfileTests(unittest.TestCase):
         self.assertEqual(subject.npm_admission_consumed_count(state), 0)
 
     def test_the_number_of_consumed_requests_is_capped(self):
+        self.assertEqual(subject.NPM_ADMISSION_MAX_CONSUMED, 48)
+        self.assertGreater(subject.NPM_ADMISSION_MAX_CONSUMED, subject.CARGO_LOCK_MAX_CONSUMED)
         state = subject.empty_state()
         for index in range(subject.NPM_ADMISSION_MAX_CONSUMED):
             request = subject.create_request(_fields(index), now=NOW)

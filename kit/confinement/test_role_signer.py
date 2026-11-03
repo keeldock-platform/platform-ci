@@ -907,6 +907,58 @@ class WorkflowAndJobMappingTests(unittest.TestCase):
         with self.assertRaises(subject.Refusal):
             subject.validate_jobs_snapshot(fixture_job_snapshot(rows), RUN_ID, RUN_ATTEMPT, CONTROL_SHA, fixture_api_names())
 
+    def test_pending_steps_are_accepted_only_in_a_running_job_and_only_without_a_conclusion(self):
+        names = fixture_api_names()
+
+        def rows_with(job_status, step_status, conclusion=None, job_conclusion=None):
+            rows = fixture_jobs()
+            rows[0]["status"] = job_status
+            rows[0]["conclusion"] = job_conclusion
+            rows[0]["steps"].append(
+                {"number": 2, "name": "later-step", "status": step_status, "conclusion": conclusion}
+            )
+            return rows
+
+        def check_both(rows, job_status, reason):
+            snapshot = fixture_job_snapshot(rows)
+            with self.assertRaisesRegex(subject.Refusal, reason):
+                subject.validate_jobs_snapshot(snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, names)
+            with self.assertRaisesRegex(subject.Refusal, reason):
+                subject.validate_role_job(
+                    snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, "windows-receiver", names["windows-receiver"],
+                    (job_status,),
+                )
+
+        for job_status in ("in_progress", "queued"):
+            snapshot = fixture_job_snapshot(rows_with(job_status, "pending"))
+            result = subject.validate_jobs_snapshot(snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, names)
+            self.assertEqual(result["windows-receiver"]["steps"][-1]["status"], "pending")
+            job = subject.validate_role_job(
+                snapshot, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, "windows-receiver", names["windows-receiver"], (job_status,),
+            )
+            self.assertEqual([step["status"] for step in job["steps"]], ["completed", "pending"])
+            self.assertIsNone(job["steps"][-1]["conclusion"])
+            for status in ("queued", "in_progress"):
+                with self.subTest(job=job_status, step=status):
+                    accepted = fixture_job_snapshot(rows_with(job_status, status))
+                    subject.validate_jobs_snapshot(accepted, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, names)
+            for conclusion in ("success", "failure", "skipped", "cancelled", ""):
+                with self.subTest(job=job_status, pending_conclusion=conclusion):
+                    check_both(rows_with(job_status, "pending", conclusion), job_status, "api-step-conclusion")
+            for status in ("in_progress", "queued"):
+                with self.subTest(job=job_status, unfinished_conclusion=status):
+                    check_both(rows_with(job_status, status, "success"), job_status, "api-step-conclusion")
+            with self.subTest(job=job_status, label="completed step without a conclusion"):
+                check_both(rows_with(job_status, "completed", None), job_status, "api-step-conclusion")
+            for status in ("Pending", "waiting", "requested", "unknown", "", None, 3):
+                with self.subTest(job=job_status, step=status):
+                    check_both(rows_with(job_status, status), job_status, "api-step-status")
+        for status in ("pending", "queued", "in_progress"):
+            with self.subTest(completed_job_step=status):
+                check_both(rows_with("completed", status, None, "success"), "completed", "api-step-status")
+        completed = fixture_job_snapshot(rows_with("completed", "completed", "success", "success"))
+        subject.validate_jobs_snapshot(completed, RUN_ID, RUN_ATTEMPT, CONTROL_SHA, names)
+
     def test_run_and_repository_metadata_bind_numeric_ids_name_ref_attempt_and_commit(self):
         repository_metadata = {
             "id": 8150001,

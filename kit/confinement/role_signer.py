@@ -1508,6 +1508,24 @@ def validate_api_runner(job, role):
     return name, labels
 
 
+def _validate_api_step_state(step, job_status):
+    status = step.get("status")
+    if status == "pending":
+        if job_status == "completed":
+            raise Refusal("api-step-status")
+    elif status not in ("queued", "in_progress", "completed"):
+        raise Refusal("api-step-status")
+    elif job_status == "completed" and status != "completed":
+        raise Refusal("api-step-status")
+    if status == "completed":
+        if step.get("conclusion") not in (
+            "success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "stale"
+        ):
+            raise Refusal("api-step-conclusion")
+    elif step.get("conclusion") is not None:
+        raise Refusal("api-step-conclusion")
+
+
 def validate_jobs_snapshot(snapshot, run_id, run_attempt, head_sha, api_name_pins, roles=None):
     jobs = _validate_snapshot(snapshot, "jobs", run_id, run_attempt, head_sha)
     roles = ROLE_ORDER if roles is None else tuple(roles)
@@ -1583,12 +1601,7 @@ def validate_jobs_snapshot(snapshot, run_id, run_attempt, head_sha, api_name_pin
                 raise Refusal("api-step-duplicate")
             numbers.add(number)
             step_names.add(step["name"])
-            if step.get("status") not in ("queued", "in_progress", "completed"):
-                raise Refusal("api-step-status")
-            if step.get("status") == "completed" and step.get("conclusion") not in (
-                "success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "stale"
-            ):
-                raise Refusal("api-step-conclusion")
+            _validate_api_step_state(step, job["status"])
         result[role] = {
             "job_id": job_id,
             "check_run_id": check_id,
@@ -1655,14 +1668,7 @@ def validate_role_job(snapshot, run_id, run_attempt, head_sha, role, api_name, a
             raise Refusal("api-step-duplicate")
         step_numbers.add(number)
         step_names.add(step["name"])
-        if step.get("status") not in ("queued", "in_progress", "completed"):
-            raise Refusal("api-step-status")
-        if step.get("status") == "completed" and step.get("conclusion") not in (
-            "success", "failure", "cancelled", "skipped", "timed_out", "action_required", "neutral", "stale"
-        ):
-            raise Refusal("api-step-conclusion")
-        if step.get("status") != "completed" and step.get("conclusion") is not None:
-            raise Refusal("api-step-conclusion")
+        _validate_api_step_state(step, job["status"])
     return job
 
 

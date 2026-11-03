@@ -502,6 +502,71 @@ class JobTests(AuditCase):
             with self.subTest(case=name):
                 self.assert_refused(mutate(change), "job_steps")
 
+    def test_post_and_completion_steps_may_take_larger_increasing_numbers(self):
+        api = FakeApi()
+        for step, number in zip(api.jobs[1]["steps"], (1, 2, 3, 42, 43)):
+            step["number"] = number
+        self.assert_accepted(api)
+        api = FakeApi()
+        for step, number in zip(api.jobs[1]["steps"], (1, 2, 3, 4, 43)):
+            step["number"] = number
+        self.assert_accepted(api)
+        api = FakeApi()
+        for step, number in zip(api.jobs[0]["steps"], (1, 2, 90)):
+            step["number"] = number
+        self.assert_accepted(api)
+
+    def test_main_step_numbers_must_be_contiguous_from_one_and_every_number_must_increase(self):
+        cases = {
+            "main_gap": (1, 2, 4, 42, 43),
+            "main_not_from_one": (2, 3, 4, 42, 43),
+            "main_numbered_like_post": (1, 2, 40, 41, 42),
+            "main_repeated": (1, 2, 2, 42, 43),
+            "post_not_increasing": (1, 2, 3, 3, 43),
+            "post_decreasing": (1, 2, 3, 43, 42),
+            "complete_not_increasing": (1, 2, 3, 42, 42),
+            "complete_decreasing": (1, 2, 3, 42, 4),
+            "zero": (0, 1, 2, 42, 43),
+            "negative_post": (1, 2, 3, -5, 43),
+            "boolean": (True, 2, 3, 42, 43),
+            "text": ("1", 2, 3, 42, 43),
+            "float": (1, 2.0, 3, 42, 43),
+            "missing": (1, 2, 3, None, 43),
+        }
+        for label, numbers in cases.items():
+            api = FakeApi()
+            for step, number in zip(api.jobs[1]["steps"], numbers):
+                step["number"] = number
+            with self.subTest(case=label):
+                self.assert_refused(api, "job_steps")
+        api = FakeApi()
+        del api.jobs[1]["steps"][2]["number"]
+        self.assert_refused(api, "job_steps")
+        api = FakeApi()
+        api.jobs[1]["steps"][2]["name"] = "Run other"
+        for step, number in zip(api.jobs[1]["steps"], (1, 2, 3, 42, 43)):
+            step["number"] = number
+        self.assert_refused(api, "job_steps")
+        api = FakeApi()
+        api.jobs[1]["steps"][3]["name"] = "Post other"
+        for step, number in zip(api.jobs[1]["steps"], (1, 2, 3, 42, 43)):
+            step["number"] = number
+        self.assert_refused(api, "job_steps")
+
+    def test_the_step_number_rule_is_exact_for_names_and_tail_steps(self):
+        self.assertTrue(subject._step_numbers_ok(("Set up job", "Post a", "Complete job"), (1, 9, 10)))
+        self.assertTrue(subject._step_numbers_ok(("Set up job", "Complete job"), (1, 2)))
+        self.assertTrue(subject._step_numbers_ok(("Set up job", "Complete job"), (1, 43)))
+        self.assertTrue(subject._step_numbers_ok(("Set up job",), (1,)))
+        self.assertFalse(subject._step_numbers_ok(("Set up job", "Post a", "Run b"), (1, 9, 10)))
+        self.assertFalse(subject._step_numbers_ok(("Set up job", "Post a", "Run b"), (1, 2, 3)))
+        self.assertFalse(subject._step_numbers_ok(("Set up job", "Run b"), (1, 1)))
+        self.assertFalse(subject._step_numbers_ok(("Set up job", "Run b"), (1,)))
+        self.assertFalse(subject._step_numbers_ok(("Set up job", "Run b"), (2, 3)))
+        self.assertFalse(subject._step_numbers_ok(("Set up job", "Posted"), (1, 3)))
+        self.assertFalse(subject._step_numbers_ok(("Set up job", "Complete job x"), (1, 3)))
+        self.assertFalse(subject._step_numbers_ok((1, "Complete job"), (1, 3)))
+
     def test_pagination_gaps_in_jobs_are_refused(self):
         api = FakeApi()
         api.total_override["jobs"] = 4
@@ -1494,6 +1559,33 @@ class QuickStepAndJobTests(QuickAuditCase):
         api.checks[202]["conclusion"] = "cancelled"
         self.assert_refused(api, "jobs")
 
+    def test_post_and_completion_steps_may_follow_a_numbering_gap_but_main_steps_may_not(self):
+        def renumber(api, numbers):
+            for step, number in zip(api.jobs[1]["steps"], numbers):
+                step["number"] = number
+
+        for numbers in ((1, 2, 3, 4, 5, 6, 42, 43), (1, 2, 3, 4, 5, 6, 7, 43), (1, 2, 3, 4, 5, 6, 7, 8)):
+            api = QuickApi()
+            renumber(api, numbers)
+            with self.subTest(numbers=numbers):
+                self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
+        api = QuickApi(failed_gate=True)
+        renumber(api, (1, 2, 3, 4, 5, 6, 42, 43))
+        self.assertEqual(subject.audit_quick(api, api.expected, CONFIG), QUICK_ACCEPTED)
+        for numbers in (
+            (1, 2, 3, 5, 6, 7, 42, 43),
+            (2, 3, 4, 5, 6, 7, 42, 43),
+            (1, 2, 3, 4, 5, 6, 43, 42),
+            (1, 2, 3, 4, 5, 6, 42, 42),
+            (1, 2, 3, 4, 5, 6, 6, 43),
+            (1, 2, 3, 4, 5, 40, 41, 42),
+            (1, 2, 3, 4, 5, 6, 42, True),
+        ):
+            api = QuickApi()
+            renumber(api, numbers)
+            with self.subTest(numbers=numbers):
+                self.assert_refused(api, "job_steps")
+
     def test_every_other_job_must_have_succeeded(self):
         api = QuickApi()
         api.jobs[0]["conclusion"] = "failure"
@@ -1965,7 +2057,8 @@ class WindowsJobTests(WindowsAuditCase):
             with self.subTest(job=name, label="skipped"):
                 self.assert_refused(api, "job_steps")
             api = WindowsApi()
-            api.job(name)["steps"][1]["number"] = 7
+            second = api.job(name)["steps"][1]
+            second["number"] = 1 if second["name"] == "Complete job" else 7
             with self.subTest(job=name, label="number"):
                 self.assert_refused(api, "job_steps")
             api = WindowsApi()
@@ -1973,26 +2066,57 @@ class WindowsJobTests(WindowsAuditCase):
             with self.subTest(job=name, label="intact"):
                 self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
 
+    def test_post_and_completion_steps_may_follow_a_numbering_gap_in_every_job_but_main_steps_may_not(self):
+        def renumber(api, name, numbers):
+            for step, number in zip(api.job(name)["steps"], numbers):
+                step["number"] = number
+
+        for name in subject.WINDOWS_OPEN_JOBS + (subject.WINDOWS_SETTINGS_JOB, subject.WINDOWS_EVIDENCE_JOB):
+            steps = windows_job_steps(name, "source")
+            main = [step for step in steps if not (step == "Complete job" or step.startswith("Post "))]
+            tail = len(steps) - len(main)
+            numbers = list(range(1, len(main) + 1))
+            gapped = tuple(
+                number if index < len(main) else 40 + index
+                for index, number in enumerate(numbers + [0] * tail)
+            )
+            api = WindowsApi()
+            renumber(api, name, gapped)
+            with self.subTest(job=name, label="gap"):
+                self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
+            if len(main) >= 2:
+                broken = list(gapped)
+                broken[1] = 5
+                api = WindowsApi()
+                renumber(api, name, tuple(broken))
+                with self.subTest(job=name, label="main gap"):
+                    self.assert_refused(api, "job_steps")
+            decreasing = list(gapped)
+            decreasing[-1] = decreasing[-2] if tail >= 2 else len(main)
+            api = WindowsApi()
+            renumber(api, name, tuple(decreasing))
+            with self.subTest(job=name, label="not increasing"):
+                self.assert_refused(api, "job_steps")
+
     def test_the_producer_may_show_the_verifier_only_verdict_step_as_skipped_and_nothing_else(self):
-        api = WindowsApi()
-        steps = api.job(subject.WINDOWS_PRODUCER_JOB)["steps"]
-        steps.insert(
-            len(steps) - 1,
-            {"number": len(steps), "name": subject.WINDOWS_VERDICT_STEP, "status": "completed", "conclusion": "skipped"},
-        )
-        steps[-1]["number"] = len(steps)
+        def with_skipped_step(name):
+            api = WindowsApi()
+            steps = api.job(subject.WINDOWS_PRODUCER_JOB)["steps"]
+            steps.insert(
+                len(steps) - 2,
+                {"number": 0, "name": name, "status": "completed", "conclusion": "skipped"},
+            )
+            for number, step in enumerate(steps, start=1):
+                step["number"] = number
+            return api
+
+        api = with_skipped_step(subject.WINDOWS_VERDICT_STEP)
         self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_ACCEPTED)
         self.assertEqual(
             api.expected["jobs"][subject.WINDOWS_PRODUCER_JOB]["optional_steps"], (subject.WINDOWS_VERDICT_STEP,),
         )
         self.assertEqual(api.expected["jobs"][subject.WINDOWS_VERIFIER_JOB]["optional_steps"], ())
-        api = WindowsApi()
-        steps = api.job(subject.WINDOWS_PRODUCER_JOB)["steps"]
-        steps.insert(
-            len(steps) - 1,
-            {"number": len(steps), "name": "Other skipped step", "status": "completed", "conclusion": "skipped"},
-        )
-        steps[-1]["number"] = len(steps)
+        api = with_skipped_step("Other skipped step")
         self.assert_refused(api, "job_steps")
 
     def test_closed_jobs_keep_their_exact_step_lists(self):

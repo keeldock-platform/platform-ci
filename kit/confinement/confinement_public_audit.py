@@ -296,14 +296,41 @@ def _check_run(api, expected):
         _fail("run")
 
 
+def _is_tail_step(name):
+    return name == "Complete job" or name.startswith("Post ")
+
+
+def _step_numbers_ok(names, numbers):
+    """Require strictly increasing numbers, main steps contiguous from one, and any gap only before a tail step.
+
+    GitHub numbers post-job steps and the final completion step after a gap that follows the
+    main steps, so only a step named Post or the completion step may take a larger number.
+    """
+    if len(names) != len(numbers):
+        return False
+    previous = 0
+    main_steps = 0
+    for name, number in zip(names, numbers):
+        if type(name) is not str or not _exact_int(number, 1) or number <= previous:
+            return False
+        if not _is_tail_step(name):
+            main_steps += 1
+            if number != main_steps:
+                return False
+        previous = number
+    return True
+
+
 def _check_steps(job, spec):
     steps = job["steps"]
     if len(steps) != len(spec["steps"]):
         _fail("job_steps")
+    if (any(type(step) is not dict for step in steps)
+            or not _step_numbers_ok(spec["steps"], [step.get("number") for step in steps])):
+        _fail("job_steps")
     for index, step in enumerate(steps, start=1):
         name = spec["steps"][index - 1]
-        if (type(step) is not dict or not _is(step.get("number"), index)
-                or not _is(step.get("name"), name) or not _is(step.get("status"), "completed")):
+        if not _is(step.get("name"), name) or not _is(step.get("status"), "completed"):
             _fail("job_steps")
         conclusion = step.get("conclusion")
         if conclusion == "success":
@@ -726,10 +753,12 @@ def _check_quick_steps(job, spec):
     if len(steps) != len(spec["steps"]):
         _fail("job_steps")
     gates = None
+    if (any(type(step) is not dict for step in steps)
+            or not _step_numbers_ok(spec["steps"], [step.get("number") for step in steps])):
+        _fail("job_steps")
     for index, step in enumerate(steps, start=1):
         name = spec["steps"][index - 1]
-        if (type(step) is not dict or not _is(step.get("number"), index)
-                or not _is(step.get("name"), name) or not _is(step.get("status"), "completed")):
+        if not _is(step.get("name"), name) or not _is(step.get("status"), "completed"):
             _fail("job_steps")
         conclusion = step.get("conclusion")
         if name == QUICK_GATES_STEP:
@@ -1023,9 +1052,12 @@ def _check_open_steps(job, spec):
             or steps[0].get("name") != "Set up job" or steps[-1].get("name") != "Complete job"):
         _fail("job_steps")
     required = list(spec["steps"])
-    for index, step in enumerate(steps, start=1):
-        if (type(step) is not dict or not _is(step.get("number"), index)
-                or type(step.get("name")) is not str or LABEL_RE.fullmatch(step["name"]) is None
+    if any(type(step) is not dict or type(step.get("name")) is not str for step in steps):
+        _fail("job_steps")
+    if not _step_numbers_ok([step["name"] for step in steps], [step.get("number") for step in steps]):
+        _fail("job_steps")
+    for step in steps:
+        if (LABEL_RE.fullmatch(step["name"]) is None
                 or not _is(step.get("status"), "completed")):
             _fail("job_steps")
         conclusion = step.get("conclusion")
