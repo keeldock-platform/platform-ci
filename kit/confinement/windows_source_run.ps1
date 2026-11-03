@@ -60,6 +60,7 @@ $DiagStdoutLines = 20
 $DiagLineLimit = 300
 $ProbeSeconds = 60
 $ProbeCargoCheckSeconds = 180
+$NodeRealpathScript = "const f=require('fs');f.realpathSync.native('.');f.promises.realpath('.').then(()=>process.stdout.write('realpath=ok'),(e)=>{process.stdout.write('realpath='+e.code);process.exitCode=1})"
 $ProbeStderrLines = 20
 $ProbeStdoutLines = 10
 $GateLongPattern = '(^|_)(clippy|tests|replay|prepare|typecheck)$'
@@ -194,6 +195,7 @@ function Get-SourceProbes([string]$project, [string]$rustBin, [string]$stdinFile
     $manifest = Join-Path $project 'Cargo.toml'
     $library = Join-Path $project 'crates\host\api\src\lib.rs'
     $rustfmtConfig = Join-Path $project 'rustfmt.toml'
+    $node = Join-Path ([string]$script:Layout.NodeDir) 'node.exe'
     $none = [string[]]@()
     return @(
         @{ Id = 'cargo_version'; Needs = ''; Extra = $none; Argv = [string[]]@($cargo, '--version') },
@@ -207,7 +209,8 @@ function Get-SourceProbes([string]$project, [string]$rustBin, [string]$stdinFile
         @{ Id = 'rustfmt_stdin_check'; Needs = $stdinFile; Extra = $none; Argv = [string[]]@($cmd, '/d', '/s', '/c', ('type ' + $stdinFile + ' | ' + $rustfmt + ' --edition 2024 --check')) },
         @{ Id = 'rustfmt_relative_check'; Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $relativeLibrary) },
         @{ Id = 'rustc_version'; Needs = ''; Extra = $none; Argv = [string[]]@($rustc, '-vV') },
-        @{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = [string[]]@($probeTarget); Seconds = $ProbeCargoCheckSeconds; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) }
+        @{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = [string[]]@($probeTarget); Seconds = $ProbeCargoCheckSeconds; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) },
+        @{ Id = 'node_realpath'; Needs = $node; Extra = $none; Argv = [string[]]@($node, '-e', $NodeRealpathScript) }
     )
 }
 
@@ -963,6 +966,12 @@ function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$envir
         if (-not [KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$link.Link, [string]$link.Target)) { throw 'npm_link' }
     }
     if ((Get-NoFollowDigest (Join-Path $project 'package-lock.json')) -cne $script:NpmLockDigest) { throw 'npm_lock_changed' }
+    try {
+        [void][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadNoFollow((Join-Path $project 'node_modules\.package-lock.json'), $MaxLockBytes)
+    } catch {
+        throw 'npm_reify_missing'
+    }
+    Write-Line 'windows-source-npm-reify=verified hidden_lock=present'
     return $merged
 }
 

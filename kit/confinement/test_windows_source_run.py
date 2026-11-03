@@ -320,6 +320,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "cargo_version", "cargo_fmt_version", "cargo_fmt_exe_version", "rustfmt_version",
             "cargo_metadata", "rustfmt_file_check", "rustfmt_file_check_config", "cargo_fmt_verbose",
             "rustfmt_stdin_check", "rustfmt_relative_check", "rustc_version", "cargo_check_api",
+            "node_realpath",
         ])
         for name in ids:
             self.assertRegex(name, r"^[a-z][a-z_]{2,40}$")
@@ -342,7 +343,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             with self.subTest(token=token[:60]):
                 self.assertIn(token, body)
         self.assertEqual(self.runner.count("RUST_BACKTRACE=1"), 1)
-        self.assertEqual(body.count("Extra = $none"), 10)
+        self.assertEqual(body.count("Extra = $none"), 11)
         self.assertEqual(len(re.findall(r"Needs = '';", body)), 6)
         self.assertIn("Get-GatePlan $project ($layout.RustBin + '\\cargo.exe')", self.runner)
         synthetic = ROOT / "kit/confinement/synthetic_project"
@@ -581,7 +582,7 @@ class WindowsSourceRunTests(unittest.TestCase):
     def test_the_added_probes_are_fixed_ids_with_the_exact_commands_and_synthetic_only(self):
         body = self.function_body("Get-SourceProbes")
         ids = re.findall(r"@\{ Id = '([^']+)'", body)
-        self.assertEqual(ids[-4:], ["rustfmt_stdin_check", "rustfmt_relative_check", "rustc_version", "cargo_check_api"])
+        self.assertEqual(ids[-5:], ["rustfmt_stdin_check", "rustfmt_relative_check", "rustc_version", "cargo_check_api", "node_realpath"])
         self.assertEqual(len(ids), len(set(ids)))
         for token in (
             "$rustc = Join-Path $rustBin 'rustc.exe'\n",
@@ -591,7 +592,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "@{ Id = 'rustfmt_stdin_check'; Needs = $stdinFile; Extra = $none; Argv = [string[]]@($cmd, '/d', '/s', '/c', ('type ' + $stdinFile + ' | ' + $rustfmt + ' --edition 2024 --check')) },\n",
             "@{ Id = 'rustfmt_relative_check'; Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $relativeLibrary) },\n",
             "@{ Id = 'rustc_version'; Needs = ''; Extra = $none; Argv = [string[]]@($rustc, '-vV') },\n",
-            "@{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = [string[]]@($probeTarget); Seconds = $ProbeCargoCheckSeconds; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) }\n",
+            "@{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = [string[]]@($probeTarget); Seconds = $ProbeCargoCheckSeconds; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) },\n",
         ):
             with self.subTest(token=token[:60]):
                 self.assertEqual(body.count(token), 1)
@@ -833,6 +834,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-confinement-mountmgr-rung=device state=applied error=0 readback=match finalpath=ok",
             "windows-confinement-mountmgr-rung=global_dir state=failed error=5 readback=na finalpath=na",
             "windows-source-npm-links=created count=1 verified=1",
+            "windows-source-npm-reify=verified hidden_lock=present",
         ):
             with self.subTest(line=line[:60]):
                 self.assertIsNotNone(public.fullmatch(line))
@@ -905,7 +907,13 @@ class WindowsSourceRunTests(unittest.TestCase):
         )
         positions = [steps.index(item) for item in order]
         self.assertEqual(positions, sorted(positions))
-        self.assertEqual(steps.count("Write-Line"), 1)
+        self.assertEqual(steps.count("Write-Line"), 2)
+        reify = (
+            "    try {\n        [void][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadNoFollow((Join-Path $project 'node_modules\\.package-lock.json'), $MaxLockBytes)\n"
+            "    } catch {\n        throw 'npm_reify_missing'\n    }\n    Write-Line 'windows-source-npm-reify=verified hidden_lock=present'\n    return $merged"
+        )
+        self.assertTrue(steps.endswith(reify))
+        self.assertLess(steps.index("throw 'npm_lock_changed'"), steps.index("throw 'npm_reify_missing'"))
         self.assertEqual(steps.count("$sandbox.Run("), 1)
         for field in ("Failure", "Created", "TimedOut", "Exited", "ExitCode", "Token", "Job", "HandleCount", "CpuMs", "ElapsedMs"):
             self.assertIsNotNone(re.search(r"'" + field + r"'", steps), field)
@@ -1002,6 +1010,18 @@ class WindowsSourceRunTests(unittest.TestCase):
         ):
             with self.subTest(key=key, resolved=resolved):
                 self.assertFalse(accepted(key, resolved, packages))
+
+    def test_the_node_realpath_probe_is_one_unquoted_argument_that_prints_only_a_fixed_token(self):
+        script = re.search(r'^\$NodeRealpathScript = "([^"]+)"$', self.runner, re.M).group(1)
+        self.assertIsNone(re.search(r"[\s\"$`]", script))
+        self.assertIn("realpathSync.native('.')", script)
+        self.assertIn("promises.realpath('.')", script)
+        self.assertEqual(re.findall(r"process\.stdout\.write\('([a-z=]+)'", script), ["realpath=ok", "realpath="])
+        self.assertIn("process.stdout.write('realpath='+e.code)", script)
+        body = self.function_body("Get-SourceProbes")
+        self.assertIn("$node = Join-Path ([string]$script:Layout.NodeDir) 'node.exe'\n", body)
+        self.assertTrue(body.rstrip().endswith(
+            "@{ Id = 'node_realpath'; Needs = $node; Extra = $none; Argv = [string[]]@($node, '-e', $NodeRealpathScript) }\n    )"))
 
     def test_source_mode_runs_the_same_gates_with_only_the_designed_lease_default(self):
         self.assertEqual(self.runner.count("$runMode -cne 'synthetic'"), 2)
