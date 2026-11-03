@@ -55,6 +55,7 @@ $DiagStderrLines = 40
 $DiagStdoutLines = 20
 $DiagLineLimit = 300
 $ProbeSeconds = 60
+$ProbeCargoCheckSeconds = 180
 $ProbeStderrLines = 20
 $ProbeStdoutLines = 10
 $GateLongPattern = '(^|_)(clippy|tests|replay|prepare|typecheck)$'
@@ -169,12 +170,13 @@ function Write-ProbeDiag([string]$id, $run) {
     }
 }
 
-function Get-SourceProbes([string]$project, [string]$rustBin, [string]$stdinFile) {
+function Get-SourceProbes([string]$project, [string]$rustBin, [string]$stdinFile, [string]$scratchRoot) {
     $cargo = Join-Path $rustBin 'cargo.exe'
     $rustc = Join-Path $rustBin 'rustc.exe'
     $cmd = Join-Path ([string]$env:SystemRoot) 'System32\cmd.exe'
     $apiManifest = Join-Path $project 'crates\host\api\Cargo.toml'
     $relativeLibrary = 'crates\host\api\src\lib.rs'
+    $probeTarget = 'CARGO_TARGET_DIR=' + (Join-Path $scratchRoot 'probe-target')
     $rustfmt = Join-Path $rustBin 'rustfmt.exe'
     $cargoFmt = Join-Path $rustBin 'cargo-fmt.exe'
     $manifest = Join-Path $project 'Cargo.toml'
@@ -193,7 +195,7 @@ function Get-SourceProbes([string]$project, [string]$rustBin, [string]$stdinFile
         @{ Id = 'rustfmt_stdin_check'; Needs = $stdinFile; Extra = $none; Argv = [string[]]@($cmd, '/d', '/s', '/c', ('type ' + $stdinFile + ' | ' + $rustfmt + ' --edition 2024 --check')) },
         @{ Id = 'rustfmt_relative_check'; Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $relativeLibrary) },
         @{ Id = 'rustc_version'; Needs = ''; Extra = $none; Argv = [string[]]@($rustc, '-vV') },
-        @{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = $none; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) }
+        @{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = [string[]]@($probeTarget); Seconds = $ProbeCargoCheckSeconds; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) }
     )
 }
 
@@ -204,7 +206,7 @@ function Invoke-SourceProbes($sandbox, [string]$project, [string]$rustBin) {
         $environment = New-GateEnvironment
         $stdinFile = Join-Path $script:Lpac.Root 'kd-stdin-input.rs'
         try { Copy-Item -LiteralPath (Join-Path $project 'crates\host\api\src\lib.rs') -Destination $stdinFile -Force -ErrorAction Stop } catch { $stdinFile = Join-Path $script:Lpac.Root 'kd-stdin-missing.rs' }
-        foreach ($probe in @(Get-SourceProbes $project $rustBin $stdinFile)) {
+        foreach ($probe in @(Get-SourceProbes $project $rustBin $stdinFile $script:Lpac.Root)) {
             $remaining = (Get-RemainingSeconds) - 900
             if ($remaining -lt 60) { return }
             if ($probe.Needs.Length -gt 0 -and -not (Test-Path -LiteralPath $probe.Needs -PathType Leaf)) {
@@ -212,8 +214,11 @@ function Invoke-SourceProbes($sandbox, [string]$project, [string]$rustBin) {
                 continue
             }
             $seconds = $ProbeSeconds
+            if ($probe.Seconds -gt 0) { $seconds = [int]$probe.Seconds }
             if ($seconds -gt $remaining) { $seconds = $remaining }
-            $probeEnvironment = [string[]]($environment + $probe.Extra)
+            $extraNames = @($probe.Extra | ForEach-Object { ([string]$_).Split([char]61)[0] })
+            $baseEnvironment = @($environment | Where-Object { $extraNames -notcontains ([string]$_).Split([char]61)[0] })
+            $probeEnvironment = [string[]]($baseEnvironment + $probe.Extra)
             $run = $sandbox.Run($true, [string]$probe.Argv[0], (ConvertTo-CommandLine $probe.Argv), $project, $probeEnvironment, ($seconds * 1000), [uint32]32)
             Write-ProbeDiag $probe.Id $run
         }
@@ -867,6 +872,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         $seconds = Get-GateSeconds $gate.Id
         $remaining = (Get-RemainingSeconds) - 900
         if ($remaining -lt 60) {
+            $outcome.Count += 1
             $outcome.Failed += 1
             if ($outcome.Failure -eq 0) {
                 $outcome.Failure = $index
@@ -903,7 +909,8 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=' + $result + ' hang=' + $hang + $causeText)
         if ($run.Truncated -or (Test-LogCanary $combined)) {
             $outcome.Canary = 'present'
-            if ($outcome.Failure -eq 0) { $outcome.Failure = $index }
+            $outcome.Failure = $index
+            $script:GateCause = $gateCause
             $outcome.Failed += 1
             $script:RefusalReason = 'log_canary'
             return $outcome
@@ -911,9 +918,10 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         if (-not $passed -and $script:RunMode -ceq 'synthetic') { Write-GateDiag $gate.Id $run }
         if (-not $boundary) {
             $outcome.Boundary = 'failed'
-            if ($outcome.Failure -eq 0) {
+            if ($script:RefusalReason -cne 'boundary') {
                 $outcome.Failure = $index
                 $script:RefusalReason = 'boundary'
+                $script:GateCause = $gateCause
             }
             $outcome.Failed += 1
             if (-not ($keepGoing -and -not $run.Created)) { return $outcome }

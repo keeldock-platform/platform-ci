@@ -119,7 +119,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn("NPM_CONFIG_UPDATE_NOTIFIER=false", self.runner)
 
     def test_a_truncated_gate_capture_counts_as_a_log_canary_hit(self):
-        self.assertIn("if ($run.Truncated -or (Test-LogCanary $combined)) {", self.runner)
+        block = self.runner.split("if ($run.Truncated -or (Test-LogCanary $combined)) {", 1)[1].split("\n        }\n", 1)[0]
         block = self.runner.split("if ($run.Truncated -or (Test-LogCanary $combined)) {", 1)[1].split("}", 1)[0]
         self.assertIn("$outcome.Canary = 'present'", block)
         self.assertIn("$script:RefusalReason = 'log_canary'", block)
@@ -338,7 +338,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             with self.subTest(token=token[:60]):
                 self.assertIn(token, body)
         self.assertEqual(self.runner.count("RUST_BACKTRACE=1"), 1)
-        self.assertEqual(body.count("Extra = $none"), 11)
+        self.assertEqual(body.count("Extra = $none"), 10)
         self.assertEqual(len(re.findall(r"Needs = '';", body)), 6)
         self.assertIn("Get-GatePlan $project ($layout.RustBin + '\\cargo.exe')", self.runner)
         synthetic = ROOT / "kit/confinement/synthetic_project"
@@ -392,7 +392,9 @@ class WindowsSourceRunTests(unittest.TestCase):
             "if ($remaining -lt 60) { return }\n",
             "$seconds = $ProbeSeconds\n",
             "if ($seconds -gt $remaining) { $seconds = $remaining }\n",
-            "$probeEnvironment = [string[]]($environment + $probe.Extra)\n",
+            "$probeEnvironment = [string[]]($baseEnvironment + $probe.Extra)\n",
+            "$baseEnvironment = @($environment | Where-Object { $extraNames -notcontains ([string]$_).Split([char]61)[0] })\n",
+            "if ($probe.Seconds -gt 0) { $seconds = [int]$probe.Seconds }\n",
             "$run = $sandbox.Run($true, [string]$probe.Argv[0], (ConvertTo-CommandLine $probe.Argv), $project, $probeEnvironment, ($seconds * 1000), [uint32]32)\n",
             "Write-ProbeDiag $probe.Id $run\n",
         ):
@@ -529,14 +531,20 @@ class WindowsSourceRunTests(unittest.TestCase):
         body = self.function_body("Invoke-SourceGates")
         first = re.findall(
             r"if \(\$outcome\.Failure -eq 0\) \{\n\s+\$outcome\.Failure = \$index\n\s+\$script:RefusalReason = '([a-z]+)'\n", body)
-        self.assertEqual(first, ["deadline", "boundary", "gate"])
+        self.assertEqual(first, ["deadline", "gate"])
+        self.assertEqual(len(re.findall(
+            r"if \(\$script:RefusalReason -cne 'boundary'\) \{\n\s+\$outcome\.Failure = \$index\n\s+\$script:RefusalReason = 'boundary'\n\s+\$script:GateCause = \$gateCause\n\s+\}\n", body)), 1)
         self.assertEqual(body.count("$outcome.Failure = $index"), 4)
-        self.assertEqual(body.count("if ($outcome.Failure -eq 0)"), 5)
+        self.assertEqual(body.count("if ($outcome.Failure -eq 0)"), 3)
         self.assertEqual(body.count("$outcome.Failed += 1"), 4)
-        self.assertEqual(body.count("$script:GateCause = "), 2)
+        self.assertEqual(body.count("$outcome.Count += 1"), 2)
+        self.assertIn("            $outcome.Count += 1\n            $outcome.Failed += 1\n            if ($outcome.Failure -eq 0) {\n", body)
+        self.assertEqual(body.count("$script:GateCause = "), 4)
         self.assertIn("            if ($outcome.Failure -eq 0) { $script:GateCause = $gateCause }\n", body)
         self.assertIn("            $gateCause = Get-GateCause $run $boundary\n", body)
-        self.assertIn("            $script:RefusalReason = 'log_canary'\n            return $outcome\n", body)
+        self.assertIn(
+            "            $outcome.Failure = $index\n            $script:GateCause = $gateCause\n            $outcome.Failed += 1\n"
+            "            $script:RefusalReason = 'log_canary'\n            return $outcome\n", body)
         self.assertNotIn("$outcome.Failure = 0", body)
         self.assertNotIn("$outcome.Failed = ", body)
         self.assertNotIn("$outcome.Failed -= ", body)
@@ -570,19 +578,27 @@ class WindowsSourceRunTests(unittest.TestCase):
             "@{ Id = 'rustfmt_stdin_check'; Needs = $stdinFile; Extra = $none; Argv = [string[]]@($cmd, '/d', '/s', '/c', ('type ' + $stdinFile + ' | ' + $rustfmt + ' --edition 2024 --check')) },\n",
             "@{ Id = 'rustfmt_relative_check'; Needs = $library; Extra = $none; Argv = [string[]]@($rustfmt, '--edition', '2024', '--check', $relativeLibrary) },\n",
             "@{ Id = 'rustc_version'; Needs = ''; Extra = $none; Argv = [string[]]@($rustc, '-vV') },\n",
-            "@{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = $none; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) }\n",
+            "@{ Id = 'cargo_check_api'; Needs = $apiManifest; Extra = [string[]]@($probeTarget); Seconds = $ProbeCargoCheckSeconds; Argv = [string[]]@($cargo, 'check', '--locked', '--offline', '--manifest-path', $apiManifest) }\n",
         ):
             with self.subTest(token=token[:60]):
                 self.assertEqual(body.count(token), 1)
-        self.assertEqual(self.runner.count("function Get-SourceProbes([string]$project, [string]$rustBin, [string]$stdinFile) {\n"), 1)
+        self.assertEqual(self.runner.count("function Get-SourceProbes([string]$project, [string]$rustBin, [string]$stdinFile, [string]$scratchRoot) {\n"), 1)
         self.assertNotIn("--config-path", "".join(item for item in body.splitlines(True) if "rustfmt_stdin_check" in item or "rustfmt_relative_check" in item))
         probes = self.function_body("Invoke-SourceProbes")
         self.assertIn("$stdinFile = Join-Path $script:Lpac.Root 'kd-stdin-input.rs'\n", probes)
-        self.assertIn("foreach ($probe in @(Get-SourceProbes $project $rustBin $stdinFile)) {\n", probes)
+        self.assertIn("foreach ($probe in @(Get-SourceProbes $project $rustBin $stdinFile $script:Lpac.Root)) {\n", probes)
         self.assertEqual(probes.count("Copy-Item "), 1)
         self.assertLess(probes.index("-cne 'synthetic'"), probes.index("Copy-Item "))
         self.assertLess(probes.index("Copy-Item "), probes.index("$sandbox.Run("))
         self.assertEqual(len(re.findall(r"Get-SourceProbes\b", self.runner)), 2)
+        self.assertIn("$probeTarget = 'CARGO_TARGET_DIR=' + (Join-Path $scratchRoot 'probe-target')\n", body)
+        self.assertEqual(body.count("$probeTarget"), 2)
+        self.assertEqual(body.count("Seconds = "), 1)
+        self.assertIn("\n$ProbeCargoCheckSeconds = 180\n", self.runner)
+        self.assertEqual(len(re.findall(r"\$ProbeCargoCheckSeconds\b", self.runner)), 2)
+        gate_environment = self.function_body("New-GateEnvironment")
+        self.assertNotIn("probe-target", gate_environment)
+        self.assertEqual(self.runner.count("probe-target"), 1)
 
     def layout_parent(self):
         return dict(re.findall(r"\$layout\.([A-Za-z]+) = Join-Path \$layout\.([A-Za-z]+) ", self.runner))
