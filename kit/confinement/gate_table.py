@@ -206,6 +206,7 @@ def emit_json(include_runtime, platform=None):
 
 
 MANIFEST_WORKSPACE_PATHS = ("packages/host-api", "packages/kernel-i18n")
+MANIFEST_UI_KIT_WORKSPACE_PATHS = ("packages/kernel-icons", "packages/kernel-ui-kit")
 MANIFEST_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 MANIFEST_PACKAGE_RE = re.compile(r"^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$")
 MANIFEST_VERSION_RE = re.compile(r"^[0-9A-Za-z.*^~<>=|+ -]{1,128}$")
@@ -251,6 +252,15 @@ def manifest_json(path):
         raise GateTableRefusal("lock") from None
 
 
+def manifest_workspace_paths(source_root):
+    """Return the workspace members the tree must carry: the two base members, plus both UI kit
+    members as one pair as soon as either of them exists; a lone kit member is refused later."""
+    paths = MANIFEST_WORKSPACE_PATHS
+    if any(os.path.lexists(Path(source_root) / path) for path in MANIFEST_UI_KIT_WORKSPACE_PATHS):
+        paths = paths + MANIFEST_UI_KIT_WORKSPACE_PATHS
+    return paths
+
+
 def _manifest_root_overrides(root):
     if "overrides" not in root:
         return None
@@ -282,12 +292,13 @@ def manifest_digest(source_root):
     overrides = _manifest_root_overrides(root)
     if overrides is not None:
         root_expected["overrides"] = overrides
+    candidate_paths = manifest_workspace_paths(source_root)
     workspace_paths = []
-    for workspace_path in MANIFEST_WORKSPACE_PATHS:
+    for workspace_path in candidate_paths:
         if any(pattern == workspace_path or pattern == "packages/*" and workspace_path.startswith("packages/")
                for pattern in workspaces):
             workspace_paths.append(workspace_path)
-    if len(workspace_paths) != len(MANIFEST_WORKSPACE_PATHS):
+    if len(workspace_paths) != len(candidate_paths):
         raise GateTableRefusal("lock")
     workspace_manifests = []
     for workspace_path in workspace_paths:

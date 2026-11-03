@@ -121,15 +121,24 @@ RECORD_TYPE = "npm-admission-proposal-receipt"
 ROOT_NAME = "keeldock" + "-core"
 SCOPE = "@" + "keeldock" + "/"
 WORKSPACE_PATHS = ("packages/host-api", "packages/kernel-i18n")
+UI_KIT_WORKSPACE_PATHS = ("packages/kernel-icons", "packages/kernel-ui-kit")
 DEFAULT_FILING = "contract-ui-batch-a"
+UI_BATCH_B_FILING = "contract-ui-batch-b"
 FIXTURE_FILING = "quick-fixture"
 FILINGS = {
     DEFAULT_FILING: {
         "request_doc": "docs/dependencies/ui-npm-admission-batch-a.md",
+        "workspaces": WORKSPACE_PATHS,
+        "overrides": {"lightningcss": "1.33.0"},
+    },
+    UI_BATCH_B_FILING: {
+        "request_doc": "docs/dependencies/ui-npm-admission-batch-b.md",
+        "workspaces": WORKSPACE_PATHS + UI_KIT_WORKSPACE_PATHS,
         "overrides": {"lightningcss": "1.33.0"},
     },
     FIXTURE_FILING: {
         "request_doc": "docs/dependencies/quick-fixture.md",
+        "workspaces": WORKSPACE_PATHS,
         "overrides": {},
     },
 }
@@ -372,9 +381,9 @@ def _scoped_name(path):
     return SCOPE + posixpath.basename(path)
 
 
-def workspace_links():
-    """Return the fixed workspace link map the lock must carry."""
-    return {"node_modules/" + _scoped_name(path): path for path in WORKSPACE_PATHS}
+def workspace_links(selector=DEFAULT_FILING):
+    """Return the fixed workspace link map the lock of one filing must carry."""
+    return {"node_modules/" + _scoped_name(path): path for path in filing_for(selector)["workspaces"]}
 
 
 def filing_for(selector):
@@ -388,7 +397,7 @@ def input_paths(selector):
     filing = filing_for(selector)
     return (
         ".node-version", ".npmrc", "package.json",
-    ) + tuple(path + "/package.json" for path in WORKSPACE_PATHS) + (
+    ) + tuple(path + "/package.json" for path in filing["workspaces"]) + (
         POLICY_FILE, filing["request_doc"],
     )
 
@@ -401,11 +410,14 @@ def _check_scripts(scripts):
             _refuse("npm_manifest_refused")
 
 
-def _check_dependencies(value, internal):
+def _check_dependencies(value, internal, workspace_names=frozenset()):
     if type(value) is not dict or len(value) > 512:
         _refuse("npm_manifest_refused")
     for name, spec in value.items():
-        if not _valid_name(name, internal) or not _exact_version(spec):
+        if name in workspace_names:
+            if not _exact_version(spec):
+                _refuse("npm_manifest_refused")
+        elif not _valid_name(name, internal) or not _exact_version(spec):
             _refuse("npm_manifest_refused")
     return dict(value)
 
@@ -432,13 +444,13 @@ def _check_root(manifest, filing, internal):
     return groups, dict(overrides)
 
 
-def _check_workspace(manifest, path, internal):
+def _check_workspace(manifest, path, internal, workspace_names=frozenset()):
     if (set(manifest) - WORKSPACE_KEYS or manifest.get("name") != _scoped_name(path)
             or not adm._valid_version(manifest.get("version"))):
         _refuse("npm_manifest_refused")
     _check_scripts(manifest.get("scripts", {}))
     return {
-        group: _check_dependencies(manifest.get(group, {}), internal)
+        group: _check_dependencies(manifest.get(group, {}), internal, workspace_names)
         for group in ("dependencies", "devDependencies")
     }
 
@@ -620,16 +632,25 @@ def check_inputs(files, selector):
         _refuse("npm_policy_refused")
     direct = dict(root_direct)
     workspaces = []
-    for path in WORKSPACE_PATHS:
+    workspace_names = frozenset(_scoped_name(path) for path in filing["workspaces"])
+    for path in filing["workspaces"]:
         manifest = _manifest(files[path + "/package.json"])
-        groups = _check_workspace(manifest, path, internal)
+        groups = _check_workspace(manifest, path, internal, workspace_names)
         workspaces.append({
             "path": path, "name": manifest["name"], "version": manifest["version"],
             "dependencies": groups["dependencies"], "devDependencies": groups["devDependencies"],
         })
         for group in groups.values():
             for name, version in group.items():
+                if name in workspace_names:
+                    continue
                 if direct.setdefault(name, version) != version:
+                    _refuse("npm_manifest_refused")
+    workspace_versions = {item["name"]: item["version"] for item in workspaces}
+    for item in workspaces:
+        for group in ("dependencies", "devDependencies"):
+            for name, spec in item[group].items():
+                if name in workspace_versions and (name == item["name"] or spec != workspace_versions[name]):
                     _refuse("npm_manifest_refused")
     rows = parse_request_doc(files[filing["request_doc"]])
     for name, version in sorted(direct.items()):
@@ -750,7 +771,7 @@ def check_lock(lock_bytes, plan):
         _refuse("npm_lock_refused", lock_detail("lock_empty"))
     if len(lock_bytes) > MAX_LOCK_BYTES:
         _bundle_refuse("npm_payload_too_large", "payload_size", "bundle", "lock")
-    links = workspace_links()
+    links = workspace_links(plan["filing"])
     internal = plan["internal_names"]
     lock = _call_adm(adm.parse_lock, lock_bytes, internal_names=internal, workspace_links=links)
     entries = _call_adm(
@@ -1509,7 +1530,7 @@ def validate_receipt(receipt_bytes, lock_bytes, plan, trusted_context):
         _evidence_refuse("receipt_inputs")
     if not hmac.compare_digest(record["lock_sha256"], _sha256(lock_bytes)):
         _evidence_refuse("receipt_lock")
-    entries = _call_adm(adm.registry_entries, lock_bytes, workspace_links=workspace_links())
+    entries = _call_adm(adm.registry_entries, lock_bytes, workspace_links=workspace_links(plan["filing"]))
     packages = record["packages"]
     if type(packages) is not list or len(packages) != len(entries):
         _evidence_refuse("receipt_packages")

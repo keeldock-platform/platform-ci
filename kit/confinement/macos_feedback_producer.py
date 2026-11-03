@@ -94,6 +94,7 @@ DIAGNOSTIC_MAX_LINES = 8192
 DIAGNOSTIC_MAX_LINE_UNITS = 8192
 DIAGNOSTIC_STREAM_MAX_LINES = 4000
 WORKSPACE_PACKAGE_PATHS = ("packages/host-api", "packages/kernel-i18n")
+UI_KIT_WORKSPACE_PACKAGE_PATHS = ("packages/kernel-icons", "packages/kernel-ui-kit")
 DEPENDENCY_GROUPS = ("dependencies", "devDependencies", "optionalDependencies", "peerDependencies")
 PROFILE_BY_KIND = feedback_request.PROFILE_BY_KIND
 PROFILE_BY_CONCERN = feedback_request.PROFILES
@@ -250,12 +251,15 @@ def _expected_manifest(source):
     if (type(workspaces) is not list or len(workspaces) != 1
             or workspaces[0] != "packages/*"):
         _refuse("manifest_invalid")
+    candidate_paths = WORKSPACE_PACKAGE_PATHS
+    if any(os.path.lexists(source / path) for path in UI_KIT_WORKSPACE_PACKAGE_PATHS):
+        candidate_paths = candidate_paths + UI_KIT_WORKSPACE_PACKAGE_PATHS
     expected_paths = []
-    for path in WORKSPACE_PACKAGE_PATHS:
+    for path in candidate_paths:
         if any(pattern == path or pattern == "packages/*" and path.startswith("packages/")
                for pattern in workspaces):
             expected_paths.append(path)
-    if len(expected_paths) != len(WORKSPACE_PACKAGE_PATHS):
+    if len(expected_paths) != len(candidate_paths):
         _refuse("manifest_invalid")
     root_expected = {
         "name": root["name"], "version": root["version"],

@@ -542,6 +542,131 @@ class InputTests(RefusalAssertions):
         self.assert_refused("npm_policy_refused", subject.check_inputs, files, subject.DEFAULT_FILING)
 
 
+class UiKitFilingTests(RefusalAssertions):
+    ICONS = "packages/kernel-icons"
+    KIT = "packages/kernel-ui-kit"
+
+    def files_for(self, world, kit_dependencies=None):
+        default_doc = subject.FILINGS[subject.DEFAULT_FILING]["request_doc"]
+        doc = subject.FILINGS[subject.UI_BATCH_B_FILING]["request_doc"]
+        files = {path: data for path, data in world.files.items() if path != default_doc}
+        files[doc] = world.files[default_doc]
+        for path in subject.UI_KIT_WORKSPACE_PATHS:
+            manifest = {
+                "name": _workspace_name(path), "version": ROOT_VERSION, "type": "module",
+                "scripts": {"test": "run test"},
+            }
+            if path == self.KIT:
+                manifest["dependencies"] = (
+                    {_workspace_name(self.ICONS): ROOT_VERSION} if kit_dependencies is None
+                    else dict(kit_dependencies)
+                )
+            files[path + "/package.json"] = _json(manifest) + b"\n"
+        return files
+
+    def lock_for(self, world, kit_dependencies=None, with_kit=True):
+        lock = json.loads(json.dumps(world.lock_dict))
+        if not with_kit:
+            return lock
+        for link, path in subject.workspace_links(subject.UI_BATCH_B_FILING).items():
+            lock["packages"][link] = {"resolved": path, "link": True}
+            lock["packages"][path] = {"name": _workspace_name(path), "version": ROOT_VERSION}
+        lock["packages"][self.KIT]["dependencies"] = (
+            {_workspace_name(self.ICONS): ROOT_VERSION} if kit_dependencies is None
+            else dict(kit_dependencies)
+        )
+        return lock
+
+    def test_the_second_batch_filing_names_the_four_workspaces_and_its_own_request_doc(self):
+        filing = subject.FILINGS[subject.UI_BATCH_B_FILING]
+        self.assertEqual(subject.UI_BATCH_B_FILING, "contract-ui-batch-b")
+        self.assertEqual(subject.UI_KIT_WORKSPACE_PATHS, (self.ICONS, self.KIT))
+        self.assertEqual(filing["workspaces"], subject.WORKSPACE_PATHS + subject.UI_KIT_WORKSPACE_PATHS)
+        self.assertEqual(filing["request_doc"], "docs/dependencies/ui-npm-admission-batch-b.md")
+        self.assertEqual(filing["overrides"], {"lightningcss": "1.33.0"})
+        self.assertEqual(subject.FILINGS[subject.DEFAULT_FILING]["workspaces"], subject.WORKSPACE_PATHS)
+        self.assertEqual(subject.FILINGS[subject.FIXTURE_FILING]["workspaces"], subject.WORKSPACE_PATHS)
+        paths = subject.input_paths(subject.UI_BATCH_B_FILING)
+        self.assertEqual(paths[3:7], tuple(path + "/package.json" for path in filing["workspaces"]))
+        self.assertEqual(len(subject.input_paths(subject.DEFAULT_FILING)), len(paths) - 2)
+        project = subject.project_paths(subject.UI_BATCH_B_FILING)
+        self.assertEqual(
+            set(paths) - set(project), {filing["request_doc"], subject.POLICY_FILE},
+        )
+        self.assertEqual(list(subject.workspace_links(subject.UI_BATCH_B_FILING).values()), list(filing["workspaces"]))
+        self.assertEqual(len(subject.workspace_links()), 2)
+        self.assert_refused("npm_input_invalid", subject.workspace_links, "other-filing")
+
+    def test_a_good_second_batch_filing_yields_four_workspaces_and_no_new_direct_package(self):
+        world = World()
+        plan = subject.check_inputs(self.files_for(world), subject.UI_BATCH_B_FILING)
+        self.assertEqual(plan["filing"], subject.UI_BATCH_B_FILING)
+        self.assertEqual(
+            [item["path"] for item in plan["workspaces"]], list(subject.WORKSPACE_PATHS + (self.ICONS, self.KIT)),
+        )
+        self.assertEqual(plan["direct"], dict(DIRECT))
+        self.assertEqual(
+            plan["workspaces"][3]["dependencies"], {_workspace_name(self.ICONS): ROOT_VERSION},
+        )
+
+    def test_workspace_links_between_listed_members_are_checked_and_nothing_else_is_accepted(self):
+        world = World()
+        for name, change in (
+            ("wrong_version", {_workspace_name(self.ICONS): "9.9.9"}),
+            ("range", {_workspace_name(self.ICONS): "^0.1.0"}),
+            ("unlisted_internal", {_workspace_name("packages/other"): ROOT_VERSION}),
+            ("self", {_workspace_name(self.KIT): ROOT_VERSION}),
+        ):
+            with self.subTest(name=name):
+                self.assert_refused(
+                    "npm_manifest_refused", subject.check_inputs,
+                    self.files_for(world, change), subject.UI_BATCH_B_FILING,
+                )
+        files = self.files_for(world)
+        root = json.loads(files["package.json"].decode("ascii"))
+        root["devDependencies"][_workspace_name(self.ICONS)] = ROOT_VERSION
+        files["package.json"] = _json(root) + b"\n"
+        self.assert_refused("npm_manifest_refused", subject.check_inputs, files, subject.UI_BATCH_B_FILING)
+
+    def test_the_member_sets_are_closed_per_filing(self):
+        world = World()
+        files = self.files_for(world)
+        missing = {path: data for path, data in files.items() if path != self.KIT + "/package.json"}
+        self.assert_refused("npm_input_invalid", subject.check_inputs, missing, subject.UI_BATCH_B_FILING)
+        self.assert_refused("npm_input_invalid", subject.check_inputs, files, subject.DEFAULT_FILING)
+        self.assert_refused("npm_input_invalid", subject.check_inputs, files, subject.FIXTURE_FILING)
+        self.assert_refused("npm_input_invalid", subject.check_inputs, world.files, subject.UI_BATCH_B_FILING)
+        extra = dict(files)
+        extra["packages/third/package.json"] = files[self.ICONS + "/package.json"]
+        self.assert_refused("npm_input_invalid", subject.check_inputs, extra, subject.UI_BATCH_B_FILING)
+
+    def test_the_second_batch_lock_is_accepted_only_against_its_own_plan(self):
+        world = World()
+        plan = subject.check_inputs(self.files_for(world), subject.UI_BATCH_B_FILING)
+        lock_bytes = _json(self.lock_for(world)) + b"\n"
+        lock, entries = subject.check_lock(lock_bytes, plan)
+        self.assertEqual(
+            sorted(entry["name"] for path, entry in entries), sorted(name for name, version in ALL_PACKAGES),
+        )
+        self.assertIn(self.KIT, lock["packages"])
+        self.assert_refused("npm_lock_refused", subject.check_lock, lock_bytes, world.plan())
+        without_kit = _json(self.lock_for(world, with_kit=False)) + b"\n"
+        self.assert_refused("npm_lock_refused", subject.check_lock, without_kit, plan)
+        for change in ({}, {_workspace_name(self.ICONS): "9.9.9"}):
+            altered = _json(self.lock_for(world, change)) + b"\n"
+            self.assert_refused("npm_lock_refused", subject.check_lock, altered, plan)
+
+    def test_an_unlisted_third_workspace_stays_refused_in_the_lock(self):
+        world = World()
+        plan = subject.check_inputs(self.files_for(world), subject.UI_BATCH_B_FILING)
+        lock = self.lock_for(world)
+        lock["packages"]["node_modules/" + _workspace_name("packages/third")] = {
+            "resolved": "packages/third", "link": True,
+        }
+        lock["packages"]["packages/third"] = {"name": _workspace_name("packages/third"), "version": ROOT_VERSION}
+        self.assert_refused("npm_lock_refused", subject.check_lock, _json(lock) + b"\n", plan)
+
+
 class CommandTests(RefusalAssertions):
     PATHS = dict(node="/n/bin/node", npm="/n/lib/npm-cli.js", user="/s/user.npmrc", glob="/s/global.npmrc")
 

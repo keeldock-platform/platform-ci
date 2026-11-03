@@ -214,6 +214,7 @@ def _runtime():
     return SimpleNamespace(
         CORE_CONTRACT_FEEDBACK_FILES=validation.CORE_CONTRACT_FEEDBACK_FILES,
         CORE_CONTRACT_KERNEL_FEEDBACK_FILES=validation.CORE_CONTRACT_KERNEL_FEEDBACK_FILES,
+        CORE_CONTRACT_KERNEL_UI_KIT_FILES=validation.CORE_CONTRACT_KERNEL_UI_KIT_FILES,
         _core_contract_pattern_paths=validation._core_contract_pattern_paths,
         MAX_CORE_CONTRACT_TS_SOURCES=validation.MAX_CORE_CONTRACT_TS_SOURCES,
         MAX_CORE_CONTRACT_TS_TESTS=validation.MAX_CORE_CONTRACT_TS_TESTS,
@@ -488,6 +489,62 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
                     "verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE, mutate,
                     accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
                 )
+
+    def test_the_ui_kit_pair_is_accepted_for_bootstrap_only_and_never_alone(self):
+        def add_pair(source):
+            for name in ("kernel-icons", "kernel-ui-kit"):
+                (source / "packages" / name).mkdir(parents=True)
+
+        def add_icons_only(source):
+            (source / "packages/kernel-icons").mkdir(parents=True)
+
+        def add_kit_only(source):
+            (source / "packages/kernel-ui-kit").mkdir(parents=True)
+
+        def add_pair_and_inert(source):
+            add_pair(source)
+            (source / "packages/kernel-tokens/src").mkdir(parents=True)
+
+        def add_pair_and_third(source):
+            add_pair(source)
+            (source / "packages/third-package/src").mkdir(parents=True)
+
+        self.assertEqual(subject.UI_KIT_BOOTSTRAP_MANIFESTS, (
+            "packages/kernel-icons/package.json", "packages/kernel-ui-kit/package.json",
+        ))
+        for mutate in (add_pair, add_pair_and_inert):
+            with self.subTest(mutation=mutate.__name__):
+                result, producer, unused_contract = self._run(
+                    "bootstrap", "lock", validated_tree="core_node_lock_return", mutate_source=mutate,
+                )
+                self.assertEqual(
+                    producer.copies[0][2], subject.BOOTSTRAP_MANIFESTS + subject.UI_KIT_BOOTSTRAP_MANIFESTS,
+                )
+                self.assertEqual(result["stages"], subject.NODE_BOOTSTRAP_GATES)
+        for mutate in (add_icons_only, add_kit_only, add_pair_and_third):
+            with self.subTest(mutation=mutate.__name__, mode="bootstrap"):
+                self._refused("bootstrap", "lock", "core_node_lock_return", mutate)
+        for mutate in (add_pair, add_icons_only):
+            with self.subTest(mutation=mutate.__name__, mode="verify"):
+                self._refused(
+                    "verify", "build_diagnostics", subject.PACKAGE_LOCK_TREE, mutate,
+                    accepted_provenance={"status": "accepted"}, lock_bytes=b"lock",
+                )
+
+    def test_bootstrap_refuses_the_ui_kit_pair_when_the_validator_does_not_supply_its_files(self):
+        runtime = _runtime()
+        del runtime.CORE_CONTRACT_KERNEL_UI_KIT_FILES
+
+        def add_pair(source):
+            for name in ("kernel-icons", "kernel-ui-kit"):
+                (source / "packages" / name).mkdir(parents=True)
+
+        with patch.object(sys.modules[__name__], "_runtime", return_value=runtime):
+            with self.assertRaises(FeedbackRefusal) as caught:
+                self._run(
+                    "bootstrap", "lock", validated_tree="core_node_lock_return", mutate_source=add_pair,
+                )
+        self.assertEqual(caught.exception.reason, "manifest_invalid")
 
     def test_an_inert_kernel_tokens_directory_is_accepted_and_never_copied(self):
         def add_inert(source):

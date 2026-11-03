@@ -367,6 +367,48 @@ class ManifestDigestTests(unittest.TestCase):
             with self.assertRaises(gate_table.GateTableRefusal):
                 gate_table.manifest_digest(directory)
 
+    def _write_kit_member(self, base, name, dependencies=None):
+        (base / "packages" / name).mkdir(parents=True)
+        manifest = {"name": "@synthetic/" + name, "version": "0.1.0"}
+        if dependencies:
+            manifest["dependencies"] = dependencies
+        (base / "packages" / name / "package.json").write_text(json.dumps(manifest), encoding="ascii")
+
+    def test_the_ui_kit_pair_extends_the_workspace_set_and_only_as_a_pair(self):
+        self.assertEqual(
+            gate_table.MANIFEST_UI_KIT_WORKSPACE_PATHS, ("packages/kernel-icons", "packages/kernel-ui-kit"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write(Path(directory))
+            plain = gate_table.manifest_digest(base)
+            self.assertEqual(gate_table.manifest_workspace_paths(base), gate_table.MANIFEST_WORKSPACE_PATHS)
+            self._write_kit_member(base, "kernel-icons")
+            with self.assertRaises(gate_table.GateTableRefusal) as caught:
+                gate_table.manifest_digest(base)
+            self.assertEqual(caught.exception.reason, "lock")
+            self._write_kit_member(base, "kernel-ui-kit", {"@synthetic/kernel-icons": "0.1.0"})
+            self.assertEqual(
+                gate_table.manifest_workspace_paths(base),
+                gate_table.MANIFEST_WORKSPACE_PATHS + gate_table.MANIFEST_UI_KIT_WORKSPACE_PATHS,
+            )
+            extended = gate_table.manifest_digest(base)
+            self.assertRegex(extended, r"[0-9a-f]{64}\Z")
+            self.assertNotEqual(extended, plain)
+            self.assertEqual(extended, gate_table.manifest_digest(base))
+
+    def test_a_lone_ui_kit_member_or_a_kit_member_without_a_manifest_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write(Path(directory))
+            self._write_kit_member(base, "kernel-ui-kit")
+            with self.assertRaises(gate_table.GateTableRefusal):
+                gate_table.manifest_digest(base)
+        with tempfile.TemporaryDirectory() as directory:
+            base = self._write(Path(directory))
+            self._write_kit_member(base, "kernel-icons")
+            (base / "packages" / "kernel-ui-kit").mkdir()
+            with self.assertRaises(gate_table.GateTableRefusal):
+                gate_table.manifest_digest(base)
+
     def test_the_command_prints_the_digest_and_refuses_other_shapes(self):
         with tempfile.TemporaryDirectory() as directory:
             base = self._write(Path(directory))

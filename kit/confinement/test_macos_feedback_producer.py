@@ -234,6 +234,51 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                     expected_for(workspaces, present)
                 self.assertEqual(raised.exception.reason, "manifest_invalid")
 
+    def test_source_manifest_extends_to_the_ui_kit_pair_and_refuses_a_lone_member(self):
+        source = Path("/synthetic-source")
+        self.assertEqual(
+            producer.UI_KIT_WORKSPACE_PACKAGE_PATHS, ("packages/kernel-icons", "packages/kernel-ui-kit"),
+        )
+
+        def expected_for(on_disk, manifests, workspaces=("packages/*",)):
+            root = {"name": "synthetic-root", "version": "1.0.0", "workspaces": list(workspaces)}
+            files = {source / "package.json": json.dumps(root).encode("utf-8")}
+            for name in ("host-api", "kernel-i18n") + tuple(manifests):
+                manifest = {"name": "@synthetic/" + name, "version": "1.0.0"}
+                if name == "kernel-ui-kit":
+                    manifest["dependencies"] = {"@synthetic/kernel-icons": "1.0.0"}
+                files[source / "packages" / name / "package.json"] = json.dumps(manifest).encode("utf-8")
+            existing = {str(source / "packages" / name) for name in on_disk}
+
+            def read(path, **unused):
+                if path not in files:
+                    producer._refuse("manifest_invalid")
+                return files[path]
+
+            with patch.object(producer.os.path, "lexists", side_effect=lambda path: str(path) in existing), \
+                    patch.object(producer, "_read_file", side_effect=read):
+                return producer._expected_manifest(source)
+
+        expected = expected_for(("kernel-icons", "kernel-ui-kit"), ("kernel-icons", "kernel-ui-kit"))
+        self.assertEqual(
+            [item["path"] for item in expected["workspaces"]],
+            list(producer.WORKSPACE_PACKAGE_PATHS + producer.UI_KIT_WORKSPACE_PACKAGE_PATHS),
+        )
+        self.assertEqual(
+            expected["workspaces"][3]["dependencies"], {"@synthetic/kernel-icons": "1.0.0"},
+        )
+        self.assertEqual(len(expected_for((), ())["workspaces"]), 2)
+        for on_disk, manifests, workspaces in (
+            (("kernel-icons",), ("kernel-icons",), ("packages/*",)),
+            (("kernel-ui-kit",), ("kernel-ui-kit",), ("packages/*",)),
+            (("kernel-icons", "kernel-ui-kit"), ("kernel-icons",), ("packages/*",)),
+            (("kernel-icons", "kernel-ui-kit"), ("kernel-icons", "kernel-ui-kit"), ("apps/*",)),
+        ):
+            with self.subTest(on_disk=on_disk, manifests=manifests, workspaces=workspaces):
+                with self.assertRaises(producer.FeedbackRefusal) as raised:
+                    expected_for(on_disk, manifests, workspaces)
+                self.assertEqual(raised.exception.reason, "manifest_invalid")
+
     def _override_manifest(self, root_extra=None, workspace_extra=None):
         root = {
             "name": "synthetic-root",

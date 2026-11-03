@@ -18,6 +18,10 @@ NODE_GATE_NAMES = (
 NODE_BOOTSTRAP_GATES = ("node_dependency_prepare", "node_dependency_audit")
 FULL_FOUNDATION_GATES = RUST_FOUNDATION_GATES + NODE_GATE_NAMES
 NODE_WORKSPACE_PACKAGES = ("packages/host-api", "packages/kernel-i18n")
+UI_KIT_WORKSPACE_PACKAGES = ("packages/kernel-icons", "packages/kernel-ui-kit")
+UI_KIT_BOOTSTRAP_MANIFESTS = (
+    "packages/kernel-icons/package.json", "packages/kernel-ui-kit/package.json",
+)
 INERT_PACKAGE_NAME = "kernel-tokens"
 STREAM_MARKER_ROOM = 64
 BOOTSTRAP_MANIFESTS = (
@@ -292,12 +296,20 @@ def _reviewed_files(source_runtime, mode, producer, source):
     except OSError:
         _refuse(producer, "manifest_invalid")
     expected_names = sorted(path.rsplit("/", 1)[-1] for path in NODE_WORKSPACE_PACKAGES)
+    kit_names = sorted(path.rsplit("/", 1)[-1] for path in UI_KIT_WORKSPACE_PACKAGES)
+    ui_kit = any(name in package_names for name in kit_names)
+    if ui_kit:
+        kit_files = getattr(source_runtime, "CORE_CONTRACT_KERNEL_UI_KIT_FILES", None)
+        if (mode != "bootstrap" or type(kit_files) is not frozenset
+                or not set(UI_KIT_BOOTSTRAP_MANIFESTS).issubset(kit_files)):
+            _refuse(producer, "manifest_invalid")
+        expected_names = sorted(expected_names + kit_names)
     if package_names == sorted(expected_names + [INERT_PACKAGE_NAME]):
         _require_inert_package(source / "packages" / INERT_PACKAGE_NAME, producer)
     elif package_names != expected_names:
         _refuse(producer, "manifest_invalid")
     if mode == "bootstrap":
-        return BOOTSTRAP_MANIFESTS
+        return BOOTSTRAP_MANIFESTS + (UI_KIT_BOOTSTRAP_MANIFESTS if ui_kit else ())
     pattern_paths = getattr(source_runtime, "_core_contract_pattern_paths", None)
     if not callable(pattern_paths):
         _refuse(producer, "manifest_invalid")
