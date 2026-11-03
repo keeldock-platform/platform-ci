@@ -50,6 +50,7 @@ GATE_RECORD_FIELDS = frozenset((
 ))
 REASONS = frozenset((
     "request", "recipient", "binding", "records", "payload", "limit", "encryptor", "output", "usage",
+    "screens",
     "invalid",
 ))
 TOKEN_SHAPE = re.compile(
@@ -68,6 +69,26 @@ CREDENTIAL_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@", re.IGN
 CREDENTIAL_PATTERNS = (
     TOKEN_SHAPE, PRIVATE_KEY_HEADER, CREDENTIAL_ASSIGNMENT, BEARER_TOKEN, CREDENTIAL_URL,
 )
+SCREENS_ROOT = ("docs", "reports", "core-ui-kit")
+SCREENS_MAX_FILES = 200
+SCREENS_MAX_BYTES = 48 * 1024 * 1024
+SCREENS_MAX_FILE_BYTES = 8 * 1024 * 1024
+SCREENS_MAX_DIMENSION = 16384
+SCREENS_MAX_AREA = 64_000_000
+SCREENS_MIN_FILE_BYTES = 45
+SCREENS_PART_BYTES = 3_000_000
+SCREENS_MAX_PARTS = -(-SCREENS_MAX_BYTES // SCREENS_PART_BYTES)
+SCREENS_UPLOAD_DIRECTORY = "kd-screens-upload"
+SCREENS_MEMBER_FORMAT = "linux-quick-screens-%02d-v1.enc"
+SCREENS_PHASE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+SCREENS_NAME_RE = re.compile(
+    r"[a-z0-9]+(?:[.-][a-z0-9]+){0,15}--[a-z0-9]+(?:-[a-z0-9]+)*--[a-z0-9]+(?:-[a-z0-9]+)*\.png\Z"
+)
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_HEADER_CHUNK = b"\x00\x00\x00\rIHDR"
+PNG_END_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
+PNG_COLOUR_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+SCREENS_PART_KIND = "screens-part"
 
 
 class QuickRefusal(Exception):
@@ -196,6 +217,131 @@ def _read_json(path, required=True):
     if type(value) is not dict:
         raise QuickRefusal("records")
     return value
+
+
+def check_png(data):
+    if (type(data) is not bytes or not SCREENS_MIN_FILE_BYTES <= len(data) <= SCREENS_MAX_FILE_BYTES
+            or data[:8] != PNG_SIGNATURE or data[8:16] != PNG_HEADER_CHUNK
+            or data[-12:] != PNG_END_CHUNK):
+        raise QuickRefusal("screens")
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    depth, colour, compression, filtering, interlace = data[24], data[25], data[26], data[27], data[28]
+    if (not 1 <= width <= SCREENS_MAX_DIMENSION or not 1 <= height <= SCREENS_MAX_DIMENSION
+            or width * height > SCREENS_MAX_AREA or depth not in PNG_COLOUR_DEPTHS.get(colour, ())
+            or compression != 0 or filtering != 0 or interlace not in (0, 1)):
+        raise QuickRefusal("screens")
+
+
+def _open_screens_directory(parent, name):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    return os.open(name, flags, dir_fd=parent)
+
+
+def _read_screen(directory, name):
+    descriptor = -1
+    try:
+        descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                             dir_fd=directory)
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > SCREENS_MAX_FILE_BYTES:
+            raise QuickRefusal("screens")
+        chunks = []
+        received = 0
+        while received <= info.st_size:
+            chunk = os.read(descriptor, min(1024 * 1024, info.st_size + 1 - received))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            received += len(chunk)
+        data = b"".join(chunks)
+        if len(data) != info.st_size:
+            raise QuickRefusal("screens")
+        return data
+    except OSError:
+        raise QuickRefusal("screens") from None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def collect_screens(worker):
+    """Return the sorted (path, bytes) pairs of the exact-shape PNG files below the browser report
+    directory, or an empty list when the directory is absent. Entries whose names do not have the
+    exact shape are ignored. A symbolic link under an accepted name, bytes that are not a bounded
+    PNG, or a count or size over the limits refuse the whole set."""
+    descriptors = []
+    found = []
+    total = 0
+    try:
+        current = os.open(str(worker), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        descriptors.append(current)
+        for name in SCREENS_ROOT:
+            try:
+                current = _open_screens_directory(current, name)
+            except FileNotFoundError:
+                return []
+            descriptors.append(current)
+        for phase in sorted(os.listdir(current)):
+            if SCREENS_PHASE_RE.fullmatch(phase) is None or len(phase) > 48:
+                continue
+            details = os.stat(phase, dir_fd=current, follow_symlinks=False)
+            if stat.S_ISLNK(details.st_mode):
+                raise QuickRefusal("screens")
+            if not stat.S_ISDIR(details.st_mode):
+                continue
+            directory = _open_screens_directory(current, phase)
+            descriptors.append(directory)
+            for name in sorted(os.listdir(directory)):
+                if SCREENS_NAME_RE.fullmatch(name) is None or len(name) > 160:
+                    continue
+                info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    raise QuickRefusal("screens")
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                if len(found) >= SCREENS_MAX_FILES or total + info.st_size > SCREENS_MAX_BYTES:
+                    raise QuickRefusal("screens")
+                data = _read_screen(directory, name)
+                check_png(data)
+                total += len(data)
+                found.append((phase + "/" + name, data))
+    except OSError:
+        raise QuickRefusal("screens") from None
+    finally:
+        for descriptor in descriptors:
+            os.close(descriptor)
+    return found
+
+
+def screens_parts(files, request_id):
+    """Return the manifest record and the part bodies for one collected file set."""
+    files = sorted(files, key=lambda item: item[0])
+    if not files:
+        return {"status": "none"}, []
+    stream = b"".join(data for unused_path, data in files)
+    chunks = [stream[start:start + SCREENS_PART_BYTES] for start in range(0, len(stream), SCREENS_PART_BYTES)]
+    if len(chunks) > SCREENS_MAX_PARTS:
+        raise QuickRefusal("screens")
+    manifest = {
+        "status": "ok", "schema_version": 1, "count": len(files), "bytes": len(stream),
+        "parts": len(chunks), "stream_sha256": hashlib.sha256(stream).hexdigest(),
+        "files": [
+            {"path": path, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            for path, data in files
+        ],
+    }
+    bodies = []
+    for index, chunk in enumerate(chunks):
+        body = json.dumps({
+            "schema_version": 1, "kind": SCREENS_PART_KIND, "request_id": request_id,
+            "index": index, "count": len(chunks), "sha256": hashlib.sha256(chunk).hexdigest(),
+            "data_b64": base64.b64encode(chunk).decode("ascii"),
+        }, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode("ascii")
+        if any(pattern.search(body.decode("ascii")) is not None for pattern in CREDENTIAL_PATTERNS):
+            raise QuickRefusal("screens")
+        bodies.append(body)
+    return manifest, bodies
 
 
 def _gate_records(records):
@@ -345,7 +491,7 @@ def unframe_payload(data):
         raise QuickRefusal("payload") from None
 
 
-def build_payload(records, environ, request_id):
+def build_payload(records, environ, request_id, screens=None):
     records = Path(records)
     binding = source_binding(environ)
     selected, outcomes, passed, failed = _gate_records(records)
@@ -364,6 +510,7 @@ def build_payload(records, environ, request_id):
         "image_version": image_version if IMAGE_RE.fullmatch(image_version) else "unknown",
         "gates_selected": len(selected), "gates_passed": passed, "gates_failed": failed,
         "revocation": _revocation(records), "boundary": _boundary(records),
+        "screens": {"status": "none"} if screens is None else screens,
     }
     cap = STREAM_TAIL_BYTES
     while True:
@@ -490,6 +637,52 @@ def run_preflight(environ):
     return "KD-LINUX-QUICK-PREFLIGHT schema=1 request-id=" + request_id + " tier=quick admission=never status=verified"
 
 
+def write_screens(runner_temp, ciphertexts, uid, gid):
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    if (nofollow is None or directory_flag is None or type(ciphertexts) is not list
+            or not 1 <= len(ciphertexts) <= SCREENS_MAX_PARTS
+            or any(type(data) is not bytes or not 1 <= len(data) <= MAX_CIPHERTEXT_BYTES for data in ciphertexts)
+            or type(uid) is not int or type(gid) is not int):
+        raise QuickRefusal("output")
+    parent_fd = directory_fd = -1
+    try:
+        parent_fd = os.open(str(runner_temp), os.O_RDONLY | directory_flag | nofollow)
+        os.mkdir(SCREENS_UPLOAD_DIRECTORY, 0o700, dir_fd=parent_fd)
+        directory_fd = os.open(SCREENS_UPLOAD_DIRECTORY, os.O_RDONLY | directory_flag | nofollow, dir_fd=parent_fd)
+        os.fchown(directory_fd, uid, gid)
+        os.fchmod(directory_fd, 0o700)
+        for index, data in enumerate(ciphertexts):
+            name = SCREENS_MEMBER_FORMAT % index
+            file_fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600, dir_fd=directory_fd)
+            try:
+                os.fchown(file_fd, uid, gid)
+                os.fchmod(file_fd, 0o400)
+                offset = 0
+                while offset < len(data):
+                    count = os.write(file_fd, data[offset:])
+                    if count <= 0:
+                        raise OSError
+                    offset += count
+                os.fsync(file_fd)
+                opened = os.fstat(file_fd)
+                named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if ((opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+                        or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                        or opened.st_size != len(data) or stat.S_IMODE(opened.st_mode) != 0o400):
+                    raise OSError
+            finally:
+                os.close(file_fd)
+        os.fsync(directory_fd)
+    except (OSError, ValueError):
+        raise QuickRefusal("output") from None
+    finally:
+        for descriptor in (directory_fd, parent_fd):
+            if descriptor >= 0:
+                os.close(descriptor)
+    return len(ciphertexts)
+
+
 def run_encrypt(environ, arguments, clock=time.time):
     ids = _arguments(arguments, ("reader-uid", "reader-gid"))
     request_id, spki, fingerprint = request_binding(environ)
@@ -500,16 +693,35 @@ def run_encrypt(environ, arguments, clock=time.time):
     if not runner_temp or not node_bin:
         raise QuickRefusal("binding")
     records = Path(runner_temp) / RECORDS_DIRECTORY
-    payload, selected, passed, failed = build_payload(records, environ, request_id)
-    now = int(clock())
-    record = crypto_input(payload, request_id, spki, fingerprint, binding, now, nonce, expiry)
     helper = Path(__file__).resolve().parents[1] / "kit" / "confinement" / "feedback_producer_crypto.mjs"
+    now = int(clock())
+    screens = None
+    part_ciphertexts = []
+    worker = environ.get("WORKER_PATH", "")
+    if worker:
+        try:
+            screens, bodies = screens_parts(collect_screens(worker), request_id)
+            part_ciphertexts = [
+                encrypt_payload(
+                    crypto_input(frame_payload(body), request_id, spki, fingerprint, binding, now, nonce, expiry),
+                    Path(node_bin) / "node", helper,
+                )
+                for body in bodies
+            ]
+        except QuickRefusal:
+            screens, part_ciphertexts = {"status": "refused"}, []
+    payload, selected, passed, failed = build_payload(records, environ, request_id, screens)
+    record = crypto_input(payload, request_id, spki, fingerprint, binding, now, nonce, expiry)
     ciphertext = encrypt_payload(record, Path(node_bin) / "node", helper)
     digest = write_ciphertext(runner_temp, ciphertext, ids["reader-uid"], ids["reader-gid"])
-    _write_output(environ, {
+    outputs = {
         "gates_selected": selected, "gates_passed": passed, "gates_failed": failed,
         "ciphertext_sha256": digest,
-    })
+    }
+    if part_ciphertexts:
+        write_screens(runner_temp, part_ciphertexts, ids["reader-uid"], ids["reader-gid"])
+        outputs["screens_parts"] = len(part_ciphertexts)
+    _write_output(environ, outputs)
     return None
 
 

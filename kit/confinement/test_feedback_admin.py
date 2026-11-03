@@ -1129,5 +1129,198 @@ class UnsupportedPlatformTests(unittest.TestCase):
                 subject.FeedbackAdmin(os.path.abspath("synthetic-state"), **arguments)
 
 
+SCREENS_REQUEST = "ab" * 32
+
+
+def _png(width=2, height=3, colour=2, depth=8, filler=b"", end=True):
+    header = width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes((depth, colour, 0, 0, 0))
+    return (
+        b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + header + b"\x00\x00\x00\x00" + filler
+        + (b"\x00\x00\x00\x00IEND\xaeB`\x82" if end else b"\x00" * 12)
+    )
+
+
+def _screens_frame(body):
+    header = b"KD-LINUX-QUICK-PAYLOAD 1 " + (b"%08d" % len(body)) + b"\n"
+    return header + body + b" " * (subject.MAX_PLAINTEXT_BYTES - len(header) - len(body))
+
+
+def _screens_set(files, part_bytes=100, request_id=SCREENS_REQUEST):
+    files = sorted(files)
+    stream = b"".join(data for unused, data in files)
+    chunks = [stream[start:start + part_bytes] for start in range(0, len(stream), part_bytes)]
+    manifest = {
+        "status": "ok", "schema_version": 1, "count": len(files), "bytes": len(stream),
+        "parts": len(chunks), "stream_sha256": hashlib.sha256(stream).hexdigest(),
+        "files": [
+            {"path": path, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+            for path, data in files
+        ],
+    }
+    frames = []
+    for index, chunk in enumerate(chunks):
+        frames.append(_screens_frame(json.dumps({
+            "schema_version": 1, "kind": "screens-part", "request_id": request_id, "index": index,
+            "count": len(chunks), "sha256": hashlib.sha256(chunk).hexdigest(),
+            "data_b64": base64.b64encode(chunk).decode("ascii"),
+        }, sort_keys=True, separators=(",", ":")).encode("ascii")))
+    return manifest, frames
+
+
+SCREEN_FILES = [
+    ("01-tokens/frame-one--light--rest.png", _png(filler=b"a" * 70)),
+    ("01-tokens/frame-one--dark--rest.png", _png(4, 4, filler=b"b" * 90)),
+    ("02-states/frame-two--light--focus.png", _png(8, 8, filler=b"c" * 30)),
+]
+
+
+class ScreensReturnTests(unittest.TestCase):
+    def assert_refused(self, function, *arguments):
+        with self.assertRaises(subject.FeedbackAdminRefusal):
+            function(*arguments)
+
+    def assemble(self, manifest, frames):
+        with mock.patch.object(subject, "SCREENS_PART_BYTES", 100):
+            return subject.assemble_screens(manifest, frames, SCREENS_REQUEST)
+
+    def test_the_bounds_are_the_producer_bounds(self):
+        self.assertEqual(
+            (subject.SCREENS_MAX_FILES, subject.SCREENS_MAX_BYTES, subject.SCREENS_PART_BYTES, subject.SCREENS_MAX_PARTS),
+            (200, 48 * 1024 * 1024, 3_000_000, 17),
+        )
+
+    def test_parts_assemble_into_the_exact_files(self):
+        manifest, frames = _screens_set(SCREEN_FILES)
+        self.assertGreater(len(frames), 1)
+        self.assertEqual(self.assemble(manifest, frames), sorted(SCREEN_FILES))
+
+    def test_manifests_with_escaping_or_malformed_paths_are_refused(self):
+        good = "01-tokens/frame-one--light--rest.png"
+        for path in (
+            "../01-tokens/frame-one--light--rest.png", "01-tokens/../frame-one--light--rest.png",
+            "/01-tokens/frame-one--light--rest.png", "01-tokens/sub/frame-one--light--rest.png",
+            "frame-one--light--rest.png", "01-tokens\\frame-one--light--rest.png",
+            "01-tokens/Frame-one--light--rest.png", "01-tokens/frame-one--light.png",
+            "01-tokens/frame-one--light--rest.PNG", "Tokens/frame-one--light--rest.png",
+            "01-tokens//frame-one--light--rest.png", "01-tokens/frame-one--light--rest.png\n",
+            "01-tokens/.frame--light--rest.png", "./01-tokens/frame-one--light--rest.png",
+        ):
+            with self.subTest(path=path):
+                manifest, frames = _screens_set([(path, SCREEN_FILES[0][1])])
+                manifest["files"][0]["path"] = path
+                self.assert_refused(self.assemble, manifest, frames)
+        manifest, frames = _screens_set([(good, SCREEN_FILES[0][1])])
+        self.assertEqual(len(self.assemble(manifest, frames)), 1)
+
+    def test_manifest_shape_count_order_and_totals_are_checked(self):
+        manifest, frames = _screens_set(SCREEN_FILES)
+        for name, change in (
+            ("extra_field", lambda value: value.update({"extra": 1})),
+            ("status", lambda value: value.update({"status": "refused"})),
+            ("schema", lambda value: value.update({"schema_version": 2})),
+            ("count", lambda value: value.update({"count": 2})),
+            ("bytes", lambda value: value.update({"bytes": value["bytes"] + 1})),
+            ("parts", lambda value: value.update({"parts": value["parts"] + 1})),
+            ("stream_hash", lambda value: value.update({"stream_sha256": "0" * 64})),
+            ("order", lambda value: value["files"].reverse()),
+            ("duplicate", lambda value: value["files"].__setitem__(1, dict(value["files"][0]))),
+            ("file_field", lambda value: value["files"][0].update({"mode": 1})),
+            ("file_size", lambda value: value["files"][0].update({"size": 10})),
+            ("file_hash", lambda value: value["files"][0].update({"sha256": "0" * 64})),
+        ):
+            with self.subTest(change=name):
+                changed = json.loads(json.dumps(manifest))
+                change(changed)
+                self.assert_refused(self.assemble, changed, frames)
+        self.assert_refused(self.assemble, None, frames)
+        with mock.patch.object(subject, "SCREENS_MAX_FILES", 2):
+            self.assert_refused(self.assemble, manifest, frames)
+        with mock.patch.object(subject, "SCREENS_MAX_BYTES", manifest["bytes"] - 1):
+            self.assert_refused(self.assemble, manifest, frames)
+        with mock.patch.object(subject, "SCREENS_MAX_FILE_BYTES", len(SCREEN_FILES[1][1]) - 1):
+            self.assert_refused(self.assemble, manifest, frames)
+
+    def test_part_frames_are_bound_to_the_manifest_the_request_and_their_hashes(self):
+        manifest, frames = _screens_set(SCREEN_FILES)
+
+        def with_part(index, **changes):
+            body = subject._unframe_screens_part(frames[index], subject.MAX_PLAINTEXT_BYTES)
+            body.update(changes)
+            changed = list(frames)
+            changed[index] = _screens_frame(json.dumps(body, sort_keys=True, separators=(",", ":")).encode("ascii"))
+            return changed
+
+        for name, changed in (
+            ("index", with_part(0, index=1)),
+            ("count", with_part(0, count=99)),
+            ("request", with_part(0, request_id="cd" * 32)),
+            ("kind", with_part(0, kind="other")),
+            ("hash", with_part(0, sha256="0" * 64)),
+            ("base64", with_part(0, data_b64="!!!!")),
+            ("empty", with_part(0, data_b64="")),
+            ("noncanonical", with_part(0, data_b64=base64.b64encode(b"x" * 100).decode("ascii")[:-2] + "==")),
+            ("extra", with_part(0, extra=1)),
+            ("missing_part", frames[:-1]),
+            ("extra_part", frames + [frames[0]]),
+            ("short_frame", [frames[0][:-1]] + frames[1:]),
+            ("not_bytes", ["text"] + frames[1:]),
+            ("reordered", list(reversed(frames))),
+        ):
+            with self.subTest(change=name):
+                self.assert_refused(self.assemble, manifest, changed)
+        self.assert_refused(self.assemble, manifest, tuple(frames))
+        with mock.patch.object(subject, "SCREENS_PART_BYTES", 100):
+            self.assert_refused(subject.assemble_screens, manifest, frames, "short")
+
+    def test_files_that_are_not_bounded_png_bytes_are_refused_even_with_matching_hashes(self):
+        for name, data in (
+            ("text", b"not a png at all" * 4), ("no_end", _png(end=False)), ("width", _png(width=0)),
+            ("colour", _png(colour=5)), ("area", _png(width=16384, height=16384)),
+        ):
+            with self.subTest(case=name):
+                manifest, frames = _screens_set([("01-tokens/frame-one--light--rest.png", data)])
+                self.assert_refused(self.assemble, manifest, frames)
+
+    def test_write_creates_one_private_tree_once_and_never_outside_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                name = subject.write_screens_directory(dir_fd, SCREENS_REQUEST, sorted(SCREEN_FILES))
+                self.assertEqual(name, "return-" + SCREENS_REQUEST + "-linux-quick-screens")
+                root = os.path.join(directory, name)
+                for path, data in SCREEN_FILES:
+                    target = os.path.join(root, *path.split("/"))
+                    with open(target, "rb") as source:
+                        self.assertEqual(source.read(), data)
+                    self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o600)
+                self.assertEqual(sorted(os.listdir(root)), ["01-tokens", "02-states"])
+                self.assertEqual(os.listdir(directory), [name])
+                self.assert_refused(subject.write_screens_directory, dir_fd, SCREENS_REQUEST, sorted(SCREEN_FILES))
+            finally:
+                os.close(dir_fd)
+
+    def test_write_refuses_bad_names_bytes_counts_and_a_planted_link_before_writing(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            dir_fd = os.open(directory, os.O_RDONLY)
+            try:
+                good = SCREEN_FILES[0]
+                for files in (
+                    [], [("../escape/frame-one--light--rest.png", good[1])],
+                    [("01-tokens/frame-one--light--rest.png", b"not a png at all" * 4)],
+                    [good, good], "text", [("01-tokens/frame-one--light--rest.png", _png(end=False))],
+                ):
+                    with self.subTest(files=repr(files)[:40]):
+                        self.assert_refused(subject.write_screens_directory, dir_fd, SCREENS_REQUEST, files)
+                with mock.patch.object(subject, "SCREENS_MAX_FILES", 1):
+                    self.assert_refused(subject.write_screens_directory, dir_fd, SCREENS_REQUEST, sorted(SCREEN_FILES))
+                self.assert_refused(subject.write_screens_directory, dir_fd, "short", [good])
+                self.assertEqual(os.listdir(directory), [])
+                os.symlink(outside, os.path.join(directory, "return-" + SCREENS_REQUEST + "-linux-quick-screens"))
+                self.assert_refused(subject.write_screens_directory, dir_fd, SCREENS_REQUEST, [good])
+                self.assertEqual(os.listdir(outside), [])
+            finally:
+                os.close(dir_fd)
+
+
 if __name__ == "__main__":
     unittest.main()

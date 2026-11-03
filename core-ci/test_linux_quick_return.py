@@ -16,7 +16,7 @@ import linux_quick_return as subject
 
 __all__ = [
     "FrameTests", "PayloadTests", "BindingTests", "CryptoTests", "OutputTests",
-    "CommandTests", "PublicLineTests", "SourceShapeTests",
+    "CommandTests", "ScreensTests", "ScreensCommandTests", "PublicLineTests", "SourceShapeTests",
 ]
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -644,6 +644,286 @@ class CommandTests(unittest.TestCase):
                     output.getvalue(),
                     "KD-LINUX-QUICK-REFUSAL schema=1 tier=quick admission=never reason=usage\n",
                 )
+
+
+def png_bytes(width=2, height=3, colour=2, depth=8, interlace=0, filler=b"", end=True):
+    header = width.to_bytes(4, "big") + height.to_bytes(4, "big") + bytes((depth, colour, 0, 0, interlace))
+    return (
+        subject.PNG_SIGNATURE + b"\x00\x00\x00\rIHDR" + header + b"\x00\x00\x00\x00" + filler
+        + (subject.PNG_END_CHUNK if end else b"\x00" * 12)
+    )
+
+
+def write_screen(worker, phase, name, data):
+    directory = Path(worker) / "docs" / "reports" / "core-ui-kit" / phase
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / name).write_bytes(data)
+    return directory / name
+
+
+FRAME_ONE = "frame-one--light--rest.png"
+FRAME_TWO = "frame-two--dark--focus.png"
+
+
+class ScreensTests(unittest.TestCase):
+    def refused(self, worker):
+        self.assertEqual(refusal_reason(subject.collect_screens, str(worker)), "screens")
+
+    @POSIX_OUTPUT
+    def test_exact_shape_png_files_are_collected_in_path_order(self):
+        with tempfile.TemporaryDirectory() as worker:
+            second = png_bytes(4, 4)
+            first = png_bytes(2, 2, filler=b"abc")
+            write_screen(worker, "02-states", FRAME_TWO, second)
+            write_screen(worker, "01-tokens", FRAME_ONE, first)
+            self.assertEqual(
+                subject.collect_screens(worker),
+                [("01-tokens/" + FRAME_ONE, first), ("02-states/" + FRAME_TWO, second)],
+            )
+
+    @POSIX_OUTPUT
+    def test_an_absent_report_directory_yields_nothing(self):
+        with tempfile.TemporaryDirectory() as worker:
+            self.assertEqual(subject.collect_screens(worker), [])
+            (Path(worker) / "docs" / "reports").mkdir(parents=True)
+            self.assertEqual(subject.collect_screens(worker), [])
+
+    @POSIX_OUTPUT
+    def test_names_and_directories_outside_the_exact_shape_are_ignored(self):
+        with tempfile.TemporaryDirectory() as worker:
+            good = png_bytes()
+            write_screen(worker, "01-tokens", FRAME_ONE, good)
+            for name in (
+                "Frame--light--rest.png", "frame--light.png", "frame--light--rest.PNG",
+                "frame--light--rest.png.txt", "frame--Light--rest.png", ".hidden--a--b.png",
+                "frame--light--rest--extra.png", "frame_one--light--rest.png", "notes.txt",
+            ):
+                write_screen(worker, "01-tokens", name, b"not a png at all")
+            write_screen(worker, "Upper", FRAME_TWO, b"not a png at all")
+            write_screen(worker, "a_b", FRAME_TWO, b"not a png at all")
+            (Path(worker) / "docs" / "reports" / "core-ui-kit" / "summary.json").write_bytes(b"{}")
+            nested = Path(worker) / "docs" / "reports" / "core-ui-kit" / "01-tokens" / "deeper"
+            nested.mkdir()
+            (nested / FRAME_TWO).write_bytes(b"not a png at all")
+            self.assertEqual(subject.collect_screens(worker), [("01-tokens/" + FRAME_ONE, good)])
+
+    @POSIX_OUTPUT
+    def test_a_symbolic_link_under_an_accepted_name_is_refused_and_never_followed(self):
+        with tempfile.TemporaryDirectory() as worker, tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "target.png"
+            target.write_bytes(png_bytes())
+            directory = Path(worker) / "docs" / "reports" / "core-ui-kit" / "01-tokens"
+            directory.mkdir(parents=True)
+            os.symlink(target, directory / FRAME_ONE)
+            self.refused(worker)
+        with tempfile.TemporaryDirectory() as worker, tempfile.TemporaryDirectory() as outside:
+            write_screen(outside, "x", FRAME_ONE, png_bytes())
+            root = Path(worker) / "docs" / "reports" / "core-ui-kit"
+            root.mkdir(parents=True)
+            os.symlink(Path(outside) / "docs" / "reports" / "core-ui-kit" / "x", root / "01-tokens")
+            self.refused(worker)
+
+    @POSIX_OUTPUT
+    def test_a_path_that_escapes_through_a_link_in_the_report_root_is_refused(self):
+        with tempfile.TemporaryDirectory() as worker, tempfile.TemporaryDirectory() as outside:
+            write_screen(outside, "01-tokens", FRAME_ONE, png_bytes())
+            os.symlink(Path(outside) / "docs", Path(worker) / "docs")
+            self.refused(worker)
+        with tempfile.TemporaryDirectory() as worker, tempfile.TemporaryDirectory() as outside:
+            write_screen(outside, "01-tokens", FRAME_ONE, png_bytes())
+            (Path(worker) / "docs").mkdir()
+            os.symlink(Path(outside) / "docs" / "reports", Path(worker) / "docs" / "reports")
+            self.refused(worker)
+        with tempfile.TemporaryDirectory() as real, tempfile.TemporaryDirectory() as outside:
+            write_screen(real, "01-tokens", FRAME_ONE, png_bytes())
+            link = Path(outside) / "worker-link"
+            os.symlink(real, link)
+            self.refused(link)
+
+    @POSIX_OUTPUT
+    def test_bytes_that_are_not_a_bounded_png_are_refused(self):
+        valid = png_bytes()
+        cases = (
+            b"", b"not a png at all", valid[:-1], valid[:30], b"\x00" + valid[1:],
+            png_bytes(end=False), png_bytes(width=0), png_bytes(height=0),
+            png_bytes(width=subject.SCREENS_MAX_DIMENSION + 1), png_bytes(colour=5),
+            png_bytes(colour=2, depth=4), png_bytes(depth=3), png_bytes(interlace=2),
+            png_bytes(width=16384, height=16384),
+            valid[:24] + b"\x08\x02\x01\x00\x00" + valid[29:],
+            valid[:8] + b"\x00\x00\x00\x0eIHDR" + valid[16:],
+        )
+        for index, data in enumerate(cases):
+            with self.subTest(case=index), tempfile.TemporaryDirectory() as worker:
+                write_screen(worker, "01-tokens", FRAME_ONE, data)
+                self.refused(worker)
+
+    @POSIX_OUTPUT
+    def test_the_count_and_the_total_and_single_file_sizes_are_bounded(self):
+        with tempfile.TemporaryDirectory() as worker:
+            for number in range(3):
+                write_screen(worker, "01-tokens", "frame-" + str(number) + "--light--rest.png", png_bytes())
+            self.assertEqual(len(subject.collect_screens(worker)), 3)
+            with patch.object(subject, "SCREENS_MAX_FILES", 2):
+                self.refused(worker)
+            with patch.object(subject, "SCREENS_MAX_BYTES", 2 * len(png_bytes()) + 1):
+                self.refused(worker)
+            with patch.object(subject, "SCREENS_MAX_FILE_BYTES", len(png_bytes()) - 1):
+                self.refused(worker)
+        self.assertEqual(subject.SCREENS_MAX_FILES, 200)
+        self.assertEqual(subject.SCREENS_MAX_BYTES, 48 * 1024 * 1024)
+        self.assertEqual(subject.SCREENS_MAX_PARTS, 17)
+
+    def test_parts_split_one_stream_and_each_body_fits_the_quick_frame(self):
+        first = png_bytes(filler=b"a" * 40)
+        second = png_bytes(filler=b"b" * 40)
+        files = [("02-states/" + FRAME_TWO, second), ("01-tokens/" + FRAME_ONE, first)]
+        with patch.object(subject, "SCREENS_PART_BYTES", 50):
+            manifest, bodies = subject.screens_parts(files, REQUEST)
+        stream = first + second
+        self.assertEqual(manifest["status"], "ok")
+        self.assertEqual((manifest["count"], manifest["bytes"], manifest["parts"]), (2, len(stream), len(bodies)))
+        self.assertEqual(manifest["stream_sha256"], hashlib.sha256(stream).hexdigest())
+        self.assertEqual([item["path"] for item in manifest["files"]], ["01-tokens/" + FRAME_ONE, "02-states/" + FRAME_TWO])
+        self.assertEqual([item["size"] for item in manifest["files"]], [len(first), len(second)])
+        joined = b""
+        for index, body in enumerate(bodies):
+            part = subject.unframe_payload(subject.frame_payload(body))
+            self.assertEqual(
+                set(part), {"schema_version", "kind", "request_id", "index", "count", "sha256", "data_b64"},
+            )
+            self.assertEqual((part["kind"], part["request_id"], part["index"], part["count"]), (
+                subject.SCREENS_PART_KIND, REQUEST, index, len(bodies),
+            ))
+            raw = base64.b64decode(part["data_b64"])
+            self.assertEqual(part["sha256"], hashlib.sha256(raw).hexdigest())
+            joined += raw
+        self.assertEqual(joined, stream)
+        self.assertEqual(subject.screens_parts([], REQUEST), ({"status": "none"}, []))
+
+    def test_a_full_part_fits_the_frame_and_a_credential_shaped_part_is_refused(self):
+        files = [("01-tokens/" + FRAME_ONE, png_bytes(filler=os.urandom(subject.SCREENS_PART_BYTES - 45)))]
+        manifest, bodies = subject.screens_parts(files, REQUEST)
+        self.assertEqual((manifest["parts"], len(files[0][1])), (1, subject.SCREENS_PART_BYTES))
+        for body in bodies:
+            self.assertLessEqual(len(body), subject.MAX_BODY_BYTES)
+            subject.frame_payload(body)
+        with patch.object(subject, "CREDENTIAL_PATTERNS", (re.compile(r"[A-Za-z0-9]"),)):
+            self.assertEqual(refusal_reason(subject.screens_parts, files, REQUEST), "screens")
+
+    @POSIX_OUTPUT
+    def test_write_screens_stages_numbered_members_once_and_refuses_bad_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            members = [b"KDLE" + b"a" * 8, b"KDLE" + b"b" * 8]
+            self.assertEqual(subject.write_screens(directory, members, os.getuid(), os.getgid()), 2)
+            staged = Path(directory) / "kd-screens-upload"
+            self.assertEqual(
+                sorted(path.name for path in staged.iterdir()),
+                ["linux-quick-screens-00-v1.enc", "linux-quick-screens-01-v1.enc"],
+            )
+            self.assertEqual((staged / "linux-quick-screens-01-v1.enc").read_bytes(), members[1])
+            self.assertEqual(
+                refusal_reason(subject.write_screens, directory, members, os.getuid(), os.getgid()), "output",
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            for data, uid in (
+                ([], 0), ([b""], 0), (["text"], 0), ([b"x" * (subject.MAX_CIPHERTEXT_BYTES + 1)], 0),
+                ([b"KDLE"] * (subject.SCREENS_MAX_PARTS + 1), 0), ([b"KDLE"], "0"), (b"KDLE", 0),
+            ):
+                with self.subTest(uid=uid):
+                    self.assertEqual(refusal_reason(subject.write_screens, directory, data, uid, 0), "output")
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+
+class ScreensCommandTests(unittest.TestCase):
+    ARGUMENTS = ["--reader-uid", str(os.getuid() if hasattr(os, "getuid") else 0),
+                 "--reader-gid", str(os.getgid() if hasattr(os, "getgid") else 0)]
+
+    def environment_for(self, directory, worker):
+        output = Path(directory) / "github-output"
+        output.write_text("", encoding="ascii")
+        return environment(
+            RUNNER_TEMP=directory, NODE_BIN=os.sep + "opt" + os.sep + "node-bin", GITHUB_OUTPUT=str(output),
+            WORKER_PATH=str(worker),
+        )
+
+    @POSIX_OUTPUT
+    def test_encrypt_returns_the_verdict_and_one_encrypted_member_per_part(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as worker:
+            write_records(directory)
+            first = png_bytes(filler=b"a" * 40)
+            second = png_bytes(filler=b"b" * 40)
+            write_screen(worker, "01-tokens", FRAME_ONE, first)
+            write_screen(worker, "02-states", FRAME_TWO, second)
+            env = self.environment_for(directory, worker)
+            with patch.object(subject, "SCREENS_PART_BYTES", 60), \
+                    patch.object(subject, "encrypt_payload", side_effect=lambda record, node, helper: b"KDLE" + b"p" * 8) as encrypt:
+                subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
+            records = [call.args[0] for call in encrypt.call_args_list]
+            verdict = subject.unframe_payload(base64.b64decode(records[-1]["payload_b64"]))
+            screens = verdict["screens"]
+            self.assertEqual(screens["status"], "ok")
+            self.assertEqual((screens["count"], screens["bytes"]), (2, len(first) + len(second)))
+            self.assertEqual(len(records), screens["parts"] + 1)
+            for record in records:
+                self.assertEqual(record["kind"], "linux_quick")
+                self.assertEqual(record["context"]["nonce"], NONCE)
+                self.assertEqual(record["context"]["request_id"], REQUEST)
+            staged = Path(directory) / "kd-screens-upload"
+            self.assertEqual(
+                sorted(path.name for path in staged.iterdir()),
+                [subject.SCREENS_MEMBER_FORMAT % index for index in range(screens["parts"])],
+            )
+            self.assertEqual(
+                (Path(directory) / "kd-quick-upload").iterdir().__next__().name, "linux-quick-return-v1.enc",
+            )
+            lines = Path(env["GITHUB_OUTPUT"]).read_text(encoding="ascii").splitlines()
+            self.assertEqual(lines[-1], "screens_parts=" + str(screens["parts"]))
+
+    @POSIX_OUTPUT
+    def test_a_hostile_screen_set_degrades_to_a_refused_marker_without_losing_the_verdict(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as worker:
+            write_records(directory)
+            write_screen(worker, "01-tokens", FRAME_ONE, b"not a png at all")
+            env = self.environment_for(directory, worker)
+            with patch.object(subject, "encrypt_payload", return_value=b"KDLE" + b"z" * 8) as encrypt:
+                subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
+            self.assertEqual(encrypt.call_count, 1)
+            verdict = subject.unframe_payload(base64.b64decode(encrypt.call_args.args[0]["payload_b64"]))
+            self.assertEqual(verdict["screens"], {"status": "refused"})
+            self.assertFalse((Path(directory) / "kd-screens-upload").exists())
+            lines = Path(env["GITHUB_OUTPUT"]).read_text(encoding="ascii").splitlines()
+            self.assertFalse(any(line.startswith("screens_parts=") for line in lines))
+
+    @POSIX_OUTPUT
+    def test_a_failed_part_encryption_also_degrades_to_the_refused_marker(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as worker:
+            write_records(directory)
+            write_screen(worker, "01-tokens", FRAME_ONE, png_bytes())
+            env = self.environment_for(directory, worker)
+            calls = []
+
+            def encrypt(record, node, helper):
+                calls.append(record)
+                if len(calls) == 1:
+                    raise subject.QuickRefusal("encryptor")
+                return b"KDLE" + b"z" * 8
+
+            with patch.object(subject, "encrypt_payload", side_effect=encrypt):
+                subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
+            verdict = subject.unframe_payload(base64.b64decode(calls[-1]["payload_b64"]))
+            self.assertEqual(verdict["screens"], {"status": "refused"})
+            self.assertFalse((Path(directory) / "kd-screens-upload").exists())
+
+    @POSIX_OUTPUT
+    def test_without_a_worker_path_or_pngs_the_verdict_says_none(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as worker:
+            write_records(directory)
+            env = self.environment_for(directory, worker)
+            with patch.object(subject, "encrypt_payload", return_value=b"KDLE" + b"z" * 8) as encrypt:
+                subject.run_encrypt(env, self.ARGUMENTS, clock=lambda: 1800000000.9)
+            verdict = subject.unframe_payload(base64.b64decode(encrypt.call_args.args[0]["payload_b64"]))
+            self.assertEqual(verdict["screens"], {"status": "none"})
+            self.assertFalse((Path(directory) / "kd-screens-upload").exists())
 
 
 class PublicLineTests(unittest.TestCase):

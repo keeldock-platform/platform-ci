@@ -483,6 +483,165 @@ def _quick_context(request, run_id):
     return context
 
 
+SCREENS_MAX_FILES = 200
+SCREENS_MAX_BYTES = 48 * 1024 * 1024
+SCREENS_MAX_FILE_BYTES = 8 * 1024 * 1024
+SCREENS_MIN_FILE_BYTES = 45
+SCREENS_MAX_DIMENSION = 16384
+SCREENS_MAX_AREA = 64_000_000
+SCREENS_PART_BYTES = 3_000_000
+SCREENS_MAX_PARTS = -(-SCREENS_MAX_BYTES // SCREENS_PART_BYTES)
+SCREENS_DIRECTORY_PREFIX = "return-"
+SCREENS_DIRECTORY_SUFFIX = "-linux-quick-screens"
+SCREENS_PATH_RE = re.compile(
+    r"[a-z0-9]+(?:-[a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+){0,15}--[a-z0-9]+(?:-[a-z0-9]+)*"
+    r"--[a-z0-9]+(?:-[a-z0-9]+)*\.png\Z"
+)
+SCREENS_FRAME_PREFIX = b"KD-LINUX-QUICK-PAYLOAD 1 "
+SCREENS_FRAME_DIGITS = 8
+SCREENS_PART_FIELDS = frozenset((
+    "schema_version", "kind", "request_id", "index", "count", "sha256", "data_b64",
+))
+SCREENS_MANIFEST_FIELDS = frozenset((
+    "status", "schema_version", "count", "bytes", "parts", "stream_sha256", "files",
+))
+SCREENS_FILE_FIELDS = frozenset(("path", "size", "sha256"))
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PNG_COLOUR_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
+
+
+def _png_is_bounded(data):
+    if (type(data) is not bytes or not SCREENS_MIN_FILE_BYTES <= len(data) <= SCREENS_MAX_FILE_BYTES
+            or data[:8] != PNG_SIGNATURE or data[8:16] != b"\x00\x00\x00\rIHDR"
+            or data[-12:] != b"\x00\x00\x00\x00IEND\xaeB`\x82"):
+        return False
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    return (1 <= width <= SCREENS_MAX_DIMENSION and 1 <= height <= SCREENS_MAX_DIMENSION
+            and width * height <= SCREENS_MAX_AREA
+            and data[24] in PNG_COLOUR_DEPTHS.get(data[25], ())
+            and data[26] == 0 and data[27] == 0 and data[28] in (0, 1))
+
+
+def validate_screens_manifest(manifest):
+    """Return the ordered file records of a closed, bounded screens manifest or refuse."""
+    if (not _exact_dict(manifest, SCREENS_MANIFEST_FIELDS) or manifest["status"] != "ok"
+            or type(manifest["schema_version"]) is not int or manifest["schema_version"] != 1
+            or type(manifest["count"]) is not int or not 1 <= manifest["count"] <= SCREENS_MAX_FILES
+            or type(manifest["bytes"]) is not int or not 1 <= manifest["bytes"] <= SCREENS_MAX_BYTES
+            or type(manifest["parts"]) is not int
+            or manifest["parts"] != -(-manifest["bytes"] // SCREENS_PART_BYTES)
+            or manifest["parts"] > SCREENS_MAX_PARTS
+            or type(manifest["stream_sha256"]) is not str or HEX64_RE.fullmatch(manifest["stream_sha256"]) is None
+            or type(manifest["files"]) is not list or len(manifest["files"]) != manifest["count"]):
+        _refuse()
+    paths = []
+    total = 0
+    for item in manifest["files"]:
+        if (not _exact_dict(item, SCREENS_FILE_FIELDS) or type(item["path"]) is not str
+                or len(item["path"]) > 220 or SCREENS_PATH_RE.fullmatch(item["path"]) is None
+                or type(item["size"]) is not int
+                or not SCREENS_MIN_FILE_BYTES <= item["size"] <= SCREENS_MAX_FILE_BYTES
+                or type(item["sha256"]) is not str or HEX64_RE.fullmatch(item["sha256"]) is None):
+            _refuse()
+        paths.append(item["path"])
+        total += item["size"]
+    if total != manifest["bytes"] or paths != sorted(set(paths)):
+        _refuse()
+    return list(manifest["files"])
+
+
+def _unframe_screens_part(data, padded_bytes):
+    header = len(SCREENS_FRAME_PREFIX) + SCREENS_FRAME_DIGITS + 1
+    if (type(data) not in (bytes, bytearray) or len(data) != padded_bytes
+            or bytes(data[:len(SCREENS_FRAME_PREFIX)]) != SCREENS_FRAME_PREFIX
+            or data[header - 1:header] != b"\n"):
+        _refuse()
+    digits = bytes(data[len(SCREENS_FRAME_PREFIX):header - 1])
+    if len(digits) != SCREENS_FRAME_DIGITS or not digits.isdigit():
+        _refuse()
+    length = int(digits)
+    body = bytes(data[header:header + length])
+    if len(body) != length or bytes(data[header + length:]).strip(b" ") != b"":
+        _refuse()
+    try:
+        return json.loads(body.decode("ascii"))
+    except (UnicodeError, ValueError):
+        _refuse()
+
+
+def assemble_screens(manifest, frames, request_id):
+    """Check the decrypted part frames against the manifest and return (path, bytes) pairs."""
+    files = validate_screens_manifest(manifest)
+    if type(frames) is not list or len(frames) != manifest["parts"] or HEX64_RE.fullmatch(request_id) is None:
+        _refuse()
+    stream = bytearray()
+    for index, frame in enumerate(frames):
+        part = _unframe_screens_part(frame, MAX_PLAINTEXT_BYTES)
+        if (not _exact_dict(part, SCREENS_PART_FIELDS) or part["schema_version"] != 1
+                or part["kind"] != "screens-part" or part["request_id"] != request_id
+                or type(part["index"]) is not int or part["index"] != index
+                or type(part["count"]) is not int or part["count"] != len(frames)
+                or type(part["sha256"]) is not str or type(part["data_b64"]) is not str
+                or len(part["data_b64"]) > (SCREENS_PART_BYTES // 3 + 1) * 4):
+            _refuse()
+        try:
+            raw = base64.b64decode(part["data_b64"].encode("ascii"), validate=True)
+        except (ValueError, UnicodeError):
+            _refuse()
+        if (not 0 < len(raw) <= SCREENS_PART_BYTES or base64.b64encode(raw).decode("ascii") != part["data_b64"]
+                or hashlib.sha256(raw).hexdigest() != part["sha256"]
+                or (index < len(frames) - 1 and len(raw) != SCREENS_PART_BYTES)):
+            _refuse()
+        stream += raw
+    if len(stream) != manifest["bytes"] or hashlib.sha256(stream).hexdigest() != manifest["stream_sha256"]:
+        _refuse()
+    result = []
+    offset = 0
+    for item in files:
+        data = bytes(stream[offset:offset + item["size"]])
+        offset += item["size"]
+        if hashlib.sha256(data).hexdigest() != item["sha256"] or not _png_is_bounded(data):
+            _refuse()
+        result.append((item["path"], data))
+    return result
+
+
+def write_screens_directory(dir_fd, request_id, files):
+    """Create the evidence directory below dir_fd and write every checked file once. Each path is
+    revalidated against the exact shape, so no name can leave the directory."""
+    if (HEX64_RE.fullmatch(request_id) is None or type(files) is not list
+            or not 1 <= len(files) <= SCREENS_MAX_FILES):
+        _refuse()
+    for path, data in files:
+        if type(path) is not str or SCREENS_PATH_RE.fullmatch(path) is None or not _png_is_bounded(data):
+            _refuse()
+    if len({path for path, unused in files}) != len(files):
+        _refuse()
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    name = SCREENS_DIRECTORY_PREFIX + request_id + SCREENS_DIRECTORY_SUFFIX
+    opened = []
+    try:
+        os.mkdir(name, 0o700, dir_fd=dir_fd)
+        root = os.open(name, directory_flags, dir_fd=dir_fd)
+        opened.append(root)
+        phases = {}
+        for path, data in files:
+            phase, filename = path.split("/")
+            if phase not in phases:
+                os.mkdir(phase, 0o700, dir_fd=root)
+                phases[phase] = os.open(phase, directory_flags, dir_fd=root)
+                opened.append(phases[phase])
+            _create_named(phases[phase], filename, data, mode=0o600, limit=SCREENS_MAX_FILE_BYTES)
+        os.fsync(root)
+    except OSError:
+        _refuse()
+    finally:
+        for descriptor in opened:
+            os.close(descriptor)
+    return name
+
+
 class FeedbackAdmin:
     """One-use owner-side administration with template-bound Summary job names.
 
