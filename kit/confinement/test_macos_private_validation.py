@@ -1249,6 +1249,164 @@ class CoreContractTreeTests(unittest.TestCase):
                         changed, concern, workspace_text=self._workspace_text(members),
                     ), "path_mode")
 
+    @staticmethod
+    def _ui_kit_gated():
+        return sorted(subject.CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES)
+
+    @staticmethod
+    def _ui_kit_all():
+        return sorted(subject.CORE_CONTRACT_KERNEL_UI_KIT_FILES)
+
+    def test_ui_kit_gated_files_are_the_exact_forty_four_paths_of_the_batch_b_addendum(self):
+        gated = subject.CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES
+        companion = subject.CORE_CONTRACT_KERNEL_UI_KIT_COMPANION_FILES
+        self.assertIs(type(gated), frozenset)
+        self.assertIs(type(companion), frozenset)
+        self.assertEqual(len(gated), 44)
+        self.assertEqual(len(companion), 7)
+        self.assertEqual(gated & companion, frozenset())
+        self.assertEqual(subject.CORE_CONTRACT_KERNEL_UI_KIT_FILES, gated | companion)
+        self.assertEqual(len(subject.CORE_CONTRACT_KERNEL_UI_KIT_FILES), 51)
+        icons = [path for path in gated if path.startswith("packages/kernel-icons/")]
+        kit = [path for path in gated if path.startswith("packages/kernel-ui-kit/")]
+        self.assertEqual((len(icons), len(kit)), (6, 38))
+        for path in subject.CORE_CONTRACT_KERNEL_UI_KIT_FILES:
+            with self.subTest(path=path):
+                self.assertTrue(path.startswith(("packages/kernel-icons/", "packages/kernel-ui-kit/")))
+                self.assertTrue(path.isascii())
+                self.assertNotIn("*", path)
+                self.assertNotIn("..", path)
+                self.assertNotIn("//", path)
+                self.assertFalse(path.endswith("/"))
+        for path in gated:
+            with self.subTest(gated=path):
+                self.assertTrue(path.endswith((".ts", ".tsx")) or path.endswith("/package.json"))
+        self.assertEqual(
+            sorted(path for path in gated if path.endswith("/package.json")),
+            ["packages/kernel-icons/package.json", "packages/kernel-ui-kit/package.json"],
+        )
+        browser = sorted(path for path in gated if "/browser/" in path)
+        self.assertEqual(len(browser), 5)
+        self.assertEqual(
+            sorted(path for path in browser if path.endswith(".pw.ts")),
+            [subject.CORE_CONTRACT_KERNEL_UI_KIT_BROWSER_PREFIX + suffix for suffix in (
+                "01-tokens.pw.ts", "04-core-components.pw.ts", "14-control-states.pw.ts",
+            )],
+        )
+        self.assertIn("packages/kernel-ui-kit/browser/playwright.config.ts", gated)
+        self.assertIn("packages/kernel-ui-kit/gallery/vite.config.ts", gated)
+        self.assertNotIn("packages/kernel-ui-kit/tsconfig.json", gated)
+        self.assertIn("packages/kernel-ui-kit/tsconfig.json", companion)
+
+    def test_ui_kit_files_are_admitted_for_every_core_concern_and_no_other(self):
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            for path in self._ui_kit_all():
+                with self.subTest(concern=concern, path=path):
+                    self.assertEqual(
+                        subject._core_contract_expected_mode(path, concern=concern), "100644",
+                    )
+        for concern in ("core-bootstrap", "rules-bootstrap", "unknown", None):
+            for path in self._ui_kit_all():
+                with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_unlisted_ui_kit_paths_are_refused_for_every_core_concern(self):
+        prefix = subject.CORE_CONTRACT_KERNEL_UI_KIT_BROWSER_PREFIX
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            for path in (
+                "packages/kernel-ui-kit/src/extra.ts",
+                "packages/kernel-ui-kit/src/components/button/extra.tsx",
+                "packages/kernel-ui-kit/gallery/other.tsx",
+                "packages/kernel-ui-kit/browser/other.pw.ts",
+                prefix + "02-other.pw.ts",
+                prefix + "01-tokens.pw.tsx",
+                "packages/kernel-ui-kit/browser/Support.ts",
+                "packages/kernel-ui-kit/browser/test-results/frame.png",
+                "packages/kernel-ui-kit/browser/nested/support.ts",
+                "packages/kernel-ui-kit/tests/extra.test.tsx",
+                "packages/kernel-ui-kit/tests/nested/setup.ts",
+                "packages/kernel-ui-kit/package.json.bak",
+                "packages/kernel-ui-kit/node_modules/x/index.js",
+                "packages/kernel-ui-kit/dist/index.js",
+                "packages/kernel-ui-kit/src/styles/tokens.css",
+                "packages/kernel-icons/dist/index.js",
+                "packages/kernel-icons/src/other.tsx",
+                "packages/kernel-icons/tests/extra.test.tsx",
+                "packages/kernel-icons/CHANGELOG.md",
+                "packages/kernel-ui-kit/",
+                "packages/kernel-ui-kit",
+                "packages/kernel-icons/",
+                "packages/kernel-ui-kit-extra/README.md",
+                "packages/kernel-ui-kits/README.md",
+                "sub/packages/kernel-ui-kit/README.md",
+                "packages/other/src/index.ts",
+            ):
+                with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_ui_kit_files_are_not_node_feedback_inputs_and_change_no_pattern_counts(self):
+        paths = set(self._ui_kit_all())
+        reviewed = (
+            set(subject.CORE_CONTRACT_FEEDBACK_FILES)
+            | set(subject.CORE_CONTRACT_FOUNDATION_FILES)
+            | set(subject.CORE_CONTRACT_KERNEL_FEEDBACK_FILES)
+            | set(subject.CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES)
+        )
+        self.assertEqual(paths & reviewed, set())
+        for path in sorted(paths):
+            with self.subTest(path=path):
+                self.assertFalse(subject._core_contract_foundation_path(path))
+                self.assertIsNone(subject._core_contract_ts_source_name(path))
+                self.assertIsNone(subject._core_contract_ts_test_name(path))
+        found = subject._core_contract_pattern_paths(paths)
+        for name in sorted(found):
+            with self.subTest(pattern=name):
+                self.assertEqual(found[name], set())
+        for concern in ("core-rust-format-return", "core-build-diagnostic-return"):
+            entries = self._four_crate_entries(concern)
+            baseline = subject._core_contract_pattern_paths(entries)
+            entries.update({path: ("100644", "a" * 40) for path in self._ui_kit_all()})
+            with self.subTest(concern=concern):
+                self.assertEqual(subject._core_contract_pattern_paths(entries), baseline)
+                self.assertEqual(
+                    {path for path in entries if subject._core_contract_foundation_path(path)} & paths,
+                    set(),
+                )
+
+    def test_ui_kit_tree_passes_and_unlisted_or_non_regular_entries_are_refused(self):
+        members = ["/".join(root) for root in subject.CORE_CONTRACT_CRATE_ROOTS]
+        listed = self._ui_kit_all()
+        for concern in (
+            "core-rust-format-return", "core-build-diagnostic-return", "core-npm-admission-return",
+        ):
+            entries = self._four_crate_entries(concern)
+            if concern in subject.CORE_CONTRACT_BUILD_FILE_CONCERNS:
+                entries.update({path: ("100644", "a" * 40) for path in self._batch5_paths()})
+            entries.update({path: ("100644", "a" * 40) for path in listed})
+            with self.subTest(concern=concern):
+                marker, unused_blob = self._validate_feedback_tree(
+                    entries, concern, workspace_text=self._workspace_text(members),
+                )
+                expected_marker = subject.CORE_CONTRACT_TREE_BY_CONCERN[concern]
+                if concern == "core-build-diagnostic-return":
+                    expected_marker = subject.CORE_CONTRACT_PACKAGE_LOCK_TREE
+                self.assertEqual(marker, expected_marker)
+            for path, mode in (
+                (listed[0], "100755"),
+                (listed[-1], "100755"),
+                (listed[0], "120000"),
+                (listed[1], "160000"),
+                ("packages/kernel-ui-kit/src/extra.ts", "100644"),
+                ("packages/kernel-icons/src/extra.tsx", "100644"),
+                ("packages/kernel-ui-kit/browser/extra.pw.ts", "100644"),
+            ):
+                changed = dict(entries)
+                changed[path] = (mode, "a" * 40)
+                with self.subTest(concern=concern, path=path, mode=mode):
+                    self.assertEqual(self._refused_check(
+                        changed, concern, workspace_text=self._workspace_text(members),
+                    ), "path_mode")
+
     def test_four_crate_two_package_tree_is_admitted_by_format_return_and_diagnostics(self):
         for concern, tree in (
             ("core-rust-format-return", "core_rust_format_return"),

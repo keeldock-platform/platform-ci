@@ -291,6 +291,65 @@ CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES = frozenset((
     "packages/kernel-tokens/tests/cli.test.ts",
     "packages/kernel-tokens/tools/generate.ts",
 ))
+CORE_CONTRACT_KERNEL_UI_KIT_BROWSER_PREFIX = "packages/kernel-ui-kit/browser/" + "kd" + "18-"
+CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES = frozenset((
+    "packages/kernel-icons/package.json",
+    "packages/kernel-icons/src/icon.tsx",
+    "packages/kernel-icons/src/index.ts",
+    "packages/kernel-icons/tests/icon.test.tsx",
+    "packages/kernel-icons/tests/setup.ts",
+    "packages/kernel-icons/vitest.config.ts",
+    CORE_CONTRACT_KERNEL_UI_KIT_BROWSER_PREFIX + "01-tokens.pw.ts",
+    CORE_CONTRACT_KERNEL_UI_KIT_BROWSER_PREFIX + "04-core-components.pw.ts",
+    CORE_CONTRACT_KERNEL_UI_KIT_BROWSER_PREFIX + "14-control-states.pw.ts",
+    "packages/kernel-ui-kit/browser/playwright.config.ts",
+    "packages/kernel-ui-kit/browser/support.ts",
+    "packages/kernel-ui-kit/gallery/css.d.ts",
+    "packages/kernel-ui-kit/gallery/gallery.tsx",
+    "packages/kernel-ui-kit/gallery/main.tsx",
+    "packages/kernel-ui-kit/gallery/sections/controls.tsx",
+    "packages/kernel-ui-kit/gallery/sections/fields.tsx",
+    "packages/kernel-ui-kit/gallery/specimen.tsx",
+    "packages/kernel-ui-kit/gallery/vite.config.ts",
+    "packages/kernel-ui-kit/package.json",
+    "packages/kernel-ui-kit/src/accessibility/name.ts",
+    "packages/kernel-ui-kit/src/components/button/button.styles.ts",
+    "packages/kernel-ui-kit/src/components/button/button.tsx",
+    "packages/kernel-ui-kit/src/components/button/icon-button.tsx",
+    "packages/kernel-ui-kit/src/components/field/field.context.ts",
+    "packages/kernel-ui-kit/src/components/field/field.tsx",
+    "packages/kernel-ui-kit/src/components/field/label.styles.ts",
+    "packages/kernel-ui-kit/src/components/field/label.tsx",
+    "packages/kernel-ui-kit/src/components/input/input.tsx",
+    "packages/kernel-ui-kit/src/components/loader/loader.tsx",
+    "packages/kernel-ui-kit/src/components/skeleton/skeleton.tsx",
+    "packages/kernel-ui-kit/src/index.ts",
+    "packages/kernel-ui-kit/src/styles/cn.ts",
+    "packages/kernel-ui-kit/tests/button.test.tsx",
+    "packages/kernel-ui-kit/tests/cn.test.ts",
+    "packages/kernel-ui-kit/tests/field.test.tsx",
+    "packages/kernel-ui-kit/tests/icon-button.test.tsx",
+    "packages/kernel-ui-kit/tests/input.test.tsx",
+    "packages/kernel-ui-kit/tests/label.test.tsx",
+    "packages/kernel-ui-kit/tests/loader.test.tsx",
+    "packages/kernel-ui-kit/tests/name.test.ts",
+    "packages/kernel-ui-kit/tests/setup.ts",
+    "packages/kernel-ui-kit/tests/skeleton.test.tsx",
+    "packages/kernel-ui-kit/tests/support.tsx",
+    "packages/kernel-ui-kit/vitest.config.ts",
+))
+CORE_CONTRACT_KERNEL_UI_KIT_COMPANION_FILES = frozenset((
+    "packages/kernel-icons/README.md",
+    "packages/kernel-icons/tsconfig.json",
+    "packages/kernel-ui-kit/README.md",
+    "packages/kernel-ui-kit/component-ownership.md",
+    "packages/kernel-ui-kit/gallery/index.html",
+    "packages/kernel-ui-kit/src/styles/layers.css",
+    "packages/kernel-ui-kit/tsconfig.json",
+))
+CORE_CONTRACT_KERNEL_UI_KIT_FILES = (
+    CORE_CONTRACT_KERNEL_UI_KIT_GATED_FILES | CORE_CONTRACT_KERNEL_UI_KIT_COMPANION_FILES
+)
 CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH = re.compile(
     r"docs/dependencies/[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\.md\Z"
 )
@@ -2371,6 +2430,7 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
     if type(path) is str and (
         path in CORE_CONTRACT_INERT_DEPENDENCY_FILES
         or path in CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES
+        or path in CORE_CONTRACT_KERNEL_UI_KIT_FILES
         or CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH.fullmatch(path) is not None
     ):
         return "100644"
