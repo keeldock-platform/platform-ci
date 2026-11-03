@@ -2794,6 +2794,10 @@ class CoreContractTreeTests(unittest.TestCase):
         ):
             entries = self._four_crate_entries(concern)
             entries.update({path: ("100644", "a" * 40) for path in added})
+            entries.update({
+                path: ("100644", subject.CORE_CONTRACT_PACKAGE_VITEST_OBJECT)
+                for path in subject.CORE_CONTRACT_PACKAGE_VITEST_FILES
+            })
             with self.subTest(concern=concern):
                 marker, unused_blob = self._validate_feedback_tree(
                     entries, concern, workspace_text=self._workspace_text(members),
@@ -2817,6 +2821,25 @@ class CoreContractTreeTests(unittest.TestCase):
                     self.assertEqual(self._refused_check(
                         changed, concern, workspace_text=self._workspace_text(members),
                     ), "path_mode")
+
+            for path in sorted(subject.CORE_CONTRACT_PACKAGE_VITEST_FILES):
+                changed = dict(entries)
+                changed[path] = ("100644", "a" * 40)
+                with self.subTest(concern=concern, path=path, content="other"):
+                    self.assertEqual(self._refused_check(
+                        changed, concern, workspace_text=self._workspace_text(members),
+                    ), "package_decode")
+
+    def test_vitest_configs_and_the_added_rule_are_pinned_to_their_reviewed_blob_ids(self):
+        self.assertEqual(
+            subject.CORE_CONTRACT_PACKAGE_VITEST_OBJECT, "29d7b9ce01fba187934b8a99e9f3c41abf73a8a5",
+        )
+        self.assertEqual(
+            subject.CORE_CONTRACT_RULES_V4_ADDED_RULE_OBJECT,
+            "7999d4144d72bef6c0a31c73d993809cfbb8f2af",
+        )
+        self.assertEqual(len(subject.CORE_CONTRACT_PACKAGE_VITEST_OBJECT), 40)
+        self.assertEqual(len(subject.CORE_CONTRACT_RULES_V4_ADDED_RULE_OBJECT), 40)
 
     def test_rules_manifest_accepts_the_v4_tag_and_no_neighbouring_tag(self):
         digest = hashlib.sha256(b"fixture").hexdigest()
@@ -2855,6 +2878,9 @@ class CoreContractTreeTests(unittest.TestCase):
         for path in subject.CORE_CONTRACT_RULES_V4_CHANGED_PATHS:
             candidate[path] = ("100644", "b" * 40)
         candidate[subject.RULES_LOCK_PATH] = ("100644", subject.CORE_CONTRACT_RULES_V4_LOCK_OBJECT)
+        candidate[subject.CORE_CONTRACT_RULES_V4_ADDED_RULE] = (
+            "100644", subject.CORE_CONTRACT_RULES_V4_ADDED_RULE_OBJECT,
+        )
         return base, candidate, signer, settings
 
     def test_core_contract_policy_allows_only_the_pinned_v3_to_v4_rules_sync(self):
@@ -2879,6 +2905,8 @@ class CoreContractTreeTests(unittest.TestCase):
         removed_change[subject.RULES_DIRECTORY + "/rules/shared/ci-and-admission.md"] = (
             base[subject.RULES_DIRECTORY + "/rules/shared/ci-and-admission.md"]
         )
+        wrong_rule_object = dict(candidate)
+        wrong_rule_object[subject.CORE_CONTRACT_RULES_V4_ADDED_RULE] = ("100644", "b" * 40)
         wrong_lock = dict(candidate)
         wrong_lock[subject.RULES_LOCK_PATH] = ("100644", "e" * 40)
         executable_lock = dict(candidate)
@@ -2890,6 +2918,7 @@ class CoreContractTreeTests(unittest.TestCase):
             ("added_shared", added_shared), ("added_repository", added_repository),
             ("executable_rule", executable_rule), ("removed_change", removed_change),
             ("wrong_lock", wrong_lock), ("executable_lock", executable_lock),
+            ("wrong_rule_object", wrong_rule_object),
         ):
             with self.subTest(name=name):
                 self.assertFalse(subject._core_contract_policy_matches_base(base, changed))

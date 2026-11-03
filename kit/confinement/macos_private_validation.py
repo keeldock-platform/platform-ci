@@ -570,6 +570,7 @@ CORE_CONTRACT_RULES_V3_CHANGED_PATHS = frozenset((
 ))
 CORE_CONTRACT_RULES_V4_LOCK_OBJECT = "ea502d669da414b7180fddb1796cec2828e69561"
 CORE_CONTRACT_RULES_V4_ADDED_RULE = RULES_DIRECTORY + "/rules/node-test-processes.md"
+CORE_CONTRACT_RULES_V4_ADDED_RULE_OBJECT = "7999d4144d72bef6c0a31c73d993809cfbb8f2af"
 CORE_CONTRACT_RULES_V4_CHANGED_PATHS = frozenset((
     RULES_LOCK_PATH,
     CORE_CONTRACT_RULES_V4_ADDED_RULE,
@@ -584,6 +585,7 @@ CORE_CONTRACT_PACKAGE_VITEST_FILES = frozenset((
     "packages/host-api/vitest.config.ts",
     "packages/kernel-i18n/vitest.config.ts",
 ))
+CORE_CONTRACT_PACKAGE_VITEST_OBJECT = "29d7b9ce01fba187934b8a99e9f3c41abf73a8a5"
 RUNTIME_WORKSPACE_DIRECTORY = "runtime"
 RUNTIME_ROOT_MANIFEST_PATH = RUNTIME_WORKSPACE_DIRECTORY + "/Cargo.toml"
 RUNTIME_ROOT_LOCK_PATH = RUNTIME_WORKSPACE_DIRECTORY + "/Cargo.lock"
@@ -2868,7 +2870,8 @@ def _core_contract_policy_matches_base(base_entries, entries):
         base_lock == ("100644", CORE_CONTRACT_RULES_V3_LOCK_OBJECT)
         and candidate_lock == ("100644", CORE_CONTRACT_RULES_V4_LOCK_OBJECT)
         and CORE_CONTRACT_RULES_V4_ADDED_RULE not in base_policy_paths
-        and policy_paths.get(CORE_CONTRACT_RULES_V4_ADDED_RULE, (None,))[0] == "100644"
+        and policy_paths.get(CORE_CONTRACT_RULES_V4_ADDED_RULE)
+        == ("100644", CORE_CONTRACT_RULES_V4_ADDED_RULE_OBJECT)
     ):
         expected_changes = CORE_CONTRACT_RULES_V4_CHANGED_PATHS
     else:
@@ -3026,6 +3029,11 @@ def _safe_core_contract_tree(
         expected_mode = _core_contract_expected_mode(path, concern=concern)
         if mode != expected_mode or expected_mode is None:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
+    if any(
+        path in entries and entries[path] != ("100644", CORE_CONTRACT_PACKAGE_VITEST_OBJECT)
+        for path in CORE_CONTRACT_PACKAGE_VITEST_FILES
+    ):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
     if not _core_contract_rust_policy_matches(entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
     if not _core_contract_policy_matches_base(base_entries, entries):
