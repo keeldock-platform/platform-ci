@@ -1048,6 +1048,24 @@ function Get-NpmLinkShimEnvironment([string[]]$environment) {
     return , ([string[]](@($environment) + @($script:NpmLinkShim.Environment)))
 }
 
+function Reset-NpmConfigFiles([string]$project) {
+    foreach ($entry in @(Get-SourceWalk $project '.npmrc' $false)) {
+        [IO.File]::Delete($entry.Substring(2))
+    }
+    if (@(Get-SourceWalk $project '.npmrc' $false).Count -ne 0) { throw 'npm_config' }
+    foreach ($name in @('empty-user.npmrc', 'empty-global.npmrc')) {
+        $path = Join-Path $script:Lpac.Root $name
+        if (Test-Path -LiteralPath $path) {
+            $info = New-Object IO.FileInfo($path)
+            if (([int]$info.Attributes -band ([int][IO.FileAttributes]::ReparsePoint -bor [int][IO.FileAttributes]::Directory)) -ne 0) { throw 'npm_config' }
+            [IO.File]::Delete($path)
+        }
+        [IO.File]::WriteAllText($path, '', (New-Object System.Text.UTF8Encoding($false)))
+        $written = New-Object IO.FileInfo($path)
+        if (([int]$written.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or $written.Length -ne 0) { throw 'npm_config' }
+    }
+}
+
 function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$environment, $first) {
     if (-not (Test-GateBoundary $first) -or $first.TimedOut -or $first.ExitCode -ne 0) { return $first }
     $created = 0
@@ -1238,6 +1256,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
             return $outcome
         }
         if ($seconds -gt $remaining) { $seconds = $remaining }
+        if ($gate.Id -ceq $NpmSteppedGate) { Reset-NpmConfigFiles $project }
         $argv = [string[]]$gate.Argv
         $gateEnvironment = $environment
         if ($NpmLinkShimGates -ccontains $gate.Id) {
@@ -1494,8 +1513,14 @@ try {
             $npmPackage = Get-Content -LiteralPath (Join-Path $layout.NodeDir 'node_modules\npm\package.json') -Raw | ConvertFrom-Json
             if ([string]$npmPackage.version -cne $NpmVersion) { throw 'npm_version' }
             $shimSource = Join-Path $PSScriptRoot $NpmLinkShimFile
-            if ((Get-FileSha256 $shimSource) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }
-            Copy-Item -LiteralPath $shimSource -Destination $layout.NpmLinkShim
+            $shimRaw = [IO.File]::ReadAllBytes($shimSource)
+            $shimText = [Text.Encoding]::Latin1.GetString($shimRaw)
+            if ($shimRaw.Length -lt 1 -or $shimText -cmatch '[^\x00-\x7F]') { throw 'npm_link_shim' }
+            $shimText = $shimText.Replace("`r`n", "`n")
+            if ($shimText.Contains("`r")) { throw 'npm_link_shim' }
+            $shimBytes = [Text.Encoding]::ASCII.GetBytes($shimText)
+            if ([Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($shimBytes)).ToLowerInvariant() -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }
+            [System.IO.File]::WriteAllBytes($layout.NpmLinkShim, $shimBytes)
             [IO.File]::SetAttributes($layout.NpmLinkShim, [IO.FileAttributes]::ReadOnly)
             if ((Get-FileSha256 $layout.NpmLinkShim) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }
 

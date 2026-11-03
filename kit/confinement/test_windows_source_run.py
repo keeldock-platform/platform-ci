@@ -1005,14 +1005,51 @@ class WindowsSourceRunTests(unittest.TestCase):
         stage = (
             "            if ([string]$npmPackage.version -cne $NpmVersion) { throw 'npm_version' }\n"
             "            $shimSource = Join-Path $PSScriptRoot $NpmLinkShimFile\n"
-            "            if ((Get-FileSha256 $shimSource) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }\n"
-            "            Copy-Item -LiteralPath $shimSource -Destination $layout.NpmLinkShim\n"
+            "            $shimRaw = [IO.File]::ReadAllBytes($shimSource)\n"
+            "            $shimText = [Text.Encoding]::Latin1.GetString($shimRaw)\n"
+            "            if ($shimRaw.Length -lt 1 -or $shimText -cmatch '[^\\x00-\\x7F]') { throw 'npm_link_shim' }\n"
+            "            $shimText = $shimText.Replace(\"`r`n\", \"`n\")\n"
+            "            if ($shimText.Contains(\"`r\")) { throw 'npm_link_shim' }\n"
+            "            $shimBytes = [Text.Encoding]::ASCII.GetBytes($shimText)\n"
+            "            if ([Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($shimBytes)).ToLowerInvariant() -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }\n"
+            "            [System.IO.File]::WriteAllBytes($layout.NpmLinkShim, $shimBytes)\n"
             "            [IO.File]::SetAttributes($layout.NpmLinkShim, [IO.FileAttributes]::ReadOnly)\n"
             "            if ((Get-FileSha256 $layout.NpmLinkShim) -cne $NpmLinkShimSha256) { throw 'npm_link_shim' }\n"
             "\n            $phase = 'stage_msvc'\n"
         )
         self.assertEqual(self.runner.count(stage), 1)
         self.assertLess(self.runner.index(stage), self.runner.index("$phase = 'gates'\n"))
+        self.assertNotIn("Copy-Item -LiteralPath $shimSource", self.runner)
+        self.assertEqual(self.runner.count("$NpmLinkShimFile"), 2)
+        shim_bytes = SHIM.read_bytes()
+        self.assertNotIn(b"\r", shim_bytes)
+        self.assertEqual(shim_bytes.decode("ascii").encode("ascii"), shim_bytes)
+        crlf = shim_bytes.replace(b"\n", b"\r\n")
+        self.assertEqual(crlf.decode("ascii").replace("\r\n", "\n").encode("ascii"), shim_bytes)
+
+    def test_npm_config_files_are_swept_and_rewritten_immediately_before_the_stepped_npm_gate(self):
+        body = self.function_body("Reset-NpmConfigFiles")
+        order = (
+            "    foreach ($entry in @(Get-SourceWalk $project '.npmrc' $false)) {\n        [IO.File]::Delete($entry.Substring(2))\n    }\n",
+            "    if (@(Get-SourceWalk $project '.npmrc' $false).Count -ne 0) { throw 'npm_config' }\n",
+            "    foreach ($name in @('empty-user.npmrc', 'empty-global.npmrc')) {\n",
+            "        $path = Join-Path $script:Lpac.Root $name\n",
+            "if (([int]$info.Attributes -band ([int][IO.FileAttributes]::ReparsePoint -bor [int][IO.FileAttributes]::Directory)) -ne 0) { throw 'npm_config' }\n            [IO.File]::Delete($path)\n",
+            "        [IO.File]::WriteAllText($path, '', (New-Object System.Text.UTF8Encoding($false)))\n",
+            "if (([int]$written.Attributes -band [int][IO.FileAttributes]::ReparsePoint) -ne 0 -or $written.Length -ne 0) { throw 'npm_config' }",
+        )
+        positions = [body.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(body.count("throw 'npm_config'"), 3)
+        self.assertNotIn("Write-Line", body)
+        self.assertNotIn("RunMode", body)
+        self.assertIn("foreach ($npmConfigName in @('empty-user.npmrc', 'empty-global.npmrc')) { [IO.File]::WriteAllText((Join-Path $script:Lpac.Root $npmConfigName), '', $encoding) }", self.runner)
+        gates = self.function_body("Invoke-SourceGates")
+        call = "        if ($gate.Id -ceq $NpmSteppedGate) { Reset-NpmConfigFiles $project }\n        $argv = [string[]]$gate.Argv\n"
+        self.assertEqual(gates.count(call), 1)
+        self.assertLess(gates.index(call), gates.index("$run = $sandbox.Run($true, $exe, $commandLine, $project, $gateEnvironment"))
+        self.assertEqual(self.runner.count("Reset-NpmConfigFiles"), 2)
+        self.assertLess(self.runner.index("Remove-SourceConfigFiles $project\n"), self.runner.index("$gateOutcome = Invoke-SourceGates"))
 
     def test_the_npm_link_map_is_written_read_only_from_the_verified_plan_and_announced_without_paths(self):
         body = self.function_body("Initialize-NpmLinkShim")
