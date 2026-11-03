@@ -546,7 +546,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         ) as duplicate:
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
                 linux_source_build.validate_dispatch(env, "token")
-            binding.assert_called_once_with(env)
+            binding.assert_called_once_with(env, prefix="LINUX_SOURCE")
             duplicate.assert_not_called()
 
     def test_protected_source_binding_refuses_one_changed_fingerprint(self):
@@ -3206,7 +3206,7 @@ class WindowsSourceBindingTests(unittest.TestCase):
         self.assertEqual(
             commands,
             gate_table.render(
-                gate_table.gate_templates(False), "/work", "/rust/bin/cargo", "/node/bin/node", "/node/bin/npm",
+                gate_table.gate_templates(False), "/work", "/rust/bin/cargo", "/node/node", "/node/npm",
             ),
         )
         by_name = dict(commands)

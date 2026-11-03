@@ -69,6 +69,7 @@ runs:
         CI_POOL: ${{ inputs.pool }}
         PYTHONDONTWRITEBYTECODE: "1"
       run: |
+        set +e
         set -uo pipefail
         suite_failed=0
         trap 'suite_failed=1' ERR

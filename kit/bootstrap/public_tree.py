@@ -265,7 +265,7 @@ ALLOWED_FILES = {
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
     '.github/workflows/linux-source-admission.yml': '488b731331465e849a557c615deb37cf85f495ac691ad6cd395cbe5dd80f1940',
-    'kit/bootstrap/action.yml': '8804a6114740f0436eb419cb154c4175460b04cb410e16569b2a9c0950d8fcaa',
+    'kit/bootstrap/action.yml': 'e36cee801fc1bc7e94bbc0df423a7c86c76bb5db179b5cdff0f17be5f43b39b7',
     'kit/confinement/release_tool_ledger.py': 'e9a4f50f806fad3d5ae7c7323adfc3024eaaa1f564a8725e9ef7281fa01c6657',
     'kit/confinement/release_tool_ledger.json': '2c0004d1e83780d780c501b794a15e6c6928f8aa352dcfab46fe389fe871dc0b',
     'kit/confinement/test_release_tool_ledger.py': '20ef9cfb0f4a64c73e34443c3d726be599c34ac6145df875d1abe8a427de8a4e',
@@ -304,7 +304,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/macos_core_contract.py': '9a1dbe58ff0e11ff7c25551fe549637cf605b1c5f5f8bff3b18989d17dd9bdf3',
     'kit/confinement/test_macos_core_contract.py': 'af59c039f8cb0c296cac1f56e1a4221771ec806b96bd28f43f4ffc5a83472f02',
     'kit/confinement/linux_source_build.py': 'c336b61a9ac23571e97b19fdaa852d07809f9fe3629427ca67c2da8888681c88',
-    'kit/confinement/test_linux_source_build.py': '5514bcea8a5468d4ea72dd5a4680c7c7b2f09b41df1ae22b68d945974d562467',
+    'kit/confinement/test_linux_source_build.py': 'f39288ecd15b794e3def25e4411f5b0e50fac8f1afe92982b99f3deb6a760a29',
     '.github/workflows/core-linux-quick-return.yml': '3f6e90950f263a94e673d8b29a5b5f3352c9a00e79accce53b001528451d1795',
     'core-ci/linux_quick_return.py': '6322fa0a98dae99054e20f2f73dc11ad8c48922b5e5c747f7163108626668923',
     'core-ci/test_linux_quick_return.py': '9060cee407ca43f36787e26fd5459727e905b6fc8463114842d93719ad04df71',
