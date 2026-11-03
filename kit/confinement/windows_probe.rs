@@ -46,6 +46,8 @@ extern "system" {
     fn CreateDirectoryW(path: *const u16, security: *mut u8) -> i32;
     fn RemoveDirectoryW(path: *const u16) -> i32;
     fn DeviceIoControl(handle: isize, code: u32, input: *mut u8, input_size: u32, output: *mut u8, output_size: u32, returned: *mut u32, overlapped: *mut u8) -> i32;
+    fn GetFileInformationByHandleEx(handle: isize, class: u32, buffer: *mut u8, size: u32) -> i32;
+    fn GetProcessMitigationPolicy(process: isize, policy: u32, buffer: *mut u8, length: usize) -> i32;
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -953,6 +955,108 @@ fn probe_tokenpriv() -> String {
     }
 }
 
+fn open_reparse(name: &[u16], access: u32) -> Result<isize, u32> {
+    let handle = unsafe { CreateFileW(name.as_ptr(), access, 7, ptr::null_mut(), 3, 0x0220_0000, 0) };
+    if handle == -1 {
+        Err(last_error())
+    } else {
+        Ok(handle)
+    }
+}
+
+fn basic_state(opened: &Result<isize, u32>) -> String {
+    let handle = match opened {
+        Ok(value) => *value,
+        Err(_) => return String::from("na"),
+    };
+    let mut buffer = vec![0u8; 40];
+    let done = unsafe { GetFileInformationByHandleEx(handle, 0, buffer.as_mut_ptr(), buffer.len() as u32) };
+    if done == 0 {
+        return format!("err{}", last_error());
+    }
+    if u32::from_le_bytes([buffer[32], buffer[33], buffer[34], buffer[35]]) & 0x0410 == 0x0410 {
+        String::from("ok")
+    } else {
+        String::from("shape")
+    }
+}
+
+fn reparse_state(opened: &Result<isize, u32>) -> String {
+    let handle = match opened {
+        Ok(value) => *value,
+        Err(_) => return String::from("na"),
+    };
+    let mut output = vec![0u8; 16384];
+    let mut returned: u32 = 0;
+    let got = unsafe { DeviceIoControl(handle, 0x0009_00A8, ptr::null_mut(), 0, output.as_mut_ptr(), output.len() as u32, &mut returned, ptr::null_mut()) };
+    if got == 0 {
+        format!("err{}", last_error())
+    } else if returned >= 4 && output[..4] == 0xA000_0003u32.to_le_bytes() {
+        String::from("ok")
+    } else {
+        String::from("err13")
+    }
+}
+
+fn redirection_trust() -> String {
+    let mut flags = [0u8; 4];
+    let done = unsafe { GetProcessMitigationPolicy(GetCurrentProcess(), 16, flags.as_mut_ptr(), 4) };
+    if done == 0 {
+        format!("err{}", last_error())
+    } else {
+        format!("{}", u32::from_le_bytes(flags) & 3)
+    }
+}
+
+fn probe_reparse(link: &str) -> String {
+    if let Err(reason) = plain_path(link) {
+        return format!("open0=usage_{} cause=usage", reason);
+    }
+    let name = wide(link);
+    let trust = redirection_trust();
+    let zero = open_reparse(&name, 0);
+    let attributes = open_reparse(&name, 0x0010_0080);
+    let control = open_reparse(&name, 0x0002_0000);
+    let follow = open_directory(link, 0x0010_0080);
+    let basic0 = basic_state(&zero);
+    let basicra = basic_state(&attributes);
+    let get0 = reparse_state(&zero);
+    let getra = reparse_state(&attributes);
+    for item in [&zero, &attributes, &control, &follow] {
+        if let Ok(handle) = item {
+            unsafe {
+                CloseHandle(*handle);
+            }
+        }
+    }
+    let cause = if zero.is_err() {
+        "open_policy"
+    } else if attributes.is_err() {
+        "acl"
+    } else if basicra != "ok" {
+        "query"
+    } else if get0 != "ok" && getra != "ok" {
+        "fsctl_policy"
+    } else if get0 != "ok" {
+        "fsctl_zero"
+    } else {
+        "none"
+    };
+    format!(
+        "open0={} openra={} openrc={} follow={} basic0={} basicra={} get0={} getra={} trust={} cause={}",
+        handle_state(&zero),
+        handle_state(&attributes),
+        handle_state(&control),
+        handle_state(&follow),
+        basic0,
+        basicra,
+        get0,
+        getra,
+        trust,
+        cause
+    )
+}
+
 fn vtable_entry(object: *mut u8, index: usize) -> usize {
     unsafe {
         let table = *(object as *const *const usize);
@@ -1132,6 +1236,7 @@ fn main() {
         "hardlink" => probe_hardlink(first, second),
         "finalpath" => probe_finalpath(first, second),
         "junction" => probe_junction(first, second, third),
+        "reparse" => probe_reparse(first),
         "mountmgr" => probe_mountmgr(first),
         "objdac" => probe_objdac(first, second),
         "tokenraise" => probe_tokenraise(),

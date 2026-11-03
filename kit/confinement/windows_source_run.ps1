@@ -48,6 +48,7 @@ $script:FinalPathText = ''
 $script:VolumeBoundary = 'denied'
 $script:NpmLinks = @()
 $script:NpmLockDigest = ''
+$script:NpmLinkLeases = @()
 
 $NpmVersion = '11.19.1'
 $GateTableScript = 'gate_table.py'
@@ -75,6 +76,7 @@ $GateTablePlatform = 'windows'
 $NpmSteppedGate = 'node_dependency_prepare'
 $MaxNpmLinks = 64
 $MaxLockBytes = 33554432
+$NpmLinkLeaseMask = 1179784
 $MountManagerRungs = @('device', 'volume', 'drive_link', 'mpm_link', 'global_dir')
 $MountManagerKinds = @{ device = 'mountmgr'; volume = 'volume'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
 $MountManagerSourceRungs = 2
@@ -991,6 +993,118 @@ function Invoke-NpmLinkTargetProbe($sandbox, [string]$project, [string]$node, [s
     }
 }
 
+function Invoke-NpmReparseProbe($sandbox, [string]$project, [string]$stage) {
+    if ($script:RunMode -cne 'synthetic') { return }
+    try {
+        $relative = ([string]@($script:NpmLinks)[0].Link).Replace('/', '\')
+        $link = Join-Path $project $relative
+        $run = Invoke-ConfinedProbe $sandbox ('reparse ' + $link) $MountManagerProbeSeconds
+        Write-ProbeDiag ('npm_reparse_' + $stage) $run
+    } catch {
+        return
+    }
+}
+
+function Get-AclHex($acl) {
+    $bytes = New-Object byte[] $acl.BinaryLength
+    $acl.GetBinaryForm($bytes, 0)
+    return [Convert]::ToHexString($bytes)
+}
+
+function Read-NpmLinkAcl([string]$project, [string]$link, [string]$target) {
+    $bytes = [byte[]][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadLinkDacl($project, $link, $target)
+    $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($bytes, 0)
+    if ($null -eq $descriptor.DiscretionaryAcl) { throw 'npm_link_lease' }
+    return , $descriptor.DiscretionaryAcl
+}
+
+function Get-NpmLinkPrior($acl) {
+    $prior = 'none'
+    foreach ($entry in $acl) {
+        if ($entry -isnot [System.Security.AccessControl.CommonAce] -or $entry.AceQualifier -ne [System.Security.AccessControl.AceQualifier]::AccessAllowed) { continue }
+        if ($entry.SecurityIdentifier.Value -cne $script:Sid -or ([int]$entry.AceFlags -band 8) -ne 0 -or ($entry.AccessMask -band 128) -eq 0) { continue }
+        if (([int]$entry.AceFlags -band 16) -ne 0) { $prior = 'inherited' } elseif ($prior -cne 'inherited') { $prior = 'explicit' }
+    }
+    return $prior
+}
+
+function Test-NpmLinkLease([string]$project, [string]$link, [string]$target, [byte[]]$original, [int]$index) {
+    try {
+        $current = Read-NpmLinkAcl $project $link $target
+        $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($original, 0)
+        $before = $descriptor.DiscretionaryAcl
+        if ($null -eq $before -or $current.Count -ne ($before.Count + 1)) { return 'mismatch' }
+        $entry = $current[$index]
+        if ($entry -isnot [System.Security.AccessControl.CommonAce] -or $entry.AceQualifier -ne [System.Security.AccessControl.AceQualifier]::AccessAllowed -or $entry.IsCallback) { return 'mismatch' }
+        if ([int]$entry.AceFlags -ne 0 -or $entry.AccessMask -ne $NpmLinkLeaseMask -or $entry.SecurityIdentifier.Value -cne $script:Sid) { return 'mismatch' }
+        $current.RemoveAce($index)
+        if ((Get-AclHex $current) -cne (Get-AclHex $before)) { return 'mismatch' }
+        return 'match'
+    } catch {
+        return 'mismatch'
+    }
+}
+
+function Grant-NpmLinkLeases([string]$project) {
+    $priors = @()
+    foreach ($link in @($script:NpmLinks)) {
+        try {
+            $original = [byte[]][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadLinkDacl($project, [string]$link.Link, [string]$link.Target)
+            $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($original, 0)
+            if ($null -eq $descriptor.DiscretionaryAcl) { throw 'npm_link_lease' }
+            $priors += Get-NpmLinkPrior $descriptor.DiscretionaryAcl
+            $identity = New-Object System.Security.Principal.SecurityIdentifier($script:Sid)
+            $ace = New-Object System.Security.AccessControl.CommonAce([System.Security.AccessControl.AceFlags]::None, [System.Security.AccessControl.AceQualifier]::AccessAllowed, $NpmLinkLeaseMask, $identity, $false, $null)
+            $index = 0
+            while ($index -lt $descriptor.DiscretionaryAcl.Count) {
+                $existing = $descriptor.DiscretionaryAcl[$index]
+                $explicitDeny = ($existing -is [System.Security.AccessControl.CommonAce]) -and ($existing.AceQualifier -eq [System.Security.AccessControl.AceQualifier]::AccessDenied) -and (([int]$existing.AceFlags -band 16) -eq 0)
+                if (-not $explicitDeny) { break }
+                $index += 1
+            }
+            $descriptor.DiscretionaryAcl.InsertAce($index, $ace)
+            $updated = New-Object byte[] $descriptor.BinaryLength
+            $descriptor.GetBinaryForm($updated, 0)
+            $script:NpmLinkLeases = @($script:NpmLinkLeases) + @(@{ Link = [string]$link.Link; Target = [string]$link.Target; Original = $original })
+            [KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$link.Link, [string]$link.Target, $updated)
+        } catch {
+            Write-SyntheticDiag ('windows-source-probe-line npm_link_lease ' + (Get-DiagLineText ([string]$_.Exception.Message)))
+            throw 'npm_link_lease'
+        }
+        if ((Test-NpmLinkLease $project ([string]$link.Link) ([string]$link.Target) $original $index) -cne 'match') { throw 'npm_link_lease' }
+    }
+    $prior = 'none'
+    if ($priors.Count -gt 0) { $prior = [string]$priors[0] }
+    foreach ($item in $priors) {
+        if ([string]$item -cne $prior) { $prior = 'mixed' }
+    }
+    Write-Line ('windows-source-npm-link-lease=applied count=' + @($script:NpmLinkLeases).Count + ' readback=match prior=' + $prior)
+}
+
+function Restore-NpmLinkLeases([string]$project) {
+    $state = 'not_applied'
+    $leases = @($script:NpmLinkLeases)
+    for ($leaseIndex = $leases.Count - 1; $leaseIndex -ge 0; $leaseIndex--) {
+        $lease = $leases[$leaseIndex]
+        $linkState = 'failed'
+        try {
+            if (-not [KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$lease.Link, [string]$lease.Target)) {
+                $linkState = 'gone'
+            } else {
+                [KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$lease.Link, [string]$lease.Target, [byte[]]$lease.Original)
+                $after = Read-NpmLinkAcl $project ([string]$lease.Link) ([string]$lease.Target)
+                $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor(([byte[]]$lease.Original), 0)
+                if ((Get-AclHex $after) -ceq (Get-AclHex $descriptor.DiscretionaryAcl)) { $linkState = 'verified' }
+            }
+        } catch {
+            $linkState = 'failed'
+        }
+        if ($linkState -ceq 'failed') { $state = 'failed' }
+        elseif ($state -cne 'failed') { $state = 'verified' }
+    }
+    return $state
+}
+
 function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$environment, $first) {
     if (-not (Test-GateBoundary $first) -or $first.TimedOut -or $first.ExitCode -ne 0) { return $first }
     $created = 0
@@ -1010,6 +1124,9 @@ function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$envir
     }
     Write-Line ('windows-source-npm-links=created count=' + $created + ' verified=' + $verified)
     if ($verified -ne @($script:NpmLinks).Count) { throw 'npm_link' }
+    if ($created -gt 0) { Invoke-NpmReparseProbe $sandbox $project 'before' }
+    if ($created -gt 0) { Grant-NpmLinkLeases $project }
+    if ($created -gt 0) { Invoke-NpmReparseProbe $sandbox $project 'after' }
     if ($created -gt 0) { Invoke-NpmLinkProbe $sandbox $project ([string]@($script:NpmLinks)[0].Target) }
     if ($created -gt 0) { Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $environment }
     $remaining = (Get-RemainingSeconds) - 900
@@ -1660,6 +1777,14 @@ if ($Mode -eq 'run' -and $libraryLoaded) {
     }
     if ($mountRestore -eq 'failed') { $cleanup = 'incomplete' }
 
+    $linkRestore = 'not_applied'
+    try {
+        if (@($script:NpmLinkLeases).Count -gt 0) { $linkRestore = Restore-NpmLinkLeases ([string]$script:Lpac.Project) }
+    } catch {
+        $linkRestore = 'failed'
+    }
+    if ($linkRestore -eq 'failed') { $cleanup = 'incomplete' }
+
     $processState = 'none'
     try {
         $processState = Get-JobLiveness @($box, $script:OtherBox) 10
@@ -1760,14 +1885,14 @@ if ($Mode -eq 'run' -and $libraryLoaded) {
 
     $profileText = 'deleted'
     if (@('deleted_by_api', 'removed_manually') -cnotcontains $profileState) { $profileText = $profileState }
-    $cleanupLine = 'windows-source-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' mountmgr_restore=' + $mountRestore + ' key=' + $keyCleanup + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' processes=' + $processState + ' liveness=job'
+    $cleanupLine = 'windows-source-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' mountmgr_restore=' + $mountRestore + ' key=' + $keyCleanup + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' npm_link_restore=' + $linkRestore + ' processes=' + $processState + ' liveness=job'
     if ($refusal) {
         Write-Line $refusal
         Write-Line $cleanupLine
         exit 1
     }
     Write-Line $cleanupLine
-    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or @('verified', 'not_applied') -cnotcontains $mountRestore -or $keyCleanup -ne 'destroyed' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }
+    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or @('verified', 'not_applied') -cnotcontains $mountRestore -or @('verified', 'not_applied') -cnotcontains $linkRestore -or $keyCleanup -ne 'destroyed' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }
     exit $exitCode
 }
 

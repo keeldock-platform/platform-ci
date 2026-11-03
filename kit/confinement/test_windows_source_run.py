@@ -356,13 +356,14 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(self.runner.count(call), 1)
         self.assertEqual(len(re.findall(r"Invoke-SourceProbes\b", self.runner)), 2)
         self.assertEqual(len(re.findall(r"Get-SourceProbes\b", self.runner)), 2)
-        self.assertEqual(len(re.findall(r"Write-ProbeDiag\b", self.runner)), 6)
+        self.assertEqual(len(re.findall(r"Write-ProbeDiag\b", self.runner)), 7)
         for name, call in (
             ("Invoke-SourceProbes", "Write-ProbeDiag $probe.Id $run"),
             ("Invoke-FinalPathProbe", "Write-ProbeDiag $id $run"),
             ("Test-OtherContainerFinalPath", "Write-ProbeDiag 'finalpath_other' $run"),
             ("Invoke-NpmLinkProbe", "Write-ProbeDiag 'npm_link_probe' $run"),
             ("Invoke-NpmLinkTargetProbe", "Write-ProbeDiag 'npm_link_targets' $run"),
+            ("Invoke-NpmReparseProbe", "Write-ProbeDiag ('npm_reparse_' + $stage) $run"),
         ):
             with self.subTest(caller=name):
                 self.assertEqual(self.function_body(name).count("Write-ProbeDiag"), 1)
@@ -835,6 +836,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-confinement-mountmgr-rung=device state=applied error=0 readback=match finalpath=ok",
             "windows-confinement-mountmgr-rung=global_dir state=failed error=5 readback=na finalpath=na",
             "windows-source-npm-links=created count=1 verified=1",
+            "windows-source-npm-link-lease=applied count=2 readback=match prior=inherited",
             "windows-source-npm-reify=verified hidden_lock=present",
         ):
             with self.subTest(line=line[:60]):
@@ -963,6 +965,85 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(self.runner.count(".Restore()"), 2)
 
+    def test_the_npm_link_lease_grants_read_attributes_only_on_each_junction_reads_back_and_restores_in_reverse(self):
+        self.assertIn("\n$NpmLinkLeaseMask = 1179784\n", self.runner)
+        self.assertEqual(1179784, 0x00100000 | 0x00020000 | 0x80 | 0x8)
+        self.assertEqual(1179784 & (0x2 | 0x4 | 0x10 | 0x100 | 0x40 | 0x10000 | 0x40000 | 0x80000), 0)
+        self.assertIn("\n$script:NpmLinkLeases = @()\n", self.runner)
+        grant = self.function_body("Grant-NpmLinkLeases")
+        order = (
+            "[KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadLinkDacl($project, [string]$link.Link, [string]$link.Target)",
+            "$priors += Get-NpmLinkPrior $descriptor.DiscretionaryAcl",
+            "CommonAce([System.Security.AccessControl.AceFlags]::None, [System.Security.AccessControl.AceQualifier]::AccessAllowed, $NpmLinkLeaseMask, $identity, $false, $null)",
+            "$descriptor.DiscretionaryAcl.InsertAce($index, $ace)",
+            "$script:NpmLinkLeases = @($script:NpmLinkLeases) + @(@{ Link = [string]$link.Link; Target = [string]$link.Target; Original = $original })",
+            "[KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$link.Link, [string]$link.Target, $updated)",
+            "Write-SyntheticDiag ('windows-source-probe-line npm_link_lease ' + (Get-DiagLineText ([string]$_.Exception.Message)))",
+            "if ((Test-NpmLinkLease $project ([string]$link.Link) ([string]$link.Target) $original $index) -cne 'match') { throw 'npm_link_lease' }",
+            "Write-Line ('windows-source-npm-link-lease=applied count=' + @($script:NpmLinkLeases).Count + ' readback=match prior=' + $prior)",
+        )
+        positions = [grant.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(grant.count("Write-Line"), 1)
+        self.assertEqual(grant.count("throw 'npm_link_lease'"), 3)
+        self.assertIn("(([int]$existing.AceFlags -band 16) -eq 0)", grant)
+        self.assertNotIn("RunMode", grant)
+        test = self.function_body("Test-NpmLinkLease")
+        for token in (
+            "$current = Read-NpmLinkAcl $project $link $target",
+            "if ($null -eq $before -or $current.Count -ne ($before.Count + 1)) { return 'mismatch' }",
+            "$entry.AceQualifier -ne [System.Security.AccessControl.AceQualifier]::AccessAllowed -or $entry.IsCallback) { return 'mismatch' }",
+            "if ([int]$entry.AceFlags -ne 0 -or $entry.AccessMask -ne $NpmLinkLeaseMask -or $entry.SecurityIdentifier.Value -cne $script:Sid) { return 'mismatch' }",
+            "$current.RemoveAce($index)",
+            "if ((Get-AclHex $current) -cne (Get-AclHex $before)) { return 'mismatch' }",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, test)
+        self.assertEqual(test.count("return 'match'"), 1)
+        self.assertIn("    return , $descriptor.DiscretionaryAcl", self.function_body("Read-NpmLinkAcl"))
+        prior = self.function_body("Get-NpmLinkPrior")
+        self.assertIn("([int]$entry.AceFlags -band 8) -ne 0 -or ($entry.AccessMask -band 128) -eq 0) { continue }", prior)
+        self.assertEqual(set(re.findall(r"\$prior = '([a-z]+)'", prior)), {"none", "inherited", "explicit"})
+        restore = self.function_body("Restore-NpmLinkLeases")
+        for token in (
+            "for ($leaseIndex = $leases.Count - 1; $leaseIndex -ge 0; $leaseIndex--) {",
+            "if (-not [KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$lease.Link, [string]$lease.Target)) {",
+            "[KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$lease.Link, [string]$lease.Target, [byte[]]$lease.Original)",
+            "if ((Get-AclHex $after) -ceq (Get-AclHex $descriptor.DiscretionaryAcl)) { $linkState = 'verified' }",
+            "if ($linkState -ceq 'failed') { $state = 'failed' }",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, restore)
+        tail = self.runner[self.runner.index("$nullRestore = 'not_applied'"):]
+        call = "        if (@($script:NpmLinkLeases).Count -gt 0) { $linkRestore = Restore-NpmLinkLeases ([string]$script:Lpac.Project) }\n"
+        self.assertIn(call, tail)
+        self.assertIn("    if ($linkRestore -eq 'failed') { $cleanup = 'incomplete' }\n", tail)
+        order = ("$leases[$leaseIndex].Restore()", call, "Get-JobLiveness", "Remove-WithinRoots $baseDirectory",
+                 "' links=' + $linksState + ' npm_link_restore=' + $linkRestore + ' processes=' + $processState")
+        positions = [tail.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("-or @('verified', 'not_applied') -cnotcontains $linkRestore -or", tail)
+        self.assertEqual(self.runner.count("Restore-NpmLinkLeases"), 2)
+        self.assertEqual(self.runner.count("Grant-NpmLinkLeases"), 2)
+
+    def test_the_reparse_probe_runs_confined_on_the_first_junction_before_and_after_the_lease(self):
+        probe = self.function_body("Invoke-NpmReparseProbe")
+        self.assertTrue(probe.split("\n", 1)[1].startswith("    if ($script:RunMode -cne 'synthetic') { return }\n"))
+        self.assertIn("$relative = ([string]@($script:NpmLinks)[0].Link).Replace('/', '\\')", probe)
+        self.assertIn("$run = Invoke-ConfinedProbe $sandbox ('reparse ' + $link) $MountManagerProbeSeconds", probe)
+        self.assertNotIn("Write-Line", probe)
+        self.assertEqual(self.runner.count("Invoke-NpmReparseProbe $sandbox $project '"), 2)
+        diag = re.compile(re.search(r"DiagLinePattern = '([^']+)'", self.runner).group(1))
+        for line in (
+            "windows-source-probe id=npm_reparse_before exit=0x00000000",
+            "windows-source-probe id=npm_reparse_after exit=0x00000000",
+            "windows-source-probe-line kd-probe reparse open0=ok openra=ok openrc=ok follow=ok basic0=ok basicra=ok get0=ok getra=ok trust=0 cause=none",
+            "windows-source-probe-line kd-probe reparse open0=err5 openra=err5 openrc=err5 follow=ok basic0=na basicra=na get0=na getra=na trust=1 cause=open_policy",
+            "windows-source-probe-line npm_link_lease npm_link_lease step=open error=5",
+        ):
+            with self.subTest(line=line[:60]):
+                self.assertIsNotNone(diag.fullmatch(line))
+
     def test_the_gate_plan_requires_exactly_the_windows_stepped_npm_gate(self):
         plan = self.function_body("Get-GatePlan")
         for token in (
@@ -994,6 +1075,9 @@ class WindowsSourceRunTests(unittest.TestCase):
             "if ([KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$link.Link, [string]$link.Target)) { $verified += 1 }",
             "Write-Line ('windows-source-npm-links=created count=' + $created + ' verified=' + $verified)",
             "if ($verified -ne @($script:NpmLinks).Count) { throw 'npm_link' }",
+            "    if ($created -gt 0) { Invoke-NpmReparseProbe $sandbox $project 'before' }\n",
+            "    if ($created -gt 0) { Grant-NpmLinkLeases $project }\n",
+            "    if ($created -gt 0) { Invoke-NpmReparseProbe $sandbox $project 'after' }\n",
             "Invoke-NpmLinkProbe $sandbox $project",
             "if ($remaining -lt 60) { throw 'deadline' }",
             "$second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $environment, ($seconds * 1000), [uint32]32)",

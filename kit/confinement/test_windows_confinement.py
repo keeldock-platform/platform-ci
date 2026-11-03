@@ -88,6 +88,7 @@ PROBE_COMMANDS = (
     "hardlink",
     "finalpath",
     "junction",
+    "reparse",
     "mountmgr",
     "objdac",
     "tokenraise",
@@ -1489,11 +1490,88 @@ foreach ($case in $cases) {
         positions = [create.index(item) for item in order]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("foreach (IntPtr item in held)", create)
-        self.assertEqual(maker.count("FlagBackupSemantics | FlagOpenReparsePoint"), 4)
-        self.assertEqual(maker.count("ShareRead | ShareWrite, IntPtr.Zero, OpenExisting"), 3)
+        self.assertEqual(maker.count("FlagBackupSemantics | FlagOpenReparsePoint"), 5)
+        self.assertEqual(maker.count("ShareRead | ShareWrite, IntPtr.Zero, OpenExisting"), 4)
         for forbidden in ("CreateSymbolicLink", "DeleteFileW", "RemoveDirectoryW", "ShareDelete", "File.Delete", "Directory.Delete", "Process.Start", "MoveFile"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, maker)
+
+    def test_junction_dacl_io_opens_the_verified_junction_itself_and_never_its_target(self):
+        maker = self.native[self.native.index("public static class JunctionMaker"):]
+        for required in (
+            "private const uint ReadControl = 0x00020000;",
+            "private const uint WriteDac = 0x00040000;",
+            "private const uint DaclSecurityInformation = 0x00000004;",
+            "private const int MaxDescriptorBytes = 65536;",
+            "internal static extern bool GetKernelObjectSecurity(IntPtr handle, uint information, byte[] descriptor, uint length, out uint needed);",
+            "internal static extern bool SetKernelObjectSecurity(IntPtr handle, uint information, byte[] descriptor);",
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, maker)
+        opened = maker[maker.index("private static IntPtr OpenLink("):maker.index("public static byte[] ReadNoFollow(")]
+        order = (
+            "held.Add(OpenVerified(root, false));",
+            "held.Add(OpenVerified(Join(root, linkParts, index), false));",
+            'Native.CreateFileW("\\\\\\\\?\\\\" + link, access | FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero)',
+            "ReadInformation(handle, out attributes, out links, out size);",
+            '(attributes & AttributeDirectory) == 0 || (attributes & AttributeReparsePoint) == 0 || !ReadsBack(handle, "\\\\??\\\\" + target)',
+            "return handle;",
+        )
+        positions = [opened.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("OpenVerified(Join(root, linkParts, index), true)", opened)
+        read = maker[maker.index("public static byte[] ReadLinkDacl("):maker.index("public static void WriteLinkDacl(")]
+        self.assertIn("handle = OpenLink(projectRoot, linkRelative, targetRelative, ReadControl, held);", read)
+        self.assertIn("if (first || error != 122 || needed < 20 || needed > MaxDescriptorBytes)", read)
+        self.assertEqual(read.count("Native.GetKernelObjectSecurity(handle, DaclSecurityInformation, "), 2)
+        write = maker[maker.index("public static void WriteLinkDacl("):maker.index("private static IntPtr OpenLink(")]
+        self.assertIn("handle = OpenLink(projectRoot, linkRelative, targetRelative, ReadControl | WriteDac, held);", write)
+        self.assertIn("Native.SetKernelObjectSecurity(handle, DaclSecurityInformation, descriptor)", write)
+        self.assertIn("descriptor.Length < 20 || descriptor.Length > MaxDescriptorBytes", write)
+        self.assertNotIn("SetSecurityInfo", maker)
+        self.assertNotIn("SetFileSecurity", maker)
+        self.assertNotIn("WriteOwner", maker)
+        for body in (read, write):
+            self.assertIn("foreach (IntPtr item in held)", body)
+
+    def test_reparse_probe_separates_zero_access_attribute_and_fsctl_denials_and_reports_redirection_trust(self):
+        probe = self.probe
+        self.assertIn("fn GetFileInformationByHandleEx(handle: isize, class: u32, buffer: *mut u8, size: u32) -> i32;", probe)
+        self.assertIn("fn GetProcessMitigationPolicy(process: isize, policy: u32, buffer: *mut u8, length: usize) -> i32;", probe)
+        self.assertIn('"reparse" => probe_reparse(first),', probe)
+        helpers = probe[probe.index("fn open_reparse"):probe.index("fn probe_reparse")]
+        for required in (
+            "CreateFileW(name.as_ptr(), access, 7, ptr::null_mut(), 3, 0x0220_0000, 0)",
+            "GetFileInformationByHandleEx(handle, 0, buffer.as_mut_ptr(), buffer.len() as u32)",
+            "u32::from_le_bytes([buffer[32], buffer[33], buffer[34], buffer[35]]) & 0x0410 == 0x0410",
+            "DeviceIoControl(handle, 0x0009_00A8, ptr::null_mut(), 0, output.as_mut_ptr()",
+            "GetProcessMitigationPolicy(GetCurrentProcess(), 16, flags.as_mut_ptr(), 4)",
+            'format!("{}", u32::from_le_bytes(flags) & 3)',
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, helpers)
+        self.assertNotIn("0x0009_00A4", helpers)
+        self.assertNotIn("0x0009_00AC", helpers)
+        body = probe[probe.index("fn probe_reparse"):probe.index("fn vtable_entry")]
+        order = (
+            "let zero = open_reparse(&name, 0);",
+            "let attributes = open_reparse(&name, 0x0010_0080);",
+            "let control = open_reparse(&name, 0x0002_0000);",
+            "let follow = open_directory(link, 0x0010_0080);",
+            "let get0 = reparse_state(&zero);",
+            "let getra = reparse_state(&attributes);",
+            "CloseHandle(*handle);",
+        )
+        positions = [body.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('return format!("open0=usage_{} cause=usage", reason);', body)
+        self.assertEqual(
+            re.findall(r'"([a-z_]+)"\n    \} else', body) + re.findall(r'\} else \{\n        "([a-z_]+)"\n    \};', body),
+            ["open_policy", "acl", "query", "fsctl_policy", "fsctl_zero", "none"])
+        self.assertIn('"open0={} openra={} openrc={} follow={} basic0={} basicra={} get0={} getra={} trust={} cause={}",', body)
+        for forbidden in ("CreateDirectoryW", "RemoveDirectoryW", "0x4000_0000", "0x0004_0000", "display()", "{:?}"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, body + helpers)
 
     def test_finalpath_junction_and_object_probes_print_only_fixed_tokens(self):
         probe = self.probe
