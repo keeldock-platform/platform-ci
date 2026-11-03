@@ -1166,10 +1166,11 @@ class NpmInertBundledTests(unittest.TestCase):
             "string": {"optional": "true"},
         }.items():
             children = {name: dict({"version": "1.2.3", "inBundle": True}, **flags) for name in self.BUNDLED}
+            token = "entry_bool:" if label == "string" else "entry_inbundle:"
             with self.subTest(case=label):
                 self.assertTrue(
                     self.child_refusal(self.child_lock(children=children)).startswith(
-                        "entry_inbundle:" + self.PATH + "/node_modules/"),
+                        token + self.PATH + "/node_modules/"),
                 )
         one_unmarked = {name: {"version": "1.2.3", "inBundle": True, "optional": True} for name in self.BUNDLED}
         del one_unmarked[self.BUNDLED[-1]]["optional"]

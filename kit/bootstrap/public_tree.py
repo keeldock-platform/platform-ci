@@ -265,7 +265,7 @@ ALLOWED_FILES = {
 MAX_FILE_BYTES = 262144
 PINNED_FILE_SHA256 = {
     '.github/workflows/linux-source-admission.yml': '488b731331465e849a557c615deb37cf85f495ac691ad6cd395cbe5dd80f1940',
-    'kit/bootstrap/action.yml': '6f74d40c68445852183a539bd2dc8f43e93809d3e22e1c4188ad4efe896041e3',
+    'kit/bootstrap/action.yml': '8804a6114740f0436eb419cb154c4175460b04cb410e16569b2a9c0950d8fcaa',
     'kit/confinement/release_tool_ledger.py': 'e9a4f50f806fad3d5ae7c7323adfc3024eaaa1f564a8725e9ef7281fa01c6657',
     'kit/confinement/release_tool_ledger.json': '2c0004d1e83780d780c501b794a15e6c6928f8aa352dcfab46fe389fe871dc0b',
     'kit/confinement/test_release_tool_ledger.py': '20ef9cfb0f4a64c73e34443c3d726be599c34ac6145df875d1abe8a427de8a4e',
