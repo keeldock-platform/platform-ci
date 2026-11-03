@@ -60,7 +60,7 @@ $DiagStdoutLines = 20
 $DiagLineLimit = 300
 $ProbeSeconds = 60
 $ProbeCargoCheckSeconds = 180
-$NodeRealpathScript = "const f=require('fs');f.realpathSync.native('.');f.promises.realpath('.').then(()=>process.stdout.write('realpath=ok'),(e)=>{process.stdout.write('realpath='+e.code);process.exitCode=1})"
+$NodeRealpathScript = "f=require('fs');f.realpathSync.native('.');f.promises.realpath('.').then(()=>process.stdout.write('realpath=ok'),(e)=>{process.stdout.write('realpath='+e.code);process.exitCode=1})"
 $ProbeStderrLines = 20
 $ProbeStdoutLines = 10
 $GateLongPattern = '(^|_)(clippy|tests|replay|prepare|typecheck)$'
@@ -330,7 +330,7 @@ function Test-OtherContainerFinalPath {
     Write-ProbeDiag 'finalpath_other' $run
     if (-not (Test-ChannelRunValid $run $true)) { return 'unknown' }
     $text = Get-ProbeText ([string]$run.Stdout) 'finalpath'
-    $device = Get-ProbeValue $text 'mpm'
+    $device = Get-ProbeValue $text 'mpmr'
     $name = Get-ProbeValue $text 'n_dos'
     if ($device -cnotmatch '^(ok|err[0-9]{1,10})$' -or $name -cnotmatch '^(ok|na|err[0-9]{1,10})$') { return 'unknown' }
     if ($device -ceq 'ok' -or $name -ceq 'ok') { return 'granted' }
