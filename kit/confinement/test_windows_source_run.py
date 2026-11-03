@@ -979,7 +979,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "$script:NpmLinkLeases = @($script:NpmLinkLeases) + @(@{ Link = [string]$link.Link; Target = [string]$link.Target; Original = $original })",
             "[KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$link.Link, [string]$link.Target, $updated)",
             "Write-SyntheticDiag ('windows-source-probe-line npm_link_lease ' + (Get-DiagLineText ([string]$_.Exception.Message)))",
-            "if ((Test-NpmLinkLease $project ([string]$link.Link) ([string]$link.Target) $original $index) -cne 'match') { throw 'npm_link_lease' }",
+            "$readback = Test-NpmLinkLease $project ([string]$link.Link) ([string]$link.Target) $original $index\n        if ($readback -cne 'match') {\n            Write-SyntheticDiag ('windows-source-probe-line npm_link_lease readback=' + $readback)\n            throw 'npm_link_lease'\n        }",
             "Write-Line ('windows-source-npm-link-lease=applied count=' + @($script:NpmLinkLeases).Count + ' readback=match prior=' + $prior)",
         )
         positions = [grant.index(item) for item in order]
@@ -990,8 +990,8 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertNotIn("RunMode", grant)
         test = self.function_body("Test-NpmLinkLease")
         for token in (
-            "$current = Read-NpmLinkAcl $project $link $target",
-            "if ($null -eq $before -or $current.Count -ne ($before.Count + 1)) { return 'mismatch' }",
+            "$read = Read-NpmLinkAcl $project $link $target\n        $current = $read.DiscretionaryAcl",
+            "if ($null -eq $before -or $current.Count -ne ($before.Count + 1)) { return 'mismatch' }\n        if ($read.ControlFlags -ne $descriptor.ControlFlags) { return 'control_mismatch' }",
             "$entry.AceQualifier -ne [System.Security.AccessControl.AceQualifier]::AccessAllowed -or $entry.IsCallback) { return 'mismatch' }",
             "if ([int]$entry.AceFlags -ne 0 -or $entry.AccessMask -ne $NpmLinkLeaseMask -or $entry.SecurityIdentifier.Value -cne $script:Sid) { return 'mismatch' }",
             "$current.RemoveAce($index)",
@@ -1000,7 +1000,9 @@ class WindowsSourceRunTests(unittest.TestCase):
             with self.subTest(token=token[:60]):
                 self.assertIn(token, test)
         self.assertEqual(test.count("return 'match'"), 1)
-        self.assertIn("    return , $descriptor.DiscretionaryAcl", self.function_body("Read-NpmLinkAcl"))
+        self.assertTrue(self.function_body("Read-NpmLinkAcl").endswith("\n    return , $descriptor"))
+        self.assertEqual(set(re.findall(r"return '([a-z_]+)'", test)), {"match", "mismatch", "control_mismatch"})
+        self.assertLess(test.index("return 'control_mismatch'"), test.index("$current.RemoveAce($index)"))
         prior = self.function_body("Get-NpmLinkPrior")
         self.assertIn("([int]$entry.AceFlags -band 8) -ne 0 -or ($entry.AccessMask -band 128) -eq 0) { continue }", prior)
         self.assertEqual(set(re.findall(r"\$prior = '([a-z]+)'", prior)), {"none", "inherited", "explicit"})
@@ -1009,11 +1011,17 @@ class WindowsSourceRunTests(unittest.TestCase):
             "for ($leaseIndex = $leases.Count - 1; $leaseIndex -ge 0; $leaseIndex--) {",
             "if (-not [KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$lease.Link, [string]$lease.Target)) {",
             "[KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$lease.Link, [string]$lease.Target, [byte[]]$lease.Original)",
-            "if ((Get-AclHex $after) -ceq (Get-AclHex $descriptor.DiscretionaryAcl)) { $linkState = 'verified' }",
+            "$openError = [KeelDock.Platform.WindowsConfinement.JunctionMaker]::OpenNoFollowError($project, [string]$lease.Link)\n                if ($openError -eq 2 -or $openError -eq 3) { $linkState = 'gone' }\n            } else {",
+            "if ((Get-AclHex $after.DiscretionaryAcl) -ceq (Get-AclHex $descriptor.DiscretionaryAcl) -and $after.ControlFlags -eq $descriptor.ControlFlags) { $linkState = 'verified' }",
             "if ($linkState -ceq 'failed') { $state = 'failed' }",
         ):
             with self.subTest(token=token[:60]):
                 self.assertIn(token, restore)
+        self.assertEqual(restore.count("$linkState = 'gone'"), 1)
+        self.assertEqual(restore.count("$linkState = 'verified'"), 1)
+        self.assertEqual(restore.count("$linkState = 'failed'"), 2)
+        self.assertLess(restore.index("        $linkState = 'failed'\n        try {"), restore.index("OpenNoFollowError("))
+        self.assertNotIn("elseif ($linkState", restore)
         tail = self.runner[self.runner.index("$nullRestore = 'not_applied'"):]
         call = "        if (@($script:NpmLinkLeases).Count -gt 0) { $linkRestore = Restore-NpmLinkLeases ([string]$script:Lpac.Project) }\n"
         self.assertIn(call, tail)
@@ -1040,6 +1048,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-source-probe-line kd-probe reparse open0=ok openra=ok openrc=ok follow=ok basic0=ok basicra=ok get0=ok getra=ok trust=0 cause=none",
             "windows-source-probe-line kd-probe reparse open0=err5 openra=err5 openrc=err5 follow=ok basic0=na basicra=na get0=na getra=na trust=1 cause=open_policy",
             "windows-source-probe-line npm_link_lease npm_link_lease step=open error=5",
+            "windows-source-probe-line npm_link_lease readback=control_mismatch",
         ):
             with self.subTest(line=line[:60]):
                 self.assertIsNotNone(diag.fullmatch(line))

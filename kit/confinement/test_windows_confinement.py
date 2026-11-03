@@ -1490,8 +1490,8 @@ foreach ($case in $cases) {
         positions = [create.index(item) for item in order]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("foreach (IntPtr item in held)", create)
-        self.assertEqual(maker.count("FlagBackupSemantics | FlagOpenReparsePoint"), 5)
-        self.assertEqual(maker.count("ShareRead | ShareWrite, IntPtr.Zero, OpenExisting"), 4)
+        self.assertEqual(maker.count("FlagBackupSemantics | FlagOpenReparsePoint"), 6)
+        self.assertEqual(maker.count("ShareRead | ShareWrite, IntPtr.Zero, OpenExisting"), 5)
         for forbidden in ("CreateSymbolicLink", "DeleteFileW", "RemoveDirectoryW", "ShareDelete", "File.Delete", "Directory.Delete", "Process.Start", "MoveFile"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, maker)
@@ -1524,7 +1524,7 @@ foreach ($case in $cases) {
         self.assertIn("handle = OpenLink(projectRoot, linkRelative, targetRelative, ReadControl, held);", read)
         self.assertIn("if (first || error != 122 || needed < 20 || needed > MaxDescriptorBytes)", read)
         self.assertEqual(read.count("Native.GetKernelObjectSecurity(handle, DaclSecurityInformation, "), 2)
-        write = maker[maker.index("public static void WriteLinkDacl("):maker.index("private static IntPtr OpenLink(")]
+        write = maker[maker.index("public static void WriteLinkDacl("):maker.index("public static int OpenNoFollowError(")]
         self.assertIn("handle = OpenLink(projectRoot, linkRelative, targetRelative, ReadControl | WriteDac, held);", write)
         self.assertIn("Native.SetKernelObjectSecurity(handle, DaclSecurityInformation, descriptor)", write)
         self.assertIn("descriptor.Length < 20 || descriptor.Length > MaxDescriptorBytes", write)
@@ -1533,6 +1533,21 @@ foreach ($case in $cases) {
         self.assertNotIn("WriteOwner", maker)
         for body in (read, write):
             self.assertIn("foreach (IntPtr item in held)", body)
+        probe = maker[maker.index("public static int OpenNoFollowError("):maker.index("private static IntPtr OpenLink(")]
+        order = (
+            "string root = Root(projectRoot);",
+            "string[] linkParts = Parts(linkRelative);",
+            "IntPtr held = OpenVerified(root, false);",
+            'Native.CreateFileW("\\\\\\\\?\\\\" + link, FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero)',
+            "return Marshal.GetLastWin32Error();",
+            "Native.CloseHandle(handle);\n                return 0;",
+            "Native.CloseHandle(held);",
+        )
+        positions = [probe.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        for forbidden in ("WriteDac", "ReadControl", "GenericWrite", "CreateDirectoryW", "SetKernelObjectSecurity"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, probe)
 
     def test_reparse_probe_separates_zero_access_attribute_and_fsctl_denials_and_reports_redirection_trust(self):
         probe = self.probe

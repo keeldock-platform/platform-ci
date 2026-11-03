@@ -2625,6 +2625,28 @@ namespace KeelDock.Platform.WindowsConfinement
             }
         }
 
+        public static int OpenNoFollowError(string projectRoot, string linkRelative)
+        {
+            string root = Root(projectRoot);
+            string[] linkParts = Parts(linkRelative);
+            string link = Join(root, linkParts, linkParts.Length);
+            IntPtr held = OpenVerified(root, false);
+            try
+            {
+                IntPtr handle = Native.CreateFileW("\\\\?\\" + link, FileReadAttributes | Synchronize, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, FlagBackupSemantics | FlagOpenReparsePoint, IntPtr.Zero);
+                if (handle == InvalidHandle || handle == IntPtr.Zero)
+                {
+                    return Marshal.GetLastWin32Error();
+                }
+                Native.CloseHandle(handle);
+                return 0;
+            }
+            finally
+            {
+                Native.CloseHandle(held);
+            }
+        }
+
         private static IntPtr OpenLink(string projectRoot, string linkRelative, string targetRelative, uint access, List<IntPtr> held)
         {
             string root = Root(projectRoot);

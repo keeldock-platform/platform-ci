@@ -1015,7 +1015,7 @@ function Read-NpmLinkAcl([string]$project, [string]$link, [string]$target) {
     $bytes = [byte[]][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadLinkDacl($project, $link, $target)
     $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($bytes, 0)
     if ($null -eq $descriptor.DiscretionaryAcl) { throw 'npm_link_lease' }
-    return , $descriptor.DiscretionaryAcl
+    return , $descriptor
 }
 
 function Get-NpmLinkPrior($acl) {
@@ -1030,10 +1030,12 @@ function Get-NpmLinkPrior($acl) {
 
 function Test-NpmLinkLease([string]$project, [string]$link, [string]$target, [byte[]]$original, [int]$index) {
     try {
-        $current = Read-NpmLinkAcl $project $link $target
+        $read = Read-NpmLinkAcl $project $link $target
+        $current = $read.DiscretionaryAcl
         $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($original, 0)
         $before = $descriptor.DiscretionaryAcl
         if ($null -eq $before -or $current.Count -ne ($before.Count + 1)) { return 'mismatch' }
+        if ($read.ControlFlags -ne $descriptor.ControlFlags) { return 'control_mismatch' }
         $entry = $current[$index]
         if ($entry -isnot [System.Security.AccessControl.CommonAce] -or $entry.AceQualifier -ne [System.Security.AccessControl.AceQualifier]::AccessAllowed -or $entry.IsCallback) { return 'mismatch' }
         if ([int]$entry.AceFlags -ne 0 -or $entry.AccessMask -ne $NpmLinkLeaseMask -or $entry.SecurityIdentifier.Value -cne $script:Sid) { return 'mismatch' }
@@ -1071,7 +1073,11 @@ function Grant-NpmLinkLeases([string]$project) {
             Write-SyntheticDiag ('windows-source-probe-line npm_link_lease ' + (Get-DiagLineText ([string]$_.Exception.Message)))
             throw 'npm_link_lease'
         }
-        if ((Test-NpmLinkLease $project ([string]$link.Link) ([string]$link.Target) $original $index) -cne 'match') { throw 'npm_link_lease' }
+        $readback = Test-NpmLinkLease $project ([string]$link.Link) ([string]$link.Target) $original $index
+        if ($readback -cne 'match') {
+            Write-SyntheticDiag ('windows-source-probe-line npm_link_lease readback=' + $readback)
+            throw 'npm_link_lease'
+        }
     }
     $prior = 'none'
     if ($priors.Count -gt 0) { $prior = [string]$priors[0] }
@@ -1089,12 +1095,13 @@ function Restore-NpmLinkLeases([string]$project) {
         $linkState = 'failed'
         try {
             if (-not [KeelDock.Platform.WindowsConfinement.JunctionMaker]::Verify($project, [string]$lease.Link, [string]$lease.Target)) {
-                $linkState = 'gone'
+                $openError = [KeelDock.Platform.WindowsConfinement.JunctionMaker]::OpenNoFollowError($project, [string]$lease.Link)
+                if ($openError -eq 2 -or $openError -eq 3) { $linkState = 'gone' }
             } else {
                 [KeelDock.Platform.WindowsConfinement.JunctionMaker]::WriteLinkDacl($project, [string]$lease.Link, [string]$lease.Target, [byte[]]$lease.Original)
                 $after = Read-NpmLinkAcl $project ([string]$lease.Link) ([string]$lease.Target)
                 $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor(([byte[]]$lease.Original), 0)
-                if ((Get-AclHex $after) -ceq (Get-AclHex $descriptor.DiscretionaryAcl)) { $linkState = 'verified' }
+                if ((Get-AclHex $after.DiscretionaryAcl) -ceq (Get-AclHex $descriptor.DiscretionaryAcl) -and $after.ControlFlags -eq $descriptor.ControlFlags) { $linkState = 'verified' }
             }
         } catch {
             $linkState = 'failed'
