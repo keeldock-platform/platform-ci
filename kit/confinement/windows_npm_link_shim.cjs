@@ -93,14 +93,32 @@ const realSymlink = fs.symlink;
 const realSymlinkSync = fs.symlinkSync;
 const realPromiseSymlink = promises.symlink;
 const realReaddirSync = fs.readdirSync;
-for (const item of [realRm, realRmSync, realPromiseRm, realSymlink, realSymlinkSync, realPromiseSymlink, realReaddirSync]) {
+const realWriteSync = fs.writeSync;
+for (const item of [realRm, realRmSync, realPromiseRm, realSymlink, realSymlinkSync, realPromiseSymlink, realReaddirSync, realWriteSync]) {
   if (typeof item !== 'function') refuse('fs_shape');
 }
 const SCOPE_DIRECTORY = /\\node_modules\\@[^\\]+$/;
+const HIT_THRESHOLDS = [100, 10000, 1000000];
+let hitTotal = 0;
+let hitLevel = 0;
+
+const countHit = () => {
+  hitTotal += 1;
+  if (hitLevel >= HIT_THRESHOLDS.length || hitTotal < HIT_THRESHOLDS[hitLevel]) return;
+  const line = 'npm_link_shim hits_over=' + HIT_THRESHOLDS[hitLevel] + '\n';
+  hitLevel += 1;
+  try {
+    realWriteSync(2, line);
+  } catch (error) {
+    return;
+  }
+};
 
 const lookup = (candidate) => {
   if (typeof candidate !== 'string' || candidate.length < 4 || candidate.length > MAX_PATH_LENGTH) return undefined;
-  return links.get(path.win32.resolve(candidate).toLowerCase());
+  const mapped = links.get(path.win32.resolve(candidate).toLowerCase());
+  if (mapped !== undefined) countHit();
+  return mapped;
 };
 
 const bigintRequested = (options) => options !== null && typeof options === 'object' && options.bigint === true;
@@ -138,7 +156,10 @@ const skipsRemoval = (candidate) => {
   if (typeof candidate !== 'string' || candidate.length < 4 || candidate.length > MAX_PATH_LENGTH) return false;
   const full = path.win32.resolve(candidate);
   const key = full.toLowerCase();
-  if (links.has(key)) return true;
+  if (links.has(key)) {
+    countHit();
+    return true;
+  }
   if (!SCOPE_DIRECTORY.test(key)) return false;
   let names;
   try {
@@ -150,6 +171,7 @@ const skipsRemoval = (candidate) => {
   for (const name of names) {
     if (typeof name !== 'string' || !links.has(key + '\\' + name.toLowerCase())) return false;
   }
+  countHit();
   return true;
 };
 
@@ -158,7 +180,9 @@ const matchesMappedTarget = (target, linkPath) => {
   if (target.length > MAX_PATH_LENGTH || linkPath.length < 4 || linkPath.length > MAX_PATH_LENGTH) return false;
   const mapped = links.get(path.win32.resolve(linkPath).toLowerCase());
   if (mapped === undefined) return false;
-  return path.win32.resolve(path.win32.dirname(linkPath), target).toLowerCase() === mapped.toLowerCase();
+  const matches = path.win32.resolve(path.win32.dirname(linkPath), target).toLowerCase() === mapped.toLowerCase();
+  if (matches) countHit();
+  return matches;
 };
 
 fs.lstat = function lstat(candidate, options, callback) {

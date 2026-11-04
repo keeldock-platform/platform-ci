@@ -79,11 +79,12 @@ $MaxNpmLinks = 64
 $GateMaxProcesses = [uint32]128
 $MaxLockBytes = 33554432
 $NpmLinkShimFile = 'windows_npm_link_shim.cjs'
-$NpmLinkShimSha256 = '188fb68bbfd2ec2f1f21bbabbfa5ad3626b1fe8d6c6a56c58edb433d36bf5d01'
+$NpmLinkShimSha256 = '9bf893336467323617878fad931158e9b97844b5c47d2ce273fef2a29ea28575'
 $NpmLinkShimGates = @('node_dependency_audit')
 $GateDetailNpmCodes = @('ENOTCACHED', 'EBADPLATFORM', 'ENOENT', 'EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY', 'EEXIST', 'ELOOP', 'ENAMETOOLONG', 'EINTEGRITY', 'EUSAGE', 'ELIFECYCLE', 'ERESOLVE', 'EJSONPARSE', 'ENOLOCK', 'ENOTSUP', 'EINVAL', 'EMFILE', 'ENOSPC', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETARGET', 'E404', 'EOVERRIDE', 'EWORKSPACEMISSING', 'ENOWORKSPACES', 'EINVALIDTAGNAME', 'EINVALIDPACKAGENAME', 'EUNKNOWNTYPE')
 $GateDetailShimReasons = @('fs_shape', 'map_count', 'map_entry', 'map_hash', 'map_json', 'map_path', 'map_shape', 'map_size', 'map_text')
 $GateDetailNodeCodes = @('ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_MODULE_NOT_FOUND', 'ERR_REQUIRE_ESM', 'ERR_INVALID_URL', 'ERR_INVALID_FILE_URL_PATH', 'ERR_UNSUPPORTED_ESM_URL_SCHEME', 'ERR_OUT_OF_RANGE', 'ERR_FS_EISDIR', 'ERR_INVALID_STATE', 'ERR_ACCESS_DENIED', 'ERR_UNKNOWN_FILE_EXTENSION', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_INVALID_PACKAGE_CONFIG', 'ERR_PACKAGE_PATH_NOT_EXPORTED')
+$GateDetailNpmPhases = @('npm:load', 'npm:load:whichnode', 'npm:load:configs', 'npm:load:mkdirpcache', 'npm:load:mkdirplogs', 'npm:load:setTitle', 'npm:load:display', 'npm:load:logFile', 'npm:load:timers', 'npm:load:configScope', 'npm-ci:rm', 'arborist:ctor', 'idealTree', 'idealTree:init', 'idealTree:userRequests', 'idealTree:buildDeps', 'idealTree:fixDepFlags', 'idealTree:inflate', 'reify', 'reify:loadTrees', 'reify:diffTrees', 'reify:retireShallow', 'reify:createSparse', 'reify:loadBundles', 'reify:loadShrinkwraps', 'reify:unpack', 'reify:unretire', 'reify:build', 'reify:trash', 'reify:save', 'reify:audit', 'reify:rollback:createSparse', 'reify:rollback:retireShallow', 'build', 'build:queue', 'build:link', 'audit')
 $MaxNpmLinkMapBytes = 65536
 $MountManagerRungs = @('device', 'volume', 'drive_link', 'mpm_link', 'global_dir')
 $MountManagerKinds = @{ device = 'mountmgr'; volume = 'volume'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
@@ -1169,6 +1170,7 @@ function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$envir
     if ($seconds -gt $remaining) { $seconds = $remaining }
     $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))
     $then = [string[]](@($then[0], '--max-old-space-size=6144') + @($then[1..($then.Count - 1)]))
+    $then = [string[]](@($then) + @('--timing'))
     $second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), $GateMaxProcesses)
     $merged = New-Object KeelDock.Platform.WindowsConfinement.RunResult
     foreach ($field in @('Failure', 'Detail', 'Created', 'CreateError', 'TimedOut', 'Exited', 'ExitCode', 'ElapsedMs', 'Token', 'Job', 'PeakProcessMemory', 'PeakJobMemory', 'CpuMs', 'HandleCount', 'Class46')) {
@@ -1315,6 +1317,8 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
     $code = 'none'
     $failedBucket = '0'
     $mem = 'unknown'
+    $phase = 'none'
+    $hits = 'lt100'
     try {
         $text = [string]$combined
         $peakText = [string]$peak
@@ -1356,6 +1360,16 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
             }
         } elseif ($tool -ceq 'npm') {
             $kind = 'npm'
+            $timings = [regex]::Matches($text, '(?m)^npm timing ([A-Za-z:-]{2,40}) Completed in [0-9]+ms')
+            if ($timings.Count -gt 0) {
+                $phase = 'other'
+                $phaseName = [string]$timings[$timings.Count - 1].Groups[1].Value
+                if ($GateDetailNpmPhases -ccontains $phaseName) { $phase = $phaseName }
+            }
+            foreach ($hit in [regex]::Matches($text, '(?m)^npm_link_shim hits_over=(100|10000|1000000)$')) {
+                $level = [string]$hit.Groups[1].Value
+                if ($level -ceq '1000000') { $hits = 'h1m' } elseif ($level -ceq '10000' -and $hits -cne 'h1m') { $hits = 'h10k' } elseif ($level -ceq '100' -and $hits -ceq 'lt100') { $hits = 'h100' }
+            }
             $found = [regex]::Match($text, 'npm (?:error|ERR!) code ([A-Z0-9_]{2,32})')
             if ($found.Success) {
                 $code = 'other'
@@ -1389,8 +1403,12 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
         $code = 'none'
         $failedBucket = '0'
         $mem = 'unknown'
+        $phase = 'none'
+        $hits = 'lt100'
     }
-    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedBucket + ' code=' + $code + ' mem=' + $mem)
+    $tail = ''
+    if ($tool -ceq 'npm') { $tail = ' phase=' + $phase + ' hits=' + $hits }
+    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedBucket + ' code=' + $code + ' mem=' + $mem + $tail)
 }
 
 function Test-NodeGate($gate) {
