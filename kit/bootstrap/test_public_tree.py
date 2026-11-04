@@ -228,6 +228,13 @@ class PublicTreeTests(unittest.TestCase):
     def test_linux_source_build_suite_is_registered_and_discovered_at_push_time(self):
         self.assertIn("kit/confinement/linux_source_build.py", PLATFORM_FILES)
         self.assertIn("kit/confinement/test_linux_source_build.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/test_linux_source_build_tiers.py", PLATFORM_FILES)
+        suite = (ROOT / "kit/confinement/test_linux_source_build.py").read_text(encoding="utf-8")
+        self.assertEqual(suite.count("\nfrom test_linux_source_build_tiers import *\n"), 1)
+        tiers = (ROOT / "kit/confinement/test_linux_source_build_tiers.py").read_text(encoding="utf-8")
+        self.assertIn('__all__ = ["WindowsSourceBindingTests", "LinuxBrowserTierTests"]', tiers)
+        self.assertNotIn("import test_linux_source_build\n", tiers)
+        self.assertNotIn("from test_linux_source_build import", tiers)
         self.assertIn("kit/confinement/rust_license_gate.py", PLATFORM_FILES)
         self.assertIn("kit/confinement/test_rust_license_gate.py", PLATFORM_FILES)
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
@@ -362,6 +369,7 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_macos_core_contract.py',
             'kit/confinement/linux_source_build.py',
             'kit/confinement/test_linux_source_build.py',
+            'kit/confinement/test_linux_source_build_tiers.py',
             'kit/confinement/fixtures/npm11_audit_report.json',
             '.github/workflows/core-linux-quick-return.yml',
             'core-ci/linux_quick_return.py',

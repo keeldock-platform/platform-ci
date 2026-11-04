@@ -47,6 +47,7 @@ LINUX_LANE_FILES = (
     "kit/confinement/test_linux_settings.py",
     "kit/confinement/linux_source_build.py",
     "kit/confinement/test_linux_source_build.py",
+    "kit/confinement/test_linux_source_build_tiers.py",
     ".github/workflows/core-linux-quick-return.yml",
     "core-ci/linux_quick_return.py",
     "core-ci/test_linux_quick_return.py",
