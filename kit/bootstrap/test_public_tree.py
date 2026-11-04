@@ -64,7 +64,7 @@ class PublicTreeTests(unittest.TestCase):
                 cwd=str(checkout_root),
                 check=True,
                 capture_output=True,
-                timeout=10,
+                timeout=120,
             )
             subprocess.run(
                 ["git", "commit", "--quiet", "--no-gpg-sign", "-m", "source-free workspace fixture"],

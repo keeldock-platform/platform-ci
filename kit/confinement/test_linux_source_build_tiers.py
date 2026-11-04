@@ -10,7 +10,7 @@ import types
 import unittest
 import zipfile
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 if not sys.platform.startswith("linux"):
     raise unittest.SkipTest("the Linux source build suite runs only on Linux")
@@ -262,6 +262,54 @@ class WindowsSourceBindingTests(unittest.TestCase):
             with self.subTest(workflow=workflow):
                 with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
                     linux_source_build._require_no_duplicate("token", environment, workflow=workflow)
+
+    def test_duplicate_check_retries_only_a_lagging_total_count_and_then_refuses(self):
+        environment = {"GITHUB_RUN_ID": "5", "REQUESTED_SOURCE_SHA": self.SOURCE}
+        windows = linux_source_build.WINDOWS_TIER
+        title = "Windows admission source " + self.SOURCE
+
+        def listing(totals, runs=()):
+            calls = []
+
+            def fake(path, token, method="GET", payload=None, expected=(200,)):
+                calls.append(path)
+                total = totals[min(len(calls) - 1, len(totals) - 1)]
+                return 200, {"total_count": total, "workflow_runs": list(runs)}
+            return fake, calls
+
+        fake, calls = listing([1, 0])
+        with patch.object(linux_source_build, "_api_request", side_effect=fake), patch.object(
+            linux_source_build.time, "sleep"
+        ) as sleep:
+            self.assertIsNone(linux_source_build._require_no_duplicate("token", environment, workflow=windows))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_args_list, [call(5)])
+        fake, calls = listing([1])
+        with patch.object(linux_source_build, "_api_request", side_effect=fake), patch.object(
+            linux_source_build.time, "sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
+                linux_source_build._require_no_duplicate("token", environment, workflow=windows)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(sleep.call_args_list, [call(5), call(5)])
+        active = {"id": 9, "display_title": title, "status": "queued", "event": "workflow_dispatch"}
+        fake, calls = listing([5], [active])
+        with patch.object(linux_source_build, "_api_request", side_effect=fake), patch.object(
+            linux_source_build.time, "sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
+                linux_source_build._require_no_duplicate("token", environment, workflow=windows)
+        self.assertEqual(len(calls), 1)
+        sleep.assert_not_called()
+        for payload in ({"total_count": "1", "workflow_runs": []}, {"total_count": 0}, [], {"total_count": 0, "workflow_runs": [1]}):
+            with self.subTest(payload=payload):
+                with patch.object(linux_source_build, "_api_request", return_value=(200, payload)) as request, patch.object(
+                    linux_source_build.time, "sleep"
+                ) as sleep:
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "duplicate"):
+                        linux_source_build._require_no_duplicate("token", environment, workflow=windows)
+                self.assertEqual(request.call_count, 1)
+                sleep.assert_not_called()
 
     def test_windows_entry_points_print_fixed_lines(self):
         environment = {"GITHUB_TOKEN": "token"}

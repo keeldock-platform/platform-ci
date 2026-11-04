@@ -566,18 +566,23 @@ def _require_no_duplicate(token, environ, workflow=None):
     title = title_prefix + source_sha
     base = "/repos/" + REPOSITORY + "/actions/workflows/" + workflow_file + "/runs?per_page=100&status="
     for active_status in ("queued", "in_progress"):
-        status, payload = _api_request(base + active_status, token)
-        runs = payload.get("workflow_runs") if type(payload) is dict else None
-        if (type(runs) is not list or len(runs) > 100
-                or type(payload.get("total_count")) is not int or payload["total_count"] > len(runs)):
-            raise SourceBuildRefusal("duplicate")
-        for run in runs:
-            if type(run) is not dict:
+        for attempt in range(3):
+            status, payload = _api_request(base + active_status, token)
+            runs = payload.get("workflow_runs") if type(payload) is dict else None
+            if type(runs) is not list or len(runs) > 100 or type(payload.get("total_count")) is not int:
                 raise SourceBuildRefusal("duplicate")
-            if (str(run.get("id")) != run_id and run.get("display_title") == title
-                    and run.get("status") == active_status
-                    and run.get("event") == "workflow_dispatch"):
+            for run in runs:
+                if type(run) is not dict:
+                    raise SourceBuildRefusal("duplicate")
+                if (str(run.get("id")) != run_id and run.get("display_title") == title
+                        and run.get("status") == active_status
+                        and run.get("event") == "workflow_dispatch"):
+                    raise SourceBuildRefusal("duplicate")
+            if payload["total_count"] <= len(runs):
+                break
+            if attempt == 2:
                 raise SourceBuildRefusal("duplicate")
+            time.sleep(5)
 
 
 def _audit_modules():

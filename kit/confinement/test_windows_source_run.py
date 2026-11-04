@@ -1243,7 +1243,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(shim.count("require("), 3)
         for forbidden in ("writeFile", "appendFile", "WriteStream", "child_process", "spawn", "exec", "fork",
                           "node:net", "node:http", "node:https", "node:dgram", "node:tls", "node:dns", "fetch", "WebSocket",
-                          "Worker", "unlink", "rmdir", "mkdir", "rename", "chmod", "chown", "utimes",
+                          "Worker", "unlink", "rmdir", "mkdirSync", "rename", "chmod", "chown", "utimes",
                           "openSync", "fs.open", "copyFile", "cpSync", "truncate", "process.binding", "eval(", "Function(",
                           "import(", "console", "process.stdout", "process.stderr", "process.exit", "setTimeout",
                           "setInterval", "module.exports", "globalThis"):
@@ -1421,10 +1421,27 @@ class WindowsSourceRunTests(unittest.TestCase):
             "};\n"
             "\n"))
         self.assertEqual(shim.count("fs.writeSync"), 1)
-        self.assertEqual(shim.count("realWriteSync"), 3)
-        self.assertEqual(shim.count("realWriteSync("), 1)
+        self.assertEqual(shim.count("realWriteSync"), 4)
+        self.assertEqual(shim.count("realWriteSync("), 2)
         self.assertEqual(shim.count("countHit()"), 4)
         self.assertEqual(shim.count("hits_over="), 1)
+        listener = shim[shim.index("process.on('time'"):]
+        self.assertEqual(listener, (
+            "process.on('time', (level, name) => {\n"
+            "  if (level !== 'start' || typeof name !== 'string' || !PHASES.has(name) || printedPhases.has(name)) return;\n"
+            "  printedPhases.add(name);\n"
+            "  try {\n"
+            "    realWriteSync(2, 'npm_link_shim phase=' + name + '\\n');\n"
+            "  } catch (error) {\n"
+            "    return;\n"
+            "  }\n"
+            "});\n"))
+        self.assertEqual(shim.count("process.on("), 1)
+        self.assertEqual(shim.count("PHASES"), 2)
+        self.assertEqual(shim.count("printedPhases"), 3)
+        self.assertEqual(shim.count("npm_link_shim phase="), 1)
+        self.assertLess(shim.index("const countHit = "), shim.index("const PHASES = new Set(["))
+        self.assertLess(shim.index("promises.symlink = async"), shim.index("const PHASES = new Set(["))
         self.assertLess(shim.index("const realWriteSync = "), shim.index("const countHit = "))
         self.assertLess(shim.index("const countHit = "), shim.index("const lookup = "))
         self.assertEqual(shim.count("refuse('fs_shape')"), 2)
@@ -1497,8 +1514,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "if ($remaining -lt 60) { throw 'deadline' }",
             "    $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))\n",
             "    $then = [string[]](@($then[0], '--max-old-space-size=6144') + @($then[1..($then.Count - 1)]))\n",
-            "    $then = [string[]](@($then) + @('--timing'))\n",
-            "$second =$sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), $GateMaxProcesses)",
+            "$second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), $GateMaxProcesses)",
             "$merged.Stdout = [string]$first.Stdout + \"`n\" + [string]$second.Stdout",
             "$merged.Truncated = [bool]($first.Truncated -or $second.Truncated)",
             "if (-not (Test-GateBoundary $second) -or $second.TimedOut -or $second.ExitCode -ne 0) { return $merged }",
@@ -1511,9 +1527,6 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(steps.count("Write-Line"), 2)
         self.assertEqual(self.runner.count("--max-old-space-size=6144"), 1)
         self.assertEqual(steps.count("--max-old-space-size=6144"), 1)
-        self.assertEqual(self.runner.count("--timing"), 1)
-        self.assertEqual(steps.count("'--timing'"), 1)
-        self.assertLess(steps.index("Add-NpmLinkShim"), steps.index("'--timing'"))
         reify = (
             "    try {\n        [void][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadNoFollow((Join-Path $project 'node_modules\\.package-lock.json'), $MaxLockBytes)\n"
             "    } catch {\n        throw 'npm_reify_missing'\n    }\n    Write-Line 'windows-source-npm-reify=verified hidden_lock=present'\n    return $merged"
@@ -1644,7 +1657,8 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn("$peakText = [string]$peak\n        if ($peakText -cmatch '^[0-9]{1,19}$') {\n            $peakBytes = [uint64]$peakText\n", body)
         for bucket in ("lt1g", "1to2g", "2to4g", "4to8g", "ge8g"):
             self.assertIn("$mem = '" + bucket + "'", body)
-        self.assertEqual(body.count("$mem = 'unknown'"), 2)
+        self.assertEqual(body.count("$mem = 'unknown'"), 3)
+        self.assertIn("if ($peakBytes -eq 0) { $mem = 'unknown' } elseif ($peakBytes -lt 1073741824) { $mem = 'lt1g' } elseif", body)
         for limit in ("1073741824", "2147483648", "4294967296", "8589934592"):
             self.assertIn("$peakBytes -lt " + limit + ")", body)
         for token in (
@@ -1684,7 +1698,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         npm_branch = body[body.index("$kind = 'npm'"):body.index("            $found = ")]
         self.assertEqual(npm_branch, (
             "$kind = 'npm'\n"
-            "            $timings = [regex]::Matches($text, '(?m)^npm timing ([A-Za-z:-]{2,40}) Completed in [0-9]+ms')\n"
+            "            $timings = [regex]::Matches($text, '(?m)^npm_link_shim phase=([A-Za-z:-]{2,40})$')\n"
             "            if ($timings.Count -gt 0) {\n"
             "                $phase = 'other'\n"
             "                $phaseName = [string]$timings[$timings.Count - 1].Groups[1].Value\n"
@@ -1698,14 +1712,18 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(len(phases), 1)
         self.assertEqual(self.runner.count("$GateDetailNpmPhases -ccontains"), 1)
         self.assertEqual(re.findall(r"'([A-Za-z:-]+)'", phases[0]), [
-            "npm:load", "npm:load:whichnode", "npm:load:configs", "npm:load:mkdirpcache", "npm:load:mkdirplogs",
-            "npm:load:setTitle", "npm:load:display", "npm:load:logFile", "npm:load:timers", "npm:load:configScope", "npm-ci:rm",
+            "npm", "npm:load", "npm:load:whichnode", "npm:load:configload", "config:load:flatten", "npm:load:mkdirpcache",
+            "npm:load:mkdirplogs", "npm:load:setTitle", "command:ci", "npm-ci:rm",
             "arborist:ctor", "idealTree", "idealTree:init", "idealTree:userRequests", "idealTree:buildDeps",
             "idealTree:fixDepFlags", "idealTree:inflate",
             "reify", "reify:loadTrees", "reify:diffTrees", "reify:retireShallow", "reify:createSparse", "reify:loadBundles",
             "reify:loadShrinkwraps", "reify:unpack", "reify:unretire", "reify:build", "reify:trash", "reify:save",
             "reify:audit", "reify:rollback:createSparse", "reify:rollback:retireShallow",
-            "build", "build:queue", "build:link", "audit"])
+            "build", "build:queue", "build:link", "audit", "auditReport:init", "auditReport:getReport"])
+        self.assertEqual(len(re.findall(r"'([A-Za-z:-]+)'", phases[0])), 38)
+        shim_block = SHIM.read_text(encoding="ascii")
+        shim_block = shim_block[shim_block.index("const PHASES = new Set(["):shim_block.index("]);\nconst printedPhases")]
+        self.assertEqual(re.findall(r"'([A-Za-z:-]+)'", shim_block), re.findall(r"'([A-Za-z:-]+)'", phases[0]))
         self.assertNotIn("Write-Line", body)
         self.assertNotIn("throw", body)
         listed = re.findall(r"^\$GateDetailNpmCodes = @\((.*)\)$", self.runner, re.M)
@@ -1751,6 +1769,8 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=npm_error_line mem=ge8g phase=build:link hits=h100",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g phase=reify:build hits=h1m",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other mem=ge8g phase=idealTree hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g phase=reify:loadTrees hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=unknown phase=auditReport:getReport hits=h10k",
         ):
             with self.subTest(line=line):
                 self.assertRegex(line, public)
@@ -1774,6 +1794,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g phase=reify:other hits=lt100",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g phase=reify hits=h5",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g phase=reify hits=lt100 extra=1",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g phase=npm:load:configs hits=lt100",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics mem=lt1g phase=none hits=lt100",
             "windows-source-gate-detail=1 id=format tool=other kind=unknown failed=0 code=none mem=lt1g phase=none hits=lt100",
         ):

@@ -79,12 +79,12 @@ $MaxNpmLinks = 64
 $GateMaxProcesses = [uint32]128
 $MaxLockBytes = 33554432
 $NpmLinkShimFile = 'windows_npm_link_shim.cjs'
-$NpmLinkShimSha256 = '9bf893336467323617878fad931158e9b97844b5c47d2ce273fef2a29ea28575'
+$NpmLinkShimSha256 = 'fa28ba90fd1d5f93b4232c7087ad5b681be09d27b93c368b84f0612341496f84'
 $NpmLinkShimGates = @('node_dependency_audit')
 $GateDetailNpmCodes = @('ENOTCACHED', 'EBADPLATFORM', 'ENOENT', 'EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY', 'EEXIST', 'ELOOP', 'ENAMETOOLONG', 'EINTEGRITY', 'EUSAGE', 'ELIFECYCLE', 'ERESOLVE', 'EJSONPARSE', 'ENOLOCK', 'ENOTSUP', 'EINVAL', 'EMFILE', 'ENOSPC', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETARGET', 'E404', 'EOVERRIDE', 'EWORKSPACEMISSING', 'ENOWORKSPACES', 'EINVALIDTAGNAME', 'EINVALIDPACKAGENAME', 'EUNKNOWNTYPE')
 $GateDetailShimReasons = @('fs_shape', 'map_count', 'map_entry', 'map_hash', 'map_json', 'map_path', 'map_shape', 'map_size', 'map_text')
 $GateDetailNodeCodes = @('ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_MODULE_NOT_FOUND', 'ERR_REQUIRE_ESM', 'ERR_INVALID_URL', 'ERR_INVALID_FILE_URL_PATH', 'ERR_UNSUPPORTED_ESM_URL_SCHEME', 'ERR_OUT_OF_RANGE', 'ERR_FS_EISDIR', 'ERR_INVALID_STATE', 'ERR_ACCESS_DENIED', 'ERR_UNKNOWN_FILE_EXTENSION', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_INVALID_PACKAGE_CONFIG', 'ERR_PACKAGE_PATH_NOT_EXPORTED')
-$GateDetailNpmPhases = @('npm:load', 'npm:load:whichnode', 'npm:load:configs', 'npm:load:mkdirpcache', 'npm:load:mkdirplogs', 'npm:load:setTitle', 'npm:load:display', 'npm:load:logFile', 'npm:load:timers', 'npm:load:configScope', 'npm-ci:rm', 'arborist:ctor', 'idealTree', 'idealTree:init', 'idealTree:userRequests', 'idealTree:buildDeps', 'idealTree:fixDepFlags', 'idealTree:inflate', 'reify', 'reify:loadTrees', 'reify:diffTrees', 'reify:retireShallow', 'reify:createSparse', 'reify:loadBundles', 'reify:loadShrinkwraps', 'reify:unpack', 'reify:unretire', 'reify:build', 'reify:trash', 'reify:save', 'reify:audit', 'reify:rollback:createSparse', 'reify:rollback:retireShallow', 'build', 'build:queue', 'build:link', 'audit')
+$GateDetailNpmPhases = @('npm', 'npm:load', 'npm:load:whichnode', 'npm:load:configload', 'config:load:flatten', 'npm:load:mkdirpcache', 'npm:load:mkdirplogs', 'npm:load:setTitle', 'command:ci', 'npm-ci:rm', 'arborist:ctor', 'idealTree', 'idealTree:init', 'idealTree:userRequests', 'idealTree:buildDeps', 'idealTree:fixDepFlags', 'idealTree:inflate', 'reify', 'reify:loadTrees', 'reify:diffTrees', 'reify:retireShallow', 'reify:createSparse', 'reify:loadBundles', 'reify:loadShrinkwraps', 'reify:unpack', 'reify:unretire', 'reify:build', 'reify:trash', 'reify:save', 'reify:audit', 'reify:rollback:createSparse', 'reify:rollback:retireShallow', 'build', 'build:queue', 'build:link', 'audit', 'auditReport:init', 'auditReport:getReport')
 $MaxNpmLinkMapBytes = 65536
 $MountManagerRungs = @('device', 'volume', 'drive_link', 'mpm_link', 'global_dir')
 $MountManagerKinds = @{ device = 'mountmgr'; volume = 'volume'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
@@ -1170,7 +1170,6 @@ function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$envir
     if ($seconds -gt $remaining) { $seconds = $remaining }
     $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))
     $then = [string[]](@($then[0], '--max-old-space-size=6144') + @($then[1..($then.Count - 1)]))
-    $then = [string[]](@($then) + @('--timing'))
     $second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), $GateMaxProcesses)
     $merged = New-Object KeelDock.Platform.WindowsConfinement.RunResult
     foreach ($field in @('Failure', 'Detail', 'Created', 'CreateError', 'TimedOut', 'Exited', 'ExitCode', 'ElapsedMs', 'Token', 'Job', 'PeakProcessMemory', 'PeakJobMemory', 'CpuMs', 'HandleCount', 'Class46')) {
@@ -1324,7 +1323,7 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
         $peakText = [string]$peak
         if ($peakText -cmatch '^[0-9]{1,19}$') {
             $peakBytes = [uint64]$peakText
-            if ($peakBytes -lt 1073741824) { $mem = 'lt1g' } elseif ($peakBytes -lt 2147483648) { $mem = '1to2g' } elseif ($peakBytes -lt 4294967296) { $mem = '2to4g' } elseif ($peakBytes -lt 8589934592) { $mem = '4to8g' } else { $mem = 'ge8g' }
+            if ($peakBytes -eq 0) { $mem = 'unknown' } elseif ($peakBytes -lt 1073741824) { $mem = 'lt1g' } elseif ($peakBytes -lt 2147483648) { $mem = '1to2g' } elseif ($peakBytes -lt 4294967296) { $mem = '2to4g' } elseif ($peakBytes -lt 8589934592) { $mem = '4to8g' } else { $mem = 'ge8g' }
         }
         $items = @($gate.Argv | ForEach-Object { [string]$_ })
         if (@($items | Where-Object { $_ -cmatch '(^|[\\/])cargo\.exe$' }).Count -gt 0) {
@@ -1360,7 +1359,7 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
             }
         } elseif ($tool -ceq 'npm') {
             $kind = 'npm'
-            $timings = [regex]::Matches($text, '(?m)^npm timing ([A-Za-z:-]{2,40}) Completed in [0-9]+ms')
+            $timings = [regex]::Matches($text, '(?m)^npm_link_shim phase=([A-Za-z:-]{2,40})$')
             if ($timings.Count -gt 0) {
                 $phase = 'other'
                 $phaseName = [string]$timings[$timings.Count - 1].Groups[1].Value

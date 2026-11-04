@@ -259,3 +259,25 @@ promises.symlink = async function symlink(target, linkPath, type) {
   if (!matchesMappedTarget(target, linkPath)) return Reflect.apply(realPromiseSymlink, this, arguments);
   return undefined;
 };
+
+const PHASES = new Set([
+  'npm', 'npm:load', 'npm:load:whichnode', 'npm:load:configload', 'config:load:flatten', 'npm:load:mkdirpcache',
+  'npm:load:mkdirplogs', 'npm:load:setTitle', 'command:ci', 'npm-ci:rm',
+  'arborist:ctor', 'idealTree', 'idealTree:init', 'idealTree:userRequests', 'idealTree:buildDeps', 'idealTree:fixDepFlags',
+  'idealTree:inflate',
+  'reify', 'reify:loadTrees', 'reify:diffTrees', 'reify:retireShallow', 'reify:createSparse', 'reify:loadBundles',
+  'reify:loadShrinkwraps', 'reify:unpack', 'reify:unretire', 'reify:build', 'reify:trash', 'reify:save', 'reify:audit',
+  'reify:rollback:createSparse', 'reify:rollback:retireShallow',
+  'build', 'build:queue', 'build:link', 'audit', 'auditReport:init', 'auditReport:getReport',
+]);
+const printedPhases = new Set();
+
+process.on('time', (level, name) => {
+  if (level !== 'start' || typeof name !== 'string' || !PHASES.has(name) || printedPhases.has(name)) return;
+  printedPhases.add(name);
+  try {
+    realWriteSync(2, 'npm_link_shim phase=' + name + '\n');
+  } catch (error) {
+    return;
+  }
+});
