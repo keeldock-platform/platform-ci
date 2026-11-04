@@ -81,7 +81,7 @@ $MaxLockBytes = 33554432
 $NpmLinkShimFile = 'windows_npm_link_shim.cjs'
 $NpmLinkShimSha256 = 'fa28ba90fd1d5f93b4232c7087ad5b681be09d27b93c368b84f0612341496f84'
 $NpmLinkShimGates = @('node_dependency_audit')
-$GateDetailNpmCodes = @('ENOTCACHED', 'EBADPLATFORM', 'ENOENT', 'EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY', 'EEXIST', 'ELOOP', 'ENAMETOOLONG', 'EINTEGRITY', 'EUSAGE', 'ELIFECYCLE', 'ERESOLVE', 'EJSONPARSE', 'ENOLOCK', 'ENOTSUP', 'EINVAL', 'EMFILE', 'ENOSPC', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETARGET', 'E404', 'EOVERRIDE', 'EWORKSPACEMISSING', 'ENOWORKSPACES', 'EINVALIDTAGNAME', 'EINVALIDPACKAGENAME', 'EUNKNOWNTYPE')
+$GateDetailNpmCodes = @('ENOTCACHED', 'EBADPLATFORM', 'ENOENT', 'EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY', 'EEXIST', 'ELOOP', 'ENAMETOOLONG', 'EINTEGRITY', 'EUSAGE', 'ELIFECYCLE', 'ERESOLVE', 'EJSONPARSE', 'ENOLOCK', 'ENOTSUP', 'EINVAL', 'EMFILE', 'ENOSPC', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETARGET', 'E404', 'EOVERRIDE', 'EWORKSPACEMISSING', 'ENOWORKSPACES', 'EINVALIDTAGNAME', 'EINVALIDPACKAGENAME', 'EUNKNOWNTYPE', 'ENOMEM', 'ENOTDIR', 'EISDIR', 'EXDEV', 'EBADF', 'EROFS', 'EMLINK', 'ENOTCONN', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EOF', 'EUNSUPPORTEDPROTOCOL', 'EINVALIDRESPONSE', 'ENOVERSIONS', 'EBADENGINE', 'ECOMPROMISED', 'EINVALIDTYPE', 'EUNKNOWN', 'UNKNOWN', 'TAR_ENTRY_ERROR', 'TAR_ENTRY_INVALID', 'TAR_ENTRY_UNSUPPORTED', 'TAR_BAD_ARCHIVE', 'TAR_ABORT', 'ERR_STRING_TOO_LONG', 'ERR_OUT_OF_RANGE', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_INVALID_URL', 'ERR_FS_FILE_TOO_LARGE', 'ERR_BUFFER_TOO_LARGE', 'ERR_INVALID_STATE', 'EINTEGRITYSIGNATURE', 'EMISSINGSIGNATUREKEY', 'EEXPIREDSIGNATUREKEY', 'EATTESTATIONVERIFY', 'EATTESTATIONSUBJECT')
 $GateDetailShimReasons = @('fs_shape', 'map_count', 'map_entry', 'map_hash', 'map_json', 'map_path', 'map_shape', 'map_size', 'map_text')
 $GateDetailNodeCodes = @('ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_MODULE_NOT_FOUND', 'ERR_REQUIRE_ESM', 'ERR_INVALID_URL', 'ERR_INVALID_FILE_URL_PATH', 'ERR_UNSUPPORTED_ESM_URL_SCHEME', 'ERR_OUT_OF_RANGE', 'ERR_FS_EISDIR', 'ERR_INVALID_STATE', 'ERR_ACCESS_DENIED', 'ERR_UNKNOWN_FILE_EXTENSION', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_INVALID_PACKAGE_CONFIG', 'ERR_PACKAGE_PATH_NOT_EXPORTED')
 $GateDetailNpmPhases = @('npm', 'npm:load', 'npm:load:whichnode', 'npm:load:configload', 'config:load:flatten', 'npm:load:mkdirpcache', 'npm:load:mkdirplogs', 'npm:load:setTitle', 'command:ci', 'npm-ci:rm', 'arborist:ctor', 'idealTree', 'idealTree:init', 'idealTree:userRequests', 'idealTree:buildDeps', 'idealTree:fixDepFlags', 'idealTree:inflate', 'reify', 'reify:loadTrees', 'reify:diffTrees', 'reify:retireShallow', 'reify:createSparse', 'reify:loadBundles', 'reify:loadShrinkwraps', 'reify:unpack', 'reify:unretire', 'reify:build', 'reify:trash', 'reify:save', 'reify:audit', 'reify:rollback:createSparse', 'reify:rollback:retireShallow', 'build', 'build:queue', 'build:link', 'audit', 'auditReport:init', 'auditReport:getReport')
@@ -1372,7 +1372,12 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
             $found = [regex]::Match($text, 'npm (?:error|ERR!) code ([A-Z0-9_]{2,32})')
             if ($found.Success) {
                 $code = 'other'
-                if ($GateDetailNpmCodes -ccontains [string]$found.Groups[1].Value) { $code = [string]$found.Groups[1].Value }
+                $foundCode = [string]$found.Groups[1].Value
+                if ($GateDetailNpmCodes -ccontains $foundCode) { $code = $foundCode
+                } elseif ($foundCode -cmatch '^ERR_[A-Z0-9_]+$') { $code = 'other_err'
+                } elseif ($foundCode -cmatch '^TAR_[A-Z_]+$') { $code = 'other_tar'
+                } elseif ($foundCode -cmatch '^E[0-9]{3}$') { $code = 'other_http'
+                } elseif ($foundCode -cmatch '^E[A-Z]{2,20}$') { $code = 'other_errno' }
             } else {
                 $shim = [regex]::Match($text, 'npm_link_shim refused ([a-z_]{2,20})')
                 $nodeError = [regex]::Match($text, '\b(ERR_[A-Z_]{3,48})\b')

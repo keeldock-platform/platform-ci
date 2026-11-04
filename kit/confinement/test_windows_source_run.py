@@ -1243,7 +1243,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(shim.count("require("), 3)
         for forbidden in ("writeFile", "appendFile", "WriteStream", "child_process", "spawn", "exec", "fork",
                           "node:net", "node:http", "node:https", "node:dgram", "node:tls", "node:dns", "fetch", "WebSocket",
-                          "Worker", "unlink", "rmdir", "mkdirSync", "rename", "chmod", "chown", "utimes",
+                          "Worker", "unlink", "rmdir", "mkdir(", ".mkdir", "rename", "chmod", "chown", "utimes",
                           "openSync", "fs.open", "copyFile", "cpSync", "truncate", "process.binding", "eval(", "Function(",
                           "import(", "console", "process.stdout", "process.stderr", "process.exit", "setTimeout",
                           "setInterval", "module.exports", "globalThis"):
@@ -1672,6 +1672,12 @@ class WindowsSourceRunTests(unittest.TestCase):
             "$code = 'os' + [int]$osError.Groups[1].Value",
             "if ([regex]::IsMatch($text, 'panicked at')) { $code = 'panics' }",
             "$code = 'other'", "$GateDetailNpmCodes -ccontains",
+            "$foundCode = [string]$found.Groups[1].Value",
+            "if ($GateDetailNpmCodes -ccontains $foundCode) { $code = $foundCode",
+            "} elseif ($foundCode -cmatch '^ERR_[A-Z0-9_]+$') { $code = 'other_err'",
+            "} elseif ($foundCode -cmatch '^TAR_[A-Z_]+$') { $code = 'other_tar'",
+            "} elseif ($foundCode -cmatch '^E[0-9]{3}$') { $code = 'other_http'",
+            "} elseif ($foundCode -cmatch '^E[A-Z]{2,20}$') { $code = 'other_errno' }",
             "if ($failedText.Length -gt 6) { $failedText = '999999' }",
             "if ($failedCount -ge 10) { $failedBucket = 'many' } elseif ($failedCount -ge 2) { $failedBucket = 'few' } else { $failedBucket = [string]$failedCount }",
         ):
@@ -1684,6 +1690,9 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertLess(body.index("$kind = 'compile'"), body.index("$kind = 'link'"))
         self.assertLess(body.index("$kind = 'link'"), body.index("$kind = 'test'"))
         self.assertLess(body.index("$kind = 'test'"), body.index("$kind = 'os_error'"))
+        families = ("{ $code = $foundCode\n", "{ $code = 'other_err'\n", "{ $code = 'other_tar'\n", "{ $code = 'other_http'\n", "{ $code = 'other_errno' }")
+        family_positions = [body.index(item) for item in families]
+        self.assertEqual(family_positions, sorted(family_positions))
         self.assertIn("    } catch {\n        $kind = 'unknown'\n        $code = 'none'\n        $failedBucket = '0'\n        $mem = 'unknown'\n        $phase = 'none'\n        $hits = 'lt100'\n    }\n", body)
         self.assertIn(
             "    $tail = ''\n    if ($tool -ceq 'npm') { $tail = ' phase=' + $phase + ' hits=' + $hits }\n"
@@ -1733,7 +1742,14 @@ class WindowsSourceRunTests(unittest.TestCase):
             "ENOTCACHED", "EBADPLATFORM", "ENOENT", "EPERM", "EACCES", "EBUSY", "ENOTEMPTY", "EEXIST", "ELOOP", "ENAMETOOLONG",
             "EINTEGRITY", "EUSAGE", "ELIFECYCLE", "ERESOLVE", "EJSONPARSE", "ENOLOCK", "ENOTSUP", "EINVAL", "EMFILE", "ENOSPC",
             "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETARGET", "E404", "EOVERRIDE", "EWORKSPACEMISSING", "ENOWORKSPACES",
-            "EINVALIDTAGNAME", "EINVALIDPACKAGENAME", "EUNKNOWNTYPE"])
+            "EINVALIDTAGNAME", "EINVALIDPACKAGENAME", "EUNKNOWNTYPE",
+            "ENOMEM", "ENOTDIR", "EISDIR", "EXDEV", "EBADF", "EROFS", "EMLINK", "ENOTCONN", "ECONNRESET", "ETIMEDOUT", "EPIPE", "EOF",
+            "EUNSUPPORTEDPROTOCOL", "EINVALIDRESPONSE", "ENOVERSIONS", "EBADENGINE", "ECOMPROMISED", "EINVALIDTYPE", "EUNKNOWN",
+            "UNKNOWN", "TAR_ENTRY_ERROR", "TAR_ENTRY_INVALID", "TAR_ENTRY_UNSUPPORTED", "TAR_BAD_ARCHIVE", "TAR_ABORT",
+            "ERR_STRING_TOO_LONG", "ERR_OUT_OF_RANGE", "ERR_INVALID_ARG_TYPE", "ERR_INVALID_ARG_VALUE", "ERR_INVALID_URL",
+            "ERR_FS_FILE_TOO_LARGE", "ERR_BUFFER_TOO_LARGE", "ERR_INVALID_STATE", "EINTEGRITYSIGNATURE", "EMISSINGSIGNATUREKEY",
+            "EEXPIREDSIGNATUREKEY", "EATTESTATIONVERIFY", "EATTESTATIONSUBJECT"])
+        self.assertEqual(len(set(npm_codes)), len(npm_codes))
         public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
         shim_reasons = re.findall(r"'([a-z_]+)'", re.findall(r"^\$GateDetailShimReasons = @\((.*)\)$", self.runner, re.M)[0])
         node_codes = re.findall(r"'ERR_([A-Z_]+)'", re.findall(r"^\$GateDetailNodeCodes = @\((.*)\)$", self.runner, re.M)[0])
@@ -1745,7 +1761,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             return (
                 r"windows-source-gate-detail=[1-9][0-9]* id=[a-z][a-z_]{2,40} tool=" + tool +
                 r" kind=(compile|link|test|os_error|npm|unknown) failed=(0|1|few|many)"
-                r" code=(" + "|".join(npm_codes) + r"|other|none|panics|E[0-9]{4}|LNK[0-9]{4}|os[0-9]{1,5}"
+                r" code=(" + "|".join(npm_codes) + r"|other_err|other_tar|other_http|other_errno|other|none|panics|E[0-9]{4}|LNK[0-9]{4}|os[0-9]{1,5}"
                 r"|shim_(" + "|".join(shim_reasons) + r"|other)|node_(ERR_(" + "|".join(node_codes) + r")|other)"
                 r"|" + "|".join(npm_tokens) + r") mem=(lt1g|1to2g|2to4g|4to8g|ge8g|unknown)")
 
@@ -1769,6 +1785,9 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=npm_error_line mem=ge8g phase=build:link hits=h100",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g phase=reify:build hits=h1m",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other mem=ge8g phase=idealTree hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOMEM mem=4to8g phase=reify:unpack hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=TAR_BAD_ARCHIVE mem=4to8g phase=reify:unpack hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other_err mem=4to8g phase=reify:rollback:retireShallow hits=lt100",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g phase=reify:loadTrees hits=lt100",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=unknown phase=auditReport:getReport hits=h10k",
         ):
@@ -1781,6 +1800,8 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few passed=4 code=none mem=lt1g",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics3 mem=lt1g",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=npm failed=0 code=EWHATEVER mem=lt1g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other_foo mem=4to8g phase=reify hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOMEMX mem=4to8g phase=reify hits=lt100",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_xyz mem=lt1g",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_FOO mem=lt1g",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_other mem=lt1g",
