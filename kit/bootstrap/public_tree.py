@@ -343,7 +343,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/windows_confinement.ps1': '1bd0b04dde27eaca58b2a7873345e3c1cacb4e988ff8b8980ebdda0bcf82f036',
     'kit/confinement/test_windows_confinement.py': 'e470c526f0497d2b6fa323ae81d25f6b4e5e4a9077a15a8bcbf5baf9a306e499',
     'kit/confinement/windows_source_run.ps1': 'ebac850590778f31db62648fe77f43313ecfb5bed1ef362748e4db0bc493fc38',
-    'kit/confinement/test_windows_source_run.py': 'd4b158f37813e5a6817c70b7989420d03ff161b46fd8a2bbf8c3288c96f96bca',
+    'kit/confinement/test_windows_source_run.py': '5f1de5f981a4a8e2d7406d21db640a3a99c236d1e5bd602d6fd78c8f97c55b99',
     'kit/confinement/windows_probe.rs': 'cf9e58d8f31e2a9773f2c4eba935fd1ed531d94397ac53e530a93c5169d08727',
     'kit/confinement/windows_npm_link_shim.cjs': '1f0befd03b49a55c554f2064658545f731f9f01db64ed7ffadfb33cc6f055adb',
     'kit/confinement/macos_source_reader.py': 'd3fbda5c68ac7d21761e946b0f546607b19c23ccb725e453f3fffef3321c0d70',

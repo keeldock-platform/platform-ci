@@ -1545,7 +1545,7 @@ class WindowsSourceRunTests(unittest.TestCase):
 
     def test_the_detail_line_is_built_only_from_fixed_tokens_with_bucketed_counts_and_no_passed_count(self):
         body = self.function_body("Get-GateDetail")
-        self.assertTrue(body.startswith("Get-GateDetail([int]$index, $gate, [string]$combined) {\n"))
+        self.assertTrue(body.startswith("([int]$index, $gate, [string]$combined) {\n"))
         for token in (
             "$items = @($gate.Argv | ForEach-Object { [string]$_ })",
             "'(^|[\\\\/])cargo\\.exe$'", "'(^|[\\\\/])npm-cli\\.js$'",
