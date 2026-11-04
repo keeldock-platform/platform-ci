@@ -1168,6 +1168,7 @@ function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$envir
     $seconds = Get-GateSeconds $gate.Id
     if ($seconds -gt $remaining) { $seconds = $remaining }
     $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))
+    $then = [string[]](@($then[0], '--max-old-space-size=6144') + @($then[1..($then.Count - 1)]))
     $second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), $GateMaxProcesses)
     $merged = New-Object KeelDock.Platform.WindowsConfinement.RunResult
     foreach ($field in @('Failure', 'Detail', 'Created', 'CreateError', 'TimedOut', 'Exited', 'ExitCode', 'ElapsedMs', 'Token', 'Job', 'PeakProcessMemory', 'PeakJobMemory', 'CpuMs', 'HandleCount', 'Class46')) {
@@ -1308,13 +1309,19 @@ function Get-GateCause($run, [bool]$boundary) {
     return 'exit'
 }
 
-function Get-GateDetail([int]$index, $gate, [string]$combined) {
+function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
     $tool = 'other'
     $kind = 'unknown'
     $code = 'none'
     $failedBucket = '0'
+    $mem = 'unknown'
     try {
         $text = [string]$combined
+        $peakText = [string]$peak
+        if ($peakText -cmatch '^[0-9]{1,19}$') {
+            $peakBytes = [uint64]$peakText
+            if ($peakBytes -lt 1073741824) { $mem = 'lt1g' } elseif ($peakBytes -lt 2147483648) { $mem = '1to2g' } elseif ($peakBytes -lt 4294967296) { $mem = '2to4g' } elseif ($peakBytes -lt 8589934592) { $mem = '4to8g' } else { $mem = 'ge8g' }
+        }
         $items = @($gate.Argv | ForEach-Object { [string]$_ })
         if (@($items | Where-Object { $_ -cmatch '(^|[\\/])cargo\.exe$' }).Count -gt 0) {
             $tool = 'cargo'
@@ -1381,8 +1388,9 @@ function Get-GateDetail([int]$index, $gate, [string]$combined) {
         $kind = 'unknown'
         $code = 'none'
         $failedBucket = '0'
+        $mem = 'unknown'
     }
-    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedBucket + ' code=' + $code)
+    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedBucket + ' code=' + $code + ' mem=' + $mem)
 }
 
 function Test-NodeGate($gate) {
@@ -1475,7 +1483,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
             if ($outcome.Failure -eq 0) {
                 $outcome.Failure = $index
                 $script:RefusalReason = 'gate'
-                Write-Line (Get-GateDetail $index $gate $combined)
+                Write-Line (Get-GateDetail $index $gate $combined $run.PeakProcessMemory)
             }
             $outcome.Failed += 1
             if ($run.TimedOut -and -not $keepGoing) { return $outcome }

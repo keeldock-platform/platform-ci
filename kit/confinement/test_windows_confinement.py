@@ -233,6 +233,13 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
         flags = re.search(r"private const uint JobLimitFlags = ([^;]+);", self.native)
         self.assertIsNotNone(flags)
         self.assertNotIn("Breakaway", flags.group(1))
+        self.assertIn("JobObjectLimitJobMemory", flags.group(1))
+        self.assertIn("private const uint JobObjectLimitJobMemory = 0x00000200;", self.native)
+        self.assertIn("private const ulong ProcessMemoryLimitBytes = 8589934592UL;", self.native)
+        self.assertIn("private const ulong JobMemoryLimitBytes = 12884901888UL;", self.native)
+        self.assertIn("information.JobMemoryLimit = new UIntPtr(JobMemoryLimitBytes);", self.native)
+        self.assertIn("&& actual.JobMemoryLimit.ToUInt64() == JobMemoryLimitBytes;", self.native)
+        self.assertIn("&& actual.ProcessMemoryLimit.ToUInt64() == ProcessMemoryLimitBytes\n", self.native)
         self.assertIn("breakaway=disabled", self.native)
         self.assertIn("JobObjectLimitBreakawayOk | JobObjectLimitSilentBreakawayOk", self.native)
         for forbidden in ("Process.Start", "ProcessStartInfo", "CREATE_BREAKAWAY", "CreateBreakaway"):

@@ -1163,11 +1163,13 @@ namespace KeelDock.Platform.WindowsConfinement
         private const uint JobObjectExtendedLimitInformation = 9;
         private const uint JobObjectLimitActiveProcess = 0x00000008;
         private const uint JobObjectLimitProcessMemory = 0x00000100;
+        private const uint JobObjectLimitJobMemory = 0x00000200;
         private const uint JobObjectLimitKillOnJobClose = 0x00002000;
         private const uint JobObjectLimitBreakawayOk = 0x00000800;
         private const uint JobObjectLimitSilentBreakawayOk = 0x00001000;
-        private const uint JobLimitFlags = JobObjectLimitActiveProcess | JobObjectLimitProcessMemory | JobObjectLimitKillOnJobClose;
-        private const ulong ProcessMemoryLimitBytes = 3221225472UL;
+        private const uint JobLimitFlags = JobObjectLimitActiveProcess | JobObjectLimitProcessMemory | JobObjectLimitJobMemory | JobObjectLimitKillOnJobClose;
+        private const ulong ProcessMemoryLimitBytes = 8589934592UL;
+        private const ulong JobMemoryLimitBytes = 12884901888UL;
         private const uint WaitObject0 = 0;
         private const uint WaitTimeout = 0x00000102;
         private const uint JobKillExitCode = 0x4b44574b;
@@ -1680,6 +1682,7 @@ namespace KeelDock.Platform.WindowsConfinement
             information.BasicLimitInformation.LimitFlags = JobLimitFlags;
             information.BasicLimitInformation.ActiveProcessLimit = maxProcesses;
             information.ProcessMemoryLimit = new UIntPtr(ProcessMemoryLimitBytes);
+            information.JobMemoryLimit = new UIntPtr(JobMemoryLimitBytes);
             int size = Marshal.SizeOf(typeof(Native.ExtendedLimitInformation));
             IntPtr buffer = Marshal.AllocHGlobal(size);
             try
@@ -1719,7 +1722,8 @@ namespace KeelDock.Platform.WindowsConfinement
                 bool breakaway = (actual.BasicLimitInformation.LimitFlags & (JobObjectLimitBreakawayOk | JobObjectLimitSilentBreakawayOk)) != 0;
                 bool exact = actual.BasicLimitInformation.LimitFlags == JobLimitFlags
                     && actual.BasicLimitInformation.ActiveProcessLimit == maxProcesses
-                    && actual.ProcessMemoryLimit.ToUInt64() == ProcessMemoryLimitBytes;
+                    && actual.ProcessMemoryLimit.ToUInt64() == ProcessMemoryLimitBytes
+                    && actual.JobMemoryLimit.ToUInt64() == JobMemoryLimitBytes;
                 if (!killOnClose || breakaway || !exact)
                 {
                     throw new InvalidOperationException();

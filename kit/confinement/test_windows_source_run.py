@@ -544,7 +544,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertTrue(deadline.rstrip().endswith("return $outcome"))
         self.assertNotIn("$keepGoing", deadline)
         gate = body.split("            $script:RefusalReason = 'gate'\n", 1)[1]
-        self.assertTrue(gate.startswith("                Write-Line (Get-GateDetail $index $gate $combined)\n            }\n            $outcome.Failed += 1\n            if ($run.TimedOut -and -not $keepGoing) { return $outcome }\n        }\n    }\n    return $outcome"))
+        self.assertTrue(gate.startswith("                Write-Line (Get-GateDetail $index $gate $combined $run.PeakProcessMemory)\n            }\n            $outcome.Failed += 1\n            if ($run.TimedOut -and -not $keepGoing) { return $outcome }\n        }\n    }\n    return $outcome"))
         self.assertIn("Write-GateDiag $gate.Id $run }", body)
 
     def test_a_later_gate_cannot_mask_an_earlier_failure_in_the_recorded_result(self):
@@ -1408,6 +1408,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $shimEnvironment",
             "if ($remaining -lt 60) { throw 'deadline' }",
             "    $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))\n",
+            "    $then = [string[]](@($then[0], '--max-old-space-size=6144') + @($then[1..($then.Count - 1)]))\n",
             "$second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), $GateMaxProcesses)",
             "$merged.Stdout = [string]$first.Stdout + \"`n\" + [string]$second.Stdout",
             "$merged.Truncated = [bool]($first.Truncated -or $second.Truncated)",
@@ -1419,6 +1420,8 @@ class WindowsSourceRunTests(unittest.TestCase):
         positions = [steps.index(item) for item in order]
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(steps.count("Write-Line"), 2)
+        self.assertEqual(self.runner.count("--max-old-space-size=6144"), 1)
+        self.assertEqual(steps.count("--max-old-space-size=6144"), 1)
         reify = (
             "    try {\n        [void][KeelDock.Platform.WindowsConfinement.JunctionMaker]::ReadNoFollow((Join-Path $project 'node_modules\\.package-lock.json'), $MaxLockBytes)\n"
             "    } catch {\n        throw 'npm_reify_missing'\n    }\n    Write-Line 'windows-source-npm-reify=verified hidden_lock=present'\n    return $merged"
@@ -1545,7 +1548,13 @@ class WindowsSourceRunTests(unittest.TestCase):
 
     def test_the_detail_line_is_built_only_from_fixed_tokens_with_bucketed_counts_and_no_passed_count(self):
         body = self.function_body("Get-GateDetail")
-        self.assertTrue(body.startswith("([int]$index, $gate, [string]$combined) {\n"))
+        self.assertTrue(body.startswith("([int]$index, $gate, [string]$combined, $peak) {\n"))
+        self.assertIn("$peakText = [string]$peak\n        if ($peakText -cmatch '^[0-9]{1,19}$') {\n            $peakBytes = [uint64]$peakText\n", body)
+        for bucket in ("lt1g", "1to2g", "2to4g", "4to8g", "ge8g"):
+            self.assertIn("$mem = '" + bucket + "'", body)
+        self.assertEqual(body.count("$mem = 'unknown'"), 2)
+        for limit in ("1073741824", "2147483648", "4294967296", "8589934592"):
+            self.assertIn("$peakBytes -lt " + limit + ")", body)
         for token in (
             "$items = @($gate.Argv | ForEach-Object { [string]$_ })",
             "'(^|[\\\\/])cargo\\.exe$'", "'(^|[\\\\/])npm-cli\\.js$'",
@@ -1569,10 +1578,10 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertLess(body.index("$kind = 'compile'"), body.index("$kind = 'link'"))
         self.assertLess(body.index("$kind = 'link'"), body.index("$kind = 'test'"))
         self.assertLess(body.index("$kind = 'test'"), body.index("$kind = 'os_error'"))
-        self.assertIn("    } catch {\n        $kind = 'unknown'\n        $code = 'none'\n        $failedBucket = '0'\n    }\n", body)
+        self.assertIn("    } catch {\n        $kind = 'unknown'\n        $code = 'none'\n        $failedBucket = '0'\n        $mem = 'unknown'\n    }\n", body)
         self.assertIn(
             "    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind"
-            " + ' failed=' + $failedBucket + ' code=' + $code)", body)
+            " + ' failed=' + $failedBucket + ' code=' + $code + ' mem=' + $mem)", body)
         self.assertEqual(body.count("return "), 1)
         self.assertNotIn("Write-Line", body)
         self.assertNotIn("throw", body)
@@ -1594,36 +1603,39 @@ class WindowsSourceRunTests(unittest.TestCase):
             r" kind=(compile|link|test|os_error|npm|unknown) failed=(0|1|few|many)"
             r" code=(" + "|".join(npm_codes) + r"|other|none|panics|E[0-9]{4}|LNK[0-9]{4}|os[0-9]{1,5}"
             r"|shim_(" + "|".join(shim_reasons) + r"|other)|node_(ERR_(" + "|".join(node_codes) + r")|other)"
-            r"|" + "|".join(npm_tokens) + r")")
+            r"|" + "|".join(npm_tokens) + r") mem=(lt1g|1to2g|2to4g|4to8g|ge8g|unknown)")
         for line in (
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=1 code=none",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOTCACHED",
-            "windows-source-gate-detail=1 id=format tool=other kind=unknown failed=0 code=none",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=compile failed=0 code=E0432",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=link failed=0 code=LNK1181",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=os_error failed=0 code=os32",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=many code=panics",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_map_entry",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_other",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_REQUIRE_ESM",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_other",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=null_property",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=npm_error_line",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics mem=lt1g",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=1 code=none mem=lt1g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOTCACHED mem=lt1g",
+            "windows-source-gate-detail=1 id=format tool=other kind=unknown failed=0 code=none mem=lt1g",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=compile failed=0 code=E0432 mem=lt1g",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=link failed=0 code=LNK1181 mem=lt1g",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=os_error failed=0 code=os32 mem=lt1g",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=many code=panics mem=lt1g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_map_entry mem=lt1g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_other mem=unknown",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_REQUIRE_ESM mem=1to2g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_other mem=2to4g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=null_property mem=4to8g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=npm_error_line mem=ge8g",
         ):
             with self.subTest(line=line):
                 self.assertRegex(line, public)
                 self.assertIsNotNone(shaped.fullmatch(line))
                 self.assertLess(len(line), 480)
         for line in (
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=2 code=none",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few passed=4 code=none",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics3",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=npm failed=0 code=EWHATEVER",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_xyz",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_FOO",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_other",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=null_properties",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=2 code=none mem=lt1g",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few passed=4 code=none mem=lt1g",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics3 mem=lt1g",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=npm failed=0 code=EWHATEVER mem=lt1g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_xyz mem=lt1g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_FOO mem=lt1g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_other mem=lt1g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=null_properties mem=lt1g",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=huge",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=lt1g extra=1",
         ):
             with self.subTest(rejected=line):
                 self.assertIsNone(shaped.fullmatch(line))
@@ -1687,8 +1699,8 @@ class WindowsSourceRunTests(unittest.TestCase):
 
     def test_the_detail_line_is_emitted_once_only_for_the_first_ordinary_failure_after_the_canary_and_boundary_checks(self):
         body = self.function_body("Invoke-SourceGates")
-        emit = "                Write-Line (Get-GateDetail $index $gate $combined)\n"
-        self.assertEqual(self.runner.count("Get-GateDetail $index $gate $combined"), 1)
+        emit = "                Write-Line (Get-GateDetail $index $gate $combined $run.PeakProcessMemory)\n"
+        self.assertEqual(self.runner.count("Get-GateDetail $index $gate $combined $run.PeakProcessMemory"), 1)
         self.assertEqual(body.count(emit), 1)
         self.assertEqual(self.runner.count("windows-source-gate-detail="), 1)
         self.assertEqual(body.count("windows-source-gate-detail"), 0)
@@ -1707,7 +1719,7 @@ class WindowsSourceRunTests(unittest.TestCase):
     def test_source_mode_continues_after_an_ordinary_failure_but_still_stops_at_canary_truncation_boundary_deadline_and_timeout(self):
         body = self.function_body("Invoke-SourceGates")
         ordinary = body.split("        if (-not $passed) {\n            if ($outcome.Failure -eq 0) {\n                $outcome.Failure = $index\n                $script:RefusalReason = 'gate'\n", 1)[1]
-        self.assertEqual(ordinary, "                Write-Line (Get-GateDetail $index $gate $combined)\n            }\n            $outcome.Failed += 1\n            if ($run.TimedOut -and -not $keepGoing) { return $outcome }\n        }\n    }\n    return $outcome")
+        self.assertEqual(ordinary, "                Write-Line (Get-GateDetail $index $gate $combined $run.PeakProcessMemory)\n            }\n            $outcome.Failed += 1\n            if ($run.TimedOut -and -not $keepGoing) { return $outcome }\n        }\n    }\n    return $outcome")
         boundary = body.split("        if (-not $boundary) {\n", 1)[1].split("\n        }\n", 1)[0]
         self.assertIn("if (-not ($keepGoing -and -not $run.Created)) { return $outcome }", boundary)
         self.assertLess(body.index("if (-not $boundary) {"), body.index("if ($run.TimedOut -and -not $keepGoing)"))
