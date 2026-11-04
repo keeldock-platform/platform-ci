@@ -80,6 +80,7 @@ $MaxLockBytes = 33554432
 $NpmLinkShimFile = 'windows_npm_link_shim.cjs'
 $NpmLinkShimSha256 = '1f0befd03b49a55c554f2064658545f731f9f01db64ed7ffadfb33cc6f055adb'
 $NpmLinkShimGates = @('node_dependency_audit')
+$GateDetailNpmCodes = @('ENOTCACHED', 'EBADPLATFORM', 'ENOENT', 'EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY', 'EEXIST', 'ELOOP', 'ENAMETOOLONG', 'EINTEGRITY', 'EUSAGE', 'ELIFECYCLE', 'ERESOLVE', 'EJSONPARSE', 'ENOLOCK', 'ENOTSUP', 'EINVAL', 'EMFILE', 'ENOSPC', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETARGET', 'E404', 'EOVERRIDE', 'EWORKSPACEMISSING', 'ENOWORKSPACES', 'EINVALIDTAGNAME', 'EINVALIDPACKAGENAME', 'EUNKNOWNTYPE')
 $MaxNpmLinkMapBytes = 65536
 $MountManagerRungs = @('device', 'volume', 'drive_link', 'mpm_link', 'global_dir')
 $MountManagerKinds = @{ device = 'mountmgr'; volume = 'volume'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
@@ -1304,6 +1305,68 @@ function Get-GateCause($run, [bool]$boundary) {
     return 'exit'
 }
 
+function Get-GateDetail([int]$index, $gate, [string]$combined) {
+    $tool = 'other'
+    $kind = 'unknown'
+    $code = 'none'
+    $failedCount = 0
+    $passedCount = 0
+    try {
+        $text = [string]$combined
+        $items = @($gate.Argv | ForEach-Object { [string]$_ })
+        if (@($items | Where-Object { $_ -cmatch '(^|[\\/])cargo\.exe$' }).Count -gt 0) {
+            $tool = 'cargo'
+        } elseif (@($items | Where-Object { $_ -cmatch '(^|[\\/])npm-cli\.js$' }).Count -gt 0) {
+            $tool = 'npm'
+        }
+        if ($tool -ceq 'cargo') {
+            $compile = [regex]::Match($text, 'error\[(E[0-9]{4})\]')
+            $link = [regex]::Match($text, 'LNK[0-9]{4}')
+            $results = [regex]::Matches($text, 'test result: FAILED\. ([0-9]+) passed; ([0-9]+) failed')
+            $osError = [regex]::Match($text, 'os error ([0-9]{1,5})')
+            if ($compile.Success) {
+                $kind = 'compile'
+                $code = [string]$compile.Groups[1].Value
+            } elseif ($link.Success) {
+                $kind = 'link'
+                $code = [string]$link.Value
+            } elseif ($results.Count -gt 0) {
+                $kind = 'test'
+                $passedSum = [int64]0
+                $failedSum = [int64]0
+                foreach ($result in $results) {
+                    $passedText = [string]$result.Groups[1].Value
+                    $failedText = [string]$result.Groups[2].Value
+                    if ($passedText.Length -gt 6) { $passedText = '999999' }
+                    if ($failedText.Length -gt 6) { $failedText = '999999' }
+                    $passedSum += [int64]$passedText
+                    $failedSum += [int64]$failedText
+                }
+                $passedCount = [int][math]::Min($passedSum, [int64]999999)
+                $failedCount = [int][math]::Min($failedSum, [int64]999999)
+                $panics = [int][math]::Min([int64][regex]::Matches($text, 'panicked at').Count, [int64]999999)
+                if ($panics -gt 0) { $code = 'panics' + $panics }
+            } elseif ($osError.Success) {
+                $kind = 'os_error'
+                $code = 'os' + [int]$osError.Groups[1].Value
+            }
+        } elseif ($tool -ceq 'npm') {
+            $kind = 'npm'
+            $found = [regex]::Match($text, 'npm (?:error|ERR!) code ([A-Z0-9_]{2,32})')
+            if ($found.Success) {
+                $code = 'other'
+                if ($GateDetailNpmCodes -ccontains [string]$found.Groups[1].Value) { $code = [string]$found.Groups[1].Value }
+            }
+        }
+    } catch {
+        $kind = 'unknown'
+        $code = 'none'
+        $failedCount = 0
+        $passedCount = 0
+    }
+    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedCount + ' passed=' + $passedCount + ' code=' + $code)
+}
+
 function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsDirectory) {
     $environment = New-GateEnvironment
     $outcome = @{ Count = 0; Failed = 0; Canary = 'absent'; Boundary = 'verified'; Failure = 0 }
@@ -1357,6 +1420,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
             $causeText = ' cause=' + $gateCause
         }
         Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=' + $result + ' hang=' + $hang + $causeText)
+        if (-not $passed) { Write-Line (Get-GateDetail $index $gate $combined) }
         if ($run.Truncated -or (Test-LogCanary $combined)) {
             $outcome.Canary = 'present'
             $outcome.Failure = $index
@@ -1383,7 +1447,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
                 $script:RefusalReason = 'gate'
             }
             $outcome.Failed += 1
-            if (-not $keepGoing) { return $outcome }
+            if ($run.TimedOut -and -not $keepGoing) { return $outcome }
         }
     }
     return $outcome
