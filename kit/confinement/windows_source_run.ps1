@@ -1467,7 +1467,7 @@ try {
             if ($systemRoot -cnotmatch '^[A-Za-z]:\\$') { throw 'workspace_path' }
             $baseFree = [uint64](New-Object System.IO.DriveInfo($systemRoot)).AvailableFreeSpace
             Write-Line ('windows-confinement-volume-space=base free_gib=' + [string][math]::Floor($baseFree / 1073741824))
-            if ($baseFree -lt 32212254720) { throw 'workspace_space' }
+            if ($baseFree -lt 21474836480) { throw 'workspace_space' }
             $baseDirectory = Join-Path $systemRoot ('kd-source-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
             if ($baseDirectory -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw 'workspace_path' }
             $recordsDirectory = Join-Path $runnerTemp 'kd-records'
@@ -1750,6 +1750,9 @@ try {
             Invoke-SourceProbes $box $project $layout.RustBin
             $gateOutcome = Invoke-SourceGates $box $plan $project $recordsDirectory
             $script:GateFailure = [int]$gateOutcome.Failure
+            $afterGib = 'unknown'
+            try { $afterGib = [string][math]::Floor([uint64](New-Object System.IO.DriveInfo($systemRoot)).AvailableFreeSpace / 1073741824) } catch { $afterGib = 'unknown' }
+            Write-Line ('windows-confinement-volume-space=after free_gib=' + $afterGib)
 
             $phase = 'channels_after'
             $channelsAfter = Invoke-ChannelPhase $box 'recheck' $true

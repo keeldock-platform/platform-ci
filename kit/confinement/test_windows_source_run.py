@@ -978,11 +978,11 @@ class WindowsSourceRunTests(unittest.TestCase):
         space = (
             "            $baseFree = [uint64](New-Object System.IO.DriveInfo($systemRoot)).AvailableFreeSpace\n"
             "            Write-Line ('windows-confinement-volume-space=base free_gib=' + [string][math]::Floor($baseFree / 1073741824))\n"
-            "            if ($baseFree -lt 32212254720) { throw 'workspace_space' }\n"
+            "            if ($baseFree -lt 21474836480) { throw 'workspace_space' }\n"
         )
         self.assertIn(space, prepare)
         self.assertLess(prepare.index("throw 'workspace_space'"), prepare.index("$baseDirectory = Join-Path $systemRoot"))
-        self.assertEqual(32212254720, 30 * 1073741824)
+        self.assertEqual(21474836480, 20 * 1073741824)
         protected = (
             "            $baseSecurity = New-Object System.Security.AccessControl.DirectorySecurity\n"
             "            $baseSecurity.SetAccessRuleProtection($true, $false)\n"
@@ -1001,9 +1001,23 @@ class WindowsSourceRunTests(unittest.TestCase):
                 self.assertNotIn(forbidden, prepare)
         self.assertLess(self.runner.index("CreateDirectory($baseSecurity, $layout.Base)"), self.runner.index("Grant-Access $layout.ReadOnly"))
         public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
-        for line in ("windows-confinement-volume-space=base free_gib=0", "windows-confinement-volume-space=base free_gib=112"):
+        for line in (
+            "windows-confinement-volume-space=base free_gib=0",
+            "windows-confinement-volume-space=base free_gib=112",
+            "windows-confinement-volume-space=after free_gib=0",
+            "windows-confinement-volume-space=after free_gib=112",
+            "windows-confinement-volume-space=after free_gib=unknown",
+        ):
             with self.subTest(line=line):
                 self.assertIsNotNone(public.fullmatch(line))
+        after = (
+            "            $afterGib = 'unknown'\n"
+            "            try { $afterGib = [string][math]::Floor([uint64](New-Object System.IO.DriveInfo($systemRoot)).AvailableFreeSpace / 1073741824) } catch { $afterGib = 'unknown' }\n"
+            "            Write-Line ('windows-confinement-volume-space=after free_gib=' + $afterGib)\n"
+        )
+        self.assertIn(after, self.runner)
+        self.assertLess(self.runner.index("$gateOutcome = Invoke-SourceGates"), self.runner.index(after))
+        self.assertLess(self.runner.index(after), self.runner.index("$phase = 'channels_after'"))
         revoke = self.function_body("Revoke-NonPropagating")
         for token in (
             "$bytes = [KeelDock.Platform.WindowsConfinement.NonPropagatingDacl]::Read($path)",
