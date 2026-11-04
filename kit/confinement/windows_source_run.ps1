@@ -46,6 +46,7 @@ $script:MountLeases = @()
 $script:MountState = $null
 $script:FinalPathText = ''
 $script:VolumeBoundary = 'denied'
+$script:GrantedAncestors = @()
 $script:NpmLinks = @()
 $script:NpmLockDigest = ''
 $script:NpmLinkShim = $null
@@ -368,6 +369,24 @@ function Invoke-MountManagerLadder($sandbox) {
         }
     }
     return $state
+}
+
+function Revoke-NonPropagating([string]$path, [string]$sid) {
+    $bytes = [KeelDock.Platform.WindowsConfinement.NonPropagatingDacl]::Read($path)
+    $descriptor = New-Object System.Security.AccessControl.RawSecurityDescriptor($bytes, 0)
+    $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
+    $removed = 0
+    for ($index = $descriptor.DiscretionaryAcl.Count - 1; $index -ge 0; $index--) {
+        $ace = $descriptor.DiscretionaryAcl[$index]
+        if ($ace -is [System.Security.AccessControl.CommonAce] -and $ace.SecurityIdentifier -eq $identity -and $ace.AceQualifier -eq [System.Security.AccessControl.AceQualifier]::AccessAllowed -and $ace.AccessMask -eq 1048704 -and [int]$ace.AceFlags -eq 0) {
+            $descriptor.DiscretionaryAcl.RemoveAce($index)
+            $removed += 1
+        }
+    }
+    if ($removed -ne 1) { throw 'ancestor_revoke' }
+    $updated = New-Object byte[] $descriptor.BinaryLength
+    $descriptor.GetBinaryForm($updated, 0)
+    [KeelDock.Platform.WindowsConfinement.NonPropagatingDacl]::Write($path, $updated)
 }
 
 function Write-VolumeFacts($sandbox) {
@@ -1446,6 +1465,9 @@ try {
             $phase = 'workspace_prepare'
             $systemRoot = [IO.Path]::GetPathRoot([Environment]::SystemDirectory)
             if ($systemRoot -cnotmatch '^[A-Za-z]:\\$') { throw 'workspace_path' }
+            $baseFree = [uint64](New-Object System.IO.DriveInfo($systemRoot)).AvailableFreeSpace
+            Write-Line ('windows-confinement-volume-space=base free_gib=' + [string][math]::Floor($baseFree / 1073741824))
+            if ($baseFree -lt 32212254720) { throw 'workspace_space' }
             $baseDirectory = Join-Path $systemRoot ('kd-source-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
             if ($baseDirectory -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw 'workspace_path' }
             $recordsDirectory = Join-Path $runnerTemp 'kd-records'
@@ -1478,7 +1500,13 @@ try {
             $layout.TestDir = Join-Path $layout.ReadOnly 'tests'
             $layout.NodeTest = Join-Path $layout.TestDir 'kd_ro.txt'
             $layout.Tarballs = Join-Path $layout.ReadOnly 'tarballs'
-            foreach ($directory in @($layout.Base, $layout.Downloads, $layout.ReadOnly, $layout.Private, $script:Lpac.Root, $script:Control.Root)) {
+            $baseSecurity = New-Object System.Security.AccessControl.DirectorySecurity
+            $baseSecurity.SetAccessRuleProtection($true, $false)
+            foreach ($ownerSid in @('S-1-5-18', 'S-1-5-32-544', [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)) {
+                $baseSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($ownerSid)), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            }
+            [void][System.IO.FileSystemAclExtensions]::CreateDirectory($baseSecurity, $layout.Base)
+            foreach ($directory in @($layout.Downloads, $layout.ReadOnly, $layout.Private, $script:Lpac.Root, $script:Control.Root)) {
                 New-Item -ItemType Directory -Path $directory | Out-Null
             }
             New-Item -ItemType File -Path (Join-Path $layout.Downloads 'acl_probe.txt') | Out-Null
@@ -1502,6 +1530,7 @@ try {
             }
             foreach ($ancestorPath in $script:AncestorPaths) {
                 Grant-NonPropagating $ancestorPath $script:Sid
+                $script:GrantedAncestors = @($script:GrantedAncestors) + @($ancestorPath)
             }
             $phase = 'acl_grant'
             foreach ($set in @($script:Lpac, $script:Control)) {
@@ -1895,6 +1924,24 @@ if ($Mode -eq 'run' -and $libraryLoaded) {
     }
     if ($tempState -eq 'failed') { $cleanup = 'incomplete' }
 
+    $ancestorState = 'not_applied'
+    try {
+        $grantedAncestors = @($script:GrantedAncestors)
+        for ($ancestorIndex = $grantedAncestors.Count - 1; $ancestorIndex -ge 0; $ancestorIndex--) {
+            $ancestor = [string]$grantedAncestors[$ancestorIndex]
+            if ($ancestor.Length -eq 0 -or -not $script:Sid -or -not (Test-Path -LiteralPath $ancestor)) { continue }
+            try {
+                Revoke-NonPropagating $ancestor $script:Sid
+                if ($ancestorState -cne 'failed') { $ancestorState = 'revoked' }
+            } catch {
+                $ancestorState = 'failed'
+            }
+        }
+    } catch {
+        $ancestorState = 'failed'
+    }
+    if ($ancestorState -eq 'failed') { $cleanup = 'incomplete' }
+
     $linksState = 'not_planted'
     try {
         if ($script:TrapDirectory) {
@@ -1912,14 +1959,14 @@ if ($Mode -eq 'run' -and $libraryLoaded) {
 
     $profileText = 'deleted'
     if (@('deleted_by_api', 'removed_manually') -cnotcontains $profileState) { $profileText = $profileState }
-    $cleanupLine = 'windows-source-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' mountmgr_restore=' + $mountRestore + ' key=' + $keyCleanup + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' links=' + $linksState + ' processes=' + $processState + ' liveness=job'
+    $cleanupLine = 'windows-source-cleanup=' + $cleanup + ' null_restore=' + $nullRestore + ' mountmgr_restore=' + $mountRestore + ' key=' + $keyCleanup + ' profile=' + $profileText + ' temp_dir=' + $tempState + ' ancestors=' + $ancestorState + ' links=' + $linksState + ' processes=' + $processState + ' liveness=job'
     if ($refusal) {
         Write-Line $refusal
         Write-Line $cleanupLine
         exit 1
     }
     Write-Line $cleanupLine
-    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or @('verified', 'not_applied') -cnotcontains $mountRestore -or $keyCleanup -ne 'destroyed' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }
+    if ($cleanup -ne 'verified' -or $nullRestore -ne 'verified' -or @('verified', 'not_applied') -cnotcontains $mountRestore -or $keyCleanup -ne 'destroyed' -or $profileText -ne 'deleted' -or $tempState -ne 'removed' -or @('revoked', 'not_applied') -cnotcontains $ancestorState -or $linksState -ne 'verified' -or $processState -ne 'none') { $exitCode = 1 }
     exit $exitCode
 }
 

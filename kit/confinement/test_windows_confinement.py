@@ -3224,6 +3224,66 @@ foreach ($case in $cases) {
         self.assertLess(entry.index("remove_failed step=verify"), entry.index("ReadInformation(handle"))
         self.assertIn("Delete | Synchronize | FileReadAttributes\n", remover)
 
+    def test_remover_accepts_a_single_level_root_only_for_the_exact_source_base_shape(self):
+        remover = self.native[self.native.index("public static class HandleRemover"):self.native.index("public sealed class Sandbox")]
+        shape = remover[remover.index("private static string Shape(string path)"):remover.index("private static bool IsSourceBase")]
+        self.assertIn(
+            "            if (parts.Length < 2)\n"
+            "            {\n"
+            "                if (!IsSourceBase(parts))\n"
+            "                {\n"
+            '                    throw new InvalidOperationException("remove_path");\n'
+            "                }\n"
+            "            }\n",
+            shape,
+        )
+        self.assertEqual(remover.count("IsSourceBase("), 2)
+        body = remover[remover.index("private static bool IsSourceBase"):remover.index("private static IntPtr ReopenDirectory")]
+        for required in (
+            "private static bool IsSourceBase(string[] parts)",
+            'if (parts.Length != 1 || parts[0].Length != 18 || !parts[0].StartsWith("kd-source-", StringComparison.Ordinal))',
+            "for (int index = 10; index < 18; ++index)",
+            "char value = parts[0][index];",
+            "if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f')))",
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, body)
+        self.assertEqual(body.count("return true;"), 1)
+        self.assertEqual(body.count("return false;"), 2)
+        length = int(re.search(r"parts\[0\]\.Length != ([0-9]+)", body).group(1))
+        prefix = re.search(r'StartsWith\("([^"]+)"', body).group(1)
+        first, last = (int(value) for value in re.search(r"for \(int index = ([0-9]+); index < ([0-9]+);", body).groups())
+
+        def accepts(parts):
+            if len(parts) != 1 or len(parts[0]) != length or not parts[0].startswith(prefix):
+                return False
+            return all(value in "0123456789abcdef" for value in parts[0][first:last])
+
+        self.assertEqual((len(prefix), last), (first, length))
+        self.assertTrue(accepts(["kd-source-0123abcd"]))
+        self.assertTrue(accepts(["kd-source-" + "f" * 8]))
+        for parts in (
+            ["kd-source-0123ABCD"],
+            ["Kd-source-0123abcd"],
+            ["kd-source-0123abc"],
+            ["kd-source-0123abcde"],
+            ["kd-source-0123abcg"],
+            ["kd-sourcex0123abcd"],
+            ["kd-confinement-0123"],
+            ["Windows"],
+            ["kd-source-0123abc."],
+            ["kd-source-0123ab~1"],
+            ["kd-source-0123:abc"],
+            ["kd-source-0123abcd", "scratch"],
+            ["kd", "kd-source-0123abcd"],
+            [""],
+            [],
+        ):
+            with self.subTest(parts=parts):
+                self.assertFalse(accepts(parts))
+        self.assertIn("RefuseSystemRoot", remover)
+        self.assertIn("RequireAllowed(trimmed);", remover)
+
     def test_remover_refuses_every_path_outside_registered_roots_and_the_system_root(self):
         remover = self.native[self.native.index("public static class HandleRemover"):self.native.index("public sealed class Sandbox")]
         for required in (

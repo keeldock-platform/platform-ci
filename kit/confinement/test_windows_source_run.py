@@ -973,6 +973,73 @@ class WindowsSourceRunTests(unittest.TestCase):
             with self.subTest(line=line[:60]):
                 self.assertIsNotNone(public.fullmatch(line))
 
+    def test_the_system_volume_base_is_created_protected_checked_for_space_and_its_ancestor_aces_are_revoked(self):
+        prepare = self.runner[self.runner.index("$phase = 'workspace_prepare'"):self.runner.index("$phase = 'lpac_profile'")]
+        space = (
+            "            $baseFree = [uint64](New-Object System.IO.DriveInfo($systemRoot)).AvailableFreeSpace\n"
+            "            Write-Line ('windows-confinement-volume-space=base free_gib=' + [string][math]::Floor($baseFree / 1073741824))\n"
+            "            if ($baseFree -lt 32212254720) { throw 'workspace_space' }\n"
+        )
+        self.assertIn(space, prepare)
+        self.assertLess(prepare.index("throw 'workspace_space'"), prepare.index("$baseDirectory = Join-Path $systemRoot"))
+        self.assertEqual(32212254720, 30 * 1073741824)
+        protected = (
+            "            $baseSecurity = New-Object System.Security.AccessControl.DirectorySecurity\n"
+            "            $baseSecurity.SetAccessRuleProtection($true, $false)\n"
+            "            foreach ($ownerSid in @('S-1-5-18', 'S-1-5-32-544', [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)) {\n"
+            "                $baseSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier($ownerSid)), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))\n"
+            "            }\n"
+            "            [void][System.IO.FileSystemAclExtensions]::CreateDirectory($baseSecurity, $layout.Base)\n"
+            "            foreach ($directory in @($layout.Downloads, $layout.ReadOnly, $layout.Private, $script:Lpac.Root, $script:Control.Root)) {\n"
+        )
+        self.assertIn(protected, prepare)
+        self.assertNotIn("@($layout.Base, $layout.Downloads", self.runner)
+        self.assertEqual(self.runner.count("FileSystemAclExtensions]::CreateDirectory("), 1)
+        self.assertEqual(self.runner.count("AddAccessRule("), 1)
+        for forbidden in ("S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-15-2"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, prepare)
+        self.assertLess(self.runner.index("CreateDirectory($baseSecurity, $layout.Base)"), self.runner.index("Grant-Access $layout.ReadOnly"))
+        public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
+        for line in ("windows-confinement-volume-space=base free_gib=0", "windows-confinement-volume-space=base free_gib=112"):
+            with self.subTest(line=line):
+                self.assertIsNotNone(public.fullmatch(line))
+        revoke = self.function_body("Revoke-NonPropagating")
+        for token in (
+            "$bytes = [KeelDock.Platform.WindowsConfinement.NonPropagatingDacl]::Read($path)",
+            "for ($index = $descriptor.DiscretionaryAcl.Count - 1; $index -ge 0; $index--) {",
+            "$ace.AceQualifier -eq [System.Security.AccessControl.AceQualifier]::AccessAllowed -and $ace.AccessMask -eq 1048704 -and [int]$ace.AceFlags -eq 0",
+            "$descriptor.DiscretionaryAcl.RemoveAce($index)",
+            "if ($removed -ne 1) { throw 'ancestor_revoke' }",
+            "[KeelDock.Platform.WindowsConfinement.NonPropagatingDacl]::Write($path, $updated)",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, revoke)
+        self.assertIn("\n$script:GrantedAncestors = @()\n", self.runner)
+        self.assertIn(
+            "                Grant-NonPropagating $ancestorPath $script:Sid\n"
+            "                $script:GrantedAncestors = @($script:GrantedAncestors) + @($ancestorPath)\n",
+            self.runner,
+        )
+        tail = self.runner[self.runner.index("$nullRestore = 'not_applied'"):]
+        for token in (
+            "    $ancestorState = 'not_applied'\n",
+            "        for ($ancestorIndex = $grantedAncestors.Count - 1; $ancestorIndex -ge 0; $ancestorIndex--) {\n",
+            "                Revoke-NonPropagating $ancestor $script:Sid\n",
+            "                if ($ancestorState -cne 'failed') { $ancestorState = 'revoked' }\n",
+            "    if ($ancestorState -eq 'failed') { $cleanup = 'incomplete' }\n",
+            "-or @('revoked', 'not_applied') -cnotcontains $ancestorState -or",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, tail)
+        order = ("Remove-WithinRoots $baseDirectory", "Revoke-NonPropagating $ancestor $script:Sid", "$cleanupLine = 'windows-source-cleanup='")
+        positions = [tail.index(item) for item in order]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(self.runner.count("Revoke-NonPropagating"), 2)
+        self.assertIsNotNone(public.fullmatch(
+            "windows-source-cleanup=verified null_restore=verified mountmgr_restore=verified key=destroyed profile=deleted"
+            " temp_dir=removed ancestors=revoked links=verified processes=none liveness=job"))
+
     def test_the_npm_link_target_probe_runs_npm_realpath_confined_and_prints_only_fixed_tokens(self):
         script = re.search(r'^\$NpmLinkTargetScript = "([^"]+)"$', self.runner, re.M).group(1)
         self.assertIsNone(re.search(r"[\s\"$`]", script))
@@ -1037,7 +1104,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             with self.subTest(native=token):
                 self.assertNotIn(token, native)
         tail = self.runner[self.runner.index("$nullRestore = 'not_applied'"):]
-        self.assertIn("' temp_dir=' + $tempState + ' links=' + $linksState + ' processes=' + $processState + ' liveness=job'", tail)
+        self.assertIn("' temp_dir=' + $tempState + ' ancestors=' + $ancestorState + ' links=' + $linksState + ' processes=' + $processState + ' liveness=job'", tail)
         self.assertIn("-cnotcontains $mountRestore -or $keyCleanup -ne 'destroyed' -or", tail)
 
     def test_the_npm_link_shim_is_staged_read_only_from_the_pinned_file(self):

@@ -751,7 +751,10 @@ namespace KeelDock.Platform.WindowsConfinement
             string[] parts = trimmed.Substring(3).Split('\\');
             if (parts.Length < 2)
             {
-                throw new InvalidOperationException("remove_path");
+                if (!IsSourceBase(parts))
+                {
+                    throw new InvalidOperationException("remove_path");
+                }
             }
             foreach (string part in parts)
             {
@@ -761,6 +764,23 @@ namespace KeelDock.Platform.WindowsConfinement
                 }
             }
             return trimmed;
+        }
+
+        private static bool IsSourceBase(string[] parts)
+        {
+            if (parts.Length != 1 || parts[0].Length != 18 || !parts[0].StartsWith("kd-source-", StringComparison.Ordinal))
+            {
+                return false;
+            }
+            for (int index = 10; index < 18; ++index)
+            {
+                char value = parts[0][index];
+                if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f')))
+                {
+                    return false;
+                }
+            }
+            return true;
         }
 
 
