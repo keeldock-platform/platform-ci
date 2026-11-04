@@ -58,7 +58,6 @@ $RequiredGateCount = 15
 $MaxGateCount = 18
 $GateTableManifestCommand = 'manifest-digest'
 $GateLongSeconds = 900
-$GateNodeTestsSeconds = 2700
 $GateShortSeconds = 300
 $DiagStderrLines = 40
 $DiagStdoutLines = 20
@@ -1289,7 +1288,6 @@ function New-GateEnvironment {
 }
 
 function Get-GateSeconds([string]$id) {
-    if ($id -ceq 'typescript_tests') { return $GateNodeTestsSeconds }
     if ($id -cmatch $GateLongPattern) { return $GateLongSeconds }
     return $GateShortSeconds
 }
@@ -1323,6 +1321,8 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak, $jobPeak) 
     $hits = 'lt100'
     $files = '0'
     $summary = 'no'
+    $banner = 'no'
+    $scripts = '0'
     try {
         $text = [string]$combined
         $peakText = [string]$peak
@@ -1383,6 +1383,9 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak, $jobPeak) 
             $progress = [regex]::Matches($plain, '(?m)^ *(\u2713|\u221A|\u00D7|\u2715|\u2717) ').Count
             if ($progress -ge 1000) { $files = 'ge1000' } elseif ($progress -ge 100) { $files = '100to999' } elseif ($progress -ge 10) { $files = '10to99' } elseif ($progress -ge 1) { $files = '1to9' }
             if ([regex]::IsMatch($plain, '(?m)^ *Test Files +')) { $summary = 'yes' }
+            if ([regex]::IsMatch($plain, '(?m)^ *RUN +v[0-9]')) { $banner = 'yes' }
+            $started = [regex]::Matches($plain, '(?m)^> \S{1,120} test\r?$').Count
+            if ($started -ge 5) { $scripts = 'ge5' } elseif ($started -ge 1) { $scripts = [string]$started }
             $found = [regex]::Match($text, 'npm (?:error|ERR!) code ([A-Z0-9_]{2,32})')
             if ($found.Success) {
                 $code = 'other'
@@ -1426,9 +1429,11 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak, $jobPeak) 
         $hits = 'lt100'
         $files = '0'
         $summary = 'no'
+        $banner = 'no'
+        $scripts = '0'
     }
     $tail = ''
-    if ($tool -ceq 'npm') { $tail = ' phase=' + $phase + ' hits=' + $hits + ' files=' + $files + ' summary=' + $summary }
+    if ($tool -ceq 'npm') { $tail = ' phase=' + $phase + ' hits=' + $hits + ' files=' + $files + ' summary=' + $summary + ' banner=' + $banner + ' scripts=' + $scripts }
     return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedBucket + ' code=' + $code + ' mem=' + $mem + ' jobmem=' + $jobmem + $tail)
 }
 
