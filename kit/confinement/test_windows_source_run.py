@@ -358,7 +358,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(self.runner.count(call), 1)
         self.assertEqual(len(re.findall(r"Invoke-SourceProbes\b", self.runner)), 2)
         self.assertEqual(len(re.findall(r"Get-SourceProbes\b", self.runner)), 2)
-        self.assertEqual(len(re.findall(r"Write-ProbeDiag\b", self.runner)), 7)
+        self.assertEqual(len(re.findall(r"Write-ProbeDiag\b", self.runner)), 8)
         for name, call in (
             ("Invoke-SourceProbes", "Write-ProbeDiag $probe.Id $run"),
             ("Invoke-FinalPathProbe", "Write-ProbeDiag $id $run"),
@@ -366,6 +366,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             ("Invoke-NpmLinkProbe", "Write-ProbeDiag 'npm_link_probe' $run"),
             ("Invoke-NpmLinkTargetProbe", "Write-ProbeDiag 'npm_link_targets' $run"),
             ("Invoke-NpmReparseProbe", "Write-ProbeDiag ('npm_reparse_' + $stage) $run"),
+            ("Write-VolumeFacts", "Write-ProbeDiag ('volopen_' + $role) $run"),
         ):
             with self.subTest(caller=name):
                 self.assertEqual(self.function_body(name).count("Write-ProbeDiag"), 1)
@@ -914,6 +915,60 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-confinement-mountmgr-detail=volume mpm=ok vol=err5 qdvp=err5 qpts=err5 n_dos=err5 canon=err5 volume_boundary=denied",
             "windows-confinement-mountmgr-rung=volume state=applied error=0 readback=match finalpath=ok",
             "windows-confinement-mountmgr-rung=volume state=applied error=0 readback=match finalpath=unproven",
+        ):
+            with self.subTest(line=line[:60]):
+                self.assertIsNotNone(public.fullmatch(line))
+
+    def test_the_layout_lives_on_the_system_volume_and_the_volume_facts_name_both_volumes(self):
+        prepare = self.runner[self.runner.index("$phase = 'workspace_prepare'"):self.runner.index("$phase = 'lpac_profile'")]
+        for token in (
+            "$systemRoot = [IO.Path]::GetPathRoot([Environment]::SystemDirectory)",
+            "if ($systemRoot -cnotmatch '^[A-Za-z]:\\\\$') { throw 'workspace_path' }",
+            "$baseDirectory = Join-Path $systemRoot ('kd-source-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))",
+            "if ($baseDirectory -notmatch '^[A-Za-z]:\\\\[A-Za-z0-9_.\\\\-]+$') { throw 'workspace_path' }",
+            "Register-RemovalRoot $baseDirectory",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, prepare)
+        self.assertNotIn("Join-Path $runnerTemp ('kd-source-'", self.runner)
+        self.assertIn("\n$VolumeOpenTokens = @('vdos', 'vnt', 'vguid', 'vqdvp', 'vqpts')\n", self.runner)
+        facts = self.function_body("Write-VolumeFacts")
+        for token in (
+            "foreach ($entry in @(@('base', $baseDrive, [string]$script:Lpac.Root), @('temp', $tempDrive, $tempRoot))) {",
+            "[KeelDock.Platform.WindowsConfinement.VolumeFacts]::Describe($drive, [string]$entry[2])",
+            "[KeelDock.Platform.WindowsConfinement.VolumeFacts]::VolumeNumber($drive)",
+            "[KeelDock.Platform.WindowsConfinement.VolumeFacts]::VolumeGuid($drive)",
+            "if ($facts -cnotmatch '^[a-z0-9=._ -]{1,400}$') { $facts = 'state=invalid' }",
+            "if ($number -cnotmatch '^[0-9]{1,4}$') { $number = '-' }",
+            "if ($guid -cnotmatch '^\\{[0-9A-Fa-f-]{36}\\}$') { $guid = '-' }",
+            "Write-Line ('windows-confinement-volume-facts=' + $role + ' same_volume=' + $same + ' ' + $facts)",
+            "$run = Invoke-ConfinedProbe $sandbox ('volopen ' + $drive + ' ' + $number + ' ' + $guid) $MountManagerProbeSeconds",
+            "Write-ProbeDiag ('volopen_' + $role) $run",
+            "if (Test-ChannelRunValid $run $true) {",
+            "if ($value -cmatch '^(ok|na|err[0-9]{1,10}|usage_drive)$') { $values[$key] = $value }",
+            "$line = 'windows-confinement-volume-open=' + $role",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, facts)
+        for forbidden in ("DeviceLease", "Apply()", "Grant-", "Set-Acl", "$script:MountLeases"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, facts)
+        main = self.runner.index("$script:MountState = Invoke-MountManagerLadder $box")
+        steps = (
+            "            Write-Line (Get-MountManagerDetail)\n",
+            "            Write-VolumeFacts $box\n",
+            "            if ($script:VolumeBoundary -cne 'denied') { throw 'mountmgr_volume' }\n",
+        )
+        positions = [self.runner.index(item, main) for item in steps]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(self.runner.count("Write-VolumeFacts $box"), 1)
+        self.assertRegex("volopen_base", r"^[a-z][a-z_]{2,40}$")
+        self.assertRegex("volopen_temp", r"^[a-z][a-z_]{2,40}$")
+        public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
+        for line in (
+            "windows-confinement-volume-facts=base same_volume=no qdd=harddisk num=3 ntdev=same guid=ok guiddev=same leaseobj=same"
+            " fs=ntfs fsflags=0x03e706ff dtype=fixed bus=scsi rmv=0 label=none deny=none allow=ba.sy.wd",
+            "windows-confinement-volume-open=temp vdos=err5 vnt=err5 vguid=err5 vqdvp=err5 vqpts=err5",
         ):
             with self.subTest(line=line[:60]):
                 self.assertIsNotNone(public.fullmatch(line))

@@ -86,6 +86,7 @@ $MountManagerSourceRungs = 2
 $MountManagerProbeSeconds = 30
 $VolumeBoundaryTokens = @('volr', 'volrd', 'voldac', 'volown', 'volusn', 'volusnu', 'volenum', 'volntfs', 'volbmp')
 $VolumeControlTokens = @('volusn', 'volusnu', 'volenum', 'volntfs', 'volbmp')
+$VolumeOpenTokens = @('vdos', 'vnt', 'vguid', 'vqdvp', 'vqpts')
 $RequiredFunctions = @(
     'Get-CleanText', 'Get-Token', 'Write-DiagLines', 'Invoke-Download', 'Assert-Sha256', 'Assert-Sri', 'Invoke-Tar', 'Copy-Tree',
     'Grant-Access', 'Set-LowIntegrityLabel', 'Test-LowIntegrityLabel', 'Grant-NonPropagating', 'Get-SidRules', 'New-ScratchSet',
@@ -367,6 +368,55 @@ function Invoke-MountManagerLadder($sandbox) {
         }
     }
     return $state
+}
+
+function Write-VolumeFacts($sandbox) {
+    $baseDrive = ([string]$script:Layout.Base).Substring(0, 1)
+    $tempRoot = [string]$env:RUNNER_TEMP
+    $tempDrive = ''
+    if ($tempRoot -cmatch '^[A-Za-z]:\\') { $tempDrive = $tempRoot.Substring(0, 1) }
+    $same = 'no'
+    if ($tempDrive.Length -eq 1 -and [string]::Equals($tempDrive, $baseDrive, [StringComparison]::OrdinalIgnoreCase)) { $same = 'yes' }
+    foreach ($entry in @(@('base', $baseDrive, [string]$script:Lpac.Root), @('temp', $tempDrive, $tempRoot))) {
+        $role = [string]$entry[0]
+        $drive = [string]$entry[1]
+        if ($drive -cnotmatch '^[A-Za-z]$') {
+            Write-Line ('windows-confinement-volume-facts=' + $role + ' state=no_drive')
+            continue
+        }
+        $facts = 'state=failed'
+        $number = '-'
+        $guid = '-'
+        try {
+            $facts = [string][KeelDock.Platform.WindowsConfinement.VolumeFacts]::Describe($drive, [string]$entry[2])
+            $number = [string][KeelDock.Platform.WindowsConfinement.VolumeFacts]::VolumeNumber($drive)
+            $guid = [string][KeelDock.Platform.WindowsConfinement.VolumeFacts]::VolumeGuid($drive)
+        } catch {
+            $facts = 'state=failed'
+        }
+        if ($facts -cnotmatch '^[a-z0-9=._ -]{1,400}$') { $facts = 'state=invalid' }
+        if ($number -cnotmatch '^[0-9]{1,4}$') { $number = '-' }
+        if ($guid -cnotmatch '^\{[0-9A-Fa-f-]{36}\}$') { $guid = '-' }
+        Write-Line ('windows-confinement-volume-facts=' + $role + ' same_volume=' + $same + ' ' + $facts)
+        $values = @{}
+        foreach ($key in $VolumeOpenTokens) { $values[$key] = 'unknown' }
+        try {
+            $run = Invoke-ConfinedProbe $sandbox ('volopen ' + $drive + ' ' + $number + ' ' + $guid) $MountManagerProbeSeconds
+            Write-ProbeDiag ('volopen_' + $role) $run
+            if (Test-ChannelRunValid $run $true) {
+                $text = Get-ProbeText ([string]$run.Stdout) 'volopen'
+                foreach ($key in $VolumeOpenTokens) {
+                    $value = Get-ProbeValue $text $key
+                    if ($value -cmatch '^(ok|na|err[0-9]{1,10}|usage_drive)$') { $values[$key] = $value }
+                }
+            }
+        } catch {
+            $values['vdos'] = 'failed'
+        }
+        $line = 'windows-confinement-volume-open=' + $role
+        foreach ($key in $VolumeOpenTokens) { $line += (' ' + $key + '=' + $values[$key]) }
+        Write-Line $line
+    }
 }
 
 function Test-OtherContainerFinalPath {
@@ -1394,7 +1444,9 @@ try {
             Write-Line ('windows-confinement-image=recorded image_os=' + $imageOs + ' image_version=' + $imageVersion + ' vs_version=' + (Get-Token ([string]$vsVersion) '^[0-9.]{1,32}$') + ' msvc_version=' + (Get-Token $msvcVersion '^[0-9.]{1,32}$') + ' sdk_version=' + (Get-Token $sdkVersion '^[0-9.]{1,32}$') + ' os_build=' + (Get-Token ([Environment]::OSVersion.Version.ToString()) '^[0-9.]{1,32}$') + ' powershell=' + (Get-Token $PSVersionTable.PSVersion.ToString() '^[0-9A-Za-z.-]{1,32}$'))
 
             $phase = 'workspace_prepare'
-            $baseDirectory = Join-Path $runnerTemp ('kd-source-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+            $systemRoot = [IO.Path]::GetPathRoot([Environment]::SystemDirectory)
+            if ($systemRoot -cnotmatch '^[A-Za-z]:\\$') { throw 'workspace_path' }
+            $baseDirectory = Join-Path $systemRoot ('kd-source-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
             if ($baseDirectory -notmatch '^[A-Za-z]:\\[A-Za-z0-9_.\\-]+$') { throw 'workspace_path' }
             $recordsDirectory = Join-Path $runnerTemp 'kd-records'
             New-Item -ItemType Directory -Force -Path $recordsDirectory | Out-Null
@@ -1586,6 +1638,7 @@ try {
             $script:MountState = Invoke-MountManagerLadder $box
             if ($script:MountState.Readback -cne 'match') { throw 'mountmgr_readback' }
             Write-Line (Get-MountManagerDetail)
+            Write-VolumeFacts $box
             if ($script:VolumeBoundary -cne 'denied') { throw 'mountmgr_volume' }
             if ($script:MountState.State -cne 'applied' -and $runMode -cne 'synthetic') { throw ('mountmgr_' + $script:MountState.State) }
 

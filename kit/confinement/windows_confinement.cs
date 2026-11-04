@@ -2422,6 +2422,557 @@ namespace KeelDock.Platform.WindowsConfinement
         }
     }
 
+    public static class VolumeFacts
+    {
+        private const uint ReadControl = 0x00020000;
+        private const uint ShareAll = 0x00000007;
+        private const uint OpenExisting = 3;
+        private const uint BackupSemantics = 0x02000000;
+        private const uint SeFileObject = 1;
+        private const uint DaclInformation = 0x00000004;
+        private const uint LabelInformation = 0x00000010;
+        private const uint StorageQueryProperty = 0x002D1400;
+        private const uint VolumeNameNt = 2;
+        private const int ObjectNameInformation = 1;
+        private const int MaxDescriptorBytes = 65536;
+        private const uint ReadAttributes = 0x00000080;
+        private const uint GenericBits = 0xF0000000;
+        private const string HarddiskPrefix = "\\Device\\HarddiskVolume";
+        private static readonly IntPtr InvalidHandle = new IntPtr(-1);
+
+        public static string VolumeNumber(string drive)
+        {
+            string target;
+            if (!TryDosTarget(CheckDrive(drive) + ":", out target))
+            {
+                return "";
+            }
+            return NumberOf(target);
+        }
+
+        public static string VolumeGuid(string drive)
+        {
+            string guid;
+            if (!TryGuid(CheckDrive(drive), out guid))
+            {
+                return "";
+            }
+            return guid;
+        }
+
+        public static string Describe(string drive, string dir)
+        {
+            string letter = CheckDrive(drive);
+            List<string> parts = new List<string>();
+            string target;
+            bool haveTarget = TryDosTarget(letter + ":", out target);
+            if (!haveTarget)
+            {
+                parts.Add("qdd=" + target);
+                parts.Add("num=na");
+            }
+            else
+            {
+                string number = NumberOf(target);
+                parts.Add("qdd=" + (number.Length > 0 ? "harddisk" : "other"));
+                parts.Add("num=" + (number.Length > 0 ? number : "na"));
+            }
+            parts.Add("ntdev=" + Compare(haveTarget, target, NtDevice(dir)));
+            string guid;
+            if (TryGuid(letter, out guid))
+            {
+                parts.Add("guid=ok");
+                string guidTarget;
+                bool haveGuid = TryDosTarget("Volume" + guid, out guidTarget);
+                parts.Add("guiddev=" + Compare(haveTarget, target, haveGuid ? guidTarget : "!" + guidTarget));
+            }
+            else
+            {
+                parts.Add("guid=" + guid);
+                parts.Add("guiddev=na");
+            }
+            parts.Add("leaseobj=" + Compare(haveTarget, target, LeaseObject(letter)));
+            parts.Add(FileSystem(letter));
+            parts.Add("dtype=" + DriveType(letter));
+            parts.Add(Storage(letter));
+            parts.Add(Security(letter));
+            return string.Join(" ", parts.ToArray());
+        }
+
+        private static string CheckDrive(string drive)
+        {
+            if (drive == null || drive.Length != 1 || !((drive[0] >= 'A' && drive[0] <= 'Z') || (drive[0] >= 'a' && drive[0] <= 'z')))
+            {
+                throw new InvalidOperationException("volume_drive");
+            }
+            return drive.ToUpperInvariant();
+        }
+
+        private static string ErrorText()
+        {
+            return "err" + Marshal.GetLastWin32Error().ToString();
+        }
+
+        private static string NumberOf(string target)
+        {
+            if (target == null || !target.StartsWith(HarddiskPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return "";
+            }
+            string rest = target.Substring(HarddiskPrefix.Length);
+            if (rest.Length < 1 || rest.Length > 4)
+            {
+                return "";
+            }
+            foreach (char value in rest)
+            {
+                if (value < '0' || value > '9')
+                {
+                    return "";
+                }
+            }
+            return rest;
+        }
+
+        private static bool TryDosTarget(string name, out string target)
+        {
+            char[] buffer = new char[4096];
+            uint count = Native.QueryDosDeviceW(name, buffer, (uint)buffer.Length);
+            if (count == 0 || count > buffer.Length)
+            {
+                target = ErrorText();
+                return false;
+            }
+            int end = Array.IndexOf(buffer, '\0');
+            if (end <= 0)
+            {
+                target = "err0";
+                return false;
+            }
+            target = new string(buffer, 0, end);
+            return true;
+        }
+
+        private static bool TryGuid(string letter, out string guid)
+        {
+            StringBuilder name = new StringBuilder(128);
+            if (!Native.GetVolumeNameForVolumeMountPointW(letter + ":\\", name, (uint)name.Capacity))
+            {
+                guid = ErrorText();
+                return false;
+            }
+            string text = name.ToString();
+            int open = text.IndexOf('{');
+            int close = text.IndexOf('}');
+            if (open < 0 || close != open + 37)
+            {
+                guid = "shape";
+                return false;
+            }
+            guid = text.Substring(open, 38);
+            foreach (char value in guid)
+            {
+                bool hex = (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f') || (value >= 'A' && value <= 'F');
+                if (!hex && value != '-' && value != '{' && value != '}')
+                {
+                    guid = "shape";
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static string Compare(bool haveTarget, string target, string other)
+        {
+            if (other == null)
+            {
+                return "na";
+            }
+            if (other.StartsWith("!", StringComparison.Ordinal))
+            {
+                return other.Substring(1);
+            }
+            if (!haveTarget)
+            {
+                return "na";
+            }
+            return string.Equals(target, other, StringComparison.OrdinalIgnoreCase) ? "same" : "differ";
+        }
+
+        private static string NtDevice(string dir)
+        {
+            if (string.IsNullOrEmpty(dir))
+            {
+                return null;
+            }
+            IntPtr handle = Native.CreateFileW(dir, 0, ShareAll, IntPtr.Zero, OpenExisting, BackupSemantics, IntPtr.Zero);
+            if (handle == InvalidHandle || handle == IntPtr.Zero)
+            {
+                return "!" + ErrorText();
+            }
+            try
+            {
+                StringBuilder path = new StringBuilder(1024);
+                uint length = Native.GetFinalPathNameByHandleW(handle, path, (uint)path.Capacity, VolumeNameNt);
+                if (length == 0 || length >= path.Capacity)
+                {
+                    return "!" + ErrorText();
+                }
+                string text = path.ToString();
+                int count = 0;
+                for (int index = 0; index < text.Length; ++index)
+                {
+                    if (text[index] == '\\')
+                    {
+                        count += 1;
+                        if (count == 3)
+                        {
+                            return text.Substring(0, index);
+                        }
+                    }
+                }
+                return text;
+            }
+            finally
+            {
+                Native.CloseHandle(handle);
+            }
+        }
+
+        private static string LeaseObject(string letter)
+        {
+            IntPtr handle = Native.CreateFileW("\\\\.\\" + letter + ":", ReadControl, ShareAll, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            if (handle == InvalidHandle || handle == IntPtr.Zero)
+            {
+                return "!" + ErrorText();
+            }
+            IntPtr buffer = Marshal.AllocHGlobal(4096);
+            try
+            {
+                uint returned;
+                int status = Native.NtQueryObject(handle, ObjectNameInformation, buffer, 4096, out returned);
+                if (status < 0)
+                {
+                    return "!err" + Native.RtlNtStatusToDosError(status).ToString();
+                }
+                Native.UnicodeString name = (Native.UnicodeString)Marshal.PtrToStructure(buffer, typeof(Native.UnicodeString));
+                if (name.Buffer == IntPtr.Zero || name.Length == 0)
+                {
+                    return "!empty";
+                }
+                return Marshal.PtrToStringUni(name.Buffer, name.Length / 2);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+                Native.CloseHandle(handle);
+            }
+        }
+
+        private static string FileSystem(string letter)
+        {
+            StringBuilder system = new StringBuilder(64);
+            uint serial;
+            uint component;
+            uint flags;
+            if (!Native.GetVolumeInformationW(letter + ":\\", null, 0, out serial, out component, out flags, system, (uint)system.Capacity))
+            {
+                return "fs=" + ErrorText() + " fsflags=na";
+            }
+            string name = system.ToString().ToLowerInvariant();
+            bool plain = name.Length > 0 && name.Length <= 16;
+            foreach (char value in name)
+            {
+                if (!((value >= 'a' && value <= 'z') || (value >= '0' && value <= '9')))
+                {
+                    plain = false;
+                }
+            }
+            return "fs=" + (plain ? name : "other") + " fsflags=0x" + flags.ToString("x8");
+        }
+
+        private static string DriveType(string letter)
+        {
+            uint kind = Native.GetDriveTypeW(letter + ":\\");
+            string[] names = new string[] { "none", "noroot", "removable", "fixed", "remote", "cdrom", "ram" };
+            return kind < names.Length ? names[kind] : "other";
+        }
+
+        private static string Storage(string letter)
+        {
+            IntPtr handle = Native.CreateFileW("\\\\.\\" + letter + ":", 0, ShareAll, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            if (handle == InvalidHandle || handle == IntPtr.Zero)
+            {
+                return "bus=" + ErrorText() + " rmv=na";
+            }
+            try
+            {
+                byte[] query = new byte[12];
+                byte[] output = new byte[1024];
+                uint returned;
+                if (!Native.DeviceIoControl(handle, StorageQueryProperty, query, (uint)query.Length, output, (uint)output.Length, out returned, IntPtr.Zero))
+                {
+                    return "bus=" + ErrorText() + " rmv=na";
+                }
+                if (returned < 32)
+                {
+                    return "bus=short rmv=na";
+                }
+                uint bus = BitConverter.ToUInt32(output, 28);
+                string[] names = new string[] { "none", "scsi", "atapi", "ata", "ieee", "ssa", "fibre", "usb", "raid", "iscsi", "sas", "sata", "sd", "mmc", "virtual", "filevirtual", "spaces", "nvme", "scm", "ufs" };
+                return "bus=" + (bus < names.Length ? names[bus] : "other") + " rmv=" + (output[10] != 0 ? "1" : "0");
+            }
+            finally
+            {
+                Native.CloseHandle(handle);
+            }
+        }
+
+        private static string Security(string letter)
+        {
+            IntPtr handle = Native.CreateFileW("\\\\.\\" + letter + ":", ReadControl, ShareAll, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            if (handle == InvalidHandle || handle == IntPtr.Zero)
+            {
+                return "label=" + ErrorText() + " deny=na allow=na";
+            }
+            IntPtr descriptor = IntPtr.Zero;
+            try
+            {
+                IntPtr owner;
+                IntPtr group;
+                IntPtr dacl;
+                IntPtr sacl;
+                string labelState = "read";
+                uint status = Native.GetSecurityInfo(handle, SeFileObject, DaclInformation | LabelInformation, out owner, out group, out dacl, out sacl, out descriptor);
+                if (status != 0 || descriptor == IntPtr.Zero)
+                {
+                    if (descriptor != IntPtr.Zero)
+                    {
+                        Native.LocalFree(descriptor);
+                    }
+                    descriptor = IntPtr.Zero;
+                    labelState = "err" + status.ToString();
+                    status = Native.GetSecurityInfo(handle, SeFileObject, DaclInformation, out owner, out group, out dacl, out sacl, out descriptor);
+                }
+                if (status != 0 || descriptor == IntPtr.Zero)
+                {
+                    return "label=" + labelState + " deny=err" + status.ToString() + " allow=na";
+                }
+                uint length = Native.GetSecurityDescriptorLength(descriptor);
+                if (length < 20 || length > MaxDescriptorBytes)
+                {
+                    return "label=" + labelState + " deny=length allow=na";
+                }
+                byte[] bytes = new byte[length];
+                Marshal.Copy(descriptor, bytes, 0, (int)length);
+                return Summarize(bytes, labelState);
+            }
+            finally
+            {
+                if (descriptor != IntPtr.Zero)
+                {
+                    Native.LocalFree(descriptor);
+                }
+                Native.CloseHandle(handle);
+            }
+        }
+
+        private static string Summarize(byte[] bytes, string labelState)
+        {
+            ushort control = BitConverter.ToUInt16(bytes, 2);
+            if ((control & 0x8000) == 0)
+            {
+                return "label=" + labelState + " deny=absolute allow=na";
+            }
+            string label = labelState == "read" ? "none" : labelState;
+            int saclOffset = BitConverter.ToInt32(bytes, 12);
+            if ((control & 0x0010) != 0 && saclOffset >= 20 && saclOffset + 8 <= bytes.Length)
+            {
+                foreach (int position in AcePositions(bytes, saclOffset))
+                {
+                    if (bytes[position] == 0x11)
+                    {
+                        label = LevelName(SidText(bytes, position + 8, position + BitConverter.ToUInt16(bytes, position + 2))) + ".0x" + (BitConverter.ToUInt32(bytes, position + 4) & 7).ToString("x1");
+                    }
+                }
+            }
+            int daclOffset = BitConverter.ToInt32(bytes, 16);
+            if ((control & 0x0004) == 0 || daclOffset == 0)
+            {
+                return "label=" + label + " deny=0 allow=nulldacl";
+            }
+            if (daclOffset < 20 || daclOffset + 8 > bytes.Length)
+            {
+                return "label=" + label + " deny=shape allow=na";
+            }
+            List<string> allowed = new List<string>();
+            List<string> denied = new List<string>();
+            foreach (int position in AcePositions(bytes, daclOffset))
+            {
+                byte type = bytes[position];
+                byte flags = bytes[position + 1];
+                uint mask = BitConverter.ToUInt32(bytes, position + 4);
+                if ((flags & 0x08) != 0 || (type != 0 && type != 1))
+                {
+                    continue;
+                }
+                string name = TrusteeName(SidText(bytes, position + 8, position + BitConverter.ToUInt16(bytes, position + 2)));
+                List<string> bucket = type == 0 ? allowed : denied;
+                if ((mask & (ReadAttributes | GenericBits)) != 0 && !bucket.Contains(name))
+                {
+                    bucket.Add(name);
+                }
+            }
+            allowed.Sort(StringComparer.Ordinal);
+            denied.Sort(StringComparer.Ordinal);
+            return "label=" + label + " deny=" + (denied.Count == 0 ? "none" : string.Join(".", denied.ToArray())) + " allow=" + (allowed.Count == 0 ? "none" : string.Join(".", allowed.ToArray()));
+        }
+
+        private static List<int> AcePositions(byte[] bytes, int offset)
+        {
+            List<int> positions = new List<int>();
+            int count = BitConverter.ToUInt16(bytes, offset + 4);
+            int position = offset + 8;
+            for (int index = 0; index < count && index < 1024; ++index)
+            {
+                if (position + 8 > bytes.Length)
+                {
+                    break;
+                }
+                int size = BitConverter.ToUInt16(bytes, position + 2);
+                if (size < 16 || position + size > bytes.Length)
+                {
+                    break;
+                }
+                positions.Add(position);
+                position += size;
+            }
+            return positions;
+        }
+
+        private static string SidText(byte[] bytes, int start, int end)
+        {
+            if (start + 8 > end || end > bytes.Length || bytes[start] != 1)
+            {
+                return "";
+            }
+            int count = bytes[start + 1];
+            if (start + 8 + (count * 4) > end)
+            {
+                return "";
+            }
+            ulong authority = 0;
+            for (int index = 2; index < 8; ++index)
+            {
+                authority = (authority << 8) | bytes[start + index];
+            }
+            StringBuilder text = new StringBuilder("S-1-" + authority.ToString());
+            for (int index = 0; index < count; ++index)
+            {
+                text.Append("-" + BitConverter.ToUInt32(bytes, start + 8 + (index * 4)).ToString());
+            }
+            return text.ToString();
+        }
+
+        private static string LevelName(string sid)
+        {
+            switch (sid)
+            {
+                case "S-1-16-0": return "untrusted";
+                case "S-1-16-4096": return "low";
+                case "S-1-16-8192": return "medium";
+                case "S-1-16-8448": return "mediumplus";
+                case "S-1-16-12288": return "high";
+                case "S-1-16-16384": return "system";
+                default: return "other";
+            }
+        }
+
+        private static string TrusteeName(string sid)
+        {
+            switch (sid)
+            {
+                case "S-1-1-0": return "wd";
+                case "S-1-3-0": return "co";
+                case "S-1-5-4": return "iu";
+                case "S-1-5-11": return "au";
+                case "S-1-5-12": return "rc";
+                case "S-1-5-18": return "sy";
+                case "S-1-5-32-544": return "ba";
+                case "S-1-5-32-545": return "bu";
+                case "S-1-15-2-1": return "ac";
+                case "S-1-15-2-2": return "rac";
+            }
+            if (sid.StartsWith("S-1-15-2-", StringComparison.Ordinal))
+            {
+                return "pkg";
+            }
+            if (sid.StartsWith("S-1-15-3-", StringComparison.Ordinal))
+            {
+                return "cap";
+            }
+            if (sid.StartsWith("S-1-16-", StringComparison.Ordinal))
+            {
+                return "il";
+            }
+            return "other";
+        }
+
+        private static class Native
+        {
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct UnicodeString
+            {
+                internal ushort Length;
+                internal ushort MaximumLength;
+                internal IntPtr Buffer;
+            }
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            internal static extern IntPtr CreateFileW(string fileName, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool CloseHandle(IntPtr handle);
+
+            [DllImport("kernel32.dll", SetLastError = true)]
+            internal static extern IntPtr LocalFree(IntPtr memory);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            internal static extern uint QueryDosDeviceW(string deviceName, [Out] char[] targetPath, uint length);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool GetVolumeNameForVolumeMountPointW(string mountPoint, StringBuilder volumeName, uint length);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            internal static extern uint GetFinalPathNameByHandleW(IntPtr handle, StringBuilder path, uint length, uint flags);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            internal static extern uint GetDriveTypeW(string rootPath);
+
+            [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool GetVolumeInformationW(string rootPath, StringBuilder volumeName, uint volumeNameLength, out uint serial, out uint maxComponent, out uint flags, StringBuilder systemName, uint systemNameLength);
+
+            [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            internal static extern bool DeviceIoControl(IntPtr handle, uint code, byte[] input, uint inputSize, [Out] byte[] output, uint outputSize, out uint returned, IntPtr overlapped);
+
+            [DllImport("advapi32.dll", ExactSpelling = true)]
+            internal static extern uint GetSecurityInfo(IntPtr handle, uint objectType, uint information, out IntPtr owner, out IntPtr group, out IntPtr dacl, out IntPtr sacl, out IntPtr descriptor);
+
+            [DllImport("advapi32.dll", ExactSpelling = true)]
+            internal static extern uint GetSecurityDescriptorLength(IntPtr descriptor);
+
+            [DllImport("ntdll.dll", ExactSpelling = true)]
+            internal static extern int NtQueryObject(IntPtr handle, int informationClass, IntPtr information, uint length, out uint returned);
+
+            [DllImport("ntdll.dll", ExactSpelling = true)]
+            internal static extern uint RtlNtStatusToDosError(int status);
+        }
+    }
+
     public static class JunctionMaker
     {
         private const uint GenericWrite = 0x40000000;

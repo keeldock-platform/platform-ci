@@ -785,6 +785,37 @@ fn push_text(data: &mut Vec<u8>, text: &[u16]) {
     }
 }
 
+fn probe_volopen(drive: &str, number: &str, guid: &str) -> String {
+    if drive.len() != 1 || !drive.chars().all(|value| value.is_ascii_alphabetic()) {
+        return String::from("vdos=usage_drive");
+    }
+    let letter = drive.to_ascii_uppercase();
+    let numbered = !number.is_empty() && number.len() <= 4 && number.bytes().all(|value| value.is_ascii_digit());
+    let guided = guid.len() == 38
+        && guid.starts_with('{')
+        && guid.ends_with('}')
+        && guid[1..37].bytes().all(|value| value.is_ascii_hexdigit() || value == b'-');
+    let vdos = device_state(&format!("\\\\.\\{}:", letter), 0x0010_0080);
+    let vnt = if numbered {
+        device_state(&format!("\\\\?\\GLOBALROOT\\Device\\HarddiskVolume{}", number), 0x0010_0080)
+    } else {
+        String::from("na")
+    };
+    let vguid = if guided {
+        device_state(&format!("\\\\?\\Volume{}", guid), 0x0010_0080)
+    } else {
+        String::from("na")
+    };
+    let device: Option<Vec<u16>> = if numbered {
+        Some(format!("\\Device\\HarddiskVolume{}", number).encode_utf16().collect())
+    } else {
+        None
+    };
+    let vqdvp = mount_query(&device, 0x006D_0030);
+    let vqpts = mount_query(&device, 0x006D_0008);
+    format!("vdos={} vnt={} vguid={} vqdvp={} vqpts={}", vdos, vnt, vguid, vqdvp, vqpts)
+}
+
 fn remove_state(path: &[u16]) -> String {
     if unsafe { RemoveDirectoryW(path.as_ptr()) } == 0 {
         format!("err{}", last_error())
@@ -1235,6 +1266,7 @@ fn main() {
         "symlink" => probe_symlink(first, second),
         "hardlink" => probe_hardlink(first, second),
         "finalpath" => probe_finalpath(first, second),
+        "volopen" => probe_volopen(first, second, third),
         "junction" => probe_junction(first, second, third),
         "reparse" => probe_reparse(first),
         "mountmgr" => probe_mountmgr(first),

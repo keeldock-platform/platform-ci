@@ -87,6 +87,7 @@ PROBE_COMMANDS = (
     "symlink",
     "hardlink",
     "finalpath",
+    "volopen",
     "junction",
     "reparse",
     "mountmgr",
@@ -1534,6 +1535,58 @@ foreach ($case in $cases) {
         for forbidden in ("CreateDirectoryW", "RemoveDirectoryW", "0x4000_0000", "0x0004_0000", "display()", "{:?}"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, body + helpers)
+
+    def test_volume_open_probe_compares_names_with_the_lease_mask_and_prints_only_fixed_tokens(self):
+        probe = self.probe
+        body = probe[probe.index("fn probe_volopen"):probe.index("fn remove_state")]
+        for required in (
+            "fn probe_volopen(drive: &str, number: &str, guid: &str) -> String {",
+            'return String::from("vdos=usage_drive");',
+            "number.len() <= 4 && number.bytes().all(|value| value.is_ascii_digit())",
+            "guid.len() == 38",
+            "guid[1..37].bytes().all(|value| value.is_ascii_hexdigit() || value == b'-')",
+            r'device_state(&format!("\\\\.\\{}:", letter), 0x0010_0080)',
+            r'device_state(&format!("\\\\?\\GLOBALROOT\\Device\\HarddiskVolume{}", number), 0x0010_0080)',
+            r'device_state(&format!("\\\\?\\Volume{}", guid), 0x0010_0080)',
+            r'Some(format!("\\Device\\HarddiskVolume{}", number).encode_utf16().collect())',
+            "let vqdvp = mount_query(&device, 0x006D_0030);",
+            "let vqpts = mount_query(&device, 0x006D_0008);",
+            'format!("vdos={} vnt={} vguid={} vqdvp={} vqpts={}", vdos, vnt, vguid, vqdvp, vqpts)',
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, body)
+        self.assertEqual(re.findall(r"device_state\([^;]*?, (0x[0-9A-F_]+)\)", body), ["0x0010_0080"] * 3)
+        for forbidden in ("println", "{:?}", "display()", "to_string_lossy", "0x8000_0000", "0x0004_0000", "0x0008_0000", "0x0010_0001", "DeviceIoControl"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, body)
+        self.assertIn('"volopen" => probe_volopen(first, second, third),', probe)
+
+    def test_volume_facts_are_read_only_and_name_the_object_the_lease_and_the_name_query_use(self):
+        native = self.native
+        facts = native[native.index("public static class VolumeFacts"):native.index("public static class JunctionMaker")]
+        for required in (
+            "public static string Describe(string drive, string dir)",
+            "public static string VolumeNumber(string drive)",
+            "public static string VolumeGuid(string drive)",
+            'private const string HarddiskPrefix = "\\\\Device\\\\HarddiskVolume";',
+            "private const uint StorageQueryProperty = 0x002D1400;",
+            'parts.Add("ntdev=" + Compare(haveTarget, target, NtDevice(dir)));',
+            'TryDosTarget("Volume" + guid, out guidTarget)',
+            'parts.Add("leaseobj=" + Compare(haveTarget, target, LeaseObject(letter)));',
+            "Native.NtQueryObject(handle, ObjectNameInformation, buffer, 4096, out returned)",
+            "Native.GetVolumeInformationW(",
+            "Native.GetDriveTypeW(",
+            "Native.GetSecurityInfo(handle, SeFileObject, DaclInformation | LabelInformation,",
+            "if ((flags & 0x08) != 0 || (type != 0 && type != 1))",
+            "if (bytes[position] == 0x11)",
+        ):
+            with self.subTest(required=required[:60]):
+                self.assertIn(required, facts)
+        for forbidden in ("SetSecurityInfo", "SetEntriesInAcl", "SetKernelObjectSecurity", "SetFileSecurity", "WriteDac", "0x00040000",
+                          "GENERIC_WRITE", "0x40000000", "DefineDosDevice", "SetVolumeMountPoint", "DeleteVolumeMountPoint"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, facts)
+        self.assertEqual(sorted(set(re.findall(r'Native\.CreateFileW\([^,]+, ([A-Za-z0-9]+),', facts))), ["0", "ReadControl"])
 
     def test_finalpath_junction_and_object_probes_print_only_fixed_tokens(self):
         probe = self.probe
