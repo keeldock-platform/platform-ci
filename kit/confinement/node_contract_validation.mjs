@@ -51,6 +51,7 @@ const MAX_ALLOWED_FINDINGS = 16;
 const SEVERITY_RANK = Object.freeze({ info: 0, low: 1, moderate: 2, high: 3, critical: 4 });
 const ALLOWABLE_SEVERITY_RANK = Object.freeze({ info: 0, low: 1, moderate: 2 });
 const IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/u;
+const NUMERIC_ADVISORY_ID = /^[1-9][0-9]{0,15}$/u;
 const LOCKED_VERSION = /^[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}(?:[-+][0-9A-Za-z.+-]{1,64})?$/u;
 const PRODUCTION_EDGE_GROUPS = Object.freeze(['dependencies', 'optionalDependencies', 'peerDependencies']);
 const ERROR_CODES = new Set([
@@ -303,6 +304,7 @@ function validateAllowedFindings(input, policyEpochMs) {
       version: finding.version,
       severity: finding.severity,
       advisoryId: finding.advisory_id,
+      range: finding.range,
       expiresAtMs: expires,
     }));
   }
@@ -534,19 +536,20 @@ function productionReach(packages, workspacePaths) {
   return seen;
 }
 
-function advisoryIdentifiers(item) {
-  const identifiers = new Set();
-  if (typeof item.id === 'string' || safeInteger(item.id)) identifiers.add(String(item.id));
-  if (typeof item.github_advisory_id === 'string') identifiers.add(item.github_advisory_id);
-  return identifiers;
+function advisoryMatches(item, advisoryId) {
+  if (NUMERIC_ADVISORY_ID.test(advisoryId)) return safeInteger(item.id, 1) && String(item.id) === advisoryId;
+  if (advisoryId.startsWith('GHSA-')) {
+    return typeof item.github_advisory_id === 'string' && item.github_advisory_id === advisoryId;
+  }
+  return false;
 }
 
 function recordedAllow(item, name, version, allowContext) {
   const severity = item.severity;
   if (typeof severity !== 'string' || !Object.hasOwn(ALLOWABLE_SEVERITY_RANK, severity)) return null;
-  const identifiers = advisoryIdentifiers(item);
   const allow = allowContext.allows.find((candidate) => candidate.name === name
-    && candidate.version === version && identifiers.has(candidate.advisoryId)
+    && candidate.version === version && advisoryMatches(item, candidate.advisoryId)
+    && candidate.range === item.vulnerable_versions
     && SEVERITY_RANK[severity] <= SEVERITY_RANK[candidate.severity]
     && candidate.expiresAtMs > allowContext.fetchedMs);
   if (!allow) return null;

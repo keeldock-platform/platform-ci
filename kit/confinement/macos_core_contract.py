@@ -210,6 +210,8 @@ SOURCE_GATES_NODE_DIAGNOSTIC_REASONS = {
     },
 }
 SOURCE_GATES_NODE_DIAGNOSTICS = frozenset(SOURCE_GATES_NODE_DIAGNOSTIC_REASONS)
+ACCEPTED_NODE_PROVENANCE_MAX_BYTES = 16384
+ACCEPTED_NODE_PROVENANCE_OVERSIZE = "source_gates_node_none_limit_exceeded"
 SOURCE_GATES_NODE_STAGE_BY_SUBSTAGE = {
     "runtime_version": "node_dependency_prepare", "npm_version": "node_dependency_prepare",
     "lock_generation": "node_dependency_prepare", "lock_validation": "node_dependency_prepare",
@@ -2054,6 +2056,7 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
         smoke_versions = _validate_smoke_receipt(runner_temp, binding, rust)
         if feedback is not None:
             operation = "toolchain_node"
+            provenance_oversize = False
             try:
                 node, npm_cli = feedback_producer.resolve_node(
                     environ,
@@ -2066,13 +2069,21 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
                 if provenance:
                     if feedback["profile"]["kind"] != "build_diagnostics":
                         raise ValueError
-                    parsed = feedback_producer._strict_json(provenance.encode("utf-8"), 16384)
+                    encoded = provenance.encode("utf-8")
+                    if len(encoded) > ACCEPTED_NODE_PROVENANCE_MAX_BYTES:
+                        provenance_oversize = True
+                        raise ValueError
+                    parsed = feedback_producer._strict_json(encoded, ACCEPTED_NODE_PROVENANCE_MAX_BYTES)
                     if type(parsed) is not dict:
                         raise ValueError
                     feedback["accepted_node_provenance"] = parsed
             except feedback_producer.FeedbackRefusal:
                 raise Refusal("runner_unavailable", "worker_setup") from None
             except BaseException:
+                if provenance_oversize:
+                    raise Refusal(
+                        "runner_unavailable", "worker_setup", diagnostic=ACCEPTED_NODE_PROVENANCE_OVERSIZE,
+                    ) from None
                 raise Refusal("runner_unavailable", "worker_setup") from None
         operation = "token_input"
         if type(token_reference) is not str or TOKEN_RE.fullmatch(token_reference) is None:

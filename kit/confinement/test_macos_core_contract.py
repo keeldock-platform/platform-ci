@@ -661,6 +661,74 @@ class CoreContractTests(unittest.TestCase):
         self.assertEqual(status, 1)
         self.assertIn('"diagnostic":"summary_guard_input"', output.getvalue())
 
+    def test_oversize_accepted_node_provenance_reports_the_precise_limit_diagnostic(self):
+        runtime = SimpleNamespace(SOURCE_CANDIDATE_REF_ENV="SOURCE_CANDIDATE_REF")
+        controls = (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(), runtime,
+                    SimpleNamespace(), SimpleNamespace())
+
+        class FeedbackRefusal(Exception):
+            pass
+
+        def strict_json(raw, maximum):
+            if type(raw) is not bytes or not 0 < len(raw) <= maximum:
+                raise FeedbackRefusal()
+            return json.loads(raw.decode("utf-8"))
+
+        def producer(kind):
+            return SimpleNamespace(
+                FeedbackRefusal=FeedbackRefusal,
+                validate_dispatch=lambda unused_kind, unused_environ: {
+                    "request": {"source_sha": SOURCE_SHA, "base_sha": BASE_SHA, "base_branch": "develop"},
+                    "profile": {"concern": subject.CONCERN, "kind": kind},
+                },
+                resolve_node=lambda unused_environ, require_npm: ("node", "npm"),
+                _strict_json=strict_json,
+            )
+
+        def fail_source(*unused_args, **unused_kwargs):
+            raise subject.Refusal("summary_guard_failed", "summary_guard")
+
+        arguments = (
+            "run", "--token-stdin", "--source-sha", SOURCE_SHA,
+            "--base-sha", BASE_SHA, "--base-branch", "develop",
+        )
+        limit = subject.ACCEPTED_NODE_PROVENANCE_MAX_BYTES
+        self.assertEqual(limit, 16384)
+        fitting = '{"a":"' + "x" * (limit - 8) + '"}'
+        oversize = '{"a":"' + "x" * (limit - 7) + '"}'
+        self.assertEqual((len(fitting), len(oversize)), (limit, limit + 1))
+        self.assertIn(subject.ACCEPTED_NODE_PROVENANCE_OVERSIZE, subject.SOURCE_GATES_NODE_DIAGNOSTICS)
+        self.assertEqual(
+            subject.SOURCE_GATES_NODE_DIAGNOSTIC_REASONS[subject.ACCEPTED_NODE_PROVENANCE_OVERSIZE],
+            "runner_unavailable",
+        )
+        self.assertNotIn(subject.ACCEPTED_NODE_PROVENANCE_OVERSIZE, subject.SOURCE_GATES_NODE_DIAGNOSTIC_STAGES)
+        cases = (
+            ("build_diagnostics", oversize,
+             ("runner_unavailable", "worker_setup", "source_gates_node_none_limit_exceeded")),
+            ("build_diagnostics", fitting, ("summary_guard_failed", "summary_guard")),
+            ("build_diagnostics", "[]", ("runner_unavailable", "worker_setup", "unavailable")),
+            ("lock", oversize, ("runner_unavailable", "worker_setup", "unavailable")),
+        )
+        for kind, value, expected in cases:
+            with self.subTest(kind=kind, size=len(value)):
+                environ = {"CORE_CONTRACT_ACCEPTED_NODE_LOCK_JSON": value}
+                with patch.object(subject, "_load_controls", return_value=controls), \
+                     patch.object(subject, "_load_control_sibling", return_value=producer(kind)), \
+                     patch.object(subject, "_validate_context", return_value=({}, Path.cwd(), Path.cwd())), \
+                     patch.object(subject, "_validate_review_gate", return_value=(DIFF_SHA256, CANDIDATE_REF)), \
+                     patch.object(subject, "_check_temp_root"), \
+                     patch.object(subject, "_validate_smoke_receipt", return_value={"rustc": "fixture"}), \
+                     patch.object(subject, "_run_source", side_effect=fail_source), \
+                     patch.object(subject.os, "geteuid", return_value=0, create=True), \
+                     patch.object(subject.sys, "platform", "darwin"), \
+                     patch.object(subject.platform, "machine", return_value="arm64"):
+                    with self.assertRaises(subject.Refusal) as raised:
+                        subject._execute(arguments, environ, "x", {}, feedback_kind=kind)
+                refusal = raised.exception
+                actual = (refusal.reason, refusal.stage, refusal.diagnostic)
+                self.assertEqual(actual[:len(expected)], expected)
+
     def test_producer_revocation_marker_follows_successful_cleanup_on_late_refusal(self):
         arguments = [
             "run", "--token-stdin", "--source-sha", SOURCE_SHA,

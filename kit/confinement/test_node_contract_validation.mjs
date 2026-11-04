@@ -504,6 +504,28 @@ hostedTest('a recorded allow never covers another advisory id, version or higher
   await assert.rejects(allowCase({ items: [withoutSeverity] }), refusedWith('vulnerable_dependency'));
 });
 
+hostedTest('a recorded allow requires the recorded range and the advisory id from its own namespace', async () => {
+  await assert.rejects(allowCase({ items: [{ ...recordedAdvisory, vulnerable_versions: '<6.0.5' }] }),
+    refusedWith('vulnerable_dependency'));
+  await assert.rejects(allowCase({ items: [{ ...recordedAdvisory, id: '1244012' }] }),
+    refusedWith('vulnerable_dependency'));
+  await assert.rejects(allowCase({ items: [{ ...recordedAdvisory, id: 5, github_advisory_id: '1244012' }] }),
+    refusedWith('vulnerable_dependency'));
+  const policyEpochMs = Date.now() - (30 * ALLOW_DAY_MS);
+  const github = recordedFinding(policyEpochMs, { advisory_id: 'GHSA-aaaa-bbbb-cccc' });
+  await assert.rejects(allowCase({
+    policyEpochMs, findings: [github], items: [{ ...recordedAdvisory, id: 'GHSA-aaaa-bbbb-cccc' }],
+  }), refusedWith('vulnerable_dependency'));
+  await assert.rejects(allowCase({
+    policyEpochMs, findings: [recordedFinding(policyEpochMs, { advisory_id: 'fixture-advisory' })],
+    items: [{ ...recordedAdvisory, id: 'fixture-advisory', github_advisory_id: 'fixture-advisory' }],
+  }), refusedWith('vulnerable_dependency'));
+  const matched = await allowCase({
+    policyEpochMs, findings: [github], items: [{ ...recordedAdvisory, id: 9, github_advisory_id: 'GHSA-aaaa-bbbb-cccc' }],
+  });
+  assert.equal(matched.result.allowed_count, 1);
+});
+
 hostedTest('a recorded allow refuses a package that is not development-only or is reachable from production', async () => {
   await assert.rejects(allowCase({ lockBytes: allowLockFixture({ dev: false }) }),
     refusedWith('vulnerable_dependency'));
