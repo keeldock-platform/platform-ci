@@ -22,7 +22,8 @@ MAX_CANARY_BYTES = 256
 MAX_SCAN_BYTES = 33554432
 SCAN_CHUNK = 4194304
 TOTAL_SCAN_BUDGET = 2147483648
-WALK_SECONDS = 240
+WALK_SECONDS = 900
+WALKER_GRACE_SECONDS = 60
 ENVIRON_BYTES = 1048576
 MAX_REQUEST_BYTES = 4194304
 MAX_REPLY_BYTES = 1048576
@@ -34,6 +35,23 @@ EXTRA_ROOTS = ("/dev/shm",)
 GROUP_SECRET = 0
 GROUP_READABLE_CONTROL = 1
 GROUP_PRIVATE_CONTROL = 2
+SCAN_DETAIL_PATHS_REPLY = 101
+SCAN_DETAIL_REQUIRED_ABSENT = 102
+SCAN_DETAIL_TARGET_UNTESTED = 103
+SCAN_DETAIL_CONTROL_ABSENT = 104
+SCAN_DETAIL_WALK_REPLY = 105
+SCAN_DETAIL_WALK_DEADLINE = 106
+SCAN_DETAIL_WALK_BUDGET = 107
+SCAN_DETAIL_WALK_LISTING = 108
+SCAN_DETAIL_WALKER_TIMEOUT = 110
+SCAN_DETAIL_WALKER_SPAWN = 111
+SCAN_DETAIL_WALKER_EXIT = 112
+SCAN_DETAIL_WALKER_REPLY = 113
+WALK_STOPS = {
+    "deadline": SCAN_DETAIL_WALK_DEADLINE,
+    "budget": SCAN_DETAIL_WALK_BUDGET,
+    "listing": SCAN_DETAIL_WALK_LISTING,
+}
 RUNNER_GLOBS = (
     "runners/*/_diag",
     "runners/*/.credentials",
@@ -299,47 +317,58 @@ def walk_tree(needles, cutoff_ns, deadline, roots=("/",)):
     visited = 0
     scanned = 0
     total = 0
-    complete = True
+    stopped = "none"
     stack = list(roots) + list(EXTRA_ROOTS)
-    while stack:
-        if time.monotonic() > deadline or total > TOTAL_SCAN_BUDGET:
-            complete = False
+    while stack and stopped == "none":
+        if time.monotonic() > deadline:
+            stopped = "deadline"
+            break
+        if total > TOTAL_SCAN_BUDGET:
+            stopped = "budget"
             break
         directory = stack.pop()
         try:
             iterator = os.scandir(directory)
         except OSError:
             continue
-        with iterator:
-            for entry in iterator:
-                path = entry.path
-                if path in skip:
-                    continue
-                visited += 1
-                try:
-                    info = entry.stat(follow_symlinks=False)
-                except OSError:
-                    continue
-                if stat.S_ISDIR(info.st_mode):
-                    stack.append(path)
-                elif stat.S_ISREG(info.st_mode) and info.st_ctime_ns >= cutoff_ns:
+        try:
+            with iterator:
+                for entry in iterator:
+                    path = entry.path
+                    if path in skip:
+                        continue
+                    visited += 1
                     try:
-                        found, used = _scan_file(path, needles, longest)
+                        info = entry.stat(follow_symlinks=False)
                     except OSError:
                         continue
-                    scanned += 1
-                    total += used
-                    for index in found:
-                        if len(hits) < MAX_HITS:
-                            hits.append([path, needles[index][0]])
-    return {"hits": hits, "visited": visited, "scanned": scanned, "complete": complete}
+                    if stat.S_ISDIR(info.st_mode):
+                        stack.append(path)
+                    elif stat.S_ISREG(info.st_mode) and info.st_ctime_ns >= cutoff_ns:
+                        if time.monotonic() > deadline:
+                            stopped = "deadline"
+                            break
+                        try:
+                            found, used = _scan_file(path, needles, longest)
+                        except OSError:
+                            continue
+                        scanned += 1
+                        total += used
+                        for index in found:
+                            if len(hits) < MAX_HITS:
+                                hits.append([path, needles[index][0]])
+        except OSError:
+            stopped = "listing"
+    return {"hits": hits, "visited": visited, "scanned": scanned, "complete": stopped == "none", "stopped": stopped}
 
 
 def probe_paths(entries, nonce):
     tested = 0
+    probed = []
     leaks = []
     for index, path in entries:
         tested += 1
+        probed.append(index)
         leaked = False
         try:
             if os.path.isdir(path):
@@ -364,7 +393,29 @@ def probe_paths(entries, nonce):
             pass
         if leaked:
             leaks.append(index)
-    return {"tested": tested, "leaks": leaks}
+    return {"tested": tested, "probed": probed, "leaks": leaks}
+
+
+def verify_path_probe(result, count, required, controls=()):
+    sets = []
+    for name in ("present", "probed", "leaks"):
+        value = result.get(name) if type(result) is dict else None
+        if (type(value) is not list
+                or not all(type(index) is int and 0 <= index < count for index in value)
+                or len(set(value)) != len(value)):
+            raise BoundaryRefusal("scan_incomplete", "runner_files", SCAN_DETAIL_PATHS_REPLY)
+        sets.append(set(value))
+    present, probed, leaks = sets
+    tested = result.get("tested")
+    if type(tested) is not int or tested != len(probed) or not leaks <= probed:
+        raise BoundaryRefusal("scan_incomplete", "runner_files", SCAN_DETAIL_PATHS_REPLY)
+    if probed != present:
+        raise BoundaryRefusal("scan_incomplete", "runner_files", SCAN_DETAIL_TARGET_UNTESTED)
+    if not all(index in present for index in required):
+        raise BoundaryRefusal("scan_incomplete", "runner_files", SCAN_DETAIL_REQUIRED_ABSENT)
+    if not all(index in present for index in controls):
+        raise BoundaryRefusal("scan_incomplete", "runner_files", SCAN_DETAIL_CONTROL_ABSENT)
+    return present, leaks
 
 
 def scan_processes(needles):
@@ -437,6 +488,7 @@ def walker_main(stdin, stdout):
         entries = [(index, item) for index, item in enumerate(targets) if os.path.lexists(item)]
         become_project_user()
         result = probe_paths(entries, nonce)
+        result["present"] = [index for index, unused in entries]
     elif mode == "walk":
         needles = decode_needles(request["needles"])
         deadline = time.monotonic() + float(request["seconds"])
@@ -469,26 +521,33 @@ def run_walker(request, timeout):
             close_fds=True,
             env=WALKER_ENV,
         )
+    except subprocess.TimeoutExpired:
+        raise BoundaryRefusal("scan_incomplete", None, SCAN_DETAIL_WALKER_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
-        raise BoundaryRefusal("scan_incomplete")
+        raise BoundaryRefusal("scan_incomplete", None, SCAN_DETAIL_WALKER_SPAWN)
     if completed.returncode != 0 or len(completed.stdout) > MAX_REPLY_BYTES:
-        raise BoundaryRefusal("scan_incomplete")
+        raise BoundaryRefusal("scan_incomplete", None, SCAN_DETAIL_WALKER_EXIT)
     try:
         result = json.loads(completed.stdout.decode("ascii"))
     except (UnicodeError, ValueError):
-        raise BoundaryRefusal("scan_incomplete")
+        raise BoundaryRefusal("scan_incomplete", None, SCAN_DETAIL_WALKER_REPLY)
     if type(result) is not dict:
-        raise BoundaryRefusal("scan_incomplete")
+        raise BoundaryRefusal("scan_incomplete", None, SCAN_DETAIL_WALKER_REPLY)
     return result
 
 
 def evaluate_walk(result, secret_group=GROUP_SECRET):
-    if type(result.get("hits")) is not list or result.get("complete") is not True:
-        raise BoundaryRefusal("scan_incomplete", "runner_files")
+    stopped = result.get("stopped")
+    if type(result.get("hits")) is not list or type(stopped) is not str:
+        raise BoundaryRefusal("scan_incomplete", "runner_files", SCAN_DETAIL_WALK_REPLY)
+    if stopped in WALK_STOPS:
+        raise BoundaryRefusal("scan_incomplete", "runner_files", WALK_STOPS[stopped])
+    if stopped != "none" or result.get("complete") is not True:
+        raise BoundaryRefusal("scan_incomplete", "runner_files", SCAN_DETAIL_WALK_REPLY)
     groups = set()
     for entry in result["hits"]:
         if type(entry) is not list or len(entry) != 2 or type(entry[1]) is not int:
-            raise BoundaryRefusal("scan_incomplete", "runner_files")
+            raise BoundaryRefusal("scan_incomplete", "runner_files", SCAN_DETAIL_WALK_REPLY)
         groups.add(entry[1])
     return {
         "secret": secret_group in groups,

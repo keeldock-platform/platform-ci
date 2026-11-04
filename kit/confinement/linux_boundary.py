@@ -409,14 +409,14 @@ class Boundary:
         control_dir, control_file = canaries.plant_writable_control(os.path.join(self.workdir, "writable"))
         real = list(self.targets)
         entries = real + [control_dir, control_file]
+        controls = (len(real), len(real) + 1)
+        if len(self.required) != 2 or not all(path in real for path in self.required):
+            raise BoundaryRefusal("scan_incomplete", "runner_files", canaries.SCAN_DETAIL_REQUIRED_ABSENT)
+        required = [real.index(path) for path in self.required]
         paths = canaries.run_walker({"mode": "paths", "targets": entries, "nonce": self.nonce}, 60)
-        existing = sum(1 for path in real if os.path.lexists(path))
-        leaks = paths.get("leaks")
-        required_ok = len(self.required) == 2 and all(path in real for path in self.required)
-        if type(leaks) is not list or paths.get("tested") != existing + 2 or not required_ok:
-            raise BoundaryRefusal("scan_incomplete", "runner_files")
-        controls_leak = (len(real) in leaks) and (len(real) + 1 in leaks)
-        real_leaks = [index for index in leaks if type(index) is int and index < len(real)]
+        unused, leaks = canaries.verify_path_probe(paths, len(entries), required, controls)
+        controls_leak = all(index in leaks for index in controls)
+        real_leaks = sorted(index for index in leaks if index < len(real))
         readable = canaries.control_token("readable", self.nonce).encode("ascii")
         private = canaries.control_token("private", self.nonce).encode("ascii")
         groups = [
@@ -430,7 +430,9 @@ class Boundary:
             "cutoff_ns": canaries.current_cutoff_ns(),
             "seconds": canaries.WALK_SECONDS,
         }
-        walk = canaries.evaluate_walk(canaries.run_walker(request, canaries.WALK_SECONDS + 60))
+        walk = canaries.evaluate_walk(
+            canaries.run_walker(request, canaries.WALK_SECONDS + canaries.WALKER_GRACE_SECONDS)
+        )
         self.readable_canary = "present" if walk["secret"] else "absent"
         control = controls_leak and walk["readable_control"] and not walk["private_control"]
         if walk["secret"]:
@@ -766,10 +768,11 @@ def run_harden(arguments):
         targets = canaries.runner_targets(arguments.runner_home, arguments.runner_temp, root)
         required = canaries.required_unreadable(arguments.runner_temp, root)
         if len(required) != 2 or not all(path in targets for path in required):
-            raise BoundaryRefusal("scan_incomplete", "runner_files")
+            raise BoundaryRefusal("scan_incomplete", "runner_files", canaries.SCAN_DETAIL_REQUIRED_ABSENT)
         changed = canaries.harden_runner_paths(targets)
         paths = canaries.run_walker({"mode": "paths", "targets": targets, "nonce": os.urandom(12).hex()}, 60)
-        if paths.get("leaks") != [] or paths.get("tested") != len(targets):
+        unused, leaks = canaries.verify_path_probe(paths, len(targets), [targets.index(path) for path in required])
+        if leaks:
             raise BoundaryRefusal("readback_failed", "runner_files")
     except BoundaryRefusal as refusal:
         line = (
@@ -778,6 +781,8 @@ def run_harden(arguments):
         )
         if refusal.channel is not None:
             line += " channel=" + refusal.channel
+        if refusal.detail is not None:
+            line += " detail=" + str(refusal.detail)
         emitter.emit(line + " project-execution=not_started")
         return 1
     emitter.emit(

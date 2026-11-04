@@ -12,7 +12,7 @@ import linux_canaries as canaries
 from linux_channels import BoundaryRefusal
 
 
-__all__ = ["LinuxCanaryTests", "LinuxCanaryWalkTests", "LinuxReviewFixCanaryTests"]
+__all__ = ["LinuxCanaryTests", "LinuxCanaryWalkTests", "LinuxReviewFixCanaryTests", "LinuxCanaryWalkerAccountingTests"]
 
 NONCE = "0123456789abcdef01234567"
 ROOT = Path(__file__).resolve().parents[2]
@@ -173,6 +173,8 @@ class LinuxCanaryWalkTests(unittest.TestCase):
             with self.assertRaises(BoundaryRefusal) as raised:
                 canaries.evaluate_walk(result)
             self.assertEqual(raised.exception.reason, "scan_incomplete")
+            self.assertEqual(result["stopped"], "deadline")
+            self.assertEqual(raised.exception.detail, canaries.SCAN_DETAIL_WALK_DEADLINE)
 
     def test_evaluation_refuses_malformed_replies(self):
         for bad in ({}, {"hits": "x", "complete": True}, {"hits": [["p"]], "complete": True}, {"hits": [["p", "g"]], "complete": True}):
@@ -243,6 +245,124 @@ class LinuxReviewFixCanaryTests(unittest.TestCase):
         self.assertTrue(canaries.valid_canary(derived))
         with self.assertRaises(ValueError):
             canaries.derive_canary("short", "label")
+
+
+class BrokenListing:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *unused):
+        return False
+
+    def __iter__(self):
+        raise OSError(5, "listing")
+
+
+class LinuxCanaryWalkerAccountingTests(unittest.TestCase):
+    def test_scan_details_are_distinct_bounded_integers(self):
+        details = [
+            canaries.SCAN_DETAIL_PATHS_REPLY, canaries.SCAN_DETAIL_REQUIRED_ABSENT,
+            canaries.SCAN_DETAIL_TARGET_UNTESTED, canaries.SCAN_DETAIL_CONTROL_ABSENT,
+            canaries.SCAN_DETAIL_WALK_REPLY, canaries.SCAN_DETAIL_WALK_DEADLINE,
+            canaries.SCAN_DETAIL_WALK_BUDGET, canaries.SCAN_DETAIL_WALK_LISTING,
+            canaries.SCAN_DETAIL_WALKER_TIMEOUT, canaries.SCAN_DETAIL_WALKER_SPAWN,
+            canaries.SCAN_DETAIL_WALKER_EXIT, canaries.SCAN_DETAIL_WALKER_REPLY,
+        ]
+        self.assertEqual(len(set(details)), 12)
+        for detail in details:
+            self.assertEqual(BoundaryRefusal("scan_incomplete", "runner_files", detail).detail, detail)
+        self.assertEqual(sorted(canaries.WALK_STOPS), ["budget", "deadline", "listing"])
+        self.assertGreater(canaries.WALK_SECONDS, 240)
+        self.assertGreater(canaries.WALKER_GRACE_SECONDS, 0)
+
+    def test_walker_reports_which_targets_were_present_and_probed(self):
+        import io
+        import json
+        with tempfile.TemporaryDirectory() as base:
+            first = os.path.join(base, "first")
+            Path(first).write_text("x")
+            missing = os.path.join(base, "missing")
+            request = json.dumps({"mode": "paths", "targets": [first, missing, base], "nonce": NONCE}).encode("ascii")
+            output = io.BytesIO()
+            with patch("linux_canaries.os.geteuid", return_value=0), \
+                 patch("linux_canaries.become_project_user"):
+                self.assertEqual(canaries.walker_main(io.BytesIO(request), output), 0)
+            reply = json.loads(output.getvalue().decode("ascii"))
+            self.assertEqual(reply["present"], [0, 2])
+            self.assertEqual(reply["probed"], [0, 2])
+            self.assertEqual(reply["tested"], 2)
+            present, leaks = canaries.verify_path_probe(reply, 3, [0], [2])
+            self.assertEqual(present, {0, 2})
+            self.assertEqual(leaks, set(reply["leaks"]))
+
+    def test_path_probe_verification_names_each_accounting_failure(self):
+        good = {"tested": 3, "probed": [0, 1, 3], "present": [0, 1, 3], "leaks": [3]}
+        self.assertEqual(canaries.verify_path_probe(good, 4, [0], [3]), ({0, 1, 3}, {3}))
+        for reply, detail in (
+            ([], canaries.SCAN_DETAIL_PATHS_REPLY),
+            (dict(good, tested=2), canaries.SCAN_DETAIL_PATHS_REPLY),
+            (dict(good, leaks=[2]), canaries.SCAN_DETAIL_PATHS_REPLY),
+            (dict(good, present=[0, 1, 4]), canaries.SCAN_DETAIL_PATHS_REPLY),
+            (dict(good, present=[0, 1, -1]), canaries.SCAN_DETAIL_PATHS_REPLY),
+            (dict(good, present=[0, 1, 2, 3]), canaries.SCAN_DETAIL_TARGET_UNTESTED),
+            (dict(good, present=[0, 3]), canaries.SCAN_DETAIL_TARGET_UNTESTED),
+        ):
+            with self.subTest(reply=reply):
+                with self.assertRaises(BoundaryRefusal) as raised:
+                    canaries.verify_path_probe(reply, 4, [0], [3])
+                self.assertEqual((raised.exception.reason, raised.exception.channel), ("scan_incomplete", "runner_files"))
+                self.assertEqual(raised.exception.detail, detail)
+        for required, controls, detail in (
+            ([2], [3], canaries.SCAN_DETAIL_REQUIRED_ABSENT),
+            ([0], [2], canaries.SCAN_DETAIL_CONTROL_ABSENT),
+        ):
+            with self.assertRaises(BoundaryRefusal) as raised:
+                canaries.verify_path_probe(good, 4, required, controls)
+            self.assertEqual(raised.exception.detail, detail)
+
+    def test_walk_stops_are_reported_by_cause(self):
+        with tempfile.TemporaryDirectory() as base:
+            Path(base, "file").write_bytes(b"content")
+            os.mkdir(os.path.join(base, "nested"))
+            Path(base, "nested", "inner").write_bytes(b"content")
+            with patch.object(canaries, "EXTRA_ROOTS", ()):
+                clean = canaries.walk_tree([(0, b"s" * 20)], 0, time.monotonic() + 30, (base,))
+                with patch.object(canaries, "TOTAL_SCAN_BUDGET", 0):
+                    budget = canaries.walk_tree([(0, b"s" * 20)], 0, time.monotonic() + 30, (base,))
+                with patch("linux_canaries.time.monotonic", side_effect=[0, 100]):
+                    late = canaries.walk_tree([(0, b"s" * 20)], 0, 50, (os.path.join(base, "nested"),))
+                with patch("linux_canaries.os.scandir", return_value=BrokenListing()):
+                    listing = canaries.walk_tree([(0, b"s" * 20)], 0, time.monotonic() + 30, (base,))
+        self.assertEqual((clean["stopped"], clean["complete"], clean["scanned"]), ("none", True, 2))
+        self.assertEqual((budget["stopped"], budget["complete"]), ("budget", False))
+        self.assertEqual((late["stopped"], late["complete"], late["scanned"]), ("deadline", False, 0))
+        self.assertEqual((listing["stopped"], listing["complete"]), ("listing", False))
+        for result, detail in ((budget, 107), (late, 106), (listing, 108)):
+            with self.assertRaises(BoundaryRefusal) as raised:
+                canaries.evaluate_walk(result)
+            self.assertEqual(raised.exception.detail, detail)
+        self.assertEqual(canaries.evaluate_walk(clean)["secret"], False)
+
+    def test_walker_process_failures_carry_distinct_details(self):
+        import subprocess
+        from types import SimpleNamespace
+        cases = (
+            (subprocess.TimeoutExpired(["walker"], 1), canaries.SCAN_DETAIL_WALKER_TIMEOUT),
+            (OSError(2, "spawn"), canaries.SCAN_DETAIL_WALKER_SPAWN),
+            (SimpleNamespace(returncode=1, stdout=b"{}"), canaries.SCAN_DETAIL_WALKER_EXIT),
+            (SimpleNamespace(returncode=0, stdout=b"not json"), canaries.SCAN_DETAIL_WALKER_REPLY),
+            (SimpleNamespace(returncode=0, stdout=b"[]"), canaries.SCAN_DETAIL_WALKER_REPLY),
+        )
+        for outcome, detail in cases:
+            with self.subTest(detail=detail):
+                effect = {"side_effect": outcome} if isinstance(outcome, BaseException) else {"return_value": outcome}
+                with patch("linux_canaries.subprocess.run", **effect):
+                    with self.assertRaises(BoundaryRefusal) as raised:
+                        canaries.run_walker({"mode": "walk"}, 5)
+                self.assertEqual((raised.exception.reason, raised.exception.channel), ("scan_incomplete", None))
+                self.assertEqual(raised.exception.detail, detail)
+        with patch("linux_canaries.subprocess.run", return_value=SimpleNamespace(returncode=0, stdout=b'{"a":1}')):
+            self.assertEqual(canaries.run_walker({"mode": "walk"}, 5), {"a": 1})
 
 
 if __name__ == "__main__":

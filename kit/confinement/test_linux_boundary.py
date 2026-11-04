@@ -28,6 +28,7 @@ __all__ = [
     "LinuxBoundaryProcessMemoryTests",
     "LinuxBoundaryFixtureDiagnosticTests",
     "LinuxBoundaryFixtureStderrDiagnosticTests",
+    "LinuxBoundaryRunnerFilesAccountingTests",
 ]
 
 SHA = "a" * 40
@@ -655,6 +656,7 @@ class LinuxBoundaryReviewFixTests(unittest.TestCase):
             with self.assertRaises(BoundaryRefusal) as raised:
                 subject.runner_files_outcome()
         self.assertEqual(raised.exception.reason, "scan_incomplete")
+        self.assertEqual(raised.exception.detail, 102)
 
     def test_harden_step_hardens_then_requires_every_target_unreadable(self):
         args = arguments(runner_home="/h", runner_temp="/w/_temp")
@@ -665,13 +667,13 @@ class LinuxBoundaryReviewFixTests(unittest.TestCase):
              patch("linux_boundary.canaries.harden_runner_paths", return_value=2) as harden:
             out = io.StringIO()
             with patch("linux_boundary.sys.stdout", out), \
-                 patch("linux_boundary.canaries.run_walker", return_value={"leaks": [], "tested": 3}):
+                 patch("linux_boundary.canaries.run_walker", return_value={"leaks": [], "tested": 3, "present": [0, 1, 2], "probed": [0, 1, 2]}):
                 self.assertEqual(boundary.run_harden(args), 0)
             self.assertEqual(out.getvalue(), "KD-LINUX-HARDEN schema=1 result=accepted targets=3 changed=2 readable=0\n")
             harden.assert_called_once_with(targets)
             out = io.StringIO()
             with patch("linux_boundary.sys.stdout", out), \
-                 patch("linux_boundary.canaries.run_walker", return_value={"leaks": [1], "tested": 3}):
+                 patch("linux_boundary.canaries.run_walker", return_value={"leaks": [1], "tested": 3, "present": [0, 1, 2], "probed": [0, 1, 2]}):
                 self.assertEqual(boundary.run_harden(args), 1)
             self.assertIn("KD-LINUX-HARDEN schema=1 result=refused reason=readback_failed channel=runner_files", out.getvalue())
             self.assertNotIn("phase=", out.getvalue())
@@ -1236,6 +1238,142 @@ class LinuxBoundaryFixtureStderrDiagnosticTests(unittest.TestCase):
         for line in shown:
             self.assertRegex(line, r"^KD-LINUX-FIXTURE-DIAG schema=1 phase=selftest form=(build_rs|proc_macro) stream=stderr line=[A-Za-z0-9 ._:/=+,()'" + chr(34) + r"?-]{1,200}$")
         self.assertTrue(shown[-1].endswith("rustc says ?79? ?x? ?y?"))
+
+
+RUNNER_TARGETS = ["/w/_temp", "/w", "/r", "/r/_diag"]
+CLEAN_WALK = {"hits": [["/c/readable", 1]], "visited": 9, "scanned": 2, "complete": True, "stopped": "none"}
+
+
+def paths_reply(present, leaks, probed=None):
+    probed = list(present) if probed is None else probed
+    return {"tested": len(probed), "probed": probed, "present": present, "leaks": leaks}
+
+
+class LinuxBoundaryRunnerFilesAccountingTests(unittest.TestCase):
+    def outcome(self, paths, walk=CLEAN_WALK, exists=True):
+        subject, unused = make()
+        subject.targets = list(RUNNER_TARGETS)
+        subject.required = ["/w/_temp", "/r/_diag"]
+        subject.workdir = "/tmp/unused-workdir"
+        subject.nonce = "0123456789abcdef01234567"
+        subject.secret_needles = (b"s" * 20,)
+        requests = []
+
+        def walker(request, timeout):
+            requests.append((request["mode"], timeout))
+            return paths if request["mode"] == "paths" else walk
+
+        with patch("linux_boundary.canaries.plant_writable_control", return_value=("/c", "/c/f")), \
+             patch("linux_boundary.canaries.run_walker", side_effect=walker), \
+             patch("linux_boundary.canaries.current_cutoff_ns", return_value=0), \
+             patch("linux_boundary.os.path.lexists", return_value=exists):
+            outcome = subject.runner_files_outcome()
+        return outcome, requests
+
+    def refusal(self, paths, walk=CLEAN_WALK):
+        with self.assertRaises(BoundaryRefusal) as raised:
+            self.outcome(paths, walk)
+        self.assertEqual((raised.exception.reason, raised.exception.channel), ("scan_incomplete", "runner_files"))
+        return raised.exception.detail
+
+    def test_targets_that_vanish_or_appear_around_the_probe_pass_when_nothing_leaks(self):
+        for present, exists in (([0, 1, 3, 4, 5], True), ([0, 1, 3, 4, 5], False), ([0, 1, 2, 3, 4, 5], False)):
+            with self.subTest(present=present, exists=exists):
+                outcome, requests = self.outcome(paths_reply(present, [4, 5]), exists=exists)
+                self.assertEqual((outcome.status, outcome.control, outcome.refusal), ("blocked", True, None))
+                self.assertEqual(requests, [("paths", 60), ("walk", canaries_walk_timeout())])
+
+    def test_a_present_target_that_leaks_or_was_readable_still_refuses(self):
+        for leaks in ([1, 4, 5], [0, 3, 4, 5]):
+            with self.subTest(leaks=leaks):
+                outcome, unused = self.outcome(paths_reply([0, 1, 2, 3, 4, 5], leaks))
+                self.assertEqual(outcome.status, "observed-leak")
+                self.assertEqual((outcome.refusal.reason, outcome.refusal.channel), ("channel_leak", "runner_files"))
+
+    def test_a_target_found_present_but_not_probed_refuses_as_untested(self):
+        self.assertEqual(self.refusal(paths_reply([0, 1, 2, 3, 4, 5], [4, 5], [0, 1, 3, 4, 5])), 103)
+        self.assertEqual(self.refusal(paths_reply([0, 1, 3, 4, 5], [4, 5], [0, 1, 2, 3, 4, 5])), 103)
+
+    def test_a_missing_control_or_required_target_still_refuses(self):
+        self.assertEqual(self.refusal(paths_reply([0, 1, 2, 3, 4], [4])), 104)
+        self.assertEqual(self.refusal(paths_reply([0, 1, 2, 3], [])), 104)
+        self.assertEqual(self.refusal(paths_reply([1, 2, 3, 4, 5], [4, 5])), 102)
+        self.assertEqual(self.refusal(paths_reply([0, 1, 2, 4, 5], [4, 5])), 102)
+
+    def test_a_control_that_cannot_be_written_is_a_dead_control_not_a_pass(self):
+        outcome, unused = self.outcome(paths_reply([0, 1, 2, 3, 4, 5], [4]))
+        self.assertEqual((outcome.status, outcome.control), ("blocked", False))
+        self.assertEqual(outcome.refusal.reason, "control_not_fired")
+
+    def test_malformed_or_miscounted_probe_replies_refuse_and_never_pass_silently(self):
+        good = paths_reply([0, 1, 2, 3, 4, 5], [4, 5])
+        variants = [{}, dict(good, tested=5), dict(good, tested=True), dict(good, leaks=[4, 5, 6]),
+                    dict(good, present=[0, 1, 2, 3, 4, 5, 5]), dict(good, probed=[0, 1, 2, 3, 4, True]),
+                    dict(good, leaks="4"), {key: value for key, value in good.items() if key != "present"},
+                    {key: value for key, value in good.items() if key != "probed"},
+                    dict(paths_reply([0, 1, 2, 3, 4], [4, 5]), present=[0, 1, 2, 3, 4, 5])]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertEqual(self.refusal(variant), 101)
+
+    def test_each_incomplete_walk_names_its_cause_in_the_refusal_detail(self):
+        good = paths_reply([0, 1, 2, 3, 4, 5], [4, 5])
+        for walk, detail in (
+            (dict(CLEAN_WALK, complete=False, stopped="deadline"), 106),
+            (dict(CLEAN_WALK, complete=False, stopped="budget"), 107),
+            (dict(CLEAN_WALK, complete=False, stopped="listing"), 108),
+            (dict(CLEAN_WALK, complete=False), 105),
+            ({"hits": [], "complete": True}, 105),
+            (dict(CLEAN_WALK, stopped="other"), 105),
+            (dict(CLEAN_WALK, hits=[["p"]]), 105),
+        ):
+            with self.subTest(walk=walk):
+                self.assertEqual(self.refusal(good, walk), detail)
+
+    def test_the_channel_refusal_and_verdict_line_carry_the_scan_detail(self):
+        subject, unused = make()
+        with tempfile.TemporaryDirectory() as base:
+            subject.canary_dir = base
+            refusal = BoundaryRefusal("scan_incomplete", "runner_files", 106)
+            with patch.object(boundary.Boundary, "runner_files_outcome", side_effect=refusal):
+                outcome = subject.run_channel("runner_files")
+        self.assertEqual((outcome.status, outcome.control), ("not-run", False))
+        self.assertEqual(outcome.refusal.detail, 106)
+        self.assertEqual(
+            channels.verdict_line("selftest", outcome.refusal, 0),
+            "linux-source-boundary=refused phase=selftest reason=scan_incomplete channel=runner_files detail=106"
+            " project-execution=not_started",
+        )
+        self.assertEqual(
+            channels.channel_line("selftest", "runner_files", outcome.status, outcome.control),
+            "KD-LINUX-CHANNEL schema=1 phase=selftest channel=runner_files status=not-run control=0",
+        )
+
+    def test_the_harden_step_accepts_churn_but_refuses_leaks_and_names_accounting_failures(self):
+        args = arguments(runner_home="/h", runner_temp="/w/_temp")
+        targets = ["/w/_temp", "/r/_diag", "/h"]
+        cases = (
+            (paths_reply([0, 1], []), 0, "KD-LINUX-HARDEN schema=1 result=accepted targets=3 changed=1 readable=0\n"),
+            (paths_reply([0, 1, 2], [2]), 1, "reason=readback_failed channel=runner_files project-execution=not_started"),
+            (paths_reply([1, 2], []), 1, "reason=scan_incomplete channel=runner_files detail=102 project-execution"),
+            (paths_reply([0, 1, 2], [], [0, 1]), 1, "reason=scan_incomplete channel=runner_files detail=103"),
+            ({"leaks": [], "tested": 3}, 1, "reason=scan_incomplete channel=runner_files detail=101"),
+        )
+        for reply, status, expected in cases:
+            with self.subTest(reply=reply):
+                out = io.StringIO()
+                with patch("linux_boundary.os.geteuid", return_value=0), \
+                     patch("linux_boundary.canaries.runner_root", return_value="/r"), \
+                     patch("linux_boundary.canaries.runner_targets", return_value=targets), \
+                     patch("linux_boundary.canaries.harden_runner_paths", return_value=1), \
+                     patch("linux_boundary.canaries.run_walker", return_value=reply), \
+                     patch("linux_boundary.sys.stdout", out):
+                    self.assertEqual(boundary.run_harden(args), status)
+                self.assertIn(expected, out.getvalue())
+
+
+def canaries_walk_timeout():
+    return boundary.canaries.WALK_SECONDS + boundary.canaries.WALKER_GRACE_SECONDS
 
 
 if __name__ == "__main__":
