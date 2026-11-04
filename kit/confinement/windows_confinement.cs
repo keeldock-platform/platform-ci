@@ -1168,8 +1168,8 @@ namespace KeelDock.Platform.WindowsConfinement
         private const uint JobObjectLimitBreakawayOk = 0x00000800;
         private const uint JobObjectLimitSilentBreakawayOk = 0x00001000;
         private const uint JobLimitFlags = JobObjectLimitActiveProcess | JobObjectLimitProcessMemory | JobObjectLimitJobMemory | JobObjectLimitKillOnJobClose;
-        private const ulong ProcessMemoryLimitBytes = 8589934592UL;
-        private const ulong JobMemoryLimitBytes = 12884901888UL;
+        private const ulong ProcessMemoryLimitBytes = 12884901888UL;
+        private const ulong JobMemoryLimitBytes = 15032385536UL;
         private const uint WaitObject0 = 0;
         private const uint WaitTimeout = 0x00000102;
         private const uint JobKillExitCode = 0x4b44574b;

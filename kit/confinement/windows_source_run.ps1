@@ -1169,7 +1169,7 @@ function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$envir
     $seconds = Get-GateSeconds $gate.Id
     if ($seconds -gt $remaining) { $seconds = $remaining }
     $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))
-    $then = [string[]](@($then[0], '--max-old-space-size=6144') + @($then[1..($then.Count - 1)]))
+    $then = [string[]](@($then[0], '--max-old-space-size=10240') + @($then[1..($then.Count - 1)]))
     $second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), $GateMaxProcesses)
     $merged = New-Object KeelDock.Platform.WindowsConfinement.RunResult
     foreach ($field in @('Failure', 'Detail', 'Created', 'CreateError', 'TimedOut', 'Exited', 'ExitCode', 'ElapsedMs', 'Token', 'Job', 'PeakProcessMemory', 'PeakJobMemory', 'CpuMs', 'HandleCount', 'Class46')) {
@@ -1310,12 +1310,13 @@ function Get-GateCause($run, [bool]$boundary) {
     return 'exit'
 }
 
-function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
+function Get-GateDetail([int]$index, $gate, [string]$combined, $peak, $jobPeak) {
     $tool = 'other'
     $kind = 'unknown'
     $code = 'none'
     $failedBucket = '0'
     $mem = 'unknown'
+    $jobmem = 'unknown'
     $phase = 'none'
     $hits = 'lt100'
     try {
@@ -1323,7 +1324,12 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
         $peakText = [string]$peak
         if ($peakText -cmatch '^[0-9]{1,19}$') {
             $peakBytes = [uint64]$peakText
-            if ($peakBytes -eq 0) { $mem = 'unknown' } elseif ($peakBytes -lt 1073741824) { $mem = 'lt1g' } elseif ($peakBytes -lt 2147483648) { $mem = '1to2g' } elseif ($peakBytes -lt 4294967296) { $mem = '2to4g' } elseif ($peakBytes -lt 8589934592) { $mem = '4to8g' } else { $mem = 'ge8g' }
+            if ($peakBytes -eq 0) { $mem = 'unknown' } elseif ($peakBytes -lt 1073741824) { $mem = 'lt1g' } elseif ($peakBytes -lt 2147483648) { $mem = '1to2g' } elseif ($peakBytes -lt 4294967296) { $mem = '2to4g' } elseif ($peakBytes -lt 8589934592) { $mem = '4to8g' } elseif ($peakBytes -lt 12884901888) { $mem = '8to12g' } else { $mem = 'ge12g' }
+        }
+        $jobPeakText = [string]$jobPeak
+        if ($jobPeakText -cmatch '^[0-9]{1,19}$') {
+            $jobPeakBytes = [uint64]$jobPeakText
+            if ($jobPeakBytes -eq 0) { $jobmem = 'unknown' } elseif ($jobPeakBytes -lt 2147483648) { $jobmem = 'lt2g' } elseif ($jobPeakBytes -lt 4294967296) { $jobmem = '2to4g' } elseif ($jobPeakBytes -lt 8589934592) { $jobmem = '4to8g' } elseif ($jobPeakBytes -lt 12884901888) { $jobmem = '8to12g' } else { $jobmem = 'ge12g' }
         }
         $items = @($gate.Argv | ForEach-Object { [string]$_ })
         if (@($items | Where-Object { $_ -cmatch '(^|[\\/])cargo\.exe$' }).Count -gt 0) {
@@ -1407,12 +1413,13 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak) {
         $code = 'none'
         $failedBucket = '0'
         $mem = 'unknown'
+        $jobmem = 'unknown'
         $phase = 'none'
         $hits = 'lt100'
     }
     $tail = ''
     if ($tool -ceq 'npm') { $tail = ' phase=' + $phase + ' hits=' + $hits }
-    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedBucket + ' code=' + $code + ' mem=' + $mem + $tail)
+    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedBucket + ' code=' + $code + ' mem=' + $mem + ' jobmem=' + $jobmem + $tail)
 }
 
 function Test-NodeGate($gate) {
@@ -1505,7 +1512,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
             if ($outcome.Failure -eq 0) {
                 $outcome.Failure = $index
                 $script:RefusalReason = 'gate'
-                Write-Line (Get-GateDetail $index $gate $combined $run.PeakProcessMemory)
+                Write-Line (Get-GateDetail $index $gate $combined $run.PeakProcessMemory $run.PeakJobMemory)
             }
             $outcome.Failed += 1
             if ($run.TimedOut -and -not $keepGoing) { return $outcome }
