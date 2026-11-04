@@ -1243,16 +1243,17 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(shim.count("require("), 3)
         for forbidden in ("writeFile", "appendFile", "WriteStream", "writeSync", "child_process", "spawn", "exec", "fork",
                           "node:net", "node:http", "node:https", "node:dgram", "node:tls", "node:dns", "fetch", "WebSocket",
-                          "Worker", "symlink", "unlink", "rmSync", "rmdir", "mkdir", "rename", "chmod", "chown", "utimes",
+                          "Worker", "unlink", "rmdir", "mkdir", "rename", "chmod", "chown", "utimes",
                           "openSync", "fs.open", "copyFile", "cpSync", "truncate", "process.binding", "eval(", "Function(",
                           "import(", "console", "process.stdout", "process.stderr", "process.exit", "setTimeout",
                           "setInterval", "module.exports", "globalThis"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, shim)
         self.assertEqual(set(re.findall(r"\bfs\.([A-Za-z]+)", shim)),
-                         {"readFileSync", "constants", "promises", "Stats", "lstat", "lstatSync", "readlink", "readlinkSync"})
+                         {"readFileSync", "readdirSync", "constants", "promises", "Stats", "lstat", "lstatSync", "readlink", "readlinkSync",
+                          "rm", "rmSync", "symlink", "symlinkSync"})
         self.assertEqual(shim.count("readFileSync"), 1)
-        self.assertEqual(set(re.findall(r"\bpromises\.([A-Za-z]+)", shim)), {"lstat", "readlink"})
+        self.assertEqual(set(re.findall(r"\bpromises\.([A-Za-z]+)", shim)), {"lstat", "readlink", "rm", "symlink"})
         self.assertIn("const MAP_VARIABLE = 'KD_NPM_LINK_MAP';\nconst HASH_VARIABLE = 'KD_NPM_LINK_MAP_SHA256';\n", shim)
         self.assertIn("const refuse = (reason) => {\n  throw new Error('npm_link_shim refused ' + reason);\n};\n", shim)
         self.assertLess(shim.index("const links = loadMap();"), shim.index("\nfs.lstat = "))
@@ -1297,15 +1298,17 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn(guard, shim)
         self.assertLess(shim.index(guard), shim.index("\nfs.lstat = "))
 
-    def test_the_npm_link_shim_wraps_exactly_six_functions_and_passes_every_unlisted_path_through(self):
+    def test_the_npm_link_shim_wraps_exactly_twelve_functions_and_passes_every_unlisted_path_through(self):
         shim = SHIM.read_text(encoding="ascii")
         assigned = re.findall(r"^((?:fs|promises)\.[A-Za-z]+) = (?:async )?function ([A-Za-z]+)\(", shim, re.M)
         self.assertEqual(assigned, [
             ("fs.lstat", "lstat"), ("fs.lstatSync", "lstatSync"), ("promises.lstat", "lstat"),
-            ("fs.readlink", "readlink"), ("fs.readlinkSync", "readlinkSync"), ("promises.readlink", "readlink")])
-        self.assertEqual(len(re.findall(r"^(?:fs|promises)\.[A-Za-z]+ = ", shim, re.M)), 6)
+            ("fs.readlink", "readlink"), ("fs.readlinkSync", "readlinkSync"), ("promises.readlink", "readlink"),
+            ("fs.rm", "rm"), ("fs.rmSync", "rmSync"), ("promises.rm", "rm"),
+            ("fs.symlink", "symlink"), ("fs.symlinkSync", "symlinkSync"), ("promises.symlink", "symlink")])
+        self.assertEqual(len(re.findall(r"^(?:fs|promises)\.[A-Za-z]+ = ", shim, re.M)), 12)
         bodies = re.split(r"\n(?=(?:fs|promises)\.[A-Za-z]+ = )", shim)[1:]
-        self.assertEqual(len(bodies), 6)
+        self.assertEqual(len(bodies), 12)
         passes = (
             ("realLstat", "  if (target === undefined || typeof done !== 'function' || bigintRequested(options)) {\n    return Reflect.apply(realLstat, this, arguments);\n  }\n  process.nextTick(done, null, linkStats(target));\n"),
             ("realLstatSync", "  if (target === undefined || bigintRequested(options)) return Reflect.apply(realLstatSync, this, arguments);\n  return linkStats(target);\n"),
@@ -1314,7 +1317,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             ("realReadlinkSync", "  if (value === undefined) return Reflect.apply(realReadlinkSync, this, arguments);\n  return value;\n"),
             ("realPromiseReadlink", "  if (value === undefined) return Reflect.apply(realPromiseReadlink, this, arguments);\n  return value;\n"),
         )
-        for body, (real, tail) in zip(bodies, passes):
+        for body, (real, tail) in zip(bodies[:6], passes):
             with self.subTest(real=real):
                 self.assertTrue(body.split("\n", 2)[1] == "  const target = lookup(candidate);")
                 self.assertIn(tail, body)
@@ -1340,6 +1343,61 @@ class WindowsSourceRunTests(unittest.TestCase):
         value = shim[shim.index("const linkValue = "):shim.index("\nfs.lstat = ")]
         self.assertIn("if (encoding === undefined || encoding === null || encoding === 'utf8' || encoding === 'utf-8') return target;", value)
         self.assertIn("if (encoding === 'buffer') return Buffer.from(target, 'utf8');\n  return undefined;", value)
+
+    def test_the_npm_link_shim_skips_only_mapped_removals_and_matching_symlinks_and_captures_every_real_function(self):
+        shim = SHIM.read_text(encoding="ascii")
+        for line in ("const realRm = fs.rm;\n", "const realRmSync = fs.rmSync;\n", "const realPromiseRm = promises.rm;\n",
+                     "const realSymlink = fs.symlink;\n", "const realSymlinkSync = fs.symlinkSync;\n",
+                     "const realPromiseSymlink = promises.symlink;\n", "const realReaddirSync = fs.readdirSync;\n"):
+            with self.subTest(line=line):
+                self.assertEqual(shim.count(line), 1)
+                self.assertLess(shim.index(line), shim.index("\nfs.lstat = "))
+        guard = ("for (const item of [realRm, realRmSync, realPromiseRm, realSymlink, realSymlinkSync, realPromiseSymlink, realReaddirSync]) {\n"
+                 "  if (typeof item !== 'function') refuse('fs_shape');\n}\n")
+        self.assertIn(guard, shim)
+        self.assertEqual(shim.count("refuse('fs_shape')"), 2)
+        self.assertLess(shim.index(guard), shim.index("\nfs.lstat = "))
+        self.assertIn(r"const SCOPE_DIRECTORY = /\\node_modules\\@[^\\]+$/;" + "\n", shim)
+        removal = shim[shim.index("const skipsRemoval = "):shim.index("const matchesMappedTarget = ")]
+        for token in (
+            "  if (typeof candidate !== 'string' || candidate.length < 4 || candidate.length > MAX_PATH_LENGTH) return false;\n",
+            "  const full = path.win32.resolve(candidate);\n  const key = full.toLowerCase();\n  if (links.has(key)) return true;\n",
+            "  if (!SCOPE_DIRECTORY.test(key)) return false;\n",
+            "    names = realReaddirSync(full);\n  } catch (error) {\n    return false;\n  }\n",
+            "  if (!Array.isArray(names) || names.length < 1) return false;\n",
+            "    if (typeof name !== 'string' || !links.has(key + '\\\\' + name.toLowerCase())) return false;\n",
+            "  return true;\n};\n",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, removal)
+        target = shim[shim.index("const matchesMappedTarget = "):shim.index("\nfs.lstat = ")]
+        for token in (
+            "  if (typeof target !== 'string' || typeof linkPath !== 'string') return false;\n",
+            "  const mapped = links.get(path.win32.resolve(linkPath).toLowerCase());\n  if (mapped === undefined) return false;\n",
+            "  return path.win32.resolve(path.win32.dirname(linkPath), target).toLowerCase() === mapped.toLowerCase();\n};\n",
+        ):
+            with self.subTest(token=token[:60]):
+                self.assertIn(token, target)
+        bodies = re.split(r"\n(?=(?:fs|promises)\.[A-Za-z]+ = )", shim)[1:]
+        expected = (
+            ("fs.rm = ", "realRm", "  if (typeof done !== 'function' || !skipsRemoval(candidate)) return Reflect.apply(realRm, this, arguments);\n  process.nextTick(done, null);\n"),
+            ("fs.rmSync = ", "realRmSync", "  if (!skipsRemoval(candidate)) return Reflect.apply(realRmSync, this, arguments);\n  return undefined;\n"),
+            ("promises.rm = async ", "realPromiseRm", "  if (!skipsRemoval(candidate)) return Reflect.apply(realPromiseRm, this, arguments);\n  return undefined;\n"),
+            ("fs.symlink = ", "realSymlink", "  if (typeof done !== 'function' || !matchesMappedTarget(target, linkPath)) return Reflect.apply(realSymlink, this, arguments);\n  process.nextTick(done, null);\n"),
+            ("fs.symlinkSync = ", "realSymlinkSync", "  if (!matchesMappedTarget(target, linkPath)) return Reflect.apply(realSymlinkSync, this, arguments);\n  return undefined;\n"),
+            ("promises.symlink = async ", "realPromiseSymlink", "  if (!matchesMappedTarget(target, linkPath)) return Reflect.apply(realPromiseSymlink, this, arguments);\n  return undefined;\n"),
+        )
+        for body, (start, real, tail) in zip(bodies[6:], expected):
+            with self.subTest(real=real):
+                self.assertTrue(body.startswith(start))
+                self.assertIn(tail, body)
+                self.assertEqual(body.count("Reflect.apply("), 1)
+                self.assertEqual(body.count("Reflect.apply(" + real + ", this, arguments)"), 1)
+        self.assertIn("  const done = typeof options === 'function' ? options : callback;\n", bodies[6])
+        self.assertIn("  const done = typeof type === 'function' ? type : callback;\n", bodies[9])
+        self.assertEqual(shim.count("process.nextTick(done, null);"), 2)
+        self.assertEqual(shim.count("skipsRemoval("), 3)
+        self.assertEqual(shim.count("matchesMappedTarget("), 3)
 
     def test_the_reparse_probe_runs_confined_once_on_the_first_junction_before_the_shim(self):
         probe = self.function_body("Invoke-NpmReparseProbe")

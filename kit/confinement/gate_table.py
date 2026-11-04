@@ -183,11 +183,11 @@ def windows_prepare_steps():
 
     The trusted harness creates the lockfile workspace junctions between the steps, because the
     container cannot create a junction. The first step validates the lock without writing, and the
-    second installs over the links the harness made, with the same flags as the shared gate.
+    second runs npm ci over the links the harness made, with the same argv as the shared gate.
     """
     return (
         _node(*NPM_PREPARE_FLAGS, "ci", "--dry-run", *NPM_WORKSPACE_FLAGS),
-        _node(*NPM_PREPARE_FLAGS, "install", "--no-save", *NPM_WORKSPACE_FLAGS),
+        _node(*NPM_PREPARE_FLAGS, "ci", *NPM_WORKSPACE_FLAGS),
     )
 
 

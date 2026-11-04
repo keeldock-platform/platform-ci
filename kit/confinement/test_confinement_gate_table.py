@@ -295,25 +295,26 @@ class EmitTests(unittest.TestCase):
                     else:
                         self.assertEqual(set(entry), {"name", "argv"})
                         self.assertEqual(tuple(entry["argv"]), shared[entry["name"]])
-        dry_run, install = gate_table.windows_prepare_steps()
+        dry_run, reify = gate_table.windows_prepare_steps()
         self.assertEqual(dry_run, (
             "{node}", "{npm}", "--offline", "--ignore-scripts", "--audit=false", "--fund=false", "ci", "--dry-run",
             "--workspaces=true", "--include-workspace-root",
         ))
-        self.assertEqual(install, (
-            "{node}", "{npm}", "--offline", "--ignore-scripts", "--audit=false", "--fund=false", "install",
-            "--no-save", "--workspaces=true", "--include-workspace-root",
+        self.assertEqual(reify, (
+            "{node}", "{npm}", "--offline", "--ignore-scripts", "--audit=false", "--fund=false", "ci",
+            "--workspaces=true", "--include-workspace-root",
         ))
         prepare = dict(gate_table.gate_templates(False))[gate_table.WINDOWS_STEPPED_GATE]
-        for step in (dry_run, install):
+        self.assertEqual(reify, prepare)
+        for step in (dry_run, reify):
             with self.subTest(step=step[6]):
-                kept = [item for item in step if item not in ("ci", "install", "--dry-run", "--no-save")]
+                kept = [item for item in step if item not in ("ci", "--dry-run")]
                 self.assertEqual(kept, [item for item in prepare if item != "ci"])
         rendered = gate_table.render(
-            (("prepare_check", dry_run), ("prepare_install", install)), *WINDOWS_ARGUMENTS, separator="\\",
+            (("prepare_check", dry_run), ("prepare_reify", reify)), *WINDOWS_ARGUMENTS, separator="\\",
         )
         self.assertEqual(rendered[0][1][:2], ("C:\\node\\node.exe", "C:\\node\\node_modules\\npm\\bin\\npm-cli.js"))
-        self.assertEqual(rendered[1][1][-4:], ("install", "--no-save", "--workspaces=true", "--include-workspace-root"))
+        self.assertEqual(rendered[1][1][-3:], ("ci", "--workspaces=true", "--include-workspace-root"))
         self.assertEqual(gate_table.emit_json(False), gate_table.emit_json(False, None))
         with self.assertRaises(gate_table.GateTableRefusal):
             gate_table.emit_json(False, "linux")

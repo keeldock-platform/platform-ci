@@ -86,6 +86,17 @@ const realPromiseReadlink = promises.readlink;
 for (const item of [realLstat, realLstatSync, realReadlink, realReadlinkSync, realPromiseLstat, realPromiseReadlink]) {
   if (typeof item !== 'function') refuse('fs_shape');
 }
+const realRm = fs.rm;
+const realRmSync = fs.rmSync;
+const realPromiseRm = promises.rm;
+const realSymlink = fs.symlink;
+const realSymlinkSync = fs.symlinkSync;
+const realPromiseSymlink = promises.symlink;
+const realReaddirSync = fs.readdirSync;
+for (const item of [realRm, realRmSync, realPromiseRm, realSymlink, realSymlinkSync, realPromiseSymlink, realReaddirSync]) {
+  if (typeof item !== 'function') refuse('fs_shape');
+}
+const SCOPE_DIRECTORY = /\\node_modules\\@[^\\]+$/;
 
 const lookup = (candidate) => {
   if (typeof candidate !== 'string' || candidate.length < 4 || candidate.length > MAX_PATH_LENGTH) return undefined;
@@ -121,6 +132,33 @@ const linkValue = (target, options) => {
   if (encoding === undefined || encoding === null || encoding === 'utf8' || encoding === 'utf-8') return target;
   if (encoding === 'buffer') return Buffer.from(target, 'utf8');
   return undefined;
+};
+
+const skipsRemoval = (candidate) => {
+  if (typeof candidate !== 'string' || candidate.length < 4 || candidate.length > MAX_PATH_LENGTH) return false;
+  const full = path.win32.resolve(candidate);
+  const key = full.toLowerCase();
+  if (links.has(key)) return true;
+  if (!SCOPE_DIRECTORY.test(key)) return false;
+  let names;
+  try {
+    names = realReaddirSync(full);
+  } catch (error) {
+    return false;
+  }
+  if (!Array.isArray(names) || names.length < 1) return false;
+  for (const name of names) {
+    if (typeof name !== 'string' || !links.has(key + '\\' + name.toLowerCase())) return false;
+  }
+  return true;
+};
+
+const matchesMappedTarget = (target, linkPath) => {
+  if (typeof target !== 'string' || typeof linkPath !== 'string') return false;
+  if (target.length > MAX_PATH_LENGTH || linkPath.length < 4 || linkPath.length > MAX_PATH_LENGTH) return false;
+  const mapped = links.get(path.win32.resolve(linkPath).toLowerCase());
+  if (mapped === undefined) return false;
+  return path.win32.resolve(path.win32.dirname(linkPath), target).toLowerCase() === mapped.toLowerCase();
 };
 
 fs.lstat = function lstat(candidate, options, callback) {
@@ -164,4 +202,36 @@ promises.readlink = async function readlink(candidate, options) {
   const value = target === undefined ? undefined : linkValue(target, options);
   if (value === undefined) return Reflect.apply(realPromiseReadlink, this, arguments);
   return value;
+};
+
+fs.rm = function rm(candidate, options, callback) {
+  const done = typeof options === 'function' ? options : callback;
+  if (typeof done !== 'function' || !skipsRemoval(candidate)) return Reflect.apply(realRm, this, arguments);
+  process.nextTick(done, null);
+};
+
+fs.rmSync = function rmSync(candidate, options) {
+  if (!skipsRemoval(candidate)) return Reflect.apply(realRmSync, this, arguments);
+  return undefined;
+};
+
+promises.rm = async function rm(candidate, options) {
+  if (!skipsRemoval(candidate)) return Reflect.apply(realPromiseRm, this, arguments);
+  return undefined;
+};
+
+fs.symlink = function symlink(target, linkPath, type, callback) {
+  const done = typeof type === 'function' ? type : callback;
+  if (typeof done !== 'function' || !matchesMappedTarget(target, linkPath)) return Reflect.apply(realSymlink, this, arguments);
+  process.nextTick(done, null);
+};
+
+fs.symlinkSync = function symlinkSync(target, linkPath, type) {
+  if (!matchesMappedTarget(target, linkPath)) return Reflect.apply(realSymlinkSync, this, arguments);
+  return undefined;
+};
+
+promises.symlink = async function symlink(target, linkPath, type) {
+  if (!matchesMappedTarget(target, linkPath)) return Reflect.apply(realPromiseSymlink, this, arguments);
+  return undefined;
 };
