@@ -26,6 +26,7 @@ const EXACT_VERSION = new RegExp(`^${NUMERIC_IDENTIFIER}\\.${NUMERIC_IDENTIFIER}
   + `(?:-${PRE_RELEASE_IDENTIFIER}(?:\\.${PRE_RELEASE_IDENTIFIER})*)?`
   + '(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$', 'u');
 const VERSION_SPEC = /^[0-9A-Za-z.*^~<>=|+ -]{1,128}$/u;
+const FUNDING_FRAGMENT = /^\x23[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const WORKSPACE_PATH = /^packages\/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*$/u;
 const LOCK_ENTRY_FIELDS = new Set([
   'name', 'version', 'workspaces', 'resolved', 'integrity', 'link', 'inBundle', 'hasInstallScript',
@@ -124,6 +125,7 @@ function normalizeExpectation(input) {
     names.add(item.name);
     paths.add(item.path);
   }
+  const versionByName = new Map(workspaces.map((item) => [item.name, item.version]));
   for (const item of [root, ...workspaces]) {
     for (const group of DEPENDENCY_GROUPS) {
       const map = item[group] === undefined ? Object.create(null) : item[group];
@@ -135,6 +137,10 @@ function normalizeExpectation(input) {
           && /^workspace:(?:\*|\^|~|[0-9][0-9A-Za-z.+-]*)$/u.test(spec);
         if (!packageName(name) || (!workspaceSpec && !safeDependencySpec(spec, !names.has(name)))
             || (!names.has(name) && typeof spec === 'string' && spec.startsWith('workspace:'))) {
+          reject('invalid_expectation');
+        }
+        if (names.has(name) && !workspaceSpec
+            && (item === root || item.name === name || spec !== versionByName.get(name))) {
           reject('invalid_expectation');
         }
       }
@@ -302,8 +308,10 @@ function validateEntryMetadata(entry, isRoot = false) {
       if (typeof funding.url !== 'string' || funding.url.length > 2048) reject('invalid_package');
       let url;
       try { url = new URL(funding.url); } catch { reject('invalid_package'); }
-      if (url.protocol !== 'https:' || url.username || url.password || url.hash
-          || url.href !== funding.url) reject('invalid_package');
+      if (url.protocol !== 'https:' || url.username || url.password
+          || (url.hash && !FUNDING_FRAGMENT.test(url.hash))) reject('invalid_package');
+      const bareOrigin = url.pathname === '/' && !url.search && !url.hash && url.href === `${funding.url}/`;
+      if (url.href !== funding.url && !bareOrigin) reject('invalid_package');
       if (funding.type !== undefined && (typeof funding.type !== 'string'
           || !/^[A-Za-z0-9._-]{1,64}$/u.test(funding.type))) reject('invalid_package');
     }
@@ -432,6 +440,9 @@ function validateDirectPin(packages, name, spec, parentPath, workspaceByName) {
   const workspacePath = workspaceByName.get(name);
   if (workspacePath) {
     if (!entry || entry.link !== true || entry.resolved !== workspacePath) reject('direct_pin_mismatch');
+    if (!spec.startsWith('workspace:') && (!parentPath || key !== `node_modules/${name}`)) {
+      reject('direct_pin_mismatch');
+    }
     return;
   }
   if (!entry || entry.link === true || entry.version !== spec
