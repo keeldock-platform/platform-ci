@@ -26,6 +26,7 @@ const EXACT_VERSION = new RegExp(`^${NUMERIC_IDENTIFIER}\\.${NUMERIC_IDENTIFIER}
   + `(?:-${PRE_RELEASE_IDENTIFIER}(?:\\.${PRE_RELEASE_IDENTIFIER})*)?`
   + '(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$', 'u');
 const VERSION_SPEC = /^[0-9A-Za-z.*^~<>=|+ -]{1,128}$/u;
+const FUNDING_FRAGMENT = /^\x23[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const WORKSPACE_PATH = /^packages\/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*\/)*[A-Za-z0-9_-][A-Za-z0-9._-]*$/u;
 const LOCK_ENTRY_FIELDS = new Set([
   'name', 'version', 'workspaces', 'resolved', 'integrity', 'link', 'inBundle', 'hasInstallScript',
@@ -307,8 +308,10 @@ function validateEntryMetadata(entry, isRoot = false) {
       if (typeof funding.url !== 'string' || funding.url.length > 2048) reject('invalid_package');
       let url;
       try { url = new URL(funding.url); } catch { reject('invalid_package'); }
-      if (url.protocol !== 'https:' || url.username || url.password || url.hash
-          || url.href !== funding.url) reject('invalid_package');
+      if (url.protocol !== 'https:' || url.username || url.password
+          || (url.hash && !FUNDING_FRAGMENT.test(url.hash))) reject('invalid_package');
+      const bareOrigin = url.pathname === '/' && !url.search && !url.hash && url.href === `${funding.url}/`;
+      if (url.href !== funding.url && !bareOrigin) reject('invalid_package');
       if (funding.type !== undefined && (typeof funding.type !== 'string'
           || !/^[A-Za-z0-9._-]{1,64}$/u.test(funding.type))) reject('invalid_package');
     }

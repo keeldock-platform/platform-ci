@@ -298,9 +298,20 @@ test('rejects extra top-level fields and malformed lock package paths', () => {
   unsafeFunding.packages['node_modules/typescript'].funding = 'https://user:pass@example.invalid/support';
   rejected(unsafeFunding);
 
-  const fragmentFunding = lockFixture();
-  fragmentFunding.packages['node_modules/typescript'].funding = `https://example.invalid/support${String.fromCharCode(35)}top`;
-  rejected(fragmentFunding);
+  for (const fragment of ['.top', '-top', 'top/next', 'top:next', 'top%20next', 'top?next', 'a'.repeat(129)]) {
+    const fragmentFunding = lockFixture();
+    fragmentFunding.packages['node_modules/typescript'].funding = `https://example.invalid/support${String.fromCharCode(35)}${fragment}`;
+    rejected(fragmentFunding);
+  }
+
+  for (const bare of [
+    'https://example.invalid?', 'https://example.invalid?sponsor=1', 'https://EXAMPLE.invalid',
+    `https://example.invalid${String.fromCharCode(35)}top`, 'https://user@example.invalid',
+  ]) {
+    const bareFunding = lockFixture();
+    bareFunding.packages['node_modules/typescript'].funding = { url: bare };
+    rejected(bareFunding);
+  }
 
   const credentialQueryFunding = lockFixture();
   credentialQueryFunding.packages['node_modules/typescript'].funding = [
@@ -323,6 +334,24 @@ test('accepts funding URLs that carry a query string', () => {
     type: 'github', url: 'https://example.invalid/owner/project?sponsor=1',
   };
   assert.doesNotThrow(() => validateLockManifest(bytes(objectForm), expected));
+});
+
+test('accepts a bare origin funding URL and one plain fragment as npm copies them', () => {
+  const bareOrigin = lockFixture();
+  bareOrigin.packages['node_modules/typescript'].funding = { url: 'https://example.invalid' };
+  assert.equal(codeOf(bareOrigin, expected), 'accepted');
+
+  const listForm = lockFixture();
+  listForm.packages['node_modules/typescript'].funding = [
+    { type: 'individual', url: 'https://www.example.invalid/owner' },
+    { type: 'individual', url: `https://www.example.invalid/how-to/faq${String.fromCharCode(35)}owner-is-here.-how-to-help` },
+    { type: 'individual', url: 'https://www.example.invalid' },
+  ];
+  assert.equal(codeOf(listForm, expected), 'accepted');
+
+  const stringForm = lockFixture();
+  stringForm.packages['node_modules/typescript'].funding = `https://example.invalid/support${String.fromCharCode(35)}top`;
+  assert.equal(codeOf(stringForm, expected), 'accepted');
 });
 
 const contractText = readFileSync(new URL('./macos_node_contract.py', import.meta.url), 'utf8');
