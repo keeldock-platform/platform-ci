@@ -285,6 +285,7 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
         admission = read_ascii(WINDOWS_ADMISSION_PATH)
         self.assertNotIn("secrets: inherit", admission)
         self.assertEqual(admission.count("    secrets:\n"), 3)
+        self.assertEqual(re.findall(r"(?m)^ *secrets:.*$", admission), ["    secrets:"] * 3)
         for job_id, names in (
             ("windows-producer", RECEIVER_SECRET_NAMES), ("windows-verifier", RECEIVER_SECRET_NAMES),
             ("linux-fetch-encrypt", FETCH_SECRET_NAMES), ("capsule-attester", ()),
