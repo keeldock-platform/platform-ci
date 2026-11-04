@@ -533,6 +533,38 @@ hostedTest('a recorded allow refuses once expired at the advisory fetch time and
   assert.equal(ceiling.result.allowed_count, 1);
 });
 
+hostedTest('a workspace dependency hoisted to a workspace ancestor node_modules is production-reachable', async () => {
+  const workspaceManifest = Object.freeze({
+    root: expectedManifest.root,
+    workspaces: Object.freeze([
+      Object.freeze({
+        ...expectedManifest.workspaces[0],
+        dependencies: Object.freeze({ '@fixture/shared': 'workspace:*', 'fixture-tool': '1.0.0' }),
+      }),
+      expectedManifest.workspaces[1],
+    ]),
+  });
+  const lock = JSON.parse(allowLockFixture().toString('utf8'));
+  lock.packages['packages/client-api'].dependencies = { '@fixture/shared': 'workspace:*', 'fixture-tool': '1.0.0' };
+  lock.packages['packages/node_modules/fixture-tool'] = {
+    version: '1.0.0',
+    resolved: 'https://registry.npmjs.org/fixture-tool/-/fixture-tool-1.0.0.tgz',
+    integrity: `sha512-${'A'.repeat(86)}==`,
+    dev: true,
+  };
+  const lockBytes = Buffer.from(`${JSON.stringify(lock)}\n`, 'utf8');
+  const policyEpochMs = Date.now() - (30 * ALLOW_DAY_MS);
+  await assert.rejects(validate({
+    mode: 'verify', lockBytes, policyEpochMs, manifest: workspaceManifest,
+    accepted: allowedProvenance(lockBytes, policyEpochMs, [
+      recordedFinding(policyEpochMs, { name: 'fixture-tool', version: '1.0.0', range: '<1.0.1' }),
+    ], workspaceManifest),
+    responseBody: JSON.stringify({
+      'fixture-tool': [{ id: 1244012, severity: 'moderate', vulnerable_versions: '<1.0.1' }],
+    }),
+  }), refusedWith('vulnerable_dependency'));
+});
+
 hostedTest('a finding that is not recorded refuses even beside a recorded one', async () => {
   await assert.rejects(allowCase({
     items: [recordedAdvisory, { id: 999, severity: 'low', vulnerable_versions: '>=6.0.0' }],

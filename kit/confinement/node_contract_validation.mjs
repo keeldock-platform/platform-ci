@@ -506,7 +506,8 @@ function resolveDependency(packages, from, name) {
     if (Object.hasOwn(packages, candidate)) return candidate;
     if (!current) return null;
     const index = current.lastIndexOf('/node_modules/');
-    current = index >= 0 ? current.slice(0, index) : '';
+    if (index >= 0) current = current.slice(0, index);
+    else { const slash = current.lastIndexOf('/'); current = slash >= 0 ? current.slice(0, slash) : ''; }
   }
   return null;
 }
