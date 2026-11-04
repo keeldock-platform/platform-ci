@@ -1,6 +1,13 @@
 name: lane-h-linux-fetch-encrypt
 on:
   workflow_call:
+    secrets:
+      SOURCE_READER_PRIVATE_KEY:
+        required: false
+      SOURCE_REPOSITORY_OWNER:
+        required: false
+      SOURCE_REPOSITORY_NAME:
+        required: false
     inputs:
       profile:
         required: true

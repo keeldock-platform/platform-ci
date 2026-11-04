@@ -1,6 +1,9 @@
 name: lane-h-windows-receiver
 on:
   workflow_call:
+    secrets:
+      KD_WINDOWS_LOG_CANARY:
+        required: false
     inputs:
       profile:
         required: true

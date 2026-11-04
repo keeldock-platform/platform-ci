@@ -212,6 +212,20 @@ ACTION_USE_PATTERN = re.compile(
 )
 SOURCE_READ_ENVIRONMENT = "environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}"
 WINDOWS_ENVIRONMENT = "environment: ${{ inputs.mode == 'source' && 'windows-source-exec' || '' }}"
+FETCH_SECRET_NAMES = ("SOURCE_READER_PRIVATE_KEY", "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME")
+RECEIVER_SECRET_NAMES = ("KD_WINDOWS_LOG_CANARY",)
+
+
+def call_secrets(names):
+    return "    secrets:\n" + "".join("      %s: ${{ secrets.%s }}\n" % (name, name) for name in names)
+
+
+def declared_secrets(names):
+    return (
+        "\non:\n  workflow_call:\n    secrets:\n"
+        + "".join("      %s:\n        required: false\n" % name for name in names)
+        + "    inputs:\n"
+    )
 
 
 def read_ascii(path):
@@ -231,8 +245,14 @@ def job_block(text, job_id):
 
 class WindowsSourceWorkflowTests(unittest.TestCase):
     def test_windows_workflows_reference_no_source_reader_or_source_repository_secret(self):
-        for path in (WINDOWS_ADMISSION_PATH, WINDOWS_RECEIVER_PATH):
-            text = read_ascii(path)
+        admission = read_ascii(WINDOWS_ADMISSION_PATH)
+        passed = call_secrets(FETCH_SECRET_NAMES)
+        self.assertEqual(admission.count(passed), 1)
+        self.assertIn(passed, job_block(admission, "linux-fetch-encrypt"))
+        for path, text in (
+            (WINDOWS_ADMISSION_PATH, admission.replace(passed, "")),
+            (WINDOWS_RECEIVER_PATH, read_ascii(WINDOWS_RECEIVER_PATH)),
+        ):
             with self.subTest(path=path.name):
                 self.assertNotRegex(text, r"secrets\.SOURCE_(READER|REPOSITORY)_")
                 for name in (
@@ -260,6 +280,34 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
         self.assertEqual(admission.count("environment:"), 1)
         self.assertEqual(admission.count(WINDOWS_ENVIRONMENT), 1)
         self.assertIn("windows-source-exec", admission)
+
+    def test_each_role_call_passes_only_its_own_environment_secrets_by_name(self):
+        admission = read_ascii(WINDOWS_ADMISSION_PATH)
+        self.assertNotIn("secrets: inherit", admission)
+        self.assertEqual(admission.count("    secrets:\n"), 3)
+        for job_id, names in (
+            ("windows-producer", RECEIVER_SECRET_NAMES), ("windows-verifier", RECEIVER_SECRET_NAMES),
+            ("linux-fetch-encrypt", FETCH_SECRET_NAMES), ("capsule-attester", ()),
+            ("settings", ()), ("verify-role-evidence", ()), ("audit", ()),
+        ):
+            block = job_block(admission, job_id)
+            with self.subTest(job=job_id):
+                found = re.findall(r"(?m)^    secrets:\n(?:      [^\n]*\n)*", block)
+                self.assertEqual(found, [call_secrets(names)] if names else [])
+        fetch = read_ascii(LINUX_FETCH_PATH)
+        receiver = read_ascii(WINDOWS_RECEIVER_PATH)
+        for text, names in ((fetch, FETCH_SECRET_NAMES), (receiver, RECEIVER_SECRET_NAMES)):
+            header = text.split("\njobs:\n", 1)[0]
+            self.assertEqual(header.count(declared_secrets(names)), 1)
+            self.assertEqual(header.count("    secrets:\n"), 1)
+            self.assertEqual(header.count("        required: true\n"), 1)
+            self.assertNotIn("secrets: inherit", text)
+        self.assertEqual(fetch.count("secrets.SOURCE_READER_PRIVATE_KEY"), 1)
+        self.assertNotIn("secrets.KD_WINDOWS_LOG_CANARY", fetch)
+        self.assertNotIn("SOURCE_RE", receiver)
+        self.assertEqual(set(re.findall(r"secrets\.([A-Za-z0-9_]+)", receiver)), set(RECEIVER_SECRET_NAMES))
+        attester = read_ascii(CAPSULE_ATTESTER_PATH)
+        self.assertNotIn("secrets", attester)
 
     def test_the_settings_job_never_holds_the_source_identity_and_the_fetch_job_rebinds_it(self):
         settings = job_block(read_ascii(WINDOWS_ADMISSION_PATH), "settings")
@@ -341,7 +389,8 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
                 self.assertIn("uses: ./.github/workflows/lane-h-windows-receiver.yml\n", block)
                 self.assertIn("      profile: candidate\n", block)
                 self.assertIn("      role: " + role + "\n", block)
-                self.assertNotIn("secrets:", block)
+                self.assertEqual(block.count("secrets:"), 1)
+                self.assertIn(call_secrets(RECEIVER_SECRET_NAMES), block)
         fetch = job_block(text, "linux-fetch-encrypt")
         self.assertIn("    needs:\n      - settings\n    if:", fetch)
         self.assertIn("uses: ./.github/workflows/lane-h-linux-fetch-encrypt.yml\n", fetch)

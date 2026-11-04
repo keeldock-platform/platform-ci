@@ -113,6 +113,8 @@ jobs:
       actions: read
       id-token: write
       attestations: write
+    secrets:
+      KD_WINDOWS_LOG_CANARY: ${{ secrets.KD_WINDOWS_LOG_CANARY }}
   windows-verifier:
     name: role-call-windows-verifier-v1
     needs:
@@ -129,6 +131,8 @@ jobs:
       actions: read
       id-token: write
       attestations: write
+    secrets:
+      KD_WINDOWS_LOG_CANARY: ${{ secrets.KD_WINDOWS_LOG_CANARY }}
   linux-fetch-encrypt:
     name: role-call-linux-fetch-encrypt-v1
     needs:
@@ -148,6 +152,10 @@ jobs:
       actions: read
       id-token: write
       attestations: write
+    secrets:
+      SOURCE_READER_PRIVATE_KEY: ${{ secrets.SOURCE_READER_PRIVATE_KEY }}
+      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
+      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
   capsule-attester:
     name: role-call-capsule-attester-v1
     needs:
