@@ -76,11 +76,14 @@ $ListingLimit = 3145728
 $GateTablePlatform = 'windows'
 $NpmSteppedGate = 'node_dependency_prepare'
 $MaxNpmLinks = 64
+$GateMaxProcesses = [uint32]128
 $MaxLockBytes = 33554432
 $NpmLinkShimFile = 'windows_npm_link_shim.cjs'
 $NpmLinkShimSha256 = '1f0befd03b49a55c554f2064658545f731f9f01db64ed7ffadfb33cc6f055adb'
 $NpmLinkShimGates = @('node_dependency_audit')
 $GateDetailNpmCodes = @('ENOTCACHED', 'EBADPLATFORM', 'ENOENT', 'EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY', 'EEXIST', 'ELOOP', 'ENAMETOOLONG', 'EINTEGRITY', 'EUSAGE', 'ELIFECYCLE', 'ERESOLVE', 'EJSONPARSE', 'ENOLOCK', 'ENOTSUP', 'EINVAL', 'EMFILE', 'ENOSPC', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETARGET', 'E404', 'EOVERRIDE', 'EWORKSPACEMISSING', 'ENOWORKSPACES', 'EINVALIDTAGNAME', 'EINVALIDPACKAGENAME', 'EUNKNOWNTYPE')
+$GateDetailShimReasons = @('fs_shape', 'map_count', 'map_entry', 'map_hash', 'map_json', 'map_path', 'map_shape', 'map_size', 'map_text')
+$GateDetailNodeCodes = @('ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_MODULE_NOT_FOUND', 'ERR_REQUIRE_ESM', 'ERR_INVALID_URL', 'ERR_INVALID_FILE_URL_PATH', 'ERR_UNSUPPORTED_ESM_URL_SCHEME', 'ERR_OUT_OF_RANGE', 'ERR_FS_EISDIR', 'ERR_INVALID_STATE', 'ERR_ACCESS_DENIED', 'ERR_UNKNOWN_FILE_EXTENSION', 'ERR_STREAM_PREMATURE_CLOSE', 'ERR_INVALID_PACKAGE_CONFIG', 'ERR_PACKAGE_PATH_NOT_EXPORTED')
 $MaxNpmLinkMapBytes = 65536
 $MountManagerRungs = @('device', 'volume', 'drive_link', 'mpm_link', 'global_dir')
 $MountManagerKinds = @{ device = 'mountmgr'; volume = 'volume'; drive_link = 'drive_link'; mpm_link = 'mpm_link'; global_dir = 'global_dir' }
@@ -1165,7 +1168,7 @@ function Invoke-NpmLinkSteps($sandbox, $gate, [string]$project, [string[]]$envir
     $seconds = Get-GateSeconds $gate.Id
     if ($seconds -gt $remaining) { $seconds = $remaining }
     $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))
-    $second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), [uint32]32)
+    $second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), $GateMaxProcesses)
     $merged = New-Object KeelDock.Platform.WindowsConfinement.RunResult
     foreach ($field in @('Failure', 'Detail', 'Created', 'CreateError', 'TimedOut', 'Exited', 'ExitCode', 'ElapsedMs', 'Token', 'Job', 'PeakProcessMemory', 'PeakJobMemory', 'CpuMs', 'HandleCount', 'Class46')) {
         $merged.$field = $second.$field
@@ -1350,6 +1353,28 @@ function Get-GateDetail([int]$index, $gate, [string]$combined) {
             if ($found.Success) {
                 $code = 'other'
                 if ($GateDetailNpmCodes -ccontains [string]$found.Groups[1].Value) { $code = [string]$found.Groups[1].Value }
+            } else {
+                $shim = [regex]::Match($text, 'npm_link_shim refused ([a-z_]{2,20})')
+                $nodeError = [regex]::Match($text, '\b(ERR_[A-Z_]{3,48})\b')
+                if ($shim.Success) {
+                    $code = 'shim_other'
+                    if ($GateDetailShimReasons -ccontains [string]$shim.Groups[1].Value) { $code = 'shim_' + [string]$shim.Groups[1].Value }
+                } elseif ($nodeError.Success) {
+                    $code = 'node_other'
+                    if ($GateDetailNodeCodes -ccontains [string]$nodeError.Groups[1].Value) { $code = 'node_' + [string]$nodeError.Groups[1].Value }
+                } elseif ([regex]::IsMatch($text, 'MODULE_NOT_FOUND|Cannot find module')) { $code = 'module_not_found'
+                } elseif ([regex]::IsMatch($text, 'Cannot read properties of (?:null|undefined)')) { $code = 'null_property'
+                } elseif ([regex]::IsMatch($text, 'is not a function')) { $code = 'not_function'
+                } elseif ([regex]::IsMatch($text, 'is not iterable')) { $code = 'not_iterable'
+                } elseif ([regex]::IsMatch($text, 'Maximum call stack size exceeded')) { $code = 'stack_overflow'
+                } elseif ([regex]::IsMatch($text, 'JavaScript heap out of memory|FATAL ERROR')) { $code = 'heap'
+                } elseif ([regex]::IsMatch($text, 'Exit handler never called')) { $code = 'exit_handler'
+                } elseif ([regex]::IsMatch($text, 'Invalid Version')) { $code = 'invalid_version'
+                } elseif ([regex]::IsMatch($text, 'TypeError')) { $code = 'typeerror'
+                } elseif ([regex]::IsMatch($text, 'RangeError')) { $code = 'rangeerror'
+                } elseif ([regex]::IsMatch($text, 'SyntaxError')) { $code = 'syntaxerror'
+                } elseif ([regex]::IsMatch($text, 'ReferenceError')) { $code = 'referenceerror'
+                } elseif ([regex]::IsMatch($text, '(?m)^npm (?:error|ERR!)')) { $code = 'npm_error_line' }
             }
         }
     } catch {
@@ -1402,7 +1427,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         }
         $exe = [string]$argv[0]
         $commandLine = ConvertTo-CommandLine $argv
-        $run = $sandbox.Run($true, $exe, $commandLine, $project, $gateEnvironment, ($seconds * 1000), [uint32]32)
+        $run = $sandbox.Run($true, $exe, $commandLine, $project, $gateEnvironment, ($seconds * 1000), $GateMaxProcesses)
         if ($null -ne $gate.Then) { $run = Invoke-NpmLinkSteps $sandbox $gate $project $environment $run }
         $outcome.Count += 1
         $combined = [string]$run.Stdout + "`n" + [string]$run.Stderr

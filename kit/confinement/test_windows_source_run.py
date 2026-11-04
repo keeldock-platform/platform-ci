@@ -1387,7 +1387,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "        $exe = [string]$argv[0]\n"
             "        $commandLine = ConvertTo-CommandLine $argv\n"
         )
-        run = "        $run = $sandbox.Run($true, $exe, $commandLine, $project, $gateEnvironment, ($seconds * 1000), [uint32]32)\n"
+        run = "        $run = $sandbox.Run($true, $exe, $commandLine, $project, $gateEnvironment, ($seconds * 1000), $GateMaxProcesses)\n"
         stepped = "        if ($null -ne $gate.Then) { $run = Invoke-NpmLinkSteps $sandbox $gate $project $environment $run }\n"
         self.assertIn(shim + run + stepped + "        $outcome.Count += 1\n", gates)
         self.assertNotIn("$gate.Argv[0]", gates)
@@ -1408,7 +1408,7 @@ class WindowsSourceRunTests(unittest.TestCase):
             "Invoke-NpmLinkTargetProbe $sandbox $project ([string]@($gate.Then)[0]) $shimEnvironment",
             "if ($remaining -lt 60) { throw 'deadline' }",
             "    $then = [string[]](Add-NpmLinkShim ([string[]]$gate.Then))\n",
-            "$second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), [uint32]32)",
+            "$second = $sandbox.Run($true, $then[0], (ConvertTo-CommandLine $then), $project, $shimEnvironment, ($seconds * 1000), $GateMaxProcesses)",
             "$merged.Stdout = [string]$first.Stdout + \"`n\" + [string]$second.Stdout",
             "$merged.Truncated = [bool]($first.Truncated -or $second.Truncated)",
             "if (-not (Test-GateBoundary $second) -or $second.TimedOut -or $second.ExitCode -ne 0) { return $merged }",
@@ -1585,10 +1585,16 @@ class WindowsSourceRunTests(unittest.TestCase):
             "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETARGET", "E404", "EOVERRIDE", "EWORKSPACEMISSING", "ENOWORKSPACES",
             "EINVALIDTAGNAME", "EINVALIDPACKAGENAME", "EUNKNOWNTYPE"])
         public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
+        shim_reasons = re.findall(r"'([a-z_]+)'", re.findall(r"^\$GateDetailShimReasons = @\((.*)\)$", self.runner, re.M)[0])
+        node_codes = re.findall(r"'ERR_([A-Z_]+)'", re.findall(r"^\$GateDetailNodeCodes = @\((.*)\)$", self.runner, re.M)[0])
+        npm_tokens = ("module_not_found", "null_property", "not_function", "not_iterable", "stack_overflow", "heap",
+                      "exit_handler", "invalid_version", "typeerror", "rangeerror", "syntaxerror", "referenceerror", "npm_error_line")
         shaped = re.compile(
             r"windows-source-gate-detail=[1-9][0-9]* id=[a-z][a-z_]{2,40} tool=(cargo|npm|other)"
             r" kind=(compile|link|test|os_error|npm|unknown) failed=(0|1|few|many)"
-            r" code=(" + "|".join(npm_codes) + r"|other|none|panics|E[0-9]{4}|LNK[0-9]{4}|os[0-9]{1,5})")
+            r" code=(" + "|".join(npm_codes) + r"|other|none|panics|E[0-9]{4}|LNK[0-9]{4}|os[0-9]{1,5}"
+            r"|shim_(" + "|".join(shim_reasons) + r"|other)|node_(ERR_(" + "|".join(node_codes) + r")|other)"
+            r"|" + "|".join(npm_tokens) + r")")
         for line in (
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=1 code=none",
@@ -1598,6 +1604,12 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=link failed=0 code=LNK1181",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=os_error failed=0 code=os32",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=many code=panics",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_map_entry",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_other",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_REQUIRE_ESM",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_other",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=null_property",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=npm_error_line",
         ):
             with self.subTest(line=line):
                 self.assertRegex(line, public)
@@ -1608,9 +1620,70 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few passed=4 code=none",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics3",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=npm failed=0 code=EWHATEVER",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_xyz",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_FOO",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_other",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=null_properties",
         ):
             with self.subTest(rejected=line):
                 self.assertIsNone(shaped.fullmatch(line))
+
+    def test_the_gate_runs_use_the_raised_process_limit_and_the_probes_keep_thirty_two(self):
+        self.assertEqual(re.findall(r"^\$GateMaxProcesses = (.*)$", self.runner, re.M), ["[uint32]128"])
+        self.assertEqual(self.runner.count("$GateMaxProcesses"), 3)
+        self.assertIn("$gateEnvironment, ($seconds * 1000), $GateMaxProcesses)", self.function_body("Invoke-SourceGates"))
+        self.assertIn("$shimEnvironment, ($seconds * 1000), $GateMaxProcesses)", self.function_body("Invoke-NpmLinkSteps"))
+        self.assertEqual(self.runner.count("[uint32]32)"), 5)
+        self.assertNotIn("[uint32]32", self.function_body("Invoke-SourceGates"))
+        self.assertNotIn("[uint32]32", self.function_body("Invoke-NpmLinkSteps"))
+
+    def test_an_npm_failure_without_an_error_code_is_classified_by_the_first_matching_fixed_rule(self):
+        body = self.function_body("Get-GateDetail")
+        shim = re.findall(r"^\$GateDetailShimReasons = @\((.*)\)$", self.runner, re.M)
+        node = re.findall(r"^\$GateDetailNodeCodes = @\((.*)\)$", self.runner, re.M)
+        self.assertEqual(len(shim), 1)
+        self.assertEqual(len(node), 1)
+        self.assertEqual(re.findall(r"'([a-z_]+)'", shim[0]), [
+            "fs_shape", "map_count", "map_entry", "map_hash", "map_json", "map_path", "map_shape", "map_size", "map_text"])
+        self.assertEqual(re.findall(r"'([A-Z_]+)'", node[0]), [
+            "ERR_INVALID_ARG_TYPE", "ERR_INVALID_ARG_VALUE", "ERR_MODULE_NOT_FOUND", "ERR_REQUIRE_ESM", "ERR_INVALID_URL",
+            "ERR_INVALID_FILE_URL_PATH", "ERR_UNSUPPORTED_ESM_URL_SCHEME", "ERR_OUT_OF_RANGE", "ERR_FS_EISDIR", "ERR_INVALID_STATE",
+            "ERR_ACCESS_DENIED", "ERR_UNKNOWN_FILE_EXTENSION", "ERR_STREAM_PREMATURE_CLOSE", "ERR_INVALID_PACKAGE_CONFIG",
+            "ERR_PACKAGE_PATH_NOT_EXPORTED"])
+        order = (
+            "'npm_link_shim refused ([a-z_]{2,20})'",
+            "'\\b(ERR_[A-Z_]{3,48})\\b'",
+            "$code = 'shim_other'",
+            "$GateDetailShimReasons -ccontains",
+            "$code = 'shim_' + [string]$shim.Groups[1].Value",
+            "$code = 'node_other'",
+            "$GateDetailNodeCodes -ccontains",
+            "$code = 'node_' + [string]$nodeError.Groups[1].Value",
+            "'MODULE_NOT_FOUND|Cannot find module')) { $code = 'module_not_found'",
+            "'Cannot read properties of (?:null|undefined)')) { $code = 'null_property'",
+            "'is not a function')) { $code = 'not_function'",
+            "'is not iterable')) { $code = 'not_iterable'",
+            "'Maximum call stack size exceeded')) { $code = 'stack_overflow'",
+            "'JavaScript heap out of memory|FATAL ERROR')) { $code = 'heap'",
+            "'Exit handler never called')) { $code = 'exit_handler'",
+            "'Invalid Version')) { $code = 'invalid_version'",
+            "'TypeError')) { $code = 'typeerror'",
+            "'RangeError')) { $code = 'rangeerror'",
+            "'SyntaxError')) { $code = 'syntaxerror'",
+            "'ReferenceError')) { $code = 'referenceerror'",
+            "'(?m)^npm (?:error|ERR!)')) { $code = 'npm_error_line'",
+        )
+        positions = [body.index(item) for item in order]
+        self.assertEqual(positions[2:], sorted(positions[2:]))
+        self.assertLess(positions[0], positions[2])
+        self.assertLess(positions[1], positions[2])
+        self.assertLess(body.index("$code = 'other'"), positions[0])
+        self.assertLess(body.index("} else {\n                $shim = "), positions[0])
+        self.assertEqual(body.count("$code = 'none'"), 2)
+        self.assertNotIn("$code = $text", body)
+        self.assertNotIn("Value + '_'", body)
+        self.assertEqual(self.runner.count("$GateDetailShimReasons -ccontains"), 1)
+        self.assertEqual(self.runner.count("$GateDetailNodeCodes -ccontains"), 1)
 
     def test_the_detail_line_is_emitted_once_only_for_the_first_ordinary_failure_after_the_canary_and_boundary_checks(self):
         body = self.function_body("Invoke-SourceGates")
