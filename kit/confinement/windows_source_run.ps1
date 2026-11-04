@@ -1309,8 +1309,7 @@ function Get-GateDetail([int]$index, $gate, [string]$combined) {
     $tool = 'other'
     $kind = 'unknown'
     $code = 'none'
-    $failedCount = 0
-    $passedCount = 0
+    $failedBucket = '0'
     try {
         $text = [string]$combined
         $items = @($gate.Argv | ForEach-Object { [string]$_ })
@@ -1332,20 +1331,15 @@ function Get-GateDetail([int]$index, $gate, [string]$combined) {
                 $code = [string]$link.Value
             } elseif ($results.Count -gt 0) {
                 $kind = 'test'
-                $passedSum = [int64]0
                 $failedSum = [int64]0
                 foreach ($result in $results) {
-                    $passedText = [string]$result.Groups[1].Value
                     $failedText = [string]$result.Groups[2].Value
-                    if ($passedText.Length -gt 6) { $passedText = '999999' }
                     if ($failedText.Length -gt 6) { $failedText = '999999' }
-                    $passedSum += [int64]$passedText
                     $failedSum += [int64]$failedText
                 }
-                $passedCount = [int][math]::Min($passedSum, [int64]999999)
                 $failedCount = [int][math]::Min($failedSum, [int64]999999)
-                $panics = [int][math]::Min([int64][regex]::Matches($text, 'panicked at').Count, [int64]999999)
-                if ($panics -gt 0) { $code = 'panics' + $panics }
+                if ($failedCount -ge 10) { $failedBucket = 'many' } elseif ($failedCount -ge 2) { $failedBucket = 'few' } else { $failedBucket = [string]$failedCount }
+                if ([regex]::IsMatch($text, 'panicked at')) { $code = 'panics' }
             } elseif ($osError.Success) {
                 $kind = 'os_error'
                 $code = 'os' + [int]$osError.Groups[1].Value
@@ -1361,10 +1355,13 @@ function Get-GateDetail([int]$index, $gate, [string]$combined) {
     } catch {
         $kind = 'unknown'
         $code = 'none'
-        $failedCount = 0
-        $passedCount = 0
+        $failedBucket = '0'
     }
-    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedCount + ' passed=' + $passedCount + ' code=' + $code)
+    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind + ' failed=' + $failedBucket + ' code=' + $code)
+}
+
+function Test-NodeGate($gate) {
+    return (@(@($gate.Argv) | Where-Object { ([string]$_) -cmatch '(^|[\\/])(node\.exe|npm-cli\.js)$' }).Count -gt 0)
 }
 
 function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsDirectory) {
@@ -1372,8 +1369,16 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
     $outcome = @{ Count = 0; Failed = 0; Canary = 'absent'; Boundary = 'verified'; Failure = 0 }
     $index = 0
     $keepGoing = ($script:RunMode -ceq 'synthetic')
+    $nodeBlocked = $false
     foreach ($gate in $plan) {
         $index += 1
+        if (-not $keepGoing -and $outcome.Failure -ne 0 -and (($gate.Id -ceq $NpmSteppedGate) -or ($NpmLinkShimGates -ccontains $gate.Id) -or ($nodeBlocked -and (Test-NodeGate $gate)))) {
+            if ($gate.Id -ceq $NpmSteppedGate) { $nodeBlocked = $true }
+            $outcome.Count += 1
+            $outcome.Failed += 1
+            Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=not_run hang=none cause=skipped')
+            continue
+        }
         $seconds = Get-GateSeconds $gate.Id
         $remaining = (Get-RemainingSeconds) - 900
         if ($remaining -lt 60) {
@@ -1410,6 +1415,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
         }
         $boundary = Test-GateBoundary $run
         $passed = ($boundary -and -not $run.TimedOut -and $run.ExitCode -eq 0)
+        if ($gate.Id -ceq $NpmSteppedGate -and -not $passed) { $nodeBlocked = $true }
         $result = 'failed'
         if ($passed) { $result = 'passed' }
         $causeText = ''
@@ -1420,7 +1426,6 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
             $causeText = ' cause=' + $gateCause
         }
         Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=' + $result + ' hang=' + $hang + $causeText)
-        if (-not $passed) { Write-Line (Get-GateDetail $index $gate $combined) }
         if ($run.Truncated -or (Test-LogCanary $combined)) {
             $outcome.Canary = 'present'
             $outcome.Failure = $index
@@ -1445,6 +1450,7 @@ function Invoke-SourceGates($sandbox, $plan, [string]$project, [string]$recordsD
             if ($outcome.Failure -eq 0) {
                 $outcome.Failure = $index
                 $script:RefusalReason = 'gate'
+                Write-Line (Get-GateDetail $index $gate $combined)
             }
             $outcome.Failed += 1
             if ($run.TimedOut -and -not $keepGoing) { return $outcome }

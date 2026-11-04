@@ -529,14 +529,14 @@ class WindowsSourceRunTests(unittest.TestCase):
     def test_every_mode_keeps_running_the_remaining_gates_after_an_ordinary_failure_and_only_synthetic_after_a_timeout_or_boundary_failure(self):
         body = self.function_body("Invoke-SourceGates")
         self.assertEqual(body.count("$keepGoing = ($script:RunMode -ceq 'synthetic')\n"), 1)
-        self.assertEqual(body.count("$keepGoing"), 3)
+        self.assertEqual(body.count("$keepGoing"), 4)
         self.assertEqual(body.count("            if ($run.TimedOut -and -not $keepGoing) { return $outcome }\n"), 1)
         self.assertNotIn("if (-not $keepGoing)", body)
         self.assertEqual(body.count("            if (-not ($keepGoing -and -not $run.Created)) { return $outcome }\n            continue\n"), 1)
         self.assertEqual(body.count("return $outcome"), 5)
         self.assertEqual(body.count("'synthetic'"), 2)
         self.assertNotIn("'source'", body)
-        self.assertEqual(self.runner.count("$keepGoing"), 3)
+        self.assertEqual(self.runner.count("$keepGoing"), 4)
         canary = body.split("if ($run.Truncated -or (Test-LogCanary $combined)) {", 1)[1].split("\n        }\n", 1)[0]
         self.assertTrue(canary.rstrip().endswith("return $outcome"))
         self.assertNotIn("$keepGoing", canary)
@@ -544,7 +544,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertTrue(deadline.rstrip().endswith("return $outcome"))
         self.assertNotIn("$keepGoing", deadline)
         gate = body.split("            $script:RefusalReason = 'gate'\n", 1)[1]
-        self.assertTrue(gate.startswith("            }\n            $outcome.Failed += 1\n            if ($run.TimedOut -and -not $keepGoing) { return $outcome }\n        }\n    }\n    return $outcome"))
+        self.assertTrue(gate.startswith("                Write-Line (Get-GateDetail $index $gate $combined)\n            }\n            $outcome.Failed += 1\n            if ($run.TimedOut -and -not $keepGoing) { return $outcome }\n        }\n    }\n    return $outcome"))
         self.assertIn("Write-GateDiag $gate.Id $run }", body)
 
     def test_a_later_gate_cannot_mask_an_earlier_failure_in_the_recorded_result(self):
@@ -556,8 +556,8 @@ class WindowsSourceRunTests(unittest.TestCase):
             r"if \(\$script:RefusalReason -cne 'boundary'\) \{\n\s+\$outcome\.Failure = \$index\n\s+\$script:RefusalReason = 'boundary'\n\s+\$script:GateCause = \$gateCause\n\s+\}\n", body)), 1)
         self.assertEqual(body.count("$outcome.Failure = $index"), 4)
         self.assertEqual(body.count("if ($outcome.Failure -eq 0)"), 3)
-        self.assertEqual(body.count("$outcome.Failed += 1"), 4)
-        self.assertEqual(body.count("$outcome.Count += 1"), 2)
+        self.assertEqual(body.count("$outcome.Failed += 1"), 5)
+        self.assertEqual(body.count("$outcome.Count += 1"), 3)
         self.assertIn("            $outcome.Count += 1\n            $outcome.Failed += 1\n            if ($outcome.Failure -eq 0) {\n", body)
         self.assertEqual(body.count("$script:GateCause = "), 4)
         self.assertIn("            if ($outcome.Failure -eq 0) { $script:GateCause = $gateCause }\n", body)
@@ -1543,36 +1543,43 @@ class WindowsSourceRunTests(unittest.TestCase):
                 self.assertNotIn("RunMode", self.function_body(name))
                 self.assertNotIn("$runMode", self.function_body(name))
 
-    def test_a_failed_gate_gets_one_bounded_detail_line_built_only_from_fixed_tokens_and_clamped_integers(self):
+    def test_the_detail_line_is_built_only_from_fixed_tokens_with_bucketed_counts_and_no_passed_count(self):
         body = self.function_body("Get-GateDetail")
         self.assertTrue(body.startswith("Get-GateDetail([int]$index, $gate, [string]$combined) {\n"))
         for token in (
+            "$items = @($gate.Argv | ForEach-Object { [string]$_ })",
             "'(^|[\\\\/])cargo\\.exe$'", "'(^|[\\\\/])npm-cli\\.js$'",
             "'error\\[(E[0-9]{4})\\]'", "'LNK[0-9]{4}'",
             "'test result: FAILED\\. ([0-9]+) passed; ([0-9]+) failed'",
             "'os error ([0-9]{1,5})'", "'panicked at'",
             "'npm (?:error|ERR!) code ([A-Z0-9_]{2,32})'",
             "$kind = 'compile'", "$kind = 'link'", "$kind = 'test'", "$kind = 'os_error'", "$kind = 'npm'",
-            "$code = 'panics' + $panics", "$code = 'os' + [int]$osError.Groups[1].Value",
+            "$code = 'os' + [int]$osError.Groups[1].Value",
+            "if ([regex]::IsMatch($text, 'panicked at')) { $code = 'panics' }",
             "$code = 'other'", "$GateDetailNpmCodes -ccontains",
-            "if ($passedText.Length -gt 6) { $passedText = '999999' }",
             "if ($failedText.Length -gt 6) { $failedText = '999999' }",
-            "[int64]999999",
+            "if ($failedCount -ge 10) { $failedBucket = 'many' } elseif ($failedCount -ge 2) { $failedBucket = 'few' } else { $failedBucket = [string]$failedCount }",
         ):
             self.assertIn(token, body)
+        self.assertNotIn("$argv", body)
+        self.assertNotIn("passed=", body)
+        self.assertNotIn("passedCount", body)
+        self.assertNotIn("passedSum", body)
+        self.assertNotIn("$code = 'panics' +", body)
         self.assertLess(body.index("$kind = 'compile'"), body.index("$kind = 'link'"))
         self.assertLess(body.index("$kind = 'link'"), body.index("$kind = 'test'"))
         self.assertLess(body.index("$kind = 'test'"), body.index("$kind = 'os_error'"))
-        self.assertIn("    } catch {\n        $kind = 'unknown'\n        $code = 'none'\n        $failedCount = 0\n        $passedCount = 0\n    }\n", body)
+        self.assertIn("    } catch {\n        $kind = 'unknown'\n        $code = 'none'\n        $failedBucket = '0'\n    }\n", body)
         self.assertIn(
             "    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind"
-            " + ' failed=' + $failedCount + ' passed=' + $passedCount + ' code=' + $code)", body)
+            " + ' failed=' + $failedBucket + ' code=' + $code)", body)
         self.assertEqual(body.count("return "), 1)
         self.assertNotIn("Write-Line", body)
         self.assertNotIn("throw", body)
         listed = re.findall(r"^\$GateDetailNpmCodes = @\((.*)\)$", self.runner, re.M)
         self.assertEqual(len(listed), 1)
-        self.assertEqual(re.findall(r"'([A-Z0-9_]+)'", listed[0]), [
+        npm_codes = re.findall(r"'([A-Z0-9_]+)'", listed[0])
+        self.assertEqual(npm_codes, [
             "ENOTCACHED", "EBADPLATFORM", "ENOENT", "EPERM", "EACCES", "EBUSY", "ENOTEMPTY", "EEXIST", "ELOOP", "ENAMETOOLONG",
             "EINTEGRITY", "EUSAGE", "ELIFECYCLE", "ERESOLVE", "EJSONPARSE", "ENOLOCK", "ENOTSUP", "EINVAL", "EMFILE", "ENOSPC",
             "ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ETARGET", "E404", "EOVERRIDE", "EWORKSPACEMISSING", "ENOWORKSPACES",
@@ -1580,41 +1587,54 @@ class WindowsSourceRunTests(unittest.TestCase):
         public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
         shaped = re.compile(
             r"windows-source-gate-detail=[1-9][0-9]* id=[a-z][a-z_]{2,40} tool=(cargo|npm|other)"
-            r" kind=(compile|link|test|os_error|npm|unknown) failed=[0-9]{1,6} passed=[0-9]{1,6}"
-            r" code=(E[0-9]{4}|LNK[0-9]{4}|panics[0-9]{1,6}|os[0-9]{1,5}|[A-Z0-9_]{2,32}|other|none)")
+            r" kind=(compile|link|test|os_error|npm|unknown) failed=(0|1|few|many)"
+            r" code=(" + "|".join(npm_codes) + r"|other|none|panics|E[0-9]{4}|LNK[0-9]{4}|os[0-9]{1,5})")
         for line in (
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=2 passed=410 code=panics2",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 passed=0 code=ENOTCACHED",
-            "windows-source-gate-detail=1 id=format tool=other kind=unknown failed=0 passed=0 code=none",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=compile failed=0 passed=0 code=E0432",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=link failed=0 passed=0 code=LNK1181",
-            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=os_error failed=0 passed=0 code=os32",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=1 code=none",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOTCACHED",
+            "windows-source-gate-detail=1 id=format tool=other kind=unknown failed=0 code=none",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=compile failed=0 code=E0432",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=link failed=0 code=LNK1181",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=os_error failed=0 code=os32",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=many code=panics",
         ):
             with self.subTest(line=line):
                 self.assertRegex(line, public)
                 self.assertIsNotNone(shaped.fullmatch(line))
                 self.assertLess(len(line), 480)
+        for line in (
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=2 code=none",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few passed=4 code=none",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics3",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=npm failed=0 code=EWHATEVER",
+        ):
+            with self.subTest(rejected=line):
+                self.assertIsNone(shaped.fullmatch(line))
 
-    def test_the_detail_line_follows_the_gate_line_of_a_failed_gate_in_both_modes_and_never_a_passed_gate(self):
+    def test_the_detail_line_is_emitted_once_only_for_the_first_ordinary_failure_after_the_canary_and_boundary_checks(self):
         body = self.function_body("Invoke-SourceGates")
-        emit = "        if (-not $passed) { Write-Line (Get-GateDetail $index $gate $combined) }\n"
+        emit = "                Write-Line (Get-GateDetail $index $gate $combined)\n"
         self.assertEqual(self.runner.count("Get-GateDetail $index $gate $combined"), 1)
         self.assertEqual(body.count(emit), 1)
-        gate_line = body.index("Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=' + $result")
-        canary = body.index("if ($run.Truncated -or (Test-LogCanary $combined)) {")
-        self.assertEqual(body.index(emit), body.index("\n", gate_line) + 1)
-        self.assertLess(body.index(emit), canary)
-        self.assertNotIn("RunMode", emit)
+        self.assertEqual(self.runner.count("windows-source-gate-detail="), 1)
         self.assertEqual(body.count("windows-source-gate-detail"), 0)
+        canary = body.index("if ($run.Truncated -or (Test-LogCanary $combined)) {")
+        boundary = body.index("if (-not $boundary) {\n            $outcome.Boundary = 'failed'")
+        ordinary = body.index("        if (-not $passed) {\n            if ($outcome.Failure -eq 0) {\n                $outcome.Failure = $index\n                $script:RefusalReason = 'gate'\n" + emit)
+        self.assertLess(canary, boundary)
+        self.assertLess(boundary, ordinary)
+        self.assertLess(ordinary, body.index(emit))
+        self.assertNotIn("Get-GateDetail", body[:ordinary])
+        self.assertNotIn("Get-GateDetail", body[body.index(emit) + len(emit):])
+        self.assertIn(emit + "            }\n            $outcome.Failed += 1\n", body)
         deadline = body.split("if ($remaining -lt 60) {", 1)[1].split("\n        }\n", 1)[0]
         self.assertNotIn("Get-GateDetail", deadline)
-        self.assertEqual(self.runner.count("windows-source-gate-detail="), 1)
-        self.assertNotRegex(self.runner, r"Write-Line \('windows-source-gate-detail=' \+ [^\n]*Stdout")
 
     def test_source_mode_continues_after_an_ordinary_failure_but_still_stops_at_canary_truncation_boundary_deadline_and_timeout(self):
         body = self.function_body("Invoke-SourceGates")
-        ordinary = body.split("        if (-not $passed) {\n            if ($outcome.Failure -eq 0) {\n                $outcome.Failure = $index\n                $script:RefusalReason = 'gate'\n            }\n", 1)[1]
-        self.assertEqual(ordinary, "            $outcome.Failed += 1\n            if ($run.TimedOut -and -not $keepGoing) { return $outcome }\n        }\n    }\n    return $outcome")
+        ordinary = body.split("        if (-not $passed) {\n            if ($outcome.Failure -eq 0) {\n                $outcome.Failure = $index\n                $script:RefusalReason = 'gate'\n", 1)[1]
+        self.assertEqual(ordinary, "                Write-Line (Get-GateDetail $index $gate $combined)\n            }\n            $outcome.Failed += 1\n            if ($run.TimedOut -and -not $keepGoing) { return $outcome }\n        }\n    }\n    return $outcome")
         boundary = body.split("        if (-not $boundary) {\n", 1)[1].split("\n        }\n", 1)[0]
         self.assertIn("if (-not ($keepGoing -and -not $run.Created)) { return $outcome }", boundary)
         self.assertLess(body.index("if (-not $boundary) {"), body.index("if ($run.TimedOut -and -not $keepGoing)"))
@@ -1624,10 +1644,40 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertNotIn("$run.TimedOut", canary)
         deadline = body.split("if ($remaining -lt 60) {", 1)[1].split("\n        }\n", 1)[0]
         self.assertTrue(deadline.rstrip().endswith("return $outcome"))
-        self.assertEqual(body.count("$keepGoing"), 3)
         self.assertEqual(body.count("return $outcome"), 5)
         self.assertIn("$passed = ($boundary -and -not $run.TimedOut -and $run.ExitCode -eq 0)", body)
         self.assertEqual(self.runner.count("if ($gateOutcome.Failed -ne 0 -or $gateOutcome.Failure -ne 0) { throw $script:RefusalReason }\n"), 1)
+
+    def test_after_a_source_mode_failure_the_npm_stepped_shim_and_dependent_node_gates_are_skipped_not_run(self):
+        body = self.function_body("Invoke-SourceGates")
+        skip = (
+            "        if (-not $keepGoing -and $outcome.Failure -ne 0 -and (($gate.Id -ceq $NpmSteppedGate) -or ($NpmLinkShimGates -ccontains $gate.Id) -or ($nodeBlocked -and (Test-NodeGate $gate)))) {\n"
+            "            if ($gate.Id -ceq $NpmSteppedGate) { $nodeBlocked = $true }\n"
+            "            $outcome.Count += 1\n"
+            "            $outcome.Failed += 1\n"
+            "            Write-Line ('windows-source-gate=' + $index + ' id=' + $gate.Id + ' result=not_run hang=none cause=skipped')\n"
+            "            continue\n"
+            "        }\n")
+        self.assertEqual(body.count(skip), 1)
+        self.assertEqual(body.count("cause=skipped"), 1)
+        start = body.index(skip)
+        self.assertLess(start, body.index("Reset-NpmConfigFiles"))
+        self.assertLess(start, body.index("Add-NpmLinkShim"))
+        self.assertLess(start, body.index("Invoke-NpmLinkSteps"))
+        self.assertLess(start, body.index("$sandbox.Run("))
+        self.assertLess(start, body.index("if ($remaining -lt 60) {"))
+        self.assertNotIn("Failure", skip.replace("$outcome.Failure -ne 0", ""))
+        self.assertNotIn("RefusalReason", skip)
+        self.assertNotIn("GateCause", skip)
+        self.assertIn("        if ($gate.Id -ceq $NpmSteppedGate -and -not $passed) { $nodeBlocked = $true }\n", body)
+        self.assertEqual(body.count("$nodeBlocked = $true"), 2)
+        self.assertEqual(body.count("$nodeBlocked = $false"), 1)
+        node = self.function_body("Test-NodeGate")
+        self.assertIn("'(^|[\\\\/])(node\\.exe|npm-cli\\.js)$'", node)
+        self.assertIn("$gate.Argv", node)
+        public = re.compile(re.search(r"PublicLinePattern = '([^']+)'", self.runner).group(1))
+        self.assertRegex("windows-source-gate=14 id=node_dependency_audit result=not_run hang=none cause=skipped", public)
+        self.assertIn("if ($gateOutcome.Failed -ne 0 -or $gateOutcome.Failure -ne 0) { throw $script:RefusalReason }\n", self.runner)
 
 
 if __name__ == "__main__":
