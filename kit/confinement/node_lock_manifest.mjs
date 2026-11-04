@@ -124,6 +124,7 @@ function normalizeExpectation(input) {
     names.add(item.name);
     paths.add(item.path);
   }
+  const versionByName = new Map(workspaces.map((item) => [item.name, item.version]));
   for (const item of [root, ...workspaces]) {
     for (const group of DEPENDENCY_GROUPS) {
       const map = item[group] === undefined ? Object.create(null) : item[group];
@@ -135,6 +136,10 @@ function normalizeExpectation(input) {
           && /^workspace:(?:\*|\^|~|[0-9][0-9A-Za-z.+-]*)$/u.test(spec);
         if (!packageName(name) || (!workspaceSpec && !safeDependencySpec(spec, !names.has(name)))
             || (!names.has(name) && typeof spec === 'string' && spec.startsWith('workspace:'))) {
+          reject('invalid_expectation');
+        }
+        if (names.has(name) && !workspaceSpec
+            && (item === root || item.name === name || spec !== versionByName.get(name))) {
           reject('invalid_expectation');
         }
       }
@@ -432,6 +437,9 @@ function validateDirectPin(packages, name, spec, parentPath, workspaceByName) {
   const workspacePath = workspaceByName.get(name);
   if (workspacePath) {
     if (!entry || entry.link !== true || entry.resolved !== workspacePath) reject('direct_pin_mismatch');
+    if (!spec.startsWith('workspace:') && (!parentPath || key !== `node_modules/${name}`)) {
+      reject('direct_pin_mismatch');
+    }
     return;
   }
   if (!entry || entry.link === true || entry.version !== spec

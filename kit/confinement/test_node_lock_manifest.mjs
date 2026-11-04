@@ -718,3 +718,135 @@ test('refuses undeclared, sourced, and deeper bundled children', () => {
   wrongParent.packages['node_modules/tslib'] = { version: '1.2.3', inBundle: true };
   assert.notEqual(codeOf(wrongParent, expected), 'accepted');
 });
+
+const MEMBER_PATHS = ['packages/edge-api', 'packages/edge-locale', 'packages/edge-icons', 'packages/edge-kit'];
+
+function memberName(path) {
+  return `@fixture/${path.slice('packages/'.length)}`;
+}
+
+function memberEdgeFixture() {
+  const expectation = {
+    root: {
+      name: 'fixture-root',
+      version: '0.1.0',
+      workspaces: ['packages/*'],
+      devDependencies: { typescript: '6.0.3' },
+    },
+    workspaces: MEMBER_PATHS.map((path) => ({ path, name: memberName(path), version: '0.1.0' })),
+  };
+  expectation.workspaces[3].dependencies = { '@fixture/edge-icons': '0.1.0' };
+  const packages = {
+    '': {
+      name: 'fixture-root',
+      version: '0.1.0',
+      workspaces: ['packages/*'],
+      devDependencies: { typescript: '6.0.3' },
+    },
+  };
+  for (const path of MEMBER_PATHS) {
+    packages[`node_modules/${memberName(path)}`] = { resolved: path, link: true };
+  }
+  packages['node_modules/typescript'] = {
+    version: '6.0.3',
+    resolved: 'https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz',
+    integrity: `sha512-${'A'.repeat(86)}==`,
+    dev: true,
+  };
+  for (const path of MEMBER_PATHS) packages[path] = { name: memberName(path), version: '0.1.0' };
+  packages['packages/edge-kit'].dependencies = { '@fixture/edge-icons': '0.1.0' };
+  const lock = {
+    name: 'fixture-root', version: '0.1.0', lockfileVersion: 3, requires: true, packages,
+  };
+  return { lock, expectation };
+}
+
+test('admits one workspace edge at the exact listed version through its root link entry', () => {
+  const { lock, expectation } = memberEdgeFixture();
+  assert.equal(codeOf(lock, expectation), 'accepted');
+  const inventory = validateLockManifestInventory(bytes(lock), expectation);
+  const kit = inventory.packages.find((item) => item.name === '@fixture/edge-kit');
+  assert.deepEqual(kit.dependencies, [{ name: '@fixture/edge-icons', version: '0.1.0' }]);
+});
+
+test('refuses a workspace edge to a package that is not a listed workspace', () => {
+  const { lock, expectation } = memberEdgeFixture();
+  expectation.workspaces[3].dependencies = { '@fixture/edge-ghost': '0.1.0' };
+  lock.packages['packages/edge-kit'].dependencies = { '@fixture/edge-ghost': '0.1.0' };
+  lock.packages['node_modules/@fixture/edge-ghost'] = { resolved: 'packages/edge-ghost', link: true };
+  assert.notEqual(codeOf(lock, expectation), 'accepted');
+
+  const listedElsewhere = memberEdgeFixture();
+  listedElsewhere.expectation.workspaces.splice(2, 1);
+  delete listedElsewhere.lock.packages['packages/edge-icons'];
+  assert.notEqual(codeOf(listedElsewhere.lock, listedElsewhere.expectation), 'accepted');
+});
+
+test('refuses a workspace edge at any spec other than the exact listed version', () => {
+  for (const spec of ['0.1.1', '^0.1.0', '~0.1.0', '>=0.1.0', '*', '0.1']) {
+    const { lock, expectation } = memberEdgeFixture();
+    expectation.workspaces[3].dependencies = { '@fixture/edge-icons': spec };
+    lock.packages['packages/edge-kit'].dependencies = { '@fixture/edge-icons': spec };
+    assert.equal(codeOf(lock, expectation), 'invalid_expectation', spec);
+  }
+  const versionDrift = memberEdgeFixture();
+  versionDrift.lock.packages['packages/edge-icons'].version = '0.1.1';
+  assert.notEqual(codeOf(versionDrift.lock, versionDrift.expectation), 'accepted');
+
+  const lockSpecDrift = memberEdgeFixture();
+  lockSpecDrift.lock.packages['packages/edge-kit'].dependencies = { '@fixture/edge-icons': '^0.1.0' };
+  assert.notEqual(codeOf(lockSpecDrift.lock, lockSpecDrift.expectation), 'accepted');
+});
+
+test('refuses a workspace edge whose link entry is missing or wrong', () => {
+  const missing = memberEdgeFixture();
+  delete missing.lock.packages['node_modules/@fixture/edge-icons'];
+  assert.notEqual(codeOf(missing.lock, missing.expectation), 'accepted');
+
+  for (const replacement of [
+    { resolved: 'packages/edge-kit', link: true },
+    { resolved: 'packages/edge-icons', link: false },
+    { resolved: 'packages/edge-icons' },
+    { resolved: 'packages/edge-icons', link: true, integrity: `sha512-${'A'.repeat(86)}==` },
+    {
+      version: '0.1.0',
+      resolved: 'https://registry.npmjs.org/@fixture/edge-icons/-/edge-icons-0.1.0.tgz',
+      integrity: `sha512-${'A'.repeat(86)}==`,
+    },
+  ]) {
+    const { lock, expectation } = memberEdgeFixture();
+    lock.packages['node_modules/@fixture/edge-icons'] = replacement;
+    assert.notEqual(codeOf(lock, expectation), 'accepted', JSON.stringify(replacement));
+  }
+
+  const nested = memberEdgeFixture();
+  nested.lock.packages['packages/edge-kit/node_modules/@fixture/edge-icons'] = {
+    resolved: 'packages/edge-icons', link: true,
+  };
+  assert.equal(codeOf(nested.lock, nested.expectation), 'direct_pin_mismatch');
+});
+
+test('refuses a workspace edge whose link points at a path that is not a listed workspace', () => {
+  for (const resolved of ['packages/edge-other', 'node_modules/typescript', 'packages', '../edge-icons']) {
+    const { lock, expectation } = memberEdgeFixture();
+    lock.packages['node_modules/@fixture/edge-icons'].resolved = resolved;
+    assert.notEqual(codeOf(lock, expectation), 'accepted', resolved);
+  }
+});
+
+test('refuses an exact version edge from the root or from a workspace to itself', () => {
+  const fromRoot = memberEdgeFixture();
+  fromRoot.expectation.root.dependencies = { '@fixture/edge-icons': '0.1.0' };
+  fromRoot.lock.packages[''].dependencies = { '@fixture/edge-icons': '0.1.0' };
+  assert.equal(codeOf(fromRoot.lock, fromRoot.expectation), 'invalid_expectation');
+
+  const fromRootDevelopment = memberEdgeFixture();
+  fromRootDevelopment.expectation.root.devDependencies['@fixture/edge-icons'] = '0.1.0';
+  fromRootDevelopment.lock.packages[''].devDependencies['@fixture/edge-icons'] = '0.1.0';
+  assert.equal(codeOf(fromRootDevelopment.lock, fromRootDevelopment.expectation), 'invalid_expectation');
+
+  const toItself = memberEdgeFixture();
+  toItself.expectation.workspaces[2].dependencies = { '@fixture/edge-icons': '0.1.0' };
+  toItself.lock.packages['packages/edge-icons'].dependencies = { '@fixture/edge-icons': '0.1.0' };
+  assert.equal(codeOf(toItself.lock, toItself.expectation), 'invalid_expectation');
+});
