@@ -1700,16 +1700,18 @@ class WindowsSourceRunTests(unittest.TestCase):
         families = ("{ $code = $foundCode\n", "{ $code = 'other_err'\n", "{ $code = 'other_tar'\n", "{ $code = 'other_http'\n", "{ $code = 'other_errno' }")
         family_positions = [body.index(item) for item in families]
         self.assertEqual(family_positions, sorted(family_positions))
-        self.assertIn("    } catch {\n        $kind = 'unknown'\n        $code = 'none'\n        $failedBucket = '0'\n        $mem = 'unknown'\n        $jobmem = 'unknown'\n        $phase = 'none'\n        $hits = 'lt100'\n    }\n", body)
+        self.assertIn("    } catch {\n        $kind = 'unknown'\n        $code = 'none'\n        $failedBucket = '0'\n        $mem = 'unknown'\n        $jobmem = 'unknown'\n        $phase = 'none'\n        $hits = 'lt100'\n        $files = '0'\n        $summary = 'no'\n    }\n", body)
         self.assertIn(
-            "    $tail = ''\n    if ($tool -ceq 'npm') { $tail = ' phase=' + $phase + ' hits=' + $hits }\n"
+            "    $tail = ''\n    if ($tool -ceq 'npm') { $tail = ' phase=' + $phase + ' hits=' + $hits + ' files=' + $files + ' summary=' + $summary }\n"
             "    return ('windows-source-gate-detail=' + $index + ' id=' + $gate.Id + ' tool=' + $tool + ' kind=' + $kind"
             " + ' failed=' + $failedBucket + ' code=' + $code + ' mem=' + $mem + ' jobmem=' + $jobmem + $tail)", body)
         self.assertTrue(body.endswith(" + ' mem=' + $mem + ' jobmem=' + $jobmem + $tail)"))
         self.assertEqual(body.count("return "), 1)
-        self.assertIn("    $mem = 'unknown'\n    $jobmem = 'unknown'\n    $phase = 'none'\n    $hits = 'lt100'\n    try {\n", body)
+        self.assertIn("    $mem = 'unknown'\n    $jobmem = 'unknown'\n    $phase = 'none'\n    $hits = 'lt100'\n    $files = '0'\n    $summary = 'no'\n    try {\n", body)
         self.assertEqual(body.count("$phase = 'none'"), 2)
         self.assertEqual(body.count("$hits = 'lt100'"), 2)
+        self.assertEqual(body.count("$files = '0'"), 2)
+        self.assertEqual(body.count("$summary = 'no'"), 2)
         self.assertEqual(body.count("$tail"), 3)
         npm_branch = body[body.index("$kind = 'npm'"):body.index("            $found = ")]
         self.assertEqual(npm_branch, (
@@ -1723,7 +1725,10 @@ class WindowsSourceRunTests(unittest.TestCase):
             "            foreach ($hit in [regex]::Matches($text, '(?m)^npm_link_shim hits_over=(100|10000|1000000)$')) {\n"
             "                $level = [string]$hit.Groups[1].Value\n"
             "                if ($level -ceq '1000000') { $hits = 'h1m' } elseif ($level -ceq '10000' -and $hits -cne 'h1m') { $hits = 'h10k' } elseif ($level -ceq '100' -and $hits -ceq 'lt100') { $hits = 'h100' }\n"
-            "            }\n"))
+            "            }\n"
+            "            $progress = [regex]::Matches($text, '(?m)^ *(\\u2713|\\u221A|\\u00D7|\\u2715|\\u2717) ').Count\n"
+            "            if ($progress -ge 1000) { $files = 'ge1000' } elseif ($progress -ge 100) { $files = '100to999' } elseif ($progress -ge 10) { $files = '10to99' } elseif ($progress -ge 1) { $files = '1to9' }\n"
+            "            if ([regex]::IsMatch($text, '(?m)^ *Test Files +')) { $summary = 'yes' }\n"))
         phases = re.findall(r"^\$GateDetailNpmPhases = @\((.*)\)$", self.runner, re.M)
         self.assertEqual(len(phases), 1)
         self.assertEqual(self.runner.count("$GateDetailNpmPhases -ccontains"), 1)
@@ -1775,30 +1780,31 @@ class WindowsSourceRunTests(unittest.TestCase):
 
         shaped = re.compile(
             "(?:" + detail_head("(?:cargo|other)") + "|" + detail_head("npm") +
-            r" phase=(" + "|".join(re.escape(name) for name in phase_names) + r"|other|none) hits=(lt100|h100|h10k|h1m))")
+            r" phase=(" + "|".join(re.escape(name) for name in phase_names) + r"|other|none) hits=(lt100|h100|h10k|h1m)"
+            r" files=(0|1to9|10to99|100to999|ge1000) summary=(yes|no))")
         for line in (
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics mem=lt1g jobmem=lt2g",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=1 code=none mem=lt1g jobmem=lt2g",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOTCACHED mem=lt1g jobmem=lt2g phase=npm:load hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOTCACHED mem=lt1g jobmem=lt2g phase=npm:load hits=lt100 files=0 summary=no",
             "windows-source-gate-detail=1 id=format tool=other kind=unknown failed=0 code=none mem=lt1g jobmem=lt2g",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=compile failed=0 code=E0432 mem=lt1g jobmem=lt2g",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=link failed=0 code=LNK1181 mem=lt1g jobmem=lt2g",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=os_error failed=0 code=os32 mem=lt1g jobmem=lt2g",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=many code=panics mem=lt1g jobmem=lt2g",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_map_entry mem=lt1g jobmem=lt2g phase=idealTree:buildDeps hits=h100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_other mem=unknown jobmem=lt2g phase=none hits=lt100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_REQUIRE_ESM mem=1to2g jobmem=lt2g phase=reify:rollback:createSparse hits=h10k",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_other mem=2to4g jobmem=lt2g phase=other hits=h1m",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=null_property mem=4to8g jobmem=lt2g phase=npm-ci:rm hits=lt100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=npm_error_line mem=8to12g jobmem=2to4g phase=build:link hits=h100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify:build hits=h1m",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other mem=ge12g jobmem=ge12g phase=idealTree hits=lt100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOMEM mem=4to8g jobmem=lt2g phase=reify:unpack hits=lt100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=TAR_BAD_ARCHIVE mem=4to8g jobmem=lt2g phase=reify:unpack hits=lt100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other_err mem=4to8g jobmem=lt2g phase=reify:rollback:retireShallow hits=lt100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify:loadTrees hits=lt100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=unknown jobmem=unknown phase=auditReport:getReport hits=h10k",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=8to12g phase=reify:unpack hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_map_entry mem=lt1g jobmem=lt2g phase=idealTree:buildDeps hits=h100 files=1to9 summary=no",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_other mem=unknown jobmem=lt2g phase=none hits=lt100 files=10to99 summary=yes",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_REQUIRE_ESM mem=1to2g jobmem=lt2g phase=reify:rollback:createSparse hits=h10k files=100to999 summary=yes",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_other mem=2to4g jobmem=lt2g phase=other hits=h1m files=ge1000 summary=yes",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=null_property mem=4to8g jobmem=lt2g phase=npm-ci:rm hits=lt100 files=0 summary=no",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=npm_error_line mem=8to12g jobmem=2to4g phase=build:link hits=h100 files=1to9 summary=no",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify:build hits=h1m files=10to99 summary=yes",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other mem=ge12g jobmem=ge12g phase=idealTree hits=lt100 files=100to999 summary=yes",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOMEM mem=4to8g jobmem=lt2g phase=reify:unpack hits=lt100 files=ge1000 summary=yes",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=TAR_BAD_ARCHIVE mem=4to8g jobmem=lt2g phase=reify:unpack hits=lt100 files=0 summary=no",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other_err mem=4to8g jobmem=lt2g phase=reify:rollback:retireShallow hits=lt100 files=1to9 summary=no",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify:loadTrees hits=lt100 files=10to99 summary=yes",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=unknown jobmem=unknown phase=auditReport:getReport hits=h10k files=100to999 summary=yes",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=8to12g phase=reify:unpack hits=lt100 files=ge1000 summary=yes",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics mem=lt1g jobmem=ge12g",
         ):
             with self.subTest(line=line):
@@ -1810,8 +1816,8 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few passed=4 code=none mem=lt1g jobmem=lt2g",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics3 mem=lt1g jobmem=lt2g",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=npm failed=0 code=EWHATEVER mem=lt1g jobmem=lt2g",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other_foo mem=4to8g jobmem=lt2g phase=reify hits=lt100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOMEMX mem=4to8g jobmem=lt2g phase=reify hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=other_foo mem=4to8g jobmem=lt2g phase=reify hits=lt100 files=0 summary=no",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=ENOMEMX mem=4to8g jobmem=lt2g phase=reify hits=lt100 files=0 summary=no",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=shim_xyz mem=lt1g jobmem=lt2g",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_FOO mem=lt1g jobmem=lt2g",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=node_ERR_other mem=lt1g jobmem=lt2g",
@@ -1829,15 +1835,34 @@ class WindowsSourceRunTests(unittest.TestCase):
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g hits=lt100 phase=reify",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify:other hits=lt100",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=h5",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify:other hits=lt100 files=0 summary=no",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=h5 files=0 summary=no",
             "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=lt100 extra=1",
-            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=npm:load:configs hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=npm:load:configs hits=lt100 files=0 summary=no",
             "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics mem=lt1g jobmem=lt2g phase=none hits=lt100",
             "windows-source-gate-detail=1 id=format tool=other kind=unknown failed=0 code=none mem=lt1g jobmem=lt2g phase=none hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=lt100",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=lt100 files=0",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=lt100 files=5 summary=no",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=lt100 files=1to9",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=lt100 summary=yes files=1to9",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=lt100 files=1to9 summary=maybe",
+            "windows-source-gate-detail=12 id=node_dependency_prepare tool=npm kind=npm failed=0 code=heap mem=4to8g jobmem=lt2g phase=reify hits=lt100 files=10 summary=yes",
+            "windows-source-gate-detail=3 id=workspace_tests tool=cargo kind=test failed=few code=panics mem=lt1g jobmem=lt2g files=0 summary=no",
         ):
             with self.subTest(rejected=line):
                 self.assertIsNone(shaped.fullmatch(line))
+
+    def test_only_the_node_tests_gate_has_the_longer_windows_budget(self):
+        self.assertEqual(re.findall(r"^\$GateLongSeconds = (.*)$", self.runner, re.M), ["900"])
+        self.assertEqual(re.findall(r"^\$GateShortSeconds = (.*)$", self.runner, re.M), ["300"])
+        self.assertEqual(re.findall(r"^\$GateNodeTestsSeconds = (.*)$", self.runner, re.M), ["2700"])
+        self.assertEqual(self.runner.count("$GateNodeTestsSeconds"), 2)
+        self.assertEqual(self.function_body("Get-GateSeconds"), (
+            "([string]$id) {\n"
+            "    if ($id -ceq 'typescript_tests') { return $GateNodeTestsSeconds }\n"
+            "    if ($id -cmatch $GateLongPattern) { return $GateLongSeconds }\n"
+            "    return $GateShortSeconds"))
 
     def test_the_gate_runs_use_the_raised_process_limit_and_the_probes_keep_thirty_two(self):
         self.assertEqual(re.findall(r"^\$GateMaxProcesses = (.*)$", self.runner, re.M), ["[uint32]128"])
