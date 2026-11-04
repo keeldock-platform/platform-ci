@@ -1726,9 +1726,10 @@ class WindowsSourceRunTests(unittest.TestCase):
             "                $level = [string]$hit.Groups[1].Value\n"
             "                if ($level -ceq '1000000') { $hits = 'h1m' } elseif ($level -ceq '10000' -and $hits -cne 'h1m') { $hits = 'h10k' } elseif ($level -ceq '100' -and $hits -ceq 'lt100') { $hits = 'h100' }\n"
             "            }\n"
-            "            $progress = [regex]::Matches($text, '(?m)^ *(\\u2713|\\u221A|\\u00D7|\\u2715|\\u2717) ').Count\n"
+            "            $plain = [regex]::Replace($text, '\\x1b\\[[0-9;]*[A-Za-z]', '')\n"
+            "            $progress = [regex]::Matches($plain, '(?m)^ *(\\u2713|\\u221A|\\u00D7|\\u2715|\\u2717) ').Count\n"
             "            if ($progress -ge 1000) { $files = 'ge1000' } elseif ($progress -ge 100) { $files = '100to999' } elseif ($progress -ge 10) { $files = '10to99' } elseif ($progress -ge 1) { $files = '1to9' }\n"
-            "            if ([regex]::IsMatch($text, '(?m)^ *Test Files +')) { $summary = 'yes' }\n"))
+            "            if ([regex]::IsMatch($plain, '(?m)^ *Test Files +')) { $summary = 'yes' }\n"))
         phases = re.findall(r"^\$GateDetailNpmPhases = @\((.*)\)$", self.runner, re.M)
         self.assertEqual(len(phases), 1)
         self.assertEqual(self.runner.count("$GateDetailNpmPhases -ccontains"), 1)

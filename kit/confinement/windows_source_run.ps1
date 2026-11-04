@@ -1379,10 +1379,11 @@ function Get-GateDetail([int]$index, $gate, [string]$combined, $peak, $jobPeak) 
                 $level = [string]$hit.Groups[1].Value
                 if ($level -ceq '1000000') { $hits = 'h1m' } elseif ($level -ceq '10000' -and $hits -cne 'h1m') { $hits = 'h10k' } elseif ($level -ceq '100' -and $hits -ceq 'lt100') { $hits = 'h100' }
             }
-            $progress = [regex]::Matches($text, '(?m)^ *(\u2713|\u221A|\u00D7|\u2715|\u2717) ').Count
+            $plain = [regex]::Replace($text, '\x1b\[[0-9;]*[A-Za-z]', '')
+            $progress = [regex]::Matches($plain, '(?m)^ *(\u2713|\u221A|\u00D7|\u2715|\u2717) ').Count
             if ($progress -ge 1000) { $files = 'ge1000' } elseif ($progress -ge 100) { $files = '100to999' } elseif ($progress -ge 10) { $files = '10to99' } elseif ($progress -ge 1) { $files = '1to9' }
-            if ([regex]::IsMatch($text, '(?m)^ *Test Files +')) { $summary = 'yes' }
-            $found =[regex]::Match($text, 'npm (?:error|ERR!) code ([A-Z0-9_]{2,32})')
+            if ([regex]::IsMatch($plain, '(?m)^ *Test Files +')) { $summary = 'yes' }
+            $found = [regex]::Match($text, 'npm (?:error|ERR!) code ([A-Z0-9_]{2,32})')
             if ($found.Success) {
                 $code = 'other'
                 $foundCode = [string]$found.Groups[1].Value
