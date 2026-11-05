@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --project tsconfig.json --noEmit && node --check src/index.js",
-    "test": "node tests/probe.mjs"
+    "test": "node --import ./tests/no-net-use.mjs ../../node_modules/vitest/vitest.mjs run --configLoader runner && node tests/run.js"
   },
   "devDependencies": {
     "typescript": "6.0.3",

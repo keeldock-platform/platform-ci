@@ -1,3 +1,6 @@
+// Vite's windowsSafeRealPathSync calls optimizeSafeRealPathSync, which runs exec('net use').
+// That pipe hangs under Windows LPAC. ENOTSUP keeps plain fs.realpathSync; gates do not use
+// mapped network drives.
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 

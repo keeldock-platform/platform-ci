@@ -38,6 +38,7 @@ NODE_FIXED_FILES = frozenset((
     ".node-version", "package.json", "tsconfig.base.json",
     "packages/host-api/package.json", "packages/host-api/tsconfig.json",
     "packages/kernel-i18n/package.json", "packages/kernel-i18n/tsconfig.json",
+    "tools/node-test/no-net-use.mjs",
 )) | NODE_EXTRA_FILES | NODE_FIXTURE_FILES
 NODE_REVIEWED_FILES = NODE_FIXED_FILES | frozenset((
     "packages/host-api/src/budget.ts", "packages/host-api/src/effects.ts",
@@ -51,7 +52,7 @@ NODE_REVIEWED_FILES = NODE_FIXED_FILES | frozenset((
     "packages/host-api/tests/ids-version.test.ts",
     "packages/host-api/tests/manifest-metadata.test.ts",
 ))
-MAX_NODE_REVIEWED_FILES = 10 + 2 * (64 + 64)
+MAX_NODE_REVIEWED_FILES = 11 + 2 * (64 + 64)
 PACKAGE_LOCK_PATH = "package-lock.json"
 PACKAGE_LOCK_TREE = "core_build_diagnostic_return_with_package_lock"
 SOURCE_IDENTITY_KEYS = ("source_sha", "base_sha", "control_sha", "reviewed_diff_sha256")

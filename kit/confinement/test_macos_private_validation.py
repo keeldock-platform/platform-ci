@@ -645,7 +645,8 @@ class CoreContractTreeTests(unittest.TestCase):
     def test_feedback_tree_allows_reviewed_typescript_patterns_and_fixed_configs(self):
         for path in subject.CORE_CONTRACT_FEEDBACK_FILES:
             with self.subTest(path=path):
-                self.assertIsNone(subject._core_contract_expected_mode(path))
+                expected = "100644" if path == subject.CORE_CONTRACT_NODE_TEST_PATH else None
+                self.assertEqual(subject._core_contract_expected_mode(path), expected)
                 for concern in subject.FEEDBACK_PROFILE_CONCERNS:
                     self.assertEqual(
                         subject._core_contract_expected_mode(path, concern=concern), "100644",
@@ -2199,7 +2200,9 @@ class CoreContractTreeTests(unittest.TestCase):
         )
         package_manifest = (
             b'{"name":"fixture","version":"1.0.0","type":"module",'
-            b'"exports":{".":{}},"scripts":{"typecheck":"fixed","test":"fixed"}}'
+            b'"exports":{".":{}},"scripts":{"typecheck":"fixed",'
+            b'"test":"node --import ../../tools/node-test/no-net-use.mjs '
+            b'../../node_modules/vitest/vitest.mjs run --configLoader runner"}}'
         )
         self.assertTrue(subject._feedback_manifest_shape(root_manifest, package_manifest))
         self.assertFalse(subject._feedback_manifest_shape(
@@ -2429,6 +2432,7 @@ class CoreContractTreeTests(unittest.TestCase):
         paths = {
             ".gitignore", "AGENTS.md", "CLAUDE.md", "README.md", subject.RULES_LOCK_PATH,
             subject.RULES_DIRECTORY + "/settings.json", "/".join(subject.SIGNER_PATH_PARTS),
+            subject.CORE_CONTRACT_NODE_TEST_PATH,
         } | set(subject.CORE_CONTRACT_ROOT_FILES)
         for crate_root in subject.CORE_CONTRACT_CRATE_ROOTS:
             prefix = "/".join(crate_root)
@@ -2445,6 +2449,9 @@ class CoreContractTreeTests(unittest.TestCase):
         if concern == "core-rust-lock-return":
             paths.update(subject.CORE_CONTRACT_RUST_POLICY_FILES)
         entries = {path: ("100644", "a" * 40) for path in paths}
+        entries[subject.CORE_CONTRACT_NODE_TEST_PATH] = (
+            "100644", subject.CORE_CONTRACT_NODE_TEST_OBJECT,
+        )
         if concern == "core-rust-lock-return":
             entries["Cargo.lock"] = ("100644", subject.CORE_CONTRACT_RUST_BOOTSTRAP_LOCK_OBJECT)
             entries.update({
@@ -2782,6 +2789,37 @@ class CoreContractTreeTests(unittest.TestCase):
                 "vitest.config.ts",
             ):
                 with self.subTest(concern=concern, path=path):
+                    self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
+
+    def test_node_test_preload_is_the_exact_pinned_core_tree_path(self):
+        path = subject.CORE_CONTRACT_NODE_TEST_PATH
+        self.assertEqual(path, "tools/node-test/no-net-use.mjs")
+        self.assertEqual(
+            subject.CORE_CONTRACT_NODE_TEST_OBJECT,
+            "8fcc6c75e84040fa9e6e1fde9c709920cf7d8739",
+        )
+        self.assertEqual(len(subject.CORE_CONTRACT_NODE_TEST_OBJECT), 40)
+        self.assertFalse(subject._core_contract_foundation_path(path))
+        for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
+            with self.subTest(concern=concern):
+                self.assertEqual(subject._core_contract_expected_mode(path, concern=concern), "100644")
+        entries = self._required_core_contract_entries("core-contract")
+        marker, unused_blob = self._validate_feedback_tree(entries, "core-contract")
+        self.assertEqual(marker, "core_contract")
+        for changed, check in (
+            ({**entries, path: ("100644", "a" * 40)}, "package_decode"),
+            ({**entries, path: ("100755", subject.CORE_CONTRACT_NODE_TEST_OBJECT)}, "path_mode"),
+            ({**entries, "tools/node-test/other.mjs": ("100644", "a" * 40)}, "path_mode"),
+        ):
+            with self.subTest(changed=set(changed) - set(entries)):
+                self.assertEqual(self._refused_check(changed, "core-contract"), check)
+        for path in (
+            "tools/node-test/other.mjs",
+            "tools/node-test/no-net-use.js",
+            "tools/other/no-net-use.mjs",
+        ):
+            with self.subTest(path=path):
+                for concern in sorted(subject.CORE_CONTRACT_CONCERNS):
                     self.assertIsNone(subject._core_contract_expected_mode(path, concern=concern))
 
     def test_repository_rule_and_vitest_files_are_admitted_in_the_npm_trees_and_only_as_regular_data(self):

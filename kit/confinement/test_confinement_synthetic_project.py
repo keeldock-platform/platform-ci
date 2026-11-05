@@ -40,12 +40,10 @@ EXPECTED_FILES = (
     "packages/host-api/src/index.js",
     "packages/host-api/src/index.ts",
     "packages/host-api/tests/no-net-use.mjs",
-    "packages/host-api/tests/probe.mjs",
     "packages/host-api/tests/run.js",
     "packages/host-api/tests/vitest.test.ts",
     "packages/host-api/tsconfig.json",
     "packages/host-api/vitest.config.ts",
-    "packages/host-api/vitest.nohmr.config.ts",
     "packages/kernel-i18n/package.json",
     "packages/kernel-i18n/src/index.js",
     "packages/kernel-i18n/tests/run.js",
@@ -246,7 +244,7 @@ class NodeGateTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         package["scripts"]["test"],
-                        "node tests/probe.mjs",
+                        "node --import ./tests/no-net-use.mjs ../../node_modules/vitest/vitest.mjs run --configLoader runner && node tests/run.js",
                     )
                 else:
                     self.assertEqual(package["scripts"]["typecheck"], "node --check src/index.js")
@@ -263,77 +261,25 @@ class NodeGateTests(unittest.TestCase):
         self.assertTrue((FIXTURE / "packages/host-api/tsconfig.json").is_file())
         self.assertIn('pool: \'threads\'', _text("packages/host-api/vitest.config.ts"))
         self.assertIn("tests/**/*.test.ts", _text("packages/host-api/vitest.config.ts"))
-        nohmr_config = _text("packages/host-api/vitest.nohmr.config.ts")
-        self.assertIn("hmr: false", nohmr_config)
-        self.assertIn("ws: false", nohmr_config)
-        self.assertIn("watch: null", nohmr_config)
-        self.assertIn("pool: 'threads'", nohmr_config)
-        self.assertIn("tests/**/*.test.ts", nohmr_config)
         self.assertIn("it(", _text("packages/host-api/tests/vitest.test.ts"))
         self.assertIn("expect(true).toBe(true)", _text("packages/host-api/tests/vitest.test.ts"))
         self.assertIn("fixtureValue: number", _text("packages/host-api/src/index.ts"))
 
-    def test_the_node_probe_uses_bounded_inherited_child_processes(self):
-        probe = _text("packages/host-api/tests/probe.mjs")
-        self.assertIn("spawnSync(executable, args", probe)
-        self.assertIn("stdio: ['ignore', 'ignore', 'inherit']", probe)
-        self.assertIn("['cmd-echo', 'cmd.exe', ['/d', '/s', '/c', 'echo hi'], 20000]", probe)
-        self.assertIn("['net-use', 'cmd.exe', ['/d', '/s', '/c', 'net use'], 20000]", probe)
-        self.assertIn("realpathSync.native(process.cwd())", probe)
-        self.assertIn("timeout,", probe)
-        self.assertIn("windowsHide: true", probe)
-        self.assertIn("const packageDir = process.cwd()", probe)
-        self.assertIn("cwd: packageDir", probe)
-        self.assertIn("process.exit(2)", probe)
-        self.assertIn("await v.resolveConfig({ configFile: false }, 'serve')", probe)
-        self.assertIn("console.error('resolved')", probe)
-        self.assertIn("process.exit(0)", probe)
-        self.assertIn("--import", probe)
-        self.assertIn("./tests/no-net-use.mjs", probe)
-        self.assertIn("server: { middlewareMode: true, watch: null, hmr: false, ws: false }", probe)
-        self.assertIn("noDiscovery: true", probe)
-        self.assertIn("const server = await createServer(${JSON.stringify(config)})", probe)
-        self.assertIn("console.error('created')", probe)
-        self.assertIn("process.exit(3)", probe)
-        self.assertIn("String(error?.message ?? error).split(/\\\\r?\\\\n/, 1)[0]", probe)
-        self.assertIn("import { createRequire } from 'node:module'", probe)
-        self.assertIn("import path from 'node:path'", probe)
-        self.assertIn("const require = createRequire(import.meta.url)", probe)
-        self.assertIn("let vitestBin = null", probe)
-        self.assertIn("const vitestDir = path.dirname(require.resolve('vitest/package.json'))", probe)
-        self.assertIn("vitestBin = path.join(vitestDir, 'vitest.mjs')", probe)
-        self.assertIn("} catch {", probe)
-        self.assertIn("result.error?.code === 'ETIMEDOUT'", probe)
-        self.assertIn("result.signal === 'SIGTERM'", probe)
-        self.assertIn("console.log(`PROBE ${number} ${name} ${code}`)", probe)
-        self.assertIn("code = 'skip'", probe)
-        self.assertIn("console.log(`PROBE summary ${summary.join(' ')}`)", probe)
-        self.assertIn("process.exitCode = 1", probe)
-        self.assertEqual(tuple(re.findall(r"(?m)^  \['([^']+)'", probe)), (
-            "cmd-echo",
-            "net-use",
-            "realpath-native",
-            "vite-resolve-config-exit",
-            "vite-resolve-config-stub",
-            "vite-server-stub",
-            "vitest-stub",
-            "vitest-stub-nohmr",
-            "vitest-default",
-        ))
-        self.assertIn("PROBE summary", probe)
-        self.assertEqual(probe.count("console.log(`PROBE ${number} ${name} ${code}`)"), 1)
-        self.assertEqual(probe.count("PROBE "), 2)
-        self.assertEqual(probe.count("['cmd-echo'"), 1)
-        self.assertTrue(probe.rstrip().endswith("process.exitCode = 1;"))
-
-        preload_bytes = (FIXTURE / "packages/host-api/tests/no-net-use.mjs").read_bytes()
-        preload = preload_bytes.decode("ascii")
-        self.assertNotIn(chr(35), preload)
-        self.assertIn("import childProcess from 'node:child_process'", preload)
-        self.assertIn("syncBuiltinESMExports()", preload)
-        self.assertIn("command.trim().toLowerCase() === 'net use'", preload)
-        self.assertIn("process.nextTick(() => callback(error))", preload)
-        self.assertIn("code: 'ENOTSUP'", preload)
+    def test_the_host_api_test_script_uses_the_pinned_preload_and_keeps_the_smoke(self):
+        package = _json("packages/host-api/package.json")
+        self.assertEqual(
+            package["scripts"]["test"],
+            "node --import ./tests/no-net-use.mjs ../../node_modules/vitest/vitest.mjs run --configLoader runner && node tests/run.js",
+        )
+        packages = _json("package-lock.json")["packages"]
+        self.assertEqual(packages["node_modules/vitest"]["version"], "5.0.5")
+        self.assertEqual(packages["packages/host-api"]["devDependencies"], {
+            "typescript": "6.0.3", "vite": "8.3.4", "vitest": "5.0.5",
+        })
+        preload = (FIXTURE / "packages/host-api/tests/no-net-use.mjs").read_bytes()
+        blob = b"blob " + str(len(preload)).encode("ascii") + b"\0" + preload
+        self.assertEqual(hashlib.sha1(blob).hexdigest(), "8fcc6c75e84040fa9e6e1fde9c709920cf7d8739")
+        self.assertNotIn(chr(35), preload.decode("ascii"))
 
     def test_the_manifest_digest_is_a_stable_sha256(self):
         first = gate_table.manifest_digest(FIXTURE)

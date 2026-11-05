@@ -202,6 +202,7 @@ CORE_CONTRACT_FEEDBACK_FILES = frozenset((
     "packages/host-api/tests/entitlements-errors.test.ts",
     "packages/host-api/tests/ids-version.test.ts",
     "packages/host-api/tests/manifest-metadata.test.ts",
+    "tools/node-test/no-net-use.mjs",
 ))
 CORE_CONTRACT_FOUNDATION_FILES = frozenset((
     "docs/adr/0002-parser-corpus-workspace.md",
@@ -586,6 +587,8 @@ CORE_CONTRACT_PACKAGE_VITEST_FILES = frozenset((
     "packages/kernel-i18n/vitest.config.ts",
 ))
 CORE_CONTRACT_PACKAGE_VITEST_OBJECT = "29d7b9ce01fba187934b8a99e9f3c41abf73a8a5"
+CORE_CONTRACT_NODE_TEST_PATH = "tools/node-test/no-net-use.mjs"
+CORE_CONTRACT_NODE_TEST_OBJECT = "8fcc6c75e84040fa9e6e1fde9c709920cf7d8739"
 RUNTIME_WORKSPACE_DIRECTORY = "runtime"
 RUNTIME_ROOT_MANIFEST_PATH = RUNTIME_WORKSPACE_DIRECTORY + "/Cargo.toml"
 RUNTIME_ROOT_LOCK_PATH = RUNTIME_WORKSPACE_DIRECTORY + "/Cargo.lock"
@@ -2226,6 +2229,7 @@ def _core_contract_admin_mode(path):
 def _core_contract_foundation_path(path):
     return (
         type(path) is str
+        and path != CORE_CONTRACT_NODE_TEST_PATH
         and (
             path in CORE_CONTRACT_FEEDBACK_FILES
             or path in CORE_CONTRACT_FOUNDATION_FILES
@@ -2453,6 +2457,7 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
         or path in CORE_CONTRACT_KERNEL_TOKENS_INERT_FILES
         or path in CORE_CONTRACT_KERNEL_UI_KIT_FILES
         or path in CORE_CONTRACT_PACKAGE_VITEST_FILES
+        or path == CORE_CONTRACT_NODE_TEST_PATH
         or CORE_CONTRACT_INERT_DEPENDENCY_NOTE_PATH.fullmatch(path) is not None
     ):
         return "100644"
@@ -3033,6 +3038,10 @@ def _safe_core_contract_tree(
         path in entries and entries[path] != ("100644", CORE_CONTRACT_PACKAGE_VITEST_OBJECT)
         for path in CORE_CONTRACT_PACKAGE_VITEST_FILES
     ):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+    if (CORE_CONTRACT_NODE_TEST_PATH in entries
+            and entries[CORE_CONTRACT_NODE_TEST_PATH]
+            != ("100644", CORE_CONTRACT_NODE_TEST_OBJECT)):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
     if not _core_contract_rust_policy_matches(entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")

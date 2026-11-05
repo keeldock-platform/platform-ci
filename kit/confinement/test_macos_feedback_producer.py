@@ -944,7 +944,7 @@ class MacosFeedbackProducerTests(unittest.TestCase):
         )
         foundation = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(foundation)
-        self.assertEqual(producer.MAX_NODE_REVIEWED_FILES, 10 + 2 * (64 + 64))
+        self.assertEqual(producer.MAX_NODE_REVIEWED_FILES, 11 + 2 * (64 + 64))
         self.assertEqual(producer.MAX_NODE_REVIEWED_FILES, foundation.MAX_NODE_REVIEWED_FILES)
         selected = producer.DIAGNOSTIC_GATE_SELECTIONS[-1]
         for count, accepted in (

@@ -954,8 +954,8 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         self.assertEqual(outcome["node_reviewed_paths_sha256"], "a" * 64)
 
     def test_reviewed_file_count_bound_covers_two_packages(self):
-        self.assertEqual(subject.MAX_NODE_REVIEWED_FILES, 10 + 2 * (64 + 64))
-        self.assertEqual(len(subject.NODE_FIXED_FILES), 10)
+        self.assertEqual(subject.MAX_NODE_REVIEWED_FILES, 11 + 2 * (64 + 64))
+        self.assertEqual(len(subject.NODE_FIXED_FILES), 11)
         rust_outcome = {
             "selected_gates": subject.RUST_FOUNDATION_GATES,
             "completed": subject.RUST_FOUNDATION_GATES, "failed_stage": None,
@@ -1166,6 +1166,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
             ".node-version", "package.json", "tsconfig.base.json",
             "packages/host-api/package.json", "packages/host-api/tsconfig.json",
             "packages/kernel-i18n/package.json", "packages/kernel-i18n/tsconfig.json",
+            "tools/node-test/no-net-use.mjs",
             "packages/kernel-i18n/tests/support.ts",
             "crates/host/api/tests/fixtures/i18n-regression-v1.jsonl",
             "crates/host/api/tests/fixtures/i18n-v1.jsonl",

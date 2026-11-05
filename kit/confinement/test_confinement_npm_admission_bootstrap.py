@@ -490,6 +490,11 @@ class InputTests(RefusalAssertions):
                 files = self.mutated("package.json", change)
                 self.assert_refused("npm_manifest_refused", subject.check_inputs, files, subject.DEFAULT_FILING)
 
+    def test_preloaded_vitest_test_script_is_allowed_by_the_bounded_script_validator(self):
+        subject._check_scripts({
+            "test": "node --import ../../tools/node-test/no-net-use.mjs ../../node_modules/vitest/vitest.mjs run --configLoader runner",
+        })
+
     def test_duplicate_keys_and_invalid_json_are_refused(self):
         world = World()
         for payload in (b'{"name":"a","name":"b"}', b"not json", b"[]", b"\xef\xbb\xbf{}"):
