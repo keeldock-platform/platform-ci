@@ -2609,11 +2609,21 @@ foreach ($case in $cases) {
         for required in (
             "FlagBackupSemantics = 0x02000000",
             "FlagOpenReparsePoint = 0x00200000",
+            "FileOpenReparsePoint = 0x00200000",
+            "FileOpenForBackupIntent = 0x00004000",
+            "FileSynchronousIoNonalert = 0x00000020",
             "AttributeReparsePoint = 0x00000400",
             "ClassDispositionInfoEx = 21",
             "DispositionDeletePosixIgnoreReadOnly = 0x13",
             "ClassFullDirectoryRestartInfo = 15",
             "uint flags = FlagBackupSemantics | FlagOpenReparsePoint;",
+            "attributes.RootDirectory = parent;",
+            "attributes.ObjectName = unicodeBuffer;",
+            "Native.NtCreateFile(",
+            "FileOpenForBackupIntent | FileOpenReparsePoint",
+            "FileOpenReparsePoint | FileSynchronousIoNonalert",
+            "private static IntPtr OpenEntry(string path, IntPtr parent, string name)",
+            "RemoveEntry(path + \"\\\\\" + names[index], here + \"\\\\\" + names[index], depth + 1, linksOnly, handle, names[index]);",
             "Native.CreateFileW(path, access, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero)",
             "Native.SetFileInformationByHandle(handle, ClassDispositionInfoEx, buffer, 4)",
             "Native.GetFileInformationByHandleEx(handle, infoClass, buffer, (uint)DirectoryBufferBytes)",
@@ -2623,6 +2633,28 @@ foreach ($case in $cases) {
             with self.subTest(required=required):
                 self.assertIn(required, remover)
         self.assertNotIn("ShareDelete", remover)
+        relative = remover[remover.index("private static IntPtr OpenRelativeOnce"):remover.index("private static IntPtr ReopenDirectory")]
+        self.assertIn("RootDirectory = parent", relative)
+        self.assertIn("ShareRead", relative)
+        self.assertNotIn("ShareWrite", relative)
+        self.assertNotIn("CreateFileW", relative)
+        self.assertIn("FileOpenReparsePoint", relative)
+        native_declarations = remover[remover.index("private static class Native"):]
+        attributes = native_declarations[native_declarations.index("internal struct ObjectAttributes"):native_declarations.index("internal struct IoStatusBlock")]
+        self.assertLess(attributes.index("internal uint Length;"), attributes.index("internal IntPtr RootDirectory;"))
+        self.assertLess(attributes.index("internal IntPtr RootDirectory;"), attributes.index("internal IntPtr ObjectName;"))
+        self.assertLess(attributes.index("internal IntPtr ObjectName;"), attributes.index("internal uint Attributes;"))
+        self.assertLess(attributes.index("internal uint Attributes;"), attributes.index("internal IntPtr SecurityDescriptor;"))
+        self.assertIn("internal IntPtr SecurityQualityOfService;", attributes)
+        unicode_string = native_declarations[native_declarations.index("internal struct UnicodeString"):native_declarations.index("internal struct ObjectAttributes")]
+        self.assertLess(unicode_string.index("internal ushort Length;"), unicode_string.index("internal ushort MaximumLength;"))
+        self.assertLess(unicode_string.index("internal ushort MaximumLength;"), unicode_string.index("internal IntPtr Buffer;"))
+        io_status = native_declarations[native_declarations.index("internal struct IoStatusBlock"):native_declarations.index("[DllImport(\"kernel32.dll\"")]
+        self.assertIn("internal IntPtr Status;", io_status)
+        self.assertIn("internal IntPtr Information;", io_status)
+        nt_create = native_declarations[native_declarations.index("internal static extern int NtCreateFile"):native_declarations.index("[DllImport(\"ntdll.dll\", ExactSpelling = true)]\n            internal static extern uint RtlNtStatusToDosError")]
+        self.assertIn("ref ObjectAttributes attributes", nt_create)
+        self.assertIn("out IoStatusBlock ioStatus", nt_create)
         for forbidden in ("Directory.Delete", "File.Delete", "Directory.GetFiles", "Directory.EnumerateFileSystemEntries", "DeleteFileW", "RemoveDirectoryW", "FindFirstFile", "Process.Start"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, remover)
@@ -3224,9 +3256,9 @@ foreach ($case in $cases) {
             "string here = FinalPath(handle);",
             "!string.Equals(here, expectedFinal, StringComparison.OrdinalIgnoreCase)",
             'throw new InvalidOperationException("remove_failed step=verify error=redirected");',
-            'RemoveEntry(path + "\\\\" + names[index], here + "\\\\" + names[index], depth + 1, linksOnly);',
-            "RemoveEntry(Extend(path), null, 0, false);",
-            "RemoveEntry(Extend(path), null, 0, true);",
+            'RemoveEntry(path + "\\\\" + names[index], here + "\\\\" + names[index], depth + 1, linksOnly, handle, names[index]);',
+            "RemoveEntry(Extend(path), null, 0, false, IntPtr.Zero, null);",
+            "RemoveEntry(Extend(path), null, 0, true, IntPtr.Zero, null);",
             "if (parts.Length < 2)",
             'part == "." || part == ".."',
         ):
@@ -3328,13 +3360,13 @@ foreach ($case in $cases) {
         entry = remover[remover.index("private static void RemoveEntry"):remover.index("private static class Native")]
         self.assertIn("if (expectedFinal == null && depth == 0)", entry)
         self.assertIn("expectedFinal = path;", entry)
-        self.assertLess(entry.index("expectedFinal = path;"), entry.index("OpenEntry(path)"))
-        reopen = remover[remover.index("private static IntPtr ReopenDirectory"):remover.index("private static IntPtr OpenEntry")]
+        self.assertLess(entry.index("expectedFinal = path;"), entry.index("OpenEntry(path, parent, name)"))
+        reopen = remover[remover.index("private static IntPtr ReopenDirectory"):remover.index("private static IntPtr OpenEntry(string path, IntPtr parent, string name)")]
         self.assertIn("Native.CreateFileW(path, access, ShareRead, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero)", reopen)
         self.assertNotIn("ShareWrite", reopen)
         self.assertIn("(attributes & AttributeReparsePoint) == 0", reopen)
         self.assertIn("string.Equals(FinalPath(handle), expectedFinal, StringComparison.OrdinalIgnoreCase)", reopen)
-        self.assertLess(entry.index("handle = ReopenDirectory(path, here);"), entry.index("ListEntries(handle, names, kinds);"))
+        self.assertLess(entry.index("handle = ReopenDirectory(path, here, parent, name);"), entry.index("ListEntries(handle, names, kinds);"))
 
     def test_deep_trees_fail_closed_at_a_fixed_depth_and_path_cap(self):
         remover = self.native[self.native.index("public static class HandleRemover"):self.native.index("public sealed class Sandbox")]

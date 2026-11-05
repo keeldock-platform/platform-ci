@@ -880,6 +880,89 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             "crates/kernel/i18n/tests/message_keys.rs",
         ))
 
+    def test_batch_seven_full_crate_trees_are_admitted_and_unlisted_paths_are_refused(self):
+        expected_rust_paths = []
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            runtime_directory = source / "runtime"
+            runtime_directory.mkdir()
+            runtime_members = tuple(
+                root.as_posix().removeprefix("runtime/") for root in producer.RUNTIME_PACKAGE_ROOTS
+            )
+            runtime_manifest = "[workspace]\nmembers = [\n" + "".join(
+                '    "' + member + '",\n' for member in runtime_members
+            ) + "]\n"
+            (runtime_directory / "Cargo.toml").write_text(runtime_manifest, encoding="ascii")
+            for package_root in producer.RUNTIME_PACKAGE_ROOTS:
+                (source / package_root / "src").mkdir(parents=True)
+            for crate_root in producer.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+                crate_name = crate_root.name.replace("-", "_")
+                (source / crate_root / "src/modules").mkdir(parents=True)
+                (source / crate_root / "tests").mkdir()
+                (source / crate_root / "README.md").write_text(crate_name + " crate overview.\n", encoding="ascii")
+                (source / crate_root / "CONTRACT.md").write_text("Contract.\n", encoding="ascii")
+                (source / crate_root / "CHANGELOG.md").write_text("Initial crate release.\n", encoding="ascii")
+                (source / crate_root / "Cargo.toml").write_text("[package]\n", encoding="ascii")
+                (source / crate_root / "src/lib.rs").write_text("pub fn crate_api() {}\n", encoding="ascii")
+                (source / crate_root / "src/modules/mod.rs").write_text("pub fn module() {}\n", encoding="ascii")
+                (source / crate_root / "tests/runtime.rs").write_text("fn works() {}\n", encoding="ascii")
+                expected_rust_paths.extend((
+                    crate_root.as_posix() + "/src/lib.rs",
+                    crate_root.as_posix() + "/src/modules/mod.rs",
+                    crate_root.as_posix() + "/tests/runtime.rs",
+                ))
+            with patch.object(producer, "_read_file", return_value=runtime_manifest.encode("ascii")):
+                self.assertEqual(
+                    producer._runtime_package_roots(source, "runtime"),
+                    producer.RUNTIME_PACKAGE_ROOTS,
+                )
+            with patch.object(Path, "lstat", self._regular_lstat()):
+                paths = producer._reviewed_rust_paths(source, roots=producer.RUNTIME_PACKAGE_ROOTS)
+        self.assertEqual(paths, tuple(sorted(expected_rust_paths)))
+
+        for crate_root in producer.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+            with self.subTest(missing_changelog=crate_root), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary)
+                for package_root in producer.RUNTIME_PACKAGE_ROOTS:
+                    (source / package_root / "src").mkdir(parents=True)
+                for batch_root in producer.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+                    (source / batch_root / "README.md").write_text("Read me.\n", encoding="ascii")
+                    (source / batch_root / "CONTRACT.md").write_text("Contract.\n", encoding="ascii")
+                    (source / batch_root / "CHANGELOG.md").write_text(
+                        "Initial crate release.\n", encoding="ascii",
+                    )
+                    (source / batch_root / "Cargo.toml").write_text("[package]\n", encoding="ascii")
+                    (source / batch_root / "src/lib.rs").touch()
+                (source / crate_root / "CHANGELOG.md").unlink()
+                with patch.object(Path, "lstat", self._regular_lstat()):
+                    with self.assertRaises(producer.FeedbackRefusal):
+                        producer._reviewed_rust_paths(source, roots=producer.RUNTIME_PACKAGE_ROOTS)
+
+        invalid = (
+            ("runtime/crates/host/registry/build.rs", "fn build() {}\n"),
+            ("runtime/crates/services/palette/src/data.json", "{}\n"),
+            ("runtime/crates/host/core/src/README.md", "Nested doc.\n"),
+            ("runtime/crates/services/palette/src/CHANGELOG.md", "Nested changelog.\n"),
+            ("runtime/crates/services/other/README.md", "Unlisted.\n"),
+        )
+        for relative, contents in invalid:
+            with self.subTest(path=relative), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary)
+                for package_root in producer.RUNTIME_PACKAGE_ROOTS:
+                    (source / package_root / "src").mkdir(parents=True)
+                for crate_root in producer.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+                    (source / crate_root / "README.md").write_text("Read me.\n", encoding="ascii")
+                    (source / crate_root / "CONTRACT.md").write_text("Contract.\n", encoding="ascii")
+                    (source / crate_root / "CHANGELOG.md").write_text("Initial crate release.\n", encoding="ascii")
+                    (source / crate_root / "Cargo.toml").write_text("[package]\n", encoding="ascii")
+                    (source / crate_root / "src/lib.rs").touch()
+                extra = source / relative
+                extra.parent.mkdir(parents=True, exist_ok=True)
+                extra.write_text(contents, encoding="ascii")
+                with patch.object(Path, "lstat", self._regular_lstat()):
+                    with self.assertRaises(producer.FeedbackRefusal):
+                        producer._reviewed_rust_paths(source, roots=producer.RUNTIME_PACKAGE_ROOTS)
+
     def test_source_profile_copies_and_formats_the_kernel_crate(self):
         dispatch = _validated_dispatch("rust_patch")
         kernel_paths = ("crates/kernel/i18n/src/lib.rs",)

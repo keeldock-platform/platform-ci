@@ -13,6 +13,7 @@ import urllib.request
 import cargo_lock_bootstrap as subject
 import cargo_lock_receipt as cargo
 import feedback_request
+import linux_source_build
 
 
 NOW = 1_793_160_000
@@ -1246,11 +1247,22 @@ class ManifestCheckTests(BootstrapTestCase):
 
 RUNTIME_MEMBERS = subject.HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS
 RUNTIME_API_NAME = subject.HOST_API_POLICY_API_PACKAGE
+RUNTIME_BASE_MEMBERS = subject.HOST_API_POLICY_RUNTIME_BASE_MEMBER_ROOTS
 RUNTIME_ROOT = (
     "[workspace]\nresolver = \"3\"\nmembers = [\n"
     + "".join('    "' + root[len("runtime/"):] + '",\n' for root in RUNTIME_MEMBERS)
     + "]\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n"
     + "\n[workspace.dependencies]\n" + RUNTIME_API_NAME + ' = { path = "../crates/host/api" }\n'
+)
+RUNTIME_BASE_ROOT = (
+    "[workspace]\nresolver = \"3\"\nmembers = [\n"
+    + "".join('    "' + root[len("runtime/"):] + '",\n' for root in RUNTIME_BASE_MEMBERS)
+    + "]\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+    + "\n[workspace.dependencies]\n"
+    + "".join(
+        name + ' = { path = "' + spec["path"] + '" }\n'
+        for name, spec in subject.HOST_API_POLICY_RUNTIME_BASE_WORKSPACE_DEPENDENCIES.items()
+    )
 )
 
 
@@ -1305,6 +1317,14 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
         expected.add(RUNTIME_API_NAME)
         self.assertEqual(self.check(_runtime_manifests()), frozenset(expected))
 
+    def test_the_pre_batch_seven_runtime_profile_remains_admitted_without_an_api_edge(self):
+        manifests = _runtime_manifests(root=RUNTIME_BASE_ROOT, members=RUNTIME_BASE_MEMBERS)
+        expected = {root.rsplit("/", 1)[-1] for root in RUNTIME_BASE_MEMBERS}
+        self.assertEqual(self.check(manifests, members=RUNTIME_BASE_MEMBERS), frozenset(expected))
+        altered_root = RUNTIME_BASE_ROOT + RUNTIME_API_NAME + ' = { path = "../crates/host/api" }\n'
+        altered = _runtime_manifests(root=altered_root, members=RUNTIME_BASE_MEMBERS)
+        self.assert_refused(altered, members=RUNTIME_BASE_MEMBERS)
+
     def test_runtime_profile_accepts_each_required_consumer_and_optional_sync_format(self):
         manifests = _runtime_manifests()
         for root in subject.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS:
@@ -1340,6 +1360,76 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
                 orphan.write_text("orphan\n", encoding="ascii")
                 with self.assertRaises(subject.BootstrapRefusal):
                     subject.validate_runtime_profile_source_tree(temporary)
+
+    @staticmethod
+    def _write_batch_seven_tree(root):
+        for crate_root in subject.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+            directory = root / crate_root
+            (directory / "src/modules").mkdir(parents=True)
+            (directory / "tests").mkdir()
+            (directory / "Cargo.toml").write_text("[package]\n", encoding="ascii")
+            (directory / "README.md").write_text("Crate overview.\n", encoding="ascii")
+            (directory / "CONTRACT.md").write_text("Crate contract.\n", encoding="ascii")
+            (directory / "CHANGELOG.md").write_text("Initial crate release.\n", encoding="ascii")
+            (directory / "src/lib.rs").write_text("pub fn crate_api() {}\n", encoding="ascii")
+            (directory / "src/modules/mod.rs").write_text("pub fn module() {}\n", encoding="ascii")
+            (directory / "tests/runtime.rs").write_text("fn works() {}\n", encoding="ascii")
+
+    def test_batch_seven_runtime_tree_admits_full_crates_and_refuses_unlisted_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._write_batch_seven_tree(root)
+            subject._validate_runtime_batch_seven_crate_trees(root)
+            descriptor = linux_source_build._open_source_root(root)
+            try:
+                linux_source_build._check_d145_runtime_batch_seven_tree(descriptor)
+            finally:
+                os.close(descriptor)
+
+        cases = (
+            ("runtime/crates/host/core/build.rs", "fn build() {}\n"),
+            ("runtime/crates/services/notifications/src/data.json", "{}\n"),
+            ("runtime/crates/host/registry/src/README.md", "Nested doc.\n"),
+            ("runtime/crates/services/other/README.md", "Unlisted service.\n"),
+        )
+        for relative, contents in cases:
+            with self.subTest(path=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                self._write_batch_seven_tree(root)
+                extra = root / relative
+                extra.parent.mkdir(parents=True, exist_ok=True)
+                extra.write_text(contents, encoding="ascii")
+                with self.assertRaises(subject.BootstrapRefusal):
+                    subject._validate_runtime_batch_seven_crate_trees(root)
+                descriptor = linux_source_build._open_source_root(root)
+                try:
+                    with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                        linux_source_build._check_d145_runtime_batch_seven_tree(descriptor)
+                finally:
+                    os.close(descriptor)
+
+    def test_batch_seven_changelog_is_required_for_each_crate_and_admitted_at_the_root(self):
+        for crate_root in subject.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+            with self.subTest(crate_root=crate_root), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                self._write_batch_seven_tree(root)
+                changelog = root / crate_root / "CHANGELOG.md"
+                subject._validate_runtime_batch_seven_crate_trees(root)
+                descriptor = linux_source_build._open_source_root(root)
+                try:
+                    linux_source_build._check_d145_runtime_batch_seven_tree(descriptor)
+                finally:
+                    os.close(descriptor)
+
+                changelog.unlink()
+                with self.assertRaises(subject.BootstrapRefusal):
+                    subject._validate_runtime_batch_seven_crate_trees(root)
+                descriptor = linux_source_build._open_source_root(root)
+                try:
+                    with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                        linux_source_build._check_d145_runtime_batch_seven_tree(descriptor)
+                finally:
+                    os.close(descriptor)
 
     def test_runtime_members_must_be_fixed_paths_inside_the_runtime_crates_directory(self):
         for member in (

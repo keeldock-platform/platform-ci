@@ -235,6 +235,26 @@ class LinuxSessionPureTests(unittest.TestCase):
 
 
 class LinuxSessionBindTargetTests(unittest.TestCase):
+    def test_pinned_node_mount_identity_must_match_the_checked_file(self):
+        with tempfile.TemporaryDirectory() as target:
+            node = os.path.join(target, "node")
+            with open(node, "wb") as sink:
+                sink.write(b"node")
+            checked = os.stat(node, follow_symlinks=False)
+            bind = {"st_dev": checked.st_dev, "st_ino": checked.st_ino}
+            session.verify_bind_identity(target, bind)
+            for changed in (
+                {"st_dev": checked.st_dev + 1, "st_ino": checked.st_ino},
+                {"st_dev": checked.st_dev, "st_ino": checked.st_ino + 1},
+            ):
+                with self.subTest(identity=changed), self.assertRaises(BoundaryRefusal) as raised:
+                    session.verify_bind_identity(target, changed)
+                self.assertEqual((raised.exception.reason, raised.exception.detail), ("fixture_incomplete", 62))
+        with tempfile.TemporaryDirectory() as target:
+            with self.assertRaises(BoundaryRefusal) as raised:
+                session.verify_bind_identity(target, {"st_dev": 1, "st_ino": 2})
+            self.assertEqual((raised.exception.reason, raised.exception.detail), ("fixture_incomplete", 62))
+
     def test_every_missing_component_of_a_bind_target_is_created_searchable_whatever_the_umask(self):
         with tempfile.TemporaryDirectory() as base:
             previous = os.umask(0o077)
@@ -277,6 +297,8 @@ class LinuxSessionBindTargetTests(unittest.TestCase):
     def test_the_root_builder_uses_the_helper_for_every_bind_target(self):
         source = inspect.getsource(session.extend_rootfs)
         self.assertIn("make_tree(rootfs, bind[", source)
+        self.assertIn("verify_bind_identity(target, bind)", source)
+        self.assertLess(source.index("harness._mount(bind[\"source\"]"), source.index("verify_bind_identity(target, bind)"))
         self.assertNotIn("makedirs(target", source)
 
 
@@ -335,6 +357,11 @@ class LinuxSessionSpecTests(unittest.TestCase):
             good_spec(binds=[{"source": "/a b", "target": "/b", "ro": True}]),
             good_spec(binds=[{"source": "/a", "target": "/b", "ro": True, "rec": "no"}]),
             good_spec(binds=[{"source": "/a", "target": "/b", "ro": True, "other": False}]),
+            good_spec(binds=[{"source": "/a", "target": "/b", "ro": True, "st_dev": 1}]),
+            good_spec(binds=[{"source": "/a", "target": "/b", "ro": True, "st_dev": True, "st_ino": 2}]),
+            good_spec(binds=[{"source": "/a", "target": "/b", "ro": True, "st_dev": 1, "st_ino": -1}]),
+            good_spec(binds=[{"source": "/a", "target": "/b", "ro": True, "rec": False, "st_dev": 1, "st_ino": 2}]),
+            good_spec(binds=[{"source": "/a", "target": "/kd-node", "ro": False, "rec": False, "st_dev": 1, "st_ino": 2}]),
             good_spec(limits="huge"),
             good_spec(timeout=0),
             good_spec(timeout=601),

@@ -272,9 +272,14 @@ ALLOWED_FILES = {
 }
 MAX_FILE_BYTES = 262144
 SYNTHETIC_NPM_LOCK_PATH = "kit/confinement/synthetic_project/package-lock.json"
+SELF_PIN_PATH = "kit/bootstrap/public_tree.py"
+SELF_PIN_LINE_PATTERN = re.compile(
+    rb"(?m)^    'kit/bootstrap/public_tree\.py': '[0-9a-f]{64}',$"
+)
 PINNED_FILE_SHA256 = {
     '.github/workflows/linux-source-admission.yml': '69dd3c9159a684809e679a48f1ab12d38a635a70d22b03afa3faf17d4b4b1ca0',
     'kit/bootstrap/action.yml': 'e36cee801fc1bc7e94bbc0df423a7c86c76bb5db179b5cdff0f17be5f43b39b7',
+    'kit/bootstrap/public_tree.py': '60d1999b778cadb67080c05645167fed6ce7ba5581e4d437b1e74e208922f09f',
     'kit/confinement/release_tool_ledger.py': 'e9a4f50f806fad3d5ae7c7323adfc3024eaaa1f564a8725e9ef7281fa01c6657',
     'kit/confinement/release_tool_ledger.json': '2c0004d1e83780d780c501b794a15e6c6928f8aa352dcfab46fe389fe871dc0b',
     'kit/confinement/test_release_tool_ledger.py': '20ef9cfb0f4a64c73e34443c3d726be599c34ac6145df875d1abe8a427de8a4e',
@@ -312,10 +317,12 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/macos-core-contract.yml': '38c33a1b30bc18378359910af0da73e493026e8105511062f96f6f80fafbe096',
     'kit/confinement/macos_core_contract.py': 'e212893da22e560374901eecb2a8f3308a73bfcffcc6e851dfceae72ffc48c98',
     'kit/confinement/test_macos_core_contract.py': '50d48ea43fe1ebf49675c1b5841892372b892cb5d59290f317cb4ee34850322b',
-    'kit/confinement/linux_source_build.py': 'bbafc70ba68238163b4538ea64aec2244370109f9e28b0bdaf6858ac1f2cae43',
-    'kit/confinement/test_linux_source_build.py': 'e0b172b80c61002ff38ac2e1c9f19a0abdf5a077d9b57107acdf6c37aa555a04',
-    'kit/confinement/linux_boundary.py': '613e3559ba104d128a50dd2b51d3a4272eb1f00014284f25b5cb19979d495878',
-    'kit/confinement/test_linux_boundary.py': '06df29985eb2889a3ad62ee62ee73d62a84a9b0ef3559ffde7989cb16445b921',
+    'kit/confinement/linux_source_build.py': 'a95676d8bde808c65dceaa87868de5100cdbc415396fe2ae621aa946853548c2',
+    'kit/confinement/test_linux_source_build.py': 'c17780167e07ddd88db8687a395b5c4c0398e4c2a6a84e3e0a52694089385d8f',
+    'kit/confinement/linux_boundary.py': '73adda7947d6add804d4f2b5b8117543d465830bfce72e7e1b4de22601c48394',
+    'kit/confinement/test_linux_boundary.py': 'bead2ac12c4e5a9eef40a76c0256523e6fa69c778bb732548e2a2e17794c9c5f',
+    'kit/confinement/linux_session.py': 'a3a77c0081f8e432fe3666e902158509e446f4dcd09e1ecb174c302bc60d7f15',
+    'kit/confinement/test_linux_session.py': 'c7bfb1544264327e7a415ea54d75e273c176da94896106caecc0afda31389f9d',
     'kit/confinement/linux_channels.py': 'dedc4f256440924c83e15be8201a998df9485fa6180f32126a5d5fe320837c5b',
     'kit/confinement/test_linux_channels.py': 'bddad18cd3fbc9ad9290004d56c08976dfd7e309e5cc32e30483d1aa15fa5adc',
     'kit/confinement/npm_admission.py': '1235b29ff44ed1f92bdb60d5b1bbcf0367762dba5ba3101032b12c1114f631c9',
@@ -343,8 +350,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_macos_core_bootstrap.py': 'f8e56bde25e64fc691adc25c3288924179797b83c8d6da66ef21c5fad256c38e',
     'kit/confinement/macos_network_observer.py': 'a7cf6cb16e68f00513e9f8ee08d52511619b18bb8edd37205faf907dcf0a98d9',
     'kit/confinement/test_macos_network_observer.py': '0187ffbe5a7b7395b2edc2025a4dd3e4c0adf5a48c881f8878578010d76307a3',
-    'kit/confinement/macos_private_validation.py': '3f12a5d9438bbc1a4c308554590a8f1b0b85958f98905855db398b79346c3db5',
-    'kit/confinement/test_macos_private_validation.py': '14462c4b3490dff0b1901207d9d2b9d4c3ce550dfa900ee412ec911d126b6280',
+    'kit/confinement/macos_private_validation.py': '9d9cc803dd447a2e12c385e452dac447c343e544bab91a044c16424bd6d3662c',
+    'kit/confinement/test_macos_private_validation.py': '28f1a153064a8c3f336bdabc35133d8e7fe749b67771be877bca31623ad59639',
     'ci/revoked-signer-fingerprints': 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
     '.github/workflows/capsule-vectors.yml': '7366acdb58988c5675e86268abe268e71f71bc16681ab560ba8e33f37fc9f9f7',
     'kit/confinement/capsule_frame.cs': 'b7de9b0af02e305d23e75ea58daf856a9e51d340b0ccee0920925930ffb1bc84',
@@ -354,9 +361,9 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/windows_native_preflight.cs': 'ba0f8859db9d8bcc1e4c8274520bcb67a3292cb311f553127e1f29fe13838543',
     'kit/confinement/windows_native_preflight.ps1': '8dbaaaad105c2fe0439dedb1b7c9572b8e7ec74a8db29f8edcab91169b06c58b',
     'kit/confinement/test_windows_native_preflight.py': '07defbc65611505f9107e5cb9186f4e15bbb9616797ff07032b3f314480eea7d',
-    'kit/confinement/windows_confinement.cs': '5573730fd8d2d9acec1e38637602fba218c5972150e7cf9915f0e8bf0e73b722',
+    'kit/confinement/windows_confinement.cs': 'd35721f5fcf4733e066fe481a2d692814e1cc5cf072c4daff5f64c40d3753cbe',
     'kit/confinement/windows_confinement.ps1': '1bd0b04dde27eaca58b2a7873345e3c1cacb4e988ff8b8980ebdda0bcf82f036',
-    'kit/confinement/test_windows_confinement.py': '377b70ca3cd2402df6b14bf17e2da2f7dd0cf02599fe73f74b5f63903b86bef7',
+    'kit/confinement/test_windows_confinement.py': '47f25a4b58f8e48c096dc8893beaa6b80c8e96b837e9b200b4e1cb7a14fb7d94',
     'kit/confinement/windows_source_run.ps1': 'a769ea37fe824736615f3bddf37d9e6d460638f808706092bdc8bfee76f28fd3',
     'kit/confinement/test_windows_source_run.py': 'df1bcdb0d9c75ed2977331134f730acd628f429608dcd78531b597400e743569',
     'kit/confinement/windows_probe.rs': 'cf9e58d8f31e2a9773f2c4eba935fd1ed531d94397ac53e530a93c5169d08727',
@@ -370,8 +377,8 @@ PINNED_FILE_SHA256 = {
     '.github/workflows/lane-h-windows-receiver.yml': '54f8bb70436ad34cbe65ac85d9de7c278a096c570dc2bcc58c2560ab75f0a635',
     '.github/workflows/lane-h-linux-fetch-encrypt.yml': 'a23f7cf71baba02cba9d20e49abb0536505930c40b3312d76a4e8fdf6b22f8b1',
     '.github/workflows/lane-h-capsule-attester.yml': '192d78328f8bf093a68bef0f1dd323a88772e2929d79c92b24a8864d17c1b48c',
-    'kit/confinement/macos_feedback_producer.py': '6705d4e2fa9ebca1212fc13e6720a59e2e5363f32e419e00d50fa030d1d936ba',
-    'kit/confinement/test_macos_feedback_producer.py': '44d485dc0daf495eb4f048949634a2e832c1333813fe929be5f072fd46939320',
+    'kit/confinement/macos_feedback_producer.py': '9b2f20654af92f464dec6a8d878799b554f71aa44ff6d2f1a9a4661cf1922b9b',
+    'kit/confinement/test_macos_feedback_producer.py': '3746f6669c49cc78cd88e3b2a179e4175dc1c60087e3d825ba417712a71cb108',
     'kit/confinement/feedback_producer_crypto.mjs': 'dd023247587eba82cb631160516641658b88f1c4584c0471247048a8c87be3aa',
     'kit/confinement/test_feedback_producer_crypto.mjs': '2661534fe1d6d41661e6a056dc03c7800dc146d2d042584841a0799123e868e0',
     'kit/confinement/feedback_admin.py': 'd9f6d9ca2f6bcdeffd38f92e57b127025af5433cf1c3480df3c6e7a2c5edc692',
@@ -401,10 +408,10 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_release_build_verify.py': '08c8b7dcb28307d8470cab9675202bcc206492261d20dec70064232c197f2579',
     'kit/confinement/cargo_vendor_verify.py': '31d346c8e66eeac9c8625ecc62fb314ff2feb87914a4030f7e8ad138277cbed2',
     'kit/confinement/test_cargo_vendor_verify.py': '6d7a02f56a81d3b9930b7d5d5e9e38334662ccd144b89d0b56597c11a1c394fc',
-    'kit/bootstrap/test_public_tree.py': '45baa98bf835ceeb2c1e2bccd52dc715387ec79506b3d0e68e69a51531286237',
+    'kit/bootstrap/test_public_tree.py': '910e6e694a53ace0fc7183121516bb1dcb8c11f2bf7a4d5aad4932c5d54cb986',
     'kit/confinement/release_evidence.py': '2609b125bf2d3cbde256e2e4229c576fc0de1c5da898faf206807205dee49ae2',
-    'kit/confinement/test_confinement_cargo_lock_bootstrap.py': 'a17746bb7a80d3ab7379ac9394d30fa130c292a3e78caf154f4dc97bf48d01b7',
-    'kit/confinement/cargo_lock_bootstrap.py': 'bbfbc58f332f6077c861954d6c70de5d6b36a17b47de870060f5dbe8dbe2eac0',
+    'kit/confinement/test_confinement_cargo_lock_bootstrap.py': '659e69c1b56f220a2f8b37b8f4c1d5123b2f0000eca0dabe491d04f6ee610da8',
+    'kit/confinement/cargo_lock_bootstrap.py': 'd36bed6ccf73bb8e8739dbec1fc99ff3fa57df4406694457787cfaba2b0cb621',
     'kit/bootstrap/test_policy_rust.py': 'eaaea07d1f0cd284198deca4d6fc6661653cd4b50e5c3929ff63decde595699b',
     'kit/bootstrap/policy_rust.py': '9d1680615e962dec9f1cbcf7e60d1478f428456bcbf76f05431b363701d50f46',
     '.github/workflows/core-rust-lock-return.yml': 'c76fc926d01d64b13c577cce9eb6b8268b9ef61542df6e50525e11120e68a0a0',
@@ -440,9 +447,9 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/synthetic_project/fuzz/Cargo.lock': '8830b2d5813276d9f6bca6c1014eb5b2a23d2077dfd2afd08757318c923e753d',
     'kit/confinement/synthetic_project/fuzz/Cargo.toml': '7f94441d88f5cc6fdc48ad0f96e0f702d4f5369910efe8f10bf8259ba467243a',
     'kit/confinement/synthetic_project/fuzz/src/main.rs': '4440b336abdd23785c6d8f6ff0559468033b9460e10c3715c51adcc5b0a7961f',
-    'kit/confinement/synthetic_project/package-lock.json': '9ab0a9e26abe512d99db6930ff05b014baf9829cf83d8c62ff57aa626110b28c',
+    'kit/confinement/synthetic_project/package-lock.json': '4091b20ce5719c9786da0b6f38223e5de7ce24b6d08b0269a6debe55b15b44fa',
     'kit/confinement/synthetic_project/package.json': '63847331195f7d981044d5187c727065f303aa116982261e0bb472238e306a69',
-    'kit/confinement/synthetic_project/packages/host-api/package.json': '07eea297c0f338d7bfa4bd6140464930be3dff0263be84999df72f91b92384ea',
+    'kit/confinement/synthetic_project/packages/host-api/package.json': 'b8cfe76d0423a82ace7b913d7608ff55eb3c1f7880cd831ec19140c9f44d2453',
     'kit/confinement/synthetic_project/packages/host-api/src/index.js': '93d2550086d545dbe2c53ef4e66d47e5e58e58c6232b830ad35fd47d2b50fac3',
     'kit/confinement/synthetic_project/packages/host-api/src/index.ts': '944f13e51b6f4882f5a6d32aba8646a31ec8cef4b94750dcd3da4f8ae7c9d39f',
     'kit/confinement/synthetic_project/packages/host-api/tests/run.js': '8b2a170f1c0cdd7787039cd8764f1c74534ed7818f352fe866b818efea3e9134',
@@ -457,7 +464,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/synthetic_project/runtime/Cargo.toml': '2163035d5965adad6df65622156c46adf3e4c22328259050d7862203efc2a571',
     'kit/confinement/synthetic_project/runtime/src/lib.rs': '2fdb08e9c85709dcbf2045c2bbda456dca7c012910f7e31e8a3eab2e9621b343',
     'kit/confinement/synthetic_project/runtime/tests/runtime.rs': '10b8b82ccc7ce5111fc25391648152f538073020ab7aef902e91c7d781688d97',
-    'kit/confinement/test_confinement_synthetic_project.py': '19acc648a607b62222488f48f1197ae7e2f63b74008b6bfa9d6dc83e73ea8768',
+    'kit/confinement/test_confinement_synthetic_project.py': 'cf274bb1a02670972e643384f23ff953801b5d2c184153c731ff40ddab3ab0f3',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 SHA512_SRI_PATTERN = re.compile(r"sha512-[A-Za-z0-9+/]{86}==\Z")
@@ -495,6 +502,17 @@ class PublicTreeError(ValueError):
     def __init__(self, code):
         super().__init__(code)
         self.code = code
+
+
+def _pinned_file_hash(relative, payload):
+    if relative != SELF_PIN_PATH:
+        return hashlib.sha256(payload).hexdigest()
+    normalized, replacements = SELF_PIN_LINE_PATTERN.subn(
+        b"    'kit/bootstrap/public_tree.py': '" + b"0" * 64 + b"',", payload,
+    )
+    if replacements != 1:
+        raise PublicTreeError("self-pin-shape")
+    return hashlib.sha256(normalized).hexdigest()
 
 
 def _valid_sha512_integrity_spans(text):
@@ -652,7 +670,7 @@ def scan_tree(root, pool):
         except UnicodeDecodeError:
             raise PublicTreeError("file-not-utf8")
         expected_hash = PINNED_FILE_SHA256.get(relative)
-        if expected_hash is not None and hashlib.sha256(payload).hexdigest() != expected_hash:
+        if expected_hash is not None and _pinned_file_hash(relative, payload) != expected_hash:
             raise PublicTreeError("file-hash-mismatch")
         inspect_text(text, pool, relative)
     return tuple(sorted(actual_files))

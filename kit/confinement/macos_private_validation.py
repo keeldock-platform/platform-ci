@@ -610,6 +610,13 @@ RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS = (RUNTIME_SERVICES_DIRECTORY + ("sync-form
 RUNTIME_HOST_CRATE_ROOTS = tuple(
     RUNTIME_HOST_DIRECTORY + (name,) for name in ("registry", "core", "settings-schema")
 )
+RUNTIME_BATCH_SEVEN_CRATE_ROOTS = (
+    *RUNTIME_HOST_CRATE_ROOTS,
+    RUNTIME_SERVICES_DIRECTORY + ("palette",),
+    RUNTIME_SERVICES_DIRECTORY + ("notifications",),
+)
+RUNTIME_BATCH_SEVEN_DOC_ROOTS = frozenset(RUNTIME_BATCH_SEVEN_CRATE_ROOTS)
+RUNTIME_BATCH_SEVEN_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELOG.md"))
 RUNTIME_HOST_API_POLICY_API_PACKAGE = "keeldock" + "-host-api"
 RUNTIME_HOST_API_POLICY_API_PATH = "../crates/host/api"
 RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS = (
@@ -627,6 +634,7 @@ RUNTIME_CRATE_ROOTS = RUNTIME_SERVICE_CRATE_ROOTS[:1] + tuple(
         "tool-bad-no-handler", "tool-bad-no-manifest",
     )
 ) + RUNTIME_HOST_CRATE_ROOTS + RUNTIME_SERVICE_CRATE_ROOTS[1:]
+RUNTIME_PRE_BATCH_SEVEN_CRATE_ROOTS = RUNTIME_CRATE_ROOTS[:7]
 RUNTIME_CONFIG_FILES = ("rust-toolchain.toml", "rustfmt.toml", "clippy.toml")
 MAX_RUNTIME_MEMBERS = 32
 RUNTIME_MEMBERS_PATTERN = re.compile(r"(?m)^members\s*=\s*\[([^\]]*)\]\s*$")
@@ -2519,12 +2527,17 @@ def _runtime_roots_from_manifest(text):
     members = _runtime_workspace_members(text)
     if members is None or not members:
         return None
-    required = _runtime_member_listing(RUNTIME_CRATE_ROOTS)
-    optional = _runtime_member_listing(RUNTIME_CRATE_ROOTS + RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS)
-    if members == required:
-        return RUNTIME_CRATE_ROOTS
-    if members == optional:
-        return RUNTIME_CRATE_ROOTS + RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS
+    profiles = (
+        RUNTIME_PRE_BATCH_SEVEN_CRATE_ROOTS,
+        RUNTIME_CRATE_ROOTS,
+    )
+    for roots in profiles:
+        required = _runtime_member_listing(roots)
+        optional = _runtime_member_listing(roots + RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS)
+        if members == required:
+            return roots
+        if members == optional:
+            return roots + RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS
     return None
 
 
@@ -2560,6 +2573,21 @@ def _runtime_workspace_mode(path, crate_roots):
             relative = path[len(prefix) + 1:]
             if relative == "Cargo.toml":
                 return "100644"
+            if root in RUNTIME_BATCH_SEVEN_DOC_ROOTS and relative in RUNTIME_BATCH_SEVEN_DOC_FILES:
+                return "100644"
+            if root in RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+                relative_parts = relative.split("/")
+                if (
+                    len(relative_parts) >= 2 and relative_parts[0] == "src"
+                    and relative.endswith(".rs") and relative_parts[-1] != "build.rs"
+                ):
+                    return "100644"
+                if (
+                    len(relative_parts) == 2 and relative_parts[0] == "tests"
+                    and relative.endswith(".rs") and relative_parts[-1] != "build.rs"
+                ):
+                    return "100644"
+                return None
             if (
                 relative in RUNTIME_SERVICE_DOC_FILES
                 and root in RUNTIME_SERVICE_DOC_ROOTS
@@ -2656,9 +2684,10 @@ def _runtime_root_manifest_shape(text, crate_roots):
         if not valid:
             return False
     dependencies = seen.get("[workspace.dependencies]", set())
+    batch_seven_profile = set(RUNTIME_BATCH_SEVEN_CRATE_ROOTS).issubset(crate_roots)
     return (
         seen.get("[workspace]") == {"resolver", "members"}
-        and RUNTIME_HOST_API_POLICY_API_PACKAGE in dependencies
+        and (RUNTIME_HOST_API_POLICY_API_PACKAGE in dependencies) == batch_seven_profile
     )
 
 
@@ -2808,7 +2837,9 @@ def _cargo_lock_is_v4(payload):
     return first == "version = 4"
 
 
-def _check_runtime_profile_runtime_contract_edge(repository, git_executable, repo_env, entries):
+def _check_runtime_profile_runtime_contract_edge(
+    repository, git_executable, repo_env, entries, *, concern,
+):
     if cargo_lock_bootstrap is None:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
     api_root = "/".join(CORE_CONTRACT_CRATE_ROOTS[0])
@@ -2823,8 +2854,13 @@ def _check_runtime_profile_runtime_contract_edge(repository, git_executable, rep
             or not api_source_paths):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     if any(
-        entries[path][0] != "100644" or not path.endswith(".rs")
-        or path.rsplit("/", 1)[-1] == "build.rs"
+        entries[path][0] != "100644"
+        or not (
+            path.endswith(".rs") and path.rsplit("/", 1)[-1] != "build.rs"
+            or path in CORE_CONTRACT_BUILD_DATA_FILES
+            and concern in CORE_CONTRACT_BUILD_FILE_CONCERNS
+            and _core_contract_expected_mode(path, concern=concern) == "100644"
+        )
         for path in api_source_paths
     ):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
@@ -2892,7 +2928,7 @@ def _check_runtime_profile_runtime_contract_edge(repository, git_executable, rep
     return api_identity, api_dependency_rules
 
 
-def _check_runtime_workspace(repository, git_executable, repo_env, entries):
+def _check_runtime_workspace(repository, git_executable, repo_env, entries, *, concern):
     root_payload = _contract_blob(
         repository, git_executable, repo_env, entries, RUNTIME_ROOT_MANIFEST_PATH,
         core_check="workspace_decode",
@@ -2917,7 +2953,13 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries):
         if prefix + "/src/lib.rs" not in entries and prefix + "/src/main.rs" not in entries:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     for root in RUNTIME_HOST_CRATE_ROOTS:
-        required.add("/".join(root) + "/CONTRACT.md")
+        if root in crate_roots:
+            required.add("/".join(root) + "/CONTRACT.md")
+    for root in RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+        if root not in crate_roots:
+            continue
+        prefix = "/".join(root)
+        required.update(prefix + "/" + name for name in RUNTIME_BATCH_SEVEN_DOC_FILES)
     if not required.issubset(entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     for path, (mode, unused_object_id) in entries.items():
@@ -2941,9 +2983,13 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
     if not _runtime_root_manifest_shape(root_text, crate_roots):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
-    api_identity, contract_dependency_rules = _check_runtime_profile_runtime_contract_edge(
-        repository, git_executable, repo_env, entries,
-    )
+    batch_seven_profile = set(RUNTIME_BATCH_SEVEN_CRATE_ROOTS).issubset(crate_roots)
+    api_identity = None
+    contract_dependency_rules = {}
+    if batch_seven_profile:
+        api_identity, contract_dependency_rules = _check_runtime_profile_runtime_contract_edge(
+            repository, git_executable, repo_env, entries, concern=concern,
+        )
     declared = _runtime_declared_dependencies(root_text)
     names = []
     runtime_manifests = {RUNTIME_ROOT_MANIFEST_PATH: root_payload}
@@ -2971,16 +3017,19 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries):
             runtime_manifests, {"/".join(root) for root in crate_roots},
             cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         )
-        if package_names != frozenset(names + [RUNTIME_HOST_API_POLICY_API_PACKAGE]):
+        expected_names = names + ([RUNTIME_HOST_API_POLICY_API_PACKAGE] if batch_seven_profile else [])
+        if package_names != frozenset(expected_names):
             raise ValueError
         package_identities = set(cargo_lock_bootstrap.manifest_package_identities(
             runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         ))
-        package_identities.add(api_identity)
+        if batch_seven_profile:
+            package_identities.add(api_identity)
         dependency_rules = cargo_lock_bootstrap.manifest_dependency_rules(
             runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         )
-        dependency_rules.update(contract_dependency_rules)
+        if batch_seven_profile:
+            dependency_rules.update(contract_dependency_rules)
     except (cargo_lock_bootstrap.BootstrapRefusal, ValueError):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
     lock_payload = _contract_blob(
@@ -3331,7 +3380,7 @@ def _safe_core_contract_tree(
                 core_check="package_build" if "build" in manifest_text else "package_decode",
             )
     if runtime_present:
-        _check_runtime_workspace(repository, git_executable, repo_env, entries)
+        _check_runtime_workspace(repository, git_executable, repo_env, entries, concern=concern)
     elif workspace_selector == "runtime":
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     tree_kind = CORE_CONTRACT_TREE_BY_CONCERN[concern]

@@ -915,11 +915,18 @@ class LinuxBoundaryFixtureDiagnosticTests(unittest.TestCase):
     def test_pinned_node_is_bound_read_only_non_recursively_at_a_fixed_target(self):
         pinned = "/tmp/kd-toolchains/node/node-v24.1.0-linux-x64/bin"
         subject, unused = make(node_bin=pinned)
+        def secure_stat(path, follow_symlinks=True):
+            mode = 0o100755 if path == pinned + "/node" else 0o40755
+            return SimpleNamespace(st_uid=0, st_mode=mode, st_dev=42, st_ino=73)
         with patch("linux_boundary.os.path.realpath", return_value=pinned + "/node"), \
-             patch("linux_boundary.os.access", return_value=True):
+             patch("linux_boundary.os.access", return_value=True), \
+             patch("linux_boundary.os.stat", side_effect=secure_stat):
             node, bind = subject.node_binary()
         self.assertEqual(node, "/kd-node/node")
-        self.assertEqual(bind, {"source": pinned, "target": "/kd-node", "ro": True, "rec": False})
+        self.assertEqual(bind, {
+            "source": pinned, "target": "/kd-node", "ro": True, "rec": False,
+            "st_dev": 42, "st_ino": 73,
+        })
         with patch("linux_boundary.os.path.realpath", return_value="/elsewhere/node"), \
              patch("linux_boundary.os.access", return_value=True):
             with self.assertRaises(BoundaryRefusal) as raised:
@@ -933,6 +940,73 @@ class LinuxBoundaryFixtureDiagnosticTests(unittest.TestCase):
             bad_subject, unused = make(node_bin=bad)
             with self.assertRaises(BoundaryRefusal) as raised:
                 bad_subject.node_binary()
+            self.assertEqual(raised.exception.detail, fixtures.HOST_NODE_PINNED_INVALID)
+
+    def test_pinned_node_accepts_the_runner_owned_readonly_installer_output(self):
+        pinned = "/tmp/kd-toolchains/node/node-v24.1.0-linux-x64/bin"
+        node_path = pinned + "/node"
+        runner_owned_paths = {
+            node_path,
+            pinned,
+            os.path.dirname(pinned),
+            os.path.dirname(os.path.dirname(pinned)),
+            "/tmp/kd-toolchains",
+        }
+        subject, unused = make(node_bin=pinned, runner_uid=1001)
+        visited = set()
+
+        def runner_owned_stat(path, follow_symlinks=True):
+            visited.add(path)
+            mode = 0o100555 if path == node_path else 0o40755
+            return SimpleNamespace(st_uid=1001, st_mode=mode, st_dev=42, st_ino=73)
+
+        self.assertEqual(len(runner_owned_paths), 5)
+        with patch("linux_boundary.os.path.realpath", return_value=node_path), \
+             patch("linux_boundary.os.access", return_value=True), \
+             patch("linux_boundary.os.geteuid", return_value=0), \
+             patch("linux_boundary.os.stat", side_effect=runner_owned_stat):
+            node, bind = subject.node_binary()
+        self.assertEqual(visited, runner_owned_paths)
+        self.assertEqual(node, "/kd-node/node")
+        self.assertEqual(bind["st_dev"], 42)
+        self.assertEqual(bind["st_ino"], 73)
+
+    def test_pinned_node_rejects_third_party_owners_and_group_or_other_writes(self):
+        pinned = "/tmp/kd-toolchains/node/node-v24.1.0-linux-x64/bin"
+        node_path = pinned + "/node"
+        subject, unused = make(node_bin=pinned, runner_uid=1001)
+        trusted_paths = (
+            node_path,
+            pinned,
+            os.path.dirname(pinned),
+            os.path.dirname(os.path.dirname(pinned)),
+            "/tmp/kd-toolchains",
+        )
+        writable_entries = tuple(
+            (path, 1001, mode)
+            for path in trusted_paths
+            for mode in ((0o100775, 0o100757) if path == node_path else (0o40775, 0o40777))
+        )
+        invalid_entries = tuple((path, 1002, None) for path in trusted_paths) + writable_entries + (
+            (node_path, 1001, 0o100644),
+            ("/tmp/kd-toolchains", 0, 0o120777),
+        )
+        for bad_path, uid, mode in invalid_entries:
+            def fake_stat(path, follow_symlinks=True):
+                current_mode = 0o100755 if path == node_path else 0o40755
+                current_uid = 1001
+                if path == bad_path:
+                    current_uid = uid
+                    if mode is not None:
+                        current_mode = mode
+                return SimpleNamespace(st_uid=current_uid, st_mode=current_mode, st_dev=42, st_ino=73)
+            with self.subTest(path=bad_path, uid=uid, mode="owner" if mode is None else oct(mode)), \
+                 patch("linux_boundary.os.path.realpath", return_value=node_path), \
+                 patch("linux_boundary.os.access", return_value=True), \
+                 patch("linux_boundary.os.geteuid", return_value=0), \
+                 patch("linux_boundary.os.stat", side_effect=fake_stat):
+                with self.assertRaises(BoundaryRefusal) as raised:
+                    subject.node_binary()
             self.assertEqual(raised.exception.detail, fixtures.HOST_NODE_PINNED_INVALID)
 
     def run_fixture(self, form, **changes):

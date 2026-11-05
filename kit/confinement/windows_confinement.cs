@@ -656,6 +656,11 @@ namespace KeelDock.Platform.WindowsConfinement
         private const uint OpenExisting = 3;
         private const uint FlagBackupSemantics = 0x02000000;
         private const uint FlagOpenReparsePoint = 0x00200000;
+        private const uint ObjectCaseInsensitive = 0x00000040;
+        private const uint FileOpen = 1;
+        private const uint FileOpenForBackupIntent = 0x00004000;
+        private const uint FileSynchronousIoNonalert = 0x00000020;
+        private const uint FileOpenReparsePoint = 0x00200000;
         private const uint AttributeReadOnly = 0x00000001;
         private const uint AttributeDirectory = 0x00000010;
         private const uint AttributeReparsePoint = 0x00000400;
@@ -682,12 +687,12 @@ namespace KeelDock.Platform.WindowsConfinement
 
         public static void Remove(string path)
         {
-            RemoveEntry(Extend(path), null, 0, false);
+            RemoveEntry(Extend(path), null, 0, false, IntPtr.Zero, null);
         }
 
         public static void RemoveLinks(string path)
         {
-            RemoveEntry(Extend(path), null, 0, true);
+            RemoveEntry(Extend(path), null, 0, true, IntPtr.Zero, null);
         }
 
         public static void AllowRoot(string path)
@@ -784,7 +789,68 @@ namespace KeelDock.Platform.WindowsConfinement
         }
 
 
-        private static IntPtr ReopenDirectory(string path, string expectedFinal)
+        private static IntPtr OpenRelativeOnce(IntPtr parent, string name, uint access, out int error)
+        {
+            if (parent == IntPtr.Zero || string.IsNullOrEmpty(name) || name == "." || name == ".."
+                || name.IndexOf('\\') >= 0 || name.IndexOf('/') >= 0 || name.IndexOf('\0') >= 0
+                || name.Length > (ushort.MaxValue - 2) / 2)
+            {
+                throw new InvalidOperationException("remove_failed step=open error=relative_name");
+            }
+            IntPtr nameBuffer = IntPtr.Zero;
+            IntPtr unicodeBuffer = IntPtr.Zero;
+            try
+            {
+                nameBuffer = Marshal.StringToHGlobalUni(name);
+                unicodeBuffer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Native.UnicodeString)));
+                Native.UnicodeString unicodeName = new Native.UnicodeString();
+                unicodeName.Length = (ushort)(name.Length * 2);
+                unicodeName.MaximumLength = (ushort)(unicodeName.Length + 2);
+                unicodeName.Buffer = nameBuffer;
+                Marshal.StructureToPtr(unicodeName, unicodeBuffer, false);
+                Native.ObjectAttributes attributes = new Native.ObjectAttributes();
+                attributes.Length = (uint)Marshal.SizeOf(typeof(Native.ObjectAttributes));
+                attributes.RootDirectory = parent;
+                attributes.ObjectName = unicodeBuffer;
+                attributes.Attributes = ObjectCaseInsensitive;
+                Native.IoStatusBlock ioStatus;
+                IntPtr handle = IntPtr.Zero;
+                int status = Native.NtCreateFile(
+                    out handle, access, ref attributes, out ioStatus, IntPtr.Zero, 0, ShareRead,
+                    FileOpen, FileOpenForBackupIntent | FileOpenReparsePoint | FileSynchronousIoNonalert, IntPtr.Zero, 0);
+                if (status >= 0 && handle != IntPtr.Zero && handle != new IntPtr(-1))
+                {
+                    error = 0;
+                    return handle;
+                }
+                if (status < 0)
+                {
+                    error = (int)Native.RtlNtStatusToDosError(status);
+                    if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+                    {
+                        Native.CloseHandle(handle);
+                    }
+                }
+                else
+                {
+                    error = 6;
+                }
+                return IntPtr.Zero;
+            }
+            finally
+            {
+                if (unicodeBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(unicodeBuffer);
+                }
+                if (nameBuffer != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(nameBuffer);
+                }
+            }
+        }
+
+        private static IntPtr ReopenDirectory(string path, string expectedFinal, IntPtr parent, string name)
         {
             uint[] tiers = new uint[]
             {
@@ -797,8 +863,17 @@ namespace KeelDock.Platform.WindowsConfinement
             {
                 for (int attempt = 0; attempt < MaxOpenRetries; ++attempt)
                 {
-                    IntPtr handle = Native.CreateFileW(path, access, ShareRead, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
-                    if (handle != new IntPtr(-1))
+                    IntPtr handle;
+                    if (parent == IntPtr.Zero)
+                    {
+                        handle = Native.CreateFileW(path, access, ShareRead, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
+                        error = handle == new IntPtr(-1) ? Marshal.GetLastWin32Error() : 0;
+                    }
+                    else
+                    {
+                        handle = OpenRelativeOnce(parent, name, access, out error);
+                    }
+                    if (handle != IntPtr.Zero && handle != new IntPtr(-1))
                     {
                         bool good = false;
                         try
@@ -822,7 +897,6 @@ namespace KeelDock.Platform.WindowsConfinement
                         }
                         return handle;
                     }
-                    error = Marshal.GetLastWin32Error();
                     if (error != ErrorSharingViolation)
                     {
                         break;
@@ -837,7 +911,7 @@ namespace KeelDock.Platform.WindowsConfinement
             throw new InvalidOperationException("remove_failed step=reopen error=" + error.ToString());
         }
 
-        private static IntPtr OpenEntry(string path)
+        private static IntPtr OpenEntry(string path, IntPtr parent, string name)
         {
             uint[] tiers = new uint[]
             {
@@ -851,12 +925,20 @@ namespace KeelDock.Platform.WindowsConfinement
             {
                 for (int attempt = 0; attempt < MaxOpenRetries; ++attempt)
                 {
-                    IntPtr handle = Native.CreateFileW(path, access, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
-                    if (handle != new IntPtr(-1))
+                    IntPtr handle;
+                    if (parent == IntPtr.Zero)
+                    {
+                        handle = Native.CreateFileW(path, access, ShareRead | ShareWrite, IntPtr.Zero, OpenExisting, flags, IntPtr.Zero);
+                        error = handle == new IntPtr(-1) ? Marshal.GetLastWin32Error() : 0;
+                    }
+                    else
+                    {
+                        handle = OpenRelativeOnce(parent, name, access, out error);
+                    }
+                    if (handle != IntPtr.Zero && handle != new IntPtr(-1))
                     {
                         return handle;
                     }
-                    error = Marshal.GetLastWin32Error();
                     if (error != ErrorSharingViolation)
                     {
                         break;
@@ -1037,7 +1119,7 @@ namespace KeelDock.Platform.WindowsConfinement
             throw new InvalidOperationException("remove_failed step=delete error=" + error.ToString());
         }
 
-        private static void RemoveEntry(string path, string expectedFinal, int depth, bool linksOnly)
+        private static void RemoveEntry(string path, string expectedFinal, int depth, bool linksOnly, IntPtr parent, string name)
         {
             if (depth > MaxDepth)
             {
@@ -1051,7 +1133,7 @@ namespace KeelDock.Platform.WindowsConfinement
             {
                 expectedFinal = path;
             }
-            IntPtr handle = OpenEntry(path);
+            IntPtr handle = OpenEntry(path, parent, name);
             try
             {
                 string here = FinalPath(handle);
@@ -1071,7 +1153,7 @@ namespace KeelDock.Platform.WindowsConfinement
                 {
                     Native.CloseHandle(handle);
                     handle = IntPtr.Zero;
-                    handle = ReopenDirectory(path, here);
+                    handle = ReopenDirectory(path, here, parent, name);
                     List<string> names = new List<string>();
                     List<uint> kinds = new List<uint>();
                     ListEntries(handle, names, kinds);
@@ -1082,7 +1164,7 @@ namespace KeelDock.Platform.WindowsConfinement
                         {
                             continue;
                         }
-                        RemoveEntry(path + "\\" + names[index], here + "\\" + names[index], depth + 1, linksOnly);
+                        RemoveEntry(path + "\\" + names[index], here + "\\" + names[index], depth + 1, linksOnly, handle, names[index]);
                     }
                     if (!linksOnly)
                     {
@@ -1106,8 +1188,51 @@ namespace KeelDock.Platform.WindowsConfinement
 
         private static class Native
         {
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct UnicodeString
+            {
+                internal ushort Length;
+                internal ushort MaximumLength;
+                internal IntPtr Buffer;
+            }
+
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct ObjectAttributes
+            {
+                internal uint Length;
+                internal IntPtr RootDirectory;
+                internal IntPtr ObjectName;
+                internal uint Attributes;
+                internal IntPtr SecurityDescriptor;
+                internal IntPtr SecurityQualityOfService;
+            }
+
+            [StructLayout(LayoutKind.Sequential)]
+            internal struct IoStatusBlock
+            {
+                internal IntPtr Status;
+                internal IntPtr Information;
+            }
+
             [DllImport("kernel32.dll", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
             internal static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+
+            [DllImport("ntdll.dll", ExactSpelling = true)]
+            internal static extern int NtCreateFile(
+                out IntPtr handle,
+                uint access,
+                ref ObjectAttributes attributes,
+                out IoStatusBlock ioStatus,
+                IntPtr allocationSize,
+                uint fileAttributes,
+                uint share,
+                uint disposition,
+                uint options,
+                IntPtr eaBuffer,
+                uint eaLength);
+
+            [DllImport("ntdll.dll", ExactSpelling = true)]
+            internal static extern uint RtlNtStatusToDosError(int status);
 
             [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
             [return: MarshalAs(UnmanagedType.Bool)]

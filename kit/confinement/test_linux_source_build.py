@@ -1413,6 +1413,14 @@ class LinuxSourceBuildTests(unittest.TestCase):
             else:
                 runtime_dependencies[name] = ()
             self._write_d145_fixture_file(root, member + "/Cargo.toml", text)
+        for member in bootstrap.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+            crate_name = member.rsplit("/", 1)[-1]
+            self._write_d145_fixture_file(root, member + "/README.md", crate_name + " crate overview.\n")
+            self._write_d145_fixture_file(root, member + "/CONTRACT.md", "Contract for " + crate_name + ".\n")
+            self._write_d145_fixture_file(root, member + "/CHANGELOG.md", "Initial crate release.\n")
+            self._write_d145_fixture_file(root, member + "/src/lib.rs", "pub fn " + crate_name.replace("-", "_") + "() {}\n")
+            self._write_d145_fixture_file(root, member + "/src/modules/mod.rs", "pub fn module() {}\n")
+            self._write_d145_fixture_file(root, member + "/tests/runtime.rs", "fn works() {}\n")
         self._write_d145_fixture_file(
             root, "runtime/Cargo.lock", self._d145_fixture_lock(runtime_dependencies),
         )
@@ -1421,13 +1429,44 @@ class LinuxSourceBuildTests(unittest.TestCase):
     def test_d145_profile_accepts_a_complete_runtime_and_paired_contract_lock(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
+        root = Path(temporary.name).resolve()
         self._write_complete_d145_fixture(root)
         descriptor = linux_source_build._open_source_root(root)
         try:
             self.assertTrue(linux_source_build._check_d145_runtime_profile(descriptor))
         finally:
             os.close(descriptor)
+        self.assertTrue(linux_source_build.cargo_lock_bootstrap.validate_runtime_profile_source_tree(root))
+        profile_output = io.StringIO()
+        with patch.object(linux_source_build.cargo_lock_bootstrap.sys, "stdout", profile_output):
+            self.assertEqual(
+                linux_source_build.cargo_lock_bootstrap._main(
+                    ["check-runtime_profile-source", str(root)],
+                ),
+                0,
+            )
+        self.assertEqual(profile_output.getvalue(), "runtime_profile=runtime\n")
+
+    def test_d145_batch_seven_tree_refuses_unlisted_paths_in_linux_and_windows_validators(self):
+        cases = (
+            ("runtime/crates/host/registry/build.rs", "fn build() {}\n"),
+            ("runtime/crates/services/palette/src/extra.json", "{}\n"),
+            ("runtime/crates/host/core/src/README.md", "Nested doc.\n"),
+            ("runtime/crates/services/other/README.md", "Unlisted service.\n"),
+        )
+        for relative, contents in cases:
+            with self.subTest(path=relative), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                self._write_complete_d145_fixture(root)
+                self._write_d145_fixture_file(root, relative, contents)
+                descriptor = linux_source_build._open_source_root(root)
+                try:
+                    with self.assertRaises(linux_source_build.SourceBuildRefusal):
+                        linux_source_build._check_d145_runtime_profile(descriptor)
+                finally:
+                    os.close(descriptor)
+                with self.assertRaises(linux_source_build.cargo_lock_bootstrap.BootstrapRefusal):
+                    linux_source_build.cargo_lock_bootstrap.validate_runtime_profile_source_tree(root)
 
     def test_time_already_spent_by_the_job_before_the_gates_shortens_the_budget(self):
         budget = linux_source_build.PROJECT_GATE_BUDGET_SECONDS

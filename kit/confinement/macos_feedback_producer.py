@@ -65,6 +65,14 @@ RUNTIME_PACKAGE_ROOTS = (
     Path("runtime/crates/host/settings-schema"), Path("runtime/crates/services/palette"),
     Path("runtime/crates/services/notifications"),
 )
+RUNTIME_BATCH_SEVEN_CRATE_ROOTS = (
+    Path("runtime/crates/host/registry"), Path("runtime/crates/host/core"),
+    Path("runtime/crates/host/settings-schema"), Path("runtime/crates/services/palette"),
+    Path("runtime/crates/services/notifications"),
+)
+RUNTIME_BATCH_SEVEN_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELOG.md"))
+RUNTIME_EXISTING_SERVICE_DOC_ROOT = Path("runtime/crates/services/sync-publication")
+RUNTIME_EXISTING_SERVICE_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELOG.md"))
 OPTIONAL_RUNTIME_PACKAGE_ROOTS = (Path("runtime/crates/services/sync-format"),)
 RUNTIME_MEMBER_LIST_RE = re.compile(r"(?m)^members\s*=\s*\[(.*?)\]\s*$", re.DOTALL)
 RUNTIME_MEMBER_ITEM_RE = re.compile(r'\s*"([A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*,?')
@@ -353,11 +361,110 @@ def _validated_fuzz_rust_paths(source):
     return tuple(paths)
 
 
+def _runtime_batch_seven_file_allowed(relative):
+    if relative in ("Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md"):
+        return True
+    parts = relative.split("/")
+    if (len(parts) >= 2 and parts[0] == "src" and relative.endswith(".rs")
+            and parts[-1] != "build.rs"):
+        return True
+    return (
+        len(parts) == 2 and parts[0] == "tests" and relative.endswith(".rs")
+        and parts[-1] != "build.rs"
+    )
+
+
+def _runtime_batch_seven_directory_allowed(relative):
+    return relative == "src" or relative.startswith("src/") or relative == "tests"
+
+
+def _validate_runtime_batch_seven_trees(source):
+    crates_root = source / "runtime/crates"
+    try:
+        root_info = crates_root.lstat()
+    except OSError:
+        _refuse("manifest_invalid")
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        _refuse("manifest_invalid")
+    prefixes = tuple(root.as_posix() for root in RUNTIME_BATCH_SEVEN_CRATE_ROOTS)
+    required = {prefix: {"Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md", "src/lib.rs"}
+                for prefix in prefixes}
+    found = {prefix: set() for prefix in prefixes}
+    stack = [(crates_root, "runtime/crates")]
+    count = 0
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    doc_names = {"README.md", "CONTRACT.md", "CHANGELOG.md"}
+    while stack:
+        directory, parent_relative = stack.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError:
+            _refuse("manifest_invalid")
+        for entry in entries:
+            count += 1
+            if count > MAX_RUST_PATHS * 128:
+                _refuse("manifest_invalid")
+            relative = parent_relative + "/" + entry.name
+            target = Path(entry.path)
+            try:
+                info = target.lstat()
+            except OSError:
+                _refuse("manifest_invalid")
+            prefix = next((item for item in prefixes
+                           if relative == item or relative.startswith(item + "/")), None)
+            if (stat.S_ISLNK(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & reparse):
+                if prefix is not None or entry.name in doc_names:
+                    _refuse("manifest_invalid")
+                continue
+            if entry.name in doc_names:
+                previous_service_path = (
+                    relative in {
+                        RUNTIME_EXISTING_SERVICE_DOC_ROOT.as_posix() + "/" + name
+                        for name in RUNTIME_EXISTING_SERVICE_DOC_FILES
+                    }
+                )
+                batch_document_path = (
+                    prefix is not None
+                    and relative[len(prefix) + 1:] in RUNTIME_BATCH_SEVEN_DOC_FILES
+                )
+                if (not previous_service_path and not batch_document_path
+                        or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != 0
+                        or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)):
+                    _refuse("manifest_invalid")
+            if stat.S_ISDIR(info.st_mode):
+                if prefix is not None and relative != prefix:
+                    within = relative[len(prefix) + 1:]
+                    if not _runtime_batch_seven_directory_allowed(within):
+                        _refuse("manifest_invalid")
+                if (info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+                    if prefix is not None:
+                        _refuse("manifest_invalid")
+                stack.append((target, relative))
+                continue
+            if prefix is not None:
+                within = relative[len(prefix) + 1:]
+                if (not _runtime_batch_seven_file_allowed(within)
+                        or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                        or info.st_uid != 0
+                        or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)):
+                    _refuse("manifest_invalid")
+                found[prefix].add(within)
+    for prefix, required_files in required.items():
+        if not required_files.issubset(found[prefix]):
+            _refuse("manifest_invalid")
+
+
 def _reviewed_rust_paths(source, *, include_fuzz=False, roots=None):
     if type(include_fuzz) is not bool:
         _refuse("manifest_invalid")
+    selected_roots = PACKAGE_ROOTS if roots is None else roots
+    if all(root in selected_roots for root in RUNTIME_BATCH_SEVEN_CRATE_ROOTS):
+        _validate_runtime_batch_seven_trees(source)
     paths = []
-    for package_root in (PACKAGE_ROOTS if roots is None else roots):
+    for package_root in selected_roots:
         source_directory = source / package_root / "src"
         try:
             source_info = source_directory.lstat()

@@ -126,6 +126,27 @@ HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS = (
     "runtime/crates/host/settings-schema", "runtime/crates/services/palette",
     "runtime/crates/services/notifications",
 )
+HOST_API_POLICY_RUNTIME_BASE_MEMBER_ROOTS = (
+    "runtime/crates/services/sync-publication",
+    "runtime/crates/test-fixtures/host-router",
+    "runtime/crates/test-fixtures/fixture-data",
+    "runtime/crates/test-fixtures/tool-a",
+    "runtime/crates/test-fixtures/tool-b",
+    "runtime/crates/test-fixtures/tool-bad-no-handler",
+    "runtime/crates/test-fixtures/tool-bad-no-manifest",
+)
+HOST_API_POLICY_RUNTIME_BASE_WORKSPACE_DEPENDENCIES = {
+    "host-router": {"path": "crates/test-fixtures/host-router"},
+    "fixture-data": {"path": "crates/test-fixtures/fixture-data"},
+    "tool-a": {"path": "crates/test-fixtures/tool-a"},
+    "tool-b": {"path": "crates/test-fixtures/tool-b"},
+    "tool-bad-no-handler": {"path": "crates/test-fixtures/tool-bad-no-handler"},
+    "tool-bad-no-manifest": {"path": "crates/test-fixtures/tool-bad-no-manifest"},
+}
+RUNTIME_BATCH_SEVEN_CRATE_ROOTS = HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS
+RUNTIME_BATCH_SEVEN_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELOG.md"))
+RUNTIME_EXISTING_SERVICE_DOC_ROOT = "runtime/crates/services/sync-publication"
+RUNTIME_EXISTING_SERVICE_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELOG.md"))
 HOST_API_POLICY_OPTIONAL_SYNC_FORMAT_ROOT = "runtime/crates/services/sync-format"
 HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS = (
     "runtime/crates/services/sync-publication",
@@ -739,13 +760,37 @@ def _check_contract_dependency_policy(documents, *, require_first_batch=True):
 
 
 def _check_runtime_profile(documents, member_set):
+    base_required = frozenset(HOST_API_POLICY_RUNTIME_BASE_MEMBER_ROOTS)
     required = frozenset(HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS)
     optional = frozenset(HOST_API_POLICY_RUNTIME_OPTIONAL_MEMBER_ROOTS)
-    if member_set not in (required, required | optional):
-        _manifest_refuse()
     root = documents.get(workspace_root_manifest(RUNTIME_WORKSPACE))
     workspace = root.get("workspace") if type(root) is dict else None
     workspace_dependencies = workspace.get("dependencies") if type(workspace) is dict else None
+    if member_set == base_required:
+        if workspace_dependencies != HOST_API_POLICY_RUNTIME_BASE_WORKSPACE_DEPENDENCIES:
+            _manifest_refuse()
+        for document in documents.values():
+            for table_name in DEPENDENCY_TABLE_NAMES:
+                table = document.get(table_name, {})
+                if (type(table) is not dict or HOST_API_POLICY_API_PACKAGE in table
+                        or any(type(spec) is dict and spec.get("package") == HOST_API_POLICY_API_PACKAGE
+                               for spec in table.values())):
+                    _manifest_refuse()
+            target = document.get("target", {})
+            if type(target) is not dict:
+                _manifest_refuse()
+            for target_entry in target.values():
+                if type(target_entry) is not dict:
+                    _manifest_refuse()
+                for table_name in DEPENDENCY_TABLE_NAMES:
+                    table = target_entry.get(table_name, {})
+                    if (type(table) is not dict or HOST_API_POLICY_API_PACKAGE in table
+                            or any(type(spec) is dict and spec.get("package") == HOST_API_POLICY_API_PACKAGE
+                                   for spec in table.values())):
+                        _manifest_refuse()
+        return
+    if member_set not in (required, required | optional):
+        _manifest_refuse()
     if (type(workspace_dependencies) is not dict
             or workspace_dependencies.get(HOST_API_POLICY_API_PACKAGE) != {"path": HOST_API_POLICY_API_PATH}):
         _manifest_refuse()
@@ -890,7 +935,8 @@ def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE, *, require
         _check_contract_dependency_policy(documents, require_first_batch=require_first_batch)
     if root_directory == RUNTIME_WORKSPACE_DIRECTORY:
         _check_runtime_profile(documents, member_set)
-        names.add(HOST_API_POLICY_API_PACKAGE)
+        if frozenset(HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS) <= member_set:
+            names.add(HOST_API_POLICY_API_PACKAGE)
     return frozenset(names)
 
 
@@ -1097,6 +1143,90 @@ def _runtime_profile_source_directory(root, relative):
     return target
 
 
+def _runtime_batch_seven_file_allowed(relative):
+    if relative in ("Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md"):
+        return True
+    parts = relative.split("/")
+    if (len(parts) >= 2 and parts[0] == "src" and relative.endswith(".rs")
+            and parts[-1] != "build.rs"):
+        return True
+    return (
+        len(parts) == 2 and parts[0] == "tests" and relative.endswith(".rs")
+        and parts[-1] != "build.rs"
+    )
+
+
+def _runtime_batch_seven_directory_allowed(relative):
+    return relative == "src" or relative.startswith("src/") or relative == "tests"
+
+
+def _validate_runtime_batch_seven_crate_trees(root):
+    crates_root = _runtime_profile_source_directory(root, "runtime/crates")
+    batch_prefixes = tuple(RUNTIME_BATCH_SEVEN_CRATE_ROOTS)
+    required_files = {prefix: {"Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md", "src/lib.rs"}
+                      for prefix in batch_prefixes}
+    found_files = {prefix: set() for prefix in batch_prefixes}
+    stack = [(crates_root, "runtime/crates")]
+    count = 0
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    doc_names = {"README.md", "CONTRACT.md", "CHANGELOG.md"}
+    while stack:
+        directory, parent_relative = stack.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError:
+            _manifest_refuse()
+        for entry in entries:
+            count += 1
+            if count > MAX_TREE_ENTRIES:
+                _manifest_refuse()
+            relative = parent_relative + "/" + entry.name
+            try:
+                info = Path(entry.path).lstat()
+            except OSError:
+                _manifest_refuse()
+            batch_root = next((prefix for prefix in batch_prefixes
+                               if relative == prefix or relative.startswith(prefix + "/")), None)
+            if (stat.S_ISLNK(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & reparse):
+                if batch_root is not None or entry.name in doc_names:
+                    _manifest_refuse()
+                continue
+            if entry.name in doc_names:
+                previous_service_path = (
+                    relative in {
+                        RUNTIME_EXISTING_SERVICE_DOC_ROOT + "/" + name
+                        for name in RUNTIME_EXISTING_SERVICE_DOC_FILES
+                    }
+                )
+                batch_document_path = (
+                    batch_root is not None
+                    and relative[len(batch_root) + 1:] in RUNTIME_BATCH_SEVEN_DOC_FILES
+                )
+                if (not previous_service_path and not batch_document_path
+                        or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+                    _manifest_refuse()
+            if stat.S_ISDIR(info.st_mode):
+                if batch_root is not None and relative != batch_root:
+                    within = relative[len(batch_root) + 1:]
+                    if not _runtime_batch_seven_directory_allowed(within):
+                        _manifest_refuse()
+                stack.append((Path(entry.path), relative))
+                continue
+            if batch_root is not None:
+                within = relative[len(batch_root) + 1:]
+                if (not _runtime_batch_seven_file_allowed(within)
+                        or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+                    _manifest_refuse()
+                found_files[batch_root].add(within)
+            elif not stat.S_ISREG(info.st_mode) and not stat.S_ISDIR(info.st_mode):
+                continue
+    for prefix, required in required_files.items():
+        if not required.issubset(found_files[prefix]):
+            _manifest_refuse()
+
+
 def validate_runtime_profile_source_tree(source):
     """Validate the paired contract and runtime locks before Windows selects Rust gates."""
     try:
@@ -1177,6 +1307,9 @@ def validate_runtime_profile_source_tree(source):
     }
     runtime_names = check_manifests(runtime_manifests, runtime_members, RUNTIME_WORKSPACE)
     runtime_identities = set(manifest_package_identities(runtime_manifests, RUNTIME_WORKSPACE))
+    batch_seven_profile = frozenset(RUNTIME_BATCH_SEVEN_CRATE_ROOTS) <= runtime_members
+    if batch_seven_profile:
+        _validate_runtime_batch_seven_crate_trees(root)
     runtime_lock = _runtime_profile_file(root, "runtime/Cargo.lock", MAX_LOCK_BYTES)
     contract_manifest_paths = {"Cargo.toml"}
     contract_manifest_paths.update(member + "/Cargo.toml" for member in CONTRACT_MEMBERS)
@@ -1189,16 +1322,18 @@ def validate_runtime_profile_source_tree(source):
     contract_identities = manifest_package_identities(contract_manifests, CONTRACT_WORKSPACE)
     api_identity = next((identity for identity in contract_identities
                          if identity[0] == HOST_API_POLICY_API_PACKAGE), None)
-    if api_identity is None or HOST_API_POLICY_API_PACKAGE not in runtime_names:
-        _manifest_refuse()
-    runtime_identities.add(api_identity)
+    if batch_seven_profile:
+        if api_identity is None or HOST_API_POLICY_API_PACKAGE not in runtime_names:
+            _manifest_refuse()
+        runtime_identities.add(api_identity)
     runtime_dependency_rules = manifest_dependency_rules(runtime_manifests, RUNTIME_WORKSPACE)
-    api_dependency_rules = manifest_dependency_rules(
-        {"Cargo.toml": contract_manifests["Cargo.toml"],
-         HOST_API_POLICY_API_MANIFEST_PATH: contract_manifests[HOST_API_POLICY_API_MANIFEST_PATH]},
-        CONTRACT_WORKSPACE,
-    )
-    runtime_dependency_rules.update(api_dependency_rules)
+    if batch_seven_profile:
+        api_dependency_rules = manifest_dependency_rules(
+            {"Cargo.toml": contract_manifests["Cargo.toml"],
+             HOST_API_POLICY_API_MANIFEST_PATH: contract_manifests[HOST_API_POLICY_API_MANIFEST_PATH]},
+            CONTRACT_WORKSPACE,
+        )
+        runtime_dependency_rules.update(api_dependency_rules)
     check_lock_members(runtime_lock, runtime_names, runtime_identities, runtime_dependency_rules)
     contract_lock = _runtime_profile_file(root, "Cargo.lock", MAX_LOCK_BYTES)
     check_lock_members(

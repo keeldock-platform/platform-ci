@@ -4002,6 +4002,23 @@ def _runtime_root_text(roots=None, extra=""):
         '    "' + "/".join(root[len(workspace_parts):]) + '",\n'
         for root in roots if type(root) is tuple
     )
+    if set(subject.RUNTIME_BATCH_SEVEN_CRATE_ROOTS).issubset(roots):
+        dependencies = (
+            subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + ' = { path = "'
+            + subject.RUNTIME_HOST_API_POLICY_API_PATH + '" }\n'
+        )
+    else:
+        dependencies = "".join(
+            "    " + name + ' = { path = "' + path + '" }\n'
+            for name, path in (
+                ("host-router", "crates/test-fixtures/host-router"),
+                ("fixture-data", "crates/test-fixtures/fixture-data"),
+                ("tool-a", "crates/test-fixtures/tool-a"),
+                ("tool-b", "crates/test-fixtures/tool-b"),
+                ("tool-bad-no-handler", "crates/test-fixtures/tool-bad-no-handler"),
+                ("tool-bad-no-manifest", "crates/test-fixtures/tool-bad-no-manifest"),
+            )
+        )
     return (
         '[workspace]\nresolver = "3"\nmembers = [\n' + listing + "]\n\n"
         "[workspace.package]\n"
@@ -4009,8 +4026,7 @@ def _runtime_root_text(roots=None, extra=""):
         "[workspace.lints.rust]\n"
         'unsafe_code = "forbid"\n\n'
         "[workspace.dependencies]\n"
-        + subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + ' = { path = "' + subject.RUNTIME_HOST_API_POLICY_API_PATH + '" }\n'
-        + extra
+        + dependencies + extra
     )
 
 
@@ -4066,8 +4082,16 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         for root in roots:
             prefix = "/".join(root)
             paths.update((prefix + "/Cargo.toml", prefix + "/src/lib.rs", prefix + "/tests/unit.rs"))
+        for root in subject.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+            if root not in roots:
+                continue
+            prefix = "/".join(root)
+            paths.update(
+                prefix + "/" + name for name in subject.RUNTIME_BATCH_SEVEN_DOC_FILES
+            )
         for root in subject.RUNTIME_HOST_CRATE_ROOTS:
-            paths.add("/".join(root) + "/CONTRACT.md")
+            if root in roots:
+                paths.add("/".join(root) + "/CONTRACT.md")
         return {path: ("100644", "a" * 40) for path in paths}
 
     @staticmethod
@@ -4076,7 +4100,10 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         blobs = {
             subject.RUNTIME_ROOT_MANIFEST_PATH: _runtime_root_text(roots).encode("utf-8"),
             subject.RUNTIME_ROOT_LOCK_PATH: _runtime_lock_text(
-                [root[-1] for root in roots] + [subject.RUNTIME_HOST_API_POLICY_API_PACKAGE],
+                [root[-1] for root in roots] + (
+                    [subject.RUNTIME_HOST_API_POLICY_API_PACKAGE]
+                    if set(subject.RUNTIME_BATCH_SEVEN_CRATE_ROOTS).issubset(roots) else []
+                ),
             ).encode("ascii"),
             "runtime/rust-toolchain.toml": subject.CORE_CONTRACT_TOOLCHAIN,
             "runtime/rustfmt.toml": b"x",
@@ -4086,7 +4113,10 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             blobs["/".join(root) + "/Cargo.toml"] = _runtime_member_text(root).encode("utf-8")
         return blobs
 
-    def _validate(self, entries=None, blobs=None, contract_overrides=None, base_entries=None):
+    def _validate(
+        self, entries=None, blobs=None, contract_overrides=None, base_entries=None,
+        concern="core-contract",
+    ):
         entries = self._runtime_entries() if entries is None else entries
         blobs = self._runtime_blobs() if blobs is None else blobs
         contract_overrides = contract_overrides or {}
@@ -4121,7 +4151,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
                 patch.object(subject, "_core_contract_policy_matches_base", return_value=True), \
                 patch.object(subject, "_rules_file_manifest", return_value={"AGENTS.md": digest}):
             marker = subject._safe_core_contract_tree(
-                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40, concern="core-contract",
+                "repository", "/usr/bin/git", {}, "a" * 40, "b" * 40, concern=concern,
             )
         return marker, reads
 
@@ -4155,6 +4185,15 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         self.assertEqual(marker, "core_contract")
         self.assertIn(subject.RUNTIME_ROOT_MANIFEST_PATH, reads)
         self.assertIn(subject.RUNTIME_ROOT_LOCK_PATH, reads)
+
+    def test_the_pre_batch_seven_runtime_tree_remains_admitted(self):
+        roots = subject.RUNTIME_PRE_BATCH_SEVEN_CRATE_ROOTS
+        self.assertEqual(len(roots), 7)
+        marker, unused_reads = self._validate(
+            entries=self._runtime_entries(roots=roots),
+            blobs=self._runtime_blobs(roots=roots),
+        )
+        self.assertEqual(marker, "core_contract")
 
     def test_absent_runtime_workspace_leaves_the_contract_checks_unchanged(self):
         entries = CoreContractTreeTests._required_core_contract_entries()
@@ -4241,11 +4280,58 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             entries[path] = ("100644", "a" * 40)
             with self.subTest(path=path):
                 self.assertEqual(self._refused(entries=entries), "path_mode")
+
+    def test_batch_seven_full_crate_file_shapes_are_admitted(self):
+        for root in subject.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+            prefix = "/".join(root)
+            entries = self._runtime_entries()
+            for relative in (
+                "src/modules/palette.rs", "tests/batch_seven.rs",
+            ):
+                entries[prefix + "/" + relative] = ("100644", "a" * 40)
+            with self.subTest(root=prefix):
+                marker, unused_reads = self._validate(entries=entries)
+                self.assertEqual(marker, "core_contract")
+            for name in subject.RUNTIME_BATCH_SEVEN_DOC_FILES:
+                incomplete = self._runtime_entries()
+                incomplete.pop(prefix + "/" + name)
+                with self.subTest(root=prefix, missing=name):
+                    self.assertEqual(self._refused(entries=incomplete), "required_files")
+        for relative in (
+            "/build.rs", "/src/build.rs", "/src/data.json", "/tests/nested/test.rs",
+            "/tests/data.json", "/src/README.md", "/src/CHANGELOG.md",
+        ):
+            entries = self._runtime_entries()
+            entries["runtime/crates/services/palette" + relative] = ("100644", "a" * 40)
+            with self.subTest(relative=relative):
+                self.assertEqual(self._refused(entries=entries), "path_mode")
         for mode in ("100755", "120000"):
             entries = self._runtime_entries()
             entries[subject.RUNTIME_ROOT_MANIFEST_PATH] = (mode, "a" * 40)
             with self.subTest(mode=mode):
                 self.assertEqual(self._refused(entries=entries), "path_mode")
+
+    def test_runtime_core_edge_reuses_the_exact_concern_scoped_build_data_allowance(self):
+        concern = subject.CORE_CONTRACT_NPM_ADMISSION_CONCERN
+        admitted = "crates/host/api/src/entitlements/key_register.tsv"
+        entries = self._runtime_entries()
+        entries[admitted] = ("100644", "a" * 40)
+        marker, unused_reads = self._validate(entries=entries, concern=concern)
+        self.assertEqual(marker, subject.CORE_CONTRACT_TREE_BY_CONCERN[concern])
+
+        for path in (
+            "crates/host/api/src/entitlements/other.tsv",
+            "crates/host/api/src/entitlements/key_register.tsv.bak",
+        ):
+            changed = dict(entries)
+            changed[path] = ("100644", "a" * 40)
+            with self.subTest(path=path):
+                self.assertEqual(self._refused(entries=changed, concern=concern), "path_mode")
+        for mode in ("100755", "120000"):
+            changed = dict(entries)
+            changed[admitted] = (mode, "a" * 40)
+            with self.subTest(mode=mode):
+                self.assertEqual(self._refused(entries=changed, concern=concern), "path_mode")
 
     def test_the_service_crate_may_carry_exactly_its_three_documents(self):
         service = "/".join(subject.RUNTIME_CRATE_ROOTS[0])
@@ -4278,8 +4364,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
                 with self.subTest(root=root, mode=mode):
                     self.assertEqual(self._refused(entries=altered), "path_mode")
         for path in (
-            "runtime/crates/host/registry/README.md",
-            "runtime/crates/host/core/CHANGELOG.md",
+            "runtime/crates/host/other/CHANGELOG.md",
             "runtime/crates/host/other/CONTRACT.md",
         ):
             entries = self._runtime_entries()
@@ -4304,8 +4389,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             "runtime/crates/services/other/src/lib.rs",
             "runtime/crates/services/README.md",
             "runtime/crates/services/sync-publication-extra/README.md",
-            "runtime/crates/services/palette/CONTRACT.md",
-            "runtime/crates/services/notifications/README.md",
+            "runtime/crates/services/other/CONTRACT.md",
         ):
             entries = self._runtime_entries()
             entries[path] = ("100644", "a" * 40)

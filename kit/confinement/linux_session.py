@@ -384,9 +384,20 @@ def validate_spec(spec):
         if type(entry[0]) is not str or type(entry[1]) is not int:
             raise harness.ProofFailure(96)
     for bind in spec.get("binds", []):
-        if type(bind) is not dict or set(bind) not in ({"source", "target", "ro"}, {"source", "target", "ro", "rec"}):
+        if type(bind) is not dict:
             raise harness.ProofFailure(96)
-        if "rec" in bind and type(bind["rec"]) is not bool:
+        keys = set(bind)
+        base = {"source", "target", "ro"}
+        if (not base.issubset(keys) or keys - base - {"rec", "st_dev", "st_ino"}
+                or ("rec" in keys and type(bind["rec"]) is not bool)
+                or ("st_dev" in keys) != ("st_ino" in keys)):
+            raise harness.ProofFailure(96)
+        if "st_dev" in bind and (
+                type(bind["st_dev"]) is not int or bind["st_dev"] < 0
+                or type(bind["st_ino"]) is not int or bind["st_ino"] < 0):
+            raise harness.ProofFailure(96)
+        if "st_dev" in bind and (
+                bind["target"] != "/kd-node" or bind["ro"] is not True or bind.get("rec") is not False):
             raise harness.ProofFailure(96)
         if SAFE_PATH.fullmatch(str(bind["source"])) is None or SAFE_PATH.fullmatch(str(bind["target"])) is None:
             raise harness.ProofFailure(96)
@@ -425,6 +436,17 @@ def make_tree(base, relative):
     return path
 
 
+def verify_bind_identity(target, bind):
+    if "st_dev" not in bind:
+        return
+    try:
+        mounted = os.stat(os.path.join(target, "node"), follow_symlinks=False)
+    except OSError:
+        raise BoundaryRefusal("fixture_incomplete", None, 62)
+    if mounted.st_dev != bind["st_dev"] or mounted.st_ino != bind["st_ino"]:
+        raise BoundaryRefusal("fixture_incomplete", None, 62)
+
+
 def extend_rootfs(rootfs, spec):
     if spec.get("fault") == "usr-writable":
         harness._mount(None, os.path.join(rootfs, "usr"), None, harness.MS_BIND | harness.MS_REMOUNT | harness.MS_NOSUID | harness.MS_NODEV)
@@ -448,6 +470,7 @@ def extend_rootfs(rootfs, spec):
         harness._mount(bind["source"], target, None, harness.MS_BIND | recursive)
         if bind["ro"]:
             harness._mount(None, target, None, harness.MS_BIND | harness.MS_REMOUNT | harness.MS_RDONLY | harness.MS_NOSUID | harness.MS_NODEV)
+        verify_bind_identity(target, bind)
     write_files(rootfs, spec["files"])
 
 

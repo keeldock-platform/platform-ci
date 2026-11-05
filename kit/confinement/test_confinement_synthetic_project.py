@@ -256,7 +256,7 @@ class NodeGateTests(unittest.TestCase):
         package = _json("packages/host-api/package.json")
         self.assertEqual(
             package["devDependencies"],
-            {"typescript": "6.0.3", "vite": "8.3.4", "vitest": "5.0.5"},
+            {"typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5"},
         )
         self.assertTrue((FIXTURE / "packages/host-api/tsconfig.json").is_file())
         self.assertIn('pool: \'threads\'', _text("packages/host-api/vitest.config.ts"))
@@ -274,7 +274,7 @@ class NodeGateTests(unittest.TestCase):
         packages = _json("package-lock.json")["packages"]
         self.assertEqual(packages["node_modules/vitest"]["version"], "5.0.5")
         self.assertEqual(packages["packages/host-api"]["devDependencies"], {
-            "typescript": "6.0.3", "vite": "8.3.4", "vitest": "5.0.5",
+            "typescript": "6.0.3", "vite": "8.3.5", "vitest": "5.0.5",
         })
         preload = (FIXTURE / "packages/host-api/tests/no-net-use.mjs").read_bytes()
         blob = b"blob " + str(len(preload)).encode("ascii") + b"\0" + preload
@@ -326,7 +326,7 @@ class NodeGateTests(unittest.TestCase):
                 self.assertRegex(value["integrity"], SRI_PATTERN)
         self.assertEqual(external["node_modules/ms"]["version"], "2.1.3")
         self.assertTrue(external["node_modules/ms"]["resolved"].endswith("/ms-2.1.3.tgz"))
-        for name, version in (("typescript", "6.0.3"), ("vite", "8.3.4"), ("vitest", "5.0.5")):
+        for name, version in (("typescript", "6.0.3"), ("vite", "8.3.5"), ("vitest", "5.0.5")):
             with self.subTest(name=name):
                 self.assertEqual(packages["node_modules/" + name]["version"], version)
         links = {key: value["resolved"] for key, value in packages.items() if value.get("link")}
@@ -346,10 +346,49 @@ class NodeGateTests(unittest.TestCase):
             self.assertEqual(entry.get("devDependencies"), package.get("devDependencies"))
         self.assertEqual(packages["packages/host-api"]["devDependencies"], {
             "typescript": "6.0.3",
-            "vite": "8.3.4",
+            "vite": "8.3.5",
             "vitest": "5.0.5",
         })
         self.assertEqual(packages[""]["workspaces"], ["packages/*"])
+
+    def test_vite_lock_fields_match_the_8_3_5_registry_manifest(self):
+        vite = _json("package-lock.json")["packages"]["node_modules/vite"]
+        self.assertEqual(vite["version"], "8.3.5")
+        self.assertEqual(vite["resolved"], "https://registry.npmjs.org/vite/-/vite-8.3.5.tgz")
+        self.assertEqual(
+            vite["integrity"],
+            "sha512-z1YpjieJ9g0ebTmQpLBv/oq9E3F9EIlOe+7LahW8SrE3LTiG3udBRUXQOlYXP9b+IC2q2phHeVxj9xGlw34OEQ==",
+        )
+        self.assertEqual(vite["license"], "MIT")
+        self.assertTrue(vite["dev"])
+        self.assertEqual(vite["dependencies"], {
+            "postcss": "^8.5.30",
+            "rolldown": "~1.2.14",
+            "picomatch": "^4.0.7",
+            "tinyglobby": "^0.2.17",
+            "lightningcss": "^1.33.0",
+        })
+        self.assertEqual(vite["optionalDependencies"], {"fsevents": "~2.3.3"})
+        self.assertEqual(vite["peerDependencies"], {
+            "tsx": "^4.8.1",
+            "jiti": ">=1.21.0",
+            "less": "^4.0.0",
+            "sass": "^1.70.0",
+            "yaml": "^2.4.2",
+            "stylus": ">=0.54.8",
+            "terser": "^5.16.0",
+            "esbuild": "^0.27.0 || ^0.28.0",
+            "sugarss": "^5.0.0",
+            "@types/node": "^20.19.0 || >=22.12.0",
+            "sass-embedded": "^1.70.0",
+            "@vitejs/devtools": "^0.7.1 || ^0.8.0",
+        })
+        self.assertEqual(vite["peerDependenciesMeta"], {
+            name: {"optional": True}
+            for name in vite["peerDependencies"]
+        })
+        self.assertEqual(vite["engines"], {"node": "^20.19.0 || >=22.12.0"})
+        self.assertEqual(vite["bin"], {"vite": "bin/vite.js"})
 
     def test_the_dependencies_are_used_by_the_expected_workspaces(self):
         self.assertEqual(_json("packages/kernel-i18n/package.json")["dependencies"], {"ms": "2.1.3"})

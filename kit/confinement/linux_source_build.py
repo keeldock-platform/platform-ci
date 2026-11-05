@@ -2371,6 +2371,112 @@ def _require_confined_manifests(root_fd):
         _require_confined_manifest(root_fd, candidate[0][:-1], document)
 
 
+def _check_d145_runtime_batch_seven_tree(root_fd):
+    prefixes = cargo_lock_bootstrap.RUNTIME_BATCH_SEVEN_CRATE_ROOTS
+    required_files = {
+        prefix: {"Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md", "src/lib.rs"}
+        for prefix in prefixes
+    }
+    found_files = {prefix: set() for prefix in prefixes}
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptors = []
+    identities = [_directory_identity(os.fstat(root_fd))]
+    current = os.dup(root_fd)
+    descriptors.append(current)
+    try:
+        for component in ("runtime", "crates"):
+            before = os.stat(component, dir_fd=current, follow_symlinks=False)
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise SourceBuildRefusal("lock")
+            child = os.open(component, directory_flags, dir_fd=current)
+            opened = os.fstat(child)
+            if _directory_identity(opened) != _directory_identity(before):
+                os.close(child)
+                raise SourceBuildRefusal("lock")
+            descriptors.append(child)
+            current = child
+            identities.append(_directory_identity(opened))
+    except SourceBuildRefusal:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise
+    except OSError:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+        raise SourceBuildRefusal("lock") from None
+    for descriptor in reversed(descriptors[:-1]):
+        os.close(descriptor)
+    pending = [(('runtime', 'crates'), tuple(identities))]
+    total_entries = 0
+    doc_names = {"README.md", "CONTRACT.md", "CHANGELOG.md"}
+    while pending:
+        parts, ancestry = pending.pop()
+        opened_directories = _open_verified_directory(root_fd, parts, ancestry)
+        current_fd = opened_directories[-1]
+        try:
+            with os.scandir(current_fd) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+            for entry in entries:
+                total_entries += 1
+                if total_entries > MAX_TREE_ENTRIES:
+                    raise SourceBuildRefusal("lock")
+                child_parts = parts + (entry.name,)
+                relative = "/".join(child_parts)
+                prefix = next((item for item in prefixes
+                               if relative == item or relative.startswith(item + "/")), None)
+                try:
+                    metadata = os.stat(entry.name, dir_fd=current_fd, follow_symlinks=False)
+                except OSError:
+                    raise SourceBuildRefusal("lock") from None
+                if entry.name in doc_names:
+                    previous_service_path = (
+                        relative in {
+                            cargo_lock_bootstrap.RUNTIME_EXISTING_SERVICE_DOC_ROOT + "/" + name
+                            for name in cargo_lock_bootstrap.RUNTIME_EXISTING_SERVICE_DOC_FILES
+                        }
+                    )
+                    batch_document_path = (
+                        prefix is not None
+                        and relative[len(prefix) + 1:] in cargo_lock_bootstrap.RUNTIME_BATCH_SEVEN_DOC_FILES
+                    )
+                    if (not previous_service_path and not batch_document_path
+                            or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1):
+                        raise SourceBuildRefusal("lock")
+                if stat.S_ISLNK(metadata.st_mode):
+                    if prefix is not None:
+                        raise SourceBuildRefusal("lock")
+                    continue
+                if stat.S_ISDIR(metadata.st_mode):
+                    if prefix is not None and relative != prefix:
+                        within = relative[len(prefix) + 1:]
+                        if not (within == "src" or within.startswith("src/") or within == "tests"):
+                            raise SourceBuildRefusal("lock")
+                    child_fd = os.open(entry.name, directory_flags, dir_fd=current_fd)
+                    child_metadata = os.fstat(child_fd)
+                    if _directory_identity(child_metadata) != _directory_identity(metadata):
+                        os.close(child_fd)
+                        raise SourceBuildRefusal("lock")
+                    os.close(child_fd)
+                    pending.append((child_parts, ancestry + (_directory_identity(metadata),)))
+                    continue
+                if prefix is not None:
+                    within = relative[len(prefix) + 1:]
+                    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                            or not cargo_lock_bootstrap._runtime_batch_seven_file_allowed(within)):
+                        raise SourceBuildRefusal("lock")
+                    found_files[prefix].add(within)
+        except SourceBuildRefusal:
+            raise
+        except OSError:
+            raise SourceBuildRefusal("lock") from None
+        finally:
+            for descriptor in reversed(opened_directories):
+                os.close(descriptor)
+    for prefix, required in required_files.items():
+        if not required.issubset(found_files[prefix]):
+            raise SourceBuildRefusal("lock")
+
+
 def _check_d145_runtime_profile(root_fd):
     manifest_candidates = _rust_lock_paths(
         root_fd, "Cargo.toml", MAX_MANIFEST_FILES, False, True,
@@ -2405,6 +2511,11 @@ def _check_d145_runtime_profile(root_fd):
         runtime_names = cargo_lock_bootstrap.check_manifests(
             runtime_manifests, runtime_members, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         )
+        batch_seven_profile = frozenset(
+            cargo_lock_bootstrap.RUNTIME_BATCH_SEVEN_CRATE_ROOTS
+        ) <= runtime_members
+        if batch_seven_profile:
+            _check_d145_runtime_batch_seven_tree(root_fd)
         runtime_identities = set(cargo_lock_bootstrap.manifest_package_identities(
             runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         ))
@@ -2424,19 +2535,21 @@ def _check_d145_runtime_profile(root_fd):
         )
         api_identity = next((identity for identity in contract_identities
                              if identity[0] == cargo_lock_bootstrap.HOST_API_POLICY_API_PACKAGE), None)
-        if api_identity is None or cargo_lock_bootstrap.HOST_API_POLICY_API_PACKAGE not in runtime_names:
-            raise ValueError
-        runtime_identities.add(api_identity)
+        if batch_seven_profile:
+            if api_identity is None or cargo_lock_bootstrap.HOST_API_POLICY_API_PACKAGE not in runtime_names:
+                raise ValueError
+            runtime_identities.add(api_identity)
         runtime_rules = cargo_lock_bootstrap.manifest_dependency_rules(
             runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         )
-        api_rules = cargo_lock_bootstrap.manifest_dependency_rules(
-            {"Cargo.toml": contract_manifests["Cargo.toml"],
-             cargo_lock_bootstrap.HOST_API_POLICY_API_MANIFEST_PATH:
-                 contract_manifests[cargo_lock_bootstrap.HOST_API_POLICY_API_MANIFEST_PATH]},
-            cargo_lock_bootstrap.CONTRACT_WORKSPACE,
-        )
-        runtime_rules.update(api_rules)
+        if batch_seven_profile:
+            api_rules = cargo_lock_bootstrap.manifest_dependency_rules(
+                {"Cargo.toml": contract_manifests["Cargo.toml"],
+                 cargo_lock_bootstrap.HOST_API_POLICY_API_MANIFEST_PATH:
+                     contract_manifests[cargo_lock_bootstrap.HOST_API_POLICY_API_MANIFEST_PATH]},
+                cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+            )
+            runtime_rules.update(api_rules)
         runtime_lock_bytes = _read_bounded_cargo_lock(root_fd, locks_by_path[runtime_lock])
         cargo_lock_bootstrap.check_lock_members(
             runtime_lock_bytes, runtime_names, runtime_identities, runtime_rules,

@@ -343,6 +343,7 @@ class PublicTreeTests(unittest.TestCase):
         expected = {
             '.github/workflows/linux-source-admission.yml',
             'kit/bootstrap/action.yml',
+            'kit/bootstrap/public_tree.py',
             '.github/workflows/node-lock-return.yml',
             '.github/workflows/core-rust-format-return.yml',
             '.github/workflows/core-build-diagnostic-return.yml',
@@ -401,6 +402,8 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/test_linux_source_build_tiers.py',
             'kit/confinement/linux_boundary.py',
             'kit/confinement/test_linux_boundary.py',
+            'kit/confinement/linux_session.py',
+            'kit/confinement/test_linux_session.py',
             'kit/confinement/linux_channels.py',
             'kit/confinement/test_linux_channels.py',
             'kit/confinement/npm_admission.py',
@@ -537,6 +540,7 @@ class PublicTreeTests(unittest.TestCase):
                 shutil.copyfile(ROOT / name, destination)
             scan_tree(root, "platform")
             for name in (
+                "kit/bootstrap/public_tree.py",
                 "kit/confinement/native_loopback_profile.py",
                 "kit/confinement/test_native_loopback_profile.py",
                 "kit/confinement/linux_harness.py",

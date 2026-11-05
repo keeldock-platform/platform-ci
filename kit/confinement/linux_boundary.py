@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -505,7 +506,37 @@ class Boundary:
                 node, bind = fixtures.pinned_node_plan(pinned)
             except ValueError:
                 raise BoundaryRefusal("fixture_incomplete", None, fixtures.HOST_NODE_PINNED_INVALID)
-            if os.path.realpath(pinned + "/node") != pinned + "/node" or not os.access(pinned + "/node", os.X_OK):
+            node_path = pinned + "/node"
+            if os.path.realpath(node_path) != node_path or not os.access(node_path, os.X_OK):
+                raise BoundaryRefusal("fixture_incomplete", None, fixtures.HOST_NODE_PINNED_INVALID)
+            try:
+                runner_uid = self.arguments.runner_uid
+                if type(runner_uid) is not int or runner_uid < 0:
+                    raise ValueError("runner-uid")
+                trusted_owners = {0, runner_uid}
+                node_info = os.stat(node_path, follow_symlinks=False)
+                if not stat.S_ISREG(node_info.st_mode) or not node_info.st_mode & 0o111:
+                    raise ValueError("node-type")
+                trusted_root = os.path.dirname(fixtures.PINNED_NODE_PREFIX.rstrip("/"))
+                current = node_path
+                while True:
+                    info = node_info if current == node_path else os.stat(current, follow_symlinks=False)
+                    if info.st_uid not in trusted_owners or info.st_mode & 0o022:
+                        raise ValueError("node-owner-or-mode")
+                    if current == node_path:
+                        current = os.path.dirname(current)
+                        continue
+                    if not stat.S_ISDIR(info.st_mode):
+                        raise ValueError("node-parent-type")
+                    if current == trusted_root:
+                        break
+                    parent = os.path.dirname(current)
+                    if parent == current or not parent.startswith(trusted_root):
+                        raise ValueError("node-parent-path")
+                    current = parent
+                bind["st_dev"] = node_info.st_dev
+                bind["st_ino"] = node_info.st_ino
+            except (OSError, ValueError, AttributeError):
                 raise BoundaryRefusal("fixture_incomplete", None, fixtures.HOST_NODE_PINNED_INVALID)
             return node, bind
         found = shutil.which("node", path=BASE_ENV["PATH"])
