@@ -226,7 +226,7 @@ class PublicTreeTests(unittest.TestCase):
     def test_synthetic_project_fixture_is_registered_pinned_and_discovered(self):
         prefix = "kit/confinement/synthetic_project/"
         fixture = sorted(name for name in PLATFORM_FILES if name.startswith(prefix))
-        self.assertEqual(len(fixture), 33)
+        self.assertEqual(len(fixture), 34)
         for name in fixture + ["kit/confinement/test_confinement_synthetic_project.py"]:
             with self.subTest(name=name):
                 self.assertIn(name, PINNED_FILE_SHA256)
@@ -487,6 +487,7 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/synthetic_project/packages/host-api/tests/vitest.test.ts",
             "kit/confinement/synthetic_project/packages/host-api/tsconfig.json",
             "kit/confinement/synthetic_project/packages/host-api/vitest.config.ts",
+            "kit/confinement/synthetic_project/packages/host-api/vitest.nohmr.config.ts",
             "kit/confinement/synthetic_project/packages/kernel-i18n/package.json",
             "kit/confinement/synthetic_project/packages/kernel-i18n/src/index.js",
             "kit/confinement/synthetic_project/packages/kernel-i18n/tests/run.js",

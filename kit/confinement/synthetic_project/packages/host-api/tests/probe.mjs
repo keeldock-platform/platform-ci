@@ -9,28 +9,38 @@ let vitestBin = null;
 try {
   const vitestDir = path.dirname(require.resolve('vitest/package.json'));
   vitestBin = path.join(vitestDir, 'vitest.mjs');
-  console.log(`PROBE vitest-bin ${path.relative(packageDir, vitestBin)}`);
 } catch {
-  console.log('PROBE vitest-bin missing');
+  vitestBin = null;
 }
 
-const steps = [
-  ['node-ok', ['-e', "console.log('ok')"]],
-  ['rolldown-binding', ['-e', "import('rolldown').then(() => console.log('ok'))"]],
-  ['vite-import', ['-e', "import('vite').then(() => console.log('ok'))"]],
-  ['vitest-node-import', ['-e', "import('vitest/node').then(() => console.log('ok'))"]],
-  ['vite-server', ['-e', "import('vite').then(async ({ createServer }) => { const server = await createServer({ configFile: false, server: { middlewareMode: true, watch: null }, optimizeDeps: { noDiscovery: true } }); await server.close(); console.log('ok'); })"]],
-  ['worker-thread', ['-e', "const { Worker } = require('node:worker_threads'); const worker = new Worker(\"const { parentPort } = require('node:worker_threads'); parentPort.postMessage('ok')\", { eval: true }); worker.once('message', message => console.log(message));"]],
-];
+const viteServerCode = (config) => `
+const fail = error => {
+  console.error(String(error?.message ?? error).split(/\\r?\\n/, 1)[0]);
+  process.exit(3);
+};
+import('vite').then(async ({ createServer }) => {
+  try {
+    const server = await createServer(${JSON.stringify(config)});
+    console.error('created');
+    await server.close();
+  } catch (error) {
+    fail(error);
+  }
+}, fail);
+`;
 
-const vitestSteps = [
-  ['vitest-threads-runner', [vitestBin, 'run', '--configLoader', 'runner']],
-  ['vitest-vmthreads', [vitestBin, 'run', '--configLoader', 'runner', '--pool=vmThreads']],
-  ['vitest-no-parallel', [vitestBin, 'run', '--configLoader', 'runner', '--no-file-parallelism', '--maxWorkers=1']],
-  ['vitest-native-loader', [vitestBin, 'run', '--configLoader', 'native']],
-  ['vitest-forks-1', [vitestBin, 'run', '--configLoader', 'runner', '--pool=forks', '--maxWorkers=1']],
+const steps = [
+  ['dns-localhost', ['-e', "require('node:dns').lookup('localhost', (error, address) => { console.error(error ? 'err ' + error.code : 'ok ' + address); })"]],
+  ['tcp-listen', ['-e', "const server = require('node:net').createServer(); server.once('error', error => { console.error(error.code); process.exit(2); }); server.listen(0, '127.0.0.1', () => server.close());"]],
+  ['vite-resolve-config', ['-e', "import('vite').then(v => v.resolveConfig({ configFile: false }, 'serve'))"]],
+  ['vite-server-nohmr', ['-e', viteServerCode({ configFile: false, server: { middlewareMode: true, watch: null, hmr: false }, optimizeDeps: { noDiscovery: true } })]],
+  ['vite-server-nows', ['-e', viteServerCode({ configFile: false, server: { middlewareMode: true, watch: null, ws: false }, optimizeDeps: { noDiscovery: true } })]],
+  ['vite-server-nohmr-nows', ['-e', viteServerCode({ configFile: false, server: { middlewareMode: true, watch: null, hmr: false, ws: false }, optimizeDeps: { noDiscovery: true } })]],
+  ['vite-server-nohmr-nows-nopretransform', ['-e', viteServerCode({ configFile: false, server: { middlewareMode: true, watch: null, hmr: false, ws: false, preTransformRequests: false }, optimizeDeps: { noDiscovery: true }, appType: 'custom' })]],
+  ['vitest-default', vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner']],
+  ['vitest-nohmr-nows', vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner', '--config', 'vitest.nohmr.config.ts']],
+  ['vitest-nohmr-nows-vmthreads', vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner', '--config', 'vitest.nohmr.config.ts', '--pool=vmThreads']],
 ];
-steps.push(...vitestSteps.map(([name, args]) => [name, vitestBin === null ? null : args]));
 
 const summary = [];
 
