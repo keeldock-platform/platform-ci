@@ -208,6 +208,10 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertIn(ENVIRONMENT_LINE, source)
         self.assertIn("REQUESTED_ENVIRONMENT_NAME: ${{ inputs.environment_name }}", source)
         self.assertIn("LINUX_SOURCE_ENVIRONMENT_NAME: ${{ vars.LINUX_SOURCE_ENVIRONMENT_NAME }}", source)
+        self.assertIn("LINUX_SOURCE_ENVIRONMENT_ID: ${{ vars.LINUX_SOURCE_ENVIRONMENT_ID }}", source)
+        self.assertIn("LINUX_SOURCE_MAIN_BRANCH_POLICY_ID: ${{ vars.LINUX_SOURCE_MAIN_BRANCH_POLICY_ID }}", source)
+        self.assertIn("LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID: ${{ vars.LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID }}", source)
+        self.assertIn("LINUX_API_FEATURE_GATE_NAMES: api_feature_clippy,api_feature_tests", source)
         self.assertNotIn("pull_request:", self.text)
         self.assertNotIn("workflow_call:", self.text)
 
@@ -544,6 +548,9 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
             ("LINUX_SOURCE_ALLOWED_FINGERPRINT", "LINUX_QUICK_ALLOWED_FINGERPRINT"),
             ("LINUX_SOURCE_ALLOWED_CONTROL_SHA", "LINUX_QUICK_ALLOWED_CONTROL_SHA"),
             ("LINUX_SOURCE_ENVIRONMENT_NAME", "LINUX_QUICK_ENVIRONMENT_NAME"),
+            ("LINUX_SOURCE_ENVIRONMENT_ID", "LINUX_QUICK_ENVIRONMENT_ID"),
+            ("LINUX_SOURCE_MAIN_BRANCH_POLICY_ID", "LINUX_QUICK_MAIN_BRANCH_POLICY_ID"),
+            ("LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID", "LINUX_QUICK_UNTRUSTED_BRANCH_POLICY_ID"),
             ("LINUX_SOURCE_ACCEPTED_NODE_LOCK_SHA256", "LINUX_QUICK_ACCEPTED_NODE_LOCK_SHA256"),
             ("LINUX_SOURCE_ACCEPTED_MANIFEST_SHA256", "LINUX_QUICK_ACCEPTED_MANIFEST_SHA256"),
             ("LINUX_SOURCE_ACCEPTED_NODE_PROVENANCE_JSON", "LINUX_QUICK_ACCEPTED_NODE_PROVENANCE_JSON"),
@@ -560,6 +567,7 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
             self.assertIn("      KD_LINUX_TIER: quick\n", body)
             self.assertIn("      CI_MODE: source\n", body)
             self.assertIn("      REQUESTED_ENVIRONMENT_NAME: linux-source-read\n", body)
+            self.assertIn("      LINUX_API_FEATURE_GATE_NAMES: api_feature_clippy,api_feature_tests\n", body)
             self.assertIn("      SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}\n", body)
             self.assertIn("      SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}\n", body)
         self.assertEqual(set(re.findall(r"vars\.([A-Z0-9_]+)", self.text)), {
@@ -692,7 +700,8 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
         self.assertNotIn("continue-on-error", self.text)
         self.assertNotIn("--synthetic-standin", self.text)
         encrypt = producer.split("      - name: Encrypt bounded quick return\n", 1)[1].split("      - name:", 1)[0]
-        self.assertIn("sudo -n --preserve-env=", encrypt)
+        self.assertIn("        run: python3 -B core-ci/linux_quick_return.py encrypt", encrypt)
+        self.assertNotIn("sudo", encrypt)
         self.assertIn('linux_quick_return.py encrypt --reader-uid "$(id -u)" --reader-gid "$(id -g)"', encrypt)
         self.assertNotIn("secrets.", encrypt)
         self.assertNotIn("KD_CANARY_SECRET", encrypt)

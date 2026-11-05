@@ -33,7 +33,7 @@ def _load_control_sibling(module_name):
     if (
         _CONTROL_DIRECTORY is None
         or type(module_name) is not str
-        or module_name not in {"macos_capability", "macos_reviewed_build"}
+        or module_name not in {"macos_capability", "macos_reviewed_build", "cargo_lock_bootstrap"}
     ):
         raise ImportError("control module unavailable")
     candidate = _CONTROL_DIRECTORY / (module_name + ".py")
@@ -69,9 +69,11 @@ def _load_control_sibling(module_name):
 try:
     capability = _load_control_sibling("macos_capability")
     reviewed_build = _load_control_sibling("macos_reviewed_build")
+    cargo_lock_bootstrap = _load_control_sibling("cargo_lock_bootstrap")
 except BaseException:
     capability = None
     reviewed_build = None
+    cargo_lock_bootstrap = None
 
 
 SCHEMA_VERSION = 1
@@ -597,15 +599,34 @@ RUNTIME_PART_PATTERN = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z")
 RUNTIME_CRATES_DIRECTORY = (RUNTIME_WORKSPACE_DIRECTORY, "crates")
 RUNTIME_FIXTURE_DIRECTORY = RUNTIME_CRATES_DIRECTORY + ("test-fixtures",)
 RUNTIME_SERVICES_DIRECTORY = RUNTIME_CRATES_DIRECTORY + ("services",)
-RUNTIME_SERVICE_CRATE_ROOTS = (RUNTIME_SERVICES_DIRECTORY + ("sync-publication",),)
+RUNTIME_HOST_DIRECTORY = RUNTIME_CRATES_DIRECTORY + ("host",)
+RUNTIME_SERVICE_CRATE_ROOTS = (
+    RUNTIME_SERVICES_DIRECTORY + ("sync-publication",),
+    RUNTIME_SERVICES_DIRECTORY + ("palette",),
+    RUNTIME_SERVICES_DIRECTORY + ("notifications",),
+)
+RUNTIME_SERVICE_DOC_ROOTS = frozenset((RUNTIME_SERVICES_DIRECTORY + ("sync-publication",),))
+RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS = (RUNTIME_SERVICES_DIRECTORY + ("sync-format",),)
+RUNTIME_HOST_CRATE_ROOTS = tuple(
+    RUNTIME_HOST_DIRECTORY + (name,) for name in ("registry", "core", "settings-schema")
+)
+RUNTIME_HOST_API_POLICY_API_PACKAGE = "keeldock" + "-host-api"
+RUNTIME_HOST_API_POLICY_API_PATH = "../crates/host/api"
+RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS = (
+    RUNTIME_HOST_DIRECTORY + ("registry",), RUNTIME_HOST_DIRECTORY + ("core",),
+    RUNTIME_HOST_DIRECTORY + ("settings-schema",), RUNTIME_SERVICES_DIRECTORY + ("palette",),
+    RUNTIME_SERVICES_DIRECTORY + ("notifications",),
+)
+RUNTIME_HOST_API_POLICY_OPTIONAL_CONSUMER_ROOT = RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS[0]
+RUNTIME_HOST_API_POLICY_HOST_CONTRACT_DOC_ROOTS = frozenset(RUNTIME_HOST_CRATE_ROOTS)
 RUNTIME_SERVICE_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELOG.md"))
-RUNTIME_CRATE_ROOTS = RUNTIME_SERVICE_CRATE_ROOTS + tuple(
+RUNTIME_CRATE_ROOTS = RUNTIME_SERVICE_CRATE_ROOTS[:1] + tuple(
     RUNTIME_FIXTURE_DIRECTORY + (name,)
     for name in (
         "host-router", "fixture-data", "tool-a", "tool-b",
         "tool-bad-no-handler", "tool-bad-no-manifest",
     )
-)
+) + RUNTIME_HOST_CRATE_ROOTS + RUNTIME_SERVICE_CRATE_ROOTS[1:]
 RUNTIME_CONFIG_FILES = ("rust-toolchain.toml", "rustfmt.toml", "clippy.toml")
 MAX_RUNTIME_MEMBERS = 32
 RUNTIME_MEMBERS_PATTERN = re.compile(r"(?m)^members\s*=\s*\[([^\]]*)\]\s*$")
@@ -621,6 +642,11 @@ RUNTIME_LINT_VALUE_PATTERN = re.compile(
     r'|\{\s*level\s*=\s*"(?:allow|warn|deny|forbid)"\s*,\s*priority\s*=\s*-?[0-9]{1,3}\s*\}\Z'
 )
 RUNTIME_ROOT_PATH_PATTERN = re.compile(r'\{\s*path\s*=\s*"([A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*\}\Z')
+RUNTIME_HOST_API_POLICY_API_EDGE_PATTERN = re.compile(r'\{\s*path\s*=\s*"\.\./crates/host/api"\s*\}\Z')
+RUNTIME_HOST_API_POLICY_API_ASSIGNMENT_PATTERN = re.compile(
+    r'(?m)^\s*' + re.escape(RUNTIME_HOST_API_POLICY_API_PACKAGE)
+    + r'\s*=\s*\{\s*path\s*=\s*"\.\./crates/host/api"\s*\}\s*$'
+)
 RUNTIME_ROOT_SECTIONS = frozenset((
     "[workspace]", "[workspace.package]", "[workspace.dependencies]",
     "[workspace.lints.rust]", "[workspace.lints.clippy]",
@@ -697,6 +723,7 @@ class RevocationState:
 class SourceLease:
     source_path: Path
     record: object
+    workspace_selector: str = "contract"
 
     def __repr__(self):
         return "SourceLease"
@@ -1628,7 +1655,7 @@ def _signer_inventory(payload, *, current_time=None):
     keys = {}
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith(chr(35)):
+        if not line or line.startswith("\x23"):
             continue
         try:
             fields = shlex.split(line, comments=False, posix=True)
@@ -1995,7 +2022,7 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
         current = None
         for line in text.splitlines():
             stripped = line.strip()
-            if not stripped or stripped.startswith(chr(35)):
+            if not stripped or stripped.startswith("\x23"):
                 continue
             if stripped.startswith("[["):
                 return None
@@ -2065,7 +2092,7 @@ def _feedback_fuzz_manifest_shape(fuzz_payload, api_payload, lock_payload):
     prefix_and_packages = re.split(r"(?m)^\[\[package\]\]\s*$", lock_text)
     if len(prefix_and_packages) != 3 or re.search(r"(?m)^\s*(?:source|checksum)\s*=", lock_text):
         return False
-    comment_line = r"(?m)^" + re.escape(chr(35)) + r".*$"
+    comment_line = r"(?m)^" + re.escape("\x23") + r".*$"
     if (re.findall(r"(?m)^version\s*=\s*(4)\s*$", prefix_and_packages[0]) != ["4"]
             or re.sub(comment_line, "", prefix_and_packages[0]).strip() != "version = 4"):
         return False
@@ -2106,7 +2133,7 @@ def _feedback_fuzz_modules_shape(main_payload, target_names):
         text = main_payload.decode("utf-8", "strict")
     except UnicodeDecodeError:
         return False
-    raw_string = re.compile(r"\b(?:b|c)?r" + re.escape(chr(35)) + r'*"')
+    raw_string = re.compile(r"\b(?:b|c)?r" + re.escape("\x23") + r'*"')
     char_quote = "'"
     if ("\r" in text or "/*" in text or "include" in text or "macro_rules" in text
             or raw_string.search(text)
@@ -2141,11 +2168,11 @@ def _feedback_fuzz_modules_shape(main_payload, target_names):
     while index < len(lines):
         line = lines[index]
         code = re.sub(r'"(?:\\.|[^"\\])*"', '""', line).split("//", 1)[0]
-        if chr(35) in code:
+        if "\x23" in code:
             if index + 1 >= len(lines):
                 return False
             match = re.fullmatch(
-                re.escape(chr(35)) + r'\[path = "\.\./fuzz_targets/([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\.rs"\]',
+                re.escape("\x23") + r'\[path = "\.\./fuzz_targets/([a-z][a-z0-9]*(?:_[a-z0-9]+)*)\.rs"\]',
                 line,
             )
             if match is None:
@@ -2268,7 +2295,7 @@ def _core_contract_crate_manifest_shape(text, *, crate_root=None, require_first_
     keys = {}
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith(chr(35)):
+        if not stripped or stripped.startswith("\x23"):
             continue
         header = CORE_CONTRACT_MANIFEST_SECTION_PATTERN.fullmatch(stripped)
         if header is not None:
@@ -2342,7 +2369,7 @@ def _core_contract_workspace_paths_shape(workspace_text):
     open_array = False
     for line in workspace_text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith(chr(35)):
+        if not stripped or stripped.startswith("\x23"):
             continue
         if open_array:
             if stripped == "]":
@@ -2481,6 +2508,21 @@ def _runtime_member_listing(crate_roots):
     ]
 
 
+def _runtime_roots_from_manifest(text):
+    if type(RUNTIME_CRATE_ROOTS) is not tuple:
+        return None
+    members = _runtime_workspace_members(text)
+    if members is None or not members:
+        return None
+    required = _runtime_member_listing(RUNTIME_CRATE_ROOTS)
+    optional = _runtime_member_listing(RUNTIME_CRATE_ROOTS + RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS)
+    if members == required:
+        return RUNTIME_CRATE_ROOTS
+    if members == optional:
+        return RUNTIME_CRATE_ROOTS + RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS
+    return None
+
+
 def _runtime_root_admitted(root):
     return (
         type(root) is tuple and len(root) == len(RUNTIME_CRATES_DIRECTORY) + 2
@@ -2515,8 +2557,10 @@ def _runtime_workspace_mode(path, crate_roots):
                 return "100644"
             if (
                 relative in RUNTIME_SERVICE_DOC_FILES
-                and root[:len(RUNTIME_SERVICES_DIRECTORY)] == RUNTIME_SERVICES_DIRECTORY
+                and root in RUNTIME_SERVICE_DOC_ROOTS
             ):
+                return "100644"
+            if relative == "CONTRACT.md" and root in RUNTIME_HOST_API_POLICY_HOST_CONTRACT_DOC_ROOTS:
                 return "100644"
             if (
                 relative.startswith(("src/", "tests/"))
@@ -2546,8 +2590,12 @@ def _runtime_workspace_members(workspace_text):
 
 
 def _runtime_root_manifest_shape(text, crate_roots):
-    if type(text) is not str or "\r" in text or "\x00" in text or ".." in text:
+    if type(text) is not str or "\r" in text or "\x00" in text:
         return False
+    if ".." in text:
+        without_api_edge = RUNTIME_HOST_API_POLICY_API_ASSIGNMENT_PATTERN.sub("", text, count=1)
+        if ".." in without_api_edge or len(RUNTIME_HOST_API_POLICY_API_ASSIGNMENT_PATTERN.findall(text)) != 1:
+            return False
     expected = _runtime_member_listing(crate_roots)
     if _runtime_workspace_members(text) != expected:
         return False
@@ -2556,7 +2604,7 @@ def _runtime_root_manifest_shape(text, crate_roots):
     in_members = False
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith(chr(35)):
+        if not stripped or stripped.startswith("\x23"):
             continue
         if in_members:
             if "]" in stripped:
@@ -2588,10 +2636,13 @@ def _runtime_root_manifest_shape(text, crate_roots):
             valid = pattern is not None and pattern.fullmatch(value) is not None
         elif section == "[workspace.dependencies]":
             match = RUNTIME_ROOT_PATH_PATTERN.fullmatch(value)
-            valid = (
-                RUNTIME_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
-                and match is not None and match.group(1) in expected
-            )
+            if key == RUNTIME_HOST_API_POLICY_API_PACKAGE:
+                valid = RUNTIME_HOST_API_POLICY_API_EDGE_PATTERN.fullmatch(value) is not None
+            else:
+                valid = (
+                    RUNTIME_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
+                    and match is not None and match.group(1) in expected
+                )
         else:
             valid = (
                 RUNTIME_LINT_KEY_PATTERN.fullmatch(key) is not None
@@ -2599,7 +2650,11 @@ def _runtime_root_manifest_shape(text, crate_roots):
             )
         if not valid:
             return False
-    return seen.get("[workspace]") == {"resolver", "members"}
+    dependencies = seen.get("[workspace.dependencies]", set())
+    return (
+        seen.get("[workspace]") == {"resolver", "members"}
+        and RUNTIME_HOST_API_POLICY_API_PACKAGE in dependencies
+    )
 
 
 def _runtime_declared_dependencies(text):
@@ -2610,12 +2665,12 @@ def _runtime_declared_dependencies(text):
         if stripped.startswith("["):
             in_section = stripped == "[workspace.dependencies]"
             continue
-        if in_section and stripped and not stripped.startswith(chr(35)):
+        if in_section and stripped and not stripped.startswith("\x23"):
             names.add(stripped.split("=", 1)[0].strip())
     return names
 
 
-def _runtime_crate_manifest_name(text, declared):
+def _runtime_crate_manifest_name(text, declared, crate_root):
     if type(text) is not str or "\r" in text or "\x00" in text or ".." in text:
         return None
     section = None
@@ -2623,7 +2678,7 @@ def _runtime_crate_manifest_name(text, declared):
     name = None
     for line in text.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith(chr(35)):
+        if not stripped or stripped.startswith("\x23"):
             continue
         header = RUNTIME_SECTION_PATTERN.fullmatch(stripped)
         if header is not None:
@@ -2650,9 +2705,19 @@ def _runtime_crate_manifest_name(text, declared):
                 valid = value == "true"
             else:
                 valid = False
-        elif section in ("dependencies", "dev-dependencies"):
+        elif section == "dependencies":
             valid = (
                 key in declared
+                and RUNTIME_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
+            )
+            if key == RUNTIME_HOST_API_POLICY_API_PACKAGE:
+                valid = (
+                    crate_root in RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS
+                    or crate_root == RUNTIME_HOST_API_POLICY_OPTIONAL_CONSUMER_ROOT
+                ) and RUNTIME_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
+        elif section == "dev-dependencies":
+            valid = (
+                key in declared and key != RUNTIME_HOST_API_POLICY_API_PACKAGE
                 and RUNTIME_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
             )
         else:
@@ -2664,6 +2729,16 @@ def _runtime_crate_manifest_name(text, declared):
         name is None or package is None
         or not (RUNTIME_MANIFEST_INHERITED_KEYS | {"name"}).issubset(package)
     ):
+        return None
+    dependency_names = keys.get("dependencies", set())
+    if crate_root in RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS:
+        if RUNTIME_HOST_API_POLICY_API_PACKAGE not in dependency_names:
+            return None
+    elif crate_root == RUNTIME_HOST_API_POLICY_OPTIONAL_CONSUMER_ROOT:
+        pass
+    elif RUNTIME_HOST_API_POLICY_API_PACKAGE in dependency_names:
+        return None
+    if RUNTIME_HOST_API_POLICY_API_PACKAGE in keys.get("dev-dependencies", set()):
         return None
     return name
 
@@ -2684,7 +2759,7 @@ def _runtime_lock_package_names(text):
                 return None
             packages[-1]["dependencies"].append(match.group(1))
             continue
-        if not line or line.startswith(chr(35)):
+        if not line or line.startswith("\x23"):
             continue
         if line == "[[package]]":
             packages.append({"name": None, "version": None, "dependencies": [], "listed": False})
@@ -2717,8 +2792,113 @@ def _runtime_lock_package_names(text):
     return set(names)
 
 
+def _cargo_lock_is_v4(payload):
+    if type(payload) is not bytes:
+        return False
+    try:
+        lines = payload.decode("ascii", "strict").splitlines()
+    except UnicodeDecodeError:
+        return False
+    first = next((line for line in lines if line and not line.startswith("\x23")), None)
+    return first == "version = 4"
+
+
+def _check_runtime_profile_runtime_contract_edge(repository, git_executable, repo_env, entries):
+    if cargo_lock_bootstrap is None:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+    api_root = "/".join(CORE_CONTRACT_CRATE_ROOTS[0])
+    api_manifest_path = api_root + "/Cargo.toml"
+    api_source_paths = [
+        path for path in entries if path.startswith(api_root + "/src/")
+    ]
+    if ("Cargo.toml" not in entries or "Cargo.lock" not in entries
+            or entries.get("Cargo.lock", (None,))[0] != "100644"
+            or entries.get(api_manifest_path, (None,))[0] != "100644"
+            or api_root + "/src/lib.rs" not in api_source_paths
+            or not api_source_paths):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+    if any(
+        entries[path][0] != "100644" or not path.endswith(".rs")
+        or path.rsplit("/", 1)[-1] == "build.rs"
+        for path in api_source_paths
+    ):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
+    api_payload = _contract_blob(
+        repository, git_executable, repo_env, entries, api_manifest_path,
+        core_check="package_decode",
+    )
+    try:
+        api_text = api_payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
+    if not _core_contract_crate_manifest_shape(
+        api_text, crate_root=CORE_CONTRACT_CRATE_ROOTS[0], require_first_batch=False,
+    ):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+    contract_root = _contract_blob(
+        repository, git_executable, repo_env, entries, "Cargo.toml",
+        core_check="workspace_decode",
+    )
+    contract_members = {"/".join(root) for root in CORE_CONTRACT_CRATE_ROOTS}
+    identity_manifests = {"Cargo.toml": contract_root}
+    for crate_root in CORE_CONTRACT_CRATE_ROOTS:
+        path = "/".join(crate_root) + "/Cargo.toml"
+        identity_manifests[path] = _contract_blob(
+            repository, git_executable, repo_env, entries, path,
+            core_check="package_decode",
+        )
+    try:
+        contract_names = cargo_lock_bootstrap.check_manifests(
+            identity_manifests, contract_members, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+            require_first_batch=False,
+        )
+        contract_identities = cargo_lock_bootstrap.manifest_package_identities(
+            identity_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+        )
+        contract_dependency_rules = cargo_lock_bootstrap.manifest_dependency_rules(
+            identity_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+        )
+    except (cargo_lock_bootstrap.BootstrapRefusal, ValueError):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
+    lock_payload = _contract_blob(
+        repository, git_executable, repo_env, entries, "Cargo.lock",
+        core_check="cargo_lock_decode",
+    )
+    try:
+        lock_text = lock_payload.decode("ascii", "strict")
+    except UnicodeDecodeError:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_decode") from None
+    if not _cargo_lock_is_v4(lock_payload):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
+    api_identity = next((identity for identity in contract_identities
+                         if identity[0] == RUNTIME_HOST_API_POLICY_API_PACKAGE), None)
+    if api_identity is None:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+    try:
+        cargo_lock_bootstrap.check_lock_members(
+            lock_payload, contract_names, contract_identities, contract_dependency_rules,
+        )
+    except cargo_lock_bootstrap.BootstrapRefusal:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape") from None
+    api_dependency_rules = {
+        RUNTIME_HOST_API_POLICY_API_PACKAGE:
+            contract_dependency_rules.get(RUNTIME_HOST_API_POLICY_API_PACKAGE, {}),
+    }
+    return api_identity, api_dependency_rules
+
+
 def _check_runtime_workspace(repository, git_executable, repo_env, entries):
-    crate_roots = RUNTIME_CRATE_ROOTS
+    root_payload = _contract_blob(
+        repository, git_executable, repo_env, entries, RUNTIME_ROOT_MANIFEST_PATH,
+        core_check="workspace_decode",
+    )
+    try:
+        root_text = root_payload.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_decode") from None
+    crate_roots = _runtime_roots_from_manifest(root_text)
+    if crate_roots is None:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
     if (
         type(crate_roots) is not tuple or len(crate_roots) > MAX_RUNTIME_MEMBERS
         or len(set(crate_roots)) != len(crate_roots)
@@ -2731,6 +2911,8 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries):
         required.add(prefix + "/Cargo.toml")
         if prefix + "/src/lib.rs" not in entries and prefix + "/src/main.rs" not in entries:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+    for root in RUNTIME_HOST_CRATE_ROOTS:
+        required.add("/".join(root) + "/CONTRACT.md")
     if not required.issubset(entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     for path, (mode, unused_object_id) in entries.items():
@@ -2752,18 +2934,14 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries):
             repository, git_executable, repo_env, entries, name, core_check="package_decode",
         ):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
-    root_payload = _contract_blob(
-        repository, git_executable, repo_env, entries, RUNTIME_ROOT_MANIFEST_PATH,
-        core_check="workspace_decode",
-    )
-    try:
-        root_text = root_payload.decode("utf-8", "strict")
-    except UnicodeDecodeError:
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_decode") from None
     if not _runtime_root_manifest_shape(root_text, crate_roots):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
+    api_identity, contract_dependency_rules = _check_runtime_profile_runtime_contract_edge(
+        repository, git_executable, repo_env, entries,
+    )
     declared = _runtime_declared_dependencies(root_text)
     names = []
+    runtime_manifests = {RUNTIME_ROOT_MANIFEST_PATH: root_payload}
     for root in crate_roots:
         payload = _contract_blob(
             repository, git_executable, repo_env, entries, "/".join(root) + "/Cargo.toml",
@@ -2773,24 +2951,44 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries):
             manifest_text = payload.decode("utf-8", "strict")
         except UnicodeDecodeError:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
-        name = _runtime_crate_manifest_name(manifest_text, declared)
+        name = _runtime_crate_manifest_name(manifest_text, declared, root)
         if name is None:
             raise Refusal(
                 "bootstrap_snapshot_invalid", "bootstrap",
                 core_check="package_build" if "build" in manifest_text else "package_decode",
             )
         names.append(name)
-    if len(set(names)) != len(names):
+        runtime_manifests["/".join(root) + "/Cargo.toml"] = payload
+    if len(set(names)) != len(names) or cargo_lock_bootstrap is None:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode")
+    try:
+        package_names = cargo_lock_bootstrap.check_manifests(
+            runtime_manifests, {"/".join(root) for root in crate_roots},
+            cargo_lock_bootstrap.RUNTIME_WORKSPACE,
+        )
+        if package_names != frozenset(names + [RUNTIME_HOST_API_POLICY_API_PACKAGE]):
+            raise ValueError
+        package_identities = set(cargo_lock_bootstrap.manifest_package_identities(
+            runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
+        ))
+        package_identities.add(api_identity)
+        dependency_rules = cargo_lock_bootstrap.manifest_dependency_rules(
+            runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
+        )
+        dependency_rules.update(contract_dependency_rules)
+    except (cargo_lock_bootstrap.BootstrapRefusal, ValueError):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
     lock_payload = _contract_blob(
         repository, git_executable, repo_env, entries, RUNTIME_ROOT_LOCK_PATH,
         core_check="cargo_lock_decode",
     )
+    if not _cargo_lock_is_v4(lock_payload):
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
     try:
-        lock_text = lock_payload.decode("ascii", "strict")
-    except UnicodeDecodeError:
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_decode") from None
-    if _runtime_lock_package_names(lock_text) != set(names):
+        cargo_lock_bootstrap.check_lock_members(
+            lock_payload, package_names, package_identities, dependency_rules,
+        )
+    except cargo_lock_bootstrap.BootstrapRefusal:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
 
 
@@ -2902,8 +3100,12 @@ def _core_contract_rust_policy_matches(entries):
 
 def _safe_core_contract_tree(
     repository, git_executable, repo_env, base_commit, commit, *, concern="core-contract",
+    workspace_selector="contract",
 ):
     if type(concern) is not str or concern not in CORE_CONTRACT_CONCERNS:
+        raise Refusal("bootstrap_not_approved", "configuration")
+    if (type(workspace_selector) is not str or workspace_selector not in ("contract", "runtime")
+            or workspace_selector == "runtime" and concern != "core-rust-lock-return"):
         raise Refusal("bootstrap_not_approved", "configuration")
     base_entries = _contract_tree_entries(repository, git_executable, repo_env, base_commit)
     entries = _contract_tree_entries(repository, git_executable, repo_env, commit)
@@ -3116,7 +3318,8 @@ def _safe_core_contract_tree(
         if not _core_contract_crate_manifest_shape(
             manifest_text,
             crate_root=crate_root,
-            require_first_batch=concern == "core-rust-lock-return",
+            require_first_batch=(concern == "core-rust-lock-return"
+                                 and workspace_selector == "contract"),
         ):
             raise Refusal(
                 "bootstrap_snapshot_invalid", "bootstrap",
@@ -3124,6 +3327,8 @@ def _safe_core_contract_tree(
             )
     if runtime_present:
         _check_runtime_workspace(repository, git_executable, repo_env, entries)
+    elif workspace_selector == "runtime":
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     tree_kind = CORE_CONTRACT_TREE_BY_CONCERN[concern]
     if concern == "core-build-diagnostic-return" and package_lock_present:
         tree_kind = CORE_CONTRACT_PACKAGE_LOCK_TREE
@@ -3172,7 +3377,8 @@ def _safe_npm_fixture_tree(repository, git_executable, repo_env, base_commit, co
     return NPM_FIXTURE_TREE
 
 
-def _snapshot_tree(repository, git_executable, repo_env, request, environ, repository_id):
+def _snapshot_tree(repository, git_executable, repo_env, request, environ, repository_id,
+                   *, workspace_selector="contract"):
     if _npm_fixture_selected(request["concern"], environ, repository_id):
         tree_kind = _safe_npm_fixture_tree(
             repository, git_executable, repo_env, request["base_sha"], request["source_sha"],
@@ -3180,7 +3386,7 @@ def _snapshot_tree(repository, git_executable, repo_env, request, environ, repos
         return tree_kind, "not-applicable"
     tree_kind = _safe_core_contract_tree(
         repository, git_executable, repo_env, request["base_sha"], request["source_sha"],
-        concern=request["concern"],
+        concern=request["concern"], workspace_selector=workspace_selector,
     )
     return tree_kind, "present"
 
@@ -3863,6 +4069,7 @@ def validated_source(
     worker_uid=None,
     storage_root=None,
     revocation_state=None,
+    workspace_selector="contract",
 ):
     _check_request(request)
     _check_rules_bootstrap_gate(request, environ)
@@ -3901,6 +4108,7 @@ def validated_source(
             retain=True,
             temp_parent=storage_root if worker_required else None,
             revocation_state=revocation_state,
+            workspace_selector=workspace_selector,
         )
         worker_access = "not_applicable"
         if worker_required:
@@ -3932,7 +4140,9 @@ def validated_source(
         record["worker_access"] = worker_access
         record["source_execution"] = "not_run_at_yield"
         record["cleanup"] = "lease_open"
-        lease = SourceLease(source_path, MappingProxyType(dict(record)))
+        lease = SourceLease(
+            source_path, MappingProxyType(dict(record)), workspace_selector=workspace_selector,
+        )
     except BaseException:
         _revoke_on_early_refusal(environ, revocation_state, request, binding)
         cleanup_safe = True
@@ -3985,6 +4195,7 @@ def _source_snapshot(
     retain=False,
     temp_parent=None,
     revocation_state=None,
+    workspace_selector="contract",
 ):
     _check_request(request)
     _check_core_contract_gate(request, environ)
@@ -4182,6 +4393,7 @@ def _source_snapshot(
         elif request["concern"] in CORE_CONTRACT_CONCERNS:
             tree_kind, rules_lock = _snapshot_tree(
                 repository, git_executable, env, request, environ, repository_id,
+                workspace_selector=workspace_selector,
             )
         else:
             raise Refusal("bootstrap_not_approved", "configuration")

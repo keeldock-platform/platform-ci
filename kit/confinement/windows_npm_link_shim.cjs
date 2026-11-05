@@ -89,12 +89,16 @@ for (const item of [realLstat, realLstatSync, realReadlink, realReadlinkSync, re
 const realRm = fs.rm;
 const realRmSync = fs.rmSync;
 const realPromiseRm = promises.rm;
+const realRename = fs.rename;
+const realRenameSync = fs.renameSync;
+const realPromiseRename = promises.rename;
 const realSymlink = fs.symlink;
 const realSymlinkSync = fs.symlinkSync;
 const realPromiseSymlink = promises.symlink;
 const realReaddirSync = fs.readdirSync;
 const realWriteSync = fs.writeSync;
-for (const item of [realRm, realRmSync, realPromiseRm, realSymlink, realSymlinkSync, realPromiseSymlink, realReaddirSync, realWriteSync]) {
+for (const item of [realRm, realRmSync, realPromiseRm, realRename, realRenameSync, realPromiseRename,
+  realSymlink, realSymlinkSync, realPromiseSymlink, realReaddirSync, realWriteSync]) {
   if (typeof item !== 'function') refuse('fs_shape');
 }
 const SCOPE_DIRECTORY = /\\node_modules\\@[^\\]+$/;
@@ -185,6 +189,21 @@ const matchesMappedTarget = (target, linkPath) => {
   return matches;
 };
 
+const skipsMappedRename = (oldPath, newPath) => {
+  if (typeof oldPath !== 'string' || typeof newPath !== 'string'
+      || oldPath.length < 4 || oldPath.length > MAX_PATH_LENGTH
+      || newPath.length < 4 || newPath.length > MAX_PATH_LENGTH
+      || !windowsPath(oldPath) || !windowsPath(newPath)) return false;
+  const oldFull = path.win32.resolve(oldPath);
+  const newFull = path.win32.resolve(newPath);
+  const oldKey = oldFull.toLowerCase();
+  const newKey = newFull.toLowerCase();
+  if (!links.has(newKey) || links.has(oldKey) || oldKey === newKey) return false;
+  if (path.win32.dirname(oldKey) !== path.win32.dirname(newKey)) return false;
+  countHit();
+  return true;
+};
+
 fs.lstat = function lstat(candidate, options, callback) {
   const target = lookup(candidate);
   const done = typeof options === 'function' ? options : callback;
@@ -241,6 +260,23 @@ fs.rmSync = function rmSync(candidate, options) {
 
 promises.rm = async function rm(candidate, options) {
   if (!skipsRemoval(candidate)) return Reflect.apply(realPromiseRm, this, arguments);
+  return undefined;
+};
+
+fs.rename = function rename(oldPath, newPath, callback) {
+  if (typeof callback !== 'function' || !skipsMappedRename(oldPath, newPath)) {
+    return Reflect.apply(realRename, this, arguments);
+  }
+  process.nextTick(callback, null);
+};
+
+fs.renameSync = function renameSync(oldPath, newPath) {
+  if (!skipsMappedRename(oldPath, newPath)) return Reflect.apply(realRenameSync, this, arguments);
+  return undefined;
+};
+
+promises.rename = async function rename(oldPath, newPath) {
+  if (!skipsMappedRename(oldPath, newPath)) return Reflect.apply(realPromiseRename, this, arguments);
   return undefined;
 };
 

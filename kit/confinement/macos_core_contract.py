@@ -1514,7 +1514,7 @@ def _toolchain_refusal(error, stage):
 
 
 def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha256, deadline, lifecycle,
-                feedback=None):
+                feedback=None, workspace_selector="contract"):
     reviewed, capability, runtime, rust, rules = controls
     host_toolchain = None
     worker_tools = None
@@ -1621,6 +1621,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
         lease_context = runtime.validated_source(
             request, binding, root, environ, worker_uid=worker_uid,
             storage_root=lease_storage, revocation_state=revocation_state,
+            workspace_selector=workspace_selector,
         )
         command_failure = None
         observer_failure = None
@@ -1772,6 +1773,12 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                             "reviewed_rust_paths": None, "source_result": "command_completed",
                         }
                     elif feedback["profile"]["kind"] == "cargo_lock":
+                        admitted_selector = getattr(lease, "workspace_selector", None)
+                        requested_selector = producer.feedback_request.request_workspace(
+                            feedback["dispatch"]["request"],
+                        )
+                        if admitted_selector != requested_selector:
+                            raise Refusal("source_binding_mismatch", "source_lease")
                         feedback_result = _run_inside_source(
                             source,
                             original_cwd,
@@ -1779,6 +1786,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                                 feedback["dispatch"], source, worker_storage, worker_uid, environment,
                                 toolchain_paths.command_paths(), host_toolchain, capability, rust,
                                 deadline, _load_control_sibling("cargo_lock_bootstrap"), environ,
+                                admitted_workspace_selector=admitted_selector,
                             ),
                         )
                     elif feedback["profile"]["kind"] == "npm_admission":
@@ -2025,6 +2033,7 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
         request = _parse_arguments(arguments)
         feedback = None
         feedback_producer = None
+        workspace_selector = "contract"
         if feedback_kind is not None:
             feedback_producer = _load_control_sibling("macos_feedback_producer")
             try:
@@ -2034,6 +2043,10 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
                        for name in ("source_sha", "base_sha", "base_branch")):
                     raise ValueError
                 request["concern"] = dispatch["profile"]["concern"]
+                if dispatch["profile"]["kind"] == "cargo_lock":
+                    workspace_selector = feedback_producer.feedback_request.request_workspace(
+                        dispatch["request"],
+                    )
                 feedback = {"profile": dispatch["profile"], "dispatch": dispatch}
             except feedback_producer.FeedbackRefusal:
                 raise Refusal("invalid_input", "arguments") from None
@@ -2095,7 +2108,7 @@ def _execute(arguments, environ, token_reference, lifecycle, feedback_kind=None)
             lease_record, versions, gates, network_captured, summary_guard_passed = _run_source(
                 request, binding, root, runner_temp, environ,
                 (reviewed, capability, runtime, rust, rules), diff_sha256, deadline, lifecycle,
-                feedback=feedback,
+                feedback=feedback, workspace_selector=workspace_selector,
             )
         finally:
             lifecycle.pop("token_reference", None)

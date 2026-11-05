@@ -64,6 +64,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         )
         self.assertEqual(linux_source_build.GATES, expected)
         self.assertEqual(len(linux_source_build.GATES), 15)
+        self.assertEqual(linux_source_build.API_FEATURE_GATE_NAMES, macos_core_contract.API_FEATURE_GATE_NAMES)
 
     def test_source_job_steps_match_the_policy_audit_contract(self):
         self.assertEqual(
@@ -470,6 +471,10 @@ class LinuxSourceBuildTests(unittest.TestCase):
             with self.subTest(gate=name):
                 self.assertIn("--offline", argv)
         by_name = dict(commands)
+        for name in linux_source_build.API_FEATURE_GATE_NAMES:
+            with self.subTest(feature_gate=name):
+                index = by_name[name].index("--features")
+                self.assertEqual(by_name[name][index + 1], gate_table.API_FEATURE_NAME)
         for name in ("node_dependency_prepare", "typescript_typecheck", "typescript_tests"):
             with self.subTest(gate=name):
                 self.assertIn("--ignore-scripts", by_name[name])
@@ -591,11 +596,12 @@ class LinuxSourceBuildTests(unittest.TestCase):
     def _environment_calls(self, environment_updates=None, branch_names=("main", "untrusted"),
                            listing_updates=None, status=200):
         environment = {
-            "name": "linux-source-read", "can_admins_bypass": False,
+            "id": 100, "name": "linux-source-read", "can_admins_bypass": False,
             "deployment_branch_policy": {"custom_branch_policies": True, "protected_branches": False},
         }
         environment.update(environment_updates or {})
-        entries = [{"id": index + 1, "name": name, "type": "branch"} for index, name in enumerate(branch_names)]
+        policy_ids = {"main": 201, "untrusted": 202}
+        entries = [{"id": policy_ids.get(name, 203), "name": name, "type": "branch"} for name in branch_names]
         listing = {"total_count": len(entries), "branch_policies": entries}
         listing.update(listing_updates or {})
         calls = []
@@ -608,10 +614,17 @@ class LinuxSourceBuildTests(unittest.TestCase):
 
         return fake, calls
 
+    def _environment_ids(self):
+        return {
+            linux_source_build.ENVIRONMENT_ID_NAME: "100",
+            linux_source_build.ENVIRONMENT_BRANCH_POLICY_ID_NAMES["main"]: "201",
+            linux_source_build.ENVIRONMENT_BRANCH_POLICY_ID_NAMES["untrusted"]: "202",
+        }
+
     def test_environment_readback_accepts_only_the_reviewed_names_and_branch_policy(self):
         fake, calls = self._environment_calls()
         with patch.object(linux_source_build, "_api_request", side_effect=fake):
-            self.assertIsNone(linux_source_build._verify_environment("token"))
+            self.assertIsNone(linux_source_build._verify_environment("token", environ=self._environment_ids()))
         base = "/repos/" + linux_source_build.REPOSITORY + "/environments/linux-source-read"
         self.assertEqual(calls, [
             (base, "GET", "token"),
@@ -621,12 +634,13 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertEqual(linux_source_build.ENVIRONMENT_BRANCHES, ("main", "untrusted"))
         fake, calls = self._environment_calls(branch_names=("untrusted", "main"))
         with patch.object(linux_source_build, "_api_request", side_effect=fake):
-            self.assertIsNone(linux_source_build._verify_environment("token"))
+            self.assertIsNone(linux_source_build._verify_environment("token", environ=self._environment_ids()))
 
     def test_environment_readback_refuses_every_other_policy_shape(self):
         refused_policy = {"custom_branch_policies": True, "protected_branches": False}
         cases = (
             {"status": 404},
+            {"environment_updates": {"id": 101}},
             {"environment_updates": {"name": "source-read"}},
             {"environment_updates": {"can_admins_bypass": True}},
             {"environment_updates": {"can_admins_bypass": None}},
@@ -646,6 +660,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             {"listing_updates": {"total_count": "2"}},
             {"listing_updates": {"branch_policies": "main"}},
             {"listing_updates": {"branch_policies": [{"name": "main", "type": "tag"}, {"name": "untrusted", "type": "branch"}]}},
+            {"listing_updates": {"branch_policies": [{"id": 999, "name": "main", "type": "branch"}, {"id": 202, "name": "untrusted", "type": "branch"}]}},
             {"listing_updates": {"branch_policies": [{"name": 7, "type": "branch"}, {"name": "untrusted", "type": "branch"}]}},
             {"listing_updates": {"branch_policies": ["main", "untrusted"]}},
         )
@@ -654,10 +669,23 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 fake, calls = self._environment_calls(**case)
                 with patch.object(linux_source_build, "_api_request", side_effect=fake):
                     with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
-                        linux_source_build._verify_environment("token")
+                        linux_source_build._verify_environment("token", environ=self._environment_ids())
         with patch.object(linux_source_build, "_api_request", side_effect=AssertionError("no request")):
             with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
-                linux_source_build._verify_environment("token", "source-read")
+                linux_source_build._verify_environment("token", "source-read", self._environment_ids())
+
+    def test_environment_readback_requires_configured_environment_and_branch_policy_ids(self):
+        for variable, value in (
+            (linux_source_build.ENVIRONMENT_ID_NAME, ""),
+            (linux_source_build.ENVIRONMENT_ID_NAME, "01"),
+            (linux_source_build.ENVIRONMENT_BRANCH_POLICY_ID_NAMES["main"], "not-an-id"),
+        ):
+            with self.subTest(variable=variable, value=value):
+                expected = self._environment_ids()
+                expected[variable] = value
+                with patch.object(linux_source_build, "_api_request", side_effect=AssertionError("no request")):
+                    with self.assertRaisesRegex(linux_source_build.SourceBuildRefusal, "binding"):
+                        linux_source_build._verify_environment("token", environ=expected)
 
     def test_api_path_check_refuses_traversal_but_accepts_the_compare_range(self):
         base = "a" * 40
@@ -676,7 +704,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         refused = (
             "", "repos/x", "/", "/repos//x", "/repos/x/", "/repos/../x", "/repos/x/..", "/repos/./x",
             "/repos/%2e%2e/x", "/repos/%2E%2e/x", "/repos/x\\y", "/repos/x\x00", None, 7,
-            "/repos/x%2Fy", "/repos/x%5Cy", "/repos/x%00", "/repos/x?a" + chr(35) + "b", "/repos/x y", "/repos/x\n",
+            "/repos/x%2Fy", "/repos/x%5Cy", "/repos/x%00", "/repos/x?a" + "\x23" + "b", "/repos/x y", "/repos/x\n",
             "/repos/caf\u00e9", "/repos/x?a?b", "/repos/x;y", "/repos/x:y", "/repos/x@y", "/repos/x+y",
         )
         for path in refused:
@@ -1286,6 +1314,119 @@ class LinuxSourceBuildTests(unittest.TestCase):
             source)
         self.assertLess(body.index("run_rust_license_gate(license_environment)"), body.index("job_elapsed = _job_elapsed_seconds()"))
 
+    def test_d145_profile_runs_before_lock_license_admission(self):
+        source = Path(linux_source_build.__file__).read_text(encoding="ascii")
+        body = source[source.index("def run_rust_license_gate("):source.index("def prepare_project(")]
+        self.assertLess(body.index("_check_d145_runtime_profile(root_fd)"),
+                        body.index("for candidate in _rust_lock_paths(root_fd):"))
+
+    @staticmethod
+    def _write_d145_fixture_file(root, relative, text):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="ascii")
+
+    @staticmethod
+    def _d145_fixture_lock(dependencies):
+        text = "version = 4\n"
+        for name in sorted(dependencies):
+            text += '\n[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n'
+            if dependencies[name]:
+                text += "dependencies = [\n" + "".join(
+                    ' "' + dependency + ' 0.1.0",\n'
+                    for dependency in dependencies[name]
+                ) + "]\n"
+        return text
+
+    def test_d145_profile_accepts_a_complete_runtime_and_paired_contract_lock(self):
+        bootstrap = linux_source_build.cargo_lock_bootstrap
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        contract_members = sorted(bootstrap.CONTRACT_MEMBERS)
+        contract_listing = "".join('    "' + member + '",\n' for member in contract_members)
+        host_mock_package = "keeldock" + "-host-mock"
+        contract_root = (
+            "[workspace]\nmembers = [\n" + contract_listing + "]\n\n"
+            '[workspace.package]\nversion = "0.1.0"\nedition = "2024"\n\n'
+            "[workspace.dependencies]\n"
+            + bootstrap.HOST_API_POLICY_API_PACKAGE + ' = { path = "crates/host/api" }\n'
+            + host_mock_package + ' = { path = "crates/host/mock" }\n'
+        )
+        self._write_d145_fixture_file(root, "Cargo.toml", contract_root)
+        host_api_package = bootstrap.HOST_API_POLICY_API_PACKAGE
+        host_conformance_package = "keeldock" + "-host-conformance"
+        kernel_i18n_package = "keeldock" + "-kernel-i18n"
+        contract_dependencies = {
+            host_api_package: (),
+            host_mock_package: (host_api_package,),
+            host_conformance_package: (host_api_package, host_mock_package),
+            kernel_i18n_package: (),
+        }
+        for member in contract_members:
+            name = bootstrap.CONTRACT_PACKAGE_NAMES[member]
+            text = (
+                "[package]\nname = \"" + name + "\"\n"
+                "version.workspace = true\nedition.workspace = true\n"
+            )
+            dependencies = bootstrap.CONTRACT_MEMBER_DEPENDENCIES[member]
+            ordinary = (
+                {} if member == "crates/host/api"
+                else dependencies.get("dependencies", {})
+            )
+            development = dependencies.get("dev-dependencies", {})
+            if ordinary:
+                text += "\n[dependencies]\n" + "".join(
+                    dependency + " = { workspace = true }\n" for dependency in ordinary
+                )
+            if development:
+                text += "\n[dev-dependencies]\n" + "".join(
+                    dependency + " = { workspace = true }\n" for dependency in development
+                )
+            self._write_d145_fixture_file(root, member + "/Cargo.toml", text)
+        self._write_d145_fixture_file(
+            root, "Cargo.lock", self._d145_fixture_lock(contract_dependencies),
+        )
+
+        runtime_members = bootstrap.HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS
+        runtime_listing = "".join(
+            '    "' + member.removeprefix("runtime/") + '",\n'
+            for member in runtime_members
+        )
+        runtime_root = (
+            "[workspace]\nresolver = \"3\"\nmembers = [\n" + runtime_listing + "]\n\n"
+            '[workspace.package]\nversion = "0.1.0"\nedition = "2024"\n'
+            'rust-version = "1.99.1"\npublish = false\n\n'
+            "[workspace.dependencies]\n"
+            + bootstrap.HOST_API_POLICY_API_PACKAGE + ' = { path = "'
+            + bootstrap.HOST_API_POLICY_API_PATH + '" }\n'
+        )
+        self._write_d145_fixture_file(root, "runtime/Cargo.toml", runtime_root)
+        runtime_dependencies = {bootstrap.HOST_API_POLICY_API_PACKAGE: ()}
+        for member in runtime_members:
+            name = member.rsplit("/", 1)[-1]
+            text = (
+                "[package]\nname = \"" + name + "\"\n"
+                "version.workspace = true\nedition.workspace = true\n"
+                "rust-version.workspace = true\npublish.workspace = true\n"
+            )
+            if member in bootstrap.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS:
+                text += "\n[dependencies]\n" + bootstrap.HOST_API_POLICY_API_PACKAGE + " = { workspace = true }\n"
+                runtime_dependencies[name] = (bootstrap.HOST_API_POLICY_API_PACKAGE,)
+            else:
+                runtime_dependencies[name] = ()
+            self._write_d145_fixture_file(root, member + "/Cargo.toml", text)
+        self._write_d145_fixture_file(
+            root, "runtime/Cargo.lock", self._d145_fixture_lock(runtime_dependencies),
+        )
+        self._write_d145_fixture_file(root, "crates/host/api/src/lib.rs", "pub fn api() {}\n")
+
+        descriptor = linux_source_build._open_source_root(root)
+        try:
+            self.assertTrue(linux_source_build._check_d145_runtime_profile(descriptor))
+        finally:
+            os.close(descriptor)
+
     def test_time_already_spent_by_the_job_before_the_gates_shortens_the_budget(self):
         budget = linux_source_build.PROJECT_GATE_BUDGET_SECONDS
         timeout = linux_source_build.PROJECT_GATE_TIMEOUT_SECONDS
@@ -1344,6 +1485,17 @@ class LinuxSourceBuildTests(unittest.TestCase):
             prepare.assert_not_called()
             construct.assert_not_called()
 
+    def test_rust_lock_gate_keeps_its_empty_result_guard_reachable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(linux_source_build, "_require_confined_manifests"), patch.object(
+                linux_source_build, "_rust_lock_paths", return_value=(),
+            ):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                    linux_source_build.run_rust_license_gate({
+                        "SOURCE_PATH": temporary, "REQUESTED_SOURCE_SHA": "a" * 40,
+                    })
+            self.assertEqual(refused.exception.reason, "lock")
+
     def test_registry_free_license_gate_prints_one_counts_only_line(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1351,15 +1503,29 @@ class LinuxSourceBuildTests(unittest.TestCase):
             (root / "fuzz").mkdir()
             (root / "fuzz" / "Cargo.lock").write_text(
                 _path_only_lock(2, "fuzz"), encoding="ascii")
-            (root / "runtime").mkdir()
-            (root / "runtime" / "Cargo.lock").write_text(
-                _path_only_lock(7, "runtime"), encoding="ascii")
             output = io.StringIO()
             with patch.object(linux_source_build.sys, "stdout", output):
                 self.assertEqual(linux_source_build.run_rust_license_gate({
                     "SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40,
                 }), 0)
-            self.assertEqual(output.getvalue(), "linux-rust-licence=registry-free locks=3\n")
+            self.assertEqual(output.getvalue(), "linux-rust-licence=registry-free locks=2\n")
+
+    def test_d145_profile_refuses_an_incomplete_runtime_workspace_before_license_processing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            (runtime / "Cargo.toml").write_text(
+                '[workspace]\nresolver = "3"\nmembers = []\n', encoding="ascii",
+            )
+            (runtime / "Cargo.lock").write_text("version = 4\n", encoding="ascii")
+            descriptor = linux_source_build._open_source_root(root)
+            try:
+                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+                    linux_source_build._check_d145_runtime_profile(descriptor)
+            finally:
+                os.close(descriptor)
+            self.assertEqual(refused.exception.reason, "lock")
 
     def test_registry_lock_license_gate_refuses_without_the_counts_line(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1566,10 +1732,13 @@ class LinuxSourceBuildTests(unittest.TestCase):
             )
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "the shared launcher stop uses Linux process facilities")
-    def test_shared_launcher_really_stops_before_the_command_runs(self):
+    def test_shared_launcher_stops_before_the_command_and_gives_it_eof_stdin(self):
         stdout_reader, stdout_writer = os.pipe()
         stderr_reader, stderr_writer = os.pipe()
-        launch = ("/usr/bin/python3", "-B", "-c", linux_source_build.linux_probes.LAUNCHER_SOURCE, "/usr/bin/true")
+        launch = (
+            "/usr/bin/python3", "-B", "-c", linux_source_build.linux_probes.LAUNCHER_SOURCE,
+            "/usr/bin/python3", "-c", "import os; raise SystemExit(0 if os.read(0, 1) == b'' else 23)",
+        )
         spec = {"mode": "open", "keep_root": True, "limits": "probe", "env": {"PATH": "/usr/bin"}, "timeout": 5}
         try:
             code, timed_out = linux_source_build.linux_session.launch_and_collect(
@@ -1697,10 +1866,33 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "RUNNER_TEMP": temporary, "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7",
                 "GITHUB_RUN_ATTEMPT": "1", "SOURCE_READER_INSTALLATION_ID": "19",
                 "CI_MODE": "source", "PRODUCER_RESULT": "success",
+                "LINUX_API_FEATURE_GATE_NAMES": ",".join(linux_source_build.API_FEATURE_GATE_NAMES),
             }
             trusted = linux_source_build._verdict_record(env)
             self.assertEqual(trusted["gates"], 15)
             self.assertTrue(confinement_verdict.run_accepted(trusted))
+            featureless = tuple(
+                name for name in linux_source_build.GATES
+                if name not in linux_source_build.API_FEATURE_GATE_NAMES
+            )
+            selected_without_features = featureless + linux_source_build.BROWSER_GATE_NAMES
+            (records / "gates.json").write_text(json.dumps({
+                "schema_version": 1,
+                "selected_gates": list(selected_without_features),
+                "completed_gates": list(selected_without_features),
+                "gates": {name: "passed" for name in selected_without_features},
+                "gate_count": len(selected_without_features),
+                "failed": 0,
+            }), encoding="ascii")
+            with patch.object(linux_source_build, "GATES", featureless):
+                self.assertEqual(linux_source_build._verdict_record(env)["project_execution"], "not_started")
+            (records / "gates.json").write_text(json.dumps(gates), encoding="ascii")
+            missing_feature_readback = dict(env)
+            del missing_feature_readback["LINUX_API_FEATURE_GATE_NAMES"]
+            self.assertEqual(
+                linux_source_build._verdict_record(missing_feature_readback)["project_execution"],
+                "not_started",
+            )
             with patch.object(linux_source_build.sys, "stdout", io.StringIO()):
                 self.assertEqual(linux_source_build.emit_verdict(env), 0)
             env["PRODUCER_RESULT"] = "failure"
@@ -1748,6 +1940,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "RUNNER_TEMP": temporary, "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7",
                 "GITHUB_RUN_ATTEMPT": "1", "SOURCE_READER_INSTALLATION_ID": "19",
                 "CI_MODE": "source", "PRODUCER_RESULT": "success",
+                "LINUX_API_FEATURE_GATE_NAMES": ",".join(linux_source_build.API_FEATURE_GATE_NAMES),
             }
             public_record = linux_source_build._verdict_record(env)
             self.assertEqual(public_record["gates"], 18)
@@ -1844,7 +2037,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         self.assertEqual(line, "::add-mask::ab%250Acd%250Dxy%2525z" + "q" * 20 + "\n")
         self.assertEqual(line.count("\n"), 1)
         self.assertNotIn("\r", line)
-        for character in "!$&'()*+-./;<=>?@[\\]^_`{|}~" + chr(35) + "0123456789" + "AZaz":
+        for character in "!$&'()*+-./;<=>?@[\\]^_`{|}~" + "\x23" + "0123456789" + "AZaz":
             with self.subTest(character=character):
                 value = "a" * 10 + character + "a" * 10
                 self.assertTrue(linux_source_build._valid_source_token(value))
@@ -2730,7 +2923,7 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
         self._audit_refused(_audit_json({"fixture-lib": wide, "tool-a": _vulnerability("tool-a", via=["fixture-lib"], nodes=["node_modules/tool-a"])}))
 
     def _run_audit(self, returncode, stdout, allows=None, valid_until=None, entry=None, missing_node=False,
-                   source_inputs=None, check_lock=None, run=None, stderr=b""):
+                   source_inputs=None, check_lock=None, run=None, stderr=b"", packages=LOCKED):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "source").mkdir()
@@ -2751,7 +2944,7 @@ class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
                     patch.object(linux_source_build, "_source_inputs", return_value={}, side_effect=source_inputs), \
                     patch.object(linux_source_build, "_check_lock_provenance", side_effect=check_lock), \
                     patch.object(linux_source_build, "_validate_provenance_binding", return_value=record), \
-                    patch.object(linux_source_build, "_locked_packages", return_value=({"packages": LOCKED}, {})), \
+                    patch.object(linux_source_build, "_locked_packages", return_value=({"packages": packages}, {})), \
                     patch.object(linux_source_build, "_run", return_value=result, side_effect=run), \
                     patch("sys.stdout", output):
                 code = command(env)
@@ -3265,8 +3458,11 @@ NPM11_PACKAGES = {
 
 
 class RealNpmReportTests(unittest.TestCase):
+    _run_audit = LinuxNodeProvenanceAndAuditTests._run_audit
+
     def setUp(self):
-        self.now_ms = int(time.time()) * 1000
+        self.now = int(time.time())
+        self.now_ms = self.now * 1000
 
     def _check(self, report, allows):
         return linux_source_build._check_audit_report(report, allows, NPM11_PACKAGES, self.now_ms)
@@ -3292,7 +3488,13 @@ class RealNpmReportTests(unittest.TestCase):
 
     def test_the_real_report_shape_is_accepted_with_matching_allows(self):
         report = _npm11_report(lowered=True)
-        self.assertEqual(self._check(report, _npm11_allows(self.now_ms)), (2, 19, 1))
+        allows = _npm11_allows(self.now_ms)
+        self.assertEqual(self._check(report, allows), (2, 19, 1))
+        code, output = self._run_audit(1, report, allows, packages=NPM11_PACKAGES)
+        self.assertEqual((code, output), (0, "linux-node-audit=verified phase=trusted findings=2 allowed=1\n"))
+        with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
+            self._run_audit(1, report, [], packages=NPM11_PACKAGES)
+        self.assertEqual(refused.exception.detail, "audit_advisory_unmatched")
 
     def test_the_real_report_shape_is_refused_without_its_allows(self):
         report = _npm11_report(lowered=True)

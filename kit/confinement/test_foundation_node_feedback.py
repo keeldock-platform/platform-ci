@@ -1076,7 +1076,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
     def test_node_stderr_cut_keeps_head_and_tail_without_partial_utf8_and_marks_truncation(self):
         metadata = b"node_reason=command_failed node_substage=tests\n"
         room = 32_768 - len(metadata)
-        character = "⎯".encode("utf-8")
+        character = "\u23af".encode("utf-8")
         marker_re = re.compile(rb"\n\[\.\.\. ([0-9]+) bytes omitted \.\.\.\]\n")
         for filler, tail in (
             (room - 1, character), (room - 2, character), (room - 3, character + b"zz"),
@@ -1132,7 +1132,7 @@ class FoundationNodeFeedbackTests(unittest.TestCase):
         producer = importlib.util.module_from_spec(producer_spec)
         producer_spec.loader.exec_module(producer)
         for data in (
-            b"", b"a", b"\xe2", b"a\xe2\x8e", "a⎯".encode("utf-8"), b"\xf0\x9f\x98",
+            b"", b"a", b"\xe2", b"a\xe2\x8e", "a\u23af".encode("utf-8"), b"\xf0\x9f\x98",
             "\U0001f600".encode("utf-8"), b"\x80\x80\x80\x80\x80", b"ab\xc3", b"\xff",
         ):
             with self.subTest(data=data):

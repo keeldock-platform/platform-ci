@@ -117,6 +117,27 @@ CONTRACT_MEMBER_DEPENDENCIES = {
     "crates/kernel/i18n": {"dependencies": {}},
 }
 CONTRACT_API_MANIFEST_PATH = "crates/host/api/Cargo.toml"
+HOST_API_POLICY_API_PACKAGE = "keeldock" + "-host-api"
+HOST_API_POLICY_API_PATH = "../crates/host/api"
+HOST_API_POLICY_API_MANIFEST_PATH = CONTRACT_API_MANIFEST_PATH
+HOST_API_POLICY_API_SOURCE_PREFIX = "crates/host/api/src/"
+HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS = (
+    "runtime/crates/host/registry", "runtime/crates/host/core",
+    "runtime/crates/host/settings-schema", "runtime/crates/services/palette",
+    "runtime/crates/services/notifications",
+)
+HOST_API_POLICY_OPTIONAL_SYNC_FORMAT_ROOT = "runtime/crates/services/sync-format"
+HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS = (
+    "runtime/crates/services/sync-publication",
+    "runtime/crates/test-fixtures/host-router",
+    "runtime/crates/test-fixtures/fixture-data",
+    "runtime/crates/test-fixtures/tool-a",
+    "runtime/crates/test-fixtures/tool-b",
+    "runtime/crates/test-fixtures/tool-bad-no-handler",
+    "runtime/crates/test-fixtures/tool-bad-no-manifest",
+    *HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS,
+)
+HOST_API_POLICY_RUNTIME_OPTIONAL_MEMBER_ROOTS = (HOST_API_POLICY_OPTIONAL_SYNC_FORMAT_ROOT,)
 RUNTIME_MEMBER_PATH_RE = re.compile(
     RUNTIME_WORKSPACE_DIRECTORY + r"/crates/[a-z][a-z0-9]*(?:-[a-z0-9]+)*/[a-z][a-z0-9]*(?:-[a-z0-9]+)*\Z"
 )
@@ -376,7 +397,7 @@ def _strip_comment(line):
                 quote = None
         elif character in "\"'":
             quote = character
-        elif character == chr(35):
+        elif character == "\x23":
             return line[:index]
     if quote is not None:
         _manifest_refuse()
@@ -564,7 +585,7 @@ def _check_pin(value):
         _manifest_refuse()
 
 
-def _check_dependency(name, spec, directory, members):
+def _check_dependency(name, spec, directory, members, allow_runtime_profile_runtime_edge=False):
     if type(name) is not str or CRATE_NAME_RE.fullmatch(name) is None:
         _manifest_refuse()
     if type(spec) is str:
@@ -581,6 +602,10 @@ def _check_dependency(name, spec, directory, members):
     if "package" in spec and (type(spec["package"]) is not str
                               or CRATE_NAME_RE.fullmatch(spec["package"]) is None):
         _manifest_refuse()
+    if allow_runtime_profile_runtime_edge and name == HOST_API_POLICY_API_PACKAGE:
+        if spec != {"path": HOST_API_POLICY_API_PATH}:
+            _manifest_refuse()
+        return
     if "workspace" in spec:
         if spec["workspace"] is not True or "version" in spec or "path" in spec:
             _manifest_refuse()
@@ -664,7 +689,7 @@ def _check_document(document, directory, members, is_root, root_directory="."):
         _check_workspace_members(workspace, members, root_directory)
     elif is_root:
         _manifest_refuse()
-    tables = [document[name] for name in DEPENDENCY_TABLE_NAMES if name in document]
+    tables = [(document[name], False) for name in DEPENDENCY_TABLE_NAMES if name in document]
     target = document.get("target")
     if target is not None:
         if type(target) is not dict:
@@ -672,14 +697,14 @@ def _check_document(document, directory, members, is_root, root_directory="."):
         for entry in target.values():
             if type(entry) is not dict or set(entry) - ALLOWED_TARGET_KEYS:
                 _manifest_refuse()
-            tables.extend(entry[name] for name in DEPENDENCY_TABLE_NAMES if name in entry)
+            tables.extend((entry[name], False) for name in DEPENDENCY_TABLE_NAMES if name in entry)
     if workspace is not None and "dependencies" in workspace:
-        tables.append(workspace["dependencies"])
-    for table in tables:
+        tables.append((workspace["dependencies"], is_root and root_directory == RUNTIME_WORKSPACE_DIRECTORY))
+    for table, allow_runtime_profile_runtime_edge in tables:
         if type(table) is not dict:
             _manifest_refuse()
         for name, spec in table.items():
-            _check_dependency(name, spec, directory, members)
+            _check_dependency(name, spec, directory, members, allow_runtime_profile_runtime_edge)
     package = document.get("package")
     if package is None:
         return None, None
@@ -691,7 +716,7 @@ def _check_document(document, directory, members, is_root, root_directory="."):
     return package["name"], package["edition"]
 
 
-def _check_contract_dependency_policy(documents):
+def _check_contract_dependency_policy(documents, *, require_first_batch=True):
     root = documents.get("Cargo.toml")
     workspace = root.get("workspace") if type(root) is dict else None
     if (type(workspace) is not dict
@@ -706,8 +731,87 @@ def _check_contract_dependency_policy(documents):
             _manifest_refuse()
         expected_tables = CONTRACT_MEMBER_DEPENDENCIES[member]
         for table_name in DEPENDENCY_TABLE_NAMES:
+            if (member == "crates/host/api" and not require_first_batch
+                    and table_name == "dependencies"):
+                continue
             if document.get(table_name, {}) != expected_tables.get(table_name, {}):
                 _manifest_refuse()
+
+
+def _check_runtime_profile(documents, member_set):
+    required = frozenset(HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS)
+    optional = frozenset(HOST_API_POLICY_RUNTIME_OPTIONAL_MEMBER_ROOTS)
+    if member_set not in (required, required | optional):
+        _manifest_refuse()
+    root = documents.get(workspace_root_manifest(RUNTIME_WORKSPACE))
+    workspace = root.get("workspace") if type(root) is dict else None
+    workspace_dependencies = workspace.get("dependencies") if type(workspace) is dict else None
+    if (type(workspace_dependencies) is not dict
+            or workspace_dependencies.get(HOST_API_POLICY_API_PACKAGE) != {"path": HOST_API_POLICY_API_PATH}):
+        _manifest_refuse()
+    for dependency, spec in workspace_dependencies.items():
+        if dependency != HOST_API_POLICY_API_PACKAGE and (
+            type(spec) is dict and spec.get("package") == HOST_API_POLICY_API_PACKAGE
+        ):
+            _manifest_refuse()
+    for table_name in DEPENDENCY_TABLE_NAMES:
+        table = root.get(table_name, {})
+        if type(table) is not dict:
+            _manifest_refuse()
+        if HOST_API_POLICY_API_PACKAGE in table or any(
+            type(spec) is dict and spec.get("package") == HOST_API_POLICY_API_PACKAGE
+            for spec in table.values()
+        ):
+            _manifest_refuse()
+    target = root.get("target", {})
+    if type(target) is not dict:
+        _manifest_refuse()
+    for target_entry in target.values():
+        if type(target_entry) is not dict:
+            _manifest_refuse()
+        for table_name in DEPENDENCY_TABLE_NAMES:
+            table = target_entry.get(table_name, {})
+            if type(table) is not dict or HOST_API_POLICY_API_PACKAGE in table or any(
+                type(spec) is dict and spec.get("package") == HOST_API_POLICY_API_PACKAGE
+                for spec in table.values()
+            ):
+                _manifest_refuse()
+    for member in member_set:
+        document = documents.get(member + "/Cargo.toml")
+        if type(document) is not dict:
+            _manifest_refuse()
+        required_consumer = member in HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS
+        optional_consumer = member == HOST_API_POLICY_OPTIONAL_SYNC_FORMAT_ROOT
+        tables = [(name, document.get(name, {})) for name in DEPENDENCY_TABLE_NAMES]
+        target = document.get("target", {})
+        if type(target) is not dict:
+            _manifest_refuse()
+        for target_entry in target.values():
+            if type(target_entry) is not dict:
+                _manifest_refuse()
+            tables.extend(("target:" + name, target_entry.get(name, {}))
+                          for name in DEPENDENCY_TABLE_NAMES)
+        for table_name, table in tables:
+            if type(table) is not dict:
+                _manifest_refuse()
+            for dependency, spec in table.items():
+                permitted_consumer = (
+                    table_name == "dependencies" and (required_consumer or optional_consumer)
+                    and dependency == HOST_API_POLICY_API_PACKAGE and spec == {"workspace": True}
+                )
+                if not permitted_consumer and (dependency == HOST_API_POLICY_API_PACKAGE or (
+                    type(spec) is dict and spec.get("package") == HOST_API_POLICY_API_PACKAGE
+                )):
+                    _manifest_refuse()
+        ordinary = document.get("dependencies", {})
+        if required_consumer:
+            if ordinary.get(HOST_API_POLICY_API_PACKAGE) != {"workspace": True}:
+                _manifest_refuse()
+        elif optional_consumer and HOST_API_POLICY_API_PACKAGE in ordinary:
+            if ordinary.get(HOST_API_POLICY_API_PACKAGE) != {"workspace": True}:
+                _manifest_refuse()
+        elif HOST_API_POLICY_API_PACKAGE in ordinary:
+            _manifest_refuse()
 
 
 def _check_edition(edition, root_document):
@@ -722,7 +826,7 @@ def _check_edition(edition, root_document):
     _manifest_refuse()
 
 
-def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE):
+def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE, *, require_first_batch=True):
     """Check the root and member manifests before any Cargo command runs.
 
     Only exact version pins from the default registry and path dependencies that name a
@@ -750,7 +854,7 @@ def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE):
             type(member) is not str or RUNTIME_MEMBER_PATH_RE.fullmatch(member) is None
             for member in member_set
         )
-        or any(type(data) is not bytes or b".." in data for data in manifests.values())
+        or any(type(data) is not bytes for data in manifests.values())
     ):
         _manifest_refuse()
     allowed = {root_path} | {member + "/Cargo.toml" for member in member_set}
@@ -763,6 +867,12 @@ def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE):
         }:
             _manifest_refuse()
     documents = {path: _parse_manifest(manifests[path]) for path in sorted(manifests)}
+    if root_directory != ".":
+        for path, data in manifests.items():
+            if b".." in data:
+                if (path != root_path or data.count(HOST_API_POLICY_API_PATH.encode("ascii")) != 1
+                        or b".." in data.replace(HOST_API_POLICY_API_PATH.encode("ascii"), b"", 1)):
+                    _manifest_refuse()
     names = set()
     for path, document in documents.items():
         directory = posixpath.dirname(path) or "."
@@ -775,17 +885,365 @@ def check_manifests(manifests, members, workspace=CONTRACT_WORKSPACE):
                 _manifest_refuse()
             names.add(name)
     if root_directory == "." and member_set == CONTRACT_MEMBERS:
-        _check_contract_dependency_policy(documents)
+        if type(require_first_batch) is not bool:
+            _manifest_refuse()
+        _check_contract_dependency_policy(documents, require_first_batch=require_first_batch)
+    if root_directory == RUNTIME_WORKSPACE_DIRECTORY:
+        _check_runtime_profile(documents, member_set)
+        names.add(HOST_API_POLICY_API_PACKAGE)
     return frozenset(names)
 
 
-def check_lock_members(lock_bytes, package_names):
-    """Require the lock's sourceless packages to be exactly the workspace packages."""
+def manifest_dependency_rules(manifests, workspace=CONTRACT_WORKSPACE):
+    """Return each local package's direct dependency identities from checked TOML bytes."""
+    root_path = workspace_root_manifest(workspace)
+    if type(manifests) is not dict or root_path not in manifests:
+        _manifest_refuse()
+    documents = {path: _parse_manifest(data) for path, data in manifests.items()}
+    root = documents[root_path]
+    workspace_table = root.get("workspace")
+    workspace_dependencies = (
+        workspace_table.get("dependencies", {}) if type(workspace_table) is dict else {}
+    )
+    if type(workspace_dependencies) is not dict:
+        _manifest_refuse()
+    result = {}
+    for document in documents.values():
+        package = document.get("package") if type(document) is dict else None
+        if package is None:
+            continue
+        if type(package) is not dict or type(package.get("name")) is not str:
+            _manifest_refuse()
+        package_name = package["name"]
+        rules = {}
+        tables = [document.get(name, {}) for name in DEPENDENCY_TABLE_NAMES]
+        target = document.get("target", {})
+        if type(target) is not dict:
+            _manifest_refuse()
+        for entry in target.values():
+            if type(entry) is not dict:
+                _manifest_refuse()
+            tables.extend(entry.get(name, {}) for name in DEPENDENCY_TABLE_NAMES)
+        for table in tables:
+            if type(table) is not dict:
+                _manifest_refuse()
+            for alias, spec in table.items():
+                if type(spec) is dict and spec.get("workspace") is True:
+                    spec = workspace_dependencies.get(alias)
+                    if type(spec) is not dict:
+                        _manifest_refuse()
+                actual_name = spec.get("package", alias) if type(spec) is dict else alias
+                if type(actual_name) is not str:
+                    _manifest_refuse()
+                if type(spec) is str:
+                    version = spec[1:] if spec.startswith("=") else spec
+                    source = "registry"
+                elif type(spec) is dict:
+                    version = spec.get("version")
+                    if type(version) is str and version.startswith("="):
+                        version = version[1:]
+                    source = None if "path" in spec else "registry"
+                else:
+                    _manifest_refuse()
+                rules.setdefault(actual_name, set()).add((version, source))
+        result[package_name] = rules
+    return result
+
+
+def check_lock_members(lock_bytes, package_names, package_identities=None,
+                       dependency_rules=None):
+    """Require exact local identities and a lock graph containing no unreferenced packages."""
     lock = parse_lock(lock_bytes)
-    sourceless = {package["name"] for package in lock["packages"] if package.get("source") is None}
-    if type(package_names) not in (set, frozenset) or sourceless != set(package_names):
+    packages = lock["packages"]
+    local = [package for package in packages if package.get("source") is None]
+    local_names = [package["name"] for package in local]
+    sourceless = set(local_names)
+    if (type(package_names) not in (set, frozenset)
+            or sourceless != set(package_names) or len(local_names) != len(sourceless)):
+        _refuse("bootstrap_lock_refused")
+    if package_identities is not None:
+        if type(package_identities) not in (set, frozenset, tuple):
+            _refuse("bootstrap_lock_refused")
+        expected = set(package_identities)
+        actual = {(package["name"], package["version"]) for package in local}
+        if expected != actual or len(expected) != len(package_names):
+            _refuse("bootstrap_lock_refused")
+    if dependency_rules is not None and type(dependency_rules) is not dict:
+        _refuse("bootstrap_lock_refused")
+    by_name = {}
+    by_identity = {}
+    for package in packages:
+        identity = (package["name"], package["version"], package.get("source"))
+        if identity in by_identity:
+            _refuse("bootstrap_lock_refused")
+        by_identity[identity] = package
+        by_name.setdefault(package["name"], []).append(package)
+    reachable = set()
+    pending = [(package["name"], package["version"], package.get("source")) for package in local]
+    while pending:
+        identity = pending.pop()
+        if identity in reachable:
+            continue
+        package = by_identity.get(identity)
+        if package is None:
+            _refuse("bootstrap_lock_refused")
+        reachable.add(identity)
+        for name, version, source in package.get("dependencies", []):
+            if version is None:
+                candidates = by_name.get(name, [])
+                candidate = candidates[0] if len(candidates) == 1 else None
+            else:
+                candidate = by_identity.get((name, version, source))
+                if candidate is None and source is None:
+                    matches = [
+                        item for item in by_name.get(name, []) if item["version"] == version
+                    ]
+                    candidate = matches[0] if len(matches) == 1 else None
+            if candidate is None:
+                _refuse("bootstrap_lock_refused")
+            if dependency_rules is not None and identity[2] is None:
+                allowed = dependency_rules.get(identity[0], {}).get(name, set())
+                source_kind = "registry" if candidate.get("source") == cargo.REGISTRY_SOURCE else None
+                if not any(
+                    (expected_version is None or expected_version == candidate["version"])
+                    and expected_source == source_kind
+                    for expected_version, expected_source in allowed
+                ):
+                    _refuse("bootstrap_lock_refused")
+            pending.append((candidate["name"], candidate["version"], candidate.get("source")))
+    if reachable != set(by_identity):
         _refuse("bootstrap_lock_refused")
     return True
+
+
+def manifest_package_identities(manifests, workspace=CONTRACT_WORKSPACE):
+    """Return exact local package name/version pairs from an already checked manifest set."""
+    root_path = workspace_root_manifest(workspace)
+    if type(manifests) is not dict or root_path not in manifests:
+        _manifest_refuse()
+    documents = {path: _parse_manifest(data) for path, data in manifests.items()}
+    root = documents[root_path]
+    workspace_table = root.get("workspace")
+    shared_package = (workspace_table.get("package")
+                      if type(workspace_table) is dict else None)
+    identities = set()
+    for document in documents.values():
+        package = document.get("package") if type(document) is dict else None
+        if package is None:
+            continue
+        if type(package) is not dict or type(package.get("name")) is not str:
+            _manifest_refuse()
+        version = package.get("version")
+        if version == {"workspace": True}:
+            version = shared_package.get("version") if type(shared_package) is dict else None
+        if (type(version) is not str
+                or not cargo._valid_package_identity(package["name"], version)):
+            _manifest_refuse()
+        identity = (package["name"], version)
+        if identity in identities:
+            _manifest_refuse()
+        identities.add(identity)
+    if not identities:
+        _manifest_refuse()
+    return frozenset(identities)
+
+
+def _runtime_profile_file(root, relative, maximum):
+    parts = relative.split("/")
+    if (not parts or any(part in ("", ".", "..") for part in parts)
+            or Path(relative).is_absolute() or "\\" in relative):
+        _manifest_refuse()
+    current = root
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    for part in parts[:-1]:
+        current = current / part
+        try:
+            info = current.lstat()
+        except OSError:
+            _manifest_refuse()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & reparse):
+            _manifest_refuse()
+    target = current / parts[-1]
+    try:
+        info = target.lstat()
+        if (not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & reparse
+                or info.st_nlink != 1 or info.st_size <= 0 or info.st_size > maximum):
+            _manifest_refuse()
+        payload = target.read_bytes()
+    except OSError:
+        _manifest_refuse()
+    if len(payload) != info.st_size or len(payload) > maximum:
+        _manifest_refuse()
+    return payload
+
+
+def _runtime_profile_source_directory(root, relative):
+    parts = relative.split("/")
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        _manifest_refuse()
+    target = root
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    for part in parts:
+        target = target / part
+        try:
+            info = target.lstat()
+        except OSError:
+            _manifest_refuse()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & reparse):
+            _manifest_refuse()
+    return target
+
+
+def validate_runtime_profile_source_tree(source):
+    """Validate the paired contract and runtime locks before Windows selects Rust gates."""
+    try:
+        root = Path(source).resolve(strict=True)
+    except OSError:
+        _manifest_refuse()
+    runtime_manifest_path = root / workspace_root_manifest(RUNTIME_WORKSPACE)
+    runtime_lock_path = root / workspace_directory(RUNTIME_WORKSPACE) / "Cargo.lock"
+    try:
+        runtime_manifest_path.lstat()
+        runtime_manifest_present = True
+    except FileNotFoundError:
+        runtime_manifest_present = False
+    except OSError:
+        _manifest_refuse()
+    try:
+        runtime_lock_path.lstat()
+        runtime_lock_present = True
+    except FileNotFoundError:
+        runtime_lock_present = False
+    except OSError:
+        _manifest_refuse()
+    if not runtime_manifest_present and not runtime_lock_present:
+        runtime_directory = root / workspace_directory(RUNTIME_WORKSPACE)
+        try:
+            directory_info = runtime_directory.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            _manifest_refuse()
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if (not stat.S_ISDIR(directory_info.st_mode) or stat.S_ISLNK(directory_info.st_mode)
+                or getattr(directory_info, "st_file_attributes", 0) & reparse):
+            _manifest_refuse()
+        stack = [runtime_directory]
+        while stack:
+            directory = stack.pop()
+            try:
+                with os.scandir(directory) as iterator:
+                    entries = sorted(iterator, key=lambda item: item.name)
+            except OSError:
+                _manifest_refuse()
+            for entry in entries:
+                target = Path(entry.path)
+                try:
+                    info = target.lstat()
+                except OSError:
+                    _manifest_refuse()
+                if (stat.S_ISLNK(info.st_mode)
+                        or getattr(info, "st_file_attributes", 0) & reparse):
+                    _manifest_refuse()
+                if entry.name in ("Cargo.toml", "Cargo.lock"):
+                    _manifest_refuse()
+                if stat.S_ISDIR(info.st_mode):
+                    stack.append(target)
+                elif not stat.S_ISREG(info.st_mode):
+                    _manifest_refuse()
+                if len(stack) > MAX_TREE_ENTRIES:
+                    _manifest_refuse()
+        return False
+    if not runtime_manifest_present or not runtime_lock_present:
+        _manifest_refuse()
+    runtime_manifest = _runtime_profile_file(
+        root, workspace_root_manifest(RUNTIME_WORKSPACE), MAX_MANIFEST_BYTES,
+    )
+    runtime_document = _parse_manifest(runtime_manifest)
+    workspace = runtime_document.get("workspace")
+    listed = workspace.get("members") if type(workspace) is dict else None
+    if type(listed) is not list or any(type(item) is not str for item in listed):
+        _manifest_refuse()
+    runtime_members = frozenset(posixpath.normpath(posixpath.join("runtime", item)) for item in listed)
+    runtime_manifest_paths = {workspace_root_manifest(RUNTIME_WORKSPACE)}
+    runtime_manifest_paths.update(member + "/Cargo.toml" for member in runtime_members)
+    runtime_manifests = {
+        path: runtime_manifest if path == workspace_root_manifest(RUNTIME_WORKSPACE)
+        else _runtime_profile_file(root, path, MAX_MANIFEST_BYTES)
+        for path in runtime_manifest_paths
+    }
+    runtime_names = check_manifests(runtime_manifests, runtime_members, RUNTIME_WORKSPACE)
+    runtime_identities = set(manifest_package_identities(runtime_manifests, RUNTIME_WORKSPACE))
+    runtime_lock = _runtime_profile_file(root, "runtime/Cargo.lock", MAX_LOCK_BYTES)
+    contract_manifest_paths = {"Cargo.toml"}
+    contract_manifest_paths.update(member + "/Cargo.toml" for member in CONTRACT_MEMBERS)
+    contract_manifests = {
+        path: _runtime_profile_file(root, path, MAX_MANIFEST_BYTES) for path in contract_manifest_paths
+    }
+    contract_names = check_manifests(
+        contract_manifests, CONTRACT_MEMBERS, CONTRACT_WORKSPACE, require_first_batch=False,
+    )
+    contract_identities = manifest_package_identities(contract_manifests, CONTRACT_WORKSPACE)
+    api_identity = next((identity for identity in contract_identities
+                         if identity[0] == HOST_API_POLICY_API_PACKAGE), None)
+    if api_identity is None or HOST_API_POLICY_API_PACKAGE not in runtime_names:
+        _manifest_refuse()
+    runtime_identities.add(api_identity)
+    runtime_dependency_rules = manifest_dependency_rules(runtime_manifests, RUNTIME_WORKSPACE)
+    api_dependency_rules = manifest_dependency_rules(
+        {"Cargo.toml": contract_manifests["Cargo.toml"],
+         HOST_API_POLICY_API_MANIFEST_PATH: contract_manifests[HOST_API_POLICY_API_MANIFEST_PATH]},
+        CONTRACT_WORKSPACE,
+    )
+    runtime_dependency_rules.update(api_dependency_rules)
+    check_lock_members(runtime_lock, runtime_names, runtime_identities, runtime_dependency_rules)
+    contract_lock = _runtime_profile_file(root, "Cargo.lock", MAX_LOCK_BYTES)
+    check_lock_members(
+        contract_lock, contract_names,
+        manifest_package_identities(contract_manifests, CONTRACT_WORKSPACE),
+        manifest_dependency_rules(contract_manifests, CONTRACT_WORKSPACE),
+    )
+    source_directory = _runtime_profile_source_directory(root, "crates/host/api/src")
+    stack = [source_directory]
+    source_files = []
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    while stack:
+        directory = stack.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError:
+            _manifest_refuse()
+        for entry in entries:
+            target = Path(entry.path)
+            try:
+                info = target.lstat()
+            except OSError:
+                _manifest_refuse()
+            if (stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & reparse):
+                _manifest_refuse()
+            if stat.S_ISDIR(info.st_mode):
+                stack.append(target)
+            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                source_files.append(target.relative_to(root).as_posix())
+            else:
+                _manifest_refuse()
+            if len(source_files) + len(stack) > MAX_TREE_ENTRIES:
+                _manifest_refuse()
+    if "crates/host/api/src/lib.rs" not in source_files:
+        _manifest_refuse()
+    return True
+
+
+def _main(arguments):
+    if len(arguments) != 2 or arguments[0] != "check-runtime_profile-source":
+        _refuse("bootstrap_input_invalid")
+    result = validate_runtime_profile_source_tree(arguments[1])
+    sys.stdout.write("runtime_profile=runtime\n" if result else "runtime_profile=base\n")
+    return 0
 
 
 def refuse_foreign_sources(lock_bytes):
@@ -1173,3 +1631,11 @@ def produce_bundle(lock_bytes, trusted_context, *, run_id, run_attempt, now, exp
     bundle = encode_bundle(lock_bytes, receipt_bytes, evidence_bytes)
     verify_bundle(bundle, trusted_context, now=now)
     return bundle
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(_main(sys.argv[1:]))
+    except BootstrapRefusal as error:
+        sys.stderr.write(error.reason + "\n")
+        sys.exit(2)

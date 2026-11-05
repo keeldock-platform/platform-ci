@@ -192,8 +192,8 @@ test('the npm diagnostic payload is a closed variant of the npm admission kind o
 });
 
 test('an npm diagnostic that carries a bidirectional control character is refused', () => {
-  const marks = ['؜', '‎', '‏', '‪', '‫', '‬', '‭', '‮',
-    '⁦', '⁧', '⁨', '⁩'];
+  const marks = ['\u061c', '\u200e', '\u200f', '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
+    '\u2066', '\u2067', '\u2068', '\u2069'];
   for (const mark of marks) {
     for (const parts of [
       { stderr: [`  npm error a${mark}b`], report: [] },
@@ -202,7 +202,7 @@ test('an npm diagnostic that carries a bidirectional control character is refuse
       assert.throws(() => validate(diagnostics(parts)), (error) => refusalCode(error) === 'invalid_payload');
     }
   }
-  const plain = diagnostics({ stderr: ['  npm error café 中'], report: ['  Found: ü@1.0.0'] });
+  const plain = diagnostics({ stderr: ['  npm error caf\u00e9 \u4e2d'], report: ['  Found: \u00fc@1.0.0'] });
   assert.deepEqual(validate(plain), plain);
 });
 

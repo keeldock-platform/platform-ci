@@ -18,6 +18,7 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 API_FEATURE_NAME = "dev-uat-policy-import"
+API_FEATURE_GATE_NAMES = ("api_feature_clippy", "api_feature_tests")
 RUST_GATE_NAMES = (
     "format", "clippy", "workspace_tests", "api_tests", "api_feature_clippy", "api_feature_tests",
     "mock_tests", "conformance_tests",

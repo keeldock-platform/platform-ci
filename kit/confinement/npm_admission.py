@@ -1060,7 +1060,40 @@ def _manifest_scripts(data, name, version, subject=None):
     for key, value in scripts.items():
         if type(key) is not str or type(value) is not str or len(key) > 128:
             _archive_refuse("archive_manifest", subject, "scripts_value")
-    return scripts, manifest.get("gypfile", True)
+    return scripts, manifest.get("gypfile", True), manifest
+
+
+def _bundled_child_name(parts):
+    if len(parts) < 4 or parts[1] != "node_modules":
+        return None
+    if parts[2].startswith("@"):
+        if len(parts) < 5:
+            return None
+        return parts[2] + "/" + parts[3]
+    return parts[2]
+
+
+def _validate_bundled_inert(manifests, binding_names, bundled, subject):
+    lifecycle = ("preinstall", "install", "postinstall", "prepare")
+    for name in sorted(bundled):
+        content = manifests.get(name)
+        if content is None:
+            _archive_refuse("archive_manifest", subject, "bundled_missing")
+        manifest = _load_json(content, MAX_PACKAGE_JSON_BYTES, "npm_archive_invalid", opaque_numbers=True)
+        if type(manifest) is not dict:
+            _archive_refuse("archive_manifest", subject, "bundled_shape")
+        if manifest.get("name") != name or not _valid_version(manifest.get("version")):
+            _archive_refuse("archive_manifest", subject, "bundled_identity")
+        scripts = manifest.get("scripts", {})
+        if type(scripts) is not dict or len(scripts) > 256:
+            _archive_refuse("archive_manifest", subject, "bundled_scripts")
+        for key, value in scripts.items():
+            if type(key) is not str or type(value) is not str or len(key) > 128:
+                _archive_refuse("archive_manifest", subject, "bundled_scripts")
+        if any(scripts.get(script) for script in lifecycle):
+            _archive_refuse("archive_manifest", subject, "bundled_lifecycle")
+        if name in binding_names:
+            _archive_refuse("archive_manifest", subject, "bundled_binding_gyp")
 
 
 def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=None):
@@ -1092,6 +1125,8 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
     total = 0
     package_json_member = None
     manifest_bytes = None
+    bundled_manifest_bytes = {}
+    bundled_binding_gyp = set()
     native_paths = []
     root_binding_gyp = False
     archive_root = None
@@ -1171,6 +1206,14 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
                     package_json_member = member
                 if folded_relative == archive_root.lower() + "/binding.gyp" and not is_directory:
                     root_binding_gyp = True
+                if bundled is not None and not is_directory:
+                    child_name = _bundled_child_name(parts)
+                    if child_name in bundled:
+                        child_root = archive_root + "/node_modules/" + child_name
+                        if folded_relative == (child_root + "/package.json").lower():
+                            bundled_manifest_bytes[child_name] = member
+                        elif folded_relative == (child_root + "/binding.gyp").lower():
+                            bundled_binding_gyp.add(child_name)
                 if not is_directory and _native_path(relative):
                     native_paths.append(relative)
             for path, (is_directory, member, member_index) in entries.items():
@@ -1189,11 +1232,18 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
                 if stream is None:
                     _archive_refuse("archive_path", subject, "unreadable", label, index=member_index)
                 with stream:
-                    if path == archive_root + "/package.json":
+                    child_name = _bundled_child_name(parts)
+                    child_root = archive_root + "/node_modules/" + child_name if child_name is not None else None
+                    if path == archive_root + "/package.json" or (
+                            bundled is not None and child_name in bundled
+                            and path.lower() == (child_root + "/package.json").lower()):
                         content = stream.read(MAX_PACKAGE_JSON_BYTES + 1)
                         if len(content) != member.size or len(content) > MAX_PACKAGE_JSON_BYTES:
                             _archive_refuse("archive_manifest", subject, "size")
-                        manifest_bytes = content
+                        if path == archive_root + "/package.json":
+                            manifest_bytes = content
+                        else:
+                            bundled_manifest_bytes[child_name] = content
                     else:
                         content = stream.read(8)
                 if not is_directory and _native_magic(content) and path not in native_paths:
@@ -1206,7 +1256,7 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
         _archive_refuse("archive_manifest", subject, "missing")
     if manifest_bytes is None:
         _archive_refuse("archive_manifest", subject, "unread")
-    scripts, gypfile = _manifest_scripts(manifest_bytes, name, version, subject)
+    scripts, gypfile, manifest = _manifest_scripts(manifest_bytes, name, version, subject)
     implicit_install = (
         root_binding_gyp and gypfile is not False
         and not scripts.get("preinstall") and not scripts.get("install")
@@ -1216,7 +1266,7 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
         script for script in lifecycle
         if scripts.get(script) or (implicit_install and script == "install")
     )
-    return {
+    report = {
         "name": name,
         "version": version,
         "sha256": archive_sha256,
@@ -1227,9 +1277,13 @@ def _inspect_tarball(name, version, integrity, data, internal_names=(), bundled=
         "implicit_install_scripts": ("install",) if implicit_install else (),
         "native_binaries": tuple(sorted(native_paths)),
     }
+    if bundled is not None:
+        _validate_bundled_inert(bundled_manifest_bytes, bundled_binding_gyp, bundled, subject)
+        report["bundled_inert"] = True
+    return report, manifest
 
 
-def verify_tarball(entry, data, internal_names=()):
+def inspect_tarball(entry, data, internal_names=()):
     if type(entry) is not dict or not {"name", "version", "integrity"}.issubset(entry):
         _archive_refuse("archive_input", None, "entry_shape")
     name = entry["name"]
@@ -1246,6 +1300,10 @@ def verify_tarball(entry, data, internal_names=()):
     return _inspect_tarball(
         name, version, entry["integrity"], data, internal_names, _inert_bundled_names(entry),
     )
+
+
+def verify_tarball(entry, data, internal_names=()):
+    return inspect_tarball(entry, data, internal_names)[0]
 
 
 def read_bounded_file(path, maximum=MAX_TARBALL_BYTES):
@@ -1294,8 +1352,8 @@ def read_bounded_file(path, maximum=MAX_TARBALL_BYTES):
             os.close(descriptor)
 
 
-def verify_tarball_file(path, entry):
-    return verify_tarball(entry, read_bounded_file(path))
+def verify_tarball_file(path, entry, internal_names=()):
+    return verify_tarball(entry, read_bounded_file(path), internal_names=internal_names)
 
 
 def verify_archive_set(lock_bytes, archive_bytes_by_path, internal_names=()):
@@ -1308,7 +1366,11 @@ def verify_archive_set(lock_bytes, archive_bytes_by_path, internal_names=()):
     total_unpacked = 0
     total_files = 0
     for path, entry in entries:
-        report = verify_tarball(entry, archive_bytes_by_path[path], internal_names=internal_names)
+        archive = archive_bytes_by_path[path]
+        if type(archive) is bytes:
+            report = verify_tarball(entry, archive, internal_names=internal_names)
+        else:
+            report = verify_tarball_file(archive, entry, internal_names=internal_names)
         total_compressed += report["compressed_bytes"]
         total_unpacked += report["unpacked_bytes"]
         total_files += report["file_count"]

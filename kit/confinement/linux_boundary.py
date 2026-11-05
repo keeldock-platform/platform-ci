@@ -24,6 +24,7 @@ BASE_ENV = {
     "PYTHONDONTWRITEBYTECODE": "1",
     "PYTHONNOUSERSITE": "1",
 }
+RUST_SYSROOT_MOUNT = "/kd-rust"
 LAUNCH = ["/usr/bin/python3", "-B", "/launch.py"]
 PATH_PATTERN = re.compile(r"/[A-Za-z0-9._/@+=-]{1,300}")
 SHA_PATTERN = re.compile(r"[a-f0-9]{40}")
@@ -366,8 +367,9 @@ class Boundary:
         verdict = channels.judge_attempts(channels.ATTEMPT_RULES["raw_logs"], result.stdout)
         marker = ("kd-log-" + self.nonce).encode("ascii")
         captured = marker in result.stdout and marker in result.stderr
-        scanner = transcript_hits(["x kd-log-" + self.nonce], self.nonce, self.secret_needles) == 1
-        leaks = transcript_hits(self.emitter.lines, self.nonce, self.secret_needles)
+        needles = tuple(self.secret_needles) + tuple(self.bare_needles)
+        scanner = transcript_hits(["x kd-log-" + self.nonce], self.nonce, needles) == 1
+        leaks = transcript_hits(self.emitter.lines, self.nonce, needles)
         return self.decide(result, verdict, [1] * leaks, captured and scanner)
 
     def channel_boundary_disablement(self):
@@ -524,8 +526,8 @@ class Boundary:
         binds = self.ipc_binds()
         rustc = None
         if needs_rust:
-            binds.append({"source": sysroot, "target": sysroot, "ro": True, "rec": False})
-            rustc = sysroot + "/bin/rustc"
+            binds.append({"source": sysroot, "target": RUST_SYSROOT_MOUNT, "ro": True, "rec": False})
+            rustc = RUST_SYSROOT_MOUNT + "/bin/rustc"
         node = None
         if form in fixtures.NEEDS_NODE:
             node, node_bind = self.node_binary()
@@ -881,7 +883,13 @@ def main(argv=None):
             return run_faults(arguments)
         return run_named_phase(arguments, arguments.command)
     except Exception:
-        sys.stdout.write("linux-source-boundary=refused phase=selftest reason=environment project-execution=not_started" + chr(10))
+        phase = arguments.command if arguments.command in channels.PHASES else "selftest"
+        if phase in channels.DIAG_PHASES:
+            try:
+                sys.stdout.write(channels.diag_line(phase, "unknown", "unavailable") + chr(10))
+            except Exception:
+                pass
+        sys.stdout.write("linux-source-boundary=refused phase=" + phase + " reason=environment project-execution=not_started" + chr(10))
         return 1
 
 

@@ -575,16 +575,18 @@ class LinuxFixtureDiagnosticLineTests(unittest.TestCase):
     def test_lines_without_any_letter_or_digit_are_dropped(self):
         self.assertEqual(self.lines(b"-----\n???\n[]{}<>\n   \n.\n"), ())
 
-    def test_only_the_selftest_phase_can_ever_produce_a_diagnostic(self):
+    def test_fixture_diagnostics_are_selftest_only_and_generic_diagnostics_accept_boundary_phases(self):
         stderr = b"error: something\n"
         self.assertEqual(len(self.lines(stderr)), 1)
-        for phase in ("recheck", "source", "project", "build", "", "SELFTEST", None, 5):
+        self.assertEqual(channels.DIAG_PHASES, ("selftest", "recheck"))
+        self.assertEqual(channels.FIXTURE_DIAG_PHASES, ("selftest",))
+        self.assertEqual(channels.fixture_diag_lines("recheck", "build_rs", stderr, NONCE, ()), ())
+        self.assertIn("phase=recheck", channels.diag_line("recheck", "unknown", "unavailable"))
+        for phase in ("source", "project", "build", "", "SELFTEST", None, 5):
             with self.subTest(phase=phase):
                 self.assertEqual(self.lines(stderr, phase=phase), ())
                 with self.assertRaises(ValueError):
                     channels.diag_line(phase, "build_rs", "error")
-        self.assertEqual(channels.DIAG_PHASES, ("selftest",))
-
     def test_the_form_must_be_a_fixture_name(self):
         for form in ("Shell", "a b", 5, None, "x" * 21, ""):
             with self.assertRaises(ValueError):

@@ -417,6 +417,20 @@ class NpmAdmissionTests(unittest.TestCase):
         self.assertIn("package/binding.node", binding_report["native_binaries"])
         self.assertEqual(by_path[fsevents_path]["version"], "2.3.3")
 
+    def test_archive_set_reads_path_inputs_through_the_bounded_file_reader(self):
+        unused_lock, lock_bytes, archives, unused_material = _fixture()
+        with tempfile.TemporaryDirectory() as directory:
+            archive_paths = {}
+            for index, (path, data) in enumerate(sorted(archives.items())):
+                archive_path = os.path.join(directory, str(index) + ".tgz")
+                with open(archive_path, "wb") as destination:
+                    destination.write(data)
+                archive_paths[path] = archive_path
+            self.assertEqual(
+                subject.verify_archive_set(lock_bytes, archive_paths),
+                subject.verify_archive_set(lock_bytes, archives),
+            )
+
         lifecycle_names = ("preinstall", "install", "postinstall", "prepare")
         lifecycle_data = _tarball(
             "sample-lifecycle", "1.0.0", scripts={name: "synthetic" for name in lifecycle_names},
@@ -593,6 +607,29 @@ class NpmAdmissionTests(unittest.TestCase):
         self.assert_refused(
             lambda: subject.verify_tarball(invalid_entry, invalid_data), "npm_archive_invalid",
         )
+
+    def test_slashless_directory_headers_are_normalized_and_collisions_are_refused(self):
+        manifest = b'{"name":"sample","version":"1.0.0","scripts":{}}'
+
+        def directory(name):
+            info = tarfile.TarInfo(name)
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            return info
+
+        valid = _tar_with_members(((directory("package/assets"), b""), (tarfile.TarInfo("package/package.json"), manifest)))
+        entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(valid)}
+        self.assertEqual(subject.verify_tarball(entry, valid)["file_count"], 1)
+        duplicate = _tar_with_members(((directory("package/assets"), b""), (directory("package/assets"), b""), (tarfile.TarInfo("package/package.json"), manifest)))
+        duplicate_entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(duplicate)}
+        with self.assertRaises(subject.Refusal) as duplicate_refused:
+            subject.verify_tarball(duplicate_entry, duplicate)
+        self.assertEqual(duplicate_refused.exception.detail, "archive_path:sample@1.0.0:duplicate:package/assets index:2")
+        collision = _tar_with_members(((directory("package/assets"), b""), (directory("package/Assets"), b""), (tarfile.TarInfo("package/package.json"), manifest)))
+        collision_entry = {"name": "sample", "version": "1.0.0", "integrity": _sri(collision)}
+        with self.assertRaises(subject.Refusal) as collision_refused:
+            subject.verify_tarball(collision_entry, collision)
+        self.assertEqual(collision_refused.exception.detail, "archive_path:sample@1.0.0:case_collision:package/Assets index:2")
 
     def test_tar_preflight_refuses_case_collisions_and_oversized_header(self):
         upper = tarfile.TarInfo("package/Binding.node")
@@ -1224,9 +1261,18 @@ class NpmInertBundledTests(unittest.TestCase):
         entry.update(fields)
         return entry
 
-    def _bundled_tarball(self, extra=()):
+    def _bundled_tarball(self, extra=(), plain_scripts=None):
+        plain_manifest = json.dumps(
+            {"name": "plain-lib", "version": "1.2.3", "scripts": plain_scripts or {}},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")
+        scoped_manifest = json.dumps(
+            {"name": "@scope-a/runtime", "version": "1.2.3", "scripts": {}},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("ascii")
         members = (
-            ("package/node_modules/plain-lib/package.json", b"{}"),
+            ("package/node_modules/plain-lib/package.json", plain_manifest),
+            ("package/node_modules/@scope-a/runtime/package.json", scoped_manifest),
             ("package/node_modules/@scope-a/runtime/index.js", b"synthetic"),
         )
         return _tarball("sample", "1.0.0", extra=members + tuple(extra))
@@ -1234,7 +1280,18 @@ class NpmInertBundledTests(unittest.TestCase):
     def test_the_archive_of_an_inert_entry_may_carry_its_declared_bundled_tree(self):
         data = self._bundled_tarball()
         report = subject.verify_tarball(self._inert_entry(data), data)
-        self.assertEqual(report["file_count"], 3)
+        self.assertEqual(report["file_count"], 4)
+        self.assertIs(report["bundled_inert"], True)
+
+    def test_an_inert_bundle_refuses_child_lifecycle_scripts_and_binding_gyp(self):
+        lifecycle = self._bundled_tarball(plain_scripts={"install": "node install.js"})
+        binding = self._bundled_tarball(extra=(
+            ("package/node_modules/plain-lib/binding.gyp", b"{}"),
+        ))
+        for data in (lifecycle, binding):
+            with self.subTest(data=hashlib.sha256(data).hexdigest()[:8]), self.assertRaises(subject.Refusal) as refused:
+                subject.verify_tarball(self._inert_entry(data), data)
+            self.assertEqual(refused.exception.reason, "npm_archive_invalid")
 
     def test_the_archive_tree_is_refused_unless_the_entry_is_inert(self):
         data = self._bundled_tarball()

@@ -496,7 +496,7 @@ class SourceRefTests(unittest.TestCase):
 
 
 CRATE_MANIFEST = (
-    chr(35) + " Synthetic crate manifest.\n"
+    "\x23" + " Synthetic crate manifest.\n"
     "[package]\n"
     "name = \"synthetic-crate\"\n"
     "description = \"Synthetic crate: used only by the tree tests.\"\n"
@@ -556,7 +556,7 @@ class CoreContractTreeTests(unittest.TestCase):
     @staticmethod
     def _module_lines(names):
         declarations = "".join(
-            chr(35) + '[path = "../fuzz_targets/' + name + '.rs"]\nmod ' + name + ';\n'
+            "\x23" + '[path = "../fuzz_targets/' + name + '.rs"]\nmod ' + name + ';\n'
             for name in sorted(names)
         )
         references = "fn replay() {\n" + "".join(
@@ -726,7 +726,7 @@ class CoreContractTreeTests(unittest.TestCase):
             "[workspace]\nmembers = [\n    \"crates/host/api\" \"crates/host/mock\",\n]\n",
             "[workspace]\nmembers = [\n    \"crates/host/api\",,\n]\n",
             "[workspace]\nmembers = [\n    crates/host/api,\n]\n",
-            "[workspace]\nmembers = [\n    \"crates/host/api\", " + chr(35) + " note\n]\n",
+            "[workspace]\nmembers = [\n    \"crates/host/api\", " + "\x23" + " note\n]\n",
             self._workspace_text(members) + 'members = [\n    "crates/host/api",\n]\n',
         ):
             with self.subTest(rejected=rejected):
@@ -1528,7 +1528,7 @@ class CoreContractTreeTests(unittest.TestCase):
             ("duplicate table",
              "[features]\ndefault = []\ndev-uat-policy-import = []\n\n[features]\n"),
             ("trailing comment",
-             "[features]\ndefault = [] " + chr(35) + " x\ndev-uat-policy-import = []\n"),
+             "[features]\ndefault = [] " + "\x23" + " x\ndev-uat-policy-import = []\n"),
         ):
             with self.subTest(form=name):
                 self.assertFalse(subject._core_contract_crate_manifest_shape(
@@ -1594,7 +1594,7 @@ class CoreContractTreeTests(unittest.TestCase):
             ("dotted package key", 'package.build = "build.rs"\n' + header),
             ("spaced key", header + 'build   =   "build.rs"\n'),
             ("build dependencies", header + '[build-dependencies]\nkeeldock' '-host-api = { workspace = true }\n'),
-            ("trailing comment", header + 'build = "b.rs" ' + chr(35) + " note\n"),
+            ("trailing comment", header + 'build = "b.rs" ' + "\x23" + " note\n"),
         ):
             with self.subTest(form=name):
                 self.assertFalse(subject._core_contract_crate_manifest_shape(text))
@@ -1691,7 +1691,7 @@ class CoreContractTreeTests(unittest.TestCase):
 
     @staticmethod
     def _real_root_manifest():
-        hash_mark = chr(35)
+        hash_mark = "\x23"
         lines = (
             hash_mark + " Contract workspace root.",
             hash_mark + " The runtime workspace is separate and is not listed here.",
@@ -1766,7 +1766,7 @@ class CoreContractTreeTests(unittest.TestCase):
 
     def test_workspace_paths_shape_is_a_full_allowlist(self):
         real = self._real_root_manifest()
-        hash_mark = chr(35)
+        hash_mark = "\x23"
         dependency = 'keeldock' '-host-api = { path = "crates/host/api" }\n'
         forms = (
             ("dotted key before workspace", 'patch.crates-io.evil = { path = "../evil" }\n' + real),
@@ -2330,10 +2330,10 @@ class CoreContractTreeTests(unittest.TestCase):
             valid + b'include_str !("../fuzz_targets/new_target.rs");\n',
             valid + b'include!("unrelated.rs");\n',
             valid + b"// include anywhere is refused\n",
-            (chr(35) + "[cfg(any())]\n").encode("ascii") + valid,
-            (chr(35) + "[allow(dead_code)]\n").encode("ascii") + valid,
-            ("use std::io; " + chr(35) + "[cfg(any())]\n").encode("ascii") + valid,
-            ("use std::io; " + chr(35) + "[allow(dead_code)]\n").encode("ascii") + valid,
+            ("\x23" + "[cfg(any())]\n").encode("ascii") + valid,
+            ("\x23" + "[allow(dead_code)]\n").encode("ascii") + valid,
+            ("use std::io; " + "\x23" + "[cfg(any())]\n").encode("ascii") + valid,
+            ("use std::io; " + "\x23" + "[allow(dead_code)]\n").encode("ascii") + valid,
             valid + b"macro_rules! helper { () => {} }\n",
             valid + ("let quote = '" + '"' + "';\n").encode("ascii"),
             valid + ("let quote = '" + "\\" + '"' + "';\n").encode("ascii"),
@@ -3962,7 +3962,7 @@ class ControlGitCommandTests(unittest.TestCase):
 
 
 BATCH4_ROOT_TEXT = (
-    chr(35) + " Platform contract workspace: the contract lane and its tag line.\n"
+    "\x23" + " Platform contract workspace: the contract lane and its tag line.\n"
     "[workspace]\n"
     'resolver = "3"\n'
     "members = [\n"
@@ -3971,7 +3971,7 @@ BATCH4_ROOT_TEXT = (
     '    "crates/host/conformance",\n'
     '    "crates/kernel/i18n",\n'
     "]\n"
-    + chr(35) + " Guard for the future runtime workspace.\n"
+    + "\x23" + " Guard for the future runtime workspace.\n"
     "exclude = [\n"
     '    "crates/host/core",\n'
     '    "crates/host/registry",\n'
@@ -3998,30 +3998,50 @@ BATCH4_ROOT_TEXT = (
 def _runtime_root_text(roots=None, extra=""):
     roots = subject.RUNTIME_CRATE_ROOTS if roots is None else roots
     listing = "".join(
-        '    "' + "/".join(root[1:]) + '",\n' for root in roots
+        '    "' + subject.posixpath.relpath("/".join(root), subject.RUNTIME_WORKSPACE_DIRECTORY) + '",\n'
+        for root in roots if type(root) is tuple
     )
     return (
         '[workspace]\nresolver = "3"\nmembers = [\n' + listing + "]\n\n"
         "[workspace.package]\n"
         'version = "0.1.0"\nedition = "2024"\nrust-version = "1.99.1"\npublish = false\n\n'
         "[workspace.lints.rust]\n"
-        'unsafe_code = "forbid"\n' + extra
+        'unsafe_code = "forbid"\n\n'
+        "[workspace.dependencies]\n"
+        + subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + ' = { path = "' + subject.RUNTIME_HOST_API_POLICY_API_PATH + '" }\n'
+        + extra
     )
 
 
 def _runtime_member_text(root, extra_package="", tail=""):
+    consumer = root in subject.RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS or (
+        root == subject.RUNTIME_HOST_API_POLICY_OPTIONAL_CONSUMER_ROOT
+    )
+    dependency = (
+        "\n[dependencies]\n" + subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + " = { workspace = true }\n"
+        if consumer else ""
+    )
     return (
         '[package]\nname = "' + root[-1] + '"\n'
         "version.workspace = true\nedition.workspace = true\n"
         "rust-version.workspace = true\npublish.workspace = true\n"
-        + extra_package + "\n[lints]\nworkspace = true\n" + tail
+        + extra_package + dependency + "\n[lints]\nworkspace = true\n" + tail
     )
 
 
-def _runtime_lock_text(names, extra=""):
-    return "version = 4\n" + "".join(
-        '\n[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n' + extra for name in names
-    )
+def _runtime_lock_text(names, extra="", api_consumers=None):
+    api_name = subject.RUNTIME_HOST_API_POLICY_API_PACKAGE
+    if api_consumers is None:
+        api_consumers = {
+            root[-1] for root in subject.RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS
+        } | {subject.RUNTIME_HOST_API_POLICY_OPTIONAL_CONSUMER_ROOT[-1]}
+    rows = []
+    for name in names:
+        row = '\n[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n'
+        if name in api_consumers and api_name in names:
+            row += 'dependencies = [\n "' + api_name + ' 0.1.0",\n]\n'
+        rows.append(row + extra)
+    return "version = 4\n" + "".join(rows)
 
 
 class RuntimeWorkspaceTreeTests(unittest.TestCase):
@@ -4035,6 +4055,8 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         for root in roots:
             prefix = "/".join(root)
             paths.update((prefix + "/Cargo.toml", prefix + "/src/lib.rs", prefix + "/tests/unit.rs"))
+        for root in subject.RUNTIME_HOST_CRATE_ROOTS:
+            paths.add("/".join(root) + "/CONTRACT.md")
         return {path: ("100644", "a" * 40) for path in paths}
 
     @staticmethod
@@ -4042,7 +4064,9 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         roots = subject.RUNTIME_CRATE_ROOTS if roots is None else roots
         blobs = {
             subject.RUNTIME_ROOT_MANIFEST_PATH: _runtime_root_text(roots).encode("utf-8"),
-            subject.RUNTIME_ROOT_LOCK_PATH: _runtime_lock_text([root[-1] for root in roots]).encode("ascii"),
+            subject.RUNTIME_ROOT_LOCK_PATH: _runtime_lock_text(
+                [root[-1] for root in roots] + [subject.RUNTIME_HOST_API_POLICY_API_PACKAGE],
+            ).encode("ascii"),
             "runtime/rust-toolchain.toml": subject.CORE_CONTRACT_TOOLCHAIN,
             "runtime/rustfmt.toml": b"x",
             "runtime/clippy.toml": b"x",
@@ -4069,10 +4093,13 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             if path.startswith("crates/") and path.endswith("/Cargo.toml"):
                 return _core_crate_manifest(path).encode("utf-8")
             if path == "Cargo.toml":
-                members = ", ".join('"' + "/".join(root) + '"' for root in subject.CORE_CONTRACT_CRATE_ROOTS)
-                return ("[workspace]\nmembers = [" + members + "]\n").encode("utf-8")
+                return BATCH4_ROOT_TEXT.encode("utf-8")
             if path == "Cargo.lock":
-                return ("version = 4\n" + "[[package]]\n" * len(subject.CORE_CONTRACT_CRATE_ROOTS)).encode("ascii")
+                names = sorted(subject.CORE_CONTRACT_CRATE_NAMES.values())
+                return ("version = 4\n" + "".join(
+                    '\n[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n'
+                    for name in names
+                )).encode("ascii")
             if path == "rust-toolchain.toml":
                 return subject.CORE_CONTRACT_TOOLCHAIN
             return b"x"
@@ -4096,12 +4123,13 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         )
         return refusal.exception.core_check
 
-    def test_the_admitted_runtime_tree_is_the_service_crate_plus_the_std_only_fixture_workspace(self):
+    def test_the_admitted_runtime_tree_contains_the_batch_seven_roots_and_runtime_profile_consumers(self):
         self.assertEqual(
             [root[-1] for root in subject.RUNTIME_CRATE_ROOTS],
             [
                 "sync-publication", "host-router", "fixture-data", "tool-a", "tool-b",
-                "tool-bad-no-handler", "tool-bad-no-manifest",
+                "tool-bad-no-handler", "tool-bad-no-manifest", "registry", "core",
+                "settings-schema", "palette", "notifications",
             ],
         )
         self.assertEqual(
@@ -4109,7 +4137,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         )
         for root in subject.RUNTIME_CRATE_ROOTS:
             self.assertTrue(subject._runtime_root_admitted(root))
-        for root in subject.RUNTIME_CRATE_ROOTS[1:]:
+        for root in subject.RUNTIME_CRATE_ROOTS[1:7]:
             self.assertEqual(root[:3], ("runtime", "crates", "test-fixtures"))
         self.assertEqual(subject.RUNTIME_WORKSPACE_DIRECTORY, "runtime")
         marker, reads = self._validate()
@@ -4226,14 +4254,35 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             entries[path] = ("100644", "a" * 40)
             with self.subTest(path=path):
                 self.assertEqual(self._refused(entries=entries), "path_mode")
+
+    def test_host_contract_documents_are_required_only_at_the_three_admitted_paths(self):
+        for root in subject.RUNTIME_HOST_CRATE_ROOTS:
+            path = "/".join(root) + "/CONTRACT.md"
+            entries = self._runtime_entries()
+            marker, unused_reads = self._validate(entries=entries)
+            self.assertEqual(marker, "core_contract")
+            for mode in ("100755", "120000"):
+                altered = dict(entries)
+                altered[path] = (mode, "a" * 40)
+                with self.subTest(root=root, mode=mode):
+                    self.assertEqual(self._refused(entries=altered), "path_mode")
+        for path in (
+            "runtime/crates/host/registry/README.md",
+            "runtime/crates/host/core/CHANGELOG.md",
+            "runtime/crates/host/other/CONTRACT.md",
+        ):
+            entries = self._runtime_entries()
+            entries[path] = ("100644", "a" * 40)
+            with self.subTest(path=path):
+                self.assertEqual(self._refused(entries=entries), "path_mode")
         for mode in ("100755", "120000"):
             entries = self._runtime_entries()
-            entries[service + "/README.md"] = (mode, "a" * 40)
+            entries["runtime/crates/services/sync-publication/README.md"] = (mode, "a" * 40)
             with self.subTest(mode=mode):
                 self.assertEqual(self._refused(entries=entries), "path_mode")
 
     def test_documents_are_refused_under_fixture_crates_and_unlisted_service_crates(self):
-        for root in subject.RUNTIME_CRATE_ROOTS[1:]:
+        for root in subject.RUNTIME_CRATE_ROOTS[1:7]:
             for name in ("README.md", "CONTRACT.md", "CHANGELOG.md"):
                 entries = self._runtime_entries()
                 entries["/".join(root) + "/" + name] = ("100644", "a" * 40)
@@ -4244,6 +4293,8 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             "runtime/crates/services/other/src/lib.rs",
             "runtime/crates/services/README.md",
             "runtime/crates/services/sync-publication-extra/README.md",
+            "runtime/crates/services/palette/CONTRACT.md",
+            "runtime/crates/services/notifications/README.md",
         ):
             entries = self._runtime_entries()
             entries[path] = ("100644", "a" * 40)
@@ -4254,7 +4305,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         roots = subject.RUNTIME_CRATE_ROOTS
         entries = self._runtime_entries(roots=roots[1:])
         blobs = self._runtime_blobs(roots=roots[1:])
-        self.assertEqual(self._refused(entries=entries, blobs=blobs), "required_files")
+        self.assertEqual(self._refused(entries=entries, blobs=blobs), "workspace_members")
         moved = roots[1:] + roots[:1]
         blobs = self._runtime_blobs()
         blobs[subject.RUNTIME_ROOT_MANIFEST_PATH] = _runtime_root_text(roots=moved).encode("utf-8")
@@ -4275,6 +4326,15 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             _runtime_root_text(extra='\n[workspace.dependencies]\nx = { git = "u" }\n'),
             _runtime_root_text(extra='\n[workspace.dependencies]\nx = { path = "crates/services/store" }\n'),
             _runtime_root_text(extra='\n[workspace.dependencies]\nx = { path = "../crates/test-fixtures/tool-a" }\n'),
+            _runtime_root_text().replace(
+                subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + ' = { path = "' + subject.RUNTIME_HOST_API_POLICY_API_PATH + '" }\n',
+                "",
+            ),
+            _runtime_root_text().replace(subject.RUNTIME_HOST_API_POLICY_API_PATH, "../crates/host/mock"),
+            _runtime_root_text().replace(
+                subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + ' = { path = "' + subject.RUNTIME_HOST_API_POLICY_API_PATH + '" }',
+                'host_api = { package = "host-api", path = "' + subject.RUNTIME_HOST_API_POLICY_API_PATH + '" }',
+            ),
             _runtime_root_text() + "\n[package]\nname = \"x\"\n",
             _runtime_root_text().replace("publish = false", 'publish = true'),
             _runtime_root_text() + 'unsafe_code = "forbid"\n',
@@ -4290,7 +4350,11 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
 
     def test_runtime_root_path_dependencies_may_name_configured_members_only(self):
         member = "/".join(subject.RUNTIME_CRATE_ROOTS[0][1:])
-        good = _runtime_root_text(extra='\n[workspace.dependencies]\nrouter = { path = "' + member + '" }\n')
+        good = _runtime_root_text().replace(
+            subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + ' = { path = "' + subject.RUNTIME_HOST_API_POLICY_API_PATH + '" }',
+            subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + ' = { path = "' + subject.RUNTIME_HOST_API_POLICY_API_PATH + '" }\n'
+            + 'router = { path = "' + member + '" }',
+        )
         blobs = self._runtime_blobs()
         blobs[subject.RUNTIME_ROOT_MANIFEST_PATH] = good.encode("utf-8")
         blobs["/".join(subject.RUNTIME_CRATE_ROOTS[1]) + "/Cargo.toml"] = (
@@ -4328,8 +4392,42 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
         blobs[path] = blobs["/".join(subject.RUNTIME_CRATE_ROOTS[4]) + "/Cargo.toml"]
         self.assertEqual(self._refused(blobs=blobs), "package_decode")
 
+    def test_exact_batch_seven_api_consumers_and_optional_sync_format(self):
+        for root in subject.RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS:
+            manifest = _runtime_member_text(root)
+            self.assertIn(
+                subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + " = { workspace = true }", manifest,
+            )
+        optional_roots = subject.RUNTIME_CRATE_ROOTS + subject.RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS
+        entries = self._runtime_entries(roots=optional_roots)
+        blobs = self._runtime_blobs(roots=optional_roots)
+        marker, unused_reads = self._validate(entries=entries, blobs=blobs)
+        self.assertEqual(marker, "core_contract")
+        optional_root = "/".join(subject.RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS[0])
+        blobs[optional_root + "/Cargo.toml"] = _runtime_member_text(
+            subject.RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS[0],
+        ).replace(
+            "\n[dependencies]\n" + subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + " = { workspace = true }\n",
+            "\n",
+        ).encode("utf-8")
+        blobs[subject.RUNTIME_ROOT_LOCK_PATH] = _runtime_lock_text(
+            [root[-1] for root in optional_roots] + [subject.RUNTIME_HOST_API_POLICY_API_PACKAGE],
+            api_consumers={root[-1] for root in subject.RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS},
+        ).encode("ascii")
+        marker, unused_reads = self._validate(entries=entries, blobs=blobs)
+        self.assertEqual(marker, "core_contract")
+        for root in (subject.RUNTIME_CRATE_ROOTS[0], subject.RUNTIME_CRATE_ROOTS[1]):
+            manifest_path = "/".join(root) + "/Cargo.toml"
+            blobs = self._runtime_blobs()
+            blobs[manifest_path] = _runtime_member_text(root).replace(
+                "\n[lints]", "\n[dependencies]\n" + subject.RUNTIME_HOST_API_POLICY_API_PACKAGE
+                + " = { workspace = true }\n\n[lints]",
+            ).encode("utf-8")
+            with self.subTest(root=root):
+                self.assertEqual(self._refused(blobs=blobs), "package_decode")
+
     def test_runtime_lock_requires_exactly_the_sourceless_members(self):
-        names = [root[-1] for root in subject.RUNTIME_CRATE_ROOTS]
+        names = [root[-1] for root in subject.RUNTIME_CRATE_ROOTS] + [subject.RUNTIME_HOST_API_POLICY_API_PACKAGE]
         source = 'source = "registry+' + "x" + '"\n'
         cases = (
             _runtime_lock_text(names[:-1]),
@@ -4351,12 +4449,29 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
                 self.assertEqual(self._refused(blobs=blobs), "cargo_lock_shape")
         blobs = self._runtime_blobs()
         blobs[subject.RUNTIME_ROOT_LOCK_PATH] = "version = 4\n\xe9".encode("utf-8")
-        self.assertEqual(self._refused(blobs=blobs), "cargo_lock_decode")
+        self.assertEqual(self._refused(blobs=blobs), "cargo_lock_shape")
+
+    def test_runtime_lock_refuses_an_unmanifested_registry_edge_from_a_local_member(self):
+        names = [root[-1] for root in subject.RUNTIME_CRATE_ROOTS]
+        names.append(subject.RUNTIME_HOST_API_POLICY_API_PACKAGE)
+        lock_text = _runtime_lock_text(names)
+        first_row = lock_text.index('name = "sync-publication"')
+        insert_at = lock_text.index("\n\n[[package]]", first_row)
+        lock_text = (
+            lock_text[:insert_at]
+            + '\ndependencies = [\n "extra 1.0.0",\n]\n'
+            + lock_text[insert_at:]
+            + '\n[[package]]\nname = "extra"\nversion = "1.0.0"\n'
+            + 'source = "registry+https:' + '/' * 2 + 'github.com/rust-lang/crates.io-index"\n'
+            + 'checksum = "' + "a" * 64 + '"\n'
+        )
+        blobs = self._runtime_blobs()
+        blobs[subject.RUNTIME_ROOT_LOCK_PATH] = lock_text.encode("ascii")
+        self.assertEqual(self._refused(blobs=blobs), "cargo_lock_shape")
         blobs[subject.RUNTIME_ROOT_LOCK_PATH] = _runtime_lock_text(
             names, extra='dependencies = [\n "tool-b",\n]\n',
         ).encode("ascii")
-        marker, unused_reads = self._validate(blobs=blobs)
-        self.assertEqual(marker, "core_contract")
+        self.assertEqual(self._refused(blobs=blobs), "cargo_lock_shape")
 
     def test_a_contract_file_never_satisfies_a_runtime_check_or_the_reverse(self):
         contract_root = BATCH4_ROOT_TEXT.encode("utf-8")
@@ -4413,7 +4528,9 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
                 }
                 with self.assertRaises(subject.Refusal) as refusal:
                     self._validate(entries=entries, blobs={})
-                if roots == ():
+                if (roots == () or type(roots) is not tuple
+                        or any(subject.RUNTIME_MEMBER_PATTERN.fullmatch(member) is None
+                               for member in subject._runtime_member_listing(roots))):
                     self.assertEqual(refusal.exception.core_check, "workspace_members")
                 else:
                     self.assertEqual(
@@ -4421,7 +4538,7 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
                         ("bootstrap_not_approved", "configuration"),
                     )
 
-    def test_an_empty_member_list_admits_only_the_two_root_files(self):
+    def test_an_empty_member_list_is_refused_by_the_exact_runtime_profile(self):
         entries = {
             subject.RUNTIME_ROOT_MANIFEST_PATH: ("100644", "a" * 40),
             subject.RUNTIME_ROOT_LOCK_PATH: ("100644", "a" * 40),
@@ -4431,10 +4548,9 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             subject.RUNTIME_ROOT_LOCK_PATH: b"version = 4\n",
         }
         with patch.object(subject, "RUNTIME_CRATE_ROOTS", ()):
-            marker, unused_reads = self._validate(entries=entries, blobs=blobs)
-            self.assertEqual(marker, "core_contract")
+            self.assertEqual(self._refused(entries=entries, blobs=blobs), "workspace_members")
             entries["runtime/crates/test-fixtures/tool-a/Cargo.toml"] = ("100644", "a" * 40)
-            self.assertEqual(self._refused(entries=entries, blobs=blobs), "path_mode")
+            self.assertEqual(self._refused(entries=entries, blobs=blobs), "workspace_members")
 
 
 class NpmFixtureProfileTests(unittest.TestCase):

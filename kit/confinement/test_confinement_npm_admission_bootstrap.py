@@ -40,10 +40,12 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
-def _tarball(name, version, licence="MIT", scripts=None, binary=False, root="package"):
+def _tarball(name, version, licence="MIT", scripts=None, binary=False, root="package",
+             extra=(), manifest_extra=None):
     fields = {"name": name, "version": version, "scripts": scripts or {}}
     if licence is not None:
         fields["license"] = licence
+    fields.update(manifest_extra or {})
     manifest = _json(fields)
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
@@ -57,6 +59,7 @@ def _tarball(name, version, licence="MIT", scripts=None, binary=False, root="pac
             members.append((root + "/install.js", b"synthetic script"))
         if binary:
             members.append((root + "/binding.node", b"\x7fELFsynthetic"))
+        members.extend(extra)
         for path, content in members:
             info = tarfile.TarInfo(path)
             info.mode = 0o644
@@ -1809,6 +1812,33 @@ class BundleTests(RefusalAssertions):
         self.assertEqual(alpha["install_scripts"], [])
         self.assertGreater(alpha["age_days"], 7)
         subject.verify_bundle(bundle, world.plan(), world.context, now=NOW)
+
+    def test_collect_evidence_reuses_the_verified_manifest_for_an_inert_bundle(self):
+        child_manifest = _json({"name": "plain-lib", "version": "1.2.3", "scripts": {}})
+        data = _tarball(
+            "alpha-pkg", "1.0.0", extra=(("package/node_modules/plain-lib/package.json", child_manifest),),
+            manifest_extra={"cpu": ["wasm32"], "bundleDependencies": ["plain-lib"]},
+        )
+        world = World()
+        world.archives[("alpha-pkg", "1.0.0")] = data
+        world.integrity["alpha-pkg"] = _sri(data)
+        world.lock_dict = world._lock()
+        world.lock_dict["packages"]["node_modules/alpha-pkg"].update({
+            "optional": True, "cpu": ["wasm32"], "bundleDependencies": ["plain-lib"],
+        })
+        world.lock_bytes = _json(world.lock_dict) + b"\n"
+        world.files = world._files()
+        plan = world.plan()
+        lock, entries = subject.check_lock(world.lock_bytes, plan)
+        with unittest.mock.patch.object(
+                subject, "_archive_manifest", side_effect=AssertionError("archive manifest parsed twice")):
+            record, identities = subject.collect_evidence(
+                lock, entries, plan, run_id="123456", run_attempt=1, now=NOW, expiry=EXPIRY,
+                fetcher=world.fetcher(), clock=lambda: NOW + 5,
+            )
+        alpha = next(item for item in record["packages"] if item["name"] == "alpha-pkg")
+        self.assertEqual(alpha["licence"], "MIT")
+        self.assertEqual(len(identities), 4)
 
     def test_each_name_is_fetched_once_and_archives_in_name_order(self):
         world = World()

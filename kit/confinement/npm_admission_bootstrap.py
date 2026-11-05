@@ -1704,10 +1704,12 @@ def _collect_entry(path, entry, name, packument, plan, fetcher, now, totals, pac
     for field in ("optional", "devOptional", "cpu", "bundledDependencies", "bundleDependencies"):
         if field in entry:
             archive_entry[field] = entry[field]
-    archive = _call_adm(
-        adm.verify_tarball, archive_entry, data, internal_names=plan["internal_names"],
+    archive, archive_manifest = _call_adm(
+        adm.inspect_tarball, archive_entry, data, internal_names=plan["internal_names"],
     )
-    archive_manifest = _archive_manifest(data, name, version)
+    if (adm._inert_bundled_names(archive_entry) is not None
+            and archive.get("bundled_inert") is not True):
+        _bundle_refuse("npm_archive_refused", "archive_manifest", subject, "inert_unverified")
     _check_inert_manifest(entry, archive_manifest, subject)
     archive_licence = licence_text(
         archive_manifest.get("license", archive_manifest.get("licenses")),

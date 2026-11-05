@@ -263,6 +263,27 @@ class PublicTreeTests(unittest.TestCase):
         self.assertNotIn("test_linux_source_build.py", macos)
         self.assertNotIn("test_rust_license_gate.py", macos)
 
+    def test_d145_profile_sources_and_regression_suites_are_registered_and_pinned(self):
+        paths = (
+            "kit/confinement/cargo_lock_bootstrap.py",
+            "kit/confinement/test_confinement_cargo_lock_bootstrap.py",
+            "kit/confinement/macos_feedback_producer.py",
+            "kit/confinement/test_macos_feedback_producer.py",
+            "kit/confinement/macos_private_validation.py",
+            "kit/confinement/test_macos_private_validation.py",
+            "kit/confinement/macos_core_contract.py",
+            "kit/confinement/test_macos_core_contract.py",
+            "kit/confinement/linux_source_build.py",
+            "kit/confinement/test_linux_source_build.py",
+            "kit/confinement/windows_source_run.ps1",
+            "kit/confinement/test_windows_source_run.py",
+            "kit/bootstrap/test_public_tree.py",
+        )
+        for name in paths:
+            with self.subTest(name=name):
+                self.assertIn(name, PLATFORM_FILES)
+                self.assertIn(name, PINNED_FILE_SHA256)
+
         workflow = (ROOT / ".github/workflows/linux-source-admission.yml").read_text(encoding="utf-8")
         unit_start = workflow.index("  linux-source-admission-unit:")
         unit_end = workflow.index("  linux-source-admission-source-read:", unit_start)
@@ -378,6 +399,14 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/linux_source_build.py',
             'kit/confinement/test_linux_source_build.py',
             'kit/confinement/test_linux_source_build_tiers.py',
+            'kit/confinement/linux_boundary.py',
+            'kit/confinement/test_linux_boundary.py',
+            'kit/confinement/linux_channels.py',
+            'kit/confinement/test_linux_channels.py',
+            'kit/confinement/npm_admission.py',
+            'kit/confinement/test_confinement_npm_admission.py',
+            'kit/bootstrap/policy_linux.py',
+            'kit/bootstrap/test_policy_linux.py',
             'kit/confinement/fixtures/npm11_audit_report.json',
             '.github/workflows/core-linux-quick-return.yml',
             'core-ci/linux_quick_return.py',
@@ -530,12 +559,12 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn('unittest discover -s kit/confinement -p "test_role_signer.py"', workflow)
 
     def test_pinned_action_version_comment_is_the_only_permitted_comment(self):
-        version_pin = "uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " v4.2.2"
+        version_pin = "uses: actions/attest@" + PROBE_ACTION_SHA + " " + "\x23" + " v4.2.2"
         inspect_text(version_pin, "platform")
         for fixture in (
-            "uses: actions/attest@main " + chr(35) + " v4.2.2",
-            "uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " latest",
-            "purpose " + chr(35) + " comment",
+            "uses: actions/attest@main " + "\x23" + " v4.2.2",
+            "uses: actions/attest@" + PROBE_ACTION_SHA + " " + "\x23" + " latest",
+            "purpose " + "\x23" + " comment",
         ):
             with self.subTest(comment_class="unapproved"):
                 with self.assertRaisesRegex(PublicTreeError, "comment-present"):
@@ -626,13 +655,13 @@ class PublicTreeTests(unittest.TestCase):
                 verify_start = block.index("      - name: Verify exact subject and signature")
                 action_step = block[action_start:verify_start]
                 self.assertIn(
-                    "        uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " v4.2.2",
+                    "        uses: actions/attest@" + PROBE_ACTION_SHA + " " + "\x23" + " v4.2.2",
                     action_step,
                 )
                 self.assertNotIn("        run:", action_step)
                 self.assertNotIn("        shell:", action_step)
 
-        action_line = "uses: actions/attest@" + PROBE_ACTION_SHA + " " + chr(35) + " v4.2.2"
+        action_line = "uses: actions/attest@" + PROBE_ACTION_SHA + " " + "\x23" + " v4.2.2"
         self.assertEqual(workflow.count(action_line), 6)
         for expected in (
             "subject-path: ${{ runner.temp }}/attestation-permission-probe/probe.bin",
@@ -814,7 +843,7 @@ class PublicTreeTests(unittest.TestCase):
 
     def test_identifying_content_fails_without_echoing_it(self):
         fixtures = (
-            "purpose " + chr(35) + " comment",
+            "purpose " + "\x23" + " comment",
             "rule " + "D" + "90",
             chr(47) + "Users" + chr(47) + "person" + chr(47) + "secret",
             "source " + "C:" + chr(92) + "Users" + chr(92) + "person" + chr(92) + "secret",

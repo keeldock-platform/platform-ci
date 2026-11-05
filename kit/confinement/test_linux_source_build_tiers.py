@@ -903,6 +903,7 @@ class LinuxBrowserTierTests(unittest.TestCase):
                 environment = {
                     "CI_SHA": "a" * 40, "GITHUB_RUN_ID": "7", "GITHUB_RUN_ATTEMPT": "1",
                     "SOURCE_READER_INSTALLATION_ID": "19",
+                    "LINUX_API_FEATURE_GATE_NAMES": ",".join(linux_source_build.API_FEATURE_GATE_NAMES),
                 }
                 self.assertEqual(linux_source_build._verified_gate_count(records, environment), expected)
 

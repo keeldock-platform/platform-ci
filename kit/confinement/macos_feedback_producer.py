@@ -55,13 +55,19 @@ PACKAGE_ROOTS = (
     Path("crates/host/api"), Path("crates/host/mock"), Path("crates/host/conformance"),
     Path("crates/kernel/i18n"),
 )
-RUNTIME_PACKAGE_ROOTS = (Path("runtime/crates/services/sync-publication"),) + tuple(
-    Path("runtime/crates/test-fixtures") / name
-    for name in (
+RUNTIME_PACKAGE_ROOTS = (
+    Path("runtime/crates/services/sync-publication"),
+    *(Path("runtime/crates/test-fixtures") / name for name in (
         "host-router", "fixture-data", "tool-a", "tool-b",
         "tool-bad-no-handler", "tool-bad-no-manifest",
-    )
+    )),
+    Path("runtime/crates/host/registry"), Path("runtime/crates/host/core"),
+    Path("runtime/crates/host/settings-schema"), Path("runtime/crates/services/palette"),
+    Path("runtime/crates/services/notifications"),
 )
+OPTIONAL_RUNTIME_PACKAGE_ROOTS = (Path("runtime/crates/services/sync-format"),)
+RUNTIME_MEMBER_LIST_RE = re.compile(r"(?m)^members\s*=\s*\[(.*?)\]\s*$", re.DOTALL)
+RUNTIME_MEMBER_ITEM_RE = re.compile(r'\s*"([A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*,?')
 CARGO_WORKSPACE_ROOTS = {"contract": PACKAGE_ROOTS, "runtime": RUNTIME_PACKAGE_ROOTS}
 FOUNDATION_FUZZ_RUST_PATHS = (
     "fuzz/src/main.rs",
@@ -408,6 +414,130 @@ def _reviewed_rust_paths(source, *, include_fuzz=False, roots=None):
     return tuple(sorted(paths))
 
 
+def _runtime_package_roots(source, selector):
+    if selector == "contract":
+        return PACKAGE_ROOTS
+    if selector != "runtime":
+        _refuse("manifest_invalid")
+    root_path = source / "runtime" / "Cargo.toml"
+    payload = _read_file(root_path, maximum=MAX_PACKAGE_JSON_BYTES)
+    try:
+        text = payload.decode("utf-8", "strict")
+    except UnicodeError:
+        _refuse("manifest_invalid")
+    matches = tuple(RUNTIME_MEMBER_LIST_RE.finditer(text))
+    if len(matches) != 1:
+        _refuse("manifest_invalid")
+    body = matches[0].group(1)
+    roots = []
+    position = 0
+    while position < len(body):
+        match = RUNTIME_MEMBER_ITEM_RE.match(body, position)
+        if match is None:
+            if body[position:].strip():
+                _refuse("manifest_invalid")
+            break
+        roots.append(Path("runtime") / match.group(1))
+        position = match.end()
+    required = tuple(RUNTIME_PACKAGE_ROOTS)
+    optional = tuple(OPTIONAL_RUNTIME_PACKAGE_ROOTS)
+    if tuple(roots) not in (required, required + optional):
+        _refuse("manifest_invalid")
+    return tuple(roots)
+
+
+def _reviewed_api_source_paths(source):
+    root = source / "crates" / "host" / "api" / "src"
+    try:
+        root_info = root.lstat()
+    except OSError:
+        _refuse("manifest_invalid")
+    if (not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode)
+            or root_info.st_uid != 0 or root_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        _refuse("manifest_invalid")
+    paths = []
+    stack = [root]
+    while stack:
+        directory = stack.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError:
+            _refuse("manifest_invalid")
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                info = path.lstat()
+            except OSError:
+                _refuse("manifest_invalid")
+            if (stat.S_ISLNK(info.st_mode) or info.st_uid != 0
+                    or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)):
+                _refuse("manifest_invalid")
+            if stat.S_ISDIR(info.st_mode):
+                stack.append(path)
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_nlink != 1:
+                    _refuse("manifest_invalid")
+                relative = path.relative_to(source).as_posix()
+                if len(relative) > 256 or relative in paths:
+                    _refuse("manifest_invalid")
+                paths.append(relative)
+                if len(paths) > MAX_RUST_PATHS:
+                    _refuse("manifest_invalid")
+            else:
+                _refuse("manifest_invalid")
+    if not paths or "crates/host/api/src/lib.rs" not in paths:
+        _refuse("manifest_invalid")
+    return tuple(sorted(paths))
+
+
+def _authenticated_candidate_files(source, source_sha):
+    if type(source_sha) is not str or re.fullmatch(r"[a-f0-9]{40}", source_sha) is None:
+        _refuse("manifest_invalid")
+    environment = {
+        "PATH": "/usr/bin:/bin", "HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_ATTR_NOSYSTEM": "1",
+    }
+    prefix = ("/usr/bin/git", "-C", str(source))
+    try:
+        head = subprocess.run(
+            prefix + ("rev-parse", "--verify", "HEAD"), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+            timeout=10, check=False,
+        )
+        if (head.returncode != 0 or head.stderr
+                or head.stdout.decode("ascii", "strict").strip() != source_sha):
+            _refuse("manifest_invalid")
+        tree = subprocess.run(
+            prefix + ("ls-tree", "-r", "-z", "--full-tree", source_sha, "--",
+                      "Cargo.toml", "crates/host/api", "runtime"),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment, timeout=30, check=False,
+        )
+        if tree.returncode != 0 or tree.stderr or len(tree.stdout) > 8 * 1024 * 1024:
+            _refuse("manifest_invalid")
+        entries = {}
+        for record in tree.stdout.split(b"\x00"):
+            if not record:
+                continue
+            metadata, path = record.split(b"\t", 1)
+            mode, kind, object_id = metadata.split(b" ", 2)
+            try:
+                relative = path.decode("ascii", "strict")
+                mode_text = mode.decode("ascii", "strict")
+                kind_text = kind.decode("ascii", "strict")
+                oid = object_id.decode("ascii", "strict")
+            except UnicodeError:
+                continue
+            if kind_text == "blob" and re.fullmatch(r"[a-f0-9]{40}", oid) is not None:
+                entries[relative] = (mode_text, oid)
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+        _refuse("manifest_invalid")
+    return entries
+
+
 def validate_dispatch(kind, environ, *, now=None):
     if type(kind) is not str or kind not in PROFILE_BY_KIND:
         _refuse("request_invalid")
@@ -635,15 +765,15 @@ def _make_worker_directory(path, worker_uid, primary_gid):
         _refuse("output_unavailable")
 
 
-def _write_worker_file(path, payload, worker_uid, primary_gid):
+def _write_worker_file(path, payload, worker_uid, primary_gid, mode=0o600):
     nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
+    if nofollow is None or mode not in (0o600, 0o644):
         _refuse("output_unavailable")
     descriptor = None
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, mode)
         os.fchown(descriptor, worker_uid, primary_gid)
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, mode)
         offset = 0
         while offset < len(payload):
             count = os.write(descriptor, payload[offset:])
@@ -656,7 +786,7 @@ def _write_worker_file(path, payload, worker_uid, primary_gid):
         if ((opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
                 or not stat.S_ISREG(opened.st_mode) or opened.st_uid != worker_uid
                 or opened.st_gid != primary_gid or opened.st_nlink != 1
-                or opened.st_size != len(payload) or stat.S_IMODE(opened.st_mode) != 0o600):
+                or opened.st_size != len(payload) or stat.S_IMODE(opened.st_mode) != mode):
             raise ValueError
     except BaseException:
         _refuse("output_unavailable")
@@ -668,7 +798,10 @@ def _write_worker_file(path, payload, worker_uid, primary_gid):
                 pass
 
 
-def _copy_reviewed_files(source, destination, relative_paths, worker_uid, primary_gid):
+def _copy_reviewed_files(source, destination, relative_paths, worker_uid, primary_gid,
+                         file_mode=0o600, candidate_files=None):
+    if file_mode not in (0o600, 0o644):
+        _refuse("output_unavailable")
     _make_worker_directory(destination, worker_uid, primary_gid)
     for relative in relative_paths:
         rel = Path(relative)
@@ -683,9 +816,25 @@ def _copy_reviewed_files(source, destination, relative_paths, worker_uid, primar
                 _make_worker_directory(current, worker_uid, primary_gid)
             except OSError:
                 _refuse("output_unavailable")
-        payload = _read_file(source / rel, maximum=MAX_RUST_FILE_BYTES if rel.suffix in (".rs", ".ts")
+        source_path = source / rel
+        payload = _read_file(source_path, maximum=MAX_RUST_FILE_BYTES if rel.suffix in (".rs", ".ts")
                              else MAX_PACKAGE_JSON_BYTES)
-        _write_worker_file(current / rel.name, payload, worker_uid, primary_gid)
+        try:
+            source_info = source_path.lstat()
+        except OSError:
+            _refuse("manifest_invalid")
+        if (not stat.S_ISREG(source_info.st_mode) or source_info.st_nlink != 1
+                or stat.S_IMODE(source_info.st_mode) not in (0o600, 0o644)
+                or source_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)):
+            _refuse("manifest_invalid")
+        if candidate_files is not None:
+            candidate = candidate_files.get(rel.as_posix())
+            git_blob = hashlib.sha1(
+                b"blob " + str(len(payload)).encode("ascii") + b"\x00" + payload,
+            ).hexdigest()
+            if candidate != ("100644", git_blob):
+                _refuse("manifest_invalid")
+        _write_worker_file(current / rel.name, payload, worker_uid, primary_gid, file_mode)
 
 
 def _read_worker_file(path, worker_uid, maximum):
@@ -905,15 +1054,17 @@ def _cargo_bootstrap_refusal(bootstrap, error):
 
 
 def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environment, tools,
-                           host_toolchain, capability, rust, deadline, bootstrap, source_environ):
+                           host_toolchain, capability, rust, deadline, bootstrap, source_environ,
+                           *, admitted_workspace_selector=None):
     profile = dispatch["profile"]
     if (profile["kind"] != feedback_request.CARGO_LOCK_KIND or type(source_environ) is not dict
             or type(environment) is not dict or type(tools) is not dict):
         _refuse("request_invalid")
     request = dispatch["request"]
     selector = feedback_request.request_workspace(request)
-    roots = CARGO_WORKSPACE_ROOTS.get(selector) if type(selector) is str else None
-    if roots is None:
+    if (selector not in CARGO_WORKSPACE_ROOTS
+            or (admitted_workspace_selector is not None
+                and selector != admitted_workspace_selector)):
         _refuse("request_invalid")
     worker_gid = capability.PROBE_PRIMARY_GID
     refusal_type = bootstrap.BootstrapRefusal
@@ -921,6 +1072,7 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
     cargo_home = worker_storage / "cargo-lock-home"
     try:
         bootstrap.refuse_cargo_config(source)
+        roots = _runtime_package_roots(source, selector)
         reviewed_paths = _reviewed_rust_paths(source, roots=roots)
         root_manifest = bootstrap.workspace_root_manifest(selector)
         manifests = (root_manifest,) + tuple((root / "Cargo.toml").as_posix() for root in roots)
@@ -930,7 +1082,58 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
             bootstrap.check_manifests(manifest_bytes, member_paths) if selector == "contract"
             else bootstrap.check_manifests(manifest_bytes, member_paths, selector)
         )
-        _copy_reviewed_files(source, project, manifests + reviewed_paths, worker_uid, worker_gid)
+        package_identities = set(bootstrap.manifest_package_identities(manifest_bytes, selector))
+        dependency_rules = bootstrap.manifest_dependency_rules(manifest_bytes, selector)
+        if selector == "runtime":
+            api_source_paths = _reviewed_api_source_paths(source)
+            api_files = ("Cargo.toml", bootstrap.HOST_API_POLICY_API_MANIFEST_PATH)
+            copy_paths = api_files + api_source_paths + manifests + reviewed_paths
+            api_manifest = _read_file(source / bootstrap.HOST_API_POLICY_API_MANIFEST_PATH, maximum=MAX_PACKAGE_JSON_BYTES)
+            try:
+                api_document = bootstrap._parse_manifest(api_manifest)
+            except BaseException:
+                _refuse("manifest_invalid")
+            api_package = api_document.get("package") if type(api_document) is dict else None
+            if type(api_package) is not dict or api_package.get("name") != bootstrap.HOST_API_POLICY_API_PACKAGE:
+                _refuse("manifest_invalid")
+            contract_identity_manifests = {
+                "Cargo.toml": _read_file(source / "Cargo.toml", maximum=bootstrap.MAX_MANIFEST_BYTES),
+                bootstrap.HOST_API_POLICY_API_MANIFEST_PATH: api_manifest,
+            }
+            contract_identities = bootstrap.manifest_package_identities(
+                contract_identity_manifests, "contract",
+            )
+            api_identity = next((identity for identity in contract_identities
+                                 if identity[0] == bootstrap.HOST_API_POLICY_API_PACKAGE), None)
+            if api_identity is None:
+                _refuse("manifest_invalid")
+            package_identities.add(api_identity)
+            dependency_rules.update(bootstrap.manifest_dependency_rules(
+                contract_identity_manifests, "contract",
+            ))
+            candidate_files = _authenticated_candidate_files(source, request["source_sha"])
+            tracked_api_sources = {
+                path for path in candidate_files
+                if path.startswith("crates/host/api/src/")
+            }
+            if tracked_api_sources != set(api_source_paths):
+                _refuse("manifest_invalid")
+            tracked_runtime_rust = {
+                path for path in candidate_files
+                if path.endswith(".rs") and path.rsplit("/", 1)[-1] != "build.rs"
+                and any(path.startswith(root.as_posix() + "/src/")
+                        or path.startswith(root.as_posix() + "/tests/") for root in roots)
+            }
+            if tracked_runtime_rust != set(reviewed_paths):
+                _refuse("manifest_invalid")
+        else:
+            copy_paths = manifests + reviewed_paths
+            candidate_files = None
+        _copy_reviewed_files(
+            source, project, tuple(dict.fromkeys(copy_paths)), worker_uid, worker_gid,
+            file_mode=0o644 if selector == "runtime" else 0o600,
+            candidate_files=candidate_files,
+        )
         _make_worker_directory(cargo_home, worker_uid, worker_gid)
         bootstrap.refuse_cargo_config(project)
         bootstrap.require_fresh_directory(cargo_home)
@@ -961,9 +1164,13 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
     )
     toolchain_target, toolchain_hash = _cargo_toolchain_hash(rust, bootstrap)
     try:
-        bootstrap.check_lock_members(lock_bytes, package_names)
+        bootstrap.check_lock_members(
+            lock_bytes, package_names, package_identities, dependency_rules,
+        )
     except refusal_type as error:
         _cargo_bootstrap_refusal(bootstrap, error)
+    if selector == "runtime" and os.path.lexists(project / "Cargo.lock"):
+        _refuse("manifest_invalid")
     owner = source_environ.get("SOURCE_REPOSITORY_OWNER", "")
     name = source_environ.get("SOURCE_REPOSITORY_NAME", "")
     trusted_context = {

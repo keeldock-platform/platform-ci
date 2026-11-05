@@ -511,8 +511,8 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                 self.assertEqual(self._body(payload), b"line\n\nstderr:\nerr\n")
                 self.assertIn(b"stdout_truncated=true stderr_truncated=true", payload)
         payload = producer.build_diagnostic_payload(
-            self._failed_outcome("ok ⎯".encode("utf-8"), b"", True, False))
-        self.assertEqual(self._body(payload), "ok ⎯\nstderr:\n".encode("utf-8"))
+            self._failed_outcome(b"ok --", b"", True, False))
+        self.assertEqual(self._body(payload), b"ok --\nstderr:\n")
         payload = producer.build_diagnostic_payload(self._failed_outcome(b"line\xe2\x8e", b"", False, False))
         self.assertEqual(self._body(payload), b"line\\xe2\\x8e\nstderr:\n")
 
@@ -663,6 +663,11 @@ class MacosFeedbackProducerTests(unittest.TestCase):
     def test_reviewed_typescript_copy_uses_validator_file_limit(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            source_directory = root / "source" / "packages/host-api/tests"
+            source_directory.mkdir(parents=True)
+            source_file = source_directory / "new-test.test.ts"
+            source_file.write_bytes(b"source")
+            source_file.chmod(0o600)
             with patch.object(producer, "_make_worker_directory"), \
                     patch.object(producer, "_read_file", return_value=b"source") as read_file, \
                     patch.object(producer, "_write_worker_file"):
@@ -1129,8 +1134,30 @@ class CargoLockProducerTests(unittest.TestCase):
             "aarch64-apple-darwin", (("cargo", "a" * 64), ("rustc", "b" * 64)),
         )
 
+    def test_runtime_package_roots_follow_only_the_validated_optional_member(self):
+        runtime_members = tuple(root.as_posix()[len("runtime/"):] for root in producer.RUNTIME_PACKAGE_ROOTS)
+        optional = tuple(root.as_posix()[len("runtime/"):] for root in producer.OPTIONAL_RUNTIME_PACKAGE_ROOTS)
+        for members, expected in (
+            (runtime_members, producer.RUNTIME_PACKAGE_ROOTS),
+            (runtime_members + optional, producer.RUNTIME_PACKAGE_ROOTS + producer.OPTIONAL_RUNTIME_PACKAGE_ROOTS),
+        ):
+            root_text = "[workspace]\nmembers = [\n" + "".join(
+                '"' + member + '",\n' for member in members
+            ) + "]\n"
+            with self.subTest(optional=len(members) > len(runtime_members)), \
+                    patch.object(producer, "_read_file", return_value=root_text.encode("ascii")):
+                self.assertEqual(
+                    producer._runtime_package_roots(Path("/source"), "runtime"), expected,
+                )
+        invalid = "[workspace]\nmembers = [\n" + "".join(
+            '"' + member + '",\n' for member in runtime_members + ("crates/services/extra",)
+        ) + "]\n"
+        with patch.object(producer, "_read_file", return_value=invalid.encode("ascii")):
+            with self.assertRaises(producer.FeedbackRefusal):
+                producer._runtime_package_roots(Path("/source"), "runtime")
+
     def _run(self, *, returncode=0, config_error=None, bundle_error=None, kind="cargo_lock",
-             manifest_error=None, members_error=None, workspace=None):
+             manifest_error=None, members_error=None, workspace=None, runtime_roots=None):
         dispatch = _validated_dispatch(kind)
         if workspace is not None:
             dispatch["request"] = dict(dispatch["request"], workspace=workspace)
@@ -1146,6 +1173,22 @@ class CargoLockProducerTests(unittest.TestCase):
                 raise bundle_error
             return b"bundle-bytes"
 
+        def read_source_file(path, *, maximum, owner=0):
+            relative = Path(path).relative_to(source).as_posix()
+            if relative == "runtime/Cargo.toml":
+                return (b'[workspace]\nresolver = "3"\n\n[workspace.package]\n'
+                        b'version = "0.1.0"\nedition = "2024"\n')
+            if relative == "Cargo.toml":
+                return (b'[workspace]\n\n[workspace.package]\n'
+                        b'version = "0.1.0"\nedition = "2024"\n')
+            if relative.endswith("/Cargo.toml"):
+                name = (self.bootstrap.HOST_API_POLICY_API_PACKAGE
+                        if relative == "crates/host/api/Cargo.toml"
+                        else Path(relative).parent.name)
+                return ('[package]\nname = "' + name + '"\n'
+                        'version = "0.1.0"\nedition = "2024"\n').encode("ascii")
+            return b"fn main() {}\n"
+
         with tempfile.TemporaryDirectory() as temporary:
             worker_storage = Path(temporary) / "worker"
             worker_storage.mkdir()
@@ -1153,7 +1196,21 @@ class CargoLockProducerTests(unittest.TestCase):
             source.mkdir()
             state["source"] = source
             state["worker_storage"] = worker_storage
-            with patch.object(producer, "_reviewed_rust_paths", return_value=("crates/host/api/src/lib.rs",)), \
+            with patch.object(producer, "_reviewed_rust_paths", side_effect=lambda unused_source, include_fuzz=False, roots=None: (
+                        ("crates/host/api/src/lib.rs",) if roots in (None, producer.PACKAGE_ROOTS) else
+                        ("runtime/crates/services/sync-publication/src/lib.rs",)
+                    )), \
+                    patch.object(producer, "_reviewed_api_source_paths", return_value=("crates/host/api/src/lib.rs",)), \
+                    patch.object(producer, "_authenticated_candidate_files", side_effect=lambda unused_source, unused_sha: {
+                        path: ("100644", "a" * 40) for path in (
+                            "crates/host/api/src/lib.rs",
+                            "runtime/crates/services/sync-publication/src/lib.rs",
+                        )
+                    }), \
+                    patch.object(producer, "_runtime_package_roots", side_effect=lambda unused_source, selector: (
+                        producer.PACKAGE_ROOTS if selector == "contract" else
+                        tuple(runtime_roots) if runtime_roots is not None else producer.RUNTIME_PACKAGE_ROOTS
+                    )), \
                     patch.object(producer, "_copy_reviewed_files") as copy_files, \
                     patch.object(producer, "_make_worker_directory"), \
                     patch.object(producer, "_run_worker", side_effect=record_command), \
@@ -1162,7 +1219,7 @@ class CargoLockProducerTests(unittest.TestCase):
                     patch.object(self.bootstrap, "refuse_cargo_config",
                                  side_effect=config_error, return_value=True) as refuse_config, \
                     patch.object(self.bootstrap, "require_fresh_directory", return_value=True), \
-                    patch.object(producer, "_read_file", return_value=b"manifest"), \
+                    patch.object(producer, "_read_file", side_effect=read_source_file), \
                     patch.object(self.bootstrap, "check_manifests",
                                  side_effect=manifest_error, return_value=frozenset(("host-api",))) as check_manifests, \
                     patch.object(self.bootstrap, "check_lock_members",
@@ -1190,10 +1247,10 @@ class CargoLockProducerTests(unittest.TestCase):
         self.assertNotIn("refusal", state)
         project = state["worker_storage"] / "feedback-cargo-lock"
         runtime_members = tuple(root.as_posix() for root in producer.RUNTIME_PACKAGE_ROOTS)
-        self.assertEqual(len(runtime_members), 7)
+        self.assertEqual(len(runtime_members), 12)
         self.assertEqual(runtime_members[0], "runtime/crates/services/sync-publication")
         self.assertEqual(
-            sorted(runtime_members[1:]),
+            sorted(runtime_members[1:7]),
             sorted("runtime/crates/test-fixtures/" + name for name in (
                 "host-router", "fixture-data", "tool-a", "tool-b",
                 "tool-bad-no-handler", "tool-bad-no-manifest",
@@ -1201,9 +1258,15 @@ class CargoLockProducerTests(unittest.TestCase):
         )
         self.assertNotIn(producer.PACKAGE_ROOTS[0].as_posix(), runtime_members)
         copied = state["copy"].call_args.args[2]
-        self.assertEqual(copied[0], "runtime/Cargo.toml")
-        self.assertEqual(copied[1:1 + len(runtime_members)], tuple(path + "/Cargo.toml" for path in runtime_members))
-        self.assertNotIn("Cargo.toml", copied)
+        self.assertEqual(copied[:3], (
+            "Cargo.toml", "crates/host/api/Cargo.toml", "crates/host/api/src/lib.rs",
+        ))
+        self.assertEqual(
+            copied[3:4 + len(runtime_members)],
+            ("runtime/Cargo.toml",) + tuple(path + "/Cargo.toml" for path in runtime_members),
+        )
+        self.assertNotIn("Cargo.lock", copied)
+        self.assertEqual(state["copy"].call_args.kwargs["file_mode"], 0o644)
         manifests, members, selector = state["check_manifests"].call_args.args
         self.assertEqual(sorted(manifests), sorted(("runtime/Cargo.toml",) + tuple(path + "/Cargo.toml" for path in runtime_members)))
         self.assertEqual(members, frozenset(runtime_members))
@@ -1214,10 +1277,206 @@ class CargoLockProducerTests(unittest.TestCase):
         lock_bytes, context, kwargs = state["bundles"][0]
         self.assertEqual(context["workspace_path"], "runtime")
 
+    def test_runtime_candidate_uses_real_validation_staging_and_generated_lock_path(self):
+        if os.name != "posix":
+            self.skipTest("root-owned source fixture requires a POSIX filesystem")
+        with tempfile.TemporaryDirectory(prefix="kd-runtime-candidate-", dir="/tmp") as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            worker_storage = root / "worker"
+            source.mkdir()
+            worker_storage.mkdir()
+
+            def write_source(relative, contents):
+                path = source / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents, encoding="ascii")
+                path.chmod(0o644)
+
+            runtime_members = tuple(path.as_posix() for path in producer.RUNTIME_PACKAGE_ROOTS)
+            runtime_member_text = "".join(
+                '    "' + path[len("runtime/"):] + '",\n' for path in runtime_members
+            )
+            runtime_root = (
+                '[workspace]\nresolver = "3"\nmembers = [\n' + runtime_member_text + ']\n\n'
+                '[workspace.package]\nversion = "0.1.0"\nedition = "2024"\n\n'
+                '[workspace.dependencies]\n' + self.bootstrap.HOST_API_POLICY_API_PACKAGE
+                + ' = { path = "../crates/host/api" }\n'
+            )
+            contract_members = (
+                "crates/host/api", "crates/host/mock", "crates/host/conformance",
+                "crates/kernel/i18n",
+            )
+            contract_root = (
+                '[workspace]\nmembers = ['
+                + ", ".join('"' + member + '"' for member in contract_members)
+                + ']\n\n[workspace.package]\nversion = "0.1.0"\nedition = "2024"\n'
+            )
+            api_name = self.bootstrap.HOST_API_POLICY_API_PACKAGE
+            write_source("Cargo.toml", contract_root)
+            write_source(
+                "crates/host/api/Cargo.toml",
+                '[package]\nname = "' + api_name + '"\nversion.workspace = true\nedition.workspace = true\n',
+            )
+            write_source("crates/host/api/src/lib.rs", "pub mod nested;\n")
+            write_source("crates/host/api/src/nested/mod.rs", "pub fn fixture() {}\n")
+            write_source("crates/host/api/src/nested/types.rs", "pub struct Fixture;\n")
+            write_source("runtime/Cargo.toml", runtime_root)
+
+            local_names = [Path(path).name for path in runtime_members] + [api_name]
+            local_dependencies = {}
+            for path in runtime_members:
+                package_name = Path(path).name
+                manifest = (
+                    '[package]\nname = "' + package_name + '"\n'
+                    'version.workspace = true\nedition.workspace = true\n'
+                )
+                dependencies = []
+                if path in self.bootstrap.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS:
+                    dependencies.append(
+                        api_name + ' = { workspace = true }'
+                    )
+                if path == self.bootstrap.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS[0]:
+                    dependencies.append('serde = "=1.0.200"')
+                if dependencies:
+                    manifest += "\n[dependencies]\n" + "\n".join(dependencies) + "\n"
+                write_source(path + "/Cargo.toml", manifest)
+                write_source(path + "/src/lib.rs", "pub fn fixture() {}\n")
+                lock_dependencies = []
+                if path in self.bootstrap.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS:
+                    lock_dependencies.append(api_name + " 0.1.0")
+                if path == self.bootstrap.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS[0]:
+                    lock_dependencies.append("serde 1.0.200")
+                local_dependencies[package_name] = lock_dependencies
+            lock_rows = []
+            for name in sorted(local_names):
+                row = '[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n'
+                dependencies = local_dependencies.get(name, [])
+                if name == api_name:
+                    dependencies = []
+                if dependencies:
+                    row += "dependencies = [\n" + "".join(
+                        ' "' + item + '",\n' for item in dependencies
+                    ) + "]\n"
+                lock_rows.append(row)
+            checksum = "a" * 64
+            lock_rows.append(
+                '[[package]]\nname = "serde"\nversion = "1.0.200"\nsource = "'
+                + self.bootstrap.cargo.REGISTRY_SOURCE + '"\nchecksum = "' + checksum + '"\n'
+            )
+            lock_bytes = ("version = 4\n\n" + "\n".join(lock_rows)).encode("ascii")
+            owner = str(os.getuid()) + ":" + str(os.getgid())
+            try:
+                root_owned = subprocess.run(
+                    ["sudo", "-n", "chown", "-R", "0:0", str(source)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+            except OSError:
+                self.skipTest("root-owned source fixture is unavailable")
+            if root_owned.returncode != 0:
+                self.skipTest("root-owned source fixture is unavailable")
+
+            class LocalFetcher:
+                def index_entry(self, name):
+                    if name != "serde":
+                        raise AssertionError("unexpected registry package")
+                    return json.dumps({
+                        "name": name, "vers": "1.0.200", "deps": [], "cksum": checksum,
+                        "features": {}, "yanked": False,
+                    }).encode("ascii") + b"\n"
+
+                def version_metadata(self, name, version):
+                    if (name, version) != ("serde", "1.0.200"):
+                        raise AssertionError("unexpected registry package")
+                    return json.dumps({"version": {
+                        "crate": name, "num": version, "checksum": checksum,
+                        "yanked": False, "created_at": "2026-10-01T00:00:00Z",
+                    }}).encode("ascii")
+
+            dispatch = _validated_dispatch("cargo_lock")
+            dispatch["request"] = dict(dispatch["request"], workspace="runtime")
+            cargo_commands = []
+
+            def run_cargo(unused_rust, argv, worker_uid, unused_environment, unused_python,
+                          unused_capability, stage, unused_deadline, **unused_keywords):
+                cargo_commands.append((argv, stage))
+                self.assertEqual(worker_uid, os.getuid())
+                self.assertEqual(stage, "feedback_lock")
+                generated = Path.cwd() / "runtime" / "Cargo.lock"
+                generated.write_bytes(lock_bytes)
+                generated.chmod(0o600)
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            def candidate_entries(candidate_root, unused_sha):
+                entries = {}
+                for path in candidate_root.rglob("*"):
+                    if not path.is_file():
+                        continue
+                    relative = path.relative_to(candidate_root).as_posix()
+                    if (relative == "Cargo.toml" or relative.startswith("runtime/")
+                            or relative.startswith("crates/host/api/")):
+                        payload = path.read_bytes()
+                        oid = hashlib.sha1(
+                            b"blob " + str(len(payload)).encode("ascii") + b"\x00" + payload,
+                        ).hexdigest()
+                        entries[relative] = ("100644", oid)
+                return entries
+
+            try:
+                with patch.object(producer, "_run_worker", side_effect=run_cargo), \
+                        patch.object(producer.time, "time", return_value=NOW), \
+                        patch.object(producer, "_authenticated_candidate_files", side_effect=candidate_entries), \
+                        patch.object(self.bootstrap, "RegistryFetcher", LocalFetcher):
+                    result = producer.run_cargo_lock_profile(
+                        dispatch, source, worker_storage, os.getuid(), self.environment,
+                        {"cargo": Path("/trusted/cargo")}, {"python": "/trusted/python"},
+                        SimpleNamespace(PROBE_PRIMARY_GID=os.getgid()), self.rust, 10**12,
+                        self.bootstrap, self.source_environ, admitted_workspace_selector="runtime",
+                    )
+                project = worker_storage / "feedback-cargo-lock"
+                self.assertEqual(len(cargo_commands), 1)
+                self.assertEqual(
+                    cargo_commands[0][0][-3:],
+                    ("generate-lockfile", "--manifest-path", str(project / "runtime/Cargo.toml")),
+                )
+                self.assertTrue((project / "runtime/Cargo.lock").is_file())
+                self.assertFalse((project / "Cargo.lock").exists())
+                self.assertEqual(os.stat(project / "runtime/Cargo.toml").st_mode & 0o777, 0o644)
+                self.assertEqual(os.stat(project / "crates/host/api/src/nested/mod.rs").st_mode & 0o777, 0o644)
+                self.assertEqual((project / "Cargo.toml").read_bytes(), (source / "Cargo.toml").read_bytes())
+                self.assertEqual(
+                    (project / "crates/host/api/src/lib.rs").read_bytes(),
+                    (source / "crates/host/api/src/lib.rs").read_bytes(),
+                )
+                for relative in (
+                    "crates/host/api/src/nested/mod.rs",
+                    "crates/host/api/src/nested/types.rs",
+                ):
+                    self.assertEqual(
+                        (project / relative).read_bytes(), (source / relative).read_bytes(),
+                    )
+                for member in runtime_members:
+                    self.assertEqual(
+                        (project / member / "Cargo.toml").read_bytes(),
+                        (source / member / "Cargo.toml").read_bytes(),
+                    )
+                    self.assertEqual(
+                        (project / member / "src/lib.rs").read_bytes(),
+                        (source / member / "src/lib.rs").read_bytes(),
+                    )
+                self.assertEqual(result["source_result"], "command_completed")
+                self.assertTrue(result["payload_bytes"])
+            finally:
+                subprocess.run(
+                    ["sudo", "-n", "chown", "-R", owner, str(source)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+
     def test_contract_request_keeps_the_root_path_and_two_argument_manifest_check(self):
         state = self._run()
         self.assertEqual(len(state["check_manifests"].call_args.args), 2)
         self.assertEqual(state["bundles"][0][1]["workspace_path"], ".")
+        self.assertEqual(state["copy"].call_args.kwargs["file_mode"], 0o600)
 
     def test_unknown_selector_refuses_before_copy_or_execution(self):
         for value in ("other", "", "runtime/", "Runtime"):
@@ -1291,7 +1550,15 @@ class CargoLockProducerTests(unittest.TestCase):
             "toolchain_hash": self._expected_hash(),
         })
         self.assertEqual(kwargs["toolchain_target"], "aarch64-apple-darwin")
-        self.assertEqual(state["check_members"].call_args.args, (b"lock-bytes", frozenset(("host-api",))))
+        lock_args = state["check_members"].call_args.args
+        self.assertEqual(lock_args[:2], (b"lock-bytes", frozenset(("host-api",))))
+        contract_names = {
+            self.bootstrap.HOST_API_POLICY_API_PACKAGE, "mock", "conformance", "i18n",
+        }
+        self.assertEqual(
+            lock_args[2], {(name, "0.1.0") for name in contract_names},
+        )
+        self.assertEqual(lock_args[3], {name: {} for name in contract_names})
         manifests, members = state["check_manifests"].call_args.args
         self.assertEqual(sorted(manifests), sorted((
             "Cargo.toml", "crates/host/api/Cargo.toml", "crates/host/mock/Cargo.toml",

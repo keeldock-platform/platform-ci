@@ -539,7 +539,10 @@ class OutputTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
-    ARGUMENTS = ["encrypt", "--reader-uid", "1000", "--reader-gid", "1000"]
+    ARGUMENTS = [
+        "encrypt", "--reader-uid", str(os.getuid() if hasattr(os, "getuid") else 0),
+        "--reader-gid", str(os.getgid() if hasattr(os, "getgid") else 0),
+    ]
 
     def staged_environment(self, directory, **updates):
         output = Path(directory) / "github-output"
@@ -624,6 +627,26 @@ class CommandTests(unittest.TestCase):
                 output = io.StringIO()
                 self.assertEqual(subject.main(self.ARGUMENTS, dict(env, NODE_BIN=""), output), 1)
                 self.assertIn("reason=binding", output.getvalue())
+                output = io.StringIO()
+                self.assertEqual(subject.main(self.ARGUMENTS, dict(env, RUNNER_TEMP=""), output), 1)
+                self.assertIn("reason=binding", output.getvalue())
+            encrypt.assert_not_called()
+
+    def test_encrypt_refuses_reader_ids_that_do_not_match_the_runner_process(self):
+        if not hasattr(os, "getuid") or not hasattr(os, "getgid"):
+            self.skipTest("the encrypted hand-off requires POSIX runner identities")
+        with tempfile.TemporaryDirectory() as directory:
+            write_records(directory)
+            env = self.staged_environment(directory)
+            other_uid = 1 if os.getuid() == 0 else 0
+            arguments = [
+                "encrypt", "--reader-uid", str(other_uid), "--reader-gid", str(os.getgid()),
+            ]
+            output = io.StringIO()
+            with patch.object(subject, "encrypt_payload") as encrypt:
+                self.assertEqual(subject.main(arguments, env, output), 1)
+            self.assertIn("reason=output", output.getvalue())
+            self.assertFalse((Path(directory) / "kd-quick-upload").exists())
             encrypt.assert_not_called()
 
     def test_usage_errors_are_closed(self):

@@ -755,7 +755,7 @@ class ProfileLimitTests(BootstrapTestCase):
 
 
 MEMBERS = ("crates/host/api", "crates/host/mock", "crates/host/conformance")
-HASH = chr(35)
+HASH = "\x23"
 ROOT_MANIFEST = (
     "[workspace]\n"
     'members = [\n  "crates/host/api",\n  "crates/host/mock",\n  "crates/host/conformance",\n]\n'
@@ -1244,34 +1244,43 @@ class ManifestCheckTests(BootstrapTestCase):
         self.assertEqual(json.loads(self.evidence(FakeFetcher()))["toolchain_target"], TARGET)
 
 
-RUNTIME_MEMBERS = ("runtime/crates/test-fixtures/tool-a", "runtime/crates/test-fixtures/tool-b")
+RUNTIME_MEMBERS = subject.HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS
+RUNTIME_API_NAME = subject.HOST_API_POLICY_API_PACKAGE
 RUNTIME_ROOT = (
-    "[workspace]\n"
-    'resolver = "3"\n'
-    "members = [\n"
-    '    "crates/test-fixtures/tool-a",\n'
-    '    "crates/test-fixtures/tool-b",\n'
-    "]\n\n"
-    "[workspace.package]\n"
-    'version = "0.1.0"\nedition = "2024"\n'
+    "[workspace]\nresolver = \"3\"\nmembers = [\n"
+    + "".join('    "' + root[len("runtime/"):] + '",\n' for root in RUNTIME_MEMBERS)
+    + "]\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+    + "\n[workspace.dependencies]\n" + RUNTIME_API_NAME + ' = { path = "../crates/host/api" }\n'
 )
 
 
-def _runtime_member(name, extra="", package_extra=""):
+def _runtime_member(root, name=None, extra="", package_extra=""):
+    package_name = name or root.rsplit("/", 1)[-1]
+    consumer = root in subject.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS or (
+        root == subject.HOST_API_POLICY_OPTIONAL_SYNC_FORMAT_ROOT
+    )
+    dependency = (
+        "\n[dependencies]\n" + RUNTIME_API_NAME + " = { workspace = true }\n"
+        if consumer else ""
+    )
     return (
-        '[package]\nname = "' + name + '"\n'
-        "edition.workspace = true\n" + package_extra + extra
+        '[package]\nname = "' + package_name + '"\n'
+        "version.workspace = true\nedition.workspace = true\n" + package_extra + dependency + extra
     )
 
 
-def _runtime_manifests(root=RUNTIME_ROOT, package_extra=""):
-    return {
-        "runtime/Cargo.toml": root.encode("utf-8"),
-        "runtime/crates/test-fixtures/tool-a/Cargo.toml": _runtime_member(
-            "tool-a", package_extra=package_extra,
-        ).encode("utf-8"),
-        "runtime/crates/test-fixtures/tool-b/Cargo.toml": _runtime_member("tool-b").encode("utf-8"),
-    }
+def _runtime_manifests(root=RUNTIME_ROOT, package_extra="", members=None):
+    if members is None:
+        members = RUNTIME_MEMBERS
+        if subject.HOST_API_POLICY_OPTIONAL_SYNC_FORMAT_ROOT[len("runtime/"):] in root:
+            members = members + subject.HOST_API_POLICY_RUNTIME_OPTIONAL_MEMBER_ROOTS
+    manifests = {"runtime/Cargo.toml": root.encode("utf-8")}
+    for member in members:
+        name = member.rsplit("/", 1)[-1]
+        manifests[member + "/Cargo.toml"] = _runtime_member(
+            member, name=name, package_extra=package_extra if member == RUNTIME_MEMBERS[0] else "",
+        ).encode("utf-8")
+    return manifests
 
 
 class RuntimeWorkspaceTests(BootstrapTestCase):
@@ -1292,16 +1301,45 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
                 subject.workspace_directory(value)
 
     def test_runtime_manifests_with_plain_inside_members_are_accepted(self):
-        self.assertEqual(self.check(_runtime_manifests()), frozenset(("tool-a", "tool-b")))
+        expected = {root.rsplit("/", 1)[-1] for root in RUNTIME_MEMBERS}
+        expected.add(RUNTIME_API_NAME)
+        self.assertEqual(self.check(_runtime_manifests()), frozenset(expected))
 
-    def test_empty_runtime_workspace_is_accepted(self):
-        root = "[workspace]\nresolver = \"3\"\nmembers = []\n"
-        self.assertEqual(self.check({"runtime/Cargo.toml": root.encode("utf-8")}, ()), frozenset())
+    def test_runtime_profile_accepts_each_required_consumer_and_optional_sync_format(self):
+        manifests = _runtime_manifests()
+        for root in subject.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS:
+            with self.subTest(root=root):
+                self.assertEqual(
+                    manifests[root + "/Cargo.toml"].count(RUNTIME_API_NAME.encode("ascii")), 1,
+                )
+        optional_members = RUNTIME_MEMBERS + subject.HOST_API_POLICY_RUNTIME_OPTIONAL_MEMBER_ROOTS
+        optional_root = RUNTIME_ROOT.replace(
+            "]\n\n[workspace.package]",
+            '    "crates/services/sync-format",\n]\n\n[workspace.package]',
+        )
+        optional_manifests = _runtime_manifests(root=optional_root, members=optional_members)
+        expected = {root.rsplit("/", 1)[-1] for root in optional_members}
+        expected.add(RUNTIME_API_NAME)
+        self.assertEqual(self.check(optional_manifests, optional_members), frozenset(expected))
+
+    def test_runtime_profile_refuses_missing_or_extra_required_roots(self):
+        for members in ((), RUNTIME_MEMBERS[:-1], RUNTIME_MEMBERS + ("runtime/crates/services/other",)):
+            with self.subTest(members=members):
+                self.assert_refused(_runtime_manifests(), members=members)
 
     def test_runtime_and_contract_manifests_never_satisfy_each_other(self):
         self.assert_refused(_runtime_manifests(), workspace="contract")
         self.assert_refused(_contract_manifests(), members=CONTRACT_MEMBERS, workspace="runtime")
         self.assert_refused({"Cargo.toml": RUNTIME_ROOT.encode("utf-8")}, workspace="runtime")
+
+    def test_windows_runtime_profile_refuses_orphan_member_manifests_and_locks(self):
+        for filename in ("Cargo.toml", "Cargo.lock"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
+                orphan = Path(temporary) / "runtime" / "crates" / "orphan" / filename
+                orphan.parent.mkdir(parents=True)
+                orphan.write_text("orphan\n", encoding="ascii")
+                with self.assertRaises(subject.BootstrapRefusal):
+                    subject.validate_runtime_profile_source_tree(temporary)
 
     def test_runtime_members_must_be_fixed_paths_inside_the_runtime_crates_directory(self):
         for member in (
@@ -1327,7 +1365,9 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
         for root in (
             RUNTIME_ROOT.replace('"crates/test-fixtures/tool-a"', '"../runtime/crates/test-fixtures/tool-a"'),
             RUNTIME_ROOT.replace('"crates/test-fixtures/tool-a"', '"crates/../crates/test-fixtures/tool-a"'),
-            RUNTIME_ROOT + '\n[workspace.dependencies]\nx = { path = "../runtime/crates/test-fixtures/tool-a" }\n',
+            RUNTIME_ROOT.replace('../crates/host/api', '../runtime/crates/test-fixtures/tool-a'),
+            RUNTIME_ROOT.replace(RUNTIME_API_NAME + ' = { path = "../crates/host/api" }',
+                                 'api = { package = "host-api", path = "../crates/host/api" }'),
         ):
             with self.subTest(root=root):
                 self.assert_refused(_runtime_manifests(root=root))
@@ -1337,8 +1377,8 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
             with self.subTest(package_extra=package_extra):
                 self.assert_refused(_runtime_manifests(package_extra=package_extra))
         manifests = _runtime_manifests()
-        manifests["runtime/crates/test-fixtures/tool-a/Cargo.toml"] = _runtime_member(
-            "tool-a", extra='\n[dependencies]\nb = { path = "../tool-b" }\n',
+        manifests[RUNTIME_MEMBERS[0] + "/Cargo.toml"] = _runtime_member(
+            RUNTIME_MEMBERS[0], extra='\n[dependencies]\nb = { path = "../tool-b" }\n',
         ).encode("utf-8")
         self.assert_refused(manifests)
         with_package = _runtime_manifests(root=RUNTIME_ROOT + '\n[package]\nname = "x"\nedition = "2024"\n')
@@ -1346,36 +1386,115 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
 
     def test_runtime_foreign_dependency_forms_are_refused(self):
         git = "https:" + chr(47) * 2 + "example.invalid/crate"
-        for dependency in (
-            'a = { git = "' + git + '" }',
-            'a = { path = "crates/test-fixtures/tool-b" }',
-            'a = "1.0.0"',
-        ):
+        for dependency in ('a = { git = "' + git + '" }', 'a = "1.0.0"'):
             manifests = _runtime_manifests()
-            manifests["runtime/crates/test-fixtures/tool-a/Cargo.toml"] = (
-                _runtime_member("tool-a", extra="[dependencies]\n" + dependency + "\n")
+            manifests[RUNTIME_MEMBERS[0] + "/Cargo.toml"] = (
+                _runtime_member(RUNTIME_MEMBERS[0], extra="\n[dependencies]\n" + dependency + "\n")
             ).encode("utf-8")
             with self.subTest(dependency=dependency):
                 self.assert_refused(manifests)
 
-    def test_runtime_root_path_dependencies_name_members_relative_to_the_root(self):
-        root = RUNTIME_ROOT + '\n[workspace.dependencies]\nb = { path = "crates/test-fixtures/tool-b" }\n'
-        manifests = _runtime_manifests(root=root)
-        manifests["runtime/crates/test-fixtures/tool-a/Cargo.toml"] = _runtime_member(
-            "tool-a", extra="[dependencies]\nb = { workspace = true }\n",
-        ).encode("utf-8")
-        self.assertEqual(self.check(manifests), frozenset(("tool-a", "tool-b")))
+    def test_runtime_profile_refuses_wrong_api_identity_and_dependency_sections(self):
+        for table in ("dev-dependencies", "build-dependencies", "target.'cfg(unix)'.dependencies"):
+            manifests = _runtime_manifests()
+            member = subject.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS[0]
+            manifests[member + "/Cargo.toml"] += (
+                ("\n[" + table + "]\n" if not table.startswith("target.") else "\n[" + table + "]\n")
+                + RUNTIME_API_NAME + " = { workspace = true }\n"
+            ).encode("utf-8")
+            with self.subTest(table=table):
+                self.assert_refused(manifests)
+        for dependency in (
+            'host_api = { package = "host-api", workspace = true }',
+            RUNTIME_API_NAME + ' = { path = "../crates/host/api" }',
+            RUNTIME_API_NAME + ' = { workspace = true, package = "host-api" }',
+        ):
+            manifests = _runtime_manifests()
+            member = subject.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS[0]
+            original = _runtime_member(member)
+            manifests[member + "/Cargo.toml"] = (
+                original.replace(RUNTIME_API_NAME + " = { workspace = true }", dependency)
+            ).encode("utf-8")
+            with self.subTest(dependency=dependency):
+                self.assert_refused(manifests)
 
     def test_runtime_lock_check_requires_exact_sourceless_members(self):
-        lock = (
-            "version = 4\n\n[[package]]\nname = \"tool-a\"\nversion = \"0.1.0\"\n\n"
-            "[[package]]\nname = \"tool-b\"\nversion = \"0.1.0\"\n"
+        packages = {root.rsplit("/", 1)[-1] for root in RUNTIME_MEMBERS} | {RUNTIME_API_NAME}
+        lock = "version = 4\n\n" + "\n\n".join(
+            '[[package]]\nname = "' + name + '"\nversion = "0.1.0"' for name in sorted(packages)
+        ) + "\n"
+        lock = lock.encode("ascii")
+        self.assertTrue(subject.check_lock_members(lock, frozenset(packages)))
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_lock_members(lock, frozenset(packages - {RUNTIME_API_NAME}))
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_lock_members(lock, frozenset(packages | {"extra"}))
+
+    def test_runtime_lock_check_refuses_extra_registry_packages_and_duplicate_local_versions(self):
+        packages = {root.rsplit("/", 1)[-1] for root in RUNTIME_MEMBERS} | {RUNTIME_API_NAME}
+        rows = [
+            '[[package]]\nname = "' + name + '"\nversion = "0.1.0"'
+            for name in sorted(packages)
+        ]
+        registry_row = (
+            '[[package]]\nname = "extra"\nversion = "1.0.0"\nsource = "'
+            + subject.cargo.REGISTRY_SOURCE + '"\nchecksum = "' + "a" * 64 + '"'
+        )
+        extra = ("version = 4\n\n" + "\n\n".join(rows + [registry_row]) + "\n").encode("ascii")
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_lock_members(extra, frozenset(packages))
+        duplicate = (
+            "version = 4\n\n" + "\n\n".join(rows + [
+                '[[package]]\nname = "' + RUNTIME_API_NAME + '"\nversion = "0.2.0"',
+            ]) + "\n"
         ).encode("ascii")
-        self.assertTrue(subject.check_lock_members(lock, frozenset(("tool-a", "tool-b"))))
         with self.assertRaises(subject.BootstrapRefusal):
-            subject.check_lock_members(lock, frozenset(("tool-a",)))
+            subject.check_lock_members(duplicate, frozenset(packages))
+
+    def test_runtime_lock_edges_must_come_from_manifests_and_accept_implicit_registry_source(self):
+        manifests = _runtime_manifests()
+        consumer = subject.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS[0]
+        manifests[consumer + "/Cargo.toml"] = _runtime_member(
+            consumer, extra='serde = "=1.0.200"\n',
+        ).encode("utf-8")
+        names = {root.rsplit("/", 1)[-1] for root in RUNTIME_MEMBERS} | {RUNTIME_API_NAME}
+        identities = {(name, "0.1.0") for name in names}
+        rules = subject.manifest_dependency_rules(manifests, subject.RUNTIME_WORKSPACE)
+        rules[RUNTIME_API_NAME] = {}
+        local_rows = []
+        for name in sorted(names):
+            row = '[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n'
+            dependencies = []
+            if name == consumer.rsplit("/", 1)[-1]:
+                dependencies.extend((RUNTIME_API_NAME + " 0.1.0", "serde 1.0.200"))
+            elif name in {root.rsplit("/", 1)[-1]
+                          for root in subject.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS[1:]}:
+                dependencies.append(RUNTIME_API_NAME + " 0.1.0")
+            if dependencies:
+                row += "dependencies = [\n" + "".join(' "' + item + '",\n' for item in dependencies) + "]\n"
+            local_rows.append(row)
+        checksum = "a" * 64
+        serde = (
+            '[[package]]\nname = "serde"\nversion = "1.0.200"\nsource = "'
+            + subject.cargo.REGISTRY_SOURCE + '"\nchecksum = "' + checksum + '"\n'
+        )
+        lock = ("version = 4\n\n" + "\n".join(local_rows) + serde).encode("ascii")
+        self.assertTrue(subject.check_lock_members(
+            lock, frozenset(names), identities, rules,
+        ))
+        injected = lock.replace(
+            b'"serde 1.0.200",\n', b'"serde 1.0.200",\n "extra 1.0.0",\n', 1,
+        ).replace(
+            b'[[package]]\nname = "serde"',
+            ('[[package]]\nname = "extra"\nversion = "1.0.0"\nsource = "'
+             + subject.cargo.REGISTRY_SOURCE + '"\nchecksum = "' + checksum + '"\n\n'
+             + '[[package]]\nname = "serde"').encode("ascii"),
+            1,
+        )
         with self.assertRaises(subject.BootstrapRefusal):
-            subject.check_lock_members(lock, frozenset(("tool-a", "tool-b", "tool-c")))
+            subject.check_lock_members(
+                injected, frozenset(names), identities, rules,
+            )
 
 
 class ContractWorkspaceUnchangedTests(BootstrapTestCase):

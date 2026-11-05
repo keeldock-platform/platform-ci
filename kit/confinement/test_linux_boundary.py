@@ -966,11 +966,15 @@ class LinuxBoundaryFixtureDiagnosticTests(unittest.TestCase):
                     self.assertEqual("KD_NODE" in env, form == "npm_postinstall")
                     targets = [item["target"] for item in binds]
                     self.assertEqual("/kd-node" in targets, form == "npm_postinstall")
-                    self.assertEqual("/opt/rust" in targets, form in fixtures.NEEDS_RUSTC)
+                    self.assertEqual(boundary.RUST_SYSROOT_MOUNT in targets, form in fixtures.NEEDS_RUSTC)
                     for item in binds:
-                        if item["target"] in ("/kd-node", "/opt/rust"):
+                        if item["target"] in ("/kd-node", boundary.RUST_SYSROOT_MOUNT):
                             self.assertTrue(item["ro"])
                             self.assertIs(item["rec"], False)
+                    if form in fixtures.NEEDS_RUSTC:
+                        self.assertEqual(env["KD_RUSTC"], "/kd-rust/bin/rustc")
+                        rust_bind = next(item for item in binds if item["target"] == boundary.RUST_SYSROOT_MOUNT)
+                        self.assertEqual(rust_bind["source"], "/opt/rust")
 
     def test_a_node_lookup_refusal_flows_through_run_fixtures(self):
         subject, emitter = make(rust_sysroot="/opt/rust")
@@ -1227,6 +1231,13 @@ class LinuxBoundaryFixtureStderrDiagnosticTests(unittest.TestCase):
         with patch.object(boundary.Boundary, "chroot", return_value=raw):
             outcome = subject.channel_raw_logs()
         self.assertEqual(outcome.status, "observed-leak")
+        emitter.lines.pop()
+        subject.bare_needles = (b"bare-canary-value-0002",)
+        emitter.lines.append(self.PREFIX + " schema=1 phase=selftest form=build_rs stream=stderr line=has bare-canary-value-0002")
+        with patch.object(boundary.Boundary, "chroot", return_value=raw):
+            outcome = subject.channel_raw_logs()
+        self.assertEqual(outcome.status, "observed-leak")
+
 
     def test_printed_diagnostics_stay_inside_the_public_alphabet_and_the_line_budget(self):
         subject, emitter = self.scaffold()
@@ -1238,6 +1249,25 @@ class LinuxBoundaryFixtureStderrDiagnosticTests(unittest.TestCase):
         for line in shown:
             self.assertRegex(line, r"^KD-LINUX-FIXTURE-DIAG schema=1 phase=selftest form=(build_rs|proc_macro) stream=stderr line=[A-Za-z0-9 ._:/=+,()'" + chr(34) + r"?-]{1,200}$")
         self.assertTrue(shown[-1].endswith("rustc says ?79? ?x? ?y?"))
+
+
+class LinuxBoundaryGenericErrorTests(unittest.TestCase):
+    def test_generic_errors_use_the_parsed_phase_and_a_sanitized_diagnostic(self):
+        for phase, expected in (
+                ("selftest", (
+                    "KD-LINUX-FIXTURE-DIAG schema=1 phase=selftest form=unknown stream=stderr line=unavailable",
+                    "linux-source-boundary=refused phase=selftest reason=environment project-execution=not_started",
+                )),
+                ("recheck", (
+                    "KD-LINUX-FIXTURE-DIAG schema=1 phase=recheck form=unknown stream=stderr line=unavailable",
+                    "linux-source-boundary=refused phase=recheck reason=environment project-execution=not_started",
+                ))):
+            output = io.StringIO()
+            with self.subTest(phase=phase), patch.object(boundary, "run_named_phase", side_effect=RuntimeError("secret detail")), \
+                    patch("linux_boundary.sys.stdout", output):
+                self.assertEqual(boundary.main([phase, "--record", "/tmp/record.json", "--runner-uid", "1"]), 1)
+            self.assertEqual(output.getvalue().splitlines(), list(expected))
+            self.assertNotIn("secret detail", output.getvalue())
 
 
 RUNNER_TARGETS = ["/w/_temp", "/w", "/r", "/r/_diag"]

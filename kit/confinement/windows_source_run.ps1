@@ -79,7 +79,7 @@ $MaxNpmLinks = 64
 $GateMaxProcesses = [uint32]128
 $MaxLockBytes = 33554432
 $NpmLinkShimFile = 'windows_npm_link_shim.cjs'
-$NpmLinkShimSha256 = 'fa28ba90fd1d5f93b4232c7087ad5b681be09d27b93c368b84f0612341496f84'
+$NpmLinkShimSha256 = '668148b9f106454b05aacd6274b9f6c07590f3ed0e532fdc9639696dc287855a'
 $NpmLinkShimGates = @('node_dependency_audit')
 $GateDetailNpmCodes = @('ENOTCACHED', 'EBADPLATFORM', 'ENOENT', 'EPERM', 'EACCES', 'EBUSY', 'ENOTEMPTY', 'EEXIST', 'ELOOP', 'ENAMETOOLONG', 'EINTEGRITY', 'EUSAGE', 'ELIFECYCLE', 'ERESOLVE', 'EJSONPARSE', 'ENOLOCK', 'ENOTSUP', 'EINVAL', 'EMFILE', 'ENOSPC', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'ETARGET', 'E404', 'EOVERRIDE', 'EWORKSPACEMISSING', 'ENOWORKSPACES', 'EINVALIDTAGNAME', 'EINVALIDPACKAGENAME', 'EUNKNOWNTYPE', 'ENOMEM', 'ENOTDIR', 'EISDIR', 'EXDEV', 'EBADF', 'EROFS', 'EMLINK', 'ENOTCONN', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EOF', 'EUNSUPPORTEDPROTOCOL', 'EINVALIDRESPONSE', 'ENOVERSIONS', 'EBADENGINE', 'ECOMPROMISED', 'EINVALIDTYPE', 'EUNKNOWN', 'UNKNOWN', 'TAR_ENTRY_ERROR', 'TAR_ENTRY_INVALID', 'TAR_ENTRY_UNSUPPORTED', 'TAR_BAD_ARCHIVE', 'TAR_ABORT', 'ERR_STRING_TOO_LONG', 'ERR_OUT_OF_RANGE', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE', 'ERR_INVALID_URL', 'ERR_FS_FILE_TOO_LARGE', 'ERR_BUFFER_TOO_LARGE', 'ERR_INVALID_STATE', 'EINTEGRITYSIGNATURE', 'EMISSINGSIGNATUREKEY', 'EEXPIREDSIGNATUREKEY', 'EATTESTATIONVERIFY', 'EATTESTATIONSUBJECT')
 $GateDetailShimReasons = @('fs_shape', 'map_count', 'map_entry', 'map_hash', 'map_json', 'map_path', 'map_shape', 'map_size', 'map_text')
@@ -1209,10 +1209,16 @@ function Expand-GateArgv($argv, [string]$cargo, [string]$node, [string]$npm, [st
     return $expanded
 }
 
-function Get-GatePlan([string]$project, [string]$cargo, [string]$node, [string]$npm) {
+function Resolve-GatePlanRuntimeProfile([string]$project) {
+    if ($script:RunMode -ceq 'synthetic') { return (Test-RuntimeWorkspace $project) }
+    $runtime = Test-RuntimeWorkspaceProfile $project
+    if ($runtime -ne (Test-RuntimeWorkspace $project)) { throw 'runtime_profile' }
+    return $runtime
+}
+
+function Get-GatePlan([string]$project, [string]$cargo, [string]$node, [string]$npm, [bool]$runtime) {
     $python = Get-TrustedTool 'python.exe'
     $gateScript = Join-Path $PSScriptRoot $GateTableScript
-    $runtime = Test-RuntimeWorkspace $project
     $selection = 'base'
     $expectedCount = $RequiredGateCount
     if ($runtime) {
@@ -1266,6 +1272,17 @@ function Test-RuntimeWorkspace([string]$project) {
     }
     if (($present -contains $true) -and ($present -contains $false)) { throw 'runtime_workspace' }
     return ($present[0] -eq $true)
+}
+
+function Test-RuntimeWorkspaceProfile([string]$project) {
+    $python = Get-TrustedTool 'python.exe'
+    $profileScript = Join-Path $PSScriptRoot 'cargo_lock_bootstrap.py'
+    $result = Invoke-TrustedProcess $python @('-B', $profileScript, 'check-runtime_profile-source', $project) $PSScriptRoot (Get-TrustedEnvironment $python $script:Layout.Private) 120 65536
+    if ($result.TimedOut -or $result.ExitCode -ne 0) { throw 'runtime_profile' }
+    $output = [string]$result.Stdout
+    if ($output -ceq "runtime_profile=runtime`n" -or $output -ceq "runtime_profile=runtime`r`n") { return $true }
+    if ($output -ceq "runtime_profile=base`n" -or $output -ceq "runtime_profile=base`r`n") { return $false }
+    throw 'runtime_profile'
 }
 
 function New-GateEnvironment {
@@ -1890,7 +1907,8 @@ try {
             if ($aclAfter -ne 'verified') { throw 'acl_readback' }
 
             $phase = 'gate_plan'
-            $plan = Get-GatePlan $project ($layout.RustBin + '\cargo.exe') ($layout.NodeDir + '\node.exe') $layout.NpmCli
+            $runtimeProfile = Resolve-GatePlanRuntimeProfile $project
+            $plan = Get-GatePlan $project ($layout.RustBin + '\cargo.exe') ($layout.NodeDir + '\node.exe') $layout.NpmCli $runtimeProfile
             Write-Line ('windows-source-gate-plan=ready gates=' + $plan.Count)
 
             $phase = 'gates'

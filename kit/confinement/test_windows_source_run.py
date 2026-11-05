@@ -1,6 +1,11 @@
+import json
 import hashlib
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -39,7 +44,7 @@ class WindowsSourceRunTests(unittest.TestCase):
                 self.assertLessEqual(len(payload), MAX_FILE_BYTES)
                 inspect_text(payload.decode("utf-8"), "platform")
                 for line in payload.decode("ascii").splitlines():
-                    if chr(35) in line:
+                    if "\x23" in line:
                         self.assertIsNotNone(ACTION_VERSION_COMMENT_PATTERN.fullmatch(line))
                 payload.decode("ascii")
 
@@ -98,6 +103,20 @@ class WindowsSourceRunTests(unittest.TestCase):
         for token in ("'^[a-z][a-z_]{2,40}$'", "$gate.Keys.Count -ne 2", "$gates.Count -ne $expectedCount",
                       "$plan.Keys.Count -ne 2", "[string]$gate['name']"):
             self.assertIn(token, self.runner)
+
+    def test_d145_profile_precedes_source_gates_and_synthetic_runtime_keeps_all_eighteen(self):
+        plan = self.function_body("Get-GatePlan")
+        profile = self.function_body("Resolve-GatePlanRuntimeProfile")
+        self.assertIn("if ($script:RunMode -ceq 'synthetic') { return (Test-RuntimeWorkspace $project) }", profile)
+        self.assertIn("$runtime = Test-RuntimeWorkspaceProfile $project", profile)
+        self.assertIn("if ($runtime -ne (Test-RuntimeWorkspace $project))", profile)
+        self.assertIn("[bool]$runtime", plan)
+        self.assertIn("$expectedCount = $MaxGateCount", plan)
+        self.assertIn("check-runtime_profile-source", self.function_body("Test-RuntimeWorkspaceProfile"))
+        self.assertLess(self.runner.index("$runtimeProfile = Resolve-GatePlanRuntimeProfile $project"),
+                        self.runner.index("$plan = Get-GatePlan"))
+        self.assertLess(self.runner.index("$plan = Get-GatePlan"),
+                        self.runner.index("$gateOutcome = Invoke-SourceGates"))
         for stale in ("GateTableGatesCommand", "$gate['cwd']", "$gate['runtime']", "$gate['id']", "-lt 13"):
             self.assertNotIn(stale, self.runner)
         self.assertNotIn("'workspace_tests'", self.runner)
@@ -1243,7 +1262,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(shim.count("require("), 3)
         for forbidden in ("writeFile", "appendFile", "WriteStream", "child_process", "spawn", "exec", "fork",
                           "node:net", "node:http", "node:https", "node:dgram", "node:tls", "node:dns", "fetch", "WebSocket",
-                          "Worker", "unlink", "rmdir", "mkdir(", ".mkdir", "rename", "chmod", "chown", "utimes",
+                          "Worker", "unlink", "rmdir", "mkdir(", ".mkdir", "chmod", "chown", "utimes",
                           "openSync", "fs.open", "copyFile", "cpSync", "truncate", "process.binding", "eval(", "Function(",
                           "import(", "console", "process.stdout", "process.stderr", "process.exit", "setTimeout",
                           "setInterval", "module.exports", "globalThis"):
@@ -1251,9 +1270,9 @@ class WindowsSourceRunTests(unittest.TestCase):
                 self.assertNotIn(forbidden, shim)
         self.assertEqual(set(re.findall(r"\bfs\.([A-Za-z]+)", shim)),
                          {"readFileSync", "readdirSync", "constants", "promises", "Stats", "lstat", "lstatSync", "readlink", "readlinkSync",
-                          "rm", "rmSync", "symlink", "symlinkSync", "writeSync"})
+                          "rm", "rmSync", "rename", "renameSync", "symlink", "symlinkSync", "writeSync"})
         self.assertEqual(shim.count("readFileSync"), 1)
-        self.assertEqual(set(re.findall(r"\bpromises\.([A-Za-z]+)", shim)), {"lstat", "readlink", "rm", "symlink"})
+        self.assertEqual(set(re.findall(r"\bpromises\.([A-Za-z]+)", shim)), {"lstat", "readlink", "rm", "rename", "symlink"})
         self.assertIn("const MAP_VARIABLE = 'KD_NPM_LINK_MAP';\nconst HASH_VARIABLE = 'KD_NPM_LINK_MAP_SHA256';\n", shim)
         self.assertIn("const refuse = (reason) => {\n  throw new Error('npm_link_shim refused ' + reason);\n};\n", shim)
         self.assertLess(shim.index("const links = loadMap();"), shim.index("\nfs.lstat = "))
@@ -1298,17 +1317,18 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn(guard, shim)
         self.assertLess(shim.index(guard), shim.index("\nfs.lstat = "))
 
-    def test_the_npm_link_shim_wraps_exactly_twelve_functions_and_passes_every_unlisted_path_through(self):
+    def test_the_npm_link_shim_wraps_exactly_fifteen_functions_and_passes_every_unlisted_path_through(self):
         shim = SHIM.read_text(encoding="ascii")
         assigned = re.findall(r"^((?:fs|promises)\.[A-Za-z]+) = (?:async )?function ([A-Za-z]+)\(", shim, re.M)
         self.assertEqual(assigned, [
             ("fs.lstat", "lstat"), ("fs.lstatSync", "lstatSync"), ("promises.lstat", "lstat"),
             ("fs.readlink", "readlink"), ("fs.readlinkSync", "readlinkSync"), ("promises.readlink", "readlink"),
             ("fs.rm", "rm"), ("fs.rmSync", "rmSync"), ("promises.rm", "rm"),
+            ("fs.rename", "rename"), ("fs.renameSync", "renameSync"), ("promises.rename", "rename"),
             ("fs.symlink", "symlink"), ("fs.symlinkSync", "symlinkSync"), ("promises.symlink", "symlink")])
-        self.assertEqual(len(re.findall(r"^(?:fs|promises)\.[A-Za-z]+ = ", shim, re.M)), 12)
+        self.assertEqual(len(re.findall(r"^(?:fs|promises)\.[A-Za-z]+ = ", shim, re.M)), 15)
         bodies = re.split(r"\n(?=(?:fs|promises)\.[A-Za-z]+ = )", shim)[1:]
-        self.assertEqual(len(bodies), 12)
+        self.assertEqual(len(bodies), 15)
         passes = (
             ("realLstat", "  if (target === undefined || typeof done !== 'function' || bigintRequested(options)) {\n    return Reflect.apply(realLstat, this, arguments);\n  }\n  process.nextTick(done, null, linkStats(target));\n"),
             ("realLstatSync", "  if (target === undefined || bigintRequested(options)) return Reflect.apply(realLstatSync, this, arguments);\n  return linkStats(target);\n"),
@@ -1344,16 +1364,19 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn("if (encoding === undefined || encoding === null || encoding === 'utf8' || encoding === 'utf-8') return target;", value)
         self.assertIn("if (encoding === 'buffer') return Buffer.from(target, 'utf8');\n  return undefined;", value)
 
-    def test_the_npm_link_shim_skips_only_mapped_removals_and_matching_symlinks_and_captures_every_real_function(self):
+    def test_the_npm_link_shim_skips_only_mapped_filesystem_changes_and_captures_every_real_function(self):
         shim = SHIM.read_text(encoding="ascii")
         for line in ("const realRm = fs.rm;\n", "const realRmSync = fs.rmSync;\n", "const realPromiseRm = promises.rm;\n",
+                     "const realRename = fs.rename;\n", "const realRenameSync = fs.renameSync;\n",
+                     "const realPromiseRename = promises.rename;\n",
                      "const realSymlink = fs.symlink;\n", "const realSymlinkSync = fs.symlinkSync;\n",
                      "const realPromiseSymlink = promises.symlink;\n", "const realReaddirSync = fs.readdirSync;\n",
                      "const realWriteSync = fs.writeSync;\n"):
             with self.subTest(line=line):
                 self.assertEqual(shim.count(line), 1)
                 self.assertLess(shim.index(line), shim.index("\nfs.lstat = "))
-        guard = ("for (const item of [realRm, realRmSync, realPromiseRm, realSymlink, realSymlinkSync, realPromiseSymlink, realReaddirSync, realWriteSync]) {\n"
+        guard = ("for (const item of [realRm, realRmSync, realPromiseRm, realRename, realRenameSync, realPromiseRename,\n"
+                 "  realSymlink, realSymlinkSync, realPromiseSymlink, realReaddirSync, realWriteSync]) {\n"
                  "  if (typeof item !== 'function') refuse('fs_shape');\n}\n")
         self.assertIn(guard, shim)
         self.assertEqual(shim.count("refuse('fs_shape')"), 2)
@@ -1384,6 +1407,9 @@ class WindowsSourceRunTests(unittest.TestCase):
             ("fs.rm = ", "realRm", "  if (typeof done !== 'function' || !skipsRemoval(candidate)) return Reflect.apply(realRm, this, arguments);\n  process.nextTick(done, null);\n"),
             ("fs.rmSync = ", "realRmSync", "  if (!skipsRemoval(candidate)) return Reflect.apply(realRmSync, this, arguments);\n  return undefined;\n"),
             ("promises.rm = async ", "realPromiseRm", "  if (!skipsRemoval(candidate)) return Reflect.apply(realPromiseRm, this, arguments);\n  return undefined;\n"),
+            ("fs.rename = ", "realRename", "  if (typeof callback !== 'function' || !skipsMappedRename(oldPath, newPath)) {\n    return Reflect.apply(realRename, this, arguments);\n  }\n  process.nextTick(callback, null);\n"),
+            ("fs.renameSync = ", "realRenameSync", "  if (!skipsMappedRename(oldPath, newPath)) return Reflect.apply(realRenameSync, this, arguments);\n  return undefined;\n"),
+            ("promises.rename = async ", "realPromiseRename", "  if (!skipsMappedRename(oldPath, newPath)) return Reflect.apply(realPromiseRename, this, arguments);\n  return undefined;\n"),
             ("fs.symlink = ", "realSymlink", "  if (typeof done !== 'function' || !matchesMappedTarget(target, linkPath)) return Reflect.apply(realSymlink, this, arguments);\n  process.nextTick(done, null);\n"),
             ("fs.symlinkSync = ", "realSymlinkSync", "  if (!matchesMappedTarget(target, linkPath)) return Reflect.apply(realSymlinkSync, this, arguments);\n  return undefined;\n"),
             ("promises.symlink = async ", "realPromiseSymlink", "  if (!matchesMappedTarget(target, linkPath)) return Reflect.apply(realPromiseSymlink, this, arguments);\n  return undefined;\n"),
@@ -1395,10 +1421,89 @@ class WindowsSourceRunTests(unittest.TestCase):
                 self.assertEqual(body.count("Reflect.apply("), 1)
                 self.assertEqual(body.count("Reflect.apply(" + real + ", this, arguments)"), 1)
         self.assertIn("  const done = typeof options === 'function' ? options : callback;\n", bodies[6])
-        self.assertIn("  const done = typeof type === 'function' ? type : callback;\n", bodies[9])
+        self.assertIn("  const done = typeof type === 'function' ? type : callback;\n", bodies[12])
+        rename = shim[shim.index("const skipsMappedRename = "):shim.index("\nfs.lstat = ")]
+        for token in (
+            "|| !windowsPath(oldPath) || !windowsPath(newPath)) return false;",
+            "if (!links.has(newKey) || links.has(oldKey) || oldKey === newKey) return false;",
+            "if (path.win32.dirname(oldKey) !== path.win32.dirname(newKey)) return false;",
+            "countHit();\n  return true;\n};",
+        ):
+            with self.subTest(rename=token[:50]):
+                self.assertIn(token, rename)
         self.assertEqual(shim.count("process.nextTick(done, null);"), 2)
         self.assertEqual(shim.count("skipsRemoval("), 3)
+        self.assertEqual(shim.count("skipsMappedRename("), 3)
         self.assertEqual(shim.count("matchesMappedTarget("), 3)
+
+    @unittest.skipUnless(sys.platform == "win32", "the npm link shim uses Windows paths")
+    def test_mapped_rename_is_skipped_and_unlisted_renames_reach_the_filesystem(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            project = os.path.join(temporary, "project")
+            modules = os.path.join(project, "node_modules")
+            os.makedirs(modules)
+            link = os.path.join(modules, "sample")
+            target = os.path.join(project, "vendor", "sample")
+            map_path = os.path.join(temporary, "links.json")
+            map_bytes = json.dumps(
+                {"schema_version": 1, "links": [{"link": link, "target": target}]},
+                sort_keys=True, separators=(",", ":"),
+            ).encode("ascii")
+            segments = link[3:].split("\\") + target[3:].split("\\")
+            if any(re.fullmatch(r"[A-Za-z0-9@._-]+", segment) is None for segment in segments):
+                self.skipTest("temporary path is outside the npm link map alphabet")
+            with open(map_path, "wb") as destination:
+                destination.write(map_bytes)
+            environment = os.environ.copy()
+            environment.update({
+                "KD_NPM_LINK_MAP": map_path,
+                "KD_NPM_LINK_MAP_SHA256": hashlib.sha256(map_bytes).hexdigest(),
+                "KD_RENAME_TEST_ROOT": temporary,
+                "KD_RENAME_TEST_LINK": link,
+            })
+            script = r"""
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const root = process.env.KD_RENAME_TEST_ROOT;
+const mapped = process.env.KD_RENAME_TEST_LINK;
+const directory = path.dirname(mapped);
+const move = (kind, from, to) => {
+  if (kind === 'sync') return fs.renameSync(from, to);
+  if (kind === 'callback') return new Promise((resolve, reject) => fs.rename(from, to, error => error ? reject(error) : resolve()));
+  return fs.promises.rename(from, to);
+};
+(async () => {
+  for (const kind of ['sync', 'callback', 'promise']) {
+    const from = path.join(directory, 'sample.' + kind + '.tmp');
+    fs.writeFileSync(from, 'mapped');
+    await move(kind, from, mapped);
+    assert.equal(fs.existsSync(from), true);
+    assert.equal(fs.existsSync(mapped), false);
+    fs.unlinkSync(from);
+    const unlistedDirectory = path.join(root, 'unlisted');
+    fs.mkdirSync(unlistedDirectory, { recursive: true });
+    const unlistedFrom = path.join(unlistedDirectory, kind + '.tmp');
+    const unlistedTo = path.join(unlistedDirectory, kind + '.moved');
+    fs.writeFileSync(unlistedFrom, 'unlisted');
+    await move(kind, unlistedFrom, unlistedTo);
+    assert.equal(fs.existsSync(unlistedFrom), false);
+    assert.equal(fs.readFileSync(unlistedTo, 'utf8'), 'unlisted');
+    fs.unlinkSync(unlistedTo);
+  }
+})().catch(error => {
+  process.stderr.write(String(error));
+  process.exitCode = 1;
+});
+"""
+            result = subprocess.run(
+                [node, "--require", str(SHIM), "-e", script], env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("ascii", errors="replace"))
 
     def test_the_npm_link_shim_counts_mapped_hits_and_reports_only_three_fixed_levels_on_stderr(self):
         shim = SHIM.read_text(encoding="ascii")
@@ -1423,7 +1528,7 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertEqual(shim.count("fs.writeSync"), 1)
         self.assertEqual(shim.count("realWriteSync"), 4)
         self.assertEqual(shim.count("realWriteSync("), 2)
-        self.assertEqual(shim.count("countHit()"), 4)
+        self.assertEqual(shim.count("countHit()"), 5)
         self.assertEqual(shim.count("hits_over="), 1)
         listener = shim[shim.index("process.on('time'"):]
         self.assertEqual(listener, (

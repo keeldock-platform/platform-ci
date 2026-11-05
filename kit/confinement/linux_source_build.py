@@ -90,12 +90,18 @@ LENGTH_BUCKETS = ((0, "0"), (19, "1-19"), (255, "20-255"), (1024, "256-1024"), (
 TOKEN_CLASS_NAMES = ("letters", "digits", "underscore", "dash", "dot", "other")
 ENVIRONMENT_NAME = "linux-source-read"
 ENVIRONMENT_BRANCHES = ("main", "untrusted")
+ENVIRONMENT_ID_NAME = "LINUX_SOURCE_ENVIRONMENT_ID"
+ENVIRONMENT_BRANCH_POLICY_ID_NAMES = {
+    "main": "LINUX_SOURCE_MAIN_BRANCH_POLICY_ID",
+    "untrusted": "LINUX_SOURCE_UNTRUSTED_BRANCH_POLICY_ID",
+}
 SOURCE_IDENTITY_NAMES = (
     "SOURCE_REPOSITORY_ID", "SOURCE_REPOSITORY_OWNER", "SOURCE_REPOSITORY_NAME",
     "SOURCE_READER_INSTALLATION_ID", "SOURCE_READER_CLIENT_ID",
 )
 SOURCE_HELD_NAMES = SOURCE_IDENTITY_NAMES + ("SOURCE_READER_PRIVATE_KEY", "SOURCE_READER_TOKEN")
 GATES = gate_table.GATES
+API_FEATURE_GATE_NAMES = gate_table.API_FEATURE_GATE_NAMES
 RUNTIME_GATE_NAMES = gate_table.RUNTIME_GATE_NAMES
 BROWSER_GATE_NAMES = gate_table.BROWSER_GATE_NAMES
 RUNTIME_ROOT_FILES = gate_table.RUNTIME_ROOT_FILES
@@ -461,13 +467,29 @@ def _source_inputs(environ, prefix=None):
     return identity
 
 
-def _verify_environment(token, name=ENVIRONMENT_NAME):
+def _environment_id(environ, variable):
+    value = environ.get(variable)
+    if type(value) is not str or DECIMAL_RE.fullmatch(value) is None:
+        raise SourceBuildRefusal("binding")
+    return int(value)
+
+
+def _verify_environment(token, name=ENVIRONMENT_NAME, environ=None):
     if name != ENVIRONMENT_NAME:
         raise SourceBuildRefusal("binding")
+    env = os.environ if environ is None else environ
+    expected_environment_id = _environment_id(env, ENVIRONMENT_ID_NAME)
+    expected_policy_ids = {
+        branch: _environment_id(env, variable)
+        for branch, variable in ENVIRONMENT_BRANCH_POLICY_ID_NAMES.items()
+    }
     path = "/repos/" + REPOSITORY + "/environments/" + name
     status, environment = _api_request(path, token, expected=(200, 404))
     policy = environment.get("deployment_branch_policy") if type(environment) is dict else None
-    if (status != 200 or type(environment) is not dict or environment.get("name") != name
+    if (status != 200 or type(environment) is not dict
+            or type(environment.get("id")) is not int
+            or environment.get("id") != expected_environment_id
+            or environment.get("name") != name
             or environment.get("can_admins_bypass") is not False
             or type(policy) is not dict
             or policy.get("custom_branch_policies") is not True
@@ -479,12 +501,17 @@ def _verify_environment(token, name=ENVIRONMENT_NAME):
             or type(listing.get("total_count")) is not int or listing["total_count"] != len(entries)):
         raise SourceBuildRefusal("binding")
     names = []
+    policy_ids = {}
     for entry in entries:
         if (type(entry) is not dict or entry.get("type") != "branch"
-                or type(entry.get("name")) is not str):
+                or type(entry.get("name")) is not str
+                or type(entry.get("id")) is not int
+                or entry["id"] < 1):
             raise SourceBuildRefusal("binding")
         names.append(entry["name"])
-    if sorted(names) != sorted(ENVIRONMENT_BRANCHES):
+        policy_ids[entry["name"]] = entry["id"]
+    if (sorted(names) != sorted(ENVIRONMENT_BRANCHES)
+            or policy_ids != expected_policy_ids):
         raise SourceBuildRefusal("binding")
 
 
@@ -1294,7 +1321,7 @@ def _signer_keys(payload):
     fingerprints = {}
     for line in lines:
         stripped = line.strip()
-        if not stripped or stripped.startswith(chr(35)):
+        if not stripped or stripped.startswith("\x23"):
             continue
         try:
             fields = shlex.split(stripped, comments=False, posix=True)
@@ -2344,6 +2371,93 @@ def _require_confined_manifests(root_fd):
         _require_confined_manifest(root_fd, candidate[0][:-1], document)
 
 
+def _check_d145_runtime_profile(root_fd):
+    manifest_candidates = _rust_lock_paths(
+        root_fd, "Cargo.toml", MAX_MANIFEST_FILES, False, True,
+    )
+    lock_candidates = _rust_lock_paths(root_fd, "Cargo.lock", 32, False, True)
+    manifests_by_path = {"/".join(item[0]): item for item in manifest_candidates}
+    locks_by_path = {"/".join(item[0]): item for item in lock_candidates}
+    runtime_root = cargo_lock_bootstrap.workspace_root_manifest("runtime")
+    runtime_lock = "runtime/Cargo.lock"
+    if runtime_root not in manifests_by_path and runtime_lock not in locks_by_path:
+        if any(path.startswith("runtime/") for path in manifests_by_path | locks_by_path):
+            raise SourceBuildRefusal("lock")
+        return False
+    if runtime_root not in manifests_by_path or runtime_lock not in locks_by_path:
+        raise SourceBuildRefusal("lock")
+    try:
+        runtime_root_bytes = _read_bounded_cargo_lock(root_fd, manifests_by_path[runtime_root])
+        runtime_document = cargo_lock_bootstrap._parse_manifest(runtime_root_bytes)
+        workspace = runtime_document.get("workspace")
+        listed = workspace.get("members") if type(workspace) is dict else None
+        if type(listed) is not list or any(type(item) is not str for item in listed):
+            raise ValueError
+        runtime_members = frozenset(
+            posixpath.normpath(posixpath.join("runtime", item)) for item in listed
+        )
+        runtime_manifest_paths = {runtime_root}
+        runtime_manifest_paths.update(member + "/Cargo.toml" for member in runtime_members)
+        runtime_manifests = {
+            path: _read_bounded_cargo_lock(root_fd, manifests_by_path[path])
+            for path in runtime_manifest_paths
+        }
+        runtime_names = cargo_lock_bootstrap.check_manifests(
+            runtime_manifests, runtime_members, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
+        )
+        runtime_identities = set(cargo_lock_bootstrap.manifest_package_identities(
+            runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
+        ))
+        contract_members = cargo_lock_bootstrap.CONTRACT_MEMBERS
+        contract_manifest_paths = {"Cargo.toml"}
+        contract_manifest_paths.update(member + "/Cargo.toml" for member in contract_members)
+        contract_manifests = {
+            path: _read_bounded_cargo_lock(root_fd, manifests_by_path[path])
+            for path in contract_manifest_paths
+        }
+        contract_names = cargo_lock_bootstrap.check_manifests(
+            contract_manifests, contract_members, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+            require_first_batch=False,
+        )
+        contract_identities = cargo_lock_bootstrap.manifest_package_identities(
+            contract_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+        )
+        api_identity = next((identity for identity in contract_identities
+                             if identity[0] == cargo_lock_bootstrap.HOST_API_POLICY_API_PACKAGE), None)
+        if api_identity is None or cargo_lock_bootstrap.HOST_API_POLICY_API_PACKAGE not in runtime_names:
+            raise ValueError
+        runtime_identities.add(api_identity)
+        runtime_rules = cargo_lock_bootstrap.manifest_dependency_rules(
+            runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
+        )
+        api_rules = cargo_lock_bootstrap.manifest_dependency_rules(
+            {"Cargo.toml": contract_manifests["Cargo.toml"],
+             cargo_lock_bootstrap.HOST_API_POLICY_API_MANIFEST_PATH:
+                 contract_manifests[cargo_lock_bootstrap.HOST_API_POLICY_API_MANIFEST_PATH]},
+            cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+        )
+        runtime_rules.update(api_rules)
+        runtime_lock_bytes = _read_bounded_cargo_lock(root_fd, locks_by_path[runtime_lock])
+        cargo_lock_bootstrap.check_lock_members(
+            runtime_lock_bytes, runtime_names, runtime_identities, runtime_rules,
+        )
+        contract_lock_bytes = _read_bounded_cargo_lock(root_fd, locks_by_path["Cargo.lock"])
+        cargo_lock_bootstrap.check_lock_members(
+            contract_lock_bytes, contract_names, contract_identities,
+            cargo_lock_bootstrap.manifest_dependency_rules(
+                contract_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+            ),
+        )
+        api_path = cargo_lock_bootstrap.HOST_API_POLICY_API_PATH
+        if posixpath.normpath(posixpath.join("runtime", api_path)) != "crates/host/api":
+            raise ValueError
+        _require_physical_manifest_path(root_fd, ("runtime",), api_path)
+        _require_confined_manifest_path(root_fd, ("crates", "host", "api"), "src/lib.rs")
+    except (KeyError, TypeError, ValueError, cargo_lock_bootstrap.BootstrapRefusal):
+        raise SourceBuildRefusal("lock") from None
+    return True
+
+
 def run_rust_license_gate(environ=None):
     env = os.environ if environ is None else environ
     source = Path(env.get("SOURCE_PATH", ""))
@@ -2360,6 +2474,7 @@ def run_rust_license_gate(environ=None):
     try:
         _require_source_root_identity(source, root_identity)
         _require_confined_manifests(root_fd)
+        _check_d145_runtime_profile(root_fd)
         for candidate in _rust_lock_paths(root_fd):
             try:
                 lock_bytes = _read_bounded_cargo_lock(root_fd, candidate)
@@ -2749,13 +2864,27 @@ def _ui_kit_workspace_present(project):
 
 def _gate_commands(project, rust_root, node_bin, browser=False):
     try:
-        return gate_table.render(
+        commands = gate_table.render(
             gate_table.gate_templates(_runtime_workspace_present(project), browser),
             str(project), str(Path(rust_root) / "bin" / "cargo"),
             str(Path(node_bin) / "node"), str(Path(node_bin) / "npm"),
         )
     except gate_table.GateTableRefusal:
         raise SourceBuildRefusal("gate") from None
+    feature_commands = tuple((name, argv) for name, argv in commands if name in API_FEATURE_GATE_NAMES)
+    if (tuple(name for name, unused in feature_commands) != API_FEATURE_GATE_NAMES
+            or any(
+                "--features" not in argv
+                or argv[argv.index("--features") + 1:argv.index("--features") + 2]
+                != (gate_table.API_FEATURE_NAME,)
+                for unused_name, argv in feature_commands
+            )):
+        raise SourceBuildRefusal("gate")
+    return commands
+
+
+def _api_feature_gate_readback(environ):
+    return environ.get("LINUX_API_FEATURE_GATE_NAMES") == ",".join(API_FEATURE_GATE_NAMES)
 
 
 PROJECT_GATE_LIMITS = "project"
@@ -2953,6 +3082,8 @@ def verify_proof_handoff(environ=None):
 
 
 def _verified_gate_count(records, env):
+    if not _api_feature_gate_readback(env):
+        return 0
     gates = _load_json(records / "gates.json")
     revoke = _load_json(records / "revocation.json")
     if type(gates) is not dict or type(gates.get("selected_gates")) is not list:
@@ -2965,6 +3096,7 @@ def _verified_gate_count(records, env):
                 "schema_version", "selected_gates", "completed_gates", "gates", "gate_count", "failed",
             }
             or selected_gates not in expected_gate_sets
+            or not set(API_FEATURE_GATE_NAMES).issubset(selected_gates)
             or gates.get("completed_gates") != list(selected_gates)
             or revoke is None or gates.get("schema_version") != 1
             or type(gates.get("gates")) is not dict

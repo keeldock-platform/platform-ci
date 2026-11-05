@@ -696,6 +696,9 @@ def write_screens(runner_temp, ciphertexts, uid, gid):
 
 def run_encrypt(environ, arguments, clock=time.time):
     ids = _arguments(arguments, ("reader-uid", "reader-gid"))
+    if (hasattr(os, "getuid") and ids["reader-uid"] != os.getuid()
+            or hasattr(os, "getgid") and ids["reader-gid"] != os.getgid()):
+        raise QuickRefusal("output")
     request_id, spki, fingerprint = request_binding(environ)
     nonce, expiry = context_binding(environ)
     binding = source_binding(environ)

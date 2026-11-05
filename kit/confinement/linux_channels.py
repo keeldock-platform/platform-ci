@@ -126,7 +126,8 @@ NETWORK_CHANNELS = (
 )
 ATTEMPT_LINE = re.compile(r"KDATT ([a-z0-9-]{1,40}) (denied|allowed|contained|na|other)")
 MAX_REFUSAL_DETAIL = 255
-DIAG_PHASES = ("selftest",)
+DIAG_PHASES = ("selftest", "recheck")
+FIXTURE_DIAG_PHASES = ("selftest",)
 DIAG_MAX_LINES = 20
 DIAG_MAX_CHARS = 200
 DIAG_TAIL_BYTES = 16384
@@ -304,7 +305,7 @@ def diag_unsafe(raw, clean, nonce, needles):
 
 
 def fixture_diag_lines(phase, form, stderr, nonce, needles, header=None):
-    if phase not in DIAG_PHASES:
+    if phase not in FIXTURE_DIAG_PHASES:
         return ()
     if type(form) is not str or DIAG_FORM.fullmatch(form) is None:
         raise ValueError("diag-line")

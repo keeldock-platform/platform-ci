@@ -1527,6 +1527,20 @@ class CoreContractTests(unittest.TestCase):
         with self.assertRaises(subject.Refusal):
             subject._source_commands(source, tools, include_runtime=1)
 
+    def test_authenticated_runtime_selector_is_threaded_to_source_snapshot(self):
+        source = Path(subject.__file__).read_text(encoding="ascii")
+        validation_source = Path(private_validation.__file__).read_text(encoding="ascii")
+        self.assertIn(
+            'workspace_selector = feedback_producer.feedback_request.request_workspace(\n'
+            '                        dispatch["request"],\n'
+            '                    )',
+            source,
+        )
+        self.assertIn("feedback=feedback, workspace_selector=workspace_selector,", source)
+        self.assertIn("workspace_selector=workspace_selector,", source)
+        self.assertIn('workspace_selector == "runtime" and concern != "core-rust-lock-return"', validation_source)
+        self.assertIn('workspace_selector == "contract"', validation_source)
+
     def test_runtime_root_selection_requires_both_validated_root_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "source"
