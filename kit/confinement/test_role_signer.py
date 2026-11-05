@@ -748,6 +748,17 @@ class KeyRecordAndPredicateTests(unittest.TestCase):
 
 
 class WorkflowAndJobMappingTests(unittest.TestCase):
+    def test_default_workflow_pins_match_checked_in_bytes(self):
+        with mock.patch.dict(subject.PINNED_WORKFLOW_SHA256, PRISTINE_PINS, clear=True):
+            for relative, expected in subject.PINNED_WORKFLOW_SHA256.items():
+                with self.subTest(path=relative):
+                    actual = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
+                    self.assertEqual(actual, expected)
+            try:
+                subject.verify_workflow_bytes(ROOT, "candidate")
+            except subject.Refusal as error:
+                self.fail("checked-in candidate workflows were refused: %s" % error)
+
     def test_checked_in_candidate_caller_and_role_graphs_have_valid_shape(self):
         paths = subject.profile_workflow_paths("candidate")
         pins = {relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest() for relative in paths}
