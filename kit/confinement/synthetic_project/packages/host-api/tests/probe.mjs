@@ -30,30 +30,29 @@ import('vite').then(async ({ createServer }) => {
 `;
 
 const steps = [
-  ['dns-localhost', ['-e', "require('node:dns').lookup('localhost', (error, address) => { console.error(error ? 'err ' + error.code : 'ok ' + address); })"]],
-  ['tcp-listen', ['-e', "const server = require('node:net').createServer(); server.once('error', error => { console.error(error.code); process.exit(2); }); server.listen(0, '127.0.0.1', () => server.close());"]],
-  ['vite-resolve-config', ['-e', "import('vite').then(v => v.resolveConfig({ configFile: false }, 'serve'))"]],
-  ['vite-server-nohmr', ['-e', viteServerCode({ configFile: false, server: { middlewareMode: true, watch: null, hmr: false }, optimizeDeps: { noDiscovery: true } })]],
-  ['vite-server-nows', ['-e', viteServerCode({ configFile: false, server: { middlewareMode: true, watch: null, ws: false }, optimizeDeps: { noDiscovery: true } })]],
-  ['vite-server-nohmr-nows', ['-e', viteServerCode({ configFile: false, server: { middlewareMode: true, watch: null, hmr: false, ws: false }, optimizeDeps: { noDiscovery: true } })]],
-  ['vite-server-nohmr-nows-nopretransform', ['-e', viteServerCode({ configFile: false, server: { middlewareMode: true, watch: null, hmr: false, ws: false, preTransformRequests: false }, optimizeDeps: { noDiscovery: true }, appType: 'custom' })]],
-  ['vitest-default', vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner']],
-  ['vitest-nohmr-nows', vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner', '--config', 'vitest.nohmr.config.ts']],
-  ['vitest-nohmr-nows-vmthreads', vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner', '--config', 'vitest.nohmr.config.ts', '--pool=vmThreads']],
+  ['cmd-echo', 'cmd.exe', ['/d', '/s', '/c', 'echo hi'], 20000],
+  ['net-use', 'cmd.exe', ['/d', '/s', '/c', 'net use'], 20000],
+  ['realpath-native', process.execPath, ['-e', "try { require('node:fs').realpathSync.native(process.cwd()); console.error('ok'); } catch (error) { console.error(error.code); process.exit(2); }"], 60000],
+  ['vite-resolve-config-exit', process.execPath, ['-e', "(async () => { try { const v = await import('vite'); await v.resolveConfig({ configFile: false }, 'serve'); console.error('resolved'); process.exit(0); } catch (error) { console.error(error?.code ?? 'error'); process.exit(2); } })()"], 60000],
+  ['vite-resolve-config-stub', process.execPath, ['--import', './tests/no-net-use.mjs', '-e', "import('vite').then(v => v.resolveConfig({ configFile: false }, 'serve')).catch(error => { console.error(error?.code ?? 'error'); process.exit(2); })"], 60000],
+  ['vite-server-stub', process.execPath, ['--import', './tests/no-net-use.mjs', '-e', viteServerCode({ configFile: false, server: { middlewareMode: true, watch: null, hmr: false, ws: false }, optimizeDeps: { noDiscovery: true } })], 60000],
+  ['vitest-stub', process.execPath, vitestBin === null ? null : ['--import', './tests/no-net-use.mjs', vitestBin, 'run', '--configLoader', 'runner'], 60000],
+  ['vitest-stub-nohmr', process.execPath, vitestBin === null ? null : ['--import', './tests/no-net-use.mjs', vitestBin, 'run', '--configLoader', 'runner', '--config', 'vitest.nohmr.config.ts'], 60000],
+  ['vitest-default', process.execPath, vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner'], 60000],
 ];
 
 const summary = [];
 
-for (const [index, [name, args]] of steps.entries()) {
+for (const [index, [name, executable, args, timeout]] of steps.entries()) {
   const number = index + 1;
   let code;
 
   if (args === null) {
     code = 'skip';
   } else {
-    const result = spawnSync(process.execPath, args, {
+    const result = spawnSync(executable, args, {
       stdio: ['ignore', 'ignore', 'inherit'],
-      timeout: 60000,
+      timeout,
       windowsHide: true,
       cwd: packageDir,
     });

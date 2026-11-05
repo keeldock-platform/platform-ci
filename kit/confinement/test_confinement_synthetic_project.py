@@ -39,6 +39,7 @@ EXPECTED_FILES = (
     "packages/host-api/package.json",
     "packages/host-api/src/index.js",
     "packages/host-api/src/index.ts",
+    "packages/host-api/tests/no-net-use.mjs",
     "packages/host-api/tests/probe.mjs",
     "packages/host-api/tests/run.js",
     "packages/host-api/tests/vitest.test.ts",
@@ -274,23 +275,22 @@ class NodeGateTests(unittest.TestCase):
 
     def test_the_node_probe_uses_bounded_inherited_child_processes(self):
         probe = _text("packages/host-api/tests/probe.mjs")
-        self.assertIn("spawnSync(process.execPath, args", probe)
+        self.assertIn("spawnSync(executable, args", probe)
         self.assertIn("stdio: ['ignore', 'ignore', 'inherit']", probe)
-        self.assertIn("timeout: 60000", probe)
+        self.assertIn("['cmd-echo', 'cmd.exe', ['/d', '/s', '/c', 'echo hi'], 20000]", probe)
+        self.assertIn("['net-use', 'cmd.exe', ['/d', '/s', '/c', 'net use'], 20000]", probe)
+        self.assertIn("realpathSync.native(process.cwd())", probe)
+        self.assertIn("timeout,", probe)
         self.assertIn("windowsHide: true", probe)
         self.assertIn("const packageDir = process.cwd()", probe)
         self.assertIn("cwd: packageDir", probe)
-        self.assertIn("require('node:dns').lookup('localhost'", probe)
-        self.assertIn("console.error(error ? 'err ' + error.code : 'ok ' + address)", probe)
-        self.assertIn("require('node:net').createServer()", probe)
-        self.assertIn("server.listen(0, '127.0.0.1'", probe)
         self.assertIn("process.exit(2)", probe)
-        self.assertIn("v.resolveConfig({ configFile: false }, 'serve')", probe)
-        self.assertIn("server: { middlewareMode: true, watch: null, hmr: false }", probe)
-        self.assertIn("server: { middlewareMode: true, watch: null, ws: false }", probe)
-        self.assertIn("hmr: false, ws: false", probe)
-        self.assertIn("preTransformRequests: false", probe)
-        self.assertIn("appType: 'custom'", probe)
+        self.assertIn("await v.resolveConfig({ configFile: false }, 'serve')", probe)
+        self.assertIn("console.error('resolved')", probe)
+        self.assertIn("process.exit(0)", probe)
+        self.assertIn("--import", probe)
+        self.assertIn("./tests/no-net-use.mjs", probe)
+        self.assertIn("server: { middlewareMode: true, watch: null, hmr: false, ws: false }", probe)
         self.assertIn("noDiscovery: true", probe)
         self.assertIn("const server = await createServer(${JSON.stringify(config)})", probe)
         self.assertIn("console.error('created')", probe)
@@ -303,9 +303,6 @@ class NodeGateTests(unittest.TestCase):
         self.assertIn("const vitestDir = path.dirname(require.resolve('vitest/package.json'))", probe)
         self.assertIn("vitestBin = path.join(vitestDir, 'vitest.mjs')", probe)
         self.assertIn("} catch {", probe)
-        self.assertIn("['vitest-default', vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner']]", probe)
-        self.assertIn("'vitest-nohmr-nows', vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner', '--config', 'vitest.nohmr.config.ts']", probe)
-        self.assertIn("'vitest-nohmr-nows-vmthreads', vitestBin === null ? null : [vitestBin, 'run', '--configLoader', 'runner', '--config', 'vitest.nohmr.config.ts', '--pool=vmThreads']", probe)
         self.assertIn("result.error?.code === 'ETIMEDOUT'", probe)
         self.assertIn("result.signal === 'SIGTERM'", probe)
         self.assertIn("console.log(`PROBE ${number} ${name} ${code}`)", probe)
@@ -313,22 +310,30 @@ class NodeGateTests(unittest.TestCase):
         self.assertIn("console.log(`PROBE summary ${summary.join(' ')}`)", probe)
         self.assertIn("process.exitCode = 1", probe)
         self.assertEqual(tuple(re.findall(r"(?m)^  \['([^']+)'", probe)), (
-            "dns-localhost",
-            "tcp-listen",
-            "vite-resolve-config",
-            "vite-server-nohmr",
-            "vite-server-nows",
-            "vite-server-nohmr-nows",
-            "vite-server-nohmr-nows-nopretransform",
+            "cmd-echo",
+            "net-use",
+            "realpath-native",
+            "vite-resolve-config-exit",
+            "vite-resolve-config-stub",
+            "vite-server-stub",
+            "vitest-stub",
+            "vitest-stub-nohmr",
             "vitest-default",
-            "vitest-nohmr-nows",
-            "vitest-nohmr-nows-vmthreads",
         ))
         self.assertIn("PROBE summary", probe)
         self.assertEqual(probe.count("console.log(`PROBE ${number} ${name} ${code}`)"), 1)
         self.assertEqual(probe.count("PROBE "), 2)
-        self.assertEqual(probe.count("['dns-localhost'"), 1)
+        self.assertEqual(probe.count("['cmd-echo'"), 1)
         self.assertTrue(probe.rstrip().endswith("process.exitCode = 1;"))
+
+        preload_bytes = (FIXTURE / "packages/host-api/tests/no-net-use.mjs").read_bytes()
+        preload = preload_bytes.decode("ascii")
+        self.assertNotIn(chr(35), preload)
+        self.assertIn("import childProcess from 'node:child_process'", preload)
+        self.assertIn("syncBuiltinESMExports()", preload)
+        self.assertIn("command.trim().toLowerCase() === 'net use'", preload)
+        self.assertIn("process.nextTick(() => callback(error))", preload)
+        self.assertIn("code: 'ENOTSUP'", preload)
 
     def test_the_manifest_digest_is_a_stable_sha256(self):
         first = gate_table.manifest_digest(FIXTURE)

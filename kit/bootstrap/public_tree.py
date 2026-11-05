@@ -249,6 +249,7 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/synthetic_project/packages/host-api/src/index.js",
         "kit/confinement/synthetic_project/packages/host-api/src/index.ts",
         "kit/confinement/synthetic_project/packages/host-api/tests/run.js",
+        "kit/confinement/synthetic_project/packages/host-api/tests/no-net-use.mjs",
         "kit/confinement/synthetic_project/packages/host-api/tests/probe.mjs",
         "kit/confinement/synthetic_project/packages/host-api/tests/vitest.test.ts",
         "kit/confinement/synthetic_project/packages/host-api/tsconfig.json",
@@ -394,7 +395,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_release_build_verify.py': '08c8b7dcb28307d8470cab9675202bcc206492261d20dec70064232c197f2579',
     'kit/confinement/cargo_vendor_verify.py': '31d346c8e66eeac9c8625ecc62fb314ff2feb87914a4030f7e8ad138277cbed2',
     'kit/confinement/test_cargo_vendor_verify.py': '6d7a02f56a81d3b9930b7d5d5e9e38334662ccd144b89d0b56597c11a1c394fc',
-    'kit/bootstrap/test_public_tree.py': '85d0f58555f34919625f3c4d7ace50d4988c706e7687b7703deebe7784ff9400',
+    'kit/bootstrap/test_public_tree.py': '43f8d32a6409f4f160580733a74397207ad703e57e8d9c7dda9bf783d13d7773',
     'kit/confinement/release_evidence.py': '2609b125bf2d3cbde256e2e4229c576fc0de1c5da898faf206807205dee49ae2',
     'kit/confinement/test_confinement_cargo_lock_bootstrap.py': '73133ce9967097231a6f2b944fe11f3fc460f7183ff3de61bb5844c2b928ed5c',
     'kit/confinement/cargo_lock_bootstrap.py': '9e138ea3cb8befa770d091f9270e0e523ec7772d6ce5eda06a45d56bc28d17e2',
@@ -439,7 +440,8 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/synthetic_project/packages/host-api/src/index.js': '93d2550086d545dbe2c53ef4e66d47e5e58e58c6232b830ad35fd47d2b50fac3',
     'kit/confinement/synthetic_project/packages/host-api/src/index.ts': '944f13e51b6f4882f5a6d32aba8646a31ec8cef4b94750dcd3da4f8ae7c9d39f',
     'kit/confinement/synthetic_project/packages/host-api/tests/run.js': '8b2a170f1c0cdd7787039cd8764f1c74534ed7818f352fe866b818efea3e9134',
-    'kit/confinement/synthetic_project/packages/host-api/tests/probe.mjs': 'e1eef218f78f048562b8ad1f96d58af81d234251f3e6bb88e2e95db0fa4017f6',
+    'kit/confinement/synthetic_project/packages/host-api/tests/no-net-use.mjs': 'ccc5be8d5101a3b4ff5e96cf38b77350626483a4f815f3a4897a4a05954e08b3',
+    'kit/confinement/synthetic_project/packages/host-api/tests/probe.mjs': 'caf13145b376ebe88a90f2a8d2278df8aba6fe94ff126a9718de5a218bffe684',
     'kit/confinement/synthetic_project/packages/host-api/tests/vitest.test.ts': '81d0ad5e5a8b8175113bf4968cc845c9294a469f7b623a7acd1e1e3e8c6ece13',
     'kit/confinement/synthetic_project/packages/host-api/tsconfig.json': '8d2377f94f98025e7d3a48de2275c8a4afd01224dfe8b97fdd3d704f0748c3d3',
     'kit/confinement/synthetic_project/packages/host-api/vitest.config.ts': 'f226c491c4ed27a1b7f23ef8aaef33b74a0632d98e37fc86360749bb9eba34e8',
@@ -451,7 +453,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/synthetic_project/runtime/Cargo.toml': '2163035d5965adad6df65622156c46adf3e4c22328259050d7862203efc2a571',
     'kit/confinement/synthetic_project/runtime/src/lib.rs': '2fdb08e9c85709dcbf2045c2bbda456dca7c012910f7e31e8a3eab2e9621b343',
     'kit/confinement/synthetic_project/runtime/tests/runtime.rs': '10b8b82ccc7ce5111fc25391648152f538073020ab7aef902e91c7d781688d97',
-    'kit/confinement/test_confinement_synthetic_project.py': 'cc3cda4fe83d8f2a18a1f607796f728bf2faf30aff08168551ccd644400760c7',
+    'kit/confinement/test_confinement_synthetic_project.py': 'e152477c26dd84158cd5d3f7c17d3edc22cb10ac714874a1f373bb1d5ea60f63',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 SHA512_SRI_PATTERN = re.compile(r"sha512-[A-Za-z0-9+/]{86}==\Z")
