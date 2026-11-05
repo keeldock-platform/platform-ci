@@ -1288,6 +1288,7 @@ class CargoLockProducerTests(unittest.TestCase):
     def test_runtime_candidate_uses_real_validation_staging_and_generated_lock_path(self):
         if os.name != "posix":
             self.skipTest("root-owned source fixture requires a POSIX filesystem")
+        original_cwd = Path.cwd()
         with tempfile.TemporaryDirectory(prefix="kd-runtime-candidate-", dir="/tmp") as temporary:
             root = Path(temporary)
             source = root / "source"
@@ -1475,10 +1476,14 @@ class CargoLockProducerTests(unittest.TestCase):
                 self.assertEqual(result["source_result"], "command_completed")
                 self.assertTrue(result["payload_bytes"])
             finally:
-                subprocess.run(
-                    ["sudo", "-n", "chown", "-R", owner, str(source)],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
-                )
+                try:
+                    subprocess.run(
+                        ["sudo", "-n", "chown", "-R", owner, str(source)],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                    )
+                finally:
+                    os.chdir(original_cwd)
+        self.assertEqual(Path.cwd(), original_cwd)
 
     def test_contract_request_keeps_the_root_path_and_two_argument_manifest_check(self):
         state = self._run()

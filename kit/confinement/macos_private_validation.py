@@ -2503,9 +2503,14 @@ def _core_contract_expected_mode(path, *, concern="core-contract"):
 
 
 def _runtime_member_listing(crate_roots):
-    return [
-        posixpath.relpath("/".join(root), RUNTIME_WORKSPACE_DIRECTORY) for root in crate_roots
-    ]
+    workspace_parts = tuple(RUNTIME_WORKSPACE_DIRECTORY.split("/"))
+    members = []
+    for root in crate_roots:
+        common = 0
+        while common < min(len(workspace_parts), len(root)) and workspace_parts[common] == root[common]:
+            common += 1
+        members.append("/".join(("..",) * (len(workspace_parts) - common) + root[common:]))
+    return members
 
 
 def _runtime_roots_from_manifest(text):

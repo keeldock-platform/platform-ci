@@ -3997,8 +3997,9 @@ BATCH4_ROOT_TEXT = (
 
 def _runtime_root_text(roots=None, extra=""):
     roots = subject.RUNTIME_CRATE_ROOTS if roots is None else roots
+    workspace_parts = tuple(subject.RUNTIME_WORKSPACE_DIRECTORY.split("/"))
     listing = "".join(
-        '    "' + subject.posixpath.relpath("/".join(root), subject.RUNTIME_WORKSPACE_DIRECTORY) + '",\n'
+        '    "' + "/".join(root[len(workspace_parts):]) + '",\n'
         for root in roots if type(root) is tuple
     )
     return (
@@ -4045,6 +4046,16 @@ def _runtime_lock_text(names, extra="", api_consumers=None):
 
 
 class RuntimeWorkspaceTreeTests(unittest.TestCase):
+    def test_runtime_member_paths_do_not_resolve_against_the_working_directory(self):
+        expected = [
+            "/".join(root[len(tuple(subject.RUNTIME_WORKSPACE_DIRECTORY.split("/"))):])
+            for root in subject.RUNTIME_CRATE_ROOTS
+        ]
+        with patch.object(subject.posixpath, "relpath", side_effect=AssertionError), \
+                patch.object(subject.posixpath, "abspath", side_effect=AssertionError):
+            self.assertEqual(subject._runtime_member_listing(subject.RUNTIME_CRATE_ROOTS), expected)
+            self.assertTrue(all(('"' + member + '",') in _runtime_root_text() for member in expected))
+
     @staticmethod
     def _runtime_entries(roots=None):
         roots = subject.RUNTIME_CRATE_ROOTS if roots is None else roots
