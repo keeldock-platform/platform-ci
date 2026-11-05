@@ -39,6 +39,7 @@ EXPECTED_FILES = (
     "packages/host-api/package.json",
     "packages/host-api/src/index.js",
     "packages/host-api/src/index.ts",
+    "packages/host-api/tests/probe.mjs",
     "packages/host-api/tests/run.js",
     "packages/host-api/tests/vitest.test.ts",
     "packages/host-api/tsconfig.json",
@@ -243,7 +244,7 @@ class NodeGateTests(unittest.TestCase):
                     )
                     self.assertEqual(
                         package["scripts"]["test"],
-                        "vitest run --configLoader runner && node tests/run.js",
+                        "node tests/probe.mjs",
                     )
                 else:
                     self.assertEqual(package["scripts"]["typecheck"], "node --check src/index.js")
@@ -263,6 +264,63 @@ class NodeGateTests(unittest.TestCase):
         self.assertIn("it(", _text("packages/host-api/tests/vitest.test.ts"))
         self.assertIn("expect(true).toBe(true)", _text("packages/host-api/tests/vitest.test.ts"))
         self.assertIn("fixtureValue: number", _text("packages/host-api/src/index.ts"))
+
+    def test_the_vitest_probe_uses_inherited_child_processes_for_each_candidate(self):
+        probe = _text("packages/host-api/tests/probe.mjs")
+        self.assertIn("spawnSync(process.execPath, args", probe)
+        self.assertIn("stdio: ['ignore', 'ignore', 'inherit']", probe)
+        self.assertIn("timeout: 60000", probe)
+        self.assertIn("windowsHide: true", probe)
+        self.assertIn("const packageDir = process.cwd()", probe)
+        self.assertIn("cwd: packageDir", probe)
+        self.assertIn("middlewareMode: true, watch: null", probe)
+        self.assertIn("noDiscovery: true", probe)
+        self.assertIn("{ eval: true }", probe)
+        self.assertIn("import { createRequire } from 'node:module'", probe)
+        self.assertIn("import path from 'node:path'", probe)
+        self.assertIn("const require = createRequire(import.meta.url)", probe)
+        self.assertIn("let vitestBin = null", probe)
+        self.assertIn("const vitestDir = path.dirname(require.resolve('vitest/package.json'))", probe)
+        self.assertIn("vitestBin = path.join(vitestDir, 'vitest.mjs')", probe)
+        self.assertIn("PROBE vitest-bin ${path.relative(packageDir, vitestBin)}", probe)
+        self.assertIn("console.log('PROBE vitest-bin missing')", probe)
+        self.assertIn("} catch {", probe)
+        self.assertIn("steps.push(...vitestSteps.map(([name, args]) => [name, vitestBin === null ? null : args]))", probe)
+        self.assertIn("'vitest-threads-runner', [vitestBin, 'run', '--configLoader', 'runner']", probe)
+        self.assertIn("'vitest-vmthreads', [vitestBin, 'run', '--configLoader', 'runner', '--pool=vmThreads']", probe)
+        self.assertIn("'vitest-no-parallel', [vitestBin, 'run', '--configLoader', 'runner', '--no-file-parallelism', '--maxWorkers=1']", probe)
+        self.assertIn("'vitest-native-loader', [vitestBin, 'run', '--configLoader', 'native']", probe)
+        self.assertIn("'vitest-forks-1', [vitestBin, 'run', '--configLoader', 'runner', '--pool=forks', '--maxWorkers=1']", probe)
+        self.assertIn("'--pool=vmThreads'", probe)
+        self.assertIn("'--no-file-parallelism', '--maxWorkers=1'", probe)
+        self.assertIn("'--configLoader', 'native'", probe)
+        self.assertIn("'--pool=forks', '--maxWorkers=1'", probe)
+        self.assertIn("result.error?.code === 'ETIMEDOUT'", probe)
+        self.assertIn("result.signal === 'SIGTERM'", probe)
+        self.assertIn("console.log(`PROBE ${number} ${name} ${code}`)", probe)
+        self.assertIn("code = 'skip'", probe)
+        self.assertIn("console.log(`PROBE summary ${summary.join(' ')}`)", probe)
+        self.assertIn("process.exitCode = 1", probe)
+        self.assertNotIn("console.log(`PROBE ${number} ${name} start`)", probe)
+        self.assertNotIn(" end status=", probe)
+        self.assertNotIn("PROBE done", probe)
+        for name in (
+            "node-ok",
+            "rolldown-binding",
+            "vite-import",
+            "vitest-node-import",
+            "vite-server",
+            "worker-thread",
+            "vitest-threads-runner",
+            "vitest-vmthreads",
+            "vitest-no-parallel",
+            "vitest-native-loader",
+            "vitest-forks-1",
+        ):
+            with self.subTest(name=name):
+                self.assertIn("'" + name + "'", probe)
+        self.assertIn("PROBE summary", probe)
+        self.assertTrue(probe.rstrip().endswith("process.exitCode = 1;"))
 
     def test_the_manifest_digest_is_a_stable_sha256(self):
         first = gate_table.manifest_digest(FIXTURE)

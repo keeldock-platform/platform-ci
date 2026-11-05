@@ -249,6 +249,7 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/synthetic_project/packages/host-api/src/index.js",
         "kit/confinement/synthetic_project/packages/host-api/src/index.ts",
         "kit/confinement/synthetic_project/packages/host-api/tests/run.js",
+        "kit/confinement/synthetic_project/packages/host-api/tests/probe.mjs",
         "kit/confinement/synthetic_project/packages/host-api/tests/vitest.test.ts",
         "kit/confinement/synthetic_project/packages/host-api/tsconfig.json",
         "kit/confinement/synthetic_project/packages/host-api/vitest.config.ts",
@@ -392,7 +393,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_release_build_verify.py': '08c8b7dcb28307d8470cab9675202bcc206492261d20dec70064232c197f2579',
     'kit/confinement/cargo_vendor_verify.py': '31d346c8e66eeac9c8625ecc62fb314ff2feb87914a4030f7e8ad138277cbed2',
     'kit/confinement/test_cargo_vendor_verify.py': '6d7a02f56a81d3b9930b7d5d5e9e38334662ccd144b89d0b56597c11a1c394fc',
-    'kit/bootstrap/test_public_tree.py': '2ad491245c32509368c8c2f1ac8eed64f08256fe1ba1e47ad3d2536ae32d3ecd',
+    'kit/bootstrap/test_public_tree.py': 'f4c3f9b6e28a921e05c53f22577c397b67cc6cdae6ba2765717b459e9a6fb772',
     'kit/confinement/release_evidence.py': '2609b125bf2d3cbde256e2e4229c576fc0de1c5da898faf206807205dee49ae2',
     'kit/confinement/test_confinement_cargo_lock_bootstrap.py': '73133ce9967097231a6f2b944fe11f3fc460f7183ff3de61bb5844c2b928ed5c',
     'kit/confinement/cargo_lock_bootstrap.py': '9e138ea3cb8befa770d091f9270e0e523ec7772d6ce5eda06a45d56bc28d17e2',
@@ -433,10 +434,11 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/synthetic_project/fuzz/src/main.rs': '4440b336abdd23785c6d8f6ff0559468033b9460e10c3715c51adcc5b0a7961f',
     'kit/confinement/synthetic_project/package-lock.json': '9ab0a9e26abe512d99db6930ff05b014baf9829cf83d8c62ff57aa626110b28c',
     'kit/confinement/synthetic_project/package.json': '63847331195f7d981044d5187c727065f303aa116982261e0bb472238e306a69',
-    'kit/confinement/synthetic_project/packages/host-api/package.json': 'fd1d07f9733d359f44ed445f20d4630e2d1f99cdea915dc95e671aa9ee6f47ba',
+    'kit/confinement/synthetic_project/packages/host-api/package.json': '204fa0fcc4c5ec8cefd84487743a056d8aca74f970c229c5ecce360ffdbe043a',
     'kit/confinement/synthetic_project/packages/host-api/src/index.js': '93d2550086d545dbe2c53ef4e66d47e5e58e58c6232b830ad35fd47d2b50fac3',
     'kit/confinement/synthetic_project/packages/host-api/src/index.ts': '944f13e51b6f4882f5a6d32aba8646a31ec8cef4b94750dcd3da4f8ae7c9d39f',
     'kit/confinement/synthetic_project/packages/host-api/tests/run.js': '8b2a170f1c0cdd7787039cd8764f1c74534ed7818f352fe866b818efea3e9134',
+    'kit/confinement/synthetic_project/packages/host-api/tests/probe.mjs': '2f4cc694b3a9e233a67332bd23fc3926bd7f3f15a55925f931c875fa09fd6551',
     'kit/confinement/synthetic_project/packages/host-api/tests/vitest.test.ts': '81d0ad5e5a8b8175113bf4968cc845c9294a469f7b623a7acd1e1e3e8c6ece13',
     'kit/confinement/synthetic_project/packages/host-api/tsconfig.json': '8d2377f94f98025e7d3a48de2275c8a4afd01224dfe8b97fdd3d704f0748c3d3',
     'kit/confinement/synthetic_project/packages/host-api/vitest.config.ts': 'f226c491c4ed27a1b7f23ef8aaef33b74a0632d98e37fc86360749bb9eba34e8',
@@ -447,7 +449,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/synthetic_project/runtime/Cargo.toml': '2163035d5965adad6df65622156c46adf3e4c22328259050d7862203efc2a571',
     'kit/confinement/synthetic_project/runtime/src/lib.rs': '2fdb08e9c85709dcbf2045c2bbda456dca7c012910f7e31e8a3eab2e9621b343',
     'kit/confinement/synthetic_project/runtime/tests/runtime.rs': '10b8b82ccc7ce5111fc25391648152f538073020ab7aef902e91c7d781688d97',
-    'kit/confinement/test_confinement_synthetic_project.py': 'c838fe7cd410a2890e62e86301cb46c14ae77db68eb2fc127c465c16499643d4',
+    'kit/confinement/test_confinement_synthetic_project.py': '06a75e0167e37dde04d38f105ed48654503267877e2ba809410ceeb0d0067db2',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
 SHA512_SRI_PATTERN = re.compile(r"sha512-[A-Za-z0-9+/]{86}==\Z")
