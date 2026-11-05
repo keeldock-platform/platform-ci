@@ -667,10 +667,18 @@ class MacosFeedbackProducerTests(unittest.TestCase):
             source_directory.mkdir(parents=True)
             source_file = source_directory / "new-test.test.ts"
             source_file.write_bytes(b"source")
-            source_file.chmod(0o600)
+            source_info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_nlink=1)
+            original_lstat = Path.lstat
+
+            def source_lstat(path):
+                if path == source_file:
+                    return source_info
+                return original_lstat(path)
+
             with patch.object(producer, "_make_worker_directory"), \
                     patch.object(producer, "_read_file", return_value=b"source") as read_file, \
-                    patch.object(producer, "_write_worker_file"):
+                    patch.object(producer, "_write_worker_file"), \
+                    patch.object(Path, "lstat", new=source_lstat):
                 producer._copy_reviewed_files(
                     root / "source", root / "worker",
                     ("packages/host-api/tests/new-test.test.ts",), 501, 20,
