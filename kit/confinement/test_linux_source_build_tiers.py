@@ -924,7 +924,9 @@ class LinuxBrowserTierTests(unittest.TestCase):
         self.assertIn('KD_BROWSER_TIER: "1"', quick_block)
         encrypt = quick[quick.index("      - name: Encrypt bounded quick return"):].split("\n      - name:", 1)[0]
         self.assertIn("WORKER_PATH: ${{ steps.project-deps.outputs.worker_path }}", encrypt)
-        self.assertIn("ImageVersion,WORKER_PATH python3", encrypt)
+        self.assertIn("NODE_BIN: ${{ steps.toolchains.outputs.node_bin }}", encrypt)
+        self.assertIn("run: python3 -B core" + "-ci/linux_quick" + "_return.py encrypt", encrypt)
+        self.assertNotIn("sudo -n --preserve-env=", encrypt)
         upload = quick[quick.index("      - name: Upload the single encrypted member"):].split("\n      - name:", 1)[0]
         self.assertIn("path: ${{ runner.temp }}/kd-quick-upload/\n", upload)
         for step in ("Record image and fetch pinned Rust and Node toolchains",

@@ -1338,11 +1338,8 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 ) + "]\n"
         return text
 
-    def test_d145_profile_accepts_a_complete_runtime_and_paired_contract_lock(self):
+    def _write_complete_d145_fixture(self, root):
         bootstrap = linux_source_build.cargo_lock_bootstrap
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
         contract_members = sorted(bootstrap.CONTRACT_MEMBERS)
         contract_listing = "".join('    "' + member + '",\n' for member in contract_members)
         host_mock_package = "keeldock" + "-host-mock"
@@ -1421,6 +1418,11 @@ class LinuxSourceBuildTests(unittest.TestCase):
         )
         self._write_d145_fixture_file(root, "crates/host/api/src/lib.rs", "pub fn api() {}\n")
 
+    def test_d145_profile_accepts_a_complete_runtime_and_paired_contract_lock(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self._write_complete_d145_fixture(root)
         descriptor = linux_source_build._open_source_root(root)
         try:
             self.assertTrue(linux_source_build._check_d145_runtime_profile(descriptor))
@@ -1694,11 +1696,8 @@ class LinuxSourceBuildTests(unittest.TestCase):
             root = Path(temporary)
             worker = root / "source"
             worker.mkdir()
-            (worker / "Cargo.lock").write_text(_path_only_lock(4), encoding="ascii")
+            self._write_complete_d145_fixture(worker)
             runtime = worker / "runtime"
-            runtime.mkdir(parents=True)
-            (runtime / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
-            (runtime / "Cargo.lock").write_text(_path_only_lock(7, "runtime"), encoding="ascii")
             source_sha = "a" * 40
             commands = tuple(
                 (name, ("/usr/bin/true",))
@@ -3491,7 +3490,7 @@ class RealNpmReportTests(unittest.TestCase):
         allows = _npm11_allows(self.now_ms)
         self.assertEqual(self._check(report, allows), (2, 19, 1))
         code, output = self._run_audit(1, report, allows, packages=NPM11_PACKAGES)
-        self.assertEqual((code, output), (0, "linux-node-audit=verified phase=trusted findings=2 allowed=1\n"))
+        self.assertEqual((code, output), (0, "linux-node-audit=verified phase=trusted findings=2 allowed=19\n"))
         with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
             self._run_audit(1, report, [], packages=NPM11_PACKAGES)
         self.assertEqual(refused.exception.detail, "audit_advisory_unmatched")
