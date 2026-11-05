@@ -1175,7 +1175,7 @@ namespace KeelDock.Platform.WindowsConfinement
         private const uint JobKillExitCode = 0x4b44574b;
         private const uint JobObjectBasicProcessIdList = 3;
         private const int ErrorMoreData = 234;
-        private const int JobListSlots = 64;
+        private const int JobListSlots = 128;
 
         private string profileName;
         private IntPtr profileSid = IntPtr.Zero;

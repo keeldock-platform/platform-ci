@@ -4,7 +4,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "node --check src/index.js",
-    "test": "node tests/run.js"
+    "typecheck": "tsc --project tsconfig.json --noEmit && node --check src/index.js",
+    "test": "vitest run --configLoader runner && node tests/run.js"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3",
+    "vite": "8.3.4",
+    "vitest": "5.0.5"
   }
 }

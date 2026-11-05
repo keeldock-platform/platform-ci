@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -6,10 +8,16 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-import re
 
 import check_candidate
-from public_tree import PINNED_FILE_SHA256, PLATFORM_FILES, PublicTreeError, inspect_text, scan_tree
+from public_tree import (
+    PINNED_FILE_SHA256,
+    PLATFORM_FILES,
+    PublicTreeError,
+    SYNTHETIC_NPM_LOCK_PATH,
+    inspect_text,
+    scan_tree,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -218,7 +226,7 @@ class PublicTreeTests(unittest.TestCase):
     def test_synthetic_project_fixture_is_registered_pinned_and_discovered(self):
         prefix = "kit/confinement/synthetic_project/"
         fixture = sorted(name for name in PLATFORM_FILES if name.startswith(prefix))
-        self.assertEqual(len(fixture), 28)
+        self.assertEqual(len(fixture), 32)
         for name in fixture + ["kit/confinement/test_confinement_synthetic_project.py"]:
             with self.subTest(name=name):
                 self.assertIn(name, PINNED_FILE_SHA256)
@@ -473,7 +481,11 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/synthetic_project/package.json",
             "kit/confinement/synthetic_project/packages/host-api/package.json",
             "kit/confinement/synthetic_project/packages/host-api/src/index.js",
+            "kit/confinement/synthetic_project/packages/host-api/src/index.ts",
             "kit/confinement/synthetic_project/packages/host-api/tests/run.js",
+            "kit/confinement/synthetic_project/packages/host-api/tests/vitest.test.ts",
+            "kit/confinement/synthetic_project/packages/host-api/tsconfig.json",
+            "kit/confinement/synthetic_project/packages/host-api/vitest.config.ts",
             "kit/confinement/synthetic_project/packages/kernel-i18n/package.json",
             "kit/confinement/synthetic_project/packages/kernel-i18n/src/index.js",
             "kit/confinement/synthetic_project/packages/kernel-i18n/tests/run.js",
@@ -818,6 +830,43 @@ class PublicTreeTests(unittest.TestCase):
             with self.subTest(fixture_class="identifying"):
                 with self.assertRaises(PublicTreeError):
                     inspect_text(fixture, "platform")
+
+    def test_only_valid_sha512_integrity_values_in_the_exact_npm_lock_are_exempt(self):
+        valid_sri = "sha512-" + "A" * 10 + "/R" + "77" + "B" * 72 + "=="
+        valid_field = '{"integrity": "' + valid_sri + '"}'
+
+        inspect_text(valid_field, "platform", SYNTHETIC_NPM_LOCK_PATH)
+
+        for text, relative_path in (
+            (
+                '{"integrity": "' + valid_sri + '", "note": "' + valid_sri + '"}',
+                SYNTHETIC_NPM_LOCK_PATH,
+            ),
+            ('{"checksum": "' + valid_sri + '"}', SYNTHETIC_NPM_LOCK_PATH),
+            (valid_field, "other/package-lock.json"),
+        ):
+            with self.subTest(relative_path=relative_path, text_class="unexempted"):
+                with self.assertRaisesRegex(PublicTreeError, "plan-id-present"):
+                    inspect_text(text, "platform", relative_path)
+
+        malformed_sri = "sha512-" + "A" * 10 + "/R" + "77" + "B" * 71 + "=="
+        with self.assertRaisesRegex(PublicTreeError, "plan-id-present"):
+            inspect_text(
+                '{"integrity": "' + malformed_sri + '"}',
+                "platform",
+                SYNTHETIC_NPM_LOCK_PATH,
+            )
+
+    def test_synthetic_lock_escapes_preserve_decoded_sha512_integrity_values(self):
+        lock_path = ROOT / SYNTHETIC_NPM_LOCK_PATH
+        raw_text = lock_path.read_text(encoding="utf-8")
+        lock = json.loads(raw_text)
+        fsevents_integrity = lock["packages"]["node_modules/fsevents"]["integrity"]
+        why_is_node_running_integrity = lock["packages"]["node_modules/why-is-node-running"]["integrity"]
+        self.assertIn("R" + "77", fsevents_integrity)
+        self.assertIn("X" + "1", why_is_node_running_integrity)
+        self.assertIn(r"\u0052", raw_text)
+        self.assertIn(r"\u0058", raw_text)
 
     def test_public_cross_pool_references_remain_allowed(self):
         inspect_text("uses: keeldock-platform/platform-ci/kit/bootstrap@" + "a" * 40, "connect")

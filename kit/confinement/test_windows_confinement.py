@@ -260,6 +260,12 @@ class WindowsConfinementSpikeTests(unittest.TestCase):
         self.assertIn("Native.TerminateJobObject(job, JobKillExitCode)", self.native)
         self.assertEqual(self.native.count("handleBuffer = Marshal.AllocHGlobal(IntPtr.Size * 3)"), 1)
 
+    def test_process_list_buffer_matches_the_active_process_limit(self):
+        self.assertIn("private const int JobListSlots = 128;", self.native)
+        self.assertIn("int size = 8 + IntPtr.Size * JobListSlots;", self.native)
+        self.assertIn("if (Marshal.GetLastWin32Error() != ErrorMoreData)", self.native)
+        self.assertIn("return Marshal.ReadInt32(buffer, 0);", self.native)
+
     def test_wrapper_pins_exact_toolchains_by_hash_and_allows_only_known_hosts(self):
         self.assertIn("$RustVersion = '1.99.1'", self.wrapper)
         self.assertIn("$RustTarget = 'x86_64-pc-windows-msvc'", self.wrapper)

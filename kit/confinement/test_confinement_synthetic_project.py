@@ -38,7 +38,11 @@ EXPECTED_FILES = (
     "package.json",
     "packages/host-api/package.json",
     "packages/host-api/src/index.js",
+    "packages/host-api/src/index.ts",
     "packages/host-api/tests/run.js",
+    "packages/host-api/tests/vitest.test.ts",
+    "packages/host-api/tsconfig.json",
+    "packages/host-api/vitest.config.ts",
     "packages/kernel-i18n/package.json",
     "packages/kernel-i18n/src/index.js",
     "packages/kernel-i18n/tests/run.js",
@@ -48,7 +52,9 @@ EXPECTED_FILES = (
     "runtime/tests/runtime.rs",
 )
 SRI_PATTERN = re.compile(r"sha512-[A-Za-z0-9+/]{86}==\Z")
-TARBALL_PATTERN = re.compile(r"https://registry\.npmjs\.org/[a-z0-9._-]+/-/[a-z0-9._-]+\.tgz\Z")
+TARBALL_PATTERN = re.compile(
+    r"https://registry\.npmjs\.org/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/-/[a-z0-9._-]+\.tgz\Z"
+)
 FORBIDDEN_NODE_SPAWN = ("child_process", "fork(", "spawn(", "vitest")
 
 
@@ -65,6 +71,33 @@ def _gate_arguments(include_runtime):
         gate_table.gate_templates(include_runtime), str(FIXTURE), "cargo", "node", "npm",
     )
     return {name: argv for name, argv in rendered}
+
+
+def _npm_dependency_closure(packages, roots):
+    selected = set()
+    pending = list(roots)
+    while pending:
+        key = pending.pop()
+        if key in selected:
+            continue
+        selected.add(key)
+        package_path = Path(key)
+        for section in ("dependencies", "optionalDependencies"):
+            for name in packages[key].get(section, {}):
+                ancestor = package_path
+                target = None
+                while True:
+                    candidate = (ancestor / "node_modules" / name).as_posix()
+                    if candidate in packages:
+                        target = candidate
+                        break
+                    if ancestor == Path("."):
+                        break
+                    ancestor = ancestor.parent
+                if target is None:
+                    raise AssertionError((key, section, name))
+                pending.append(target)
+    return selected
 
 
 class FixtureShapeTests(unittest.TestCase):
@@ -203,10 +236,33 @@ class NodeGateTests(unittest.TestCase):
         for path in gate_table.MANIFEST_WORKSPACE_PATHS:
             with self.subTest(path=path):
                 package = _json(path + "/package.json")
-                self.assertEqual(package["scripts"]["typecheck"], "node --check src/index.js")
-                self.assertEqual(package["scripts"]["test"], "node tests/run.js")
+                if path == "packages/host-api":
+                    self.assertEqual(
+                        package["scripts"]["typecheck"],
+                        "tsc --project tsconfig.json --noEmit && node --check src/index.js",
+                    )
+                    self.assertEqual(
+                        package["scripts"]["test"],
+                        "vitest run --configLoader runner && node tests/run.js",
+                    )
+                else:
+                    self.assertEqual(package["scripts"]["typecheck"], "node --check src/index.js")
+                    self.assertEqual(package["scripts"]["test"], "node tests/run.js")
                 self.assertTrue((FIXTURE / path / "src/index.js").is_file())
                 self.assertTrue((FIXTURE / path / "tests/run.js").is_file())
+
+    def test_the_host_api_typescript_and_vitest_sources_are_declared(self):
+        package = _json("packages/host-api/package.json")
+        self.assertEqual(
+            package["devDependencies"],
+            {"typescript": "6.0.3", "vite": "8.3.4", "vitest": "5.0.5"},
+        )
+        self.assertTrue((FIXTURE / "packages/host-api/tsconfig.json").is_file())
+        self.assertIn('pool: \'threads\'', _text("packages/host-api/vitest.config.ts"))
+        self.assertIn("tests/**/*.test.ts", _text("packages/host-api/vitest.config.ts"))
+        self.assertIn("it(", _text("packages/host-api/tests/vitest.test.ts"))
+        self.assertIn("expect(true).toBe(true)", _text("packages/host-api/tests/vitest.test.ts"))
+        self.assertIn("fixtureValue: number", _text("packages/host-api/src/index.ts"))
 
     def test_the_manifest_digest_is_a_stable_sha256(self):
         first = gate_table.manifest_digest(FIXTURE)
@@ -241,13 +297,21 @@ class NodeGateTests(unittest.TestCase):
         self.assertEqual(lock["lockfileVersion"], 3)
         packages = lock["packages"]
         external = {key: value for key, value in packages.items() if "resolved" in value and not value.get("link")}
-        self.assertEqual(sorted(external), ["node_modules/ms"])
+        closure = _npm_dependency_closure(
+            packages,
+            ("node_modules/typescript", "node_modules/vite", "node_modules/vitest"),
+        )
+        self.assertEqual(set(external), closure | {"node_modules/ms"})
+        self.assertEqual(len(closure), 62)
         for key, value in external.items():
             with self.subTest(key=key):
                 self.assertRegex(value["resolved"], TARBALL_PATTERN)
                 self.assertRegex(value["integrity"], SRI_PATTERN)
-                self.assertEqual(value["version"], "2.1.3")
-                self.assertTrue(value["resolved"].endswith("/ms-2.1.3.tgz"))
+        self.assertEqual(external["node_modules/ms"]["version"], "2.1.3")
+        self.assertTrue(external["node_modules/ms"]["resolved"].endswith("/ms-2.1.3.tgz"))
+        for name, version in (("typescript", "6.0.3"), ("vite", "8.3.4"), ("vitest", "5.0.5")):
+            with self.subTest(name=name):
+                self.assertEqual(packages["node_modules/" + name]["version"], version)
         links = {key: value["resolved"] for key, value in packages.items() if value.get("link")}
         self.assertEqual(
             links,
@@ -262,12 +326,19 @@ class NodeGateTests(unittest.TestCase):
             self.assertEqual(entry["name"], package["name"])
             self.assertEqual(entry["version"], package["version"])
             self.assertEqual(entry.get("dependencies"), package.get("dependencies"))
+            self.assertEqual(entry.get("devDependencies"), package.get("devDependencies"))
+        self.assertEqual(packages["packages/host-api"]["devDependencies"], {
+            "typescript": "6.0.3",
+            "vite": "8.3.4",
+            "vitest": "5.0.5",
+        })
         self.assertEqual(packages[""]["workspaces"], ["packages/*"])
 
-    def test_the_dependency_is_used_by_exactly_one_workspace(self):
+    def test_the_dependencies_are_used_by_the_expected_workspaces(self):
         self.assertEqual(_json("packages/kernel-i18n/package.json")["dependencies"], {"ms": "2.1.3"})
         self.assertNotIn("dependencies", _json("packages/host-api/package.json"))
         self.assertNotIn("dependencies", _json("package.json"))
+        self.assertNotIn("devDependencies", _json("package.json"))
         self.assertIn("from 'ms'", _text("packages/kernel-i18n/src/index.js"))
 
 

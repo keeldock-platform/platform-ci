@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -246,7 +247,11 @@ PLATFORM_FILES = frozenset(
         "kit/confinement/synthetic_project/package.json",
         "kit/confinement/synthetic_project/packages/host-api/package.json",
         "kit/confinement/synthetic_project/packages/host-api/src/index.js",
+        "kit/confinement/synthetic_project/packages/host-api/src/index.ts",
         "kit/confinement/synthetic_project/packages/host-api/tests/run.js",
+        "kit/confinement/synthetic_project/packages/host-api/tests/vitest.test.ts",
+        "kit/confinement/synthetic_project/packages/host-api/tsconfig.json",
+        "kit/confinement/synthetic_project/packages/host-api/vitest.config.ts",
         "kit/confinement/synthetic_project/packages/kernel-i18n/package.json",
         "kit/confinement/synthetic_project/packages/kernel-i18n/src/index.js",
         "kit/confinement/synthetic_project/packages/kernel-i18n/tests/run.js",
@@ -265,6 +270,7 @@ ALLOWED_FILES = {
     "data": CONSUMER_FILES,
 }
 MAX_FILE_BYTES = 262144
+SYNTHETIC_NPM_LOCK_PATH = "kit/confinement/synthetic_project/package-lock.json"
 PINNED_FILE_SHA256 = {
     '.github/workflows/linux-source-admission.yml': 'ff3ca426bd9eb4210782cdd84b042f9c58e856ae272aeb280aede6893abb12b3',
     'kit/bootstrap/action.yml': 'e36cee801fc1bc7e94bbc0df423a7c86c76bb5db179b5cdff0f17be5f43b39b7',
@@ -339,9 +345,9 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/windows_native_preflight.cs': 'ba0f8859db9d8bcc1e4c8274520bcb67a3292cb311f553127e1f29fe13838543',
     'kit/confinement/windows_native_preflight.ps1': '8dbaaaad105c2fe0439dedb1b7c9572b8e7ec74a8db29f8edcab91169b06c58b',
     'kit/confinement/test_windows_native_preflight.py': '07defbc65611505f9107e5cb9186f4e15bbb9616797ff07032b3f314480eea7d',
-    'kit/confinement/windows_confinement.cs': '9de0bdf590b0465d7cbb0224c9ed30d959affdccc09c99eaeed6c4cb257667eb',
+    'kit/confinement/windows_confinement.cs': '5573730fd8d2d9acec1e38637602fba218c5972150e7cf9915f0e8bf0e73b722',
     'kit/confinement/windows_confinement.ps1': '1bd0b04dde27eaca58b2a7873345e3c1cacb4e988ff8b8980ebdda0bcf82f036',
-    'kit/confinement/test_windows_confinement.py': '9474c366bfcb55adcc352f6e35cd4db08879d246a512464068c8ac5b60d7953d',
+    'kit/confinement/test_windows_confinement.py': '377b70ca3cd2402df6b14bf17e2da2f7dd0cf02599fe73f74b5f63903b86bef7',
     'kit/confinement/windows_source_run.ps1': '844d76aec369e7ec5622ca17ec97ce73dcf07df78c1febdd7c80120773bcb506',
     'kit/confinement/test_windows_source_run.py': '9a477fae4fe76537faf3a06e5971353bc9b6d6870223eb2504a1d3c8f5a9dd42',
     'kit/confinement/windows_probe.rs': 'cf9e58d8f31e2a9773f2c4eba935fd1ed531d94397ac53e530a93c5169d08727',
@@ -386,7 +392,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_release_build_verify.py': '08c8b7dcb28307d8470cab9675202bcc206492261d20dec70064232c197f2579',
     'kit/confinement/cargo_vendor_verify.py': '31d346c8e66eeac9c8625ecc62fb314ff2feb87914a4030f7e8ad138277cbed2',
     'kit/confinement/test_cargo_vendor_verify.py': '6d7a02f56a81d3b9930b7d5d5e9e38334662ccd144b89d0b56597c11a1c394fc',
-    'kit/bootstrap/test_public_tree.py': 'c913eec55998895113d0dc3677a02414ef1849685de754db98d5a17078750d1e',
+    'kit/bootstrap/test_public_tree.py': '2ad491245c32509368c8c2f1ac8eed64f08256fe1ba1e47ad3d2536ae32d3ecd',
     'kit/confinement/release_evidence.py': '2609b125bf2d3cbde256e2e4229c576fc0de1c5da898faf206807205dee49ae2',
     'kit/confinement/test_confinement_cargo_lock_bootstrap.py': '73133ce9967097231a6f2b944fe11f3fc460f7183ff3de61bb5844c2b928ed5c',
     'kit/confinement/cargo_lock_bootstrap.py': '9e138ea3cb8befa770d091f9270e0e523ec7772d6ce5eda06a45d56bc28d17e2',
@@ -425,11 +431,15 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/synthetic_project/fuzz/Cargo.lock': '8830b2d5813276d9f6bca6c1014eb5b2a23d2077dfd2afd08757318c923e753d',
     'kit/confinement/synthetic_project/fuzz/Cargo.toml': '7f94441d88f5cc6fdc48ad0f96e0f702d4f5369910efe8f10bf8259ba467243a',
     'kit/confinement/synthetic_project/fuzz/src/main.rs': '4440b336abdd23785c6d8f6ff0559468033b9460e10c3715c51adcc5b0a7961f',
-    'kit/confinement/synthetic_project/package-lock.json': 'f0d5c2510b8e399d293a3793c1f15952815647cdfb910c579e6a12ee60dae686',
+    'kit/confinement/synthetic_project/package-lock.json': '9ab0a9e26abe512d99db6930ff05b014baf9829cf83d8c62ff57aa626110b28c',
     'kit/confinement/synthetic_project/package.json': '63847331195f7d981044d5187c727065f303aa116982261e0bb472238e306a69',
-    'kit/confinement/synthetic_project/packages/host-api/package.json': '28ff5a2751319b8f40804bd6275057ff0ac9028b133a79b1bbcad79829446699',
+    'kit/confinement/synthetic_project/packages/host-api/package.json': 'fd1d07f9733d359f44ed445f20d4630e2d1f99cdea915dc95e671aa9ee6f47ba',
     'kit/confinement/synthetic_project/packages/host-api/src/index.js': '93d2550086d545dbe2c53ef4e66d47e5e58e58c6232b830ad35fd47d2b50fac3',
+    'kit/confinement/synthetic_project/packages/host-api/src/index.ts': '944f13e51b6f4882f5a6d32aba8646a31ec8cef4b94750dcd3da4f8ae7c9d39f',
     'kit/confinement/synthetic_project/packages/host-api/tests/run.js': '8b2a170f1c0cdd7787039cd8764f1c74534ed7818f352fe866b818efea3e9134',
+    'kit/confinement/synthetic_project/packages/host-api/tests/vitest.test.ts': '81d0ad5e5a8b8175113bf4968cc845c9294a469f7b623a7acd1e1e3e8c6ece13',
+    'kit/confinement/synthetic_project/packages/host-api/tsconfig.json': '8d2377f94f98025e7d3a48de2275c8a4afd01224dfe8b97fdd3d704f0748c3d3',
+    'kit/confinement/synthetic_project/packages/host-api/vitest.config.ts': 'f226c491c4ed27a1b7f23ef8aaef33b74a0632d98e37fc86360749bb9eba34e8',
     'kit/confinement/synthetic_project/packages/kernel-i18n/package.json': '9f47cb3edc3211e1759ff29b12193d059c95c889b5e28bdfc61d51c1f82318f7',
     'kit/confinement/synthetic_project/packages/kernel-i18n/src/index.js': '5cb814c7a240ce0a3e0df21b4c1bdedba8ebb936c42cc46353dafb41d3847fd7',
     'kit/confinement/synthetic_project/packages/kernel-i18n/tests/run.js': '4fa83c16417d678b1a585021825d3e6af84c322d75e70fde695c34590d0f482e',
@@ -437,9 +447,10 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/synthetic_project/runtime/Cargo.toml': '2163035d5965adad6df65622156c46adf3e4c22328259050d7862203efc2a571',
     'kit/confinement/synthetic_project/runtime/src/lib.rs': '2fdb08e9c85709dcbf2045c2bbda456dca7c012910f7e31e8a3eab2e9621b343',
     'kit/confinement/synthetic_project/runtime/tests/runtime.rs': '10b8b82ccc7ce5111fc25391648152f538073020ab7aef902e91c7d781688d97',
-    'kit/confinement/test_confinement_synthetic_project.py': 'a2f5cf1b9e5a603466a03981f0a48492c2ef9c33a55680cffb37657a0dfc67d3',
+    'kit/confinement/test_confinement_synthetic_project.py': 'c838fe7cd410a2890e62e86301cb46c14ae77db68eb2fc127c465c16499643d4',
 }
 PLAN_ID_PATTERN = re.compile(r"(?<![A-Za-z0-9])(?:D|R|H|X|CI|PF|K)[0-9]{1,3}(?![0-9])")
+SHA512_SRI_PATTERN = re.compile(r"sha512-[A-Za-z0-9+/]{86}==\Z")
 ACTION_VERSION_COMMENT_PATTERN = re.compile(
     r"^\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}\s+"
     + re.escape(chr(35))
@@ -476,14 +487,81 @@ class PublicTreeError(ValueError):
         self.code = code
 
 
-def inspect_text(text, pool):
+def _valid_sha512_integrity_spans(text):
+    try:
+        json.loads(text)
+    except (TypeError, ValueError, RecursionError):
+        return ()
+
+    decoder = json.JSONDecoder()
+
+    def skip_whitespace(index):
+        while index < len(text) and text[index] in " \t\r\n":
+            index += 1
+        return index
+
+    def parse_value(index):
+        index = skip_whitespace(index)
+        if text[index] == "{":
+            index = skip_whitespace(index + 1)
+            if text[index] == "}":
+                return index + 1
+            while True:
+                key, index = decoder.raw_decode(text, index)
+                index = skip_whitespace(index)
+                index = skip_whitespace(index + 1)
+                value_start = index
+                if key == "integrity" and text[value_start] == '"':
+                    value, index = decoder.raw_decode(text, value_start)
+                    if type(value) is str and SHA512_SRI_PATTERN.fullmatch(value):
+                        spans.append((value_start, index))
+                else:
+                    index = parse_value(value_start)
+                index = skip_whitespace(index)
+                if text[index] == "}":
+                    return index + 1
+                index = skip_whitespace(index + 1)
+        if text[index] == "[":
+            index = skip_whitespace(index + 1)
+            if text[index] == "]":
+                return index + 1
+            while True:
+                index = parse_value(index)
+                index = skip_whitespace(index)
+                if text[index] == "]":
+                    return index + 1
+                index = skip_whitespace(index + 1)
+        _, index = decoder.raw_decode(text, index)
+        return index
+
+    spans = []
+    try:
+        parse_value(0)
+    except (IndexError, ValueError, RecursionError):
+        return ()
+    return tuple(spans)
+
+
+def _plan_scan_text(text, relative_path):
+    if relative_path != SYNTHETIC_NPM_LOCK_PATH:
+        return text
+    spans = _valid_sha512_integrity_spans(text)
+    if not spans:
+        return text
+    characters = list(text)
+    for start, end in spans:
+        characters[start:end] = " " * (end - start)
+    return "".join(characters)
+
+
+def inspect_text(text, pool, relative_path=None):
     lowered = text.lower()
     if any(
         chr(35) in line and not ACTION_VERSION_COMMENT_PATTERN.fullmatch(line)
         for line in text.splitlines()
     ):
         raise PublicTreeError("comment-present")
-    if PLAN_ID_PATTERN.search(text):
+    if PLAN_ID_PATTERN.search(_plan_scan_text(text, relative_path)):
         raise PublicTreeError("plan-id-present")
     if PRIVATE_PATH_PATTERN.search(text):
         raise PublicTreeError("absolute-path-present")
@@ -566,5 +644,5 @@ def scan_tree(root, pool):
         expected_hash = PINNED_FILE_SHA256.get(relative)
         if expected_hash is not None and hashlib.sha256(payload).hexdigest() != expected_hash:
             raise PublicTreeError("file-hash-mismatch")
-        inspect_text(text, pool)
+        inspect_text(text, pool, relative)
     return tuple(sorted(actual_files))
