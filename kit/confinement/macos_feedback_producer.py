@@ -390,6 +390,7 @@ def _validate_runtime_batch_seven_trees(source):
     required = {prefix: {"Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md", "src/lib.rs"}
                 for prefix in prefixes}
     found = {prefix: set() for prefix in prefixes}
+    present = set()
     stack = [(crates_root, "runtime/crates")]
     count = 0
     reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -435,6 +436,8 @@ def _validate_runtime_batch_seven_trees(source):
                         or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)):
                     _refuse("manifest_invalid")
             if stat.S_ISDIR(info.st_mode):
+                if relative in prefixes:
+                    present.add(relative)
                 if prefix is not None and relative != prefix:
                     within = relative[len(prefix) + 1:]
                     if not _runtime_batch_seven_directory_allowed(within):
@@ -452,8 +455,8 @@ def _validate_runtime_batch_seven_trees(source):
                         or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH | stat.S_ISUID | stat.S_ISGID)):
                     _refuse("manifest_invalid")
                 found[prefix].add(within)
-    for prefix, required_files in required.items():
-        if not required_files.issubset(found[prefix]):
+    for prefix in present:
+        if not required[prefix].issubset(found[prefix]):
             _refuse("manifest_invalid")
 
 

@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -13,7 +14,6 @@ import urllib.request
 import cargo_lock_bootstrap as subject
 import cargo_lock_receipt as cargo
 import feedback_request
-import linux_source_build
 
 
 NOW = 1_793_160_000
@@ -1375,7 +1375,10 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
             (directory / "src/modules/mod.rs").write_text("pub fn module() {}\n", encoding="ascii")
             (directory / "tests/runtime.rs").write_text("fn works() {}\n", encoding="ascii")
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "linux_source_build needs POSIX-only modules")
     def test_batch_seven_runtime_tree_admits_full_crates_and_refuses_unlisted_paths(self):
+        import linux_source_build
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
             self._write_batch_seven_tree(root)
@@ -1408,7 +1411,10 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
                 finally:
                     os.close(descriptor)
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "linux_source_build needs POSIX-only modules")
     def test_batch_seven_changelog_is_required_for_each_crate_and_admitted_at_the_root(self):
+        import linux_source_build
+
         for crate_root in subject.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
             with self.subTest(crate_root=crate_root), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary).resolve()

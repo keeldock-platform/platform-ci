@@ -938,6 +938,28 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                     with self.assertRaises(producer.FeedbackRefusal):
                         producer._reviewed_rust_paths(source, roots=producer.RUNTIME_PACKAGE_ROOTS)
 
+    def test_batch_seven_documents_are_required_only_for_present_crates(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            crates_root = source / "runtime/crates"
+            crates_root.mkdir(parents=True)
+            with patch.object(Path, "lstat", self._regular_lstat()):
+                producer._validate_runtime_batch_seven_trees(source)
+
+            crate_root = source / producer.RUNTIME_BATCH_SEVEN_CRATE_ROOTS[0]
+            (crate_root / "src").mkdir(parents=True)
+            (crate_root / "Cargo.toml").write_text("[package]\n", encoding="ascii")
+            (crate_root / "src/lib.rs").write_text("pub fn crate_api() {}\n", encoding="ascii")
+            for missing_document in producer.RUNTIME_BATCH_SEVEN_DOC_FILES:
+                with self.subTest(missing_document=missing_document):
+                    with patch.object(Path, "lstat", self._regular_lstat()):
+                        with self.assertRaises(producer.FeedbackRefusal):
+                            producer._validate_runtime_batch_seven_trees(source)
+                    (crate_root / missing_document).write_text("Crate documentation.\n", encoding="ascii")
+
+            with patch.object(Path, "lstat", self._regular_lstat()):
+                producer._validate_runtime_batch_seven_trees(source)
+
         invalid = (
             ("runtime/crates/host/registry/build.rs", "fn build() {}\n"),
             ("runtime/crates/services/palette/src/data.json", "{}\n"),
@@ -1434,6 +1456,9 @@ class CargoLockProducerTests(unittest.TestCase):
                     manifest += "\n[dependencies]\n" + "\n".join(dependencies) + "\n"
                 write_source(path + "/Cargo.toml", manifest)
                 write_source(path + "/src/lib.rs", "pub fn fixture() {}\n")
+                if path in self.bootstrap.RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
+                    for document in self.bootstrap.RUNTIME_BATCH_SEVEN_DOC_FILES:
+                        write_source(path + "/" + document, "Runtime crate documentation.\n")
                 lock_dependencies = []
                 if path in self.bootstrap.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS:
                     lock_dependencies.append(api_name + " 0.1.0")
