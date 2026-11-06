@@ -2124,6 +2124,46 @@ class WindowsJobTests(WindowsAuditCase):
         api = with_skipped_step("Other skipped step")
         self.assert_refused(api, "job_steps")
 
+    def test_the_source_only_receiver_step_may_be_skipped_only_in_synthetic_producer_and_verifier_jobs(self):
+        def with_skipped_step(job_name, mode, step_name):
+            api = WindowsApi(mode)
+            steps = api.job(job_name)["steps"]
+            steps.insert(
+                len(steps) - 2,
+                {"number": 0, "name": step_name, "status": "completed", "conclusion": "skipped"},
+            )
+            for number, step in enumerate(steps, start=1):
+                step["number"] = number
+            return api
+
+        for job_name in (subject.WINDOWS_PRODUCER_JOB, subject.WINDOWS_VERIFIER_JOB):
+            with self.subTest(job=job_name, mode="synthetic"):
+                api = with_skipped_step(job_name, "synthetic", subject.WINDOWS_SOURCE_ONLY_RECEIVER_STEP)
+                self.assertEqual(subject.audit_windows(api, api.expected, CONFIG), WINDOWS_SYNTHETIC_ACCEPTED)
+            with self.subTest(job=job_name, mode="source"):
+                api = with_skipped_step(job_name, "source", subject.WINDOWS_SOURCE_ONLY_RECEIVER_STEP)
+                self.assert_refused(api, "job_steps")
+            with self.subTest(job=job_name, skipped_step="unrelated"):
+                api = with_skipped_step(job_name, "synthetic", "Other skipped step")
+                self.assert_refused(api, "job_steps")
+
+        expected = subject.windows_expected(
+            windows_environment("synthetic"), subject.cache_inventory_digest([]),
+        )
+        self.assertEqual(
+            expected["jobs"][subject.WINDOWS_PRODUCER_JOB]["optional_steps"],
+            (subject.WINDOWS_VERDICT_STEP, subject.WINDOWS_SOURCE_ONLY_RECEIVER_STEP),
+        )
+        self.assertEqual(
+            expected["jobs"][subject.WINDOWS_VERIFIER_JOB]["optional_steps"],
+            (subject.WINDOWS_SOURCE_ONLY_RECEIVER_STEP,),
+        )
+        source = subject.windows_expected(windows_environment(), subject.cache_inventory_digest([]))
+        self.assertEqual(
+            source["jobs"][subject.WINDOWS_PRODUCER_JOB]["optional_steps"], (subject.WINDOWS_VERDICT_STEP,),
+        )
+        self.assertEqual(source["jobs"][subject.WINDOWS_VERIFIER_JOB]["optional_steps"], ())
+
     def test_closed_jobs_keep_their_exact_step_lists(self):
         for name in (subject.WINDOWS_SETTINGS_JOB, subject.WINDOWS_EVIDENCE_JOB):
             api = WindowsApi()

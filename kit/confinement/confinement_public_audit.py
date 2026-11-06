@@ -919,6 +919,7 @@ WINDOWS_OPEN_JOBS = (
     WINDOWS_PRODUCER_JOB, WINDOWS_VERIFIER_JOB, WINDOWS_LINUX_JOB, WINDOWS_ATTESTER_JOB,
 )
 WINDOWS_VERDICT_STEP = "Publish confinement verdict"
+WINDOWS_SOURCE_ONLY_RECEIVER_STEP = "Install pinned cargo-deny and prepare the RustSec database"
 WINDOWS_SETTINGS_STEPS = (
     "Set up job",
     "Fetch exact public control",
@@ -1207,6 +1208,7 @@ def windows_expected(environ, cache_digest):
     else:
         title = WINDOWS_SYNTHETIC_TITLE
         optional = WINDOWS_LINUX_SYNTHETIC_SKIPS
+    receiver_optional = (WINDOWS_SOURCE_ONLY_RECEIVER_STEP,) if mode == "synthetic" else ()
     expected = {
         "repository": environ.get("CI_REPOSITORY", ""),
         "os": "windows",
@@ -1219,8 +1221,11 @@ def windows_expected(environ, cache_digest):
         "display_title": title,
         "jobs": {
             WINDOWS_SETTINGS_JOB: {"steps": WINDOWS_SETTINGS_STEPS, "optional_steps": ()},
-            WINDOWS_PRODUCER_JOB: {"steps": WINDOWS_PRODUCER_STEPS, "optional_steps": (WINDOWS_VERDICT_STEP,)},
-            WINDOWS_VERIFIER_JOB: {"steps": WINDOWS_VERIFIER_STEPS, "optional_steps": ()},
+            WINDOWS_PRODUCER_JOB: {
+                "steps": WINDOWS_PRODUCER_STEPS,
+                "optional_steps": (WINDOWS_VERDICT_STEP,) + receiver_optional,
+            },
+            WINDOWS_VERIFIER_JOB: {"steps": WINDOWS_VERIFIER_STEPS, "optional_steps": receiver_optional},
             WINDOWS_LINUX_JOB: {"steps": WINDOWS_LINUX_STEPS, "optional_steps": optional},
             WINDOWS_ATTESTER_JOB: {"steps": WINDOWS_ATTESTER_STEPS, "optional_steps": ()},
             WINDOWS_EVIDENCE_JOB: {"steps": WINDOWS_EVIDENCE_STEPS, "optional_steps": ()},

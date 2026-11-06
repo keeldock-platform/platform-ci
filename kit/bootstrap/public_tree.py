@@ -323,7 +323,7 @@ SELF_PIN_LINE_PATTERN = re.compile(
 PINNED_FILE_SHA256 = {
     '.github/workflows/linux-source-admission.yml': '3289ca0b02871ac345743f0727bd40f5cae0b10e90e4f9f9a984c2a389103046',
     'kit/bootstrap/action.yml': '6d0022330e8d8be3923937217227fdbe831fc2a0fab14c70a23550478dd487e3',
-    'kit/bootstrap/public_tree.py': '3ee68ee14d2a70b12f255fcea6ec610ebde688d76e4fa8228f29a5006097d3f2',
+    'kit/bootstrap/public_tree.py': 'dac36c8f5b71750cbad8437e2a4ee606785257a7ba8c160538644057f5493853',
     'kit/confinement/release_tool_ledger.py': 'e9a4f50f806fad3d5ae7c7323adfc3024eaaa1f564a8725e9ef7281fa01c6657',
     'kit/confinement/release_tool_ledger.json': '2c0004d1e83780d780c501b794a15e6c6928f8aa352dcfab46fe389fe871dc0b',
     'kit/confinement/test_release_tool_ledger.py': '20ef9cfb0f4a64c73e34443c3d726be599c34ac6145df875d1abe8a427de8a4e',
@@ -447,7 +447,7 @@ PINNED_FILE_SHA256 = {
     'kit/confinement/test_role_signer.py': '31cd7cc4189aeba885da2870c04292423cd72032746d6351ef6ef480f182cc6e',
     'kit/bootstrap/policy_handoff.py': '5eda9a596929dc6066147d904a9640504475445c8397700d7d052dde7afe6813',
     'kit/bootstrap/test_policy_handoff.py': '2bea84bccc3dba7e42b485d4d4f70ff3715513e968603f4631957680d926cf56',
-    'kit/confinement/confinement_public_audit.py': '9ad9e5d5425f8d83fa8e61c2a71afd62fea0171342cf7a0d495a6e6d02d31808',
+    'kit/confinement/confinement_public_audit.py': 'c87ef3b6209efceb1a131dadf62e7677f5aef198691bd6d453eff7014c184dd0',
     'kit/confinement/macos_public_audit.py': 'd874c153f17abe085617bc6c783b99af45faec6d94c4a7e631337bc5925ab751',
     'kit/confinement/release_build_verify.py': 'ad9b18d2faaa6e7f408ea854f8483d9d97ebca0a7a2711e57d521203a882d91e',
     'kit/confinement/test_release_build_verify.py': '08c8b7dcb28307d8470cab9675202bcc206492261d20dec70064232c197f2579',
