@@ -114,6 +114,12 @@ class WindowsConfinementWorkflowTests(unittest.TestCase):
         )
         self.assertIn("windows_confinement.ps1 -Mode compile", workflow)
         self.assertIn("windows_confinement.ps1 -Mode spike", workflow)
+        parser_step = workflow.split("      - name: Parse every PowerShell file under kit\n", 1)[1].split("      - name:", 1)[0]
+        self.assertIn("Get-ChildItem -LiteralPath (Join-Path $root 'kit') -Recurse -File -Force", parser_step)
+        self.assertIn("$_.Extension -in @('.ps1', '.psm1')", parser_step)
+        self.assertIn("Parser]::ParseFile($file.FullName", parser_step)
+        self.assertIn("if ($bad -ne 0) { exit 1 }", parser_step)
+        self.assertNotIn("foreach ($name in @('windows_confinement.ps1'))", parser_step)
         self.assertIn("test_windows_confinement.py", workflow)
         for forbidden in (
             "inputs:",

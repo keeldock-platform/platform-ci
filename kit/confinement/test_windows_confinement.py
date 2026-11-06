@@ -16,6 +16,7 @@ from linux_channels import CHANNELS as LINUX_CHANNELS
 
 NATIVE = ROOT / "kit/confinement/windows_confinement.cs"
 WRAPPER = ROOT / "kit/confinement/windows_confinement.ps1"
+RUNNER = ROOT / "kit/confinement/windows_source_run.ps1"
 PROBE = ROOT / "kit/confinement/windows_probe.rs"
 WORKFLOW = ROOT / ".github/workflows/windows-confinement.yml"
 CONFINED_STAGES = (
@@ -558,21 +559,22 @@ foreach ($case in $cases) {
     def test_scripts_have_no_line_starting_with_an_operator(self):
         starts = re.compile(r"^\s*-(and|or|band|bor|eq|ne|not)\b")
         ends = re.compile(r"(?:-(?:and|or|band|bor|eq|ne)|,|\|)\s*$")
-        for path in (WRAPPER,):
+        for path in (WRAPPER, RUNNER):
             lines = path.read_text(encoding="utf-8").splitlines()
             for number, line in enumerate(lines[1:], 2):
                 if starts.match(line):
                     with self.subTest(path=path.name, line=number):
                         self.assertRegex(lines[number - 2], ends)
 
-    def test_syntax_check_step_runs_before_the_compile_step(self):
+    def test_parser_step_checks_every_powershell_file_before_the_compile_step(self):
         text = WORKFLOW.read_text(encoding="utf-8")
-        check = text.index("      - name: Check PowerShell script syntax\n")
+        check = text.index("      - name: Parse every PowerShell file under kit\n")
         self.assertLess(check, text.index("      - name: Compile native confinement module\n"))
         block = text[check:text.index("      - name: Compile native confinement module\n")]
         self.assertIn("[System.Management.Automation.Language.Parser]::ParseFile", block)
-        for name in ("windows_confinement.ps1",):
-            self.assertIn("'" + name + "'", block)
+        self.assertIn("Get-ChildItem -LiteralPath (Join-Path $root 'kit') -Recurse -File -Force", block)
+        self.assertIn("$_.Extension -in @('.ps1', '.psm1')", block)
+        self.assertIn("ParseFile($file.FullName", block)
         self.assertIn("if ($bad -ne 0) { exit 1 }", block)
         self.assertNotIn("if:", block)
 

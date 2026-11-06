@@ -716,6 +716,12 @@ class WindowsSourceRunTests(unittest.TestCase):
         self.assertIn("Invoke-CargoLockAdmissions $project $bound['source_sha']", self.runner)
         self.assertIn("$lockInfo['registry_packages']", self.runner)
 
+    def test_cargo_lock_metadata_guard_keeps_binary_operators_on_one_line(self):
+        self.assertIn(
+            "if ($lockInfo['schema_version'] -ne 1 -or $lockInfo['package_count'] -lt 1 -or $lockInfo['lock_sha256'] -cne (Get-FileSha256 $lockPath)) { throw 'cargo_admission_lock' }",
+            self.runner,
+        )
+
     def test_npm_tarballs_are_registry_only_integrity_checked_and_copied_not_moved(self):
         self.assertIn("$uri.Host -cne 'registry.npmjs.org'", self.runner)
         self.assertIn("Assert-Sri $downloaded $integrity 'npm'", self.runner)

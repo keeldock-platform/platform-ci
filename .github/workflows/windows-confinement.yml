@@ -56,18 +56,22 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           python -B kit/bootstrap/check_candidate.py --root $env:CI_WORKSPACE --pool platform --sha $env:CI_SHA
           if ($LASTEXITCODE -ne 0) { exit 1 }
-      - name: Check PowerShell script syntax
+      - name: Parse every PowerShell file under kit
         run: |
           $ErrorActionPreference = 'Stop'
           $root = (Get-Location).Path
+          $files = @(Get-ChildItem -LiteralPath (Join-Path $root 'kit') -Recurse -File -Force | Where-Object { $_.Extension -in @('.ps1', '.psm1') })
+          if ($files.Count -eq 0) { Write-Output 'parse-error reason=no_files'; exit 1 }
           $bad = 0
-          foreach ($name in @('windows_confinement.ps1')) {
+          foreach ($file in $files) {
             $tokens = $null
             $errors = $null
-            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $root ('kit/confinement/' + $name)), [ref]$tokens, [ref]$errors)
-            foreach ($item in $errors) { Write-Output ('parse-error file=' + $name + ' line=' + $item.Extent.StartLineNumber + ' id=' + $item.ErrorId); $bad = 1 }
+            [void][System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$errors)
+            $relative = [IO.Path]::GetRelativePath($root, $file.FullName)
+            foreach ($item in $errors) { Write-Output ('parse-error file=' + $relative + ' line=' + $item.Extent.StartLineNumber + ' id=' + $item.ErrorId); $bad = 1 }
           }
           if ($bad -ne 0) { exit 1 }
+          Write-Output ('parsed-powershell-files=' + $files.Count + ' errors=0')
       - name: Compile native confinement module
         run: |
           $ErrorActionPreference = 'Stop'

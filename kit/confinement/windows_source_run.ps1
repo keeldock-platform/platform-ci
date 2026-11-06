@@ -635,8 +635,7 @@ function Invoke-CargoLockAdmissions([string]$project, [string]$sourceSha) {
         $inspected = Invoke-TrustedProcess $python @('-B', $helper, 'inspect-lock', '--lock-path', $lockPath) $PSScriptRoot $environment 120 4096
         if ($inspected.TimedOut -or $inspected.ExitCode -ne 0) { throw 'cargo_admission_lock' }
         try { $lockInfo = ([string]$inspected.Stdout | ConvertFrom-Json -AsHashtable) } catch { throw 'cargo_admission_lock' }
-        if ($lockInfo['schema_version'] -ne 1 -or $lockInfo['package_count'] -lt 1
-                -or $lockInfo['lock_sha256'] -cne (Get-FileSha256 $lockPath)) { throw 'cargo_admission_lock' }
+        if ($lockInfo['schema_version'] -ne 1 -or $lockInfo['package_count'] -lt 1 -or $lockInfo['lock_sha256'] -cne (Get-FileSha256 $lockPath)) { throw 'cargo_admission_lock' }
         if ([int]$lockInfo['registry_packages'] -eq 0) { continue }
         if ([string]::IsNullOrWhiteSpace($evidenceRoot) -or -not (Test-Path -LiteralPath $evidenceRoot -PathType Container)) { throw 'cargo_admission_receipt' }
         $profile = [IO.Path]::GetDirectoryName($relative)
@@ -654,11 +653,11 @@ function Invoke-CargoLockAdmissions([string]$project, [string]$sourceSha) {
         $admitted = Invoke-TrustedProcess $python $arguments $PSScriptRoot $environment 900 65536
         if ($admitted.TimedOut -or $admitted.ExitCode -ne 0) { throw 'cargo_admission_refused' }
         try { $proof = ([string]$admitted.Stdout | ConvertFrom-Json -AsHashtable) } catch { throw 'cargo_admission_refused' }
-        if ($proof['source_sha'] -cne $sourceSha -or $proof['lock_path'] -cne $relative
-                -or $proof['required_flags'] -isnot [System.Collections.IEnumerable]
-                -or @($proof['required_flags']) -notcontains '--locked'
-                -or @($proof['required_flags']) -notcontains '--offline'
-                -or $proof['cargo_arguments'] -isnot [System.Collections.IEnumerable]) { throw 'cargo_admission_refused' }
+        if ($proof['source_sha'] -cne $sourceSha -or $proof['lock_path'] -cne $relative -or
+                $proof['required_flags'] -isnot [System.Collections.IEnumerable] -or
+                @($proof['required_flags']) -notcontains '--locked' -or
+                @($proof['required_flags']) -notcontains '--offline' -or
+                $proof['cargo_arguments'] -isnot [System.Collections.IEnumerable]) { throw 'cargo_admission_refused' }
         $script:CargoAdmissionByLock[$relative] = [string[]]@($proof['cargo_arguments'])
     }
 }
@@ -985,8 +984,8 @@ function Remove-SourceConfigFiles([string]$project) {
         $inspected = Invoke-TrustedProcess $python @('-B', $lockInspector, 'inspect-lock', '--lock-path', $file) $PSScriptRoot $inspectionEnvironment 120 4096
         if ($inspected.TimedOut -or $inspected.ExitCode -ne 0) { throw 'lock' }
         try { $lockInfo = ([string]$inspected.Stdout | ConvertFrom-Json -AsHashtable) } catch { throw 'lock' }
-        if ($lockInfo['schema_version'] -ne 1 -or $lockInfo['package_count'] -lt 1
-                -or $lockInfo['lock_sha256'] -cne (Get-FileSha256 $file)) { throw 'lock' }
+        if ($lockInfo['schema_version'] -ne 1 -or $lockInfo['package_count'] -lt 1 -or
+                $lockInfo['lock_sha256'] -cne (Get-FileSha256 $file)) { throw 'lock' }
         $locks += 1
     }
     if ($locks -lt 1) { throw 'lock' }
