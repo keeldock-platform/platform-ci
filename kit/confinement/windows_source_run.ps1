@@ -1209,9 +1209,9 @@ function Expand-GateArgv($argv, [string]$cargo, [string]$node, [string]$npm, [st
     return $expanded
 }
 
-function Resolve-GatePlanRuntimeProfile([string]$project) {
+function Resolve-GatePlanRuntimeProfile([string]$project, [string]$sourceSha) {
     if ($script:RunMode -ceq 'synthetic') { return (Test-RuntimeWorkspace $project) }
-    $runtime = Test-RuntimeWorkspaceProfile $project
+    $runtime = Test-RuntimeWorkspaceProfile $project $sourceSha
     if ($runtime -ne (Test-RuntimeWorkspace $project)) { throw 'runtime_profile' }
     return $runtime
 }
@@ -1274,10 +1274,11 @@ function Test-RuntimeWorkspace([string]$project) {
     return ($present[0] -eq $true)
 }
 
-function Test-RuntimeWorkspaceProfile([string]$project) {
+function Test-RuntimeWorkspaceProfile([string]$project, [string]$sourceSha) {
     $python = Get-TrustedTool 'python.exe'
     $profileScript = Join-Path $PSScriptRoot 'cargo_lock_bootstrap.py'
-    $result = Invoke-TrustedProcess $python @('-B', $profileScript, 'check-runtime_profile-source', $project) $PSScriptRoot (Get-TrustedEnvironment $python $script:Layout.Private) 120 65536
+    if ($sourceSha -cnotmatch '^[a-f0-9]{40}$') { throw 'runtime_profile' }
+    $result = Invoke-TrustedProcess $python @('-B', $profileScript, 'check-runtime_profile-source', $project, $sourceSha) $PSScriptRoot (Get-TrustedEnvironment $python $script:Layout.Private) 120 65536
     if ($result.TimedOut -or $result.ExitCode -ne 0) { throw 'runtime_profile' }
     $output = [string]$result.Stdout
     if ($output -ceq "runtime_profile=runtime`n" -or $output -ceq "runtime_profile=runtime`r`n") { return $true }
@@ -1907,7 +1908,7 @@ try {
             if ($aclAfter -ne 'verified') { throw 'acl_readback' }
 
             $phase = 'gate_plan'
-            $runtimeProfile = Resolve-GatePlanRuntimeProfile $project
+            $runtimeProfile = Resolve-GatePlanRuntimeProfile $project $bound['source_sha']
             $plan = Get-GatePlan $project ($layout.RustBin + '\cargo.exe') ($layout.NodeDir + '\node.exe') $layout.NpmCli $runtimeProfile
             Write-Line ('windows-source-gate-plan=ready gates=' + $plan.Count)
 

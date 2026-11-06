@@ -245,6 +245,10 @@ class PublicTreeTests(unittest.TestCase):
         self.assertNotIn("from test_linux_source_build import", tiers)
         self.assertIn("kit/confinement/rust_license_gate.py", PLATFORM_FILES)
         self.assertIn("kit/confinement/test_rust_license_gate.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/cargo_deny_installer.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/test_cargo_deny_installer.py", PLATFORM_FILES)
+        self.assertIn("kit/confinement/cargo_deny_policy.toml", PLATFORM_FILES)
+        self.assertIn("kit/confinement/rust_license_checker.py", PLATFORM_FILES)
         action = (ROOT / "kit/bootstrap/action.yml").read_text(encoding="utf-8")
         self.assertEqual(action.count('"test_linux_source_build.py"'), 1)
         self.assertEqual(action.count('"test_rust_license_gate.py"'), 1)
@@ -271,6 +275,7 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_macos_feedback_producer.py",
             "kit/confinement/macos_private_validation.py",
             "kit/confinement/test_macos_private_validation.py",
+            "kit/confinement/test_macos_wave70.py",
             "kit/confinement/macos_core_contract.py",
             "kit/confinement/test_macos_core_contract.py",
             "kit/confinement/linux_source_build.py",
@@ -419,6 +424,10 @@ class PublicTreeTests(unittest.TestCase):
             'kit/confinement/cargo_lock_receipt.py',
             'kit/confinement/test_cargo_lock_receipt.py',
             'kit/confinement/test_rust_license_gate.py',
+            'kit/confinement/cargo_deny_installer.py',
+            'kit/confinement/test_cargo_deny_installer.py',
+            'kit/confinement/cargo_deny_policy.toml',
+            'kit/confinement/rust_license_checker.py',
             'kit/bootstrap/test_public_tree.py',
             '.github/workflows/macos-rust-toolchain-smoke.yml',
             'kit/confinement/macos_rust_toolchain.py',
@@ -433,6 +442,7 @@ class PublicTreeTests(unittest.TestCase):
             '.github/workflows/macos-core-bootstrap.yml',
             'kit/confinement/macos_private_validation.py',
             'kit/confinement/test_macos_private_validation.py',
+            'kit/confinement/test_macos_wave70.py',
             'ci/revoked-signer-fingerprints',
             '.github/workflows/capsule-vectors.yml',
             'kit/confinement/capsule_frame.cs',
@@ -464,6 +474,12 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_release_build_verify.py",
             'kit/confinement/cargo_vendor_verify.py',
             'kit/confinement/test_cargo_vendor_verify.py',
+            'kit/confinement/cargo_archive_producer.py',
+            'kit/confinement/test_cargo_archive_producer.py',
+            'kit/confinement/cargo_deny_installer.py',
+            'kit/confinement/test_cargo_deny_installer.py',
+            'kit/confinement/cargo_deny_policy.toml',
+            'kit/confinement/rust_license_checker.py',
             '.github/workflows/core-rust-lock-return.yml',
             'kit/bootstrap/policy_rust.py',
             'kit/bootstrap/test_policy_rust.py',

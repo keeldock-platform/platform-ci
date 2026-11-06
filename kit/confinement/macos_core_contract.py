@@ -93,6 +93,7 @@ CORE_BOOTSTRAP_CHECKS = frozenset((
     "rules_inventory", "rules_hash", "workspace_decode", "workspace_members",
     "cargo_lock_decode", "cargo_lock_shape", "toolchain", "package_decode",
     "package_build", "checkout", "lease_paths", "lease_acl", "lease_access", "lease_census",
+    "source_inventory",
 ))
 SOURCE_LEASE_OPEN_ERROR_DIAGNOSTICS = {
     TypeError: "source_lease_open_type_error",

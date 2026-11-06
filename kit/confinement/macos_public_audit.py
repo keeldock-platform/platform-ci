@@ -390,7 +390,8 @@ CORE_CONTRACT_BOOTSTRAP_CHECKS = frozenset((
     "tree_entries", "required_files", "path_mode", "base_policy", "rules_manifest",
     "rules_inventory", "rules_hash", "workspace_decode", "workspace_members",
     "cargo_lock_decode", "cargo_lock_shape", "toolchain", "package_decode",
-    "package_build", "checkout", "lease_paths", "lease_acl", "lease_access", "lease_census",
+    "package_build", "source_inventory", "checkout", "lease_paths", "lease_acl",
+    "lease_access", "lease_census",
 ))
 CORE_CONTRACT_SOURCE_LEASE_OPEN_CLASSES = frozenset((
     "type_error", "attribute_error", "value_error", "permission_error", "not_found",

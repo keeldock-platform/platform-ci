@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import hmac
 import json
 import os
 import posixpath
@@ -169,6 +170,7 @@ SOURCE_STEP_NAMES = (
     "Verify selected installation identity",
     "Fetch exact source and verify binding, tree, signatures and lock provenance",
     "Revoke source-reader token and verify rejection",
+    "Install pinned cargo-deny and prepare the RustSec database",
     "Require trusted Rust licence admission",
     "Fetch npm tarballs by committed lock integrity",
     "Run trusted dependency audit",
@@ -187,6 +189,7 @@ VERDICT_STEP_NAMES = (
     "Mint verifier scoped source-reader token",
     "Verify source independently against binding, tree, signatures and lock",
     "Revoke verifier token and verify rejection",
+    "Install independent pinned cargo-deny and prepare RustSec database",
     "Require trusted Rust licence admission independently",
     "Fetch independent npm tarballs by lock integrity",
     "Run independent trusted dependency audit",
@@ -201,6 +204,7 @@ OPTIONAL_VERDICT_SYNTHETIC_STEPS = (
     "Mint verifier scoped source-reader token",
     "Verify source independently against binding, tree, signatures and lock",
     "Revoke verifier token and verify rejection",
+    "Install independent pinned cargo-deny and prepare RustSec database",
     "Require trusted Rust licence admission independently",
     "Fetch independent npm tarballs by lock integrity",
     "Run independent trusted dependency audit",
@@ -261,6 +265,7 @@ OPTIONAL_SOURCE_STEPS = frozenset((
     "Verify selected installation identity",
     "Fetch exact source and verify binding, tree, signatures and lock provenance",
     "Revoke source-reader token and verify rejection",
+    "Install pinned cargo-deny and prepare the RustSec database",
     "Require trusted Rust licence admission",
     "Fetch npm tarballs by committed lock integrity",
     "Run trusted dependency audit",
@@ -1927,13 +1932,30 @@ def _gate_npm_config_files(home, create):
 
 
 def _prepare_worker_tree(source, tarball_index, environ):
+    source_sha = environ.get("REQUESTED_SOURCE_SHA", "")
+    inventory_payload = None
+    inventory_rows = ()
+    original_inventory_sha256 = None
+    inventory_file = Path(source) / cargo_lock_bootstrap.SOURCE_INVENTORY_PATH
+    if inventory_file.exists():
+        try:
+            original_inventory_sha256 = cargo_lock_bootstrap.validate_runtime_source_inventory(
+                source, source_sha,
+            )
+            inventory_payload = inventory_file.read_bytes()
+            inventory_rows, parsed_sha256 = cargo_lock_bootstrap.parse_runtime_source_inventory(
+                inventory_payload, source_sha,
+            )
+            if not hmac.compare_digest(original_inventory_sha256, parsed_sha256):
+                raise SourceBuildRefusal("lock")
+        except (OSError, cargo_lock_bootstrap.BootstrapRefusal):
+            raise SourceBuildRefusal("lock") from None
     root = _open_project_root()
     os.close(root)
     worker = PROJECT_ROOT / "source"
     if worker.is_symlink():
         raise SourceBuildRefusal("gate")
     shutil.rmtree(worker, ignore_errors=True)
-    _neutralize_config_files(source)
     shutil.copytree(source, worker, symlinks=True, ignore=shutil.ignore_patterns(".git"))
     for current, directories, files in os.walk(worker, followlinks=False):
         for name in directories + files:
@@ -1943,6 +1965,7 @@ def _prepare_worker_tree(source, tarball_index, environ):
                 resolved = (path.parent / link).resolve(strict=False)
                 if os.path.isabs(link) or os.path.commonpath((str(worker.resolve()), str(resolved))) != str(worker.resolve()):
                     raise SourceBuildRefusal("gate")
+    _neutralize_config_files(worker)
     for current, directories, files in os.walk(worker, followlinks=False):
         directories[:] = [name for name in directories if not os.path.islink(os.path.join(current, name))]
         for name in list(files):
@@ -2009,6 +2032,66 @@ def _prepare_worker_tree(source, tarball_index, environ):
             os.chown(path, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
             mode = path.stat().st_mode
             os.chmod(path, 0o755 if mode & stat.S_IXUSR else 0o644)
+    if inventory_payload is not None:
+        original_by_path = {row["path"]: row for row in inventory_rows}
+        staged_rows = []
+        deleted_paths = []
+        modified_paths = []
+        for path in sorted(original_by_path):
+            row = dict(original_by_path[path])
+            target = worker.joinpath(*path.split("/"))
+            if not target.exists():
+                if path != ".npmrc" and not path.endswith("/.npmrc"):
+                    raise SourceBuildRefusal("lock")
+                deleted_paths.append(path)
+                continue
+            if target.is_symlink() or not target.is_file():
+                raise SourceBuildRefusal("lock")
+            staged_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if staged_digest != row["sha256"]:
+                if path not in ("package-lock.json", "runtime/package-lock.json"):
+                    raise SourceBuildRefusal("lock")
+                modified_paths.append(path)
+                row["sha256"] = staged_digest
+            staged_rows.append(row)
+        inventory_lines = ["schema_version = 1"]
+        inventory_fields = (
+            "path", "sha256", "owner", "package", "target", "generator",
+            "generator_version", "provenance",
+        )
+        for row in staged_rows:
+            inventory_lines.append("[[files]]")
+            inventory_lines.extend(key + ' = "' + row[key] + '"' for key in inventory_fields)
+        staged_inventory = ("\n".join(inventory_lines) + "\n").encode("ascii")
+        inventory_path = worker / cargo_lock_bootstrap.SOURCE_INVENTORY_PATH
+        inventory_path.write_bytes(staged_inventory)
+        os.chown(inventory_path, linux_harness.CHILD_UID, linux_harness.CHILD_GID)
+        os.chmod(inventory_path, 0o444)
+        receipt = {
+            "schema_version": 1,
+            "source_sha": source_sha,
+            "original_inventory_sha256": original_inventory_sha256,
+            "sanitized_inventory_sha256": hashlib.sha256(staged_inventory).hexdigest(),
+            "deleted_paths": deleted_paths,
+            "modified_paths": modified_paths,
+        }
+        receipt_bytes = cargo_lock_bootstrap._canonical(receipt, "bootstrap_manifest_refused") + b"\n"
+        records_root = Path(environ.get("RUNNER_TEMP", "/tmp")) / "kd-records"
+        records_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        receipt_path = records_root / "runtime-inventory-stage.json"
+        try:
+            descriptor = os.open(
+                receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o400,
+            )
+            try:
+                os.write(descriptor, receipt_bytes)
+                os.fchmod(descriptor, 0o400)
+            finally:
+                os.close(descriptor)
+        except OSError:
+            raise SourceBuildRefusal("gate") from None
+        environ["KD_STAGED_INVENTORY_RECEIPT"] = str(receipt_path)
     return worker
 
 
@@ -2477,7 +2560,7 @@ def _check_d145_runtime_batch_seven_tree(root_fd):
             raise SourceBuildRefusal("lock")
 
 
-def _check_d145_runtime_profile(root_fd):
+def _check_d145_runtime_profile(root_fd, source=None, source_sha=None, staged_inventory_receipt=None):
     manifest_candidates = _rust_lock_paths(
         root_fd, "Cargo.toml", MAX_MANIFEST_FILES, False, True,
     )
@@ -2516,10 +2599,19 @@ def _check_d145_runtime_profile(root_fd):
         ) <= runtime_members
         if batch_seven_profile:
             _check_d145_runtime_batch_seven_tree(root_fd)
+        wave70a_profile = frozenset(
+            cargo_lock_bootstrap.HOST_API_POLICY_RUNTIME_WAVE_70A_REQUIRED_MEMBER_ROOTS
+        ) <= runtime_members
+        wave70b_profile = frozenset(
+            cargo_lock_bootstrap.HOST_API_POLICY_RUNTIME_WAVE_70B_REQUIRED_MEMBER_ROOTS
+        ) <= runtime_members
         runtime_identities = set(cargo_lock_bootstrap.manifest_package_identities(
             runtime_manifests, cargo_lock_bootstrap.RUNTIME_WORKSPACE,
         ))
-        contract_members = cargo_lock_bootstrap.CONTRACT_MEMBERS
+        contract_root_bytes = _read_bounded_cargo_lock(root_fd, manifests_by_path["Cargo.toml"])
+        contract_members = cargo_lock_bootstrap._contract_members_from_root_bytes(contract_root_bytes)
+        if wave70a_profile or wave70b_profile:
+            cargo_lock_bootstrap._validate_contract_wave70_trees(source, contract_members)
         contract_manifest_paths = {"Cargo.toml"}
         contract_manifest_paths.update(member + "/Cargo.toml" for member in contract_members)
         contract_manifests = {
@@ -2566,15 +2658,56 @@ def _check_d145_runtime_profile(root_fd):
             raise ValueError
         _require_physical_manifest_path(root_fd, ("runtime",), api_path)
         _require_confined_manifest_path(root_fd, ("crates", "host", "api"), "src/lib.rs")
+        if wave70a_profile or wave70b_profile:
+            if source is None or SOURCE_SHA_RE.fullmatch(source_sha or "") is None:
+                raise ValueError
+            cargo_lock_bootstrap.validate_runtime_profile_source_tree(
+                source, source_sha, staged_inventory_receipt=staged_inventory_receipt,
+            )
     except (KeyError, TypeError, ValueError, cargo_lock_bootstrap.BootstrapRefusal):
         raise SourceBuildRefusal("lock") from None
     return True
+
+
+def _read_staged_inventory_receipt(environ):
+    supplied = environ.get("KD_STAGED_INVENTORY_RECEIPT", "")
+    if not supplied:
+        return None
+    expected = Path(environ.get("RUNNER_TEMP", "/tmp")) / "kd-records" / "runtime-inventory-stage.json"
+    path = Path(supplied)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    if path != expected or not path.is_absolute():
+        raise SourceBuildRefusal("gate")
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            details = os.fstat(descriptor)
+            if (not stat.S_ISREG(details.st_mode) or details.st_uid != 0
+                    or details.st_nlink != 1 or stat.S_IMODE(details.st_mode) != 0o400
+                    or details.st_size <= 0 or details.st_size > 65536):
+                raise SourceBuildRefusal("gate")
+            chunks = []
+            total = 0
+            while True:
+                block = os.read(descriptor, min(8192, 65537 - total))
+                if not block:
+                    break
+                total += len(block)
+                if total > 65536:
+                    raise SourceBuildRefusal("gate")
+                chunks.append(block)
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        raise SourceBuildRefusal("gate") from None
 
 
 def run_rust_license_gate(environ=None):
     env = os.environ if environ is None else environ
     source = Path(env.get("SOURCE_PATH", ""))
     source_sha = env.get("REQUESTED_SOURCE_SHA", "")
+    staged_inventory_receipt = _read_staged_inventory_receipt(env)
     if SOURCE_SHA_RE.fullmatch(source_sha) is None:
         raise SourceBuildRefusal("binding")
     try:
@@ -2587,7 +2720,9 @@ def run_rust_license_gate(environ=None):
     try:
         _require_source_root_identity(source, root_identity)
         _require_confined_manifests(root_fd)
-        _check_d145_runtime_profile(root_fd)
+        _check_d145_runtime_profile(
+            root_fd, source, source_sha, staged_inventory_receipt,
+        )
         for candidate in _rust_lock_paths(root_fd):
             try:
                 lock_bytes = _read_bounded_cargo_lock(root_fd, candidate)
@@ -2650,6 +2785,8 @@ def prepare_project(environ=None):
         with open(output, "at", encoding="ascii") as sink:
             sink.write("worker_path=" + str(worker) + "\n")
             sink.write("cargo_home=" + str(cargo_home) + "\n")
+            if env.get("KD_STAGED_INVENTORY_RECEIPT"):
+                sink.write("staged_inventory_receipt=" + env["KD_STAGED_INVENTORY_RECEIPT"] + "\n")
     sys.stdout.write("linux-project-inputs=prepared cargo=registry-free npm=integrity\n")
     return 0
 

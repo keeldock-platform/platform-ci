@@ -36,7 +36,10 @@ NPM_ADMISSION_MAX_EVIDENCE_BYTES = 640 * 1024
 NPM_ADMISSION_MAX_PACKAGES = 1024
 NPM_ADMISSION_MAX_CONSUMED = 48
 NPM_ADMISSION_BUILD_INPUTS = ()
-NPM_FILING_SELECTORS = ("contract-ui-batch-a", "contract-ui-batch-b", "quick-fixture")
+NPM_FILING_SELECTORS = (
+    "contract-ui-batch-a", "contract-ui-batch-b", "quick-fixture",
+    "core-wave70a", "runtime-wave70a", "core-wave70b", "runtime-wave70b",
+)
 NPM_DEFAULT_FILING = "contract-ui-batch-a"
 
 PROFILE_FIELDS = (

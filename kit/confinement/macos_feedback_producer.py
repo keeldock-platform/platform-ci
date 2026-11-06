@@ -13,6 +13,7 @@ import time
 
 try:
     from . import feedback_request
+    from . import rust_license_gate
 except ImportError:
     _request_path = Path(__file__).resolve(strict=True).parent / "feedback_request.py"
     _request_spec = importlib.util.spec_from_file_location("feedback_request", str(_request_path))
@@ -24,6 +25,16 @@ except ImportError:
         _request_spec.loader.exec_module(feedback_request)
     except BaseException:
         raise ImportError("feedback request unavailable") from None
+    _license_path = Path(__file__).resolve(strict=True).parent / "rust_license_gate.py"
+    _license_spec = importlib.util.spec_from_file_location("rust_license_gate", str(_license_path))
+    if _license_spec is None or _license_spec.loader is None:
+        raise ImportError("rust license gate unavailable")
+    rust_license_gate = importlib.util.module_from_spec(_license_spec)
+    sys.modules["rust_license_gate"] = rust_license_gate
+    try:
+        _license_spec.loader.exec_module(rust_license_gate)
+    except BaseException:
+        raise ImportError("rust license gate unavailable") from None
 
 
 SCHEMA_VERSION = 1
@@ -69,6 +80,15 @@ RUNTIME_BATCH_SEVEN_CRATE_ROOTS = (
     Path("runtime/crates/host/registry"), Path("runtime/crates/host/core"),
     Path("runtime/crates/host/settings-schema"), Path("runtime/crates/services/palette"),
     Path("runtime/crates/services/notifications"),
+)
+RUNTIME_WAVE_70_CRATE_ROOTS = (
+    Path("runtime/crates/host/entitlements"), Path("runtime/crates/services/log"),
+    Path("runtime/crates/services/fs"), Path("runtime/crates/services/store"),
+    Path("runtime/crates/services/vault"),
+)
+RUNTIME_WAVE_70_APP_ROOTS = (
+    Path("runtime/apps/test-shell-desktop/src-tauri"),
+    Path("runtime/apps/test-shell-mobile/src-tauri"),
 )
 RUNTIME_BATCH_SEVEN_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELOG.md"))
 RUNTIME_EXISTING_SERVICE_DOC_ROOT = Path("runtime/crates/services/sync-publication")
@@ -460,12 +480,77 @@ def _validate_runtime_batch_seven_trees(source):
             _refuse("manifest_invalid")
 
 
-def _reviewed_rust_paths(source, *, include_fuzz=False, roots=None):
+def _runtime_wave70_directory_allowed(relative, root_name, inventory_paths):
+    if _runtime_batch_seven_directory_allowed(relative):
+        return True
+    absolute = root_name + "/" + relative
+    return any(path.startswith(absolute + "/") for path in inventory_paths)
+
+
+def _validate_runtime_wave70_trees(source, inventory_paths=frozenset()):
+    crates_root = source / "runtime/crates"
+    try:
+        root_info = crates_root.lstat()
+    except OSError:
+        _refuse("manifest_invalid")
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        _refuse("manifest_invalid")
+    prefixes = tuple(root.as_posix() for root in RUNTIME_WAVE_70_CRATE_ROOTS)
+    required = {prefix: {"Cargo.toml", "README.md", "CONTRACT.md", "CHANGELOG.md", "src/lib.rs"}
+                for prefix in prefixes}
+    found = {prefix: set() for prefix in prefixes}
+    stack = [(crates_root, "runtime/crates")]
+    count = 0
+    while stack:
+        directory, parent_relative = stack.pop()
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda item: item.name)
+        except OSError:
+            _refuse("manifest_invalid")
+        for entry in entries:
+            count += 1
+            if count > MAX_RUST_PATHS * 128:
+                _refuse("manifest_invalid")
+            relative = parent_relative + "/" + entry.name
+            target = Path(entry.path)
+            try:
+                info = target.lstat()
+            except OSError:
+                _refuse("manifest_invalid")
+            prefix = next((item for item in prefixes
+                           if relative == item or relative.startswith(item + "/")), None)
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                if prefix is not None:
+                    _refuse("manifest_invalid")
+                continue
+            if stat.S_ISDIR(info.st_mode):
+                if prefix is not None and relative != prefix:
+                    within = relative[len(prefix) + 1:]
+                    if not _runtime_wave70_directory_allowed(within, prefix, inventory_paths):
+                        _refuse("manifest_invalid")
+                stack.append((target, relative))
+                continue
+            if prefix is not None:
+                within = relative[len(prefix) + 1:]
+                if (not _runtime_batch_seven_file_allowed(within)
+                        and relative not in inventory_paths
+                        or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1):
+                    _refuse("manifest_invalid")
+                found[prefix].add(within)
+    for prefix, required_files in required.items():
+        if not required_files.issubset(found[prefix]):
+            _refuse("manifest_invalid")
+
+
+def _reviewed_rust_paths(source, *, include_fuzz=False, roots=None, inventory_paths=frozenset()):
     if type(include_fuzz) is not bool:
         _refuse("manifest_invalid")
     selected_roots = PACKAGE_ROOTS if roots is None else roots
     if all(root in selected_roots for root in RUNTIME_BATCH_SEVEN_CRATE_ROOTS):
         _validate_runtime_batch_seven_trees(source)
+    if all(root in selected_roots for root in RUNTIME_WAVE_70_CRATE_ROOTS):
+        _validate_runtime_wave70_trees(source, inventory_paths)
     paths = []
     for package_root in selected_roots:
         source_directory = source / package_root / "src"
@@ -526,7 +611,35 @@ def _reviewed_rust_paths(source, *, include_fuzz=False, roots=None):
 
 def _runtime_package_roots(source, selector):
     if selector == "contract":
-        return PACKAGE_ROOTS
+        payload = _read_file(source / "Cargo.toml", maximum=MAX_PACKAGE_JSON_BYTES)
+        try:
+            text = payload.decode("utf-8", "strict")
+        except UnicodeError:
+            _refuse("manifest_invalid")
+        matches = tuple(RUNTIME_MEMBER_LIST_RE.finditer(text))
+        if len(matches) != 1:
+            _refuse("manifest_invalid")
+        roots = []
+        body = matches[0].group(1)
+        position = 0
+        while position < len(body):
+            match = RUNTIME_MEMBER_ITEM_RE.match(body, position)
+            if match is None:
+                if body[position:].strip():
+                    _refuse("manifest_invalid")
+                break
+            roots.append(Path(match.group(1)))
+            position = match.end()
+        from cargo_lock_bootstrap import (
+            CONTRACT_BASE_MEMBERS, CONTRACT_WAVE_70A_MEMBERS, CONTRACT_WAVE_70B_MEMBERS,
+        )
+        selected = frozenset(path.as_posix() for path in roots)
+        if selected not in (CONTRACT_BASE_MEMBERS, CONTRACT_WAVE_70A_MEMBERS,
+                            CONTRACT_WAVE_70B_MEMBERS):
+            _refuse("manifest_invalid")
+        if len(set(roots)) != len(roots):
+            _refuse("manifest_invalid")
+        return tuple(roots)
     if selector != "runtime":
         _refuse("manifest_invalid")
     root_path = source / "runtime" / "Cargo.toml"
@@ -549,9 +662,14 @@ def _runtime_package_roots(source, selector):
             break
         roots.append(Path("runtime") / match.group(1))
         position = match.end()
-    required = tuple(RUNTIME_PACKAGE_ROOTS)
-    optional = tuple(OPTIONAL_RUNTIME_PACKAGE_ROOTS)
-    if tuple(roots) not in (required, required + optional):
+    base = frozenset(RUNTIME_PACKAGE_ROOTS)
+    wave70a = base | frozenset(RUNTIME_WAVE_70_APP_ROOTS)
+    wave70b = wave70a | frozenset(RUNTIME_WAVE_70_CRATE_ROOTS)
+    optional = frozenset(OPTIONAL_RUNTIME_PACKAGE_ROOTS)
+    root_set = frozenset(roots)
+    if (len(root_set) != len(roots)
+            or root_set not in (base, base | optional, wave70a, wave70a | optional,
+                                wave70b, wave70b | optional)):
         _refuse("manifest_invalid")
     return tuple(roots)
 
@@ -622,7 +740,9 @@ def _authenticated_candidate_files(source, source_sha):
             _refuse("manifest_invalid")
         tree = subprocess.run(
             prefix + ("ls-tree", "-r", "-z", "--full-tree", source_sha, "--",
-                      "Cargo.toml", "crates/host/api", "runtime"),
+                      "Cargo.toml", "package.json", "package-lock.json", ".node-version",
+                      ".npmrc", "dependency-policy.json", "docs/dependencies", "packages",
+                      "crates/host/api", "runtime"),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=environment, timeout=30, check=False,
         )
@@ -909,7 +1029,8 @@ def _write_worker_file(path, payload, worker_uid, primary_gid, mode=0o600):
 
 
 def _copy_reviewed_files(source, destination, relative_paths, worker_uid, primary_gid,
-                         file_mode=0o600, candidate_files=None):
+                         file_mode=0o600, candidate_files=None, inventoried_paths=frozenset(),
+                         inventory_file_max_bytes=MAX_RUST_FILE_BYTES):
     if file_mode not in (0o600, 0o644):
         _refuse("output_unavailable")
     _make_worker_directory(destination, worker_uid, primary_gid)
@@ -927,8 +1048,12 @@ def _copy_reviewed_files(source, destination, relative_paths, worker_uid, primar
             except OSError:
                 _refuse("output_unavailable")
         source_path = source / rel
-        payload = _read_file(source_path, maximum=MAX_RUST_FILE_BYTES if rel.suffix in (".rs", ".ts")
-                             else MAX_PACKAGE_JSON_BYTES)
+        if relative in inventoried_paths:
+            maximum = inventory_file_max_bytes
+        else:
+            maximum = (MAX_RUST_FILE_BYTES if rel.suffix in (".rs", ".ts")
+                       else MAX_PACKAGE_JSON_BYTES)
+        payload = _read_file(source_path, maximum=maximum)
         try:
             source_info = source_path.lstat()
         except OSError:
@@ -1183,7 +1308,47 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
     try:
         bootstrap.refuse_cargo_config(source)
         roots = _runtime_package_roots(source, selector)
-        reviewed_paths = _reviewed_rust_paths(source, roots=roots)
+        candidate_files = None
+        inventory_paths = set()
+        authenticated_inventory_inputs = set()
+        if selector == "runtime" and any(root in roots for root in RUNTIME_WAVE_70_APP_ROOTS):
+            bootstrap.validate_runtime_source_inventory(source, request["source_sha"])
+            inventory_path = bootstrap.SOURCE_INVENTORY_PATH
+            inventory_payload = _read_file(
+                source / inventory_path, maximum=bootstrap.MAX_SOURCE_INVENTORY_BYTES,
+            )
+            inventory_rows, unused_inventory_digest = bootstrap.parse_runtime_source_inventory(
+                inventory_payload, request["source_sha"],
+            )
+            inventory_paths = set(bootstrap._source_inventory_required_paths(source))
+            authenticated_inventory_inputs = inventory_paths | {inventory_path}
+            candidate_files = _authenticated_candidate_files(source, request["source_sha"])
+            if not authenticated_inventory_inputs.issubset(candidate_files):
+                _refuse("manifest_invalid")
+            row_hashes = {row["path"]: row["sha256"] for row in inventory_rows}
+            for path in authenticated_inventory_inputs:
+                maximum = (bootstrap.MAX_SOURCE_INVENTORY_BYTES if path == inventory_path
+                           else bootstrap.MAX_INVENTORY_FILE_BYTES)
+                payload = inventory_payload if path == inventory_path else _read_file(
+                    source / path, maximum=maximum,
+                )
+                if path != inventory_path and hashlib.sha256(payload).hexdigest() != row_hashes[path]:
+                    _refuse("manifest_invalid")
+                git_blob = hashlib.sha1(
+                    b"blob " + str(len(payload)).encode("ascii") + b"\x00" + payload,
+                ).hexdigest()
+                if candidate_files[path] != ("100644", git_blob):
+                    _refuse("manifest_invalid")
+            try:
+                bootstrap._validate_runtime_wave70_app_trees(source, inventory_paths)
+                bootstrap._validate_runtime_profile_tree_files(
+                    source, roots, authenticated_inventory_inputs,
+                )
+            except bootstrap.BootstrapRefusal:
+                _refuse("manifest_invalid")
+        reviewed_paths = _reviewed_rust_paths(
+            source, roots=roots, inventory_paths=frozenset(inventory_paths),
+        )
         root_manifest = bootstrap.workspace_root_manifest(selector)
         manifests = (root_manifest,) + tuple((root / "Cargo.toml").as_posix() for root in roots)
         manifest_bytes = {path: _read_file(source / path, maximum=MAX_PACKAGE_JSON_BYTES) for path in manifests}
@@ -1197,7 +1362,10 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
         if selector == "runtime":
             api_source_paths = _reviewed_api_source_paths(source)
             api_files = ("Cargo.toml", bootstrap.HOST_API_POLICY_API_MANIFEST_PATH)
-            copy_paths = api_files + api_source_paths + manifests + reviewed_paths
+            copy_paths = (
+                api_files + api_source_paths + manifests + reviewed_paths
+                + tuple(sorted(authenticated_inventory_inputs))
+            )
             api_manifest = _read_file(source / bootstrap.HOST_API_POLICY_API_MANIFEST_PATH, maximum=MAX_PACKAGE_JSON_BYTES)
             try:
                 api_document = bootstrap._parse_manifest(api_manifest)
@@ -1221,7 +1389,8 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
             dependency_rules.update(bootstrap.manifest_dependency_rules(
                 contract_identity_manifests, "contract",
             ))
-            candidate_files = _authenticated_candidate_files(source, request["source_sha"])
+            if candidate_files is None:
+                candidate_files = _authenticated_candidate_files(source, request["source_sha"])
             tracked_api_sources = {
                 path for path in candidate_files
                 if path.startswith("crates/host/api/src/")
@@ -1243,6 +1412,8 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
             source, project, tuple(dict.fromkeys(copy_paths)), worker_uid, worker_gid,
             file_mode=0o644 if selector == "runtime" else 0o600,
             candidate_files=candidate_files,
+            inventoried_paths=frozenset(inventory_paths),
+            inventory_file_max_bytes=bootstrap.MAX_INVENTORY_FILE_BYTES,
         )
         _make_worker_directory(cargo_home, worker_uid, worker_gid)
         bootstrap.refuse_cargo_config(project)
@@ -1279,6 +1450,23 @@ def run_cargo_lock_profile(dispatch, source, worker_storage, worker_uid, environ
         )
     except refusal_type as error:
         _cargo_bootstrap_refusal(bootstrap, error)
+    lock_root = (project / root_manifest).parent
+    identity = rust_license_gate.Identity(
+        request["source_sha"], selector, str(lock_root), hashlib.sha256(lock_bytes).hexdigest(),
+    )
+    prior_rust_root = os.environ.get("RUST_ROOT")
+    os.environ["RUST_ROOT"] = str(Path(tools["cargo"]).parent.parent)
+    try:
+        rust_license_gate.require_lock_admission(
+            lock_bytes, identity, rust_license_gate.TRUSTED_PORTS,
+        )
+    except rust_license_gate.LicenseGateRefusal:
+        _refuse("command_failed")
+    finally:
+        if prior_rust_root is None:
+            os.environ.pop("RUST_ROOT", None)
+        else:
+            os.environ["RUST_ROOT"] = prior_rust_root
     if selector == "runtime" and os.path.lexists(project / "Cargo.lock"):
         _refuse("manifest_invalid")
     owner = source_environ.get("SOURCE_REPOSITORY_OWNER", "")
@@ -1686,6 +1874,16 @@ def _npm_lock_absent(contract, project):
                 else "tool_unavailable")
 
 
+def _npm_root_lock_path(project, filing):
+    relative = filing.get("root_lock", "package-lock.json")
+    if type(relative) is not str or relative.startswith("/") or "\\" in relative:
+        _refuse("request_invalid")
+    parts = relative.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        _refuse("request_invalid")
+    return Path(project).joinpath(*parts)
+
+
 def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, environment,
                               host_toolchain, capability, rust, deadline, bootstrap, contract,
                               node, npm_cli, source_environ):
@@ -1710,8 +1908,17 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
     python_executable = host_toolchain["python"]
     step = "npm_inputs"
     try:
+        filing = bootstrap.filing_for(selector)
+        root_project = project / filing.get("project_root", "")
         paths = bootstrap.input_paths(selector)
         files = {path: _read_file(source / path, maximum=bootstrap.MAX_INPUT_BYTES) for path in paths}
+        candidate_files = _authenticated_candidate_files(source, request["source_sha"])
+        for path, payload in files.items():
+            git_blob = hashlib.sha1(
+                b"blob " + str(len(payload)).encode("ascii") + b"\x00" + payload,
+            ).hexdigest()
+            if candidate_files.get(path) != ("100644", git_blob):
+                _refuse("manifest_invalid")
         plan = bootstrap.check_inputs(files, selector)
         now = int(time.time())
         bootstrap.check_policy_time(plan, now)
@@ -1744,7 +1951,7 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
         return _npm_capture_diagnostic(step_name, key, resolve_stderr, npm_storage, worker_uid, check)
 
     try:
-        os.chdir(project)
+        os.chdir(root_project)
         _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
         step = "npm_version"
         probe = _npm_run_worker(
@@ -1758,7 +1965,7 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
             _npm_refuse(step, "mismatch", "tool_unavailable")
         step = "npm_config"
         _npm_config_unchanged(contract, npm_environment, npm_storage, worker_uid, worker_gid)
-        _npm_lock_absent(contract, project)
+        _npm_lock_absent(contract, root_project)
         step = "npm_resolve"
         result = _npm_run_worker(
             step, rust, command, worker_uid, npm_environment, python_executable, capability,
@@ -1784,7 +1991,8 @@ def run_npm_admission_profile(dispatch, source, worker_storage, worker_uid, envi
     step = "npm_lock"
     try:
         lock_bytes = _read_worker_file(
-            project / "package-lock.json", worker_uid, bootstrap.MAX_LOCK_BYTES,
+            _npm_root_lock_path(project, filing),
+            worker_uid, bootstrap.MAX_LOCK_BYTES,
         )
         bootstrap.check_lock(lock_bytes, plan)
     except refusal_type as error:

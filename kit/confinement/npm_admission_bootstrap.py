@@ -125,6 +125,49 @@ UI_KIT_WORKSPACE_PATHS = ("packages/kernel-icons", "packages/kernel-ui-kit")
 DEFAULT_FILING = "contract-ui-batch-a"
 UI_BATCH_B_FILING = "contract-ui-batch-b"
 FIXTURE_FILING = "quick-fixture"
+CORE_WAVE_70A_FILING = "core-wave70a"
+RUNTIME_WAVE_70A_FILING = "runtime-wave70a"
+CORE_WAVE_70B_FILING = "core-wave70b"
+RUNTIME_WAVE_70B_FILING = "runtime-wave70b"
+CORE_WAVE_70A_WORKSPACES = WORKSPACE_PATHS + UI_KIT_WORKSPACE_PATHS
+CORE_WAVE_70B_WORKSPACES = CORE_WAVE_70A_WORKSPACES + ("packages/i18n",)
+RUNTIME_WAVE_70_WORKSPACES = (
+    "runtime/apps/test-shell-desktop/web",
+    "runtime/apps/test-shell-mobile/web",
+    "runtime/packages/host-ui",
+)
+RUNTIME_SHELL_WORKSPACES = RUNTIME_WAVE_70_WORKSPACES[:2]
+RUNTIME_WAVE_70A_FILE_EDGES = tuple(
+    (source, name, target)
+    for source in RUNTIME_SHELL_WORKSPACES
+    for name, target in (
+        (SCOPE + "host-api", "packages/host-api"),
+        (SCOPE + "kernel-ui-kit", "packages/kernel-ui-kit"),
+    )
+) + tuple(
+    ("runtime/packages/host-ui", name, target)
+    for name, target in (
+        (SCOPE + "host-api", "packages/host-api"),
+        (SCOPE + "kernel-ui-kit", "packages/kernel-ui-kit"),
+    )
+) + (("packages/kernel-ui-kit", SCOPE + "kernel-icons", "packages/kernel-icons"),)
+RUNTIME_WAVE_70B_FILE_EDGES = RUNTIME_WAVE_70A_FILE_EDGES + tuple(
+    (source, SCOPE + "i18n", "packages/i18n")
+    for source in RUNTIME_WAVE_70_WORKSPACES
+)
+RUNTIME_WAVE_70A_MEMBER_EDGES = tuple(
+    (source, "runtime/packages/host-ui") for source in RUNTIME_SHELL_WORKSPACES
+)
+RUNTIME_WAVE_70B_MEMBER_EDGES = RUNTIME_WAVE_70A_MEMBER_EDGES
+RUNTIME_WAVE_70B_FILE_EDGES += (
+    ("packages/i18n", SCOPE + "kernel-i18n", "packages/kernel-i18n"),
+    ("runtime/packages/host-ui", SCOPE + "i18n", "packages/i18n"),
+    ("runtime/packages/host-ui", SCOPE + "kernel-markdown", "packages/kernel-markdown"),
+    ("runtime/packages/host-ui", SCOPE + "kernel-workers", "packages/kernel-workers"),
+    ("runtime/packages/host-ui", SCOPE + "extension-sdk", "packages/extension-sdk"),
+) + tuple(
+    (source, SCOPE + "i18n", "packages/i18n") for source in RUNTIME_SHELL_WORKSPACES
+)
 FILINGS = {
     DEFAULT_FILING: {
         "request_doc": "docs/dependencies/ui-npm-admission-batch-a.md",
@@ -143,6 +186,45 @@ FILINGS = {
         "workspaces": WORKSPACE_PATHS,
         "member_edges": (),
         "overrides": {},
+    },
+    CORE_WAVE_70A_FILING: {
+        "root_kind": "core", "root_manifest": "package.json", "root_lock": "package-lock.json",
+        "root_name": ROOT_NAME, "project_root": "", "node_version": ".node-version",
+        "npmrc": ".npmrc", "workspace_patterns": ("packages/*",),
+        "request_doc": "docs/dependencies/ui-npm-admission-batch-b.md",
+        "workspaces": CORE_WAVE_70A_WORKSPACES,
+        "member_edges": ((UI_KIT_WORKSPACE_PATHS[1], UI_KIT_WORKSPACE_PATHS[0]),),
+        "file_edges": (), "overrides": {"lightningcss": "1.33.0"},
+    },
+    RUNTIME_WAVE_70A_FILING: {
+        "root_kind": "runtime", "root_manifest": "runtime/package.json",
+        "root_lock": "runtime/package-lock.json", "root_name": None, "project_root": "runtime",
+        "node_version": "runtime/.node-version", "npmrc": "runtime/.npmrc",
+        "workspace_patterns": tuple(path[len("runtime/"):] for path in RUNTIME_WAVE_70_WORKSPACES),
+        "request_doc": "docs/dependencies/ui-npm-admission-batch-b.md",
+        "workspaces": RUNTIME_WAVE_70_WORKSPACES, "member_edges": RUNTIME_WAVE_70A_MEMBER_EDGES,
+        "file_edges": RUNTIME_WAVE_70A_FILE_EDGES, "overrides": {},
+    },
+    CORE_WAVE_70B_FILING: {
+        "root_kind": "core", "root_manifest": "package.json", "root_lock": "package-lock.json",
+        "root_name": ROOT_NAME, "project_root": "", "node_version": ".node-version",
+        "npmrc": ".npmrc", "workspace_patterns": ("packages/*",),
+        "request_doc": "docs/dependencies/ui-npm-admission-batch-b.md",
+        "workspaces": CORE_WAVE_70B_WORKSPACES,
+        "member_edges": (
+            (UI_KIT_WORKSPACE_PATHS[1], UI_KIT_WORKSPACE_PATHS[0]),
+            ("packages/i18n", "packages/kernel-i18n"),
+        ),
+        "file_edges": (), "overrides": {"lightningcss": "1.33.0"},
+    },
+    RUNTIME_WAVE_70B_FILING: {
+        "root_kind": "runtime", "root_manifest": "runtime/package.json",
+        "root_lock": "runtime/package-lock.json", "root_name": None, "project_root": "runtime",
+        "node_version": "runtime/.node-version", "npmrc": "runtime/.npmrc",
+        "workspace_patterns": tuple(path[len("runtime/"):] for path in RUNTIME_WAVE_70_WORKSPACES),
+        "request_doc": "docs/dependencies/ui-npm-admission-batch-b.md",
+        "workspaces": RUNTIME_WAVE_70_WORKSPACES, "member_edges": RUNTIME_WAVE_70B_MEMBER_EDGES,
+        "file_edges": RUNTIME_WAVE_70B_FILE_EDGES, "overrides": {},
     },
 }
 NODE_VERSION_BYTES = (NODE_VERSION + "\n").encode("ascii")
@@ -209,7 +291,8 @@ TRUSTED_CONTEXT_FIELDS = frozenset((
 ))
 RECEIPT_FIELDS = frozenset((
     "schema_version", "record_type", "context", "inputs_sha256", "request_doc_sha256",
-    "lock_sha256", "archive_set_sha256", "package_set_sha256", "packages",
+    "lock_sha256", "archive_set_sha256", "package_set_sha256", "root_kind", "node_version",
+    "npm_version", "members", "file_edges", "packages",
 ))
 RECEIPT_PACKAGE_FIELDS = frozenset((
     "path", "name", "version", "integrity", "sha256", "audit_record_id",
@@ -381,12 +464,44 @@ def _valid_name(name, extra=()):
 
 
 def _scoped_name(path):
+    if path == "runtime/apps/test-shell-desktop/web":
+        return SCOPE + "test-shell-desktop"
+    if path == "runtime/apps/test-shell-mobile/web":
+        return SCOPE + "test-shell-mobile"
     return SCOPE + posixpath.basename(path)
+
+
+def _lock_workspace_path(path, filing):
+    project_root = filing.get("project_root", "")
+    relative = path[len(project_root) + 1:] if project_root and path.startswith(project_root + "/") else path
+    if relative.startswith("apps/"):
+        return "packages/runtime/" + relative
+    return relative
+
+
+def _profile_file_spec(source, target):
+    return "file:" + posixpath.relpath(target, source)
+
+
+def _profile_file_lock_path(target, filing):
+    project_root = filing.get("project_root", "")
+    return posixpath.relpath(target, project_root or ".")
 
 
 def workspace_links(selector=DEFAULT_FILING):
     """Return the fixed workspace link map the lock of one filing must carry."""
-    return {"node_modules/" + _scoped_name(path): path for path in filing_for(selector)["workspaces"]}
+    filing = filing_for(selector)
+    links = {
+        "node_modules/" + _scoped_name(path): _lock_workspace_path(path, filing)
+        for path in filing["workspaces"]
+    }
+    for source, name, target in filing.get("file_edges", ()):
+        lock_path = target
+        link_path = "node_modules/" + name
+        previous = links.setdefault(link_path, lock_path)
+        if previous != lock_path:
+            _refuse("npm_input_invalid")
+    return links
 
 
 def filing_for(selector):
@@ -398,9 +513,14 @@ def filing_for(selector):
 def input_paths(selector):
     """Return the exact repository paths read from the source revision, in a fixed order."""
     filing = filing_for(selector)
+    root_manifest = filing.get("root_manifest", "package.json")
+    package_paths = list(filing["workspaces"])
+    extra_package_paths = set()
+    for source, name, target in filing.get("file_edges", ()):
+        extra_package_paths.update((source, target))
     return (
-        ".node-version", ".npmrc", "package.json",
-    ) + tuple(path + "/package.json" for path in filing["workspaces"]) + (
+        filing.get("node_version", ".node-version"), filing.get("npmrc", ".npmrc"), root_manifest,
+    ) + tuple(path + "/package.json" for path in package_paths + sorted(extra_package_paths - set(package_paths))) + (
         POLICY_FILE, filing["request_doc"],
     )
 
@@ -413,18 +533,6 @@ def _check_scripts(scripts):
             _refuse("npm_manifest_refused")
 
 
-def _check_dependencies(value, internal, workspace_names=frozenset()):
-    if type(value) is not dict or len(value) > 512:
-        _refuse("npm_manifest_refused")
-    for name, spec in value.items():
-        if name in workspace_names:
-            if not _exact_version(spec):
-                _refuse("npm_manifest_refused")
-        elif not _valid_name(name, internal) or not _exact_version(spec):
-            _refuse("npm_manifest_refused")
-    return dict(value)
-
-
 def _manifest(data):
     manifest = _strict_json(data, MAX_MANIFEST_BYTES, "npm_manifest_refused")
     if type(manifest) is not dict:
@@ -432,12 +540,32 @@ def _manifest(data):
     return manifest
 
 
+def _check_dependencies(value, internal, workspace_names=frozenset(), file_specs=None):
+    if type(value) is not dict or len(value) > 512:
+        _refuse("npm_manifest_refused")
+    file_specs = {} if file_specs is None else file_specs
+    for name, spec in value.items():
+        if name in file_specs:
+            if spec != file_specs[name]:
+                _refuse("npm_manifest_refused")
+        elif name in workspace_names:
+            if not _exact_version(spec):
+                _refuse("npm_manifest_refused")
+        elif not _valid_name(name, internal) or not _exact_version(spec):
+            _refuse("npm_manifest_refused")
+    return dict(value)
+
+
 def _check_root(manifest, filing, internal):
-    if (set(manifest) - ROOT_KEYS or manifest.get("name") != ROOT_NAME
+    if "root_name" in filing:
+        root_name = filing["root_name"] or manifest.get("name")
+    else:
+        root_name = ROOT_NAME
+    if (set(manifest) - ROOT_KEYS or manifest.get("name") != root_name
             or not adm._valid_version(manifest.get("version")) or manifest.get("private") is not True
             or manifest.get("packageManager") != "npm@" + NPM_VERSION
             or manifest.get("engines") != {"node": NODE_VERSION, "npm": NPM_VERSION}
-            or manifest.get("workspaces") != ["packages/*"]):
+            or manifest.get("workspaces") != list(filing.get("workspace_patterns", ("packages/*",)))):
         _refuse("npm_manifest_refused")
     _check_scripts(manifest.get("scripts", {}))
     groups = {group: _check_dependencies(manifest.get(group, {}), internal) for group in DEPENDENCY_GROUPS}
@@ -447,13 +575,13 @@ def _check_root(manifest, filing, internal):
     return groups, dict(overrides)
 
 
-def _check_workspace(manifest, path, internal, workspace_names=frozenset()):
+def _check_workspace(manifest, path, internal, workspace_names=frozenset(), file_specs=None):
     if (set(manifest) - WORKSPACE_KEYS or manifest.get("name") != _scoped_name(path)
             or not adm._valid_version(manifest.get("version"))):
         _refuse("npm_manifest_refused")
     _check_scripts(manifest.get("scripts", {}))
     return {
-        group: _check_dependencies(manifest.get(group, {}), internal, workspace_names)
+        group: _check_dependencies(manifest.get(group, {}), internal, workspace_names, file_specs)
         for group in ("dependencies", "devDependencies")
     }
 
@@ -571,9 +699,22 @@ def parse_policy(data):
     internal = _check_name_list(policy["internal_names"], 1024)
     if type(direct) is not dict or len(direct) > 512:
         _refuse("npm_policy_refused")
-    for name, version in direct.items():
-        if not _valid_name(name, internal) or not _exact_version(version):
+    if direct and all(type(value) is dict for value in direct.values()):
+        if set(direct) - {"core", "runtime"}:
             _refuse("npm_policy_refused")
+        root_direct = {}
+        for root_kind, dependencies in direct.items():
+            if len(dependencies) > 512:
+                _refuse("npm_policy_refused")
+            for name, version in dependencies.items():
+                if not _valid_name(name, internal) or not _exact_version(version):
+                    _refuse("npm_policy_refused")
+            root_direct[root_kind] = dict(dependencies)
+    else:
+        for name, version in direct.items():
+            if not _valid_name(name, internal) or not _exact_version(version):
+                _refuse("npm_policy_refused")
+        root_direct = dict(direct)
     singletons = _check_name_list(policy["singleton_names"], 1024)
     licences = policy["licence_allowlist"]
     if (type(licences) is not list or not 0 < len(licences) <= 1024 or len(set(licences)) != len(licences)
@@ -594,7 +735,7 @@ def parse_policy(data):
         _refuse("npm_policy_refused")
     return {
         "policy_epoch_ms": policy["policy_epoch_ms"],
-        "direct": dict(direct),
+        "direct": root_direct,
         "singleton_names": frozenset(singletons),
         "internal_names": internal,
         "licence_allowlist": frozenset(licences),
@@ -620,38 +761,93 @@ def check_inputs(files, selector):
     for path in paths:
         if type(files[path]) is not bytes or not files[path]:
             _refuse("npm_input_invalid")
-    if files[".node-version"] != NODE_VERSION_BYTES or files[".npmrc"] != NPMRC_BYTES:
+    node_path = filing.get("node_version", ".node-version")
+    npmrc_path = filing.get("npmrc", ".npmrc")
+    root_manifest_path = filing.get("root_manifest", "package.json")
+    if files[node_path] != NODE_VERSION_BYTES or files[npmrc_path] != NPMRC_BYTES:
         _refuse("npm_manifest_refused")
     policy = parse_policy(files[POLICY_FILE])
     internal = policy["internal_names"]
-    root_manifest = _manifest(files["package.json"])
+    root_manifest = _manifest(files[root_manifest_path])
     root_groups, overrides = _check_root(root_manifest, filing, internal)
+    root_policy_direct = policy["direct"]
+    if root_policy_direct and all(type(value) is dict for value in root_policy_direct.values()):
+        root_policy_direct = root_policy_direct.get(filing.get("root_kind"), {})
     root_direct = {}
     for group in root_groups.values():
         for name, version in group.items():
             if root_direct.setdefault(name, version) != version:
                 _refuse("npm_manifest_refused")
-    if not root_direct or root_direct != policy["direct"]:
-        _refuse("npm_policy_refused")
     direct = dict(root_direct)
-    workspaces = []
-    for path in filing["workspaces"]:
-        allowed_edges = frozenset(
-            _scoped_name(target) for source, target in filing["member_edges"] if source == path
+    package_paths = set(filing["workspaces"])
+    for source, name, target in filing.get("file_edges", ()):
+        package_paths.add(source)
+        package_paths.add(target)
+    for source, target in filing.get("member_edges", ()):
+        package_paths.add(source)
+        package_paths.add(target)
+    file_specs_by_source = {}
+    file_targets_by_source = {}
+    for source, name, target in filing.get("file_edges", ()):
+        file_specs_by_source.setdefault(source, {})[name] = _profile_file_spec(source, target)
+        file_targets_by_source.setdefault(source, {})[name] = target
+    package_records = {}
+    for path in sorted(package_paths):
+        data_path = path + "/package.json"
+        manifest_bytes = files[data_path]
+        manifest = _manifest(manifest_bytes)
+        allowed_members = frozenset(
+            _scoped_name(target) for source, target in filing.get("member_edges", ()) if source == path
         )
-        manifest = _manifest(files[path + "/package.json"])
-        groups = _check_workspace(manifest, path, internal, allowed_edges)
-        workspaces.append({
-            "path": path, "name": manifest["name"], "version": manifest["version"],
+        file_specs = file_specs_by_source.get(path, {})
+        link_names = allowed_members | frozenset(file_specs)
+        groups = _check_workspace(manifest, path, internal, link_names, file_specs)
+        record = {
+            "path": path, "lock_path": _lock_workspace_path(path, filing),
+            "name": manifest["name"], "version": manifest["version"],
+            "manifest_sha256": _sha256(manifest_bytes),
             "dependencies": groups["dependencies"], "devDependencies": groups["devDependencies"],
-        })
-        for group in groups.values():
-            for name, version in group.items():
-                if name in allowed_edges:
+            "lock_dependencies": {}, "lock_devDependencies": {},
+        }
+        for group in ("dependencies", "devDependencies"):
+            lock_group = dict(groups[group])
+            for name, target in file_targets_by_source.get(path, {}).items():
+                if name in lock_group:
+                    target_manifest = _manifest(files[target + "/package.json"])
+                    if target_manifest.get("name") != name:
+                        _refuse("npm_manifest_refused")
+                    lock_group[name] = target_manifest["version"]
+            record["lock_" + group] = lock_group
+            for name, version in groups[group].items():
+                if name in link_names:
                     continue
                 if direct.setdefault(name, version) != version:
                     _refuse("npm_manifest_refused")
+        package_records[path] = record
+    if not direct or direct != root_policy_direct:
+        _refuse("npm_policy_refused")
+    workspaces = [package_records[path] for path in filing["workspaces"]]
     workspace_versions = {item["name"]: item["version"] for item in workspaces}
+    file_edges = []
+    for source, name, target in filing.get("file_edges", ()):
+        source_record = package_records[source]
+        target_record = package_records[target]
+        if _scoped_name(target) != name or target_record["name"] != name:
+            _refuse("npm_manifest_refused")
+        file_edges.append({
+            "source": source, "name": name, "target": target,
+            "spec": _profile_file_spec(source, target),
+            "source_manifest_sha256": source_record["manifest_sha256"],
+            "target_manifest_sha256": target_record["manifest_sha256"],
+        })
+    for source, target in filing.get("member_edges", ()):
+        if package_records[target]["name"] != _scoped_name(target):
+            _refuse("npm_manifest_refused")
+        source_record = package_records[source]
+        target_name = package_records[target]["name"]
+        for group in ("dependencies", "devDependencies"):
+            if target_name in source_record[group] and source_record[group][target_name] != package_records[target]["version"]:
+                _refuse("npm_manifest_refused")
     for item in workspaces:
         for group in ("dependencies", "devDependencies"):
             for name, spec in item[group].items():
@@ -672,8 +868,16 @@ def check_inputs(files, selector):
             "dependencies": root_groups["dependencies"],
             "devDependencies": root_groups["devDependencies"],
             "optionalDependencies": root_groups["optionalDependencies"],
+            "workspaces": ["packages/*"],
         },
         "workspaces": workspaces,
+        "source_packages": list(package_records.values()),
+        "file_edges": file_edges,
+        "workspace_names": workspace_versions,
+        "workspace_patterns": list(filing.get("workspace_patterns", ("packages/*",))),
+        "project_root": filing.get("project_root", ""),
+        "root_kind": filing.get("root_kind", "core"),
+        "node_version": NODE_VERSION, "npm_version": NPM_VERSION,
         "direct": direct,
         "overrides": overrides,
         "rows": rows,
@@ -703,10 +907,9 @@ def check_policy_time(plan, now):
 
 def project_paths(selector):
     """Return the files copied into the resolver project: manifests and settings only."""
-    return tuple(
-        path for path in input_paths(selector)
-        if path in (".node-version", ".npmrc") or path.endswith("package.json")
-    )
+    filing = filing_for(selector)
+    return tuple(path for path in input_paths(selector)
+                 if path not in (POLICY_FILE, filing["request_doc"]))
 
 
 def _iso_cutoff(cutoff_ms):
@@ -770,17 +973,115 @@ def build_npm_environment(node, *, home, tmpdir, cache, user_config, global_conf
     }
 
 
+def _normalize_profile_lock(lock_bytes, plan):
+    """Validate local paths and convert the runtime lock to the shared parser's bounded shape."""
+    if plan["root_kind"] != "runtime":
+        return lock_bytes
+    raw = _strict_json(lock_bytes, MAX_LOCK_BYTES, "npm_lock_refused")
+    if type(raw) is not dict or type(raw.get("packages")) is not dict or "" not in raw["packages"]:
+        _refuse("npm_lock_refused")
+    packages = raw["packages"]
+    filing = filing_for(plan["filing"])
+    root = packages[""]
+    if type(root) is not dict or root.get("workspaces") != plan["workspace_patterns"]:
+        _refuse("npm_lock_refused")
+    expected_link_paths = workspace_links(plan["filing"])
+    raw_link_targets = {}
+    normalized_targets = {}
+    member_paths = {item["path"] for item in plan["workspaces"]}
+    file_target_paths = {item["target"] for item in plan["file_edges"]}
+    package_paths = set(member_paths) | file_target_paths
+    project_root = plan["project_root"]
+    for item in plan["source_packages"]:
+        path = item["path"]
+        relative = path[len(project_root) + 1:] if project_root and path.startswith(project_root + "/") else path
+        if path in member_paths:
+            raw_path = relative
+            normalized_path = item["lock_path"]
+        elif path in file_target_paths:
+            raw_path = _profile_file_lock_path(path, filing)
+            normalized_path = path
+        else:
+            continue
+        if raw_path in raw_link_targets.values() or normalized_path in normalized_targets.values():
+            _refuse("npm_lock_refused")
+        raw_link_targets[path] = raw_path
+        normalized_targets[path] = normalized_path
+        entry = packages.get(raw_path)
+        if type(entry) is not dict or entry.get("name") != item["name"] or entry.get("version") != item["version"]:
+            _refuse("npm_lock_refused")
+    for link_path, normalized_target in expected_link_paths.items():
+        match_paths = [path for path, normalized in normalized_targets.items() if normalized == normalized_target]
+        if len(match_paths) != 1:
+            _refuse("npm_lock_refused")
+        target_path = match_paths[0]
+        actual_target = raw_link_targets[target_path]
+        link = packages.get(link_path)
+        if type(link) is not dict or link != {"resolved": actual_target, "link": True}:
+            _refuse("npm_lock_refused")
+    allowed_package_entries = {"", *raw_link_targets.values()}
+    allowed_link_entries = set(expected_link_paths)
+    local_names = {adm._package_name_from_lock_path(path) for path in expected_link_paths}
+    for path in packages:
+        if path in allowed_package_entries or path in allowed_link_entries:
+            continue
+        if path.startswith("node_modules/"):
+            name = adm._package_name_from_lock_path(path)
+            if name in local_names:
+                _refuse("npm_lock_refused")
+            continue
+        _refuse("npm_lock_refused")
+    raw_to_normalized = dict(zip(raw_link_targets.values(), normalized_targets.values()))
+    transformed = {}
+    for path, entry in packages.items():
+        new_path = raw_to_normalized.get(path, path)
+        if new_path in transformed:
+            _refuse("npm_lock_refused")
+        transformed_entry = dict(entry) if type(entry) is dict else entry
+        if path in allowed_link_entries:
+            target_path = next(target for link, target in expected_link_paths.items() if link == path)
+            transformed_entry = {"resolved": target_path, "link": True}
+        elif path == "":
+            transformed_entry = dict(entry)
+            transformed_entry["workspaces"] = ["packages/*"]
+        else:
+            source = next((item for item in plan["source_packages"] if raw_link_targets.get(item["path"]) == path), None)
+            if source is not None:
+                transformed_entry = dict(entry)
+                for group in ("dependencies", "devDependencies"):
+                    values = transformed_entry.get(group)
+                    if type(values) is dict:
+                        values = dict(values)
+                        for edge in plan["file_edges"]:
+                            if edge["source"] == source["path"] and edge["name"] in values:
+                                if values[edge["name"]] != edge["spec"]:
+                                    _refuse("npm_lock_refused")
+                                values[edge["name"]] = next(
+                                    item["version"] for item in plan["source_packages"]
+                                    if item["path"] == edge["target"]
+                                )
+                        transformed_entry[group] = values
+        transformed[new_path] = transformed_entry
+    normalized = dict(raw)
+    normalized["packages"] = transformed
+    normalized_bytes = json.dumps(
+        normalized, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("ascii")
+    return normalized_bytes
+
+
 def check_lock(lock_bytes, plan):
     """Check the resolved lock against the plan and return the parsed lock and registry entries."""
     if type(lock_bytes) is not bytes or not lock_bytes:
         _refuse("npm_lock_refused", lock_detail("lock_empty"))
     if len(lock_bytes) > MAX_LOCK_BYTES:
         _bundle_refuse("npm_payload_too_large", "payload_size", "bundle", "lock")
+    normalized_bytes = _normalize_profile_lock(lock_bytes, plan)
     links = workspace_links(plan["filing"])
     internal = plan["internal_names"]
-    lock = _call_adm(adm.parse_lock, lock_bytes, internal_names=internal, workspace_links=links)
+    lock = _call_adm(adm.parse_lock, normalized_bytes, internal_names=internal, workspace_links=links)
     entries = _call_adm(
-        adm.registry_entries, lock_bytes, internal_names=internal, workspace_links=links,
+        adm.registry_entries, normalized_bytes, internal_names=internal, workspace_links=links,
     )
     if not entries or len(entries) > MAX_PACKAGES:
         _refuse("npm_lock_refused", lock_detail("entry_count", count=len(entries) if entries else 0))
@@ -790,7 +1091,7 @@ def check_lock(lock_bytes, plan):
     for field, same in (
         ("name", lock["name"] == expected["name"]),
         ("version", lock["version"] == expected["version"]),
-        ("workspaces", root.get("workspaces") == ["packages/*"]),
+        ("workspaces", root.get("workspaces") == plan["root"]["workspaces"]),
         ("engines", root.get("engines") == {"node": NODE_VERSION, "npm": NPM_VERSION}),
     ):
         if not same:
@@ -799,11 +1100,20 @@ def check_lock(lock_bytes, plan):
         if root.get(group, {}) != expected[group]:
             _refuse("npm_lock_refused", lock_detail("root_group", group))
     for workspace in plan["workspaces"]:
-        entry = packages[workspace["path"]]
+        entry = packages[workspace["lock_path"]]
         if (entry.get("name") != workspace["name"] or entry.get("version") != workspace["version"]
-                or entry.get("dependencies", {}) != workspace["dependencies"]
-                or entry.get("devDependencies", {}) != workspace["devDependencies"]):
+                or entry.get("dependencies", {}) != workspace["lock_dependencies"]
+                or entry.get("devDependencies", {}) != workspace["lock_devDependencies"]):
             _refuse("npm_lock_refused", lock_detail("workspace", workspace["path"]))
+    for source_package in plan["source_packages"]:
+        if source_package["path"] in {item["path"] for item in plan["workspaces"]}:
+            continue
+        entry = packages.get(source_package["lock_path"])
+        if (type(entry) is not dict or entry.get("name") != source_package["name"]
+                or entry.get("version") != source_package["version"]
+                or entry.get("dependencies", {}) != source_package["lock_dependencies"]
+                or entry.get("devDependencies", {}) != source_package["lock_devDependencies"]):
+            _refuse("npm_lock_refused")
     by_name = {}
     for path, entry in entries:
         by_name.setdefault(entry["name"], []).append((path, entry["version"]))
@@ -1015,7 +1325,7 @@ class RegistryFetcher:
 
     def _exchange(self, path, limit, accept, body=None, subject="fetch"):
         if (type(path) is not str or not path.startswith(chr(47)) or "?" in path
-                or chr(35) in path or len(path) > 1024):
+                or "\x23" in path or len(path) > 1024):
             _bundle_refuse("npm_network_refused", "fetch", subject, "path")
         if self._deadline is not None and time.monotonic() >= self._deadline:
             _bundle_refuse("npm_stale", "stale", subject, "fetch_deadline")
@@ -1448,6 +1758,13 @@ def build_receipt(lock_bytes, plan, trusted_context, identities):
         "lock_sha256": lock_sha,
         "archive_set_sha256": _call_adm(adm.archive_set_digest, identities),
         "package_set_sha256": _call_adm(adm.package_set_digest, lock_sha, identities),
+        "root_kind": plan["root_kind"],
+        "node_version": plan["node_version"],
+        "npm_version": plan["npm_version"],
+        "members": [{key: item[key] for key in (
+            "path", "name", "version", "manifest_sha256",
+        )} for item in plan["workspaces"]],
+        "file_edges": [dict(item) for item in plan["file_edges"]],
         "packages": [dict(item, audit_record_id=PENDING_AUDIT_ID) for item in identities],
     }
     encoded = _canonical(record, "npm_evidence_invalid")
@@ -1533,9 +1850,21 @@ def validate_receipt(receipt_bytes, lock_bytes, plan, trusted_context):
     if (record["inputs_sha256"] != plan["inputs_sha256"]
             or record["request_doc_sha256"] != plan["request_doc_sha256"]):
         _evidence_refuse("receipt_inputs")
+    expected_members = [{key: item[key] for key in (
+        "path", "name", "version", "manifest_sha256",
+    )} for item in plan["workspaces"]]
+    if (record["root_kind"] != plan["root_kind"]
+            or record["node_version"] != plan["node_version"]
+            or record["npm_version"] != plan["npm_version"]
+            or record["members"] != expected_members
+            or record["file_edges"] != plan["file_edges"]):
+        _evidence_refuse("receipt_inputs")
     if not hmac.compare_digest(record["lock_sha256"], _sha256(lock_bytes)):
         _evidence_refuse("receipt_lock")
-    entries = _call_adm(adm.registry_entries, lock_bytes, workspace_links=workspace_links(plan["filing"]))
+    normalized_bytes = _normalize_profile_lock(lock_bytes, plan)
+    entries = _call_adm(
+        adm.registry_entries, normalized_bytes, workspace_links=workspace_links(plan["filing"]),
+    )
     packages = record["packages"]
     if type(packages) is not list or len(packages) != len(entries):
         _evidence_refuse("receipt_packages")

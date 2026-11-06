@@ -7,9 +7,11 @@ import json
 import socket
 import sys
 import tarfile
+import tempfile
 import unittest
 import unittest.mock
 import urllib.error
+from pathlib import Path
 
 import npm_admission as adm
 import npm_admission_bootstrap as subject
@@ -722,6 +724,228 @@ class UiKitFilingTests(RefusalAssertions):
         }
         lock["packages"]["packages/third"] = {"name": _workspace_name("packages/third"), "version": ROOT_VERSION}
         self.assert_refused("npm_lock_refused", subject.check_lock, _json(lock) + b"\n", plan)
+
+
+class Wave70ProfileTests(RefusalAssertions):
+    def core_files_and_lock(self, world):
+        filing_name = subject.CORE_WAVE_70A_FILING
+        filing = subject.FILINGS[filing_name]
+        policy = world.policy()
+        policy["direct"] = {"core": dict(DIRECT), "runtime": dict(DIRECT)}
+        policy["internal_names"] = sorted(
+            subject._scoped_name(path) for path in filing["workspaces"]
+        )
+        files = dict(world.files)
+        default_doc = subject.FILINGS[subject.DEFAULT_FILING]["request_doc"]
+        files.pop(default_doc)
+        files[filing["request_doc"]] = world.request_doc()
+        files[subject.POLICY_FILE] = _json(policy) + b"\n"
+        root = json.loads(files[filing["root_manifest"]].decode("ascii"))
+        root["workspaces"] = list(filing["workspace_patterns"])
+        files[filing["root_manifest"]] = _json(root) + b"\n"
+        for path in filing["workspaces"]:
+            manifest = {
+                "name": subject._scoped_name(path), "version": "0.1.0", "type": "module",
+                "scripts": {"typecheck": "run typecheck", "test": "run test"},
+            }
+            for source, target in filing["member_edges"]:
+                if source == path:
+                    manifest.setdefault("dependencies", {})[subject._scoped_name(target)] = "0.1.0"
+            files[path + "/package.json"] = _json(manifest) + b"\n"
+        lock = json.loads(json.dumps(world.lock_dict))
+        lock["packages"][""]["workspaces"] = list(filing["workspace_patterns"])
+        for link, path in subject.workspace_links(filing_name).items():
+            lock["packages"][link] = {"resolved": path, "link": True}
+            entry = {"name": subject._scoped_name(path), "version": "0.1.0"}
+            manifest = json.loads(files[path + "/package.json"].decode("ascii"))
+            if "dependencies" in manifest:
+                entry["dependencies"] = manifest["dependencies"]
+            lock["packages"][path] = entry
+        return files, _json(lock) + b"\n"
+
+    def runtime_files(self, filing_name=subject.RUNTIME_WAVE_70A_FILING):
+        world = World()
+        filing = subject.FILINGS[filing_name]
+        package_paths = set(filing["workspaces"])
+        for source, name, target in filing["file_edges"]:
+            package_paths.update((source, target))
+        for source, target in filing["member_edges"]:
+            package_paths.update((source, target))
+        package_names = {path: subject._scoped_name(path) for path in package_paths}
+        manifests = {}
+        for path in package_paths:
+            dependencies = {}
+            for source, target in filing["member_edges"]:
+                if source == path:
+                    dependencies[subject._scoped_name(target)] = "0.1.0"
+            for source, name, target in filing["file_edges"]:
+                if source == path:
+                    dependencies[name] = subject._profile_file_spec(source, target)
+            manifest = {"name": package_names[path], "version": "0.1.0", "scripts": {}}
+            if dependencies:
+                manifest["dependencies"] = dependencies
+            manifests[path] = manifest
+        runtime_root = {
+            "name": "runtime-shell", "version": "0.1.0", "private": True,
+            "packageManager": "npm@" + subject.NPM_VERSION,
+            "engines": {"node": subject.NODE_VERSION, "npm": subject.NPM_VERSION},
+            "workspaces": list(filing["workspace_patterns"]),
+            "devDependencies": dict(DIRECT), "overrides": {},
+        }
+        policy = world.policy()
+        policy["direct"] = {"core": dict(DIRECT), "runtime": dict(DIRECT)}
+        policy["internal_names"] = sorted(set(package_names.values()))
+        files = {
+            subject.POLICY_FILE: _json(policy) + b"\n",
+            filing["root_manifest"]: _json(runtime_root) + b"\n",
+            filing["node_version"]: subject.NODE_VERSION_BYTES,
+            filing["npmrc"]: subject.NPMRC_BYTES,
+            filing["request_doc"]: world.files[subject.FILINGS[subject.DEFAULT_FILING]["request_doc"]],
+        }
+        for path, manifest in manifests.items():
+            files[path + "/package.json"] = _json(manifest) + b"\n"
+        self.assertEqual(set(files), set(subject.input_paths(filing_name)))
+        return world, manifests, files
+
+    def runtime_lock(self, world, manifests, filing_name=subject.RUNTIME_WAVE_70A_FILING):
+        filing = subject.FILINGS[filing_name]
+        project_root = filing["project_root"]
+        _, _, files = self.runtime_files(filing_name)
+        root_manifest = json.loads(files[filing["root_manifest"]].decode("ascii"))
+        packages = {
+            "": {
+                "name": root_manifest["name"], "version": root_manifest["version"],
+                "workspaces": list(filing["workspace_patterns"]),
+                "devDependencies": dict(DIRECT),
+                "engines": {"node": subject.NODE_VERSION, "npm": subject.NPM_VERSION},
+            },
+        }
+        for path in filing["workspaces"]:
+            relative = path[len(project_root) + 1:]
+            entry = dict(name=manifests[path]["name"], version=manifests[path]["version"])
+            if "dependencies" in manifests[path]:
+                entry["dependencies"] = dict(manifests[path]["dependencies"])
+            packages[relative] = entry
+        targets = set(target for source, name, target in filing["file_edges"])
+        for target in targets:
+            raw_path = subject._profile_file_lock_path(target, filing)
+            entry = dict(name=manifests[target]["name"], version=manifests[target]["version"])
+            if "dependencies" in manifests[target]:
+                entry["dependencies"] = dict(manifests[target]["dependencies"])
+            packages[raw_path] = entry
+        for link_path, target_path in subject.workspace_links(filing_name).items():
+            if target_path.startswith("packages/runtime/"):
+                raw_target = target_path[len("packages/runtime/"):]
+            elif target_path == "packages/host-ui":
+                raw_target = target_path
+            else:
+                raw_target = subject._profile_file_lock_path(target_path, filing)
+            packages[link_path] = {"resolved": raw_target, "link": True}
+        for path, entry in world.lock_dict["packages"].items():
+            if path == "" or not path.startswith("node_modules/") or "integrity" not in entry:
+                continue
+            packages[path] = dict(entry)
+        return _json({
+            "name": root_manifest["name"], "version": root_manifest["version"],
+            "lockfileVersion": 3, "requires": True, "packages": packages,
+        }) + b"\n"
+
+    def test_wave70_profiles_have_exact_root_members_and_edges(self):
+        self.assertEqual(
+            subject.FILINGS[subject.CORE_WAVE_70A_FILING]["workspaces"],
+            ("packages/host-api", "packages/kernel-i18n", "packages/kernel-icons", "packages/kernel-ui-kit"),
+        )
+        self.assertIn("packages/i18n", subject.FILINGS[subject.CORE_WAVE_70B_FILING]["workspaces"])
+        self.assertEqual(
+            subject.FILINGS[subject.RUNTIME_WAVE_70A_FILING]["workspaces"],
+            ("runtime/apps/test-shell-desktop/web", "runtime/apps/test-shell-mobile/web",
+             "runtime/packages/host-ui"),
+        )
+        self.assertGreater(
+            len(subject.FILINGS[subject.RUNTIME_WAVE_70B_FILING]["file_edges"]),
+            len(subject.FILINGS[subject.RUNTIME_WAVE_70A_FILING]["file_edges"]),
+        )
+
+    def test_runtime_profile_checks_exact_file_edges_and_receipt_binding(self):
+        world, manifests, files = self.runtime_files()
+        plan = subject.check_inputs(files, subject.RUNTIME_WAVE_70A_FILING)
+        lock_bytes = self.runtime_lock(world, manifests)
+        lock, entries = subject.check_lock(lock_bytes, plan)
+        self.assertEqual(len(plan["workspaces"]), 3)
+        self.assertEqual(len(plan["file_edges"]), 7)
+        self.assertEqual(len(entries), len(world.lock_dict["packages"]) - 5)
+        identities = [{
+            "path": path, "name": entry["name"], "version": entry["version"],
+            "integrity": entry["integrity"], "sha256": "0" * 64,
+        } for path, entry in entries]
+        context = dict(world.context, filing=subject.RUNTIME_WAVE_70A_FILING)
+        receipt = subject.build_receipt(lock_bytes, plan, context, identities)
+        record = subject.validate_receipt(receipt, lock_bytes, plan, context)
+        self.assertEqual(record["members"], [{key: item[key] for key in (
+            "path", "name", "version", "manifest_sha256",
+        )} for item in plan["workspaces"]])
+        self.assertEqual(record["file_edges"], plan["file_edges"])
+
+    def test_runtime_profile_rejects_changed_manifest_edge_and_crossed_lock(self):
+        world, manifests, files = self.runtime_files()
+        plan = subject.check_inputs(files, subject.RUNTIME_WAVE_70A_FILING)
+        extra_workspace = dict(files)
+        root = json.loads(extra_workspace["runtime/package.json"].decode("ascii"))
+        root["workspaces"].append("packages/host-ui")
+        extra_workspace["runtime/package.json"] = _json(root) + b"\n"
+        self.assert_refused("npm_manifest_refused", subject.check_inputs, extra_workspace,
+                            subject.RUNTIME_WAVE_70A_FILING)
+        changed_files = dict(files)
+        shell = subject.RUNTIME_SHELL_WORKSPACES[0]
+        shell_manifest = json.loads(changed_files[shell + "/package.json"].decode("ascii"))
+        shell_manifest["dependencies"][subject.SCOPE + "host-api"] = "file:../../packages/host-api"
+        changed_files[shell + "/package.json"] = _json(shell_manifest) + b"\n"
+        self.assert_refused("npm_manifest_refused", subject.check_inputs, changed_files,
+                            subject.RUNTIME_WAVE_70A_FILING)
+        lock = json.loads(self.runtime_lock(world, manifests).decode("ascii"))
+        link = "node_modules/" + subject.SCOPE + "host-api"
+        lock["packages"][link]["resolved"] = "../../packages/host-api"
+        self.assert_refused("npm_lock_refused", subject.check_lock, _json(lock) + b"\n", plan)
+        extra_member = json.loads(self.runtime_lock(world, manifests).decode("ascii"))
+        extra_member["packages"]["apps/unlisted/web"] = {
+            "name": subject.SCOPE + "unlisted", "version": "0.1.0",
+        }
+        self.assert_refused("npm_lock_refused", subject.check_lock, _json(extra_member) + b"\n", plan)
+        duplicate_source = json.loads(self.runtime_lock(world, manifests).decode("ascii"))
+        duplicate_source["packages"]["node_modules/alpha-pkg/node_modules/" + subject.SCOPE + "host-api"] = {
+            "version": "0.1.0",
+        }
+        self.assert_refused("npm_lock_refused", subject.check_lock, _json(duplicate_source) + b"\n", plan)
+        crossed_plan = subject.check_inputs(self.runtime_files(subject.RUNTIME_WAVE_70B_FILING)[2],
+                                            subject.RUNTIME_WAVE_70B_FILING)
+        self.assert_refused("npm_lock_refused", subject.check_lock, self.runtime_lock(world, manifests),
+                            crossed_plan)
+
+    def test_both_wave70_npm_roots_accept_locks_at_their_production_locations(self):
+        world = World()
+        core_files, core_lock = self.core_files_and_lock(world)
+        core_plan = subject.check_inputs(core_files, subject.CORE_WAVE_70A_FILING)
+        runtime_world, runtime_manifests, runtime_files = self.runtime_files()
+        runtime_plan = subject.check_inputs(runtime_files, subject.RUNTIME_WAVE_70A_FILING)
+        runtime_lock = self.runtime_lock(runtime_world, runtime_manifests)
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / "runtime").mkdir()
+            (project / "package-lock.json").write_bytes(core_lock)
+            (project / "runtime/package-lock.json").write_bytes(runtime_lock)
+            core_path = project / subject.FILINGS[subject.CORE_WAVE_70A_FILING]["root_lock"]
+            runtime_path = project / subject.FILINGS[subject.RUNTIME_WAVE_70A_FILING]["root_lock"]
+            self.assertEqual(subject.check_lock(core_path.read_bytes(), core_plan)[0]["name"],
+                             subject.ROOT_NAME)
+            self.assertEqual(subject.check_lock(runtime_path.read_bytes(), runtime_plan)[0]["name"],
+                             "runtime-shell")
+            self.assertNotEqual(runtime_path, project / "runtime/runtime/package-lock.json")
+            self.assert_refused("npm_lock_refused", subject.check_lock, core_lock, runtime_plan)
+            changed_runtime = json.loads(runtime_lock.decode("ascii"))
+            del changed_runtime["packages"]["packages/host-ui"]
+            self.assert_refused(
+                "npm_lock_refused", subject.check_lock, _json(changed_runtime) + b"\n", runtime_plan,
+            )
 
 
 class CommandTests(RefusalAssertions):
@@ -1468,7 +1692,7 @@ class FetcherTests(RefusalAssertions):
 
     def test_paths_with_queries_fragments_or_other_shapes_are_refused(self):
         fetcher = subject.RegistryFetcher(opener=FakeOpener({}))
-        for path in ("plain", "/a?b=1", "/a" + chr(35) + "b", "/" + "x" * 1100, None):
+        for path in ("plain", "/a?b=1", "/a" + "\x23" + "b", "/" + "x" * 1100, None):
             with self.subTest(path=path):
                 self.assert_refused("npm_network_refused", fetcher._exchange, path, 10, "application/json")
 

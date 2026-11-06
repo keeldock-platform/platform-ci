@@ -5,13 +5,15 @@ import hashlib
 import hmac
 import os
 import re
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import cargo_lock_receipt
 
 
 UNSET = "UNSET"
-TRUSTED_PORTS = None
 MAX_LOCK_BYTES = 4 * 1024 * 1024
 MAX_PACKAGES = 20000
 MAX_OUTPUT_BYTES = 4096
@@ -23,6 +25,7 @@ MAX_NOTICE_PATH_BYTES = 512
 MAX_IDENTITY_FILE_BYTES = 268_435_456
 PROCESS_TIMEOUT_SECONDS = 120
 MAX_ADVISORY_AGE_SECONDS = 24 * 60 * 60
+CARGO_DENY_POLICY_SHA256 = "e5c21cc604c5ffc78830e0125086887e76302c6e54f5184ec8230bc812db4b13"
 SOURCE_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX_RE = re.compile(r"[a-f0-9]{64}\Z")
 PACKAGE_RE = re.compile(r"[a-zA-Z0-9_-]{1,128}\Z")
@@ -110,11 +113,12 @@ class GateConfig:
     cargo_deny_issue_910_safe: bool
     cargo_deny_affected_patched_controls_qualified: bool
     seal: object
+    cargo_executable_path: str = ""
 
 
 @dataclass(frozen=True)
 class TrustedPorts:
-    """Trusted source-free adapters; no production set is configured."""
+    """Trusted source-free adapters, bound to the pinned Wave 70 configuration."""
 
     lock: object
     config: object
@@ -289,6 +293,7 @@ def _validated_config(config):
         config.advisory_database_commit, config.advisory_database_generated_at_epoch,
         config.cargo_deny_issue_910_safe,
         config.cargo_deny_affected_patched_controls_qualified, _SEAL,
+        config.cargo_executable_path,
     )
 
 
@@ -413,8 +418,11 @@ def _validate_config(config, identity):
             config.checker_path, config.cargo_deny_path, config.cargo_deny_home,
             config.policy_path)):
         _refuse("identity")
+    if config.cargo_executable_path and not os.path.isabs(config.cargo_executable_path):
+        _refuse("identity")
     for path in (config.checker_path, config.cargo_deny_path, config.cargo_deny_home,
-                 config.policy_path):
+                 config.policy_path, *((config.cargo_executable_path,)
+                                       if config.cargo_executable_path else ())):
         _require_outside_source(path, identity.root)
     expected_argv_sha256 = _cargo_deny_argv_sha256(identity, config.policy_path)
     if not hmac.compare_digest(config.cargo_deny_cli_argv_sha256, expected_argv_sha256):
@@ -550,13 +558,18 @@ def _run_license_checker(process_port, config, identity, evidence, cancellation)
 
 
 def _run_cargo_deny(process_port, config, identity, archive_spdx_sha256, cancellation):
-    environment = (
+    environment = [
         ("CARGO_HOME", config.cargo_deny_home), ("HOME", config.cargo_deny_home),
         ("LANG", "C"), ("LC_ALL", "C"),
-    )
+    ]
+    if config.cargo_executable_path:
+        environment.append((
+            "PATH", os.path.dirname(config.cargo_executable_path) + os.pathsep
+            + os.environ.get("PATH", ""),
+        ))
     argv = _cargo_deny_argv(identity, config.policy_path)
     request = _request((
-        config.cargo_deny_path, config.checker_source_sha, argv, identity.root, b"", environment,
+        config.cargo_deny_path, config.checker_source_sha, argv, identity.root, b"", tuple(environment),
         PROCESS_TIMEOUT_SECONDS, MAX_OUTPUT_BYTES, cancellation,
         config.cargo_deny_sha256, config.policy_sha256,
         config.cargo_deny_qualification_sha256,
@@ -701,3 +714,158 @@ def require_lock_admission(lock_bytes, identity, ports=None):
     if any(package.get("source") is not None for package in packages):
         return require_configured_control(lock_bytes, identity, ports)
     return RegistryFreeReceipt(identity, len(packages), _SEAL)
+
+
+class _PinnedLockPort:
+    def validate(self, lock_bytes, identity):
+        try:
+            parsed = cargo_lock_receipt.parse_cargo_lock(lock_bytes)
+        except cargo_lock_receipt.Refusal:
+            _refuse("lock")
+        packages = []
+        for row in parsed["packages"]:
+            source = row.get("source")
+            if source is None:
+                continue
+            if source != cargo_lock_receipt.REGISTRY_SOURCE:
+                _refuse("lock")
+            packages.append(Package(row["name"], row["version"], row["checksum"]))
+        packages = tuple(sorted(
+            packages, key=lambda item: (item.name, item.version, item.checksum),
+        ))
+        if not packages:
+            _refuse("lock")
+        return _validated_lock(identity, packages)
+
+
+class _PinnedConfigPort:
+    def for_identity(self, identity):
+        import cargo_deny_installer
+
+        environment = os.environ
+        control_sha = environment.get("CI_SHA", UNSET)
+        executable = environment.get("KD_CARGO_DENY_PATH", UNSET)
+        receipt = environment.get("KD_CARGO_DENY_RECEIPT_PATH", UNSET)
+        cargo_home = environment.get("KD_CARGO_DENY_HOME", UNSET)
+        advisory_path = environment.get("KD_RUSTSEC_ADVISORY_DB_PATH", UNSET)
+        rust_root = environment.get("RUST_ROOT", UNSET)
+        if (SOURCE_RE.fullmatch(control_sha or "") is None or UNSET in (
+                executable, receipt, cargo_home, advisory_path, rust_root)):
+            _refuse("archive_producer_unavailable")
+        try:
+            install_record = cargo_deny_installer.verify_installed(executable, receipt)
+            expected_db = cargo_deny_installer.advisory_database_path(cargo_home)
+            if os.path.realpath(advisory_path) != os.path.realpath(expected_db):
+                _refuse("advisory_database_unavailable")
+            commit, generated_epoch = cargo_deny_installer.verify_advisory_database(advisory_path)
+            policy_path = os.path.join(os.path.dirname(__file__), "cargo_deny_policy.toml")
+            checker_path = os.path.join(os.path.dirname(__file__), "rust_license_checker.py")
+            cargo_executable = os.path.join(
+                rust_root, "bin", "cargo.exe" if os.name == "nt" else "cargo",
+            )
+            policy_sha256 = _digest_file(policy_path)
+            if not hmac.compare_digest(policy_sha256, CARGO_DENY_POLICY_SHA256):
+                _refuse("identity")
+            checker_sha256 = _digest_file(checker_path)
+            deny_sha256 = install_record["executable_sha256"]
+            qualification = hashlib.sha256((
+                "cargo-deny=" + install_record["version"]
+                + "\nasset=" + install_record["asset_sha256"]
+                + "\npolicy=" + policy_sha256
+                + "\nadvisory-origin=" + cargo_deny_installer.RUSTSEC_ADVISORY_DATABASE_URL
+                + "\nadvisory-max-age=" + str(MAX_ADVISORY_AGE_SECONDS)
+                + "\ncli=manifest,config,workspace,all-features,locked,offline,all-checks"
+            ).encode("ascii")).hexdigest()
+        except LicenseGateRefusal:
+            raise
+        except BaseException:
+            _refuse("archive_context_unavailable")
+        if not os.path.isfile(cargo_executable):
+            _refuse("archive_context_unavailable")
+        return _validated_config(GateConfig(
+            identity=identity,
+            checker_source_sha=control_sha,
+            checker_path=checker_path,
+            checker_sha256=checker_sha256,
+            cargo_deny_path=executable,
+            cargo_deny_home=cargo_home,
+            cargo_deny_sha256=deny_sha256,
+            cargo_deny_qualification_sha256=qualification,
+            policy_path=policy_path,
+            policy_sha256=policy_sha256,
+            cargo_deny_provenance_qualified=True,
+            cargo_deny_cli_qualified=True,
+            cargo_deny_cli_argv_sha256=_cargo_deny_argv_sha256(identity, policy_path),
+            r108_qualified=False,
+            advisory_database_fresh=True,
+            advisory_database_commit=commit,
+            advisory_database_generated_at_epoch=generated_epoch,
+            cargo_deny_issue_910_safe=False,
+            cargo_deny_affected_patched_controls_qualified=False,
+            seal=None,
+            cargo_executable_path=cargo_executable,
+        ))
+
+
+class _PinnedArchivePort:
+    def verify_complete(self, lock_bytes, identity, lock_packages):
+        import cargo_archive_producer
+
+        return cargo_archive_producer.TrustedArchivePort().verify_complete(
+            lock_bytes, identity, lock_packages,
+        )
+
+
+class _PinnedProcessPort:
+    def run(self, request):
+        try:
+            actual = _digest_file(request.executable)
+            if not hmac.compare_digest(actual, request.executable_sha256):
+                _refuse("substitution")
+            environment = dict(request.environment)
+            executable_path = Path(request.executable)
+            if executable_path.suffix.lower() == ".py":
+                argv = [sys.executable, "-I", "-S", "-B", str(executable_path), *request.argv]
+            else:
+                argv = [request.executable, *request.argv]
+            process = subprocess.Popen(
+                argv, cwd=request.cwd, stdin=subprocess.PIPE if request.stdin else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
+            )
+            try:
+                stdout, stderr = process.communicate(
+                    input=request.stdin if request.stdin else None,
+                    timeout=request.timeout_seconds,
+                )
+                timed_out = False
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+                timed_out = True
+            if len(stdout) > request.output_limit or len(stderr) > request.output_limit:
+                _refuse("process")
+            outcome = (process.returncode, timed_out, False, stdout, stderr)
+            return _process_result(request, outcome, actual)
+        except LicenseGateRefusal:
+            raise
+        except (OSError, subprocess.SubprocessError, ValueError):
+            _refuse("process")
+
+    def cleanup(self, request, result):
+        del request, result
+
+
+class _NeverCancelled:
+    def cancelled(self):
+        return False
+
+
+def _production_trusted_ports():
+    """Create adapters for the pinned checker; missing review proofs still refuse admission."""
+    return _validated_ports(TrustedPorts(
+        _PinnedLockPort(), _PinnedConfigPort(), _PinnedArchivePort(),
+        _PinnedProcessPort(), _NeverCancelled(), None,
+    ))
+
+
+TRUSTED_PORTS = _production_trusted_ports()

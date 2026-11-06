@@ -12,11 +12,10 @@ import zipfile
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
-if not sys.platform.startswith("linux"):
-    raise unittest.SkipTest("the Linux source build suite runs only on Linux")
-
-import gate_table
-import linux_source_build
+_LINUX_ONLY = not sys.platform.startswith("linux")
+if not _LINUX_ONLY:
+    import gate_table
+    import linux_source_build
 
 
 __all__ = ["WindowsSourceBindingTests", "LinuxBrowserTierTests"]
@@ -35,6 +34,7 @@ def _path_only_lock(count, prefix="member"):
     return text
 
 
+@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class WindowsSourceBindingTests(unittest.TestCase):
     SOURCE = "a" * 40
     BASE = "b" * 40
@@ -571,6 +571,7 @@ def _browser_zip(path, entries):
             archive.writestr(info, data)
 
 
+@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class LinuxBrowserTierTests(unittest.TestCase):
     def test_the_pinned_chromium_matches_the_playwright_release_and_is_hash_verified(self):
         subject = linux_source_build
@@ -913,7 +914,9 @@ class LinuxBrowserTierTests(unittest.TestCase):
         quick = (root / "core-linux-quick-return.yml").read_text(encoding="utf-8")
         self.assertEqual(admission.count('KD_BROWSER_TIER: "1"'), 2)
         self.assertEqual(admission.count("BROWSER_ROOT: ${{ steps."), 2)
-        self.assertEqual(admission.count("REQUESTED_SOURCE_SHA,BROWSER_ROOT python3"), 2)
+        self.assertEqual(
+            admission.count("REQUESTED_SOURCE_SHA,BROWSER_ROOT,CI_SHA,KD_CARGO_DENY_PATH"), 2,
+        )
         self.assertIn("BROWSER_ROOT: ${{ steps.toolchains.outputs.browser_root }}", admission)
         self.assertIn("BROWSER_ROOT: ${{ steps.verifier-toolchain.outputs.browser_root }}", admission)
         self.assertEqual(quick.count('KD_BROWSER_TIER: "1"'), 1)

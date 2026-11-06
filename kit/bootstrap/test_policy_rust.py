@@ -50,7 +50,7 @@ class RustLockWorkflowPolicyTests(unittest.TestCase):
         self.assertEqual(workflow, policy_rust.CORE_RUST_LOCK_RETURN_WORKFLOW_TEMPLATE.encode("utf-8"))
         self.assertTrue(validate_workflow_text(workflow.decode("utf-8"), "platform", RUST_LOCK_KIND))
         self.assertTrue(workflow.isascii())
-        self.assertNotIn(chr(35).encode("ascii"), workflow)
+        self.assertNotIn(b"\x23", workflow)
         self.assertLess(len(workflow), 262144)
 
     def test_workflow_is_manual_main_only_with_no_privileged_default_permission(self):
@@ -116,9 +116,13 @@ class RustLockWorkflowPolicyTests(unittest.TestCase):
             "name: Revoke token when producer did not confirm",
         )]
         self.assertEqual(order, sorted(order))
-        for forbidden in ("cargo ", "rustup", ".cargo", "CARGO_", "RUSTC", "HTTP_PROXY", "https_proxy"):
+        for forbidden in ("cargo ", "rustup", ".cargo", "RUSTC", "HTTP_PROXY", "https_proxy"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, workflow)
+        for required in ("KD_CARGO_DENY_PATH", "KD_CARGO_DENY_RECEIPT_PATH", "KD_CARGO_DENY_HOME",
+                         "KD_RUSTSEC_ADVISORY_DB_PATH"):
+            with self.subTest(required=required):
+                self.assertIn(required, workflow)
 
     def test_every_action_is_pinned_to_a_full_commit_and_nothing_else_is_used(self):
         workflow = RUST_LOCK_WORKFLOW.read_text(encoding="utf-8")

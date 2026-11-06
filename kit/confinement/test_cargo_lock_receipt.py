@@ -231,7 +231,7 @@ class CargoLockReceiptTests(unittest.TestCase):
             _assert_refused(self, lambda: subject.parse_cargo_lock(LOCK_BYTES + second), "cargo_lock_invalid")
 
     def test_multiline_array_counts_raw_whitespace_and_comment_bytes(self):
-        marker = chr(35).encode("ascii")
+        marker = b"\x23"
         for continuation in (b" " * 80, marker + b" " * 80):
             lock = LOCK_BYTES.replace(
                 b"dependencies = []", b"dependencies = [\n" + continuation + b"\n]",
@@ -851,7 +851,11 @@ class CargoLockReceiptTests(unittest.TestCase):
     def test_macos_system_temp_alias_returns_physical_path(self):
         if not Path("/var").is_symlink():
             self.skipTest("system temporary path has no alias")
-        with tempfile.TemporaryDirectory(dir="/var/tmp") as temporary:
+        try:
+            temporary_context = tempfile.TemporaryDirectory(dir="/var/tmp")
+        except OSError:
+            self.skipTest("system temporary alias is not writable in this runner")
+        with temporary_context as temporary:
             descriptor, physical = subject._open_target_directory(temporary)
             try:
                 expected = Path("/") / "private" / "var" / "tmp"

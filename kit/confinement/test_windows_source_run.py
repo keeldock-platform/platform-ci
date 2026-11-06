@@ -108,11 +108,12 @@ class WindowsSourceRunTests(unittest.TestCase):
         plan = self.function_body("Get-GatePlan")
         profile = self.function_body("Resolve-GatePlanRuntimeProfile")
         self.assertIn("if ($script:RunMode -ceq 'synthetic') { return (Test-RuntimeWorkspace $project) }", profile)
-        self.assertIn("$runtime = Test-RuntimeWorkspaceProfile $project", profile)
+        self.assertIn("$runtime = Test-RuntimeWorkspaceProfile $project $sourceSha", profile)
         self.assertIn("if ($runtime -ne (Test-RuntimeWorkspace $project))", profile)
         self.assertIn("[bool]$runtime", plan)
         self.assertIn("$expectedCount = $MaxGateCount", plan)
         self.assertIn("check-runtime_profile-source", self.function_body("Test-RuntimeWorkspaceProfile"))
+        self.assertIn("$bound['source_sha']", self.runner)
         self.assertLess(self.runner.index("$runtimeProfile = Resolve-GatePlanRuntimeProfile $project"),
                         self.runner.index("$plan = Get-GatePlan"))
         self.assertLess(self.runner.index("$plan = Get-GatePlan"),

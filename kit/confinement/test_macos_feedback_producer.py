@@ -15,6 +15,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import cargo_lock_bootstrap as cargo_bootstrap
+
 
 MODULE_PATH = Path(__file__).resolve().parent / "macos_feedback_producer.py"
 SPEC = importlib.util.spec_from_file_location("macos_feedback_producer", MODULE_PATH)
@@ -685,6 +687,66 @@ class MacosFeedbackProducerTests(unittest.TestCase):
                 )
         self.assertEqual(read_file.call_args.kwargs["maximum"], producer.MAX_RUST_FILE_BYTES)
 
+    def test_inventoried_native_inputs_are_candidate_bound_and_use_inventory_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            relative = "runtime/apps/test-shell-desktop/src-tauri/resources/app.bin"
+            source_file = source / relative
+            source_file.parent.mkdir(parents=True)
+            source_file.write_bytes(b"native-input")
+            source_info = SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_nlink=1)
+            original_lstat = Path.lstat
+
+            def source_lstat(path):
+                if path == source_file:
+                    return source_info
+                return original_lstat(path)
+
+            payload = b"native-input"
+            object_id = hashlib.sha1(
+                b"blob " + str(len(payload)).encode("ascii") + b"\x00" + payload,
+            ).hexdigest()
+            with patch.object(producer, "_make_worker_directory"), \
+                    patch.object(producer, "_read_file", return_value=payload) as read_file, \
+                    patch.object(producer, "_write_worker_file") as write_file, \
+                    patch.object(Path, "lstat", new=source_lstat):
+                producer._copy_reviewed_files(
+                    source, root / "worker", (relative,), 501, 20,
+                    candidate_files={relative: ("100644", object_id)},
+                    inventoried_paths=frozenset((relative,)),
+                    inventory_file_max_bytes=cargo_bootstrap.MAX_INVENTORY_FILE_BYTES,
+                )
+            self.assertEqual(
+                read_file.call_args.kwargs["maximum"],
+                cargo_bootstrap.MAX_INVENTORY_FILE_BYTES,
+            )
+            self.assertEqual(write_file.call_args.args[1], payload)
+
+    def test_runtime_package_root_parser_admits_only_wave_70a_and_70b_profiles(self):
+        cases = (
+            producer.RUNTIME_PACKAGE_ROOTS,
+            producer.RUNTIME_PACKAGE_ROOTS + producer.RUNTIME_WAVE_70_APP_ROOTS,
+            producer.RUNTIME_PACKAGE_ROOTS + producer.RUNTIME_WAVE_70_APP_ROOTS
+            + producer.RUNTIME_WAVE_70_CRATE_ROOTS,
+        )
+        for roots in cases:
+            manifest = "[workspace]\nmembers = [\n" + "".join(
+                '    "' + path.as_posix().removeprefix("runtime/") + '",\n'
+                for path in roots
+            ) + "]\n"
+            with self.subTest(member_count=len(roots)), patch.object(
+                    producer, "_read_file", return_value=manifest.encode("ascii")):
+                self.assertEqual(producer._runtime_package_roots(Path("/source"), "runtime"), roots)
+        invalid = cases[-1] + (Path("runtime/crates/host/registry"),)
+        manifest = "[workspace]\nmembers = [\n" + "".join(
+            '    "' + path.as_posix().removeprefix("runtime/") + '",\n'
+            for path in invalid
+        ) + "]\n"
+        with patch.object(producer, "_read_file", return_value=manifest.encode("ascii")):
+            with self.assertRaises(producer.FeedbackRefusal):
+                producer._runtime_package_roots(Path("/source"), "runtime")
+
     def test_source_profile_failure_restores_source_cwd_and_never_returns_payload(self):
         dispatch = _validated_dispatch("rust_patch")
         calls = []
@@ -1270,7 +1332,8 @@ class CargoLockProducerTests(unittest.TestCase):
                 producer._runtime_package_roots(Path("/source"), "runtime")
 
     def _run(self, *, returncode=0, config_error=None, bundle_error=None, kind="cargo_lock",
-             manifest_error=None, members_error=None, workspace=None, runtime_roots=None):
+             manifest_error=None, members_error=None, workspace=None, runtime_roots=None,
+             license_gate_error=None):
         dispatch = _validated_dispatch(kind)
         if workspace is not None:
             dispatch["request"] = dict(dispatch["request"], workspace=workspace)
@@ -1309,7 +1372,7 @@ class CargoLockProducerTests(unittest.TestCase):
             source.mkdir()
             state["source"] = source
             state["worker_storage"] = worker_storage
-            with patch.object(producer, "_reviewed_rust_paths", side_effect=lambda unused_source, include_fuzz=False, roots=None: (
+            with patch.object(producer, "_reviewed_rust_paths", side_effect=lambda unused_source, include_fuzz=False, roots=None, inventory_paths=frozenset(): (
                         ("crates/host/api/src/lib.rs",) if roots in (None, producer.PACKAGE_ROOTS) else
                         ("runtime/crates/services/sync-publication/src/lib.rs",)
                     )), \
@@ -1337,9 +1400,12 @@ class CargoLockProducerTests(unittest.TestCase):
                                  side_effect=manifest_error, return_value=frozenset(("host-api",))) as check_manifests, \
                     patch.object(self.bootstrap, "check_lock_members",
                                  side_effect=members_error, return_value=True) as check_members, \
+                    patch.object(producer.rust_license_gate, "require_lock_admission",
+                                 side_effect=license_gate_error) as admit_lock, \
                     patch.object(self.bootstrap, "produce_bundle", side_effect=record_bundle):
                 state["check_manifests"] = check_manifests
                 state["check_members"] = check_members
+                state["admit_lock"] = admit_lock
                 state["copy"] = copy_files
                 state["read_lock"] = read_lock
                 state["refuse_config"] = refuse_config
@@ -1543,6 +1609,8 @@ class CargoLockProducerTests(unittest.TestCase):
                 with patch.object(producer, "_run_worker", side_effect=run_cargo), \
                         patch.object(producer.time, "time", return_value=NOW), \
                         patch.object(producer, "_authenticated_candidate_files", side_effect=candidate_entries), \
+                        patch.object(producer.rust_license_gate, "require_lock_admission",
+                                     return_value=object()) as admit_lock, \
                         patch.object(self.bootstrap, "RegistryFetcher", LocalFetcher):
                     result = producer.run_cargo_lock_profile(
                         dispatch, source, worker_storage, os.getuid(), self.environment,
@@ -1550,6 +1618,11 @@ class CargoLockProducerTests(unittest.TestCase):
                         SimpleNamespace(PROBE_PRIMARY_GID=os.getgid()), self.rust, 10**12,
                         self.bootstrap, self.source_environ, admitted_workspace_selector="runtime",
                     )
+                admitted_identity = admit_lock.call_args.args[1]
+                self.assertEqual(admit_lock.call_args.args[0], lock_bytes)
+                self.assertEqual(admitted_identity.source_sha, SOURCE_SHA)
+                self.assertEqual(admitted_identity.profile, "runtime")
+                self.assertEqual(admitted_identity.lock_sha256, hashlib.sha256(lock_bytes).hexdigest())
                 project = worker_storage / "feedback-cargo-lock"
                 self.assertEqual(len(cargo_commands), 1)
                 self.assertEqual(
@@ -1653,6 +1726,13 @@ class CargoLockProducerTests(unittest.TestCase):
         self.assertEqual(state["read_lock"].call_args.args, (
             project / "Cargo.lock", 501, self.bootstrap.MAX_LOCK_BYTES,
         ))
+
+    def test_license_gate_refusal_blocks_lock_return(self):
+        failure = producer.rust_license_gate.LicenseGateRefusal("archive_producer_unavailable")
+        state = self._run(license_gate_error=failure)
+        self.assertEqual(state["refusal"], "command_failed")
+        self.assertEqual(state["admit_lock"].call_args.args[0], b"lock-bytes")
+        self.assertEqual(state["bundles"], [])
 
     def test_bundle_is_bound_to_the_request_toolchain_and_pending_policy(self):
         state = self._run()

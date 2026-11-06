@@ -110,7 +110,10 @@ class NpmAdmissionProfileTests(unittest.TestCase):
         )
         self.assertNotEqual(fixture_request["request_id"], request["request_id"])
         self.assertEqual(
-            subject.NPM_FILING_SELECTORS, ("contract-ui-batch-a", "contract-ui-batch-b", "quick-fixture"),
+            subject.NPM_FILING_SELECTORS, (
+                "contract-ui-batch-a", "contract-ui-batch-b", "quick-fixture",
+                "core-wave70a", "runtime-wave70a", "core-wave70b", "runtime-wave70b",
+            ),
         )
         second = _fields()
         second["workspace"] = "contract-ui-batch-b"

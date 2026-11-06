@@ -1,6 +1,7 @@
 """Source-only contract tests for the trusted Rust licence gate."""
 
 import hashlib
+import os
 import tempfile
 import time
 import unittest
@@ -212,6 +213,46 @@ class RustLicenseGateTests(unittest.TestCase):
             gate._cargo_deny_argv_sha256(self.identity, str(self.policy)),
             self.config.cargo_deny_cli_argv_sha256,
         )
+
+    def test_production_process_adapter_runs_and_unqualified_flags_still_refuse(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = root / "real_checker.py"
+            executable.write_text(
+                "import sys\nsys.stdout.buffer.write(b'real-adapter-ok\\n')\n",
+                encoding="ascii",
+            )
+            identity = gate.Identity(
+                "c" * 40, "fixture-profile", str(root / "source"), "d" * 64,
+            )
+            request = gate.ProcessRequest(
+                str(executable), "e" * 40, ("--stdin-protocol",), str(root), b"",
+                (("HOME", str(root)), ("LANG", "C"), ("LC_ALL", "C"),
+                 ("SystemRoot", os.environ.get("SystemRoot", ""))),
+                gate.PROCESS_TIMEOUT_SECONDS, gate.MAX_OUTPUT_BYTES, _Cancellation(),
+                hashlib.sha256(executable.read_bytes()).hexdigest(), "f" * 64,
+                "a" * 64, "b" * 40, identity, "9" * 64,
+            )
+            output = gate._run_process(
+                gate._PinnedProcessPort(), request, "process",
+            )
+            self.assertEqual(output, b"real-adapter-ok\n")
+
+        unqualified = self._with_config(
+            r108_qualified=False,
+            cargo_deny_issue_910_safe=False,
+            cargo_deny_affected_patched_controls_qualified=False,
+        )
+        production_process = gate._PinnedProcessPort()
+        with self.assertRaises(gate.LicenseGateRefusal) as raised:
+            gate.require_rust_license_gate(
+                self.lock, self.identity,
+                _trusted_ports(
+                    _LockPort(self.packages), _ConfigPort(unqualified),
+                    _ArchivePort((self.archive,)), production_process, _Cancellation(),
+                ),
+            )
+        self.assertEqual(raised.exception.reason, "cargo_deny_unqualified")
 
     def test_missing_archive_and_archive_coverage_mismatch_refuse_before_process(self):
         for port in (_ArchivePort((), omit=True), _ArchivePort(()),
@@ -517,7 +558,7 @@ class RegistryFreeAdmissionTests(unittest.TestCase):
                 self.assertIs(receipt.seal, gate._SEAL)
 
     def test_registry_package_without_trusted_ports_refuses_producer_unavailable(self):
-        self.assertIsNone(gate.TRUSTED_PORTS)
+        self.assertIs(type(gate.TRUSTED_PORTS), gate.TrustedPorts)
         self.assertEqual(self._reason(_registry_lock()), "archive_producer_unavailable")
 
     def test_unsupported_lock_shapes_refuse_with_lock(self):
@@ -526,7 +567,7 @@ class RegistryFreeAdmissionTests(unittest.TestCase):
                 ("root-app",), extra_fields='checksum = "' + "c" * 64 + '"\n'),
             "git_source": _path_lock(("root-app",), extra_fields=(
                 'source = "git+https://example.invalid/repo?rev=' + "d" * 40
-                + chr(35) + "d" * 40 + '"\n')),
+                + "\x23" + "d" * 40 + '"\n')),
             "metadata": _path_lock(("root-app",), trailer='\n[metadata]\n'),
             "patch_unused": _path_lock(("root-app",), trailer='\n[[patch.unused]]\n'),
             "duplicate": _path_lock(("root-app", "root-app")),

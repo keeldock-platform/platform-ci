@@ -130,6 +130,23 @@ class SuiteSelectorTests(unittest.TestCase):
                 self.assertTrue(report.escalated)
                 self.assertEqual(report.would_select, tuple(sorted(FULL_SUITES)))
 
+    def test_wave_70_runtime_inventory_and_xtask_changes_are_protected_inputs(self):
+        for path in (
+            "runtime/admission/inventory.toml",
+            "runtime/apps/test-shell-desktop/src-tauri/src/main.rs",
+            "runtime/apps/test-shell-mobile/src-tauri/tauri.conf.json",
+            "runtime/crates/host/entitlements/src/lib.rs",
+            "runtime/crates/services/vault/src/lib.rs",
+            "tools/xtask/src/main.rs",
+        ):
+            with self.subTest(path=path):
+                report = select_suites(
+                    (path,), FULL_SUITES, GOOD_BASE_SHA, base_resolved=True,
+                )
+                self.assertTrue(report.escalated)
+                self.assertEqual(report.would_select, tuple(sorted(FULL_SUITES)))
+                self.assertIn("protected-input", report.reasons)
+
     def test_valid_sha_with_unresolved_base_escalates_to_full_set(self):
         report = select_suites(
             ("crates/host/mcp-host/windows/file.rs",),

@@ -245,7 +245,7 @@ class CoreCheckTests(unittest.TestCase):
             "tree_entries", "required_files", "path_mode", "base_policy", "rules_manifest",
             "rules_inventory", "rules_hash", "workspace_decode", "workspace_members",
             "cargo_lock_decode", "cargo_lock_shape", "toolchain", "package_decode",
-            "package_build", "checkout", "lease_paths", "lease_acl", "lease_access",
+            "package_build", "source_inventory", "checkout", "lease_paths", "lease_acl", "lease_access",
             "lease_census",
         }
         self.assertEqual(subject.CORE_BOOTSTRAP_CHECKS, expected)
@@ -4003,9 +4003,11 @@ def _runtime_root_text(roots=None, extra=""):
         for root in roots if type(root) is tuple
     )
     if set(subject.RUNTIME_BATCH_SEVEN_CRATE_ROOTS).issubset(roots):
+        wave70_profile = set(subject.RUNTIME_APP_TAURI_ROOTS).issubset(roots)
+        version = ', version = "=0.2.0"' if wave70_profile else ""
         dependencies = (
             subject.RUNTIME_HOST_API_POLICY_API_PACKAGE + ' = { path = "'
-            + subject.RUNTIME_HOST_API_POLICY_API_PATH + '" }\n'
+            + subject.RUNTIME_HOST_API_POLICY_API_PATH + '"' + version + ' }\n'
         )
     else:
         dependencies = "".join(
@@ -4046,18 +4048,55 @@ def _runtime_member_text(root, extra_package="", tail=""):
     )
 
 
-def _runtime_lock_text(names, extra="", api_consumers=None):
+def _runtime_lock_text(names, extra="", api_consumers=None, api_version=None):
     api_name = subject.RUNTIME_HOST_API_POLICY_API_PACKAGE
+    if api_version is None:
+        api_version = "0.2.0" if {
+            "test-shell-desktop", "test-shell-mobile",
+        }.intersection(names) else "0.1.0"
     if api_consumers is None:
         api_consumers = {
             root[-1] for root in subject.RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS
         } | {subject.RUNTIME_HOST_API_POLICY_OPTIONAL_CONSUMER_ROOT[-1]}
     rows = []
+    registry_source = subject.cargo_lock_bootstrap.cargo.REGISTRY_SOURCE
+    registry_deps = {}
     for name in names:
-        row = '\n[[package]]\nname = "' + name + '"\nversion = "0.1.0"\n'
+        version = api_version if name == api_name else "0.1.0"
+        row = '\n[[package]]\nname = "' + name + '"\nversion = "' + version + '"\n'
+        dependencies = []
         if name in api_consumers and api_name in names:
-            row += 'dependencies = [\n "' + api_name + ' 0.1.0",\n]\n'
+            dependencies.append(api_name + " " + api_version)
+        if name in ("test-shell-desktop", "test-shell-mobile"):
+            dependencies.append("tauri 2.12.4 (" + registry_source + ")")
+        if name == "store":
+            dependencies.append("rusqlite 0.37.0 (" + registry_source + ")")
+        if dependencies:
+            row += "dependencies = [\n" + "".join(
+                ' "' + dependency + '",\n' for dependency in dependencies
+            ) + "]\n"
         rows.append(row + extra)
+    if any(name in ("test-shell-desktop", "test-shell-mobile") for name in names):
+        registry_deps.update({
+            "tauri": ("2.12.4", ("tauri-macros 2.3.0 (" + registry_source + ")",
+                                  "tauri-runtime 2.7.0 (" + registry_source + ")")),
+            "tauri-macros": ("2.3.0", ("tauri-utils 2.7.0 (" + registry_source + ")",)),
+            "tauri-runtime": ("2.7.0", ("tauri-utils 2.7.0 (" + registry_source + ")",)),
+            "tauri-utils": ("2.7.0", ()),
+        })
+    if "store" in names:
+        registry_deps.update({
+            "rusqlite": ("0.37.0", ("libsqlite3-sys 0.35.0 (" + registry_source + ")",)),
+            "libsqlite3-sys": ("0.35.0", ()),
+        })
+    for name, (version, dependencies) in sorted(registry_deps.items()):
+        row = ('\n[[package]]\nname = "' + name + '"\nversion = "' + version
+               + '"\nsource = "' + registry_source + '"\nchecksum = "' + "e" * 64 + '"\n')
+        if dependencies:
+            row += "dependencies = [\n" + "".join(
+                ' "' + dependency + '",\n' for dependency in dependencies
+            ) + "]\n"
+        rows.append(row)
     return "version = 4\n" + "".join(rows)
 
 
@@ -4071,6 +4110,24 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
                 patch.object(subject.posixpath, "abspath", side_effect=AssertionError):
             self.assertEqual(subject._runtime_member_listing(subject.RUNTIME_CRATE_ROOTS), expected)
             self.assertTrue(all(('"' + member + '",') in _runtime_root_text() for member in expected))
+
+    def test_outer_runtime_validator_refuses_build_script_aliases_and_ambiguity(self):
+        core_root = next(root for root in subject.RUNTIME_HOST_CRATE_ROOTS
+                         if root[-1] == "core")
+        canonical = "/".join(core_root) + "/build.rs"
+        for filename in ("BUILD.RS", "Build.rs", "\uFF22UILD.RS"):
+            alias = "/".join(core_root) + "/" + filename
+            with self.subTest(filename=filename):
+                self.assertIsNone(subject._runtime_workspace_mode(
+                    alias, (core_root,), frozenset((alias,)), frozenset((alias,)),
+                ))
+        self.assertEqual(subject._runtime_workspace_mode(
+            canonical, (core_root,), frozenset((canonical,)), frozenset((canonical,)),
+        ), "100644")
+        self.assertIsNone(subject._runtime_workspace_mode(
+            canonical, (core_root,), frozenset((canonical, canonical.upper())),
+            frozenset((canonical,)),
+        ))
 
     @staticmethod
     def _runtime_entries(roots=None):
@@ -4089,6 +4146,10 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             paths.update(
                 prefix + "/" + name for name in subject.RUNTIME_BATCH_SEVEN_DOC_FILES
             )
+        for root in subject.RUNTIME_WAVE_70_CRATE_ROOTS + subject.RUNTIME_APP_TAURI_ROOTS:
+            if root in roots:
+                prefix = "/".join(root)
+                paths.update(prefix + "/" + name for name in subject.RUNTIME_BATCH_SEVEN_DOC_FILES)
         for root in subject.RUNTIME_HOST_CRATE_ROOTS:
             if root in roots:
                 paths.add("/".join(root) + "/CONTRACT.md")
@@ -4097,21 +4158,88 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
     @staticmethod
     def _runtime_blobs(roots=None):
         roots = subject.RUNTIME_CRATE_ROOTS if roots is None else roots
+        package_names = [
+            root[-2] if root in subject.RUNTIME_APP_TAURI_ROOTS else root[-1]
+            for root in roots
+        ]
+        api_consumers = {
+            root[-2] if root in subject.RUNTIME_APP_TAURI_ROOTS else root[-1]
+            for root in roots if root in subject.RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS
+        }
         blobs = {
             subject.RUNTIME_ROOT_MANIFEST_PATH: _runtime_root_text(roots).encode("utf-8"),
             subject.RUNTIME_ROOT_LOCK_PATH: _runtime_lock_text(
-                [root[-1] for root in roots] + (
+                package_names + (
                     [subject.RUNTIME_HOST_API_POLICY_API_PACKAGE]
                     if set(subject.RUNTIME_BATCH_SEVEN_CRATE_ROOTS).issubset(roots) else []
-                ),
+                ), api_consumers=api_consumers,
+                api_version=("0.2.0" if set(subject.RUNTIME_APP_TAURI_ROOTS).issubset(roots)
+                             else "0.1.0"),
             ).encode("ascii"),
             "runtime/rust-toolchain.toml": subject.CORE_CONTRACT_TOOLCHAIN,
             "runtime/rustfmt.toml": b"x",
             "runtime/clippy.toml": b"x",
         }
         for root in roots:
-            blobs["/".join(root) + "/Cargo.toml"] = _runtime_member_text(root).encode("utf-8")
+            manifest = _runtime_member_text(root)
+            if root in subject.RUNTIME_APP_TAURI_ROOTS:
+                manifest = manifest.replace(
+                    'name = "src-tauri"', 'name = "' + root[-2] + '"', 1,
+                )
+                manifest = manifest.replace(
+                    "\n[lints]\n", '\ntauri = "=2.12.4"\n\n[lints]\n', 1,
+                )
+            if root == ("runtime", "crates", "services", "store") \
+                    and set(subject.RUNTIME_WAVE_70_CRATE_ROOTS).issubset(roots):
+                manifest = manifest.replace(
+                    "\n[lints]\n",
+                    '\nrusqlite = { version = "=0.37.0", features = ["bundled"] }\n\n[lints]\n',
+                    1,
+                )
+            blobs["/".join(root) + "/Cargo.toml"] = manifest.encode("utf-8")
         return blobs
+
+    def _wave70_profile_files(self, roots, include_build_script=False):
+        entries = self._runtime_entries(roots)
+        blobs = self._runtime_blobs(roots)
+        inventory_paths = []
+        for app in subject.RUNTIME_APP_TAURI_ROOTS:
+            config = "/".join(app) + "/tauri.conf.json"
+            payload = b"{}\n"
+            entries[config] = ("100644", "a" * 40)
+            blobs[config] = payload
+            inventory_paths.append(config)
+        for frontend in (
+            "runtime/apps/test-shell-desktop/web/src/App.tsx",
+            "runtime/apps/test-shell-mobile/web/src/App.tsx",
+            "runtime/packages/host-ui/src/index.ts",
+        ):
+            entries[frontend] = ("100644", "a" * 40)
+            blobs[frontend] = b"export {}\n"
+        if include_build_script:
+            build_script = "runtime/crates/host/core/build.rs"
+            build_payload = b"fn main() {}\n"
+            entries[build_script] = ("100644", "a" * 40)
+            blobs[build_script] = build_payload
+            inventory_paths.append(build_script)
+        source_sha = "b" * 40
+        rows = []
+        for path in sorted(inventory_paths):
+            rows.append("[[files]]\n" + "".join((
+                'path = "' + path + '"\n',
+                'sha256 = "' + hashlib.sha256(blobs[path]).hexdigest() + '"\n',
+                'owner = "9.5"\n',
+                'package = "test-shell"\n',
+                'target = "all-platforms"\n',
+                'generator = ""\n',
+                'generator_version = ""\n',
+                'provenance = ""\n',
+            )))
+        inventory = ('schema_version = 1\n' + "".join(rows)).encode("ascii")
+        inventory_path = subject.cargo_lock_bootstrap.SOURCE_INVENTORY_PATH
+        entries[inventory_path] = ("100644", "a" * 40)
+        blobs[inventory_path] = inventory
+        return entries, blobs
 
     def _validate(
         self, entries=None, blobs=None, contract_overrides=None, base_entries=None,
@@ -4119,7 +4247,86 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
     ):
         entries = self._runtime_entries() if entries is None else entries
         blobs = self._runtime_blobs() if blobs is None else blobs
-        contract_overrides = contract_overrides or {}
+        contract_overrides = dict(contract_overrides or {})
+        runtime_root = blobs.get(subject.RUNTIME_ROOT_MANIFEST_PATH)
+        try:
+            runtime_roots = (
+                subject._runtime_roots_from_manifest(runtime_root.decode("utf-8"))
+                if type(runtime_root) is bytes else None
+            )
+        except UnicodeDecodeError:
+            runtime_roots = None
+        wave70_runtime = runtime_roots is not None and set(
+            subject.RUNTIME_APP_TAURI_ROOTS,
+        ).issubset(runtime_roots)
+        wave70b_contract = wave70_runtime and set(
+            subject.RUNTIME_WAVE_70_CRATE_ROOTS,
+        ).issubset(runtime_roots)
+        if wave70_runtime:
+            xtask = "tools/xtask"
+            for name in subject.CORE_CONTRACT_PACKAGE_FILES:
+                entries[xtask + "/" + name] = ("100644", "a" * 40)
+            entries[xtask + "/src/main.rs"] = ("100644", "a" * 40)
+            xtask_manifest = (
+                '[package]\nname = "keeldock' + '-xtask"\n'
+                "version.workspace = true\nedition.workspace = true\n"
+                "rust-version.workspace = true\npublish.workspace = true\n\n"
+                '[dependencies]\nkeeldock' + '-host-api = { path = "../../crates/host/api" }\n'
+            )
+            contract_overrides[xtask + "/Cargo.toml"] = xtask_manifest.encode("ascii")
+            extra_members = '    "tools/xtask",\n'
+            local_dependencies = {
+                "keeldock" + "-host-mock": ("keeldock" + "-host-api",),
+                "keeldock" + "-host-conformance": ("keeldock" + "-host-api", "keeldock" + "-host-mock"),
+                "keeldock" + "-xtask": ("keeldock" + "-host-api",),
+            }
+            local_names = set(subject.CORE_CONTRACT_CRATE_NAMES.values()) | {"keeldock" + "-xtask"}
+            if wave70b_contract:
+                demo = "crates/host/conformance/fixtures/demo-tool"
+                for name in subject.CORE_CONTRACT_PACKAGE_FILES:
+                    entries[demo + "/" + name] = ("100644", "a" * 40)
+                entries[demo + "/src/lib.rs"] = ("100644", "a" * 40)
+                contract_overrides[demo + "/Cargo.toml"] = (
+                    '[package]\nname = "keeldock' + '-demo-tool"\n'
+                    "version.workspace = true\nedition.workspace = true\n"
+                    "rust-version.workspace = true\npublish.workspace = true\n\n"
+                    '[dependencies]\nkeeldock' + '-host-api = { path = "../../../api", version = "=0.2.0" }\n'
+                ).encode("ascii")
+                extra_members += '    "' + demo + '",\n'
+                local_dependencies["keeldock" + "-demo-tool"] = ("keeldock" + "-host-api",)
+                local_names.add("keeldock" + "-demo-tool")
+            contract_root = BATCH4_ROOT_TEXT.replace(
+                '    "crates/kernel/i18n",\n',
+                '    "crates/kernel/i18n",\n' + extra_members,
+            ).replace('version = "0.1.0"', 'version = "0.2.0"', 1)
+            contract_overrides["Cargo.toml"] = contract_root.encode("ascii")
+            if wave70b_contract:
+                local_dependencies["keeldock" + "-host-api"] = (
+                    "schemars 1.2.3 (" + subject.cargo_lock_bootstrap.cargo.REGISTRY_SOURCE + ")",
+                    "serde 1.0.229 (" + subject.cargo_lock_bootstrap.cargo.REGISTRY_SOURCE + ")",
+                    "serde_json 1.0.154 (" + subject.cargo_lock_bootstrap.cargo.REGISTRY_SOURCE + ")",
+                )
+            lock_rows = []
+            for name in sorted(local_names):
+                row = '\n[[package]]\nname = "' + name + '"\nversion = "0.2.0"\n'
+                dependencies = local_dependencies.get(name, ())
+                if dependencies:
+                    row += "dependencies = [\n" + "".join(
+                        ' "' + (dependency if " (" in dependency else dependency + " 0.2.0")
+                        + '",\n' for dependency in dependencies
+                    ) + "]\n"
+                lock_rows.append(row)
+            if wave70b_contract:
+                registry_source = subject.cargo_lock_bootstrap.cargo.REGISTRY_SOURCE
+                for name, version in (
+                    ("schemars", "1.2.3"), ("serde", "1.0.229"),
+                    ("serde_json", "1.0.154"),
+                ):
+                    lock_rows.append(
+                        '\n[[package]]\nname = "' + name + '"\nversion = "' + version
+                        + '"\nsource = "' + registry_source + '"\nchecksum = "' + "e" * 64 + '"\n'
+                    )
+            contract_overrides["Cargo.lock"] = ("version = 4\n" + "".join(lock_rows)).encode("ascii")
         merged = CoreContractTreeTests._required_core_contract_entries()
         merged.update(entries)
         digest = hashlib.sha256(b"x").hexdigest()
@@ -4132,7 +4339,10 @@ class RuntimeWorkspaceTreeTests(unittest.TestCase):
             if path in contract_overrides:
                 return contract_overrides[path]
             if path.startswith("crates/") and path.endswith("/Cargo.toml"):
-                return _core_crate_manifest(path).encode("utf-8")
+                return _core_crate_manifest(
+                    path, first_batch=wave70b_contract
+                    and path == "/".join(subject.CORE_CONTRACT_CRATE_ROOTS[0]) + "/Cargo.toml",
+                ).encode("utf-8")
             if path == "Cargo.toml":
                 return BATCH4_ROOT_TEXT.encode("utf-8")
             if path == "Cargo.lock":

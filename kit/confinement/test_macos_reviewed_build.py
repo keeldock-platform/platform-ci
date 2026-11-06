@@ -323,8 +323,19 @@ class ChildEnvironmentTests(unittest.TestCase):
 )
 class RealSummaryFileTests(unittest.TestCase):
     def _temporary_summary(self):
-        home = Path.home()
-        temporary = tempfile.TemporaryDirectory(dir=str(home))
+        temporary_root = Path(tempfile.gettempdir()).resolve()
+        home = temporary_root.parent
+        home_info = home.stat()
+        if home_info.st_uid <= 0 or home_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            self.skipTest("runner-owned home ancestor is unavailable")
+        for ancestor in home.parents:
+            info = ancestor.stat()
+            if info.st_uid != 0 or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                self.skipTest("protected home ancestors are unavailable")
+        try:
+            temporary = tempfile.TemporaryDirectory(dir=str(home))
+        except OSError:
+            self.skipTest("protected runner home is not writable in this sandbox")
         directory = Path(temporary.name)
         summary = directory / "step_summary_fixture"
         descriptor = os.open(summary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

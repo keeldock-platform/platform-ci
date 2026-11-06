@@ -140,6 +140,7 @@ CORE_BOOTSTRAP_CHECKS = frozenset((
     "toolchain",
     "package_decode",
     "package_build",
+    "source_inventory",
     "checkout",
     "lease_paths",
     "lease_acl",
@@ -163,6 +164,16 @@ CORE_CONTRACT_CRATE_ROOTS = (
     ("crates", "host", "mock"),
     ("crates", "host", "conformance"),
     ("crates", "kernel", "i18n"),
+)
+CORE_CONTRACT_WAVE_70A_MEMBER_PATHS = tuple(
+    "/".join(root) for root in CORE_CONTRACT_CRATE_ROOTS
+) + ("tools/xtask",)
+CORE_CONTRACT_WAVE_70B_MEMBER_PATHS = CORE_CONTRACT_WAVE_70A_MEMBER_PATHS + (
+    "crates/host/conformance/fixtures/demo-tool",
+)
+CORE_CONTRACT_WAVE_70_BUILDABLE_ROOTS = (
+    ("tools", "xtask"),
+    ("crates", "host", "conformance", "fixtures", "demo-tool"),
 )
 CORE_CONTRACT_CRATE_NAMES = {
     ("crates", "host", "api"): "keeldock" + "-host-api",
@@ -604,25 +615,49 @@ RUNTIME_SERVICE_CRATE_ROOTS = (
     RUNTIME_SERVICES_DIRECTORY + ("sync-publication",),
     RUNTIME_SERVICES_DIRECTORY + ("palette",),
     RUNTIME_SERVICES_DIRECTORY + ("notifications",),
+    RUNTIME_SERVICES_DIRECTORY + ("log",),
+    RUNTIME_SERVICES_DIRECTORY + ("fs",),
+    RUNTIME_SERVICES_DIRECTORY + ("store",),
+    RUNTIME_SERVICES_DIRECTORY + ("vault",),
 )
 RUNTIME_SERVICE_DOC_ROOTS = frozenset((RUNTIME_SERVICES_DIRECTORY + ("sync-publication",),))
 RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS = (RUNTIME_SERVICES_DIRECTORY + ("sync-format",),)
 RUNTIME_HOST_CRATE_ROOTS = tuple(
-    RUNTIME_HOST_DIRECTORY + (name,) for name in ("registry", "core", "settings-schema")
+    RUNTIME_HOST_DIRECTORY + (name,) for name in ("registry", "core", "settings-schema", "entitlements")
 )
 RUNTIME_BATCH_SEVEN_CRATE_ROOTS = (
-    *RUNTIME_HOST_CRATE_ROOTS,
-    RUNTIME_SERVICES_DIRECTORY + ("palette",),
+    RUNTIME_HOST_DIRECTORY + ("registry",), RUNTIME_HOST_DIRECTORY + ("core",),
+    RUNTIME_HOST_DIRECTORY + ("settings-schema",), RUNTIME_SERVICES_DIRECTORY + ("palette",),
     RUNTIME_SERVICES_DIRECTORY + ("notifications",),
+)
+RUNTIME_WAVE_70_CRATE_ROOTS = (
+    RUNTIME_HOST_DIRECTORY + ("entitlements",), RUNTIME_SERVICES_DIRECTORY + ("log",),
+    RUNTIME_SERVICES_DIRECTORY + ("fs",), RUNTIME_SERVICES_DIRECTORY + ("store",),
+    RUNTIME_SERVICES_DIRECTORY + ("vault",),
+)
+RUNTIME_APP_TAURI_ROOTS = (
+    (RUNTIME_WORKSPACE_DIRECTORY, "apps", "test-shell-desktop", "src-tauri"),
+    (RUNTIME_WORKSPACE_DIRECTORY, "apps", "test-shell-mobile", "src-tauri"),
 )
 RUNTIME_BATCH_SEVEN_DOC_ROOTS = frozenset(RUNTIME_BATCH_SEVEN_CRATE_ROOTS)
 RUNTIME_BATCH_SEVEN_DOC_FILES = frozenset(("README.md", "CONTRACT.md", "CHANGELOG.md"))
 RUNTIME_HOST_API_POLICY_API_PACKAGE = "keeldock" + "-host-api"
 RUNTIME_HOST_API_POLICY_API_PATH = "../crates/host/api"
+RUNTIME_HOST_API_POLICY_API_VERSION = "=0.2.0"
+RUNTIME_WAVE_70_REGISTRY_DEPENDENCIES = {
+    RUNTIME_APP_TAURI_ROOTS[0]: {"tauri": '"=2.12.4"'},
+    RUNTIME_APP_TAURI_ROOTS[1]: {"tauri": '"=2.12.4"'},
+    RUNTIME_WAVE_70_CRATE_ROOTS[3]: {
+        "rusqlite": '{ version = "=0.37.0", features = ["bundled"] }',
+    },
+}
 RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS = (
     RUNTIME_HOST_DIRECTORY + ("registry",), RUNTIME_HOST_DIRECTORY + ("core",),
     RUNTIME_HOST_DIRECTORY + ("settings-schema",), RUNTIME_SERVICES_DIRECTORY + ("palette",),
-    RUNTIME_SERVICES_DIRECTORY + ("notifications",),
+    RUNTIME_SERVICES_DIRECTORY + ("notifications",), RUNTIME_WAVE_70_CRATE_ROOTS[0],
+    RUNTIME_WAVE_70_CRATE_ROOTS[1], RUNTIME_WAVE_70_CRATE_ROOTS[2],
+    RUNTIME_WAVE_70_CRATE_ROOTS[3], RUNTIME_WAVE_70_CRATE_ROOTS[4],
+    RUNTIME_APP_TAURI_ROOTS[0], RUNTIME_APP_TAURI_ROOTS[1],
 )
 RUNTIME_HOST_API_POLICY_OPTIONAL_CONSUMER_ROOT = RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS[0]
 RUNTIME_HOST_API_POLICY_HOST_CONTRACT_DOC_ROOTS = frozenset(RUNTIME_HOST_CRATE_ROOTS)
@@ -635,6 +670,18 @@ RUNTIME_CRATE_ROOTS = RUNTIME_SERVICE_CRATE_ROOTS[:1] + tuple(
     )
 ) + RUNTIME_HOST_CRATE_ROOTS + RUNTIME_SERVICE_CRATE_ROOTS[1:]
 RUNTIME_PRE_BATCH_SEVEN_CRATE_ROOTS = RUNTIME_CRATE_ROOTS[:7]
+RUNTIME_BASE_CRATE_ROOTS = RUNTIME_PRE_BATCH_SEVEN_CRATE_ROOTS + RUNTIME_BATCH_SEVEN_CRATE_ROOTS
+RUNTIME_CRATE_ROOTS = RUNTIME_BASE_CRATE_ROOTS
+RUNTIME_WAVE_70A_CRATE_ROOTS = RUNTIME_BASE_CRATE_ROOTS + RUNTIME_APP_TAURI_ROOTS
+RUNTIME_WAVE_70B_CRATE_ROOTS = (
+    RUNTIME_BASE_CRATE_ROOTS + RUNTIME_WAVE_70_CRATE_ROOTS + RUNTIME_APP_TAURI_ROOTS
+)
+RUNTIME_SUPPORTED_CRATE_PROFILES = (
+    RUNTIME_PRE_BATCH_SEVEN_CRATE_ROOTS,
+    RUNTIME_BASE_CRATE_ROOTS,
+    RUNTIME_WAVE_70A_CRATE_ROOTS,
+    RUNTIME_WAVE_70B_CRATE_ROOTS,
+)
 RUNTIME_CONFIG_FILES = ("rust-toolchain.toml", "rustfmt.toml", "clippy.toml")
 MAX_RUNTIME_MEMBERS = 32
 RUNTIME_MEMBERS_PATTERN = re.compile(r"(?m)^members\s*=\s*\[([^\]]*)\]\s*$")
@@ -650,10 +697,16 @@ RUNTIME_LINT_VALUE_PATTERN = re.compile(
     r'|\{\s*level\s*=\s*"(?:allow|warn|deny|forbid)"\s*,\s*priority\s*=\s*-?[0-9]{1,3}\s*\}\Z'
 )
 RUNTIME_ROOT_PATH_PATTERN = re.compile(r'\{\s*path\s*=\s*"([A-Za-z0-9][A-Za-z0-9/_-]{0,127})"\s*\}\Z')
-RUNTIME_HOST_API_POLICY_API_EDGE_PATTERN = re.compile(r'\{\s*path\s*=\s*"\.\./crates/host/api"\s*\}\Z')
+RUNTIME_HOST_API_POLICY_API_EDGE_LEGACY_PATTERN = re.compile(
+    r'\{\s*path\s*=\s*"\.\./crates/host/api"\s*\}\Z'
+)
+RUNTIME_HOST_API_POLICY_API_EDGE_PATTERN = re.compile(
+    r'\{\s*path\s*=\s*"\.\./crates/host/api"\s*,\s*version\s*=\s*"=0\.2\.0"\s*\}\Z'
+)
 RUNTIME_HOST_API_POLICY_API_ASSIGNMENT_PATTERN = re.compile(
     r'(?m)^\s*' + re.escape(RUNTIME_HOST_API_POLICY_API_PACKAGE)
-    + r'\s*=\s*\{\s*path\s*=\s*"\.\./crates/host/api"\s*\}\s*$'
+    + r'\s*=\s*\{\s*path\s*=\s*"\.\./crates/host/api"'
+    + r'(?:\s*,\s*version\s*=\s*"=0\.2\.0")?\s*\}\s*$'
 )
 RUNTIME_ROOT_SECTIONS = frozenset((
     "[workspace]", "[workspace.package]", "[workspace.dependencies]",
@@ -2296,6 +2349,27 @@ def _core_contract_workspace_members(workspace_text):
     return members
 
 
+def _core_contract_member_roots(workspace_payload):
+    if type(workspace_payload) is not bytes or cargo_lock_bootstrap is None:
+        return None
+    try:
+        members = cargo_lock_bootstrap._contract_members_from_root_bytes(workspace_payload)
+    except (cargo_lock_bootstrap.BootstrapRefusal, ValueError, TypeError):
+        return None
+    try:
+        ordered = _core_contract_workspace_members(workspace_payload.decode("utf-8", "strict"))
+    except UnicodeDecodeError:
+        return None
+    if ordered not in (
+            ["/".join(root) for root in CORE_CONTRACT_CRATE_ROOTS],
+            list(CORE_CONTRACT_WAVE_70A_MEMBER_PATHS),
+            list(CORE_CONTRACT_WAVE_70B_MEMBER_PATHS)):
+        return None
+    if set(ordered) != set(members):
+        return None
+    return tuple(tuple(path.split("/")) for path in ordered)
+
+
 def _core_contract_crate_manifest_shape(text, *, crate_root=None, require_first_batch=False):
     if type(text) is not str or "\r" in text or "\x00" in text:
         return False
@@ -2465,11 +2539,31 @@ def _core_contract_package_mode(path, *, feedback_profile=False):
             if (
                 relative.startswith(("src/", "tests/"))
                 and relative.endswith(".rs")
-                and relative.rsplit("/", 1)[-1] != "build.rs"
+                and not _runtime_build_script_name(relative.rsplit("/", 1)[-1])
             ):
                 return "100644"
     if feedback_profile and _core_contract_foundation_path(path):
         return "100644"
+    return None
+
+
+def _core_contract_wave70_member_mode(path):
+    if type(path) is not str:
+        return None
+    for crate_root in CORE_CONTRACT_WAVE_70_BUILDABLE_ROOTS:
+        prefix = "/".join(crate_root)
+        if not path.startswith(prefix + "/"):
+            continue
+        relative = path[len(prefix) + 1:]
+        if relative in CORE_CONTRACT_PACKAGE_FILES:
+            return "100644"
+        parts = relative.split("/")
+        if (relative.startswith("src/") and relative.endswith(".rs")
+                and not _runtime_build_script_name(parts[-1])):
+            return "100644"
+        if (len(parts) == 2 and parts[0] == "tests" and relative.endswith(".rs")
+                and not _runtime_build_script_name(parts[-1])):
+            return "100644"
     return None
 
 
@@ -2527,10 +2621,7 @@ def _runtime_roots_from_manifest(text):
     members = _runtime_workspace_members(text)
     if members is None or not members:
         return None
-    profiles = (
-        RUNTIME_PRE_BATCH_SEVEN_CRATE_ROOTS,
-        RUNTIME_CRATE_ROOTS,
-    )
+    profiles = RUNTIME_SUPPORTED_CRATE_PROFILES
     for roots in profiles:
         required = _runtime_member_listing(roots)
         optional = _runtime_member_listing(roots + RUNTIME_OPTIONAL_SERVICE_CRATE_ROOTS)
@@ -2542,8 +2633,12 @@ def _runtime_roots_from_manifest(text):
 
 
 def _runtime_root_admitted(root):
+    if type(root) is not tuple:
+        return False
+    if root in RUNTIME_APP_TAURI_ROOTS:
+        return True
     return (
-        type(root) is tuple and len(root) == len(RUNTIME_CRATES_DIRECTORY) + 2
+        len(root) == len(RUNTIME_CRATES_DIRECTORY) + 2
         and root[:len(RUNTIME_CRATES_DIRECTORY)] == RUNTIME_CRATES_DIRECTORY
         and all(
             type(part) is str and RUNTIME_PART_PATTERN.fullmatch(part) is not None
@@ -2558,14 +2653,50 @@ def _runtime_workspace_path(path):
     )
 
 
+def _runtime_path_comparison_key(path):
+    if type(path) is not str:
+        return None
+    normalized = unicodedata.normalize("NFKC", path)
+    return unicodedata.normalize("NFKC", normalized.casefold())
+
+
+def _runtime_build_script_name(name):
+    return _runtime_path_comparison_key(name) == "build.rs"
+
+
+def _runtime_build_script_path(path):
+    key = _runtime_path_comparison_key(path)
+    return key is not None and key.rsplit("/", 1)[-1] == "build.rs"
+
+
+def _runtime_unique_canonical_path_member(path, candidates):
+    key = _runtime_path_comparison_key(path)
+    if key is None or path != key:
+        return False
+    matches = [candidate for candidate in candidates
+               if _runtime_path_comparison_key(candidate) == key]
+    return len(matches) == 1 and matches[0] == path
+
+
 def _runtime_workspace_present(entries):
     return any(path in entries for path in RUNTIME_ROOT_FILES)
 
 
-def _runtime_workspace_mode(path, crate_roots):
+def _runtime_workspace_mode(
+        path, crate_roots, inventory_paths=frozenset(), approved_build_paths=frozenset()):
+    if _runtime_build_script_path(path):
+        return (
+            "100644"
+            if _runtime_unique_canonical_path_member(path, inventory_paths)
+            and _runtime_unique_canonical_path_member(path, approved_build_paths)
+            else None
+        )
     if path in RUNTIME_ROOT_FILES or path in (
         RUNTIME_WORKSPACE_DIRECTORY + "/" + name for name in RUNTIME_CONFIG_FILES
-    ):
+    ) or path in inventory_paths:
+        return "100644"
+    if (cargo_lock_bootstrap is not None
+            and cargo_lock_bootstrap._runtime_frontend_source_allowed(path)):
         return "100644"
     for root in crate_roots:
         prefix = "/".join(root)
@@ -2573,18 +2704,37 @@ def _runtime_workspace_mode(path, crate_roots):
             relative = path[len(prefix) + 1:]
             if relative == "Cargo.toml":
                 return "100644"
+            if root in RUNTIME_WAVE_70_CRATE_ROOTS + RUNTIME_APP_TAURI_ROOTS:
+                if relative in RUNTIME_BATCH_SEVEN_DOC_FILES:
+                    return "100644"
+                relative_parts = relative.split("/")
+                if (
+                    len(relative_parts) >= 2 and relative_parts[0] == "src"
+                    and relative.endswith(".rs")
+                    and not _runtime_build_script_name(relative_parts[-1])
+                ):
+                    return "100644"
+                if (
+                    len(relative_parts) == 2 and relative_parts[0] == "tests"
+                    and relative.endswith(".rs")
+                    and not _runtime_build_script_name(relative_parts[-1])
+                ):
+                    return "100644"
+                return None
             if root in RUNTIME_BATCH_SEVEN_DOC_ROOTS and relative in RUNTIME_BATCH_SEVEN_DOC_FILES:
                 return "100644"
             if root in RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
                 relative_parts = relative.split("/")
                 if (
                     len(relative_parts) >= 2 and relative_parts[0] == "src"
-                    and relative.endswith(".rs") and relative_parts[-1] != "build.rs"
+                    and relative.endswith(".rs")
+                    and not _runtime_build_script_name(relative_parts[-1])
                 ):
                     return "100644"
                 if (
                     len(relative_parts) == 2 and relative_parts[0] == "tests"
-                    and relative.endswith(".rs") and relative_parts[-1] != "build.rs"
+                    and relative.endswith(".rs")
+                    and not _runtime_build_script_name(relative_parts[-1])
                 ):
                     return "100644"
                 return None
@@ -2598,7 +2748,7 @@ def _runtime_workspace_mode(path, crate_roots):
             if (
                 relative.startswith(("src/", "tests/"))
                 and relative.endswith(".rs")
-                and relative.rsplit("/", 1)[-1] != "build.rs"
+                and not _runtime_build_script_name(relative.rsplit("/", 1)[-1])
             ):
                 return "100644"
     return None
@@ -2630,6 +2780,7 @@ def _runtime_root_manifest_shape(text, crate_roots):
         if ".." in without_api_edge or len(RUNTIME_HOST_API_POLICY_API_ASSIGNMENT_PATTERN.findall(text)) != 1:
             return False
     expected = _runtime_member_listing(crate_roots)
+    wave70_profile = set(RUNTIME_APP_TAURI_ROOTS).issubset(crate_roots)
     if _runtime_workspace_members(text) != expected:
         return False
     section = None
@@ -2670,7 +2821,11 @@ def _runtime_root_manifest_shape(text, crate_roots):
         elif section == "[workspace.dependencies]":
             match = RUNTIME_ROOT_PATH_PATTERN.fullmatch(value)
             if key == RUNTIME_HOST_API_POLICY_API_PACKAGE:
-                valid = RUNTIME_HOST_API_POLICY_API_EDGE_PATTERN.fullmatch(value) is not None
+                edge_pattern = (
+                    RUNTIME_HOST_API_POLICY_API_EDGE_PATTERN
+                    if wave70_profile else RUNTIME_HOST_API_POLICY_API_EDGE_LEGACY_PATTERN
+                )
+                valid = edge_pattern.fullmatch(value) is not None
             else:
                 valid = (
                     RUNTIME_DEPENDENCY_NAME_PATTERN.fullmatch(key) is not None
@@ -2744,6 +2899,8 @@ def _runtime_crate_manifest_name(text, declared, crate_root):
                 key in declared
                 and RUNTIME_WORKSPACE_VALUE_PATTERN.fullmatch(value) is not None
             )
+            if key in RUNTIME_WAVE_70_REGISTRY_DEPENDENCIES.get(crate_root, {}):
+                valid = value == RUNTIME_WAVE_70_REGISTRY_DEPENDENCIES[crate_root][key]
             if key == RUNTIME_HOST_API_POLICY_API_PACKAGE:
                 valid = (
                     crate_root in RUNTIME_HOST_API_POLICY_API_CONSUMER_ROOTS
@@ -2856,7 +3013,8 @@ def _check_runtime_profile_runtime_contract_edge(
     if any(
         entries[path][0] != "100644"
         or not (
-            path.endswith(".rs") and path.rsplit("/", 1)[-1] != "build.rs"
+            path.endswith(".rs")
+            and not _runtime_build_script_name(path.rsplit("/", 1)[-1])
             or path in CORE_CONTRACT_BUILD_DATA_FILES
             and concern in CORE_CONTRACT_BUILD_FILE_CONCERNS
             and _core_contract_expected_mode(path, concern=concern) == "100644"
@@ -2880,9 +3038,12 @@ def _check_runtime_profile_runtime_contract_edge(
         repository, git_executable, repo_env, entries, "Cargo.toml",
         core_check="workspace_decode",
     )
-    contract_members = {"/".join(root) for root in CORE_CONTRACT_CRATE_ROOTS}
+    contract_roots = _core_contract_member_roots(contract_root)
+    if contract_roots is None:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
+    contract_members = {"/".join(root) for root in contract_roots}
     identity_manifests = {"Cargo.toml": contract_root}
-    for crate_root in CORE_CONTRACT_CRATE_ROOTS:
+    for crate_root in contract_roots:
         path = "/".join(crate_root) + "/Cargo.toml"
         identity_manifests[path] = _contract_blob(
             repository, git_executable, repo_env, entries, path,
@@ -2928,7 +3089,7 @@ def _check_runtime_profile_runtime_contract_edge(
     return api_identity, api_dependency_rules
 
 
-def _check_runtime_workspace(repository, git_executable, repo_env, entries, *, concern):
+def _check_runtime_workspace(repository, git_executable, repo_env, entries, *, concern, source_sha):
     root_payload = _contract_blob(
         repository, git_executable, repo_env, entries, RUNTIME_ROOT_MANIFEST_PATH,
         core_check="workspace_decode",
@@ -2955,16 +3116,59 @@ def _check_runtime_workspace(repository, git_executable, repo_env, entries, *, c
     for root in RUNTIME_HOST_CRATE_ROOTS:
         if root in crate_roots:
             required.add("/".join(root) + "/CONTRACT.md")
+    crate_root_set = set(crate_roots)
     for root in RUNTIME_BATCH_SEVEN_CRATE_ROOTS:
         if root not in crate_roots:
             continue
         prefix = "/".join(root)
         required.update(prefix + "/" + name for name in RUNTIME_BATCH_SEVEN_DOC_FILES)
+    for root in RUNTIME_WAVE_70_CRATE_ROOTS:
+        if root in crate_roots:
+            prefix = "/".join(root)
+            required.update(prefix + "/" + name for name in RUNTIME_BATCH_SEVEN_DOC_FILES)
     if not required.issubset(entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+    wave70a_profile = set(RUNTIME_WAVE_70A_CRATE_ROOTS).issubset(crate_root_set)
+    wave70b_profile = set(RUNTIME_WAVE_70B_CRATE_ROOTS).issubset(crate_root_set)
+    inventory_paths = set()
+    approved_build_paths = set()
+    if wave70a_profile or wave70b_profile:
+        inventory_path = cargo_lock_bootstrap.SOURCE_INVENTORY_PATH
+        inventory_blob = _contract_blob(
+            repository, git_executable, repo_env, entries, inventory_path,
+            core_check="source_inventory",
+        )
+        try:
+            rows, unused_inventory_sha256 = cargo_lock_bootstrap.parse_runtime_source_inventory(
+                inventory_blob, source_sha,
+            )
+        except (cargo_lock_bootstrap.BootstrapRefusal, ValueError):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="source_inventory") from None
+        listed_paths = {row["path"] for row in rows}
+        required_paths = {
+            path for path in entries
+            if cargo_lock_bootstrap._source_inventory_path_required(path)
+        }
+        if listed_paths != required_paths:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="source_inventory")
+        for row in rows:
+            payload = _contract_blob(
+                repository, git_executable, repo_env, entries, row["path"],
+                core_check="source_inventory",
+            )
+            if hashlib.sha256(payload).hexdigest() != row["sha256"]:
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="source_inventory")
+        inventory_paths.update(listed_paths)
+        inventory_paths.add(inventory_path)
+        approved_build_paths.update(
+            path for path in listed_paths
+            if cargo_lock_bootstrap._is_build_script_path(path)
+        )
     for path, (mode, unused_object_id) in entries.items():
         if _runtime_workspace_path(path) and (
-            mode != "100644" or _runtime_workspace_mode(path, crate_roots) != "100644"
+            mode != "100644" or _runtime_workspace_mode(
+                path, crate_roots, frozenset(inventory_paths), frozenset(approved_build_paths),
+            ) != "100644"
             or _core_contract_expected_mode(path, concern="core-contract") is not None
         ):
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
@@ -3163,6 +3367,9 @@ def _safe_core_contract_tree(
         raise Refusal("bootstrap_not_approved", "configuration")
     base_entries = _contract_tree_entries(repository, git_executable, repo_env, base_commit)
     entries = _contract_tree_entries(repository, git_executable, repo_env, commit)
+    contract_roots = CORE_CONTRACT_CRATE_ROOTS
+    contract_member_paths = tuple("/".join(root) for root in contract_roots)
+    wave70_contract_profile = False
     signer_path = "/".join(SIGNER_PATH_PARTS)
     required = {
         ".gitignore", "AGENTS.md", "CLAUDE.md", "README.md", RULES_LOCK_PATH,
@@ -3170,13 +3377,18 @@ def _safe_core_contract_tree(
     } | set(CORE_CONTRACT_ROOT_FILES)
     if concern == "core-rust-lock-return":
         required.update(CORE_CONTRACT_RUST_POLICY_FILES)
-    for crate_root in CORE_CONTRACT_CRATE_ROOTS:
+    for crate_root in contract_roots:
         prefix = "/".join(crate_root)
         required.update(prefix + "/" + path for path in CORE_CONTRACT_PACKAGE_FILES)
-        required.add(prefix + "/src/lib.rs")
+        if crate_root in CORE_CONTRACT_CRATE_ROOTS:
+            required.add(prefix + "/src/lib.rs")
+        elif not ({prefix + "/src/lib.rs", prefix + "/src/main.rs"} & entries.keys()):
+            required.add(prefix + "/src/lib.rs")
     if not required.issubset(entries):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     if (concern == "core-rust-lock-return"
+            and tuple("/".join(root) for root in contract_roots)
+            == tuple("/".join(root) for root in CORE_CONTRACT_CRATE_ROOTS)
             and entries.get("Cargo.lock") != ("100644", CORE_CONTRACT_RUST_BOOTSTRAP_LOCK_OBJECT)):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
     foundation_present = any(
@@ -3288,6 +3500,8 @@ def _safe_core_contract_tree(
         if runtime_present and _runtime_workspace_path(path):
             continue
         expected_mode = _core_contract_expected_mode(path, concern=concern)
+        if expected_mode is None:
+            expected_mode = _core_contract_wave70_member_mode(path)
         if mode != expected_mode or expected_mode is None:
             raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
     if any(
@@ -3334,53 +3548,98 @@ def _safe_core_contract_tree(
         workspace_text = workspace.decode("utf-8", "strict")
     except UnicodeDecodeError:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_decode") from None
-    if _core_contract_workspace_members(workspace_text) != [
-        "/".join(root) for root in CORE_CONTRACT_CRATE_ROOTS
-    ]:
+    contract_roots = _core_contract_member_roots(workspace)
+    if contract_roots is None:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
+    contract_member_paths = tuple("/".join(root) for root in contract_roots)
+    wave70_contract_profile = contract_member_paths in (
+        CORE_CONTRACT_WAVE_70A_MEMBER_PATHS, CORE_CONTRACT_WAVE_70B_MEMBER_PATHS,
+    )
+    wave70_only_paths = {
+        path for path in entries
+        if _core_contract_expected_mode(path, concern=concern) is None
+        and _core_contract_wave70_member_mode(path) is not None
+    }
+    if wave70_only_paths and not wave70_contract_profile:
+        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="path_mode")
+    if wave70_contract_profile:
+        required_wave70_members = set(contract_member_paths)
+        for root in contract_member_paths[len(CORE_CONTRACT_CRATE_ROOTS):]:
+            prefix = root + "/"
+            if not all(prefix + name in entries for name in CORE_CONTRACT_PACKAGE_FILES):
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+            if not ({prefix + "src/lib.rs", prefix + "src/main.rs"} & entries.keys()):
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
+    if _core_contract_workspace_members(workspace_text) != ["/".join(root) for root in contract_roots]:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
     if not _core_contract_workspace_paths_shape(workspace_text):
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="workspace_members")
 
-    lock_text = _contract_blob(
+    lock_payload = _contract_blob(
         repository, git_executable, repo_env, entries, "Cargo.lock",
         core_check="cargo_lock_decode",
     )
-    try:
-        lock_text = lock_text.decode("utf-8", "strict")
-    except UnicodeDecodeError:
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_decode") from None
-    if (
-        re.search(r"(?m)^version\s*=\s*4\s*$", lock_text) is None
-        or len(re.findall(r"(?m)^\[\[package\]\]$", lock_text)) != len(CORE_CONTRACT_CRATE_ROOTS)
-        or re.search(r"(?m)^\s*source\s*=", lock_text) is not None
-    ):
-        raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
+    contract_manifests = {"Cargo.toml": workspace}
+    for crate_root in contract_roots:
+        path = "/".join(crate_root) + "/Cargo.toml"
+        contract_manifests[path] = _contract_blob(
+            repository, git_executable, repo_env, entries, path,
+            core_check="package_decode",
+        )
+        if crate_root in CORE_CONTRACT_CRATE_ROOTS:
+            try:
+                manifest_text = contract_manifests[path].decode("utf-8", "strict")
+            except UnicodeDecodeError:
+                raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
+            if not _core_contract_crate_manifest_shape(
+                manifest_text, crate_root=crate_root,
+                require_first_batch=(concern == "core-rust-lock-return"
+                                     and workspace_selector == "contract"),
+            ):
+                raise Refusal(
+                    "bootstrap_snapshot_invalid", "bootstrap",
+                    core_check="package_build" if "build" in manifest_text else "package_decode",
+                )
+    if wave70_contract_profile:
+        try:
+            contract_names = cargo_lock_bootstrap.check_manifests(
+                contract_manifests, set(contract_member_paths),
+                cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+                require_first_batch=(concern == "core-rust-lock-return"
+                                     and workspace_selector == "contract"),
+            )
+            contract_identities = cargo_lock_bootstrap.manifest_package_identities(
+                contract_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+            )
+            contract_rules = cargo_lock_bootstrap.manifest_dependency_rules(
+                contract_manifests, cargo_lock_bootstrap.CONTRACT_WORKSPACE,
+            )
+            cargo_lock_bootstrap.check_lock_members(
+                lock_payload, contract_names, contract_identities, contract_rules,
+            )
+        except (cargo_lock_bootstrap.BootstrapRefusal, ValueError, KeyError):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
+    else:
+        try:
+            lock_text = lock_payload.decode("ascii", "strict")
+        except UnicodeDecodeError:
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_decode") from None
+        if (
+            re.search(r"(?m)^version\s*=\s*4\s*$", lock_text) is None
+            or len(re.findall(r"(?m)^\[\[package\]\]$", lock_text))
+            != len(CORE_CONTRACT_CRATE_ROOTS)
+            or re.search(r"(?m)^\s*source\s*=", lock_text) is not None
+        ):
+            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="cargo_lock_shape")
     if _contract_blob(
         repository, git_executable, repo_env, entries, "rust-toolchain.toml",
         core_check="toolchain",
     ) != CORE_CONTRACT_TOOLCHAIN:
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="toolchain")
-    for crate_root in CORE_CONTRACT_CRATE_ROOTS:
-        payload = _contract_blob(
-            repository, git_executable, repo_env, entries, "/".join(crate_root) + "/Cargo.toml",
-            core_check="package_decode",
-        )
-        try:
-            manifest_text = payload.decode("utf-8", "strict")
-        except UnicodeDecodeError:
-            raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="package_decode") from None
-        if not _core_contract_crate_manifest_shape(
-            manifest_text,
-            crate_root=crate_root,
-            require_first_batch=(concern == "core-rust-lock-return"
-                                 and workspace_selector == "contract"),
-        ):
-            raise Refusal(
-                "bootstrap_snapshot_invalid", "bootstrap",
-                core_check="package_build" if "build" in manifest_text else "package_decode",
-            )
     if runtime_present:
-        _check_runtime_workspace(repository, git_executable, repo_env, entries, concern=concern)
+        _check_runtime_workspace(
+            repository, git_executable, repo_env, entries, concern=concern, source_sha=commit,
+        )
     elif workspace_selector == "runtime":
         raise Refusal("bootstrap_snapshot_invalid", "bootstrap", core_check="required_files")
     tree_kind = CORE_CONTRACT_TREE_BY_CONCERN[concern]

@@ -1246,6 +1246,8 @@ class ManifestCheckTests(BootstrapTestCase):
 
 
 RUNTIME_MEMBERS = subject.HOST_API_POLICY_RUNTIME_REQUIRED_MEMBER_ROOTS
+RUNTIME_WAVE_70A_MEMBERS = subject.HOST_API_POLICY_RUNTIME_WAVE_70A_REQUIRED_MEMBER_ROOTS
+RUNTIME_WAVE_70B_MEMBERS = subject.HOST_API_POLICY_RUNTIME_WAVE_70B_REQUIRED_MEMBER_ROOTS
 RUNTIME_API_NAME = subject.HOST_API_POLICY_API_PACKAGE
 RUNTIME_BASE_MEMBERS = subject.HOST_API_POLICY_RUNTIME_BASE_MEMBER_ROOTS
 RUNTIME_ROOT = (
@@ -1288,11 +1290,26 @@ def _runtime_manifests(root=RUNTIME_ROOT, package_extra="", members=None):
             members = members + subject.HOST_API_POLICY_RUNTIME_OPTIONAL_MEMBER_ROOTS
     manifests = {"runtime/Cargo.toml": root.encode("utf-8")}
     for member in members:
-        name = member.rsplit("/", 1)[-1]
+        name = (member.rsplit("/", 2)[-2] if member in subject.RUNTIME_APP_TAURI_ROOTS
+                else member.rsplit("/", 1)[-1])
         manifests[member + "/Cargo.toml"] = _runtime_member(
             member, name=name, package_extra=package_extra if member == RUNTIME_MEMBERS[0] else "",
         ).encode("utf-8")
     return manifests
+
+
+def _runtime_profile_root(members):
+    wave70 = set(subject.RUNTIME_APP_TAURI_ROOTS).issubset(members)
+    api_spec = (
+        ' = { path = "../crates/host/api", version = "=0.2.0" }\n'
+        if wave70 else ' = { path = "../crates/host/api" }\n'
+    )
+    return (
+        "[workspace]\nresolver = \"3\"\nmembers = [\n"
+        + "".join('    "' + root[len("runtime/"):] + '",\n' for root in members)
+        + "]\n\n[workspace.package]\nversion = \"0.1.0\"\nedition = \"2024\"\n"
+        + "\n[workspace.dependencies]\n" + RUNTIME_API_NAME + api_spec
+    )
 
 
 class RuntimeWorkspaceTests(BootstrapTestCase):
@@ -1303,6 +1320,7 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
         with self.assertRaises(subject.BootstrapRefusal) as raised:
             subject.check_manifests(manifests, members, workspace)
         self.assertIn(raised.exception.reason, ("bootstrap_manifest_refused", "bootstrap_input_invalid"))
+
 
     def test_selector_maps_only_to_the_two_fixed_roots(self):
         self.assertEqual(subject.workspace_root_manifest("contract"), "Cargo.toml")
@@ -1327,7 +1345,7 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
 
     def test_runtime_profile_accepts_each_required_consumer_and_optional_sync_format(self):
         manifests = _runtime_manifests()
-        for root in subject.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS:
+        for root in subject.HOST_API_POLICY_RUNTIME_BASE_CONSUMER_ROOTS:
             with self.subTest(root=root):
                 self.assertEqual(
                     manifests[root + "/Cargo.toml"].count(RUNTIME_API_NAME.encode("ascii")), 1,
@@ -1342,10 +1360,90 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
         expected.add(RUNTIME_API_NAME)
         self.assertEqual(self.check(optional_manifests, optional_members), frozenset(expected))
 
+    def test_wave_70a_and_70b_profiles_admit_only_exact_members_and_api_edges(self):
+        for members in (RUNTIME_WAVE_70A_MEMBERS, RUNTIME_WAVE_70B_MEMBERS):
+            with self.subTest(member_count=len(members)):
+                manifests = _runtime_manifests(
+                    root=_runtime_profile_root(members), members=members,
+                )
+                expected = {
+                    (root.rsplit("/", 2)[-2] if root in subject.RUNTIME_APP_TAURI_ROOTS
+                     else root.rsplit("/", 1)[-1])
+                    for root in members
+                }
+                expected.add(RUNTIME_API_NAME)
+                self.assertEqual(self.check(manifests, members=members), frozenset(expected))
+                for root in subject.HOST_API_POLICY_RUNTIME_CONSUMER_ROOTS:
+                    if root in members:
+                        self.assertEqual(
+                            manifests[root + "/Cargo.toml"].count(RUNTIME_API_NAME.encode("ascii")),
+                            1,
+                        )
+        without_mobile = tuple(
+            root for root in RUNTIME_WAVE_70A_MEMBERS
+            if root != subject.RUNTIME_WAVE_70A_NEW_CONSUMER_ROOTS[-1]
+        )
+        self.assert_refused(
+            _runtime_manifests(root=_runtime_profile_root(without_mobile), members=without_mobile),
+            members=without_mobile,
+        )
+
+    def test_wave_70_member_cannot_drop_or_redirect_its_direct_api_edge(self):
+        members = RUNTIME_WAVE_70B_MEMBERS
+        manifests = _runtime_manifests(root=_runtime_profile_root(members), members=members)
+        target = subject.RUNTIME_WAVE_70_CRATE_ROOTS[0] + "/Cargo.toml"
+        manifests[target] = manifests[target].replace(
+            (RUNTIME_API_NAME + ' = { workspace = true }').encode("ascii"), b"", 1,
+        )
+        self.assert_refused(manifests, members=members)
+
     def test_runtime_profile_refuses_missing_or_extra_required_roots(self):
         for members in ((), RUNTIME_MEMBERS[:-1], RUNTIME_MEMBERS + ("runtime/crates/services/other",)):
             with self.subTest(members=members):
                 self.assert_refused(_runtime_manifests(), members=members)
+
+    def test_runtime_tree_checker_accepts_production_frontend_and_path_member_shapes(self):
+        roots = (
+            "runtime/crates/host/core",
+            "runtime/apps/test-shell-desktop/src-tauri",
+            "runtime/apps/test-shell-mobile/src-tauri",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            runtime.mkdir()
+            (runtime / "apps/test-shell-desktop/web/src").mkdir(parents=True)
+            (runtime / "apps/test-shell-desktop/web/src/App.tsx").write_text(
+                "export default function App() { return null; }\n", encoding="ascii",
+            )
+            (runtime / "apps/test-shell-mobile/web/src").mkdir(parents=True)
+            (runtime / "apps/test-shell-mobile/web/src/App.tsx").write_text(
+                "export default function App() { return null; }\n", encoding="ascii",
+            )
+            (runtime / "packages/host-ui/src").mkdir(parents=True)
+            (runtime / "packages/host-ui/src/index.ts").write_text(
+                "export const hostUi = true;\n", encoding="ascii",
+            )
+            for member in roots:
+                crate = root / member
+                (crate / "src").mkdir(parents=True)
+                (crate / "Cargo.toml").write_text("[package]\n", encoding="ascii")
+                (crate / "src/lib.rs").write_text("pub fn checked() {}\n", encoding="ascii")
+            shapes = (
+                tuple(Path(member) for member in roots),
+                roots,
+                tuple(tuple(member.split("/")) for member in roots),
+            )
+            for shape in shapes:
+                with self.subTest(shape=shape):
+                    subject._validate_runtime_profile_tree_files(root, shape, frozenset())
+
+            invalid = runtime / "packages/host-ui/src/unsafe.md"
+            invalid.write_text("not an admitted frontend source\n", encoding="ascii")
+            with self.assertRaises(subject.BootstrapRefusal):
+                subject._validate_runtime_profile_tree_files(
+                    root, tuple(Path(member) for member in roots), frozenset(),
+                )
 
     def test_runtime_and_contract_manifests_never_satisfy_each_other(self):
         self.assert_refused(_runtime_manifests(), workspace="contract")
@@ -1593,6 +1691,156 @@ class RuntimeWorkspaceTests(BootstrapTestCase):
             )
 
 
+class RuntimeSourceInventoryTests(BootstrapTestCase):
+    def _inventory(self, root, source_sha):
+        paths = subject._source_inventory_required_paths(root)
+        rows = []
+        for path in sorted(paths):
+            payload = (root / path).read_bytes()
+            fields = {
+                "path": path,
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "owner": "9.5",
+                "package": "test-shell",
+                "target": "all-platforms",
+                "generator": "",
+                "generator_version": "",
+                "provenance": "",
+            }
+            rows.append("[[files]]\n" + "".join(
+                key + ' = "' + fields[key] + '"\n'
+                for key in ("path", "sha256", "owner", "package", "target",
+                            "generator", "generator_version", "provenance")
+            ))
+        payload = ("schema_version = 1\n" + "".join(rows)).encode("ascii")
+        inventory = root / subject.SOURCE_INVENTORY_PATH
+        inventory.parent.mkdir(parents=True, exist_ok=True)
+        inventory.write_bytes(payload)
+        return payload
+
+    def _candidate(self, root):
+        for app in ("test-shell-desktop", "test-shell-mobile"):
+            tauri = root / "runtime" / "apps" / app / "src-tauri"
+            tauri.mkdir(parents=True)
+            (tauri / "tauri.conf.json").write_text("{}\n", encoding="ascii")
+        service = root / "runtime" / "crates" / "services" / "log"
+        service.mkdir(parents=True)
+
+    def test_inventory_is_sorted_and_matches_exact_non_crate_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._candidate(root)
+            source_sha = "a" * 40
+            payload = self._inventory(root, source_sha)
+            self.assertEqual(
+                [row["path"] for row in subject.parse_runtime_source_inventory(payload, source_sha)[0]],
+                sorted(subject._source_inventory_required_paths(root)),
+            )
+            self.assertTrue(subject.validate_runtime_source_inventory(root, source_sha))
+            self.assertEqual(
+                subject.parse_runtime_source_inventory(payload, "b" * 40)[0],
+                subject.parse_runtime_source_inventory(payload, source_sha)[0],
+            )
+
+    def test_inventory_refuses_changed_digest_and_unlisted_input(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._candidate(root)
+            source_sha = "c" * 40
+            self._inventory(root, source_sha)
+            (root / "runtime/apps/test-shell-mobile/src-tauri/tauri.conf.json").write_text(
+                "{\"changed\":true}\n", encoding="ascii",
+            )
+            with self.assertRaises(subject.BootstrapRefusal):
+                subject.validate_runtime_source_inventory(root, source_sha)
+            (root / "runtime/apps/test-shell-desktop/src-tauri/native-resource.bin").write_bytes(b"x")
+            with self.assertRaises(subject.BootstrapRefusal):
+                subject.validate_runtime_source_inventory(root, source_sha)
+
+    def test_inventory_generated_provenance_is_all_or_none(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._candidate(root)
+            source_sha = "d" * 40
+            payload = self._inventory(root, source_sha)
+            corrupted = payload.replace(b'generator = ""', b'generator = "xtask"', 1)
+            with self.assertRaises(subject.BootstrapRefusal):
+                subject.parse_runtime_source_inventory(corrupted, source_sha)
+
+    def test_inventoried_build_script_stays_refused_without_source_bound_r132_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._candidate(root)
+            build_script = root / "runtime/crates/host/core/build.rs"
+            build_script.parent.mkdir(parents=True, exist_ok=True)
+            build_script.write_text("fn main() {}\n", encoding="ascii")
+            source_sha = "e" * 40
+            payload = self._inventory(root, source_sha)
+            digest = hashlib.sha256(build_script.read_bytes()).hexdigest()
+            with self.assertRaises(subject.BootstrapRefusal):
+                subject.parse_runtime_source_inventory(payload, source_sha)
+            rows, unused = subject.parse_runtime_source_inventory(
+                payload, source_sha,
+                build_script_reviews=(("runtime/crates/host/core/build.rs", digest, source_sha),),
+            )
+            self.assertIn("runtime/crates/host/core/build.rs", {row["path"] for row in rows})
+            with self.assertRaises(subject.BootstrapRefusal):
+                subject.validate_runtime_source_inventory(root, source_sha)
+
+    def test_build_script_filename_casing_is_refused_without_a_review(self):
+        for filename in ("BUILD.RS", "Build.rs"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self._candidate(root)
+                build_script = root / "runtime" / "crates" / "host" / "core" / filename
+                build_script.parent.mkdir(parents=True, exist_ok=True)
+                build_script.write_text("fn main() {}\n", encoding="ascii")
+                source_sha = "f" * 40
+                payload = self._inventory(root, source_sha)
+                digest = hashlib.sha256(build_script.read_bytes()).hexdigest()
+                for reviews in ((), ((build_script.relative_to(root).as_posix(), digest,
+                                      source_sha),)):
+                    with self.subTest(reviewed=bool(reviews)), self.assertRaises(
+                            subject.BootstrapRefusal):
+                        subject.parse_runtime_source_inventory(
+                            payload, source_sha, build_script_reviews=reviews,
+                        )
+
+    def test_build_script_casefold_collisions_are_ambiguous(self):
+        rows = []
+        for index, path in enumerate((
+                "runtime/crates/host/core/BUILD.RS",
+                "runtime/crates/host/core/build.rs")):
+            fields = {
+                "path": path,
+                "sha256": str(index + 1) * 64,
+                "owner": "9.5",
+                "package": "test-shell",
+                "target": "all-platforms",
+                "generator": "",
+                "generator_version": "",
+                "provenance": "",
+            }
+            rows.append("[[files]]\n" + "".join(
+                key + ' = "' + fields[key] + '"\n'
+                for key in ("path", "sha256", "owner", "package", "target",
+                            "generator", "generator_version", "provenance")
+            ))
+        payload = ("schema_version = 1\n" + "".join(rows)).encode("ascii")
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.parse_runtime_source_inventory(payload, "1" * 40)
+
+    def test_unicode_normalized_build_script_alias_is_refused(self):
+        filename = "\uFF22UILD.RS"
+        self.assertTrue(subject._is_build_script_name(filename))
+        payload = (
+            'schema_version = 1\n[[files]]\npath = "runtime/crates/host/core/'
+            + filename + '"\n'
+        ).encode("utf-8")
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.parse_runtime_source_inventory(payload, "2" * 40)
+
+
 class ContractWorkspaceUnchangedTests(BootstrapTestCase):
     def test_default_selector_is_the_contract_workspace(self):
         self.assertEqual(
@@ -1612,6 +1860,73 @@ class ContractWorkspaceUnchangedTests(BootstrapTestCase):
         ).encode("utf-8")
         with self.assertRaises(subject.BootstrapRefusal):
             subject.check_manifests(manifests, CONTRACT_MEMBERS)
+
+    def test_wave70_contract_xtask_demo_and_registry_lock_are_exact_and_reachable(self):
+        root = _contract_root().replace(
+            '    "crates/kernel/i18n",\n',
+            '    "crates/kernel/i18n",\n'
+            '    "tools/xtask",\n'
+            '    "crates/host/conformance/fixtures/demo-tool",\n',
+        ).replace('version = "0.1.0"', 'version = "0.2.0"', 1)
+        members = subject.CONTRACT_WAVE_70B_MEMBERS
+        manifests = _contract_manifests(root)
+        manifests[subject.CONTRACT_XTASK_MEMBER + "/Cargo.toml"] = _contract_member(
+            "xtask", "KeelDock workspace task runner.",
+            PRIVATE_PREFIX + 'host-api = { path = "../../crates/host/api" }\n',
+        ).encode("utf-8")
+        manifests[subject.CONTRACT_DEMO_MEMBER + "/Cargo.toml"] = _contract_member(
+            "demo-tool", "API-only contract demo fixture.",
+            PRIVATE_PREFIX + 'host-api = { path = "../../../api", version = "=0.2.0" }\n',
+        ).encode("utf-8")
+        names = subject.check_manifests(manifests, members)
+        identities = subject.manifest_package_identities(manifests)
+        rules = subject.manifest_dependency_rules(manifests)
+        self.assertIn("keeldock" + "-xtask", names)
+        self.assertIn("keeldock" + "-demo-tool", names)
+        self.assertIn(("keeldock" + "-host-api", "0.2.0"), identities)
+
+        registry_source = cargo.REGISTRY_SOURCE
+        local_dependencies = {
+            "keeldock" + "-host-mock": ("keeldock" + "-host-api 0.2.0",),
+            "keeldock" + "-host-conformance": (
+                "keeldock" + "-host-api 0.2.0", "keeldock" + "-host-mock 0.2.0",
+            ),
+            "keeldock" + "-xtask": ("keeldock" + "-host-api 0.2.0",),
+            "keeldock" + "-demo-tool": ("keeldock" + "-host-api 0.2.0",),
+            "keeldock" + "-host-api": (
+                "schemars 1.2.3 (" + registry_source + ")",
+                "serde 1.0.229 (" + registry_source + ")",
+                "serde_json 1.0.154 (" + registry_source + ")",
+            ),
+        }
+        rows = []
+        for name in sorted(names):
+            row = '\n[[package]]\nname = "' + name + '"\nversion = "0.2.0"\n'
+            dependencies = local_dependencies.get(name, ())
+            if dependencies:
+                row += "dependencies = [\n" + "".join(
+                    ' "' + dependency + '",\n' for dependency in dependencies
+                ) + "]\n"
+            rows.append(row)
+        for name, version in (("schemars", "1.2.3"), ("serde", "1.0.229"),
+                              ("serde_json", "1.0.154")):
+            rows.append(
+                '\n[[package]]\nname = "' + name + '"\nversion = "' + version
+                + '"\nsource = "' + registry_source + '"\nchecksum = "' + "a" * 64 + '"\n'
+            )
+        lock = ("version = 4\n" + "".join(rows)).encode("ascii")
+        self.assertTrue(subject.check_lock_members(lock, names, identities, rules))
+
+        altered_lock = lock.replace(
+            b"serde 1.0.229 (registry+https:" + b"/" * 2 + b"github.com/rust-lang/crates.io-index)",
+            b"serde 1.0.228 (registry+https:" + b"/" * 2 + b"github.com/rust-lang/crates.io-index)",
+        )
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_lock_members(altered_lock, names, identities, rules)
+        with self.assertRaises(subject.BootstrapRefusal):
+            subject.check_manifests(
+                manifests, subject.CONTRACT_WAVE_70A_MEMBERS,
+            )
 
 
 if __name__ == "__main__":

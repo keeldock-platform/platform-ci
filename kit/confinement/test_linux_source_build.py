@@ -17,17 +17,18 @@ import zipfile
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-if not sys.platform.startswith("linux"):
-    raise unittest.SkipTest("the Linux source build suite runs only on Linux")
-
-import foundation_node_feedback
-import gate_table
-import confinement_public_audit
-import confinement_verdict
-import log_canary
-import linux_source_build
-import macos_core_contract
-import npm_admission_bootstrap
+_LINUX_ONLY = not sys.platform.startswith("linux")
+if not _LINUX_ONLY:
+    import foundation_node_feedback
+    import gate_table
+    import confinement_public_audit
+    import confinement_verdict
+    import log_canary
+    import linux_source_build
+    import macos_core_contract
+    import npm_admission_bootstrap
+else:
+    linux_source_build = types.SimpleNamespace(SourceBuildRefusal=Exception)
 
 
 _FIXTURE_BODY = base64.b64encode(b"\x30\x0b" + b"fixture-der").decode("ascii")
@@ -55,6 +56,7 @@ def _registry_lock():
     )
 
 
+@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class LinuxSourceBuildTests(unittest.TestCase):
     def test_gate_order_matches_the_shared_macos_contracts(self):
         expected = (
@@ -79,6 +81,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Verify selected installation identity",
                 "Fetch exact source and verify binding, tree, signatures and lock provenance",
                 "Revoke source-reader token and verify rejection",
+                "Install pinned cargo-deny and prepare the RustSec database",
                 "Require trusted Rust licence admission",
                 "Fetch npm tarballs by committed lock integrity",
                 "Run trusted dependency audit",
@@ -96,6 +99,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
             "Mint verifier scoped source-reader token",
             "Verify source independently against binding, tree, signatures and lock",
             "Revoke verifier token and verify rejection",
+            "Install independent pinned cargo-deny and prepare RustSec database",
             "Require trusted Rust licence admission independently",
             "Fetch independent npm tarballs by lock integrity",
             "Run independent trusted dependency audit",
@@ -112,6 +116,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 "Verify selected installation identity",
                 "Fetch exact source and verify binding, tree, signatures and lock provenance",
                 "Revoke source-reader token and verify rejection",
+                "Install pinned cargo-deny and prepare the RustSec database",
                 "Require trusted Rust licence admission",
                 "Fetch npm tarballs by committed lock integrity",
                 "Run trusted dependency audit",
@@ -463,6 +468,80 @@ class LinuxSourceBuildTests(unittest.TestCase):
             )
             with self.assertRaises(linux_source_build.SourceBuildRefusal):
                 linux_source_build._neutralize_config_files(root)
+
+    def test_inventory_authenticates_both_npm_roots_before_staging_sanitizes_them(self):
+        bootstrap = linux_source_build.cargo_lock_bootstrap
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / "candidate"
+            source.mkdir()
+            for path, contents in (
+                (".npmrc", "registry=https://registry.npmjs.org/\n"),
+                ("runtime/.npmrc", "registry=https://registry.npmjs.org/\n"),
+                ("package-lock.json", '{ "name":"root", "lockfileVersion":3, "packages":{} }\n'),
+                ("runtime/package-lock.json", '{ "name":"runtime", "lockfileVersion":3, "packages":{} }\n'),
+                ("runtime/apps/test-shell-desktop/src-tauri/tauri.conf.json", "{}\n"),
+                ("runtime/apps/test-shell-mobile/src-tauri/tauri.conf.json", "{}\n"),
+            ):
+                target = source / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(contents, encoding="ascii")
+            rows = []
+            for path in sorted(bootstrap._source_inventory_required_paths(source)):
+                digest = hashlib.sha256((source / path).read_bytes()).hexdigest()
+                fields = {
+                    "path": path, "sha256": digest, "owner": "10.i",
+                    "package": "test-shell", "target": "all-platforms",
+                    "generator": "", "generator_version": "", "provenance": "",
+                }
+                rows.append("[[files]]\n" + "".join(
+                    key + ' = "' + fields[key] + '"\n'
+                    for key in bootstrap.SOURCE_INVENTORY_FIELDS
+                ))
+            inventory_path = source / bootstrap.SOURCE_INVENTORY_PATH
+            inventory_path.parent.mkdir(parents=True)
+            inventory_path.write_bytes(("schema_version = 1\n" + "".join(rows)).encode("ascii"))
+            source_sha = "a" * 40
+            original_digest = bootstrap.validate_runtime_source_inventory(source, source_sha)
+            tarball_index = base / "tarball-index.json"
+            tarball_index.write_text("{}\n", encoding="ascii")
+            project_root = base / "worker-root"
+            project_root.mkdir()
+            worker = project_root / "source"
+            receipt_directory = base / "runner-temp"
+
+            def open_project_root():
+                return os.open(project_root, os.O_RDONLY | os.O_DIRECTORY)
+
+            with patch.object(linux_source_build, "PROJECT_ROOT", project_root), \
+                    patch.object(linux_source_build, "_open_project_root", side_effect=open_project_root), \
+                    patch.object(linux_source_build.linux_harness, "CHILD_UID", os.getuid()), \
+                    patch.object(linux_source_build.linux_harness, "CHILD_GID", os.getgid()):
+                linux_source_build._prepare_worker_tree(source, tarball_index, {
+                    "REQUESTED_SOURCE_SHA": source_sha, "RUNNER_TEMP": str(receipt_directory),
+                })
+
+            self.assertFalse((worker / ".npmrc").exists())
+            self.assertFalse((worker / "runtime/.npmrc").exists())
+            self.assertTrue((worker / "package-lock.json").is_file())
+            self.assertTrue((worker / "runtime/package-lock.json").is_file())
+            self.assertEqual(
+                bootstrap.validate_runtime_source_inventory_staged(
+                    worker, source_sha,
+                    (receipt_directory / "kd-records/runtime-inventory-stage.json").read_bytes(),
+                ),
+                hashlib.sha256((worker / bootstrap.SOURCE_INVENTORY_PATH).read_bytes()).hexdigest(),
+            )
+            receipt = json.loads((receipt_directory / "kd-records/runtime-inventory-stage.json").read_text())
+            self.assertEqual(receipt["original_inventory_sha256"], original_digest)
+            self.assertEqual(receipt["deleted_paths"], [".npmrc", "runtime/.npmrc"])
+            self.assertEqual(receipt["modified_paths"], ["package-lock.json"])
+            (worker / "runtime/package-lock.json").write_text("{}\n", encoding="ascii")
+            with self.assertRaises(bootstrap.BootstrapRefusal):
+                bootstrap.validate_runtime_source_inventory_staged(
+                    worker, source_sha,
+                    (receipt_directory / "kd-records/runtime-inventory-stage.json").read_bytes(),
+                )
 
     def test_gate_commands_are_offline_after_dependency_preparation(self):
         commands = linux_source_build._gate_commands(Path("/work"), "/rust", "/node")
@@ -1317,7 +1396,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
     def test_d145_profile_runs_before_lock_license_admission(self):
         source = Path(linux_source_build.__file__).read_text(encoding="ascii")
         body = source[source.index("def run_rust_license_gate("):source.index("def prepare_project(")]
-        self.assertLess(body.index("_check_d145_runtime_profile(root_fd)"),
+        self.assertLess(body.index("_check_d145_runtime_profile("),
                         body.index("for candidate in _rust_lock_paths(root_fd):"))
 
     @staticmethod
@@ -1441,7 +1520,7 @@ class LinuxSourceBuildTests(unittest.TestCase):
         with patch.object(linux_source_build.cargo_lock_bootstrap.sys, "stdout", profile_output):
             self.assertEqual(
                 linux_source_build.cargo_lock_bootstrap._main(
-                    ["check-runtime_profile-source", str(root)],
+                    ["check-runtime_profile-source", str(root), "a" * 40],
                 ),
                 0,
             )
@@ -2574,6 +2653,8 @@ def _synthetic_receipt():
         },
         "inputs_sha256": "1" * 64, "request_doc_sha256": "2" * 64, "lock_sha256": LOCK_SHA,
         "archive_set_sha256": "3" * 64, "package_set_sha256": "4" * 64,
+        "root_kind": "core", "node_version": npm_admission_bootstrap.NODE_VERSION,
+        "npm_version": npm_admission_bootstrap.NPM_VERSION, "members": [], "file_edges": [],
         "packages": [{
             "path": "node_modules/fixture-lib", "name": "fixture-lib", "version": "1.5.0",
             "integrity": "sha512-" + "A" * 86 + "==", "sha256": "8" * 64,
@@ -2684,6 +2765,7 @@ def _honoured_report():
     })
 
 
+@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class LinuxNodeProvenanceAndAuditTests(unittest.TestCase):
     def setUp(self):
         self.now = int(time.time())
@@ -3025,6 +3107,7 @@ LINE_PATTERN = re.compile(
 )
 
 
+@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class LinuxAuditDetailTests(unittest.TestCase):
     _run_audit = LinuxNodeProvenanceAndAuditTests._run_audit
 
@@ -3495,6 +3578,7 @@ NPM11_PACKAGES = {
 }
 
 
+@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class RealNpmReportTests(unittest.TestCase):
     _run_audit = LinuxNodeProvenanceAndAuditTests._run_audit
 
@@ -3554,6 +3638,7 @@ class RealNpmReportTests(unittest.TestCase):
         self.assertEqual(self._refusal(json.dumps(tampered).encode("ascii"), _npm11_allows(self.now_ms)).detail, "audit_count")
 
 
+@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class ManifestReadAndLockGuardTests(unittest.TestCase):
     def test_manifest_json_reads_only_a_bounded_regular_file(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -3590,6 +3675,7 @@ class ManifestReadAndLockGuardTests(unittest.TestCase):
                 os.fstat(descriptor)
 
 
+@unittest.skipIf(_LINUX_ONLY, "the Linux source build suite runs only on Linux")
 class QuickTierVerdictTests(unittest.TestCase):
     def test_the_quick_tier_can_never_emit_a_verdict(self):
         for mode in ("source", "synthetic", ""):

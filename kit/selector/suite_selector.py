@@ -91,6 +91,8 @@ FULL_SET_PREFIXES = (
     "kit/selector",
     ".cargo",
     "vendor",
+    "runtime",
+    "tools/xtask",
 )
 FULL_SET_NAMES = frozenset(
     (

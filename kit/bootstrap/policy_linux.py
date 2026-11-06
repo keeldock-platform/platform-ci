@@ -413,12 +413,39 @@ jobs:
         env:
           SOURCE_READER_TOKEN: ${{ steps.source-reader-token.outputs.token }}
         run: python3 -B kit/confinement/linux_source_build.py revoke
+      - name: Install pinned cargo-deny and prepare the RustSec database
+        id: rust-license-tools
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
+        run: |
+          set -euo pipefail
+          control_root="$RUNNER_TEMP/kd-rust-license-control"
+          cargo_deny_root="$control_root/cargo-deny"
+          cargo_home="$control_root/cargo-home"
+          mkdir -m 700 -p "$control_root"
+          python3 -B kit/confinement/cargo_deny_installer.py install --destination "$cargo_deny_root" > "$control_root/install-record"
+          python3 -B kit/confinement/cargo_deny_installer.py prepare-advisories --cargo-home "$cargo_home" > "$control_root/advisory-record"
+          [[ -x "$RUST_ROOT/bin/cargo" ]]
+          cargo_deny_path="$cargo_deny_root/cargo-deny"
+          receipt_path="$cargo_deny_root/cargo-deny-install.json"
+          advisory_path="$cargo_home/advisory-dbs/advisory-db-3157b0e258782691"
+          [[ -x "$cargo_deny_path" && -f "$receipt_path" && -d "$advisory_path" ]]
+          printf 'cargo_deny_path=%s\n' "$cargo_deny_path" >> "$GITHUB_OUTPUT"
+          printf 'cargo_deny_receipt_path=%s\n' "$receipt_path" >> "$GITHUB_OUTPUT"
+          printf 'cargo_deny_home=%s\n' "$cargo_home" >> "$GITHUB_OUTPUT"
+          printf 'advisory_database_path=%s\n' "$advisory_path" >> "$GITHUB_OUTPUT"
       - name: Require trusted Rust licence admission
         id: rust-license-gate
         if: ${{ inputs.mode == 'source' }}
         env:
           SOURCE_PATH: ${{ steps.checkout.outputs.source_path }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
+          KD_CARGO_DENY_PATH: ${{ steps.rust-license-tools.outputs.cargo_deny_path }}
+          KD_CARGO_DENY_RECEIPT_PATH: ${{ steps.rust-license-tools.outputs.cargo_deny_receipt_path }}
+          KD_CARGO_DENY_HOME: ${{ steps.rust-license-tools.outputs.cargo_deny_home }}
+          KD_RUSTSEC_ADVISORY_DB_PATH: ${{ steps.rust-license-tools.outputs.advisory_database_path }}
         run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
       - name: Fetch npm tarballs by committed lock integrity
         id: npm-tarballs
@@ -441,7 +468,8 @@ jobs:
           RUST_ROOT: ${{ steps.toolchains.outputs.rust_root }}
           EXPECTED_NODE_LOCK_SHA256: ${{ steps.checkout.outputs.lock_sha256 }}
           EXPECTED_MANIFEST_SHA256: ${{ steps.checkout.outputs.manifest_sha256 }}
-        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,REQUESTED_SOURCE_SHA,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
       - name: Re-run positive controls immediately before the first project command
         id: recheck
         env:
@@ -466,7 +494,12 @@ jobs:
           CARGO_HOME: ${{ steps.project-deps.outputs.cargo_home }}
           BROWSER_ROOT: ${{ steps.toolchains.outputs.browser_root }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT python3 -B kit/confinement/linux_source_build.py gates
+          KD_CARGO_DENY_PATH: ${{ steps.rust-license-tools.outputs.cargo_deny_path }}
+          KD_CARGO_DENY_RECEIPT_PATH: ${{ steps.rust-license-tools.outputs.cargo_deny_receipt_path }}
+          KD_CARGO_DENY_HOME: ${{ steps.rust-license-tools.outputs.cargo_deny_home }}
+          KD_RUSTSEC_ADVISORY_DB_PATH: ${{ steps.rust-license-tools.outputs.advisory_database_path }}
+          KD_STAGED_INVENTORY_RECEIPT: ${{ steps.project-deps.outputs.staged_inventory_receipt }}
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT,CI_SHA,KD_CARGO_DENY_PATH,KD_CARGO_DENY_RECEIPT_PATH,KD_CARGO_DENY_HOME,KD_RUSTSEC_ADVISORY_DB_PATH,KD_STAGED_INVENTORY_RECEIPT python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge confinement phase records
         if: ${{ always() && steps.selftest.outcome != 'skipped' && steps.recheck.outcome != 'skipped' }}
         run: |
@@ -594,11 +627,38 @@ jobs:
         env:
           SOURCE_READER_TOKEN: ${{ steps.verifier-token.outputs.token }}
         run: python3 -B kit/confinement/linux_source_build.py revoke
+      - name: Install independent pinned cargo-deny and prepare RustSec database
+        id: verifier-rust-license-tools
+        if: ${{ inputs.mode == 'source' }}
+        env:
+          RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
+        run: |
+          set -euo pipefail
+          control_root="$RUNNER_TEMP/kd-rust-license-control"
+          cargo_deny_root="$control_root/cargo-deny"
+          cargo_home="$control_root/cargo-home"
+          mkdir -m 700 -p "$control_root"
+          python3 -B kit/confinement/cargo_deny_installer.py install --destination "$cargo_deny_root" > "$control_root/install-record"
+          python3 -B kit/confinement/cargo_deny_installer.py prepare-advisories --cargo-home "$cargo_home" > "$control_root/advisory-record"
+          [[ -x "$RUST_ROOT/bin/cargo" ]]
+          cargo_deny_path="$cargo_deny_root/cargo-deny"
+          receipt_path="$cargo_deny_root/cargo-deny-install.json"
+          advisory_path="$cargo_home/advisory-dbs/advisory-db-3157b0e258782691"
+          [[ -x "$cargo_deny_path" && -f "$receipt_path" && -d "$advisory_path" ]]
+          printf 'cargo_deny_path=%s\n' "$cargo_deny_path" >> "$GITHUB_OUTPUT"
+          printf 'cargo_deny_receipt_path=%s\n' "$receipt_path" >> "$GITHUB_OUTPUT"
+          printf 'cargo_deny_home=%s\n' "$cargo_home" >> "$GITHUB_OUTPUT"
+          printf 'advisory_database_path=%s\n' "$advisory_path" >> "$GITHUB_OUTPUT"
       - name: Require trusted Rust licence admission independently
         if: ${{ inputs.mode == 'source' }}
         env:
           SOURCE_PATH: ${{ steps.verifier-checkout.outputs.source_path }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
+          KD_CARGO_DENY_PATH: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_path }}
+          KD_CARGO_DENY_RECEIPT_PATH: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_receipt_path }}
+          KD_CARGO_DENY_HOME: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_home }}
+          KD_RUSTSEC_ADVISORY_DB_PATH: ${{ steps.verifier-rust-license-tools.outputs.advisory_database_path }}
         run: python3 -B kit/confinement/linux_source_build.py rust-license-gate
       - name: Fetch independent npm tarballs by lock integrity
         id: verifier-npm
@@ -621,7 +681,8 @@ jobs:
           RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
           EXPECTED_NODE_LOCK_SHA256: ${{ steps.verifier-checkout.outputs.lock_sha256 }}
           EXPECTED_MANIFEST_SHA256: ${{ steps.verifier-checkout.outputs.manifest_sha256 }}
-        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: sudo -n --preserve-env=SOURCE_PATH,NPM_TARBALL_INDEX,RUST_ROOT,EXPECTED_NODE_LOCK_SHA256,EXPECTED_MANIFEST_SHA256,REQUESTED_SOURCE_SHA,RUNNER_TEMP,GITHUB_OUTPUT python3 -B kit/confinement/linux_source_build.py prepare-project
       - name: Re-run independent positive controls before project execution
         id: verifier-recheck
         env:
@@ -644,7 +705,13 @@ jobs:
           RUST_ROOT: ${{ steps.verifier-toolchain.outputs.rust_root }}
           NODE_BIN: ${{ steps.verifier-toolchain.outputs.node_bin }}
           REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
-        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT python3 -B kit/confinement/linux_source_build.py gates
+          CI_SHA: ${{ github.sha }}
+          KD_CARGO_DENY_PATH: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_path }}
+          KD_CARGO_DENY_RECEIPT_PATH: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_receipt_path }}
+          KD_CARGO_DENY_HOME: ${{ steps.verifier-rust-license-tools.outputs.cargo_deny_home }}
+          KD_RUSTSEC_ADVISORY_DB_PATH: ${{ steps.verifier-rust-license-tools.outputs.advisory_database_path }}
+          KD_STAGED_INVENTORY_RECEIPT: ${{ steps.verifier-project.outputs.staged_inventory_receipt }}
+        run: sudo -n --preserve-env=WORKER_PATH,CARGO_HOME,RUST_ROOT,NODE_BIN,RUNNER_TEMP,REQUESTED_SOURCE_SHA,BROWSER_ROOT,CI_SHA,KD_CARGO_DENY_PATH,KD_CARGO_DENY_RECEIPT_PATH,KD_CARGO_DENY_HOME,KD_RUSTSEC_ADVISORY_DB_PATH,KD_STAGED_INVENTORY_RECEIPT python3 -B kit/confinement/linux_source_build.py gates
       - name: Merge independent confinement records
         if: ${{ always() && steps.verifier-selftest.outcome != 'skipped' && steps.verifier-recheck.outcome != 'skipped' }}
         run: |

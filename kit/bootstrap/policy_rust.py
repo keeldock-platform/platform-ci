@@ -342,6 +342,24 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$ACTUAL_INSTALLATION_ID" == "$EXPECTED_INSTALLATION_ID" ]] || exit 1
+      - name: Install pinned cargo-deny and prepare the RustSec database
+        id: rust-license-tools
+        run: |
+          set -euo pipefail
+          control_root="$RUNNER_TEMP/kd-rust-license-control"
+          cargo_deny_root="$control_root/cargo-deny"
+          cargo_home="$control_root/cargo-home"
+          mkdir -m 700 -p "$control_root"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/cargo_deny_installer.py install --destination "$cargo_deny_root" > "$control_root/install-record"
+          /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 -I -S -B kit/confinement/cargo_deny_installer.py prepare-advisories --cargo-home "$cargo_home" > "$control_root/advisory-record"
+          cargo_deny_path="$cargo_deny_root/cargo-deny"
+          receipt_path="$cargo_deny_root/cargo-deny-install.json"
+          advisory_path="$cargo_home/advisory-dbs/advisory-db-3157b0e258782691"
+          [[ -x "$cargo_deny_path" && -f "$receipt_path" && -d "$advisory_path" ]]
+          printf 'checker_path=%s\n' "$cargo_deny_path" >> "$GITHUB_OUTPUT"
+          printf 'checker_receipt_path=%s\n' "$receipt_path" >> "$GITHUB_OUTPUT"
+          printf 'checker_home=%s\n' "$cargo_home" >> "$GITHUB_OUTPUT"
+          printf 'advisory_database_path=%s\n' "$advisory_path" >> "$GITHUB_OUTPUT"
       - name: Run and publish encrypted feedback
         id: producer
         env:
@@ -351,6 +369,10 @@ jobs:
           SOURCE_REPOSITORY_ID: ${{ vars.SOURCE_REPOSITORY_ID }}
           SOURCE_REPOSITORY_OWNER: ${{ secrets.SOURCE_REPOSITORY_OWNER }}
           SOURCE_REPOSITORY_NAME: ${{ secrets.SOURCE_REPOSITORY_NAME }}
+          KD_CARGO_DENY_PATH: ${{ steps.rust-license-tools.outputs.checker_path }}
+          KD_CARGO_DENY_RECEIPT_PATH: ${{ steps.rust-license-tools.outputs.checker_receipt_path }}
+          KD_CARGO_DENY_HOME: ${{ steps.rust-license-tools.outputs.checker_home }}
+          KD_RUSTSEC_ADVISORY_DB_PATH: ${{ steps.rust-license-tools.outputs.advisory_database_path }}
           CORE_CONTRACT_ALLOWED_SHA: ${{ vars.CORE_CONTRACT_ALLOWED_SHA }}
           CORE_CONTRACT_ALLOWED_CONTROL_SHA: ${{ vars.CORE_CONTRACT_ALLOWED_CONTROL_SHA }}
           CORE_CONTRACT_REVIEWED_SOURCE_SHA: ${{ vars.CORE_CONTRACT_REVIEWED_SOURCE_SHA }}
@@ -396,6 +418,10 @@ jobs:
             SOURCE_READER_INSTALLATION_ID="$SOURCE_READER_INSTALLATION_ID" \
             SOURCE_READER_CLIENT_ID="$SOURCE_READER_CLIENT_ID" SOURCE_REPOSITORY_ID="$SOURCE_REPOSITORY_ID" \
             SOURCE_REPOSITORY_OWNER="$SOURCE_REPOSITORY_OWNER" SOURCE_REPOSITORY_NAME="$SOURCE_REPOSITORY_NAME" \
+            KD_CARGO_DENY_PATH="$KD_CARGO_DENY_PATH" \
+            KD_CARGO_DENY_RECEIPT_PATH="$KD_CARGO_DENY_RECEIPT_PATH" \
+            KD_CARGO_DENY_HOME="$KD_CARGO_DENY_HOME" \
+            KD_RUSTSEC_ADVISORY_DB_PATH="$KD_RUSTSEC_ADVISORY_DB_PATH" \
             /Library/Developer/CommandLineTools/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9 \
             -I -S -B kit/confinement/macos_feedback_producer.py run --profile cargo_lock --token-stdin \
             --source-sha "$REQUESTED_SOURCE_SHA" --base-sha "$REQUESTED_BASE_SHA" \

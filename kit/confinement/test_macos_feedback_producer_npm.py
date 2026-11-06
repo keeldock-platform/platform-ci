@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import io
 import json
 import os
@@ -88,6 +89,27 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         self.resolve = SimpleNamespace(returncode=0, stdout=b"")
         self.fetcher = self.world.fetcher()
         self.files = dict(self.world.files)
+        self.candidate_file_transform = None
+
+    def test_core_and_runtime_returns_use_the_lock_paths_written_by_npm(self):
+        for selector, relative in (
+            (bootstrap.CORE_WAVE_70A_FILING, "package-lock.json"),
+            (bootstrap.RUNTIME_WAVE_70A_FILING, "runtime/package-lock.json"),
+        ):
+            with self.subTest(selector=selector), tempfile.TemporaryDirectory() as temporary:
+                project = Path(temporary)
+                expected = project / relative
+                expected.parent.mkdir(parents=True, exist_ok=True)
+                expected.write_bytes(b"production lock\n")
+                resolved = producer._npm_root_lock_path(
+                    project, bootstrap.filing_for(selector),
+                )
+                self.assertEqual(resolved, expected)
+                self.assertEqual(resolved.read_bytes(), b"production lock\n")
+                if selector == bootstrap.RUNTIME_WAVE_70A_FILING:
+                    self.assertNotEqual(resolved, project / "runtime/runtime/package-lock.json")
+                    with self.assertRaises(FileNotFoundError):
+                        (project / "runtime/runtime/package-lock.json").read_bytes()
 
     def run_worker(self, rust, argv, uid, environment, python, capability, stage, deadline, **keywords):
         self.commands.append((tuple(argv), dict(environment), stage, keywords))
@@ -117,7 +139,22 @@ class NpmAdmissionProducerTests(unittest.TestCase):
                 raise self.lock_failure
             return lock if lock is not None else self.world.lock_bytes
 
+        def candidate_files(unused_source, unused_sha):
+            result = {
+                path: (
+                    "100644",
+                    hashlib.sha1(
+                        b"blob " + str(len(payload)).encode("ascii") + b"\x00" + payload,
+                    ).hexdigest(),
+                )
+                for path, payload in self.files.items()
+            }
+            if self.candidate_file_transform is not None:
+                self.candidate_file_transform(result)
+            return result
+
         with patch.object(producer, "_read_file", self.read_file), \
+                patch.object(producer, "_authenticated_candidate_files", side_effect=candidate_files), \
                 patch.object(producer, "_make_worker_directory",
                              lambda path, uid, gid: self.directories.append(Path(path).as_posix())), \
                 patch.object(producer, "_write_worker_file",
@@ -149,6 +186,21 @@ class NpmAdmissionProducerTests(unittest.TestCase):
         self.assertEqual(evidence["run_id"], "9876")
         self.assertEqual(evidence["totals"]["packages"], 4)
         self.assertEqual(self.chdirs, [(STORAGE / "feedback-npm-admission").as_posix(), SOURCE.as_posix()])
+
+    def test_candidate_input_blob_mismatch_refuses_before_npm_executes(self):
+        self.candidate_file_transform = lambda entries: entries.update({
+            "package.json": ("100644", "0" * 40),
+        })
+        self.assertEqual(self.refusal(), "manifest_invalid")
+        self.assertEqual(self.commands, [])
+
+    def test_candidate_input_symlink_refuses_before_npm_executes(self):
+        self.candidate_file_transform = lambda entries: entries.update({
+            "package.json": ("120000", entries["package.json"][1]),
+        })
+        self.assertEqual(self.refusal(), "manifest_invalid")
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.written, [])
 
     def test_the_fixture_filing_and_the_fixture_repository_id_must_agree_before_any_read(self):
         base = {"SOURCE_REPOSITORY_OWNER": "owner", "SOURCE_REPOSITORY_NAME": "name"}

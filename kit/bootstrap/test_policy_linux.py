@@ -370,6 +370,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
                 "Verify selected installation identity",
                 "Fetch exact source and verify binding, tree, signatures and lock provenance",
                 "Revoke source-reader token and verify rejection",
+                "Install pinned cargo-deny and prepare the RustSec database",
                 "Require trusted Rust licence admission",
                 "Fetch npm tarballs by committed lock integrity",
                 "Run trusted dependency audit",
@@ -419,7 +420,7 @@ class LinuxSourceAdmissionWorkflowTests(unittest.TestCase):
         self.assertIn("linux_source_build.py gates", verdict)
         self.assertIn("run: python3 -B kit/confinement/linux_source_build.py verdict", verdict)
         self.assertNotIn("uses:", verdict)
-        self.assertEqual(verdict.count("      - name:"), 17)
+        self.assertEqual(verdict.count("      - name:"), 18)
         self.assertEqual(verdict.count("--preserve-env=KD_CANARY_SECRET"), 2)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", self.text)
         self.assertNotIn("KD-CONFINEMENT" + "-VERDICT", verdict)
@@ -707,7 +708,7 @@ class LinuxQuickReturnWorkflowTests(unittest.TestCase):
         self.assertNotIn("KD_CANARY_SECRET", encrypt)
 
     def test_the_encrypted_upload_directory_is_uploaded_for_one_day_without_overwrite_or_compression(self):
-        self.assertEqual(self.text.count("uses: " + self.PINNED_UPLOAD + " " + chr(35) + " v7.0.2\n"), 1)
+        self.assertEqual(self.text.count("uses: " + self.PINNED_UPLOAD + " " + "\x23" + " v7.0.2\n"), 1)
         upload = self.text.split("      - name: Upload the single encrypted member\n", 1)[1].split("      - name:", 1)[0]
         for line in (
             "          name: linux-quick-${{ inputs.request_id }}\n",
