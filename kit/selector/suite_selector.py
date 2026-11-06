@@ -1,6 +1,12 @@
 import json
 import re
 from dataclasses import dataclass
+from pathlib import Path
+
+try:
+    from .ci19_catalogue import load_snapshot
+except ImportError:
+    from ci19_catalogue import load_snapshot
 
 
 SHADOW_MODE = "shadow"
@@ -36,17 +42,40 @@ class SelectionReport:
         return ()
 
 
-MCP_HOST_FEATURE_OWNERS = (
-    ("settings", "core.settings-schema"),
-    ("ui", "core.shell-ui"),
-    ("workspace", "core.workspace"),
-    ("logs", "core.log"),
-    ("search", "core.search"),
-    ("diagnostics", "core.diagnostics"),
-    ("windows", "core.windows"),
-    ("legacy-import", "core.legacy-import"),
-    ("ai", "core.ai"),
+MCP_HOST_FEATURE_OWNERS = load_snapshot(
+    Path(__file__).resolve().parent / "fixtures" / "ci19_mcp_feature_owners.json"
 )
+
+ci19_canonical_catalogue = "repos/16-ci-suite-catalogue.md"
+ci19_catalogue_feature_pattern = re.compile(
+    r"crates/host/mcp-host/([a-z][a-z0-9-]{0,31})/\*\*"
+)
+
+
+def validate_ci19_catalogue(markdown):
+    """Require the eight active reverse edges recorded in the core suite catalogue."""
+    if type(markdown) is not str or len(markdown) > 2 * 1024 * 1024:
+        raise ValueError("invalid-ci19-catalogue")
+    expected = dict(MCP_HOST_FEATURE_OWNERS)
+    observed = []
+    for line in markdown.splitlines():
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 4:
+            continue
+        suite_match = re.fullmatch(r"`(core\.[a-z0-9.-]{1,96})`", cells[0])
+        if suite_match is None:
+            continue
+        suite_id = suite_match.group(1)
+        for feature in ci19_catalogue_feature_pattern.findall(cells[3]):
+            observed.append((feature, suite_id))
+    if (len(observed) != len(expected)
+            or len(set(observed)) != len(observed)
+            or dict(observed) != expected
+            or set(feature for feature, _ in observed) != set(expected)):
+        raise ValueError("invalid-ci19-catalogue")
+    return MCP_HOST_FEATURE_OWNERS
 
 
 MCP_HOST_REVERSE_EDGES = tuple(
@@ -86,9 +115,18 @@ MCP_HOST_SHARED_EDGES = tuple(
 
 
 SUITE_EDGES = MCP_HOST_REVERSE_EDGES + MCP_HOST_SHARED_EDGES
+
+
+def _canonical_catalogue(edges):
+    expected = set(SUITE_EDGES)
+    return len(edges) == len(expected) and set(edges) == expected
+
+
 FULL_SET_PREFIXES = (
     ".github",
-    "kit/selector",
+    "ci",
+    "kit",
+    "repos",
     ".cargo",
     "vendor",
     "runtime",
@@ -154,6 +192,8 @@ def _requires_full_set(path):
     if any(_path_is_within(path, prefix) for prefix in FULL_SET_PREFIXES):
         return True
     parts = path.split("/")
+    if parts[0].startswith("core-"):
+        return True
     lowered_parts = tuple(part.lower() for part in parts)
     if any(part in FULL_SET_NAMES for part in lowered_parts):
         return True
@@ -227,6 +267,9 @@ def select_suites(
         or not edge.edge_name
         for edge in edges
     ):
+        edges = ()
+        reasons.append("invalid-catalogue")
+    elif not _canonical_catalogue(edges):
         edges = ()
         reasons.append("invalid-catalogue")
 

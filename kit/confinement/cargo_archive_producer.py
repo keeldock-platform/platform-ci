@@ -218,7 +218,7 @@ class TrustedArchivePort:
             urllib.request.ProxyHandler({}), _NoRedirectHandler(),
         )
 
-    def verify_complete(self, lock_bytes, identity, lock_packages):
+    def verify_complete(self, lock_bytes, identity, lock_packages, archive_consumer=None):
         try:
             expected = _registry_packages(lock_bytes, identity)
             supplied = tuple(lock_packages)
@@ -244,6 +244,13 @@ class TrustedArchivePort:
                 if not hmac.compare_digest(archive_sha256, package.checksum):
                     _refuse()
                 spdx, notices = _license_and_notices(payload, package)
+                if archive_consumer is not None:
+                    if not callable(archive_consumer):
+                        _refuse()
+                    try:
+                        archive_consumer(package, payload)
+                    except (cargo_lock_receipt.Refusal, OSError, TypeError, ValueError):
+                        _refuse()
                 archive_packages.append(rust_license_gate.ArchivePackage(
                     package, archive_sha256, spdx, spdx, True, notices,
                 ))

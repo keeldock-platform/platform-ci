@@ -1573,14 +1573,14 @@ class LinuxSourceBuildTests(unittest.TestCase):
             ) as prepare, patch.object(linux_source_build, "_gate_commands") as construct, patch.object(
                 linux_source_build.linux_session, "run_host",
             ) as execute:
-                with self.assertRaises(linux_source_build.rust_license_gate.LicenseGateRefusal) as refused:
+                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
                     linux_source_build.run_project_gates({
                         "RUNNER_TEMP": temporary, "WORKER_PATH": str(worker),
                         "CARGO_HOME": str(worker / ".kd-cargo-home"),
                         "RUST_ROOT": "/rust", "NODE_BIN": "/node",
                         "REQUESTED_SOURCE_SHA": "a" * 40,
                     })
-            self.assertEqual(refused.exception.reason, "archive_producer_unavailable")
+            self.assertEqual(refused.exception.reason, "gate")
             prepare.assert_not_called()
             construct.assert_not_called()
             execute.assert_not_called()
@@ -1630,6 +1630,54 @@ class LinuxSourceBuildTests(unittest.TestCase):
                 }), 0)
             self.assertEqual(output.getvalue(), "linux-rust-licence=registry-free locks=2\n")
 
+    def test_registry_admission_separates_workspace_profiles_from_lock_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary).resolve()
+            (source / "Cargo.toml").write_text("[package]\n", encoding="ascii")
+            (source / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
+            runtime = source / "runtime"
+            runtime.mkdir()
+            (runtime / "Cargo.toml").write_text("[workspace]\n", encoding="ascii")
+            (runtime / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
+            calls = []
+
+            def admit(*arguments):
+                calls.append(arguments)
+                return {"license_gate_receipt": object()}
+
+            with patch.object(linux_source_build, "_require_confined_manifests"), patch.object(
+                linux_source_build, "_check_d145_runtime_profile",
+            ), patch.object(
+                linux_source_build.cargo_rust_admission, "admit_authenticated_lock", side_effect=admit,
+            ):
+                self.assertEqual(linux_source_build.run_rust_license_gate({
+                    "SOURCE_PATH": str(source), "REQUESTED_SOURCE_SHA": "a" * 40,
+                }), 0)
+            self.assertEqual([(call[3], call[4]) for call in calls], [
+                (".", "Cargo.lock"), ("runtime", "runtime/Cargo.lock"),
+            ])
+
+            cargo_path = "/rust/bin/cargo"
+            commands = (
+                ("contract", (cargo_path, "check", "--manifest-path", str(source / "Cargo.toml"))),
+                ("runtime", (cargo_path, "check", "--manifest-path", str(runtime / "Cargo.toml"))),
+            )
+            admissions = {
+                "Cargo.lock": {
+                    "cargo_arguments": ["--config", "source.crates-io.replace-with=\"contract-vendor\""],
+                    "required_flags": ("--locked", "--offline"),
+                },
+                "runtime/Cargo.lock": {
+                    "cargo_arguments": ["--config", "source.crates-io.replace-with=\"runtime-vendor\""],
+                    "required_flags": ("--locked", "--offline"),
+                },
+            }
+            updated = linux_source_build._apply_vendor_arguments(
+                commands, admissions, source, cargo_path,
+            )
+        self.assertTrue(any("contract-vendor" in argument for argument in updated[0][1]))
+        self.assertTrue(any("runtime-vendor" in argument for argument in updated[1][1]))
+
     def test_d145_profile_refuses_an_incomplete_runtime_workspace_before_license_processing(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1653,10 +1701,11 @@ class LinuxSourceBuildTests(unittest.TestCase):
             (root / "Cargo.lock").write_text(_registry_lock(), encoding="ascii")
             output = io.StringIO()
             with patch.object(linux_source_build.sys, "stdout", output):
-                with self.assertRaises(linux_source_build.rust_license_gate.LicenseGateRefusal):
+                with self.assertRaises(linux_source_build.SourceBuildRefusal) as refused:
                     linux_source_build.run_rust_license_gate({
                         "SOURCE_PATH": str(root), "REQUESTED_SOURCE_SHA": "a" * 40,
                     })
+            self.assertEqual(refused.exception.reason, "gate")
             self.assertEqual(output.getvalue(), "")
 
     def _gate_over_tree(self, files, links=None):
@@ -1804,9 +1853,12 @@ class LinuxSourceBuildTests(unittest.TestCase):
     def test_tree_without_any_lock_refuses_with_lock(self):
         self._assert_tree_refused({"Cargo.toml": '[workspace]\nmembers = []\n'})
 
-    def test_gate_receipt_from_trusted_ports_prints_no_counts_line(self):
-        gate = linux_source_build.rust_license_gate
-        with patch.object(gate, "require_lock_admission", return_value=object()):
+    def test_registry_gate_receipt_prints_no_counts_line(self):
+        with patch.object(
+            linux_source_build.cargo_rust_admission,
+            "admit_authenticated_lock",
+            return_value={"license_gate_receipt": object()},
+        ):
             self.assertEqual(self._gate_over_tree({"Cargo.lock": _registry_lock()}), (0, ""))
 
     def test_runtime_gate_receipt_requires_every_selected_stage_to_complete(self):

@@ -1,7 +1,16 @@
 import json
 import unittest
+from pathlib import Path
 
+from ci19_catalogue import (
+    EXPECTED_OWNERS,
+    CatalogueError,
+    parse_catalogue,
+    validate_snapshot,
+)
 from suite_selector import (
+    ci19_canonical_catalogue,
+    MCP_HOST_FEATURE_OWNERS,
     MCP_HOST_REVERSE_EDGES,
     MCP_HOST_SHARED_EDGES,
     PathChange,
@@ -10,6 +19,7 @@ from suite_selector import (
     SuiteEdge,
     format_shadow_report,
     select_suites,
+    validate_ci19_catalogue,
 )
 
 
@@ -22,7 +32,6 @@ EXPECTED_MCP_REVERSE_EDGES = (
     ("search", "core.search"),
     ("diagnostics", "core.diagnostics"),
     ("windows", "core.windows"),
-    ("legacy-import", "core.legacy-import"),
     ("ai", "core.ai"),
 )
 FULL_SUITES = frozenset(
@@ -36,7 +45,6 @@ FULL_SUITES = frozenset(
         "core.search",
         "core.diagnostics",
         "core.windows",
-        "core.legacy-import",
         "core.ai",
         "core.static",
     )
@@ -44,6 +52,40 @@ FULL_SUITES = frozenset(
 
 
 class SuiteSelectorTests(unittest.TestCase):
+    def test_staged_ci19_snapshot_matches_the_exact_owner_pairs(self):
+        fixture = Path(__file__).resolve().parent / "fixtures" / "ci19_mcp_feature_owners.json"
+        raw = fixture.read_bytes()
+        self.assertEqual(validate_snapshot(raw), EXPECTED_MCP_REVERSE_EDGES)
+        self.assertEqual(EXPECTED_OWNERS, EXPECTED_MCP_REVERSE_EDGES)
+
+    def test_ci19_snapshot_rejects_missing_renamed_or_duplicate_pairs(self):
+        fixture = Path(__file__).resolve().parent / "fixtures" / "ci19_mcp_feature_owners.json"
+        snapshot = json.loads(fixture.read_text(encoding="ascii"))
+        for mutation in ("missing", "renamed", "duplicate", "wrong-digest"):
+            changed = json.loads(json.dumps(snapshot))
+            if mutation == "missing":
+                changed["owners"].pop()
+            elif mutation == "renamed":
+                changed["owners"][0]["folder"] = "settings-schema"
+            elif mutation == "duplicate":
+                changed["owners"][1] = dict(changed["owners"][0])
+            else:
+                changed["catalogue_sha256"] = "0" * 64
+            payload = (json.dumps(changed, sort_keys=True, indent=2) + "\n").encode("ascii")
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(CatalogueError):
+                    validate_snapshot(payload)
+
+    def test_ci19_catalogue_parser_accepts_only_the_eight_active_owner_edges(self):
+        markdown = "\n".join(
+            "| `%s` | core | area | `crates/host/mcp-host/%s/**` |"
+            % (suite, folder)
+            for folder, suite in reversed(EXPECTED_MCP_REVERSE_EDGES)
+        )
+        self.assertEqual(parse_catalogue(markdown), EXPECTED_MCP_REVERSE_EDGES)
+        with self.assertRaises(CatalogueError):
+            parse_catalogue(markdown.replace("mcp-host/ai/**", "mcp-host/log/**", 1))
+
     def test_every_mcp_feature_change_selects_host_and_owning_suite(self):
         for feature, owner_suite in EXPECTED_MCP_REVERSE_EDGES:
             with self.subTest(feature=feature):
@@ -63,7 +105,6 @@ class SuiteSelectorTests(unittest.TestCase):
     def test_required_reverse_edges_select_both_suites_from_one_changed_path(self):
         required = {
             "windows": "core.windows",
-            "legacy-import": "core.legacy-import",
             "ai": "core.ai",
         }
         for feature, owner_suite in required.items():
@@ -79,7 +120,7 @@ class SuiteSelectorTests(unittest.TestCase):
                     {"core.mcp-host", owner_suite, "core.static", "core.feature-states"},
                 )
 
-    def test_removing_any_required_reverse_edge_fails_its_fixture(self):
+    def test_removing_any_required_reverse_edge_escalates_to_the_full_set(self):
         for edge in MCP_HOST_REVERSE_EDGES:
             with self.subTest(path=edge.path_prefix, suite=edge.suite_id):
                 mutated_catalogue = tuple(
@@ -92,15 +133,9 @@ class SuiteSelectorTests(unittest.TestCase):
                     catalogue=mutated_catalogue,
                     base_resolved=True,
                 )
-                feature = edge.path_prefix.rsplit("/", 1)[1]
-                owner_suite = dict(EXPECTED_MCP_REVERSE_EDGES)[feature]
-                expected = {
-                    "core.mcp-host",
-                    owner_suite,
-                    "core.static",
-                    "core.feature-states",
-                }
-                self.assertEqual(set(report.would_select), expected - {edge.suite_id})
+                self.assertTrue(report.escalated)
+                self.assertEqual(report.would_select, tuple(sorted(FULL_SUITES)))
+                self.assertIn("invalid-catalogue", report.reasons)
 
     def test_base_sha_must_be_resolved_and_canonical(self):
         for base_sha in (None, "a" * 39, "A" * 40):
@@ -220,6 +255,77 @@ class SuiteSelectorTests(unittest.TestCase):
                 SuiteEdge(expected_prefix, "core.feature-states", "host-feature-states"),
                 MCP_HOST_SHARED_EDGES,
             )
+
+    def test_ci19_owners_match_the_eight_active_catalogue_folders(self):
+        self.assertEqual(ci19_canonical_catalogue, "repos/16-ci-suite-catalogue.md")
+        self.assertEqual(MCP_HOST_FEATURE_OWNERS, EXPECTED_MCP_REVERSE_EDGES)
+        self.assertEqual(len(MCP_HOST_FEATURE_OWNERS), 8)
+        self.assertNotIn("legacy-import", dict(MCP_HOST_FEATURE_OWNERS))
+        catalogue = "\n".join(
+            "| `" + suite + "` | core | source | `crates/host/mcp-host/" + feature + "/**` |"
+            for feature, suite in EXPECTED_MCP_REVERSE_EDGES
+        )
+        self.assertEqual(
+            validate_ci19_catalogue(catalogue),
+            EXPECTED_MCP_REVERSE_EDGES,
+        )
+
+    def test_ci19_catalogue_rejects_missing_renamed_duplicate_and_invented_folders(self):
+        canonical = [
+            "| `" + suite + "` | core | source | `crates/host/mcp-host/" + feature + "/**` |"
+            for feature, suite in EXPECTED_MCP_REVERSE_EDGES
+        ]
+        mutations = (
+            canonical[:-1],
+            [line.replace("/settings/**", "/settings-ui/**") for line in canonical],
+            canonical + [canonical[0]],
+            canonical + ["| `core.extra` | core | source | `crates/host/mcp-host/extra/**` |"],
+            canonical + ["| `core.legacy-import` | core | source | `crates/host/mcp-host/legacy-import/**` |"],
+        )
+        for mutated in mutations:
+            with self.subTest(lines=len(mutated)):
+                with self.assertRaisesRegex(ValueError, "invalid-ci19-catalogue"):
+                    validate_ci19_catalogue("\n".join(mutated))
+
+    def test_noncanonical_catalogue_edges_escalate_to_full_set(self):
+        edge = MCP_HOST_REVERSE_EDGES[0]
+        mutations = (
+            tuple(candidate for candidate in SUITE_EDGES if candidate != edge),
+            SUITE_EDGES + (edge,),
+            tuple(
+                SuiteEdge("crates/host/mcp-host/invented", "core.invented", "mcp-host-owner")
+                if candidate == edge else candidate
+                for candidate in SUITE_EDGES
+            ),
+        )
+        for catalogue in mutations:
+            with self.subTest(size=len(catalogue)):
+                report = select_suites(
+                    ("crates/host/mcp-host/settings/only.rs",),
+                    FULL_SUITES,
+                    GOOD_BASE_SHA,
+                    catalogue=catalogue,
+                    base_resolved=True,
+                )
+                self.assertTrue(report.escalated)
+                self.assertEqual(report.would_select, tuple(sorted(FULL_SUITES)))
+                self.assertIn("invalid-catalogue", report.reasons)
+
+    def test_ci_control_changes_are_always_full_set_inputs(self):
+        for path in (
+            "kit/confinement/feedback_request.py",
+            "kit/confinement/npm_admission_bootstrap.py",
+            "kit/cache/policy.py",
+            "ci/policy.json",
+            "core-runtime/test_separation.py",
+            "repos/16-ci-suite-catalogue.md",
+        ):
+            with self.subTest(path=path):
+                report = select_suites(
+                    (path,), FULL_SUITES, GOOD_BASE_SHA, base_resolved=True,
+                )
+                self.assertTrue(report.escalated)
+                self.assertIn("protected-input", report.reasons)
 
 
 if __name__ == "__main__":

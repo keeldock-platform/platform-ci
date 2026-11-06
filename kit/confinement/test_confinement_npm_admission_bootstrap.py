@@ -727,8 +727,7 @@ class UiKitFilingTests(RefusalAssertions):
 
 
 class Wave70ProfileTests(RefusalAssertions):
-    def core_files_and_lock(self, world):
-        filing_name = subject.CORE_WAVE_70A_FILING
+    def core_files_and_lock(self, world, filing_name=subject.CORE_WAVE_70A_FILING):
         filing = subject.FILINGS[filing_name]
         policy = world.policy()
         policy["direct"] = {"core": dict(DIRECT), "runtime": dict(DIRECT)}
@@ -750,7 +749,8 @@ class Wave70ProfileTests(RefusalAssertions):
             }
             for source, target in filing["member_edges"]:
                 if source == path:
-                    manifest.setdefault("dependencies", {})[subject._scoped_name(target)] = "0.1.0"
+                    group = "devDependencies" if path in filing.get("test_only_workspaces", ()) else "dependencies"
+                    manifest.setdefault(group, {})[subject._scoped_name(target)] = "0.1.0"
             files[path + "/package.json"] = _json(manifest) + b"\n"
         lock = json.loads(json.dumps(world.lock_dict))
         lock["packages"][""]["workspaces"] = list(filing["workspace_patterns"])
@@ -760,6 +760,8 @@ class Wave70ProfileTests(RefusalAssertions):
             manifest = json.loads(files[path + "/package.json"].decode("ascii"))
             if "dependencies" in manifest:
                 entry["dependencies"] = manifest["dependencies"]
+            if "devDependencies" in manifest:
+                entry["devDependencies"] = manifest["devDependencies"]
             lock["packages"][path] = entry
         return files, _json(lock) + b"\n"
 
@@ -865,6 +867,84 @@ class Wave70ProfileTests(RefusalAssertions):
             len(subject.FILINGS[subject.RUNTIME_WAVE_70B_FILING]["file_edges"]),
             len(subject.FILINGS[subject.RUNTIME_WAVE_70A_FILING]["file_edges"]),
         )
+
+    def test_wave71b_profiles_freeze_the_expanded_roots_and_cross_root_edges(self):
+        core = subject.FILINGS[subject.CORE_WAVE_71B_FILING]
+        runtime = subject.FILINGS[subject.RUNTIME_WAVE_71B_FILING]
+        self.assertEqual(core["workspaces"], (
+            "packages/host-api", "packages/kernel-i18n", "packages/kernel-icons",
+            "packages/kernel-tokens", "packages/kernel-ui-kit", "packages/i18n",
+            "packages/kernel-markdown", "packages/kernel-workers", "packages/extension-sdk",
+            "packages/extension-mock",
+        ))
+        self.assertEqual(core["workspace_patterns"], ("packages/*",))
+        self.assertEqual(runtime["workspaces"], subject.RUNTIME_WAVE_70_WORKSPACES)
+        self.assertEqual(runtime["workspace_patterns"], (
+            "apps/test-shell-desktop/web", "apps/test-shell-mobile/web", "packages/host-ui",
+        ))
+        self.assertEqual(core["test_only_workspaces"], ("packages/extension-mock",))
+        self.assertEqual(runtime["file_edges"], subject.RUNTIME_WAVE_71B_FILE_EDGES)
+        self.assertEqual(len(runtime["file_edges"]), 15)
+        self.assertEqual(len(set(runtime["file_edges"])), 15)
+        self.assertIn(
+            ("runtime/packages/host-ui", subject.SCOPE + "extension-sdk", "packages/extension-sdk"),
+            runtime["file_edges"],
+        )
+        self.assertIn(
+            ("packages/i18n", subject.SCOPE + "kernel-i18n", "packages/kernel-i18n"),
+            runtime["file_edges"],
+        )
+        self.assertIn(
+            ("packages/kernel-ui-kit", subject.SCOPE + "kernel-tokens", "packages/kernel-tokens"),
+            runtime["file_edges"],
+        )
+
+    def test_wave71b_core_graph_accepts_exact_ten_members_and_refuses_test_only_leakage(self):
+        world = World()
+        files, lock_bytes = self.core_files_and_lock(world, subject.CORE_WAVE_71B_FILING)
+        plan = subject.check_inputs(files, subject.CORE_WAVE_71B_FILING)
+        self.assertEqual(tuple(item["path"] for item in plan["workspaces"]),
+                         subject.CORE_WAVE_71B_WORKSPACES)
+        subject.check_lock(lock_bytes, plan)
+
+        missing = dict(files)
+        missing.pop("packages/kernel-tokens/package.json")
+        self.assert_refused("npm_input_invalid", subject.check_inputs,
+                            missing, subject.CORE_WAVE_71B_FILING)
+
+        root_edge = dict(files)
+        manifest = json.loads(root_edge["package.json"].decode("ascii"))
+        manifest.setdefault("devDependencies", {})[subject.SCOPE + "extension-mock"] = "0.1.0"
+        root_edge["package.json"] = _json(manifest) + b"\n"
+        self.assert_refused("npm_manifest_refused", subject.check_inputs,
+                            root_edge, subject.CORE_WAVE_71B_FILING)
+
+        production_edge = dict(files)
+        manifest = json.loads(production_edge["packages/kernel-ui-kit/package.json"].decode("ascii"))
+        manifest.setdefault("dependencies", {})[subject.SCOPE + "extension-mock"] = "0.1.0"
+        production_edge["packages/kernel-ui-kit/package.json"] = _json(manifest) + b"\n"
+        self.assert_refused("npm_manifest_refused", subject.check_inputs,
+                            production_edge, subject.CORE_WAVE_71B_FILING)
+
+    def test_wave71b_runtime_graph_authenticates_each_allowed_file_edge(self):
+        world, manifests, files = self.runtime_files(subject.RUNTIME_WAVE_71B_FILING)
+        plan = subject.check_inputs(files, subject.RUNTIME_WAVE_71B_FILING)
+        lock_bytes = self.runtime_lock(world, manifests, subject.RUNTIME_WAVE_71B_FILING)
+        subject.check_lock(lock_bytes, plan)
+        self.assertEqual(len(plan["workspaces"]), 3)
+        self.assertEqual(len(plan["file_edges"]), 15)
+        changed = dict(files)
+        ui_path = "runtime/packages/host-ui/package.json"
+        ui = json.loads(changed[ui_path].decode("ascii"))
+        ui["dependencies"][subject.SCOPE + "extension-sdk"] = "file:../../extension-sdk"
+        changed[ui_path] = _json(ui) + b"\n"
+        self.assert_refused("npm_manifest_refused", subject.check_inputs,
+                            changed, subject.RUNTIME_WAVE_71B_FILING)
+
+        missing = dict(files)
+        missing.pop("packages/kernel-tokens/package.json")
+        self.assert_refused("npm_input_invalid", subject.check_inputs,
+                            missing, subject.RUNTIME_WAVE_71B_FILING)
 
     def test_runtime_profile_checks_exact_file_edges_and_receipt_binding(self):
         world, manifests, files = self.runtime_files()

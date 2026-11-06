@@ -1,0 +1,13 @@
+[package]
+name = "cargo-deny-rustsec-2020-0071-affected"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+time = "=0.2.22"
+
+[dev-dependencies]
+time = "=0.2.22"
+
+[build-dependencies]
+time = "=0.2.22"

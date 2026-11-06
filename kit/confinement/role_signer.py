@@ -73,7 +73,7 @@ PROFILE_ROLES = {
 }
 PINNED_WORKFLOW_SHA256 = {
     ".github/workflows/windows-source-admission.yml": "118975166728aed8ee2ecc79c48fb5171f94fe5d4413ff05defaa556892c8273",
-    ".github/workflows/lane-h-windows-receiver.yml": "54f8bb70436ad34cbe65ac85d9de7c278a096c570dc2bcc58c2560ab75f0a635",
+    ".github/workflows/lane-h-windows-receiver.yml": "52c564f8b52db004f6e89202aff310a9d9b9b6f92e264814027a9e67f0edd772",
     ".github/workflows/lane-h-linux-fetch-encrypt.yml": "a23f7cf71baba02cba9d20e49abb0536505930c40b3312d76a4e8fdf6b22f8b1",
     ".github/workflows/lane-h-capsule-attester.yml": "192d78328f8bf093a68bef0f1dd323a88772e2929d79c92b24a8864d17c1b48c",
 }
@@ -95,8 +95,8 @@ API_LINUX_STEP_ORDINAL_PINS = {
 API_LINUX_STEP_ORDINAL_PINS["candidate"] = {"revoke-source-token": 12, "verify-token-rejection": 13}
 UNLABELED_LOG_STEP = "UNKNOWN STEP"
 BYTE_ORDER_MARK = chr(65279)
-LOG_GROUP_PREFIX = chr(35) * 2 + "[group]Run "
-LOG_GROUP_END = chr(35) * 2 + "[endgroup]"
+LOG_GROUP_PREFIX = "\x23" * 2 + "[group]Run "
+LOG_GROUP_END = "\x23" * 2 + "[endgroup]"
 LINUX_STEP_LOG_MARKERS = {
     "revoke-source-token": "printf '%s\\n' 'probe=source-free-revocation-simulation status=passed'",
     "verify-token-rejection": "printf '%s\\n' 'probe=source-free-revocation-simulation result=synthetic'",
@@ -858,7 +858,7 @@ CANDIDATE_ROLE_FILES = (
 FETCH_ENVIRONMENT_LINE = "    environment: ${{ inputs.mode == 'source' && 'linux-source-read' || '' }}"
 ACTION_USE_PATTERN = re.compile(
     r"\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[a-f0-9]{40}\s+"
-    + chr(35)
+    + "\x23"
     + r"\s+v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?"
 )
 
@@ -1029,7 +1029,7 @@ def validate_workflow_graph(root, profile):
             continue
         if re.fullmatch(
             r"\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[a-f0-9]{40}\s+"
-            + chr(35)
+            + "\x23"
             + r"\s+v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?",
             line,
         ) is None:
@@ -1084,7 +1084,7 @@ def validate_workflow_graph(root, profile):
                 continue
             if re.fullmatch(
                 r"\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[a-f0-9]{40}\s+"
-                + chr(35)
+                + "\x23"
                 + r"\s+v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?",
                 line,
             ) is None:

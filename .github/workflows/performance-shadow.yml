@@ -1,0 +1,36 @@
+name: performance-shadow-harness
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  performance-shadow:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch exact public control
+        env:
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_REF: ${{ github.ref }}
+          CI_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_REF" == "refs/heads/main" ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git init -q .
+          git remote add origin "https://github.com/${CI_REPOSITORY}.git"
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF"
+          git checkout --quiet --detach FETCH_HEAD
+          [[ "$(git rev-parse --verify HEAD)" == "$CI_SHA" ]]
+      - name: Check the pinned control tree and measure the 10,000-row harness
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          export PYTHONDONTWRITEBYTECODE=1
+          python3 -B kit/bootstrap/test_public_tree.py
+          python3 -B kit/ci/perf_shadow.py --samples 10000 \
+            | tee "$RUNNER_TEMP/performance-shadow.json"
+          cat "$RUNNER_TEMP/performance-shadow.json" >> "$GITHUB_STEP_SUMMARY"

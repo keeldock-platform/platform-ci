@@ -1,0 +1,38 @@
+{
+  "catalogue_sha256": "4b2e9a9eedbea850ef4e1c13dbdca9989e9d49fac7e61e3fc9999b23d110fe3a",
+  "owners": [
+    {
+      "folder": "settings",
+      "suite": "core.settings-schema"
+    },
+    {
+      "folder": "ui",
+      "suite": "core.shell-ui"
+    },
+    {
+      "folder": "workspace",
+      "suite": "core.workspace"
+    },
+    {
+      "folder": "logs",
+      "suite": "core.log"
+    },
+    {
+      "folder": "search",
+      "suite": "core.search"
+    },
+    {
+      "folder": "diagnostics",
+      "suite": "core.diagnostics"
+    },
+    {
+      "folder": "windows",
+      "suite": "core.windows"
+    },
+    {
+      "folder": "ai",
+      "suite": "core.ai"
+    }
+  ],
+  "schema_version": 1
+}

@@ -343,6 +343,50 @@ class PublicTreeTests(unittest.TestCase):
             'unittest discover -s "$CI_ACTION_PATH/../cache" -p "test_*.py"',
             action,
         )
+        self.assertIn(
+            'unittest discover -s "$CI_ACTION_PATH/../ci" -p "test_*.py"',
+            action,
+        )
+
+    def test_wave71b_ci_workflows_and_helpers_are_pinned_and_discovered(self):
+        expected = (
+            ".github/workflows/ci-future-stages.yml",
+            ".github/workflows/appium-ci.yml",
+            ".github/workflows/performance-shadow.yml",
+            "kit/selector/suite_selector.py",
+            "kit/selector/test_suite_selector.py",
+            "kit/selector/ci19_catalogue.py",
+            "kit/selector/fixtures/ci19_mcp_feature_owners.json",
+            "kit/ci/feature_states.py",
+            "kit/ci/test_feature_states.py",
+            "kit/ci/future_stage.py",
+            "kit/ci/test_future_stage.py",
+            "kit/ci/future-stage-inventory.json",
+            "kit/ci/perf_shadow.py",
+            "kit/ci/test_perf_shadow.py",
+        )
+        tree = scan_tree(ROOT, "platform")
+        for name in expected:
+            with self.subTest(name=name):
+                self.assertIn(name, PLATFORM_FILES)
+                self.assertIn(name, PINNED_FILE_SHA256)
+                self.assertIn(name, tree)
+        for name in (".github/workflows/ci-future-stages.yml", ".github/workflows/appium-ci.yml"):
+            workflow = (ROOT / name).read_text(encoding="ascii")
+            self.assertIn("--publish", workflow)
+            self.assertIn("future-stage", workflow)
+        future_stage = (ROOT / "kit/ci/future_stage.py").read_text(encoding="ascii")
+        self.assertIn('"conclusion": "failure"', future_stage)
+        self.assertIn('FUTURE_STAGE_GATE_EVIDENCE = "forbidden"', future_stage)
+        self.assertIn('"gate_evidence": FUTURE_STAGE_GATE_EVIDENCE', future_stage)
+        self.assertIn('"status": FUTURE_STAGE_STATUS', future_stage)
+        self.assertNotIn('"conclusion": "neutral"', future_stage)
+        self.assertNotIn('"conclusion": "success"', future_stage)
+        self.assertIn("FUTURE_STAGE_JOB_EXIT_CODE = 78", future_stage)
+        for name in (".github/workflows/ci-future-stages.yml", ".github/workflows/appium-ci.yml"):
+            workflow = (ROOT / name).read_text(encoding="ascii")
+            self.assertIn('if [[ "$probe_status" -eq 0 || "$probe_status" -eq 78 ]]; then', workflow)
+            self.assertIn('exit 78', workflow)
 
     def test_reviewed_native_and_source_controls_have_public_tree_hash_pins(self):
         expected = {
@@ -474,11 +518,32 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_release_build_verify.py",
             'kit/confinement/cargo_vendor_verify.py',
             'kit/confinement/test_cargo_vendor_verify.py',
+            'kit/confinement/test_cargo_vendor_producer.py',
+            'kit/confinement/cargo_vendor_producer.py',
+            'kit/confinement/cargo_rust_admission.py',
+            'kit/confinement/test_cargo_rust_admission.py',
+            'kit/confinement/cargo_deny_qualification.py',
+            'kit/confinement/cargo_deny_qualification_reviewed.json',
+            'kit/confinement/test_cargo_deny_qualification.py',
             'kit/confinement/cargo_archive_producer.py',
             'kit/confinement/test_cargo_archive_producer.py',
             'kit/confinement/cargo_deny_installer.py',
             'kit/confinement/test_cargo_deny_installer.py',
             'kit/confinement/cargo_deny_policy.toml',
+            'kit/confinement/fixtures/cargo-deny/issue-910-cycle/Cargo.toml',
+            'kit/confinement/fixtures/cargo-deny/issue-910-cycle/Cargo.lock',
+            'kit/confinement/fixtures/cargo-deny/issue-910-cycle/a/Cargo.toml',
+            'kit/confinement/fixtures/cargo-deny/issue-910-cycle/a/src/lib.rs',
+            'kit/confinement/fixtures/cargo-deny/issue-910-cycle/b/Cargo.toml',
+            'kit/confinement/fixtures/cargo-deny/issue-910-cycle/b/src/lib.rs',
+            'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-affected/Cargo.toml',
+            'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-affected/Cargo.lock',
+            'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-affected/build.rs',
+            'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-affected/src/lib.rs',
+            'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-patched/Cargo.toml',
+            'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-patched/Cargo.lock',
+            'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-patched/build.rs',
+            'kit/confinement/fixtures/cargo-deny/rustsec-2020-0071-patched/src/lib.rs',
             'kit/confinement/rust_license_checker.py',
             '.github/workflows/core-rust-lock-return.yml',
             'kit/bootstrap/policy_rust.py',
@@ -545,6 +610,20 @@ class PublicTreeTests(unittest.TestCase):
             "kit/confinement/test_confinement_synthetic_project.py",
             "kit/confinement/confinement_public_audit.py",
             "kit/confinement/macos_public_audit.py",
+            ".github/workflows/ci-future-stages.yml",
+            ".github/workflows/appium-ci.yml",
+            ".github/workflows/performance-shadow.yml",
+            "kit/selector/suite_selector.py",
+            "kit/selector/test_suite_selector.py",
+            "kit/selector/ci19_catalogue.py",
+            "kit/selector/fixtures/ci19_mcp_feature_owners.json",
+            "kit/ci/feature_states.py",
+            "kit/ci/test_feature_states.py",
+            "kit/ci/future_stage.py",
+            "kit/ci/test_future_stage.py",
+            "kit/ci/future-stage-inventory.json",
+            "kit/ci/perf_shadow.py",
+            "kit/ci/test_perf_shadow.py",
         }
         self.assertEqual(set(PINNED_FILE_SHA256), expected)
         self.assertTrue(expected.issubset(PLATFORM_FILES))

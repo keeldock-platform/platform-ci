@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "jobs": [
+    {"job_id":"cp1-api-mock-demo","checkpoint":"CP1","required_paths":["crates/host/api/Cargo.toml","crates/host/mock/Cargo.toml","crates/host/conformance/fixtures/demo-tool/Cargo.toml","packages/host-api/package.json"]},
+    {"job_id":"cp1-green-scaffold","checkpoint":"CP1","required_paths":["tools/xtask/Cargo.toml","tools/xtask/src/main.rs","crates/host/conformance/tests/conformance.rs"]},
+    {"job_id":"cp1-shell-bootstrap","checkpoint":"CP1","required_paths":["runtime/apps/test-shell-desktop/src-tauri/Cargo.toml","runtime/apps/test-shell-mobile/src-tauri/Cargo.toml","runtime/packages/host-ui/package.json"]},
+    {"job_id":"cp2-sqlite-store","checkpoint":"CP2","required_paths":["runtime/crates/services/store/Cargo.toml","runtime/crates/services/store/CONTRACT.md","runtime/crates/services/store/src/lib.rs"]},
+    {"job_id":"cp2-vault-lifecycle","checkpoint":"CP2","required_paths":["runtime/crates/services/vault-lifecycle/Cargo.toml","runtime/crates/services/vault-native/Cargo.toml","runtime/crates/services/vault/Cargo.toml"]},
+    {"job_id":"cp2-runtime-early","checkpoint":"CP2","required_paths":["runtime/crates/host/core/Cargo.toml","runtime/crates/services/streams/Cargo.toml","runtime/crates/services/cache/Cargo.toml"]},
+    {"job_id":"cp3-files-engine","checkpoint":"CP3","required_paths":["runtime/crates/services/store-files/Cargo.toml","runtime/crates/services/storage-migration/Cargo.toml","runtime/crates/services/files/Cargo.toml"]},
+    {"job_id":"cp3-sync","checkpoint":"CP3","required_paths":["runtime/crates/services/sync/Cargo.toml","runtime/crates/services/sync-format/Cargo.toml","runtime/crates/services/sync-publication/Cargo.toml"]},
+    {"job_id":"cp3-security-windows-bus","checkpoint":"CP3","required_paths":["runtime/crates/services/windows/src/message_bus/CONTRACT.md","runtime/crates/services/tls/Cargo.toml","runtime/apps/test-shell-desktop/src-tauri/capabilities/default.json"]},
+    {"job_id":"ci27-core-feature-states","checkpoint":"ci27","required_paths":["repos/16-ci-suite-catalogue.md","crates/host/api/src/manifest.rs","ci/feature-state-inventory.json"]},
+    {"job_id":"ci28-public-prose-audit","checkpoint":"ci28","required_paths":["ci/source-inventory.json","kit/confinement/confinement_public_audit.py","ci/public-prose-policy.json"]},
+    {"job_id":"ci28-source-auditor-permissions","checkpoint":"ci28","required_paths":["ci/source-reader-permissions.json","kit/confinement/macos_public_audit.py",".github/workflows/macos-source-reader-preflight.yml"]},
+    {"job_id":"ci29-sdk-compatibility","checkpoint":"ci29","required_paths":["packages/extension-sdk/package.json","packages/extension-mock/package.json","ci/extension-compatibility.json"]},
+    {"job_id":"ci30-extension-isolation","checkpoint":"ci30","required_paths":["runtime/crates/host/extensions/runtime/Cargo.toml","runtime/crates/host/extensions/broker/Cargo.toml","runtime/crates/host/extensions/storage/Cargo.toml"]},
+    {"job_id":"ci31-test-key-catalogue","checkpoint":"ci31","required_paths":["ci/test-key-catalogue.json","ci/test-key-revocation.json","ci/test-artifact-provenance.json"]},
+    {"job_id":"ci-platform-org-app-baseline","checkpoint":"CP1","required_paths":["ci/organization-baseline.json","ci/platform-app-permissions.json","ci/private-pin-overlay.json"]},
+    {"job_id":"appium-linux-android","checkpoint":"appium","required_paths":["ci/toolchains/appium-linux-android.json","ci/runner-capabilities/linux-android.json","ci/appium-probe/tauri-smoke.json"]},
+    {"job_id":"appium-macos-ios","checkpoint":"appium","required_paths":["ci/toolchains/appium-macos-ios.json","ci/runner-capabilities/macos-ios.json","ci/appium-probe/tauri-smoke.json"]},
+    {"job_id":"appium-windows-native","checkpoint":"appium","required_paths":["ci/toolchains/appium-windows-native.json","ci/runner-capabilities/windows-nova.json","ci/appium-probe/tauri-smoke.json"]}
+  ]
+}

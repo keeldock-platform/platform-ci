@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import hashlib
 import hmac
+import json
 import os
 import re
 import subprocess
@@ -25,7 +26,7 @@ MAX_NOTICE_PATH_BYTES = 512
 MAX_IDENTITY_FILE_BYTES = 268_435_456
 PROCESS_TIMEOUT_SECONDS = 120
 MAX_ADVISORY_AGE_SECONDS = 24 * 60 * 60
-CARGO_DENY_POLICY_SHA256 = "e5c21cc604c5ffc78830e0125086887e76302c6e54f5184ec8230bc812db4b13"
+CARGO_DENY_POLICY_SHA256 = "1c73e15eaa5605465b953c9907bfea22ab071583dd2fff67c25f14459387b810"
 SOURCE_RE = re.compile(r"[a-f0-9]{40}\Z")
 HEX_RE = re.compile(r"[a-f0-9]{64}\Z")
 PACKAGE_RE = re.compile(r"[a-zA-Z0-9_-]{1,128}\Z")
@@ -174,6 +175,7 @@ class GateReceipt:
     cargo_deny_sha256: str
     cargo_deny_qualification_sha256: str
     advisory_database_commit: str
+    advisory_database_generated_at_epoch: int
     seal: object
 
 
@@ -640,7 +642,8 @@ def require_rust_license_gate(lock_bytes, identity, ports):
         identity, evidence.archive_spdx_sha256, len(lock_keys),
         config.checker_source_sha, config.checker_sha256,
         config.policy_sha256, config.cargo_deny_sha256,
-        config.cargo_deny_qualification_sha256, config.advisory_database_commit, _SEAL,
+        config.cargo_deny_qualification_sha256, config.advisory_database_commit,
+        config.advisory_database_generated_at_epoch, _SEAL,
     )
 
 
@@ -655,7 +658,9 @@ def require_gate_receipt(receipt, identity, lock_packages):
             or not _valid_hash(receipt.policy_sha256)
             or not _valid_hash(receipt.cargo_deny_sha256)
             or not _valid_hash(receipt.cargo_deny_qualification_sha256)
-            or SOURCE_RE.fullmatch(receipt.advisory_database_commit or "") is None):
+            or SOURCE_RE.fullmatch(receipt.advisory_database_commit or "") is None
+            or type(receipt.advisory_database_generated_at_epoch) is not int
+            or receipt.advisory_database_generated_at_epoch <= 0):
         _refuse("unset")
     return receipt
 
@@ -674,9 +679,36 @@ def require_vendor_gate_receipt(receipt, source_sha, profile, lock_sha256, packa
             or not _valid_hash(receipt.policy_sha256)
             or not _valid_hash(receipt.cargo_deny_sha256)
             or not _valid_hash(receipt.cargo_deny_qualification_sha256)
-            or SOURCE_RE.fullmatch(receipt.advisory_database_commit or "") is None):
+            or SOURCE_RE.fullmatch(receipt.advisory_database_commit or "") is None
+            or type(receipt.advisory_database_generated_at_epoch) is not int
+            or receipt.advisory_database_generated_at_epoch <= 0):
         _refuse("unset")
     return receipt
+
+
+def gate_receipt_sha256(receipt):
+    """Return the canonical digest of a sealed successful licence-gate receipt."""
+    if type(receipt) is not GateReceipt or receipt.seal is not _SEAL:
+        _refuse("unset")
+    value = {
+        "source_sha": receipt.identity.source_sha,
+        "profile": receipt.identity.profile,
+        "lock_sha256": receipt.identity.lock_sha256,
+        "archive_spdx_sha256": receipt.archive_spdx_sha256,
+        "package_count": receipt.package_count,
+        "checker_source_sha": receipt.checker_source_sha,
+        "checker_sha256": receipt.checker_sha256,
+        "policy_sha256": receipt.policy_sha256,
+        "cargo_deny_sha256": receipt.cargo_deny_sha256,
+        "cargo_deny_qualification_sha256": receipt.cargo_deny_qualification_sha256,
+        "advisory_database_commit": receipt.advisory_database_commit,
+        "advisory_database_generated_at_epoch": receipt.advisory_database_generated_at_epoch,
+    }
+    try:
+        payload = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
+    except (TypeError, ValueError, UnicodeError):
+        _refuse("unset")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def require_configured_control(lock_bytes, identity, ports=None):
@@ -764,15 +796,42 @@ class _PinnedConfigPort:
                 rust_root, "bin", "cargo.exe" if os.name == "nt" else "cargo",
             )
             policy_sha256 = _digest_file(policy_path)
-            if not hmac.compare_digest(policy_sha256, CARGO_DENY_POLICY_SHA256):
+            if CARGO_DENY_POLICY_SHA256 != "UNSET" and not hmac.compare_digest(
+                    policy_sha256, CARGO_DENY_POLICY_SHA256):
                 _refuse("identity")
             checker_sha256 = _digest_file(checker_path)
             deny_sha256 = install_record["executable_sha256"]
+            import cargo_deny_qualification
+
+            qualification_path = os.path.join(
+                os.path.dirname(__file__), "cargo_deny_qualification_reviewed.json",
+            )
+            qualification_context = {
+                "tool_version": install_record["version"],
+                "policy_sha256": policy_sha256,
+                "advisory_database_commit": commit,
+                "advisory_database_generated_at_epoch": generated_epoch,
+                "installed_platform": cargo_deny_qualification.platform_key(),
+                "installed_executable_sha256": deny_sha256,
+            }
+            try:
+                qualification_bytes = Path(qualification_path).read_bytes()
+            except OSError:
+                qualification_bytes = b""
+            qualification_flags, qualification_evidence_sha256 = (
+                cargo_deny_qualification.derive_flags(
+                    qualification_bytes, qualification_context,
+                )
+            )
             qualification = hashlib.sha256((
                 "cargo-deny=" + install_record["version"]
                 + "\nasset=" + install_record["asset_sha256"]
+                + "\nbinary=" + deny_sha256
                 + "\npolicy=" + policy_sha256
                 + "\nadvisory-origin=" + cargo_deny_installer.RUSTSEC_ADVISORY_DATABASE_URL
+                + "\nadvisory-commit=" + commit
+                + "\nadvisory-generated=" + str(generated_epoch)
+                + "\nqualification-evidence=" + qualification_evidence_sha256
                 + "\nadvisory-max-age=" + str(MAX_ADVISORY_AGE_SECONDS)
                 + "\ncli=manifest,config,workspace,all-features,locked,offline,all-checks"
             ).encode("ascii")).hexdigest()
@@ -793,15 +852,19 @@ class _PinnedConfigPort:
             cargo_deny_qualification_sha256=qualification,
             policy_path=policy_path,
             policy_sha256=policy_sha256,
-            cargo_deny_provenance_qualified=True,
-            cargo_deny_cli_qualified=True,
+            cargo_deny_provenance_qualified=qualification_flags[
+                "cargo_deny_provenance_qualified"
+            ],
+            cargo_deny_cli_qualified=qualification_flags["cargo_deny_cli_qualified"],
             cargo_deny_cli_argv_sha256=_cargo_deny_argv_sha256(identity, policy_path),
-            r108_qualified=False,
+            r108_qualified=qualification_flags["r108_qualified"],
             advisory_database_fresh=True,
             advisory_database_commit=commit,
             advisory_database_generated_at_epoch=generated_epoch,
-            cargo_deny_issue_910_safe=False,
-            cargo_deny_affected_patched_controls_qualified=False,
+            cargo_deny_issue_910_safe=qualification_flags["cargo_deny_issue_910_safe"],
+            cargo_deny_affected_patched_controls_qualified=qualification_flags[
+                "cargo_deny_affected_patched_controls_qualified"
+            ],
             seal=None,
             cargo_executable_path=cargo_executable,
         ))

@@ -1,12 +1,10 @@
 import argparse
 import ctypes
 import errno
-import fcntl
 import http.server
 import os
 import pathlib
 import re
-import resource
 import shutil
 import signal
 import socket
@@ -21,6 +19,18 @@ import urllib.parse
 import urllib.request
 
 
+class _LazyModuleProxy:
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, name):
+        import importlib
+
+        return getattr(importlib.import_module(self._name), name)
+
+
+fcntl = _LazyModuleProxy("fcntl")
+resource = _LazyModuleProxy("resource")
 SHA_PATTERN = re.compile(r"[a-f0-9]{40}\Z")
 PROBES = ("tcp", "udp", "dns", "http", "proxy", "redirect", "ipc", "socket-policy", "file", "environment", "process", "boundary")
 SUPERVISION_TRANSITIONS = {
@@ -347,14 +357,15 @@ def _wait_for_process_state(pid, expected):
     raise ProofFailure(74)
 
 
-CHILD_LIMITS = (
-    (resource.RLIMIT_CPU, (3, 3)),
-    (resource.RLIMIT_FSIZE, (MAX_CAPTURE // 2, MAX_CAPTURE // 2)),
-    (resource.RLIMIT_AS, (268435456, 268435456)),
-    (resource.RLIMIT_NPROC, (16, 16)),
-    (resource.RLIMIT_NOFILE, (16, 16)),
-    (resource.RLIMIT_CORE, (0, 0)),
-)
+def _child_limits():
+    return (
+        (resource.RLIMIT_CPU, (3, 3)),
+        (resource.RLIMIT_FSIZE, (MAX_CAPTURE // 2, MAX_CAPTURE // 2)),
+        (resource.RLIMIT_AS, (268435456, 268435456)),
+        (resource.RLIMIT_NPROC, (16, 16)),
+        (resource.RLIMIT_NOFILE, (16, 16)),
+        (resource.RLIMIT_CORE, (0, 0)),
+    )
 
 
 def _drop_child(limits=None, socket_filter=True, drop_privileges=True, loopback=False):
@@ -375,7 +386,7 @@ def _drop_child(limits=None, socket_filter=True, drop_privileges=True, loopback=
             _install_socket_filter(LOOPBACK_SOCKET_FILTER)
         else:
             _install_socket_filter()
-    for key, limit in (CHILD_LIMITS if limits is None else limits):
+    for key, limit in (_child_limits() if limits is None else limits):
         resource.setrlimit(key, limit)
     os.close(0)
 

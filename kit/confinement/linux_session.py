@@ -3,7 +3,6 @@ import functools
 import json
 import os
 import re
-import resource
 import shutil
 import signal
 import socket
@@ -18,36 +17,79 @@ import linux_harness as harness
 from linux_channels import BoundaryRefusal, valid_nonce
 
 
+class _LazyModuleProxy:
+    def __init__(self, name):
+        self._name = name
+
+    def __getattr__(self, name):
+        import importlib
+
+        return getattr(importlib.import_module(self._name), name)
+
+
+class _LazyLimitProfile:
+    def __init__(self, name):
+        self.name = name
+
+    def __iter__(self):
+        return iter(_limit_profiles()[self.name])
+
+    def __len__(self):
+        return len(_limit_profiles()[self.name])
+
+    def __getitem__(self, index):
+        return _limit_profiles()[self.name][index]
+
+    def __eq__(self, other):
+        return tuple(self) == other
+
+
+resource = _LazyModuleProxy("resource")
 RESULT_PREFIX = b"KD-SESSION "
 MAX_CAPTURE_BYTES = 65536
 MAX_RESULT_BYTES = 400000
 OUTER_SLACK_SECONDS = 40
-PROBE_LIMITS = (
-    (resource.RLIMIT_CPU, (20, 20)),
-    (resource.RLIMIT_FSIZE, (4194304, 4194304)),
-    (resource.RLIMIT_AS, (1073741824, 1073741824)),
-    (resource.RLIMIT_NPROC, (64, 64)),
-    (resource.RLIMIT_NOFILE, (64, 64)),
-    (resource.RLIMIT_CORE, (0, 0)),
-)
-FIXTURE_LIMITS = (
-    (resource.RLIMIT_CPU, (120, 120)),
-    (resource.RLIMIT_FSIZE, (67108864, 67108864)),
-    (resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
-    (resource.RLIMIT_NPROC, (256, 256)),
-    (resource.RLIMIT_NOFILE, (256, 256)),
-    (resource.RLIMIT_CORE, (0, 0)),
-)
-PROJECT_LIMITS = (
-    (resource.RLIMIT_CPU, (3600, 3600)),
-    (resource.RLIMIT_FSIZE, (4294967296, 4294967296)),
-    (resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
-    (resource.RLIMIT_NPROC, (1024, 1024)),
-    (resource.RLIMIT_NOFILE, (4096, 4096)),
-    (resource.RLIMIT_CORE, (0, 0)),
-)
 MAX_TIMEOUT_SECONDS = {"probe": 600, "fixture": 600, "project": 1800}
-LIMIT_PROFILES = {"probe": PROBE_LIMITS, "fixture": FIXTURE_LIMITS, "project": PROJECT_LIMITS}
+LIMIT_PROFILE_NAMES = frozenset(("probe", "fixture", "project"))
+
+
+def _limit_profiles():
+    return {
+        "probe": (
+            (resource.RLIMIT_CPU, (20, 20)),
+            (resource.RLIMIT_FSIZE, (4194304, 4194304)),
+            (resource.RLIMIT_AS, (1073741824, 1073741824)),
+            (resource.RLIMIT_NPROC, (64, 64)),
+            (resource.RLIMIT_NOFILE, (64, 64)),
+            (resource.RLIMIT_CORE, (0, 0)),
+        ),
+        "fixture": (
+            (resource.RLIMIT_CPU, (120, 120)),
+            (resource.RLIMIT_FSIZE, (67108864, 67108864)),
+            (resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
+            (resource.RLIMIT_NPROC, (256, 256)),
+            (resource.RLIMIT_NOFILE, (256, 256)),
+            (resource.RLIMIT_CORE, (0, 0)),
+        ),
+        "project": (
+            (resource.RLIMIT_CPU, (3600, 3600)),
+            (resource.RLIMIT_FSIZE, (4294967296, 4294967296)),
+            (resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)),
+            (resource.RLIMIT_NPROC, (1024, 1024)),
+            (resource.RLIMIT_NOFILE, (4096, 4096)),
+            (resource.RLIMIT_CORE, (0, 0)),
+        ),
+    }
+
+
+PROBE_LIMITS = _LazyLimitProfile("probe")
+FIXTURE_LIMITS = _LazyLimitProfile("fixture")
+PROJECT_LIMITS = _LazyLimitProfile("project")
+LIMIT_PROFILES = {
+    "probe": PROBE_LIMITS,
+    "fixture": FIXTURE_LIMITS,
+    "project": PROJECT_LIMITS,
+}
 CONFINED_UNSHARE = tuple(harness.UNSHARE_ARGUMENTS)
 OPEN_UNSHARE = ("--mount", "--pid", "--fork", "--ipc", "--propagation", "private", "--kill-child=KILL")
 HOST_UNSHARE = ("--mount", "--pid", "--fork", "--ipc", "--net", "--propagation", "private", "--kill-child=KILL")
@@ -401,7 +443,7 @@ def validate_spec(spec):
             raise harness.ProofFailure(96)
         if SAFE_PATH.fullmatch(str(bind["source"])) is None or SAFE_PATH.fullmatch(str(bind["target"])) is None:
             raise harness.ProofFailure(96)
-    if spec.get("limits") not in LIMIT_PROFILES:
+    if spec.get("limits") not in LIMIT_PROFILE_NAMES:
         raise harness.ProofFailure(96)
     if type(spec.get("timeout")) is not int or not 1 <= spec["timeout"] <= MAX_TIMEOUT_SECONDS[spec["limits"]]:
         raise harness.ProofFailure(96)
@@ -498,7 +540,7 @@ def launch_and_collect(spec, argv, cwd, out, err, chrooted):
     confined = spec["mode"] == "confined"
     keep_root = bool(spec.get("keep_root"))
     drop = not keep_root and spec.get("fault") != "uid-root"
-    limits = LIMIT_PROFILES[spec["limits"]]
+    limits = _limit_profiles()[spec["limits"]]
     filter_on = confined and not keep_root and spec.get("fault") != "uid-root"
     preexec = functools.partial(harness._drop_child, limits, filter_on, drop)
     if spec.get("loopback") is True:

@@ -129,8 +129,23 @@ CORE_WAVE_70A_FILING = "core-wave70a"
 RUNTIME_WAVE_70A_FILING = "runtime-wave70a"
 CORE_WAVE_70B_FILING = "core-wave70b"
 RUNTIME_WAVE_70B_FILING = "runtime-wave70b"
+CORE_WAVE_71B_FILING = "core-wave71b"
+RUNTIME_WAVE_71B_FILING = "runtime-wave71b"
 CORE_WAVE_70A_WORKSPACES = WORKSPACE_PATHS + UI_KIT_WORKSPACE_PATHS
 CORE_WAVE_70B_WORKSPACES = CORE_WAVE_70A_WORKSPACES + ("packages/i18n",)
+CORE_WAVE_71B_WORKSPACES = (
+    "packages/host-api", "packages/kernel-i18n", "packages/kernel-icons",
+    "packages/kernel-tokens", "packages/kernel-ui-kit", "packages/i18n",
+    "packages/kernel-markdown", "packages/kernel-workers", "packages/extension-sdk",
+    "packages/extension-mock",
+)
+CORE_WAVE_71B_MEMBER_EDGES = (
+    ("packages/kernel-ui-kit", "packages/kernel-icons"),
+    ("packages/kernel-ui-kit", "packages/kernel-tokens"),
+    ("packages/i18n", "packages/kernel-i18n"),
+    ("packages/extension-mock", "packages/extension-sdk"),
+)
+CORE_WAVE_71B_TEST_ONLY_WORKSPACES = ("packages/extension-mock",)
 RUNTIME_WAVE_70_WORKSPACES = (
     "runtime/apps/test-shell-desktop/web",
     "runtime/apps/test-shell-mobile/web",
@@ -168,6 +183,30 @@ RUNTIME_WAVE_70B_FILE_EDGES += (
 ) + tuple(
     (source, SCOPE + "i18n", "packages/i18n") for source in RUNTIME_SHELL_WORKSPACES
 )
+RUNTIME_WAVE_71B_FILE_EDGES = tuple(
+    (source, name, target)
+    for source in RUNTIME_SHELL_WORKSPACES
+    for name, target in (
+        (SCOPE + "host-api", "packages/host-api"),
+        (SCOPE + "kernel-ui-kit", "packages/kernel-ui-kit"),
+        (SCOPE + "i18n", "packages/i18n"),
+    )
+) + tuple(
+    ("runtime/packages/host-ui", name, target)
+    for name, target in (
+        (SCOPE + "host-api", "packages/host-api"),
+        (SCOPE + "kernel-ui-kit", "packages/kernel-ui-kit"),
+        (SCOPE + "i18n", "packages/i18n"),
+        (SCOPE + "kernel-markdown", "packages/kernel-markdown"),
+        (SCOPE + "kernel-workers", "packages/kernel-workers"),
+        (SCOPE + "extension-sdk", "packages/extension-sdk"),
+    )
+) + (
+    ("packages/kernel-ui-kit", SCOPE + "kernel-icons", "packages/kernel-icons"),
+    ("packages/kernel-ui-kit", SCOPE + "kernel-tokens", "packages/kernel-tokens"),
+    ("packages/i18n", SCOPE + "kernel-i18n", "packages/kernel-i18n"),
+)
+RUNTIME_WAVE_71B_MEMBER_EDGES = RUNTIME_WAVE_70A_MEMBER_EDGES
 FILINGS = {
     DEFAULT_FILING: {
         "request_doc": "docs/dependencies/ui-npm-admission-batch-a.md",
@@ -225,6 +264,25 @@ FILINGS = {
         "request_doc": "docs/dependencies/ui-npm-admission-batch-b.md",
         "workspaces": RUNTIME_WAVE_70_WORKSPACES, "member_edges": RUNTIME_WAVE_70B_MEMBER_EDGES,
         "file_edges": RUNTIME_WAVE_70B_FILE_EDGES, "overrides": {},
+    },
+    CORE_WAVE_71B_FILING: {
+        "root_kind": "core", "root_manifest": "package.json", "root_lock": "package-lock.json",
+        "root_name": ROOT_NAME, "project_root": "", "node_version": ".node-version",
+        "npmrc": ".npmrc", "workspace_patterns": ("packages/*",),
+        "request_doc": "docs/dependencies/npm-wave71b-core.md",
+        "workspaces": CORE_WAVE_71B_WORKSPACES,
+        "member_edges": CORE_WAVE_71B_MEMBER_EDGES,
+        "test_only_workspaces": CORE_WAVE_71B_TEST_ONLY_WORKSPACES,
+        "overrides": {"lightningcss": "1.33.0"},
+    },
+    RUNTIME_WAVE_71B_FILING: {
+        "root_kind": "runtime", "root_manifest": "runtime/package.json",
+        "root_lock": "runtime/package-lock.json", "root_name": None, "project_root": "runtime",
+        "node_version": "runtime/.node-version", "npmrc": "runtime/.npmrc",
+        "workspace_patterns": tuple(path[len("runtime/"):] for path in RUNTIME_WAVE_70_WORKSPACES),
+        "request_doc": "docs/dependencies/npm-wave71b-runtime.md",
+        "workspaces": RUNTIME_WAVE_70_WORKSPACES, "member_edges": RUNTIME_WAVE_71B_MEMBER_EDGES,
+        "file_edges": RUNTIME_WAVE_71B_FILE_EDGES, "overrides": {},
     },
 }
 NODE_VERSION_BYTES = (NODE_VERSION + "\n").encode("ascii")
@@ -853,6 +911,19 @@ def check_inputs(files, selector):
             for name, spec in item[group].items():
                 if name in workspace_versions and spec != workspace_versions[name]:
                     _refuse("npm_manifest_refused")
+    test_only_names = {
+        _scoped_name(path) for path in filing.get("test_only_workspaces", ())
+    }
+    if test_only_names:
+        if any(name in group for group in root_groups.values() for name in test_only_names):
+            _refuse("npm_manifest_refused")
+        for source_record in package_records.values():
+            if source_record["path"] in filing.get("test_only_workspaces", ()):
+                continue
+            if any(
+                name in source_record["dependencies"] for name in test_only_names
+            ):
+                _refuse("npm_manifest_refused")
     rows = parse_request_doc(files[filing["request_doc"]])
     for name, version in sorted(direct.items()):
         if (name, version) not in rows:

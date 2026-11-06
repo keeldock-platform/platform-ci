@@ -1,0 +1,83 @@
+name: ci-future-stage-probes
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  future-stage-matrix:
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      jobs: ${{ steps.matrix.outputs.jobs }}
+    steps:
+      - name: Fetch exact public control
+        env:
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_REF: ${{ github.ref }}
+          CI_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_REF" == "refs/heads/main" ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git init -q .
+          git remote add origin "https://github.com/${CI_REPOSITORY}.git"
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF"
+          git checkout --quiet --detach FETCH_HEAD
+          [[ "$(git rev-parse --verify HEAD)" == "$CI_SHA" ]]
+      - name: Create the closed CP1 to CP3 matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          jobs="$(python3 -B kit/ci/future_stage.py matrix --inventory kit/ci/future-stage-inventory.json --checkpoint CP1 --checkpoint CP2 --checkpoint CP3 --checkpoint ci27 --checkpoint ci28 --checkpoint ci29 --checkpoint ci30 --checkpoint ci31)"
+          printf 'jobs=%s\n' "$jobs" >> "$GITHUB_OUTPUT"
+  future-stage:
+    needs: future-stage-matrix
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs.future-stage-matrix.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.future-stage-matrix.outputs.jobs) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - name: Fetch exact public control
+        env:
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_REF: ${{ github.ref }}
+          CI_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CI_REPOSITORY" == "keeldock-platform/platform-ci" && "$CI_REF" == "refs/heads/main" ]]
+          [[ "$CI_SHA" =~ ^[a-f0-9]{40}$ ]]
+          git init -q .
+          git remote add origin "https://github.com/${CI_REPOSITORY}.git"
+          git fetch --quiet --no-tags --depth=1 origin "$CI_REF"
+          git checkout --quiet --detach FETCH_HEAD
+          [[ "$(git rev-parse --verify HEAD)" == "$CI_SHA" ]]
+      - name: Probe inventory and publish a failing future-stage check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          FUTURE_STAGE_ID: ${{ matrix.job_id }}
+          FUTURE_STAGE_SHA: ${{ github.sha }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          export PYTHONDONTWRITEBYTECODE=1
+          set +e
+          python3 -B kit/ci/future_stage.py probe \
+            --inventory kit/ci/future-stage-inventory.json \
+            --job "$FUTURE_STAGE_ID" --root . --source-sha "$FUTURE_STAGE_SHA" \
+            --output "$RUNNER_TEMP/future-stage-result.json" --publish \
+            | tee "$RUNNER_TEMP/future-stage-result.txt"
+          probe_status=$?
+          set -e
+          cat "$RUNNER_TEMP/future-stage-result.txt" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$probe_status" -eq 0 || "$probe_status" -eq 78 ]]; then
+            exit 78
+          fi
+          exit "$probe_status"

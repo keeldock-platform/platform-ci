@@ -1,4 +1,5 @@
 import base64
+import contextvars
 import hashlib
 import hmac
 import json
@@ -21,6 +22,7 @@ import zipfile
 from pathlib import Path
 
 import cargo_lock_bootstrap
+import cargo_rust_admission
 import gate_table
 import linux_harness
 import linux_channels
@@ -2106,14 +2108,15 @@ def _validate_cargo_lock_sources(project):
             continue
         found = True
         try:
-            payload = (Path(current) / "Cargo.lock").read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+            payload = (Path(current) / "Cargo.lock").read_bytes()
+        except OSError:
             raise SourceBuildRefusal("lock") from None
-        if len(payload) > 4 * 1024 * 1024:
+        if len(payload) > rust_license_gate.MAX_LOCK_BYTES:
             raise SourceBuildRefusal("lock")
-        for line in payload.splitlines():
-            if re.match(r"^\s*source\s*=", line):
-                raise SourceBuildRefusal("registry")
+        try:
+            cargo_lock_bootstrap.cargo.parse_cargo_lock(payload)
+        except cargo_lock_bootstrap.cargo.Refusal:
+            raise SourceBuildRefusal("registry") from None
     if not found:
         raise SourceBuildRefusal("lock")
 
@@ -2703,7 +2706,11 @@ def _read_staged_inventory_receipt(environ):
         raise SourceBuildRefusal("gate") from None
 
 
+_RUST_VENDOR_ADMISSIONS = contextvars.ContextVar("rust_vendor_admissions", default=None)
+
+
 def run_rust_license_gate(environ=None):
+    _RUST_VENDOR_ADMISSIONS.set(None)
     env = os.environ if environ is None else environ
     source = Path(env.get("SOURCE_PATH", ""))
     source_sha = env.get("REQUESTED_SOURCE_SHA", "")
@@ -2717,6 +2724,7 @@ def run_rust_license_gate(environ=None):
     root_identity = _directory_identity(os.fstat(root_fd))
     lock_count = 0
     all_registry_free = True
+    vendor_admissions = {}
     try:
         _require_source_root_identity(source, root_identity)
         _require_confined_manifests(root_fd)
@@ -2727,8 +2735,9 @@ def run_rust_license_gate(environ=None):
             try:
                 lock_bytes = _read_bounded_cargo_lock(root_fd, candidate)
                 relative_parts = candidate[0][:-1]
-                relative = "/".join(relative_parts) or "."
-                if len(relative) > 64:
+                profile = "/".join(relative_parts) or "."
+                lock_relative = (profile + "/" if profile != "." else "") + "Cargo.lock"
+                if len(profile) > 64 or len(lock_relative) > 512:
                     raise SourceBuildRefusal("lock")
                 _require_source_root_identity(source, root_identity)
             except (OSError, ValueError):
@@ -2736,12 +2745,30 @@ def run_rust_license_gate(environ=None):
             if not lock_bytes or len(lock_bytes) > rust_license_gate.MAX_LOCK_BYTES:
                 raise SourceBuildRefusal("lock")
             identity = rust_license_gate.Identity(
-                source_sha, relative, str(source.joinpath(*relative_parts)),
+                source_sha, profile, str(source.joinpath(*relative_parts)),
                 hashlib.sha256(lock_bytes).hexdigest(),
             )
-            receipt = rust_license_gate.require_lock_admission(
-                lock_bytes, identity, rust_license_gate.TRUSTED_PORTS,
-            )
+            try:
+                parsed_lock = cargo_lock_bootstrap.cargo.parse_cargo_lock(lock_bytes)
+            except cargo_lock_bootstrap.cargo.Refusal:
+                raise rust_license_gate.LicenseGateRefusal("lock") from None
+            if any(item.get("source") == cargo_lock_bootstrap.cargo.REGISTRY_SOURCE
+                   for item in parsed_lock["packages"]):
+                try:
+                    vendor_admissions[lock_relative] = cargo_rust_admission.admit_authenticated_lock(
+                        lock_bytes, source, source_sha, profile, lock_relative,
+                        env.get("KD_CARGO_LOCK_EVIDENCE_DIR", ""),
+                        env.get("RUNNER_TEMP", "/tmp"), env.get("RUST_ROOT", ""),
+                        rust_license_gate.TRUSTED_PORTS,
+                    )
+                except (cargo_rust_admission.RustAdmissionRefusal,
+                        rust_license_gate.LicenseGateRefusal):
+                    raise SourceBuildRefusal("gate") from None
+                receipt = vendor_admissions[lock_relative]["license_gate_receipt"]
+            else:
+                receipt = rust_license_gate.require_lock_admission(
+                    lock_bytes, identity, rust_license_gate.TRUSTED_PORTS,
+                )
             lock_count += 1
             if type(receipt) is not rust_license_gate.RegistryFreeReceipt:
                 all_registry_free = False
@@ -2751,6 +2778,7 @@ def run_rust_license_gate(environ=None):
         raise SourceBuildRefusal("lock")
     if all_registry_free:
         sys.stdout.write("linux-rust-licence=registry-free locks=" + str(lock_count) + "\n")
+    _RUST_VENDOR_ADMISSIONS.set(vendor_admissions)
     return 0
 
 
@@ -3192,6 +3220,54 @@ def _gate_refusal_line(completed, failed, gate, cause):
     return line + "\n"
 
 
+def _cargo_lock_for_command(argv, worker):
+    manifest = None
+    try:
+        index = argv.index("--manifest-path")
+        manifest = Path(argv[index + 1])
+    except (ValueError, IndexError):
+        manifest = Path(worker) / "Cargo.toml"
+    try:
+        relative_parent = manifest.parent.resolve(strict=True).relative_to(Path(worker).resolve(strict=True))
+    except (OSError, ValueError):
+        raise SourceBuildRefusal("gate") from None
+    current = relative_parent
+    while True:
+        candidate = (current / "Cargo.lock").as_posix() if current.parts else "Cargo.lock"
+        if (Path(worker) / candidate).is_file():
+            return candidate
+        if not current.parts:
+            break
+        current = current.parent
+    raise SourceBuildRefusal("gate")
+
+
+def _apply_vendor_arguments(commands, vendor_admissions, worker, cargo_path):
+    updated = []
+    for name, argv in commands:
+        arguments = tuple(argv)
+        if arguments and os.path.realpath(arguments[0]) == os.path.realpath(cargo_path):
+            lock_relative = _cargo_lock_for_command(arguments, worker)
+            admission = vendor_admissions.get(lock_relative)
+            if admission is not None:
+                vendor_arguments = admission.get("cargo_arguments")
+                required = admission.get("required_flags")
+                if (type(vendor_arguments) is not list or len(vendor_arguments) % 2
+                        or type(required) is not tuple or "--locked" not in required
+                        or "--offline" not in required):
+                    raise SourceBuildRefusal("gate")
+                for index in range(0, len(vendor_arguments), 2):
+                    if vendor_arguments[index] != "--config":
+                        raise SourceBuildRefusal("gate")
+                try:
+                    split = arguments.index("--")
+                except ValueError:
+                    split = len(arguments)
+                arguments = arguments[:split] + tuple(vendor_arguments) + arguments[split:]
+        updated.append((name, arguments))
+    return tuple(updated)
+
+
 def run_project_gates(environ=None):
     env = os.environ if environ is None else environ
     worker = Path(env.get("WORKER_PATH", ""))
@@ -3203,6 +3279,9 @@ def run_project_gates(environ=None):
     license_environment = dict(env)
     license_environment["SOURCE_PATH"] = str(worker)
     run_rust_license_gate(license_environment)
+    vendor_admissions = _RUST_VENDOR_ADMISSIONS.get()
+    if type(vendor_admissions) is not dict:
+        raise SourceBuildRefusal("gate")
     records = Path(env.get("RUNNER_TEMP", "/tmp")) / "kd-records"
     records.mkdir(mode=0o700, parents=True, exist_ok=True)
     browser_root = env.get(BROWSER_ROOT_ENV, "")
@@ -3212,6 +3291,9 @@ def run_project_gates(environ=None):
     if browser and not browser_root:
         raise SourceBuildRefusal("gate")
     commands = _gate_commands(worker, rust_root, node_bin, browser)
+    commands = _apply_vendor_arguments(
+        commands, vendor_admissions, worker, str(Path(rust_root) / "bin" / "cargo"),
+    )
     selected_gates = tuple(name for name, unused_argv in commands)
     expected_gates = GATES + (RUNTIME_GATE_NAMES if _runtime_workspace_present(worker) else ())
     expected_gates += BROWSER_GATE_NAMES if browser else ()

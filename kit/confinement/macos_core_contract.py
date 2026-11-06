@@ -42,7 +42,8 @@ ALLOWED_CONTROL_SIBLINGS = frozenset((
     "macos_private_validation", "macos_source_reader", "macos_network_observer",
     "macos_rust_toolchain", "macos_rules_bootstrap", "macos_feedback_producer",
     "macos_node_contract", "foundation_node_feedback", "cargo_lock_bootstrap",
-    "npm_admission_bootstrap",
+    "npm_admission_bootstrap", "cargo_lock_receipt", "cargo_rust_admission",
+    "rust_license_gate", "cargo_deny_installer",
 ))
 FEEDBACK_TREE_LABELS = {
     "core-contract": "core_contract",
@@ -1150,8 +1151,46 @@ def _gate_timeout_result(limit_seconds):
     return result
 
 
+def _ensure_cargo_deny_control(tools, control_sha):
+    installer = _load_control_sibling("cargo_deny_installer")
+    names = (
+        "KD_CARGO_DENY_PATH", "KD_CARGO_DENY_RECEIPT_PATH", "KD_CARGO_DENY_HOME",
+        "KD_RUSTSEC_ADVISORY_DB_PATH",
+    )
+    configured = tuple(os.environ.get(name) for name in names)
+    if any(configured) and not all(configured):
+        raise Refusal("gate_failed", "source_gates")
+    if not any(configured):
+        runner_temp = os.environ.get("RUNNER_TEMP", "")
+        if not runner_temp or not os.path.isabs(runner_temp):
+            raise Refusal("gate_failed", "source_gates")
+        root = Path(runner_temp) / "kd-rust-license-control"
+        try:
+            root.mkdir(mode=0o700)
+            deny_root = root / "cargo-deny"
+            cargo_home = root / "cargo-home"
+            executable, receipt = installer.install(deny_root)
+            database = installer.prepare_advisories(cargo_home)
+        except BaseException:
+            raise Refusal("gate_failed", "source_gates") from None
+        os.environ["KD_CARGO_DENY_PATH"] = str(executable)
+        os.environ["KD_CARGO_DENY_RECEIPT_PATH"] = str(receipt)
+        os.environ["KD_CARGO_DENY_HOME"] = str(cargo_home)
+        os.environ["KD_RUSTSEC_ADVISORY_DB_PATH"] = str(database)
+    os.environ["CI_SHA"] = control_sha
+    os.environ["RUST_ROOT"] = str(Path(tools["cargo"]).parent.parent)
+    try:
+        installer.verify_installed(
+            os.environ["KD_CARGO_DENY_PATH"], os.environ["KD_CARGO_DENY_RECEIPT_PATH"],
+        )
+        installer.verify_advisory_database(os.environ["KD_RUSTSEC_ADVISORY_DB_PATH"])
+    except BaseException:
+        raise Refusal("gate_failed", "source_gates") from None
+
+
 def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools, deadline,
-               capture_failure=False, include_parser=False, include_runtime=False):
+               capture_failure=False, include_parser=False, include_runtime=False,
+               source_sha=None):
     if (type(capture_failure) is not bool or type(include_parser) is not bool
             or type(include_runtime) is not bool):
         raise Refusal("capture_invalid", "source_gates")
@@ -1162,6 +1201,84 @@ def _run_gates(source, environment, uid, host_toolchain, capability, rust, tools
     commands = _source_commands(
         source, tools, include_parser=include_parser, include_runtime=include_runtime,
     )
+    vendor_admissions = {}
+    if source_sha is not None:
+        cargo = _load_control_sibling("cargo_lock_receipt")
+        admission = _load_control_sibling("cargo_rust_admission")
+        license_gate = _load_control_sibling("rust_license_gate")
+        for current, directories, files in os.walk(source, followlinks=False):
+            directories[:] = [name for name in directories
+                              if not os.path.islink(os.path.join(current, name))]
+            if "Cargo.lock" not in files:
+                continue
+            lock_path = Path(current) / "Cargo.lock"
+            try:
+                lock_bytes = lock_path.read_bytes()
+                parsed = cargo.parse_cargo_lock(lock_bytes)
+            except (OSError, cargo.Refusal):
+                raise Refusal("source_validation_failed", "source_validation") from None
+            registry = any(item.get("source") == cargo.REGISTRY_SOURCE
+                           for item in parsed["packages"])
+            if not registry:
+                continue
+            relative_lock = lock_path.relative_to(source).as_posix()
+            profile = Path(relative_lock).parent.as_posix()
+            try:
+                receipt_bytes, binding_bytes = admission.control_files_for_lock(
+                    os.environ.get("KD_CARGO_LOCK_EVIDENCE_DIR", ""), source, relative_lock,
+                )
+                _ensure_cargo_deny_control(tools, os.environ.get("CI_SHA", ""))
+                vendor_admissions[relative_lock] = admission.admit_lock(
+                    lock_bytes, source, source_sha, profile, receipt_bytes, binding_bytes,
+                    os.environ.get("RUNNER_TEMP", "/tmp"),
+                    str(Path(tools["cargo"]).parent.parent), license_gate.TRUSTED_PORTS,
+                )
+            except (admission.RustAdmissionRefusal, license_gate.LicenseGateRefusal):
+                raise Refusal("gate_failed", "source_gates") from None
+
+    def bind_vendor_arguments(argv):
+        actual = tuple(argv)
+        if not vendor_admissions:
+            return actual
+        if not actual or os.path.realpath(actual[0]) != os.path.realpath(str(tools["cargo"])):
+            return actual
+        manifest = None
+        try:
+            manifest = Path(actual[actual.index("--manifest-path") + 1])
+        except (ValueError, IndexError):
+            manifest = Path(source) / "Cargo.toml"
+        try:
+            parent = manifest.parent.resolve(strict=True).relative_to(Path(source).resolve(strict=True))
+        except (OSError, ValueError):
+            raise Refusal("gate_failed", "source_gates") from None
+        while True:
+            relative = (parent / "Cargo.lock").as_posix() if parent.parts else "Cargo.lock"
+            selected = vendor_admissions.get(relative)
+            if selected is not None:
+                config = selected.get("cargo_arguments")
+                flags = selected.get("required_flags")
+                if (type(config) is not list or len(config) % 2
+                        or type(flags) is not tuple or "--locked" not in flags
+                        or "--offline" not in flags):
+                    raise Refusal("gate_failed", "source_gates")
+                for position in range(0, len(config), 2):
+                    if config[position] != "--config":
+                        raise Refusal("gate_failed", "source_gates")
+                try:
+                    separator = actual.index("--")
+                except ValueError:
+                    separator = len(actual)
+                required_flags = tuple(
+                    flag for flag in ("--locked", "--offline") if flag not in actual
+                )
+                return (actual[:separator] + required_flags + tuple(config)
+                        + actual[separator:])
+            if not parent.parts:
+                break
+            parent = parent.parent
+        return actual
+
+    commands = tuple((stage, bind_vendor_arguments(argv)) for stage, argv in commands)
     selected_gates = tuple(stage for stage, unused_argv in commands)
     expected_gates = GATE_NAMES
     if include_parser:
@@ -1706,6 +1823,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                             source, environment, worker_uid, host_toolchain, capability, rust,
                             toolchain_paths.command_paths(), deadline,
                             include_runtime=runtime_workspace_present,
+                            source_sha=lease_record["source_sha"],
                         ),
                     )
                 else:
@@ -1723,6 +1841,7 @@ def _run_source(request, binding, root, runner_temp, environ, controls, diff_sha
                                 source, environment, worker_uid, host_toolchain, capability, rust,
                                 toolchain_paths.command_paths(), deadline, capture_failure=True,
                                 include_parser=validated_fuzz_workspace,
+                                source_sha=lease_record["source_sha"],
                             ),
                         )
                         if lease_record["tree"] == LOCKED_FOUNDATION_TREE:

@@ -1,5 +1,7 @@
 import hashlib
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -485,6 +487,24 @@ class WindowsSourceWorkflowTests(unittest.TestCase):
             block = job_block(caller, job_id)
             for name in re.findall(r"(?m)^      ([a-z_]+): ", block.split("    with:\n", 1)[1].split("    permissions:", 1)[0]):
                 self.assertIn("      " + name + ":\n", receiver.split("\njobs:\n", 1)[0])
+
+    def test_receiver_workflow_has_only_supported_actions_keys_and_parses(self):
+        receiver = read_ascii(WINDOWS_RECEIVER_PATH)
+        self.assertNotRegex(receiver, r"(?m)^\s+cache-mode:")
+        self.assertEqual(receiver.count("\npermissions: {}\n"), 1)
+        self.assertIn("    runs-on: windows-2025\n", receiver)
+        self.assertIn("    timeout-minutes: 330\n", receiver)
+        self.assertIn("    permissions:\n", receiver)
+        for permission in ("contents: read", "actions: read", "id-token: write", "attestations: write"):
+            self.assertIn("      " + permission + "\n", receiver)
+        actionlint = shutil.which("actionlint")
+        if actionlint is None:
+            self.skipTest("actionlint is not installed")
+        result = subprocess.run(
+            [actionlint, "-oneline", str(WINDOWS_RECEIVER_PATH)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_the_receivers_get_a_synthetic_canary_that_differs_from_the_one_the_audit_scans_for(self):
         receiver = read_ascii(WINDOWS_RECEIVER_PATH)

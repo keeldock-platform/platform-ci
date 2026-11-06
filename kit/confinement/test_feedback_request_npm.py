@@ -113,6 +113,7 @@ class NpmAdmissionProfileTests(unittest.TestCase):
             subject.NPM_FILING_SELECTORS, (
                 "contract-ui-batch-a", "contract-ui-batch-b", "quick-fixture",
                 "core-wave70a", "runtime-wave70a", "core-wave70b", "runtime-wave70b",
+                "core-wave71b", "runtime-wave71b",
             ),
         )
         second = _fields()

@@ -709,10 +709,12 @@ class WindowsSourceRunTests(unittest.TestCase):
                       "(100644|100755) blob", "[StringComparer]::Ordinal"):
             self.assertIn(token, self.runner)
 
-    def test_configs_are_neutralised_and_cargo_sources_refused(self):
+    def test_configs_are_neutralised_and_cargo_lock_sources_are_authenticated(self):
         self.assertIn("'.npmrc'", self.runner)
         self.assertIn("(?im)^\\s*\\[(?:source\\.|registries\\.)|^\\s*(?:replace-with|registry)\\s*=", self.runner)
-        self.assertIn("'^\\s*source\\s*='", self.runner)
+        self.assertIn("'inspect-lock'", self.runner)
+        self.assertIn("Invoke-CargoLockAdmissions $project $bound['source_sha']", self.runner)
+        self.assertIn("$lockInfo['registry_packages']", self.runner)
 
     def test_npm_tarballs_are_registry_only_integrity_checked_and_copied_not_moved(self):
         self.assertIn("$uri.Host -cne 'registry.npmjs.org'", self.runner)
@@ -1576,7 +1578,8 @@ const move = (kind, from, to) => {
             "if ($name -cne $NpmSteppedGate -or $steps.Count -ne 2) { throw 'gate_plan' }",
             "$then = [string[]](Expand-GateArgv @($steps[1]) $cargo $node $npm $project)",
             "if ($name -ceq $NpmSteppedGate) { throw 'gate_plan' }",
-            "Argv = [string[]](Expand-GateArgv $argv $cargo $node $npm $project); Then = $then",
+            "$expanded = [string[]](Add-CargoAdmissionArguments $expanded $project)",
+            "$gates += @{ Id = $name; Argv = $expanded; Then = $then }",
             "if ($gates.Count -ne $expectedCount -or $stepped -ne 1) { throw 'gate_plan' }",
         ):
             with self.subTest(token=token[:60]):

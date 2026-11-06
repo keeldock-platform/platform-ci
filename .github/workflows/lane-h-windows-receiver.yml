@@ -28,7 +28,6 @@ jobs:
     runs-on: windows-2025
     environment: ${{ inputs.mode == 'source' && 'windows-source-exec' || '' }}
     timeout-minutes: 330
-    cache-mode: none
     permissions:
       contents: read
       actions: read
@@ -67,6 +66,24 @@ jobs:
           if ($env:KD_WORKFLOW_REF -ne ($env:KD_REPOSITORY + '/.github/workflows/windows-source-admission.yml@' + $expectedRef)) { throw 'caller' }
           if ($env:KD_MODE -eq 'source' -and $env:KD_SOURCE_SHA -cnotmatch '^[a-f0-9]{40}$') { throw 'source' }
           if ($env:KD_MODE -eq 'synthetic' -and $env:KD_SOURCE_SHA -ne '') { throw 'source' }
+      - name: Install pinned cargo-deny and prepare the RustSec database
+        if: ${{ inputs.mode == 'source' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $controlRoot = Join-Path $env:RUNNER_TEMP 'kd-rust-license-control'
+          $denyRoot = Join-Path $controlRoot 'cargo-deny'
+          $cargoHome = Join-Path $controlRoot 'cargo-home'
+          New-Item -ItemType Directory -Path $controlRoot | Out-Null
+          & python -B kit/confinement/cargo_deny_installer.py install --destination $denyRoot
+          if ($LASTEXITCODE -ne 0) { throw 'cargo-deny-install' }
+          & python -B kit/confinement/cargo_deny_installer.py prepare-advisories --cargo-home $cargoHome
+          if ($LASTEXITCODE -ne 0) { throw 'rustsec-prepare' }
+          $advisoryPath = Join-Path $cargoHome 'advisory-dbs\advisory-db-3157b0e258782691'
+          if (-not (Test-Path -LiteralPath (Join-Path $denyRoot 'cargo-deny.exe') -PathType Leaf) -or -not (Test-Path -LiteralPath $advisoryPath -PathType Container)) { throw 'cargo-deny-setup' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value ('KD_CARGO_DENY_PATH=' + (Join-Path $denyRoot 'cargo-deny.exe'))
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value ('KD_CARGO_DENY_RECEIPT_PATH=' + (Join-Path $denyRoot 'cargo-deny-install.json'))
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value ('KD_CARGO_DENY_HOME=' + $cargoHome)
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value ('KD_RUSTSEC_ADVISORY_DB_PATH=' + $advisoryPath)
       - name: Read numeric control repository identifier
         run: |
           $ErrorActionPreference = 'Stop'

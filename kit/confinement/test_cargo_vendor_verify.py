@@ -8,6 +8,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from unittest.mock import patch
 
 import cargo_lock_receipt as cargo
 import cargo_vendor_verify as subject
@@ -88,11 +89,22 @@ def _write_vendor(directory, manifest_package=CHECKSUM,
 
 
 def _vendor_receipt(record, vendor_digest, changes=None):
+    gate_receipt = _license_gate_receipt(record)
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "lock_receipt_sha256": hashlib.sha256(cargo.encode_receipt(record)).hexdigest(),
         "lock_sha256": record["lock_sha256"],
+        "source_sha": record["source_sha"],
+        "profile": record["workspace_path"],
         "vendor_sha256": vendor_digest,
+        "license_gate_receipt_sha256": rust_license_gate.gate_receipt_sha256(gate_receipt),
+        "archive_spdx_sha256": gate_receipt.archive_spdx_sha256,
+        "policy_sha256": gate_receipt.policy_sha256,
+        "checker_sha256": gate_receipt.checker_sha256,
+        "cargo_deny_sha256": gate_receipt.cargo_deny_sha256,
+        "cargo_deny_qualification_sha256": gate_receipt.cargo_deny_qualification_sha256,
+        "advisory_database_commit": gate_receipt.advisory_database_commit,
+        "advisory_database_generated_at_epoch": gate_receipt.advisory_database_generated_at_epoch,
     }
     if changes:
         value.update(changes)
@@ -108,7 +120,7 @@ def _license_gate_receipt(record):
     return rust_license_gate.GateReceipt(
         identity, "f" * 64, len(record["packages"]),
         "2" * 40, "1" * 64, "e" * 64, "c" * 64, "d" * 64,
-        "e" * 40,
+        "e" * 40, 1_800_000_000,
         rust_license_gate._SEAL,
     )
 
@@ -879,27 +891,51 @@ class CargoVendorVerifyTests(unittest.TestCase):
                     _unfreeze(path)
 
 
-@unittest.skipUnless(os.name == "nt", "Windows handoff refusal")
 class WindowsVendorHandoffTests(unittest.TestCase):
-    def test_windows_refuses_without_native_namespace_protection(self):
+    def test_windows_verifies_read_only_tree_and_returns_offline_replacement(self):
         record = _lock_receipt()
         with tempfile.TemporaryDirectory() as temporary:
-            vendor = Path(temporary) / "vendor"
+            staging = Path(temporary)
+            vendor = staging / "vendor"
             vendor.mkdir()
             digest = _write_vendor(vendor)
             receipt, trusted_digest = _vendor_receipt(record, digest)
+            config_arguments = [
+                "--config", 'source.crates-io.replace-with="verified-vendor"',
+                "--config", "source.verified-vendor.directory=" + json.dumps(str(vendor.resolve())),
+                "--config", "net.offline=true",
+                "--config", "registry.global-credential-providers=[]",
+                "--config", "patch.crates-io={}",
+            ]
+            with patch.object(subject, "_is_windows", return_value=True), patch.object(
+                    cargo, "cargo_config_for_vendor",
+                    return_value=(config_arguments, {})):
+                result = subject.verify_vendor_tree(
+                    subject.VendorVerificationRequest(
+                        LOCK_BYTES, record, _lock_context(record),
+                        _authorized_audits(record), vendor, receipt, trusted_digest,
+                        staging, _license_gate_receipt(record),
+                    ),
+                )
             try:
-                with self.assertRaises(cargo.Refusal) as raised:
-                    subject.verify_vendor_tree(
-                        subject.VendorVerificationRequest(
-                            LOCK_BYTES, record, _lock_context(record),
-                            _authorized_audits(record), vendor, receipt, trusted_digest,
-                            vendor.parent, _license_gate_receipt(record),
-                        ),
-                    )
-                self.assertEqual(raised.exception.reason, "cargo_vendor_invalid")
+                self.assertEqual(result["vendor_sha256"], digest)
+                self.assertEqual(result["materialized_vendor_directory"], vendor.resolve())
+                self.assertEqual(result["required_flags"], ("--locked", "--offline"))
+                self.assertIn("net.offline=true", result["cargo_arguments"])
+                self.assertIn('source.crates-io.replace-with="verified-vendor"', result["cargo_arguments"])
             finally:
                 _unfreeze(vendor)
+
+    def test_windows_inventory_refuses_writable_vendor_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            vendor = Path(temporary) / "vendor"
+            vendor.mkdir()
+            _write_vendor(vendor)
+            source = vendor / "serde-1.0.1" / "src" / "lib.rs"
+            source.chmod(0o644)
+            with self.assertRaises(cargo.Refusal):
+                subject._windows_inventory(vendor)
+            _unfreeze(vendor)
 
 
 if __name__ == "__main__":

@@ -13,9 +13,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-if not sys.platform.startswith("linux"):
-    raise unittest.SkipTest("the source capsule suite runs only on Linux")
-
 import source_capsule as subject
 
 frame = subject.frame
@@ -165,6 +162,7 @@ class SourceFixtureMixin:
         self.assertEqual(caught.exception.reason, reason)
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "the source capsule suite runs only on Linux")
 class BundleAndManifestTests(SourceFixtureMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -336,6 +334,7 @@ class BundleAndManifestTests(SourceFixtureMixin, unittest.TestCase):
             self.assert_refusal("source-sha", subject.build_manifest, self.repository, self.source_sha, 1, 100, bytes(32))
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "the source capsule suite runs only on Linux")
 class SealedCapsuleTests(SourceFixtureMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -460,6 +459,7 @@ class SealedCapsuleTests(SourceFixtureMixin, unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_GIT, "git is required")
+@unittest.skipUnless(sys.platform.startswith("linux"), "the source capsule suite runs only on Linux")
 class SealRefusalTests(SourceFixtureMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -587,6 +587,7 @@ class SealRefusalTests(SourceFixtureMixin, unittest.TestCase):
         self.assertFalse((self.root / "duplicate.bin").exists())
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "the source capsule suite runs only on Linux")
 class CommandLineTests(unittest.TestCase):
     def run_main(self, arguments):
         output = io.StringIO()
@@ -651,6 +652,7 @@ class CommandLineTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_GIT, "git is required")
+@unittest.skipUnless(sys.platform.startswith("linux"), "the source capsule suite runs only on Linux")
 class RealProviderTests(SourceFixtureMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
